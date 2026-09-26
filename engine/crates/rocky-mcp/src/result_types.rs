@@ -137,7 +137,8 @@ pub struct LineageResult {
 pub struct TestFailureLite {
     pub name: String,
     pub error: String,
-    /// `"model"` or `"unit"` — which suite this failure came from.
+    /// `"model"`, `"unit"` or `"declarative"` — which suite this failure
+    /// came from.
     pub suite: String,
 }
 
@@ -149,7 +150,26 @@ pub struct TestSuiteCounts {
     pub failed: usize,
 }
 
-/// `test` result — BOTH DuckDB-backed local suites, in one shape.
+/// Counts for the declarative `[[tests]]` suite — the checks `rocky test
+/// --declarative` runs against the configured warehouse.
+///
+/// Wider than [`TestSuiteCounts`] because a declarative check has two more
+/// outcomes: `warned` (a `severity = "warning"` check that failed — reported,
+/// never a failure) and `errored` (the runner could not evaluate the check,
+/// for example because the model's table does not exist yet). `failed`
+/// counts `severity = "error"` checks that failed. `passed + failed + warned
+/// + errored == total`.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct DeclarativeSuiteCounts {
+    pub total: usize,
+    pub passed: usize,
+    pub failed: usize,
+    pub warned: usize,
+    pub errored: usize,
+}
+
+/// `test` result — BOTH DuckDB-backed local suites, in one shape, plus the
+/// declarative suite when the caller asks for it (`declarative: true`).
 ///
 /// `rocky test` runs two things, and this result used to report one of them.
 /// `commands::test_output` returns model-execution counts (`total`, `passed`,
@@ -190,6 +210,14 @@ pub struct TestResult {
     pub models: TestSuiteCounts,
     /// The fixture `[[test]]` suite on its own.
     pub unit_tests: TestSuiteCounts,
+    /// The declarative `[[tests]]` suite, run against the configured
+    /// warehouse. Present only when the call passed `declarative: true`;
+    /// absent means the suite was NOT run, not that it passed. When present,
+    /// its checks are in `total` and `passed`, its `failed` and `errored`
+    /// checks are in `failures` and make `all_passed` false, and a `warned`
+    /// check is counted here only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub declarative: Option<DeclarativeSuiteCounts>,
 }
 
 /// One row in a `list` result. Each `kind` populates a distinct subset of
@@ -496,8 +524,10 @@ pub struct DraftContractResult {
 /// `[[tests]]` blocks, the tool appends them to the model's sidecar
 /// (`models/<model>.toml`), compiles so a malformed block fails structurally, and
 /// gates the write through the agent-policy plane. The check *executes* via the
-/// `test` tool (compile validates the sidecar's structure; column-reference
-/// validity is proven when the check runs). Distinct from `ai_test`, which asks
+/// `test` tool with `declarative: true`, against the model's table in the
+/// configured warehouse (compile validates the sidecar's structure; the
+/// generator's validators run before the write; column existence is proven
+/// when the check runs). Distinct from `ai_test`, which asks
 /// an LLM to *generate* assertions and returns them without writing.
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct DraftCheckResult {
@@ -512,8 +542,8 @@ pub struct DraftCheckResult {
     /// Count of warning-severity diagnostics.
     pub warning_count: usize,
     /// The immediate compile's diagnostics, scoped to the model. Compile proves
-    /// the merged sidecar is structurally sound; run the `test` tool to execute
-    /// the check against the data.
+    /// the merged sidecar is structurally sound; run the `test` tool with
+    /// `declarative: true` to execute the check against the data.
     pub diagnostics: Vec<DiagnosticLite>,
     /// The authoring-loop reminder: a draft is not applied. It restates the flow
     /// (write → compile → `test` → `propose` → human review → apply).
@@ -793,7 +823,7 @@ pub struct TestAssertionLite {
 ///
 /// `assertions` are DRAFTS the caller encodes as declarative `[[tests]]` blocks
 /// (or hands to `draft_check` to write + policy-gate) and runs via the `test`
-/// tool. `message` explains why no assertions were produced (the API key is
+/// tool with `declarative: true`. `message` explains why no assertions were produced (the API key is
 /// unset, or the model wasn't found) so a no-op is distinguishable from an
 /// error.
 #[derive(Debug, Default, Serialize, JsonSchema)]

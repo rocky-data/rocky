@@ -1463,6 +1463,18 @@ const WORKER_TOOL_DESCRIPTIONS: &[(&str, &str, &str)] = &[
         "before proposing a materialization.",
         "before you hand off to the trusted runner.",
     ),
+    // #2176: the default text offers `declarative: true`, which this profile
+    // refuses — the worker surface stays offline.
+    (
+        "test",
+        "Pass `declarative: true` to ALSO run the declarative `[[tests]]` checks in model \
+         sidecars (the `rocky test --declarative` set) as read queries against the configured \
+         warehouse, on the table each model materializes: their counts come back in \
+         `declarative`, their failures in `failures` tagged `declarative`, and a model that \
+         has not been applied yet reports its checks as errored.",
+        "Do not pass `declarative`: this profile refuses it. The declarative checks read the \
+         configured warehouse, and they run after the apply in the trusted runner.",
+    ),
     (
         "draft_model",
         "a draft is inert until you `propose` it and a human reviews it.",
@@ -1753,10 +1765,17 @@ pub struct ProfileColumnArgs {
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct TestArgs {
-    /// Optional single-model scope: run only this model's declarative tests.
+    /// Optional single-model scope: run only this model's tests.
     /// When unset, runs the whole project's tests (unchanged behavior).
     #[serde(default)]
     pub model: Option<String>,
+    /// Also run the declarative `[[tests]]` checks in model sidecars, the
+    /// set `rocky test --declarative` runs. They execute as read queries
+    /// against the configured warehouse, on the table each model
+    /// materializes, so a model that has not been applied reports its checks
+    /// as `errored`. Defaults to false: the local suites only.
+    #[serde(default)]
+    pub declarative: bool,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -1915,7 +1934,8 @@ pub struct DraftCheckArgs {
     /// model's sidecar verbatim. Each block is a Rocky data-quality check
     /// (`not_null`, `unique`, `accepted_values`, `relationships`, `expression`,
     /// range, …). Compile proves the merged sidecar is structurally sound; the
-    /// check executes via the `test` tool. When omitted, the call is treated as
+    /// check executes via the `test` tool with `declarative: true`, against the
+    /// model's table in the configured warehouse. When omitted, the call is treated as
     /// a mis-dispatch to the generator and returns an actionable error pointing
     /// at the `ai_test` tool.
     #[serde(default)]
@@ -2635,11 +2655,30 @@ impl RockyMcpServer {
          fixture-driven `[[test]]` blocks declared in model sidecars. `failures` carries both, \
          each tagged with its `suite`; `models` and `unit_tests` hold the per-suite counts. \
          Branch on `all_passed` — it is true only when both suites are clean. Use after writing \
-         or changing a model. Pass `model` to scope the run to one model's tests."
+         or changing a model. Pass `model` to scope the run to one model's tests. Pass \
+         `declarative: true` to ALSO run the declarative `[[tests]]` checks in model sidecars \
+         (the `rocky test --declarative` set) as read queries against the configured \
+         warehouse, on the table each model materializes: their counts come back in \
+         `declarative`, their failures in `failures` tagged `declarative`, and a model that \
+         has not been applied yet reports its checks as errored."
     )]
     async fn test(&self, params: Parameters<TestArgs>) -> ToolResult<TestResult> {
-        let output = commands::test_output(&self.models_dir, None, params.0.model.as_deref())
-            .map_err(|e| {
+        let args = params.0;
+        // The worker surface stays offline (`WORKER_TOOL_EFFECTS` classifies
+        // `test` as `Offline`). The declarative suite reads the configured
+        // warehouse and evaluates sidecar SQL fragments with its
+        // credentials, which is the post-apply observation's job in the
+        // fulfillment loop, not a drafting worker's.
+        if args.declarative && self.profile == McpProfile::Worker {
+            return Err(ToolError::invalid_argument(
+                "`declarative: true` is not served on this profile: the declarative checks \
+                 run against the configured warehouse, and this session stays offline",
+                "Run `test` without `declarative`. The product's declared checks run after \
+                 the apply, in the trusted runner's observation step.",
+            ));
+        }
+        let output =
+            commands::test_output(&self.models_dir, None, args.model.as_deref()).map_err(|e| {
                 // Preserve the stable taxonomy the way `compile` and
                 // `plan_preview` do: an unknown `model` filter is
                 // `model_not_found` (with its "list the models, retry" hint),
@@ -2707,14 +2746,66 @@ impl RockyMcpServer {
                 });
             }
         }
+        // The declarative suite, only when asked for (#2176). It is the same
+        // tally `rocky test --declarative` prints, so the MCP answer and the
+        // CLI exit code agree: `failed` (severity error) and `errored` fail
+        // the run, `warned` does not.
+        let declarative =
+            if args.declarative {
+                let summary = commands::declarative_test_output(
+                &self.config_path,
+                &self.models_dir,
+                None,
+                args.model.as_deref(),
+            )
+            .await
+            .map_err(|e| match e.downcast_ref::<commands::ModelNotFound>() {
+                Some(commands::ModelNotFound(name)) => ToolError::model_not_found(name),
+                None => ToolError::internal(
+                    format!("{e:#}"),
+                    "The declarative checks could not run; confirm `rocky.toml` loads, names \
+                     one pipeline (or one default), and its warehouse adapter is reachable.",
+                ),
+            })?;
+                for result in summary.results.iter().filter(|r| {
+                    r.status == "error" || (r.status == "fail" && r.severity == "error")
+                }) {
+                    let column = result
+                        .column
+                        .as_deref()
+                        .map(|c| format!(".{c}"))
+                        .unwrap_or_default();
+                    let detail = result
+                        .detail
+                        .clone()
+                        .unwrap_or_else(|| result.status.clone());
+                    failures.push(TestFailureLite {
+                        name: format!("{}{column}::{}", result.model, result.test_type),
+                        error: detail,
+                        suite: "declarative".to_string(),
+                    });
+                }
+                Some(DeclarativeSuiteCounts {
+                    total: summary.total,
+                    passed: summary.passed,
+                    failed: summary.failed,
+                    warned: summary.warned,
+                    errored: summary.errored,
+                })
+            } else {
+                None
+            };
         let all_passed = failures.is_empty();
+        let (declarative_total, declarative_passed) =
+            declarative.as_ref().map_or((0, 0), |d| (d.total, d.passed));
         Ok(Json(TestResult {
-            total: models.total + unit_tests.total,
-            passed: models.passed + unit_tests.passed,
+            total: models.total + unit_tests.total + declarative_total,
+            passed: models.passed + unit_tests.passed + declarative_passed,
             failures,
             all_passed,
             models,
             unit_tests,
+            declarative,
         }))
     }
 
@@ -3296,7 +3387,7 @@ impl RockyMcpServer {
          when the invariant holds (not-null, grain uniqueness, value ranges, referential \
          integrity). Returns the assertions as DRAFTS — encode them as declarative `[[tests]]` \
          checks (or hand them to `draft_check` to write + policy-gate) and run them via the `test` \
-         tool; it mutates nothing itself. Requires ANTHROPIC_API_KEY in the server environment — \
+         tool with `declarative: true`; it mutates nothing itself. Requires ANTHROPIC_API_KEY in the server environment — \
          without it, `assertions` is empty and `message` explains why."
     )]
     async fn ai_test(&self, params: Parameters<AiTestArgs>) -> ToolResult<AiTestResult> {
@@ -4689,8 +4780,15 @@ impl RockyMcpServer {
          a check. Appends your `spec` (one or more declarative `[[tests]]` blocks — not_null, \
          unique, accepted_values, relationships, expression, range, …) to the model's sidecar \
          (models/<model>.toml), then compiles so a malformed block fails structurally and returns \
-         the diagnostics. The check EXECUTES via the `test` tool (compile proves structure; the \
-         data-level assertion runs under `test`). It does NOT run, apply, or touch the warehouse. \
+         the diagnostics. Before the write, each block is checked with the validators \
+         `rocky test --declarative` applies when it generates the check's SQL (identifiers such \
+         as `column`, `to_table`, `to_column` and composite `columns`; a non-empty `values`; a \
+         safe regex `pattern`; numeric bounds; and the `expression` / `filter` / `key_expr` \
+         SQL), so a check that run would refuse is refused here. This call does NOT run the \
+         check, apply, or touch the warehouse. To EXECUTE it, call the `test` tool with \
+         `declarative: true`: that runs the sidecar's `[[tests]]` as read queries against the \
+         table the model materializes in the configured warehouse, so the model must already \
+         be applied. \
          Path-gated to the models directory and policy-aware: a governed scope returns a \
          structured policy_denied / policy_review_required error, and a denied draft restores the \
          prior sidecar. Omit `spec` and this returns an error pointing you at `ai_test`, the LLM \
@@ -4729,6 +4827,10 @@ impl RockyMcpServer {
         // when it is WRITTEN, not when it is later refused at
         // `rocky test --declarative`.
         validate_check_spec_expressions(&spec, Some(&self.config_path))?;
+        // Field gate (#2176): every other field the generator validates —
+        // `column`, `to_table` / `to_column`, a regex `pattern`, `values`,
+        // composite `columns`, bounds — by the generator's own call.
+        validate_check_spec_fields(&spec, Some(&self.config_path))?;
         let paths = self.resolve_draft_paths(&args.model)?;
         if !self.model_source_exists(&paths.stem) {
             return Err(ToolError::model_not_found(&paths.stem));
@@ -6169,7 +6271,9 @@ impl RockyMcpServer {
                      directly, or call ai_test to draft them, then write them with draft_check — \
                      it merges the `[[tests]]` blocks into the model and compiles in the same \
                      call, policy-gated.\n\
-                     4. run the new checks via the `test` tool. Loop until clean.\n\
+                     4. run the new checks via the `test` tool with `declarative: true` (it \
+                     reads the model's table in the warehouse; a model not yet applied reports \
+                     them as errored). Loop until clean.\n\
                      5. propose — generate the plan recording the new tests. It is an AI-authored \
                      plan with a plan_id.\n\n\
                      RECONCILE DISCIPLINE: only assert uniqueness/not-null on columns the profile \
@@ -6907,7 +7011,9 @@ const DRAFT_CONTRACT_NEXT_STEPS: &str = "This is a draft — Rocky has NOT appli
 /// [`WORKER_DRAFT_CHECK_NEXT_STEPS`].
 const DRAFT_CHECK_NEXT_STEPS: &str = "This is a draft — Rocky has NOT applied it or touched the \
      warehouse. The check is merged into the model's sidecar and the project compiles; run the \
-     `test` tool to EXECUTE the check against the data and confirm it passes. When it is clean, \
+     `test` tool with `declarative: true` to EXECUTE the check against the model's table in the \
+     warehouse and confirm it passes (a model not yet applied has no table, so its checks report \
+     as errored until it is). When it is clean, \
      `propose` to record an AI-authored plan for a human to `rocky review <plan_id> --approve` \
      and `rocky apply`. Never apply a draft directly.";
 
@@ -6916,8 +7022,8 @@ const DRAFT_CHECK_NEXT_STEPS: &str = "This is a draft — Rocky has NOT applied 
 /// instead of instructing `propose`.
 const WORKER_DRAFT_CHECK_NEXT_STEPS: &str = "This is a draft — Rocky has NOT applied it or \
      touched the warehouse. The check is merged into the model's sidecar and the project \
-     compiles; run the `test` tool to EXECUTE the check against the data and confirm it passes. \
-     When it is clean, STOP and end at the typed hand-off to the trusted runner: report the \
+     compiles. It runs against the data after the apply, in the trusted runner's observation \
+     step; the `test` tool here runs the LOCAL tests only. When it is clean, STOP and end at the typed hand-off to the trusted runner: report the \
      model, the invariants you encoded, and anything you flagged. Recording, review, and apply \
      belong to the trusted runner — never act on them yourself.";
 
@@ -7630,6 +7736,77 @@ fn validate_check_spec_expressions(
             rocky_sql::check_expression::ExpressionUse::SinglePredicate,
         )
         .map_err(|err| ToolError::invalid_argument(err.to_string(), advice))?;
+    }
+    Ok(())
+}
+
+/// Field gate for a `draft_check` spec (#2176): run each `[[tests]]` block
+/// through the generator `rocky test --declarative` uses
+/// ([`commands::validate_declarative_test`]), so a field the generator
+/// refuses — an invalid `column`, `to_table` or `to_column` identifier, an
+/// empty `values` list, an unsafe or empty regex `pattern`, fewer than two
+/// composite `columns`, a missing or non-numeric bound — is refused before
+/// the write instead of at the run.
+///
+/// Runs after [`validate_check_spec_expressions`], so a bad SQL fragment is
+/// still reported by the gate that names it with the project's dialect.
+///
+/// Two outcomes are NOT refused here, on purpose:
+///
+/// - A block that does not deserialize as a check (an unknown `type`, a
+///   wrong field type). That is the compile's structural diagnostic, which
+///   the call returns after the write, as it always has.
+/// - "This adapter cannot render this kind" (`RegexNotSupported`,
+///   `TimeWindowNotSupported`) when no `default` adapter resolves from
+///   `rocky.toml`. The DuckDB dialect this falls back to is a guess, and
+///   a guess must not refuse a check the real target renders. When the
+///   project names its default adapter, that dialect decides, the same
+///   dialect the expression gate parses under.
+fn validate_check_spec_fields(
+    spec: &str,
+    config_path: Option<&Path>,
+) -> Result<(), Json<ToolError>> {
+    let Ok(parsed) = toml::from_str::<toml::Table>(spec) else {
+        return Ok(());
+    };
+    let Some(tests) = parsed.get("tests").and_then(toml::Value::as_array) else {
+        return Ok(());
+    };
+    let configured_adapter = config_path
+        .and_then(|p| rocky_core::config::load_optional_project_config(Some(p)).ok())
+        .flatten()
+        .and_then(|cfg| cfg.adapters.get("default").map(|a| a.adapter_type.clone()));
+    let adapter_type = configured_adapter
+        .clone()
+        .unwrap_or_else(|| "duckdb".to_string());
+    for (index, test) in tests.iter().enumerate() {
+        let Ok(decl) = test.clone().try_into::<rocky_core::tests::TestDecl>() else {
+            continue;
+        };
+        let err = match commands::validate_declarative_test(&decl, &adapter_type) {
+            Ok(()) => continue,
+            Err(err) => err,
+        };
+        let adapter_level = matches!(
+            err,
+            rocky_core::tests::TestGenError::RegexNotSupported(_)
+                | rocky_core::tests::TestGenError::TimeWindowNotSupported(_)
+        );
+        if adapter_level && configured_adapter.is_none() {
+            continue;
+        }
+        return Err(ToolError::invalid_argument(
+            format!(
+                "draft_check `tests[{index}]` ({kind}) would be refused when \
+                 `rocky test --declarative` generates its SQL: {err}",
+                kind = rocky_core::tests::test_type_kind(&decl.test_type),
+            ),
+            "Fix the named field and pass the spec again. A column or table name must be a \
+             plain identifier (letters, digits, underscores; a table may be \
+             `catalog.schema.table`). `accepted_values` needs at least one value, a \
+             `composite` check at least two `columns`, and a `regex_match` pattern may not \
+             contain a single quote, a backtick or a semicolon.",
+        ));
     }
     Ok(())
 }
@@ -8972,6 +9149,85 @@ database = ":memory:"
                 err.0.message
             );
         }
+    }
+
+    // --- validate_check_spec_fields (draft_check field gate, #2176) ---
+
+    /// Every field the issue names is refused at draft time, by the
+    /// generator's own validators, and each refusal names the block.
+    #[test]
+    fn check_spec_fields_refuse_what_the_generator_refuses() {
+        let refused = [
+            ("column", "type = \"not_null\"\ncolumn = \"status; drop\""),
+            (
+                "to_table",
+                "type = \"relationships\"\ncolumn = \"id\"\nto_table = \"a.b;c\"\n\
+                 to_column = \"id\"",
+            ),
+            (
+                "to_column",
+                "type = \"relationships\"\ncolumn = \"id\"\nto_table = \"a.b.c\"\n\
+                 to_column = \"id x\"",
+            ),
+            (
+                "pattern",
+                "type = \"regex_match\"\ncolumn = \"email\"\npattern = \"a';--\"",
+            ),
+            (
+                "empty pattern",
+                "type = \"regex_match\"\ncolumn = \"email\"\npattern = \"\"",
+            ),
+            (
+                "values",
+                "type = \"accepted_values\"\ncolumn = \"status\"\nvalues = []",
+            ),
+            (
+                "columns",
+                "type = \"composite\"\nkind = \"unique\"\ncolumns = [\"a\"]",
+            ),
+            (
+                "composite column",
+                "type = \"composite\"\nkind = \"unique\"\ncolumns = [\"a\", \"b;c\"]",
+            ),
+        ];
+        for (field, body) in refused {
+            let spec = format!("[[tests]]\n{body}\n");
+            let err = validate_check_spec_fields(&spec, None)
+                .expect_err(&format!("a bad `{field}` must be refused at draft time"));
+            assert_eq!(err.0.code, crate::error::ToolErrorCode::InvalidArgument);
+            assert!(
+                err.0.message.contains("tests[0]"),
+                "the refusal names the block ({field}): {}",
+                err.0.message
+            );
+        }
+    }
+
+    /// The gate refuses only what the generator refuses. A clean check of
+    /// each kind passes, and so does a value the dialect-less generator path
+    /// would have refused but every real run (which has a dialect) accepts.
+    #[test]
+    fn check_spec_fields_pass_what_the_generator_accepts() {
+        let accepted = [
+            "type = \"not_null\"\ncolumn = \"status\"",
+            "type = \"accepted_values\"\ncolumn = \"status\"\nvalues = [\"a\\\\b\", \"c\"]",
+            "type = \"relationships\"\ncolumn = \"id\"\nto_table = \"cat.sch.tbl\"\n\
+             to_column = \"id\"",
+            "type = \"regex_match\"\ncolumn = \"email\"\npattern = \"^[a-z]+@\"",
+            "type = \"composite\"\nkind = \"unique\"\ncolumns = [\"a\", \"b\"]",
+            "type = \"row_count_range\"\nmin = 1",
+        ];
+        for body in accepted {
+            let spec = format!("[[tests]]\n{body}\n");
+            validate_check_spec_fields(&spec, None)
+                .unwrap_or_else(|e| panic!("`{body}` must pass: {}", e.0.message));
+        }
+        // A block that does not deserialize as a check is left to the
+        // compile's structural diagnostic, as before this gate.
+        assert!(
+            validate_check_spec_fields("[[tests]]\ntype = \"no_such_kind\"\n", None).is_ok(),
+            "an unknown kind is the compile's to report"
+        );
     }
 
     // --- validate_check_spec (draft_check structural gate) ---
@@ -10578,8 +10834,10 @@ database = ":memory:"
         assert_eq!(
             default_server.draft_check_next_steps(),
             "This is a draft — Rocky has NOT applied it or touched the warehouse. The check is \
-             merged into the model's sidecar and the project compiles; run the `test` tool to \
-             EXECUTE the check against the data and confirm it passes. When it is clean, \
+             merged into the model's sidecar and the project compiles; run the `test` tool \
+             with `declarative: true` to EXECUTE the check against the model's table in the \
+             warehouse and confirm it passes (a model not yet applied has no table, so its \
+             checks report as errored until it is). When it is clean, \
              `propose` to record an AI-authored plan for a human to `rocky review <plan_id> \
              --approve` and `rocky apply`. Never apply a draft directly.",
             "default draft_check next_steps are byte-unchanged"

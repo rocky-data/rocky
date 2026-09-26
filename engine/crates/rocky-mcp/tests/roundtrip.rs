@@ -641,6 +641,161 @@ async fn a_project_with_no_fixture_tests_reports_zero_not_absent() {
     client.cancel().await.unwrap();
 }
 
+/// #2176: the loop `draft_check` describes exists. A check drafted through
+/// the write path RUNS under the `test` tool with `declarative: true`, and a
+/// violated check comes back red.
+///
+/// Before the fix the tool ignored the flag and ran only the local suites,
+/// so this call came back `all_passed: true` with the drafted `not_null`
+/// check never evaluated — a green run over a table holding a NULL.
+#[tokio::test]
+async fn a_drafted_check_runs_under_test_declarative() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("test.duckdb");
+    write_project(dir.path(), &db_path);
+    // DuckDB names a database file's catalog after its stem, so the model's
+    // target must say `test` for the check to reach the table below.
+    let sidecar = dir.path().join("models").join("orders.toml");
+    let toml = std::fs::read_to_string(&sidecar).unwrap();
+    std::fs::write(
+        &sidecar,
+        toml.replace("catalog = \"warehouse\"", "catalog = \"test\""),
+    )
+    .unwrap();
+    // The applied table holds a NULL `status`, which the drafted check forbids.
+    materialize_orders(&db_path, "out", "(1, 'COMPLETE'), (2, NULL)").await;
+    let server = RockyMcpServer::new(dir.path().join("rocky.toml"));
+    let client = connect(server).await;
+
+    let spec = "[[tests]]\ntype = \"not_null\"\ncolumn = \"status\"\n";
+    let drafted = client
+        .call_tool(
+            CallToolRequestParams::new("draft_check").with_arguments(
+                serde_json::json!({ "model": "orders", "spec": spec })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        )
+        .await
+        .expect("draft_check call");
+    assert_ne!(drafted.is_error, Some(true), "{drafted:?}");
+
+    let result = client
+        .call_tool(
+            CallToolRequestParams::new("test").with_arguments(
+                serde_json::json!({ "declarative": true })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        )
+        .await
+        .expect("declarative test call");
+    assert_ne!(result.is_error, Some(true), "{result:?}");
+    let sc = result.structured_content.expect("test result");
+    assert_eq!(sc["declarative"]["total"], serde_json::json!(1), "{sc:?}");
+    assert_eq!(sc["declarative"]["failed"], serde_json::json!(1), "{sc:?}");
+    assert_eq!(sc["all_passed"], serde_json::json!(false), "{sc:?}");
+    let failure = sc["failures"]
+        .as_array()
+        .expect("failures")
+        .iter()
+        .find(|f| f["suite"] == serde_json::json!("declarative"))
+        .unwrap_or_else(|| panic!("a declarative failure entry: {sc:?}"));
+    assert_eq!(
+        failure["name"],
+        serde_json::json!("orders.status::not_null"),
+        "{sc:?}"
+    );
+
+    // Without the flag the local suites run alone, and the result says the
+    // declarative suite did not run rather than reporting it as zero.
+    let local = client
+        .call_tool(CallToolRequestParams::new("test"))
+        .await
+        .expect("local test call");
+    let sc = local.structured_content.expect("test result");
+    assert!(sc.get("declarative").is_none(), "{sc:?}");
+    assert_eq!(sc["all_passed"], serde_json::json!(true), "{sc:?}");
+
+    client.cancel().await.unwrap();
+}
+
+/// #2176: the worker profile stays offline. `declarative: true` reads the
+/// configured warehouse, so the worker refuses it rather than running it.
+#[tokio::test]
+async fn the_worker_profile_refuses_a_declarative_test_run() {
+    let dir = TempDir::new().unwrap();
+    write_project(dir.path(), &dir.path().join("test.duckdb"));
+    let server = RockyMcpServer::new_with_profile(
+        dir.path().join("rocky.toml"),
+        rocky_mcp::McpProfile::Worker,
+    );
+    let client = connect(server).await;
+
+    let result = client
+        .call_tool(
+            CallToolRequestParams::new("test").with_arguments(
+                serde_json::json!({ "declarative": true })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        )
+        .await
+        .expect("worker test call returns a tool result");
+    assert_eq!(result.is_error, Some(true), "{result:?}");
+    let err = result.structured_content.expect("envelope");
+    assert_eq!(
+        err["code"],
+        serde_json::json!("invalid_argument"),
+        "{err:?}"
+    );
+
+    client.cancel().await.unwrap();
+}
+
+/// #2176: `draft_check` refuses a field the generator would refuse, before
+/// the write. The probe from the issue: `column = "status; drop"` was a
+/// green draft and an `InvalidIdentifier` at `rocky test --declarative`.
+#[tokio::test]
+async fn draft_check_refuses_a_column_the_generator_refuses() {
+    let dir = TempDir::new().unwrap();
+    write_project(dir.path(), &dir.path().join("test.duckdb"));
+    let sidecar = dir.path().join("models").join("orders.toml");
+    let before = std::fs::read_to_string(&sidecar).unwrap();
+    let server = RockyMcpServer::new(dir.path().join("rocky.toml"));
+    let client = connect(server).await;
+
+    let spec = "[[tests]]\ntype = \"not_null\"\ncolumn = \"status; drop\"\n";
+    let result = client
+        .call_tool(
+            CallToolRequestParams::new("draft_check").with_arguments(
+                serde_json::json!({ "model": "orders", "spec": spec })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        )
+        .await
+        .expect("draft_check call returns a tool result");
+    assert_eq!(result.is_error, Some(true), "{result:?}");
+    let err = result.structured_content.expect("envelope");
+    assert_eq!(
+        err["code"],
+        serde_json::json!("invalid_argument"),
+        "{err:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&sidecar).unwrap(),
+        before,
+        "a refused check writes nothing"
+    );
+
+    client.cancel().await.unwrap();
+}
+
 /// FF-WP1: `review_queue` filters the listing by `product_id` via
 /// integrity-checked plan reads — and a pending plan whose file no longer
 /// passes its integrity check surfaces as a WARNING entry, never a silent

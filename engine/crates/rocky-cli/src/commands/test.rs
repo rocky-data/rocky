@@ -852,6 +852,58 @@ async fn execute_declarative(
     Ok(DeclarativeRun { declared, results })
 }
 
+/// Run the declarative `[[tests]]` from model sidecars against the
+/// configured warehouse adapter and tally them — the typed result of
+/// `rocky test --declarative`, without the printing or the exit rule.
+///
+/// [`run_declarative_tests`] reports this; the MCP `test` tool returns it
+/// when a caller asks for the declarative suite (#2176). One tally, so the
+/// two cannot disagree about what counts as a failure: `failed` is a
+/// `severity = "error"` check that failed, `warned` a `severity = "warning"`
+/// one, and `errored` a check the runner could not evaluate.
+pub async fn declarative_test_output(
+    config_path: &Path,
+    models_dir: &Path,
+    pipeline_name: Option<&str>,
+    model_filter: Option<&str>,
+) -> Result<DeclarativeTestSummary> {
+    let run = declarative_run(config_path, models_dir, pipeline_name, model_filter).await?;
+    Ok(DeclarativeTestSummary {
+        total: run.results.len(),
+        passed: run.passed(),
+        failed: run.failed(),
+        warned: run.warned(),
+        errored: run.errored(),
+        results: run.results,
+    })
+}
+
+/// Check one declarative test with the generator's own validators, without
+/// running it: the identifiers (`column`, `to_table`, `to_column`, composite
+/// `columns`), a non-empty `values` list, a safe regex `pattern`, the
+/// numeric bounds, and the SQL fragments. `adapter_type` picks the offline
+/// dialect the generator encodes literals in (`"duckdb"`, `"snowflake"`, …).
+///
+/// Built for write-time gates such as the MCP `draft_check` tool (#2176):
+/// the same [`generate_test_sql_with_dialect`] call `rocky test
+/// --declarative` makes, against a placeholder table, so a check this
+/// accepts is one the generator accepts. An error that only says the
+/// adapter cannot render the kind (`RegexNotSupported`,
+/// `TimeWindowNotSupported`) is returned too; the caller decides whether
+/// the dialect it guessed is authoritative.
+pub fn validate_declarative_test(
+    test: &rocky_core::tests::TestDecl,
+    adapter_type: &str,
+) -> std::result::Result<(), rocky_core::tests::TestGenError> {
+    let dialect = super::plan::dialect_for_adapter_type(adapter_type);
+    generate_test_sql_with_dialect(
+        test,
+        "draft_catalog.draft_schema.draft_table",
+        dialect.as_ref(),
+    )
+    .map(|_| ())
+}
+
 /// Execute `rocky test --declarative`: run `[[tests]]` from model sidecars
 /// against the configured warehouse adapter.
 pub async fn run_declarative_tests(
@@ -861,21 +913,14 @@ pub async fn run_declarative_tests(
     model_filter: Option<&str>,
     output_json: bool,
 ) -> Result<()> {
-    let run = declarative_run(config_path, models_dir, pipeline_name, model_filter).await?;
-    let results = run.results;
+    let summary =
+        declarative_test_output(config_path, models_dir, pipeline_name, model_filter).await?;
 
-    if results.is_empty() {
+    if summary.results.is_empty() {
         info!("no declarative tests found in models directory");
         if output_json {
             let output = TestOutput {
-                declarative: Some(DeclarativeTestSummary {
-                    total: 0,
-                    passed: 0,
-                    failed: 0,
-                    warned: 0,
-                    errored: 0,
-                    results: vec![],
-                }),
+                declarative: Some(summary),
                 ..TestOutput::new(0, 0, vec![])
             };
             print_json(&output)?;
@@ -885,18 +930,14 @@ pub async fn run_declarative_tests(
         return Ok(());
     }
 
-    // 5. Tally results.
-    let total = results.len();
-    let passed = results.iter().filter(|r| r.status == "pass").count();
-    let failed = results
-        .iter()
-        .filter(|r| r.status == "fail" && r.severity == "error")
-        .count();
-    let warned = results
-        .iter()
-        .filter(|r| r.status == "fail" && r.severity == "warning")
-        .count();
-    let errored = results.iter().filter(|r| r.status == "error").count();
+    let DeclarativeTestSummary {
+        total,
+        passed,
+        failed,
+        warned,
+        errored,
+        results,
+    } = summary;
 
     // 6. Report.
     if output_json {

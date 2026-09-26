@@ -208,7 +208,7 @@ pub use shell::run_shell;
 pub use snapshot::run_snapshot;
 pub use state::{state_clear_schema_cache, state_retention_sweep, state_schedule_hold, state_show};
 #[cfg(feature = "duckdb")]
-pub use test::run_declarative_tests;
+pub use test::{declarative_test_output, run_declarative_tests, validate_declarative_test};
 #[cfg(feature = "duckdb")]
 pub use test::{run_test, test_output};
 pub use test_adapter::{run_test_adapter, run_test_adapter_builtin};
