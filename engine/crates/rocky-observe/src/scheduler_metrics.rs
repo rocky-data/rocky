@@ -302,7 +302,7 @@ mod enabled {
     }
 
     fn build_provider() -> Result<SdkMeterProvider, Box<dyn std::error::Error + Send + Sync>> {
-        use opentelemetry_otlp::WithExportConfig;
+        use opentelemetry_otlp::{RetryPolicy, WithExportConfig, WithTonicConfig};
         use opentelemetry_sdk::Resource;
         use opentelemetry_sdk::metrics::PeriodicReader;
 
@@ -313,6 +313,10 @@ mod enabled {
 
         let exporter = opentelemetry_otlp::MetricExporter::builder()
             .with_tonic()
+            // opentelemetry-otlp 0.33 retries failed exports by default (up to
+            // 4 attempts with backoff). Keep the pre-0.33 behaviour: one
+            // attempt per export, so a down collector adds no retry delay. #2167.
+            .with_retry_policy(RetryPolicy::disabled())
             .with_endpoint(&endpoint)
             .build()?;
 

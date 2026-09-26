@@ -191,7 +191,7 @@ fn jsonl_layer_disabled() -> bool {
 #[cfg(feature = "otel")]
 fn build_otel_tracer()
 -> Result<opentelemetry_sdk::trace::SdkTracerProvider, Box<dyn std::error::Error + Send + Sync>> {
-    use opentelemetry_otlp::WithExportConfig;
+    use opentelemetry_otlp::{RetryPolicy, WithExportConfig, WithTonicConfig};
     use opentelemetry_sdk::Resource;
     use opentelemetry_sdk::trace::{Sampler, SdkTracerProvider};
 
@@ -205,6 +205,10 @@ fn build_otel_tracer()
 
     let exporter = opentelemetry_otlp::SpanExporter::builder()
         .with_tonic()
+        // opentelemetry-otlp 0.33 retries failed exports by default (up to
+        // 4 attempts with backoff). Keep the pre-0.33 behaviour: one
+        // attempt per export, so a down collector adds no retry delay. #2167.
+        .with_retry_policy(RetryPolicy::disabled())
         .with_endpoint(&endpoint)
         .build()?;
 
