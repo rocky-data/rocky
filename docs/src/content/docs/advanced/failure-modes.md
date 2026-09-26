@@ -244,6 +244,8 @@ model fails while running  ->  no later layer starts
 The default compile-error boundary follows declared DAG edges. An undeclared
 read can still use a retained table. Add `depends_on` when that relationship
 must be withheld. `rocky run --dag` runs each model as a separate sub-run.
+It refuses to start while any model has a compile error. The refused model's
+SQL would still add edges to the DAG and could reorder the models that run.
 
 This is the model graph only. Replicated tables have their own switch, [`[execution] fail_fast`](/reference/configuration/#pipelinenameexecution), which is `false` by default: one table that fails does not stop the others. A second switch still can. `error_rate_abort_pct` defaults to 50, so once 4 or more tables finish, a failure rate at or above half aborts the rest.
 

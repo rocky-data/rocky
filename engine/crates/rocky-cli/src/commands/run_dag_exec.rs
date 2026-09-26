@@ -317,6 +317,13 @@ pub async fn run_with_dag(
             .collect(),
     );
 
+    // A model the compile refuses runs nothing, but its SQL still feeds the
+    // edge inference below. Its phantom edges can make a true edge look
+    // cycle-closing: the true edge is skipped with a warning, and
+    // `strict_scheduling` refuses the run over that warning (#1630). So refuse
+    // up front, naming the model and its error, before any edge is inferred.
+    refuse_compile_failed_models(&models_by_pipeline, &seed_names)?;
+
     // Infer cross-step edges from each model's SQL `FROM` references so a
     // model that reads a seed (or replication load) is ordered *after* it,
     // even when no explicit `depends_on` is declared. Without this, a seed
@@ -486,6 +493,55 @@ pub async fn run_with_dag(
         anyhow::bail!("DAG execution had {} failed node(s)", result.failed);
     }
     Ok(())
+}
+
+/// Refuse a `--dag` run when any transformation model has a blocking compile
+/// error (#1630).
+///
+/// Each pipeline's already-loaded models are compiled the way its sub-runs
+/// compile them: one pipeline at a time, with the DAG's seed names as known
+/// `depends_on` names. The sub-run's compile also reads cached source
+/// schemas, which can expire between this check and a node, so the two
+/// compiles cannot be proven to refuse the same set. A skip-the-refused-model
+/// scheme would then order a model by a guess. The run refuses instead, before
+/// any edge is inferred and before any node executes.
+fn refuse_compile_failed_models(
+    models_by_pipeline: &rocky_core::unified_dag::ModelsByPipeline,
+    seed_names: &BTreeSet<String>,
+) -> Result<()> {
+    let mut refused: Vec<String> = Vec::new();
+    for (pipeline, models) in models_by_pipeline {
+        if models.is_empty() {
+            continue;
+        }
+        let config = rocky_compiler::compile::CompilerConfig {
+            external_dependencies: seed_names.clone(),
+            ..Default::default()
+        };
+        match rocky_compiler::compile::compile_preloaded_models(models.clone(), &config) {
+            Ok(result) => {
+                for diagnostic in result.diagnostics.iter().filter(|d| d.is_error()) {
+                    refused.push(format!(
+                        "{} ({}: {})",
+                        diagnostic.model, diagnostic.code, diagnostic.message
+                    ));
+                }
+            }
+            Err(e) => refused.push(format!("pipeline '{pipeline}' ({e})")),
+        }
+    }
+    if refused.is_empty() {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "rocky run --dag refuses to start: {} compile error(s) block the run: {}. A model the \
+         compile refuses runs nothing, but its SQL would still add edges to the DAG and could \
+         reorder the models that do run. Fix the model (`rocky compile` shows every error), \
+         or run without --dag: a plain `rocky run` skips a refused model and its dependents \
+         and runs the rest.",
+        refused.len(),
+        refused.join("; ")
+    )
 }
 
 /// Load each transformation pipeline's own model set, keyed by pipeline name.
@@ -2001,6 +2057,97 @@ mod tests {
             .execute_sql("SELECT COUNT(*) FROM proj.seeds.orders")
             .unwrap();
         assert_eq!(cell_i64(&seed.rows[0][0]), 2, "the seed loaded too");
+    }
+
+    /// #1630: under `--dag`, a model the compile refuses (here E038, an
+    /// ephemeral model) must not shape the DAG. The issue's own shape: `a`
+    /// reads `c`'s target, ephemeral `e` reads bare `a`, and `c` reads bare
+    /// `e`. Before the fix, `e`'s phantom edges made the true `c -> a` order
+    /// look cycle-closing, and `strict_scheduling` refused the run over a
+    /// misleading cycle warning. Now the run refuses up front, names E038,
+    /// and builds nothing.
+    #[tokio::test]
+    async fn a_compile_refused_model_refuses_the_dag_run_up_front() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let models = root.join("models");
+        std::fs::create_dir_all(&models).unwrap();
+
+        let db_path = root.join("proj.duckdb");
+        std::fs::write(
+            root.join("rocky.toml"),
+            format!(
+                "[adapter.local]\n\
+                 type = \"duckdb\"\n\
+                 path = \"{}\"\n\n\
+                 [run]\n\
+                 strict_scheduling = true\n\n\
+                 [pipeline.silver]\n\
+                 type = \"transformation\"\n\n\
+                 [pipeline.silver.target]\n\
+                 adapter = \"local\"\n\n\
+                 [pipeline.silver.target.governance]\n\
+                 auto_create_catalogs = true\n\
+                 auto_create_schemas = true\n",
+                db_path.display()
+            ),
+        )
+        .unwrap();
+        let write_model = |name: &str, sql: &str, extra: &str| {
+            std::fs::write(models.join(format!("{name}.sql")), format!("{sql}\n")).unwrap();
+            std::fs::write(
+                models.join(format!("{name}.toml")),
+                format!(
+                    "name = \"{name}\"\n{extra}\n\
+                     [target]\n\
+                     catalog = \"proj\"\n\
+                     schema = \"silver\"\n\
+                     table = \"{name}\"\n"
+                ),
+            )
+            .unwrap();
+        };
+        write_model("a", "SELECT id FROM proj.silver.c", "");
+        write_model("c", "SELECT id FROM e", "");
+        write_model(
+            "e",
+            "SELECT 1 AS id FROM a",
+            "[strategy]\ntype = \"ephemeral\"\n",
+        );
+
+        let config_path = root.join("rocky.toml");
+        let err = run_with_dag(
+            &config_path,
+            dag_snapshot(&config_path),
+            &root.join(".rocky-state.redb"),
+            false,
+            &PartitionRunOptions::default(),
+            &crate::commands::run::SkipRunOptions::default(),
+            None,
+            None,
+        )
+        .await
+        .expect_err("a compile-refused model must refuse the --dag run");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("E038") && message.contains("e ("),
+            "the refusal names the refused model and its code: {message}"
+        );
+        assert!(
+            !message.contains("cycle"),
+            "no misleading cycle warning: {message}"
+        );
+        assert!(
+            !db_path.exists()
+                || DuckDbWarehouseAdapter::open(&db_path)
+                    .unwrap()
+                    .shared_connector()
+                    .lock()
+                    .unwrap()
+                    .execute_sql("SELECT id FROM proj.silver.c")
+                    .is_err(),
+            "no node ran"
+        );
     }
 
     /// #2018: `rocky run --dag` must load a seed on a project with MORE THAN
