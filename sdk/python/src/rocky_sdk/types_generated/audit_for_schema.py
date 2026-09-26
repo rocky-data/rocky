@@ -47,6 +47,14 @@ class AuditSubjectKind3(StrEnum):
     plan = "plan"
 
 
+class AuditSubjectKind4(StrEnum):
+    """
+    A product id, `product:<name>` — the identity the fulfillment loop stamps on the plans it proposes. Resolved to the product's output model (from `products/<name>.toml`, or `<name>` when no spec is found), so the chain holds every decision about that model: the loop's `draft:<model>` rows, its proposals, and its applies.
+    """
+
+    product = "product"
+
+
 class AuditVerifyEntry(BaseModel):
     """
     One post-apply verification outcome inside [`AuditChainVerify`] — a decision-ledger custody row with a non-empty `verify_after` check list.
@@ -473,7 +481,9 @@ class AuditForOutput(BaseModel):
     """
     The selector as supplied on the command line.
     """
-    subject_kind: AuditSubjectKind1 | AuditSubjectKind2 | AuditSubjectKind3
+    subject_kind: (
+        AuditSubjectKind1 | AuditSubjectKind2 | AuditSubjectKind3 | AuditSubjectKind4
+    )
     """
     What the selector resolved to.
     """

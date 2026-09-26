@@ -232,15 +232,38 @@ pub fn compute_audit_for(
     let plan_on_disk = is_hex64 && plan_file_path(root, selector).exists();
     let run_match = runs.iter().any(|r| r.run_id == selector);
     let plan_in_ledger = decisions.iter().any(|d| d.plan_id == selector);
+    // A product id (#2003). No model can carry the name: a model name is a
+    // plain identifier, and `:` is not one. Checked after the plan and run
+    // lookups so nothing that resolved before resolves differently now.
+    let product_name = selector
+        .strip_prefix(PRODUCT_SUBJECT_PREFIX)
+        .filter(|name| !name.is_empty());
     let kind = if plan_on_disk {
         AuditSubjectKind::Plan
     } else if run_match {
         AuditSubjectKind::Run
     } else if plan_in_ledger {
         AuditSubjectKind::Plan
+    } else if product_name.is_some() {
+        AuditSubjectKind::Product
     } else {
         AuditSubjectKind::Model
     };
+
+    // What the ledger joins on. A product's rows are the rows about its
+    // output model — the loop records its drafts as `draft:<model>` and its
+    // proposals and applies against the same model — so a product subject
+    // is scoped by that model. The spec names it; a product whose spec is
+    // gone falls back to its name, the output model's default.
+    let product_model: Option<String> = match (kind, product_name) {
+        (AuditSubjectKind::Product, Some(name)) => Some(
+            resolve_product_scope(root, name)
+                .map(|scope| scope.output_model)
+                .unwrap_or_else(|_| name.to_string()),
+        ),
+        _ => None,
+    };
+    let scope = product_model.as_deref().unwrap_or(selector);
 
     // The set of models the subject touches — drives the runs join and the
     // blast-radius computation.
@@ -249,15 +272,15 @@ pub fn compute_audit_for(
         _ => None,
     };
 
-    let decisions_link = build_decisions_link(kind, selector, &decisions);
-    let plan_link = build_plan_link(kind, selector, &decisions_link, root);
-    let runs_link = build_runs_link(kind, selector, subject_run, &runs);
-    let verify_link = build_verify_link(kind, selector, &plan_link, &decisions);
+    let decisions_link = build_decisions_link(kind, scope, &decisions);
+    let plan_link = build_plan_link(kind, scope, &decisions_link, root);
+    let runs_link = build_runs_link(kind, scope, subject_run, &runs);
+    let verify_link = build_verify_link(kind, scope, &plan_link, &decisions);
 
-    // Subject models for the blast radius: the model itself, the run's executed
-    // models, or the plan's changed models.
+    // Subject models for the blast radius: the model itself (a product's
+    // output model), the run's executed models, or the plan's changed models.
     let subject_models: Vec<String> = match kind {
-        AuditSubjectKind::Model => vec![selector.to_string()],
+        AuditSubjectKind::Model | AuditSubjectKind::Product => vec![scope.to_string()],
         AuditSubjectKind::Run => subject_run
             .map(|r| {
                 let mut m: Vec<String> = r
@@ -276,7 +299,7 @@ pub fn compute_audit_for(
 
     let resolved = match kind {
         AuditSubjectKind::Plan | AuditSubjectKind::Run => true,
-        AuditSubjectKind::Model => {
+        AuditSubjectKind::Model | AuditSubjectKind::Product => {
             !decisions_link.entries.is_empty()
                 || !runs_link.runs.is_empty()
                 || blast_link.availability == SectionAvailability::Available
@@ -296,6 +319,10 @@ pub fn compute_audit_for(
         blast_radius: blast_link,
     })
 }
+
+/// The prefix of a product id (`product:<name>`), the form the fulfillment
+/// loop stamps on its plans and the browser UI links custody by.
+const PRODUCT_SUBJECT_PREFIX: &str = "product:";
 
 /// Path a plan file would occupy — existence-checked without the
 /// dir-creating side effects of [`read_plan`].
@@ -334,13 +361,17 @@ fn build_decisions_link(
         .iter()
         .filter(|d| match kind {
             AuditSubjectKind::Plan => d.plan_id == selector,
+            // A product joins by its output model, which is the `selector`
+            // here (`compute_audit_for` scopes it); a run returned above.
             // `graph_keys` yields the recorded model set AND `model`, so a
             // backfill / gc / restore escalation is now findable by the models
             // it actually touches — it never was, because its `model` holds a
             // summary no user would type (#1766). Purely additive: the summary
             // still matches too, which the audit screen depends on
             // (`AuditScreen.tsx` renders `subject={entry.model}`).
-            _ => d.graph_keys().any(|m| m == selector),
+            AuditSubjectKind::Model | AuditSubjectKind::Product | AuditSubjectKind::Run => {
+                d.graph_keys().any(|m| m == selector)
+            }
         })
         .collect();
     // Newest first.
@@ -379,6 +410,16 @@ fn build_plan_link(
         AuditSubjectKind::Plan => Some(selector.to_string()),
         // The newest decision on the model names the plan that governed it.
         AuditSubjectKind::Model => decisions_link.entries.first().map(|e| e.plan_id.clone()),
+        // A product's newest rows are often its drafts (`draft:<model>`),
+        // which never had a plan file. The governing plan is the newest
+        // decision whose plan is on disk; failing that, the newest row, so
+        // the link still says which plan it could not read.
+        AuditSubjectKind::Product => decisions_link
+            .entries
+            .iter()
+            .find(|e| plan_file_path(root, &e.plan_id).exists())
+            .or_else(|| decisions_link.entries.first())
+            .map(|e| e.plan_id.clone()),
         AuditSubjectKind::Run => None,
     };
 
@@ -471,7 +512,7 @@ fn build_runs_link(
 ) -> AuditChainRuns {
     let matched: Vec<&RunRecord> = match kind {
         AuditSubjectKind::Run => subject_run.into_iter().collect(),
-        AuditSubjectKind::Model => {
+        AuditSubjectKind::Model | AuditSubjectKind::Product => {
             let mut m: Vec<&RunRecord> = runs
                 .iter()
                 .filter(|r| r.models_executed.iter().any(|e| e.model_name == selector))
@@ -544,7 +585,7 @@ fn build_verify_link(
     // Which plan id's custody rows count as this subject's verification?
     let subject_plan_id: Option<String> = match kind {
         AuditSubjectKind::Plan => Some(selector.to_string()),
-        AuditSubjectKind::Model => plan_link.plan_id.clone(),
+        AuditSubjectKind::Model | AuditSubjectKind::Product => plan_link.plan_id.clone(),
         AuditSubjectKind::Run => Some(format!("autoapply-verify:{selector}")),
     };
 
@@ -1735,6 +1776,92 @@ mod tests {
         assert!(out.resolved, "a ledger-only plan id must resolve: {out:?}");
         assert_eq!(out.decisions.total, 1);
         assert_eq!(out.decisions.entries[0].plan_id, "freeze:global");
+    }
+
+    /// #2003: `rocky audit --for product:<name>` resolves a product subject.
+    /// Before, the selector fell through to the Model join (`subject_kind:
+    /// "model"`, `resolved: false`, zero decisions) while the loop's rows
+    /// sat in the ledger under `draft:<model>` and the plans it proposed.
+    #[test]
+    fn audit_for_resolves_a_product_id_through_its_output_model() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        let models_dir = root.join("models");
+        fs::create_dir_all(&models_dir).unwrap();
+        let state_path = root.join("state.redb");
+        {
+            let store = StateStore::open(&state_path).unwrap();
+            for (secs, plan, model) in [
+                (1, "draft:revenue_daily", "revenue_daily"),
+                (2, "plan-applied", "revenue_daily"),
+                (3, "draft:orders", "orders"),
+                (4, "draft:revenue_daily", "revenue_daily"),
+            ] {
+                store
+                    .record_policy_decision(&decision(secs, plan, model, PolicyEffect::Allow))
+                    .unwrap();
+            }
+        }
+        // `daily_revenue` names `revenue_daily` as its output model, so the
+        // join goes through the spec, not the product's own name.
+        fs::create_dir_all(root.join("products")).unwrap();
+        fs::write(
+            root.join("products/daily_revenue.toml"),
+            SPEC_FIXTURE.replace("name   = \"revenue_daily\"", "name   = \"daily_revenue\""),
+        )
+        .unwrap();
+        // The applied plan is on disk; the newer `draft:` row never had a
+        // plan file, so the plan link must skip past it.
+        fs::create_dir_all(root.join(".rocky/plans")).unwrap();
+        fs::write(plan_file_path(root, "plan-applied"), "{}").unwrap();
+
+        let out = compute_audit_for(
+            root,
+            &root.join("rocky.toml"),
+            &state_path,
+            &models_dir,
+            "product:daily_revenue",
+        )
+        .unwrap();
+
+        assert_eq!(out.subject, "product:daily_revenue");
+        assert_eq!(out.subject_kind, AuditSubjectKind::Product);
+        assert!(out.resolved, "{out:?}");
+        let plan_ids: Vec<&str> = out
+            .decisions
+            .entries
+            .iter()
+            .map(|e| e.plan_id.as_str())
+            .collect();
+        assert_eq!(
+            plan_ids,
+            ["draft:revenue_daily", "plan-applied", "draft:revenue_daily"],
+            "every decision about the output model, newest first, and none about another"
+        );
+        assert_eq!(out.plan.plan_id.as_deref(), Some("plan-applied"));
+
+        // A product with no spec falls back to its name as the output model.
+        let bare = compute_audit_for(
+            root,
+            &root.join("rocky.toml"),
+            &state_path,
+            &models_dir,
+            "product:orders",
+        )
+        .unwrap();
+        assert_eq!(bare.subject_kind, AuditSubjectKind::Product);
+        assert_eq!(bare.decisions.total, 1);
+
+        // A plain model name still resolves as a model.
+        let model = compute_audit_for(
+            root,
+            &root.join("rocky.toml"),
+            &state_path,
+            &models_dir,
+            "revenue_daily",
+        )
+        .unwrap();
+        assert_eq!(model.subject_kind, AuditSubjectKind::Model);
     }
 
     #[test]

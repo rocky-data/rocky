@@ -8778,7 +8778,8 @@ pub struct AuditDecisionEntry {
 /// `run_id` in the run ledger is a [`AuditSubjectKind::Run`]; a string the
 /// decision ledger keys rows by is likewise a [`AuditSubjectKind::Plan`]
 /// (the plan file may be gone, or the id may be a decision-only custody key
-/// that never had one); anything else is treated as a
+/// that never had one); a `product:<name>` product id is a
+/// [`AuditSubjectKind::Product`]; anything else is treated as a
 /// [`AuditSubjectKind::Model`] name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -8792,6 +8793,12 @@ pub enum AuditSubjectKind {
     /// ids like `freeze:…` / `draft:…` / `autoapply:…`, which never had a
     /// plan file).
     Plan,
+    /// A product id, `product:<name>` — the identity the fulfillment loop
+    /// stamps on the plans it proposes. Resolved to the product's output
+    /// model (from `products/<name>.toml`, or `<name>` when no spec is
+    /// found), so the chain holds every decision about that model: the
+    /// loop's `draft:<model>` rows, its proposals, and its applies.
+    Product,
 }
 
 /// JSON output for `rocky audit --for <table|run|plan>` — the custody chain.

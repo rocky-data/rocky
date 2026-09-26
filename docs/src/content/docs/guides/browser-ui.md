@@ -109,7 +109,7 @@ The scorecard shows acceptance, review and denial rates for a window you pick. G
 
 ### Custody
 
-Enter a subject to trace its chain of custody. A subject is a model, a run id, a plan id, or another id the ledger records, such as `freeze:global`. It shows the decisions about it, the plan, the runs that applied it, any verification after apply, and its blast radius. It matches `rocky audit --for <subject>`.
+Enter a subject to trace its chain of custody. A subject is a model, a run id, a plan id, a product id such as `product:revenue_daily`, or another id the ledger records, such as `freeze:global`. It shows the decisions about it, the plan, the runs that applied it, any verification after apply, and its blast radius. It matches `rocky audit --for <subject>`.
 
 ![The Custody tab for the model revenue_daily: ten policy decisions, the latest plan, two apply runs, no verification row, and a blast radius of zero downstream models](/ui-governor-custody.png)
 

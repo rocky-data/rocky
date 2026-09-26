@@ -205,7 +205,9 @@ they cannot be persisted, the apply fails closed. Treat the ledger as a
 best-effort record rather than proof that a decision happened. `rocky audit` lists the decisions.
 `rocky audit --for <table|run|plan>` assembles the custody chain for one
 subject: who proposed, what policy decided, what the plan changed, which runs
-materialized it, and what verification found. A link with no recorded signal
+materialized it, and what verification found. A product id,
+`product:<name>`, is a subject too: its chain holds every decision about the
+product's output model, including the loop's `draft:<model>` rows. A link with no recorded signal
 renders as `unavailable`. Rocky does not fabricate a value to complete the
 chain.
 
