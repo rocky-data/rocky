@@ -118,9 +118,27 @@ kill_grace_seconds = 30
 
 Bring your own model: the command template is the whole integration. `type = "replay"` executes a recorded session file instead — deterministic and credential-free, which is how CI exercises the loop.
 
+### Wrapping the worker in an OS sandbox
+
+The loop kills the worker's whole process group when a task ends. A process that leaves the group with `setsid` and forks again survives that kill (see [What v0 does not defend](#what-v0-does-not-defend)). An operating-system sandbox contains it. Rocky runs `command` as given, so you can wrap the worker in one today:
+
+```toml
+# Linux: a new PID namespace. When the agent exits, the kernel kills every
+# process left in the namespace, including a setsid escapee.
+# --user --map-current-user lets an unprivileged user create it (util-linux 2.38+).
+command = ["unshare", "--user", "--map-current-user", "--pid", "--fork", "--kill-child", "my-agent", "{brief}"]
+
+# macOS: a seatbelt profile you write, for example one that denies process-fork.
+command = ["sandbox-exec", "-f", "worker.sb", "my-agent", "{brief}"]
+```
+
+`{brief}` must still appear in exactly one argument. The wrapper must stay in the foreground and exit when the agent exits: the loop supervises the process it spawned.
+
+Rocky does not check that a wrapper is there, and it does not refuse to run without one. The wrapper is yours to configure and to test on your hosts. Some hosts block unprivileged user namespaces, for example Ubuntu 24.04 under its default AppArmor profile. There `unshare` fails, and the task fails with it. Run the wrapped command once by hand before you point the loop at it.
+
 ## What v0 does not defend
 
-The worker runs on the same machine as the runner and the review markers, and markers are unsigned. The gates defend against mistakes, prompt-injection-shaped drift, and tool misuse — not against a hostile local process acting as your user. Do not point the driver at an agent binary you do not trust. Signed approvals and OS sandboxing are named follow-up work.
+The worker runs on the same machine as the runner and the review markers, and markers are unsigned. The gates defend against mistakes, prompt-injection-shaped drift, and tool misuse — not against a hostile local process acting as your user. Do not point the driver at an agent binary you do not trust. Signed approvals are named follow-up work. Rocky does not sandbox the worker itself; you can wrap it in an OS sandbox, as [shown above](#wrapping-the-worker-in-an-os-sandbox).
 
 Be precise about what "acting as your user" means, because it is a property of how you deploy, not of Rocky. `.rocky/fulfillment/<product>/outbox/` is the one part of that directory the worker is meant to write. Elicitation writes `candidate_spec.toml` and, optionally, `questions.json` there directly. Drafting's `draft_model` tool mirrors its draft there. The loop deletes and recreates `outbox/` before every dispatch. A worker meant to write only that directory needs an inherited default, such as a umask or an ACL on its parent. A one-off `chmod` would not do: the next dispatch would erase it. The loop reads the outbox only after the worker exits and its process group is killed.
 
@@ -153,7 +171,7 @@ The worker's MCP client must pass `ROCKY_STATE_PATH` through to the `rocky mcp` 
 
 A worker that can write anything in the closed list above is the hostile-local-process case, and nothing here defends against it. If your worker and your runner share a user, treat that as the concession it is.
 
-Two limits have their own tracking issues. A descendant that puts itself in a new session with `setsid` leaves the process group, is re-parented by the operating system, and survives the group kill; OS-level sandboxing is the fix ([#1491](https://github.com/rocky-data/rocky/issues/1491)). Rocky opens committed files with `O_NOFOLLOW` and creates them with `O_EXCL`, but it does not use directory-relative system calls, so a directory component swapped between the check and the open stays a window. `O_NOFOLLOW` is a Unix flag; on Windows one backup read follows a link.
+Two limits have their own tracking issues. A descendant that puts itself in a new session with `setsid` leaves the process group, is re-parented by the operating system, and survives the group kill. An OS sandbox around the worker contains it, and you configure it [in the driver command](#wrapping-the-worker-in-an-os-sandbox). Rocky does not enforce one ([#1491](https://github.com/rocky-data/rocky/issues/1491)). Rocky opens committed files with `O_NOFOLLOW` and creates them with `O_EXCL`, but it does not use directory-relative system calls, so a directory component swapped between the check and the open stays a window. `O_NOFOLLOW` is a Unix flag; on Windows one backup read follows a link.
 
 The full boundary, and how it applies to any agent rather than just this loop, is set out in [Operating Rocky with agents](/concepts/operating-rocky-with-agents/), "What the three gates do not defend against".
 

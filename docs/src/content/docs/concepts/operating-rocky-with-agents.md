@@ -221,8 +221,11 @@ fulfillment loop runs its drafting agent in a separate process group, and kills
 the whole group when the task ends. A descendant that puts itself in a new
 session with `setsid` leaves that group. The operating system re-parents it, and
 it survives the kill. A test exhibits the escape, so the limit cannot quietly
-turn into a false guarantee. Sandboxing at the operating-system level is the
-planned fix. Tracked in
+turn into a false guarantee. An operating-system sandbox contains it: the
+driver command can wrap the agent in one, such as a Linux PID namespace
+(`unshare --pid --fork`) or a macOS `sandbox-exec` profile. See
+[Wrapping the worker in an OS sandbox](/reference/commands/fulfill/#wrapping-the-worker-in-an-os-sandbox).
+Rocky does not require the wrapper or check that it is there. Tracked in
 [#1491](https://github.com/rocky-data/rocky/issues/1491).
 
 **A repair round opens a window where the sidecar is not hash-pinned.** When the
