@@ -1,3 +1,4 @@
+import type { ScheduleSpoolOutput } from "@rocky-types/schedule_spool";
 import type { ScheduleStatusOutput } from "@rocky-types/schedule_status";
 import { EmptyState, StatusCard, type Tone } from "../components";
 import { NOT_RECORDED, formatInstant, orNotRecorded } from "../format";
@@ -100,6 +101,41 @@ export function SchedulePanel({ status, now }: { status: ScheduleStatusOutput; n
         </table>
         </div>
       )}
+    </div>
+  );
+}
+
+/**
+ * The webhook spool's counts, from `GET /api/v1/schedule/spool` (#1900).
+ *
+ * `GET /api/v1/schedule` reports claims only, so a demand that waits in the
+ * spool appears nowhere in it. A scheduler whose ticks stopped looked healthy
+ * while demands piled up. The route stays blind by design; this panel reads
+ * the spool itself. The caller renders a refused spool read as its error,
+ * never as a count of zero.
+ */
+export function SpoolCounts({ spool }: { spool: ScheduleSpoolOutput }) {
+  const { counts } = spool;
+  return (
+    <div className="grid gap-2 sm:grid-cols-3">
+      <StatusCard
+        label="spool pending"
+        value={counts.pending}
+        tone={counts.pending > 0 ? "pending" : "muted"}
+        sub="webhook demands waiting for a tick"
+      />
+      <StatusCard
+        label="spool skipped"
+        value={counts.skipped}
+        tone={counts.skipped > 0 ? "warn" : "muted"}
+        sub="entries the listing could not read"
+      />
+      <StatusCard
+        label="spool corrupt"
+        value={counts.corrupt}
+        tone={counts.corrupt > 0 ? "risk" : "muted"}
+        sub="demands set aside, never run"
+      />
     </div>
   );
 }

@@ -4,6 +4,7 @@ import type { DagOutput } from "@rocky-types/dag";
 import type { HistoryOutput } from "@rocky-types/history";
 import type { ModelDetailOutput } from "@rocky-types/model_detail";
 import type { ProjectOutput } from "@rocky-types/project";
+import type { ScheduleSpoolOutput } from "@rocky-types/schedule_spool";
 import type { ScheduleStatusOutput } from "@rocky-types/schedule_status";
 import dagFixture from "@rocky-fixtures/dag.json";
 import historyFixture from "@rocky-fixtures/history.json";
@@ -44,6 +45,15 @@ const emptySchedule: ScheduleStatusOutput = {
   timezone: "UTC",
 };
 
+const emptySpool: ScheduleSpoolOutput = {
+  command: "state schedule spool",
+  counts: { pending: 0, skipped: 0, corrupt: 0 },
+  pending: [],
+  skipped: [],
+  spool_path: "/tmp/playground/.rocky/pending-demands",
+  version: "0.0.0",
+};
+
 const detail = (name: string): ModelDetailOutput => ({
   name,
   file_path: `models/${name}.sql`,
@@ -65,6 +75,7 @@ function loaders(overrides: Partial<EstateLoaders> = {}): EstateLoaders {
     dag: async () => capturedDag,
     runs: async () => capturedHistory,
     schedule: async () => emptySchedule,
+    spool: async () => emptySpool,
     detail: async (name) => detail(name),
     ...overrides,
   };
@@ -99,7 +110,7 @@ describe("EstateScreen", () => {
       ["Project", "GET /api/v1/project"],
       ["DAG", "GET /api/v1/dag"],
       ["Runs", "GET /api/v1/runs"],
-      ["Schedule", "GET /api/v1/schedule"],
+      ["Schedule", "GET /api/v1/schedule, GET /api/v1/schedule/spool"],
     ]) {
       const h = screen.getByRole("heading", { name: heading });
       expect(h).toHaveAttribute("title", route);
@@ -187,6 +198,52 @@ describe("EstateScreen", () => {
     expect(within(core).getByText("0 * * * *")).toBeInTheDocument();
     expect(within(table).getByText(/config error: cron does not parse/)).toBeInTheDocument();
     expect(screen.getByText("free")).toBeInTheDocument();
+  });
+
+  it("shows the webhook spool's pending, skipped and corrupt counts beside the schedule (#1900)", async () => {
+    // `GET /api/v1/schedule` reports claims only: a demand waiting in the
+    // spool is invisible there. The panel reads the spool itself.
+    const spool: ScheduleSpoolOutput = { ...emptySpool, counts: { pending: 3, skipped: 1, corrupt: 2 } };
+    render(<EstateScreen loaders={loaders({ spool: async () => spool })} refreshMs={0} now={NOW} />);
+    const group = await screen.findByRole("group", { name: "Webhook spool" });
+    await within(group).findByText("spool pending");
+    for (const [label, value] of [
+      ["spool pending", "3"],
+      ["spool skipped", "1"],
+      ["spool corrupt", "2"],
+    ]) {
+      const card = within(group).getByText(label).parentElement as HTMLElement;
+      expect(within(card).getByText(value)).toBeInTheDocument();
+    }
+    // The schedule status still renders beside it.
+    expect(screen.getByText("No schedules configured")).toBeInTheDocument();
+  });
+
+  it("shows a refused spool read as its error, never as zero (#1900)", async () => {
+    const refused = new ApiError(500, {
+      code: "spool_unreadable",
+      message: "permission denied",
+      remediation_hint: "inspect the spool directory's permissions",
+    });
+    render(
+      <EstateScreen
+        loaders={loaders({
+          spool: async () => {
+            throw refused;
+          },
+        })}
+        refreshMs={0}
+        now={NOW}
+      />,
+    );
+    const group = await screen.findByRole("group", { name: "Webhook spool" });
+    expect(await within(group).findByText("spool_unreadable")).toBeInTheDocument();
+    expect(within(group).getByText("refused (500)")).toBeInTheDocument();
+    expect(within(group).getByText("inspect the spool directory's permissions")).toBeInTheDocument();
+    expect(within(group).queryByText("spool pending")).toBeNull();
+    expect(within(group).queryByText("0")).toBeNull();
+    // A refused spool does not take the schedule status down with it.
+    expect(screen.getByText("No schedules configured")).toBeInTheDocument();
   });
 
   it("shows a refused producer's envelope in its own panel while the others render", async () => {

@@ -3,6 +3,7 @@ import type { DagOutput } from "@rocky-types/dag";
 import type { HistoryOutput } from "@rocky-types/history";
 import type { ModelDetailOutput } from "@rocky-types/model_detail";
 import type { ProjectOutput } from "@rocky-types/project";
+import type { ScheduleSpoolOutput } from "@rocky-types/schedule_spool";
 import type { ScheduleStatusOutput } from "@rocky-types/schedule_status";
 import { apiGet } from "../api";
 import { StatusCard } from "../components";
@@ -10,15 +11,16 @@ import { DagPanel } from "./DagPanel";
 import { ModelDetail } from "./ModelDetail";
 import { ProjectStrip } from "./ProjectStrip";
 import { RunsPanel } from "./RunsPanel";
-import { SchedulePanel } from "./SchedulePanel";
+import { SchedulePanel, SpoolCounts } from "./SchedulePanel";
 import { type Resource, useResource } from "./useResource";
 
-/** The four producers this screen reads. Tests hand in fixtures. */
+/** The producers this screen reads. Tests hand in fixtures. */
 export interface EstateLoaders {
   project: () => Promise<ProjectOutput>;
   dag: () => Promise<DagOutput>;
   runs: () => Promise<HistoryOutput>;
   schedule: () => Promise<ScheduleStatusOutput>;
+  spool: () => Promise<ScheduleSpoolOutput>;
   detail: (name: string) => Promise<ModelDetailOutput>;
 }
 
@@ -27,6 +29,7 @@ export const defaultLoaders: EstateLoaders = {
   dag: () => apiGet<DagOutput>("dag"),
   runs: () => apiGet<HistoryOutput>("runs"),
   schedule: () => apiGet<ScheduleStatusOutput>("schedule"),
+  spool: () => apiGet<ScheduleSpoolOutput>("schedule/spool"),
   detail: (name) => apiGet<ModelDetailOutput>(`models/${encodeURIComponent(name)}`),
 };
 
@@ -51,6 +54,7 @@ export function EstateScreen({
   const dag = useResource(loaders.dag, [loaders]);
   const runs = useResource(loaders.runs, [loaders], refreshMs);
   const schedule = useResource(loaders.schedule, [loaders], refreshMs);
+  const spool = useResource(loaders.spool, [loaders], refreshMs);
   const [selected, setSelected] = useState<string | null>(null);
 
   const refreshAll = () => {
@@ -58,6 +62,7 @@ export function EstateScreen({
     dag.reload();
     runs.reload();
     schedule.reload();
+    spool.reload();
   };
 
   return (
@@ -98,10 +103,17 @@ export function EstateScreen({
         <Loaded resource={runs}>{(value) => <RunsPanel history={value} now={now} />}</Loaded>
       </Panel>
 
-      <Panel title="Schedule" producer="GET /api/v1/schedule">
+      <Panel title="Schedule" producer="GET /api/v1/schedule, GET /api/v1/schedule/spool">
         <Loaded resource={schedule}>
           {(value) => <SchedulePanel status={value} now={now} />}
         </Loaded>
+        {/*
+          The spool is its own read, so a refused spool shows its error here
+          while the schedule above still renders, and the reverse (#1900).
+        */}
+        <div className="mt-3" role="group" aria-label="Webhook spool">
+          <Loaded resource={spool}>{(value) => <SpoolCounts spool={value} />}</Loaded>
+        </div>
       </Panel>
     </div>
   );
