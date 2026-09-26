@@ -5,8 +5,11 @@
 //!
 //! Supports multiple templates via `--template`:
 //! - `quickstart` (default): 3 models, basic pipeline
-//! - `ecommerce`: orders/customers/products, incremental + merge
-//! - `showcase`: every Rocky feature in one project
+//! - `ecommerce`: orders/customers/products, 10 models with merge upserts
+//! - `showcase`: ecommerce plus a Rocky DSL model and an extra contract
+//!
+//! Every template is a transformation pipeline over a file-backed DuckDB
+//! that the scaffold seeds, so `rocky run` builds the models first try.
 
 use std::path::Path;
 
@@ -17,9 +20,9 @@ use anyhow::{Context, Result};
 pub enum Template {
     /// Minimal: 3 models, basic full refresh pipeline
     Quickstart,
-    /// E-commerce: 4 sources, staging, intermediate, marts with incremental + merge
+    /// E-commerce: 4 sources, staging, intermediate, marts with merge upserts
     Ecommerce,
-    /// Every Rocky feature demonstrated in one project
+    /// E-commerce plus a Rocky DSL model and an extra contract
     Showcase,
 }
 
@@ -61,19 +64,26 @@ pub fn run_playground_with_template(target_dir: &str, template_name: &str) -> Re
         Template::Showcase => write_showcase(dir)?,
     }
 
-    // Auto-seed the persistent DuckDB file for the quickstart template so the
+    // Auto-seed the persistent DuckDB file so the
     // `rocky compile && rocky test && rocky run` golden path works first-try
-    // with no manual `duckdb playground.duckdb < data/seed.sql` step and no
-    // DuckDB-CLI prerequisite. The quickstart `rocky.toml` points its adapter
-    // at `playground.duckdb`; we load the seed into that exact file.
-    if template == Template::Quickstart {
-        seed_quickstart_db(dir)?;
-    }
+    // with no manual `duckdb <file> < data/seed.sql` step and no DuckDB-CLI
+    // prerequisite. Each template's `rocky.toml` points its adapter at the
+    // file named here; we load the seed into that exact file. DuckDB names
+    // the catalog after the file, so the file name matches the sidecars'
+    // `catalog` (#1983).
+    let (db_file, seed_sql) = match template {
+        Template::Quickstart => ("playground.duckdb", QUICKSTART_SEED),
+        Template::Ecommerce | Template::Showcase => ("warehouse.duckdb", ECOMMERCE_SEED),
+    };
+    seed_playground_db(dir, db_file, seed_sql)?;
 
-    let template_label = match template {
-        Template::Quickstart => "Quickstart (3 models)",
-        Template::Ecommerce => "E-Commerce (11 models, incremental + merge)",
-        Template::Showcase => "Showcase (every Rocky feature)",
+    let (template_label, preview_model) = match template {
+        Template::Quickstart => ("Quickstart (3 models)", "customer_orders"),
+        Template::Ecommerce => ("E-Commerce (10 models, merge upserts)", "dim_customers"),
+        Template::Showcase => (
+            "Showcase (ecommerce + Rocky DSL + extra contracts)",
+            "stg_products",
+        ),
     };
 
     println!("  Rocky Playground");
@@ -87,28 +97,29 @@ pub fn run_playground_with_template(target_dir: &str, template_name: &str) -> Re
     println!("    rocky compile                           # type-check the models");
     println!("    rocky test                              # run models on an in-memory DuckDB");
     println!("    rocky run                               # materialize the model DAG");
-    println!("    rocky preview rows --model customer_orders  # peek at materialized rows");
+    println!("    rocky preview rows --model {preview_model}  # peek at materialized rows");
     println!();
 
     Ok(())
 }
 
-/// Load `data/seed.sql` into the quickstart's persistent `playground.duckdb`
-/// file so `rocky run` has source tables to read on the very first invocation.
+/// Load the template's seed (the same script written to `data/seed.sql`) into
+/// its persistent DuckDB file so `rocky run` has source tables to read on the
+/// very first invocation.
 ///
-/// The seed is applied to `<dir>/playground.duckdb` — the exact path the
-/// scaffolded `rocky.toml` adapter points at. We open the file, execute the
-/// (already-written) seed script, then drop the connection before returning so
-/// the file isn't locked when the user's `rocky run` opens it.
+/// The seed is applied to `<dir>/<db_file>` — the exact path the scaffolded
+/// `rocky.toml` adapter points at. We open the file, execute the seed script,
+/// then drop the connection before returning so the file isn't locked when
+/// the user's `rocky run` opens it.
 #[cfg(feature = "duckdb")]
-fn seed_quickstart_db(dir: &Path) -> Result<()> {
+fn seed_playground_db(dir: &Path, db_file: &str, seed_sql: &str) -> Result<()> {
     use rocky_duckdb::DuckDbConnector;
 
-    let db_path = dir.join("playground.duckdb");
+    let db_path = dir.join(db_file);
     let conn = DuckDbConnector::open(&db_path)
         .with_context(|| format!("failed to open {}", db_path.display()))?;
-    conn.execute_statement(QUICKSTART_SEED)
-        .context("failed to seed playground.duckdb")?;
+    conn.execute_statement(seed_sql)
+        .with_context(|| format!("failed to seed {db_file}"))?;
     // `conn` drops here, releasing the file lock before the next-steps print.
     Ok(())
 }
@@ -117,7 +128,7 @@ fn seed_quickstart_db(dir: &Path) -> Result<()> {
 /// `data/seed.sql`, and the printed next-steps tell the user to seed manually
 /// is no longer applicable for such builds (which can't run DuckDB anyway).
 #[cfg(not(feature = "duckdb"))]
-fn seed_quickstart_db(_dir: &Path) -> Result<()> {
+fn seed_playground_db(_dir: &Path, _db_file: &str, _seed_sql: &str) -> Result<()> {
     Ok(())
 }
 
@@ -306,37 +317,33 @@ fn write_ecommerce(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-const ECOMMERCE_PIPELINE: &str = r#"# Rocky E-Commerce Playground — DuckDB
-# Demonstrates: sources, staging, intermediate, marts, incremental, contracts
+const ECOMMERCE_PIPELINE: &str = r#"# Rocky E-Commerce Playground — a runnable DuckDB pipeline. No credentials.
+# Demonstrates: source, staging, intermediate and mart models, merge upserts,
+# and a data contract.
+#
+# `rocky playground` already seeded the local DuckDB (data/seed.sql), so you
+# can materialize the model DAG straight away:
+#   rocky run
+#
+# `rocky test` runs the models against an in-memory DuckDB (auto-loading
+# data/seed.sql). Re-seed any time with
+# `duckdb warehouse.duckdb < data/seed.sql`.
 
-[adapter.local]
+[adapter]
 type = "duckdb"
+path = "warehouse.duckdb"
 
 [pipeline.ecommerce]
-type = "replication"
-strategy = "incremental"
-timestamp_column = "_fivetran_synced"
+type = "transformation"
+models = "models/**"
 
-[pipeline.ecommerce.source]
-adapter = "local"
-
-[pipeline.ecommerce.source.schema_pattern]
-prefix = "raw__"
-separator = "__"
-components = ["source"]
-
-[pipeline.ecommerce.target]
-adapter = "local"
-catalog_template = "warehouse"
-schema_template = "ecommerce__{source}"
-
+# DuckDB names the catalog after the file, so `warehouse.duckdb` holds the
+# `warehouse` catalog the sidecars name. Every model lands in
+# `warehouse.main`, so a model can reference an upstream by name
+# (`FROM stg_orders`) in both `rocky run` and `rocky test`. The folders under
+# models/ show the layers.
 [pipeline.ecommerce.target.governance]
-auto_create_catalogs = false
-auto_create_schemas = false
-
-[pipeline.ecommerce.checks]
-row_count = true
-column_match = true
+auto_create_schemas = true
 
 [pipeline.ecommerce.execution]
 concurrency = 4
@@ -347,17 +354,17 @@ backend = "local"
 
 // --- Source models ---
 const ECOM_RAW_ORDERS_SQL: &str = "SELECT order_id, customer_id, order_date, status, total_amount, _fivetran_synced\nFROM source.raw_orders\n";
-const ECOM_RAW_ORDERS_TOML: &str = "name = \"raw_orders\"\n\n[strategy]\ntype = \"full_refresh\"\n\n[target]\ncatalog = \"warehouse\"\nschema = \"sources\"\ntable = \"raw_orders\"\n";
+const ECOM_RAW_ORDERS_TOML: &str = "name = \"raw_orders\"\n\n[strategy]\ntype = \"full_refresh\"\n\n[target]\ncatalog = \"warehouse\"\nschema = \"main\"\ntable = \"raw_orders\"\n";
 
 const ECOM_RAW_CUSTOMERS_SQL: &str = "SELECT customer_id, name, email, tier, signup_date, _fivetran_synced\nFROM source.raw_customers\n";
-const ECOM_RAW_CUSTOMERS_TOML: &str = "name = \"raw_customers\"\n\n[strategy]\ntype = \"full_refresh\"\n\n[target]\ncatalog = \"warehouse\"\nschema = \"sources\"\ntable = \"raw_customers\"\n";
+const ECOM_RAW_CUSTOMERS_TOML: &str = "name = \"raw_customers\"\n\n[strategy]\ntype = \"full_refresh\"\n\n[target]\ncatalog = \"warehouse\"\nschema = \"main\"\ntable = \"raw_customers\"\n";
 
 const ECOM_RAW_PRODUCTS_SQL: &str =
     "SELECT product_id, name, category, price, _fivetran_synced\nFROM source.raw_products\n";
-const ECOM_RAW_PRODUCTS_TOML: &str = "name = \"raw_products\"\n\n[strategy]\ntype = \"full_refresh\"\n\n[target]\ncatalog = \"warehouse\"\nschema = \"sources\"\ntable = \"raw_products\"\n";
+const ECOM_RAW_PRODUCTS_TOML: &str = "name = \"raw_products\"\n\n[strategy]\ntype = \"full_refresh\"\n\n[target]\ncatalog = \"warehouse\"\nschema = \"main\"\ntable = \"raw_products\"\n";
 
 const ECOM_RAW_ORDER_ITEMS_SQL: &str = "SELECT order_id, product_id, quantity, unit_price, _fivetran_synced\nFROM source.raw_order_items\n";
-const ECOM_RAW_ORDER_ITEMS_TOML: &str = "name = \"raw_order_items\"\n\n[strategy]\ntype = \"full_refresh\"\n\n[target]\ncatalog = \"warehouse\"\nschema = \"sources\"\ntable = \"raw_order_items\"\n";
+const ECOM_RAW_ORDER_ITEMS_TOML: &str = "name = \"raw_order_items\"\n\n[strategy]\ntype = \"full_refresh\"\n\n[target]\ncatalog = \"warehouse\"\nschema = \"main\"\ntable = \"raw_order_items\"\n";
 
 // --- Staging models ---
 const ECOM_STG_ORDERS_SQL: &str = r#"SELECT
@@ -370,7 +377,7 @@ const ECOM_STG_ORDERS_SQL: &str = r#"SELECT
 FROM raw_orders
 WHERE status != 'cancelled'
 "#;
-const ECOM_STG_ORDERS_TOML: &str = "name = \"stg_orders\"\ndepends_on = [\"raw_orders\"]\n\n[strategy]\ntype = \"merge\"\nunique_key = [\"order_id\"]\n\n[target]\ncatalog = \"warehouse\"\nschema = \"staging\"\ntable = \"stg_orders\"\n";
+const ECOM_STG_ORDERS_TOML: &str = "name = \"stg_orders\"\ndepends_on = [\"raw_orders\"]\n\n[strategy]\ntype = \"merge\"\nunique_key = [\"order_id\"]\nupdate_columns = [\"customer_id\", \"order_date\", \"status\", \"total_amount\", \"_fivetran_synced\"]\n\n[target]\ncatalog = \"warehouse\"\nschema = \"main\"\ntable = \"stg_orders\"\n";
 
 const ECOM_STG_CUSTOMERS_SQL: &str = r#"SELECT
     customer_id,
@@ -381,7 +388,7 @@ const ECOM_STG_CUSTOMERS_SQL: &str = r#"SELECT
     _fivetran_synced
 FROM raw_customers
 "#;
-const ECOM_STG_CUSTOMERS_TOML: &str = "name = \"stg_customers\"\ndepends_on = [\"raw_customers\"]\n\n[strategy]\ntype = \"full_refresh\"\n\n[target]\ncatalog = \"warehouse\"\nschema = \"staging\"\ntable = \"stg_customers\"\n";
+const ECOM_STG_CUSTOMERS_TOML: &str = "name = \"stg_customers\"\ndepends_on = [\"raw_customers\"]\n\n[strategy]\ntype = \"full_refresh\"\n\n[target]\ncatalog = \"warehouse\"\nschema = \"main\"\ntable = \"stg_customers\"\n";
 
 // --- Intermediate models ---
 const ECOM_INT_ORDER_TOTALS_SQL: &str = r#"SELECT
@@ -394,7 +401,7 @@ const ECOM_INT_ORDER_TOTALS_SQL: &str = r#"SELECT
 FROM stg_orders o
 GROUP BY o.customer_id
 "#;
-const ECOM_INT_ORDER_TOTALS_TOML: &str = "name = \"int_order_totals\"\ndepends_on = [\"stg_orders\"]\n\n[strategy]\ntype = \"full_refresh\"\n\n[target]\ncatalog = \"warehouse\"\nschema = \"intermediate\"\ntable = \"int_order_totals\"\n";
+const ECOM_INT_ORDER_TOTALS_TOML: &str = "name = \"int_order_totals\"\ndepends_on = [\"stg_orders\"]\n\n[strategy]\ntype = \"full_refresh\"\n\n[target]\ncatalog = \"warehouse\"\nschema = \"main\"\ntable = \"int_order_totals\"\n";
 
 // --- Mart models ---
 const ECOM_FCT_ORDERS_SQL: &str = r#"SELECT
@@ -409,7 +416,7 @@ const ECOM_FCT_ORDERS_SQL: &str = r#"SELECT
 FROM stg_orders o
 JOIN stg_customers c ON o.customer_id = c.customer_id
 "#;
-const ECOM_FCT_ORDERS_TOML: &str = "name = \"fct_orders\"\ndepends_on = [\"stg_orders\", \"stg_customers\"]\n\n[strategy]\ntype = \"merge\"\nunique_key = [\"order_id\"]\n\n[target]\ncatalog = \"warehouse\"\nschema = \"marts\"\ntable = \"fct_orders\"\n";
+const ECOM_FCT_ORDERS_TOML: &str = "name = \"fct_orders\"\ndepends_on = [\"stg_orders\", \"stg_customers\"]\n\n[strategy]\ntype = \"merge\"\nunique_key = [\"order_id\"]\nupdate_columns = [\"customer_id\", \"customer_name\", \"customer_tier\", \"order_date\", \"status\", \"total_amount\", \"_fivetran_synced\"]\n\n[target]\ncatalog = \"warehouse\"\nschema = \"main\"\ntable = \"fct_orders\"\n";
 
 const ECOM_DIM_CUSTOMERS_SQL: &str = r#"SELECT
     c.customer_id,
@@ -430,7 +437,7 @@ const ECOM_DIM_CUSTOMERS_SQL: &str = r#"SELECT
 FROM stg_customers c
 LEFT JOIN int_order_totals t ON c.customer_id = t.customer_id
 "#;
-const ECOM_DIM_CUSTOMERS_TOML: &str = "name = \"dim_customers\"\ndepends_on = [\"stg_customers\", \"int_order_totals\"]\n\n[strategy]\ntype = \"full_refresh\"\n\n[target]\ncatalog = \"warehouse\"\nschema = \"marts\"\ntable = \"dim_customers\"\n";
+const ECOM_DIM_CUSTOMERS_TOML: &str = "name = \"dim_customers\"\ndepends_on = [\"stg_customers\", \"int_order_totals\"]\n\n[strategy]\ntype = \"full_refresh\"\n\n[target]\ncatalog = \"warehouse\"\nschema = \"main\"\ntable = \"dim_customers\"\n";
 
 const ECOM_FCT_DAILY_REVENUE_SQL: &str = r#"SELECT
     order_date,
@@ -442,7 +449,7 @@ FROM stg_orders
 GROUP BY order_date
 ORDER BY order_date
 "#;
-const ECOM_FCT_DAILY_REVENUE_TOML: &str = "name = \"fct_daily_revenue\"\ndepends_on = [\"stg_orders\"]\n\n[strategy]\ntype = \"full_refresh\"\n\n[target]\ncatalog = \"warehouse\"\nschema = \"marts\"\ntable = \"fct_daily_revenue\"\n";
+const ECOM_FCT_DAILY_REVENUE_TOML: &str = "name = \"fct_daily_revenue\"\ndepends_on = [\"stg_orders\"]\n\n[strategy]\ntype = \"full_refresh\"\n\n[target]\ncatalog = \"warehouse\"\nschema = \"main\"\ntable = \"fct_daily_revenue\"\n";
 
 const ECOM_FCT_ORDERS_CONTRACT: &str = r#"[[columns]]
 name = "order_id"
@@ -464,7 +471,8 @@ required = ["order_id", "customer_id", "total_amount", "order_date"]
 "#;
 
 const ECOMMERCE_SEED: &str = r#"-- Seed data for e-commerce playground
--- Run: duckdb playground.duckdb < data/seed.sql
+-- `rocky playground` already loaded this into warehouse.duckdb.
+-- Re-seed: duckdb warehouse.duckdb < data/seed.sql
 SELECT SETSEED(0.42);
 
 CREATE SCHEMA IF NOT EXISTS source;
@@ -521,6 +529,7 @@ FROM source.raw_orders o,
 fn write_showcase(dir: &Path) -> Result<()> {
     // Showcase includes everything from ecommerce plus extra features
     write_ecommerce(dir)?;
+    std::fs::write(dir.join("rocky.toml"), showcase_pipeline())?;
 
     // Add a Rocky DSL model
     std::fs::write(
@@ -539,6 +548,17 @@ fn write_showcase(dir: &Path) -> Result<()> {
     )?;
 
     Ok(())
+}
+
+/// The ecommerce config under the showcase's own title and pipeline name.
+fn showcase_pipeline() -> String {
+    ECOMMERCE_PIPELINE
+        .replacen(
+            "# Rocky E-Commerce Playground",
+            "# Rocky Showcase Playground (ecommerce + Rocky DSL + extra contracts)",
+            1,
+        )
+        .replace("[pipeline.ecommerce", "[pipeline.showcase")
 }
 
 const SHOWCASE_STG_PRODUCTS_ROCKY: &str = r#"-- Rocky DSL staging model (compiles to SQL)
@@ -560,7 +580,7 @@ select {
 }
 "#;
 
-const SHOWCASE_STG_PRODUCTS_TOML: &str = "name = \"stg_products\"\ndepends_on = [\"raw_products\"]\n\n[strategy]\ntype = \"full_refresh\"\n\n[target]\ncatalog = \"warehouse\"\nschema = \"staging\"\ntable = \"stg_products\"\n";
+const SHOWCASE_STG_PRODUCTS_TOML: &str = "name = \"stg_products\"\ndepends_on = [\"raw_products\"]\n\n[strategy]\ntype = \"full_refresh\"\n\n[target]\ncatalog = \"warehouse\"\nschema = \"main\"\ntable = \"stg_products\"\n";
 
 const SHOWCASE_DIM_CUSTOMERS_CONTRACT: &str = r#"[[columns]]
 name = "customer_id"

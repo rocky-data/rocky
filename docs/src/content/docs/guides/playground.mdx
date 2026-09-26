@@ -40,9 +40,7 @@ rocky playground my-project --template ecommerce   # 10 models, sources/staging/
 rocky playground my-project --template showcase    # ecommerce + Rocky DSL + extra contracts
 ```
 
-:::caution
-Today `rocky run` builds nothing in an `ecommerce` or `showcase` project. It prints `Copied 0 tables` and exits 0. Use `quickstart` to follow this guide. [Issue #1983](https://github.com/rocky-data/rocky/issues/1983) tracks the fix.
-:::
+Both larger templates seed `warehouse.duckdb`, so `rocky compile`, `rocky test` and `rocky run` work first try. The folders under `models/` show the layers. Every model lands in the `warehouse.main` schema, so a model can name its upstream directly, such as `FROM stg_orders`. The rest of this guide follows `quickstart`.
 
 Enter the project directory:
 
