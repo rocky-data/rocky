@@ -24,6 +24,59 @@ pub struct DbtManifest {
     /// Counts of resource classes the importer does not translate, captured at
     /// parse time so the sweep can report them.
     pub dropped: DbtDroppedCounts,
+    /// Whether the manifest came from a `--full-refresh` compile. Read from
+    /// `run_results.json` beside the manifest at parse time. See
+    /// [`CompileMode`].
+    pub compile_mode: CompileMode,
+}
+
+/// How dbt compiled the manifest, as far as the importer can prove it
+/// (#2059).
+///
+/// dbt compiles `is_incremental()` as true against an existing table, so the
+/// compiled SQL of an incremental model can keep its delta filter. Under
+/// `--full-refresh`, `is_incremental()` is false and the filter is gone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CompileMode {
+    /// `run_results.json` beside the manifest has the manifest's
+    /// `invocation_id`, and its args record `full_refresh: true`.
+    FullRefresh,
+    /// Anything else: no `run_results.json`, another invocation, or no
+    /// `full_refresh: true`. The compiled SQL can keep incremental filters.
+    #[default]
+    Unconfirmed,
+}
+
+/// Read `run_results.json` beside `manifest_path` and decide the
+/// [`CompileMode`]. The two files must share a non-empty `invocation_id`:
+/// a `run_results.json` from a later `dbt run` says nothing about how the
+/// manifest was compiled.
+fn read_compile_mode(manifest_path: &Path, manifest_invocation_id: &str) -> CompileMode {
+    if manifest_invocation_id.is_empty() {
+        return CompileMode::Unconfirmed;
+    }
+    let Some(dir) = manifest_path.parent() else {
+        return CompileMode::Unconfirmed;
+    };
+    let Ok(text) = std::fs::read_to_string(dir.join("run_results.json")) else {
+        return CompileMode::Unconfirmed;
+    };
+    let Ok(run_results) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return CompileMode::Unconfirmed;
+    };
+    let same_invocation = run_results
+        .pointer("/metadata/invocation_id")
+        .and_then(serde_json::Value::as_str)
+        == Some(manifest_invocation_id);
+    let full_refresh = run_results
+        .pointer("/args/full_refresh")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true);
+    if same_invocation && full_refresh {
+        CompileMode::FullRefresh
+    } else {
+        CompileMode::Unconfirmed
+    }
 }
 
 /// Counts of dbt resource classes the importer skips. Surfaced (not silently
@@ -43,6 +96,8 @@ pub struct DbtManifestMetadata {
     pub dbt_version: String,
     pub generated_at: String,
     pub project_name: String,
+    /// The dbt invocation that wrote the manifest. Empty when absent.
+    pub invocation_id: String,
 }
 
 /// A model/test/seed node in the manifest.
@@ -265,6 +320,8 @@ struct RawMetadata {
     generated_at: Option<String>,
     #[serde(default)]
     project_name: Option<String>,
+    #[serde(default)]
+    invocation_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -411,7 +468,9 @@ pub fn parse_manifest(path: &Path) -> Result<DbtManifest, String> {
         dbt_version: raw.metadata.dbt_version.unwrap_or_default(),
         generated_at: raw.metadata.generated_at.unwrap_or_default(),
         project_name: raw.metadata.project_name.unwrap_or_default(),
+        invocation_id: raw.metadata.invocation_id.unwrap_or_default(),
     };
+    let compile_mode = read_compile_mode(path, &metadata.invocation_id);
 
     let dropped = DbtDroppedCounts {
         snapshots: raw
@@ -461,6 +520,7 @@ pub fn parse_manifest(path: &Path) -> Result<DbtManifest, String> {
         sources,
         unit_tests,
         dropped,
+        compile_mode,
     })
 }
 
@@ -737,6 +797,55 @@ mod tests {
         assert_eq!(manifest.metadata.dbt_version, "1.7.4");
         assert_eq!(manifest.metadata.project_name, "my_analytics");
         assert_eq!(manifest.metadata.generated_at, "2024-01-15T10:30:00Z");
+    }
+
+    /// #2059: the compile mode is `FullRefresh` only when `run_results.json`
+    /// shares the manifest's `invocation_id` and records `full_refresh: true`.
+    #[test]
+    fn test_compile_mode_from_run_results() {
+        let case = |run_results: Option<serde_json::Value>| {
+            let dir = tempfile::TempDir::new().unwrap();
+            let path = dir.path().join("manifest.json");
+            std::fs::write(
+                &path,
+                serde_json::json!({
+                    "metadata": { "project_name": "p", "invocation_id": "inv-1" },
+                    "nodes": {}, "sources": {}
+                })
+                .to_string(),
+            )
+            .unwrap();
+            if let Some(rr) = run_results {
+                std::fs::write(dir.path().join("run_results.json"), rr.to_string()).unwrap();
+            }
+            parse_manifest(&path).unwrap().compile_mode
+        };
+        let rr = |id: &str, full_refresh: serde_json::Value| {
+            serde_json::json!({
+                "metadata": { "invocation_id": id },
+                "args": { "which": "compile", "full_refresh": full_refresh },
+                "results": []
+            })
+        };
+        assert_eq!(
+            case(Some(rr("inv-1", true.into()))),
+            CompileMode::FullRefresh
+        );
+        assert_eq!(case(None), CompileMode::Unconfirmed);
+        assert_eq!(
+            case(Some(rr("inv-1", false.into()))),
+            CompileMode::Unconfirmed
+        );
+        assert_eq!(
+            case(Some(rr("inv-2", true.into()))),
+            CompileMode::Unconfirmed
+        );
+        assert_eq!(
+            case(Some(
+                serde_json::json!({ "metadata": { "invocation_id": "inv-1" } })
+            )),
+            CompileMode::Unconfirmed
+        );
     }
 
     #[test]

@@ -95,7 +95,7 @@ Case one is `is_incremental()`. When a model still holds a
 import path refuses it. For a model named `stg_events` the line reads:
 
 ```
-  stg_events: contains an unresolved reference to dbt's `is_incremental()` macro; the raw SQL importer cannot preserve dbt's false-on-bootstrap, true-on-existing-target semantics without either referencing a missing target during bootstrap or deleting bounded incremental logic. Compile dbt in an incremental context, verify the compiled SQL retains its intended predicate and is valid for Rocky's initial target state, and import that manifest; otherwise, rewrite the model with a Rocky-supported strategy
+  stg_events: contains an unresolved reference to dbt's `is_incremental()` macro; the raw SQL importer cannot preserve dbt's false-on-bootstrap, true-on-existing-target semantics without either referencing a missing target during bootstrap or deleting bounded incremental logic. Run `dbt compile --full-refresh` and import that manifest's compiled SQL (a keyed model imports from it); otherwise, rewrite the model with a Rocky-supported strategy
 ```
 
 The message names two ways out, but only the second one works today. A
