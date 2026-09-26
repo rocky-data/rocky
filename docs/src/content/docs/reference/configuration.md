@@ -657,6 +657,8 @@ s3_bucket = "${ROCKY_STATE_BUCKET}"
 s3_prefix = "rocky/state/"
 ```
 
+The S3, GCS, and Azure clients cannot reach an endpoint that resolves only to a scoped link-local IPv6 address such as `fe80::1%en0`, because the client drops the `%en0` scope; use a routable address or a hostname instead.
+
 **Valkey (low-latency, shared):**
 
 ```toml

@@ -38,6 +38,13 @@ const CLIENT_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 /// endpoints fail fast rather than chewing through the retry budget.
 const CLIENT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Known limitation (#2124): `object_store` 0.14.2+ drops the interface scope
+/// of a scoped link-local IPv6 address (`fe80::1%en0`) in its default DNS
+/// resolver, which every client built here uses (`randomize_addresses` is left
+/// on). An endpoint that resolves only to such an address is unreachable.
+/// Upstream says scope ids do not apply to `object_store`, and no known
+/// deployment uses one. `with_randomize_addresses(false)` would keep the scope
+/// but change address ordering for every user.
 fn default_client_options() -> ClientOptions {
     let mut opts = ClientOptions::new()
         .with_timeout(CLIENT_REQUEST_TIMEOUT)
