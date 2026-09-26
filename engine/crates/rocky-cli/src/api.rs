@@ -6400,11 +6400,15 @@ mod tests {
     /// every such thread to finish. A one-shot writer (write once, then exit)
     /// only answers that first, abandoned read -- sampling the hung test
     /// binaries directly caught a SECOND read of this FIFO starting after this
-    /// test's writer had already exited, from a caller this test does not
-    /// otherwise pin down. That read found no writer, blocked forever, and the
-    /// runtime's drop hung the whole test BINARY with it (#2153; #2133 is the
-    /// duplicate that first hit it under load and killed the binary after it
-    /// sat hung for about 53 minutes).
+    /// test's writer had already exited. That caller is `ServerState::recompile`
+    /// (#2175): `ServerState::with_auth_and_webhook` spawns the initial compile,
+    /// and `recompile` reads the same `rocky.toml`. That read found no writer,
+    /// blocked forever, and the runtime's drop hung the whole test BINARY with
+    /// it (#2153; #2133 is the duplicate that first hit it under load and
+    /// killed the binary after it sat hung for about 53 minutes). `recompile`
+    /// now bounds its read the way this route does, but its abandoned read
+    /// still holds a blocking worker until the writer answers it, so the
+    /// persistent writer below is still needed.
     ///
     /// So the fix has two independent parts:
     ///

@@ -22,6 +22,12 @@ use crate::schema_cache_throttle::SchemaCacheThrottle;
 /// adapter-specific and is not in this package, which the guide says plainly.
 pub const DEFAULT_SAMPLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// How long [`ServerState::recompile`]'s one `rocky.toml` read may take
+/// before the recompile reports it as a compile error (#2175). Generous for
+/// a local file; the point is that it ends, not that it is tight. The same
+/// value as the settings route's own config read.
+pub const RECOMPILE_CONFIG_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// What one [`ServerState::recompile`] invocation found: its own outcome,
 /// not a re-read of the shared fields after the fact (#1823).
 #[derive(Debug, Clone, Default)]
@@ -186,6 +192,15 @@ pub struct ServerState {
     /// unrelated `spawn_blocking` work — the state-store reads especially.
     /// One permit bounds that to a single stuck worker.
     pub settings_reads: Arc<tokio::sync::Semaphore>,
+    /// Admission for the `rocky.toml` read inside [`Self::recompile`]: one
+    /// read in flight at a time (#2175).
+    ///
+    /// The same hazard as [`Self::settings_reads`], on its own lane so a stuck
+    /// settings read cannot refuse a recompile or the reverse. `spawn_blocking`
+    /// cannot be cancelled, so a read that outlives its deadline keeps its
+    /// blocking worker until it returns. It keeps this permit too, so the next
+    /// recompile is refused at once instead of parking a second worker.
+    recompile_config_reads: Arc<tokio::sync::Semaphore>,
     /// The sample deadline, in milliseconds: [`DEFAULT_SAMPLE_TIMEOUT`]
     /// unless [`ServerState::set_sample_timeout`] changed it. An atomic
     /// rather than a constructor argument because the state is handed out as
@@ -413,6 +428,7 @@ impl ServerState {
             review_diffs: Arc::new(tokio::sync::Semaphore::new(1)),
             warehouse_samples: Arc::new(tokio::sync::Semaphore::new(1)),
             settings_reads: Arc::new(tokio::sync::Semaphore::new(1)),
+            recompile_config_reads: Arc::new(tokio::sync::Semaphore::new(1)),
             sample_timeout_ms: std::sync::atomic::AtomicU64::new(millis(DEFAULT_SAMPLE_TIMEOUT)),
         });
 
@@ -451,8 +467,27 @@ impl ServerState {
         // and each copy decided independently what a broken config meant.
         // That per-caller decision is the defect #1625 is about, so there
         // is now one snapshot and one decision.
-        let project_config =
-            rocky_core::config::load_optional_project_config(self.config_path.as_deref());
+        //
+        // Bounded, the way `resolve_config_labels` in `rocky-cli`'s `api.rs`
+        // bounds the settings route's read (#2175). This read used to run on
+        // the async worker itself, with no deadline, while holding the
+        // compile gate. A `rocky.toml` that is a FIFO or sits on a stalled
+        // mount then parked that worker for the life of the process, and
+        // every later recompile (the file watcher, `POST /api/v1/compile`)
+        // waited behind the gate with no diagnostic. Now the read runs on the
+        // blocking pool under one permit and a deadline, and a stuck read is
+        // reported as a compile error.
+        let project_config = match self.read_project_config().await {
+            Ok(config) => config,
+            Err(reason) => {
+                warn!(reason = %reason, "rocky.toml read did not complete");
+                self.publish_failure(reason.clone()).await;
+                return RecompileOutcome {
+                    config_error: Some(reason.clone()),
+                    compile_error: Some(reason),
+                };
+            }
+        };
 
         let config_unreadable = match &project_config {
             // `Ok(None)` is "no rocky.toml", which is an ordinary fact
@@ -606,6 +641,52 @@ impl ServerState {
     /// result with it (#1823): "no result" means no result, so the routes
     /// that read one answer `engine_not_ready` rather than serve models the
     /// project no longer has. Lock order as in [`Self::compile_failure`].
+    /// Read `rocky.toml` for [`Self::recompile`], bounded (#2175).
+    ///
+    /// The same shape as `resolve_config_labels` in `rocky-cli`'s `api.rs`:
+    /// one permit, refused at once rather than queued; the read on the
+    /// blocking pool; and [`RECOMPILE_CONFIG_READ_TIMEOUT`] as the deadline.
+    /// The permit travels into the blocking closure, so a read that outlives
+    /// the deadline keeps the lane until it returns. At most one blocking
+    /// worker can ever be stuck here.
+    ///
+    /// `Ok` carries the loader's own result: a config that loaded, no config,
+    /// or a config the loader could not parse (which `recompile` tolerates,
+    /// #1625). `Err` is a read that did not complete, with the reason.
+    async fn read_project_config(
+        &self,
+    ) -> Result<
+        Result<Option<rocky_core::config::RockyConfig>, rocky_core::config::ConfigError>,
+        String,
+    > {
+        let path = self
+            .config_path
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "rocky.toml".to_string());
+        let Ok(permit) = Arc::clone(&self.recompile_config_reads).try_acquire_owned() else {
+            return Err(format!(
+                "{path} could not be read: an earlier read of it has not returned. Check that \
+                 it is a regular file on responsive storage"
+            ));
+        };
+        let config_path = self.config_path.clone();
+        let read = tokio::task::spawn_blocking(move || {
+            // Held for the life of the read, not just the spawn: dropping it
+            // early would let every recompile park another blocking worker.
+            let _permit = permit;
+            rocky_core::config::load_optional_project_config(config_path.as_deref())
+        });
+        match tokio::time::timeout(RECOMPILE_CONFIG_READ_TIMEOUT, read).await {
+            Ok(Ok(loaded)) => Ok(loaded),
+            Ok(Err(join_err)) => Err(format!("the read of {path} did not complete: {join_err}")),
+            Err(_) => Err(format!(
+                "reading {path} did not finish within {RECOMPILE_CONFIG_READ_TIMEOUT:?}. Check \
+                 that it is a regular file on responsive storage"
+            )),
+        }
+    }
+
     async fn publish_failure(&self, reason: String) {
         let mut failure = self.compile_failure.write().await;
         *self.compile_result.write().await = None;
@@ -1025,5 +1106,197 @@ mod tests {
             1,
             "an unmasked, unallowed classification tag must raise W004"
         );
+    }
+
+    /// #2175. `recompile` read `rocky.toml` on its async worker with no
+    /// deadline while holding the compile gate. A `rocky.toml` that is a FIFO
+    /// parked the read forever, and every later recompile queued behind the
+    /// gate with no diagnostic.
+    ///
+    /// ```text
+    ///   constructor's compile -> parks in the FIFO read (holds the lane)
+    ///   recompile 1           -> returns a compile error, bounded
+    ///   recompile 2           -> refused at once: the stuck read holds the lane
+    ///   writer released       -> the stuck read returns, the lane frees
+    ///   recompile 3           -> compiles clean, the failure is cleared
+    /// ```
+    ///
+    /// Without the bound, recompile 1 either waits behind the constructor's
+    /// parked compile or parks in the read itself, and the timeout below
+    /// fails the test.
+    ///
+    /// The FIFO hazards are the ones `a_stuck_config_read_is_bounded_refused_and_recovers`
+    /// in `rocky-cli`'s `api.rs` records (#2153): the temp directory is kept
+    /// so a panic cannot delete the FIFO under a parked reader; the writer
+    /// answers every open, not just the first; and the runtime is dropped
+    /// explicitly while the writer still answers. A watchdog aborts the
+    /// process if the test still hangs. Here the writer starts answering only
+    /// when the test releases it, so the refusals do not race a timer.
+    #[cfg(unix)]
+    #[test]
+    fn a_stuck_config_read_fails_the_recompile_and_frees_the_gate() {
+        use std::io::Write as _;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::{Duration, Instant};
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        struct CancelWatchdog(Option<std::sync::mpsc::Sender<()>>);
+        impl Drop for CancelWatchdog {
+            fn drop(&mut self) {
+                if let Some(tx) = self.0.take() {
+                    let _ = tx.send(());
+                }
+            }
+        }
+        let _cancel_watchdog = CancelWatchdog(Some(done_tx));
+        std::thread::spawn(move || {
+            let bound = Duration::from_secs(90);
+            if done_rx.recv_timeout(bound).is_err() {
+                let _ = std::io::stderr().write_all(
+                    format!(
+                        "\nWATCHDOG: a_stuck_config_read_fails_the_recompile_and_frees_the_gate \
+                         did not finish within {bound:?}; aborting (#2175).\n"
+                    )
+                    .as_bytes(),
+                );
+                std::process::abort();
+            }
+        });
+
+        let root = tempfile::tempdir().unwrap().keep();
+        let models_dir = root.join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        std::fs::write(models_dir.join("users.sql"), "SELECT 1 AS id").unwrap();
+        std::fs::write(
+            models_dir.join("users.toml"),
+            "name = \"users\"\n\n[target]\ncatalog = \"demo\"\nschema = \"main\"\ntable = \"users\"\n",
+        )
+        .unwrap();
+        let fifo = root.join("rocky.toml");
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .expect("mkfifo runs")
+                .success(),
+            "could not create the FIFO this test needs"
+        );
+
+        // The persistent writer. It waits for `release`, then answers every
+        // open of the FIFO until `stop`.
+        let release = Arc::new(AtomicBool::new(false));
+        let stop = Arc::new(AtomicBool::new(false));
+        let writer = {
+            let release = Arc::clone(&release);
+            let stop = Arc::clone(&stop);
+            let path = fifo.clone();
+            std::thread::spawn(move || {
+                while !release.load(Ordering::Acquire) && !stop.load(Ordering::Acquire) {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                while !stop.load(Ordering::Acquire) {
+                    let _ = std::fs::write(&path, "# empty config\n");
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+            })
+        };
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let body_release = Arc::clone(&release);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            runtime.block_on(async move {
+                let release = body_release;
+                let state = ServerState::new(models_dir, None, Some(fifo.clone()));
+
+                // Recompile 1. The constructor's compile parks in the read
+                // (or this one does); either way this call must END, with the
+                // stuck read reported as a compile error.
+                // Spawned, so a read that blocks a runtime worker (the
+                // defect) cannot also block this thread and its timer.
+                let bound = RECOMPILE_CONFIG_READ_TIMEOUT * 3;
+                let first = {
+                    let state = Arc::clone(&state);
+                    tokio::spawn(async move { state.recompile().await })
+                };
+                let first = tokio::time::timeout(bound, first)
+                    .await
+                    .expect("a stuck rocky.toml read must not hold the recompile for ever")
+                    .expect("the recompile task completes");
+                let reason = first
+                    .compile_error
+                    .expect("a stuck read is a compile error");
+                assert!(reason.contains("rocky.toml"), "{reason}");
+                assert!(
+                    state.compile_failure.read().await.is_some(),
+                    "the failure is recorded for the project route"
+                );
+                // The constructor's compile may have queued behind this one;
+                // it is refused at once, so the gate frees well inside the
+                // read deadline. Nothing can hold it longer.
+                let freed_by = Instant::now() + RECOMPILE_CONFIG_READ_TIMEOUT / 2;
+                while state.compile_gate.try_lock().is_err() {
+                    assert!(
+                        Instant::now() < freed_by,
+                        "the gate must be free once the stuck read is reported"
+                    );
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+
+                // Recompile 2. The abandoned read still holds the lane, so this
+                // one is refused at once rather than parking another worker.
+                let started = Instant::now();
+                let second = state.recompile().await;
+                assert!(
+                    second.compile_error.is_some(),
+                    "the lane is held: {second:?}"
+                );
+                assert!(
+                    started.elapsed() < RECOMPILE_CONFIG_READ_TIMEOUT,
+                    "a second read must be refused at once, not wait out a deadline"
+                );
+
+                // Recovery. The writer answers, the stuck read returns and
+                // frees the lane, and a recompile compiles clean.
+                release.store(true, Ordering::Release);
+                let deadline = Instant::now() + Duration::from_secs(30);
+                loop {
+                    let outcome = state.recompile().await;
+                    if outcome.compile_error.is_none() {
+                        assert!(outcome.config_error.is_none(), "{outcome:?}");
+                        break;
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "the recompile never recovered: {outcome:?}"
+                    );
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                assert!(state.compile_failure.read().await.is_none());
+                assert!(state.compile_result.read().await.is_some());
+            });
+        }));
+
+        // Release the writer before the runtime drops, so a failing run
+        // (whose parked read was never answered) still shuts down.
+        release.store(true, Ordering::Release);
+        drop(runtime);
+        stop.store(true, Ordering::Release);
+        let unstick = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(root.join("rocky.toml"));
+        writer.join().unwrap();
+        drop(unstick);
+
+        if result.is_ok() {
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
     }
 }
