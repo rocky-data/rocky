@@ -308,12 +308,21 @@ pub(crate) const TRANSFORMATION_FILTER_KEYS: &[&str] = &["table", "model", "cata
 ///
 /// `verb` names the caller in the two error messages, so a user sees the
 /// command they ran rather than this helper.
+///
+/// Each entry also carries the model's strategy: `branch promote` needs it to
+/// know what kind of object the target is (#2024).
 pub(crate) fn transformation_prod_targets(
     pipeline: &rocky_core::config::TransformationPipelineConfig,
     config_path: &std::path::Path,
     filter: Option<&str>,
     verb: &str,
-) -> Result<Vec<(String, rocky_ir::TargetRef)>> {
+) -> Result<
+    Vec<(
+        String,
+        rocky_ir::TargetRef,
+        rocky_core::models::StrategyConfig,
+    )>,
+> {
     let parsed_filter = filter.map(parse_filter).transpose()?;
     if let Some((key, _)) = &parsed_filter
         && !TRANSFORMATION_FILTER_KEYS.contains(&key.as_str())
@@ -371,6 +380,7 @@ pub(crate) fn transformation_prod_targets(
                 schema: model.config.target.schema.clone(),
                 table: model.config.target.table.clone(),
             },
+            model.config.strategy.clone(),
         ));
     }
     Ok(targets)

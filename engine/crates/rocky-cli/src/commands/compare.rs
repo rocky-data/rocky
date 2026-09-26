@@ -197,7 +197,7 @@ async fn compute_compare(
         rocky_core::config::PipelineConfig::Transformation(pipeline) => {
             super::transformation_prod_targets(pipeline, config_path, filter, "compare")?
                 .into_iter()
-                .map(|(_model, target)| target)
+                .map(|(_model, target, _strategy)| target)
                 .collect()
         }
         // Unreachable: the guard above rejects every other kind before any

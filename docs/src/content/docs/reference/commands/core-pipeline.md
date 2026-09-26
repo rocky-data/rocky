@@ -846,6 +846,10 @@ Writes a content-addressed approval artifact that binds the approver's git ident
 
 `rocky branch promote` enumerates the pipeline's production targets and promotes each one. A replication pipeline finds the source connector's tables through the schema-pattern templates. A transformation pipeline walks the configured `models` glob and promotes one target per model, skipping ephemeral models. Rocky then runs the optional `[branch.approval]` gate, followed by the semantic breaking-change gate against `--base-ref`. For each target it dispatches `CREATE OR REPLACE TABLE prod.<x> AS SELECT * FROM branch__<name>.<x>`. Quality and snapshot pipelines are not supported and return a clear error.
 
+Promote copies every target as a table. So a transformation model whose target is not a table cannot be promoted: a `view`, a `materialized_view` or a `dynamic_table`. When the targets include one, Rocky refuses the promote at plan time and names the models. Nothing is replaced. Promote the table models with `--filter model=<name>`. Then re-create the others in production with `rocky run`.
+
+Promote runs one statement per target and stops at the first failure. It does not roll back the targets it already replaced. When a promote fails, the error lists every target under one of three headings: replaced, failed, or not attempted. When at least one target was replaced, it also says that production is mixed. The JSON `targets` array lists only the targets it attempted.
+
 The breaking-change gate vetoes the promote and exits non-zero when any finding has `severity == "breaking"`, unless you pass `--allow-breaking`. Rocky records every gate decision in the audit trail: a block, an allow via override, and a fail-open when the gate could not run. To surface the same findings on every pull request without blocking, use [`rocky ci-diff --semantic`](/reference/commands/modeling/#rocky-ci-diff).
 
 ### Examples

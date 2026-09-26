@@ -1049,6 +1049,72 @@ pub(crate) async fn run_promote_apply(
     Ok((targets_out, overall_success))
 }
 
+/// A plain-text account of a promote that did not complete (#2024): every
+/// planned target's outcome, and whether production is now mixed.
+///
+/// Promote runs one statement per target and stops at the first failure, so
+/// the targets before it already hold the branch's data. The JSON `targets`
+/// list names only the targets it attempted; this report also names the ones
+/// it never reached, so an operator can tell what state production is in.
+pub(crate) fn promote_outcome_report(
+    planned: &[crate::output::PromoteTargetPlan],
+    attempted: &[crate::output::PromoteTarget],
+) -> String {
+    let replaced: Vec<&str> = attempted
+        .iter()
+        .filter(|t| t.succeeded)
+        .map(|t| t.target.as_str())
+        .collect();
+    let failed: Vec<String> = attempted
+        .iter()
+        .filter(|t| !t.succeeded)
+        .map(|t| {
+            format!(
+                "{}: {}",
+                t.target,
+                t.error.as_deref().unwrap_or("unknown error")
+            )
+        })
+        .collect();
+    let not_attempted: Vec<&str> = planned
+        .iter()
+        .filter(|p| !attempted.iter().any(|t| t.target == p.target))
+        .map(|p| p.target.as_str())
+        .collect();
+
+    let mut report = String::new();
+    for (heading, rows) in [
+        (
+            "replaced (production holds the branch's data)",
+            replaced.clone(),
+        ),
+        ("failed", failed.iter().map(String::as_str).collect()),
+        (
+            "not attempted (production unchanged)",
+            not_attempted.clone(),
+        ),
+    ] {
+        if rows.is_empty() {
+            continue;
+        }
+        report.push_str(&format!("{heading}:\n"));
+        for row in rows {
+            report.push_str(&format!("  - {row}\n"));
+        }
+    }
+    if replaced.is_empty() {
+        report.push_str("production is unchanged: no target was replaced.");
+    } else {
+        report.push_str(&format!(
+            "production is mixed: {} of {} targets hold the branch's data, and the rest do not. \
+             Promote does not roll back the replaced targets.",
+            replaced.len(),
+            planned.len()
+        ));
+    }
+    report
+}
+
 // ---------------------------------------------------------------------------
 // `rocky branch approve`
 // ---------------------------------------------------------------------------
@@ -1404,7 +1470,34 @@ fn discover_transformation_branch_targets(
     // reach it.
     let mut claimed: std::collections::HashMap<rocky_sql::defer::CollisionIdentity, String> =
         std::collections::HashMap::new();
-    for (model_name, prod) in targets {
+    // Promote copies each target as a table (`CREATE OR REPLACE TABLE ... AS
+    // SELECT * FROM <branch copy>`). A model whose target is not a table
+    // cannot take that statement: the warehouse refuses to replace a view
+    // with a table, after the earlier targets were already replaced (#2024).
+    // Refuse here, at plan time, before anything runs.
+    let not_tables: Vec<String> = targets
+        .iter()
+        .filter_map(|(model_name, _, strategy)| {
+            promote_refused_kind(strategy).map(|kind| format!("'{model_name}' ({kind})"))
+        })
+        .collect();
+    if !not_tables.is_empty() {
+        anyhow::bail!(
+            "`branch promote` copies each target as a table, but {} {} not a table: {}. The \
+             warehouse would refuse to replace it with a table, after the other targets were \
+             already replaced. Promote the table models with `--filter model=<name>`, then \
+             re-create the others in production with `rocky run`.",
+            not_tables.len(),
+            if not_tables.len() == 1 {
+                "model is"
+            } else {
+                "models are"
+            },
+            not_tables.join(", ")
+        );
+    }
+
+    for (model_name, prod, _strategy) in targets {
         let key = rocky_sql::defer::CollisionIdentity::of(&prod.catalog, &prod.schema, &prod.table);
         if let Some(prior) = claimed.insert(key, model_name.clone()) {
             anyhow::bail!(
@@ -1426,6 +1519,25 @@ fn discover_transformation_branch_targets(
     }
 
     Ok(planned)
+}
+
+/// The object kind a model's production target has when promote cannot copy
+/// it as a table (#2024). `None` for every table-shaped strategy.
+fn promote_refused_kind(strategy: &rocky_core::models::StrategyConfig) -> Option<&'static str> {
+    use rocky_core::models::StrategyConfig as S;
+    match strategy {
+        S::View => Some("a view"),
+        S::MaterializedView => Some("a materialized view"),
+        S::DynamicTable { .. } => Some("a dynamic table"),
+        S::FullRefresh
+        | S::Incremental { .. }
+        | S::Merge { .. }
+        | S::TimeInterval { .. }
+        | S::Ephemeral
+        | S::DeleteInsert { .. }
+        | S::Microbatch { .. }
+        | S::ContentAddressed { .. } => None,
+    }
 }
 
 /// `rocky branch promote <name>` — promote a branch's materialized tables
@@ -1608,17 +1720,14 @@ pub async fn run_branch_promote(
             output.targets.len()
         );
     } else {
-        println!(
-            "promote failed for branch '{}' after {} target(s) — see audit/JSON for details",
-            output.branch,
-            output.targets.len()
-        );
+        println!("promote failed for branch '{}'", output.branch);
     }
 
     if !overall_success {
         anyhow::bail!(
-            "`rocky branch promote {}` did not complete successfully",
-            promote_plan.branch_name
+            "`rocky branch promote {}` did not complete successfully\n{}",
+            promote_plan.branch_name,
+            promote_outcome_report(&promote_plan.targets, &output.targets)
         );
     }
     Ok(())
@@ -2012,14 +2121,14 @@ pub async fn run_branch_promote_from_plan(
             output.targets.len()
         );
     } else {
-        println!(
-            "promote failed for branch '{}' — see JSON output for details",
-            output.branch
-        );
+        println!("promote failed for branch '{}'", output.branch);
     }
 
     if !overall_success {
-        anyhow::bail!("`rocky branch promote --plan {plan_id}` did not complete successfully");
+        anyhow::bail!(
+            "`rocky branch promote --plan {plan_id}` did not complete successfully\n{}",
+            promote_outcome_report(&promote_plan.targets, &output.targets)
+        );
     }
     Ok(())
 }
@@ -5595,6 +5704,171 @@ mod duplicate_target_refusal_tests {
         )
         .expect("a filtered promote of one model must still plan");
         assert_eq!(planned.len(), 1, "exactly the filtered model plans");
+    }
+
+    /// The #2024 shape: `orders` (a table), `orders_view` (a view) and
+    /// `orders_summary` (a table) in one transformation pipeline.
+    fn three_model_project(tmp: &TempDir) -> std::path::PathBuf {
+        let root = tmp.path();
+        let models = root.join("models");
+        std::fs::create_dir_all(&models).unwrap();
+        for (name, strategy, sql) in [
+            ("orders", "full_refresh", "SELECT 1 AS id, 100.0 AS amount"),
+            ("orders_view", "view", "SELECT * FROM orders"),
+            (
+                "orders_summary",
+                "full_refresh",
+                "SELECT SUM(amount) AS total FROM orders",
+            ),
+        ] {
+            std::fs::write(models.join(format!("{name}.sql")), sql).unwrap();
+            std::fs::write(
+                models.join(format!("{name}.toml")),
+                format!(
+                    "[strategy]\ntype = \"{strategy}\"\n\n\
+                     [target]\ncatalog = \"promote\"\nschema = \"main\"\ntable = \"{name}\"\n"
+                ),
+            )
+            .unwrap();
+        }
+        let config = root.join("rocky.toml");
+        std::fs::write(
+            &config,
+            "[adapter]\ntype = \"duckdb\"\npath = \"probe.duckdb\"\n\n\
+             [pipeline.probe]\ntype = \"transformation\"\nmodels = \"models\"\n\n\
+             [pipeline.probe.target.governance]\nauto_create_schemas = true\n",
+        )
+        .unwrap();
+        config
+    }
+
+    /// #2024 (a): promote copies each target as a table, so a `view` model
+    /// cannot be promoted. Discovery refuses at plan time, naming the model
+    /// and the remedy, before any target is replaced. Pre-fix the plan was
+    /// built, and execution replaced the two tables before the view failed.
+    #[test]
+    fn discovery_refuses_a_view_model_at_plan_time() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = three_model_project(&tmp);
+        let pipeline = transformation_pipeline(&config_path);
+        let record = sample_branch_record_for_promote("b1");
+        let err = discover_transformation_branch_targets(&pipeline, &config_path, &record, None)
+            .expect_err("a view target must refuse at plan time");
+        let msg = format!("{err:#}");
+        for needle in [
+            "'orders_view' (a view)",
+            "--filter model=<name>",
+            "rocky run",
+        ] {
+            assert!(msg.contains(needle), "error must mention {needle:?}: {msg}");
+        }
+        assert!(
+            !msg.contains("'orders'"),
+            "table models are not named: {msg}"
+        );
+    }
+
+    /// The table models of the same project still promote with `--filter`.
+    #[test]
+    fn discovery_plans_a_table_model_filtered_out_of_a_project_with_a_view() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = three_model_project(&tmp);
+        let pipeline = transformation_pipeline(&config_path);
+        let record = sample_branch_record_for_promote("b1");
+        let planned = discover_transformation_branch_targets(
+            &pipeline,
+            &config_path,
+            &record,
+            Some("model=orders_summary"),
+        )
+        .expect("a table model plans");
+        assert_eq!(planned.len(), 1);
+        assert_eq!(planned[0].prod.full_name(), "promote.main.orders_summary");
+    }
+
+    /// #2024 (b): a promote that fails part-way reports every target: the
+    /// ones replaced, the one that failed, and the ones never attempted, and
+    /// says production is mixed. Drives `run_promote_apply` on an on-disk
+    /// DuckDB where the second statement fails.
+    #[tokio::test]
+    async fn partial_promote_reports_every_target_and_says_production_is_mixed() {
+        let tmp = TempDir::new().unwrap();
+        let db = tmp.path().join("probe.duckdb");
+        {
+            let adapter = rocky_duckdb::adapter::DuckDbWarehouseAdapter::open(&db).unwrap();
+            use rocky_core::traits::WarehouseAdapter;
+            adapter
+                .execute_statement("CREATE VIEW main.v AS SELECT 1 AS id")
+                .await
+                .unwrap();
+        }
+        let config_path = tmp.path().join("rocky.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "[adapter]\ntype = \"duckdb\"\npath = \"{}\"\n\n\
+                 [pipeline.one]\ntype = \"transformation\"\nmodels = \"models\"\n\n\
+                 [pipeline.one.target.governance]\nauto_create_schemas = true\n",
+                db.display()
+            ),
+        )
+        .unwrap();
+        let loaded = rocky_core::config::LoadedConfig {
+            config: rocky_core::config::load_rocky_config(&config_path).unwrap(),
+            fingerprint: "0000000000000000".to_string(),
+        };
+        let step = |table: &str| crate::output::PromoteTargetPlan {
+            target: format!("probe.main.{table}"),
+            source: format!("probe.br.{table}"),
+            statement: format!("CREATE OR REPLACE TABLE main.{table} AS SELECT 1 AS id"),
+        };
+        let plan = [step("a"), step("v"), step("c")];
+        let (attempted, ok) = run_promote_apply(&loaded, &plan, Some("one"))
+            .await
+            .expect("apply runs");
+        assert!(!ok, "the view target fails");
+        assert_eq!(attempted.len(), 2, "promote stops at the first failure");
+
+        let report = promote_outcome_report(&plan, &attempted);
+        let expect_in_order = [
+            "replaced (production holds the branch's data):",
+            "  - probe.main.a",
+            "failed:",
+            "  - probe.main.v: ",
+            "not attempted (production unchanged):",
+            "  - probe.main.c",
+            "production is mixed: 1 of 3 targets hold the branch's data",
+        ];
+        let mut from = 0;
+        for needle in expect_in_order {
+            let at = report[from..]
+                .find(needle)
+                .unwrap_or_else(|| panic!("report must contain {needle:?} in order:\n{report}"));
+            from += at + needle.len();
+        }
+    }
+
+    /// No target replaced: the report says production is unchanged.
+    #[test]
+    fn promote_report_says_unchanged_when_the_first_target_fails() {
+        let planned = [crate::output::PromoteTargetPlan {
+            target: "w.s.a".to_string(),
+            source: "w.b.a".to_string(),
+            statement: String::new(),
+        }];
+        let attempted = [crate::output::PromoteTarget {
+            target: "w.s.a".to_string(),
+            source: "w.b.a".to_string(),
+            statement: String::new(),
+            succeeded: false,
+            error: Some("boom".to_string()),
+        }];
+        let report = promote_outcome_report(&planned, &attempted);
+        assert!(report.contains("  - w.s.a: boom"), "{report}");
+        assert!(
+            report.ends_with("production is unchanged: no target was replaced."),
+            "{report}"
+        );
     }
 
     /// The persisted-plan bypass: a `PromotePlan` built before discovery

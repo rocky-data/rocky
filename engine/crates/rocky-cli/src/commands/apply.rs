@@ -4951,15 +4951,14 @@ async fn run_apply_promote_plan(
             output.targets.len()
         );
     } else {
-        println!(
-            "promote failed for branch '{}' after {} target(s) — see JSON output for details",
-            output.branch,
-            output.targets.len()
-        );
+        println!("promote failed for branch '{}'", output.branch);
     }
 
     if !overall_success {
-        bail!("`rocky apply {plan_id}` (promote) did not complete successfully");
+        bail!(
+            "`rocky apply {plan_id}` (promote) did not complete successfully\n{}",
+            crate::commands::branch::promote_outcome_report(&promote_plan.targets, &output.targets)
+        );
     }
     Ok(())
 }
