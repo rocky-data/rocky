@@ -6306,6 +6306,33 @@ mod tests {
         );
     }
 
+    /// A never-run project has no state file. The read routes answer empty
+    /// with a 200, and no `GET` creates the file (#1980).
+    #[tokio::test]
+    async fn read_routes_on_a_never_run_project_are_empty_and_create_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let models_dir = dir.path().join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        let state_path = pinned_state_path(&models_dir);
+        assert!(!state_path.exists(), "precondition: no state file");
+
+        let state = pinned_server(models_dir.clone(), None, &state_path);
+        let base = spawn_router(state).await;
+
+        for route in [
+            "/api/v1/runs",
+            "/api/v1/models/some_model/history",
+            "/api/v1/models/some_model/metrics",
+        ] {
+            let resp = get_retrying_on_busy(&format!("{base}{route}")).await;
+            assert_eq!(resp.status(), 200, "{route}");
+            assert!(!state_path.exists(), "GET {route} created the state file");
+        }
+        let resp = get_retrying_on_busy(&format!("{base}/api/v1/runs")).await;
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["runs"], serde_json::json!([]), "{body}");
+    }
+
     /// Minimal on-disk transformation project (rocky.toml + one model) for the
     /// `/dag` parity test. Mirrors the playground's config shape.
     fn minimal_dag_project() -> (tempfile::TempDir, PathBuf, PathBuf) {

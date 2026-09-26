@@ -175,10 +175,9 @@ impl std::fmt::Debug for ServeToken {
 ///    against a store that holds anything: no stamp, no upgrade, no table
 ///    creation; a store missing a table is refused
 ///    (`StateError::ReadOnlyNeedsInit`). #1545 had fixed only the case where
-///    the stamp read exactly the current version. What is left:
-///    - A read-only open of a path with NO state file still creates the file
-///      and its tables, unstamped — the pre-existing first-run bootstrap.
-///      Tracked as #1980.
+///    the stamp read exactly the current version. A read-only open of a path
+///    with NO state file no longer creates it either: it answers from an
+///    empty in-memory store (#1980). What is left:
 ///    - redb's own open-time recovery of an uncleanly closed file is not a
 ///      Rocky transaction and is unchanged.
 ///

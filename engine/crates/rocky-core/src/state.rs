@@ -1150,8 +1150,9 @@ enum InitOutcome {
 /// written by an older binary forward to [`CURRENT_SCHEMA_VERSION`]: stamping
 /// on a read would let a `rocky state show` silently rewrite the very version
 /// it is reporting, and would defeat forward/backward-compat probes that depend
-/// on the on-disk version staying put until a real write occurs. The one write
-/// it still performs is bootstrapping an EMPTY database (#1980).
+/// on the on-disk version staying put until a real write occurs. A path with
+/// no state file is never created: the open answers from an empty in-memory
+/// store (#1980).
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum OpenMode {
     /// Read-write open: take the advisory lock and stamp/upgrade the version.
@@ -1224,9 +1225,12 @@ impl StateStore {
     /// that lacks a table this binary reads is refused with
     /// [`StateError::ReadOnlyNeedsInit`], which names the tables; the next
     /// read-write open creates them. A store stamped at an older version but
-    /// carrying every table opens normally and keeps its stamp. The one write
-    /// left is bootstrapping an EMPTY database — a path with no state file is
-    /// created and given its tables, unstamped, as before (#1980).
+    /// carrying every table opens normally and keeps its stamp.
+    ///
+    /// **Never creates a file.** A path with no state file opens an empty
+    /// in-memory store, so a never-run project reads as "nothing yet" and
+    /// nothing is left on disk (#1980). An existing file with no table at
+    /// all is still bootstrapped in place, as before.
     pub fn open_read_only(path: &Path) -> Result<Self, StateError> {
         Self::open_inner(path, OpenMode::ReadOnly, SchemaMismatchPolicy::Fail, None)
     }
@@ -1384,7 +1388,17 @@ impl StateStore {
             None
         };
 
-        let db = open_redb_with_retry(path, cache_budget)?;
+        // A read-only open of a path with no state file must not create one
+        // (#1980): a `GET` or a `rocky state show` on a never-run project
+        // would leave an empty database on disk. It answers from an empty
+        // in-memory store instead, bootstrapped below exactly like a fresh
+        // file, so every read-only caller still sees "nothing yet". Nothing
+        // written to that store reaches disk.
+        let db = if matches!(mode, OpenMode::ReadOnly) && !path.exists() {
+            open_absent_in_memory(cache_budget)?
+        } else {
+            open_redb_with_retry(path, cache_budget)?
+        };
 
         match Self::init_db(&db, path, mode, policy)? {
             InitOutcome::Ready => Ok(StateStore {
@@ -1524,15 +1538,13 @@ impl StateStore {
     /// `rocky serve` wrote to the store it was reporting on until a
     /// read-write open re-stamped it (C1-P1b).
     ///
-    /// `Ok(None)` means the database is EMPTY — no table at all. That is a
-    /// file this very open has just created ([`open_redb_with_retry`] uses
-    /// `Database::create`, so a read-only open of a path with no state file
-    /// lands here) or one nothing has initialised, and the caller bootstraps
-    /// it through the write path exactly as before: `rocky doctor`,
-    /// `rocky history` and `GET /api/v1/runs` on a never-run project answer
-    /// "nothing yet", not an error. That is the one write a read-only open
-    /// still performs, on a store that holds nothing; #1980 tracks replacing
-    /// it with a typed absence so a read never creates the file either.
+    /// `Ok(None)` means the database is EMPTY — no table at all. That is the
+    /// in-memory store a read-only open of a missing path gets
+    /// ([`open_absent_in_memory`], #1980), or an existing file nothing has
+    /// initialised, and the caller bootstraps it through the write path:
+    /// `rocky doctor`, `rocky history` and `GET /api/v1/runs` on a never-run
+    /// project answer "nothing yet", not an error. For a missing path that
+    /// write lands in memory only, so the read creates no file.
     ///
     /// A store that holds something but lacks a table is refused with
     /// [`StateError::ReadOnlyNeedsInit`] naming the missing tables; the next
@@ -1607,8 +1619,8 @@ impl StateStore {
         // (#1545). The read-only path answers from a read transaction alone
         // for any store that holds something, and refuses rather than escalate
         // here when a table is missing. The one case it hands down is an EMPTY
-        // database — the file this open has just created, or one nothing has
-        // initialised — which is bootstrapped below exactly as before (#1980).
+        // database — the in-memory store for a missing path (#1980), or a
+        // file nothing has initialised — which is bootstrapped below.
         if matches!(mode, OpenMode::ReadOnly)
             && let Some(outcome) = Self::init_db_read_only(db, path)?
         {
@@ -2088,6 +2100,20 @@ thread_local! {
     /// is itself load-sensitive — which is the defect class #1234 is about.
     static LOCK_RETRY_OBSERVER: std::cell::RefCell<Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>> =
         const { std::cell::RefCell::new(None) };
+}
+
+/// Opens the empty in-memory database a read-only open answers from when the
+/// state file does not exist (#1980). It has the shape of a freshly created
+/// store once `init_db` bootstraps it, so reads return "nothing yet", and it
+/// never touches the filesystem.
+fn open_absent_in_memory(cache_budget: Option<usize>) -> Result<Database, StateError> {
+    let mut builder = Database::builder();
+    if let Some(bytes) = cache_budget {
+        builder.set_cache_size(bytes);
+    }
+    builder
+        .create_with_backend(redb::backends::InMemoryBackend::new())
+        .map_err(StateError::Database)
 }
 
 /// Open the redb database file, retrying briefly on the transient
@@ -7573,36 +7599,47 @@ mod tests {
         assert!(after_migration == std::fs::read(&path).expect("read state file"));
     }
 
-    /// A read-only open of a path with NO state file bootstraps an empty store
-    /// — the file, every table, no stamp — exactly as before this change:
-    /// `rocky doctor`, `rocky history` and `GET /api/v1/runs` on a never-run
-    /// project answer "nothing yet", not an error. That is the one write a
-    /// read-only open still performs, on a store that holds nothing (#1980).
-    /// The second read-only open then writes nothing.
+    /// A read-only open of a path with NO state file creates nothing (#1980).
+    /// It answers from an empty in-memory store, so `rocky doctor`,
+    /// `rocky history` and `GET /api/v1/runs` on a never-run project still
+    /// answer "nothing yet", not an error. The same holds for the
+    /// cache-budgeted open that `rocky serve` uses, and for a missing parent
+    /// directory. A later read-write open still creates the file as usual.
     #[test]
-    fn a_read_only_open_of_a_missing_file_bootstraps_an_empty_store_once() {
+    fn a_read_only_open_of_a_missing_file_creates_nothing() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.redb");
         assert!(!path.exists(), "precondition: no state file");
 
         {
-            let store = StateStore::open_read_only(&path).expect("bootstrap from a read-only open");
+            let store =
+                StateStore::open_read_only(&path).expect("read-only open of a missing file");
             assert!(store.get_watermark("cat.sch.tbl").unwrap().is_none());
             assert!(store.list_jobs().unwrap().is_empty());
             assert!(store.list_tombstones().unwrap().is_empty());
+            assert!(store.list_runs(10).unwrap().is_empty());
         }
-        assert!(path.exists(), "the bootstrap created the file");
+        {
+            let store = StateStore::open_read_only_with_cache(&path, 1 << 20)
+                .expect("budgeted read-only open of a missing file");
+            assert!(store.list_runs(10).unwrap().is_empty());
+        }
+        assert!(!path.exists(), "a read-only open created the state file");
         assert_eq!(
-            StateStore::peek_schema_version(&path).unwrap(),
-            None,
-            "a read-only bootstrap never stamps the version"
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            0,
+            "a read-only open left something on disk"
         );
 
-        let before = std::fs::read(&path).expect("read state file");
-        drop(StateStore::open_read_only(&path).expect("second read-only open"));
-        assert!(
-            before == std::fs::read(&path).expect("read state file"),
-            "the second read-only open of the bootstrapped store wrote"
+        let nested = dir.path().join("never").join("state.redb");
+        drop(StateStore::open_read_only(&nested).expect("read-only open under a missing dir"));
+        assert!(!nested.parent().unwrap().exists());
+
+        drop(StateStore::open(&path).expect("read-write open creates the file"));
+        assert!(path.exists());
+        assert_eq!(
+            StateStore::peek_schema_version(&path).unwrap(),
+            Some(CURRENT_SCHEMA_VERSION)
         );
     }
 

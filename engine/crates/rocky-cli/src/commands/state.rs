@@ -316,6 +316,19 @@ mod tests {
             .unwrap();
     }
 
+    /// `rocky state show` on a never-run project answers with an empty
+    /// watermark list and creates no state file (#1980).
+    #[test]
+    fn show_on_a_never_run_project_is_empty_and_creates_nothing() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("state.redb");
+
+        state_show(&path, true).unwrap();
+
+        assert!(!path.exists(), "rocky state show created the state file");
+        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
+    }
+
     #[test]
     fn clear_removes_all_entries() {
         let tmp = TempDir::new().unwrap();

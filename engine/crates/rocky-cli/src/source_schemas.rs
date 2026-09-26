@@ -43,10 +43,8 @@ static CLI_PARTIAL_HIT_LOGGED: OnceLock<()> = OnceLock::new();
 /// Precedence (matches the design doc §4.4):
 /// 1. `config.enabled == false` -> empty map (strict-CI posture).
 /// 2. `state_path` doesn't exist -> empty map (fresh clone, cold cache).
-///    Does **not** create `state.redb` as a side effect — calling
-///    `StateStore::open_read_only` on a non-existent path would call
-///    `Database::create` and leave a fresh empty file behind for any user
-///    who runs `rocky compile` before their first `rocky run`.
+///    Skips the open entirely. `StateStore::open_read_only` no longer
+///    creates a missing file (#1980), but there is nothing to read.
 /// 3. Open fails (corrupt DB, permission error) -> empty map + debug log.
 ///    A broken cache should never fail typecheck.
 /// 4. Scan fails (rare — version mismatch on a table we didn't create
