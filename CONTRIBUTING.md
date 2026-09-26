@@ -212,6 +212,19 @@ Prefer the tag-driven flow for a normal release. The `rocky-release` skill, mirr
 - Conventional commits required: `feat:`, `fix:`, `refactor:`, `test:`, `docs:`, `chore:`. Scope by subproject or crate where it helps: `feat(engine/rocky-databricks): add OAuth M2M auth`, `fix(dagster): handle partial-success exit codes`, `docs(vscode): update README screenshots`.
 - **Never** include `Co-Authored-By` trailers in commit messages.
 
+### Your first pull request
+
+On your first pull request to this repository, CI does not start by itself. GitHub holds the workflow runs until a maintainer approves them. The PR shows one reported check, or none, until then. You do not need to do anything. A maintainer approves the runs, and CI starts.
+
+The hold applies to first-time contributors only. After a first PR merges, CI starts on every push.
+
+**For maintainers.** List the held runs for a PR's head branch, then approve each one:
+
+```bash
+gh run list --repo rocky-data/rocky --branch <head-branch> --status action_required
+gh api -X POST repos/rocky-data/rocky/actions/runs/<run-id>/approve
+```
+
 ### What CI runs
 
 CI is path-filtered. The paths your PR touches decide which workflows run. Every required check must pass before merge.

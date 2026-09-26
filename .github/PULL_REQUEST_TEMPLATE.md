@@ -1,3 +1,6 @@
+<!-- First pull request here? CI waits until a maintainer approves the workflow runs.
+     You do not need to do anything. See "Your first pull request" in CONTRIBUTING.md. -->
+
 ## Summary
 
 <!-- Brief description of what this PR does -->
