@@ -9106,8 +9106,21 @@ pub(crate) fn case_near_miss_remedy(rules: rocky_sql::defer::IdentifierCaseRules
 /// Cycle-closing candidates never leave the derivation (skipped
 /// deterministically, reported as warnings), so this recompute cannot turn
 /// a compiling project into a refused one.
+///
+/// `excluded` is the run's compile-excluded set: every model with an error
+/// diagnostic, plus its declared-DAG descendants. None of them executes, so
+/// none is a producer or a consumer here (#1630). Before this, a failed
+/// model still entered the derivation, and a cycle through it could make a
+/// TRUE edge between two models that do execute look like a cycle-closer.
+/// The shape: `a_reader` reads the failed `f`'s target, `f` reads bare
+/// `z_victim`, and `z_victim` reads `a_reader`'s target. The phantom
+/// `a_reader -> f` edge suppressed `z_victim -> a_reader`, so `z_victim`
+/// ran first and read a stale `a_reader`. The name-level edges stay in
+/// `existing`, so the cycle guard still sees every declared path, and no
+/// accepted edge can close a cycle in the recomputed layers.
 fn augment_physical_read_edges(
     compile_result: &mut rocky_compiler::compile::CompileResult,
+    excluded: &BTreeSet<String>,
     contain_failures: bool,
     warnings: &mut Vec<String>,
 ) -> Result<()> {
@@ -9115,6 +9128,7 @@ fn augment_physical_read_edges(
         .project
         .models
         .iter()
+        .filter(|m| !excluded.contains(&m.config.name))
         .map(rocky_core::physical_edges::PhysicalEdgeModel::from_model)
         .collect();
     let existing: Vec<(String, String)> = compile_result
@@ -10782,6 +10796,7 @@ pub(crate) async fn execute_models(
     } else {
         augment_physical_read_edges(
             &mut compile_result,
+            &compile_excluded_models,
             resilience.contain_failures,
             &mut output.scheduling_warnings,
         )?;
@@ -29997,8 +30012,13 @@ auto_create_schemas = true
         );
 
         let mut warnings = Vec::new();
-        super::augment_physical_read_edges(&mut compiled, false, &mut warnings)
-            .expect("augmentation");
+        super::augment_physical_read_edges(
+            &mut compiled,
+            &std::collections::BTreeSet::new(),
+            false,
+            &mut warnings,
+        )
+        .expect("augmentation");
         assert_eq!(
             compiled.project.layers,
             vec![
@@ -30028,8 +30048,13 @@ auto_create_schemas = true
             .expect("compile models");
 
         let mut warnings = Vec::new();
-        super::augment_physical_read_edges(&mut compiled, false, &mut warnings)
-            .expect("mutual reads must not refuse the run");
+        super::augment_physical_read_edges(
+            &mut compiled,
+            &std::collections::BTreeSet::new(),
+            false,
+            &mut warnings,
+        )
+        .expect("mutual reads must not refuse the run");
         assert_eq!(
             compiled.project.layers,
             vec![vec!["b".to_string()], vec!["a".to_string()]],
@@ -30039,6 +30064,124 @@ auto_create_schemas = true
         assert!(
             warnings[0].contains("would close a dependency cycle"),
             "{warnings:?}"
+        );
+    }
+
+    /// #1630: a model with a blocking compile error must not take part in
+    /// the physical-edge derivation. Here `f` stands for any model that
+    /// failed to compile (it is passed as excluded, as `run()` does). It is
+    /// not ephemeral, so without the exclusion it is indexed as a producer:
+    /// `a_reader -> f` is accepted first, and then the TRUE edge
+    /// `z_victim -> a_reader` looks like it closes `a_reader -> f -> z_victim`
+    /// and is skipped. `z_victim` then runs before `a_reader` and reads it
+    /// stale, while `f` runs nothing.
+    ///
+    /// Mutation that must turn this red: drop the `excluded` filter in
+    /// `augment_physical_read_edges`.
+    #[cfg(feature = "duckdb")]
+    #[test]
+    fn a_compile_failed_model_cannot_suppress_a_true_physical_edge() {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir(&models_dir).expect("mkdir models");
+        write_model_with_target(&models_dir, "f", "SELECT id FROM z_victim", "main", "f");
+        write_model_with_target(
+            &models_dir,
+            "a_reader",
+            "SELECT id FROM main.f",
+            "main",
+            "a_reader",
+        );
+        write_model_with_target(
+            &models_dir,
+            "z_victim",
+            "SELECT id FROM main.a_reader",
+            "main",
+            "z_victim",
+        );
+        let mut compiled =
+            rocky_compiler::compile::compile(&rocky_compiler::compile::CompilerConfig {
+                models_dir,
+                ..Default::default()
+            })
+            .expect("compile models");
+
+        let excluded: std::collections::BTreeSet<String> = ["f".to_string()].into();
+        let mut warnings = Vec::new();
+        super::augment_physical_read_edges(&mut compiled, &excluded, false, &mut warnings)
+            .expect("augmentation");
+        let layer_of = |name: &str| {
+            compiled
+                .project
+                .layers
+                .iter()
+                .position(|layer| layer.iter().any(|m| m == name))
+                .unwrap_or_else(|| panic!("{name} missing: {:?}", compiled.project.layers))
+        };
+        assert!(
+            layer_of("a_reader") < layer_of("z_victim"),
+            "the true physical edge must order z_victim after a_reader: {:?}",
+            compiled.project.layers
+        );
+        assert!(warnings.is_empty(), "{warnings:?}");
+    }
+
+    /// #1630, the issue's own shape, through the real compile: `e` is
+    /// ephemeral (E038), `e` reads bare `a`, `c` reads bare `e`, and `a`
+    /// reads `c`'s target. The run excludes `e` (E038) and `c` (its
+    /// declared descendant), so the phantom `c -> e -> a` path never meets
+    /// the `a -> c` candidate and no cycle warning fires. Under
+    /// `strict_scheduling` that warning refused the whole run.
+    #[cfg(feature = "duckdb")]
+    #[test]
+    fn an_ephemeral_models_phantom_edge_raises_no_cycle_warning() {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir(&models_dir).expect("mkdir models");
+        write_model_with_target(&models_dir, "a", "SELECT id FROM main.c", "main", "a");
+        write_model_with_target(&models_dir, "c", "SELECT id FROM e", "main", "c");
+        std::fs::write(models_dir.join("e.sql"), "SELECT id FROM a\n").expect("write e.sql");
+        std::fs::write(
+            models_dir.join("e.toml"),
+            "[strategy]\ntype = \"ephemeral\"\n\n\
+             [target]\ncatalog = \"\"\nschema = \"main\"\ntable = \"e\"\n",
+        )
+        .expect("write e.toml");
+        let mut compiled =
+            rocky_compiler::compile::compile(&rocky_compiler::compile::CompilerConfig {
+                models_dir,
+                ..Default::default()
+            })
+            .expect("compile models");
+
+        // The same two steps `run()` takes to build its exclusion set.
+        let failed: std::collections::BTreeSet<String> = compiled
+            .diagnostics
+            .iter()
+            .filter(|d| d.is_error())
+            .map(|d| d.model.clone())
+            .collect();
+        assert_eq!(
+            failed,
+            std::collections::BTreeSet::from(["e".to_string()]),
+            "precondition: E038"
+        );
+        let mut excluded = failed.clone();
+        excluded.extend(
+            super::compile_error_descendant_blocks(
+                &compiled.project.dag_nodes,
+                &failed,
+                &std::collections::BTreeMap::new(),
+            )
+            .into_keys(),
+        );
+
+        let mut warnings = Vec::new();
+        super::augment_physical_read_edges(&mut compiled, &excluded, false, &mut warnings)
+            .expect("augmentation");
+        assert!(
+            warnings.is_empty(),
+            "a refused model must not make a true edge look cycle-closing: {warnings:?}"
         );
     }
 
