@@ -630,8 +630,10 @@ pub struct AnomalyOutput {
 /// failure (retry, page someone, surface in the UI) without parsing the
 /// free-form `error` string.
 ///
-/// Variants partition the [`rocky_databricks::connector::ConnectorError`]
-/// and [`rocky_snowflake::connector::ConnectorError`] spaces; `Unknown`
+/// Variants partition the [`rocky_databricks::connector::ConnectorError`],
+/// [`rocky_snowflake::connector::ConnectorError`],
+/// [`rocky_trino::connector::TrinoError`] and
+/// [`rocky_bigquery::connector::BigQueryError`] spaces; `Unknown`
 /// is the fallback for non-connector failures (drift, governance,
 /// adapter-internal errors) where the error reached the output layer
 /// already type-erased.
@@ -746,6 +748,116 @@ impl From<&rocky_snowflake::connector::ConnectorError> for FailureKind {
     }
 }
 
+impl From<&rocky_trino::connector::TrinoError> for FailureKind {
+    fn from(err: &rocky_trino::connector::TrinoError) -> Self {
+        use rocky_trino::connector::TrinoError as E;
+        match err {
+            E::Auth(_) => FailureKind::AuthFailed,
+            E::Http(e) => {
+                if e.is_connect() {
+                    FailureKind::ConnectionFailed
+                } else if e.is_timeout() {
+                    FailureKind::Transient
+                } else {
+                    FailureKind::ConnectionFailed
+                }
+            }
+            E::HttpStatus { status, .. } => match status {
+                401 | 403 => FailureKind::AuthFailed,
+                404 => FailureKind::NotFound,
+                429 => FailureKind::QuotaExceeded,
+                500..=599 => FailureKind::Transient,
+                _ => FailureKind::QueryRejected,
+            },
+            // A cluster-side blip (worker gone, coordinator restarting) is
+            // retryable; the connector's own retry layer agrees
+            // (`is_retryable_error_name`). Every other query failure is a
+            // rejected statement, as Databricks `StatementFailed` is.
+            E::QueryFailed { error_name, .. } => {
+                if rocky_trino::connector::is_retryable_error_name(error_name) {
+                    FailureKind::Transient
+                } else {
+                    FailureKind::QueryRejected
+                }
+            }
+            E::Timeout { .. } => FailureKind::Transient,
+            // The coordinator handed back something Rocky cannot use (or
+            // must refuse to follow). Retrying does not fix it.
+            E::MalformedResponse(_)
+            | E::UntrustedNextUri { .. }
+            | E::ArrowEncodingUnavailable
+            | E::ArrowDecode(_) => FailureKind::QueryRejected,
+        }
+    }
+}
+
+/// Leading HTTP code of a BigQuery `ApiError` status. The connector stores
+/// the reqwest `StatusCode` `Display` form (e.g. `"429 Too Many Requests"`),
+/// or a protocol-anomaly label with no code (e.g. `"missing jobReference"`).
+fn bigquery_status_code(status: &str) -> Option<u16> {
+    status
+        .split_whitespace()
+        .next()
+        .and_then(|c| c.parse::<u16>().ok())
+}
+
+/// `true` when a BigQuery error `reason` names a quota or rate limit.
+/// BigQuery reports both as HTTP 403 (not 429) with one of these reasons
+/// in the body, and as a job-level `errors[].reason`.
+fn bigquery_reason_is_quota(reason: &str) -> bool {
+    reason.contains("quotaExceeded") || reason.contains("rateLimitExceeded")
+}
+
+impl From<&rocky_bigquery::connector::BigQueryError> for FailureKind {
+    fn from(err: &rocky_bigquery::connector::BigQueryError) -> Self {
+        use rocky_bigquery::connector::BigQueryError as E;
+        use rocky_bigquery::storage_read::StorageReadError as S;
+        match err {
+            E::Auth(_) => FailureKind::AuthFailed,
+            E::Http(e) => {
+                if e.is_connect() {
+                    FailureKind::ConnectionFailed
+                } else if e.is_timeout() {
+                    FailureKind::Transient
+                } else {
+                    FailureKind::ConnectionFailed
+                }
+            }
+            E::ApiError { status, message } => match bigquery_status_code(status) {
+                // A BigQuery quota or rate limit is a 403 whose body names
+                // the reason; only a 403 without one is a permission error.
+                Some(403) if bigquery_reason_is_quota(message) => FailureKind::QuotaExceeded,
+                Some(401 | 403) => FailureKind::AuthFailed,
+                Some(404) => FailureKind::NotFound,
+                Some(429) => FailureKind::QuotaExceeded,
+                Some(500..=599) => FailureKind::Transient,
+                // Another HTTP status, or a protocol anomaly with no code.
+                Some(_) | None => FailureKind::QueryRejected,
+            },
+            E::JobError { reason, .. } | E::LoadJobError { reason, .. } => {
+                if bigquery_reason_is_quota(reason) {
+                    FailureKind::QuotaExceeded
+                } else if reason == "notFound" {
+                    FailureKind::NotFound
+                } else {
+                    FailureKind::QueryRejected
+                }
+            }
+            E::Timeout { .. } => FailureKind::Transient,
+            // A budget cap, as for the Databricks and Snowflake variants.
+            E::RetryBudgetExhausted { .. } => FailureKind::QuotaExceeded,
+            E::StorageRead(s) => match s {
+                S::Auth(_) | S::InvalidToken(_) => FailureKind::AuthFailed,
+                S::Transport(_) => FailureKind::ConnectionFailed,
+                // A gRPC status carries its own code, but rocky-cli does not
+                // depend on `tonic` to read it. Do not guess.
+                S::Status(_) => FailureKind::Unknown,
+                S::NoStreams | S::MissingSchema | S::Arrow(_) => FailureKind::QueryRejected,
+            },
+        }
+    }
+}
+
 /// Extract the warehouse-reported cooldown (in whole seconds) from a
 /// typed connector error, when the variant carries one. Populated only
 /// for `CircuitBreakerOpen` against breakers configured with timed
@@ -803,6 +915,12 @@ fn classify_cause(cause: &(dyn std::error::Error + 'static)) -> Option<FailureKi
     if let Some(e) = cause.downcast_ref::<rocky_snowflake::connector::ConnectorError>() {
         return Some(e.into());
     }
+    if let Some(e) = cause.downcast_ref::<rocky_trino::connector::TrinoError>() {
+        return Some(e.into());
+    }
+    if let Some(e) = cause.downcast_ref::<rocky_bigquery::connector::BigQueryError>() {
+        return Some(e.into());
+    }
     None
 }
 
@@ -821,7 +939,33 @@ fn classify_cause_with_cooldown(
     if let Some(e) = cause.downcast_ref::<rocky_snowflake::connector::ConnectorError>() {
         return Some((e.into(), cooldown_from_snowflake(e)));
     }
+    // Neither Trino nor BigQuery has a circuit breaker, so neither error
+    // carries a cooldown.
+    if let Some(e) = cause.downcast_ref::<rocky_trino::connector::TrinoError>() {
+        return Some((e.into(), None));
+    }
+    if let Some(e) = cause.downcast_ref::<rocky_bigquery::connector::BigQueryError>() {
+        return Some((e.into(), None));
+    }
     None
+}
+
+/// The inner error of a chain link that is either `AdapterError` wrapper
+/// type — [`rocky_adapter_sdk::AdapterError`] or
+/// [`rocky_core::traits::AdapterError`] — or `None` for any other link.
+/// Both wrappers' `source()` skips the inner error itself, so a caller
+/// walking an `anyhow` chain must start from here to see it (#2064).
+fn wrapped_adapter_inner<'a>(
+    cause: &'a (dyn std::error::Error + 'static),
+) -> Option<&'a (dyn std::error::Error + 'static)> {
+    if let Some(e) = cause.downcast_ref::<rocky_adapter_sdk::AdapterError>() {
+        return Some(e.inner());
+    }
+    Some(
+        cause
+            .downcast_ref::<rocky_core::traits::AdapterError>()?
+            .inner(),
+    )
 }
 
 /// Downcast a single chain link to whichever `AdapterError` wrapper type
@@ -836,15 +980,7 @@ fn classify_cause_with_cooldown(
 fn classify_wrapped_adapter_cause(
     cause: &(dyn std::error::Error + 'static),
 ) -> Option<(FailureKind, Option<u64>)> {
-    let inner: &(dyn std::error::Error + 'static) =
-        if let Some(e) = cause.downcast_ref::<rocky_adapter_sdk::AdapterError>() {
-            e.inner()
-        } else {
-            cause
-                .downcast_ref::<rocky_core::traits::AdapterError>()?
-                .inner()
-        };
-    let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(inner);
+    let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(wrapped_adapter_inner(cause)?);
     while let Some(c) = cause {
         if let Some(pair) = classify_cause_with_cooldown(c) {
             return Some(pair);
@@ -951,18 +1087,25 @@ fn frame_status(status: u16, target: &str) -> Option<String> {
     }
 }
 
-/// Walk an `anyhow` error chain (including any `rocky_adapter_sdk::
-/// AdapterError` inner) for a recognised warehouse auth status and frame
-/// it. See [`frame_status`].
+/// Walk an `anyhow` error chain for a recognised warehouse auth status and
+/// frame it. See [`frame_status`].
+///
+/// Descends into either `AdapterError` wrapper through
+/// [`wrapped_adapter_inner`], the same walk the failure classifiers use.
+/// Warehouse adapters return `rocky_core::traits::AdapterError`; before
+/// #2136 only the SDK wrapper was unwrapped here, so a Databricks or
+/// Snowflake 401/403 missed the concise hint.
 pub fn frame_warehouse_anyhow_error(err: &anyhow::Error, target: &str) -> Option<String> {
     for cause in err.chain() {
         if let Some(status) = api_status_from_cause(cause) {
             return frame_status(status, target);
         }
-        if let Some(adapter_err) = cause.downcast_ref::<rocky_adapter_sdk::AdapterError>()
-            && let Some(status) = api_status_from_cause(adapter_err.inner())
-        {
-            return frame_status(status, target);
+        let mut inner = wrapped_adapter_inner(cause);
+        while let Some(c) = inner {
+            if let Some(status) = api_status_from_cause(c) {
+                return frame_status(status, target);
+            }
+            inner = c.source();
         }
     }
     None
@@ -12156,6 +12299,136 @@ mod failure_kind_tests {
         assert!(m403.contains("permission denied"));
         assert!(m403.contains("cat.sch.tbl"));
         assert!(m401.contains("authentication rejected"));
+    }
+
+    /// #2136: warehouse adapters return `rocky_core::traits::AdapterError`,
+    /// not the SDK wrapper. A 401/403 inside it still gets the concise hint.
+    #[test]
+    fn frame_403_and_401_through_core_adapter_error_wrapper() {
+        let e403 = anyhow::Error::new(rocky_core::traits::AdapterError::new(db_api(403)))
+            .context("execute_statement failed");
+        let e401 = anyhow::Error::new(rocky_core::traits::AdapterError::new(SnE::ApiError {
+            status: 401,
+            body: "expired".into(),
+        }));
+        let m403 = frame_warehouse_anyhow_error(&e403, "cat.sch.tbl").expect("403 must frame");
+        let m401 = frame_warehouse_anyhow_error(&e401, "cat.sch.tbl").expect("401 must frame");
+        assert!(
+            m403.contains("permission denied on `cat.sch.tbl`"),
+            "{m403}"
+        );
+        assert!(m401.contains("authentication rejected"), "{m401}");
+    }
+
+    // ---- Trino / BigQuery classification (#2136) --------------------------
+    //
+    // Each case builds the wrapper production returns — the connector error
+    // inside `rocky_core::traits::AdapterError`, inside an `anyhow` chain —
+    // and classifies it the way `run.rs` does.
+
+    fn core_wrapped(err: impl std::error::Error + Send + Sync + 'static) -> anyhow::Error {
+        anyhow::Error::new(rocky_core::traits::AdapterError::new(err))
+            .context("execute_statement failed")
+    }
+
+    #[test]
+    fn trino_errors_classify_with_kind_and_no_cooldown() {
+        use rocky_trino::connector::TrinoError as TE;
+        let status = |status: u16| TE::HttpStatus {
+            status,
+            message: String::new(),
+        };
+        let query = |name: &str| TE::QueryFailed {
+            state: "FAILED".into(),
+            error_code: 1,
+            error_name: name.into(),
+            message: String::new(),
+        };
+        let cases = [
+            (status(429), FailureKind::QuotaExceeded),
+            (status(401), FailureKind::AuthFailed),
+            (status(403), FailureKind::AuthFailed),
+            (status(404), FailureKind::NotFound),
+            (status(503), FailureKind::Transient),
+            (status(400), FailureKind::QueryRejected),
+            (query("NO_NODES_AVAILABLE"), FailureKind::Transient),
+            (query("SYNTAX_ERROR"), FailureKind::QueryRejected),
+            (
+                TE::Timeout {
+                    timeout_secs: 1,
+                    last_state: "RUNNING".into(),
+                },
+                FailureKind::Transient,
+            ),
+            (
+                TE::MalformedResponse("x".into()),
+                FailureKind::QueryRejected,
+            ),
+        ];
+        for (err, kind) in cases {
+            let label = err.to_string();
+            let wrapped = core_wrapped(err);
+            assert_eq!(classify_anyhow_error(&wrapped), kind, "{label}");
+            assert_eq!(
+                classify_anyhow_error_with_cooldown(&wrapped),
+                (kind, None),
+                "{label}"
+            );
+        }
+    }
+
+    #[test]
+    fn bigquery_errors_classify_with_kind_and_no_cooldown() {
+        use rocky_bigquery::connector::BigQueryError as BE;
+        let api = |status: &str, message: &str| BE::ApiError {
+            status: status.into(),
+            message: message.into(),
+        };
+        let job = |reason: &str| BE::JobError {
+            reason: reason.into(),
+            message: String::new(),
+        };
+        let cases = [
+            (api("429 Too Many Requests", ""), FailureKind::QuotaExceeded),
+            // BigQuery reports quota and rate limits as 403 with a reason.
+            (
+                api(
+                    "403 Forbidden",
+                    r#"{"error":{"errors":[{"reason":"rateLimitExceeded"}]}}"#,
+                ),
+                FailureKind::QuotaExceeded,
+            ),
+            (
+                api(
+                    "403 Forbidden",
+                    r#"{"error":{"errors":[{"reason":"accessDenied"}]}}"#,
+                ),
+                FailureKind::AuthFailed,
+            ),
+            (api("401 Unauthorized", ""), FailureKind::AuthFailed),
+            (api("404 Not Found", ""), FailureKind::NotFound),
+            (api("503 Service Unavailable", ""), FailureKind::Transient),
+            (api("400 Bad Request", ""), FailureKind::QueryRejected),
+            (api("missing jobReference", ""), FailureKind::QueryRejected),
+            (job("quotaExceeded"), FailureKind::QuotaExceeded),
+            (job("notFound"), FailureKind::NotFound),
+            (job("invalidQuery"), FailureKind::QueryRejected),
+            (BE::Timeout { timeout_secs: 1 }, FailureKind::Transient),
+            (
+                BE::RetryBudgetExhausted { limit: 3 },
+                FailureKind::QuotaExceeded,
+            ),
+        ];
+        for (err, kind) in cases {
+            let label = err.to_string();
+            let wrapped = core_wrapped(err);
+            assert_eq!(classify_anyhow_error(&wrapped), kind, "{label}");
+            assert_eq!(
+                classify_anyhow_error_with_cooldown(&wrapped),
+                (kind, None),
+                "{label}"
+            );
+        }
     }
 
     #[test]

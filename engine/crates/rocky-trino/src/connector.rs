@@ -113,7 +113,8 @@ pub enum TrinoError {
 /// `SYNTAX_ERROR` / `TABLE_NOT_FOUND` / `TYPE_MISMATCH`, permission errors,
 /// resource-exhaustion the retry can't fix) is permanent. A missed transient
 /// name just doesn't get retried; it is never unsafe.
-fn is_retryable_error_name(name: &str) -> bool {
+#[must_use]
+pub fn is_retryable_error_name(name: &str) -> bool {
     matches!(
         name,
         "NO_NODES_AVAILABLE"
