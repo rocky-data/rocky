@@ -685,6 +685,29 @@ fn substitute_partition_placeholders(sql: &str, window: &PartitionWindow) -> Str
         .replace("@end_date", &end)
 }
 
+/// Substitute `@start_date` / `@end_date` with one fixed wide window, from
+/// `1970-01-01 00:00:00` (inclusive) to `2100-01-01 00:00:00` (exclusive).
+///
+/// For local runs with no partition selection: `rocky test` and the
+/// `[[test]]` unit-test path (#2020). The window lets every fixture row pass
+/// through the same substitution `rocky run` applies per partition.
+pub fn substitute_wide_test_window(sql: &str) -> String {
+    let at = |date: &str| {
+        chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(
+            chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")
+                .expect("hardcoded date parses")
+                .and_time(chrono::NaiveTime::MIN),
+            chrono::Utc,
+        )
+    };
+    let window = PartitionWindow {
+        key: "test".to_string(),
+        start: at("1970-01-01"),
+        end: at("2100-01-01"),
+    };
+    substitute_partition_placeholders(sql, &window)
+}
+
 /// Generates CREATE OR REPLACE VIEW SQL for a transformation model.
 ///
 /// Delegates to the dialect's [`SqlDialect::view_ddl`] so per-warehouse
@@ -2096,6 +2119,15 @@ SELECT id, name, email FROM cat.sch.src WHERE active = true";
         assert_eq!(
             out,
             "SELECT * FROM t WHERE ts >= '2026-04-07 00:00:00' AND ts < '2026-04-08 00:00:00'"
+        );
+    }
+
+    #[test]
+    fn test_substitute_wide_test_window() {
+        let sql = "SELECT * FROM t WHERE ts >= @start_date AND ts < '@end_date'";
+        assert_eq!(
+            substitute_wide_test_window(sql),
+            "SELECT * FROM t WHERE ts >= '1970-01-01 00:00:00' AND ts < '2100-01-01 00:00:00'"
         );
     }
 

@@ -103,6 +103,11 @@ The compiler emits `E024` if neither placeholder is present, and `W003`
 if only one of the two is referenced (the partition window would be
 unbounded on one side).
 
+`rocky test` and `[[test]]` fixtures select no partition. They substitute one
+fixed wide window instead, so every test row can reach the model:
+- `@start_date` → `'1970-01-01 00:00:00'`
+- `@end_date` → `'2100-01-01 00:00:00'`
+
 ## Partition key format
 
 Canonical ISO format, derived from `granularity`. These keys appear in

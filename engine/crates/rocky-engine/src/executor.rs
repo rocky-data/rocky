@@ -51,7 +51,10 @@ pub fn execute_locally(compile_result: &CompileResult, db: &DuckDbConnector) -> 
                 }
                 // Wrap model SQL in CREATE TABLE AS for local execution.
                 // `model_name` was validated above; `model.sql` is compiler-emitted SQL.
-                let exec_sql = format!("CREATE OR REPLACE TABLE {model_name} AS\n{}", model.sql);
+                let exec_sql = format!(
+                    "CREATE OR REPLACE TABLE {model_name} AS\n{}",
+                    local_model_sql(model)
+                );
 
                 match db.execute_statement(&exec_sql) {
                     Ok(()) => {
@@ -67,6 +70,22 @@ pub fn execute_locally(compile_result: &CompileResult, db: &DuckDbConnector) -> 
     }
 
     result
+}
+
+/// The SQL a local run executes for `model`.
+///
+/// A `time_interval` model carries `@start_date` / `@end_date` (E024). A local
+/// run selects no partition, so it substitutes one fixed wide window through
+/// the same function `rocky run` uses (#2020). Other models run as compiled.
+pub(crate) fn local_model_sql(model: &rocky_core::models::Model) -> String {
+    if matches!(
+        model.config.strategy,
+        rocky_core::models::StrategyConfig::TimeInterval { .. }
+    ) {
+        rocky_core::sql_gen::substitute_wide_test_window(&model.sql)
+    } else {
+        model.sql.clone()
+    }
 }
 
 /// Compile and execute a project locally.

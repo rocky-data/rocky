@@ -257,7 +257,10 @@ pub fn run_unit_tests(
         if !include_model(model_filter, name) {
             continue;
         }
-        let compiled_sql = compile_result.project.model(name).map(|m| m.sql.clone());
+        let compiled_sql = compile_result
+            .project
+            .model(name)
+            .map(crate::executor::local_model_sql);
         for test in &unit_tests[name] {
             match &compiled_sql {
                 Some(sql) => results.push(run_one_unit_test(name, sql, test)),
@@ -692,6 +695,79 @@ mod tests {
             !run.results[0].mismatches.is_empty(),
             "expected mismatch diagnostics"
         );
+    }
+
+    /// #2020: the issue's repro. A `time_interval` model carries
+    /// `@start_date` / `@end_date` (E024 requires them). `rocky test` selects
+    /// no partition, so it substitutes one fixed wide window. Before the fix
+    /// DuckDB read `@start_date` as a column and the model failed.
+    fn scaffold_time_interval_project(
+        dir: &std::path::Path,
+        unit_test: &str,
+    ) -> std::path::PathBuf {
+        let models = dir.join("models");
+        std::fs::create_dir_all(&models).unwrap();
+        std::fs::write(
+            models.join("raw_orders.sql"),
+            "SELECT DATE '2026-08-01' AS order_date, 10 AS amount",
+        )
+        .unwrap();
+        std::fs::write(
+            models.join("raw_orders.toml"),
+            "[strategy]\ntype = \"full_refresh\"\n[target]\ncatalog=\"wh\"\nschema=\"main\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            models.join("daily_totals.sql"),
+            "SELECT order_date, SUM(amount) AS total\nFROM raw_orders\n\
+             WHERE order_date >= @start_date\n  AND order_date < @end_date\n\
+             GROUP BY order_date",
+        )
+        .unwrap();
+        std::fs::write(
+            models.join("daily_totals.toml"),
+            format!(
+                "[strategy]\ntype = \"time_interval\"\ntime_column = \"order_date\"\n\
+                 granularity = \"day\"\nfirst_partition = \"2026-08-01\"\n\
+                 [target]\ncatalog = \"wh\"\nschema = \"main\"\n{unit_test}"
+            ),
+        )
+        .unwrap();
+        models
+    }
+
+    #[test]
+    fn time_interval_model_passes_rocky_test() {
+        let dir = tempfile::tempdir().unwrap();
+        let models = scaffold_time_interval_project(dir.path(), "");
+        let result = run_tests(&models, None, None, &rocky_core::run_vars::RunVars::new()).unwrap();
+        assert!(
+            result.failures.is_empty(),
+            "failures: {:?}",
+            result.failures
+        );
+        assert_eq!(result.total, 2);
+        assert_eq!(result.passed, 2);
+    }
+
+    /// #2020, `[[test]]` path: every fixture row inside the wide window
+    /// reaches the model, however far apart the rows are.
+    #[test]
+    fn time_interval_unit_test_sees_every_fixture_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let models = scaffold_time_interval_project(
+            dir.path(),
+            "\n[[test]]\nname = \"sums_each_day\"\n\n\
+             [[test.given]]\nref = \"raw_orders\"\n\
+             rows = [ { order_date = \"1971-01-01\", amount = 1 }, \
+                      { order_date = \"2099-12-31\", amount = 2 } ]\n\n\
+             [test.expect]\n\
+             rows = [ { order_date = \"1971-01-01\", total = 1 }, \
+                      { order_date = \"2099-12-31\", total = 2 } ]\n",
+        );
+        let run = run_unit_tests(&models, None).unwrap();
+        assert_eq!(run.total(), 1);
+        assert_eq!(run.passed(), 1, "result: {:?}", run.results[0]);
     }
 
     /// A project whose models declare no `[[test]]` blocks runs zero unit
