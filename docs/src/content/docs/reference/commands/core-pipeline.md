@@ -668,6 +668,8 @@ Resume the most recent failed replication run from its last checkpoint:
 rocky run --filter client=acme --resume-latest
 ```
 
+A resume is refused when it has nothing to copy. That includes a run that copied every planned table and then stopped with no run record, for example a crash after the last copy. A resume of it would skip every table, run no check, and record a success nobody verified. Start a fresh run instead. For an incremental pipeline, check the watermarks first (`rocky state show`). See [when the watermark save is lost](/concepts/state-management/#when-the-watermark-save-is-lost) for the adapters where the fresh run repairs them.
+
 Run in [shadow mode](/reference/glossary/), which writes to `*_rocky_shadow` tables instead of production, so you can compare the results before you promote:
 
 ```bash

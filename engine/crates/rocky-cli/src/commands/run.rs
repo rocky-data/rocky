@@ -2199,12 +2199,18 @@ fn ensure_resume_scope(progress: &RunProgress, current: &ResumeScope) -> Result<
 /// `--resume <run-id>` (#1635): a run id names the same checkpoint either
 /// way, and a succeeded one has nothing to recover however it was chosen.
 /// The failure statuses stay resumable.
+///
 /// No record at all is the crash case — the run never reached a terminal
-/// status — and stays resumable whatever the checkpoint shows: a run killed
-/// after its last table copy still has post-copy work (checks, hooks, the
-/// record itself) to finish, and a complete checkpoint is exactly what that
-/// crash leaves. Retention cannot forge the crash shape, because a swept
-/// run record takes its checkpoint with it in the same transaction
+/// status. An INCOMPLETE checkpoint resumes: copy work remains. A COMPLETE
+/// one is refused (#1814, ruling 2026-09-26). That is a run that stopped
+/// after its last table copy (a crash, or a record write that failed), and
+/// a resume of it skips every table, builds no check input, runs no check,
+/// and records `Success` — a green nobody verified. The resume cannot finish
+/// the post-copy work either: it rebuilds its check inputs only from the
+/// tables it copies. See [`ensure_a_record_less_resume_would_do_work`].
+///
+/// Retention cannot forge the crash shape, because a swept run record takes
+/// its checkpoint with it in the same transaction
 /// (`StateStore::sweep_retention`). There is no searching backwards past a
 /// refused run.
 ///
@@ -2214,7 +2220,7 @@ fn ensure_run_is_resumable(state_store: &StateStore, progress: &RunProgress) -> 
         .get_run(&progress.run_id)
         .with_context(|| format!("failed to load the run record for '{}'", progress.run_id))?;
     let Some(record) = record else {
-        return Ok(());
+        return ensure_a_record_less_resume_would_do_work(progress);
     };
     use rocky_core::state::RunStatus;
     match record.status {
@@ -2230,6 +2236,54 @@ fn ensure_run_is_resumable(state_store: &StateStore, progress: &RunProgress) -> 
              partial state to recover",
             progress.run_id,
             record.status
+        ),
+    }
+}
+
+/// Refuse a record-less checkpoint whose planned tables were all copied
+/// (#1814).
+///
+/// The same completeness test [`ensure_the_resume_would_do_work`] applies to a
+/// recorded failure, in the same order: a run that planned nothing re-plans
+/// everything, and a non-`Success` entry is copy work the resume re-attempts.
+/// Only then does [`copy_completeness`] decide, from the planned SET (a
+/// pre-v30 checkpoint falls back to the count).
+///
+/// ```text
+///   planned nothing            -> resume: every table is re-planned
+///   a table not Success        -> resume: that table is re-copied
+///   a planned table missing    -> resume: that table is copied
+///   every planned table copied -> refuse: a resume copies nothing, runs no
+///                                 check, and records Success
+/// ```
+///
+/// The refusal says to check the watermarks before the fresh run, because the
+/// crash that left this checkpoint can also have lost the end-of-run
+/// watermark flush (#1854). What is true on each adapter is in the message.
+fn ensure_a_record_less_resume_would_do_work(progress: &RunProgress) -> Result<()> {
+    if progress.total_tables == 0 {
+        return Ok(());
+    }
+    if progress
+        .tables
+        .iter()
+        .any(|t| t.status != rocky_core::state::TableStatus::Success)
+    {
+        return Ok(());
+    }
+    match copy_completeness(progress) {
+        CopyCompleteness::Incomplete => Ok(()),
+        CopyCompleteness::Complete | CopyCompleteness::CompleteByCount => anyhow::bail!(
+            "cannot resume run {}: its checkpoint shows every planned table copied, but the run \
+             left no run record — it stopped after its last copy (a crash, or a failed record \
+             write). A resume would copy nothing and run none of its checks, and would record a \
+             Success nobody verified. Start a fresh run without a resume flag. For an \
+             incremental pipeline, check the watermarks first (`rocky state show`): the run can \
+             have stopped before it saved them. On DuckDB, Databricks, Snowflake and BigQuery \
+             targets the fresh run re-derives an unsaved watermark from the target, so it does \
+             not insert those rows again. On Trino and process-adapter targets it does not: \
+             a stale watermark there makes the fresh run insert the same rows again",
+            progress.run_id
         ),
     }
 }
@@ -19004,14 +19058,11 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
         );
     }
 
-    /// The crash case: no run record, whatever the checkpoint shows. An
-    /// incomplete checkpoint (a table unrecorded, or recorded as anything
-    /// but `Success`) is a crash mid-run; a complete one is a crash after
-    /// the last table copy, with post-copy work still owed. Every shape
-    /// resumes — retention can no longer leave a complete, record-less
-    /// checkpoint behind, so there is no swept-run shape to mistake it for.
+    /// The crash case, resumable half: no run record and an INCOMPLETE
+    /// checkpoint — a table unrecorded, or recorded as anything but
+    /// `Success`. Copy work remains, so each shape resumes.
     #[test]
-    fn resume_latest_resumes_any_checkpoint_without_a_record() {
+    fn resume_latest_resumes_an_incomplete_checkpoint_without_a_record() {
         use rocky_core::state::TableStatus;
 
         for (planned, recorded) in [
@@ -19019,8 +19070,6 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
             (1, vec![TableStatus::Failed]),
             (1, vec![TableStatus::Interrupted]),
             (2, vec![TableStatus::Success, TableStatus::Skipped]),
-            (1, vec![TableStatus::Success]),
-            (2, vec![TableStatus::Success, TableStatus::Success]),
         ] {
             let dir = tempfile::tempdir().unwrap();
             let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
@@ -19042,6 +19091,69 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
                 .unwrap();
             assert_eq!(progress.run_id, "run-1");
         }
+    }
+
+    /// The crash case, refused half (#1814, ruling 2026-09-26): no run record
+    /// and a COMPLETE checkpoint. The run stopped after its last copy. A
+    /// resume would copy nothing, run no check, and record `Success`, so it
+    /// is refused, through `--resume-latest` and `--resume <id>` alike. The
+    /// message says to check the watermark before re-running.
+    #[test]
+    fn resume_refuses_a_complete_checkpoint_without_a_record() {
+        use rocky_core::state::TableStatus;
+
+        for planned in [1, 2] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
+            let scope = test_resume_scope("p1");
+            store
+                .init_run_progress("run-1", &planned_keys(planned), Some(&scope))
+                .unwrap();
+            for (index, key) in planned_keys(planned).iter().enumerate() {
+                store
+                    .record_table_progress("run-1", &table_entry(index, key, TableStatus::Success))
+                    .unwrap();
+            }
+
+            for (resume_id, latest) in [(None, true), (Some("run-1"), false)] {
+                let err = resolve_resume_progress(&store, resume_id, latest, &scope)
+                    .expect_err("a complete record-less checkpoint must not resume");
+                let message = format!("{err:#}");
+                assert!(
+                    message.contains("cannot resume run run-1")
+                        && message.contains("every planned table copied")
+                        && message.contains("no run record")
+                        && message.contains("rocky state show")
+                        && message.contains("Trino"),
+                    "unexpected error: {message}"
+                );
+            }
+        }
+    }
+
+    /// #1814: completeness is the planned SET, not a count. Two `Success`
+    /// entries against a plan of two, one of them a key the plan never held,
+    /// leave a planned table uncopied — so the record-less checkpoint resumes.
+    #[test]
+    fn a_record_less_resume_reads_the_planned_set_not_the_count() {
+        use rocky_core::state::TableStatus;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
+        let scope = test_resume_scope("p1");
+        store
+            .init_run_progress("run-1", &planned_keys(2), Some(&scope))
+            .unwrap();
+        for (index, key) in ["wh.staging_p1__acme.t0", "wh.staging_p1__acme.other"]
+            .iter()
+            .enumerate()
+        {
+            store
+                .record_table_progress("run-1", &table_entry(index, key, TableStatus::Success))
+                .unwrap();
+        }
+        resolve_resume_progress(&store, None, true, &scope)
+            .expect("t1 was never copied, so the resume has work to do");
     }
 
     /// A planned table for the checkpoint-completeness test: source
@@ -19609,8 +19721,8 @@ auto_create_schemas = true
     async fn resume_latest_resumes_crashed_and_failed_runs() {
         // The crash case plans two tables and completed one — an incomplete
         // checkpoint with no record. (The complete-checkpoint crash, a kill
-        // after the last table, is
-        // `resume_latest_resumes_a_run_that_crashed_after_its_last_table`.)
+        // after the last table, is refused since #1814:
+        // `resume_latest_refuses_a_run_that_crashed_after_its_last_table`.)
         //
         // The `Failure` case plans two as well, because #1598 refuses a
         // *complete* checkpoint whose run failed with no failed model: a
@@ -19734,7 +19846,9 @@ auto_create_schemas = true
         // The checkpoint a `--branch branch__feature` run leaves: the scope
         // built by the run path's own helper, and the one source table
         // recorded under the key that run writes. No run record — the crash
-        // shape, which stays resumable.
+        // shape. The plan holds a second table the run never copied, so the
+        // checkpoint is incomplete and stays resumable (#1814 refuses a
+        // complete record-less one).
         {
             let loaded = rocky_core::config::load_rocky_config_fingerprinted(&config_path).unwrap();
             let (name, pipeline_config) =
@@ -19770,7 +19884,10 @@ auto_create_schemas = true
             store
                 .init_run_progress(
                     "run-branch",
-                    &["warehouse.branch__feature.orders".to_string()],
+                    &[
+                        "warehouse.branch__feature.orders".to_string(),
+                        "warehouse.branch__feature.items".to_string(),
+                    ],
                     Some(&scope),
                 )
                 .unwrap();
@@ -19890,12 +20007,13 @@ auto_create_schemas = true
     }
 
     /// `kill -9` after the last table copy, before the run record is
-    /// written: a complete checkpoint and no record. That is a crash with
-    /// post-copy work still owed, and it resumes — skipping the copied
-    /// table — instead of being mistaken for a swept succeeded run.
+    /// written: a complete checkpoint and no record. It used to resume, skip
+    /// every table, run no check and record `Success` (#1814; the 2026-09-09
+    /// experiment showed `check_outcomes = []`). It is now refused, end to
+    /// end, and the refused resume copies nothing and writes no checkpoint.
     #[cfg(feature = "duckdb")]
     #[tokio::test]
-    async fn resume_latest_resumes_a_run_that_crashed_after_its_last_table() {
+    async fn resume_latest_refuses_a_run_that_crashed_after_its_last_table() {
         let dir = tempfile::tempdir().unwrap();
         let (config_path, state_path, db_path) =
             write_two_pipeline_project(dir.path(), "staging_p1__{source}", "staging_p2__{source}")
@@ -19950,21 +20068,24 @@ auto_create_schemas = true
             assert!(store.get_run("run-crashed").unwrap().is_none());
         }
 
-        drive_resume_test_run(&config_path, &state_path, "p2", None, true)
+        let err = drive_resume_test_run(&config_path, &state_path, "p2", None, true)
             .await
-            .unwrap_or_else(|err| {
-                panic!("a complete checkpoint with no record is a crash and resumes: {err:#}")
-            });
+            .expect_err("a complete checkpoint with no record must not resume");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("cannot resume run run-crashed")
+                && message.contains("every planned table copied"),
+            "unexpected error: {message}"
+        );
         assert!(
             !target_table_exists(&db_path, "staging_p2__acme", "orders").await,
-            "the resumed run skips the table the checkpoint completed"
+            "a refused resume must not run fresh"
         );
         let store = StateStore::open(&state_path).unwrap();
-        let resumed = store.get_latest_run_progress().unwrap().unwrap();
-        assert_ne!(resumed.run_id, "run-crashed");
         assert_eq!(
-            resumed.total_tables, 0,
-            "the resumed run had nothing left to copy"
+            store.get_latest_run_progress().unwrap().unwrap().run_id,
+            "run-crashed",
+            "a refused resume must not write a new checkpoint"
         );
     }
 
