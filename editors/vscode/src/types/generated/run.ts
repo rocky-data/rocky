@@ -90,7 +90,7 @@ export type TestSeverity = "error" | "warning";
 /**
  * Coarse-grained failure classification for an entry on [`RunOutput::errors`]. Lets orchestrators branch on the kind of failure (retry, page someone, surface in the UI) without parsing the free-form `error` string.
  *
- * Variants partition the [`rocky_databricks::connector::ConnectorError`] and [`rocky_snowflake::connector::ConnectorError`] spaces; `Unknown` is the fallback for non-connector failures (drift, governance, adapter-internal errors) where the error reached the output layer already type-erased.
+ * Variants partition the [`rocky_databricks::connector::ConnectorError`], [`rocky_snowflake::connector::ConnectorError`], [`rocky_trino::connector::TrinoError`] and [`rocky_bigquery::connector::BigQueryError`] spaces; `Unknown` is the fallback for non-connector failures (drift, governance, adapter-internal errors) where the error reached the output layer already type-erased.
  */
 export type FailureKind =
   | "connection-failed"
