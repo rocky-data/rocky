@@ -338,26 +338,17 @@ auto_create_schemas = true
     )
     .unwrap();
 
-    // DuckDB's parser refuses the `MERGE ... WHEN NOT MATCHED THEN INSERT
-    // (*) VALUES (source.*, ...)` SQL `generate_snapshot_sql` emits for this
-    // pipeline type — a pre-existing dialect gap, unrelated to Pipes and out
-    // of scope here. `closed()` must still fire on THIS failure path (it
-    // runs before the `tables_failed > 0` bail in `run_snapshot`), which is
-    // exactly the case worth pinning: a Pipes launch must not lose its
-    // `closed` message just because the pipeline's own work failed.
+    // Since #2012 the DuckDB snapshot MERGE executes (`INSERT BY NAME`), so
+    // this run succeeds. It used to fail on the old `INSERT (*) VALUES
+    // (source.*, ...)` form, and that failure path was what this test
+    // pinned. The invariant is unchanged: a Pipes launch opens and closes
+    // its channel around the snapshot pipeline.
     let (lines, result) = run_with_pipes_capture(&messages_path, || {
         drive_run(&config_path, &state_path, None)
     })
     .await;
 
-    let err = result.expect_err(
-        "this test's snapshot SQL is expected to fail on DuckDB's MERGE dialect gap; \
-         if it now succeeds, DuckDB gained support and this test should assert Ok instead",
-    );
-    assert!(
-        err.to_string().contains("snapshot pipeline failed"),
-        "expected the known DuckDB-dialect failure, got a different error (a real regression?): {err}"
-    );
+    result.expect("the snapshot pipeline runs on DuckDB since #2012");
 
     assert!(lines.len() >= 2, "{lines:?}");
     assert_eq!(lines[0]["method"], "opened", "{lines:?}");

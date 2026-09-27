@@ -413,7 +413,7 @@ mod tests {
             ("null", json!(null), "null"),
             ("a non-numeric string", json!("n/a"), "\"n/a\""),
             ("a fraction", json!(5.5), "5.5"),
-            ("an out-of-range float", json!(1e30), "1e30"),
+            ("an out-of-range float", json!(1e30), "1e+30"),
             ("a bool", json!(true), "true"),
         ] {
             let parsed = parse_row_count_rows(&[row(cell)]);
