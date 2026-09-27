@@ -14,10 +14,13 @@
 //! their single `RunOutput` for human readability — the streaming
 //! contract is the watch-specific add.
 
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use futures::FutureExt;
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use tokio::sync::mpsc;
 use tracing::warn;
@@ -25,6 +28,7 @@ use tracing::warn;
 use rocky_core::config::GovernanceOverride;
 
 use super::run::{Interrupted, PartitionRunOptions, run};
+use super::run_cancel::{RunCancel, RunCancelTrigger};
 
 /// Debounce window: collect events for this long before triggering a re-run.
 /// Editor save bursts (e.g. vim's atomic-rename, vscode's two-phase write)
@@ -44,11 +48,11 @@ const EVENT_CHANNEL_CAP: usize = 64;
 /// On first call the watcher seeds with one immediate run; thereafter every
 /// change to a watched path triggers a debounced re-run. Errors from the
 /// inner `run` are logged and the loop continues — only adapter-init /
-/// config-parse errors at startup exit non-zero. A single SIGINT always exits
-/// the watch loop with status 0, whether it lands between runs (caught by the
-/// loop's own `ctrl_c` arm) or during one (consumed by the inner run, which
-/// reports it back as [`IterOutcome::interrupted`]). Requiring a second signal
-/// in the second case was #1405.
+/// config-parse errors at startup exit non-zero. A single SIGINT or SIGTERM
+/// always exits the watch loop with status 0, whether it lands between runs
+/// or during one. Requiring a second signal in the second case was #1405.
+/// During a run, the signal cancels the run and waits for it to settle its
+/// state before exiting (#1606); see `run_iteration`.
 ///
 /// # Arguments
 ///
@@ -201,120 +205,41 @@ pub async fn run_watch(
     // watcher could not be killed by `timeout`, CI cancellation or a
     // container eviction. Same shape as the run loop's own handling
     // (`run.rs`).
-    let ctrl_c_signal = tokio::signal::ctrl_c();
-    tokio::pin!(ctrl_c_signal);
-    #[cfg(unix)]
-    let mut sigint_stream =
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()).ok();
-    #[cfg(unix)]
-    let mut sigterm_stream =
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
+    let mut signals = StopSignals::register();
 
     // First run is immediate so the user gets feedback without having to
     // touch a file.
     //
-    // The run is RACED against the signal arms rather than plainly awaited.
-    // With the streams registered above, a signal arriving mid-run is only
-    // latched — nothing polls the streams while `iter_once` is in flight —
-    // and the replication path's own graceful arms (`run.rs`) exist only
-    // after its setup, while the transformation path has none at all. An
-    // un-raced await would therefore defer shutdown to the end of the
-    // iteration and make a stalled run unkillable by SIGTERM, where the
-    // pre-registration code died instantly on the default disposition.
-    // Racing restores prompt shutdown: the outer arm fires, the iteration
-    // future is dropped, and the process exits. Dropping mid-run is
-    // crash-parity — the state store's commit protocol and `InProgress`
-    // breadcrumbs are designed for exactly that — and is strictly cleaner
-    // than the old mid-run default-disposition kill.
-    {
-        let first_run = iter_once(
-            config_path,
-            filter,
-            pipeline_name_arg,
-            state_path,
-            governance_override,
-            output_json,
-            models_dir,
-            run_all,
-            shadow_config,
-            partition_opts,
-            cache_ttl_override,
-            env,
-            skip_opts,
-        );
-        tokio::pin!(first_run);
-        let interrupted = tokio::select! {
-            outcome = &mut first_run => outcome.interrupted,
-            _ = &mut ctrl_c_signal => true,
-            Some(()) = async {
-                #[cfg(unix)]
-                {
-                    match sigint_stream.as_mut() {
-                        Some(stream) => stream.recv().await,
-                        None => std::future::pending().await,
-                    }
-                }
-                #[cfg(not(unix))]
-                {
-                    std::future::pending().await
-                }
-            } => true,
-            Some(()) = async {
-                #[cfg(unix)]
-                {
-                    match sigterm_stream.as_mut() {
-                        Some(stream) => stream.recv().await,
-                        None => std::future::pending().await,
-                    }
-                }
-                #[cfg(not(unix))]
-                {
-                    std::future::pending().await
-                }
-            } => true,
-        };
-        if interrupted {
-            eprintln!("\n[watch] stopped");
-            return Ok(());
-        }
+    // Every iteration is RACED against the signal arms rather than plainly
+    // awaited: with the streams registered above, a signal arriving mid-run
+    // is only latched, and an un-raced await would defer shutdown to the end
+    // of the iteration. But the race no longer DROPS the iteration (#1606):
+    // see `run_iteration` for the cancel-then-settle protocol.
+    let (trigger, cancel) = RunCancel::new();
+    let first_run = cancel.scope(iter_once(
+        config_path,
+        filter,
+        pipeline_name_arg,
+        state_path,
+        governance_override,
+        output_json,
+        models_dir,
+        run_all,
+        shadow_config,
+        partition_opts,
+        cache_ttl_override,
+        env,
+        skip_opts,
+    ));
+    if run_iteration(&mut signals, &trigger, first_run).await {
+        eprintln!("\n[watch] stopped");
+        return Ok(());
     }
 
     // Steady-state loop: wait for an event, debounce, drain, re-run.
     loop {
         tokio::select! {
-            _ = &mut ctrl_c_signal => {
-                eprintln!("\n[watch] stopped");
-                return Ok(());
-            }
-            Some(()) = async {
-                #[cfg(unix)]
-                {
-                    match sigint_stream.as_mut() {
-                        Some(stream) => stream.recv().await,
-                        None => std::future::pending().await,
-                    }
-                }
-                #[cfg(not(unix))]
-                {
-                    std::future::pending().await
-                }
-            } => {
-                eprintln!("\n[watch] stopped");
-                return Ok(());
-            }
-            Some(()) = async {
-                #[cfg(unix)]
-                {
-                    match sigterm_stream.as_mut() {
-                        Some(stream) => stream.recv().await,
-                        None => std::future::pending().await,
-                    }
-                }
-                #[cfg(not(unix))]
-                {
-                    std::future::pending().await
-                }
-            } => {
+            () = signals.recv() => {
                 eprintln!("\n[watch] stopped");
                 return Ok(());
             }
@@ -341,13 +266,10 @@ pub async fn run_watch(
                     .unwrap_or_default();
                 eprintln!("[watch] detected change: {display}");
 
-                // Same race as the first run, for the same reason: a signal
-                // during the debounce sleep or the re-run is only latched by
-                // the streams above, and an un-raced await would defer
-                // shutdown to the end of the iteration (or forever, for a
-                // stalled one). A signal latched during the debounce fires
-                // here immediately, before the re-run starts.
-                let rerun = iter_once(
+                // Same race as the first run. A signal latched during the
+                // debounce sleep stops the watcher before the re-run starts.
+                let (trigger, cancel) = RunCancel::new();
+                let rerun = cancel.scope(iter_once(
                     config_path,
                     filter,
                     pipeline_name_arg,
@@ -361,44 +283,157 @@ pub async fn run_watch(
                     cache_ttl_override,
                     env,
                     skip_opts,
-                );
-                tokio::pin!(rerun);
-                let interrupted = tokio::select! {
-                    outcome = &mut rerun => outcome.interrupted,
-                    _ = &mut ctrl_c_signal => true,
-                    Some(()) = async {
-                        #[cfg(unix)]
-                        {
-                            match sigint_stream.as_mut() {
-                                Some(stream) => stream.recv().await,
-                                None => std::future::pending().await,
-                            }
-                        }
-                        #[cfg(not(unix))]
-                        {
-                            std::future::pending().await
-                        }
-                    } => true,
-                    Some(()) = async {
-                        #[cfg(unix)]
-                        {
-                            match sigterm_stream.as_mut() {
-                                Some(stream) => stream.recv().await,
-                                None => std::future::pending().await,
-                            }
-                        }
-                        #[cfg(not(unix))]
-                        {
-                            std::future::pending().await
-                        }
-                    } => true,
-                };
-                if interrupted {
+                ));
+                if run_iteration(&mut signals, &trigger, rerun).await {
                     eprintln!("\n[watch] stopped");
                     return Ok(());
                 }
             }
         }
+    }
+}
+
+/// Drive one iteration to its end. Returns `true` when the watcher must stop.
+///
+/// A signal during the iteration cancels the run instead of dropping it
+/// (#1606, #1603). Dropping stopped the warehouse work and the state tail at
+/// once, so a signal could cut the deferred watermark batch (the next run
+/// then appended the same delta again) and leak the `RemoteStateSession`
+/// without its finalize or abandon.
+///
+/// ```text
+///   signal ──▶ cancel the run ──▶ no new table / layer / model starts
+///                              ──▶ in-flight work: IN_FLIGHT_GRACE, then cut
+///                              ──▶ state tail settles ──▶ iteration returns
+///   second signal while settling ──▶ drop the iteration (the escape hatch)
+/// ```
+///
+/// `main`'s bounded runtime shutdown stays as the backstop. After a settled
+/// iteration it can only cut a wedged warehouse statement, never a state
+/// commit: the run awaited all of those before it returned.
+async fn run_iteration<F>(
+    signals: &mut StopSignals,
+    trigger: &RunCancelTrigger,
+    iteration: F,
+) -> bool
+where
+    F: Future<Output = IterOutcome>,
+{
+    // A signal latched before the iteration started (for example during the
+    // debounce sleep) stops the watcher without starting any work.
+    if signals.recv().now_or_never().is_some() {
+        return true;
+    }
+    tokio::pin!(iteration);
+    tokio::select! {
+        outcome = &mut iteration => return outcome.interrupted,
+        () = signals.recv() => {}
+    }
+    trigger.cancel();
+    eprintln!(
+        "\n[watch] stopping: no new work starts; the run settles its state first \
+         (signal again to stop at once)"
+    );
+    tokio::select! {
+        _ = &mut iteration => {}
+        () = signals.recv() => {
+            eprintln!("[watch] second signal: stopping without waiting for the run to settle");
+        }
+    }
+    true
+}
+
+/// The watcher's long-lived signal registrations (see `run_watch`).
+///
+/// On unix the SIGINT and SIGTERM streams carry every signal. The portable
+/// `ctrl_c()` future is used only where no SIGINT stream exists. Listening on
+/// both would count one Ctrl-C twice, and the second count would skip the
+/// settle step of [`run_iteration`].
+struct StopSignals {
+    #[cfg(unix)]
+    sigint: Option<tokio::signal::unix::Signal>,
+    #[cfg(unix)]
+    sigterm: Option<tokio::signal::unix::Signal>,
+    ctrl_c: Option<CtrlC>,
+}
+
+type CtrlC = Pin<Box<dyn Future<Output = std::io::Result<()>> + Send>>;
+
+impl StopSignals {
+    fn register() -> Self {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{SignalKind, signal};
+            let sigint = signal(SignalKind::interrupt()).ok();
+            let sigterm = signal(SignalKind::terminate()).ok();
+            let ctrl_c = sigint.is_none().then(new_ctrl_c);
+            Self {
+                sigint,
+                sigterm,
+                ctrl_c,
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            Self {
+                ctrl_c: Some(new_ctrl_c()),
+            }
+        }
+    }
+
+    /// Resolves on the next shutdown signal. Cancel-safe: a dropped call
+    /// loses no signal.
+    async fn recv(&mut self) {
+        #[cfg(unix)]
+        let (sigint, sigterm) = (&mut self.sigint, &mut self.sigterm);
+        let ctrl_c = &mut self.ctrl_c;
+        let ctrl_c_fired = tokio::select! {
+            Some(()) = async {
+                #[cfg(unix)]
+                {
+                    recv_signal(sigint).await
+                }
+                #[cfg(not(unix))]
+                {
+                    std::future::pending::<Option<()>>().await
+                }
+            } => false,
+            Some(()) = async {
+                #[cfg(unix)]
+                {
+                    recv_signal(sigterm).await
+                }
+                #[cfg(not(unix))]
+                {
+                    std::future::pending::<Option<()>>().await
+                }
+            } => false,
+            () = async {
+                match ctrl_c.as_mut() {
+                    Some(fut) => {
+                        let _ = fut.await;
+                    }
+                    None => std::future::pending::<()>().await,
+                }
+            } => true,
+        };
+        // A completed `ctrl_c()` future must not be polled again; re-arm it
+        // so a second Ctrl-C is still seen.
+        if ctrl_c_fired {
+            *ctrl_c = Some(new_ctrl_c());
+        }
+    }
+}
+
+fn new_ctrl_c() -> CtrlC {
+    Box::pin(tokio::signal::ctrl_c())
+}
+
+#[cfg(unix)]
+async fn recv_signal(stream: &mut Option<tokio::signal::unix::Signal>) -> Option<()> {
+    match stream.as_mut() {
+        Some(stream) => stream.recv().await,
+        None => std::future::pending().await,
     }
 }
 

@@ -5560,6 +5560,11 @@ pub async fn run(
     };
 
     for (idx, task) in tables_to_process.iter().enumerate() {
+        // A cancelled run starts no new table (#1606). This check also covers
+        // a signal that landed before this run's own listeners above existed.
+        if super::run_cancel::run_cancelled() {
+            interrupted = true;
+        }
         if interrupted || freeze_withheld.is_some() || drain_abort.is_some() {
             break;
         }
@@ -5644,6 +5649,10 @@ pub async fn run(
                 interrupted = true;
                 break;
             }
+            () = super::run_cancel::run_cancel_requested(), if !interrupted => {
+                interrupted = true;
+                break;
+            }
         };
         let warehouse = shared_warehouse.clone();
         let state = shared_state.clone();
@@ -5677,6 +5686,9 @@ pub async fn run(
     // Driven as a `loop { tokio::select! }` so a first SIGINT fires the
     // hard-exit watcher and flips `interrupted = true`; tasks already in
     // flight keep running and their results are still collected below.
+    // Hoisted so the grace counts from the cancel, not from the last result.
+    let in_flight_grace = super::run_cancel::in_flight_grace_elapsed();
+    tokio::pin!(in_flight_grace);
     loop {
         // An inline drain already aborted every remaining task. Joining them
         // would collect one cancellation per table as a fresh "task failed"
@@ -5690,6 +5702,25 @@ pub async fn run(
                 Some(r) => r,
                 None => break,
             },
+            () = super::run_cancel::run_cancel_requested(), if !interrupted => {
+                interrupted = true;
+                continue;
+            }
+            // A cancelled run gives in-flight tables a grace, then stops
+            // waiting for them (#1606). The aborted tables settle below as
+            // `Interrupted`; the deferred watermarks of every table that
+            // finished are still flushed. Draining the aborted tasks drops
+            // their `Arc<StateStore>` clones before the tail runs.
+            () = &mut in_flight_grace => {
+                warn!(
+                    in_flight = join_set.len(),
+                    "run cancelled: in-flight tables did not finish within the grace, \
+                     no longer waiting for them"
+                );
+                join_set.abort_all();
+                while join_set.join_next().await.is_some() {}
+                break;
+            }
             _ = &mut ctrl_c_signal, if !interrupted => {
                 arm_hard_exit_on_second_signal();
                 interrupted = true;
@@ -5900,6 +5931,12 @@ pub async fn run(
                 break;
             }
         }
+    }
+
+    // A cancel that lands after the last table was dispatched still skips the
+    // warehouse work below (retries, checks, models) and settles here (#1606).
+    if super::run_cancel::run_cancelled() {
+        interrupted = true;
     }
 
     // SIGINT cleanup: flush watermarks for tables that completed, mark
@@ -6412,7 +6449,9 @@ pub async fn run(
             // fresh disk compile.
             let exec_result: Result<GovernanceSnapshot> = async {
                 let warehouse = adapter_registry.warehouse_adapter(&pipeline.target.adapter)?;
-                execute_models(
+                // A cancel cuts an in-flight model after the grace (#1606);
+                // the cut is recorded as this phase's failure below.
+                let exec = super::run_cancel::await_unless_cut(Box::pin(execute_models(
                     mdir,
                     None,
                     warehouse.as_ref(),
@@ -6448,8 +6487,12 @@ pub async fn run(
                     Some(&freeze_fence),
                     // Finding #4: THE mask-reconciling path — bind the mask.
                     true,
-                )
-                .await
+                )))
+                .await;
+                exec.unwrap_or_else(|| {
+                    output.interrupted = true;
+                    Err(anyhow::Error::new(Interrupted))
+                })
             }
             .await;
             // ‼️ Governance runs ONLY when the model phase completed cleanly
@@ -6462,7 +6505,10 @@ pub async fn run(
             // governance to the warehouse *despite the gate detecting the change*.
             // On any failure we record it and SKIP all post-model governance
             // below, falling through to the failure payload + non-zero exit.
-            let mut exec_ok = model_phase_ok(&exec_result, failures_before, output.tables_failed);
+            // An interrupted model phase is never clean: governance must not
+            // reconcile a model set that did not fully execute (#1606).
+            let mut exec_ok = model_phase_ok(&exec_result, failures_before, output.tables_failed)
+                && !output.interrupted;
             model_phase_clean = exec_ok;
             let governance_snapshot = match exec_result {
                 // #1093: keep the gated snapshot for the reconcile below.
@@ -11323,6 +11369,13 @@ pub(crate) async fn execute_models(
     };
 
     for layer in execution_layers {
+        // A cancelled run starts no new layer (#1606). Like the freeze fence
+        // below, this returns `Ok` so the caller's terminal persist still
+        // records the layers that committed; `interrupted` marks the rest.
+        if super::run_cancel::run_cancelled() {
+            output.interrupted = true;
+            return Ok(governance_snapshot);
+        }
         // Freeze fence — one fresh LIST per execution-layer boundary
         // (ADR-CONCURRENCY.md D3 fence granularity): a freeze landing mid-run
         // withholds this and all remaining layers fail-closed. The `Ok`
@@ -11670,6 +11723,12 @@ pub(crate) async fn execute_models(
 
         for &(idx, model_name, model) in &matched {
             let model_name: &str = model_name.as_str();
+
+            // Serial path: a cancelled run starts no further model (#1606).
+            if super::run_cancel::run_cancelled() {
+                output.interrupted = true;
+                return Ok(governance_snapshot);
+            }
 
             // Re-adjudicate immediately before dispatch (serial path): the
             // layer's verdicts were computed before any of this layer's models

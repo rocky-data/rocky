@@ -695,16 +695,15 @@ fn mkfifo(path: &Path) {
 /// `read()` never sees EOF and the statement stays in flight for as long as the
 /// assertion needs. Nothing about the timing is load-dependent.
 ///
-/// # What is asserted, and what deliberately is not
+/// # What is asserted
 ///
-/// The assertion is *promptness*, within the same run-scaled budget the sibling
-/// tests use. The exit code is asserted only as one of two known values. A
-/// mid-iteration drop also leaks the run's `RemoteStateSession` (its `Drop`
-/// tripwire at `rocky-core/src/state_sync.rs`), which is a `debug_assert!` — a
-/// panic here, a `warn!` in the shipped release binary. So requiring `success()`
-/// would assert the build profile rather than the shutdown, while accepting any
-/// code would bless an unrelated failure. The release binary was measured
-/// separately at exit 0.
+/// *Promptness*, within the same run-scaled budget the sibling tests use, and
+/// exit 0. The signal no longer drops the iteration (#1606): it cancels the
+/// run, which cuts the wedged statement after its grace and then settles its
+/// state and its `RemoteStateSession`. Before that, the dropped session hit its
+/// `Drop` tripwire (`rocky-core/src/state_sync.rs`), a `debug_assert!` that
+/// made this debug build exit 101 (#1603). Exit 0 in a debug build is the
+/// evidence that the run reached its own cleanup path.
 #[test]
 fn run_watch_exits_on_a_signal_during_an_iteration() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -848,23 +847,26 @@ fn run_watch_exits_on_a_signal_during_an_iteration() {
         }
     };
 
-    // Two codes, and only two. `0` is the documented contract and what the
-    // release binary returns. `101` is this build profile's `RemoteStateSession`
-    // tripwire (see the doc comment): a `debug_assert!` that fires because the
-    // dropped iteration never finalized its session. Accepting any exit code —
-    // `status.code().is_some()` — would also bless a config error or an adapter
-    // failure, which would say nothing about shutdown.
-    let code = status.code();
+    // Exit 0 is the documented contract. In this debug build it also proves
+    // the session was settled: a dropped one trips a `debug_assert!` and the
+    // process exits 101 (#1603).
     assert!(
-        matches!(code, Some(0 | 101)),
-        "expected exit 0 (the documented signal contract) or 101 (this profile's \
-         RemoteStateSession debug tripwire); got {status:?}.\nstderr:\n{transcript}"
+        status.success(),
+        "expected exit 0 (the documented signal contract); got {status:?}. Exit 101 \
+         is the RemoteStateSession drop tripwire: the iteration was dropped instead \
+         of settled.\nstderr:\n{transcript}"
     );
 
-    // The signal arm is what ended the process.
+    // The signal arm is what ended the process, and it cancelled the run
+    // rather than dropping it: the run reported its own interrupted exit.
     assert!(
         transcript.contains("[watch] stopped"),
         "expected the watch loop's '[watch] stopped' notice.\nstderr:\n{transcript}"
+    );
+    assert!(
+        transcript.contains("[watch] run interrupted in"),
+        "expected the cancelled run to return through its own interrupted exit, \
+         not to be dropped.\nstderr:\n{transcript}"
     );
 
     // Positive evidence that the signal landed *during* an iteration and not
@@ -891,6 +893,216 @@ fn run_watch_exits_on_a_signal_during_an_iteration() {
     eprintln!(
         "run_watch_exits_on_a_signal_during_an_iteration: exited {exit_latency:?} after \
          SIGTERM (budget {shutdown_budget:?}, one run {one_run:?})"
+    );
+}
+
+/// Replication fixture for the settle test below: two tables, copied one at a
+/// time, in declared order. Both sources are views over CSV files, so the test
+/// can swap the second one for a FIFO. A manual discovery adapter is what lets
+/// a view be a source: DuckDB discovery lists base tables only.
+const SETTLE_ROCKY_TOML: &str = r#"
+[adapter.local]
+type = "duckdb"
+path = "fixture.duckdb"
+
+[adapter.local_discovery]
+type = "manual"
+kind = "discovery"
+
+[[adapter.local_discovery.schemas]]
+name = "raw__demo"
+tables = ["a_events", "b_blocking"]
+
+[pipeline.ingest]
+strategy = "full_refresh"
+timestamp_column = "_updated_at"
+
+[pipeline.ingest.source]
+adapter = "local"
+
+[pipeline.ingest.source.discovery]
+adapter = "local_discovery"
+
+[pipeline.ingest.source.schema_pattern]
+prefix = "raw__"
+separator = "__"
+components = ["source"]
+
+[pipeline.ingest.target]
+adapter = "local"
+catalog_template = "fixture"
+schema_template = "stg__{source}"
+
+[pipeline.ingest.target.governance]
+auto_create_schemas = true
+
+[pipeline.ingest.execution]
+concurrency = 1
+"#;
+
+fn settle_seed_sql(a_path: &Path, b_path: &Path) -> String {
+    let view = |name: &str, path: &Path| {
+        format!(
+            "CREATE OR REPLACE VIEW raw__demo.{name} AS SELECT * FROM read_csv('{}', \
+             columns = {{'id': 'INTEGER', '_updated_at': 'TIMESTAMP'}}, header = false);\n",
+            path.display()
+        )
+    };
+    format!(
+        "CREATE SCHEMA IF NOT EXISTS raw__demo;\n{}{}",
+        view("a_events", a_path),
+        view("b_blocking", b_path)
+    )
+}
+
+/// A signal during a replication iteration settles the state tail (#1606).
+///
+/// ```text
+///   re-run:  a_events copies ──▶ watermark deferred to the run's tail
+///            b_blocking wedges on a FIFO ──▶ SIGTERM
+///   before:  select! drops the iteration ──▶ a_events' watermark is lost,
+///            the next run appends its delta again; the dropped
+///            RemoteStateSession trips its debug tripwire (exit 101, #1603)
+///   now:     cancel ──▶ b_blocking cut after the grace ──▶ tail flushes
+///            a_events' watermark ──▶ session abandoned ──▶ exit 0
+/// ```
+///
+/// The watermark is the observable. A full-refresh watermark is the run's
+/// clock, so a value newer than the re-run trigger can only come from the
+/// interrupted re-run's own tail.
+#[test]
+fn run_watch_signal_during_an_iteration_settles_the_state_tail() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dir = tmp.path();
+
+    let a_path = dir.join("a_events.csv");
+    let b_path = dir.join("b_blocking.csv");
+    fs::write(&a_path, "1,2024-01-01 00:00:00\n").expect("write a csv");
+    fs::write(&b_path, "1,2024-01-01 00:00:00\n").expect("write b csv");
+    {
+        let conn = duckdb::Connection::open(dir.join("fixture.duckdb")).expect("open duckdb");
+        conn.execute_batch(&settle_seed_sql(&a_path, &b_path))
+            .expect("seed sql");
+    }
+    let cfg_path = dir.join("rocky.toml");
+    fs::write(&cfg_path, SETTLE_ROCKY_TOML).expect("write rocky.toml");
+    let state_path = dir.join("state.redb");
+
+    let calibration_start = Instant::now();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_rocky"))
+        .arg("-c")
+        .arg(&cfg_path)
+        .arg("--state-path")
+        .arg(&state_path)
+        .arg("run")
+        .arg("--watch")
+        .current_dir(dir)
+        .env("RUST_LOG", "error")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn rocky");
+    let pid = child.id();
+    let stderr_rx = spawn_line_reader(child.stderr.take().expect("stderr piped"));
+    let _stdout_drain = spawn_collecting_reader(child.stdout.take().expect("stdout piped"));
+
+    let first = wait_for(&stderr_rx, "run completed in", BOOTSTRAP_BUDGET);
+    if !first.matched {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!(
+            "first run never completed within {BOOTSTRAP_BUDGET:?}.\nstderr so far:\n{}",
+            first.buffered
+        );
+    }
+    let one_run = calibration_start.elapsed().max(Duration::from_millis(100));
+    let mut transcript = first.buffered;
+
+    // Wedge the second table only. `.csv` changes are not re-run triggers.
+    fs::remove_file(&b_path).expect("remove b csv");
+    mkfifo(&b_path);
+    let (open_tx, open_rx) = channel::<fs::File>();
+    let fifo_path = b_path.clone();
+    thread::spawn(move || {
+        if let Ok(write_end) = fs::OpenOptions::new().write(true).open(&fifo_path) {
+            let _ = open_tx.send(write_end);
+        }
+    });
+
+    let triggered_at = chrono::Utc::now();
+    touch(&cfg_path);
+
+    let handshake_budget = scaled_budget(one_run, RERUN_BUDGET_RUNS);
+    let write_end = match open_rx.recv_timeout(handshake_budget) {
+        Ok(write_end) => write_end,
+        Err(e) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!(
+                "the re-run never opened the FIFO within {handshake_budget:?} ({e}) — the \
+                 FIXTURE did not wedge b_blocking, so this run proves nothing.\nstderr so \
+                 far:\n{transcript}"
+            );
+        }
+    };
+
+    // b_blocking is in flight. With concurrency 1, a_events finished first.
+    sigterm(pid);
+    let shutdown_budget = scaled_budget(one_run, SHUTDOWN_BUDGET_RUNS);
+    let outcome = wait_with_timeout(&mut child, shutdown_budget);
+    if !matches!(outcome, WaitOutcome::Exited(_)) {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    while let Ok(line) = stderr_rx.recv_timeout(Duration::from_secs(5)) {
+        transcript.push_str(&line);
+        transcript.push('\n');
+    }
+    let status = match outcome {
+        WaitOutcome::Exited(status) => status,
+        WaitOutcome::StillRunning => panic!(
+            "rocky was still running {shutdown_budget:?} after SIGTERM with b_blocking \
+             wedged: the cancelled run never stopped waiting for it.\nstderr:\n{transcript}"
+        ),
+        WaitOutcome::WaitFailed(e) => {
+            panic!("could not determine whether rocky exited after SIGTERM: {e}")
+        }
+    };
+    drop(write_end);
+
+    let store = rocky_core::state::StateStore::open_read_only(&state_path).expect("open state");
+    let watermarks = store.list_watermarks().expect("list watermarks");
+    let watermark_of = |table: &str| {
+        watermarks
+            .iter()
+            .find(|(key, _)| key.ends_with(table))
+            .map(|(_, wm)| wm.last_value)
+            .unwrap_or_else(|| panic!("no watermark for {table}: {watermarks:?}"))
+    };
+    // The deferred batch of the interrupted re-run reached the ledger.
+    assert!(
+        watermark_of("a_events") >= triggered_at,
+        "a_events' watermark is still the first run's ({:?} < trigger {triggered_at:?}): \
+         the interrupted re-run's deferred watermark was never flushed, so the next run \
+         would append its delta again (#1606).\nstderr:\n{transcript}",
+        watermark_of("a_events")
+    );
+    // And the signal did land mid-iteration: the cut table advanced nothing.
+    assert!(
+        watermark_of("b_blocking") < triggered_at,
+        "b_blocking's watermark advanced, so it finished before the signal and the test \
+         did not exercise a mid-iteration signal.\nstderr:\n{transcript}"
+    );
+
+    // Checked after the ledger, so the ledger evidence stands on its own.
+    assert!(
+        status.success(),
+        "expected exit 0; got {status:?}. Exit 101 is the RemoteStateSession drop \
+         tripwire (#1603).\nstderr:\n{transcript}"
+    );
+    assert!(
+        transcript.contains("[watch] run interrupted in"),
+        "expected the run to return through its own interrupted exit.\nstderr:\n{transcript}"
     );
 }
 

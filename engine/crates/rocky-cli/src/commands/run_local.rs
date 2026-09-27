@@ -159,46 +159,55 @@ pub async fn run_transformation(
 
             // Finding #1: baseline failures so a soft model failure skips governance.
             let failures_before = output.tables_failed;
-            let exec_result = super::run::execute_models(
-                models_dir,
-                Some(models_glob),
-                warehouse_adapter.as_ref(),
-                Some(&store),
-                partition_opts,
-                run_id,
-                None, // no model filter in local execution path
-                None, // no backfill model-set scope in local execution path
-                &mut output,
-                None, // run_local doesn't build a HookRegistry
-                None,
-                schema_cache_cfg,
-                pipeline.target.governance.auto_create_schemas,
-                shadow_config,
-                // run_local has no `--model` selection; defer is a no-op here.
-                &super::run::DeferOptions::default(),
-                skip_gate,
-                // Reuse is active iff `[reuse]` is enabled AND `--no-reuse` was
-                // not passed (clause 1 of the fail-closed decision) — same
-                // resolution as the replication / model-only entry points.
-                rocky_cfg.reuse.enabled && !no_reuse,
-                // Content-addressed column-level skip (its own `[reuse]`
-                // sub-key), likewise disabled by the `--no-reuse` escape hatch.
-                rocky_cfg.reuse.column_level && !no_reuse,
-                run_vars,
-                rocky_cfg.resilience.clone(),
-                rocky_cfg.run.strict_scheduling,
-                super::resilience::retry_policy_allows(rocky_cfg),
-                exec_fp_gate,
-                freeze_fence,
-                // Finding #4: the transformation route reconciles no masks.
-                false,
-            )
-            .await;
+            // A cancelled run stops waiting for an in-flight model once the
+            // grace elapses, then settles below like any interrupted run
+            // (#1606). The dropped model is crash-parity for that model alone.
+            let exec_result =
+                super::run_cancel::await_unless_cut(Box::pin(super::run::execute_models(
+                    models_dir,
+                    Some(models_glob),
+                    warehouse_adapter.as_ref(),
+                    Some(&store),
+                    partition_opts,
+                    run_id,
+                    None, // no model filter in local execution path
+                    None, // no backfill model-set scope in local execution path
+                    &mut output,
+                    None, // run_local doesn't build a HookRegistry
+                    None,
+                    schema_cache_cfg,
+                    pipeline.target.governance.auto_create_schemas,
+                    shadow_config,
+                    // run_local has no `--model` selection; defer is a no-op here.
+                    &super::run::DeferOptions::default(),
+                    skip_gate,
+                    // Reuse is active iff `[reuse]` is enabled AND `--no-reuse` was
+                    // not passed (clause 1 of the fail-closed decision) — same
+                    // resolution as the replication / model-only entry points.
+                    rocky_cfg.reuse.enabled && !no_reuse,
+                    // Content-addressed column-level skip (its own `[reuse]`
+                    // sub-key), likewise disabled by the `--no-reuse` escape hatch.
+                    rocky_cfg.reuse.column_level && !no_reuse,
+                    run_vars,
+                    rocky_cfg.resilience.clone(),
+                    rocky_cfg.run.strict_scheduling,
+                    super::resilience::retry_policy_allows(rocky_cfg),
+                    exec_fp_gate,
+                    freeze_fence,
+                    // Finding #4: the transformation route reconciles no masks.
+                    false,
+                )))
+                .await;
 
             match exec_result {
+                // Cut after a cancel: nothing to reconcile. `interrupted`
+                // routes the tail below to the interrupted exit.
+                None => output.interrupted = true,
+                // An interrupted model phase is not clean: skip governance.
+                Some(Ok(_)) if output.interrupted => {}
                 // Finding #1: only when the model phase is CLEAN (no new soft
                 // failures) — a soft failure returns `Ok`.
-                Ok(snapshot) if output.tables_failed == failures_before => {
+                Some(Ok(snapshot)) if output.tables_failed == failures_before => {
                     // Pre-reconcile freeze fence (fresh LIST): a freeze landing
                     // after the final layer must withhold the governance
                     // reconcile, recorded so the terminal persist below still
@@ -239,8 +248,8 @@ pub async fn run_transformation(
                     }
                 }
                 // Soft model failure — skip governance, fall through.
-                Ok(_) => {}
-                Err(e) => {
+                Some(Ok(_)) => {}
+                Some(Err(e)) => {
                     // A runtime model failure (warehouse rejected the SQL, an
                     // unresolved upstream, ...) surfaces here as `Err`. Record it
                     // as a first-class run failure so the JSON `RunOutput` below
@@ -379,6 +388,13 @@ pub async fn run_transformation(
         for m in &output.materializations {
             crate::status_line!("  {} ({})", m.asset_key.join("."), m.metadata.strategy);
         }
+    }
+
+    // A cancelled run exits as interrupted, like the replication path: its
+    // record is persisted above, and the caller abandons the remote-state
+    // session without an upload (#1606, #1603).
+    if output.interrupted {
+        return Err(anyhow::Error::new(super::run::Interrupted));
     }
 
     // Propagate a hard `[budget]` breach (`on_breach = "error"`) now that the

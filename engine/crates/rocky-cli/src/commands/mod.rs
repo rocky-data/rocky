@@ -66,6 +66,7 @@ mod reuse_decision;
 pub(crate) mod review;
 mod run;
 mod run_audit;
+mod run_cancel;
 mod run_content_addressed;
 mod run_dag_exec;
 mod run_local;

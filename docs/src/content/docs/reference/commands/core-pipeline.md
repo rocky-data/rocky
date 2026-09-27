@@ -574,7 +574,7 @@ rocky run [flags]
 | `--shadow-suffix <SUFFIX>` | `string` | `_rocky_shadow` | Suffix appended to table names in shadow mode. |
 | `--shadow-schema <NAME>` | `string` | | Override schema for shadow tables (mutually exclusive with `--shadow-suffix`). |
 | `--branch <NAME>` | `string` | | Execute against a named branch previously registered with `rocky branch create`. Applies the branch's `schema_prefix` to every target (internally equivalent to `--shadow --shadow-schema <branch.schema_prefix>`). Mutually exclusive with `--shadow` / `--shadow-schema`. |
-| `--watch` | `bool` | `false` | Wrap the run in a filesystem watcher: re-execute the pipeline on every change to `rocky.toml` or any file under `models/`, debounced to 200 ms so editor save bursts coalesce into a single re-run. Failed runs do not exit the loop; Ctrl-C exits cleanly between runs. **v0 limitations:** mutually exclusive with `--dag`, `--resume`, `--resume-latest`, `--idempotency-key`, and `--model` (rejected at parse time). |
+| `--watch` | `bool` | `false` | Wrap the run in a filesystem watcher: re-execute the pipeline on every change to `rocky.toml` or any file under `models/`, debounced to 200 ms so editor save bursts coalesce into a single re-run. Failed runs do not exit the loop. One Ctrl-C or `SIGTERM` exits with status 0, between runs or during one (see [what a signal does](#what-a-signal-does-in-watch-mode)). **v0 limitations:** mutually exclusive with `--dag`, `--resume`, `--resume-latest`, `--idempotency-key`, and `--model` (rejected at parse time). |
 | `--defer` | `bool` | `false` | Build only the `--model`-selected models locally, resolving unbuilt upstream models to an existing (production) schema — the dbt-Core-style defer convenience. Takes effect **only together with `--model`**: a full run builds everything, so the flag is inert. Applies to transformation models; mutually exclusive with `--dag`. See the limitation note below. |
 | `--defer-to <SCHEMA>` | `string` | | Schema the deferred upstream models resolve to. Requires `--defer`. Defaults to each unbuilt upstream's own configured target schema (its production home); pass this to point every deferred reference at a single schema instead (catalog + table are preserved). |
 | `--skip-unchanged` | `bool` | `false` | Turn on the model-skip gate for this invocation regardless of the `[run] skip_unchanged` config: skip re-materializing a transformation model whose logic and every upstream's data both appear unchanged. **Best-effort optimization, not a result-equivalence guarantee** — non-deterministic SQL and models without provably-complete lineage (CTEs, subqueries, `PIVOT`/`UNNEST`, set operations) always rebuild. See [`[run]`](/reference/configuration/#run) for the full eligibility rules. |
@@ -709,6 +709,25 @@ rocky run --watch
 ```
 
 `--watch` watches the parent directory of `rocky.toml` (filtered to `rocky.toml` itself) plus the resolved `models/` directory recursively. The directory watch is FSEvents-safe on macOS: atomic-rename saves (vim's `:w`, VSCode's default) trigger correctly where a file-level watch can miss the new inode. Banner / "detected change" lines go to `stderr` so `stdout` stays parseable; with `--output json`, each iteration emits one `RunOutput` JSON object on `stdout` (newline-delimited).
+
+#### What a signal does in watch mode
+
+A signal between runs stops the watcher at once. A signal during a run stops the run in order:
+
+```
+  signal ──▶ no new table, layer or model starts
+         ──▶ work already running gets 5 seconds to finish, then Rocky stops waiting for it
+         ──▶ Rocky saves its state: finished tables' watermarks, table progress, the run record
+         ──▶ the run ends as interrupted ──▶ the watcher exits with status 0
+```
+
+The saved watermarks matter. Without them, the next run copies the finished tables' new rows again.
+
+An interrupted run does not upload its state to a remote `[state]` backend. This matches a plain `rocky run` that a signal interrupts.
+
+A second signal while the run saves its state stops the watcher at once, without waiting. Use it only when the run hangs.
+
+A statement that Rocky stopped waiting for can still hold the process for up to 5 seconds on exit. Rocky then ends it. Quality and snapshot pipelines have no stop points: they finish their current run before the watcher exits.
 
 ### Related Commands
 
