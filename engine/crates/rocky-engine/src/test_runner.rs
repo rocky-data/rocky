@@ -127,6 +127,10 @@ pub fn run_tests(
     // Execute locally
     let db = DuckDbConnector::in_memory()?;
 
+    // Before the seed runs: every target catalog exists, and a project's only
+    // catalog is the default one, as on the DuckDB adapter's database file.
+    crate::executor::prepare_local_catalogs(&compile_result, &db);
+
     // Auto-load seed data if a `data/seed.sql` file exists alongside `models/`.
     // Lets `rocky test` work on projects (like the playground) that ship inline
     // seed SQL without requiring users to load it manually.

@@ -110,7 +110,7 @@ A column can end up with type `Unknown`, which means the compiler could not infe
 ### What each step does
 
 1. **Compile.** Rocky compiles every model through the full pipeline: load, resolve, semantic graph, type check, contracts.
-2. **Execute locally.** Rocky executes each model's SQL against an in-memory DuckDB. It runs the models in dependency order, so an upstream model exists before a downstream model reads it.
+2. **Execute locally.** Rocky executes each model's SQL against an in-memory DuckDB. It runs the models in dependency order, so an upstream model exists before a downstream model reads it. The next section says where each model lands.
 3. **Validate.** Where a contract exists, Rocky checks the output schema against it. It reports the compilation diagnostics too.
 4. **Report.** Rocky prints a pass or fail line per model.
 
@@ -124,6 +124,21 @@ rocky test --models models/ --contracts contracts/
 # JSON output for CI systems
 rocky test --models models/ --output json
 ```
+
+### Where each model lands
+
+`rocky test` builds each model at its configured target, `catalog.schema.table`. That is the table a warehouse run writes.
+
+```
+  model orders ── [target] poc.staging.orders ──▶ table poc.staging.orders
+  model fct    ── SELECT ... FROM orders      ──▶ reads poc.staging.orders
+```
+
+- **A bare model name reads that model.** `FROM orders` in a model's SQL reads the target of model `orders`, the model the compiler bound to that name.
+- **Each catalog is a separate in-memory database.** Rocky attaches one for each target catalog, so `cat1.s.t` and `cat2.s.t` stay two tables.
+- **One catalog is the default one.** When every model names the same catalog, a read without a catalog resolves inside it, as on the DuckDB adapter's database file. That includes the tables `data/seed.sql` creates. With two or more catalogs, the default stays the in-memory one.
+- **Some catalog names are refused.** DuckDB reserves `main`, `memory`, `system` and `temp`, in any case. A model that targets one of them fails with a message that names the catalog.
+- **A failed model stops its consumers.** A model that depends on a failed model does not run. Its error names the upstream model and the upstream error.
 
 ### Test output
 

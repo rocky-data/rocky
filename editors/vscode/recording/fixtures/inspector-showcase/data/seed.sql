@@ -6,11 +6,10 @@
 
 CREATE SCHEMA IF NOT EXISTS demo;
 
--- Make `demo` the connection default schema. The file-DB `rocky run` path is
--- unaffected (it materializes via fully-qualified poc.demo.*), but the
--- in-memory `rocky test` path materializes each model output as a bare
--- `CREATE TABLE <model_name>` on this same connection — `USE demo` lands those
--- outputs in `demo` so model->model refs (`demo.dim_customers`, ...) resolve.
+-- Make `demo` the connection default schema. Both paths materialize each
+-- model at poc.demo.*. `rocky run` opens poc.duckdb, whose catalog is `poc`;
+-- the in-memory `rocky test` path makes the project's only catalog, `poc`,
+-- the default one, so model->model refs (`demo.dim_customers`, ...) resolve.
 USE demo;
 
 -- 50 customers. full_name / email / tax_id / country are all deterministic

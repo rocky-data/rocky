@@ -117,10 +117,9 @@ pub fn fold_identifier(s: &str) -> String {
 /// not (#1354).
 ///
 /// This is a question about the WAREHOUSE. `rocky test` / `rocky ci` go
-/// through `rocky_engine::executor::execute_locally`, which materializes every
-/// model as `CREATE OR REPLACE TABLE <model name>` and ignores the configured
-/// target — there a bare read of the name always reaches the model, whatever
-/// this returns. Callers must know which execution they are reasoning about.
+/// through `rocky_engine::executor::execute_locally`, which rewrites a bare
+/// read of a model's name to that model's configured target — there the read
+/// always reaches the model, whatever this returns. Callers must know which execution they are reasoning about.
 ///
 /// The comparison folds both sides through [`fold_identifier`], so a project
 /// that spells its targets in upper case (`[target] table = "CUSTOMERS"` for

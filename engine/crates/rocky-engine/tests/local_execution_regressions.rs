@@ -11,10 +11,12 @@
 //! DuckDB `error(...)` that names the value when the value is wrong, so the
 //! consumer's pass or fail in the `rocky test` result IS the value it read.
 //!
-//! Shapes 1 and 2 assert the invariant only where #2044 decision 1 is still
-//! open. Shape 2 asserts E038: #2044 decision 2 made `type = "ephemeral"` a
-//! compile error (#1996). Shape 6 pins the `D012` text against what the
-//! binary does today; the step-1 rebuild of #1354 flips both halves together.
+//! Shape 1 asserts that both values survive: #2044 decision 1 (ruling
+//! 2026-09-26) emulates each catalog as an attached DuckDB database. Shape 2
+//! asserts E038: #2044 decision 2 made `type = "ephemeral"` a compile error
+//! (#1996). Shape 6 pins the `D012` text against what the binary does since
+//! #1354 step 1: each model lands at its configured target, and a bare read
+//! of a model's name is bound to that target.
 
 use std::path::{Path, PathBuf};
 
@@ -95,7 +97,8 @@ fn has_error_code(result: &TestResult, model: &str, code: &str) -> bool {
 }
 
 /// Shape 1: two catalogs, one `schema.table`. Two distinct warehouse objects
-/// never silently become one: both values survive, or the run refuses.
+/// never silently become one: each catalog is its own attached database, so
+/// both values survive (#2044 decision 1).
 #[test]
 fn shape1_two_catalogs_one_schema_table_never_merge() {
     let (_root, models) = project();
@@ -116,18 +119,30 @@ fn shape1_two_catalogs_one_schema_table_never_merge() {
         "",
     );
 
-    let result = test(&models, None);
-    let both_survive = passed(&result, "read_a") && passed(&result, "read_b");
-    let refused = !result.failures.is_empty()
-        && !read_a_wrong_value(&result, "read_a")
-        && !read_a_wrong_value(&result, "read_b")
-        && !passed(&result, "read_a")
-        && !passed(&result, "read_b");
-    assert!(
-        both_survive || refused,
-        "both values must survive, or the run must refuse by name: {:?}",
-        result.model_results
+    // Three-part reads name the objects directly, bypassing the binding.
+    model(
+        &models,
+        "raw_a",
+        &consumer_sql("cat1.s.t", 1),
+        ["cat1", "s", "raw_a"],
+        "depends_on = [\"a\", \"b\"]\n",
     );
+    model(
+        &models,
+        "raw_b",
+        &consumer_sql("cat2.s.t", 2),
+        ["cat1", "s", "raw_b"],
+        "depends_on = [\"a\", \"b\"]\n",
+    );
+
+    let result = test(&models, None);
+    for reader in ["read_a", "read_b", "raw_a", "raw_b"] {
+        assert!(
+            passed(&result, reader),
+            "{reader}: both values survive: {:?}",
+            result.model_results
+        );
+    }
 }
 
 /// Shape 2: an ephemeral model shares a real model's target. E038 refuses the
@@ -302,9 +317,9 @@ fn shape5_an_unparseable_schema_fails_only_its_own_model() {
 }
 
 /// Shape 6: a renamed target and a bare read of the model's name. The `D012`
-/// text says what `rocky test` does: it materializes each model under its own
-/// name. So the bare read reaches the model. When #1354's step 1 changes the
-/// binary, the text and this behaviour change together.
+/// text says what `rocky test` does since #1354 step 1: `m` lands at its
+/// configured target `main.renamed`, and the bare read of `m` is bound to that
+/// target, the edge the compiler derived. Nothing is left under the name `m`.
 #[test]
 fn shape6_the_d012_text_describes_what_rocky_test_does() {
     let (_root, models) = project();
@@ -316,6 +331,20 @@ fn shape6_the_d012_text_describes_what_rocky_test_does() {
         ["", "main", "reader"],
         "",
     );
+    model(
+        &models,
+        "physical",
+        &consumer_sql("renamed", 3),
+        ["", "main", "physical"],
+        "depends_on = [\"m\"]\n",
+    );
+    model(
+        &models,
+        "by_name",
+        &consumer_sql("main.m", 3),
+        ["", "main", "by_name"],
+        "depends_on = [\"m\"]\n",
+    );
 
     let result = test(&models, None);
     let d012 = result
@@ -324,14 +353,26 @@ fn shape6_the_d012_text_describes_what_rocky_test_does() {
         .find(|d| &*d.code == "D012" && d.model == "reader")
         .unwrap_or_else(|| panic!("D012 on reader: {:?}", result.diagnostics));
     assert!(
-        d012.message
-            .contains("`rocky test` and `rocky ci` materialize each model under its own name"),
+        d012.message.contains(
+            "`rocky test` and `rocky ci` rewrite a bare read of a model's name to that \
+                 model's configured target"
+        ),
         "D012 names the local behaviour: {}",
         d012.message
     );
     assert!(
         passed(&result, "reader"),
         "the behaviour D012 describes: the bare read of m reaches m: {:?}",
+        result.model_results
+    );
+    assert!(
+        passed(&result, "physical"),
+        "m landed at its configured target main.renamed: {:?}",
+        result.model_results
+    );
+    assert!(
+        matches!(outcome(&result, "by_name"), Some((ModelTestStatus::Fail, Some(e))) if e.contains("Table with name m does not exist")),
+        "nothing is left under the model's name: {:?}",
         result.model_results
     );
 }

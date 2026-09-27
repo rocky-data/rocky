@@ -14,11 +14,11 @@
 //! through connection state to a PHYSICAL table called `customers` — which is
 //! not the output of a model that writes `prod.customers_v2`. On the local
 //! path it is: `rocky_engine::executor::execute_locally` (`rocky test`,
-//! `rocky ci`) materializes every model as `CREATE OR REPLACE TABLE
-//! <model name>`, ignoring the configured target, so there the bare read does
-//! reach the model.
+//! `rocky ci`) materializes each model at its configured target and rewrites
+//! a bare read of a model's name to that target — this binding — so there the
+//! bare read does reach the model.
 //!
-//! The edge is therefore kept — dropping it breaks the local path and can
+//! The edge is therefore kept — dropping it is #1354 step 2, and it can
 //! reorder `semantic.rs`, changing `SELECT *` expansion — and the ambiguity is
 //! reported instead, as D012. `rocky_core::physical_edges::bare_name_binds` is
 //! the shared spelling of "does a bare read of this name reach this model's
@@ -186,9 +186,9 @@ pub fn resolve_dependencies(models: &[Model]) -> Result<ResolveOutput, ResolveEr
         // D012: this edge exists because the names match, and on a warehouse
         // run it may name a different object than the model writes. The edge is
         // KEPT — `rocky_engine::executor::execute_locally` (`rocky test`,
-        // `rocky ci`) materializes each model under its own NAME, so there the
-        // read really does reach it, and dropping the edge would break that
-        // path and reorder `semantic.rs` (changing `SELECT *` expansion).
+        // `rocky ci`) rewrites the read to the model's configured target, so
+        // there it really does reach it, and dropping the edge (#1354 step 2)
+        // also reorders `semantic.rs` (changing `SELECT *` expansion).
         // Reporting is what this layer can honestly do; #1354 holds the
         // decision about which execution semantics the graph should encode.
         for bare in &renamed_target_reads {
@@ -203,10 +203,10 @@ pub fn resolve_dependencies(models: &[Model]) -> Result<ResolveOutput, ResolveEr
                          '{target}'. A bare name carries no schema, so on a warehouse run it \
                          resolves through the connection's search path to a physical table \
                          called '{bare}', not to '{target}', and the edge may be false. It \
-                         holds where the bare name IS the object: `rocky test` and `rocky ci` \
-                         materialize each model under its own name, and `--defer` rewrites a \
-                         selected model's read of an unbuilt upstream to that upstream's defer \
-                         target."
+                         holds where Rocky rewrites the read itself: `rocky test` and \
+                         `rocky ci` rewrite a bare read of a model's name to that model's \
+                         configured target, and `--defer` rewrites a selected model's read of \
+                         an unbuilt upstream to that upstream's defer target."
                     ),
                 )
                 .with_suggestion(format!(
@@ -442,10 +442,9 @@ mod tests {
     }
 
     /// A bare name matching a model NAME is a model reference. #1354 asked
-    /// whether it should instead match the model's TARGET; the answer is not
-    /// this layer's to give (`rocky test` materializes by model name, so both
-    /// answers are right on some path), so the rule is unchanged and the
-    /// ambiguous case is reported as D012 instead.
+    /// whether it should instead match the model's TARGET. That is #1354 step
+    /// 2, and until it lands `rocky test` binds the read through this rule, so
+    /// the rule is unchanged and the ambiguous case is reported as D012.
     #[test]
     fn test_classify_bare_name_model() {
         let models: HashSet<String> = ["orders", "customers"]
@@ -583,10 +582,9 @@ mod tests {
     /// a differently-named table. The edge is KEPT and the ambiguity reported.
     ///
     /// Keeping it is not indecision. `rocky_engine::executor::execute_locally`
-    /// (`rocky test`, `rocky ci`) materializes every model as
-    /// `CREATE OR REPLACE TABLE <model name>`, ignoring the configured target,
-    /// so on that path this read really does return the model's output and the
-    /// edge orders it correctly. On a warehouse run it does not. One graph, two
+    /// (`rocky test`, `rocky ci`) rewrites this read to the model's configured
+    /// target, so on that path it really does return the model's output and
+    /// the edge orders it correctly. On a warehouse run it does not. One graph, two
     /// execution semantics — D012 says so rather than picking silently.
     #[test]
     fn a_bare_read_of_a_renamed_target_models_name_keeps_its_edge_and_warns() {
@@ -600,7 +598,7 @@ mod tests {
         assert_eq!(
             rollup.depends_on,
             vec!["customers"],
-            "the edge is kept: dropping it breaks `rocky test`, which materializes by name"
+            "the edge is kept: `rocky test` binds this read to the model through it"
         );
 
         let d012: Vec<&Diagnostic> = diags.iter().filter(|d| &*d.code == "D012").collect();
