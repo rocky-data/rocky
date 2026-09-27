@@ -170,6 +170,7 @@ async fn drive_run(
         None,  // governed_ctx
         false, // assume_fresh_state
         None,  // #1460
+        None,
     )
     .await
     .map(|_| ())
@@ -222,6 +223,7 @@ async fn drive_run_governed(config_path: &Path, state_path: &Path) -> anyhow::Re
         Some(&ctx),
         false, // assume_fresh_state
         None,  // #1460
+        None,
     )
     .await
     .map(|_| ())

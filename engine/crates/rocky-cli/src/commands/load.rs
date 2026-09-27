@@ -52,12 +52,15 @@ pub async fn run_load(
     truncate: bool,
     durability: rocky_core::state_sync::FinalizeDurability,
     json: bool,
+    // #1609: the caller's registry, or `None` to build one from `loaded`.
+    // `run::run` passes its `registry_override` through.
+    registry_override: Option<&std::sync::Arc<AdapterRegistry>>,
 ) -> Result<()> {
     let start = Instant::now();
 
     // The caller's threaded snapshot (formerly a self-load here — #1120).
     let rocky_cfg = &loaded.config;
-    let registry = AdapterRegistry::from_config(rocky_cfg)?;
+    let registry = AdapterRegistry::for_run(rocky_cfg, registry_override)?;
 
     // Resolve pipeline to get the target adapter.
     let (pipeline_name, pipeline_cfg) =
@@ -1380,6 +1383,7 @@ required_columns = [
             false,
             rocky_core::state_sync::FinalizeDurability::ConfigDefault,
             json,
+            None,
         )
         .await
     }

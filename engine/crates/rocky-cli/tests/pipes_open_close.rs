@@ -157,6 +157,7 @@ async fn drive_run(
         None,  // governed_ctx
         false, // assume_fresh_state
         None,  // #1460
+        None,
     )
     .await
     .map(|_| ())

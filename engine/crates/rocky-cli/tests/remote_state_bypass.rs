@@ -217,6 +217,7 @@ async fn drive_run(
         None,  // governed_ctx
         false, // assume_fresh_state
         None,  // #1460
+        None,
     )
     .await
     .map(|_| ())
@@ -275,6 +276,7 @@ async fn drive_run_governed(
         Some(&ctx),
         false, // assume_fresh_state
         None,  // #1460
+        None,
     )
     .await
     .map(|_| ())
@@ -371,6 +373,7 @@ async fn drive_load(project: &LoadProject) -> anyhow::Result<()> {
         false,
         rocky_core::state_sync::FinalizeDurability::ConfigDefault,
         false,
+        None,
     )
     .await
 }

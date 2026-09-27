@@ -761,6 +761,7 @@ mod tests {
             None,  // no governance ctx (test)
             false, // assume_fresh_state (test)
             None,  // #1460
+            None,
         )
         .await
         .expect("the scaffolded duckdb project must run end to end");

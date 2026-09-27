@@ -191,6 +191,7 @@ fn default_sub_runner(seed_names: Arc<BTreeSet<String>>) -> SubRunner {
                     // `--assume-fresh-state` is not surfaced on the DAG path.
                     false,
                     None, // #1460: DAG sub-run, no persisted plan
+                    None,
                 )
                 .await
                 .map(|_| ())

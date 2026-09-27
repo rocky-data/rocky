@@ -2844,6 +2844,14 @@ pub async fn run(
     // SAME `decide_drift_scope` rule at the point the work is actually built,
     // which keeps the filter-scope tolerance identical.
     reviewed_source_state: Option<(&str, &[crate::output::ReplicationConnectorSnapshot])>,
+    // #1609: an adapter registry the caller already built. `None` for every
+    // production caller today — each site below builds its own from `loaded`,
+    // byte-identical to before. `Some` is used by EVERY site in the run path
+    // that needs adapters (the model-only arm, the transformation, quality,
+    // snapshot and load arms, and the replication path), via
+    // `AdapterRegistry::for_run`. That is what lets a test install a registry
+    // that records governance calls and assert a whole run made none.
+    registry_override: Option<Arc<AdapterRegistry>>,
 ) -> Result<RunTermination> {
     // With `-o json` stdout is reserved for the JSON payload — route any
     // human-readable summary/progress line (e.g. a `depends_on` upstream
@@ -3010,7 +3018,7 @@ pub async fn run(
     // when it controls the DAG scheduling.
     if let Some(target_model) = model_name_filter {
         ensure_resume_supported(resume_requested, false, "model-only")?;
-        let adapter_registry = AdapterRegistry::from_config(rocky_cfg)?;
+        let adapter_registry = AdapterRegistry::for_run(rocky_cfg, registry_override.as_ref())?;
         // An explicit `--pipeline` alongside `--model` (also how the unified-DAG
         // sub-runner drives each transformation node) resolves the model against
         // THAT pipeline's target adapter and schema-creation policy — not the
@@ -3660,6 +3668,7 @@ pub async fn run(
                 // executor when a governed plan reviewed a non-empty model set but
                 // its models directory is gone. `false` for a bare run.
                 governed_ctx.is_some_and(|c| c.expects_models),
+                registry_override.as_ref(),
             )
             .await;
             match dispatch_result {
@@ -3807,6 +3816,7 @@ pub async fn run(
                 started_at,
                 &config_hash,
                 pipeline_name,
+                registry_override.as_ref(),
             )
             .await;
             match dispatch_result {
@@ -3921,6 +3931,7 @@ pub async fn run(
                 started_at,
                 &config_hash,
                 pipeline_name,
+                registry_override.as_ref(),
             )
             .await;
             match dispatch_result {
@@ -3994,6 +4005,7 @@ pub async fn run(
                     rocky_core::state_sync::FinalizeDurability::ConfigDefault
                 },
                 output_json,
+                registry_override.as_ref(),
             )
             .await?;
             finalize_idempotency_on_success(&mut idempotency_ctx, state_path, &run_id).await;
@@ -4131,7 +4143,7 @@ pub async fn run(
     let entry_marker_freezes = freeze_fence.active_snapshot().await?;
 
     // Build adapter registry and resolve adapters
-    let adapter_registry = AdapterRegistry::from_config(rocky_cfg)?;
+    let adapter_registry = AdapterRegistry::for_run(rocky_cfg, registry_override.as_ref())?;
     let warehouse_adapter = adapter_registry.warehouse_adapter(&pipeline.target.adapter)?;
 
     // Batch check adapter (optional): present when the warehouse has any
@@ -16220,6 +16232,7 @@ max_retries = 0
                 None,
                 false,
                 None,
+                None,
             )
             .await
         })
@@ -16301,6 +16314,7 @@ row_count = true
                 Some("quality-branch-refused"),
                 None,
                 false,
+                None,
                 None,
             )
             .await
@@ -16494,6 +16508,7 @@ max_retries = 0
                 None,
                 false,
                 None,
+                None,
             )
             .await
         })
@@ -16653,6 +16668,7 @@ max_retries = 0
                 Some(run_id),
                 None,
                 false,
+                None,
                 None,
             )
             .await
@@ -19706,6 +19722,7 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
             None,
             false,
             None,
+            None,
         )
         .await
         .map(|_| ())
@@ -20531,6 +20548,7 @@ auto_create_schemas = true
             Some(run_id),
             None,
             false,
+            None,
             None,
         )
         .await
@@ -22285,6 +22303,7 @@ auto_create_schemas = true
             None,
             false,
             Some(("plan-under-test", reviewed.as_slice())),
+            None,
         )
         .await
         .expect_err("a reviewed state that does not match discovery must refuse");
@@ -22441,6 +22460,7 @@ threshold = 0
             None,
             false,
             None,
+            None,
         )
         .await
         .expect_err("a check-name collision must refuse the run before copying anything");
@@ -22563,6 +22583,7 @@ adapter = "default"
             None,  // no governance ctx (test)
             false, // assume_fresh_state (test)
             None,  // #1460
+            None,
         )
         .await
         .expect("transformation run should succeed");
@@ -22761,6 +22782,7 @@ adapter = "default"
                     None,
                     false,
                     None,
+                    None,
                 )
                 .await;
                 let commit_path =
@@ -22938,6 +22960,7 @@ adapter = "default"
             Some(&run_id),
             None,
             false,
+            None,
             None,
         )
         .await;
@@ -23178,6 +23201,7 @@ schema_template = "staging__{{source}}"
             None,
             false,
             None,
+            None,
         )
         .await;
         assert!(result.is_err(), "the model write must fail: {failure}");
@@ -23312,6 +23336,7 @@ adapter = "default"
                 None,
                 false,
                 None, // #1460
+                None,
             ))
             .expect("the run must succeed regardless of the trace context");
         }
@@ -23462,6 +23487,7 @@ schema = "mart"
             None,  // no governance ctx (test)
             false, // assume_fresh_state (test)
             None,  // #1460
+            None,
         )
         .await
         .expect(
@@ -27137,6 +27163,7 @@ timestamp_column = "ts"
                 None,
                 false,
                 None, // #1460
+                None,
             )
             .await
         }
@@ -27326,6 +27353,7 @@ backend = "local"
             None,
             false,
             None, // #1460
+            None,
         )
         .await
         .expect_err("a source without the timestamp column must fail the table");
@@ -27437,6 +27465,7 @@ backend = "local"
                 None,
                 false,
                 None, // #1460
+                None,
             )
             .await
             .map(|_| ())
@@ -40695,6 +40724,7 @@ value = "'{source}'"
                 None,
                 false,
                 None,
+                None,
             )
             .await
         }
@@ -40761,6 +40791,178 @@ value = "'{source}'"
             "the refusal issued warehouse statements; the guard is no longer \
              ahead of the setup loop. calls: {:?}",
             treat_log.calls()
+        );
+    }
+
+    /// #1609: a refused `metadata_columns[].value` issues **zero governance
+    /// calls** over the whole run — no catalog tag, workspace binding,
+    /// isolation or grant call, through any site that asks the registry.
+    ///
+    /// ```text
+    ///   test ── AdapterRegistry::from_config(..).with_governance_log(log)
+    ///             │
+    ///             └─► run(.., Some(registry)) ── every for_run site ──► log
+    ///
+    ///   control   (no metadata column) ─► preflight passes ─► set_tags, …
+    ///   treatment (hostile value)       ─► preflight REFUSES ─► log empty
+    /// ```
+    ///
+    /// The statement-log test above proves no SQL was issued. This one proves
+    /// the governance trait was never called, which that log cannot see on an
+    /// adapter whose governance is not SQL. The control is load-bearing: it
+    /// shows the injected registry is the one the run used. A registry the run
+    /// rebuilt from config carries no log, so the control would record nothing.
+    ///
+    /// It also records what the refusal does NOT yet promise: the state store
+    /// is opened before the preflight (see the last assertion).
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn a_refused_metadata_value_issues_no_governance_call() {
+        use rocky_core::traits::GovernanceLog;
+
+        const SOURCE_SCHEMA: &str = "raw__ship-it";
+
+        const CONFIG: &str = r#"
+[adapter.default]
+type = "duckdb"
+path = "__FIXTURE__"
+
+[adapter.rec]
+type = "recording"
+path = "__KEY__"
+
+[pipeline.ingest]
+strategy = "full_refresh"
+__METADATA__
+[pipeline.ingest.source.discovery]
+adapter = "default"
+
+[pipeline.ingest.source.schema_pattern]
+prefix = "raw__"
+separator = "__"
+components = ["source"]
+
+[pipeline.ingest.target]
+adapter = "rec"
+catalog_template = "fixture"
+schema_template = "staging"
+
+[pipeline.ingest.target.governance]
+auto_create_catalogs = true
+auto_create_schemas = true
+"#;
+
+        const HOSTILE_METADATA: &str = r#"
+[[pipeline.ingest.metadata_columns]]
+name = "_src"
+type = "VARCHAR"
+value = "'{source}'"
+"#;
+
+        async fn drive(
+            dir: &std::path::Path,
+            metadata: &str,
+            log: &GovernanceLog,
+        ) -> Result<RunTermination> {
+            let fixture = dir.join("fixture.duckdb");
+            {
+                let seed = rocky_duckdb::adapter::DuckDbWarehouseAdapter::open(&fixture)
+                    .expect("open the duckdb fixture");
+                for sql in [
+                    format!("CREATE SCHEMA \"{SOURCE_SCHEMA}\""),
+                    format!("CREATE TABLE \"{SOURCE_SCHEMA}\".orders AS SELECT 1 AS id"),
+                ] {
+                    seed.execute_statement(&sql).await.expect("seed the source");
+                }
+            }
+
+            let config_path = dir.join("rocky.toml");
+            std::fs::write(
+                &config_path,
+                CONFIG
+                    .replace("__FIXTURE__", &fixture.display().to_string())
+                    .replace("__KEY__", &dir.join("calls").display().to_string())
+                    .replace("__METADATA__", metadata),
+            )
+            .expect("write rocky.toml");
+            let loaded = rocky_core::config::load_rocky_config_fingerprinted(&config_path).unwrap();
+            let registry = AdapterRegistry::from_config(&loaded.config)
+                .expect("build the registry")
+                .with_governance_log(log.clone());
+
+            let opts = PartitionRunOptions::default();
+            super::run(
+                &config_path,
+                std::sync::Arc::new(loaded),
+                None,
+                None,
+                &dir.join("state.redb"),
+                None,
+                false,
+                None,
+                false,
+                None,
+                false,
+                None,
+                &opts,
+                None,
+                None,
+                None,
+                None,
+                &DeferOptions::default(),
+                &SkipRunOptions::default(),
+                &rocky_core::run_vars::RunVars::new(),
+                None,
+                None,
+                false,
+                None,
+                Some(std::sync::Arc::new(registry)),
+            )
+            .await
+        }
+
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+
+        // --- Control: the preflight passes and the setup loop tags the
+        // catalog it creates, through the injected registry.
+        let control_dir = tmp.path().join("control");
+        std::fs::create_dir_all(&control_dir).unwrap();
+        let control_log = GovernanceLog::default();
+        let _ = drive(&control_dir, "", &control_log).await;
+        assert!(
+            control_log.methods().contains(&"set_tags"),
+            "the control must reach governance through the injected registry, or \
+             an empty treatment log proves nothing. calls: {:?}",
+            control_log.methods()
+        );
+
+        // --- Treatment: the hostile metadata value is refused.
+        let treat_dir = tmp.path().join("treatment");
+        std::fs::create_dir_all(&treat_dir).unwrap();
+        let treat_log = GovernanceLog::default();
+        let refused = drive(&treat_dir, HOSTILE_METADATA, &treat_log)
+            .await
+            .expect_err("a non-identifier schema component in a metadata value must be refused");
+        let msg = format!("{refused:#}");
+        assert!(
+            msg.contains("metadata_columns") && msg.contains("ship-it"),
+            "the refusal must be THE metadata-columns refusal; got: {msg}"
+        );
+        assert!(
+            treat_log.is_empty(),
+            "the refused run issued governance calls: {:?}",
+            treat_log.methods()
+        );
+
+        // PINS A GAP, not a contract (#1609 point 1): the state store opens
+        // before the preflight, because resume resolution and the governed
+        // replication gate read it first, and the end-of-run retention sweep
+        // reopens it on the error path anyway. When the refusal moves ahead
+        // of the store, this assertion flips.
+        assert!(
+            treat_dir.join("state.redb").exists(),
+            "the state store is no longer opened before the refusal — update \
+             this assertion and #1609"
         );
     }
 
@@ -42306,6 +42508,7 @@ auto_create_schemas = true
             Some(run_id),
             None,
             false,
+            None,
             None,
         )
         .await

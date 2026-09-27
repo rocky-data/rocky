@@ -123,6 +123,9 @@ pub async fn run_transformation(
     // the legitimate no-op silent-skip. `false` for a bare `rocky run` and for a
     // governed plan with an empty reviewed set — both keep the silent-skip.
     expects_models: bool,
+    // #1609: the caller's registry, or `None` to build one from `rocky_cfg`.
+    // See `run::run`'s `registry_override`.
+    registry_override: Option<&std::sync::Arc<AdapterRegistry>>,
 ) -> Result<()> {
     let start = Instant::now();
 
@@ -131,7 +134,7 @@ pub async fn run_transformation(
         p.log("INFO", "rocky run starting (transformation pipeline)");
     }
 
-    let adapter_registry = AdapterRegistry::from_config(rocky_cfg)?;
+    let adapter_registry = AdapterRegistry::for_run(rocky_cfg, registry_override)?;
     let warehouse_adapter = adapter_registry.warehouse_adapter(&pipeline.target.adapter)?;
     let concurrency = pipeline.execution.concurrency.max_concurrency();
 
@@ -559,6 +562,9 @@ pub async fn run_quality(
     // The resolved `--pipeline` name, stamped onto the persisted `RunRecord` so
     // the reconciler can answer `after`/`freshness` demands on this pipeline.
     pipeline_name: &str,
+    // #1609: the caller's registry, or `None` to build one from `rocky_cfg`.
+    // See `run::run`'s `registry_override`.
+    registry_override: Option<&std::sync::Arc<AdapterRegistry>>,
 ) -> Result<()> {
     let start = Instant::now();
 
@@ -567,7 +573,7 @@ pub async fn run_quality(
         p.log("INFO", "rocky run starting (quality pipeline)");
     }
 
-    let adapter_registry = AdapterRegistry::from_config(rocky_cfg)?;
+    let adapter_registry = AdapterRegistry::for_run(rocky_cfg, registry_override)?;
     let warehouse_adapter = adapter_registry.warehouse_adapter(&pipeline.target.adapter)?;
     let dialect = warehouse_adapter.dialect();
 
@@ -1432,6 +1438,9 @@ pub async fn run_snapshot(
     config_hash: &str,
     // The resolved `--pipeline` name, stamped onto the persisted `RunRecord`.
     pipeline_name: &str,
+    // #1609: the caller's registry, or `None` to build one from `rocky_cfg`.
+    // See `run::run`'s `registry_override`.
+    registry_override: Option<&std::sync::Arc<AdapterRegistry>>,
 ) -> Result<()> {
     let start = Instant::now();
 
@@ -1440,7 +1449,7 @@ pub async fn run_snapshot(
         p.log("INFO", "rocky run starting (snapshot pipeline)");
     }
 
-    let adapter_registry = AdapterRegistry::from_config(rocky_cfg)?;
+    let adapter_registry = AdapterRegistry::for_run(rocky_cfg, registry_override)?;
     let warehouse_adapter = adapter_registry.warehouse_adapter(&pipeline.target.adapter)?;
 
     let mut output = RunOutput::new(String::new(), 0, 1);
@@ -1722,6 +1731,7 @@ mod tests {
             None,  // no governance ctx (test)
             false, // assume_fresh_state (test)
             None,  // #1460
+            None,
         )
         .await
         .expect("full-DAG transformation run should succeed");
@@ -1858,6 +1868,7 @@ auto_create_schemas = true
             None,
             false,
             None, // #1460
+            None,
         )
         .await
         .expect("--model with --pipeline must resolve that pipeline's models dir");
@@ -1938,6 +1949,7 @@ auto_create_schemas = true
             None,
             false,
             None, // #1460
+            None,
         )
         .await
         .map(|_| ())
@@ -2328,6 +2340,7 @@ auto_create_schemas = true
             None,  // no governance ctx (test)
             false, // assume_fresh_state (test)
             None,  // #1460
+            None,
         )
         .await
         .expect("full-DAG transformation run with idempotency key should succeed");
@@ -2660,6 +2673,7 @@ auto_create_schemas = true
             None,  // no governance ctx (test)
             false, // assume_fresh_state (test)
             None,  // #1460
+            None,
         )
         .await
         .expect("model-only run must reach the governance.tags apply path and succeed");
@@ -2741,6 +2755,7 @@ auto_create_schemas = true
             None,  // no governance ctx (test)
             false, // assume_fresh_state (test)
             None,  // #1460
+            None,
         )
         .await;
 
@@ -3625,6 +3640,7 @@ auto_create_schemas = true
             None,  // exec_fp_gate
             None,  // freeze_fence
             false, // expects_models
+            None,
         )
         .await
         .expect("an Absent decision is the silent no-op, even with the dir on disk");

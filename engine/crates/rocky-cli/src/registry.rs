@@ -18,7 +18,8 @@ use rocky_core::adapter_capability::capability_for;
 use rocky_core::config::{AdapterConfig, AdapterKind, RockyConfig};
 use rocky_core::source::ManualDiscoveryAdapter;
 use rocky_core::traits::{
-    BatchCheckAdapter, DiscoveryAdapter, GovernanceAdapter, NoopGovernanceAdapter, WarehouseAdapter,
+    BatchCheckAdapter, DiscoveryAdapter, GovernanceAdapter, GovernanceLog, NoopGovernanceAdapter,
+    RecordingGovernanceAdapter, WarehouseAdapter,
 };
 
 use rocky_catalog_core::GovernanceCatalogClient;
@@ -101,9 +102,47 @@ pub struct AdapterRegistry {
     #[cfg(feature = "duckdb")]
     duckdb_connectors: HashMap<String, Arc<std::sync::Mutex<rocky_duckdb::DuckDbConnector>>>,
     adapter_configs: HashMap<String, AdapterConfig>,
+    /// When set, every governance adapter this registry hands out records its
+    /// calls here. See [`AdapterRegistry::with_governance_log`] (#1609).
+    governance_log: Option<GovernanceLog>,
 }
 
 impl AdapterRegistry {
+    /// The registry one `rocky run` uses: the caller's, when it passed one,
+    /// else a fresh one built from `config`.
+    ///
+    /// Every site in the run path that needs adapters goes through this, so
+    /// a registry passed to [`crate::commands::run::run`] reaches all of them.
+    /// An override honoured at one site and not another would be a partial
+    /// wire: a test could pass while another path made the calls (#1609).
+    pub fn for_run(
+        config: &RockyConfig,
+        registry_override: Option<&Arc<AdapterRegistry>>,
+    ) -> Result<Arc<AdapterRegistry>> {
+        match registry_override {
+            Some(registry) => Ok(Arc::clone(registry)),
+            None => Ok(Arc::new(Self::from_config(config)?)),
+        }
+    }
+
+    /// Record every governance call made through this registry into `log`.
+    ///
+    /// [`Self::governance_adapter`] then wraps the adapter it would have
+    /// returned in a [`RecordingGovernanceAdapter`], so behaviour is unchanged
+    /// and every call lands in `log`. [`Self::governance_catalog_client`]
+    /// returns `None` instead: grants then take the
+    /// [`GovernanceAdapter::apply_grants`] path, which is recorded. Without
+    /// that, a Databricks REST grant would bypass the log.
+    ///
+    /// This is how a test proves a whole run issued no catalog, tag, binding
+    /// or grant call (#1609). It is a value on the registry, not a thread-local
+    /// or a global: a call made on another tokio worker thread still reaches
+    /// the same log.
+    pub fn with_governance_log(mut self, log: GovernanceLog) -> Self {
+        self.governance_log = Some(log);
+        self
+    }
+
     /// Returns the list of adapter type strings the registry knows how
     /// to construct.
     ///
@@ -594,6 +633,7 @@ impl AdapterRegistry {
             #[cfg(feature = "duckdb")]
             duckdb_connectors,
             adapter_configs,
+            governance_log: None,
         })
     }
 
@@ -698,6 +738,14 @@ impl AdapterRegistry {
     ///   (`Ok(None)`) so `retention-status --drift` degrades to "no
     ///   observation" on those adapters.
     pub fn governance_adapter(&self, name: &str) -> Box<dyn GovernanceAdapter> {
+        let adapter = self.unrecorded_governance_adapter(name);
+        match &self.governance_log {
+            Some(log) => Box::new(RecordingGovernanceAdapter::wrapping(log.clone(), adapter)),
+            None => adapter,
+        }
+    }
+
+    fn unrecorded_governance_adapter(&self, name: &str) -> Box<dyn GovernanceAdapter> {
         if let Some(connector) = self.connectors.get(name).cloned() {
             let adapter_cfg = self.adapter_configs.get(name);
             let auth = adapter_cfg.and_then(|cfg| {
@@ -743,6 +791,10 @@ impl AdapterRegistry {
         &self,
         name: &str,
     ) -> Option<Arc<dyn GovernanceCatalogClient>> {
+        // A recorded registry routes grants through the recorded adapter.
+        if self.governance_log.is_some() {
+            return None;
+        }
         if self.connectors.contains_key(name) {
             let adapter_cfg = self.adapter_configs.get(name)?;
             let host = adapter_cfg.host.as_deref()?;

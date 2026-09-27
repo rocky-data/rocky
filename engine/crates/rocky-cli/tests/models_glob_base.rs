@@ -135,6 +135,7 @@ async fn run_pipeline(config_path: &Path, state_path: &Path) -> anyhow::Result<(
         None, // governed_ctx
         false,
         None, // #1460
+        None,
     )
     .await
     .map(|_| ())
@@ -171,6 +172,7 @@ async fn run_pipeline_model(config_path: &Path, state_path: &Path) -> anyhow::Re
         None,
         false,
         None, // #1460
+        None,
     )
     .await
     .map(|_| ())

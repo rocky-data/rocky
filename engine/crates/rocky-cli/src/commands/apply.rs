@@ -1029,6 +1029,7 @@ async fn execute_run_plan(
         // a persisted plan — the two-step apply path always runs without it.
         false,
         None, // #1460: not a replication plan
+        None,
     )
     .await
     .with_context(|| format!("rocky apply run plan '{plan_id}' failed"))
@@ -4572,6 +4573,7 @@ async fn run_apply_replication_plan(
         // a persisted plan — the replication apply path always runs without it.
         false,
         Some((plan_id, replication_plan.source_state_snapshot.as_slice())), // #1460
+        None,
     )
     .await
     .with_context(|| format!("rocky apply replication plan '{plan_id}' failed"))?;
@@ -5035,6 +5037,7 @@ pub async fn run_apply_inline_for_run(
         // validated it against the configured `[state]` backend).
         assume_fresh_state,
         None, // #1460: inline `rocky run`, not a persisted plan
+        None,
     )
     .await
     .map(|_| ())
