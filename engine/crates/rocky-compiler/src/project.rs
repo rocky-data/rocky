@@ -1058,7 +1058,7 @@ mod tests {
     fn external_dependency_names_leave_the_project_dag() {
         let with_deps = |deps: &[&str]| {
             let mut stg = make_model("stg_orders", "SELECT 1 AS id");
-            stg.config.depends_on = deps.iter().map(|d| d.to_string()).collect();
+            stg.config.depends_on = deps.iter().map(ToString::to_string).collect();
             vec![make_model("customers", "SELECT 1 AS id"), stg]
         };
         let external: BTreeSet<String> = ["orders".to_string(), "customers".to_string()].into();

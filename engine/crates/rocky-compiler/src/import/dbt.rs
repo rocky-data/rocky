@@ -4104,7 +4104,7 @@ FROM {{ ref('stg_events') }}
     /// dbt emits it against an existing table.
     fn keyed_is_incremental_manifest(
         invocation_id: &str,
-        config: serde_json::Value,
+        config: &serde_json::Value,
     ) -> serde_json::Value {
         serde_json::json!({
             "metadata": { "project_name": "p", "invocation_id": invocation_id },
@@ -4177,7 +4177,7 @@ FROM {{ ref('stg_events') }}
                 Some(compile_run_results("inv-2", true)),
             ] {
                 let result = import_with_run_results(
-                    &keyed_is_incremental_manifest("inv-1", config.clone()),
+                    &keyed_is_incremental_manifest("inv-1", &config),
                     run_results.clone(),
                 );
                 assert!(
@@ -4211,7 +4211,7 @@ FROM {{ ref('stg_events') }}
         let result = import_with_run_results(
             &keyed_is_incremental_manifest(
                 "inv-1",
-                serde_json::json!({ "materialized": "incremental", "unique_key": "id" }),
+                &serde_json::json!({ "materialized": "incremental", "unique_key": "id" }),
             ),
             Some(compile_run_results("inv-1", true)),
         );
