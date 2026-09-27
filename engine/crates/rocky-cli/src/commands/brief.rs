@@ -1749,6 +1749,7 @@ mod tests {
             reason: "test".to_string(),
             verify_after: Vec::new(),
             auto_apply: None,
+            fail_closed: false,
         }
     }
 

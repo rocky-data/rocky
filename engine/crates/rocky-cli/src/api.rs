@@ -4276,6 +4276,7 @@ mod tests {
                 reason: "test freeze".to_string(),
                 verify_after: Vec::new(),
                 auto_apply: None,
+                fail_closed: false,
             })
             .expect("decision recorded");
         drop(store);
@@ -4592,6 +4593,7 @@ mod tests {
                 reason: "test".to_string(),
                 verify_after: Vec::new(),
                 auto_apply: None,
+                fail_closed: false,
             })
             .unwrap();
         // A spec the loader rejects, beside the fixture's valid one.

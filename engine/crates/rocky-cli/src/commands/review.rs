@@ -992,18 +992,15 @@ pub(crate) fn select_outstanding<'a>(
     plan_exists: impl Fn(&str) -> bool,
 ) -> (Vec<&'a PolicyDecisionRecord>, u64) {
     let mut latest: BTreeMap<(&str, &str), &PolicyDecisionRecord> = BTreeMap::new();
-    // A `deny` row is left out of the latest-row pick, so it neither queues
-    // nor supersedes. It cannot supersede: the fail-closed path records a
-    // `deny` when the ledger snapshot could not be read — an operational
-    // refusal, not a policy decision about the plan — and the row cannot say
-    // which kind it is. Letting it supersede hid an escalation the policy
-    // still required until someone retried the mutation (#1815, review round
-    // three). A superseded-by-deny escalation stays approvable, which is what
-    // it was before; approval then meets the deny at apply, loudly.
-    for d in decisions
-        .into_iter()
-        .filter(|d| d.effect != PolicyEffect::Deny)
-    {
+    // A fail-closed `deny` is left out of the latest-row pick, so it neither
+    // queues nor supersedes: the gate wrote it because the ledger snapshot
+    // could not be read — an operational refusal, not a policy decision about
+    // the plan. Letting it supersede hid an escalation the policy still
+    // required until someone retried the mutation (#1815, review round three).
+    // A POLICY `deny` does supersede: the policy now refuses the plan, so an
+    // older `require_review` for it is moot. The writer records which kind it
+    // wrote (`fail_closed`, #1829).
+    for d in decisions.into_iter().filter(|d| !is_operational_deny(d)) {
         latest
             .entry((d.plan_id.as_str(), d.model.as_str()))
             .and_modify(|cur| {
@@ -1034,6 +1031,22 @@ pub(crate) fn select_outstanding<'a>(
         .collect();
     (outstanding, excluded_non_plan)
 }
+
+/// Whether `d` is a `deny` the gate wrote as its fail-closed floor rather than
+/// as a policy verdict.
+///
+/// A row written since #1829 says so itself (`fail_closed`). A row written
+/// before carries only the gate's reason suffix, which is the one mark the
+/// old writer left; such a row is read by that mark so an old operational
+/// deny still cannot hide an escalation.
+fn is_operational_deny(d: &PolicyDecisionRecord) -> bool {
+    d.effect == PolicyEffect::Deny
+        && (d.fail_closed || d.reason.contains(LEGACY_FAIL_CLOSED_DENY_MARK))
+}
+
+/// The reason suffix the apply gate appends to a fail-closed deny. Only the
+/// legacy fallback in [`is_operational_deny`] reads it.
+const LEGACY_FAIL_CLOSED_DENY_MARK: &str = "(fail-closed deny; a review marker cannot satisfy it)";
 
 /// The graph keys a queue row stands for — what the ranking resolves and what
 /// the entry reports as `models`, from one derivation so the two cannot drift.
@@ -1121,6 +1134,7 @@ pub(crate) fn record_plan_review_escalation(
         reason: reason.to_string(),
         verify_after: Vec::new(),
         auto_apply: None,
+        fail_closed: false,
     };
     let written = StateStore::open(state_path).and_then(|s| s.record_policy_decision(&record));
     if let Err(e) = written {
@@ -1472,6 +1486,7 @@ mod tests {
             reason: "test".to_string(),
             verify_after: Vec::new(),
             auto_apply: None,
+            fail_closed: false,
         }
     }
 
@@ -1601,16 +1616,16 @@ mod tests {
         assert_eq!(d.capability, PolicyCapability::SchemaChangeBreaking);
     }
 
-    /// The latest of `require_review` and `allow` per (plan, model) decides.
-    /// A `require_review` followed by an `allow` (policy loosened, plan
-    /// re-run) is moot and used to stay in the queue, because the effect
-    /// filter ran before the latest-row pick. A later `deny` does NOT
-    /// supersede: a deny may be the fail-closed refusal of an unreadable
-    /// ledger, which says nothing about the plan, and the row cannot tell
-    /// the two apart — so the escalation stays, as it always did. The
-    /// reverse orders queue: the newest row is the escalation.
+    /// The latest of `require_review`, `allow` and a POLICY `deny` per
+    /// (plan, model) decides. A `require_review` followed by an `allow`
+    /// (policy loosened, plan re-run) or by a policy `deny` (policy now
+    /// refuses the plan) is moot. A fail-closed `deny` does NOT supersede: it
+    /// is the refusal of an unreadable ledger and says nothing about the plan.
+    /// The writer marks it (`fail_closed`, #1829); a row from before the bit
+    /// is known by the gate's reason suffix. The reverse orders queue: the
+    /// newest row is the escalation.
     #[test]
-    fn a_later_allow_supersedes_an_older_require_review_but_a_deny_does_not() {
+    fn a_later_allow_or_policy_deny_supersedes_but_a_fail_closed_deny_does_not() {
         let decisions = vec![
             qd(
                 1,
@@ -1656,6 +1671,28 @@ mod tests {
                 PolicyEffect::RequireReview,
                 PolicyCapability::Apply,
             ),
+            qd(
+                1,
+                "planE",
+                "v",
+                PolicyEffect::RequireReview,
+                PolicyCapability::Apply,
+            ),
+            PolicyDecisionRecord {
+                fail_closed: true,
+                ..qd(5, "planE", "v", PolicyEffect::Deny, PolicyCapability::Apply)
+            },
+            qd(
+                1,
+                "planF",
+                "u",
+                PolicyEffect::RequireReview,
+                PolicyCapability::Apply,
+            ),
+            PolicyDecisionRecord {
+                reason: format!("no rule matched; {LEGACY_FAIL_CLOSED_DENY_MARK}"),
+                ..qd(5, "planF", "u", PolicyEffect::Deny, PolicyCapability::Apply)
+            },
         ];
         let (out, excluded) = select_outstanding(&decisions, |_| false, |_| true);
         assert_eq!(excluded, 0);
@@ -1663,8 +1700,9 @@ mod tests {
         plans.sort_unstable();
         assert_eq!(
             plans,
-            vec!["planB", "planC", "planD"],
-            "an allow supersedes; a deny does not; new escalations queue"
+            vec!["planC", "planD", "planE", "planF"],
+            "an allow or a policy deny supersedes; a fail-closed deny (marked, or a legacy \
+             row with the gate's suffix) does not; new escalations queue"
         );
     }
 

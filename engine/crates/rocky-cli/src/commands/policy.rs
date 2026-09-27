@@ -1064,6 +1064,7 @@ pub fn run_policy_freeze(
             // A freeze/unfreeze is a policy-change decision, not a drift
             // auto-apply, so it carries no auto-apply custody.
             auto_apply: None,
+            fail_closed: false,
         };
         if let Some(store) = &legacy_store {
             store
@@ -1889,6 +1890,7 @@ max_retries = 0
             reason: "remote winner".to_string(),
             verify_after: Vec::new(),
             auto_apply: None,
+            fail_closed: false,
         };
         {
             let store = harness.open_store(&harness.pod_b);

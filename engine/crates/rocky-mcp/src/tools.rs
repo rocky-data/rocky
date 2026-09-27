@@ -4241,6 +4241,31 @@ impl RockyMcpServer {
         Ok(())
     }
 
+    /// The logical model name the compiler gives the drafted model: the
+    /// sidecar's `name`, else the file stem — the same default the model
+    /// loader applies.
+    ///
+    /// The draft tools address a model by its file stem, but a sidecar may
+    /// name it differently (`payments.sql` + `name = "gold_payments"`). The
+    /// compile filter, the policy gate and the ledger row all key on the
+    /// logical name, so the tool that has just read the sidecar records the
+    /// identity it knows rather than the stem (#1829). An unreadable or
+    /// unparseable sidecar falls back to the stem; the compile that follows
+    /// reports it.
+    fn drafted_logical_name(&self, paths: &DraftPaths) -> String {
+        read_no_follow_bytes(&paths.sidecar_path)
+            .ok()
+            .and_then(|bytes| String::from_utf8(bytes).ok())
+            .and_then(|text| text.parse::<toml::Table>().ok())
+            .and_then(|table| {
+                table
+                    .get("name")
+                    .and_then(toml::Value::as_str)
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| paths.stem.clone())
+    }
+
     /// Whether the model `stem` already has a source file under `models/`
     /// (`.sql` or `.rocky`). The write-path contract/check tools refuse to write
     /// a sidecar artifact for a model that does not exist — author the model
@@ -4700,13 +4725,14 @@ impl RockyMcpServer {
 
         // Compile with the write — the contract is validated against the model's
         // inferred schema. A hard compile failure rolls the draft back.
-        let compiled = self.compile_drafted(&paths.stem)?;
+        let logical = self.drafted_logical_name(&paths);
+        let compiled = self.compile_drafted(&logical)?;
 
-        let decision_id = format!("draft-contract:{}", paths.stem);
+        let decision_id = format!("draft-contract:{logical}");
         // Durable freeze-marker LIST, hoisted in the async body (the gate is
         // synchronous). Fail-closed; no `[policy]` ⇒ no LIST.
-        let marker_freezes = self.draft_marker_freezes(&paths.stem).await?;
-        match self.evaluate_draft_policy(&paths.stem, &decision_id, &marker_freezes) {
+        let marker_freezes = self.draft_marker_freezes(&logical).await?;
+        match self.evaluate_draft_policy(&logical, &decision_id, &marker_freezes) {
             // NOT grouped with NotConfigured. A config that failed to LOAD may
             // carry a `[policy]` block denying exactly this write; treating it
             // as "no policy configured" is what let a configured deny stop
@@ -4887,13 +4913,14 @@ impl RockyMcpServer {
             ));
         }
 
-        let compiled = self.compile_drafted(&paths.stem)?;
+        let logical = self.drafted_logical_name(&paths);
+        let compiled = self.compile_drafted(&logical)?;
 
-        let decision_id = format!("draft-check:{}", paths.stem);
+        let decision_id = format!("draft-check:{logical}");
         // Durable freeze-marker LIST, hoisted in the async body (the gate is
         // synchronous). Fail-closed; no `[policy]` ⇒ no LIST.
-        let marker_freezes = self.draft_marker_freezes(&paths.stem).await?;
-        match self.evaluate_draft_policy(&paths.stem, &decision_id, &marker_freezes) {
+        let marker_freezes = self.draft_marker_freezes(&logical).await?;
+        match self.evaluate_draft_policy(&logical, &decision_id, &marker_freezes) {
             // NOT grouped with NotConfigured. A config that failed to LOAD may
             // carry a `[policy]` block denying exactly this write; treating it
             // as "no policy configured" is what let a configured deny stop
@@ -5119,16 +5146,19 @@ impl RockyMcpServer {
             ));
         }
 
-        // Compile with the write — a hard failure rolls the patch back.
-        let compiled = self.compile_drafted(&paths.stem)?;
+        // Compile with the write — a hard failure rolls the patch back. The
+        // compile, the gate and the ledger row key on the LOGICAL name the
+        // sidecar declares, not the file stem (#1829).
+        let logical = self.drafted_logical_name(&paths);
+        let compiled = self.compile_drafted(&logical)?;
 
         // ⟦RTL-2⟧ the policy gate runs AFTER the write, so the evaluation
         // compiles the model's attributes AS PATCHED from disk — a patch that
         // first ADDS a governed classification is gated by that
         // classification, not by the pre-patch attribute set.
-        let decision_id = format!("draft-metadata:{}", paths.stem);
-        let marker_freezes = self.draft_marker_freezes(&paths.stem).await?;
-        match self.evaluate_draft_policy(&paths.stem, &decision_id, &marker_freezes) {
+        let decision_id = format!("draft-metadata:{logical}");
+        let marker_freezes = self.draft_marker_freezes(&logical).await?;
+        match self.evaluate_draft_policy(&logical, &decision_id, &marker_freezes) {
             // NOT grouped with NotConfigured. A config that failed to LOAD may
             // carry a `[policy]` block denying exactly this write; treating it
             // as "no policy configured" is what let a configured deny stop

@@ -868,6 +868,43 @@ adapter = "default"
             );
         }
 
+        /// #1829 item 6: a one- or two-part `--model` is a MODEL name or
+        /// nothing. `prod.orders` is a legal logical name here and resolves to
+        /// that model's own table, so the gate and the `DELETE` describe one
+        /// table. A two-part string that names no model is refused and the
+        /// message asks for a model name or a full three-part table: it is
+        /// never passed through as a physical identifier the warehouse would
+        /// complete with its current catalog.
+        #[test]
+        fn a_two_part_name_is_a_model_or_refused_never_a_partial_table() {
+            let dir = tempfile::tempdir().unwrap();
+            let config = write_project(dir.path());
+            let models = dir.path().join("models");
+            std::fs::write(models.join("dotted.sql"), "SELECT 1 AS id\n").unwrap();
+            std::fs::write(
+                models.join("dotted.toml"),
+                "name = \"prod.orders\"\n\n[strategy]\ntype = \"full_refresh\"\n\n\
+                 [target]\ncatalog = \"wh\"\nschema = \"gold\"\ntable = \"shadow_orders\"\n",
+            )
+            .unwrap();
+
+            assert_eq!(
+                super::super::resolve_archive_model_target(&config, Some("prod.orders"))
+                    .expect("a declared dotted model name resolves")
+                    .as_deref(),
+                Some("wh.gold.shadow_orders"),
+            );
+            for partial in ["prod.events", "events"] {
+                let err = super::super::resolve_archive_model_target(&config, Some(partial))
+                    .expect_err("a partial identifier that names no model must refuse");
+                let msg = format!("{err:#}");
+                assert!(
+                    msg.contains("no model by that name") && msg.contains("catalog.schema.table"),
+                    "the refusal names the cause and the remedy: {msg}"
+                );
+            }
+        }
+
         /// Two shapes that must NOT change. A fully qualified name is kept
         /// verbatim so an operator can still name a table directly, and the
         /// project-wide archive (no `--model`) names no table at all.

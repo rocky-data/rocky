@@ -1766,6 +1766,85 @@ effect = "deny"
     );
 }
 
+/// #1829 item 5: the draft tools address a model by file stem, but the
+/// compile, the gate and the ledger row must use the LOGICAL name the sidecar
+/// declares. `payments.sql` is named `gold_payments`; a different file is
+/// named `payments`. Patching `payments` adds the first `pii` tag to
+/// `gold_payments`, so the pii deny must fire on `gold_payments`. Keyed on
+/// the stem, the gate read the unrelated model named `payments` (no pii),
+/// fell to the default require_review and kept the patch.
+#[tokio::test]
+async fn draft_metadata_gates_and_records_the_logical_name_not_the_stem() {
+    let dir = TempDir::new().unwrap();
+    write_project_with_policy(
+        dir.path(),
+        &dir.path().join("test.duckdb"),
+        r#"[policy]
+version = 1
+default_agent_effect = "require_review"
+
+[[policy.rules]]
+principal = "agent"
+capability = "propose"
+scope = { classifications = ["pii"] }
+effect = "deny"
+"#,
+    );
+    let models = dir.path().join("models");
+    let model = |stem: &str, name: &str| {
+        std::fs::write(models.join(format!("{stem}.sql")), "SELECT 1 AS id\n").unwrap();
+        std::fs::write(
+            models.join(format!("{stem}.toml")),
+            format!(
+                "name = \"{name}\"\n\n[strategy]\ntype = \"full_refresh\"\n\n[target]\n\
+                 catalog = \"warehouse\"\nschema = \"out\"\ntable = \"{name}\"\n"
+            ),
+        )
+        .unwrap();
+    };
+    model("payments", "gold_payments");
+    model("ledger_src", "payments");
+    let sidecar = models.join("payments.toml");
+    let before = std::fs::read(&sidecar).unwrap();
+
+    let server = RockyMcpServer::new(dir.path().join("rocky.toml"));
+    let client = connect(server).await;
+    let result = client
+        .call_tool(
+            CallToolRequestParams::new("draft_metadata").with_arguments(metadata_args(
+                serde_json::json!({
+                    "model": "payments",
+                    "classifications": { "id": "pii" },
+                }),
+            )),
+        )
+        .await
+        .expect("draft_metadata returns a result");
+    assert_eq!(result.is_error, Some(true));
+    let err = result.structured_content.expect("envelope");
+    assert_eq!(
+        err["code"],
+        serde_json::json!("policy_denied"),
+        "the gate must read gold_payments AS PATCHED, not the model named payments: {err:?}"
+    );
+    assert_eq!(std::fs::read(&sidecar).unwrap(), before);
+
+    client.cancel().await.unwrap();
+    let state_path = rocky_core::state::resolve_state_path(None, &models).path;
+    let store = rocky_core::state::StateStore::open(&state_path).expect("open ledger");
+    let decisions = store.list_policy_decisions().expect("list decisions");
+    assert!(
+        decisions.iter().any(|d| d.model == "gold_payments"
+            && d.plan_id == "draft-metadata:gold_payments"
+            && d.effect == rocky_core::config::PolicyEffect::Deny),
+        "the row records the logical name: {decisions:?}"
+    );
+    assert!(
+        decisions.iter().all(|d| d.model != "payments"),
+        "no row may name the unrelated model the stem collides with: {decisions:?}"
+    );
+}
+
 /// A `require_review` verdict PERSISTS the draft (it is the reviewable artifact,
 /// mirroring the propose gate) and returns a structured `policy_review_required`
 /// signal that routes the agent to human review.

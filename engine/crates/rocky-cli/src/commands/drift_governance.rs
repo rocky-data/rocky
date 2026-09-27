@@ -357,6 +357,7 @@ impl DriftGovernor {
                 // reachable on this drive.
                 revert_pointer: revert_pointer_for(),
             }),
+            fail_closed: false,
         };
         // Persist the custody row on the blocking pool. `row_persisted` gates
         // the fail-closed decision below: a panicking write task counts as
@@ -586,6 +587,7 @@ pub(crate) fn finalize_drift_verify_after(
             reason: reason.clone(),
             verify_after: required.clone(),
             auto_apply: d.auto_apply.clone(),
+            fail_closed: false,
         };
         // Persist the verification-custody row. Fail-closed (C): the row is the
         // durable record that an auto-applied mutation was verified; if its
@@ -837,6 +839,7 @@ mod tests {
                 applied: true,
                 revert_pointer: None,
             }),
+            fail_closed: false,
         }
     }
 
@@ -1122,6 +1125,7 @@ mod tests {
             reason: "policy freeze: agent actions frozen to deny".to_string(),
             verify_after: Vec::new(),
             auto_apply: None,
+            fail_closed: false,
         }
     }
 
@@ -1225,6 +1229,7 @@ mod tests {
                 reason: "verify_after FAILED".to_string(),
                 verify_after: vec!["row_count".to_string()],
                 auto_apply: None,
+                fail_closed: false,
             })
             .unwrap();
         let state = Arc::new(store);

@@ -6707,6 +6707,21 @@ pub struct PolicyDecisionRecord {
     /// forward-deserializes with it absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_apply: Option<AutoApplyCustody>,
+    /// `true` when this row's `deny` is the gate's fail-closed floor, not a
+    /// policy decision: the decision ledger could not be read, so a freeze or
+    /// an exhausted budget was unverifiable and the agent mutation was refused
+    /// on principle (#1829).
+    ///
+    /// The writer is the only place that knows which kind of `deny` it wrote.
+    /// Before this bit the two were the same bytes, told apart only by a
+    /// reason suffix, so the review queue could not let a policy `deny`
+    /// supersede an older `require_review` without an operational one doing
+    /// the same. Serde-defaulted and skipped when `false`, so an ordinary row
+    /// serializes exactly as before and a row written before the bit reads
+    /// back `false`. An older binary ignores the key. No schema-version bump:
+    /// the table set and every existing field are unchanged.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub fail_closed: bool,
 }
 
 /// What kind of event a [`PolicyDecisionRecord`] row records.
@@ -12989,6 +13004,7 @@ mod tests {
             reason: "allow by rule 1".to_string(),
             verify_after: Vec::new(),
             auto_apply: None,
+            fail_closed: false,
         };
         let later = PolicyDecisionRecord {
             keys_recorded: false,
@@ -13005,6 +13021,7 @@ mod tests {
             reason: "denied by rule 0 (deny overrides)".to_string(),
             verify_after: Vec::new(),
             auto_apply: None,
+            fail_closed: false,
         };
         // Insert out of order; the ledger must return them chronologically.
         store.record_policy_decision(&later).unwrap();
@@ -13045,6 +13062,7 @@ mod tests {
             reason: "backfill plan awaits review".to_string(),
             verify_after: Vec::new(),
             auto_apply: None,
+            fail_closed: false,
         };
         let mut value = serde_json::to_value(&record).expect("serialize record");
         value
@@ -13091,6 +13109,7 @@ mod tests {
             reason: "replication target awaits review".to_string(),
             verify_after: Vec::new(),
             auto_apply: None,
+            fail_closed: false,
         };
         let mut value = serde_json::to_value(&record).expect("serialize record");
         value
@@ -13106,6 +13125,48 @@ mod tests {
             !read.keys_recorded,
             "a v28 blob never said whether its set was deliberate: unknown, not vouched"
         );
+    }
+
+    /// #1829: `fail_closed` is additive without a schema bump. An ordinary row
+    /// serializes exactly as before (no key), a row written before the bit
+    /// reads back `false`, and a marked row round-trips.
+    #[test]
+    fn policy_decision_fail_closed_is_additive_and_round_trips() {
+        use crate::config::{PolicyCapability, PolicyEffect, PolicyPrincipal};
+
+        let record = PolicyDecisionRecord {
+            keys_recorded: true,
+            models: vec!["orders".to_string()],
+            timestamp: chrono::DateTime::parse_from_rfc3339("2026-09-26T10:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+            plan_id: "plan_x".to_string(),
+            principal: PolicyPrincipal::Agent,
+            capability: PolicyCapability::Apply,
+            model: "orders".to_string(),
+            effect: PolicyEffect::Deny,
+            rule_id: None,
+            reason: "policy deny".to_string(),
+            verify_after: Vec::new(),
+            auto_apply: None,
+            fail_closed: false,
+        };
+        let plain = serde_json::to_value(&record).expect("serialize");
+        assert!(
+            plain.get("fail_closed").is_none(),
+            "an unmarked row serializes exactly as before: {plain}"
+        );
+        let read: PolicyDecisionRecord =
+            serde_json::from_value(plain).expect("a row without the key deserializes");
+        assert!(!read.fail_closed);
+
+        let marked = PolicyDecisionRecord {
+            fail_closed: true,
+            ..record
+        };
+        let blob = serde_json::to_vec(&marked).expect("serialize marked");
+        let back: PolicyDecisionRecord = serde_json::from_slice(&blob).expect("round trip");
+        assert!(back.fail_closed);
     }
 
     /// `graph_keys` yields the model set when there is one and the single
@@ -13133,6 +13194,7 @@ mod tests {
             reason: String::new(),
             verify_after: Vec::new(),
             auto_apply: None,
+            fail_closed: false,
         };
 
         // No set: the label is the only candidate. It will not resolve in any
@@ -13190,6 +13252,7 @@ mod tests {
             reason: "allow by rule 1".to_string(),
             verify_after: Vec::new(),
             auto_apply: None,
+            fail_closed: false,
         };
         let mut value = serde_json::to_value(&record).expect("serialize record");
         value
@@ -13983,6 +14046,7 @@ mod tests {
                     reason: "backfill plan awaits review".to_string(),
                     verify_after: Vec::new(),
                     auto_apply: None,
+                    fail_closed: false,
                 })
                 .unwrap();
         }

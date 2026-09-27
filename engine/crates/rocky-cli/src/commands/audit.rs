@@ -1441,6 +1441,7 @@ mod tests {
             reason: "test".to_string(),
             verify_after: Vec::new(),
             auto_apply: None,
+            fail_closed: false,
         }
     }
 
@@ -1486,6 +1487,7 @@ mod tests {
             reason: "backfill plan awaits review".to_string(),
             verify_after: Vec::new(),
             auto_apply: None,
+            fail_closed: false,
         };
         let decisions = vec![plan_level];
 
@@ -1540,6 +1542,7 @@ mod tests {
             reason: "allow by rule 0".to_string(),
             verify_after: Vec::new(),
             auto_apply: None,
+            fail_closed: false,
         }];
 
         let link = build_decisions_link(AuditSubjectKind::Model, "dim_customer", &decisions);
@@ -1581,6 +1584,7 @@ mod tests {
             reason: "gc plan awaits review".to_string(),
             verify_after: Vec::new(),
             auto_apply: None,
+            fail_closed: false,
         };
 
         {
@@ -1956,6 +1960,7 @@ mod tests {
             reason: reason.to_string(),
             verify_after: checks.iter().map(ToString::to_string).collect(),
             auto_apply: None,
+            fail_closed: false,
         }
     }
 
@@ -2347,6 +2352,7 @@ mod tests {
             reason: "test".to_string(),
             verify_after: Vec::new(),
             auto_apply: None,
+            fail_closed: false,
         }
     }
 

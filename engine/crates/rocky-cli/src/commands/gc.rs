@@ -4467,6 +4467,7 @@ auto_create_schemas = true
             reason: "unit ledger-only freeze".to_string(),
             verify_after: Vec::new(),
             auto_apply: None,
+            fail_closed: false,
         };
         let err = gc_seam_regate(
             Some(&cfg),
@@ -4594,6 +4595,7 @@ auto_create_schemas = true
                                 reason: "kill switch engaged mid-seam".to_string(),
                                 verify_after: Vec::new(),
                                 auto_apply: None,
+                                fail_closed: false,
                             })
                             .unwrap();
                     }

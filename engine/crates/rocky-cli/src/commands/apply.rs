@@ -2313,11 +2313,15 @@ pub(crate) fn evaluate_apply_policy_core(
             reason.push_str("; ");
             reason.push_str(&suffix);
         }
+        // Whether THIS row's deny is the fail-closed floor rather than a
+        // policy verdict. Only the writer knows, so it records it (#1829).
+        let mut fail_closed = false;
         if snapshot_unreadable
             && principal == PolicyPrincipal::Agent
             && effect != PolicyEffect::Deny
         {
             effect = PolicyEffect::Deny;
+            fail_closed = true;
             reason.push_str(
                 "; policy ledger unreadable — freeze/budget state unverifiable, agent mutation \
                  refused (fail-closed deny; a review marker cannot satisfy it)",
@@ -2346,6 +2350,7 @@ pub(crate) fn evaluate_apply_policy_core(
             verify_after: Vec::new(),
             // Ordinary apply/promote evaluation — no auto-apply custody.
             auto_apply: None,
+            fail_closed,
         });
 
         let gate = match effect {
@@ -3873,6 +3878,7 @@ fn run_verify_after_capturing(
         reason: reason.clone(),
         verify_after: required.to_vec(),
         auto_apply: None,
+        fail_closed: false,
     };
     // Finding 6: FAIL-CLOSED — the verify custody row is the budget-burning half
     // of the pair, so a write failure must abort (not warn-and-continue) rather
@@ -6652,6 +6658,7 @@ auto_create_schemas = true
             reason: "policy freeze: agent actions frozen to deny".to_string(),
             verify_after: Vec::new(),
             auto_apply: None,
+            fail_closed: false,
         })?;
         Ok(())
     }
@@ -6843,6 +6850,7 @@ max_retries = 0
             reason: "allowed by rule 0".to_string(),
             verify_after: vec!["row_count".to_string()],
             auto_apply: None,
+            fail_closed: false,
         }
     }
 
@@ -9261,6 +9269,70 @@ verify_after = ["row_count"]
             matches!(custody, Some(ref d) if d.effect == PolicyEffect::Allow),
             "the replication plan's post-run frame must persist allow custody"
         );
+        Ok(())
+    }
+
+    /// #1829 item 3: the gate is the writer that knows which kind of deny it
+    /// wrote. An unreadable ledger forces an agent's allow to a fail-closed
+    /// deny, and that row says so (`fail_closed`). A policy deny under the
+    /// same unreadable ledger is a policy verdict, and a human's evaluation
+    /// is not forced at all: neither row carries the bit.
+    #[test]
+    fn the_gate_marks_its_fail_closed_deny_and_only_that_one() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let config = write_config(
+            dir.path(),
+            r#"
+[[policy.rules]]
+principal = "agent"
+capability = "apply"
+scope = { any = true }
+effect = "allow"
+
+[[policy.rules]]
+principal = "agent"
+capability = "promote"
+scope = { any = true }
+effect = "deny"
+"#,
+        )?;
+        let policy = rocky_core::config::load_rocky_config(&config)?
+            .policy
+            .expect("policy block");
+        let attrs = BTreeMap::new();
+        let rows_for = |principal, capability| {
+            let touched: BTreeMap<String, PolicyCapability> =
+                [("orders".to_string(), capability)].into_iter().collect();
+            let mut rows = Vec::new();
+            super::evaluate_apply_policy_core(
+                &policy,
+                "plan_x",
+                principal,
+                &touched,
+                &attrs,
+                GateSubjects::CompiledModels,
+                &[],
+                &[],
+                true,
+                |r| rows.push(r.clone()),
+            );
+            rows
+        };
+
+        let forced = rows_for(PolicyPrincipal::Agent, PolicyCapability::Apply);
+        assert_eq!(forced.len(), 1);
+        assert_eq!(forced[0].effect, PolicyEffect::Deny);
+        assert!(
+            forced[0].fail_closed,
+            "the forced deny is marked: {forced:?}"
+        );
+
+        let denied = rows_for(PolicyPrincipal::Agent, PolicyCapability::Promote);
+        assert_eq!(denied[0].effect, PolicyEffect::Deny);
+        assert!(!denied[0].fail_closed, "a policy deny is not operational");
+
+        let human = rows_for(PolicyPrincipal::Human, PolicyCapability::Apply);
+        assert!(!human[0].fail_closed);
         Ok(())
     }
 
