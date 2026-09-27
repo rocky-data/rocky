@@ -11211,7 +11211,7 @@ mod tests {
             store
                 .init_run_progress(
                     run,
-                    &keys.iter().map(|k| k.to_string()).collect::<Vec<_>>(),
+                    &keys.iter().map(ToString::to_string).collect::<Vec<_>>(),
                     None,
                 )
                 .unwrap();
@@ -11235,7 +11235,7 @@ mod tests {
         let pending = store.unconfirmed_flush_table_keys("now").unwrap();
         assert_eq!(
             pending,
-            ["c.s.a", "c.s.z"].iter().map(|k| k.to_string()).collect()
+            ["c.s.a", "c.s.z"].iter().map(ToString::to_string).collect()
         );
 
         assert_eq!(
@@ -11270,7 +11270,7 @@ mod tests {
         );
         assert_eq!(
             store.unconfirmed_flush_table_keys("none").unwrap(),
-            ["c.s.a", "c.s.z"].iter().map(|k| k.to_string()).collect()
+            ["c.s.a", "c.s.z"].iter().map(ToString::to_string).collect()
         );
     }
 

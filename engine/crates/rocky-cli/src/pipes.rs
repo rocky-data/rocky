@@ -150,25 +150,21 @@ impl PipesEmitter {
     /// zlib-decompress is not a lenient variant of the protocol, it's
     /// malformed, and is refused like a base64 or JSON failure.
     pub fn detect() -> anyhow::Result<Option<Self>> {
-        Self::detect_from(
-            env::var(ENV_PIPES_CONTEXT).ok(),
-            env::var(ENV_PIPES_MESSAGES).ok(),
-        )
+        let context = env::var(ENV_PIPES_CONTEXT).ok();
+        let messages = env::var(ENV_PIPES_MESSAGES).ok();
+        Self::detect_from(context.as_deref(), messages.as_deref())
     }
 
     /// [`Self::detect`] over explicit values instead of the process
     /// environment, so tests can drive every refusal without mutating
     /// process-global env vars that other tests' `rocky run` reads.
-    fn detect_from(
-        context: Option<String>,
-        messages: Option<String>,
-    ) -> anyhow::Result<Option<Self>> {
+    fn detect_from(context: Option<&str>, messages: Option<&str>) -> anyhow::Result<Option<Self>> {
         if context.is_none() {
             return Ok(None);
         }
         let channel = messages
             .ok_or_else(|| format!("{ENV_PIPES_MESSAGES} is not set"))
-            .and_then(|raw| decode_pipes_param(&raw, ENV_PIPES_MESSAGES))
+            .and_then(|raw| decode_pipes_param(raw, ENV_PIPES_MESSAGES))
             .and_then(|params| Self::open_channel(&params))
             .map_err(|reason| {
                 anyhow::anyhow!(
@@ -590,7 +586,7 @@ mod tests {
             ),
         ];
         for (messages, cause) in cases {
-            let err = PipesEmitter::detect_from(context.clone(), messages.clone())
+            let err = PipesEmitter::detect_from(context.as_deref(), messages.as_deref())
                 .err()
                 .unwrap_or_else(|| panic!("expected a refusal for messages={messages:?}"));
             let msg = err.to_string();
@@ -610,7 +606,7 @@ mod tests {
     /// or broken `DAGSTER_PIPES_MESSAGES` alone is ignored, not refused.
     #[test]
     fn detect_ignores_messages_without_a_pipes_context() {
-        let result = PipesEmitter::detect_from(None, Some("%%% not base64".to_string()));
+        let result = PipesEmitter::detect_from(None, Some("%%% not base64"));
         assert!(matches!(result, Ok(None)));
     }
 
