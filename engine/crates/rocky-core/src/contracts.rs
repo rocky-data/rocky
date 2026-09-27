@@ -2,6 +2,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::column_map;
+use crate::traits::SqlDialect;
 use rocky_ir::{ColumnInfo, RockyType, is_assignable};
 
 /// Data contract configuration — enforced at copy/load time.
@@ -188,6 +189,12 @@ pub fn validate_contract(
 ///   naming both raw strings, because that string is the user's own file and
 ///   says nothing about what landed.
 ///
+/// `dialect` is the warehouse the columns landed on. It is read for one thing:
+/// a landed type that is a bare decimal name the warehouse documents digits
+/// for ([`SqlDialect::bare_decimal_digits`]), such as BigQuery's bare
+/// `NUMERIC`, which is `NUMERIC(38, 9)` (#1856). The declared type and every
+/// other landed type are read without it, by [`warehouse_type_to_rocky`].
+///
 /// `protected_columns` and `allowed_type_changes` describe source-vs-target
 /// *evolution*, which a single-table load can't meaningfully evaluate (there
 /// is no prior target snapshot in scope). When declared, they are surfaced
@@ -195,6 +202,7 @@ pub fn validate_contract(
 pub fn validate_contract_typed(
     contract: &ContractConfig,
     landed_columns: &[ColumnInfo],
+    dialect: &dyn SqlDialect,
 ) -> ContractResult {
     let mut violations = Vec::new();
     let mut warnings = Vec::new();
@@ -247,7 +255,22 @@ pub fn validate_contract_typed(
         // data, and the remedy is to edit the contract — so naming it is
         // the useful response. The same shape is closed on the
         // compile-time gate by I003 (#1240).
-        let landed_ty = warehouse_type_to_rocky(&col.data_type);
+        //
+        // A bare decimal name has no digits in the string, so the dialect is
+        // asked what the name means where it landed. Only BigQuery answers,
+        // and only for `NUMERIC`: a bare `BIGNUMERIC` stays refused, because
+        // no legal `BIGNUMERIC(P, S)` covers its range. The gate checks
+        // fit-within, so a wrong reading can refuse a load but never pass one
+        // that the true type would refuse (#1856).
+        let (landed_ty, read_from_bare_name) = match warehouse_type_to_rocky(&col.data_type) {
+            RockyType::Unknown => {
+                match dialect.bare_decimal_digits(&col.data_type.trim().to_uppercase()) {
+                    Some((precision, scale)) => (RockyType::Decimal { precision, scale }, true),
+                    None => (RockyType::Unknown, false),
+                }
+            }
+            known => (known, false),
+        };
         let expected_ty = warehouse_type_to_rocky(&req.data_type);
         let landed_unknown = landed_ty == RockyType::Unknown;
         let expected_unknown = expected_ty == RockyType::Unknown;
@@ -275,8 +298,20 @@ pub fn validate_contract_typed(
                 rule: "required_column_type".to_string(),
                 column: req.name.clone(),
                 message: format!(
-                    "column '{}' has type '{}' ({landed_ty}), expected '{}' ({expected_ty})",
-                    req.name, col.data_type, req.data_type
+                    "column '{}' has type '{}' ({landed_ty}), expected '{}' ({expected_ty}){}",
+                    req.name,
+                    col.data_type,
+                    req.data_type,
+                    if read_from_bare_name {
+                        format!(
+                            ". The landed '{}' carries no digits; Rocky read it as {landed_ty}, \
+                             the {} default for that name",
+                            col.data_type,
+                            dialect.name()
+                        )
+                    } else {
+                        String::new()
+                    }
                 ),
             });
         }
@@ -460,6 +495,12 @@ fn unchecked_type_warning(column: &str, landed_type: &str, declared_type: &str) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A dialect that documents no digits for a bare decimal name, as every
+    /// warehouse but BigQuery does.
+    fn no_dialect() -> crate::traits::test_dialects::StubDialect {
+        crate::traits::test_dialects::StubDialect(crate::traits::LiteralEscape::Standard)
+    }
 
     fn col(name: &str, data_type: &str) -> ColumnInfo {
         ColumnInfo {
@@ -697,7 +738,7 @@ mod tests {
             ..Default::default()
         };
         let landed = vec![col_n("id", "BIGINT", true), col_n("name", "VARCHAR", true)];
-        let result = validate_contract_typed(&contract, &landed);
+        let result = validate_contract_typed(&contract, &landed, &no_dialect());
         assert!(result.passed, "violations: {:?}", result.violations);
         assert!(
             result.warnings.is_empty(),
@@ -717,7 +758,7 @@ mod tests {
             ..Default::default()
         };
         let landed = vec![col_n("name", "VARCHAR", true)];
-        let result = validate_contract_typed(&contract, &landed);
+        let result = validate_contract_typed(&contract, &landed, &no_dialect());
         assert!(!result.passed);
         assert_eq!(result.violations[0].rule, "required_column");
     }
@@ -734,7 +775,7 @@ mod tests {
             ..Default::default()
         };
         let landed = vec![col_n("id", "BIGINT", true)];
-        let result = validate_contract_typed(&contract, &landed);
+        let result = validate_contract_typed(&contract, &landed, &no_dialect());
         assert!(!result.passed);
         assert_eq!(result.violations[0].rule, "required_column_type");
     }
@@ -752,7 +793,7 @@ mod tests {
             ..Default::default()
         };
         let landed = vec![col_n("name", "VARCHAR", true)];
-        let result = validate_contract_typed(&contract, &landed);
+        let result = validate_contract_typed(&contract, &landed, &no_dialect());
         assert!(result.passed, "violations: {:?}", result.violations);
     }
 
@@ -770,7 +811,7 @@ mod tests {
             ..Default::default()
         };
         let landed = vec![col_n("id", "INT", true)];
-        let result = validate_contract_typed(&contract, &landed);
+        let result = validate_contract_typed(&contract, &landed, &no_dialect());
         assert!(result.passed, "violations: {:?}", result.violations);
     }
 
@@ -787,7 +828,7 @@ mod tests {
             ..Default::default()
         };
         let landed = vec![col_n("id", "BIGINT", true)];
-        let result = validate_contract_typed(&contract, &landed);
+        let result = validate_contract_typed(&contract, &landed, &no_dialect());
         assert!(!result.passed);
         assert_eq!(result.violations[0].rule, "required_column_type");
     }
@@ -810,7 +851,11 @@ mod tests {
                 }],
                 ..Default::default()
             };
-            let result = validate_contract_typed(&contract, &[col_n("amount", landed_type, true)]);
+            let result = validate_contract_typed(
+                &contract,
+                &[col_n("amount", landed_type, true)],
+                &no_dialect(),
+            );
 
             assert_eq!(
                 result.passed, should_pass,
@@ -844,7 +889,7 @@ mod tests {
             ..Default::default()
         };
         let landed = vec![col_n("geo", "GEOMETRY", true)];
-        let result = validate_contract_typed(&contract, &landed);
+        let result = validate_contract_typed(&contract, &landed, &no_dialect());
         assert!(
             !result.passed,
             "an uncomparable landed type must refuse, not pass: {result:?}"
@@ -900,7 +945,8 @@ mod tests {
                 }],
                 ..Default::default()
             };
-            let result = validate_contract_typed(&contract, &[col_n("c", landed, true)]);
+            let result =
+                validate_contract_typed(&contract, &[col_n("c", landed, true)], &no_dialect());
             assert!(
                 result.passed,
                 "landed '{landed}' against '{declared}' must still pass: {:?}",
@@ -922,7 +968,7 @@ mod tests {
             ..Default::default()
         };
         let landed = vec![col_n("id", "BIGINT", true)];
-        let result = validate_contract_typed(&contract, &landed);
+        let result = validate_contract_typed(&contract, &landed, &no_dialect());
         assert!(result.passed, "violations: {:?}", result.violations);
         assert_eq!(result.warnings.len(), 1, "warnings: {:?}", result.warnings);
         let w = &result.warnings[0];
@@ -953,7 +999,7 @@ mod tests {
             ..Default::default()
         };
         let landed = vec![col_n("geo", "GEOMETRY", true)];
-        let result = validate_contract_typed(&contract, &landed);
+        let result = validate_contract_typed(&contract, &landed, &no_dialect());
         assert!(!result.passed, "violations: {:?}", result.violations);
         assert_eq!(
             result.violations.len(),
@@ -1064,7 +1110,11 @@ mod tests {
             }],
             ..Default::default()
         };
-        let result = validate_contract_typed(&contract, &[col_n("amount", "NUMERIC", true)]);
+        let result = validate_contract_typed(
+            &contract,
+            &[col_n("amount", "NUMERIC", true)],
+            &no_dialect(),
+        );
 
         assert!(
             !result.passed,
@@ -1095,7 +1145,11 @@ mod tests {
             }],
             ..Default::default()
         };
-        let result = validate_contract_typed(&contract, &[col_n("amount", "NUMERIC", true)]);
+        let result = validate_contract_typed(
+            &contract,
+            &[col_n("amount", "NUMERIC", true)],
+            &no_dialect(),
+        );
 
         assert!(
             !result.passed,
@@ -1147,7 +1201,11 @@ mod tests {
             }],
             ..Default::default()
         };
-        let result = validate_contract_typed(&contract, &[col_n("amount", "NUMBER(38,0)", true)]);
+        let result = validate_contract_typed(
+            &contract,
+            &[col_n("amount", "NUMBER(38,0)", true)],
+            &no_dialect(),
+        );
         assert!(result.passed, "violations: {:?}", result.violations);
         assert_eq!(result.warnings.len(), 1, "warnings: {:?}", result.warnings);
         let w = &result.warnings[0];
@@ -1173,8 +1231,11 @@ mod tests {
             }],
             ..Default::default()
         };
-        let result =
-            validate_contract_typed(&contract, &[col_n("amount", "DECIMAL(10,2,3)", true)]);
+        let result = validate_contract_typed(
+            &contract,
+            &[col_n("amount", "DECIMAL(10,2,3)", true)],
+            &no_dialect(),
+        );
         assert!(!result.passed, "violations: {:?}", result.violations);
         assert_eq!(
             result.violations.len(),
@@ -1220,7 +1281,7 @@ mod tests {
             ..Default::default()
         };
         let landed = vec![col_n("id", "BIGINT", true)]; // landed nullable
-        let result = validate_contract_typed(&contract, &landed);
+        let result = validate_contract_typed(&contract, &landed, &no_dialect());
         assert!(!result.passed);
         assert_eq!(result.violations[0].rule, "required_column_nullability");
     }
@@ -1236,7 +1297,7 @@ mod tests {
             }],
         };
         let landed = vec![col_n("id", "BIGINT", true)];
-        let result = validate_contract_typed(&contract, &landed);
+        let result = validate_contract_typed(&contract, &landed, &no_dialect());
         // Unenforceable clauses must surface as warnings, not silently no-op,
         // and must not fail the contract.
         assert!(result.passed);

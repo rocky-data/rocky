@@ -1346,6 +1346,21 @@ pub trait SqlDialect: Send + Sync {
         None
     }
 
+    /// The `(precision, scale)` a bare decimal type name stands for when this
+    /// warehouse's `DESCRIBE` reports it without digits, or `None`.
+    ///
+    /// `name` is upper-cased and trimmed, such as `NUMERIC`. Only the load
+    /// contract gate reads it, and only for the landed side
+    /// ([`crate::contracts::validate_contract_typed`], #1856). A name means
+    /// digits only on a warehouse that documents them: BigQuery reports a
+    /// default-precision column as bare `NUMERIC`, which is `NUMERIC(38, 9)`
+    /// there. The default is `None`: the gate then refuses the column as
+    /// uncomparable rather than guess.
+    fn bare_decimal_digits(&self, name: &str) -> Option<(u8, u8)> {
+        let _ = name;
+        None
+    }
+
     /// Does this warehouse read backslash escape sequences inside a QUOTED
     /// identifier?
     ///

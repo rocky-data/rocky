@@ -344,6 +344,23 @@ impl SqlDialect for BigQueryDialect {
         Some(format!("* EXCEPT ({})", columns.join(", ")))
     }
 
+    /// A bare `NUMERIC` is `NUMERIC(38, 9)` (#1856).
+    ///
+    /// `INFORMATION_SCHEMA.COLUMNS` reports a default-precision column as the
+    /// bare name and has no precision or scale column to read instead. Google
+    /// documents `NUMERIC` as precision 38, scale 9. **Doc-derived, not
+    /// executed**: the BigQuery sandbox is expired.
+    ///
+    /// A bare `BIGNUMERIC` stays `None`, so the gate refuses it. Its range
+    /// (precision 76.76, scale 38) is wider than any legal
+    /// `BIGNUMERIC(P, S)`, so no contract can state it exactly.
+    fn bare_decimal_digits(&self, name: &str) -> Option<(u8, u8)> {
+        match name {
+            "NUMERIC" => Some((38, 9)),
+            _ => None,
+        }
+    }
+
     fn identifier_takes_backslash_escapes(&self) -> bool {
         // GoogleSQL quoted identifiers take the string-literal escape
         // sequences, unlike every other dialect Rocky ships (#1939).
@@ -446,6 +463,60 @@ impl SqlDialect for BigQueryDialect {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The load contract gate reads a landed bare `NUMERIC` as
+    /// `NUMERIC(38, 9)` on BigQuery, so a default-precision column can pass a
+    /// contract it fits, and still fails one it does not fit (#1856). A bare
+    /// `BIGNUMERIC` stays refused.
+    #[test]
+    fn contract_gate_reads_a_bare_numeric_as_38_9() {
+        use rocky_core::contracts::{ContractConfig, RequiredColumn, validate_contract_typed};
+
+        let gate = |declared: &str, landed: &str| {
+            validate_contract_typed(
+                &ContractConfig {
+                    required_columns: vec![RequiredColumn {
+                        name: "amount".into(),
+                        data_type: declared.into(),
+                        nullable: true,
+                    }],
+                    ..Default::default()
+                },
+                &[rocky_ir::ColumnInfo {
+                    name: "amount".into(),
+                    data_type: landed.into(),
+                    nullable: true,
+                }],
+                &BigQueryDialect,
+            )
+        };
+
+        let fits = gate("NUMERIC(38,9)", "NUMERIC");
+        assert!(fits.passed, "{fits:?}");
+        let wider = gate("BIGNUMERIC(76,38)", "NUMERIC");
+        assert!(wider.passed, "{wider:?}");
+
+        // Fit-within: (38, 9) does not fit (10, 2) or (38, 0).
+        for narrow in ["NUMERIC(10,2)", "NUMERIC(38,0)"] {
+            let result = gate(narrow, "NUMERIC");
+            assert!(!result.passed, "{narrow}: {result:?}");
+            let v = &result.violations[0];
+            assert_eq!(v.rule, "required_column_type", "{narrow}");
+            assert!(
+                v.message.contains("DECIMAL(38,9)") && v.message.contains("bigquery default"),
+                "the refusal says which reading it used: {}",
+                v.message
+            );
+        }
+
+        let big = gate("BIGNUMERIC(76,38)", "BIGNUMERIC");
+        assert!(!big.passed, "{big:?}");
+        assert_eq!(big.violations[0].rule, "unverifiable_landed_type");
+
+        // A parameterized landed type is read from its own digits.
+        let spelled = gate("NUMERIC(38,9)", "NUMERIC(10, 2)");
+        assert!(spelled.passed, "{spelled:?}");
+    }
 
     #[test]
     fn test_format_table_ref() {

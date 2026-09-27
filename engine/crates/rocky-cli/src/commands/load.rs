@@ -697,7 +697,7 @@ async fn load_with_contract_gate(
             ));
         }
     };
-    let result = validate_contract_typed(contract, &landed);
+    let result = validate_contract_typed(contract, &landed, warehouse.dialect());
 
     for warning in &result.warnings {
         tracing::warn!(table = %target, "{warning}");
@@ -1149,7 +1149,7 @@ required_columns = [
             .await
             .unwrap();
         assert!(
-            !validate_contract_typed(&contract, &landed)
+            !validate_contract_typed(&contract, &landed, wh.dialect())
                 .warnings
                 .is_empty()
         );
