@@ -182,6 +182,7 @@ fn infer_column_map(
     let compiler_cfg = CompilerConfig {
         models_dir: models_dir.to_path_buf(),
         contracts_dir: None,
+        required_explicit_contract_model: None,
         source_schemas: crate::source_schemas::load_cached_source_schemas(
             &schema_cache_cfg,
             state_path,

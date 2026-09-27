@@ -3954,6 +3954,7 @@ effect = "require_review"
             compile::compile(&CompilerConfig {
                 models_dir: root.join("models"),
                 contracts_dir: None,
+                required_explicit_contract_model: None,
                 source_schemas,
                 mask: cfg.mask.clone(),
                 allow_unmasked: cfg.classifications.allow_unmasked.clone(),
