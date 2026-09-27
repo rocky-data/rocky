@@ -19,3 +19,9 @@ Staging: **spine-first** (PR-A → PR-B → PR-F) then the CAS **fast-follow** (
 These ADRs went through three adversarial review rounds (a strategic-plan red team, an independent per-ADR second review, and a red team over the implementation plan); the corrections from all three are folded in.
 
 These three ADRs were authored under adversarial review (Codex, 10 findings dispositioned) and a cross-consistency pass. **Status: Accepted (2026-07-17) — implementation in progress.**
+
+## Secrets in config
+
+| ADR | Status | Closes |
+|---|---|---|
+| [`ADR-SECRET-TYPE.md`](ADR-SECRET-TYPE.md) | Proposed (2026-09-27) | #1919 — an `EnvString` type that prints a resolved `${VAR}` as `${NAME}`. |
