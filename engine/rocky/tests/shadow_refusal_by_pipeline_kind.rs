@@ -402,13 +402,9 @@ fn a_refused_model_request_on_a_quality_pipeline_does_not_spend_its_key() {
     ]);
 
     assert_eq!(refused.status.code(), Some(1), "{}", stderr(&refused));
-    assert!(
-        stderr(&refused).contains(&format!(
-            "--branch {BRANCH} is not supported for quality pipeline 'dq'"
-        )),
-        "the shadow refusal, not the later `--model` one: {}",
-        stderr(&refused)
-    );
+    // The effects first, the wording last: a request refused at the older,
+    // later point exits 1 as well, so the side effects are what tell the two
+    // placements apart.
     assert!(
         !warehouse_file.exists(),
         "the refused request built an adapter and created the warehouse file"
@@ -417,6 +413,13 @@ fn a_refused_model_request_on_a_quality_pipeline_does_not_spend_its_key() {
         project.state_digest(),
         state_before,
         "no claim and no `Failed` stamp"
+    );
+    assert!(
+        stderr(&refused).contains(&format!(
+            "--branch {BRANCH} is not supported for quality pipeline 'dq'"
+        )),
+        "the shadow refusal, not the later `--model` one: {}",
+        stderr(&refused)
     );
 
     seed_production(&project.dir);
