@@ -191,10 +191,6 @@ fn jsonl_layer_disabled() -> bool {
 #[cfg(feature = "otel")]
 fn build_otel_tracer()
 -> Result<opentelemetry_sdk::trace::SdkTracerProvider, Box<dyn std::error::Error + Send + Sync>> {
-    use opentelemetry_otlp::WithExportConfig;
-    use opentelemetry_sdk::Resource;
-    use opentelemetry_sdk::trace::{Sampler, SdkTracerProvider};
-
     const DEFAULT_ENDPOINT: &str = "http://localhost:4317";
     const DEFAULT_SERVICE_NAME: &str = "rocky";
 
@@ -203,13 +199,23 @@ fn build_otel_tracer()
     let service_name =
         std::env::var("OTEL_SERVICE_NAME").unwrap_or_else(|_| DEFAULT_SERVICE_NAME.to_string());
 
-    let exporter = opentelemetry_otlp::SpanExporter::builder()
-        .with_tonic()
-        .with_endpoint(&endpoint)
-        .build()?;
+    build_tracer_provider(&endpoint, &service_name)
+}
+
+/// [`build_otel_tracer`] with the endpoint and service name given, not read from
+/// the environment.
+#[cfg(feature = "otel")]
+fn build_tracer_provider(
+    endpoint: &str,
+    service_name: &str,
+) -> Result<opentelemetry_sdk::trace::SdkTracerProvider, Box<dyn std::error::Error + Send + Sync>> {
+    use opentelemetry_sdk::Resource;
+    use opentelemetry_sdk::trace::{Sampler, SdkTracerProvider};
+
+    let exporter = crate::otel::build_span_exporter(endpoint)?;
 
     let resource = Resource::builder()
-        .with_service_name(service_name.clone())
+        .with_service_name(service_name.to_owned())
         .build();
 
     // ParentBased(AlwaysOn) honours the upstream sampler decision when
@@ -1287,6 +1293,31 @@ mod tests {
             );
         });
         provider.shutdown().expect("provider shutdown");
+    }
+
+    /// The tracer provider behind `init_tracing`'s OTLP export makes exactly one
+    /// export attempt against a collector that answers `UNAVAILABLE`.
+    /// `opentelemetry-otlp` 0.33 retries by default (four requests here), so this
+    /// fails if the span exporter built by `build_tracer_provider` loses its
+    /// `RetryPolicy::disabled()`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn otlp_span_export_is_a_single_attempt_when_the_collector_is_unavailable() {
+        use crate::otel::test_collector::{TRACE_EXPORT, UnavailableCollector};
+        use opentelemetry::trace::{Span as _, Tracer as _};
+
+        let collector = UnavailableCollector::start().await;
+        let provider = build_tracer_provider(collector.endpoint(), "rocky-test")
+            .expect("build the OTLP tracer provider");
+        let mut span = provider.tracer("rocky-test").start("retry.probe");
+        span.end();
+        // `shutdown` flushes the batch and blocks on the export, so keep it off
+        // the runtime threads that drive the exporter's channel and the
+        // collector. The export fails by design, so its result is not asserted.
+        let _ = tokio::task::spawn_blocking(move || provider.shutdown())
+            .await
+            .expect("tracer shutdown thread");
+
+        assert_eq!(collector.requests(), [TRACE_EXPORT]);
     }
 
     /// Drive a future to completion on the current thread, so the span under
