@@ -271,6 +271,7 @@ A transformation model that fails to compile during a run counts as a failure, n
 | Field | Type | Description |
 |-------|------|-------------|
 | `asset_key` | array of strings | Unique asset identifier. |
+| `notes` | array of strings | Run notes for this materialization, including a completed kind switch or why `drop_existing_kind` was not used after a failed kind probe. Empty when there is nothing to report. |
 | `rows_copied` | integer or null | Number of rows inserted. Null if the warehouse does not report this. |
 | `duration_ms` | integer | Time spent copying this table in milliseconds. |
 | `metadata.strategy` | string | Replication strategy used (`"incremental"` or `"full_refresh"`). |

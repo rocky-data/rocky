@@ -446,7 +446,7 @@ pub trait WarehouseAdapter: Send + Sync {
     }
 
     /// Execute a kind switch in one transaction when supported. `None` means
-    /// the caller must issue DROP and CREATE separately. If CREATE fails,
+    /// unsupported; the caller must not drop the old object. If CREATE fails,
     /// the adapter rolls back the DROP before returning an error. A failed
     /// COMMIT can leave target state uncertain and must say so in its error.
     async fn atomic_drop_and_create(
@@ -520,8 +520,9 @@ pub trait WarehouseAdapter: Send + Sync {
     /// Default: `Ok(ObjectKind::Unknown)`. Every adapter but `rocky-duckdb`
     /// reports this today, which makes the reconciliation check this backs
     /// a no-op for them: their `CREATE OR REPLACE <kind>` runs exactly as
-    /// it always has. The runner adds a possible-cause remedy to failures
-    /// when the kind cannot be determined. Extending this to
+    /// it always has. A failed probe is also Unknown and never authorizes a
+    /// drop; with explicit permission the run reports why it was unused.
+    /// Extending this to
     /// another adapter is a follow-up, not a prerequisite.
     ///
     /// # Errors

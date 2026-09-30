@@ -13190,8 +13190,8 @@ async fn execute_one_plain_model(
     // the OLD kind, and the warehouse refuses with its own catalog error
     // ("Existing object X is of type Y, trying to replace with type Z")
     // naming neither the cause nor the fix (#2037's repro). Check the
-    // target's actual kind here, before that statement is generated or
-    // sent. Drop only when the model explicitly names the existing kind.
+    // target's actual kind before sending that statement. Drop only when
+    // the model names the existing kind and the adapter can do so atomically.
     //
     // Scoped to `FullRefresh`/`View` only: they are the two strategies
     // whose SQL is *always* a `CREATE OR REPLACE <kind>` of the two kinds
@@ -13207,6 +13207,7 @@ async fn execute_one_plain_model(
         warehouse.warehouse_name(),
     )?;
     let mut pending_drop: Option<(String, &'static str, &'static str)> = None;
+    let mut kind_probe_note = None;
     if let Some(expected_kind) = strategy_implies_object_kind(&model_ir.materialization) {
         if model.drop_existing_kind.is_some() && !warehouse.supports_object_kind_probe() {
             return Err(anyhow::anyhow!(
@@ -13218,17 +13219,21 @@ async fn execute_one_plain_model(
             schema: model_ir.target.schema.clone(),
             table: model_ir.target.table.clone(),
         };
-        // Unknown means no mismatch was confirmed. Without an explicit
-        // permission, let CREATE run and report its actual error. An adapter
-        // without this probe cannot use the standing DROP permission.
-        let existing_kind = warehouse
-            .object_kind(&target_table_struct)
-            .await
-            .map_err(|e| {
-                anyhow::Error::from(e).context(format!(
-                    "model '{model_name}' could not confirm the target kind; no object was dropped"
-                ))
-            })?;
+        // A failed probe is Unknown: it never authorizes a DROP or blocks
+        // CREATE. If permission was supplied, explain why it was unused.
+        let existing_kind = match warehouse.object_kind(&target_table_struct).await {
+            Ok(kind) => kind,
+            Err(error) => {
+                if model.drop_existing_kind.is_some() {
+                    let note = format!(
+                        "model '{model_name}' could not confirm the target kind for {target_ref}: {error}; drop_existing_kind was not used"
+                    );
+                    eprintln!("{note}");
+                    kind_probe_note = Some(note);
+                }
+                rocky_core::traits::ObjectKind::Unknown
+            }
+        };
         // Exhaustive over `existing_kind` (no `_ =>`) so a future
         // `ObjectKind` variant fails to compile here instead of silently
         // falling into "skip" or "mismatch".
@@ -13402,9 +13407,8 @@ async fn execute_one_plain_model(
     // tables already have. Skipped on a first-run bootstrap that already
     // loaded the data via CTAS (Incremental / DeleteInsert / Microbatch).
     if !skip_strategy_exec {
-        let mut dropped_nonatomic = false;
         let mut atomic_create_done = false;
-        if let Some((drop_sql, existing_name, _)) = &pending_drop {
+        if let Some((drop_sql, _, _)) = &pending_drop {
             if exec_stmts.len() != 1 {
                 return Err(anyhow::anyhow!(
                     "model '{model_name}' expected one CREATE statement for its kind switch, got {}",
@@ -13426,12 +13430,9 @@ async fn execute_one_plain_model(
                     atomic_create_done = true;
                 }
                 Ok(None) => {
-                    warehouse.execute_statement(drop_sql).await.map_err(|e| {
-                        anyhow::Error::from(e).context(format!(
-                            "model '{model_name}' could not drop its existing {existing_name} target {target_ref}"
-                        ))
-                    })?;
-                    dropped_nonatomic = true;
+                    return Err(anyhow::anyhow!(
+                        "model '{model_name}' cannot switch the kind of {target_ref}: this adapter does not support atomic DROP and CREATE; no object was dropped"
+                    ));
                 }
                 Err(e) => {
                     return Err(anyhow::Error::from(e).context(format!(
@@ -13453,13 +13454,10 @@ async fn execute_one_plain_model(
                     }
                 }
                 Err(e) => {
-                    let guidance = if dropped_nonatomic {
-                        format!(
-                            "model '{model_name}' failed after the old object {target_ref} was dropped; restore it or rerun after fixing the CREATE failure"
-                        )
-                    } else {
-                        format!("model '{model_name}' failed")
-                    };
+                    let guidance = kind_probe_note
+                        .as_ref()
+                        .map(|note| format!("model '{model_name}' failed; {note}"))
+                        .unwrap_or_else(|| format!("model '{model_name}' failed"));
                     return Err(anyhow::Error::from(e).context(guidance));
                 }
             }
@@ -13486,11 +13484,11 @@ async fn execute_one_plain_model(
         notes: pending_drop
             .as_ref()
             .map(|(_, old, new)| {
-                vec![format!(
-                    "Dropped {old} {target_ref} and created {new} for model '{model_name}'"
-                )]
+                format!("Dropped {old} {target_ref} and created {new} for model '{model_name}'")
             })
-            .unwrap_or_default(),
+            .into_iter()
+            .chain(kind_probe_note)
+            .collect(),
         attempts: Vec::new(),
         rows_copied: None,
         duration_ms: model_duration_ms,
@@ -20046,6 +20044,49 @@ auto_create_schemas = true
         }
     }
 
+    #[cfg(feature = "duckdb")]
+    struct FailingKindProbe<'a>(&'a rocky_duckdb::adapter::DuckDbWarehouseAdapter);
+
+    #[cfg(feature = "duckdb")]
+    #[async_trait::async_trait]
+    impl rocky_core::traits::WarehouseAdapter for FailingKindProbe<'_> {
+        fn dialect(&self) -> &dyn rocky_core::traits::SqlDialect {
+            self.0.dialect()
+        }
+        fn supports_object_kind_probe(&self) -> bool {
+            true
+        }
+        async fn object_kind(
+            &self,
+            _table: &rocky_ir::TableRef,
+        ) -> rocky_core::traits::AdapterResult<rocky_core::traits::ObjectKind> {
+            Err(rocky_core::traits::AdapterError::msg(
+                "injected kind probe failure",
+            ))
+        }
+        async fn execute_statement(&self, sql: &str) -> rocky_core::traits::AdapterResult<()> {
+            self.0.execute_statement(sql).await
+        }
+        async fn execute_statement_with_stats(
+            &self,
+            sql: &str,
+        ) -> rocky_core::traits::AdapterResult<rocky_core::traits::ExecutionStats> {
+            self.0.execute_statement_with_stats(sql).await
+        }
+        async fn execute_query(
+            &self,
+            sql: &str,
+        ) -> rocky_core::traits::AdapterResult<rocky_core::traits::QueryResult> {
+            self.0.execute_query(sql).await
+        }
+        async fn describe_table(
+            &self,
+            table: &rocky_ir::TableRef,
+        ) -> rocky_core::traits::AdapterResult<Vec<rocky_ir::ColumnInfo>> {
+            self.0.describe_table(table).await
+        }
+    }
+
     #[test]
     fn run_trigger_from_env_maps_known_values() {
         use rocky_core::state::RunTrigger;
@@ -23907,11 +23948,10 @@ table = "orders_view"
             .unwrap();
         assert_eq!(kind, ObjectKind::View);
 
-        // A non-transactional adapter must say that the old object was
-        // dropped when the later CREATE fails.
+        // A probe alone cannot authorize a non-atomic DROP.
         permitted_model.sql = "SELECT missing_column FROM src.orders".into();
         let non_atomic = NonAtomicDuckDb(&warehouse);
-        let failed_create = super::execute_one_plain_model(
+        let refused_nonatomic = super::execute_one_plain_model(
             &permitted_model,
             &non_atomic,
             &dialect,
@@ -23920,11 +23960,10 @@ table = "orders_view"
             exec_ctx,
         )
         .await
-        .expect_err("bad CREATE must fail after DROP");
+        .expect_err("an adapter without an atomic switch must refuse before DROP");
         assert!(
-            format!("{failed_create:#}")
-                .contains("failed after the old object tgt.orders_view was dropped"),
-            "{failed_create:#}"
+            format!("{refused_nonatomic:#}").contains("does not support atomic DROP and CREATE"),
+            "{refused_nonatomic:#}"
         );
         assert_eq!(
             warehouse
@@ -23935,7 +23974,166 @@ table = "orders_view"
                 })
                 .await
                 .unwrap(),
-            ObjectKind::Unknown
+            ObjectKind::View
+        );
+    }
+
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn strategy_switch_probe_error_allows_create_without_permission() {
+        use rocky_core::models::load_model_pair;
+        use rocky_core::traits::{ObjectKind, WarehouseAdapter};
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+        use rocky_duckdb::dialect::DuckDbSqlDialect;
+
+        let warehouse = DuckDbWarehouseAdapter::in_memory().unwrap();
+        warehouse
+            .execute_statement("CREATE SCHEMA tgt")
+            .await
+            .unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("orders.sql"), "SELECT 1 AS id").unwrap();
+        std::fs::write(
+            dir.path().join("orders.toml"),
+            "name = \"orders\"\n[strategy]\ntype = \"full_refresh\"\n[target]\ncatalog = \"\"\nschema = \"tgt\"\ntable = \"orders\"\n",
+        )
+        .unwrap();
+        let model = load_model_pair(
+            &dir.path().join("orders.sql"),
+            &dir.path().join("orders.toml"),
+            None,
+        )
+        .unwrap();
+        let typed_models = indexmap::IndexMap::new();
+        let model_timings = std::collections::HashMap::new();
+        let surrogate_keys = std::collections::HashMap::new();
+        let exec_ctx = super::ExecutionContext {
+            typed_models: &typed_models,
+            model_timings: &model_timings,
+            surrogate_keys: &surrogate_keys,
+        };
+        let output = super::execute_one_plain_model(
+            &model,
+            &FailingKindProbe(&warehouse),
+            &DuckDbSqlDialect,
+            "orders",
+            std::time::Instant::now(),
+            exec_ctx,
+        )
+        .await
+        .expect("failed advisory probe must allow CREATE");
+        assert!(output.notes.is_empty());
+        assert_eq!(
+            warehouse
+                .object_kind(&rocky_ir::TableRef {
+                    catalog: String::new(),
+                    schema: "tgt".into(),
+                    table: "orders".into(),
+                })
+                .await
+                .unwrap(),
+            ObjectKind::Table
+        );
+
+        let mut permitted = model.clone();
+        permitted.drop_existing_kind = Some(rocky_core::models::DropExistingKind::View);
+        let output = super::execute_one_plain_model(
+            &permitted,
+            &FailingKindProbe(&warehouse),
+            &DuckDbSqlDialect,
+            "orders",
+            std::time::Instant::now(),
+            exec_ctx,
+        )
+        .await
+        .expect("a failed probe must not block a permitted model either");
+        assert!(output.notes[0].contains("injected kind probe failure"));
+        assert!(output.notes[0].contains("drop_existing_kind was not used"));
+    }
+
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn strategy_switch_unknown_create_failure_has_no_drop_advice() {
+        use rocky_core::models::load_model_pair;
+        use rocky_core::traits::{ObjectKind, WarehouseAdapter};
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+        use rocky_duckdb::dialect::DuckDbSqlDialect;
+
+        let warehouse = DuckDbWarehouseAdapter::in_memory().unwrap();
+        warehouse
+            .execute_statement("CREATE SCHEMA tgt")
+            .await
+            .unwrap();
+        warehouse
+            .execute_statement("CREATE VIEW tgt.orders AS SELECT 1 AS id")
+            .await
+            .unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("orders.sql"), "SELECT 2 AS id").unwrap();
+        std::fs::write(
+            dir.path().join("orders.toml"),
+            "name = \"orders\"\n[strategy]\ntype = \"full_refresh\"\n[target]\ncatalog = \"\"\nschema = \"tgt\"\ntable = \"orders\"\n",
+        )
+        .unwrap();
+        let model = load_model_pair(
+            &dir.path().join("orders.sql"),
+            &dir.path().join("orders.toml"),
+            None,
+        )
+        .unwrap();
+        let typed_models = indexmap::IndexMap::new();
+        let model_timings = std::collections::HashMap::new();
+        let surrogate_keys = std::collections::HashMap::new();
+        let exec_ctx = super::ExecutionContext {
+            typed_models: &typed_models,
+            model_timings: &model_timings,
+            surrogate_keys: &surrogate_keys,
+        };
+        let error = super::execute_one_plain_model(
+            &model,
+            &FailTargetDescribe {
+                inner: &warehouse,
+                inject_msg: "unused for full_refresh",
+            },
+            &DuckDbSqlDialect,
+            "orders",
+            std::time::Instant::now(),
+            exec_ctx,
+        )
+        .await
+        .expect_err("CREATE must report its own failure");
+        let message = format!("{error:#}");
+        assert!(message.contains("model 'orders' failed"), "{message}");
+        assert!(!message.contains("DROP TABLE"), "{message}");
+        assert!(!message.contains("DROP VIEW"), "{message}");
+        let mut permitted = model.clone();
+        permitted.drop_existing_kind = Some(rocky_core::models::DropExistingKind::View);
+        let error = super::execute_one_plain_model(
+            &permitted,
+            &FailingKindProbe(&warehouse),
+            &DuckDbSqlDialect,
+            "orders",
+            std::time::Instant::now(),
+            exec_ctx,
+        )
+        .await
+        .expect_err("CREATE fails, but an unknown kind must not be dropped");
+        let message = format!("{error:#}");
+        assert!(message.contains("injected kind probe failure"), "{message}");
+        assert!(
+            message.contains("drop_existing_kind was not used"),
+            "{message}"
+        );
+        assert_eq!(
+            warehouse
+                .object_kind(&rocky_ir::TableRef {
+                    catalog: String::new(),
+                    schema: "tgt".into(),
+                    table: "orders".into(),
+                })
+                .await
+                .unwrap(),
+            ObjectKind::View
         );
     }
 

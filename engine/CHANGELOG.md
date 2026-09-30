@@ -71,6 +71,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **A model can switch between `view` and `full_refresh` with an explicit per-model drop permission.** Set `drop_existing_kind = "view"` or `"table"` in its sidecar to name the existing kind Rocky may remove. A known mismatch without matching permission still names the needed `DROP`; an unknown kind never triggers a drop. The run reports the removed target and the new kind. (#2037)
 - **A model kind switch now keeps the old DuckDB object if creation fails.** Rocky carries the permission from `.rocky` sidecars, generates SQL before any drop, reports a successful drop in run JSON, and gives DROP advice only for a confirmed mismatch. The permission is refused on adapters without a kind probe. (#2037)
+- **A failed target-kind probe no longer stops a model run or permits a drop.** Rocky treats the kind as unknown and lets CREATE report its result. With an explicit drop permission, the run explains why the permission was unused. An adapter that cannot make DROP and CREATE atomic refuses a known kind switch before dropping anything. (#2037)
 
 ### Added
 
