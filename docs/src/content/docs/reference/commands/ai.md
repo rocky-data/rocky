@@ -415,7 +415,7 @@ The server **never materializes anything**. No tool runs SQL that changes your w
 
 Three rules keep that boundary in place:
 
-- The generators (`ai_contract`, `ai_test`, `explain_model`) return **drafts** and mutate nothing. Hand a draft to the `draft_contract` or `draft_check` write tool, or save it to disk and run `compile` and `test` yourself.
+- The generators (`ai_contract`, `ai_test`, `explain_model`) return **drafts** and mutate nothing. Hand a draft to `draft_contract` or `draft_check`. After review and apply, run sidecar checks with `test` and `declarative = true`.
 - `governance_preview` and `drift_preview` are **read-only** previews.
 - The server does not apply. `rocky apply` is the only step that WRITES to the warehouse, and no MCP tool runs it. Some tools do read the warehouse: `sample_rows`, `profile_column`, `inspect_schema`, and `drift_preview` issue queries against it. `review_queue` can write a plan's approval marker, but only on `rocky mcp --profile approver` — the default server refuses the call with `approve_not_enabled` and writes nothing. Where it is served it still needs `confirm: true` from the caller, and it still refuses a plan that is not already in the pending review queue. `rocky mcp --profile worker` does not serve `review_queue` at all. So treat approval as a step the server can take **only on a server you started for that purpose**; the profile is chosen at launch and an agent cannot change it mid-session.
 
@@ -428,7 +428,7 @@ Three rules keep that boundary in place:
 | `compile` | Type-check the project and return diagnostics (errors / warnings). |
 | `plan_preview` | Render the SQL Rocky generates, offline, with no warehouse I/O. Not the whole plan: a model it cannot render offline is skipped and is not named in the result. Skipped by construction: Snowflake dynamic tables, time-interval models, and content-addressed models. |
 | `lineage` | Column-level lineage for a model (or a single column). |
-| `test` | Run the project's DuckDB-backed local tests (contracts + assertions). |
+| `test` | Run local model and fixture tests by default. Set `declarative = true` to run sidecar `[[tests]]` against the configured warehouse after apply. |
 | `list` | List project entities (`models`, `pipelines`, `adapters`, `sources`). |
 | `inspect_schema` | Typed columns of every model and source table — works at cold start, before anything is materialized. |
 | `catalog` | The project-wide asset catalog (every model + source) in one call. |

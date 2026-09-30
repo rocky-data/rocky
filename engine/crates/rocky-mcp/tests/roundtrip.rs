@@ -4,6 +4,7 @@
 //! drives it with an rmcp client, exercising `tools/list` + `tools/call`
 //! exactly as a real harness would over stdio.
 
+use std::io::Write;
 use std::path::Path;
 
 use rmcp::ServiceExt;
@@ -2141,6 +2142,262 @@ async fn draft_check_writes_and_compiles() {
     client.cancel().await.unwrap();
 }
 
+/// The draft gate must report the generator's own refusal before writing.
+async fn assert_draft_check_refused(field: &str, spec: &str, reason: &str) {
+    let dir = TempDir::new().unwrap();
+    write_project(dir.path(), &dir.path().join("test.duckdb"));
+    let sidecar_path = dir.path().join("models/orders.toml");
+    let before = std::fs::read(&sidecar_path).unwrap();
+    let client = connect(RockyMcpServer::new(dir.path().join("rocky.toml"))).await;
+    let result = client
+        .call_tool(
+            CallToolRequestParams::new("draft_check").with_arguments(
+                serde_json::json!({"model": "orders", "spec": spec})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        )
+        .await
+        .expect("draft_check result");
+    assert_eq!(result.is_error, Some(true), "{field}");
+    let body = format!("{result:?}");
+    assert!(body.contains(reason), "{field}: {body}");
+    assert_eq!(
+        std::fs::read(&sidecar_path).unwrap(),
+        before,
+        "{field} wrote a sidecar"
+    );
+    client.cancel().await.unwrap();
+}
+
+macro_rules! rejected_check_case {
+    ($name:ident, $field:literal, $spec:literal, $reason:literal) => {
+        #[tokio::test]
+        async fn $name() {
+            assert_draft_check_refused($field, $spec, $reason).await;
+        }
+    };
+}
+
+rejected_check_case!(
+    draft_check_rejects_column,
+    "column",
+    "[[tests]]\ntype = \"not_null\"\ncolumn = \"status; drop\"\n",
+    "invalid SQL identifier 'status; drop'"
+);
+rejected_check_case!(
+    draft_check_rejects_unique_column,
+    "column",
+    "[[tests]]\ntype = \"unique\"\ncolumn = \"bad;column\"\n",
+    "invalid SQL identifier 'bad;column'"
+);
+rejected_check_case!(
+    draft_check_rejects_missing_column,
+    "column",
+    "[[tests]]\ntype = \"not_null\"\n",
+    "requires a column but none was provided"
+);
+rejected_check_case!(
+    draft_check_rejects_invalid_range_bound,
+    "min",
+    "[[tests]]\ntype = \"in_range\"\ncolumn = \"id\"\nmin = \"tomorrow\"\n",
+    "must parse as a number"
+);
+rejected_check_case!(
+    draft_check_rejects_invalid_aggregate_value,
+    "value",
+    "[[tests]]\ntype = \"aggregate\"\nop = \"sum\"\ncmp = \"gte\"\ncolumn = \"id\"\nvalue = \"invalid\"\n",
+    "must parse as a number"
+);
+rejected_check_case!(
+    draft_check_rejects_to_table,
+    "to_table",
+    "[[tests]]\ntype = \"relationships\"\ncolumn = \"id\"\nto_table = \"bad;table\"\nto_column = \"id\"\n",
+    "invalid SQL identifier 'bad;table'"
+);
+rejected_check_case!(
+    draft_check_rejects_to_column,
+    "to_column",
+    "[[tests]]\ntype = \"relationships\"\ncolumn = \"id\"\nto_table = \"ref_table\"\nto_column = \"bad;column\"\n",
+    "invalid SQL identifier 'bad;column'"
+);
+rejected_check_case!(
+    draft_check_rejects_pattern,
+    "pattern",
+    "[[tests]]\ntype = \"regex_match\"\ncolumn = \"status\"\npattern = \"a;b\"\n",
+    "regex_match pattern contains unsafe character ';'"
+);
+rejected_check_case!(
+    draft_check_rejects_values,
+    "values",
+    "[[tests]]\ntype = \"accepted_values\"\ncolumn = \"status\"\nvalues = []\n",
+    "accepted_values test requires at least one value"
+);
+rejected_check_case!(
+    draft_check_rejects_columns,
+    "columns",
+    "[[tests]]\ntype = \"composite\"\nkind = \"unique\"\ncolumns = [\"id\"]\n",
+    "composite test requires at least two columns"
+);
+rejected_check_case!(
+    draft_check_rejects_composite_identifier,
+    "columns",
+    "[[tests]]\ntype = \"composite\"\nkind = \"unique\"\ncolumns = [\"id\", \"bad;column\"]\n",
+    "invalid SQL identifier 'bad;column'"
+);
+
+#[tokio::test]
+async fn test_declarative_mode_runs_the_sidecar_check() {
+    let dir = TempDir::new().unwrap();
+    write_project(dir.path(), &dir.path().join("test.duckdb"));
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(dir.path().join("models/orders.toml"))
+        .unwrap()
+        .write_all(b"\n[[tests]]\ntype = \"not_null\"\ncolumn = \"id\"\n")
+        .unwrap();
+    let client = connect(RockyMcpServer::new(dir.path().join("rocky.toml"))).await;
+    let result = client
+        .call_tool(
+            CallToolRequestParams::new("test").with_arguments(
+                serde_json::json!({"model": "orders", "pipeline": "p", "declarative": true})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        )
+        .await
+        .expect("declarative test result");
+    assert_ne!(result.is_error, Some(true));
+    let body = result.structured_content.unwrap();
+    assert_eq!(body["declarative"]["total"], 1);
+    assert_eq!(body["declarative"]["errored"], 1);
+    assert_eq!(body["all_passed"], false);
+    assert_eq!(body["failures"][0]["suite"], "declarative");
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_declarative_mode_zero_checks_matches_cli_success() {
+    let dir = TempDir::new().unwrap();
+    write_project(dir.path(), &dir.path().join("test.duckdb"));
+    let client = connect(RockyMcpServer::new(dir.path().join("rocky.toml"))).await;
+    let args = object(serde_json::json!({"model": "orders", "pipeline": "p", "declarative": true}));
+    let result = client
+        .call_tool(CallToolRequestParams::new("test").with_arguments(args))
+        .await
+        .expect("zero-check declarative result");
+    assert_ne!(result.is_error, Some(true), "{result:?}");
+    let body = result.structured_content.unwrap();
+    assert_eq!(body["declarative"]["total"], 0);
+    assert_eq!(body["all_passed"], true);
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_declarative_mode_names_applied_pass_and_failure() {
+    use rocky_core::traits::WarehouseAdapter;
+
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("warehouse.duckdb");
+    write_project(dir.path(), &db_path);
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(dir.path().join("models/orders.toml"))
+        .unwrap()
+        .write_all(b"\n[[tests]]\ntype = \"not_null\"\ncolumn = \"id\"\n\n[[tests]]\ntype = \"not_null\"\ncolumn = \"status\"\n")
+        .unwrap();
+    let adapter = rocky_duckdb::adapter::DuckDbWarehouseAdapter::open(&db_path).unwrap();
+    adapter
+        .execute_statement("CREATE SCHEMA out")
+        .await
+        .unwrap();
+    adapter
+        .execute_statement("CREATE TABLE out.orders AS SELECT 1 AS id, NULL::VARCHAR AS status")
+        .await
+        .unwrap();
+    drop(adapter);
+
+    let client = connect(RockyMcpServer::new(dir.path().join("rocky.toml"))).await;
+    let result = client
+        .call_tool(
+            CallToolRequestParams::new("test").with_arguments(
+                serde_json::json!({"model": "orders", "pipeline": "p", "declarative": true})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        )
+        .await
+        .expect("applied declarative test result");
+    assert_ne!(result.is_error, Some(true), "{result:?}");
+    let body = result.structured_content.unwrap();
+    assert_eq!(body["declarative"]["passed"], 1, "{body:?}");
+    assert_eq!(body["declarative"]["failed"], 1, "{body:?}");
+    assert_eq!(body["declarative"]["results"][0]["column"], "id");
+    assert_eq!(body["declarative"]["results"][0]["status"], "pass");
+    assert_eq!(body["declarative"]["results"][1]["column"], "status");
+    assert_eq!(body["declarative"]["results"][1]["status"], "fail");
+    assert_eq!(body["failures"][0]["name"], "orders::not_null::status");
+    assert_eq!(body["all_passed"], false);
+
+    // The CLI exits successfully for a warning-severity failure. The MCP
+    // summary keeps that result visible without marking the run as blocked.
+    let sidecar = dir.path().join("models/orders.toml");
+    let original = std::fs::read_to_string(&sidecar).unwrap();
+    std::fs::write(
+        &sidecar,
+        original.replace(
+            "column = \"status\"",
+            "column = \"status\"\nseverity = \"warning\"",
+        ),
+    )
+    .unwrap();
+    let warning = client
+        .call_tool(
+            CallToolRequestParams::new("test").with_arguments(
+                serde_json::json!({"model": "orders", "pipeline": "p", "declarative": true})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        )
+        .await
+        .expect("warning declarative test result")
+        .structured_content
+        .unwrap();
+    assert_eq!(warning["declarative"]["warned"], 1, "{warning:?}");
+    assert_eq!(warning["declarative"]["failed"], 0, "{warning:?}");
+    assert_eq!(warning["all_passed"], true, "{warning:?}");
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_declarative_mode_is_unavailable_to_worker() {
+    let dir = TempDir::new().unwrap();
+    write_project(dir.path(), &dir.path().join("test.duckdb"));
+    let client = connect(RockyMcpServer::new_with_profile(
+        dir.path().join("rocky.toml"),
+        rocky_mcp::McpProfile::Worker,
+    ))
+    .await;
+    let result = client
+        .call_tool(
+            CallToolRequestParams::new("test").with_arguments(
+                serde_json::json!({"declarative": true})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        )
+        .await
+        .expect("worker result");
+    assert_eq!(result.is_error, Some(true));
+    assert!(format!("{result:?}").contains("unavailable in the worker profile"));
+    client.cancel().await.unwrap();
+}
+
 /// A `draft_check` call with no `spec` is a mis-dispatch to the generator: it
 /// returns a structured `invalid_argument` error whose hint names `ai_test`.
 #[tokio::test]
@@ -2427,6 +2684,195 @@ async fn draft_check_writes_a_valid_filter_and_key_expr() {
     assert_ne!(after, before, "a valid spec must actually be written");
     assert!(after.contains("lower(status)") && after.contains("status = 'COMPLETE'"));
 
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn draft_check_refuses_comment_only_tests_without_aborting_server() {
+    let dir = TempDir::new().unwrap();
+    write_project(dir.path(), &dir.path().join("absent.duckdb"));
+    let before = std::fs::read(dir.path().join("models/orders.toml")).unwrap();
+    let client = connect(RockyMcpServer::new(dir.path().join("rocky.toml"))).await;
+    let args = object(serde_json::json!({"model": "orders", "spec": "# [[tests]]\n"}));
+    let result = client
+        .call_tool(CallToolRequestParams::new("draft_check").with_arguments(args))
+        .await
+        .expect("server survives malformed draft");
+    assert_eq!(result.is_error, Some(true));
+    let err = result.structured_content.expect("structured error");
+    assert_eq!(err["code"], "invalid_argument");
+    assert!(
+        err["message"]
+            .as_str()
+            .unwrap()
+            .contains("real `[[tests]]`")
+    );
+    assert_eq!(
+        std::fs::read(dir.path().join("models/orders.toml")).unwrap(),
+        before
+    );
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn draft_check_uses_target_adapter_without_creating_duckdb_file() {
+    let dir = TempDir::new().unwrap();
+    let db = dir.path().join("absent.duckdb");
+    write_project(dir.path(), &db);
+    let config = std::fs::read_to_string(dir.path().join("rocky.toml")).unwrap();
+    let config = config
+        .replace(
+            "[adapter]\ntype = \"duckdb\"",
+            "[adapter.default]\ntype = \"duckdb\"\n\n[adapter.target]\ntype = \"duckdb\"",
+        )
+        .replace(
+            "[pipeline.p.target]\n",
+            "[pipeline.p.target]\nadapter = \"target\"\n",
+        );
+    std::fs::write(dir.path().join("rocky.toml"), config).unwrap();
+    let client = connect(RockyMcpServer::new(dir.path().join("rocky.toml"))).await;
+    let args = object(
+        serde_json::json!({"model": "orders", "spec": "[[tests]]\ntype = \"not_null\"\ncolumn = \"id\"\n"}),
+    );
+    let result = client
+        .call_tool(CallToolRequestParams::new("draft_check").with_arguments(args))
+        .await
+        .expect("draft result");
+    assert_ne!(
+        result.is_error,
+        Some(true),
+        "target DuckDB dialect is selected: {:?}",
+        result.structured_content
+    );
+    assert!(
+        !db.exists(),
+        "draft validation must not open the configured DuckDB file"
+    );
+    client.cancel().await.unwrap();
+}
+
+fn add_check_pipeline(dir: &Path, other_type: &str) {
+    let path = dir.join("rocky.toml");
+    let config = std::fs::read_to_string(&path).unwrap();
+    let config = config.replace(
+        "[adapter]\ntype = \"duckdb\"",
+        "[adapter.default]\ntype = \"duckdb\"",
+    );
+    let pipeline = config[config.find("[pipeline.p]").unwrap()..]
+        .replace("pipeline.p", "pipeline.other")
+        .replace(
+            "[pipeline.other.target]\n",
+            "[pipeline.other.target]\nadapter = \"other\"\n",
+        );
+    std::fs::write(
+        path,
+        format!(
+            "{config}\n[adapter.other]\ntype = \"{other_type}\"\nhost = \"localhost\"\n\n{pipeline}"
+        ),
+    )
+    .unwrap();
+}
+
+#[tokio::test]
+async fn draft_check_accepts_multiple_pipelines_with_same_dialect() {
+    let dir = TempDir::new().unwrap();
+    write_project(dir.path(), &dir.path().join("absent.duckdb"));
+    add_check_pipeline(dir.path(), "duckdb");
+    let before = std::fs::read(dir.path().join("models/orders.toml")).unwrap();
+    let client = connect(RockyMcpServer::new(dir.path().join("rocky.toml"))).await;
+    let args = object(
+        serde_json::json!({"model": "orders", "spec": "[[tests]]\ntype = \"not_null\"\ncolumn = \"id\"\n"}),
+    );
+    let result = client
+        .call_tool(CallToolRequestParams::new("draft_check").with_arguments(args))
+        .await
+        .unwrap();
+    assert_ne!(result.is_error, Some(true), "{result:?}");
+    assert_ne!(
+        std::fs::read(dir.path().join("models/orders.toml")).unwrap(),
+        before
+    );
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn draft_check_requires_pipeline_only_for_different_dialects() {
+    let dir = TempDir::new().unwrap();
+    write_project(dir.path(), &dir.path().join("absent.duckdb"));
+    add_check_pipeline(dir.path(), "trino");
+    let before = std::fs::read(dir.path().join("models/orders.toml")).unwrap();
+    let client = connect(RockyMcpServer::new(dir.path().join("rocky.toml"))).await;
+    let spec = "[[tests]]\ntype = \"not_null\"\ncolumn = \"id\"\n";
+    let args = object(serde_json::json!({"model": "orders", "spec": spec}));
+    let result = client
+        .call_tool(CallToolRequestParams::new("draft_check").with_arguments(args))
+        .await
+        .unwrap();
+    assert_eq!(result.is_error, Some(true));
+    let err = result.structured_content.unwrap();
+    assert_eq!(err["code"], "invalid_argument");
+    let message = err["message"].as_str().unwrap();
+    assert!(
+        message.contains("(other, p)") || message.contains("(p, other)"),
+        "{message}"
+    );
+    assert_eq!(
+        std::fs::read(dir.path().join("models/orders.toml")).unwrap(),
+        before
+    );
+
+    let args = object(serde_json::json!({"model": "orders", "spec": spec, "pipeline": "p"}));
+    let result = client
+        .call_tool(CallToolRequestParams::new("draft_check").with_arguments(args))
+        .await
+        .unwrap();
+    assert_ne!(result.is_error, Some(true), "{result:?}");
+    assert_ne!(
+        std::fs::read(dir.path().join("models/orders.toml")).unwrap(),
+        before
+    );
+    let args = object(serde_json::json!({"model": "orders", "spec": spec, "pipeline": "other"}));
+    let result = client
+        .call_tool(CallToolRequestParams::new("draft_check").with_arguments(args))
+        .await
+        .unwrap();
+    assert_ne!(result.is_error, Some(true), "{result:?}");
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn draft_check_refuses_unresolved_target_adapter() {
+    let dir = TempDir::new().unwrap();
+    write_project(dir.path(), &dir.path().join("absent.duckdb"));
+    let config = std::fs::read_to_string(dir.path().join("rocky.toml"))
+        .unwrap()
+        .replace(
+            "[pipeline.p.target]\n",
+            "[pipeline.p.target]\nadapter = \"missing\"\n",
+        );
+    std::fs::write(dir.path().join("rocky.toml"), config).unwrap();
+    let before = std::fs::read(dir.path().join("models/orders.toml")).unwrap();
+    let client = connect(RockyMcpServer::new(dir.path().join("rocky.toml"))).await;
+    let args = object(
+        serde_json::json!({"model": "orders", "spec": "[[tests]]\ntype = \"not_null\"\ncolumn = \"id\"\n"}),
+    );
+    let result = client
+        .call_tool(CallToolRequestParams::new("draft_check").with_arguments(args))
+        .await
+        .expect("draft refusal");
+    assert_eq!(result.is_error, Some(true));
+    let err = result.structured_content.expect("structured error");
+    assert_eq!(err["code"], "config_invalid");
+    assert!(
+        err["message"]
+            .as_str()
+            .unwrap()
+            .contains("target adapter 'missing'")
+    );
+    assert_eq!(
+        std::fs::read(dir.path().join("models/orders.toml")).unwrap(),
+        before
+    );
     client.cancel().await.unwrap();
 }
 
@@ -6182,6 +6628,10 @@ fn record(
     nonce: &str,
 ) {
     assert!(
+        !stale_declarative_test_guidance(payload),
+        "'{key}' tells the caller to run drafted checks through default `test`: {payload}"
+    );
+    assert!(
         !payload.is_empty(),
         "'{key}' serialized to nothing; a golden over an empty payload pins nothing"
     );
@@ -6194,6 +6644,43 @@ fn record(
         blake3::hash(payload.as_bytes()).to_hex().to_string(),
     );
     assert!(previous.is_none(), "duplicate golden key '{key}'");
+}
+
+/// Applied `[[tests]]` checks require the declarative mode. Scan every
+/// recorded served payload, including tool schemas, prompts and instructions.
+fn stale_declarative_test_guidance(payload: &str) -> bool {
+    let normalized = payload
+        .to_lowercase()
+        .replace("\\n", " ")
+        .replace('\n', " ");
+    // Check each instruction clause, not a fixed list of exact sentences.
+    // Drafted-check verbs can precede or follow the `test` tool reference.
+    normalized.split(['.', ';']).any(|clause| {
+        let runs = ["run ", "runs ", "execute", "executes", "call "]
+            .iter()
+            .any(|verb| clause.contains(verb));
+        let check = ["check", "them", "assertion", "new test", "drafted test"]
+            .iter()
+            .any(|word| clause.contains(word));
+        runs && check && clause.contains("`test` tool") && !clause.contains("declarative = true")
+    })
+}
+
+#[test]
+fn phrase_guard_rejects_each_stale_guidance_form() {
+    for stale in [
+        "run the new checks via the `test` tool. Loop until clean.",
+        "run them via the `test` tool; it mutates nothing itself.",
+        "The check executes via the `test` tool.",
+        "After apply, run them with the `test` tool.",
+        "After apply, run the new tests via the `test` tool.",
+        "The drafted assertion executes via the `test` tool.",
+    ] {
+        assert!(stale_declarative_test_guidance(stale), "{stale}");
+    }
+    assert!(!stale_declarative_test_guidance(
+        "After apply, run the new checks via the `test` tool with `declarative = true`."
+    ));
 }
 
 /// Replace this run's temporary roots with a fixed sentinel.
@@ -6375,11 +6862,9 @@ async fn served_text_digests(
 /// withheld set, and the worker profile does not serve any of them. What is
 /// left run-dependent is the temp root, and replacing it exactly is cheap.
 ///
-/// WORKER ONLY, deliberately. The default profile serves the tools the
-/// exclusion was really about, so driving it here would import exactly the
-/// drift the reviewer established is absent from the worker surface. Rows
-/// 1–5 stay on both profiles; these three are worker-scoped, and the golden
-/// keys say so.
+/// This full call sweep is worker only. The default profile serves tools that
+/// produce run-dependent plans, so its call sweep needs separate fixtures.
+/// The default `draft_check` success result is covered below.
 ///
 /// The fixture MIRRORS `worker_result_text_names_no_excluded_tool`: the same
 /// budget-breached sidecar so `compile` and `draft_model` are RED with an
@@ -6590,6 +7075,40 @@ async fn worker_call_digests(
     out
 }
 
+/// Pin the check-authoring response, where the guidance about executing
+/// drafted checks is returned to the caller.
+async fn draft_check_call_digest(
+    dir: &Path,
+    nonce: &str,
+    profile: rocky_mcp::McpProfile,
+) -> std::collections::BTreeMap<String, String> {
+    write_project(dir, &dir.join("absent.duckdb"));
+    let client = connect(RockyMcpServer::new_with_profile(
+        dir.join("rocky.toml"),
+        profile,
+    ))
+    .await;
+    let args = object(serde_json::json!({
+        "model": "orders",
+        "spec": "[[tests]]\ntype = \"not_null\"\ncolumn = \"id\"\n"
+    }));
+    let result = client
+        .call_tool(CallToolRequestParams::new("draft_check").with_arguments(args))
+        .await
+        .expect("default draft_check call");
+    assert_ne!(result.is_error, Some(true), "{result:?}");
+    let mut out = std::collections::BTreeMap::new();
+    let whole = serde_json::to_string(&result).expect("draft_check result serializes");
+    record(
+        &mut out,
+        "tools/call/ok/draft_check",
+        &normalize_run_paths(&whole, &temp_roots(dir)),
+        nonce,
+    );
+    client.cancel().await.unwrap();
+    out
+}
+
 /// Render a digest table as the golden's on-disk form: `key<TAB>hash`, one
 /// per line, sorted (a `BTreeMap` iterates in key order).
 fn render_golden(table: &std::collections::BTreeMap<String, String>) -> String {
@@ -6655,10 +7174,9 @@ fn render_golden(table: &std::collections::BTreeMap<String, String>) -> String {
 /// The general principle was right; whether it applied to the specific set
 /// was never checked. That gap is the finding, not the principle.
 ///
-/// WORKER ONLY for those three, and the asymmetry with rows 1–5 is
-/// deliberate rather than an oversight: the DEFAULT profile serves the
-/// plan-producing tools the exclusion was really about, so driving it here
-/// would import the drift that is genuinely absent from the worker surface.
+/// The full call sweep is worker only. The default profile serves
+/// plan-producing tools with run-dependent output. Its `draft_check` success
+/// result uses a separate fixture and has its own golden row.
 ///
 /// WHAT IT STILL DOES NOT COVER, listed rather than left to be discovered:
 ///
@@ -6667,13 +7185,13 @@ fn render_golden(table: &std::collections::BTreeMap<String, String>) -> String {
 ///  - row 9 stays PARTIAL for the reason the enumeration gives — policy
 ///    denials, warehouse failures and internal errors are not reachable
 ///    from an offline harness;
-///  - the DEFAULT profile's call results are unpinned, deliberately (it
-///    serves the plan-producing tools);
-///  - the APPROVER profile's call results are unpinned too, and this one is
-///    a genuine hole rather than a choice. The approver serves an action
+///  - most DEFAULT profile call results are unpinned because they include
+///    run-dependent plan data. The `draft_check` success result is pinned;
+///  - most APPROVER profile call results are unpinned too. The approver serves an action
 ///    neither other profile does — `review_queue` approve, #1517 — and its
-///    result envelope is read by no sweep and pinned by no golden. Rows 1–5
-///    cover the approver only because they are compared for EQUALITY
+///    result envelope is read by no sweep and pinned by no golden. Its
+///    `draft_check` success result is pinned. Rows 1–5 cover the approver
+///    because they are compared for EQUALITY
 ///    against the default surface, and that equality says nothing about
 ///    what a call returns.
 ///
@@ -6757,6 +7275,32 @@ async fn served_text_golden_pins_every_worded_surface() {
         !worker_calls.is_empty(),
         "the call sweep produced no rows; it would pin nothing"
     );
+    let default_call_dir = TempDir::new().unwrap();
+    let default_call_nonce = default_call_dir
+        .path()
+        .file_name()
+        .expect("temp dir has a final component")
+        .to_string_lossy()
+        .to_string();
+    let default_calls = draft_check_call_digest(
+        default_call_dir.path(),
+        &default_call_nonce,
+        rocky_mcp::McpProfile::Default,
+    )
+    .await;
+    let approver_call_dir = TempDir::new().unwrap();
+    let approver_call_nonce = approver_call_dir
+        .path()
+        .file_name()
+        .expect("temp dir has a final component")
+        .to_string_lossy()
+        .to_string();
+    let approver_calls = draft_check_call_digest(
+        approver_call_dir.path(),
+        &approver_call_nonce,
+        rocky_mcp::McpProfile::Approver,
+    )
+    .await;
 
     // `record` refuses a duplicate key WITHIN one table. Two tables now merge
     // under the same `worker` label, and a plain `insert` would drop the
@@ -6767,6 +7311,8 @@ async fn served_text_golden_pins_every_worded_surface() {
     let mut live = std::collections::BTreeMap::new();
     for (label, table) in [
         ("default", default),
+        ("default", default_calls),
+        ("approver", approver_calls),
         ("worker", worker),
         ("worker", worker_calls),
     ] {

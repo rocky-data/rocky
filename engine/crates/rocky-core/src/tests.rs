@@ -482,9 +482,7 @@ fn generate_test_sql_inner(
         TestType::AcceptedValues { values } => {
             let col = require_column(test, "accepted_values")?;
             validation::validate_identifier(col)?;
-            if values.is_empty() {
-                return Err(TestGenError::EmptyAcceptedValues);
-            }
+            validate_accepted_values(values)?;
             let in_list = values
                 .iter()
                 .map(|v| accepted_value_literal(v, dialect, table))
@@ -503,10 +501,7 @@ fn generate_test_sql_inner(
             validation::validate_identifier(col)?;
             // to_table may be fully-qualified (catalog.schema.table) so we
             // validate each dot-separated component individually.
-            for part in to_table.split('.') {
-                validation::validate_identifier(part)?;
-            }
-            validation::validate_identifier(to_column)?;
+            validate_relationship_target(to_table, to_column)?;
             let filter_clause = filter.map(|f| format!("({f}) AND ")).unwrap_or_default();
             Ok(format!(
                 "SELECT t.{col} FROM {table} t \
@@ -604,12 +599,7 @@ fn generate_test_sql_inner(
             ))
         }
         TestType::Composite { kind, columns } => {
-            if columns.len() < 2 {
-                return Err(TestGenError::CompositeTooFewColumns);
-            }
-            for col in columns {
-                validation::validate_identifier(col)?;
-            }
+            validate_composite_columns(columns)?;
             let cols = columns.join(", ");
             let where_clause = filter.map(|f| format!(" WHERE ({f})")).unwrap_or_default();
             match kind {
@@ -762,6 +752,34 @@ pub fn validate_regex_pattern(pattern: &str) -> Result<(), TestGenError> {
         if matches!(ch, '\'' | '`' | ';') {
             return Err(TestGenError::UnsafeRegexPattern { found: ch });
         }
+    }
+    Ok(())
+}
+
+/// Validate the accepted-values list before it is used in generated SQL.
+pub fn validate_accepted_values(values: &[String]) -> Result<(), TestGenError> {
+    if values.is_empty() {
+        return Err(TestGenError::EmptyAcceptedValues);
+    }
+    Ok(())
+}
+
+/// Validate both identifiers of a relationship target.
+pub fn validate_relationship_target(to_table: &str, to_column: &str) -> Result<(), TestGenError> {
+    for part in to_table.split('.') {
+        validation::validate_identifier(part)?;
+    }
+    validation::validate_identifier(to_column)?;
+    Ok(())
+}
+
+/// Validate the column list used as a composite key.
+pub fn validate_composite_columns(columns: &[String]) -> Result<(), TestGenError> {
+    if columns.len() < 2 {
+        return Err(TestGenError::CompositeTooFewColumns);
+    }
+    for col in columns {
+        validation::validate_identifier(col)?;
     }
     Ok(())
 }
