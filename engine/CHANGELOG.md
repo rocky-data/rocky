@@ -106,6 +106,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **A `.rocky` string literal containing a backslash now fails compilation with E040 at the literal's file, line, and column.** DSL lowering has no target dialect, so it cannot preserve that value across warehouses that interpret backslashes differently. Use a `.sql` model with the target's own escaping for such values. This is a breaking change before 2.0: existing `.rocky` models with backslashes must move that expression to SQL. Literals without backslashes keep their existing SQL output. (#1596)
 
 - **Trino quarantine `drop` can write its valid table again on a later run.** Rocky now runs `DROP TABLE IF EXISTS` before Trino's plain `CREATE TABLE AS` for the valid table. Trino `tag` is refused during quarantine compilation with advice to use `drop`, because its output is also its source. `split` remains refused. Other dialects keep their existing SQL. (#2063)
+- **Every CLI job cache write now checks the full record before insertion.** API submission, completion, durable-read warming, and scheduler running and terminal records share one cache write helper. A registered value in a caller or scheduler principal, or across serialized fields, is withheld from the live cache. Generated keys and lifecycle values can still equal a registered value; the storage guarantee does not cover those collisions. (#1897)
 
 ### Added
 
