@@ -265,7 +265,7 @@ fn load_source_schemas_best_effort(
     if !cfg.cache.schemas.enabled {
         return std::collections::HashMap::new();
     }
-    let Ok(store) = StateStore::open_read_only(state_path) else {
+    let Ok(store) = StateStore::open_read_only_or_empty(state_path) else {
         return std::collections::HashMap::new();
     };
     load_source_schemas_from_cache(&store, chrono::Utc::now(), cfg.cache.schemas.ttl())
@@ -677,7 +677,7 @@ pub fn lookup_apply_receipt(
         }
     };
 
-    let store = rocky_core::state::StateStore::open_read_only(state_path)
+    let store = rocky_core::state::StateStore::open_read_only_or_empty(state_path)
         .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
     let entry = store.idempotency_get(idempotency_key)?;
     let lookup = match (mirrored, entry) {

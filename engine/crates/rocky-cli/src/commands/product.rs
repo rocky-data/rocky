@@ -1398,12 +1398,13 @@ const PRODUCT_READ_CACHE_BYTES: usize = 1 << 20;
 /// a table — a store missing one is refused with `ReadOnlyNeedsInit`); one
 /// written by a newer engine is refused.
 fn open_state_store_read_only(state_path: &Path) -> Result<StateStore> {
-    StateStore::open_read_only_with_cache(state_path, PRODUCT_READ_CACHE_BYTES).with_context(|| {
-        format!(
-            "failed to open the state store at {} to read the product records",
-            state_path.display()
-        )
-    })
+    StateStore::open_read_only_or_empty_with_cache(state_path, PRODUCT_READ_CACHE_BYTES)
+        .with_context(|| {
+            format!(
+                "failed to open the state store at {} to read the product records",
+                state_path.display()
+            )
+        })
 }
 
 /// The E4 authority transition, as one function the CLI wraps.

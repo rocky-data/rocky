@@ -24,7 +24,7 @@ pub fn optimize_output(
     models_dir: Option<&Path>,
     model_filter: Option<&str>,
 ) -> Result<OptimizeOutput> {
-    let store = StateStore::open_read_only(state_path)?;
+    let store = StateStore::open_read_only_or_empty(state_path)?;
 
     // `[cost]` pricing: read it from the loaded project config when one
     // exists, and fall back to `CostConfig::default()` only when the

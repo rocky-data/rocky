@@ -181,7 +181,7 @@ async fn collect_health_checks(
         } else {
             Vec::new()
         };
-        match rocky_core::state::StateStore::open_read_only(state_path) {
+        match rocky_core::state::StateStore::open_read_only_or_empty(state_path) {
             Ok(store) => {
                 // Try reading watermarks to verify the DB is healthy
                 match store.list_watermarks() {
@@ -1024,7 +1024,7 @@ fn scheduler_check(
     // A file that EXISTS but cannot be opened (corrupt, unreadable, forward-
     // incompatible) is a real fault, and discarding that error left the check
     // reporting "reconciler healthy" over a broken store.
-    let store = match rocky_core::state::StateStore::open_read_only(state_path) {
+    let store = match rocky_core::state::StateStore::open_read_only_or_empty(state_path) {
         Ok(store) => Some(store),
         Err(e) => {
             if state_path.exists() {

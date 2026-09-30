@@ -493,7 +493,7 @@ pub async fn run_preview_diff(
 
     crate::commands::branch::validate_branch_name_pub(branch_name)?;
 
-    let store = rocky_core::state::StateStore::open_read_only(state_path)
+    let store = rocky_core::state::StateStore::open_read_only_or_empty(state_path)
         .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
 
     // `--name X --base X` would select the same run for both sides and
@@ -1249,7 +1249,7 @@ pub async fn run_preview_cost(
 
     crate::commands::branch::validate_branch_name_pub(branch_name)?;
 
-    let store = rocky_core::state::StateStore::open_read_only(state_path)
+    let store = rocky_core::state::StateStore::open_read_only_or_empty(state_path)
         .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
 
     let (branch_run, base_run, _base_note) =

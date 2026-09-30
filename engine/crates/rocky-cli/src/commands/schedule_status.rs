@@ -70,7 +70,7 @@ pub fn schedule_status_output(
     let store = if !state_path.exists() {
         None
     } else {
-        match StateStore::open_read_only(state_path) {
+        match StateStore::open_read_only_or_empty(state_path) {
             Ok(store) => Some(store),
             Err(e) => return Err(ScheduleStatusError::State(e.into())),
         }

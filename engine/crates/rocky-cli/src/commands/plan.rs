@@ -2502,7 +2502,7 @@ pub(crate) async fn build_promote_plan_inner(
 
     // `state_path` is the namespace-aware path threaded from main.rs; the
     // branch record lives in whichever state file this invocation targets.
-    let store = StateStore::open_read_only(state_path).with_context(|| {
+    let store = StateStore::open_read_only_or_empty(state_path).with_context(|| {
         format!(
             "failed to open state store at {} — run `rocky branch create {}` first",
             state_path.display(),

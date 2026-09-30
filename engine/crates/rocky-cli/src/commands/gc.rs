@@ -749,7 +749,7 @@ pub fn run_gc_derivable(
     min_age_days: i64,
     json: bool,
 ) -> Result<()> {
-    let store = StateStore::open_read_only(state_path)
+    let store = StateStore::open_read_only_or_empty(state_path)
         .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
 
     let adapter = load_adapter_cost(config_path);
@@ -902,7 +902,7 @@ pub(crate) fn run_gc_plan_in(
 ) -> Result<()> {
     let adapter = load_adapter_cost(config_path);
     let candidates = {
-        let store = StateStore::open_read_only(state_path)
+        let store = StateStore::open_read_only_or_empty(state_path)
             .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
         gather_eviction_candidates(&store, adapter.as_ref(), Utc::now(), min_age_days)?
         // The read handle drops here so the escalation write below can open

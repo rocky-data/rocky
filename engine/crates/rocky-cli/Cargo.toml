@@ -85,6 +85,7 @@ fs4 = { workspace = true }
 # and the golden API-vs-CLI parity tests spin up the axum router and hit it
 # over loopback with a real HTTP client.
 reqwest = { workspace = true }
+tower = { workspace = true, features = ["util"] }
 wiremock = { workspace = true }
 
 [[bench]]
