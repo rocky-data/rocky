@@ -737,6 +737,68 @@ impl From<&rocky_snowflake::connector::ConnectorError> for FailureKind {
     }
 }
 
+impl From<&rocky_trino::connector::TrinoError> for FailureKind {
+    fn from(err: &rocky_trino::connector::TrinoError) -> Self {
+        use rocky_trino::connector::TrinoError as E;
+        match err {
+            E::Auth(_) => Self::AuthFailed,
+            E::Http(e) if e.is_timeout() => Self::Transient,
+            E::Http(_) => Self::ConnectionFailed,
+            E::HttpStatus { status, .. } => match status {
+                401 | 403 => Self::AuthFailed,
+                404 => Self::NotFound,
+                429 => Self::QuotaExceeded,
+                500..=599 => Self::Transient,
+                _ => Self::QueryRejected,
+            },
+            E::QueryFailed { error_name, .. } => match error_name.as_str() {
+                "TABLE_NOT_FOUND" => Self::NotFound,
+                "NO_NODES_AVAILABLE"
+                | "REMOTE_TASK_ERROR"
+                | "REMOTE_TASK_MISMATCH"
+                | "REMOTE_HOST_GONE"
+                | "PAGE_TRANSPORT_ERROR"
+                | "PAGE_TRANSPORT_TIMEOUT"
+                | "SERVER_STARTING_UP"
+                | "SERVER_SHUTTING_DOWN" => Self::Transient,
+                _ => Self::QueryRejected,
+            },
+            E::Timeout { .. } => Self::Transient,
+            E::MalformedResponse(_)
+            | E::UntrustedNextUri { .. }
+            | E::ArrowEncodingUnavailable
+            | E::ArrowDecode(_) => Self::Unknown,
+        }
+    }
+}
+
+impl From<&rocky_bigquery::connector::BigQueryError> for FailureKind {
+    fn from(err: &rocky_bigquery::connector::BigQueryError) -> Self {
+        type E = rocky_bigquery::connector::BigQueryError;
+        match err {
+            E::Auth(_) => Self::AuthFailed,
+            E::Http(e) if e.is_timeout() => Self::Transient,
+            E::Http(_) => Self::ConnectionFailed,
+            E::ApiError { status, .. } => match status
+                .split_whitespace()
+                .next()
+                .and_then(|code| code.parse::<u16>().ok())
+            {
+                Some(401 | 403) => Self::AuthFailed,
+                Some(404) => Self::NotFound,
+                Some(429) => Self::QuotaExceeded,
+                Some(500..=599) => Self::Transient,
+                Some(_) => Self::QueryRejected,
+                None => Self::Unknown,
+            },
+            E::JobError { .. } | E::LoadJobError { .. } => Self::QueryRejected,
+            E::Timeout { .. } => Self::Transient,
+            E::RetryBudgetExhausted { .. } => Self::QuotaExceeded,
+            E::StorageRead(_) => Self::Unknown,
+        }
+    }
+}
+
 /// Extract the warehouse-reported cooldown (in whole seconds) from a
 /// typed connector error, when the variant carries one. Populated only
 /// for `CircuitBreakerOpen` against breakers configured with timed
@@ -767,7 +829,7 @@ fn cooldown_from_snowflake(err: &rocky_snowflake::connector::ConnectorError) -> 
 
 /// Walk an `anyhow::Error`'s `chain()` looking for a typed
 /// `ConnectorError` and classify it via [`FailureKind`]. Returns
-/// [`FailureKind::Unknown`] when neither connector enum is reachable.
+/// [`FailureKind::Unknown`] when no recognised connector enum is reachable.
 ///
 /// Production-path note: adapter calls go through one of two `Box<dyn
 /// Error>` wrapper types — [`rocky_adapter_sdk::AdapterError`] (the
@@ -779,7 +841,7 @@ fn cooldown_from_snowflake(err: &rocky_snowflake::connector::ConnectorError) -> 
 /// `chain()` walk skips past either wrapper straight to whatever the
 /// `ConnectorError` carries (e.g. `reqwest::Error`) and never sees the
 /// connector variant itself (#2064). To handle that, each cause is also
-/// downcast to both wrapper types via [`classify_wrapped_adapter_cause`];
+/// downcast to both wrapper types via [`probe_wrapped_adapter_cause`];
 /// when matched, its inner error is probed for the typed `ConnectorError`.
 ///
 /// Many existing call sites in `run.rs` still build their `anyhow`
@@ -792,6 +854,12 @@ fn classify_cause(cause: &(dyn std::error::Error + 'static)) -> Option<FailureKi
         return Some(e.into());
     }
     if let Some(e) = cause.downcast_ref::<rocky_snowflake::connector::ConnectorError>() {
+        return Some(e.into());
+    }
+    if let Some(e) = cause.downcast_ref::<rocky_trino::connector::TrinoError>() {
+        return Some(e.into());
+    }
+    if let Some(e) = cause.downcast_ref::<rocky_bigquery::connector::BigQueryError>() {
         return Some(e.into());
     }
     None
@@ -812,6 +880,12 @@ fn classify_cause_with_cooldown(
     if let Some(e) = cause.downcast_ref::<rocky_snowflake::connector::ConnectorError>() {
         return Some((e.into(), cooldown_from_snowflake(e)));
     }
+    if let Some(e) = cause.downcast_ref::<rocky_trino::connector::TrinoError>() {
+        return Some((e.into(), None));
+    }
+    if let Some(e) = cause.downcast_ref::<rocky_bigquery::connector::BigQueryError>() {
+        return Some((e.into(), None));
+    }
     None
 }
 
@@ -820,13 +894,13 @@ fn classify_cause_with_cooldown(
 /// [`rocky_core::traits::AdapterError`] (#2064: warehouse adapters return
 /// the latter, not the former the classifiers previously assumed) — and
 /// walk from its `inner()` through `source()` the same way
-/// [`classify_adapter_error_with_cooldown`] does, so a typed connector
-/// error nested at any depth inside either wrapper is found. Returns
-/// `None` when `cause` is neither wrapper type, or neither wrapper's inner
-/// chain holds a typed connector error.
-fn classify_wrapped_adapter_cause(
+/// [`classify_adapter_error_with_cooldown`] does. The caller's probe can
+/// extract either a failure classification or a status from the same chain.
+/// Returns `None` when no wrapper or matching inner cause is found.
+fn probe_wrapped_adapter_cause<T>(
     cause: &(dyn std::error::Error + 'static),
-) -> Option<(FailureKind, Option<u64>)> {
+    probe: impl Fn(&(dyn std::error::Error + 'static)) -> Option<T>,
+) -> Option<T> {
     let inner: &(dyn std::error::Error + 'static) =
         if let Some(e) = cause.downcast_ref::<rocky_adapter_sdk::AdapterError>() {
             e.inner()
@@ -837,8 +911,8 @@ fn classify_wrapped_adapter_cause(
         };
     let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(inner);
     while let Some(c) = cause {
-        if let Some(pair) = classify_cause_with_cooldown(c) {
-            return Some(pair);
+        if let Some(value) = probe(c) {
+            return Some(value);
         }
         cause = c.source();
     }
@@ -850,7 +924,7 @@ pub fn classify_anyhow_error(err: &anyhow::Error) -> FailureKind {
         if let Some(kind) = classify_cause(cause) {
             return kind;
         }
-        if let Some((kind, _)) = classify_wrapped_adapter_cause(cause) {
+        if let Some((kind, _)) = probe_wrapped_adapter_cause(cause, classify_cause_with_cooldown) {
             return kind;
         }
     }
@@ -871,7 +945,7 @@ pub fn classify_anyhow_error_with_cooldown(err: &anyhow::Error) -> (FailureKind,
         if let Some(pair) = classify_cause_with_cooldown(cause) {
             return pair;
         }
-        if let Some(pair) = classify_wrapped_adapter_cause(cause) {
+        if let Some(pair) = probe_wrapped_adapter_cause(cause, classify_cause_with_cooldown) {
             return pair;
         }
     }
@@ -883,7 +957,7 @@ pub fn classify_anyhow_error_with_cooldown(err: &anyhow::Error) -> (FailureKind,
 ///
 /// `rocky_core`'s `AdapterError::source()` returns its inner error's source,
 /// skipping the inner error itself, so this starts at [`inner`] and walks
-/// `source()` from there — the same walk [`classify_wrapped_adapter_cause`]
+/// `source()` from there — the same walk [`probe_wrapped_adapter_cause`]
 /// now runs on a *wrapped* `AdapterError` found inside an `anyhow::Error`
 /// chain; this is the entry point for a caller holding the bare type
 /// directly, with no `anyhow::Error` to walk.
@@ -942,17 +1016,14 @@ fn frame_status(status: u16, target: &str) -> Option<String> {
     }
 }
 
-/// Walk an `anyhow` error chain (including any `rocky_adapter_sdk::
-/// AdapterError` inner) for a recognised warehouse auth status and frame
-/// it. See [`frame_status`].
+/// Walk an `anyhow` error chain, including both adapter wrappers, for a
+/// recognised warehouse auth status. See [`frame_status`].
 pub fn frame_warehouse_anyhow_error(err: &anyhow::Error, target: &str) -> Option<String> {
     for cause in err.chain() {
         if let Some(status) = api_status_from_cause(cause) {
             return frame_status(status, target);
         }
-        if let Some(adapter_err) = cause.downcast_ref::<rocky_adapter_sdk::AdapterError>()
-            && let Some(status) = api_status_from_cause(adapter_err.inner())
-        {
+        if let Some(status) = probe_wrapped_adapter_cause(cause, api_status_from_cause) {
             return frame_status(status, target);
         }
     }
@@ -11593,14 +11664,199 @@ mod ci_diff_markdown_tests {
 
 #[cfg(test)]
 mod failure_kind_tests {
-    //! Mapping coverage for [`FailureKind`] against every variant of
-    //! Databricks and Snowflake [`ConnectorError`]. The `Http(reqwest::Error)`
-    //! variant is not directly constructed here (reqwest exposes no public
-    //! constructor) — its mapping is exercised end-to-end inside the
-    //! `classify_anyhow_error` path.
+    //! Mapping coverage for [`FailureKind`] against the warehouse connector
+    //! enums. Each new Trino and BigQuery case crosses the core adapter
+    //! wrapper used by warehouse methods.
     use super::*;
+    type BqE = rocky_bigquery::connector::BigQueryError;
     use rocky_databricks::connector::ConnectorError as DbE;
     use rocky_snowflake::connector::ConnectorError as SnE;
+    use rocky_trino::connector::TrinoError as TrE;
+
+    fn assert_core_wrapped<E: std::error::Error + Send + Sync + 'static>(
+        connector: E,
+        kind: FailureKind,
+    ) {
+        let err = anyhow::Error::new(rocky_core::traits::AdapterError::new(connector))
+            .context("warehouse statement failed");
+        assert_eq!(classify_anyhow_error(&err), kind);
+        assert_eq!(classify_anyhow_error_with_cooldown(&err), (kind, None));
+    }
+
+    #[test]
+    fn trino_variants_classify_through_core_wrapper() {
+        let cases = [
+            (
+                TrE::Auth(rocky_trino::auth::AuthError::NoAuth),
+                FailureKind::AuthFailed,
+            ),
+            (
+                TrE::HttpStatus {
+                    status: 401,
+                    message: String::new(),
+                },
+                FailureKind::AuthFailed,
+            ),
+            (
+                TrE::HttpStatus {
+                    status: 403,
+                    message: String::new(),
+                },
+                FailureKind::AuthFailed,
+            ),
+            (
+                TrE::HttpStatus {
+                    status: 404,
+                    message: String::new(),
+                },
+                FailureKind::NotFound,
+            ),
+            (
+                TrE::HttpStatus {
+                    status: 429,
+                    message: String::new(),
+                },
+                FailureKind::QuotaExceeded,
+            ),
+            (
+                TrE::HttpStatus {
+                    status: 503,
+                    message: String::new(),
+                },
+                FailureKind::Transient,
+            ),
+            (
+                TrE::HttpStatus {
+                    status: 400,
+                    message: String::new(),
+                },
+                FailureKind::QueryRejected,
+            ),
+            (
+                TrE::QueryFailed {
+                    state: String::new(),
+                    error_code: 1,
+                    error_name: "TABLE_NOT_FOUND".into(),
+                    message: String::new(),
+                },
+                FailureKind::NotFound,
+            ),
+            (
+                TrE::QueryFailed {
+                    state: String::new(),
+                    error_code: 1,
+                    error_name: "REMOTE_HOST_GONE".into(),
+                    message: String::new(),
+                },
+                FailureKind::Transient,
+            ),
+            (
+                TrE::QueryFailed {
+                    state: String::new(),
+                    error_code: 1,
+                    error_name: "SYNTAX_ERROR".into(),
+                    message: String::new(),
+                },
+                FailureKind::QueryRejected,
+            ),
+            (
+                TrE::Timeout {
+                    timeout_secs: 30,
+                    last_state: "RUNNING".into(),
+                },
+                FailureKind::Transient,
+            ),
+            (
+                TrE::MalformedResponse("missing rows".into()),
+                FailureKind::Unknown,
+            ),
+            (
+                TrE::UntrustedNextUri {
+                    coordinator: "a".into(),
+                    next: "b".into(),
+                },
+                FailureKind::Unknown,
+            ),
+            (TrE::ArrowEncodingUnavailable, FailureKind::Unknown),
+            (TrE::ArrowDecode("bad IPC".into()), FailureKind::Unknown),
+        ];
+        for (error, kind) in cases {
+            assert_core_wrapped(error, kind);
+        }
+        let http = reqwest::Client::new()
+            .get("://invalid")
+            .build()
+            .unwrap_err();
+        assert_core_wrapped(TrE::Http(http), FailureKind::ConnectionFailed);
+    }
+
+    #[test]
+    fn bigquery_variants_classify_through_core_wrapper() {
+        let api = |status: &str| BqE::ApiError {
+            status: status.into(),
+            message: String::new(),
+        };
+        let cases = [
+            (
+                BqE::Auth(rocky_bigquery::auth::AuthError::NoAuth),
+                FailureKind::AuthFailed,
+            ),
+            (api("401 Unauthorized"), FailureKind::AuthFailed),
+            (api("403 Forbidden"), FailureKind::AuthFailed),
+            (api("404 Not Found"), FailureKind::NotFound),
+            (api("429 Too Many Requests"), FailureKind::QuotaExceeded),
+            (api("503 Service Unavailable"), FailureKind::Transient),
+            (api("400 Bad Request"), FailureKind::QueryRejected),
+            (api("missing jobReference"), FailureKind::Unknown),
+            (
+                BqE::JobError {
+                    reason: "invalidQuery".into(),
+                    message: String::new(),
+                },
+                FailureKind::QueryRejected,
+            ),
+            (
+                BqE::LoadJobError {
+                    reason: "invalid".into(),
+                    message: String::new(),
+                },
+                FailureKind::QueryRejected,
+            ),
+            (BqE::Timeout { timeout_secs: 30 }, FailureKind::Transient),
+            (
+                BqE::RetryBudgetExhausted { limit: 3 },
+                FailureKind::QuotaExceeded,
+            ),
+            (
+                BqE::StorageRead(rocky_bigquery::storage_read::StorageReadError::NoStreams),
+                FailureKind::Unknown,
+            ),
+        ];
+        for (error, kind) in cases {
+            assert_core_wrapped(error, kind);
+        }
+        let http = reqwest::Client::new()
+            .get("://invalid")
+            .build()
+            .unwrap_err();
+        assert_core_wrapped(BqE::Http(http), FailureKind::ConnectionFailed);
+    }
+
+    #[test]
+    fn framing_walks_core_wrapper_for_both_warehouses() {
+        for (connector, status) in [(db_api(401), 401), (db_api(403), 403)] {
+            let err = anyhow::Error::new(rocky_core::traits::AdapterError::new(connector))
+                .context("running materialization");
+            let framed = frame_warehouse_anyhow_error(&err, "cat.sch.tbl").unwrap();
+            assert!(framed.contains(&format!("HTTP {status}")));
+        }
+        for (connector, status) in [(sn_api(401), 401), (sn_api(403), 403)] {
+            let err = anyhow::Error::new(rocky_core::traits::AdapterError::new(connector))
+                .context("running materialization");
+            let framed = frame_warehouse_anyhow_error(&err, "cat.sch.tbl").unwrap();
+            assert!(framed.contains(&format!("HTTP {status}")));
+        }
+    }
 
     fn db_api(status: u16) -> DbE {
         DbE::ApiError {

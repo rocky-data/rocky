@@ -87,6 +87,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Incremental replication checks the source timestamp column before copying a table.** When the discovered source columns clearly lack the configured `timestamp_column`, Rocky fails that table with the source name and available columns before changing its target. Other tables continue. The precheck compares names without regard to case, including Snowflake's lowercased discovery results. An unavailable source schema keeps the existing warehouse behavior. (#2155)
 
+- **Warehouse failures now show useful auth hints and classify Trino and BigQuery errors.** Databricks and Snowflake 401/403 errors keep their concise guidance through the core adapter wrapper. Trino and BigQuery report clear auth, rate limit, timeout, missing resource, and query failures with the same failure kinds as the other warehouses. Ambiguous connector failures stay unknown. (#2136)
+
 ### Added
 
 - **A selected transformation model can require its explicit contract during `rocky run`.** `rocky run --pipeline <name> --model <name> --contracts <dir>` checks that model's contract in the same compile result used for execution. A missing contract or an `E010` violation fails before replacing the selected table. This first guarded route supports one `full_refresh` model; it refuses defer, branch/shadow, partition, resume, idempotency, skip, governed apply, and post-compile surrogate keys. Other run routes do not gain this guarantee. Model-only run JSON now correctly reports `pipeline_type: "transformation"`. (#2182)
