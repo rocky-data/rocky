@@ -28,7 +28,7 @@
 //!
 //! Precedence (#1629): candidate edges are decided in passes, strongest
 //! evidence first — every model's exact reads, then the catalog fallback,
-//! then bare-name guesses ([`Evidence`]). The cycle guard can therefore only
+//! then bare-name guesses (`Evidence`). The cycle guard can therefore only
 //! ever skip a LATER, weaker edge: a guess never displaces an exact edge, and
 //! that does not depend on the order model names sort in.
 
@@ -104,9 +104,9 @@ enum Evidence {
     Exact3,
     /// A two-part read that matches a producer's `(schema, table)`.
     Exact2,
-    /// A three-part read whose exact lookup missed, bound to the one
-    /// producer that declares no catalog and is established to live in the
-    /// catalog the read names.
+    /// A three-part read whose exact lookup missed, bound to the only
+    /// producer of that `schema.table` — when it declares no catalog and is
+    /// established to live in the catalog the read names.
     Fallback,
     /// A bare read that matches a producer's table component alone — a
     /// search-path guess.
@@ -293,7 +293,7 @@ fn bind_catalogless<'a>(
 ///
 /// # Precedence
 ///
-/// Candidates are decided in [`Evidence`] order, one full pass per kind:
+/// Candidates are decided in `Evidence` order, one full pass per kind:
 /// every model's exact three-part reads, then exact two-part reads, then the
 /// catalog fallback, then bare-name guesses. A candidate that would close a
 /// cycle is skipped, so only a LATER, weaker edge is ever skipped.

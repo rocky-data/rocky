@@ -105,10 +105,10 @@ pub enum UnifiedDagError {
     /// exactly one of them by its physical target. See [`build_runtime_dag`].
     #[error(
         "model '{reader}' reads '{read}', but the label '{label}' belongs to {}. The read does \
-         not name exactly one of them by its full `catalog.schema.table` target, so Rocky \
-         cannot tell which one '{reader}' must run after — and ordering it after the wrong one, \
-         or none, could let it read a table that is not built yet. Rename one of the producers \
-         so each label is unique, or write the read as the intended producer's full target.",
+         not name exactly one of them by its full `catalog.schema.table` target. Rocky cannot \
+         tell which one '{reader}' must run after, and a wrong choice could let it read a \
+         table that is not built yet. Rename one of the producers so each label is unique, or \
+         write the read as the intended producer's full target.",
         .producers.join(" and ")
     )]
     AmbiguousLabelProducer {
@@ -976,7 +976,7 @@ pub struct RuntimeDag {
 /// 1. **Declared** — `depends_on` and pipeline chaining ([`build_unified_dag`]).
 /// 2. **Physical reads** — a model reads another model's `[target]` by name:
 ///    exact three-part and two-part reads, then the catalog fallback, then
-///    bare-name guesses ([`derive_physical_edges`]).
+///    bare-name guesses ([`crate::physical_edges::derive_physical_edges`]).
 /// 3. **Label reads** — a model reads a name that is a model's, seed's or
 ///    load's label. This is the weakest evidence: it matches the last segment
 ///    of the read and ignores its schema and catalog. A label edge that would
@@ -1007,10 +1007,7 @@ pub fn build_runtime_dag(
     // The catalog a catalogless `[target]` resolves in is a property of the
     // adapter the target writes through, so it is asked per adapter name.
     let established = |adapter: &str| -> Option<String> {
-        config
-            .adapters
-            .get(adapter)
-            .and_then(default_catalog_of)
+        config.adapters.get(adapter).and_then(default_catalog_of)
     };
     let pipeline_catalog: HashMap<&str, Option<String>> = models_by_pipeline
         .keys()
@@ -1094,7 +1091,7 @@ struct ProducerTarget {
 }
 
 impl ProducerTarget {
-    /// Fold each component the way [`derive_physical_edges`] folds both
+    /// Fold each component the way [`crate::physical_edges::derive_physical_edges`] folds both
     /// sides; an empty component is an unknown one.
     fn new(catalog: Option<&str>, schema: Option<&str>, table: Option<&str>) -> Self {
         let fold = |c: Option<&str>| c.map(fold_identifier).filter(|c| !c.is_empty());
@@ -1433,7 +1430,7 @@ fn producer_kind(kind: NodeKind) -> &'static str {
     }
 }
 
-/// What [`infer_label_dependencies`] could not settle — surfaced by the
+/// What the label pass (`infer_label_dependencies`) could not settle — surfaced by the
 /// `run --dag` caller as scheduling warnings instead of silently dropping
 /// edges (#1351).
 #[derive(Debug, Default)]

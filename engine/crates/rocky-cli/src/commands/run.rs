@@ -30034,66 +30034,81 @@ auto_create_schemas = true
     /// `db.duckdb`, so `db`), which is what lets the read `db.silver.z_orders`
     /// bind to the catalogless `z_orders`. The consumer sorts first, so
     /// without that edge it would run first and fail — this pins the wiring
-    /// at the call site, not only the derivation behind it.
+    /// at the call site, not only the derivation behind it. Under
+    /// `[resilience] contain_failures` execution follows the containment
+    /// ledger's own layering, which is fed the derived edge through the
+    /// model's dependencies, so both settings must order the pair.
     #[cfg(feature = "duckdb")]
     #[tokio::test]
     async fn a_plain_run_orders_a_catalogless_producer_by_its_warehouses_catalog() {
-        let dir = tempfile::TempDir::new().expect("temp dir");
-        let models = dir.path().join("models");
-        std::fs::create_dir(&models).expect("mkdir models");
-        write_model_with_target(&models, "z_orders", "SELECT 1 AS id", "silver", "z_orders");
-        write_model_in_catalog(
-            &models,
-            "a_mart",
-            "SELECT id FROM db.silver.z_orders",
-            "db",
-            "silver",
-            "a_mart",
-        );
-        let adapter =
-            rocky_duckdb::adapter::DuckDbWarehouseAdapter::open(&dir.path().join("db.duckdb"))
-                .expect("open duckdb");
-        assert_eq!(
-            rocky_core::traits::WarehouseAdapter::default_catalog(&adapter).as_deref(),
-            Some("db"),
-            "the adapter names the catalog its file gives it"
-        );
-        let mut output = RunOutput::new(String::new(), 0, 1);
-        super::execute_models(
-            &models,
-            None,
-            &adapter as &dyn rocky_core::traits::WarehouseAdapter,
-            None,
-            &PartitionRunOptions::default(),
-            "run-catalogless",
-            None,
-            None,
-            &mut output,
-            None,
-            None,
-            &rocky_core::config::SchemaCacheConfig::default(),
-            true, // auto_create_schemas
-            None, // shadow_config (test)
-            &DeferOptions::default(),
-            super::SkipGateConfig::off(),
-            false,
-            false,
-            &rocky_core::run_vars::RunVars::new(),
-            rocky_core::config::ResilienceConfig::default(),
-            false, // strict_scheduling
-            true,
-            None,
-            None, // freeze_fence (test)
-            false,
-        )
-        .await
-        .expect("the producer must build before the read that names its catalog");
-        assert_eq!(output.tables_failed, 0, "{:?}", output.errors);
-        assert!(
-            output.scheduling_warnings.is_empty(),
-            "the read was bound, so nothing is left unresolved: {:?}",
-            output.scheduling_warnings
-        );
+        for contain_failures in [false, true] {
+            let dir = tempfile::TempDir::new().expect("temp dir");
+            let models = dir.path().join("models");
+            std::fs::create_dir(&models).expect("mkdir models");
+            write_model_with_target(&models, "z_orders", "SELECT 1 AS id", "silver", "z_orders");
+            write_model_in_catalog(
+                &models,
+                "a_mart",
+                "SELECT id FROM db.silver.z_orders",
+                "db",
+                "silver",
+                "a_mart",
+            );
+            let adapter =
+                rocky_duckdb::adapter::DuckDbWarehouseAdapter::open(&dir.path().join("db.duckdb"))
+                    .expect("open duckdb");
+            assert_eq!(
+                rocky_core::traits::WarehouseAdapter::default_catalog(&adapter).as_deref(),
+                Some("db"),
+                "the adapter names the catalog its file gives it"
+            );
+            let mut output = RunOutput::new(String::new(), 0, 1);
+            super::execute_models(
+                &models,
+                None,
+                &adapter as &dyn rocky_core::traits::WarehouseAdapter,
+                None,
+                &PartitionRunOptions::default(),
+                "run-catalogless",
+                None,
+                None,
+                &mut output,
+                None,
+                None,
+                &rocky_core::config::SchemaCacheConfig::default(),
+                true, // auto_create_schemas
+                None, // shadow_config (test)
+                &DeferOptions::default(),
+                super::SkipGateConfig::off(),
+                false,
+                false,
+                &rocky_core::run_vars::RunVars::new(),
+                rocky_core::config::ResilienceConfig {
+                    contain_failures,
+                    ..Default::default()
+                },
+                false, // strict_scheduling
+                true,
+                None,
+                None, // freeze_fence (test)
+                false,
+            )
+            .await
+            .unwrap_or_else(|e| {
+                panic!("contain_failures={contain_failures}: the producer must build first: {e:#}")
+            });
+            assert_eq!(
+                output.tables_failed, 0,
+                "contain_failures={contain_failures}: {:?}",
+                output.errors
+            );
+            assert!(
+                output.scheduling_warnings.is_empty(),
+                "contain_failures={contain_failures}: the read was bound, so nothing is left \
+                 unresolved: {:?}",
+                output.scheduling_warnings
+            );
+        }
     }
 
     /// The review's P1 construction, through the plain-run entry point.
