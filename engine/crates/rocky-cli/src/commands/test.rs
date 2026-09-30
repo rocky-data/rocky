@@ -861,8 +861,16 @@ pub async fn run_declarative_tests(
     model_filter: Option<&str>,
     output_json: bool,
 ) -> Result<()> {
-    let run = declarative_run(config_path, models_dir, pipeline_name, model_filter).await?;
-    let results = run.results;
+    let summary =
+        declarative_test_output(config_path, models_dir, pipeline_name, model_filter).await?;
+    let DeclarativeTestSummary {
+        total,
+        passed,
+        failed,
+        warned,
+        errored,
+        results,
+    } = summary;
 
     if results.is_empty() {
         info!("no declarative tests found in models directory");
@@ -884,19 +892,6 @@ pub async fn run_declarative_tests(
         }
         return Ok(());
     }
-
-    // 5. Tally results.
-    let total = results.len();
-    let passed = results.iter().filter(|r| r.status == "pass").count();
-    let failed = results
-        .iter()
-        .filter(|r| r.status == "fail" && r.severity == "error")
-        .count();
-    let warned = results
-        .iter()
-        .filter(|r| r.status == "fail" && r.severity == "warning")
-        .count();
-    let errored = results.iter().filter(|r| r.status == "error").count();
 
     // 6. Report.
     if output_json {
@@ -950,6 +945,32 @@ pub async fn run_declarative_tests(
     }
 
     Ok(())
+}
+
+/// Typed declarative-check result for in-process callers, using the same
+/// loader and executor as `rocky test --declarative`.
+pub async fn declarative_test_output(
+    config_path: &Path,
+    models_dir: &Path,
+    pipeline_name: Option<&str>,
+    model_filter: Option<&str>,
+) -> Result<DeclarativeTestSummary> {
+    let run = declarative_run(config_path, models_dir, pipeline_name, model_filter).await?;
+    let results = run.results;
+    Ok(DeclarativeTestSummary {
+        total: results.len(),
+        passed: results.iter().filter(|r| r.status == "pass").count(),
+        failed: results
+            .iter()
+            .filter(|r| r.status == "fail" && r.severity == "error")
+            .count(),
+        warned: results
+            .iter()
+            .filter(|r| r.status == "fail" && r.severity == "warning")
+            .count(),
+        errored: results.iter().filter(|r| r.status == "error").count(),
+        results,
+    })
 }
 
 /// Execute a single declarative test and return a result.

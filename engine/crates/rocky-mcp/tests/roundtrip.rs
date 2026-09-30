@@ -4,6 +4,7 @@
 //! drives it with an rmcp client, exercising `tools/list` + `tools/call`
 //! exactly as a real harness would over stdio.
 
+use std::io::Write;
 use std::path::Path;
 
 use rmcp::ServiceExt;
@@ -2138,6 +2139,143 @@ async fn draft_check_writes_and_compiles() {
         "the prior sidecar content survives the merge: {sidecar}"
     );
 
+    client.cancel().await.unwrap();
+}
+
+/// The draft gate must report the generator's own refusal before writing.
+async fn assert_draft_check_refused(field: &str, spec: &str, reason: &str) {
+    let dir = TempDir::new().unwrap();
+    write_project(dir.path(), &dir.path().join("test.duckdb"));
+    let sidecar_path = dir.path().join("models/orders.toml");
+    let before = std::fs::read(&sidecar_path).unwrap();
+    let client = connect(RockyMcpServer::new(dir.path().join("rocky.toml"))).await;
+    let result = client
+        .call_tool(
+            CallToolRequestParams::new("draft_check").with_arguments(
+                serde_json::json!({"model": "orders", "spec": spec})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        )
+        .await
+        .expect("draft_check result");
+    assert_eq!(result.is_error, Some(true), "{field}");
+    let body = format!("{result:?}");
+    assert!(body.contains(reason), "{field}: {body}");
+    assert_eq!(
+        std::fs::read(&sidecar_path).unwrap(),
+        before,
+        "{field} wrote a sidecar"
+    );
+    client.cancel().await.unwrap();
+}
+
+macro_rules! rejected_check_case {
+    ($name:ident, $field:literal, $spec:literal, $reason:literal) => {
+        #[tokio::test]
+        async fn $name() {
+            assert_draft_check_refused($field, $spec, $reason).await;
+        }
+    };
+}
+
+rejected_check_case!(
+    draft_check_rejects_column,
+    "column",
+    "[[tests]]\ntype = \"not_null\"\ncolumn = \"status; drop\"\n",
+    "invalid SQL identifier 'status; drop'"
+);
+rejected_check_case!(
+    draft_check_rejects_to_table,
+    "to_table",
+    "[[tests]]\ntype = \"relationships\"\ncolumn = \"id\"\nto_table = \"bad;table\"\nto_column = \"id\"\n",
+    "invalid SQL identifier 'bad;table'"
+);
+rejected_check_case!(
+    draft_check_rejects_to_column,
+    "to_column",
+    "[[tests]]\ntype = \"relationships\"\ncolumn = \"id\"\nto_table = \"ref_table\"\nto_column = \"bad;column\"\n",
+    "invalid SQL identifier 'bad;column'"
+);
+rejected_check_case!(
+    draft_check_rejects_pattern,
+    "pattern",
+    "[[tests]]\ntype = \"regex_match\"\ncolumn = \"status\"\npattern = \"a;b\"\n",
+    "regex_match pattern contains unsafe character ';'"
+);
+rejected_check_case!(
+    draft_check_rejects_values,
+    "values",
+    "[[tests]]\ntype = \"accepted_values\"\ncolumn = \"status\"\nvalues = []\n",
+    "accepted_values test requires at least one value"
+);
+rejected_check_case!(
+    draft_check_rejects_columns,
+    "columns",
+    "[[tests]]\ntype = \"composite\"\nkind = \"unique\"\ncolumns = [\"id\"]\n",
+    "composite test requires at least two columns"
+);
+rejected_check_case!(
+    draft_check_rejects_composite_identifier,
+    "columns",
+    "[[tests]]\ntype = \"composite\"\nkind = \"unique\"\ncolumns = [\"id\", \"bad;column\"]\n",
+    "invalid SQL identifier 'bad;column'"
+);
+
+#[tokio::test]
+async fn test_declarative_mode_runs_the_sidecar_check() {
+    let dir = TempDir::new().unwrap();
+    write_project(dir.path(), &dir.path().join("test.duckdb"));
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(dir.path().join("models/orders.toml"))
+        .unwrap()
+        .write_all(b"\n[[tests]]\ntype = \"not_null\"\ncolumn = \"id\"\n")
+        .unwrap();
+    let client = connect(RockyMcpServer::new(dir.path().join("rocky.toml"))).await;
+    let result = client
+        .call_tool(
+            CallToolRequestParams::new("test").with_arguments(
+                serde_json::json!({"model": "orders", "pipeline": "p", "declarative": true})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        )
+        .await
+        .expect("declarative test result");
+    assert_ne!(result.is_error, Some(true));
+    let body = result.structured_content.unwrap();
+    assert_eq!(body["declarative"]["total"], 1);
+    assert_eq!(body["declarative"]["errored"], 1);
+    assert_eq!(body["all_passed"], false);
+    assert_eq!(body["failures"][0]["suite"], "declarative");
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_declarative_mode_is_unavailable_to_worker() {
+    let dir = TempDir::new().unwrap();
+    write_project(dir.path(), &dir.path().join("test.duckdb"));
+    let client = connect(RockyMcpServer::new_with_profile(
+        dir.path().join("rocky.toml"),
+        rocky_mcp::McpProfile::Worker,
+    ))
+    .await;
+    let result = client
+        .call_tool(
+            CallToolRequestParams::new("test").with_arguments(
+                serde_json::json!({"declarative": true})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        )
+        .await
+        .expect("worker result");
+    assert_eq!(result.is_error, Some(true));
+    assert!(format!("{result:?}").contains("unavailable in the worker profile"));
     client.cancel().await.unwrap();
 }
 

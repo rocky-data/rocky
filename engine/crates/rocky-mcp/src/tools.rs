@@ -1753,10 +1753,16 @@ pub struct ProfileColumnArgs {
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct TestArgs {
-    /// Optional single-model scope: run only this model's declarative tests.
-    /// When unset, runs the whole project's tests (unchanged behavior).
+    /// Optional single-model scope.
     #[serde(default)]
     pub model: Option<String>,
+    /// Run sidecar `[[tests]]` against the configured warehouse. Requires an
+    /// applied target table. The default runs local model and fixture tests.
+    #[serde(default)]
+    pub declarative: bool,
+    /// Pipeline to use for declarative checks when the project has more than one.
+    #[serde(default)]
+    pub pipeline: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -2630,14 +2636,84 @@ impl RockyMcpServer {
     }
 
     #[tool(
-        description = "Run the project's DuckDB-backed local tests and return pass/fail counts \
+        description = "By default, run the project's DuckDB-backed local tests and return pass/fail counts \
          plus per-failure detail. Covers BOTH local suites: executing each model, and the \
          fixture-driven `[[test]]` blocks declared in model sidecars. `failures` carries both, \
          each tagged with its `suite`; `models` and `unit_tests` hold the per-suite counts. \
-         Branch on `all_passed` — it is true only when both suites are clean. Use after writing \
-         or changing a model. Pass `model` to scope the run to one model's tests."
+         Branch on `all_passed` — it is true only when every test in the chosen mode passes. Use after writing \
+         or changing a model. Pass `model` to scope the run to one model's tests. Set \
+         `declarative = true` to run sidecar `[[tests]]` against the configured warehouse; \
+         the model must already have been applied. Pass `pipeline` if the project has more than \
+         one pipeline. The declarative mode is unavailable in the worker profile."
     )]
     async fn test(&self, params: Parameters<TestArgs>) -> ToolResult<TestResult> {
+        if params.0.declarative {
+            if self.profile == McpProfile::Worker {
+                return Err(ToolError::invalid_argument(
+                    "declarative test execution is unavailable in the worker profile",
+                    "The trusted runner executes the declared checks after apply.",
+                ));
+            }
+            let summary = commands::declarative_test_output(
+                &self.config_path,
+                &self.models_dir,
+                params.0.pipeline.as_deref(),
+                params.0.model.as_deref(),
+            )
+            .await
+            .map_err(|e| match e.downcast_ref::<commands::ModelNotFound>() {
+                Some(commands::ModelNotFound(name)) => ToolError::model_not_found(name),
+                None => ToolError::internal(
+                    format!("{e:#}"),
+                    "Check the project config, applied target table, and warehouse connection.",
+                ),
+            })?;
+            let failures = summary
+                .results
+                .iter()
+                .filter(|r| r.status != "pass")
+                .map(|r| TestFailureLite {
+                    name: format!("{}::{}", r.model, r.test_type),
+                    error: r.detail.clone().unwrap_or_else(|| r.status.clone()),
+                    suite: "declarative".to_string(),
+                })
+                .collect();
+            let all_passed = summary.total > 0 && summary.passed == summary.total;
+            return Ok(Json(TestResult {
+                total: summary.total,
+                passed: summary.passed,
+                failures,
+                all_passed,
+                models: TestSuiteCounts {
+                    total: 0,
+                    passed: 0,
+                    failed: 0,
+                },
+                unit_tests: TestSuiteCounts {
+                    total: 0,
+                    passed: 0,
+                    failed: 0,
+                },
+                declarative: Some(DeclarativeSuiteLite {
+                    total: summary.total,
+                    passed: summary.passed,
+                    failed: summary.failed,
+                    warned: summary.warned,
+                    errored: summary.errored,
+                    results: summary
+                        .results
+                        .into_iter()
+                        .map(|r| DeclarativeCheckLite {
+                            model: r.model,
+                            test_type: r.test_type,
+                            status: r.status,
+                            severity: r.severity,
+                            detail: r.detail,
+                        })
+                        .collect(),
+                }),
+            }));
+        }
         let output = commands::test_output(&self.models_dir, None, params.0.model.as_deref())
             .map_err(|e| {
                 // Preserve the stable taxonomy the way `compile` and
@@ -2715,6 +2791,7 @@ impl RockyMcpServer {
             all_passed,
             models,
             unit_tests,
+            declarative: None,
         }))
     }
 
@@ -4689,8 +4766,9 @@ impl RockyMcpServer {
          a check. Appends your `spec` (one or more declarative `[[tests]]` blocks — not_null, \
          unique, accepted_values, relationships, expression, range, …) to the model's sidecar \
          (models/<model>.toml), then compiles so a malformed block fails structurally and returns \
-         the diagnostics. The check EXECUTES via the `test` tool (compile proves structure; the \
-         data-level assertion runs under `test`). It does NOT run, apply, or touch the warehouse. \
+         the diagnostics. To execute the data-level assertion against an applied target, call \
+         the `test` tool with `declarative = true`; the default `test` run covers local models \
+         and fixture `[[test]]` blocks only. Drafting does NOT apply or touch the warehouse. \
          Path-gated to the models directory and policy-aware: a governed scope returns a \
          structured policy_denied / policy_review_required error, and a denied draft restores the \
          prior sidecar. Omit `spec` and this returns an error pointing you at `ai_test`, the LLM \
@@ -6902,21 +6980,23 @@ const DRAFT_CONTRACT_NEXT_STEPS: &str = "This is a draft — Rocky has NOT appli
      --approve` and `rocky apply`. Never apply a draft directly.";
 
 /// The authoring-loop reminder every successful `draft_check` response carries.
-/// The check is written and structurally compiled, then executed via `test`.
+/// The check is written and structurally compiled, then executed via
+/// `test` with `declarative = true` after the target is applied.
 /// Default profile only; the worker profile serves
 /// [`WORKER_DRAFT_CHECK_NEXT_STEPS`].
 const DRAFT_CHECK_NEXT_STEPS: &str = "This is a draft — Rocky has NOT applied it or touched the \
-     warehouse. The check is merged into the model's sidecar and the project compiles; run the \
-     `test` tool to EXECUTE the check against the data and confirm it passes. When it is clean, \
+     warehouse. The check is merged into the model's sidecar and the project compiles. Call \
      `propose` to record an AI-authored plan for a human to `rocky review <plan_id> --approve` \
-     and `rocky apply`. Never apply a draft directly.";
+     and `rocky apply`. After the target is applied, call the `test` tool with \
+     `declarative = true` to execute the check against warehouse data. Never apply a draft directly.";
 
 /// The worker-profile variant of [`DRAFT_CHECK_NEXT_STEPS`] (FF-WP1 fix
 /// round 2, item 5c): ends at the typed hand-off to the trusted runner
 /// instead of instructing `propose`.
 const WORKER_DRAFT_CHECK_NEXT_STEPS: &str = "This is a draft — Rocky has NOT applied it or \
      touched the warehouse. The check is merged into the model's sidecar and the project \
-     compiles; run the `test` tool to EXECUTE the check against the data and confirm it passes. \
+     compiles; the trusted runner can call `test` with `declarative = true` after apply to \
+     execute the check against data and confirm it passes. \
      When it is clean, STOP and end at the typed hand-off to the trusted runner: report the \
      model, the invariants you encoded, and anything you flagged. Recording, review, and apply \
      belong to the trusted runner — never act on them yourself.";
@@ -7539,6 +7619,61 @@ fn validate_check_spec_expressions(
             continue;
         };
         let test_type = table.get("type").and_then(toml::Value::as_str);
+
+        // Match the generator's per-kind validation before the sidecar is
+        // written. A malformed typed block is left to the compile gate.
+        if let Ok(decl) = test.clone().try_into::<rocky_core::tests::TestDecl>() {
+            use rocky_core::tests::{AggregateOp, TestType};
+            let advice = "Correct the declarative check field and draft it again.";
+            let check = |result: Result<(), rocky_core::tests::TestGenError>| {
+                result.map_err(|err| ToolError::invalid_argument(err.to_string(), advice))
+            };
+            let needs_column = matches!(
+                decl.test_type,
+                TestType::NotNull
+                    | TestType::Unique
+                    | TestType::AcceptedValues { .. }
+                    | TestType::Relationships { .. }
+                    | TestType::InRange { .. }
+                    | TestType::RegexMatch { .. }
+                    | TestType::NotInFuture
+                    | TestType::OlderThanNDays { .. }
+                    | TestType::Aggregate {
+                        op: AggregateOp::Sum
+                            | AggregateOp::Avg
+                            | AggregateOp::Min
+                            | AggregateOp::Max,
+                        ..
+                    }
+            );
+            if needs_column && let Some(column) = decl.column.as_deref() {
+                check(
+                    rocky_sql::validation::validate_identifier(column)
+                        .map(|_| ())
+                        .map_err(Into::into),
+                )?;
+            }
+            match &decl.test_type {
+                TestType::Relationships {
+                    to_table,
+                    to_column,
+                } => {
+                    check(rocky_core::tests::validate_relationship_target(
+                        to_table, to_column,
+                    ))?;
+                }
+                TestType::RegexMatch { pattern } => {
+                    check(rocky_core::tests::validate_regex_pattern(pattern))?;
+                }
+                TestType::AcceptedValues { values } => {
+                    check(rocky_core::tests::validate_accepted_values(values))?;
+                }
+                TestType::Composite { columns, .. } => {
+                    check(rocky_core::tests::validate_composite_columns(columns))?;
+                }
+                _ => {}
+            }
+        }
 
         // `filter` scopes which rows a check applies to and is spliced into
         // the same generated statement for every test kind (`tests.rs`'s
@@ -10578,11 +10713,11 @@ database = ":memory:"
         assert_eq!(
             default_server.draft_check_next_steps(),
             "This is a draft — Rocky has NOT applied it or touched the warehouse. The check is \
-             merged into the model's sidecar and the project compiles; run the `test` tool to \
-             EXECUTE the check against the data and confirm it passes. When it is clean, \
-             `propose` to record an AI-authored plan for a human to `rocky review <plan_id> \
-             --approve` and `rocky apply`. Never apply a draft directly.",
-            "default draft_check next_steps are byte-unchanged"
+             merged into the model's sidecar and the project compiles. Call `propose` to record \
+             an AI-authored plan for a human to `rocky review <plan_id> --approve` and `rocky \
+             apply`. After the target is applied, call the `test` tool with `declarative = true` \
+             to execute the check against warehouse data. Never apply a draft directly.",
+            "default draft_check next_steps are pinned byte-for-byte"
         );
 
         let worker_server = server_with(McpProfile::Worker);
