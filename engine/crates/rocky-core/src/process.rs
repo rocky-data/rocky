@@ -151,3 +151,36 @@ pub fn stamp_is_this_process(owner_pid: Option<u32>, owner_start_time: Option<u6
         Ok(None) | Err(_) => false,
     }
 }
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strip_removes_inherited_pipes_variables_from_child() {
+        const KEY: &str = "DAGSTER_PIPES_CORE_INHERITED_PROBE";
+        struct Restore(Option<std::ffi::OsString>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                // SAFETY: restore this test's unique environment variable.
+                unsafe {
+                    match self.0.take() {
+                        Some(value) => std::env::set_var(KEY, value),
+                        None => std::env::remove_var(KEY),
+                    }
+                }
+            }
+        }
+        let _restore = Restore(std::env::var_os(KEY));
+        // SAFETY: no other test reads this probe variable.
+        unsafe { std::env::set_var(KEY, "outer") };
+        let mut command = std::process::Command::new("/bin/sh");
+        strip_dagster_pipes_env(&mut command);
+        let output = command
+            .args(["-c", "printf '%s' \"$DAGSTER_PIPES_CORE_INHERITED_PROBE\""])
+            .output()
+            .expect("spawn probe child");
+        assert!(output.status.success());
+        assert!(output.stdout.is_empty(), "child inherited Pipes variable");
+    }
+}

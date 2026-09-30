@@ -3163,9 +3163,17 @@ fn main() -> Result<()> {
     // A Pipes writer must receive EPIPE as a Rust error. With SIG_DFL,
     // Dagster closing its stream would kill this process before the run
     // releases its idempotency claim. Keep the ordinary CLI pipe behavior
-    // above for help/version and invocations without a Pipes context.
+    // above for help/version and commands that never open a Pipes channel.
     #[cfg(unix)]
-    if std::env::var_os(rocky_cli::pipes::ENV_PIPES_CONTEXT).is_some() {
+    if std::env::var_os(rocky_cli::pipes::ENV_PIPES_CONTEXT).is_some()
+        && matches!(
+            &cli.command,
+            Command::Run { .. }
+                | Command::Apply { .. }
+                | Command::Snapshot { .. }
+                | Command::Fulfill { .. }
+        )
+    {
         // SAFETY: this runs before the Tokio runtime and its threads exist.
         unsafe { libc::signal(libc::SIGPIPE, libc::SIG_IGN) };
     }

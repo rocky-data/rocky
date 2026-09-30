@@ -250,6 +250,12 @@ before the JSON output payload, not as each table completes. A future
 engine release can move to per-event streaming without changing the wire
 protocol or any consumer.
 
+If Dagster closes the messages channel after receiving `opened`, Rocky logs
+subsequent write errors but does not cancel the run. Warehouse writes can
+continue while Dagster receives no further events. A run that needs strict
+observation should monitor the Rocky process and reconcile its final result
+and warehouse state after a lost channel.
+
 ## RockyComponent default
 
 `RockyComponent` streams by default, with `execution_mode: streaming`.

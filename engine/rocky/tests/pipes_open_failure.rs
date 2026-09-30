@@ -226,6 +226,39 @@ fn pipes_opened_write_failure_releases_idempotency_claim() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn non_pipes_compile_keeps_sigpipe_with_inherited_context() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    fixture(tmp.path());
+    for inherited_context in [false, true] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_rocky"));
+        command
+            .current_dir(tmp.path())
+            .args(["--output", "json", "--config"])
+            .arg(tmp.path().join("rocky.toml"))
+            .arg("compile")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .env_remove("DAGSTER_PIPES_CONTEXT");
+        if inherited_context {
+            command.env("DAGSTER_PIPES_CONTEXT", VALID_CONTEXT);
+        }
+        let mut child = command.spawn().expect("spawn compile");
+        drop(child.stdout.take());
+        let output = child.wait_with_output().expect("wait for compile");
+        assert_eq!(
+            output.status.signal(),
+            Some(libc::SIGPIPE),
+            "context={inherited_context}, status={}, stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
 fn encode_param(value: &serde_json::Value) -> String {
     encode_raw_param(value.to_string().as_bytes())
 }

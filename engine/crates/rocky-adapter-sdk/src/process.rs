@@ -685,15 +685,7 @@ mod tests {
         assert!(expr.contains("col1, col2"));
     }
 
-    /// Spawn a tiny Python-based JSON-RPC echo adapter and fire two
-    /// `call`s concurrently. Without [`ProcessAdapter::call_lock`] the two
-    /// requests/responses can interleave on stdin/stdout and the per-call
-    /// id-mismatch guard turns the race into a hard error. With the lock
-    /// in place each caller deterministically reads its own response, so
-    /// both ids match.
-    ///
-    /// Unix-only because the test relies on `python3` being on `PATH`,
-    /// which is true for the engine CI matrix (ubuntu) but not Windows.
+    /// A spawned adapter must not inherit the outer Pipes session.
     #[cfg(unix)]
     #[tokio::test]
     async fn spawned_adapter_does_not_inherit_pipes_environment() {
@@ -736,6 +728,8 @@ print(json.dumps({'jsonrpc': '2.0', 'id': request['id'],
         drop(adapter);
     }
 
+    /// Spawn a tiny Python-based JSON-RPC echo adapter and fire two calls
+    /// concurrently. The call lock keeps each response paired with its id.
     #[cfg(unix)]
     #[tokio::test]
     async fn test_concurrent_calls_do_not_swap_ids() {
