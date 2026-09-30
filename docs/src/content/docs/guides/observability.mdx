@@ -146,10 +146,10 @@ export OTEL_SERVICE_NAME=rocky   # optional; defaults to "rocky"
 rocky -c rocky.toml run
 ```
 
-- `OTEL_EXPORTER_OTLP_ENDPOINT` is the gRPC endpoint of your OTLP collector.
+- `OTEL_EXPORTER_OTLP_ENDPOINT` is the gRPC endpoint of your OTLP collector. Use an `http://` URL: Rocky's exporter does not use TLS. An `https://` URL, or a bare `host:port` (which is read as `https://`), logs a warning at start-up and exports nothing. Set `OTEL_EXPORTER_OTLP_INSECURE=true` to read a bare `host:port` as `http://`.
 - `OTEL_SERVICE_NAME` sets the `service.name` resource attribute, which is how you filter Rocky's data in the backend. It defaults to `rocky`.
 
-If the endpoint is unreachable, Rocky logs a warning and keeps running. Export is best-effort and never fails a run.
+If the endpoint is unreachable, Rocky logs a warning and keeps running. Each send is tried once, with no retry. Export is best-effort and never fails a run.
 
 OTLP export requires a Rocky release built with the OpenTelemetry exporter. Earlier release binaries were compiled without it, so setting these variables had no effect on them. See the CHANGELOG for the release that adds it.
 

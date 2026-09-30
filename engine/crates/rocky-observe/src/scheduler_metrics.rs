@@ -292,9 +292,11 @@ mod enabled {
             // so a single call exports the last tick's metrics — no separate
             // `force_flush` (which would be a second export attempt, doubling the
             // worst-case hang against a black-hole endpoint). The blocking here is
-            // bounded by the OTLP exporter's request timeout
-            // (`OTEL_EXPORTER_OTLP_TIMEOUT`, default 10s), so an unreachable
-            // collector cannot delay process exit indefinitely.
+            // one export attempt (the exporter's retries are off, see
+            // `crate::otel::build_metric_exporter`), bounded by the OTLP
+            // exporter's request timeout (`OTEL_EXPORTER_OTLP_TIMEOUT`, default
+            // 10s), so an unreachable collector cannot delay process exit
+            // indefinitely.
             if let Err(e) = provider.shutdown() {
                 tracing::warn!(error = %e, "scheduler meter provider shutdown failed");
             }
@@ -302,25 +304,32 @@ mod enabled {
     }
 
     fn build_provider() -> Result<SdkMeterProvider, Box<dyn std::error::Error + Send + Sync>> {
-        use opentelemetry_otlp::WithExportConfig;
-        use opentelemetry_sdk::Resource;
-        use opentelemetry_sdk::metrics::PeriodicReader;
-
         let endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
             .unwrap_or_else(|_| DEFAULT_ENDPOINT.to_string());
         let service_name =
             std::env::var("OTEL_SERVICE_NAME").unwrap_or_else(|_| DEFAULT_SERVICE_NAME.to_string());
 
-        let exporter = opentelemetry_otlp::MetricExporter::builder()
-            .with_tonic()
-            .with_endpoint(&endpoint)
-            .build()?;
+        build_provider_at(&endpoint, &service_name)
+    }
+
+    /// [`build_provider`] with the endpoint and service name given, not read
+    /// from the environment.
+    fn build_provider_at(
+        endpoint: &str,
+        service_name: &str,
+    ) -> Result<SdkMeterProvider, Box<dyn std::error::Error + Send + Sync>> {
+        use opentelemetry_sdk::Resource;
+        use opentelemetry_sdk::metrics::PeriodicReader;
+
+        let exporter = crate::otel::build_metric_exporter(endpoint)?;
 
         let reader = PeriodicReader::builder(exporter)
             .with_interval(EXPORT_INTERVAL)
             .build();
 
-        let resource = Resource::builder().with_service_name(service_name).build();
+        let resource = Resource::builder()
+            .with_service_name(service_name.to_owned())
+            .build();
 
         Ok(SdkMeterProvider::builder()
             .with_reader(reader)
@@ -705,6 +714,31 @@ mod enabled {
             // is what the guard's `Drop` relies on to export the last tick.
             let points = harness.shutdown_and_collect();
             assert_eq!(point(&points, "rocky.scheduler.ticks").unwrap().value, 1.0);
+        }
+
+        /// The scheduler's meter makes exactly one export attempt against a
+        /// collector that answers `UNAVAILABLE`. `opentelemetry-otlp` 0.33
+        /// retries by default (four requests here), so this fails if the
+        /// exporter built by `build_provider` loses its `RetryPolicy::disabled()`.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn scheduler_export_is_a_single_attempt_when_the_collector_is_unavailable() {
+            use crate::otel::test_collector::{METRICS_EXPORT, UnavailableCollector};
+
+            let collector = UnavailableCollector::start().await;
+            let provider = super::build_provider_at(collector.endpoint(), "rocky-test")
+                .expect("build the scheduler meter provider");
+            let guard = super::SchedulerMeterGuard {
+                provider: Some(provider),
+            };
+            guard.metrics().record_tick_outcome("completed");
+            // Dropping the guard flushes the final scrape and blocks on the
+            // export, so keep it off the runtime threads that drive the
+            // exporter's channel and the collector.
+            tokio::task::spawn_blocking(move || drop(guard))
+                .await
+                .expect("scheduler meter shutdown thread");
+
+            assert_eq!(collector.requests(), [METRICS_EXPORT]);
         }
     }
 }
