@@ -5394,6 +5394,69 @@ mod tests {
         assert_eq!(resp.status(), 200, "without --ui the guard is off");
     }
 
+    /// Raw HTTP requests exercise the parser and the outer Host/Origin guard
+    /// together. A client library may reject or rewrite these authorities.
+    #[tokio::test]
+    async fn ui_mode_refuses_malformed_bracketed_hosts_and_origins_over_tcp() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let base = spawn_router(ui_state(&["rocky.internal"], &[])).await;
+        let addr = base.trim_start_matches("http://");
+        for (header, expected_status, expected_code) in [
+            ("Host: [rocky.internal]evil", "421", "host_not_allowed"),
+            ("Host: [::1]:x", "421", "host_not_allowed"),
+            ("Host: [::1", "421", "host_not_allowed"),
+            (
+                "Host: 127.0.0.1\r\nOrigin: http://[rocky.internal]evil",
+                "403",
+                "origin_not_allowed",
+            ),
+            (
+                "Host: 127.0.0.1\r\nOrigin: http://[::1]:x",
+                "403",
+                "origin_not_allowed",
+            ),
+            (
+                "Host: 127.0.0.1\r\nOrigin: http://[::1",
+                "403",
+                "origin_not_allowed",
+            ),
+        ] {
+            let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+            stream
+                .write_all(format!("GET /ui/ HTTP/1.0\r\n{header}\r\n\r\n").as_bytes())
+                .await
+                .unwrap();
+            let mut raw = Vec::new();
+            stream.read_to_end(&mut raw).await.unwrap();
+            let response = String::from_utf8(raw).unwrap();
+            let (head, body) = response.split_once("\r\n\r\n").unwrap();
+            assert_eq!(
+                head.split_whitespace().nth(1),
+                Some(expected_status),
+                "{header}: {response}"
+            );
+            let envelope: ErrorEnvelope = serde_json::from_str(body).unwrap();
+            assert_eq!(envelope.code, expected_code, "{header}: {response}");
+        }
+
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        stream
+            .write_all(
+                b"GET /ui/ HTTP/1.0\r\nHost: [::1]:8080\r\nOrigin: http://[::1]:8080\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let mut raw = Vec::new();
+        stream.read_to_end(&mut raw).await.unwrap();
+        let response = String::from_utf8(raw).unwrap();
+        assert_eq!(
+            response.split_whitespace().nth(1),
+            Some("200"),
+            "{response}"
+        );
+    }
+
     /// A body over the limit is refused with the envelope before any
     /// handler; a body under it reaches the handler. Every mode.
     #[tokio::test]
