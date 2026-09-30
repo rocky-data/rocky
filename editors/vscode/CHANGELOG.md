@@ -26,7 +26,6 @@ Pairs with engine 1.75.0.
   - `ReviewQueueEntry.classification_weight` is renamed `change_class_weight`. The field is required, so code that names the old key stops type-checking (#2009).
   - `ModelDetail` loses `incrementality_hint`, and `OptimizeOutput` loses `incrementality_note`. `IncrementalityHint` and `Confidence` are gone from `compile.ts` (#1990).
   - The freshness config loses `overrides` (#1620).
-  - The barrel no longer re-exports `PolicyLedgerSource` and `PolicyMarkerSource`. Both are still exported from `src/types/generated/policy_show.ts` (#1907).
   - Doc comments change for `ErrorEnvelope`, which lists the `state_needs_migration` code (#1981), for `PreviewRowsOutput`, which says a classified column with no mask strategy refuses the preview (#2029), and for the `ephemeral` strategy, which Rocky now refuses with E038 (#1996).
 - **Dependencies.**
   - `vscode-languageclient` 10.1.1 → 10.1.2 is the extension's one production dependency, so it ships. Its protocol packages move with it in the lockfile: `vscode-languageserver-protocol` 3.18.4, `vscode-jsonrpc` 9.0.3, `vscode-languageserver-types` 3.18.4 and `vscode-languageserver-textdocument` 1.0.15 (#2184).

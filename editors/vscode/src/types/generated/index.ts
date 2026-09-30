@@ -80,6 +80,8 @@ export type {
   PolicyAutonomyBudgetOutput,
   PolicyFreezeInForce,
   PolicyFreezeSources,
+  PolicyLedgerSource,
+  PolicyMarkerSource,
   PolicyEffect,
   PolicyPrincipal,
   PolicyCapability,
