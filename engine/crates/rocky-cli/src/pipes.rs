@@ -52,6 +52,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
+use anyhow::{Result, anyhow, bail};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
 use flate2::read::ZlibDecoder;
@@ -125,11 +126,8 @@ impl std::fmt::Debug for PipesEmitter {
 impl PipesEmitter {
     /// Detect Pipes mode from the environment.
     ///
-    /// Returns `Some(emitter)` when both `DAGSTER_PIPES_CONTEXT` and
-    /// `DAGSTER_PIPES_MESSAGES` are set AND the messages channel can
-    /// be opened successfully. Returns `None` otherwise — calls to
-    /// `log` / `report_*` on a `None` emitter are no-ops via the
-    /// caller's `Option::and_then` guard.
+    /// Returns `None` only when `DAGSTER_PIPES_CONTEXT` is absent.
+    /// If it is present, both params must decode and the channel must open.
     ///
     /// Decodes `DAGSTER_PIPES_MESSAGES` as `base64(zlib(json))` —
     /// `dagster_pipes.decode_param`'s exact shape, and the only shape a
@@ -137,29 +135,39 @@ impl PipesEmitter {
     /// doc comment and #2163). There is deliberately no plain-JSON
     /// fallback: a value that base64-decodes but doesn't
     /// zlib-decompress is not a lenient variant of the protocol, it's
-    /// malformed, and gets the same warn-and-fall-back-to-`None`
-    /// treatment as a base64 or JSON failure.
-    ///
-    /// Logs a warning via `tracing::warn!` if env vars are set but
-    /// the channel can't be opened (e.g. malformed base64, malformed
-    /// zlib, unsupported writer params, file permission denied). Falls
-    /// back to `None` in that case so the run still completes — the
-    /// user just loses per-message streaming and falls back to stderr
-    /// forwarding.
-    pub fn detect() -> Option<Self> {
-        if env::var(ENV_PIPES_CONTEXT).is_err() {
-            return None;
-        }
-        let raw_messages = env::var(ENV_PIPES_MESSAGES).ok()?;
-        let params = decode_pipes_param(&raw_messages, ENV_PIPES_MESSAGES)?;
-        let channel = Self::open_channel(&params)?;
+    /// malformed, and is refused before pipeline execution.
+    pub fn detect() -> Result<Option<Self>> {
+        let Some(channel) = Self::requested_channel()? else {
+            return Ok(None);
+        };
         let emitter = PipesEmitter {
             channel: Mutex::new(channel),
         };
         // Must be the first line ever written to the channel — see
         // `opened`'s doc comment.
-        emitter.opened();
-        Some(emitter)
+        emitter.opened()?;
+        Ok(Some(emitter))
+    }
+
+    /// Check a requested channel before apply or DAG preparation can write
+    /// state. This does not send an `opened` handshake; `detect` does that
+    /// when execution starts.
+    pub fn validate_requested() -> Result<()> {
+        drop(Self::requested_channel()?);
+        Ok(())
+    }
+
+    fn requested_channel() -> Result<Option<Box<dyn Write + Send>>> {
+        let raw_context = match env::var(ENV_PIPES_CONTEXT) {
+            Ok(value) => value,
+            Err(env::VarError::NotPresent) => return Ok(None),
+            Err(e) => return Err(anyhow!("{ENV_PIPES_CONTEXT} cannot be read: {e}")),
+        };
+        decode_pipes_param(&raw_context, ENV_PIPES_CONTEXT)?;
+        let raw_messages = env::var(ENV_PIPES_MESSAGES)
+            .map_err(|e| anyhow!("{ENV_PIPES_MESSAGES} is missing or cannot be read: {e}"))?;
+        let params = decode_pipes_param(&raw_messages, ENV_PIPES_MESSAGES)?;
+        Self::open_channel(&params).map(Some)
     }
 
     /// Open the message channel based on the writer params.
@@ -168,45 +176,35 @@ impl PipesEmitter {
     /// - `{"path": "/some/file"}` — append-mode file writes
     /// - `{"stdio": "stderr"}` — write to the process's own stderr
     ///
-    /// Returns `None` for unsupported channel shapes (S3, GCS, etc. —
+    /// Refuses unsupported channel shapes (S3, GCS, etc. —
     /// those are uncommon for `rocky run` use cases and would
     /// require extra dependencies).
-    fn open_channel(params: &Value) -> Option<Box<dyn Write + Send>> {
+    fn open_channel(params: &Value) -> Result<Box<dyn Write + Send>> {
         if let Some(path) = params.get("path").and_then(Value::as_str) {
             let path = PathBuf::from(path);
-            match OpenOptions::new().create(true).append(true).open(&path) {
-                Ok(file) => Some(Box::new(file)),
-                Err(e) => {
-                    tracing::warn!(
-                        path = %path.display(),
-                        error = %e,
-                        "failed to open Pipes message channel file; falling back to non-Pipes mode",
-                    );
-                    None
-                }
-            }
+            let file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .map_err(|e| {
+                    anyhow!(
+                        "{ENV_PIPES_MESSAGES} path {:?} cannot be opened: {e}",
+                        path.display()
+                    )
+                })?;
+            Ok(Box::new(file))
         } else if let Some(stream) = params.get("stdio").and_then(Value::as_str) {
             match stream {
-                "stderr" => Some(Box::new(std::io::stderr())),
-                "stdout" => {
-                    // We never write Pipes messages to stdout because
-                    // stdout is reserved for the JSON RunOutput payload.
-                    // Treat as misconfigured and fall back.
-                    tracing::warn!(
-                        "Pipes channel requested stdout, but rocky-cli reserves stdout for JSON output; falling back to non-Pipes mode",
-                    );
-                    None
-                }
-                other => {
-                    tracing::warn!(stream = %other, "unknown Pipes stdio target; falling back to non-Pipes mode");
-                    None
-                }
+                "stderr" => Ok(Box::new(std::io::stderr())),
+                "stdout" => bail!(
+                    "{ENV_PIPES_MESSAGES} stdio 'stdout' is unsupported: stdout is reserved for Rocky output"
+                ),
+                other => bail!("{ENV_PIPES_MESSAGES} stdio target {other:?} is unsupported"),
             }
         } else {
-            tracing::warn!(
-                "DAGSTER_PIPES_MESSAGES has neither 'path' nor 'stdio' key; falling back to non-Pipes mode",
-            );
-            None
+            bail!(
+                "{ENV_PIPES_MESSAGES} has unsupported channel shape: expected a string 'path' or 'stdio' key"
+            )
         }
     }
 
@@ -228,8 +226,18 @@ impl PipesEmitter {
     /// #2166, so that warning fired on every single Pipes run,
     /// including ones where every other message decoded and reported
     /// correctly.
-    fn opened(&self) {
-        self.write_message("opened", &json!({"extras": {}}));
+    fn opened(&self) -> Result<()> {
+        let line = json!({
+            "__dagster_pipes_version": PIPES_PROTOCOL_VERSION,
+            "method": "opened",
+            "params": {"extras": {}},
+        });
+        let mut channel = self.channel.lock().map_err(|e| {
+            anyhow!("{ENV_PIPES_MESSAGES} channel lock failed before execution: {e}")
+        })?;
+        writeln!(channel, "{line}")
+            .and_then(|_| channel.flush())
+            .map_err(|e| anyhow!("{ENV_PIPES_MESSAGES} channel cannot write opened message: {e}"))
     }
 
     /// Emit a `log` message. Mirrors
@@ -347,39 +355,26 @@ impl PipesEmitter {
 /// pre-2.0). Shared by [`PipesEmitter::detect`] and its tests so the
 /// decode logic has exactly one definition (#2163).
 ///
-/// `env_var_name` is only for the warning messages below — this
+/// `env_var_name` is only for the error messages below — this
 /// function decodes the same shape regardless of which env var it
 /// came from, so it names whichever one the caller is decoding
-/// instead of hardcoding `DAGSTER_PIPES_MESSAGES` (today's only
-/// caller, but not a reason to bake its name into a generic decoder).
+/// instead of hardcoding either variable's name.
 ///
 /// Every real Dagster producer encodes with `encode_param` — plain
 /// `base64(json)`, with no zlib step, is not a value any real launch
-/// ever sends, so there is no fallback for it here. Returns `None`
-/// (after a `tracing::warn!` naming which step failed) on any decode
-/// failure — base64, zlib, or JSON.
-fn decode_pipes_param(raw: &str, env_var_name: &str) -> Option<Value> {
-    let decoded = match B64.decode(raw.as_bytes()) {
-        Ok(bytes) => bytes,
-        Err(e) => {
-            tracing::warn!(error = %e, env_var = env_var_name, "failed to base64-decode Pipes param; falling back to non-Pipes mode");
-            return None;
-        }
-    };
+/// ever sends, so there is no fallback for it here. Returns an error
+/// naming the decode step and env var on base64, zlib, or JSON failure.
+fn decode_pipes_param(raw: &str, env_var_name: &str) -> Result<Value> {
+    let decoded = B64
+        .decode(raw.as_bytes())
+        .map_err(|e| anyhow!("{env_var_name} cannot be base64-decoded: {e}"))?;
 
     let mut decompressed = Vec::new();
-    if let Err(e) = ZlibDecoder::new(decoded.as_slice()).read_to_end(&mut decompressed) {
-        tracing::warn!(error = %e, env_var = env_var_name, "failed to zlib-decompress Pipes param; falling back to non-Pipes mode");
-        return None;
-    }
-
-    match serde_json::from_slice(&decompressed) {
-        Ok(v) => Some(v),
-        Err(e) => {
-            tracing::warn!(error = %e, env_var = env_var_name, "failed to JSON-parse Pipes param; falling back to non-Pipes mode");
-            None
-        }
-    }
+    ZlibDecoder::new(decoded.as_slice())
+        .read_to_end(&mut decompressed)
+        .map_err(|e| anyhow!("{env_var_name} cannot be zlib-decompressed: {e}"))?;
+    serde_json::from_slice(&decompressed)
+        .map_err(|e| anyhow!("{env_var_name} cannot be JSON-decoded: {e}"))
 }
 
 /// Wrap every metadata value the way the real `dagster_pipes` SDK does
@@ -513,7 +508,7 @@ mod tests {
                 env::set_var(ENV_PIPES_CONTEXT, value);
             }
         }
-        assert!(result.is_none());
+        assert!(result.unwrap().is_none());
     }
 
     /// Pins `decode_pipes_param` against a constant captured from the REAL
@@ -546,7 +541,7 @@ mod tests {
     #[test]
     fn decode_pipes_param_rejects_plain_base64_json_with_no_zlib_step() {
         let plain = B64.encode(serde_json::to_vec(&json!({"path": "/tmp/x"})).unwrap());
-        assert!(decode_pipes_param(&plain, ENV_PIPES_MESSAGES).is_none());
+        assert!(decode_pipes_param(&plain, ENV_PIPES_MESSAGES).is_err());
     }
 
     /// End-to-end: `detect()` reads a zlib-encoded `DAGSTER_PIPES_MESSAGES`
@@ -573,7 +568,7 @@ mod tests {
             env::set_var(ENV_PIPES_MESSAGES, &messages_env);
         }
 
-        let emitter = PipesEmitter::detect();
+        let emitter = PipesEmitter::detect().expect("detect Pipes env");
 
         // Restore before any assertion can panic and skip the cleanup.
         unsafe {
@@ -745,20 +740,20 @@ mod tests {
     }
 
     #[test]
-    fn open_channel_unsupported_params_returns_none() {
-        // S3 / GCS shapes aren't supported — fall back gracefully.
+    fn open_channel_unsupported_params_returns_error() {
+        // S3 / GCS shapes are refused.
         let s3_params = json!({"bucket": "my-bucket", "key": "msgs"});
-        assert!(PipesEmitter::open_channel(&s3_params).is_none());
+        assert!(PipesEmitter::open_channel(&s3_params).is_err());
 
         // Unknown stdio target.
         let bogus_stdio = json!({"stdio": "bogus"});
-        assert!(PipesEmitter::open_channel(&bogus_stdio).is_none());
+        assert!(PipesEmitter::open_channel(&bogus_stdio).is_err());
     }
 
     #[test]
     fn open_channel_stdout_rejected() {
         // stdout is reserved for the JSON RunOutput payload.
         let stdout_params = json!({"stdio": "stdout"});
-        assert!(PipesEmitter::open_channel(&stdout_params).is_none());
+        assert!(PipesEmitter::open_channel(&stdout_params).is_err());
     }
 }

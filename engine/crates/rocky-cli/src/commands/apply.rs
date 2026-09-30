@@ -131,6 +131,9 @@ pub(crate) async fn run_apply_core_in(
     expect_spec_digest: Option<&str>,
     output_json: bool,
 ) -> Result<ApplyOutcome> {
+    // A run plan can sync or write policy state before it delegates to run().
+    // The binary checks this too; keep the direct apply API fail-fast.
+    crate::pipes::PipesEmitter::validate_requested()?;
     let plan =
         read_plan(root, plan_id).with_context(|| format!("failed to read plan '{plan_id}'"))?;
 

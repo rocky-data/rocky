@@ -3353,6 +3353,13 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
 
     let config_path = cli.config.clone();
 
+    // Apply can write policy state before its run reaches PipesEmitter::detect.
+    // DAG seeds bypass that detector, and watch absorbs iteration errors.
+    // Validate these binary entry points before any of those paths begin.
+    if matches!(&cli.command, Command::Run { .. } | Command::Apply { .. }) {
+        rocky_cli::pipes::PipesEmitter::validate_requested()?;
+    }
+
     // Resolve `--state-path` once so every command below sees the same
     // canonical location. When the caller didn't pass `--state-path`
     // explicitly, the resolver prefers `<models>/.rocky-state.redb`
