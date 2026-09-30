@@ -212,6 +212,8 @@ Prefer the tag-driven flow for a normal release. The `rocky-release` skill, mirr
 - Conventional commits required: `feat:`, `fix:`, `refactor:`, `test:`, `docs:`, `chore:`. Scope by subproject or crate where it helps: `feat(engine/rocky-databricks): add OAuth M2M auth`, `fix(dagster): handle partial-success exit codes`, `docs(vscode): update README screenshots`.
 - **Never** include `Co-Authored-By` trailers in commit messages.
 
+If this is your first pull request from a fork, GitHub holds its CI workflow runs until a maintainer approves them. Required checks may be missing while the runs wait. You do not need to approve anything. A maintainer will approve the held runs. If you push another commit, the new runs need approval too.
+
 ### What CI runs
 
 CI is path-filtered. The paths your PR touches decide which workflows run. Every required check must pass before merge.
@@ -235,6 +237,17 @@ The table covers the common cases, not every path. Each workflow in `.github/wor
 Expect more than one workflow on most PRs. Any `engine/**` change triggers at least `engine-ci.yml` and `codegen-drift.yml`, and a narrower engine path can add more. `schemas/**` triggers `engine-ci.yml`, `sdk-ci.yml`, `dagster-ci.yml`, and `vscode-ci.yml`, plus `codegen-drift.yml`. `sdk/python/**` also triggers `dagster-ci.yml`, because the Dagster integration depends on the SDK. The credential-containment policy checks run on every PR, whatever it touches.
 
 Benchmarks run only on a PR labelled `perf` (`engine-bench.yml`). Coverage, the dependency audit, and a POC smoke run happen weekly (`engine-weekly.yml`).
+
+### Maintainer: approve CI for a first-time fork contributor
+
+Check a first-time fork contributor's pull request for held workflow runs. Match each run to the pull request and current head commit before approving it. Run these commands for each held run:
+
+```bash
+gh api 'repos/rocky-data/rocky/actions/runs?status=action_required'
+gh api --method POST repos/rocky-data/rocky/actions/runs/<id>/approve
+```
+
+Approve new held runs after each push. A fork does not add a separate approving-review requirement. The ruleset's extra approval for unattributed Copilot pull requests is a different rule.
 
 ### Merge strategy
 
