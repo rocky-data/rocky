@@ -33,6 +33,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 use rocky_compiler::compile::CompileResult;
+use rocky_compiler::diagnostic::Severity;
 use rocky_core::config::{PolicyCapability, PolicyPrincipal};
 use rocky_core::cost::{WarehouseType, compute_observed_cost_usd, warehouse_size_to_dbu_per_hour};
 use rocky_core::models::StrategyConfig;
@@ -152,6 +153,26 @@ pub(crate) fn run_backfill_in(
 
     // 3. Expand to the downstream lineage closure.
     let closure = compute_closure(&seeds, &compiled, include_downstream);
+
+    // Compilation can return Ok with errors for individual models. Refuse
+    // before writing anything when the resolved backfill would include one.
+    let errors: Vec<_> = compiled
+        .diagnostics
+        .iter()
+        .filter(|d| d.severity == Severity::Error && closure.contains(&d.model))
+        .collect();
+    if !errors.is_empty() {
+        for diagnostic in &errors {
+            eprintln!(
+                "model '{}': {}: {}",
+                diagnostic.model, diagnostic.code, diagnostic.message
+            );
+        }
+        bail!(
+            "backfill refused: {} compile error(s) in its model scope",
+            errors.len()
+        );
+    }
 
     // 4. Order the closure topologically (dependency-first), using only the
     //    intra-closure dependencies — upstreams outside the closure are healthy

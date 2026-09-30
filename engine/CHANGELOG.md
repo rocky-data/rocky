@@ -101,6 +101,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **A stuck `rocky.toml` read no longer holds the serve compile gate indefinitely.** Recompile reads it on a bounded blocking lane with a five-second deadline. A timeout keeps the previous compile available and reports the read failure through the compile response and project status. A later read can recover after the stuck reader finishes. (#2175)
 
 - **DuckDB snapshots now run through the CLI and keep changed row history.** The example uses a persistent database with the matching catalog, the target schema is created when auto-create is enabled, and DuckDB MERGE inserts the SCD2 columns by name. DuckDB's hard-delete statement now declares its target alias. (#2012)
+- **`rocky backfill` refuses compile errors in the models it would rebuild.** It prints each affected model and diagnostic code, exits without a plan ID or plan file, and still composes backfills for warning-only projects or errors outside the backfill scope. (#2199)
 
 ### Added
 
