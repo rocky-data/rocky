@@ -143,6 +143,9 @@ const CONSUMED_ENGINE_PATHS: &[&str] = &[
     // depend on this crate, which sits above it. This crate re-exports
     // it, so the ownership probe and every caller are unchanged.
     "rocky_core::process::process_liveness",
+    // DELIBERATE: child workers and sibling MCP processes must not inherit
+    // the outer Dagster Pipes channel. This helper only edits child env.
+    "rocky_core::process::strip_dagster_pipes_env",
     // The worker transcript's O_EXCL no-follow create. Added DELIBERATELY
     // (#1500): the driver used `std::fs::File::create`, which is
     // O_CREAT|O_TRUNC — it follows a symlink at the leaf and truncates

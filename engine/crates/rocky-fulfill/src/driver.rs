@@ -322,7 +322,9 @@ impl AgentDriver for SubprocessDriver {
             // The worker sees ONLY the allowlist.
             .env_clear();
         for key in &self.env_allow {
-            if let Ok(value) = std::env::var(key) {
+            if !key.to_ascii_uppercase().starts_with("DAGSTER_PIPES_")
+                && let Ok(value) = std::env::var(key)
+            {
                 cmd.env(key, value);
             }
         }
@@ -757,6 +759,7 @@ pub fn spawn_sibling_in_group(
     cwd: &Path,
 ) -> Result<tokio::process::Child, DriverError> {
     let mut cmd = tokio::process::Command::new(program);
+    rocky_core::process::strip_dagster_pipes_env(cmd.as_std_mut());
     cmd.args(args)
         .current_dir(cwd)
         .stdin(std::process::Stdio::null())
@@ -892,6 +895,7 @@ impl AgentDriver for ReplayDriver {
             .map_err(|e| DriverError::Spawn(format!("transcript file: {e}")))?;
 
         let mut cmd = tokio::process::Command::new(&argv[0]);
+        rocky_core::process::strip_dagster_pipes_env(cmd.as_std_mut());
         cmd.args(&argv[1..])
             .current_dir(&brief.project_root)
             .stdin(std::process::Stdio::piped())
@@ -1317,23 +1321,51 @@ mod supervision_tests {
     async fn env_is_only_the_allowlist() {
         let dir = tempfile::tempdir().expect("tempdir");
         let probe = dir.path().join("env-probe");
+        struct RestoreEnv(Vec<(&'static str, Option<std::ffi::OsString>)>);
+        impl Drop for RestoreEnv {
+            fn drop(&mut self) {
+                // SAFETY: these test-only values are restored before this test ends.
+                unsafe {
+                    for (key, value) in self.0.drain(..) {
+                        match value {
+                            Some(value) => std::env::set_var(key, value),
+                            None => std::env::remove_var(key),
+                        }
+                    }
+                }
+            }
+        }
+        let _restore = RestoreEnv(
+            [
+                "ROCKY_FULFILL_BATTERY_ALLOWED",
+                "ROCKY_FULFILL_BATTERY_BLOCKED",
+                "DAGSTER_PIPES_CONTEXT",
+            ]
+            .into_iter()
+            .map(|key| (key, std::env::var_os(key)))
+            .collect(),
+        );
         // SAFETY: test-process env mutation is serialized by the test
         // harness convention (no other test reads these names).
         unsafe {
             std::env::set_var("ROCKY_FULFILL_BATTERY_ALLOWED", "yes");
             std::env::set_var("ROCKY_FULFILL_BATTERY_BLOCKED", "leak");
+            std::env::set_var("DAGSTER_PIPES_CONTEXT", "outer");
         }
         let script = handoff_then(
             dir.path(),
             &format!(
-                "printf '%s,%s' \"$ROCKY_FULFILL_BATTERY_ALLOWED\" \
-                 \"$ROCKY_FULFILL_BATTERY_BLOCKED\" > {}; echo {{brief}}",
+                "printf '%s,%s,%s' \"$ROCKY_FULFILL_BATTERY_ALLOWED\" \
+                 \"$ROCKY_FULFILL_BATTERY_BLOCKED\" \"$DAGSTER_PIPES_CONTEXT\" > {}; echo {{brief}}",
                 probe.display()
             ),
         );
         let driver = SubprocessDriver::new(
             vec!["/bin/sh".into(), "-c".into(), script],
-            vec!["ROCKY_FULFILL_BATTERY_ALLOWED".into()],
+            vec![
+                "ROCKY_FULFILL_BATTERY_ALLOWED".into(),
+                "DAGSTER_PIPES_CONTEXT".into(),
+            ],
             Duration::from_secs(30),
             Duration::from_secs(2),
         )
@@ -1342,7 +1374,29 @@ mod supervision_tests {
         let (outcome, _) = run(&driver, &brief).await;
         assert!(outcome.is_ok(), "{outcome:?}");
         let seen = std::fs::read_to_string(&probe).expect("probe file");
-        assert_eq!(seen, "yes,", "allowed passes; everything else is cleared");
+        assert_eq!(seen, "yes,,", "Pipes stays absent even if allowlisted");
+
+        let sibling_probe = dir.path().join("sibling-probe");
+        let mut leader = tokio::process::Command::new("/bin/sleep");
+        leader.arg("30").process_group(0);
+        let mut leader = leader.spawn().expect("leader");
+        let pgid = leader.id().expect("leader pid");
+        let sibling_script = format!(
+            "test -z \"$DAGSTER_PIPES_CONTEXT\" && printf clean > {}",
+            sibling_probe.display()
+        );
+        let mut sibling =
+            spawn_sibling_in_group(pgid, "/bin/sh", &["-c", &sibling_script], dir.path())
+                .expect("sibling starts");
+        let sibling_status = sibling.wait().await.expect("sibling exit");
+        kill_group(pgid, Duration::from_secs(2), vec![&mut leader])
+            .await
+            .expect("reap group");
+        assert!(sibling_status.success(), "sibling inherited Pipes context");
+        assert_eq!(
+            std::fs::read_to_string(sibling_probe).expect("sibling probe"),
+            "clean"
+        );
     }
 
     /// The transcript captures the worker's stdout and stderr.

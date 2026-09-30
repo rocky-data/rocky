@@ -2966,6 +2966,7 @@ async fn execute_job_subprocess(
     };
 
     let mut cmd = tokio::process::Command::new(exe);
+    rocky_core::process::strip_dagster_pipes_env(cmd.as_std_mut());
     for arg in job_subprocess_args(kind, config_path.as_deref(), &state_path, &request) {
         cmd.arg(arg);
     }

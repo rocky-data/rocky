@@ -158,6 +158,74 @@ fn pipes_path_channel_open_failure_exits_before_work() {
     assert!(!tmp.path().join("state.redb").exists());
 }
 
+#[cfg(unix)]
+#[test]
+fn pipes_opened_write_failure_releases_idempotency_claim() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    fixture(tmp.path());
+    let messages = encode_param(&serde_json::json!({"stdio": "stderr"}));
+    // The entry gate accepts stderr without writing. Close the pipe's read
+    // end before the binary reaches the later `opened` handshake.
+    let mut first_child = Command::new(env!("CARGO_BIN_EXE_rocky"))
+        .arg("--config")
+        .arg(tmp.path().join("rocky.toml"))
+        .arg("--state-path")
+        .arg(tmp.path().join("state.redb"))
+        .args([
+            "run",
+            "--pipeline",
+            "t",
+            "--idempotency-key",
+            "pipes-bootstrap-test",
+            "--output",
+            "json",
+        ])
+        .current_dir(tmp.path())
+        .env("RUST_LOG", "error")
+        .env("DAGSTER_PIPES_CONTEXT", VALID_CONTEXT)
+        .env("DAGSTER_PIPES_MESSAGES", messages)
+        .stderr(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn rocky with piped stderr");
+    drop(first_child.stderr.take());
+    let first = first_child
+        .wait_with_output()
+        .expect("wait for failed opened write");
+    assert!(
+        !first.status.success(),
+        "opened write unexpectedly succeeded"
+    );
+    assert!(
+        tmp.path().join("state.redb").exists(),
+        "claim was not persisted"
+    );
+    assert!(!target_exists(tmp.path()), "failed launch ran model");
+
+    let retry = run(tmp.path(), None, None);
+    assert!(
+        retry.status.success(),
+        "retry failed: {}",
+        String::from_utf8_lossy(&retry.stderr)
+    );
+    let retry_json: serde_json::Value =
+        serde_json::from_slice(&retry.stdout).expect("retry JSON output");
+    assert_ne!(
+        retry_json["status"],
+        "SkippedInFlight",
+        "retry was suppressed: {}",
+        String::from_utf8_lossy(&retry.stdout)
+    );
+    assert!(
+        target_exists(tmp.path()),
+        "retry did not build target: first_status={} first_stdout={} stdout={} stderr={}",
+        first.status,
+        String::from_utf8_lossy(&first.stdout),
+        String::from_utf8_lossy(&retry.stdout),
+        String::from_utf8_lossy(&retry.stderr)
+    );
+}
+
 fn encode_param(value: &serde_json::Value) -> String {
     encode_raw_param(value.to_string().as_bytes())
 }
@@ -441,14 +509,17 @@ fn pipes_unset_context_watch_runs_normally() {
         .spawn()
         .expect("spawn normal watch");
     let deadline = Instant::now() + Duration::from_secs(15);
-    while !dir.join("state.redb").exists() {
+    while rocky_core::state::StateStore::open_read_only(&dir.join("state.redb"))
+        .ok()
+        .and_then(|store| store.latest_successful_run("t").ok().flatten())
+        .is_none()
+    {
         if Instant::now() >= deadline {
             child.kill().expect("kill hung watch");
-            panic!("normal watch did not start a run");
+            panic!("normal watch did not complete a run");
         }
         std::thread::sleep(Duration::from_millis(50));
     }
-    std::thread::sleep(Duration::from_millis(500));
     // SAFETY: `child.id()` is a live child process and SIGINT is a valid signal.
     unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGINT) };
     let output = child.wait_with_output().expect("wait for watch shutdown");
@@ -509,4 +580,37 @@ fn pipes_bad_messages_snapshot_exits_before_work() {
 #[test]
 fn pipes_bad_messages_fulfill_exits_before_work() {
     assert_command_refused_at_pipes_gate(&["fulfill", "sample"]);
+}
+
+#[test]
+fn pipes_refusal_does_not_create_state_namespace() {
+    for args in [
+        &["snapshot", "--pipeline", "t"][..],
+        &["fulfill", "sample"][..],
+    ] {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        fixture(tmp.path());
+        let output = Command::new(env!("CARGO_BIN_EXE_rocky"))
+            .current_dir(tmp.path())
+            .arg("--config")
+            .arg(tmp.path().join("rocky.toml"))
+            .args(["--state-namespace", "isolated"])
+            .args(args)
+            .env("RUST_LOG", "error")
+            .env("DAGSTER_PIPES_CONTEXT", VALID_CONTEXT)
+            .env("DAGSTER_PIPES_MESSAGES", "not-base64")
+            .output()
+            .expect("spawn rocky");
+        assert!(!output.status.success(), "expected refusal for {args:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("DAGSTER_PIPES_MESSAGES cannot be base64-decoded"),
+            "wrong refusal: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            !tmp.path().join("models/.rocky-state").exists(),
+            "{args:?} created namespace before refusal"
+        );
+    }
 }

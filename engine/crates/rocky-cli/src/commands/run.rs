@@ -2833,7 +2833,13 @@ pub async fn run_with_explicit_contracts(
         None => None,
     };
 
-    let pipes = crate::pipes::PipesEmitter::detect()?;
+    let pipes = match crate::pipes::PipesEmitter::detect() {
+        Ok(pipes) => pipes,
+        Err(error) => {
+            finalize_idempotency_on_error(&mut idempotency_ctx, state_path, &run_id).await;
+            return Err(error);
+        }
+    };
     if let Some(p) = &pipes {
         p.log("INFO", "rocky run starting");
     }

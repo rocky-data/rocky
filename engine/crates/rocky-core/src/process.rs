@@ -13,6 +13,24 @@
 //! pairs the pid with the start time this module returns, which is what
 //! makes a stamp reuse-proof.
 
+/// Remove an outer Dagster Pipes session from a child Rocky starts. A child
+/// does not own the outer process's message channel, even when it runs `rocky`.
+pub fn strip_dagster_pipes_env(command: &mut std::process::Command) {
+    let keys: Vec<_> = std::env::vars_os()
+        .map(|(key, _)| key)
+        .chain(command.get_envs().map(|(key, _)| key.to_os_string()))
+        .collect();
+    for key in keys {
+        if key
+            .to_string_lossy()
+            .to_ascii_uppercase()
+            .starts_with("DAGSTER_PIPES_")
+        {
+            command.env_remove(key);
+        }
+    }
+}
+
 /// The start time of a live process, or `None` when no such pid exists.
 ///
 /// The value's unit is platform-specific (macOS: microseconds since the

@@ -573,9 +573,30 @@ mod tests {
     #[test]
     fn non_unicode_environment_errors_never_echo_payload() {
         use std::os::unix::ffi::OsStringExt;
+        struct RestorePipesEnv {
+            context: Option<std::ffi::OsString>,
+            messages: Option<std::ffi::OsString>,
+        }
+        impl Drop for RestorePipesEnv {
+            fn drop(&mut self) {
+                // SAFETY: the shared Pipes environment lock remains held until this guard drops.
+                unsafe {
+                    match self.context.take() {
+                        Some(value) => env::set_var(ENV_PIPES_CONTEXT, value),
+                        None => env::remove_var(ENV_PIPES_CONTEXT),
+                    }
+                    match self.messages.take() {
+                        Some(value) => env::set_var(ENV_PIPES_MESSAGES, value),
+                        None => env::remove_var(ENV_PIPES_MESSAGES),
+                    }
+                }
+            }
+        }
         let _g = lock_env();
-        let prior_context = env::var_os(ENV_PIPES_CONTEXT);
-        let prior_messages = env::var_os(ENV_PIPES_MESSAGES);
+        let _restore = RestorePipesEnv {
+            context: env::var_os(ENV_PIPES_CONTEXT),
+            messages: env::var_os(ENV_PIPES_MESSAGES),
+        };
         let secret = std::ffi::OsString::from_vec(b"secret\xffpayload".to_vec());
         // SAFETY: all Pipes environment readers in this crate take the shared lock.
         unsafe {
@@ -583,19 +604,9 @@ mod tests {
             env::set_var(ENV_PIPES_MESSAGES, &secret);
         }
         let context_error = PipesEmitter::validate_requested().unwrap_err().to_string();
+        // SAFETY: the shared Pipes environment lock prevents concurrent readers in this crate.
         unsafe { env::set_var(ENV_PIPES_CONTEXT, encode_like_dagster_pipes(&json!({}))) };
         let messages_error = PipesEmitter::validate_requested().unwrap_err().to_string();
-        // SAFETY: restore process-global environment while holding the shared lock.
-        unsafe {
-            match prior_context {
-                Some(value) => env::set_var(ENV_PIPES_CONTEXT, value),
-                None => env::remove_var(ENV_PIPES_CONTEXT),
-            }
-            match prior_messages {
-                Some(value) => env::set_var(ENV_PIPES_MESSAGES, value),
-                None => env::remove_var(ENV_PIPES_MESSAGES),
-            }
-        }
         assert_eq!(context_error, "DAGSTER_PIPES_CONTEXT is not valid Unicode");
         assert_eq!(
             messages_error,

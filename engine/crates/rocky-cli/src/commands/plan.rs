@@ -2607,7 +2607,9 @@ pub(crate) async fn build_promote_plan_inner(
     let (resolved_pipeline_name, planned_targets) =
         discover_branch_targets_for_plan(config_path, &record, filter, pipeline_name).await?;
 
-    let head_ref = std::process::Command::new("git")
+    let mut git = std::process::Command::new("git");
+    rocky_core::process::strip_dagster_pipes_env(&mut git);
+    let head_ref = git
         .args(["rev-parse", "HEAD"])
         .output()
         .ok()

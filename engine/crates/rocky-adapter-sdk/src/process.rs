@@ -137,7 +137,17 @@ impl ProcessAdapter {
         args: &[&str],
         config: &serde_json::Value,
     ) -> Result<Self, AdapterError> {
-        let mut child = Command::new(command)
+        let mut command_builder = Command::new(command);
+        for (key, _) in std::env::vars_os() {
+            if key
+                .to_string_lossy()
+                .to_ascii_uppercase()
+                .starts_with("DAGSTER_PIPES_")
+            {
+                command_builder.env_remove(key);
+            }
+        }
+        let mut child = command_builder
             .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -684,6 +694,48 @@ mod tests {
     ///
     /// Unix-only because the test relies on `python3` being on `PATH`,
     /// which is true for the engine CI matrix (ubuntu) but not Windows.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn spawned_adapter_does_not_inherit_pipes_environment() {
+        const KEY: &str = "DAGSTER_PIPES_ADAPTER_PROBE";
+        struct Restore(Option<std::ffi::OsString>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                // SAFETY: restore this test's process-global value before returning.
+                unsafe {
+                    match self.0.take() {
+                        Some(value) => std::env::set_var(KEY, value),
+                        None => std::env::remove_var(KEY),
+                    }
+                }
+            }
+        }
+        let _restore = Restore(std::env::var_os(KEY));
+        // SAFETY: no other test uses this probe name.
+        unsafe { std::env::set_var(KEY, "outer") };
+        let script = r#"
+import json, os, sys
+if os.environ.get('DAGSTER_PIPES_ADAPTER_PROBE'):
+    sys.exit(7)
+request = json.loads(sys.stdin.readline())
+manifest = {
+    'name': 'probe', 'version': '0.0.0', 'sdk_version': '0.0.0',
+    'dialect': 'probe',
+    'capabilities': {'warehouse': True, 'discovery': False, 'governance': False,
+                     'batch_checks': False, 'create_catalog': False,
+                     'create_schema': False, 'merge': False, 'tablesample': False,
+                     'file_load': False},
+    'auth_methods': [], 'config_schema': {},
+}
+print(json.dumps({'jsonrpc': '2.0', 'id': request['id'],
+                  'result': {'manifest': manifest}}), flush=True)
+"#;
+        let adapter = ProcessAdapter::spawn("python3", &["-c", script], &serde_json::json!({}))
+            .await
+            .expect("adapter should initialize without outer Pipes environment");
+        drop(adapter);
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn test_concurrent_calls_do_not_swap_ids() {

@@ -194,6 +194,12 @@ types. In the run viewer they arrive as `MaterializationEvent`s, carrying
 strategy, duration_ms, rows_copied, sql_hash, and partition_key, plus
 `AssetCheckEvaluation`s.
 
+If your own code starts a subprocess inside a Pipes run, that subprocess
+inherits `DAGSTER_PIPES_*` variables by default. Remove all variables with
+that prefix from its environment unless the child is meant to speak on the
+same Pipes channel. Rocky removes them from processes it starts itself,
+including hooks and fulfillment workers.
+
 Returns a `PipesClientCompletedInvocation`. Call `.get_results()` to
 extract the materialization events Dagster built from the Pipes
 messages.

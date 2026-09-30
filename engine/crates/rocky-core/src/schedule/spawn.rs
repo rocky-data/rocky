@@ -216,6 +216,7 @@ impl SubprocessSpawner {
     fn build_command(request: &SpawnRequest) -> tokio::process::Command {
         let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("rocky"));
         let mut cmd = tokio::process::Command::new(exe);
+        crate::process::strip_dagster_pipes_env(cmd.as_std_mut());
         // Discard the child's stdout: the child runs with `--output json`, so its
         // own `RunOutput` would otherwise be inherited onto the tick's stdout and
         // corrupt the tick's `--output json` document (two JSON payloads on one

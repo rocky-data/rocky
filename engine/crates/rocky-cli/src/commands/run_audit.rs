@@ -16,7 +16,7 @@
 //! | Variable | Purpose |
 //! |---|---|
 //! | `DAGSTER_PIPES_CONTEXT` | If present, session source = Dagster |
-//! | `ROCKY_SESSION_SOURCE` | Explicit override (`cli` / `dagster` / `lsp` / `http_api`) |
+//! | `ROCKY_SESSION_SOURCE` | Explicit override (`cli` / `dagster` / `lsp` / `http_api`, `http-api`, or `httpapi`) |
 //! | `USER` (Unix) / `USERNAME` (Windows) | Triggering identity |
 //!
 //! # Subprocess usage
@@ -130,7 +130,7 @@ fn detect_triggering_identity() -> Option<String> {
 /// 3. Default → [`SessionSource::Cli`].
 ///
 /// Values accepted for `ROCKY_SESSION_SOURCE` (case-insensitive):
-/// `"cli"`, `"dagster"`, `"lsp"`, `"http_api"`. Anything else is
+/// `"cli"`, `"dagster"`, `"lsp"`, `"http_api"`, `"http-api"`, or `"httpapi"`. Anything else is
 /// silently ignored — better to fall back to the env-detected default
 /// than to reject a run over a typo'd audit-stamp var.
 fn detect_session_source() -> SessionSource {
@@ -171,7 +171,9 @@ fn detect_git_branch() -> Option<String> {
 /// available or the checkout isn't a git repo — those are both
 /// expected on production hosts.
 fn run_git(args: &[&str]) -> Option<String> {
-    let output = Command::new("git")
+    let mut command = Command::new("git");
+    rocky_core::process::strip_dagster_pipes_env(&mut command);
+    let output = command
         .args(args)
         .stdin(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())

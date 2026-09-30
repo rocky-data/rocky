@@ -718,6 +718,7 @@ impl BrowserOpener for SystemOpener {
             c.arg(url);
             c
         };
+        rocky_core::process::strip_dagster_pipes_env(&mut command);
         let mut child = command
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())

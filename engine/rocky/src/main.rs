@@ -3160,6 +3160,15 @@ fn main() -> Result<()> {
     reset_sigpipe();
 
     let cli = Cli::parse();
+    // A Pipes writer must receive EPIPE as a Rust error. With SIG_DFL,
+    // Dagster closing its stream would kill this process before the run
+    // releases its idempotency claim. Keep the ordinary CLI pipe behavior
+    // above for help/version and invocations without a Pipes context.
+    #[cfg(unix)]
+    if std::env::var_os(rocky_cli::pipes::ENV_PIPES_CONTEXT).is_some() {
+        // SAFETY: this runs before the Tokio runtime and its threads exist.
+        unsafe { libc::signal(libc::SIGPIPE, libc::SIG_IGN) };
+    }
     // Resolve the effective output format: an explicit `--output` always wins;
     // otherwise TTY-detect (table at a terminal, json when piped). Computed
     // here because `json` feeds both `init_tracing` and the miette hook.
@@ -3356,7 +3365,13 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
     // Apply can write policy state before its run reaches PipesEmitter::detect.
     // DAG seeds bypass that detector, and watch absorbs iteration errors.
     // Validate these binary entry points before any of those paths begin.
-    if matches!(&cli.command, Command::Run { .. } | Command::Apply { .. }) {
+    if matches!(
+        &cli.command,
+        Command::Run { .. }
+            | Command::Apply { .. }
+            | Command::Snapshot { .. }
+            | Command::Fulfill { .. }
+    ) {
         rocky_cli::pipes::PipesEmitter::validate_requested()?;
     }
 
@@ -3462,29 +3477,21 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             subcommand,
             product,
             retry,
-        } => {
-            rocky_cli::pipes::PipesEmitter::validate_requested()?;
-            match subcommand {
-                Some(FulfillSubcommand::ApproveSpec { product }) => {
-                    rocky_fulfill::run_fulfill_approve_spec(
-                        &cli.config,
-                        &state_path,
-                        &product,
-                        json,
-                    )
-                }
-                None => match product {
-                    Some(product) => {
-                        rocky_fulfill::run_fulfill(&cli.config, &state_path, &product, retry, json)
-                            .await
-                    }
-                    None => anyhow::bail!(
-                        "usage: rocky fulfill <product> [--retry] | rocky fulfill approve-spec \
-                     <product>"
-                    ),
-                },
+        } => match subcommand {
+            Some(FulfillSubcommand::ApproveSpec { product }) => {
+                rocky_fulfill::run_fulfill_approve_spec(&cli.config, &state_path, &product, json)
             }
-        }
+            None => match product {
+                Some(product) => {
+                    rocky_fulfill::run_fulfill(&cli.config, &state_path, &product, retry, json)
+                        .await
+                }
+                None => anyhow::bail!(
+                    "usage: rocky fulfill <product> [--retry] | rocky fulfill approve-spec \
+                     <product>"
+                ),
+            },
+        },
         Command::Product { subcommand } => match subcommand {
             ProductSubcommand::Verify { product } => {
                 rocky_cli::commands::run_product_verify(&cli.config, &product, json)
@@ -4128,7 +4135,6 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             .await
         }
         Command::Snapshot { pipeline, dry_run } => {
-            rocky_cli::pipes::PipesEmitter::validate_requested()?;
             rocky_cli::commands::run_snapshot(&cli.config, pipeline.as_deref(), dry_run, json).await
         }
         Command::Docs {

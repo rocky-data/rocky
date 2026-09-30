@@ -1748,11 +1748,17 @@ fn render_preview_cost_markdown(
 // Git plumbing — change detection between two refs
 // ---------------------------------------------------------------------------
 
+fn git_command() -> Command {
+    let mut command = Command::new("git");
+    rocky_core::process::strip_dagster_pipes_env(&mut command);
+    command
+}
+
 /// Resolve `HEAD` to a short SHA for output provenance. Returns the
 /// literal `"HEAD"` if git is unavailable so the PreviewCreateOutput
 /// stays well-formed even off git.
 fn git_head_sha() -> Result<String> {
-    let out = Command::new("git")
+    let out = git_command()
         .args(["rev-parse", "--short", "HEAD"])
         .output()
         .context("`git rev-parse HEAD` failed")?;
@@ -1785,7 +1791,7 @@ fn preview_branch_name_from_git_ref(raw: &str) -> String {
 /// Falls back to a timestamp-based name if no branch is checked out
 /// (e.g. detached HEAD).
 fn default_branch_name_from_git() -> Result<String> {
-    let out = Command::new("git")
+    let out = git_command()
         .args(["rev-parse", "--abbrev-ref", "HEAD"])
         .output()
         .context("`git rev-parse --abbrev-ref HEAD` failed")?;
@@ -1805,7 +1811,7 @@ fn default_branch_name_from_git() -> Result<String> {
 /// two-dot fallback for shallow clones. Returns paths relative to the
 /// repository root.
 fn git_changed_paths(base_ref: &str) -> Result<Vec<String>> {
-    let three_dot = Command::new("git")
+    let three_dot = git_command()
         .args(["diff", "--name-only", &format!("{base_ref}...HEAD")])
         .output()
         .context("`git diff` failed — is git installed?")?;
@@ -1817,7 +1823,7 @@ fn git_changed_paths(base_ref: &str) -> Result<Vec<String>> {
         "three-dot git diff failed (exit {}), falling back to two-dot",
         three_dot.status
     );
-    let two_dot = Command::new("git")
+    let two_dot = git_command()
         .args(["diff", "--name-only", base_ref, "HEAD"])
         .output()
         .context("`git diff` (two-dot) failed")?;
