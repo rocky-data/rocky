@@ -776,6 +776,10 @@ class MaterializationOutput(BaseModel):
     Useful for cross-checking rocky's reported figures against the warehouse's own statistics — e.g., feeding a job ID into `bq show -j <id>` and comparing `totalBytesBilled` to [`Self::bytes_scanned`]. Empty `Vec` for adapters that don't surface a job concept (DuckDB) or haven't wired it yet (Databricks, Snowflake).
     """
     metadata: MaterializationMetadata
+    notes: list[str] | None = None
+    """
+    Operator-visible actions taken while materializing this model.
+    """
     partition: PartitionInfo | None = None
     """
     Partition window this materialization targeted, present only when the model's strategy is `time_interval`. `None` for unpartitioned strategies (full_refresh, incremental, merge).

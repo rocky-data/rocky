@@ -3923,6 +3923,7 @@ schema_template = "demo"
     fn test_l002_skips_env_template_default() {
         use rocky_core::models::{Model, ModelConfig, SourceConfig, StrategyConfig, TargetConfig};
         let model = Model {
+            drop_existing_kind: None,
             config: ModelConfig {
                 name: "customer_facts".into(),
                 depends_on: Vec::new(),
@@ -3985,6 +3986,7 @@ target.adapter = "default"
     fn test_l002_still_fires_on_literal_redundant_table() {
         use rocky_core::models::{Model, ModelConfig, SourceConfig, StrategyConfig, TargetConfig};
         let model = Model {
+            drop_existing_kind: None,
             config: ModelConfig {
                 name: "customer_facts".into(),
                 depends_on: Vec::new(),

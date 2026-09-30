@@ -1140,6 +1140,9 @@ impl FailedSourceOutput {
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct MaterializationOutput {
     pub asset_key: Vec<String>,
+    /// Operator-visible actions taken while materializing this model.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
     pub rows_copied: Option<u64>,
     pub duration_ms: u64,
     /// Wall-clock timestamp captured at the moment the engine began
@@ -6666,6 +6669,7 @@ mod cost_finalize_tests {
     fn mat(asset_key: &[&str], duration_ms: u64) -> MaterializationOutput {
         MaterializationOutput {
             asset_key: asset_key.iter().map(|s| (*s).to_string()).collect(),
+            notes: vec![],
             attempts: Vec::new(),
             rows_copied: None,
             duration_ms,
@@ -6959,6 +6963,7 @@ mod run_record_tests {
     ) -> MaterializationOutput {
         MaterializationOutput {
             asset_key: asset_key.iter().map(|s| (*s).to_string()).collect(),
+            notes: vec![],
             attempts: Vec::new(),
             rows_copied: Some(42),
             duration_ms,

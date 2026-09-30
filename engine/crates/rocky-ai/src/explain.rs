@@ -149,6 +149,7 @@ mod save_intent_tests {
     fn make_model(file_path: impl Into<std::path::PathBuf>) -> Model {
         Model {
             sql: String::new(),
+            drop_existing_kind: None,
             file_path: file_path.into(),
             contract_path: None,
             config: ModelConfig {

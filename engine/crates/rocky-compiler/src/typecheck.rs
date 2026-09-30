@@ -2845,6 +2845,7 @@ mod tests {
 
     fn make_model(name: &str, sql: &str) -> Model {
         Model {
+            drop_existing_kind: None,
             config: ModelConfig {
                 name: name.to_string(),
                 depends_on: vec![],
@@ -4765,6 +4766,7 @@ mod tests {
         first_partition: Option<&str>,
     ) -> Model {
         Model {
+            drop_existing_kind: None,
             config: ModelConfig {
                 name: name.to_string(),
                 depends_on: vec![],

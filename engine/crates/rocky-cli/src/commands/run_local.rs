@@ -1447,6 +1447,7 @@ pub async fn run_snapshot(
         output.tables_copied = 1;
         output.materializations.push(MaterializationOutput {
             attempts: Vec::new(),
+            notes: vec![],
             asset_key: vec![
                 pipeline.target.catalog.clone(),
                 pipeline.target.schema.clone(),

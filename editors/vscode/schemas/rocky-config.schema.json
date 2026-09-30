@@ -8,6 +8,11 @@
       "type": "string",
       "description": "Model name (defaults to file name stem if omitted)"
     },
+    "drop_existing_kind": {
+      "type": "string",
+      "enum": ["table", "view"],
+      "description": "Standing permission to drop this existing target kind when switching between full_refresh and view. Rocky refuses full_refresh or view models carrying this key on every non-DuckDB adapter."
+    },
     "depends_on": {
       "type": "array",
       "items": { "type": "string" },

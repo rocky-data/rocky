@@ -202,6 +202,8 @@ class PartitionSummary(BaseModel):
 
 class MaterializationInfo(BaseModel):
     asset_key: list[str]
+    #: Operator-visible actions taken while materializing this model.
+    notes: list[str] = Field(default_factory=list)
     rows_copied: int | None = None
     duration_ms: int
     metadata: MaterializationMetadata

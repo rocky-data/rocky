@@ -346,8 +346,8 @@ pub enum CaseSignificance {
 /// (or back) hits the warehouse's own "Existing object X is of type Y,
 /// trying to replace with type Z" error with no explanation. That check
 /// compares this value against what the strategy implies and, on a real
-/// mismatch, fails the model with a Rocky diagnostic before the statement
-/// is ever sent.
+/// mismatch, either refuses with a Rocky diagnostic or applies the model's
+/// exact-kind drop permission before the replacement statement.
 ///
 /// Unlike [`CaseSignificance`], this deliberately has a third state.
 /// `CaseSignificance` has no `Unknown` because no state there would
@@ -464,6 +464,23 @@ pub trait WarehouseAdapter: Send + Sync {
             .map(|()| ExecutionStats::default())
     }
 
+    /// Execute a kind switch in one transaction when supported. `None` means
+    /// unsupported; the caller must not drop the old object. If CREATE fails,
+    /// the adapter rolls back the DROP before returning an error. A failed
+    /// COMMIT can leave target state uncertain and must say so in its error.
+    async fn atomic_drop_and_create(
+        &self,
+        _drop_sql: &str,
+        _create_sql: &str,
+    ) -> AdapterResult<Option<ExecutionStats>> {
+        Ok(None)
+    }
+
+    /// Whether `object_kind` can distinguish table from view on this adapter.
+    fn supports_object_kind_probe(&self) -> bool {
+        false
+    }
+
     /// Classify an error this adapter returned into a run-loop
     /// [`FailureClass`](crate::failure_class::FailureClass).
     ///
@@ -522,8 +539,9 @@ pub trait WarehouseAdapter: Send + Sync {
     /// Default: `Ok(ObjectKind::Unknown)`. Every adapter but `rocky-duckdb`
     /// reports this today, which makes the reconciliation check this backs
     /// a no-op for them: their `CREATE OR REPLACE <kind>` runs exactly as
-    /// it always has, and a genuine mismatch still surfaces — just as the
-    /// warehouse's own error, not yet a Rocky diagnostic. Extending this to
+    /// it always has. A failed probe is also Unknown and never authorizes a
+    /// drop; with explicit permission the run reports why it was unused.
+    /// Extending this to
     /// another adapter is a follow-up, not a prerequisite.
     ///
     /// # Errors

@@ -5702,6 +5702,7 @@ mod tests {
         );
 
         let model = rocky_core::models::Model {
+            drop_existing_kind: None,
             config: rocky_core::models::ModelConfig {
                 name: "downstream".into(),
                 depends_on: vec!["upstream".into()],
@@ -5819,6 +5820,7 @@ mod tests {
         depends_on: Vec<String>,
     ) -> rocky_core::models::Model {
         rocky_core::models::Model {
+            drop_existing_kind: None,
             config: rocky_core::models::ModelConfig {
                 name: name.into(),
                 depends_on,

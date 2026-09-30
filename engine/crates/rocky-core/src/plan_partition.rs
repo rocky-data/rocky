@@ -405,6 +405,7 @@ mod tests {
         first_partition: Option<&str>,
     ) -> Model {
         Model {
+            drop_existing_kind: None,
             config: ModelConfig {
                 name: name.into(),
                 depends_on: vec![],
@@ -684,6 +685,7 @@ mod tests {
     #[test]
     fn test_wrong_strategy_errors() {
         let model = Model {
+            drop_existing_kind: None,
             config: ModelConfig {
                 name: "m".into(),
                 depends_on: vec![],

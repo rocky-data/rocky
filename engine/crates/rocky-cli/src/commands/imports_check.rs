@@ -436,6 +436,7 @@ mod tests {
     /// Build a consumer model that reads `shop.core.orders` via the given SQL.
     fn consumer_model(sql: &str) -> Model {
         Model {
+            drop_existing_kind: None,
             config: ModelConfig {
                 name: "shipments".to_string(),
                 depends_on: vec![],
