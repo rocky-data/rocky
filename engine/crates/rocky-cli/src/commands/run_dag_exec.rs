@@ -251,63 +251,18 @@ pub async fn run_with_dag(
     // success against the reviewed plan id.
     let cfg = &loaded.config;
 
-    // Load models from the model set each transformation pipeline actually
-    // declares — NOT a hardcoded `<config_dir>/models`. Hardcoding it was wrong
-    // in both directions: a pipeline with `models = "transforms/**"` loaded
-    // nothing, built zero transformation nodes, and reported success; and a
-    // project with no transformation pipeline at all was still forced to
-    // validate a `models/` directory that only transformation pipelines
-    // consume (`add_transformation_nodes`), so an unrelated broken model there
-    // failed a replication-only run that `rocky run` executes happily.
-    let models_by_pipeline = load_transformation_models(config_path, cfg)?.by_pipeline;
-
-    // Seed-discovery errors are NOT recoverable into "no seeds": seed nodes and
-    // the seed→model edges that order a model after the seed it reads are built
-    // only from this list. Swallowing a malformed seed sidecar drops the seed
-    // node, leaves the model unordered, and lets it run against whatever the
-    // previous run left in the table — a green DAG over stale data.
-    let seeds_dir = config_path.parent().unwrap_or(Path::new(".")).join("seeds");
-    let seeds = if seeds_dir.is_dir() {
-        rocky_core::seeds::discover_seeds(&seeds_dir)
-            .map_err(|e| anyhow::anyhow!("{e}"))
-            .with_context(|| format!("failed to discover seeds in {}", seeds_dir.display()))?
-    } else {
-        Vec::new()
-    };
-
-    let mut dag = unified_dag::build_unified_dag(cfg, &models_by_pipeline, &seeds)
-        .context("failed to build unified DAG")?;
-
-    // Infer cross-step edges from each model's SQL `FROM` references so a
-    // model that reads a seed (or replication load) is ordered *after* it,
-    // even when no explicit `depends_on` is declared. Without this, a seed
-    // and a model that selects from it both land in layer 0 and race.
-    //
-    // Flattened across pipelines: `build_unified_dag` has already refused any
-    // model claimed by two of them, so a name appears at most once here.
-    let sql_by_name: HashMap<String, String> = models_by_pipeline
-        .values()
-        .flatten()
-        .map(|m| (m.config.name.clone(), m.sql.clone()))
-        .collect();
-    let label_report = unified_dag::infer_runtime_dependencies(&mut dag, &sql_by_name);
-
-    // Physical-read ordering (#1275): the label heuristic above is blind to
-    // configured `[target]`s — a model reading another model's physical
-    // `schema.table` needs its edge derived from rendered target components,
-    // or the two race in one executor phase. Shared derivation with the
-    // plain-run layer computation; cycle-closing candidates are skipped
-    // deterministically inside (the executor refuses cyclic graphs, and a
-    // derived edge must never make a runnable project un-runnable).
-    let physical_inputs: Vec<rocky_core::physical_edges::PhysicalEdgeModel<'_>> =
-        models_by_pipeline
-            .values()
-            .flatten()
-            .map(rocky_core::physical_edges::PhysicalEdgeModel::from_model)
-            .collect();
-    let derived = unified_dag::infer_physical_dependencies(&mut dag, &physical_inputs);
-    let mut physical_edge_warnings = label_report.warnings();
-    physical_edge_warnings.extend(rocky_core::physical_edges::derivation_warnings(&derived));
+    // The unified DAG plus every ordering edge inferable from what each model
+    // reads — everything decided before a node is dispatched. A governed
+    // `rocky apply` of a `--dag` plan comes through this same call, so it sees
+    // the same edges. A label two producers share that a reader cannot pin to
+    // one of them by its target refuses the DAG here, before any node runs.
+    let PlannedDag {
+        runtime,
+        seeds,
+        seeds_dir,
+    } = plan_runtime_dag(config_path, cfg)?;
+    let dag = runtime.dag;
+    let physical_edge_warnings = runtime.warnings;
     for w in &physical_edge_warnings {
         tracing::warn!("{w}");
     }
@@ -447,6 +402,86 @@ pub async fn run_with_dag(
         anyhow::bail!("DAG execution had {} failed node(s)", result.failed);
     }
     Ok(())
+}
+
+/// What [`run_with_dag`] schedules from: the graph with every inferred edge,
+/// and the seeds it was built from.
+struct PlannedDag {
+    runtime: unified_dag::RuntimeDag,
+    seeds: Vec<rocky_core::seeds::SeedFile>,
+    seeds_dir: PathBuf,
+}
+
+/// Load the project's models and seeds and build the graph `--dag` executes.
+///
+/// Everything [`run_with_dag`] does before it dispatches a node, split out so
+/// a test can drive the production path — model loading, seed discovery, the
+/// catalog each adapter establishes, and [`unified_dag::build_runtime_dag`] —
+/// without executing anything.
+fn plan_runtime_dag(
+    config_path: &Path,
+    cfg: &rocky_core::config::RockyConfig,
+) -> Result<PlannedDag> {
+    // Load models from the model set each transformation pipeline actually
+    // declares — NOT a hardcoded `<config_dir>/models`. Hardcoding it was wrong
+    // in both directions: a pipeline with `models = "transforms/**"` loaded
+    // nothing, built zero transformation nodes, and reported success; and a
+    // project with no transformation pipeline at all was still forced to
+    // validate a `models/` directory that only transformation pipelines
+    // consume (`add_transformation_nodes`), so an unrelated broken model there
+    // failed a replication-only run that `rocky run` executes happily.
+    let models_by_pipeline = load_transformation_models(config_path, cfg)?.by_pipeline;
+
+    // Seed-discovery errors are NOT recoverable into "no seeds": seed nodes and
+    // the seed→model edges that order a model after the seed it reads are built
+    // only from this list. Swallowing a malformed seed sidecar drops the seed
+    // node, leaves the model unordered, and lets it run against whatever the
+    // previous run left in the table — a green DAG over stale data.
+    let seeds_dir = config_path.parent().unwrap_or(Path::new(".")).join("seeds");
+    let seeds = if seeds_dir.is_dir() {
+        rocky_core::seeds::discover_seeds(&seeds_dir)
+            .map_err(|e| anyhow::anyhow!("{e}"))
+            .with_context(|| format!("failed to discover seeds in {}", seeds_dir.display()))?
+    } else {
+        Vec::new()
+    };
+
+    // Built in ONE place and in one order (see `build_runtime_dag`): declared
+    // edges, then physical-read edges (exact, catalog fallback, bare guess),
+    // then by-name label edges — a model that reads a seed or load is ordered
+    // after it without an explicit `depends_on`, and a guess never displaces an
+    // exact edge.
+    let runtime =
+        unified_dag::build_runtime_dag(cfg, &models_by_pipeline, &seeds, &default_catalog_of)
+            .context("failed to build unified DAG")?;
+    Ok(PlannedDag {
+        runtime,
+        seeds,
+        seeds_dir,
+    })
+}
+
+/// The catalog a warehouse resolves a catalogless `[target]` in, from the
+/// adapter's config alone — or `None` when it cannot be said without
+/// connecting, which is every adapter but DuckDB (#1629).
+///
+/// For DuckDB it is the name DuckDB gives the primary database: the file's
+/// base name, or `memory`. That is the derivation `DuckDbWarehouseAdapter`
+/// applies to the path it opens (`WarehouseAdapter::default_catalog`), which
+/// is what a plain `rocky run` asks — so `rocky run` and `rocky run --dag`
+/// bind the same reads. A test pins the two together.
+#[cfg(feature = "duckdb")]
+fn default_catalog_of(adapter: &rocky_core::config::AdapterConfig) -> Option<String> {
+    (adapter.adapter_type == "duckdb").then(|| {
+        rocky_duckdb::dialect::catalog_name_for_path(adapter.path.as_deref().unwrap_or(":memory:"))
+    })
+}
+
+/// Without the `duckdb` feature there is no adapter whose catalog can be
+/// established from its config, so no catalogless target is ever bound.
+#[cfg(not(feature = "duckdb"))]
+fn default_catalog_of(_adapter: &rocky_core::config::AdapterConfig) -> Option<String> {
+    None
 }
 
 /// Load each transformation pipeline's own model set, keyed by pipeline name.
@@ -3088,5 +3123,338 @@ mod tests {
                 "{table} must materialize exactly once"
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // The graph `--dag` schedules from (#1629). These drive `plan_runtime_dag`
+    // — the function `run_with_dag` calls — over a project on disk, so model
+    // loading, seed discovery, each adapter's established catalog and the
+    // inference passes are the production ones.
+    // -----------------------------------------------------------------------
+
+    /// One model of a fixture project: `(name, catalog, schema, table, sql)`.
+    type FixtureModel<'a> = (&'a str, &'a str, &'a str, &'a str, &'a str);
+
+    /// Write a DuckDB project: `rocky.toml` = the `local` adapter (a file
+    /// named `db.duckdb`, so the catalog DuckDB gives it is `db`) plus
+    /// `pipelines`, and one sidecar pair per model under `models/`.
+    fn write_fixture_project(root: &Path, pipelines: &str, models: &[FixtureModel<'_>]) {
+        std::fs::create_dir_all(root.join("models")).unwrap();
+        std::fs::write(
+            root.join("rocky.toml"),
+            format!(
+                "[adapter.local]\ntype = \"duckdb\"\npath = \"{}\"\n\n{pipelines}",
+                root.join("db.duckdb").display()
+            ),
+        )
+        .unwrap();
+        for (name, catalog, schema, table, sql) in models {
+            std::fs::write(root.join(format!("models/{name}.sql")), format!("{sql}\n")).unwrap();
+            std::fs::write(
+                root.join(format!("models/{name}.toml")),
+                format!(
+                    "name = \"{name}\"\n\n[strategy]\ntype = \"full_refresh\"\n\n\
+                     [target]\ncatalog = \"{catalog}\"\nschema = \"{schema}\"\ntable = \"{table}\"\n"
+                ),
+            )
+            .unwrap();
+        }
+    }
+
+    /// A transformation pipeline named `name` writing through `local`.
+    fn transformation_block(name: &str) -> String {
+        format!(
+            "[pipeline.{name}]\ntype = \"transformation\"\n\n[pipeline.{name}.target]\nadapter = \"local\"\n\n"
+        )
+    }
+
+    /// The graph `run_with_dag` would schedule, planned from `root`.
+    fn plan_fixture(root: &Path) -> Result<PlannedDag> {
+        let config_path = root.join("rocky.toml");
+        let loaded = dag_snapshot(&config_path);
+        plan_runtime_dag(&config_path, &loaded.config)
+    }
+
+    /// Whether node `from` must complete before node `to` (ids, `kind:name`).
+    fn planned_edge(planned: &PlannedDag, from: &str, to: &str) -> bool {
+        planned
+            .runtime
+            .dag
+            .edges
+            .iter()
+            .any(|e| e.from.0 == from && e.to.0 == to)
+    }
+
+    /// The execution phase of a node, from the planned graph.
+    fn planned_phase(planned: &PlannedDag, id: &str) -> usize {
+        unified_dag::execution_phases(&planned.runtime.dag)
+            .expect("the planned graph is acyclic")
+            .iter()
+            .position(|phase| phase.iter().any(|n| n.id.0 == id))
+            .unwrap_or_else(|| panic!("no node {id}"))
+    }
+
+    /// The catalog `run --dag` establishes for a DuckDB adapter must be the
+    /// one the adapter reports to a plain `rocky run`, or the two schedulers
+    /// bind different reads. Compared for every path shape `catalog_name_for_path`
+    /// distinguishes.
+    #[test]
+    fn run_dag_and_the_adapter_agree_on_a_duckdb_catalog() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        for file in [
+            Some("db.duckdb"),
+            Some("main.duckdb"),
+            Some("my.warehouse.duckdb"),
+            Some(":memory:"),
+            None,
+        ] {
+            let path_line = file.map_or(String::new(), |f| {
+                let path = if f == ":memory:" {
+                    f.to_string()
+                } else {
+                    root.join(f).display().to_string()
+                };
+                format!("path = \"{path}\"\n")
+            });
+            let config_path = root.join("rocky.toml");
+            std::fs::write(
+                &config_path,
+                format!("[adapter.local]\ntype = \"duckdb\"\n{path_line}"),
+            )
+            .unwrap();
+            let loaded = dag_snapshot(&config_path);
+            let adapter_cfg = loaded.config.adapters.get("local").expect("adapter");
+            let registry = crate::registry::AdapterRegistry::from_config(&loaded.config)
+                .expect("registry builds");
+            let warehouse = registry.warehouse_adapter("local").expect("warehouse");
+            assert_eq!(
+                default_catalog_of(adapter_cfg),
+                warehouse.default_catalog(),
+                "path {file:?}: `run --dag` and the adapter must name the same catalog"
+            );
+            assert!(warehouse.default_catalog().is_some(), "path {file:?}");
+        }
+    }
+
+    /// Only DuckDB can name a catalogless target's catalog from its config;
+    /// anything else establishes nothing rather than guessing.
+    #[test]
+    fn no_other_adapter_establishes_a_catalog() {
+        let databricks: rocky_core::config::AdapterConfig = serde_json::from_value(
+            serde_json::json!({ "type": "databricks", "host": "h", "http_path": "/p" }),
+        )
+        .expect("databricks fixture");
+        assert_eq!(default_catalog_of(&databricks), None);
+    }
+
+    /// #1629 P1 through the production planner: a catalogless producer is
+    /// ordered before a read that names the catalog its DuckDB file gives it,
+    /// and not before a read of another catalog's table of the same name.
+    #[test]
+    fn a_catalogless_producer_is_ordered_by_the_catalog_its_adapter_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write_fixture_project(
+            root,
+            &transformation_block("t"),
+            &[
+                ("orders_model", "", "silver", "orders_v2", "SELECT 1 AS id"),
+                (
+                    "mart",
+                    "db",
+                    "silver",
+                    "mart",
+                    "SELECT id FROM db.silver.orders_v2",
+                ),
+                (
+                    "elsewhere",
+                    "db",
+                    "silver",
+                    "elsewhere",
+                    "SELECT id FROM other.silver.orders_v2",
+                ),
+            ],
+        );
+        let planned = plan_fixture(root).expect("plan");
+        assert!(
+            planned_edge(
+                &planned,
+                "transformation:orders_model",
+                "transformation:mart"
+            ),
+            "{:?}",
+            planned.runtime.physical
+        );
+        assert!(
+            !planned_edge(
+                &planned,
+                "transformation:orders_model",
+                "transformation:elsewhere"
+            ),
+            "a read naming ANOTHER catalog is not this producer's table"
+        );
+        assert!(
+            planned_phase(&planned, "transformation:orders_model")
+                < planned_phase(&planned, "transformation:mart")
+        );
+    }
+
+    /// The review's P2 construction through the production planner: a load
+    /// pipeline named like a model. The reader means the load; the order is
+    /// load, reader, model — whichever pipeline sorts first in the config.
+    #[test]
+    fn a_reader_of_a_label_a_load_shares_is_ordered_after_the_load() {
+        for models_pipeline in ["a_models", "z_models"] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            write_fixture_project(
+                root,
+                &format!(
+                    "{}[pipeline.shared]\ntype = \"load\"\nsource_dir = \"data/\"\n\n\
+                     [pipeline.shared.target]\nadapter = \"local\"\ncatalog = \"prod\"\n\
+                     schema = \"bronze\"\ntable = \"shared\"\n",
+                    transformation_block(models_pipeline)
+                ),
+                &[
+                    (
+                        "shared",
+                        "prod",
+                        "silver",
+                        "shared_output",
+                        "SELECT y FROM prod.silver.reader_output",
+                    ),
+                    (
+                        "reader",
+                        "prod",
+                        "silver",
+                        "reader_output",
+                        "SELECT x FROM prod.bronze.shared",
+                    ),
+                ],
+            );
+            let planned = plan_fixture(root).expect("the read names the load's target");
+            assert!(
+                planned_edge(&planned, "load:shared", "transformation:reader"),
+                "{models_pipeline}: the reader reads the load's table"
+            );
+            assert!(
+                !planned_edge(&planned, "transformation:shared", "transformation:reader"),
+                "{models_pipeline}: it must never wait for the same-named model"
+            );
+            let (load, reader, model) = (
+                planned_phase(&planned, "load:shared"),
+                planned_phase(&planned, "transformation:reader"),
+                planned_phase(&planned, "transformation:shared"),
+            );
+            assert!(
+                load < reader && reader < model,
+                "{models_pipeline}: no model may run before its input: \
+                 load={load} reader={reader} model={model}"
+            );
+        }
+    }
+
+    /// The refusal reaches `run --dag` itself: a bare read of a label a model
+    /// and a load share refuses the run before any node is dispatched, and the
+    /// message names both producers.
+    #[tokio::test]
+    async fn run_dag_refuses_an_unresolvable_shared_label_before_running_anything() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write_fixture_project(
+            root,
+            &format!(
+                "{}[pipeline.shared]\ntype = \"load\"\nsource_dir = \"data/\"\n\n\
+                 [pipeline.shared.target]\nadapter = \"local\"\ncatalog = \"prod\"\n\
+                 schema = \"bronze\"\ntable = \"shared\"\n",
+                transformation_block("t")
+            ),
+            &[
+                ("shared", "prod", "silver", "shared_output", "SELECT 1 AS y"),
+                (
+                    "reader",
+                    "prod",
+                    "silver",
+                    "reader_output",
+                    "SELECT x FROM shared",
+                ),
+            ],
+        );
+        let err = run_with_dag(
+            &root.join("rocky.toml"),
+            dag_snapshot(&root.join("rocky.toml")),
+            &root.join(".rocky-state.redb"),
+            false,
+            &PartitionRunOptions::default(),
+            &crate::commands::run::SkipRunOptions::default(),
+            None,
+            None,
+        )
+        .await
+        .expect_err("an ambiguous label must refuse the run");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("model 'shared' (target prod.silver.shared_output)")
+                && message.contains("load pipeline 'shared' (target prod.bronze.shared)"),
+            "the refusal names both producers: {message}"
+        );
+        assert!(
+            !root.join("db.duckdb").exists(),
+            "nothing was dispatched, so no warehouse was touched"
+        );
+    }
+
+    /// End to end: a catalogless producer and the read that names its
+    /// catalog run in dependency order under `rocky run --dag` and the
+    /// consumer sees the producer's rows. (The order is asserted by the
+    /// planner tests above; this proves the whole run accepts and executes
+    /// the graph they build.)
+    #[tokio::test]
+    async fn run_dag_builds_a_catalogless_producer_before_the_read_that_names_its_catalog() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write_fixture_project(
+            root,
+            &format!(
+                "{}[pipeline.t.target.governance]\nauto_create_schemas = true\n",
+                transformation_block("t")
+            ),
+            // The consumer sorts BEFORE the producer, so without the edge it
+            // is the one dispatched first.
+            &[
+                (
+                    "a_mart",
+                    "db",
+                    "silver",
+                    "a_mart",
+                    "SELECT id FROM db.silver.z_orders",
+                ),
+                ("z_orders", "", "silver", "z_orders", "SELECT 1 AS id"),
+            ],
+        );
+        run_with_dag(
+            &root.join("rocky.toml"),
+            dag_snapshot(&root.join("rocky.toml")),
+            &root.join(".rocky-state.redb"),
+            false,
+            &PartitionRunOptions::default(),
+            &crate::commands::run::SkipRunOptions::default(),
+            None,
+            None,
+        )
+        .await
+        .expect("run --dag should succeed");
+        let adapter = DuckDbWarehouseAdapter::open(&root.join("db.duckdb")).unwrap();
+        let conn = adapter.shared_connector();
+        let guard = conn.lock().unwrap();
+        let rows = guard
+            .execute_sql("SELECT COUNT(*) FROM db.silver.a_mart")
+            .unwrap();
+        assert_eq!(
+            cell_i64(&rows.rows[0][0]),
+            1,
+            "the consumer read the producer's row"
+        );
     }
 }

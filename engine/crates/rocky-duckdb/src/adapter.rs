@@ -48,6 +48,10 @@ pub struct DuckDbWarehouseAdapter {
     /// be exercised against real DuckDB storage in unit tests. Always `false`
     /// in production: the single `Mutex` connection just serializes work.
     concurrent_for_test: bool,
+    /// The catalog DuckDB assigned the primary database, known only when this
+    /// adapter opened the database itself (so it saw the path). Adapters built
+    /// from an existing connector never saw one and report `None`.
+    default_catalog: Option<String>,
 }
 
 impl DuckDbWarehouseAdapter {
@@ -58,6 +62,7 @@ impl DuckDbWarehouseAdapter {
             connector: Arc::new(Mutex::new(connector)),
             dialect: DuckDbSqlDialect,
             concurrent_for_test: false,
+            default_catalog: Some(crate::dialect::catalog_name_for_path(":memory:")),
         })
     }
 
@@ -68,6 +73,9 @@ impl DuckDbWarehouseAdapter {
             connector: Arc::new(Mutex::new(connector)),
             dialect: DuckDbSqlDialect,
             concurrent_for_test: false,
+            default_catalog: Some(crate::dialect::catalog_name_for_path(
+                &path.to_string_lossy(),
+            )),
         })
     }
 
@@ -77,6 +85,7 @@ impl DuckDbWarehouseAdapter {
             connector: Arc::new(Mutex::new(connector)),
             dialect: DuckDbSqlDialect,
             concurrent_for_test: false,
+            default_catalog: None,
         }
     }
 
@@ -88,6 +97,7 @@ impl DuckDbWarehouseAdapter {
             connector,
             dialect: DuckDbSqlDialect,
             concurrent_for_test: false,
+            default_catalog: None,
         }
     }
 
@@ -128,6 +138,14 @@ impl WarehouseAdapter for DuckDbWarehouseAdapter {
         &self,
     ) -> AdapterResult<rocky_core::traits::CaseSignificance> {
         Ok(rocky_core::traits::CaseSignificance::Insignificant)
+    }
+
+    /// The name DuckDB gives the primary database — the file's base name, or
+    /// `memory` — which is where a catalogless `schema.table` resolves. Known
+    /// from the path the adapter opened, with no round trip; `None` for an
+    /// adapter built from an existing connector, which never saw one.
+    fn default_catalog(&self) -> Option<String> {
+        self.default_catalog.clone()
     }
 
     async fn execute_statement(&self, sql: &str) -> AdapterResult<()> {

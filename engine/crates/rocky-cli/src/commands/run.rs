@@ -9142,16 +9142,27 @@ pub(crate) fn case_near_miss_remedy(rules: rocky_sql::defer::IdentifierCaseRules
 /// Cycle-closing candidates never leave the derivation (skipped
 /// deterministically, reported as warnings), so this recompute cannot turn
 /// a compiling project into a refused one.
+///
+/// `default_catalog` is what the run's warehouse resolves a catalogless
+/// `[target]` in (`WarehouseAdapter::default_catalog`), or `None` when it
+/// cannot say. It is what lets a `catalog.schema.table` read bind to a model
+/// whose `[target]` names no catalog (#1629); `rocky run --dag` establishes
+/// the same catalog for the same models, so the two schedulers derive the
+/// same edges.
 fn augment_physical_read_edges(
     compile_result: &mut rocky_compiler::compile::CompileResult,
     contain_failures: bool,
+    default_catalog: Option<&str>,
     warnings: &mut Vec<String>,
 ) -> Result<()> {
     let inputs: Vec<rocky_core::physical_edges::PhysicalEdgeModel<'_>> = compile_result
         .project
         .models
         .iter()
-        .map(rocky_core::physical_edges::PhysicalEdgeModel::from_model)
+        .map(|m| {
+            rocky_core::physical_edges::PhysicalEdgeModel::from_model(m)
+                .with_effective_catalog(default_catalog)
+        })
         .collect();
     let existing: Vec<(String, String)> = compile_result
         .project
@@ -10894,9 +10905,11 @@ pub(crate) async fn execute_models_with_explicit_contracts(
         }
         output.shadow = true;
     } else {
+        let default_catalog = warehouse.default_catalog();
         augment_physical_read_edges(
             &mut compile_result,
             resilience.contain_failures,
+            default_catalog.as_deref(),
             &mut output.scheduling_warnings,
         )?;
         refuse_on_scheduling_warnings(strict_scheduling, &output.scheduling_warnings)?;
@@ -29848,7 +29861,7 @@ auto_create_schemas = true
         );
 
         let mut warnings = Vec::new();
-        super::augment_physical_read_edges(&mut compiled, false, &mut warnings)
+        super::augment_physical_read_edges(&mut compiled, false, None, &mut warnings)
             .expect("augmentation");
         assert_eq!(
             compiled.project.layers,
@@ -29879,7 +29892,7 @@ auto_create_schemas = true
             .expect("compile models");
 
         let mut warnings = Vec::new();
-        super::augment_physical_read_edges(&mut compiled, false, &mut warnings)
+        super::augment_physical_read_edges(&mut compiled, false, None, &mut warnings)
             .expect("mutual reads must not refuse the run");
         assert_eq!(
             compiled.project.layers,
@@ -29891,6 +29904,173 @@ auto_create_schemas = true
             warnings[0].contains("would close a dependency cycle"),
             "{warnings:?}"
         );
+    }
+
+    /// Like [`write_model_with_target`], but the model's `[target]` names a
+    /// catalog.
+    #[cfg(feature = "duckdb")]
+    fn write_model_in_catalog(
+        dir: &std::path::Path,
+        name: &str,
+        sql: &str,
+        catalog: &str,
+        schema: &str,
+        table: &str,
+    ) {
+        std::fs::write(dir.join(format!("{name}.sql")), format!("{sql}\n"))
+            .expect("write model sql");
+        std::fs::write(
+            dir.join(format!("{name}.toml")),
+            format!(
+                "[strategy]\ntype = \"full_refresh\"\n\n\
+                 [target]\ncatalog = \"{catalog}\"\nschema = \"{schema}\"\ntable = \"{table}\"\n"
+            ),
+        )
+        .expect("write model toml");
+    }
+
+    /// Compile the models in `dir` the way a plain run does.
+    #[cfg(feature = "duckdb")]
+    fn compile_models(dir: &std::path::Path) -> rocky_compiler::compile::CompileResult {
+        rocky_compiler::compile::compile(&rocky_compiler::compile::CompilerConfig {
+            models_dir: dir.to_path_buf(),
+            ..Default::default()
+        })
+        .expect("compile models")
+    }
+
+    /// What the plain run's graph says a model must run after.
+    #[cfg(feature = "duckdb")]
+    fn upstreams_of(compiled: &rocky_compiler::compile::CompileResult, model: &str) -> Vec<String> {
+        let mut deps = compiled
+            .project
+            .dag_nodes
+            .iter()
+            .find(|n| n.name == model)
+            .unwrap_or_else(|| panic!("no model {model}"))
+            .depends_on
+            .clone();
+        deps.sort();
+        deps
+    }
+
+    /// #1629 P1, through the plain-run entry point: a model whose `[target]`
+    /// names no catalog is found by a three-part read that names the
+    /// catalog its warehouse resolves it in, so the pair is never
+    /// co-scheduled.
+    #[cfg(feature = "duckdb")]
+    #[test]
+    fn a_catalogless_producer_is_ordered_before_a_read_naming_the_warehouses_catalog() {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir(&models_dir).expect("mkdir models");
+        write_model_with_target(&models_dir, "orders", "SELECT 1 AS id", "main", "orders");
+        write_model_in_catalog(
+            &models_dir,
+            "mart",
+            "SELECT id FROM db.main.orders",
+            "db",
+            "main",
+            "mart",
+        );
+        let mut compiled = compile_models(&models_dir);
+        assert_eq!(
+            compiled.project.layers.len(),
+            1,
+            "precondition: compile sees no edge — {:?}",
+            compiled.project.layers
+        );
+
+        let mut warnings = Vec::new();
+        super::augment_physical_read_edges(&mut compiled, false, Some("db"), &mut warnings)
+            .expect("augmentation");
+        assert_eq!(
+            compiled.project.layers,
+            vec![vec!["orders".to_string()], vec!["mart".to_string()]],
+            "the producer layers strictly before the read that names its catalog"
+        );
+        assert!(warnings.is_empty(), "{warnings:?}");
+    }
+
+    /// The same project when the warehouse cannot say which catalog a
+    /// catalogless target lives in: the read might name another catalog's
+    /// table, so no edge is guessed — and the read is reported by name.
+    #[cfg(feature = "duckdb")]
+    #[test]
+    fn a_catalogless_producer_whose_catalog_is_unknown_is_not_guessed_at_in_a_plain_run() {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir(&models_dir).expect("mkdir models");
+        write_model_with_target(&models_dir, "orders", "SELECT 1 AS id", "main", "orders");
+        write_model_in_catalog(
+            &models_dir,
+            "mart",
+            "SELECT id FROM db.main.orders",
+            "db",
+            "main",
+            "mart",
+        );
+        let mut compiled = compile_models(&models_dir);
+
+        let mut warnings = Vec::new();
+        super::augment_physical_read_edges(&mut compiled, false, None, &mut warnings)
+            .expect("augmentation");
+        assert_eq!(
+            compiled.project.layers.len(),
+            1,
+            "{:?}",
+            compiled.project.layers
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("'mart'") && w.contains("db.main.orders")),
+            "the unbound read is named: {warnings:?}"
+        );
+    }
+
+    /// The review's P1 construction, through the plain-run entry point.
+    /// `alpha` reads ANOTHER catalog's `beta_table`; `beta` reads alpha's
+    /// table by a two-part name. The real edge is beta-after-alpha and a
+    /// `(schema, table)` guess would invent the reverse one.
+    #[cfg(feature = "duckdb")]
+    #[test]
+    fn a_read_of_another_catalogs_table_never_reverses_a_real_edge_in_a_plain_run() {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir(&models_dir).expect("mkdir models");
+        write_model_in_catalog(
+            &models_dir,
+            "alpha",
+            "SELECT x FROM external.main.beta_table",
+            "prod",
+            "main",
+            "alpha_table",
+        );
+        write_model_in_catalog(
+            &models_dir,
+            "beta",
+            "SELECT y FROM main.alpha_table",
+            "prod",
+            "main",
+            "beta_table",
+        );
+        let mut compiled = compile_models(&models_dir);
+
+        let mut warnings = Vec::new();
+        super::augment_physical_read_edges(&mut compiled, false, Some("prod"), &mut warnings)
+            .expect("augmentation");
+        assert_eq!(upstreams_of(&compiled, "beta"), vec!["alpha".to_string()]);
+        assert!(
+            upstreams_of(&compiled, "alpha").is_empty(),
+            "alpha reads a table in ANOTHER catalog, not beta's: {:?}",
+            upstreams_of(&compiled, "alpha")
+        );
+        assert_eq!(
+            compiled.project.layers,
+            vec![vec!["alpha".to_string()], vec!["beta".to_string()]]
+        );
+        assert!(warnings.is_empty(), "{warnings:?}");
     }
 
     /// #1359: schema pre-creation covers exactly the models the run will

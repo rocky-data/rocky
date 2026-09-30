@@ -422,6 +422,25 @@ pub trait WarehouseAdapter: Send + Sync {
         ))
     }
 
+    /// The catalog this connection resolves a catalogless target in, when the
+    /// adapter can name it without a round trip.
+    ///
+    /// A model whose `[target]` sets no `catalog` renders as `schema.table`,
+    /// which the warehouse resolves against the connection's current catalog.
+    /// Rocky needs that name to decide whether a `catalog.schema.table` read
+    /// in another model is that model's table or another catalog's table of
+    /// the same `schema.table` (#1629) — a guess across catalogs can order a
+    /// real dependency backwards.
+    ///
+    /// **`None` means "not established", never "no catalog".** The default is
+    /// `None`, and that is load-bearing: a consumer treats it as unknown and
+    /// derives nothing from it. Only an adapter that can state the answer
+    /// exactly, without connecting, overrides it. DuckDB does: the catalog is
+    /// the database file's name, which its own configuration determines.
+    fn default_catalog(&self) -> Option<String> {
+        None
+    }
+
     /// Execute a SQL statement (DDL/DML) without returning rows.
     async fn execute_statement(&self, sql: &str) -> AdapterResult<()>;
 
