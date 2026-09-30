@@ -258,8 +258,8 @@ pub async fn run_with_dag(
     // one of them by its target refuses the DAG here, before any node runs.
     let PlannedDag {
         runtime,
-        seeds,
         seeds_dir,
+        seed_pipeline,
     } = plan_runtime_dag(config_path, cfg)?;
     let dag = runtime.dag;
     let physical_edge_warnings = runtime.warnings;
@@ -335,7 +335,7 @@ pub async fn run_with_dag(
         .iter()
         .filter_map(|n| n.pipeline.as_ref().map(|p| (n.id.clone(), p.clone())))
         .collect();
-    let (seed_pipeline, seed_pipeline_refusal) = match sole_adapter_pipeline(cfg, &seeds) {
+    let (seed_pipeline, seed_pipeline_refusal) = match seed_pipeline {
         Ok(name) => (Some(name), None),
         Err(reason) => (None, Some(reason)),
     };
@@ -405,12 +405,16 @@ pub async fn run_with_dag(
 }
 
 /// What [`run_with_dag`] schedules from: the graph with every inferred edge,
-/// and the seeds it was built from.
+/// and where its seeds come from.
 #[derive(Debug)]
 struct PlannedDag {
     runtime: unified_dag::RuntimeDag,
-    seeds: Vec<rocky_core::seeds::SeedFile>,
     seeds_dir: PathBuf,
+    /// The pipeline the `Seed` nodes load against, or why none could be chosen
+    /// ([`sole_adapter_pipeline`]). Resolved once, here, because the graph
+    /// needs the catalog it implies for a seed's target, and the dispatcher
+    /// must load the seeds against the very pipeline the graph assumed.
+    seed_pipeline: std::result::Result<String, SeedPipelineRefusal>,
 }
 
 /// Load the project's models and seeds and build the graph `--dag` executes.
@@ -447,18 +451,34 @@ fn plan_runtime_dag(
         Vec::new()
     };
 
+    // The pipeline the seed nodes will load against, and so the catalog a seed
+    // with no sidecar catalog lands in — the seed loader's own default for it.
+    // When no single pipeline can be chosen the seed nodes fail at dispatch,
+    // and the seeds' catalog is unknown to the graph.
+    let seed_pipeline = sole_adapter_pipeline(cfg, &seeds);
+    let seed_default_catalog = seed_pipeline
+        .as_ref()
+        .ok()
+        .and_then(|name| cfg.pipelines.get(name))
+        .map(super::seed::default_seed_catalog);
+
     // Built in ONE place and in one order (see `build_runtime_dag`): declared
     // edges, then physical-read edges (exact, catalog fallback, bare guess),
     // then by-name label edges — a model that reads a seed or load is ordered
     // after it without an explicit `depends_on`, and a guess never displaces an
     // exact edge.
-    let runtime =
-        unified_dag::build_runtime_dag(cfg, &models_by_pipeline, &seeds, &default_catalog_of)
-            .context("failed to build unified DAG")?;
+    let runtime = unified_dag::build_runtime_dag(
+        cfg,
+        &models_by_pipeline,
+        &seeds,
+        seed_default_catalog.as_deref(),
+        &default_catalog_of,
+    )
+    .context("failed to build unified DAG")?;
     Ok(PlannedDag {
         runtime,
-        seeds,
         seeds_dir,
+        seed_pipeline,
     })
 }
 
@@ -3359,10 +3379,11 @@ mod tests {
     /// Two writers of one table, through the production planner and real seed
     /// discovery. A model `orders` writes `main.seeds.orders`, and so does the
     /// sidecar-free seed `orders.csv`: the seed loader defaults it to the
-    /// `seeds` schema, and drops and recreates whatever is there. The graph is
-    /// built before the seed's catalog is chosen, so a read of
-    /// `main.seeds.orders` cannot be pinned to the model alone — it is refused,
-    /// not resolved to the one producer whose target happens to be known.
+    /// `seeds` schema and to the catalog of the pipeline the seeds load
+    /// against (`main`, its fallback, for a project with no replication
+    /// pipeline), and drops and recreates whatever is there. A read of
+    /// `main.seeds.orders` cannot be pinned to the model alone — it is
+    /// refused, not resolved to one of two definite writers.
     #[test]
     fn a_sidecar_free_seed_and_a_model_writing_one_table_make_its_readers_ambiguous() {
         let dir = tempfile::tempdir().unwrap();
@@ -3389,9 +3410,48 @@ mod tests {
         );
         assert!(
             message.contains("model 'orders' (target main.seeds.orders)")
-                && message.contains("seed 'orders' (target ?.seeds.orders)"),
-            "the refusal names both writers and marks the unknown catalog: {message}"
+                && message.contains("seed 'orders' (target main.seeds.orders)"),
+            "the refusal names both writers: {message}"
         );
+    }
+
+    /// The same shape when the model writes another catalog: the seeds load
+    /// against a pipeline whose default catalog is `main`, so a read of
+    /// `prod.seeds.orders` cannot be the seed's table and the plan is accepted,
+    /// with the reader after the model. Without the seed pipeline's default
+    /// catalog in the graph the seed would count as possibly in `prod`, and
+    /// this valid project would be refused.
+    #[test]
+    fn a_sidecar_free_seed_does_not_block_a_model_writing_another_catalog() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write_fixture_project(
+            root,
+            &transformation_block("t"),
+            &[
+                ("orders", "prod", "seeds", "orders", "SELECT 1 AS id"),
+                (
+                    "mart",
+                    "prod",
+                    "marts",
+                    "mart",
+                    "SELECT id FROM prod.seeds.orders",
+                ),
+            ],
+        );
+        std::fs::create_dir_all(root.join("seeds")).unwrap();
+        std::fs::write(root.join("seeds/orders.csv"), "id\n1\n").unwrap();
+        let planned = plan_fixture(root).expect("the seed is in `main`, not `prod`");
+        assert!(planned_edge(
+            &planned,
+            "transformation:orders",
+            "transformation:mart"
+        ));
+        assert!(!planned_edge(
+            &planned,
+            "seed:orders",
+            "transformation:mart"
+        ));
     }
 
     /// The same project when the model writes a schema the seed's default

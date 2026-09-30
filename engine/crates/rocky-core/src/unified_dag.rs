@@ -968,6 +968,11 @@ pub struct RuntimeDag {
 /// which is the answer for every adapter but DuckDB. See
 /// [`PhysicalEdgeModel::effective_catalog`] for why it is asked for at all.
 ///
+/// `seed_default_catalog` is the catalog the seed loader gives a seed whose
+/// sidecar names none, for the pipeline the seed nodes run under — `None` when
+/// no single pipeline could be chosen, in which case those seeds fail when they
+/// are dispatched and their catalog is unknown here.
+///
 /// # Precedence
 ///
 /// Edges join the graph in passes, strongest evidence first, and a later pass
@@ -992,10 +997,11 @@ pub struct RuntimeDag {
 /// says nothing about which one a reader means, so it is not consulted. A read
 /// is ordered after the producer whose full `catalog.schema.table` target it
 /// names, provided no other producer of the label could be the same table. A
-/// producer whose target is not fully known (a seed with no sidecar `[target]`
-/// is in the default seed schema but in a catalog chosen when it loads) is not
-/// ruled out by a read that does not contradict it. A read that names none of
-/// them, several, or one while another could be the same table, is refused with
+/// producer whose target is not fully known (a load with no explicit `table`,
+/// or a seed whose catalog is unknown because no single pipeline could be
+/// chosen for the seed nodes) is not ruled out by a read that does not
+/// contradict it. A read that names none of them, several, or one while another
+/// could be the same table, is refused with
 /// [`UnifiedDagError::AmbiguousLabelProducer`] before anything runs.
 ///
 /// # Errors
@@ -1006,6 +1012,7 @@ pub fn build_runtime_dag(
     config: &RockyConfig,
     models_by_pipeline: &ModelsByPipeline,
     seeds: &[SeedFile],
+    seed_default_catalog: Option<&str>,
     default_catalog_of: &dyn Fn(&AdapterConfig) -> Option<String>,
 ) -> Result<RuntimeDag, UnifiedDagError> {
     let mut dag = build_unified_dag(config, models_by_pipeline, seeds)?;
@@ -1069,6 +1076,7 @@ pub fn build_runtime_dag(
         config,
         models_by_pipeline,
         seeds,
+        seed_default_catalog,
         &pipeline_catalog,
         &established,
     );
@@ -1172,18 +1180,20 @@ impl ProducerTarget {
 /// The declared target of every node that can produce a table a model reads.
 ///
 /// A model's own `[target]` (or, when it names no catalog, the catalog its
-/// adapter established); a seed's sidecar `[target]`; a load pipeline's
-/// `[target]`. What a target does not fix stays unknown: a seed with no sidecar
-/// target is in the default seed schema but in a catalog its loader picks from
-/// the pipeline it runs under, and a load with no explicit table writes tables
-/// named after its files. Such a producer is never named by a read, and never
-/// ruled out by one — see [`ProducerTarget::match_read`]. A replication
-/// pipeline's load writes templated targets and is entirely unknown.
+/// adapter established); a seed's sidecar `[target]`, with the seed loader's
+/// defaults for what it leaves out; a load pipeline's `[target]`. What a target
+/// does not fix stays unknown: a seed's catalog when no single pipeline could
+/// be chosen for the seed nodes, and a load with no explicit table, which
+/// writes tables named after its files. Such a producer is never named by a
+/// read, and never ruled out by one — see [`ProducerTarget::match_read`]. A
+/// replication pipeline's load writes templated targets and is entirely
+/// unknown.
 fn producer_targets(
     dag: &UnifiedDag,
     config: &RockyConfig,
     models_by_pipeline: &ModelsByPipeline,
     seeds: &[SeedFile],
+    seed_default_catalog: Option<&str>,
     pipeline_catalog: &HashMap<&str, Option<String>>,
     established: &dyn Fn(&str) -> Option<String>,
 ) -> HashMap<NodeId, ProducerTarget> {
@@ -1210,18 +1220,20 @@ fn producer_targets(
         }
     }
 
+    // The seed loader's own rule: a sidecar `[target]` names the schema, and the
+    // catalog and table where it says so; whatever it leaves out defaults — the
+    // catalog to the one chosen for the seed nodes' pipeline, the schema to the
+    // default seed schema, the table to the seed's name. A sidecar catalog that
+    // is spelled empty is taken as spelled, and stays unknown.
     for seed in seeds {
         let target = match &seed.config.target {
             Some(t) => ProducerTarget::new(
-                t.catalog.as_deref(),
+                t.catalog.as_deref().or(seed_default_catalog),
                 Some(&t.schema),
                 Some(t.table.as_deref().unwrap_or(&seed.name)),
             ),
-            // No sidecar target: the seed loader puts it in the default seed
-            // schema, in the catalog of the pipeline it runs under, which is
-            // not known here.
             None => ProducerTarget::new(
-                None,
+                seed_default_catalog,
                 Some(crate::seeds::DEFAULT_SEED_SCHEMA),
                 Some(&seed.name),
             ),
@@ -3449,7 +3461,7 @@ mod tests {
 
         // The graph `run --dag` actually schedules from.
         let runtime =
-            build_runtime_dag(&config, &by_pipeline, &[], &no_catalog).expect("runtime dag");
+            build_runtime_dag(&config, &by_pipeline, &[], None, &no_catalog).expect("runtime dag");
         assert_eq!(runtime.physical.edges.len(), 1, "{:?}", runtime.physical);
         let phases = execution_phases(&runtime.dag).expect("phases after augmentation");
         assert!(
@@ -3538,7 +3550,7 @@ mod tests {
                 ),
             ],
         );
-        let runtime = build_runtime_dag(&config, &by_pipeline, &[], &duckdb_stem_catalog)
+        let runtime = build_runtime_dag(&config, &by_pipeline, &[], None, &duckdb_stem_catalog)
             .expect("runtime dag");
         assert!(
             has_edge(
@@ -3578,7 +3590,7 @@ mod tests {
             ],
         );
         let runtime =
-            build_runtime_dag(&config, &by_pipeline, &[], &no_catalog).expect("runtime dag");
+            build_runtime_dag(&config, &by_pipeline, &[], None, &no_catalog).expect("runtime dag");
         assert!(
             !has_edge(
                 &runtime.dag,
@@ -3617,7 +3629,7 @@ mod tests {
                 ),
             ],
         );
-        let runtime = build_runtime_dag(&config, &by_pipeline, &[], &duckdb_stem_catalog)
+        let runtime = build_runtime_dag(&config, &by_pipeline, &[], None, &duckdb_stem_catalog)
             .expect("runtime dag");
         assert!(!has_edge(
             &runtime.dag,
@@ -3644,7 +3656,7 @@ mod tests {
                 ),
             ],
         );
-        let runtime = build_runtime_dag(&config, &by_pipeline, &[], &duckdb_stem_catalog)
+        let runtime = build_runtime_dag(&config, &by_pipeline, &[], None, &duckdb_stem_catalog)
             .expect("runtime dag");
         assert!(!has_edge(
             &runtime.dag,
@@ -3711,7 +3723,7 @@ mod tests {
                 )],
             ),
         ]);
-        let runtime = build_runtime_dag(&config, &by_pipeline, &[], &duckdb_stem_catalog)
+        let runtime = build_runtime_dag(&config, &by_pipeline, &[], None, &duckdb_stem_catalog)
             .expect("runtime dag");
         for producer in ["shared_alpha", "shared_beta"] {
             assert!(
@@ -3756,7 +3768,7 @@ mod tests {
                 ),
             ],
         );
-        let runtime = build_runtime_dag(&config, &by_pipeline, &[], &duckdb_stem_catalog)
+        let runtime = build_runtime_dag(&config, &by_pipeline, &[], None, &duckdb_stem_catalog)
             .expect("runtime dag");
         assert!(
             has_edge(&runtime.dag, "transformation:alpha", "transformation:beta"),
@@ -3794,7 +3806,7 @@ mod tests {
                 ),
             ],
         );
-        let runtime = build_runtime_dag(&config, &by_pipeline, &[], &duckdb_stem_catalog)
+        let runtime = build_runtime_dag(&config, &by_pipeline, &[], None, &duckdb_stem_catalog)
             .expect("runtime dag");
         assert!(
             has_edge(
@@ -3841,7 +3853,7 @@ mod tests {
                 ),
             ],
         );
-        let runtime = build_runtime_dag(&config, &by_pipeline, &[], &no_catalog)
+        let runtime = build_runtime_dag(&config, &by_pipeline, &[], None, &no_catalog)
             .expect("the exact edge stands and the guess is dropped, not refused");
         assert!(has_edge(
             &runtime.dag,
@@ -3882,7 +3894,7 @@ mod tests {
         let mut b = model("b", vec![], vec![]);
         b.sql = "SELECT y FROM a".into();
         let by_pipeline = owned_by_sole_transformation(&config, vec![a, b]);
-        let runtime = build_runtime_dag(&config, &by_pipeline, &[], &no_catalog)
+        let runtime = build_runtime_dag(&config, &by_pipeline, &[], None, &no_catalog)
             .expect("the DAG builds; the cycle is the executor's to refuse");
         assert!(
             execution_phases(&runtime.dag).is_err(),
@@ -3929,7 +3941,7 @@ mod tests {
     fn a_reader_of_a_colliding_label_is_ordered_after_the_load_it_names() {
         for load_first in [true, false] {
             let (config, by_pipeline) = shared_label_project(load_first);
-            let runtime = build_runtime_dag(&config, &by_pipeline, &[], &no_catalog)
+            let runtime = build_runtime_dag(&config, &by_pipeline, &[], None, &no_catalog)
                 .expect("the read names the load's exact target");
             let dag = &runtime.dag;
             assert!(
@@ -3987,8 +3999,9 @@ mod tests {
             schema: "bronze".into(),
             table: Some("shared".into()),
         });
-        let runtime = build_runtime_dag(&config, &by_pipeline, &[colliding_seed], &no_catalog)
-            .expect("the read names the seed's exact target");
+        let runtime =
+            build_runtime_dag(&config, &by_pipeline, &[colliding_seed], None, &no_catalog)
+                .expect("the read names the seed's exact target");
         let dag = &runtime.dag;
         assert!(has_edge(dag, "seed:shared", "transformation:reader"));
         assert!(!has_edge(
@@ -4032,7 +4045,7 @@ mod tests {
                 .find(|m| m.config.name == "reader")
                 .expect("reader")
                 .sql = "SELECT x FROM prod.silver.shared".to_string();
-            let runtime = build_runtime_dag(&config, &by_pipeline, &[], &no_catalog)
+            let runtime = build_runtime_dag(&config, &by_pipeline, &[], None, &no_catalog)
                 .expect("the read names the model's exact target");
             assert!(
                 has_edge(
@@ -4067,7 +4080,7 @@ mod tests {
                 .find(|m| m.config.name == "reader")
                 .expect("reader")
                 .sql = "SELECT x FROM shared".to_string();
-            let err = build_runtime_dag(&config, &by_pipeline, &[], &no_catalog)
+            let err = build_runtime_dag(&config, &by_pipeline, &[], None, &no_catalog)
                 .expect_err("an unresolvable collision must refuse");
             let UnifiedDagError::AmbiguousLabelProducer {
                 label,
@@ -4105,7 +4118,7 @@ mod tests {
             .expect("reader")
             .sql = "SELECT x FROM prod.elsewhere.shared".to_string();
         assert!(matches!(
-            build_runtime_dag(&config, &by_pipeline, &[], &no_catalog),
+            build_runtime_dag(&config, &by_pipeline, &[], None, &no_catalog),
             Err(UnifiedDagError::AmbiguousLabelProducer { .. })
         ));
     }
@@ -4130,7 +4143,7 @@ mod tests {
                 ),
             ],
         );
-        let err = build_runtime_dag(&config, &by_pipeline, &[seed("orders")], &no_catalog)
+        let err = build_runtime_dag(&config, &by_pipeline, &[seed("orders")], None, &no_catalog)
             .expect_err("two possible writers of the read table must refuse");
         let message = err.to_string();
         assert!(
@@ -4159,8 +4172,9 @@ mod tests {
                 ),
             ],
         );
-        let runtime = build_runtime_dag(&config, &by_pipeline, &[seed("orders")], &no_catalog)
-            .expect("the read names silver, which the seed cannot be in");
+        let runtime =
+            build_runtime_dag(&config, &by_pipeline, &[seed("orders")], None, &no_catalog)
+                .expect("the read names silver, which the seed cannot be in");
         assert!(
             !has_edge(&runtime.dag, "seed:orders", "transformation:mart"),
             "the seed is not what `prod.silver.orders` names"
@@ -4170,6 +4184,140 @@ mod tests {
             "transformation:orders",
             "transformation:mart"
         ));
+    }
+
+    /// When the seed nodes' pipeline is known, so is the catalog a sidecar-free
+    /// seed loads into (`main` here, the seed loader's fallback). A model writing
+    /// `prod.seeds.orders` is then the only producer a read of that table can
+    /// mean — the seed is in `main.seeds.orders` — and the read resolves. With
+    /// the seed's catalog unknown the same read is refused: the seed could be in
+    /// `prod` too.
+    #[test]
+    fn a_sidecar_free_seed_in_another_catalog_is_ruled_out_by_its_default_catalog() {
+        let make = || {
+            let config = config_with_pipelines(vec![("t", transform_pipeline(vec![]))]);
+            let by_pipeline = owned_by_sole_transformation(
+                &config,
+                vec![
+                    model_reading("orders", ("prod", "seeds", "orders"), "SELECT 1 AS id"),
+                    model_reading(
+                        "mart",
+                        ("prod", "marts", "mart"),
+                        "SELECT id FROM prod.seeds.orders",
+                    ),
+                ],
+            );
+            (config, by_pipeline)
+        };
+
+        let (config, by_pipeline) = make();
+        let runtime = build_runtime_dag(
+            &config,
+            &by_pipeline,
+            &[seed("orders")],
+            Some("main"),
+            &no_catalog,
+        )
+        .expect("the seed is in `main`, so `prod.seeds.orders` cannot be its table");
+        assert!(
+            !has_edge(&runtime.dag, "seed:orders", "transformation:mart"),
+            "the read names the model's table, not the seed's"
+        );
+
+        let (config, by_pipeline) = make();
+        assert!(
+            matches!(
+                build_runtime_dag(&config, &by_pipeline, &[seed("orders")], None, &no_catalog),
+                Err(UnifiedDagError::AmbiguousLabelProducer { .. })
+            ),
+            "with the seed's catalog unknown it could be `prod`"
+        );
+    }
+
+    /// The same catalog on both sides is two writers of one table, and it is
+    /// still refused now that the seed's catalog is known: both are definitely
+    /// the table the read names.
+    #[test]
+    fn a_sidecar_free_seed_and_a_model_in_one_catalog_still_make_the_read_ambiguous() {
+        let config = config_with_pipelines(vec![("t", transform_pipeline(vec![]))]);
+        let by_pipeline = owned_by_sole_transformation(
+            &config,
+            vec![
+                model_reading("orders", ("main", "seeds", "orders"), "SELECT 1 AS id"),
+                model_reading(
+                    "mart",
+                    ("main", "marts", "mart"),
+                    "SELECT id FROM main.seeds.orders",
+                ),
+            ],
+        );
+        let err = build_runtime_dag(
+            &config,
+            &by_pipeline,
+            &[seed("orders")],
+            Some("main"),
+            &no_catalog,
+        )
+        .expect_err("two definite writers of the read table must refuse");
+        let message = err.to_string();
+        assert!(
+            message.contains("model 'orders' (target main.seeds.orders)")
+                && message.contains("seed 'orders' (target main.seeds.orders)"),
+            "both writers are fully known: {message}"
+        );
+    }
+
+    /// A seed's sidecar `[target]` that names a schema but no catalog takes the
+    /// same default catalog as one with no sidecar, as the seed loader gives it.
+    /// The model is in another catalog, so the read of `prod.bronze.shared` is
+    /// the seed's alone — an edge only the label pass can add.
+    #[test]
+    fn a_sidecar_target_with_no_catalog_takes_the_seed_default_catalog() {
+        let make = || {
+            let config = config_with_pipelines(vec![("t", transform_pipeline(vec![]))]);
+            let by_pipeline = owned_by_sole_transformation(
+                &config,
+                vec![
+                    model_reading("shared", ("other", "bronze", "shared"), "SELECT 1 AS y"),
+                    model_reading(
+                        "reader",
+                        ("prod", "silver", "reader_output"),
+                        "SELECT y FROM prod.bronze.shared",
+                    ),
+                ],
+            );
+            let mut sidecar_seed = seed("shared");
+            sidecar_seed.config.target = Some(crate::seeds::SeedTarget {
+                catalog: None,
+                schema: "bronze".into(),
+                table: None,
+            });
+            (config, by_pipeline, sidecar_seed)
+        };
+
+        let (config, by_pipeline, sidecar_seed) = make();
+        let runtime = build_runtime_dag(
+            &config,
+            &by_pipeline,
+            &[sidecar_seed],
+            Some("prod"),
+            &no_catalog,
+        )
+        .expect("the seed is in `prod`, the model is not");
+        assert!(has_edge(
+            &runtime.dag,
+            "seed:shared",
+            "transformation:reader"
+        ));
+
+        let (config, by_pipeline, sidecar_seed) = make();
+        assert!(
+            matches!(
+                build_runtime_dag(&config, &by_pipeline, &[sidecar_seed], None, &no_catalog),
+                Err(UnifiedDagError::AmbiguousLabelProducer { .. })
+            ),
+            "with no default catalog the seed could be anywhere, so it is not named"
+        );
     }
 
     /// A catalogless model whose catalog Rocky could not establish could be in
@@ -4201,14 +4349,14 @@ mod tests {
         let (config, by_pipeline) = make();
         assert!(
             matches!(
-                build_runtime_dag(&config, &by_pipeline, &[], &no_catalog),
+                build_runtime_dag(&config, &by_pipeline, &[], None, &no_catalog),
                 Err(UnifiedDagError::AmbiguousLabelProducer { .. })
             ),
             "the model's catalog is unknown, so it could be `prod`"
         );
 
         let (config, by_pipeline) = make();
-        let runtime = build_runtime_dag(&config, &by_pipeline, &[], &duckdb_stem_catalog)
+        let runtime = build_runtime_dag(&config, &by_pipeline, &[], None, &duckdb_stem_catalog)
             .expect("the model lives in `db`, so the read cannot be its table");
         assert!(has_edge(
             &runtime.dag,
@@ -4225,7 +4373,7 @@ mod tests {
         for m in by_pipeline.get_mut("t").expect("pipeline t") {
             m.sql = "SELECT 1 AS x".to_string();
         }
-        let runtime = build_runtime_dag(&config, &by_pipeline, &[], &no_catalog)
+        let runtime = build_runtime_dag(&config, &by_pipeline, &[], None, &no_catalog)
             .expect("no reader, no ambiguity");
         assert_eq!(
             runtime.labels.label_collisions,
@@ -4431,7 +4579,7 @@ mod tests {
         b.sql = "SELECT y FROM a".into();
         let models = vec![a.clone(), b.clone()];
         let by_pipeline = owned_by_sole_transformation(&config, models);
-        let runtime = build_runtime_dag(&config, &by_pipeline, &[], &no_catalog)
+        let runtime = build_runtime_dag(&config, &by_pipeline, &[], None, &no_catalog)
             .expect("the DAG builds; the cycle is the executor's to refuse");
         assert!(
             runtime.labels.label_collisions.is_empty()
