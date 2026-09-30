@@ -22,6 +22,9 @@ use crate::schema_cache_throttle::SchemaCacheThrottle;
 /// adapter-specific and is not in this package, which the guide says plainly.
 pub const DEFAULT_SAMPLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Shared deadline for reading `rocky.toml` on serve's background paths.
+pub const CONFIG_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// What one [`ServerState::recompile`] invocation found: its own outcome,
 /// not a re-read of the shared fields after the fact (#1823).
 #[derive(Debug, Clone, Default)]
@@ -80,6 +83,11 @@ pub struct ServerState {
     /// Reading the failure, releasing it, and then reading the result can
     /// pair an earlier failure with a newer result.
     pub compile_failure: RwLock<Option<String>>,
+    /// A timed-out config read leaves the last compiled models intact, but
+    /// the project route must still report why this recompile was skipped.
+    pub config_read_failure: RwLock<Option<String>>,
+    /// The permit lives in the blocking task, even after its caller times out.
+    config_reads: Arc<tokio::sync::Semaphore>,
     /// Serialises [`Self::recompile`]: the constructor's background compile,
     /// the file watcher and concurrent `POST /api/v1/compile` requests all
     /// call it, and two compiles in flight at once could publish each
@@ -400,6 +408,8 @@ impl ServerState {
             settings,
             compile_result: RwLock::new(None),
             compile_failure: RwLock::new(None),
+            config_read_failure: RwLock::new(None),
+            config_reads: Arc::new(tokio::sync::Semaphore::new(1)),
             compile_gate: tokio::sync::Mutex::new(()),
             #[cfg(test)]
             publish_hold: std::sync::Mutex::new(None),
@@ -451,8 +461,47 @@ impl ServerState {
         // and each copy decided independently what a broken config meant.
         // That per-caller decision is the defect #1625 is about, so there
         // is now one snapshot and one decision.
-        let project_config =
-            rocky_core::config::load_optional_project_config(self.config_path.as_deref());
+        let permit = match Arc::clone(&self.config_reads).try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                let reason = "another rocky.toml read is still in progress".to_string();
+                *self.config_read_failure.write().await = Some(reason.clone());
+                return RecompileOutcome {
+                    config_error: Some(reason.clone()),
+                    compile_error: Some(reason),
+                };
+            }
+        };
+        let config_path = self.config_path.clone();
+        let read = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            rocky_core::config::load_optional_project_config(config_path.as_deref())
+        });
+        let project_config = match tokio::time::timeout(CONFIG_READ_TIMEOUT, read).await {
+            Ok(Ok(config)) => {
+                *self.config_read_failure.write().await = None;
+                config
+            }
+            Ok(Err(e)) => {
+                let reason = format!("the rocky.toml read task did not complete: {e}");
+                warn!(error = %reason, "rocky.toml read failed");
+                *self.config_read_failure.write().await = Some(reason.clone());
+                return RecompileOutcome {
+                    config_error: Some(reason.clone()),
+                    compile_error: Some(reason),
+                };
+            }
+            Err(_) => {
+                let reason =
+                    format!("reading rocky.toml did not finish within {CONFIG_READ_TIMEOUT:?}");
+                warn!(error = %reason, "rocky.toml read failed");
+                *self.config_read_failure.write().await = Some(reason.clone());
+                return RecompileOutcome {
+                    config_error: Some(reason.clone()),
+                    compile_error: Some(reason),
+                };
+            }
+        };
 
         let config_unreadable = match &project_config {
             // `Ok(None)` is "no rocky.toml", which is an ordinary fact
@@ -736,6 +785,110 @@ mod tests {
             .iter()
             .filter(|d| &*d.code == "W004")
             .count()
+    }
+
+    /// A FIFO with no writer must not hold the compile gate past the config
+    /// deadline. The old graph remains available until a readable config
+    /// allows the next recompile to publish a new result.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stuck_config_read_times_out_releases_gate_and_recovers() {
+        let (_dir, models_dir, config_path) = pii_project("");
+        let state = ServerState::new(models_dir.clone(), None, Some(config_path.clone()));
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while state.compile_result.read().await.is_none() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("initial compile finishes");
+        let before = state
+            .compile_result
+            .read()
+            .await
+            .as_ref()
+            .unwrap()
+            .project
+            .model_count();
+        std::fs::write(models_dir.join("extra.sql"), "SELECT 42 AS id").unwrap();
+        std::fs::write(models_dir.join("extra.toml"), "name = \"extra\"\n\n[target]\ncatalog = \"demo\"\nschema = \"main\"\ntable = \"extra\"\n").unwrap();
+
+        std::fs::remove_file(&config_path).unwrap();
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&config_path)
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        let timed = tokio::time::timeout(
+            CONFIG_READ_TIMEOUT + std::time::Duration::from_secs(2),
+            state.recompile(),
+        )
+        .await;
+        // The abandoned blocking reader must be answered before runtime drop,
+        // including when the assertion below detects a regression.
+        std::fs::write(&config_path, "[adapter]\ntype = \"duckdb\"\n").unwrap();
+        std::fs::remove_file(&config_path).unwrap();
+        std::fs::write(&config_path, "").unwrap();
+
+        let outcome = timed.expect("recompile must return by the deadline");
+        assert!(
+            outcome
+                .config_error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("did not finish"),
+            "{outcome:?}"
+        );
+        assert!(
+            state.compile_gate.try_lock().is_ok(),
+            "compile gate remains held"
+        );
+        assert_eq!(
+            state
+                .compile_result
+                .read()
+                .await
+                .as_ref()
+                .unwrap()
+                .project
+                .model_count(),
+            before
+        );
+        assert!(
+            state
+                .config_read_failure
+                .read()
+                .await
+                .as_deref()
+                .unwrap_or_default()
+                .contains("did not finish")
+        );
+
+        let drained = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            Arc::clone(&state.config_reads).acquire_owned(),
+        )
+        .await
+        .expect("abandoned read finishes")
+        .unwrap();
+        drop(drained);
+        let recovered = state.recompile().await;
+        assert!(recovered.config_error.is_none(), "{recovered:?}");
+        assert!(state.config_read_failure.read().await.is_none());
+        assert_eq!(
+            state
+                .compile_result
+                .read()
+                .await
+                .as_ref()
+                .unwrap()
+                .project
+                .model_count(),
+            before + 1
+        );
     }
 
     /// The server compile path must consult rocky.toml: an

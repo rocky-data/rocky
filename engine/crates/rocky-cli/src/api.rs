@@ -960,6 +960,7 @@ async fn health() -> PrettyJson<HealthOutput> {
 async fn project(
     State(state): State<Arc<ServerState>>,
 ) -> Result<PrettyJson<ProjectOutput>, ApiError> {
+    let read_failure = state.config_read_failure.read().await.clone();
     let (name, config_path, pipelines, adapters, config_error) = match state.config_path.as_deref()
     {
         None => ("rocky".to_string(), None, Vec::new(), Vec::new(), None),
@@ -970,27 +971,31 @@ async fn project(
                 .map(|dir| dir.to_string_lossy().to_string())
                 .unwrap_or_else(|| "rocky".to_string());
             let shown = Some(path.display().to_string());
-            match rocky_core::config::load_rocky_config(path) {
-                Ok(config) => {
-                    let pipelines = config
-                        .pipelines
-                        .iter()
-                        .map(|(pipeline, cfg)| crate::output::ProjectPipelineOutput {
-                            name: pipeline.clone(),
-                            pipeline_type: pipeline_type_label(cfg).to_string(),
-                        })
-                        .collect();
-                    let adapters = config
-                        .adapters
-                        .iter()
-                        .map(|(adapter, cfg)| crate::output::ProjectAdapterOutput {
-                            name: adapter.clone(),
-                            adapter_type: cfg.adapter_type.clone(),
-                        })
-                        .collect();
-                    (name, shown, pipelines, adapters, None)
+            if let Some(reason) = read_failure {
+                (name, shown, Vec::new(), Vec::new(), Some(reason))
+            } else {
+                match rocky_core::config::load_rocky_config(path) {
+                    Ok(config) => {
+                        let pipelines = config
+                            .pipelines
+                            .iter()
+                            .map(|(pipeline, cfg)| crate::output::ProjectPipelineOutput {
+                                name: pipeline.clone(),
+                                pipeline_type: pipeline_type_label(cfg).to_string(),
+                            })
+                            .collect();
+                        let adapters = config
+                            .adapters
+                            .iter()
+                            .map(|(adapter, cfg)| crate::output::ProjectAdapterOutput {
+                                name: adapter.clone(),
+                                adapter_type: cfg.adapter_type.clone(),
+                            })
+                            .collect();
+                        (name, shown, pipelines, adapters, None)
+                    }
+                    Err(e) => (name, shown, Vec::new(), Vec::new(), Some(format!("{e:#}"))),
                 }
-                Err(e) => (name, shown, Vec::new(), Vec::new(), Some(format!("{e:#}"))),
             }
         }
     };
@@ -2215,7 +2220,7 @@ async fn settings(
 /// How long the one `rocky.toml` read behind this route may take before the
 /// caller is told to retry. Generous for a local file; the point is that it
 /// ends, not that it is tight.
-const SETTINGS_CONFIG_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const SETTINGS_CONFIG_READ_TIMEOUT: std::time::Duration = rocky_server::state::CONFIG_READ_TIMEOUT;
 
 /// The `[state]` labels, read from `rocky.toml` once and then fixed.
 ///
@@ -5086,6 +5091,38 @@ mod tests {
         assert_eq!(project["pipelines"], serde_json::json!([]));
     }
 
+    /// The project route must expose a skipped recompile without replacing
+    /// the last successful compile or retrying the problematic config read.
+    #[tokio::test]
+    async fn project_route_shows_a_recorded_config_read_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = ServerState::new(
+            simple_project_models(),
+            None,
+            Some(dir.path().to_path_buf()),
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while state.compile_result.read().await.is_none() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("initial compile finishes");
+        let expected = "reading rocky.toml did not finish within 5s";
+        *state.config_read_failure.write().await = Some(expected.to_string());
+
+        let output = project(State(state))
+            .await
+            .ok()
+            .expect("project response")
+            .0;
+        assert_eq!(output.config_error.as_deref(), Some(expected));
+        assert!(
+            output.models_compiled.is_some(),
+            "the earlier compile remains available"
+        );
+    }
+
     /// #1823. The background compile failed — the project's `models` entry
     /// is a dangling symlink, which the walker refuses since #1817 — and the
     /// route read the absent result as a clean project: `diagnostics: []`,
@@ -6400,8 +6437,8 @@ mod tests {
     /// every such thread to finish. A one-shot writer (write once, then exit)
     /// only answers that first, abandoned read -- sampling the hung test
     /// binaries directly caught a SECOND read of this FIFO starting after this
-    /// test's writer had already exited, from a caller this test does not
-    /// otherwise pin down. That read found no writer, blocked forever, and the
+    /// test's writer had already exited, from the server's background
+    /// `recompile()`. That read found no writer, blocked forever, and the
     /// runtime's drop hung the whole test BINARY with it (#2153; #2133 is the
     /// duplicate that first hit it under load and killed the binary after it
     /// sat hung for about 53 minutes).

@@ -68,6 +68,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **A transformation model's runtime failure reports its real `failure_kind`, not always `unknown`.** Normal transformation runs, `--model` runs, replication runs with `--models`/`--all`, contained model failures, and supervised backfills now classify typed connector errors in the engine's emitted `RunOutput.errors[]`. A tripped warehouse circuit breaker also carries its cooldown in `cooldown_seconds`. (#2143)
 
 - **New branch names now use 1–64 ASCII letters, digits, or underscores at every unquoted SQL-backed entry point.** Invalid names fail before config or state I/O. Git-derived preview names use underscores. `branch compare` reports unreadable counts as null with an error reason instead of inventing zero. The preview action defaults to `pr_<PR number>_<head slug>` within the 64-character limit, so separate PRs cannot replace the same preview schema through slug collisions. Legacy names can still be listed, shown, approved, and promoted; deleting a branch record leaves warehouse tables and does not revoke an already persisted promote plan. (#2137)
+- **A stuck `rocky.toml` read no longer holds the serve compile gate indefinitely.** Recompile reads it on a bounded blocking lane with a five-second deadline. A timeout keeps the previous compile available and reports the read failure through the compile response and project status. A later read can recover after the stuck reader finishes. (#2175)
 
 ### Added
 
