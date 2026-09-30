@@ -2187,6 +2187,30 @@ rejected_check_case!(
     "invalid SQL identifier 'status; drop'"
 );
 rejected_check_case!(
+    draft_check_rejects_unique_column,
+    "column",
+    "[[tests]]\ntype = \"unique\"\ncolumn = \"bad;column\"\n",
+    "invalid SQL identifier 'bad;column'"
+);
+rejected_check_case!(
+    draft_check_rejects_missing_column,
+    "column",
+    "[[tests]]\ntype = \"not_null\"\n",
+    "requires a column but none was provided"
+);
+rejected_check_case!(
+    draft_check_rejects_invalid_range_bound,
+    "min",
+    "[[tests]]\ntype = \"in_range\"\ncolumn = \"id\"\nmin = \"tomorrow\"\n",
+    "must parse as a number"
+);
+rejected_check_case!(
+    draft_check_rejects_invalid_aggregate_value,
+    "value",
+    "[[tests]]\ntype = \"aggregate\"\nop = \"sum\"\ncmp = \"gte\"\ncolumn = \"id\"\nvalue = \"invalid\"\n",
+    "must parse as a number"
+);
+rejected_check_case!(
     draft_check_rejects_to_table,
     "to_table",
     "[[tests]]\ntype = \"relationships\"\ncolumn = \"id\"\nto_table = \"bad;table\"\nto_column = \"id\"\n",
@@ -2251,6 +2275,84 @@ async fn test_declarative_mode_runs_the_sidecar_check() {
     assert_eq!(body["declarative"]["errored"], 1);
     assert_eq!(body["all_passed"], false);
     assert_eq!(body["failures"][0]["suite"], "declarative");
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_declarative_mode_names_applied_pass_and_failure() {
+    use rocky_core::traits::WarehouseAdapter;
+
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("warehouse.duckdb");
+    write_project(dir.path(), &db_path);
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(dir.path().join("models/orders.toml"))
+        .unwrap()
+        .write_all(b"\n[[tests]]\ntype = \"not_null\"\ncolumn = \"id\"\n\n[[tests]]\ntype = \"not_null\"\ncolumn = \"status\"\n")
+        .unwrap();
+    let adapter = rocky_duckdb::adapter::DuckDbWarehouseAdapter::open(&db_path).unwrap();
+    adapter
+        .execute_statement("CREATE SCHEMA out")
+        .await
+        .unwrap();
+    adapter
+        .execute_statement("CREATE TABLE out.orders AS SELECT 1 AS id, NULL::VARCHAR AS status")
+        .await
+        .unwrap();
+    drop(adapter);
+
+    let client = connect(RockyMcpServer::new(dir.path().join("rocky.toml"))).await;
+    let result = client
+        .call_tool(
+            CallToolRequestParams::new("test").with_arguments(
+                serde_json::json!({"model": "orders", "pipeline": "p", "declarative": true})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        )
+        .await
+        .expect("applied declarative test result");
+    assert_ne!(result.is_error, Some(true), "{result:?}");
+    let body = result.structured_content.unwrap();
+    assert_eq!(body["declarative"]["passed"], 1, "{body:?}");
+    assert_eq!(body["declarative"]["failed"], 1, "{body:?}");
+    assert_eq!(body["declarative"]["results"][0]["column"], "id");
+    assert_eq!(body["declarative"]["results"][0]["status"], "pass");
+    assert_eq!(body["declarative"]["results"][1]["column"], "status");
+    assert_eq!(body["declarative"]["results"][1]["status"], "fail");
+    assert_eq!(body["failures"][0]["name"], "orders::not_null::status");
+    assert_eq!(body["all_passed"], false);
+
+    // The CLI exits successfully for a warning-severity failure. The MCP
+    // summary keeps that result visible without marking the run as blocked.
+    let sidecar = dir.path().join("models/orders.toml");
+    let original = std::fs::read_to_string(&sidecar).unwrap();
+    std::fs::write(
+        &sidecar,
+        original.replace(
+            "column = \"status\"",
+            "column = \"status\"\nseverity = \"warning\"",
+        ),
+    )
+    .unwrap();
+    let warning = client
+        .call_tool(
+            CallToolRequestParams::new("test").with_arguments(
+                serde_json::json!({"model": "orders", "pipeline": "p", "declarative": true})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        )
+        .await
+        .expect("warning declarative test result")
+        .structured_content
+        .unwrap();
+    assert_eq!(warning["declarative"]["warned"], 1, "{warning:?}");
+    assert_eq!(warning["declarative"]["failed"], 0, "{warning:?}");
+    assert_eq!(warning["all_passed"], true, "{warning:?}");
     client.cancel().await.unwrap();
 }
 
@@ -6319,6 +6421,10 @@ fn record(
     nonce: &str,
 ) {
     assert!(
+        !stale_declarative_test_guidance(payload),
+        "'{key}' tells the caller to run drafted checks through default `test`: {payload}"
+    );
+    assert!(
         !payload.is_empty(),
         "'{key}' serialized to nothing; a golden over an empty payload pins nothing"
     );
@@ -6331,6 +6437,44 @@ fn record(
         blake3::hash(payload.as_bytes()).to_hex().to_string(),
     );
     assert!(previous.is_none(), "duplicate golden key '{key}'");
+}
+
+/// Applied `[[tests]]` checks require the declarative mode. Scan every
+/// recorded served payload, including tool schemas, prompts and instructions.
+fn stale_declarative_test_guidance(payload: &str) -> bool {
+    let normalized = payload.to_lowercase().replace("\\n", " ");
+    for needle in [
+        "checks via the `test` tool",
+        "them via the `test` tool",
+        "check executes via the `test` tool",
+        "checks with the `test` tool",
+        "run the `test` tool to execute them",
+    ] {
+        let mut remaining = normalized.as_str();
+        while let Some(pos) = remaining.find(needle) {
+            let after = &remaining[pos + needle.len()..];
+            let clause = after.split(['.', ';']).next().unwrap_or(after);
+            if !clause.contains("declarative = true") {
+                return true;
+            }
+            remaining = after;
+        }
+    }
+    false
+}
+
+#[test]
+fn phrase_guard_rejects_each_stale_guidance_form() {
+    for stale in [
+        "run the new checks via the `test` tool. Loop until clean.",
+        "run them via the `test` tool; it mutates nothing itself.",
+        "The check executes via the `test` tool.",
+    ] {
+        assert!(stale_declarative_test_guidance(stale), "{stale}");
+    }
+    assert!(!stale_declarative_test_guidance(
+        "After apply, run the new checks via the `test` tool with `declarative = true`."
+    ));
 }
 
 /// Replace this run's temporary roots with a fixed sentinel.

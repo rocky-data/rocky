@@ -1921,7 +1921,8 @@ pub struct DraftCheckArgs {
     /// model's sidecar verbatim. Each block is a Rocky data-quality check
     /// (`not_null`, `unique`, `accepted_values`, `relationships`, `expression`,
     /// range, …). Compile proves the merged sidecar is structurally sound; the
-    /// check executes via the `test` tool. When omitted, the call is treated as
+    /// check executes via the `test` tool with `declarative = true` after the
+    /// target is applied. When omitted, the call is treated as
     /// a mis-dispatch to the generator and returns an actionable error pointing
     /// at the `ai_test` tool.
     #[serde(default)]
@@ -2640,7 +2641,7 @@ impl RockyMcpServer {
          plus per-failure detail. Covers BOTH local suites: executing each model, and the \
          fixture-driven `[[test]]` blocks declared in model sidecars. `failures` carries both, \
          each tagged with its `suite`; `models` and `unit_tests` hold the per-suite counts. \
-         Branch on `all_passed` — it is true only when every test in the chosen mode passes. Use after writing \
+         Branch on `all_passed` — declarative warning-severity failures do not block it. Use after writing \
          or changing a model. Pass `model` to scope the run to one model's tests. Set \
          `declarative = true` to run sidecar `[[tests]]` against the configured warehouse; \
          the model must already have been applied. Pass `pipeline` if the project has more than \
@@ -2648,11 +2649,14 @@ impl RockyMcpServer {
     )]
     async fn test(&self, params: Parameters<TestArgs>) -> ToolResult<TestResult> {
         if params.0.declarative {
-            if self.profile == McpProfile::Worker {
-                return Err(ToolError::invalid_argument(
-                    "declarative test execution is unavailable in the worker profile",
-                    "The trusted runner executes the declared checks after apply.",
-                ));
+            match self.profile {
+                McpProfile::Worker => {
+                    return Err(ToolError::invalid_argument(
+                        "declarative test execution is unavailable in the worker profile",
+                        "The trusted runner executes the declared checks after apply.",
+                    ));
+                }
+                McpProfile::Default | McpProfile::Approver => {}
             }
             let summary = commands::declarative_test_output(
                 &self.config_path,
@@ -2673,12 +2677,18 @@ impl RockyMcpServer {
                 .iter()
                 .filter(|r| r.status != "pass")
                 .map(|r| TestFailureLite {
-                    name: format!("{}::{}", r.model, r.test_type),
+                    name: match &r.column {
+                        Some(column) => format!("{}::{}::{column}", r.model, r.test_type),
+                        None => format!("{}::{}", r.model, r.test_type),
+                    },
                     error: r.detail.clone().unwrap_or_else(|| r.status.clone()),
                     suite: "declarative".to_string(),
                 })
                 .collect();
-            let all_passed = summary.total > 0 && summary.passed == summary.total;
+            let all_passed = summary.total > 0
+                && summary.failed == 0
+                && summary.errored == 0
+                && summary.passed + summary.warned == summary.total;
             return Ok(Json(TestResult {
                 total: summary.total,
                 passed: summary.passed,
@@ -2706,6 +2716,7 @@ impl RockyMcpServer {
                         .map(|r| DeclarativeCheckLite {
                             model: r.model,
                             test_type: r.test_type,
+                            column: r.column,
                             status: r.status,
                             severity: r.severity,
                             detail: r.detail,
@@ -3372,8 +3383,9 @@ impl RockyMcpServer {
          an LLM (the `rocky ai-test` generator). Proposes SQL assertions that each return 0 rows \
          when the invariant holds (not-null, grain uniqueness, value ranges, referential \
          integrity). Returns the assertions as DRAFTS — encode them as declarative `[[tests]]` \
-         checks (or hand them to `draft_check` to write + policy-gate) and run them via the `test` \
-         tool; it mutates nothing itself. Requires ANTHROPIC_API_KEY in the server environment — \
+         checks (or hand them to `draft_check` to write + policy-gate). After the target is \
+         applied, run them via the `test` tool with `declarative = true`; it mutates nothing \
+         itself. Requires ANTHROPIC_API_KEY in the server environment — \
          without it, `assertions` is empty and `message` explains why."
     )]
     async fn ai_test(&self, params: Parameters<AiTestArgs>) -> ToolResult<AiTestResult> {
@@ -6132,8 +6144,9 @@ impl RockyMcpServer {
                  it with draft_contract. Both write tools compile-validate and policy-gate the \
                  write; you can also author the check/contract yourself and pass it straight to \
                  the write tool.\n\
-                 4. compile — the write tools already type-check; run the new checks via the \
-                 `test` tool. Fix against any diagnostic and re-run until clean.\n\
+                 4. compile — the write tools already type-check. After the target is applied, \
+                 run the new checks via the `test` tool with `declarative = true`. Fix against \
+                 any diagnostic and re-run until clean.\n\
                  5. propose — generate the plan that records the new tests/contracts. It is an \
                  AI-authored plan with a plan_id.\n\n\
                  RECONCILE DISCIPLINE: a test that asserts the wrong invariant passes and is still \
@@ -6247,7 +6260,8 @@ impl RockyMcpServer {
                      directly, or call ai_test to draft them, then write them with draft_check — \
                      it merges the `[[tests]]` blocks into the model and compiles in the same \
                      call, policy-gated.\n\
-                     4. run the new checks via the `test` tool. Loop until clean.\n\
+                     4. After the target is applied, run the new checks via the `test` tool \
+                     with `declarative = true`. Loop until clean.\n\
                      5. propose — generate the plan recording the new tests. It is an AI-authored \
                      plan with a plan_id.\n\n\
                      RECONCILE DISCIPLINE: only assert uniqueness/not-null on columns the profile \
@@ -7558,213 +7572,51 @@ fn validate_check_spec(spec: &str) -> Result<(), Json<ToolError>> {
     Ok(())
 }
 
-/// Content gate for the user-supplied SQL fragments in a `draft_check` spec
-/// (#1524, #2144): an `expression` check's `expression`, any test's
-/// `filter`, and a `unique_expr` test's `key_expr`.
-///
-/// Applies the same TWO gates `rocky test --declarative` runs at generation
-/// time, in the same order (`rocky-core/src/tests.rs`): first
-/// [`rocky_sql::validation::reject_statement_terminator`], a pre-parse scan
-/// that refuses a construct the warehouses read differently regardless of
-/// dialect (a backtick-quoted identifier, a `//`/`#` line comment, ...);
-/// then [`rocky_sql::check_expression::validate_check_expression`] — one
-/// boolean expression, no subquery, no qualified function, only allowlisted
-/// pure scalar functions, plus the stricter grouping-key rules (no volatile
-/// function, no `COLLATE`) for `key_expr`. Running the parse gate ALONE
-/// would miss the first: sqlparser accepts backtick identifiers the scanner
-/// refuses, so a filter or key using one would be a green draft and a red
-/// `rocky test --declarative` (#2144, round 2). Both gates run BEFORE the
-/// sidecar write, so a fragment that can never run is refused at authoring
-/// time with the reason, rather than committed and refused later. Direct
-/// file writers bypass this tool entirely; the generation-time checks are
-/// the backstop for them.
-///
-/// Parses under the project's resolved default adapter dialect when
-/// `rocky.toml` loads and declares one (matching what generation itself
-/// parses under), falling back to the generic dialect otherwise — an
-/// absent, unresolvable, or ambiguous (no `default` key) config, same as no
-/// config at all. GENERIC IS THE PERMISSIVE ONE: it is not a safe stand-in
-/// for a stricter target dialect, because it can accept what a real target
-/// dialect would refuse outright (a construct a target's own parser does
-/// not have, or reads differently) — the opposite of the safe direction.
-/// This does not resolve a per-model adapter override (`ModelConfig.adapter`
-/// in a model's own sidecar): that needs `draft_check` to read the model's
-/// sidecar before this gate runs, which is a bigger change than this one.
+/// Validate each typed check through the SQL generator used by `rocky test
+/// --declarative`. This keeps draft refusals in step with execution, including
+/// required columns, numeric bounds, and adapter-specific SQL.
 fn validate_check_spec_expressions(
     spec: &str,
     config_path: Option<&Path>,
 ) -> Result<(), Json<ToolError>> {
-    // `validate_check_spec` already proved this parses and holds a `tests`
-    // array; a second parse is cheaper than threading the table through.
-    let Ok(parsed) = toml::from_str::<toml::Table>(spec) else {
-        return Ok(());
-    };
-    let Some(tests) = parsed.get("tests").and_then(toml::Value::as_array) else {
-        return Ok(());
-    };
-    // The project's default adapter (`[adapter]`, unnamed, wraps to this
-    // key), when the config loads and declares one; generic otherwise. A
-    // config that fails to load, or declares no `default` adapter, falls
-    // back the same way an absent config does -- this gate's job is
-    // content, not reporting a broken `rocky.toml` a caller already sees
-    // elsewhere.
-    let adapter_type = config_path
-        .and_then(|p| rocky_core::config::load_optional_project_config(Some(p)).ok())
+    // The structural gate ran first; malformed typed blocks remain compile
+    // errors. A successfully parsed declaration must also generate SQL.
+    let parsed: toml::Table = toml::from_str(spec).expect("structural gate parsed check spec");
+    let tests = parsed
+        .get("tests")
+        .and_then(toml::Value::as_array)
+        .expect("structural gate required tests array");
+    let configured_adapter = config_path
+        .and_then(|path| rocky_core::config::load_optional_project_config(Some(path)).ok())
         .flatten()
-        .and_then(|cfg| cfg.adapters.get("default").map(|a| a.adapter_type.clone()))
-        .unwrap_or_else(|| "generic".to_string());
-    let dialect = rocky_sql::check_expression::dialect_for(&adapter_type);
-    for (index, test) in tests.iter().enumerate() {
-        let Some(table) = test.as_table() else {
+        .and_then(|cfg| {
+            let registry = commands_adapter_registry(&cfg).ok()?;
+            registry.warehouse_adapter("default").ok()
+        });
+    let fallback = rocky_duckdb::dialect::DuckDbSqlDialect;
+    let dialect: &dyn rocky_core::traits::SqlDialect = configured_adapter
+        .as_ref()
+        .map(|adapter| adapter.dialect())
+        .unwrap_or(&fallback);
+    for (index, value) in tests.iter().enumerate() {
+        let Some(table) = value.as_table() else {
             continue;
         };
-        let test_type = table.get("type").and_then(toml::Value::as_str);
-
-        // Match the generator's per-kind validation before the sidecar is
-        // written. A malformed typed block is left to the compile gate.
-        if let Ok(decl) = test.clone().try_into::<rocky_core::tests::TestDecl>() {
-            use rocky_core::tests::{AggregateOp, TestType};
-            let advice = "Correct the declarative check field and draft it again.";
-            let check = |result: Result<(), rocky_core::tests::TestGenError>| {
-                result.map_err(|err| ToolError::invalid_argument(err.to_string(), advice))
-            };
-            let needs_column = matches!(
-                decl.test_type,
-                TestType::NotNull
-                    | TestType::Unique
-                    | TestType::AcceptedValues { .. }
-                    | TestType::Relationships { .. }
-                    | TestType::InRange { .. }
-                    | TestType::RegexMatch { .. }
-                    | TestType::NotInFuture
-                    | TestType::OlderThanNDays { .. }
-                    | TestType::Aggregate {
-                        op: AggregateOp::Sum
-                            | AggregateOp::Avg
-                            | AggregateOp::Min
-                            | AggregateOp::Max,
-                        ..
-                    }
-            );
-            if needs_column && let Some(column) = decl.column.as_deref() {
-                check(
-                    rocky_sql::validation::validate_identifier(column)
-                        .map(|_| ())
-                        .map_err(Into::into),
-                )?;
-            }
-            match &decl.test_type {
-                TestType::Relationships {
-                    to_table,
-                    to_column,
-                } => {
-                    check(rocky_core::tests::validate_relationship_target(
-                        to_table, to_column,
-                    ))?;
-                }
-                TestType::RegexMatch { pattern } => {
-                    check(rocky_core::tests::validate_regex_pattern(pattern))?;
-                }
-                TestType::AcceptedValues { values } => {
-                    check(rocky_core::tests::validate_accepted_values(values))?;
-                }
-                TestType::Composite { columns, .. } => {
-                    check(rocky_core::tests::validate_composite_columns(columns))?;
-                }
-                _ => {}
-            }
-        }
-
-        // `filter` scopes which rows a check applies to and is spliced into
-        // the same generated statement for every test kind (`tests.rs`'s
-        // per-check `filter` handling), so it is gated regardless of `type`
-        // — unlike `expression` and `key_expr` below, this is NOT behind a
-        // `type` match. Trimmed and treated as absent when blank, mirroring
-        // `tests.rs`'s own `filter` handling exactly: the generator accepts
-        // `filter = ""` as "no filter", so this gate must not refuse it as
-        // an unparsable expression.
-        if let Some(filter) = table
-            .get("filter")
-            .and_then(toml::Value::as_str)
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
-            let context = format!("draft_check `tests[{index}]` filter");
-            let advice = "A filter is one boolean expression over the row's columns \
-                 — comparisons, CASE, CAST, and pure scalar functions such as coalesce, \
-                 length, lower or date_trunc. It may not contain a subquery, a qualified \
-                 function, or a warehouse function that reads files, secrets, session state \
-                 or remote endpoints. It scopes which rows the check applies to; it does \
-                 not repeat the check's own condition.";
-            rocky_sql::validation::reject_statement_terminator(&context, filter)
-                .map_err(|err| ToolError::invalid_argument(err.to_string(), advice))?;
-            rocky_sql::check_expression::validate_check_expression(
-                &context,
-                filter,
-                dialect.as_ref(),
-                // Same boundary as `expression`: a filter is spliced into
-                // the same statement as the predicate it scopes, evaluated
-                // once. Separate variant only so a refusal names `filter`.
-                rocky_sql::check_expression::ExpressionUse::Filter,
-            )
-            .map_err(|err| ToolError::invalid_argument(err.to_string(), advice))?;
-        }
-
-        if test_type == Some("unique_expr") {
-            // A missing `key_expr` is the generator's own `EmptyKeyExpr`;
-            // this gate judges content, not presence.
-            if let Some(key_expr) = table.get("key_expr").and_then(toml::Value::as_str) {
-                let context = format!("draft_check `tests[{index}]` key_expr");
-                let advice = "A key expression is one expression over the row's own columns \
-                     that rows can be grouped by, e.g. `lower(email)`. It may not contain a \
-                     subquery, a qualified function, a warehouse function that reads \
-                     files, secrets, session state or remote endpoints, a volatile \
-                     function such as `now()` or `random()` (the key must not change \
-                     between evaluations), or an explicit `COLLATE` (it would change what \
-                     equality means for the grouping).";
-                rocky_sql::validation::reject_statement_terminator(&context, key_expr)
-                    .map_err(|err| ToolError::invalid_argument(err.to_string(), advice))?;
-                rocky_sql::check_expression::validate_check_expression(
-                    &context,
-                    key_expr,
-                    dialect.as_ref(),
-                    // A grouping key: unlike `expression`/`filter`, a
-                    // volatile value is refused (rows must group by
-                    // something that does not change between evaluations),
-                    // and so is `COLLATE` (it would change what equality
-                    // means for the grouping).
-                    rocky_sql::check_expression::ExpressionUse::GroupingKey,
-                )
-                .map_err(|err| ToolError::invalid_argument(err.to_string(), advice))?;
-            }
-        }
-
-        if test_type != Some("expression") {
-            continue;
-        }
-        // A missing `expression` is the generator's `MissingExpression`;
-        // this gate judges content, not presence.
-        let Some(expression) = table.get("expression").and_then(toml::Value::as_str) else {
+        let Ok(decl) = toml::Value::Table(table.clone()).try_into::<rocky_core::tests::TestDecl>()
+        else {
             continue;
         };
-        let context = format!("draft_check `tests[{index}]` expression");
-        let advice = "An expression check is one boolean expression over the model's own \
-                 columns — comparisons, CASE, CAST, and pure scalar functions such as \
-                 coalesce, length, lower or date_trunc. It may not contain a subquery, a \
-                 qualified function, or a warehouse function that reads files, secrets, \
-                 session state or remote endpoints.";
-        rocky_sql::validation::reject_statement_terminator(&context, expression)
-            .map_err(|err| ToolError::invalid_argument(err.to_string(), advice))?;
-        rocky_sql::check_expression::validate_check_expression(
-            &context,
-            expression,
-            dialect.as_ref(),
-            // `draft_check` writes an `expression` test, which is evaluated
-            // once in one statement — the same position as the checks path
-            // this mirrors.
-            rocky_sql::check_expression::ExpressionUse::SinglePredicate,
+        rocky_core::tests::generate_test_sql_with_dialect(
+            &decl,
+            "rocky_draft_check_target",
+            dialect,
         )
-        .map_err(|err| ToolError::invalid_argument(err.to_string(), advice))?;
+        .map_err(|err| {
+            ToolError::invalid_argument(
+                format!("draft_check `tests[{index}]`: {err}"),
+                "Correct the declarative check field and draft it again.",
+            )
+        })?;
     }
     Ok(())
 }

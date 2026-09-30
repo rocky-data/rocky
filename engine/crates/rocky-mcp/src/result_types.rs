@@ -167,8 +167,8 @@ pub struct TestSuiteCounts {
 ///
 /// - `total` / `passed` are the sum across both suites.
 /// - `failures` carries failures from both, tagged by `suite`.
-/// - `all_passed` is the single field to branch on. It is true only when
-///   every test in the chosen mode passes.
+/// - `all_passed` is the single field to branch on. Declarative warning
+///   failures are reported but do not block it, matching the CLI.
 /// - `models` and `unit_tests` break the totals back down, so nothing is
 ///   lost by summing them.
 ///
@@ -184,7 +184,8 @@ pub struct TestResult {
     pub passed: usize,
     /// Every failure or warning in the chosen mode.
     pub failures: Vec<TestFailureLite>,
-    /// True only when every test in the chosen mode passed. Branch on this.
+    /// True when the chosen mode has no hard failure or execution error.
+    /// Warning-severity declarative failures follow the CLI and are allowed.
     pub all_passed: bool,
     /// The model-execution suite on its own.
     pub models: TestSuiteCounts,
@@ -209,6 +210,7 @@ pub struct DeclarativeSuiteLite {
 pub struct DeclarativeCheckLite {
     pub model: String,
     pub test_type: String,
+    pub column: Option<String>,
     pub status: String,
     pub severity: String,
     pub detail: Option<String>,
