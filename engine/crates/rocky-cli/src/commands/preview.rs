@@ -215,9 +215,10 @@ pub async fn run_preview_create(
 /// Structural + row-level diff between branch and base for every model
 /// that ran on both sides.
 ///
-/// **Default (`--algorithm=sampled`).** Surfaces the row-count delta +
-/// bytes-scanned/written deltas computed off the per-model `RunRecord`
-/// pair. Each model carries a [`PreviewSamplingWindow`] with
+/// **Default (`--algorithm=sampled`).** Compares recorded `rows_affected`
+/// counts and reports rows added or removed when both runs have a count.
+/// It does not compute byte deltas or inspect row content. Each model carries
+/// a [`PreviewSamplingWindow`] with
 /// `coverage = "not_yet_sampled"` and `coverage_warning = true` — an
 /// honest flag that the sampled algorithm doesn't read row content
 /// yet, so changes that don't shift row counts won't surface here.
@@ -232,12 +233,10 @@ pub async fn run_preview_create(
 /// back to the sampled placeholder with a `tracing::warn` skip
 /// reason.
 ///
-/// **Why structural-only is useful.** `RunRecord` carries `rows_affected`
-/// and `bytes_scanned` per model from the live run path, so a
-/// branch-vs-base run-record diff already answers *"did this PR change
-/// how many rows the model produced?"* and *"did the cost change?"* —
-/// the two things a reviewer most needs to see. Sampled row content
-/// remains the gold standard but the structural layer ships today.
+/// **Why structural-only is useful.** When `rows_affected` is recorded
+/// on both runs, the diff shows whether the count changed. A missing
+/// count remains unknown; content changes with the same count are not
+/// detected by this default algorithm.
 /// Algorithm selector mirrored on the public command surface so the
 /// `rocky` binary can map its clap `ValueEnum` to a stable in-tree type
 /// without leaking clap into the CLI library.
@@ -452,27 +451,21 @@ fn newest_branch_and_base_runs(
             )),
         ));
     }
-    // Unnamed selection (the cost preview): newest run not on this branch —
-    // byte-for-byte main's behavior, detached runs included. Cost baselines
-    // from detached CI runs are deliberate (`run_audit` records
+    // Unnamed selection (the cost preview): newest ordinary run, including
+    // detached runs. Cost baselines from detached CI runs are deliberate
+    // (`run_audit` records
     // `rocky_branch: None` there), and excluding them yielded an empty cost
     // report mislabeled "No branch run yet".
     //
-    // Matches on `rocky_branch`, same as the branch-side selection above and
-    // for the same reason (#2032): this must exclude the branch's OWN run
-    // from becoming its own base, and only `rocky_branch` reliably identifies
-    // that run.
-    //
-    // The second clause covers a record written BEFORE `rocky_branch`
-    // existed: it forward-deserializes with `rocky_branch: None`, so the
-    // first clause alone cannot see it — but if its `git_branch` happens to
-    // equal this preview's branch name, that is the shape a pre-#2032 branch
-    // run actually had (back when `git_branch` was the pairing key), and it
-    // must not be treated as an ordinary "not this branch" candidate.
+    // Any run with `rocky_branch` set was written with `--branch` and cannot
+    // be an ordinary base, regardless of which branch it names (#2194).
+    // A record written before `rocky_branch` existed deserializes with
+    // `rocky_branch: None`. If its `git_branch` equals this preview's branch
+    // name, it has the shape of a pre-#2032 branch run (when `git_branch`
+    // was the pairing key), so it must not become the ordinary base.
     let fallback = store
         .list_runs_matching(1, |r| {
-            r.rocky_branch.as_deref() != Some(branch_name)
-                && !(r.rocky_branch.is_none() && r.git_branch.as_deref() == Some(branch_name))
+            r.rocky_branch.is_none() && r.git_branch.as_deref() != Some(branch_name)
         })?
         .into_iter()
         .next();
@@ -1324,6 +1317,10 @@ pub async fn run_preview_cost(
 
     let markdown = render_preview_cost_markdown(
         branch_name,
+        CostRunPresence {
+            branch: branch_run.is_some(),
+            base: base_run.is_some(),
+        },
         &summary,
         &per_model,
         &projected_budget_breaches,
@@ -1616,9 +1613,17 @@ pub fn project_per_model_budget_breaches(
     out
 }
 
+/// Which run records were available when the cost summary was built.
+#[derive(Clone, Copy)]
+struct CostRunPresence {
+    branch: bool,
+    base: bool,
+}
+
 /// Render a `PreviewCostOutput` summary into the PR-comment Markdown.
 fn render_preview_cost_markdown(
     branch_name: &str,
+    runs: CostRunPresence,
     summary: &crate::output::PreviewCostSummary,
     per_model: &[crate::output::PreviewModelCostDelta],
     projected_budget_breaches: &[crate::output::BudgetBreachOutput],
@@ -1626,10 +1631,19 @@ fn render_preview_cost_markdown(
     budget: &rocky_core::config::BudgetConfig,
 ) -> String {
     if per_model.is_empty() {
+        let next_step = if !runs.branch {
+            format!(
+                "No branch run yet. Run `rocky run --branch {branch_name}` on the prune set, \
+                 then re-invoke `rocky preview cost`."
+            )
+        } else if !runs.base {
+            "No base run yet. Run the ordinary base pipeline without `--branch` against this state store, then re-invoke `rocky preview cost`.".to_string()
+        } else {
+            "Both runs exist, but neither recorded a model execution to compare.".to_string()
+        };
         return format!(
             "**Preview cost** — branch `{branch_name}`\n\n\
-             _No branch run yet. Run `rocky run --branch {branch_name}` on the prune set, \
-             then re-invoke `rocky preview cost`._\n"
+             _{next_step}_\n"
         );
     }
     let fmt_usd = |v: Option<f64>| -> String {
@@ -2236,6 +2250,11 @@ mod tests {
     };
     use std::io::Write;
     use tempfile::TempDir;
+
+    const BOTH_RUNS: CostRunPresence = CostRunPresence {
+        branch: true,
+        base: true,
+    };
 
     #[tokio::test]
     async fn preview_name_entry_points_refuse_hyphens_before_io() {
@@ -3784,7 +3803,15 @@ mod tests {
         let params = (rocky_core::cost::WarehouseType::Databricks, 12.0, 0.55);
         let (summary, per_model) = build_preview_cost_delta(&branch, &base, Some(&params));
         let budget = rocky_core::config::BudgetConfig::default();
-        let md = render_preview_cost_markdown("feature", &summary, &per_model, &[], &[], &budget);
+        let md = render_preview_cost_markdown(
+            "feature",
+            BOTH_RUNS,
+            &summary,
+            &per_model,
+            &[],
+            &[],
+            &budget,
+        );
         assert!(md.contains("**Preview cost**"));
         assert!(md.contains("`feature`"));
         assert!(md.contains("Δ vs base"));
@@ -3968,6 +3995,7 @@ mod tests {
         };
         let md_warn = render_preview_cost_markdown(
             "feature",
+            BOTH_RUNS,
             &summary,
             &per_model,
             &breaches,
@@ -3992,6 +4020,7 @@ mod tests {
         };
         let md_err = render_preview_cost_markdown(
             "feature",
+            BOTH_RUNS,
             &summary,
             &per_model,
             &breaches,
@@ -4211,6 +4240,7 @@ mod tests {
         };
         let md = render_preview_cost_markdown(
             "feature",
+            BOTH_RUNS,
             &summary,
             &per_model,
             &project_breaches,
@@ -4318,7 +4348,15 @@ table = "plain"
             max_usd: Some(10.0),
             ..rocky_core::config::BudgetConfig::default()
         };
-        let md = render_preview_cost_markdown("feature", &summary, &per_model, &[], &[], &budget);
+        let md = render_preview_cost_markdown(
+            "feature",
+            BOTH_RUNS,
+            &summary,
+            &per_model,
+            &[],
+            &[],
+            &budget,
+        );
         assert!(!md.contains("Budget projection"));
     }
 
