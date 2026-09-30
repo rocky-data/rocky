@@ -994,11 +994,11 @@ The `breaking_findings` field is JSON-only: `--output table` still renders the s
 
 ## `rocky preview`
 
-Preview a change before it merges. Rocky re-executes only the changed models and their downstream column lineage on a per-pull-request branch, and copies everything else from the base ref.
+Preview a change before it merges. Rocky identifies changed model files and downstream models through sidecar `depends_on`. It copies the other models from the base schema into a per-PR branch.
 
 Three subcommands compose into one review artifact. `preview create` prepares the branch, `preview diff` reports what changed, and `preview cost` reports the cost delta against base. A fourth, `preview rows`, is separate: it samples the output rows of a single model.
 
-For the design (why CTAS today and warehouse-native clones tomorrow, how the column-level pruner works, what the sampling window's correctness ceiling is), see the [How Preview Works](/concepts/preview-internals/) concept page. For a step-by-step walkthrough on a feature branch, see the [Preview a PR](/guides/preview-a-pr/) how-to.
+For the prune set, adapter copy methods, and diff coverage, see [How Preview Works](/concepts/preview-internals/). For a walkthrough, see [Preview a PR](/guides/preview-a-pr/).
 
 ```bash
 rocky preview create --base <ref> [--name <branch_name>]
@@ -1034,7 +1034,7 @@ rocky preview create --base main
   "base_ref": "main",
   "head_ref": "HEAD",
   "prune_set": [
-    { "model_name": "fct_revenue", "reason": "changed", "changed_columns": ["amount_cents"] },
+    { "model_name": "fct_revenue", "reason": "changed" },
     { "model_name": "rev_by_region", "reason": "downstream_of_changed" }
   ],
   "copy_set": [
@@ -1048,7 +1048,7 @@ rocky preview create --base main
 }
 ```
 
-`copy_strategy` reports `"ctas"` for every successful copy regardless of which SQL primitive the adapter actually emitted. As of `engine-v1.19.1`, Databricks uses `SHALLOW CLONE` and BigQuery uses `CREATE TABLE … COPY` (both metadata-only) under the hood; DuckDB and Snowflake fall through to the portable CTAS default. Surfacing the per-adapter strategy in the wire output is a follow-up.
+`changed_columns` exists in the output type, but Rocky leaves it empty and omits it from JSON today. `copy_strategy` reports `"ctas"` for every successful copy. Databricks uses `SHALLOW CLONE`, BigQuery uses `CREATE TABLE … COPY`, and Snowflake uses `CREATE TABLE … CLONE`. DuckDB uses CTAS. The output does not distinguish these methods yet.
 
 ### `rocky preview diff`
 

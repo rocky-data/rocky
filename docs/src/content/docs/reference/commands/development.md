@@ -561,7 +561,7 @@ Hook 'bash scripts/notify.sh': OK (exit 0, 120ms)
 
 ## `rocky validate-migration`
 
-Cross-check a dbt project against the Rocky project imported from it. Use it after [`rocky import-dbt`](#rocky-import-dbt) to confirm that every model made the trip.
+Compare imported dbt model names with a Rocky project. The command also reports dbt test conversion. It does not compile Rocky models or compare warehouse data.
 
 ```bash
 rocky validate-migration --dbt-project <PATH> [flags]
@@ -573,16 +573,19 @@ rocky validate-migration --dbt-project <PATH> [flags]
 |------|------|---------|-------------|
 | `--dbt-project <PATH>` | `PathBuf` | **(required)** | Path to the dbt project directory. |
 | `--rocky-project <PATH>` | `PathBuf` | | Path to the Rocky project directory. Optional, for a side-by-side comparison. |
-| `--sample-size <N>` | `usize` | | Number of sample rows for data comparison. |
+| `--sample-size <N>` | `usize` | | Accepted but ignored. This command does not sample rows or compare warehouse data. |
 
 ### Examples
 
 ```bash
 $ rocky validate-migration --dbt-project ~/dbt-project
-Validating 12 models...
-  stg_customers: PASS (schema match, row count match)
-  fct_orders:    PASS (schema match, row count match)
-  dim_products:  WARN (column order differs)
+Migration Validation Report
+===========================
+
+Models:  12 imported, 0 failed
+
+Results:
+  12 models validated successfully
 ```
 
 ### Related Commands

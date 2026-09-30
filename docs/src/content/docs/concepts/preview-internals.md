@@ -20,16 +20,16 @@ The sampling described below is the design, not what 1.74.0 runs. The default pa
   │ --base ref   │───────────────────────►│ changed model    │
   │ (e.g. main)  │        vs HEAD         │ files            │
   └──────────────┘                        └────────┬─────────┘
-                                                   │ load into the
-                                                   │ compiler: a
-                                                   ▼ column-level DAG
+                                                   │ scan model sidecars
+                                                   │ for depends_on
+                                                   ▼ model-level DAG
   ┌────────────────────────────────────────────────────────────┐
   │  every model in the working DAG lands in one of two sets   │
   ├──────────────────────────────┬─────────────────────────────┤
   │ PRUNE SET                    │ COPY SET                    │
   │ the changed models, plus     │ everything else. Logically  │
   │ every model downstream of a  │ identical to its --base     │
-  │ changed COLUMN               │ counterpart                 │
+  │ changed model via depends_on │ counterpart                 │
   └──────────────┬───────────────┴──────────────┬──────────────┘
                  │ rocky plan --branch <name>   │ clone_table_for_
                  │ + rocky apply <plan-id>      │ branch, per adapter
@@ -43,7 +43,7 @@ The sampling described below is the design, not what 1.74.0 runs. The default pa
 
 1. **Identify the change set.** Rocky shells out to `git diff --name-only <base_ref> HEAD` against the models directory, the same plumbing [`rocky ci-diff`](/reference/commands/modeling/#rocky-ci-diff) uses. The output is the set of model files that changed between `--base` and `HEAD`.
 
-2. **Compute the prune set from the compiler IR.** Loading the working-tree models into the [compiler](/concepts/compiler/) gives a column-level dependency graph. The prune set is every changed model **plus** every model that transitively depends on a changed column. A model downstream of an *unchanged* column on a changed model is not pulled in. That makes column-level pruning strictly tighter than git-diff alone.
+2. **Compute the prune set from model dependencies.** Rocky scans the working-tree model sidecars for `depends_on`. It includes every changed model and every model transitively downstream of one. The prune set does not use column lineage.
 
 3. **Compute the copy set.** Every model in the working DAG that is not in the prune set is a copy candidate. It is logically identical to its counterpart on `--base`, so re-running it would produce the same bytes. Rocky issues `CREATE TABLE <branch_schema>.<model> AS SELECT * FROM <base_schema>.<model>` against the configured adapter, with the per-adapter overrides described below.
 
@@ -58,9 +58,9 @@ The copy step dispatches per adapter through the `WarehouseAdapter::clone_table_
 - **Databricks** — `CREATE OR REPLACE TABLE … SHALLOW CLONE …`. Metadata-only; the branch table references the source's underlying files until either side mutates.
 - **BigQuery** — `CREATE OR REPLACE TABLE … COPY …`. Metadata-only; same single-project scope as the source dataset.
 - **DuckDB** — `CREATE OR REPLACE TABLE … AS SELECT *` (CTAS). Bytes-copying but trivially portable; matches the trait's default impl, so the same code path works on any future adapter that doesn't override.
-- **Snowflake** — falls through to the CTAS default. Native zero-copy `CLONE TABLE` is a planned override. It switches in once a Snowflake consumer drives the integration test against a workspace.
+- **Snowflake** — `CREATE TABLE … CLONE …`. The adapter uses Snowflake's native zero-copy clone.
 
-On Databricks and BigQuery, `clone_table_for_branch` turns the copy step from a bytes-bearing CTAS into a metadata operation. That makes preview cheap enough to run on tables you could not afford to CTAS today.
+On Databricks, BigQuery, and Snowflake, `clone_table_for_branch` uses a metadata-only copy. DuckDB uses CTAS to copy the table data.
 
 ## Comparison to Fivetran's Smart Run
 
@@ -68,14 +68,14 @@ The closest published commercial analogue is Fivetran's [Smart Run for dbt Core]
 
 | Property | Fivetran Smart Run (per article) | Rocky `preview` |
 |---|---|---|
-| Change detection | "Manifest-independent" — mechanism not specified in the article | git-diff plus compiler-IR type-equivalence (the compiler can tell that two textually different models produce identical column types and lineage) |
-| Pruning granularity | Model-level (per the article's red / I-node / R-node example) | Column-level — derived from the compiler IR; a column added to an unused tail of a wide table prunes to zero downstream |
-| Copy substrate | `COPY` ("the COPY command is free" per article) | Per-adapter dispatch: Databricks `SHALLOW CLONE`, BigQuery `CREATE TABLE … COPY` (both metadata-only), DuckDB CTAS, Snowflake CTAS pending native `CLONE` override |
+| Change detection | "Manifest-independent" — mechanism not specified in the article | Git diff identifies changed model files; sidecar `depends_on` links identify downstream models |
+| Pruning granularity | Model-level (per the article's red / I-node / R-node example) | Model-level; a changed model pulls in all downstream models linked by `depends_on` |
+| Copy substrate | `COPY` ("the COPY command is free" per article) | Per-adapter dispatch: Databricks `SHALLOW CLONE`, BigQuery `CREATE TABLE … COPY`, Snowflake `CREATE TABLE … CLONE`, DuckDB CTAS |
 | Cost delta | Not surfaced in the article | First-class output ([`PreviewCostOutput`](#output-shapes)) |
 | Data diff | Not surfaced in the article | First-class output ([`PreviewDiffOutput`](#output-shapes)) |
 | PR comment | Not described in the article | Pre-rendered Markdown in every output |
 
-The article does not document Smart Run's internal mechanism beyond a conceptual diagram and the "manifest-independent" claim. The rows above hedge accordingly. Rocky's column-level pruning follows from owning the compiler that builds the graph.
+The article does not document Smart Run's internal mechanism beyond a conceptual diagram and the "manifest-independent" claim. The rows above hedge accordingly.
 
 ## Two diff algorithms
 
@@ -162,6 +162,6 @@ The [codegen pipeline](/reference/json-output/) generates the Pydantic (Dagster)
 
 ## Related concepts
 
-- [The Rocky Compiler](/concepts/compiler/) — the IR `preview` queries to build the prune set.
+- [The Rocky Compiler](/concepts/compiler/) — type checks models; preview builds its prune set from sidecar dependencies.
 - [Shadow Mode](/concepts/shadow-mode/) — the comparison kernel `preview diff` extends with sampled row-level diffing.
 - [State Management](/concepts/state-management/) — the `RunRecord` store `preview cost` reads to compute base-vs-branch deltas.
