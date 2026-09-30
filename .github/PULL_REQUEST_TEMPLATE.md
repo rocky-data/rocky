@@ -25,6 +25,8 @@
 
 -
 
+If this is your first pull request from a fork, CI waits for a maintainer to approve its workflow runs. You do not need to take action. A new push needs new run approval.
+
 ## Checklist
 
 - [ ] Commit messages follow [conventional commits](https://www.conventionalcommits.org/), scoped by subproject when relevant (e.g. `feat(engine/rocky-databricks): ...`, `fix(dagster): ...`)
