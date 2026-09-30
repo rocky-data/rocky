@@ -346,8 +346,8 @@ pub enum CaseSignificance {
 /// (or back) hits the warehouse's own "Existing object X is of type Y,
 /// trying to replace with type Z" error with no explanation. That check
 /// compares this value against what the strategy implies and, on a real
-/// mismatch, fails the model with a Rocky diagnostic before the statement
-/// is ever sent.
+/// mismatch, either refuses with a Rocky diagnostic or applies the model's
+/// exact-kind drop permission before the replacement statement.
 ///
 /// Unlike [`CaseSignificance`], this deliberately has a third state.
 /// `CaseSignificance` has no `Unknown` because no state there would
@@ -503,8 +503,8 @@ pub trait WarehouseAdapter: Send + Sync {
     /// Default: `Ok(ObjectKind::Unknown)`. Every adapter but `rocky-duckdb`
     /// reports this today, which makes the reconciliation check this backs
     /// a no-op for them: their `CREATE OR REPLACE <kind>` runs exactly as
-    /// it always has, and a genuine mismatch still surfaces — just as the
-    /// warehouse's own error, not yet a Rocky diagnostic. Extending this to
+    /// it always has. The runner adds a possible-cause remedy to failures
+    /// when the kind cannot be determined. Extending this to
     /// another adapter is a follow-up, not a prerequisite.
     ///
     /// # Errors

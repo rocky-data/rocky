@@ -1581,6 +1581,7 @@ mod tests {
     /// Helper: build a minimal Model.
     fn model(name: &str, depends_on: Vec<&str>, tests: Vec<TestDecl>) -> Model {
         Model {
+            drop_existing_kind: None,
             config: ModelConfig {
                 name: name.into(),
                 depends_on: depends_on.into_iter().map(String::from).collect(),

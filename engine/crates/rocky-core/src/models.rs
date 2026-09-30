@@ -491,6 +491,9 @@ fn default_microbatch_granularity() -> TimeGrain {
 #[derive(Debug, Clone, Deserialize)]
 pub struct RawModelConfig {
     pub name: Option<String>,
+    /// Explicit permission to replace a target of this existing kind.
+    #[serde(default)]
+    pub drop_existing_kind: Option<DropExistingKind>,
     #[serde(default)]
     pub depends_on: Vec<String>,
     #[serde(default)]
@@ -561,6 +564,14 @@ pub struct RawModelConfig {
     /// [`TestDecl`]s and appended to `tests` at load.
     #[serde(default)]
     pub use_test: Vec<TestRef>,
+}
+
+/// The exact existing object kind a model owner permits Rocky to drop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DropExistingKind {
+    Table,
+    View,
 }
 
 /// `[skip]` — per-model overrides for the opt-in model-skip gate.
@@ -1260,6 +1271,7 @@ pub(crate) fn extract_declared_fields(raw_toml: &str) -> DeclaredModelFields {
 #[derive(Debug, Clone)]
 pub struct Model {
     pub config: ModelConfig,
+    pub drop_existing_kind: Option<DropExistingKind>,
     pub sql: String,
     /// Path to the source file.
     ///
@@ -1495,12 +1507,14 @@ pub fn load_model_pair_with_context(
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_default();
 
+    let drop_existing_kind = raw.drop_existing_kind;
     let config = resolve_model_config(raw, &file_stem, defaults, ctx, declared)?;
 
     let contract_path = sibling_contract_path(sql_path);
 
     Ok(Model {
         config,
+        drop_existing_kind,
         sql,
         // The whole point of #1730: `display().to_string()` here is
         // `to_string_lossy`, and four sites downstream compare the result to a
@@ -1566,6 +1580,7 @@ pub fn parse_model_inline_with_context(
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_default();
 
+    let drop_existing_kind = raw.drop_existing_kind;
     let config = resolve_model_config(raw, &file_stem, defaults, ctx, declared)?;
 
     // Inline models can have a sibling contract too — same probe, same rule.
@@ -1573,6 +1588,7 @@ pub fn parse_model_inline_with_context(
 
     Ok(Model {
         config,
+        drop_existing_kind,
         sql: sql.to_string(),
         file_path: file_path.to_path_buf(),
         contract_path,
@@ -2994,6 +3010,7 @@ granularity = "day"
         let cfg: ModelConfig = toml::from_str(toml_str).unwrap();
         let model = Model {
             config: cfg,
+            drop_existing_kind: None,
             sql: "SELECT @start_date AS d".into(),
             file_path: "fake.sql".into(),
             contract_path: None,

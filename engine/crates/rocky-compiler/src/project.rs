@@ -785,6 +785,7 @@ fn load_single_rocky_model_with_db(
     let contract_path = models::sibling_contract_path(path);
 
     Ok(Model {
+        drop_existing_kind: None,
         config,
         sql,
         // The second of the two lossy constructions #1730 names. Both are
@@ -802,6 +803,7 @@ mod tests {
 
     fn make_model(name: &str, sql: &str) -> Model {
         Model {
+            drop_existing_kind: None,
             config: ModelConfig {
                 name: name.to_string(),
                 depends_on: vec![],

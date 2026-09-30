@@ -13076,6 +13076,18 @@ fn strategy_implies_object_kind(
     }
 }
 
+fn strategy_switch_drop_sql(
+    dialect: &dyn rocky_core::traits::SqlDialect,
+    target: &str,
+    existing: rocky_core::traits::ObjectKind,
+) -> Option<String> {
+    match existing {
+        rocky_core::traits::ObjectKind::Table => Some(dialect.drop_table_sql(target)),
+        rocky_core::traits::ObjectKind::View => Some(format!("DROP VIEW {target}")),
+        rocky_core::traits::ObjectKind::Unknown => None,
+    }
+}
+
 /// The target already exists, but as the other warehouse-visible kind
 /// (table vs view) than the model's materialization strategy implies
 /// (#2037). Raised by [`execute_one_plain_model`] BEFORE the strategy's
@@ -13088,7 +13100,8 @@ fn strategy_implies_object_kind(
 #[error(
     "target {target} exists as a {existing_kind}, but the strategy now asks for a \
      {expected_kind}. Rocky does not drop an existing object implicitly. Run \
-     `DROP {existing_kind_sql} {target}` first, then re-run."
+     `DROP {existing_kind_sql} {target}` first, then re-run, or set \
+     `drop_existing_kind = \"{existing_kind}\"` in this model's sidecar."
 )]
 struct StrategyKindMismatch {
     target: String,
@@ -13168,8 +13181,7 @@ async fn execute_one_plain_model(
         )
         .map_err(anyhow::Error::from)?;
 
-    // Strategy/target-kind reconciliation (#2037, part 1: "say what
-    // happened"). `FullRefresh` and `View` each issue `CREATE OR REPLACE
+    // Strategy/target-kind reconciliation (#2037). `FullRefresh` and `View` each issue `CREATE OR REPLACE
     // <kind>` further down — `TABLE` for `FullRefresh`, `VIEW` for `View`
     // (`sql_gen::generate_transformation_sql_with_warehouse`) — and that
     // statement only ever replaces an object of the SAME kind. Switching a
@@ -13178,7 +13190,7 @@ async fn execute_one_plain_model(
     // ("Existing object X is of type Y, trying to replace with type Z")
     // naming neither the cause nor the fix (#2037's repro). Check the
     // target's actual kind here, before that statement is generated or
-    // sent, and fail with a Rocky diagnostic instead.
+    // sent. Drop only when the model explicitly names the existing kind.
     //
     // Scoped to `FullRefresh`/`View` only: they are the two strategies
     // whose SQL is *always* a `CREATE OR REPLACE <kind>` of the two kinds
@@ -13187,6 +13199,7 @@ async fn execute_one_plain_model(
     // bootstrap once via a non-replacing `CREATE TABLE` below and otherwise
     // `INSERT`/`MERGE` into it); `MaterializedView`/`DynamicTable` are a
     // third and fourth object kind this binary check does not model.
+    let mut kind_probe_unknown = false;
     if let Some(expected_kind) = strategy_implies_object_kind(&model_ir.materialization) {
         let target_table_struct = rocky_ir::TableRef {
             catalog: model_ir.target.catalog.clone(),
@@ -13198,8 +13211,8 @@ async fn execute_one_plain_model(
         // a transport/permission failure asking for it (`Err`) are treated
         // identically — skip the check. Neither is a safety regression: on
         // "can't tell", the strategy's own `CREATE OR REPLACE` runs exactly
-        // as it did before this check existed, so a genuine mismatch still
-        // surfaces — just as the warehouse's own error, not yet this one.
+        // as it did before this check existed. A failure then gets guidance
+        // that names a possible kind mismatch and its manual remedy.
         let existing_kind = warehouse
             .object_kind(&target_table_struct)
             .await
@@ -13208,26 +13221,52 @@ async fn execute_one_plain_model(
         // `ObjectKind` variant fails to compile here instead of silently
         // falling into "skip" or "mismatch".
         match existing_kind {
-            rocky_core::traits::ObjectKind::Unknown => {}
+            rocky_core::traits::ObjectKind::Unknown => kind_probe_unknown = true,
             rocky_core::traits::ObjectKind::Table | rocky_core::traits::ObjectKind::View
                 if existing_kind == expected_kind => {}
-            rocky_core::traits::ObjectKind::Table => {
-                return Err(strategy_kind_mismatch_error(
-                    model_name,
-                    &target_ref,
-                    "table",
-                    "view",
-                    "TABLE",
-                ));
-            }
-            rocky_core::traits::ObjectKind::View => {
-                return Err(strategy_kind_mismatch_error(
-                    model_name,
-                    &target_ref,
-                    "view",
-                    "table",
-                    "VIEW",
-                ));
+            rocky_core::traits::ObjectKind::Table | rocky_core::traits::ObjectKind::View => {
+                let (existing_name, expected_name, existing_sql, permission) = match existing_kind {
+                    rocky_core::traits::ObjectKind::Table => (
+                        "table",
+                        "view",
+                        "TABLE",
+                        rocky_core::models::DropExistingKind::Table,
+                    ),
+                    rocky_core::traits::ObjectKind::View => (
+                        "view",
+                        "table",
+                        "VIEW",
+                        rocky_core::models::DropExistingKind::View,
+                    ),
+                    rocky_core::traits::ObjectKind::Unknown => {
+                        return Err(anyhow::anyhow!(
+                            "model '{model_name}' target kind became unknown during reconciliation"
+                        ));
+                    }
+                };
+                if model.drop_existing_kind != Some(permission) {
+                    return Err(strategy_kind_mismatch_error(
+                        model_name,
+                        &target_ref,
+                        existing_name,
+                        expected_name,
+                        existing_sql,
+                    ));
+                }
+                let Some(drop_sql) = strategy_switch_drop_sql(dialect, &target_ref, existing_kind)
+                else {
+                    return Err(anyhow::anyhow!(
+                        "model '{model_name}' has no DROP statement for its existing target kind"
+                    ));
+                };
+                warehouse.execute_statement(&drop_sql).await.map_err(|e| {
+                    anyhow::Error::from(e).context(format!(
+                        "model '{model_name}' could not drop its existing {existing_name} target {target_ref}"
+                    ))
+                })?;
+                eprintln!(
+                    "Dropped {existing_name} {target_ref}: model '{model_name}' now requires a {expected_name} ({drop_sql})."
+                );
             }
         }
     }
@@ -13377,9 +13416,14 @@ async fn execute_one_plain_model(
                     }
                 }
                 Err(e) => {
-                    return Err(
-                        anyhow::Error::from(e).context(format!("model '{model_name}' failed"))
-                    );
+                    let guidance = if kind_probe_unknown {
+                        format!(
+                            "model '{model_name}' failed; the adapter could not determine whether {target_ref} is a table or view. A strategy switch may have left the other kind at this target. Inspect it, then run `DROP TABLE {target_ref}` or `DROP VIEW {target_ref}` as appropriate before rerunning"
+                        )
+                    } else {
+                        format!("model '{model_name}' failed")
+                    };
+                    return Err(anyhow::Error::from(e).context(guidance));
                 }
             }
         }
@@ -23743,6 +23787,27 @@ table = "orders_view"
             "the raw warehouse catalog error must not reach the operator: {message}"
         );
 
+        // This wrapper leaves object_kind at the trait default (Unknown).
+        // It must not drop the view, and the failed CREATE names the likely
+        // cause and the manual remedy for adapters without a kind probe.
+        let unknown_kind = FailTargetDescribe {
+            inner: &warehouse,
+            inject_msg: "unused for full_refresh",
+        };
+        let unknown_error = super::execute_one_plain_model(
+            &model,
+            &unknown_kind,
+            &dialect,
+            "orders_view",
+            std::time::Instant::now(),
+            exec_ctx,
+        )
+        .await
+        .expect_err("an unknown kind must not authorize a drop");
+        let unknown_message = format!("{unknown_error:#}");
+        assert!(unknown_message.contains("A strategy switch may have left the other kind"));
+        assert!(unknown_message.contains("DROP VIEW tgt.orders_view"));
+
         // Refused before anything was sent — the view survives untouched.
         let kind = warehouse
             .object_kind(&TableRef {
@@ -23753,6 +23818,55 @@ table = "orders_view"
             .await
             .unwrap();
         assert_eq!(kind, ObjectKind::View);
+    }
+
+    #[test]
+    fn strategy_switch_drop_sql_uses_each_dialect_target() {
+        use rocky_core::traits::{ObjectKind, SqlDialect};
+        let dialects: Vec<(Box<dyn SqlDialect>, &str)> = vec![
+            (
+                Box::new(rocky_duckdb::dialect::DuckDbSqlDialect),
+                "project123.sch.orders",
+            ),
+            (
+                Box::new(rocky_databricks::dialect::DatabricksSqlDialect),
+                "project123.sch.orders",
+            ),
+            (
+                Box::new(rocky_snowflake::dialect::SnowflakeSqlDialect),
+                "\"project123\".\"sch\".\"orders\"",
+            ),
+            (
+                Box::new(rocky_bigquery::dialect::BigQueryDialect),
+                "`project123`.`sch`.`orders`",
+            ),
+            (
+                Box::new(rocky_trino::dialect::TrinoDialect::new()),
+                "\"project123\".\"sch\".\"orders\"",
+            ),
+        ];
+        for (dialect, expected_target) in dialects {
+            let target = dialect
+                .format_table_ref("project123", "sch", "orders")
+                .unwrap();
+            assert_eq!(target, expected_target, "{} target", dialect.name());
+            assert_eq!(
+                super::strategy_switch_drop_sql(dialect.as_ref(), &target, ObjectKind::View),
+                Some(format!("DROP VIEW {expected_target}")),
+                "{} view drop",
+                dialect.name()
+            );
+            assert_eq!(
+                super::strategy_switch_drop_sql(dialect.as_ref(), &target, ObjectKind::Table),
+                Some(format!("DROP TABLE IF EXISTS {expected_target}")),
+                "{} table drop",
+                dialect.name()
+            );
+            assert_eq!(
+                super::strategy_switch_drop_sql(dialect.as_ref(), &target, ObjectKind::Unknown),
+                None
+            );
+        }
     }
 
     /// #2037, part 1, the reverse direction: a model run as `strategy =
@@ -29904,6 +30018,7 @@ auto_create_schemas = true
                 "name = \"{name}\"\n[strategy]\ntype = \"full_refresh\"\n\n[target]\ncatalog = \"cat\"\nschema = \"{schema}\"\ntable = \"{name}\"\n"
             );
             Model {
+                drop_existing_kind: None,
                 config: toml::from_str(&toml).expect("model config"),
                 sql: "SELECT 1".into(),
                 file_path: std::path::PathBuf::new(),

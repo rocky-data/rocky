@@ -172,6 +172,7 @@ mod tests {
         };
 
         Model {
+            drop_existing_kind: None,
             config: ModelConfig {
                 name: name.to_string(),
                 depends_on: vec![],
