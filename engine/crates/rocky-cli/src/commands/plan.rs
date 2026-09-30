@@ -1689,15 +1689,11 @@ fn build_and_persist_replication_plan(
         // Success. That is the #1272 defect shape, one plan kind over.
         shadow: run_options.shadow,
         // Only carry the descriptors when the plan is actually a shadow plan.
-        // `--shadow-schema` and `--shadow-suffix` are accepted WITHOUT
-        // `--shadow` (only `--branch` conflicts with them), and such a run is
-        // still a production run. Persisting an inert flag would add a payload
-        // key — and so a new `plan_id` — to a plan whose behaviour is
-        // unchanged. `main.rs` already applies exactly this normalisation to
-        // `shadow_suffix` before it reaches `PlanRunOptions`, and for the same
-        // stated reason; `shadow_schema` is not normalised there, so it is
-        // handled here rather than widening that path and shifting `RunPlan`
-        // ids too.
+        // Clap now requires `--shadow` with either explicit descriptor, but
+        // `PlanRunOptions` can also be constructed by internal callers. Keep
+        // non-shadow replication plan payloads free of inert descriptors so
+        // their plan IDs remain stable. `main.rs` already normalises the
+        // default suffix before it reaches this point.
         shadow_suffix: shadow_descriptor(run_options, run_options.shadow_suffix.as_ref()),
         shadow_schema: shadow_descriptor(run_options, run_options.shadow_schema.as_ref()),
         branch: run_options.branch.clone(),
