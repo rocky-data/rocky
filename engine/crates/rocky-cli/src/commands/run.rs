@@ -2763,15 +2763,23 @@ pub async fn run_with_explicit_contracts(
     // Decided HERE, once, for every caller of `run` — the inline `rocky run`,
     // `rocky apply` of a stored plan, and `--watch` all arrive at this
     // function — and before the idempotency claim, the Pipes channel, the
-    // adapters and the state store. A refusal taken later, inside a dispatch
-    // arm, still leaves an idempotency claim, a `Failed` stamp and the
-    // end-of-run retention sweep behind.
+    // adapters, and any write to the state store. (`--branch` itself is
+    // resolved from the state store by a read-only open in `main.rs`, before
+    // this function is entered.) A refusal taken later, inside a dispatch arm,
+    // still leaves an idempotency claim, a `Failed` stamp and the end-of-run
+    // retention sweep behind.
     //
-    // A `--model` run is not gated here: it resolves its own transformation
-    // pipeline below and refuses any other kind. A pipeline that does not
-    // resolve falls through, so the run body reports it as it always did.
+    // A `--model` run without `--pipeline` is not gated here: it never selects
+    // a quality, snapshot or load pipeline (`resolve_model_run_target` picks a
+    // transformation pipeline or the replication adapter). A `--model` run that
+    // NAMES a pipeline is gated like any other: it would be refused below
+    // anyway, unless the pipeline is a transformation one, but only after the
+    // idempotency claim and the adapters, and under `dedup_on = "any"` that
+    // claim leaves a `Failed` stamp which skips the corrected retry. A
+    // pipeline that does not resolve falls through, so the run body reports it
+    // as it always did.
     if let Some(shadow) = shadow_config
-        && model_name_filter.is_none()
+        && (model_name_filter.is_none() || pipeline_name_arg.is_some())
         && let Ok((pipeline_name, pipeline)) =
             registry::resolve_pipeline(&loaded.config, pipeline_name_arg)
     {
@@ -8964,8 +8972,9 @@ fn rewrite_quote_style(dialect: &dyn rocky_core::traits::SqlDialect) -> Result<O
 /// asked to keep production untouched is told it succeeded. Refusing is the only
 /// honest answer until the routing exists.
 ///
-/// Call it before the idempotency claim, the adapters and the state store, so a
-/// refused run has written nothing: no claim, no run record, no retention sweep.
+/// Call it before the idempotency claim, the adapters and any write to the state
+/// store, so a refused run has written nothing: no claim, no run record, no
+/// retention sweep.
 fn require_shadow_support(
     shadow: &rocky_core::shadow::ShadowConfig,
     pipeline_name: &str,

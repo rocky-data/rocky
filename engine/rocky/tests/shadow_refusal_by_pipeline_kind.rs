@@ -12,7 +12,7 @@
 //!        │
 //!        ▼
 //!   one decision per pipeline kind, before the idempotency claim,
-//!   the adapters, and the state store
+//!   the adapters, and any write to the state store
 //!        │
 //!        ├─ replication / transformation ─▶ run, routed to the branch
 //!        └─ quality / snapshot / load ────▶ refuse, exit 1, write nothing
@@ -22,10 +22,10 @@
 //! `--branch` becomes a shadow config and the exit code is decided.
 //!
 //! What "writes nothing" means here is measured, not assumed. The warehouse is
-//! fingerprinted (schemas, tables, columns, row counts) and the state file is
-//! compared by length and hash, before and after the refused run. Each quality test
-//! has a control that runs the same pipeline WITHOUT the flag and shows the
-//! fingerprint does move, so an unchanged fingerprint means something.
+//! fingerprinted (schemas, tables, columns, row counts, a hash of every row) and
+//! the state file is compared by length and hash, before and after the refused
+//! run. Each quality test has a control that runs the same pipeline WITHOUT the
+//! flag and shows the fingerprint does move, so an unchanged fingerprint means something.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -55,9 +55,22 @@ fn stdout(out: &Output) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
+/// Create `fixture.duckdb` with `main.orders`, one row of which has a NULL
+/// `name`, so the `not_null` assertion below has something to quarantine.
+fn seed_production(dir: &Path) {
+    let conn = duckdb::Connection::open(dir.join("fixture.duckdb")).expect("open duckdb");
+    conn.execute_batch(
+        "CREATE TABLE main.orders AS SELECT * FROM (VALUES
+             (1, 'ada', TIMESTAMP '2020-01-01'),
+             (2, CAST(NULL AS VARCHAR), TIMESTAMP '2020-01-01'),
+             (3, 'bob', TIMESTAMP '2020-01-01')
+         ) AS t(id, name, updated_at);",
+    )
+    .expect("seed production");
+}
+
 /// A project directory with a registered branch. `production` seeds
-/// `main.orders`, one row of which has a NULL `name`, so the `not_null`
-/// assertion below has something to quarantine.
+/// `main.orders` (see [`seed_production`]).
 struct Project {
     _tmp: tempfile::TempDir,
     dir: PathBuf,
@@ -69,15 +82,7 @@ impl Project {
         let dir = tmp.path().to_path_buf();
         fs::write(dir.join("rocky.toml"), config).expect("write rocky.toml");
         if production {
-            let conn = duckdb::Connection::open(dir.join("fixture.duckdb")).expect("open duckdb");
-            conn.execute_batch(
-                "CREATE TABLE main.orders AS SELECT * FROM (VALUES
-                     (1, 'ada', TIMESTAMP '2020-01-01'),
-                     (2, CAST(NULL AS VARCHAR), TIMESTAMP '2020-01-01'),
-                     (3, 'bob', TIMESTAMP '2020-01-01')
-                 ) AS t(id, name, updated_at);",
-            )
-            .expect("seed production");
+            seed_production(&dir);
         }
         let project = Self { _tmp: tmp, dir };
         let created = rocky(&project.dir, &["branch", "create", BRANCH]);
@@ -93,9 +98,10 @@ impl Project {
         rocky(&self.dir, args)
     }
 
-    /// Every schema, table, column list and row count in the warehouse. Two
-    /// equal fingerprints mean no statement changed anything a reader could
-    /// see: not a row, not a column, not a table, not an empty schema.
+    /// Every schema, table, column list, row count and content hash in the
+    /// warehouse. Two equal fingerprints mean no statement changed anything a
+    /// reader could see: not a value, not a row, not a column, not a table, not
+    /// an empty schema.
     fn warehouse(&self) -> Vec<String> {
         let db = self.dir.join("fixture.duckdb");
         if !db.exists() {
@@ -145,7 +151,21 @@ impl Project {
                     |r| r.get(0),
                 )
                 .expect("row count");
-            lines.push(format!("table {schema}.{table} ({columns}) rows={rows}"));
+            // Row count and column names miss an in-place UPDATE. A hash of
+            // every row's text does not.
+            let content: String = conn
+                .query_row(
+                    &format!(
+                        "SELECT COALESCE(md5(string_agg(CAST(t AS VARCHAR), '|' \
+                         ORDER BY CAST(t AS VARCHAR))), '-') FROM \"{schema}\".\"{table}\" AS t"
+                    ),
+                    [],
+                    |r| r.get(0),
+                )
+                .expect("content hash");
+            lines.push(format!(
+                "table {schema}.{table} ({columns}) rows={rows} content={content}"
+            ));
         }
         lines
     }
@@ -349,6 +369,79 @@ fn a_refused_run_does_not_spend_its_idempotency_key() {
     );
 }
 
+/// A `--model` request that names a quality pipeline is refused before the
+/// idempotency claim too. `--model` was the one run mode the shadow decision
+/// skipped, so it reached the older "not a transformation pipeline" refusal,
+/// which comes AFTER the claim and after the adapters are built. Under
+/// `dedup_on = "any"` that claim leaves a `Failed` stamp behind, and the
+/// corrected request with the same key is then skipped without running a check.
+///
+/// The warehouse file does not exist when the request is refused, so "still
+/// absent" also shows no adapter was built. The warehouse is created after the
+/// refusal, and the retry is what a user meets next: it runs its checks.
+#[test]
+fn a_refused_model_request_on_a_quality_pipeline_does_not_spend_its_key() {
+    let config = format!(
+        "{}\n[state.idempotency]\ndedup_on = \"any\"\n",
+        quality_config("split", "main")
+    );
+    let project = Project::new(&config, false);
+    let warehouse_file = project.dir.join("fixture.duckdb");
+    let state_before = project.state_digest();
+
+    let refused = project.run(&[
+        "run",
+        "--pipeline",
+        "dq",
+        "--model",
+        "orders",
+        "--branch",
+        BRANCH,
+        "--idempotency-key",
+        "k-2161-model",
+    ]);
+
+    assert_eq!(refused.status.code(), Some(1), "{}", stderr(&refused));
+    assert!(
+        stderr(&refused).contains(&format!(
+            "--branch {BRANCH} is not supported for quality pipeline 'dq'"
+        )),
+        "the shadow refusal, not the later `--model` one: {}",
+        stderr(&refused)
+    );
+    assert!(
+        !warehouse_file.exists(),
+        "the refused request built an adapter and created the warehouse file"
+    );
+    assert_eq!(
+        project.state_digest(),
+        state_before,
+        "no claim and no `Failed` stamp"
+    );
+
+    seed_production(&project.dir);
+    let retried = project.run(&[
+        "run",
+        "--pipeline",
+        "dq",
+        "--idempotency-key",
+        "k-2161-model",
+    ]);
+    assert_eq!(retried.status.code(), Some(0), "{}", stderr(&retried));
+    let payload: serde_json::Value =
+        serde_json::from_slice(&retried.stdout).expect("the retried run reports JSON");
+    assert_eq!(
+        payload["status"], "Success",
+        "the key was never claimed, so the retry runs rather than skips: {payload}"
+    );
+    assert!(
+        payload["check_results"]
+            .as_array()
+            .is_some_and(|checked| !checked.is_empty()),
+        "the retry ran its checks: {payload}"
+    );
+}
+
 /// The refusal comes before any adapter is opened. The warehouse file does not
 /// exist; a run that got as far as building the adapters would create it.
 /// The control opens it, which is what makes "still absent" mean "never opened".
@@ -503,6 +596,26 @@ auto_create_schemas = true
             .iter()
             .any(|l| l.starts_with("table main.summary ")),
         "and not in production: {warehouse:?}"
+    );
+
+    // The `--model` mode, which the gate now also covers when it names a
+    // pipeline: a transformation pipeline passes it and still runs on the
+    // branch.
+    let scoped = project.run(&[
+        "run",
+        "--pipeline",
+        "marts",
+        "--model",
+        "summary",
+        "--branch",
+        BRANCH,
+    ]);
+    assert_eq!(
+        scoped.status.code(),
+        Some(0),
+        "stdout: {}\nstderr: {}",
+        stdout(&scoped),
+        stderr(&scoped)
     );
 }
 
