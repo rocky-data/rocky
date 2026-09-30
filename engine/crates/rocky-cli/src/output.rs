@@ -1664,12 +1664,9 @@ pub struct PlanOutput {
     /// warehouses without a first-class retention knob.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub retention_actions: Vec<RetentionAction>,
-    /// Models the preview could not render, one entry each, with the
-    /// reason. A model whose SQL cannot be rendered offline lands here
-    /// (a Snowflake dynamic table needs a live compute-warehouse name),
-    /// and so does one whose strategy is refused, such as `ephemeral`
-    /// (E038). Before, such a model left no trace: an ephemeral-only
-    /// project previewed as an empty plan and exit 0.
+    /// Models excluded from the SQL preview or refused by compilation, with
+    /// the reason for each. This includes SQL that needs a live warehouse to
+    /// render and compiler errors such as E038 for an `ephemeral` model.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub skipped: Vec<SkippedModel>,
 
