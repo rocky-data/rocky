@@ -1,3 +1,4 @@
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -474,6 +475,8 @@ pub async fn plan(
         output.skipped = preview.skipped;
     }
     let mut run_plan_persisted = false;
+    let mut run_plan_built = false;
+    let mut compile_refused = false;
     if blueprint_models_dir.exists() {
         match build_and_persist_run_plan(
             config_path,
@@ -485,13 +488,44 @@ pub async fn plan(
             base_ref,
             state_path,
         ) {
-            Ok(Some((run_plan, plan_id, persisted_at))) => {
-                output.plan_id = Some(plan_id);
-                output.plan_kind = Some("run".to_string());
-                output.created_at = Some(persisted_at);
+            Ok(Some(RunPlanBuild {
+                plan: run_plan,
+                refused,
+                persisted,
+            })) => {
+                run_plan_built = true;
                 output.models = run_plan.models.clone();
                 output.execution_layers = run_plan.execution_layers.clone();
-                run_plan_persisted = true;
+                compile_refused = !refused.is_empty();
+                if compile_refused && run_options.model.is_some() {
+                    output.statements.clear();
+                }
+                // A model-scoped SQL preview may already have reported a
+                // generator refusal. Replace that entry with *all* compiler
+                // diagnostics for the model, rather than keeping only the last.
+                let refused_names: BTreeSet<&str> =
+                    refused.iter().map(|item| item.model.as_str()).collect();
+                output
+                    .skipped
+                    .retain(|item| !refused_names.contains(item.model.as_str()));
+                output.skipped.extend(refused);
+                match persisted {
+                    Ok((plan_id, persisted_at)) => {
+                        output.plan_id = Some(plan_id);
+                        output.plan_kind = Some("run".to_string());
+                        output.created_at = Some(persisted_at);
+                        run_plan_persisted = true;
+                    }
+                    Err(e) => {
+                        if run_options.model.is_some() && !compile_refused {
+                            return Err(e).context(
+                                "failed to persist a model-scoped run plan for --model; \
+                                 refusing to fall back to a replication plan",
+                            );
+                        }
+                        tracing::warn!(error = %e, "failed to persist run plan");
+                    }
+                }
             }
             Ok(None) => {
                 // `models/` exists but compile produced zero models.
@@ -534,7 +568,7 @@ pub async fn plan(
     // any residual path — e.g. a models-directory TOCTOU that flips the
     // `exists()` check between the preview and persistence — so replication is
     // provably unreachable whenever `--model` is set.
-    if run_options.model.is_some() && !run_plan_persisted {
+    if run_options.model.is_some() && !run_plan_persisted && !compile_refused {
         anyhow::bail!(
             "failed to build a model-scoped run plan for --model; \
              refusing to fall back to a replication plan"
@@ -549,7 +583,7 @@ pub async fn plan(
     // is content-addressed by the canonical `RockyConfig` snapshot + the
     // discovered source state (sorted connectors + tables), so identical
     // inputs produce an identical plan_id across machines.
-    if !run_plan_persisted {
+    if !run_plan_built {
         match build_and_persist_replication_plan(
             &rocky_cfg,
             &connectors,
@@ -584,6 +618,9 @@ pub async fn plan(
         render_governance_preview_text(&output);
         render_budget_diagnostics_text(&output);
         render_semantic_verdict_text(&output);
+        for skipped in &output.skipped {
+            eprintln!("Skipped model '{}': {}", skipped.model, skipped.reason);
+        }
         if let Some(ref plan_id) = output.plan_id {
             println!();
             match output.plan_kind.as_deref() {
@@ -606,6 +643,10 @@ pub async fn plan(
             println!("Apply with: rocky apply {plan_id}");
         }
     }
+    anyhow::ensure!(
+        !compile_refused,
+        "one or more models were refused by the compiler"
+    );
     Ok(())
 }
 
@@ -1161,7 +1202,7 @@ pub fn plan_preview_output(
 
 /// Compile the models directory, build a `RunPlan` payload, persist it to
 /// `.rocky/plans/<plan_id>.json`, and return
-/// `Some((payload, plan_id, persisted_at))`.
+/// `Some(RunPlanBuild)`.
 ///
 /// Returns `Ok(None)` when the compile succeeds but produces zero models —
 /// the caller falls through to the replication-plan branch in that case.
@@ -1179,17 +1220,21 @@ fn build_and_persist_run_plan(
     run_options: &PlanRunOptions,
     base_ref: &str,
     state_path: &Path,
-) -> Result<Option<(RunPlan, String, chrono::DateTime<Utc>)>> {
+) -> Result<Option<RunPlanBuild>> {
     use rocky_compiler::compile::{self, CompilerConfig};
 
+    let rocky_config = rocky_core::config::load_rocky_config(config_path)
+        .context("failed to load project config for run-plan compilation")?;
+    let source_schemas =
+        crate::source_schemas::load_cached_source_schemas(&rocky_config.cache.schemas, state_path);
     let config = CompilerConfig {
         models_dir: models_dir.to_path_buf(),
         contracts_dir: None,
         required_explicit_contract_model: None,
-        source_schemas: std::collections::HashMap::new(),
+        source_schemas,
         mask: std::collections::BTreeMap::new(),
         allow_unmasked: vec![],
-        project_freshness: Default::default(),
+        project_freshness: rocky_config.freshness,
         run_vars: rocky_core::run_vars::RunVars::new(),
     };
 
@@ -1203,17 +1248,70 @@ fn build_and_persist_run_plan(
         return Ok(None);
     }
 
+    let failed: BTreeSet<String> = result
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.is_error())
+        .map(|diagnostic| diagnostic.model.clone())
+        .collect();
+    let blocked = super::run::compile_error_descendant_blocks(
+        &result.project.dag_nodes,
+        &failed,
+        &BTreeMap::new(),
+    );
+    let mut refused: Vec<SkippedModel> = result
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.is_error())
+        .map(|diagnostic| SkippedModel {
+            model: diagnostic.model.clone(),
+            reason: format!("[{}] {}", diagnostic.code, diagnostic.message),
+        })
+        .collect();
+    refused.extend(blocked.iter().map(|(model, blocked_by)| SkippedModel {
+        model: model.clone(),
+        reason: format!(
+            "withheld because upstream compile failure(s) affect: {}",
+            blocked_by.join(", ")
+        ),
+    }));
+    if let Some(selected) = run_options.model.as_deref() {
+        refused.retain(|item| item.model == selected);
+    }
+    let excluded: BTreeSet<&str> = failed
+        .iter()
+        .map(String::as_str)
+        .chain(blocked.keys().map(String::as_str))
+        .collect();
+
     let (models, execution_layers) = if let Some(model) = run_options.model.as_deref() {
-        (vec![model.to_string()], vec![vec![model.to_string()]])
+        if excluded.contains(model) {
+            (Vec::new(), Vec::new())
+        } else {
+            (vec![model.to_string()], vec![vec![model.to_string()]])
+        }
     } else {
         (
             result
                 .project
                 .models
                 .iter()
+                .filter(|m| !excluded.contains(m.config.name.as_str()))
                 .map(|m| m.config.name.clone())
                 .collect(),
-            result.project.layers.clone(),
+            result
+                .project
+                .layers
+                .iter()
+                .map(|layer| {
+                    layer
+                        .iter()
+                        .filter(|name| !excluded.contains(name.as_str()))
+                        .cloned()
+                        .collect::<Vec<_>>()
+                })
+                .filter(|layer| !layer.is_empty())
+                .collect(),
         )
     };
 
@@ -1253,41 +1351,52 @@ fn build_and_persist_run_plan(
         spec_digest: None,
     };
 
-    let cwd = std::env::current_dir().context("failed to get current working directory")?;
+    let persisted = (|| -> Result<(String, chrono::DateTime<Utc>)> {
+        let cwd = std::env::current_dir().context("failed to get current working directory")?;
 
-    // policy seam 1 + capability-embed: stamp the authoring principal and embed the propose-time
-    // change-classification into the plan payload, so a later `rocky apply`
-    // evaluates the plan against the identity that authored it and the exact
-    // capabilities that were reviewed.
-    let principal = run_options.principal.unwrap_or(PolicyPrincipal::Human);
-    // Finding #4: bind the mask iff the apply reaches the mask-reconciling path —
-    // a Replication pipeline whose model leg runs (`--all` / `--models`) on a full
-    // (`--model`-less) run. Resolved with the SAME `resolve_pipeline` `run()` uses,
-    // and the SAME `run_all || models_dir` predicate `run.rs` gates the model leg
-    // with, so it matches the apply-side literal `reconciles_masks`. A resolution
-    // failure ⇒ `false` (fail-safe: apply that doesn't reach the leg never checks
-    // the gate, so a wrong-`true` is harmless; a wrong-`false` would false-refuse).
-    let bind_masks = rocky_core::config::load_rocky_config(config_path)
-        .ok()
-        .map(|cfg| {
-            crate::commands::apply::pipeline_is_replication(&cfg, pipeline)
-                && (run_options.all || run_options.models_dir.is_some())
-                && run_options.model.is_none()
-        })
-        .unwrap_or(false);
-    let capabilities = compute_embedded_capabilities(
-        config_path,
-        models_dir,
-        base_ref,
-        Some(state_path),
-        env,
-        bind_masks,
-    )?;
-    let plan_id = write_plan_governed(&cwd, PlanKind::Run, &run_plan, principal, capabilities)
-        .context("failed to write run plan")?;
+        // policy seam 1 + capability-embed: stamp the authoring principal and embed the propose-time
+        // change-classification into the plan payload, so a later `rocky apply`
+        // evaluates the plan against the identity that authored it and the exact
+        // capabilities that were reviewed.
+        let principal = run_options.principal.unwrap_or(PolicyPrincipal::Human);
+        // Finding #4: bind the mask iff the apply reaches the mask-reconciling path —
+        // a Replication pipeline whose model leg runs (`--all` / `--models`) on a full
+        // (`--model`-less) run. Resolved with the SAME `resolve_pipeline` `run()` uses,
+        // and the SAME `run_all || models_dir` predicate `run.rs` gates the model leg
+        // with, so it matches the apply-side literal `reconciles_masks`. A resolution
+        // failure ⇒ `false` (fail-safe: apply that doesn't reach the leg never checks
+        // the gate, so a wrong-`true` is harmless; a wrong-`false` would false-refuse).
+        let bind_masks = rocky_core::config::load_rocky_config(config_path)
+            .ok()
+            .map(|cfg| {
+                crate::commands::apply::pipeline_is_replication(&cfg, pipeline)
+                    && (run_options.all || run_options.models_dir.is_some())
+                    && run_options.model.is_none()
+            })
+            .unwrap_or(false);
+        let capabilities = compute_embedded_capabilities(
+            config_path,
+            models_dir,
+            base_ref,
+            Some(state_path),
+            env,
+            bind_masks,
+        )?;
+        let plan_id = write_plan_governed(&cwd, PlanKind::Run, &run_plan, principal, capabilities)
+            .context("failed to write run plan")?;
+        Ok((plan_id, Utc::now()))
+    })();
+    Ok(Some(RunPlanBuild {
+        plan: run_plan,
+        refused,
+        persisted,
+    }))
+}
 
-    let persisted_at = Utc::now();
-    Ok(Some((run_plan, plan_id, persisted_at)))
+struct RunPlanBuild {
+    plan: RunPlan,
+    refused: Vec<SkippedModel>,
+    persisted: Result<(String, chrono::DateTime<Utc>)>,
 }
 
 /// Compute the propose-time change-classification (capability-embed) to embed in a governed

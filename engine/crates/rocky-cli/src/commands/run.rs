@@ -926,7 +926,7 @@ fn deferred_externalized_edges(
 /// reads and unknown read sets retain their existing opt-in containment policy.
 /// A selected model whose inputs were successfully externalized by `--defer`
 /// has no local declared input edge for this execution.
-fn compile_error_descendant_blocks(
+pub(super) fn compile_error_descendant_blocks(
     dag_nodes: &[DagNode],
     failed: &BTreeSet<String>,
     externalized_edges: &BTreeMap<String, BTreeSet<String>>,

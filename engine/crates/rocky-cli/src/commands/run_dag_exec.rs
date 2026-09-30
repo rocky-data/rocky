@@ -8,7 +8,7 @@
 //! Results are emitted as a [`DagRunOutput`] in JSON mode so orchestrators
 //! can correlate per-node status, timing, and errors.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -259,7 +259,8 @@ pub async fn run_with_dag(
     // validate a `models/` directory that only transformation pipelines
     // consume (`add_transformation_nodes`), so an unrelated broken model there
     // failed a replication-only run that `rocky run` executes happily.
-    let models_by_pipeline = load_transformation_models(config_path, cfg)?.by_pipeline;
+    let mut models_by_pipeline = load_transformation_models(config_path, cfg)?.by_pipeline;
+    let compile_refusals = exclude_compile_refusals(cfg, state_path, &mut models_by_pipeline)?;
 
     // Seed-discovery errors are NOT recoverable into "no seeds": seed nodes and
     // the seed→model edges that order a model after the seed it reads are built
@@ -316,6 +317,8 @@ pub async fn run_with_dag(
     // (#1355). Placed before the executor is built, so a refused run dispatches
     // no nodes.
     super::run::refuse_on_scheduling_warnings(cfg.run.strict_scheduling, &physical_edge_warnings)?;
+    let mut output_warnings = physical_edge_warnings.clone();
+    output_warnings.extend(compile_refusals.iter().cloned());
 
     // `--dag` cannot isolate a run, so it refuses to pretend it can.
     //
@@ -409,7 +412,7 @@ pub async fn run_with_dag(
         let output = DagRunOutput {
             version: VERSION.into(),
             command: "run --dag".into(),
-            warnings: physical_edge_warnings.clone(),
+            warnings: output_warnings,
             total_nodes: result.total_nodes,
             total_layers: result.total_layers,
             completed: result.completed,
@@ -441,12 +444,113 @@ pub async fn run_with_dag(
             result.skipped,
             result.duration_ms
         );
+        for refusal in &compile_refusals {
+            eprintln!("{refusal}");
+        }
     }
 
+    if !compile_refusals.is_empty() {
+        anyhow::bail!("DAG execution withheld model(s) after compile failure");
+    }
     if result.had_failures() {
         anyhow::bail!("DAG execution had {} failed node(s)", result.failed);
     }
     Ok(())
+}
+
+/// Compile the exact loaded transformation set before constructing the
+/// executable graph. The display DAG keeps the unfiltered loader above.
+fn exclude_compile_refusals(
+    cfg: &rocky_core::config::RockyConfig,
+    state_path: &Path,
+    models_by_pipeline: &mut rocky_core::unified_dag::ModelsByPipeline,
+) -> Result<Vec<String>> {
+    let compile_config = rocky_compiler::compile::CompilerConfig {
+        source_schemas: crate::source_schemas::load_cached_source_schemas(
+            &cfg.cache.schemas,
+            state_path,
+        ),
+        project_freshness: cfg.freshness.clone(),
+        ..Default::default()
+    };
+    let mut failed = BTreeSet::new();
+    let mut dag_nodes = Vec::new();
+    let mut refusals = BTreeSet::new();
+    // Runtime sub-runs compile one transformation pipeline at a time. A
+    // project-wide compile can invent E036 between two different adapters
+    // whose physical catalogs happen to share a spelling.
+    for (pipeline, models) in models_by_pipeline.iter() {
+        if models.is_empty() {
+            continue;
+        }
+        let result =
+            rocky_compiler::compile::compile_preloaded_models(models.clone(), &compile_config)
+                .with_context(|| {
+                    format!("failed to compile pipeline '{pipeline}' before DAG construction")
+                })?;
+        dag_nodes.extend(result.project.dag_nodes);
+        for diagnostic in result
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.is_error())
+        {
+            failed.insert(diagnostic.model.clone());
+            refusals.insert(format!(
+                "model '{}': [{}] {}",
+                diagnostic.model, diagnostic.code, diagnostic.message
+            ));
+        }
+    }
+    let mut blocked =
+        super::run::compile_error_descendant_blocks(&dag_nodes, &failed, &BTreeMap::new());
+    // The unified executor can also infer edges between pipelines by a bare
+    // SQL read. Withhold those readers before the graph's label and physical
+    // edge passes, so a refused producer cannot leave a runnable stale read.
+    loop {
+        let mut changed = false;
+        for model in models_by_pipeline.values().flatten() {
+            if failed.contains(&model.config.name) || blocked.contains_key(&model.config.name) {
+                continue;
+            }
+            let mut dependencies = model.config.depends_on.clone();
+            if let Ok(refs) = rocky_sql::lineage::referenced_tables(&model.sql) {
+                dependencies.extend(
+                    refs.into_iter()
+                        .filter_map(|relation| relation.rsplit('.').next().map(str::to_string)),
+                );
+            }
+            let direct: Vec<String> = dependencies
+                .into_iter()
+                .filter_map(|dependency| {
+                    let name = dependency.to_lowercase();
+                    failed
+                        .iter()
+                        .chain(blocked.keys())
+                        .find(|candidate| candidate.to_lowercase() == name)
+                        .cloned()
+                })
+                .collect();
+            if !direct.is_empty() {
+                blocked.insert(model.config.name.clone(), direct);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    refusals.extend(blocked.iter().map(|(model, blocked_by)| {
+        format!(
+            "model '{model}' withheld because upstream compile failure(s) affect: {}",
+            blocked_by.join(", ")
+        )
+    }));
+    for models in models_by_pipeline.values_mut() {
+        models.retain(|model| {
+            !failed.contains(&model.config.name) && !blocked.contains_key(&model.config.name)
+        });
+    }
+    Ok(refusals.into_iter().collect())
 }
 
 /// Load each transformation pipeline's own model set, keyed by pipeline name.
