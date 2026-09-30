@@ -144,6 +144,11 @@ The resolver calls `branch_deploy_shadow_suffix()` once per run. It fires only
 when the caller passed no explicit `shadow_suffix`. Outside a branch deployment
 it resolves to `None`, so production runs do not change.
 
+The suffix reaches every `run()` call, whatever the pipeline kind. Rocky
+refuses a shadow run of a quality, snapshot or load pipeline, so that call fails
+in a branch deployment instead of reading or writing production. To run such a
+pipeline anyway, call it through a resource that has no `shadow_suffix_fn`.
+
 ## Future work
 
 A config-string `shadow_mode="branch_deploy"` shortcut over the

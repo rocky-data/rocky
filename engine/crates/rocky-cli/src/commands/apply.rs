@@ -477,6 +477,7 @@ async fn run_apply_run_plan(
             )
         })?,
     );
+    preflight_run_plan_shadow_support(&loaded.config, &run_plan)?;
     let (models_dir, models_glob) = run_model_selection(&loaded.config, config_path, &run_plan)?;
     // Gate on the models this apply will ACTUALLY execute (fresh compile +
     // `--model` selection), not the plan's informational `models` list.
@@ -571,6 +572,33 @@ async fn run_apply_run_plan(
     )
     .await?;
     Ok(apply_outcome_for(termination, &apply_run_id))
+}
+
+/// Refuse a persisted shadow request against the current pipeline before
+/// policy synchronization or decision rows touch the state store. Branch
+/// lookup needs the store too, so this uses only the branch name here.
+fn preflight_run_plan_shadow_support(
+    config: &rocky_core::config::RockyConfig,
+    run_plan: &RunPlan,
+) -> Result<()> {
+    if run_plan.branch.is_none() && !run_plan.shadow {
+        return Ok(());
+    }
+    let shadow = rocky_core::shadow::ShadowConfig {
+        suffix: run_plan
+            .shadow_suffix
+            .clone()
+            .unwrap_or_else(|| "_rocky_shadow".to_string()),
+        schema_override: run_plan.shadow_schema.clone(),
+        cleanup_after: run_plan.branch.is_none(),
+        branch: run_plan.branch.clone(),
+    };
+    crate::commands::run::require_shadow_support_for_config(
+        config,
+        run_plan.pipeline.as_deref(),
+        run_plan.model.as_deref(),
+        &shadow,
+    )
 }
 
 /// Reject contradictory persisted run flags before an apply reads config or
@@ -3780,6 +3808,7 @@ async fn run_apply_ai_authored_plan(
             )
         })?,
     );
+    preflight_run_plan_shadow_support(&loaded.config, &run_plan)?;
     let (models_dir, models_glob) = run_model_selection(&loaded.config, config_path, &run_plan)?;
     // Gate on the models this apply will ACTUALLY execute (fresh compile +
     // `--model` selection), not the plan's informational `models` list.
@@ -5993,6 +6022,95 @@ mod tests {
             product_id: None,
             spec_digest: None,
         }
+    }
+
+    #[tokio::test]
+    async fn transformation_shadow_and_branch_plans_pass_apply_preflight() -> anyhow::Result<()> {
+        for branch in [None, Some("fix_price")] {
+            let dir = tempfile::tempdir()?;
+            let config_path = dir.path().join("rocky.toml");
+            std::fs::write(
+                &config_path,
+                "[adapter]\ntype = \"duckdb\"\npath = \"fixture.duckdb\"\n\n\
+                 [pipeline.marts]\ntype = \"transformation\"\nmodels = \"models\"\n\n\
+                 [pipeline.marts.target.governance]\nauto_create_schemas = true\n",
+            )?;
+            let models = dir.path().join("models");
+            std::fs::create_dir(&models)?;
+            std::fs::write(models.join("summary.sql"), "SELECT 1 AS id\n")?;
+            std::fs::write(
+                models.join("summary.toml"),
+                "[strategy]\ntype = \"full_refresh\"\n\n\
+                 [target]\ncatalog = \"fixture\"\nschema = \"main\"\ntable = \"summary\"\n",
+            )?;
+            let state_path = dir.path().join("state.redb");
+            if let Some(name) = branch {
+                crate::commands::branch::run_branch_create(&state_path, name, None, false)?;
+            }
+            let mut plan = minimal_run_plan();
+            plan.pipeline = Some("marts".to_string());
+            plan.models_dir = Some(models.to_string_lossy().into_owned());
+            plan.models = vec!["summary".to_string()];
+            plan.execution_layers = vec![vec!["summary".to_string()]];
+            plan.branch = branch.map(str::to_string);
+            plan.shadow = branch.is_none();
+            let plan_id = write_plan(dir.path(), PlanKind::Run, &plan)?;
+
+            super::run_apply_core_in(
+                dir.path(),
+                &config_path,
+                &plan_id,
+                &state_path,
+                PolicyPrincipal::Human,
+                None,
+                true,
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ai_authored_shadow_plan_checks_current_pipeline_before_review() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let config_path = dir.path().join("rocky.toml");
+        std::fs::write(
+            &config_path,
+            "[adapter]\ntype = \"duckdb\"\npath = \"fixture.duckdb\"\n\n\
+             [pipeline.dq]\ntype = \"quality\"\n\n\
+             [pipeline.dq.target]\nadapter = \"default\"\n\n\
+             [[pipeline.dq.tables]]\ncatalog = \"fixture\"\nschema = \"main\"\n\
+             table = \"orders\"\n\n[pipeline.dq.checks]\nenabled = true\n\n\
+             [policy]\nversion = 1\ndefault_agent_effect = \"deny\"\n",
+        )?;
+        let models_dir = dir.path().join("models");
+        write_min_model(&models_dir, "orders");
+        let mut plan = minimal_run_plan();
+        plan.pipeline = Some("dq".to_string());
+        plan.shadow = true;
+        plan.models_dir = Some(models_dir.to_string_lossy().into_owned());
+        let plan_id = write_plan(dir.path(), PlanKind::AiAuthored, &plan)?;
+        let state_path = dir.path().join("state.redb");
+
+        let error = super::run_apply_core_in(
+            dir.path(),
+            &config_path,
+            &plan_id,
+            &state_path,
+            PolicyPrincipal::Agent,
+            None,
+            true,
+        )
+        .await
+        .expect_err("current quality pipeline must refuse a stale shadow plan");
+        assert!(
+            error
+                .to_string()
+                .contains("--shadow is not supported for quality pipeline 'dq'"),
+            "the shadow guard must precede review and policy: {error:#}"
+        );
+        assert!(!state_path.exists(), "no state store was opened");
+        Ok(())
     }
 
     #[test]

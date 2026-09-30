@@ -3781,8 +3781,25 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             var,
             assume_fresh_state,
         } => {
-            // Resolve branch names before config or warehouse work. This is
-            // also the single name-to-schema funnel used by apply and compare.
+            // Reject an unsupported pipeline using config alone. Resolving a
+            // branch opens the state store, even when it is read-only.
+            if let Some(name) = branch.as_ref() {
+                rocky_cli::commands::validate_branch_name(name)?;
+                let config = rocky_core::config::load_rocky_config(&cli.config)?;
+                let pending_shadow = rocky_core::shadow::ShadowConfig {
+                    suffix: shadow_suffix.clone(),
+                    schema_override: None,
+                    cleanup_after: false,
+                    branch: Some(name.clone()),
+                };
+                rocky_cli::commands::require_shadow_support_for_config(
+                    &config,
+                    pipeline.as_deref(),
+                    model.as_deref(),
+                    &pending_shadow,
+                )?;
+            }
+            // Resolve branch names through the shared name-to-schema funnel.
             let branch_shadow_config = branch
                 .as_ref()
                 .map(|name| {

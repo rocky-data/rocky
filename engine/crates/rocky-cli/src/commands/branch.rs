@@ -67,7 +67,7 @@ pub const APPROVAL_SKIP_ENV: &str = "ROCKY_BRANCH_APPROVAL_SKIP";
 /// branch can reach an unquoted consumer with a name it can't handle.
 ///
 /// `branch show`, `branch list`, and `branch delete` only access stored records.
-fn validate_branch_name(name: &str) -> Result<()> {
+pub fn validate_branch_name(name: &str) -> Result<()> {
     if name.is_empty() {
         anyhow::bail!(
             "invalid branch name: use 1–64 [A-Za-z0-9_] characters (for example, pr_preview_x)"
