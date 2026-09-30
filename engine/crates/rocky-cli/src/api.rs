@@ -1047,7 +1047,7 @@ async fn project(
                 if !state_path.exists() {
                     return Ok(None);
                 }
-                let store = rocky_core::state::StateStore::open_read_only(&state_path)?;
+                let store = rocky_core::state::StateStore::open_read_only_or_empty(&state_path)?;
                 Ok(store.list_runs(1)?.into_iter().next().map(|run| {
                     crate::output::ProjectRunOutput {
                         run_id: run.run_id,
@@ -3034,7 +3034,7 @@ async fn get_job(
 
     let lookup_id = id.clone();
     let record = store_read(&state, move || {
-        let store = rocky_core::state::StateStore::open_read_only(&state_path)?;
+        let store = rocky_core::state::StateStore::open_read_only_or_empty(&state_path)?;
         store.get_job(&lookup_id)
     })
     .await?
@@ -3072,6 +3072,7 @@ mod tests {
     use super::*;
     use std::io::Write;
     use std::path::PathBuf;
+    use tower::ServiceExt;
 
     #[cfg(unix)]
     #[tokio::test]
@@ -6131,39 +6132,50 @@ mod tests {
         let models_dir = dir.path().join("models");
         std::fs::create_dir_all(&models_dir).unwrap();
         let state_path = pinned_state_path(&models_dir);
-        // Create + init the (empty) store so open_read_only succeeds.
-        drop(rocky_core::state::StateStore::open(&state_path).unwrap());
+        assert!(!state_path.exists(), "precondition: never-run project");
 
-        let state = pinned_server(models_dir.clone(), None, &state_path);
-        let base = spawn_router(state).await;
+        let app = router(pinned_server(models_dir.clone(), None, &state_path));
+
+        async fn get(app: &Router, path: &str) -> String {
+            let response = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri(path)
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), axum::http::StatusCode::OK);
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            String::from_utf8(bytes.to_vec()).unwrap()
+        }
 
         // /runs
-        let resp = get_retrying_on_busy(&format!("{base}/api/v1/runs")).await;
-        assert_eq!(resp.status(), 200);
         assert_eq!(
-            resp.text().await.unwrap(),
+            get(&app, "/api/v1/runs").await,
             reference_bytes(&history_runs_output(&state_path, None, false).unwrap())
         );
 
         // /models/{name}/history
-        let resp = get_retrying_on_busy(&format!("{base}/api/v1/models/some_model/history")).await;
-        assert_eq!(resp.status(), 200);
         assert_eq!(
-            resp.text().await.unwrap(),
+            get(&app, "/api/v1/models/some_model/history").await,
             reference_bytes(
                 &model_history_output(&state_path, "some_model", None, false, 20).unwrap()
             )
         );
 
         // /models/{name}/metrics
-        let resp = get_retrying_on_busy(&format!("{base}/api/v1/models/some_model/metrics")).await;
-        assert_eq!(resp.status(), 200);
         assert_eq!(
-            resp.text().await.unwrap(),
+            get(&app, "/api/v1/models/some_model/metrics").await,
             reference_bytes(
                 &metrics_output(&state_path, "some_model", false, None, false).unwrap()
             )
         );
+        assert!(!state_path.exists(), "GET routes must not create state");
     }
 
     /// Minimal on-disk transformation project (rocky.toml + one model) for the

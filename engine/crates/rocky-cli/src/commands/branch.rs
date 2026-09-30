@@ -117,7 +117,7 @@ pub(crate) fn validate_existing_branch_name(state_path: &Path, name: &str) -> Re
         return Ok(());
     }
     validate_persisted_promote_branch_name(name)?;
-    let store = StateStore::open_read_only(state_path)
+    let store = StateStore::open_read_only_or_empty(state_path)
         .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
     if store.get_branch(name)?.is_none() {
         anyhow::bail!("legacy branch '{name}' not found — see 'rocky branch list'");
@@ -215,7 +215,7 @@ pub fn run_branch_delete(state_path: &Path, name: &str, json: bool) -> Result<()
 
 /// `rocky branch list` — list every branch in the state store.
 pub fn compute_branch_list(state_path: &Path) -> Result<BranchListOutput> {
-    let store = StateStore::open_read_only(state_path)
+    let store = StateStore::open_read_only_or_empty(state_path)
         .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
 
     let records = store.list_branches()?;
@@ -273,7 +273,7 @@ pub fn resolve_branch_shadow_config(
     suffix: String,
 ) -> Result<ShadowConfig> {
     validate_branch_name(name)?;
-    let store = StateStore::open_read_only(state_path)
+    let store = StateStore::open_read_only_or_empty(state_path)
         .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
     let record = store.get_branch(name)?.with_context(|| {
         format!("branch '{name}' not found — create it with `rocky branch create {name}`")
@@ -1072,7 +1072,7 @@ pub fn run_branch_approve(
 ) -> Result<()> {
     validate_existing_branch_name(state_path, branch_name)?;
 
-    let store = StateStore::open_read_only(state_path)
+    let store = StateStore::open_read_only_or_empty(state_path)
         .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
 
     let record = store
@@ -1788,7 +1788,7 @@ fn compile_result_to_project_ir(result: &rocky_compiler::compile::CompileResult)
 
 /// `rocky branch show <name>` — inspect a single branch.
 pub fn compute_branch_show(state_path: &Path, name: &str) -> Result<BranchOutput> {
-    let store = StateStore::open_read_only(state_path)
+    let store = StateStore::open_read_only_or_empty(state_path)
         .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
 
     let record = store

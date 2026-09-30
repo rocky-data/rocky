@@ -84,7 +84,7 @@ pub fn run_replay(
     model_filter: Option<&str>,
     json: bool,
 ) -> Result<()> {
-    let store = StateStore::open_read_only(state_path)
+    let store = StateStore::open_read_only_or_empty(state_path)
         .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
 
     let record = resolve(&store, target)?;
@@ -358,7 +358,7 @@ pub fn compute_replay_check(
     target: &str,
     model_filter: Option<&str>,
 ) -> Result<ReplayCheckOutput> {
-    let store = StateStore::open_read_only(state_path)
+    let store = StateStore::open_read_only_or_empty(state_path)
         .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
 
     let record = resolve(&store, target)?;
@@ -1351,7 +1351,7 @@ pub async fn run_replay_execute(
     verify: bool,
     json: bool,
 ) -> Result<()> {
-    let store = StateStore::open_read_only(state_path)
+    let store = StateStore::open_read_only_or_empty(state_path)
         .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
 
     let record = resolve(&store, target)?;
@@ -1933,7 +1933,7 @@ pub async fn run_replay_execute_warehouse(
     keep: bool,
     json: bool,
 ) -> Result<()> {
-    let store = StateStore::open_read_only(state_path)
+    let store = StateStore::open_read_only_or_empty(state_path)
         .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
 
     let record = resolve(&store, target)?;

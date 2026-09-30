@@ -27,7 +27,7 @@ pub fn metrics_output(
     column: Option<&str>,
     alerts: bool,
 ) -> Result<MetricsOutput> {
-    let store = StateStore::open_read_only(state_path)?;
+    let store = StateStore::open_read_only_or_empty(state_path)?;
 
     let snapshots = store.get_quality_trend(model_name, if trend { 20 } else { 1 })?;
 

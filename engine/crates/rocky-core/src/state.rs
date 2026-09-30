@@ -871,6 +871,9 @@ const CURRENT_SCHEMA_VERSION: u32 = 30;
 /// Errors from the embedded redb state store.
 #[derive(Debug, Error)]
 pub enum StateError {
+    #[error("state store not found at {path}")]
+    NotFound { path: String },
+
     #[error("database error: {0}")]
     Database(#[from] redb::DatabaseError),
 
@@ -1150,8 +1153,8 @@ enum InitOutcome {
 /// written by an older binary forward to [`CURRENT_SCHEMA_VERSION`]: stamping
 /// on a read would let a `rocky state show` silently rewrite the very version
 /// it is reporting, and would defeat forward/backward-compat probes that depend
-/// on the on-disk version staying put until a real write occurs. The one write
-/// it still performs is bootstrapping an EMPTY database (#1980).
+/// on the on-disk version staying put until a real write occurs. A missing
+/// file is reported as [`StateError::NotFound`].
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum OpenMode {
     /// Read-write open: take the advisory lock and stamp/upgrade the version.
@@ -1224,9 +1227,8 @@ impl StateStore {
     /// that lacks a table this binary reads is refused with
     /// [`StateError::ReadOnlyNeedsInit`], which names the tables; the next
     /// read-write open creates them. A store stamped at an older version but
-    /// carrying every table opens normally and keeps its stamp. The one write
-    /// left is bootstrapping an EMPTY database — a path with no state file is
-    /// created and given its tables, unstamped, as before (#1980).
+    /// carrying every table opens normally and keeps its stamp. A missing
+    /// file returns [`StateError::NotFound`] without creating it.
     pub fn open_read_only(path: &Path) -> Result<Self, StateError> {
         Self::open_inner(path, OpenMode::ReadOnly, SchemaMismatchPolicy::Fail, None)
     }
@@ -1255,6 +1257,49 @@ impl StateStore {
             SchemaMismatchPolicy::Fail,
             Some(cache_bytes),
         )
+    }
+
+    /// Open an existing store, or answer reads from an empty in-memory store
+    /// when the project has never written state. The project path is untouched.
+    pub fn open_read_only_or_empty(path: &Path) -> Result<Self, StateError> {
+        Self::open_read_only_or_empty_inner(path, None)
+    }
+
+    /// Cache-budgeted counterpart for request-local history reads.
+    pub fn open_read_only_or_empty_with_cache(
+        path: &Path,
+        cache_bytes: usize,
+    ) -> Result<Self, StateError> {
+        Self::open_read_only_or_empty_inner(path, Some(cache_bytes))
+    }
+
+    fn open_read_only_or_empty_inner(
+        path: &Path,
+        cache_budget: Option<usize>,
+    ) -> Result<Self, StateError> {
+        match Self::open_inner(
+            path,
+            OpenMode::ReadOnly,
+            SchemaMismatchPolicy::Fail,
+            cache_budget,
+        ) {
+            Ok(store) => Ok(store),
+            Err(StateError::NotFound { .. }) => {
+                let mut builder = Database::builder();
+                if let Some(bytes) = cache_budget {
+                    builder.set_cache_size(bytes);
+                }
+                let db = builder.create_with_backend(redb::backends::InMemoryBackend::new())?;
+                Self::init_db(&db, path, OpenMode::ReadWrite, SchemaMismatchPolicy::Fail)?;
+                Ok(Self {
+                    db,
+                    _lock: None,
+                    recreated_for_forward_incompat: false,
+                    write_epoch: AtomicU64::new(0),
+                })
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// redb's count of pages evicted from its read cache since this handle
@@ -1292,12 +1337,13 @@ impl StateStore {
     /// shared open path (with the same lock-contention retry) but never Rocky's
     /// advisory write lock.
     pub fn peek_schema_version(path: &Path) -> Result<Option<u32>, StateError> {
-        // Side-effect-free for a missing file: do not let the redb open path
-        // create an empty database as a probe artifact.
-        if !path.exists() {
-            return Ok(None);
-        }
-        let db = open_redb_with_retry(path, None)?;
+        // The same existing-file open as read-only callers closes the race
+        // between an existence probe and opening the database.
+        let db = match open_existing_redb_with_retry(path, None) {
+            Ok(db) => db,
+            Err(StateError::NotFound { .. }) => return Ok(None),
+            Err(error) => return Err(error),
+        };
         let txn = db.begin_read()?;
         let metadata = match txn.open_table(METADATA) {
             Ok(table) => table,
@@ -1384,7 +1430,11 @@ impl StateStore {
             None
         };
 
-        let db = open_redb_with_retry(path, cache_budget)?;
+        let db = if matches!(mode, OpenMode::ReadOnly) {
+            open_existing_redb_with_retry(path, cache_budget)?
+        } else {
+            open_redb_with_retry(path, cache_budget)?
+        };
 
         match Self::init_db(&db, path, mode, policy)? {
             InitOutcome::Ready => Ok(StateStore {
@@ -1524,15 +1574,9 @@ impl StateStore {
     /// `rocky serve` wrote to the store it was reporting on until a
     /// read-write open re-stamped it (C1-P1b).
     ///
-    /// `Ok(None)` means the database is EMPTY — no table at all. That is a
-    /// file this very open has just created ([`open_redb_with_retry`] uses
-    /// `Database::create`, so a read-only open of a path with no state file
-    /// lands here) or one nothing has initialised, and the caller bootstraps
-    /// it through the write path exactly as before: `rocky doctor`,
-    /// `rocky history` and `GET /api/v1/runs` on a never-run project answer
-    /// "nothing yet", not an error. That is the one write a read-only open
-    /// still performs, on a store that holds nothing; #1980 tracks replacing
-    /// it with a typed absence so a read never creates the file either.
+    /// `Ok(None)` means an existing database is empty — no table at all.
+    /// Its prior bootstrap behavior remains for compatibility. A missing
+    /// path never reaches here: opening it read-only returns typed absence.
     ///
     /// A store that holds something but lacks a table is refused with
     /// [`StateError::ReadOnlyNeedsInit`] naming the missing tables; the next
@@ -1606,9 +1650,9 @@ impl StateStore {
         // polling `/api/v1/runs` contended with the work it was reporting on
         // (#1545). The read-only path answers from a read transaction alone
         // for any store that holds something, and refuses rather than escalate
-        // here when a table is missing. The one case it hands down is an EMPTY
-        // database — the file this open has just created, or one nothing has
-        // initialised — which is bootstrapped below exactly as before (#1980).
+        // here when a table is missing. An existing EMPTY database still
+        // follows the prior bootstrap path. A missing path is refused before
+        // reaching this function.
         if matches!(mode, OpenMode::ReadOnly)
             && let Some(outcome) = Self::init_db_read_only(db, path)?
         {
@@ -2109,16 +2153,47 @@ thread_local! {
 /// (the writer holds the lock for seconds-to-minutes); inspection commands
 /// will still hit `Busy` in that scenario, but with a clear next step.
 fn open_redb_with_retry(path: &Path, cache_budget: Option<usize>) -> Result<Database, StateError> {
+    open_redb_with_retry_mode(path, cache_budget, false)
+}
+
+fn open_existing_redb_with_retry(
+    path: &Path,
+    cache_budget: Option<usize>,
+) -> Result<Database, StateError> {
+    open_redb_with_retry_mode(path, cache_budget, true)
+}
+
+fn open_redb_with_retry_mode(
+    path: &Path,
+    cache_budget: Option<usize>,
+    existing_only: bool,
+) -> Result<Database, StateError> {
     // `None` preserves redb's default cache capacity (~1 GiB). A budget is
     // only threaded through for request-local opens that read once and drop
     // the handle — see [`StateStore::open_read_only_with_cache`] for why.
-    let create = |path: &Path| match cache_budget {
-        Some(bytes) => Database::builder().set_cache_size(bytes).create(path),
-        None => Database::create(path),
+    let open = |path: &Path| match (existing_only, cache_budget) {
+        (true, Some(bytes)) => Database::builder().set_cache_size(bytes).open(path),
+        (true, None) => Database::open(path),
+        (false, Some(bytes)) => Database::builder().set_cache_size(bytes).create(path),
+        (false, None) => Database::create(path),
     };
     for attempt in 0..REDB_OPEN_RETRY_ATTEMPTS {
-        match create(path) {
+        match open(path) {
             Ok(db) => return Ok(db),
+            Err(redb::DatabaseError::Storage(redb::StorageError::Io(ref error)))
+                if existing_only && error.kind() == std::io::ErrorKind::NotFound =>
+            {
+                return match crate::path_presence::classify_not_found(path) {
+                    crate::path_presence::PathPresence::Absent => Err(StateError::NotFound {
+                        path: path.display().to_string(),
+                    }),
+                    crate::path_presence::PathPresence::Present { .. } => {
+                        Err(StateError::Database(redb::DatabaseError::from(
+                            std::io::Error::new(std::io::ErrorKind::NotFound, error.to_string()),
+                        )))
+                    }
+                };
+            }
             Err(redb::DatabaseError::DatabaseAlreadyOpen) => {
                 #[cfg(test)]
                 REDB_RETRY_OBSERVER.with(|o| {
@@ -7331,37 +7406,34 @@ mod tests {
         assert!(after_migration == std::fs::read(&path).expect("read state file"));
     }
 
-    /// A read-only open of a path with NO state file bootstraps an empty store
-    /// — the file, every table, no stamp — exactly as before this change:
-    /// `rocky doctor`, `rocky history` and `GET /api/v1/runs` on a never-run
-    /// project answer "nothing yet", not an error. That is the one write a
-    /// read-only open still performs, on a store that holds nothing (#1980).
-    /// The second read-only open then writes nothing.
+    /// Missing state is a typed absence and never leaves a database behind.
     #[test]
-    fn a_read_only_open_of_a_missing_file_bootstraps_an_empty_store_once() {
+    fn a_read_only_open_of_a_missing_file_returns_not_found_without_creating_it() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.redb");
         assert!(!path.exists(), "precondition: no state file");
+        assert!(matches!(
+            StateStore::open_read_only(&path),
+            Err(StateError::NotFound { .. })
+        ));
+        assert!(!path.exists(), "read-only open must not create state");
+        let store = StateStore::open_read_only_or_empty(&path).unwrap();
+        assert!(store.list_jobs().unwrap().is_empty());
+        drop(store);
+        assert!(!path.exists(), "empty fallback must not create state");
+    }
 
-        {
-            let store = StateStore::open_read_only(&path).expect("bootstrap from a read-only open");
-            assert!(store.get_watermark("cat.sch.tbl").unwrap().is_none());
-            assert!(store.list_jobs().unwrap().is_empty());
-            assert!(store.list_tombstones().unwrap().is_empty());
-        }
-        assert!(path.exists(), "the bootstrap created the file");
-        assert_eq!(
-            StateStore::peek_schema_version(&path).unwrap(),
-            None,
-            "a read-only bootstrap never stamps the version"
-        );
-
-        let before = std::fs::read(&path).expect("read state file");
-        drop(StateStore::open_read_only(&path).expect("second read-only open"));
-        assert!(
-            before == std::fs::read(&path).expect("read state file"),
-            "the second read-only open of the bootstrapped store wrote"
-        );
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_state_link_is_not_empty_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.redb");
+        std::os::unix::fs::symlink(dir.path().join("gone.redb"), &path).unwrap();
+        assert!(matches!(
+            StateStore::open_read_only_or_empty(&path),
+            Err(StateError::Database(_))
+        ));
+        assert!(std::fs::symlink_metadata(&path).is_ok());
     }
 
     /// An unversioned store (no `schema_version` key) that carries every

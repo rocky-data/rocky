@@ -43,10 +43,7 @@ static CLI_PARTIAL_HIT_LOGGED: OnceLock<()> = OnceLock::new();
 /// Precedence (matches the design doc §4.4):
 /// 1. `config.enabled == false` -> empty map (strict-CI posture).
 /// 2. `state_path` doesn't exist -> empty map (fresh clone, cold cache).
-///    Does **not** create `state.redb` as a side effect — calling
-///    `StateStore::open_read_only` on a non-existent path would call
-///    `Database::create` and leave a fresh empty file behind for any user
-///    who runs `rocky compile` before their first `rocky run`.
+///    The read-only open reports typed absence without creating a file.
 /// 3. Open fails (corrupt DB, permission error) -> empty map + debug log.
 ///    A broken cache should never fail typecheck.
 /// 4. Scan fails (rare — version mismatch on a table we didn't create
@@ -68,17 +65,12 @@ pub(crate) fn load_cached_source_schemas(
         return HashMap::new();
     }
 
-    // Gate on existence so we don't create an empty `state.redb` as a side
-    // effect of `rocky compile` on a fresh checkout.
-    if !state_path.exists() {
-        return HashMap::new();
-    }
-
     // `open_read_only` doesn't take the advisory write lock, so concurrent
     // `rocky run` writers are unaffected. This matters for CI systems that
     // run `rocky compile` and `rocky run` side by side.
     let store = match StateStore::open_read_only(state_path) {
         Ok(s) => s,
+        Err(rocky_core::state::StateError::NotFound { .. }) => return HashMap::new(),
         Err(e) => {
             debug!(
                 error = %e,

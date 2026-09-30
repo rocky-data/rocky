@@ -88,7 +88,7 @@ pub fn resolve_product_scope(
 /// store read-only; an absent store is an empty ledger, not an error.
 pub fn compute_audit(state_path: &Path, product: Option<AuditProductScope>) -> Result<AuditOutput> {
     let decisions = if state_path.exists() {
-        let store = StateStore::open_read_only(state_path)
+        let store = StateStore::open_read_only_or_empty(state_path)
             .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
         store
             .list_policy_decisions()
@@ -205,7 +205,7 @@ pub fn compute_audit_for(
     selector: &str,
 ) -> Result<AuditForOutput> {
     let (decisions, runs): (Vec<PolicyDecisionRecord>, Vec<RunRecord>) = if state_path.exists() {
-        let store = StateStore::open_read_only(state_path)
+        let store = StateStore::open_read_only_or_empty(state_path)
             .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
         let d = store
             .list_policy_decisions()
@@ -1025,7 +1025,7 @@ fn load_decisions_for_scorecard(state_path: &Path) -> Result<Vec<PolicyDecisionR
     if !state_path.exists() {
         return Ok(Vec::new());
     }
-    let store = StateStore::open_read_only(state_path)
+    let store = StateStore::open_read_only_or_empty(state_path)
         .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
     store
         .list_policy_decisions()

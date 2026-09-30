@@ -348,7 +348,7 @@ pub fn read_policy_show_ledger(
             )));
         }
     }
-    let store = StateStore::open_read_only(state_path)
+    let store = StateStore::open_read_only_or_empty(state_path)
         .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
     let decisions = store
         .list_policy_decisions()

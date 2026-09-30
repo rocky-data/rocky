@@ -165,7 +165,7 @@ pub fn compute_trace(
     target: &str,
     model_filter: Option<&str>,
 ) -> Result<TraceOutput> {
-    let store = StateStore::open_read_only(state_path)
+    let store = StateStore::open_read_only_or_empty(state_path)
         .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
 
     let record = resolve(&store, target)?;

@@ -5267,6 +5267,8 @@ async fn history_reports_runs_and_model_executions() {
 async fn history_is_empty_without_runs() {
     let dir = TempDir::new().unwrap();
     write_project(dir.path(), &dir.path().join("test.duckdb"));
+    let state_path = rocky_core::state::resolve_state_path(None, &dir.path().join("models")).path;
+    assert!(!state_path.exists(), "precondition: never-run project");
     let server = RockyMcpServer::new(dir.path().join("rocky.toml"));
 
     let client = connect(server).await;
@@ -5278,6 +5280,7 @@ async fn history_is_empty_without_runs() {
         .expect("structured content");
     // No runs recorded → `runs` omitted (skip_serializing_if empty), no panic.
     assert!(sc.get("runs").is_none() || sc["runs"].as_array().unwrap().is_empty());
+    assert!(!state_path.exists(), "MCP history must not create state");
 
     client.cancel().await.unwrap();
 }
