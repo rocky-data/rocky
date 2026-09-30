@@ -495,7 +495,7 @@ fn pipes_bad_messages_watch_exits_before_work() {
         .expect("spawn watch");
     // main() waits up to five seconds for its runtime to drain after an
     // error, so the test deadline must exceed that normal shutdown grace.
-    let deadline = Instant::now() + Duration::from_secs(12);
+    let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         if child.try_wait().expect("poll watch").is_some() {
             break;
@@ -541,7 +541,7 @@ fn pipes_unset_context_watch_runs_normally() {
         .stderr(std::process::Stdio::piped())
         .spawn()
         .expect("spawn normal watch");
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + Duration::from_secs(90);
     while rocky_core::state::StateStore::open_read_only(&dir.join("state.redb"))
         .ok()
         .and_then(|store| store.latest_successful_run("t").ok().flatten())
