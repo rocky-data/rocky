@@ -1,6 +1,6 @@
 [project]
 name = "dagster-rocky"
-version = "1.66.0"
+version = "1.67.0"
 description = "Dagster integration for the Rocky SQL transformation engine"
 readme = "README.md"
 license = "Apache-2.0"
@@ -43,12 +43,13 @@ dependencies = [
     # 0.15.0: `resource.py` imports ProductJournalOutput, ProductListOutput and
     # ScheduleSpoolOutput, and `component.py` reads RunResult.check_gate_failed.
     # None of them exists in 0.14.0, so the same import-time failure applies.
-    # Release rocky-sdk 0.15.0 BEFORE dagster-rocky 1.66.0.
-    # MIN_ROCKY_VERSION moved to 1.35.0 in the SDK after 0.15.0 (#1984). A
-    # dagster-rocky release that claims the 1.35.0 floor needs the rocky-sdk
-    # release that carries it: release that SDK first, then raise this floor
-    # to it. Against rocky-sdk 0.15.0 only the "no plan_id" hint text changes.
-    "rocky-sdk>=0.15.0",
+    # 0.16.0: MIN_ROCKY_VERSION moved to 1.35.0 (#1984), and only rocky-sdk
+    # 0.16.0 carries that floor. `dagster_rocky` re-exports MIN_ROCKY_VERSION
+    # from the SDK, so a dagster-rocky release that claims the 1.35.0 floor
+    # needs this SDK release. Against rocky-sdk 0.15.0 only the "no plan_id"
+    # hint text changes.
+    # Release rocky-sdk 0.16.0 BEFORE dagster-rocky 1.67.0.
+    "rocky-sdk>=0.16.0",
     # Floor matches the version CI actually resolves and tests (uv.lock). The
     # RockyComponent path uses dagster.components.* APIs from preview namespaces,
     # so we advertise a tested floor rather than an older, never-exercised one.

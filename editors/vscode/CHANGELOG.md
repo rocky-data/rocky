@@ -5,7 +5,33 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.42.0] — 2026-09-30
+
+Pairs with engine 1.75.0.
+
+### Changed
+
+- **The preview diff shows an unmeasured row count as `?`, not as zero.** When Rocky could not read a model's row count on one side, the diff used to show no row change for it, which read as unchanged. The tree row now shows `?`. The summary line and the **Rocky: Preview Diff** message add `, N unknown` when any model is unmeasured. The hover text for a model now lists its row counts (`Rows: +a / -r / ~c`), and the diff text prints `?` where a count is unmeasured. (#2032)
+- **The name prompts of the branch and preview commands suggest names the engine accepts.** The examples are now `fix_price` and `pr_preview_fix_price`. The engine takes 1 to 64 ASCII letters, digits or underscores for a new branch name, so the old hyphenated examples `fix-price` and `preview-fix-price` would be refused. (#2137)
+- **A failed `Compare Shadow vs Production` still opens its per-table results.** `rocky compare` exits non-zero when a table fails, but it still writes its per-table JSON to stdout. The command now shows the error and then opens that JSON in an editor tab. It does this only when the output is a compare result (`command` is `compare`, with `results` and `tables_failed`). Any other output is not shown as a compare result. (#2137)
+- **The bundled sidecar schema lists `drop_existing_kind`.** The key is a model's standing permission to drop an existing `table` or `view` target when the model switches between `full_refresh` and `view`. `schemas/rocky-config.schema.json` is registered for JSON validation only, so it does not check `.toml` sidecars in the editor. (#2037)
+- **The bundled `rocky.toml` schema follows the engine.** `[checks.freshness]` loses `overrides`, which the engine removed because nothing ever read it (#1620). The example defaults for `anomaly_threshold_pct` and `fail_on_error` read `50.0` and `true` (#1924). The `prune_unchanged` hover says an incremental table is never pruned until it has a recorded watermark (#1969). The `concurrency_control` hover names the writers that are still outside compare-and-swap (#1989, #2033). `src/types/generated/rocky_project.ts` carries the same changes.
+- **Regenerated TypeScript bindings for engine 1.75.0.** For a TypeScript consumer:
+  - New module `settings`, exported from the barrel: `SettingsOutput`, `TokenSettings`, `WebhookSecretStatus`, `ConfigStatus` and `TokenScopeLabel` (#1907). The barrel also exports `AnomalyEvaluationOutput`.
+  - `RunOutput` gains optional `anomaly_evaluated` (#1790). `MaterializationOutput` gains optional `notes` (#2037). `DriftActionOutput`, `AnomalyOutput` and `AnomalyEvaluationOutput` have a **required** `asset_key: string[]` (#2073). **On upgrade:** a TypeScript object literal typed as one of them must now supply `asset_key`, or it stops type-checking.
+  - `PlanOutput` gains optional `skipped`, a list of the new `SkippedModel` (#1996).
+  - `TableCompareResult`: `production_count`, `shadow_count` and `row_count_diff_pct` become optional and nullable. It gains a **required** `reasons: string[]` (#2137).
+  - `PreviewDiffSummary` gains a **required** `models_unknown`. `rows_added` and `rows_removed` on `PreviewSampledRowDiff` become optional and nullable (#2032).
+  - `RunHistoryRecord` gains optional `rocky_branch` (#2032). `PromotePlan` gains optional `pipeline` (#2019).
+  - `ReviewQueueEntry.classification_weight` is renamed `change_class_weight`. The field is required, so code that names the old key stops type-checking (#2009).
+  - `ModelDetail` loses `incrementality_hint`, and `OptimizeOutput` loses `incrementality_note`. `IncrementalityHint` and `Confidence` are gone from `compile.ts` (#1990).
+  - The freshness config loses `overrides` (#1620).
+  - The barrel no longer re-exports `PolicyLedgerSource` and `PolicyMarkerSource`. Both are still exported from `src/types/generated/policy_show.ts` (#1907).
+  - Doc comments change for `ErrorEnvelope`, which lists the `state_needs_migration` code (#1981), for `PreviewRowsOutput`, which says a classified column with no mask strategy refuses the preview (#2029), and for the `ephemeral` strategy, which Rocky now refuses with E038 (#1996).
+- **Dependencies.**
+  - `vscode-languageclient` 10.1.1 → 10.1.2 is the extension's one production dependency, so it ships. Its protocol packages move with it in the lockfile: `vscode-languageserver-protocol` 3.18.4, `vscode-jsonrpc` 9.0.3, `vscode-languageserver-types` 3.18.4 and `vscode-languageserver-textdocument` 1.0.15 (#2184).
+  - `react` and `react-dom` 19.2.8 → 19.3.0 (#1963) and `@xyflow/react` 12.11.6 → 12.12.0 (#2184) are dev dependencies, but esbuild bundles them into the webview panels, so they ship too.
+  - Dev only: `@vscode/vsce` 3.9.1 → 4.0.0 (#2095), `mocha` 12.0.2 (#2094), `vitest` 5.0.2 (#2094, #2184), `jsdom` 30.1.1 (#2094, #2184), `eslint` 10.11.0 (#1963, #2117), `typescript-eslint` 8.70.1 (#1963, #2184), `@types/node` 26.6.2 (#1963, #2094, #2117), and `@types/react` and `@types/react-dom` 19.3.0 (#1963).
 
 ### Fixed
 

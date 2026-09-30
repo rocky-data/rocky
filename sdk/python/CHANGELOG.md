@@ -5,7 +5,9 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.16.0] — 2026-09-30
+
+Pairs with engine 1.75.0.
 
 ### Added
 
@@ -19,6 +21,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`MIN_ROCKY_VERSION` is `1.35.0`, up from `1.34.0`.** The floor is shared with `dagster-rocky`, whose plan/apply path needs a `plan_id` from `rocky plan` for every project shape, and a replication-only project first got a content-addressed `plan_id` in engine 1.35.0. Against a 1.34.x binary the old floor passed the version check and the run then failed with "rocky plan did not emit a plan_id", with a hint naming the version already installed. A 1.34.x binary is now refused by `RockyVersionError` before any command runs. (#1984)
 - **`DriftAction`, `AnomalyResult` and `AnomalyEvaluation` gain `asset_key`.** The Dagster-style asset key path, the same convention `MaterializationInfo`/`TableError` already carry, so a consumer can key off it without re-deriving it from `table`. Added to the hand-written runtime models and the generated ones, required on both — no back-compat default for an engine that predates this field, matching every other required field in `schemas/run.schema.json`. Needs engine #2073. (#2073)
 - **`RockyClient` no longer passes inherited `DAGSTER_PIPES_*` variables to the `rocky` it starts.** A script that Dagster launched through Pipes, and that calls `rocky` through `RockyClient`, used to hand `rocky` the script's own Pipes channel. From the next engine release, `rocky` refuses to run when it cannot open that channel. The client now removes every `DAGSTER_PIPES_*` variable from the child environment of its ordinary calls. Dagster's own Pipes launch of `rocky apply` (through `PipesSubprocessClient`) keeps them. (#2164)
+- **`MaterializationInfo` gains `notes`.** A list of run notes for one materialization. It holds a completed switch between `view` and `full_refresh`, and why `drop_existing_kind` was not used after a failed kind probe. It is empty when there is nothing to report. Added to the hand-written runtime models and the generated `MaterializationOutput`. An engine that does not emit the field parses as before, with an empty list. (#2037)
+- **`PlanResult` gains `skipped`.** One `SkippedModel` (`model` and `reason`) for each model `rocky plan` left out of the preview: a strategy the compiler refuses (`ephemeral`, E038), or SQL that needs a live warehouse to render. It is empty when every model rendered. Added to the hand-written runtime models and the generated ones. An engine that does not emit the field parses as before, with an empty list. (#1996)
+- **`RunResult.contained` now also fills after an upstream compile failure.** The field and `ContainedModel` are unchanged. The engine now withholds the declared downstream models of a selected model that fails to compile, and lists them there whether or not `[resilience] contain_failures` is on. Only the docstrings change. (#2101)
+- **`RockyClient.plan()` says a compile refusal raises `RockyCommandError`.** The engine now refuses to persist a plan when compilation reports an error for a planned model, and exits with code 1 (#2173). `plan()` raises, as it does for any failing command. The docstring now says so, and says a `plan_id` exists only when Rocky persisted a plan. No code change.
+- **Regenerated models for engine 1.75.0.** For a consumer of the generated models:
+  - `SettingsOutput` and `TokenSettings` are new, for `GET /api/v1/settings`. They are exported from `rocky_sdk.types_generated`. There is no client method, because the route has no CLI command (#1907).
+  - `TableCompareResult.production_count`, `shadow_count` and `row_count_diff_pct` are now nullable. A count Rocky could not read is `None`, not zero. `TableCompareResult` also gains a **required** `reasons: list[str]`, so code that builds one by hand must supply it (#2137).
+  - `PreviewDiffSummary` gains a **required** `models_unknown`. `PreviewSampledRowDiff.rows_added` and `rows_removed` are nullable: `None` means the row count was not measured, which is not the same as zero (#2032).
+  - `RunHistoryRecord` gains an optional `rocky_branch`, the `--branch` name a run wrote to (#2032).
+  - `PromotePlan` gains an optional `pipeline`, the pipeline the promote was built against (#2019).
+  - The generated `FreshnessConfig` loses `overrides`, because the engine removed the key (#1620).
+  - Doc comments and example defaults change. The example defaults for `anomaly_threshold_pct` and `fail_on_error` on the pipeline config models now read `50.0` and `True` (#1924). `ErrorEnvelope` lists the `state_needs_migration` code (#1981). The `ephemeral` variant of `StrategyConfig` says Rocky refuses the strategy with E038 (#1996). The example `PreviewCreateOutput` schema prefix uses underscores (#2137).
 
 ## [0.15.0] — 2026-09-12
 
