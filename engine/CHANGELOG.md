@@ -69,6 +69,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **New branch names now use 1–64 ASCII letters, digits, or underscores at every unquoted SQL-backed entry point.** Invalid names fail before config or state I/O. Git-derived preview names use underscores. `branch compare` reports unreadable counts as null with an error reason instead of inventing zero. The preview action defaults to `pr_<PR number>_<head slug>` within the 64-character limit, so separate PRs cannot replace the same preview schema through slug collisions. Legacy names can still be listed, shown, approved, and promoted; deleting a branch record leaves warehouse tables and does not revoke an already persisted promote plan. (#2137)
 
+- **Trino quarantine `drop` can write its valid table again on a later run.** Rocky now runs `DROP TABLE IF EXISTS` before Trino's plain `CREATE TABLE AS` for the valid table. Trino `tag` is refused during quarantine compilation with advice to use `drop`, because its output is also its source. `split` remains refused. Other dialects keep their existing SQL. (#2063)
+
 ### Added
 
 - **A selected transformation model can require its explicit contract during `rocky run`.** `rocky run --pipeline <name> --model <name> --contracts <dir>` checks that model's contract in the same compile result used for execution. A missing contract or an `E010` violation fails before replacing the selected table. This first guarded route supports one `full_refresh` model; it refuses defer, branch/shadow, partition, resume, idempotency, skip, governed apply, and post-compile surrogate keys. Other run routes do not gain this guarantee. Model-only run JSON now correctly reports `pipeline_type: "transformation"`. (#2182)
