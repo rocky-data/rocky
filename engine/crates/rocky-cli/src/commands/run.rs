@@ -21238,7 +21238,8 @@ auto_create_schemas = true
     /// itself, but that call still runs AFTER `governance_setup`, so
     /// `auto_create_schemas` had already created both target schemas by the
     /// time it fired (a real review finding against the HEAD binary — the
-    /// schema-absence assertions below exist because of it).
+    /// schema-absence assertions below exist because of it). That post-resume
+    /// call has since been removed.
     ///
     /// Uses a `cross_source_overlap` collision deliberately: that check name
     /// depends on which tables discovery actually finds siblings for, so

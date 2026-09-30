@@ -131,14 +131,15 @@ pub async fn plan(
     output.env = env.map(str::to_string);
 
     // #1941: one (target table name, source_type) pair per table that
-    // survives this loop's own skip conditions (filter, source listing,
-    // disabled override),
+    // survives this loop's own skip conditions (filter, disabled override),
     // collected below and checked once the loop ends — before this plan is
     // persisted (`output.plan_id`). Without this, `rocky plan` exits 0 and
     // persists a plan a later `rocky apply` (which re-executes `run()`,
     // where the same collision refuses) would then reject — late, and
     // outside the bounded, watchdog-covered plan step Dagster Pipes relies
-    // on for this check.
+    // on for this check. Plan does not list source tables: it can refuse a
+    // collision for a discovered table that run later skips as missing from
+    // the source, but it cannot miss a collision that run would check.
     let mut collision_check_pairs: Vec<(String, String)> = Vec::new();
 
     // Detect whether this dialect supports catalogs. Dialects without catalog
@@ -207,23 +208,6 @@ pub async fn plan(
 
         // Per-table copy SQL
         let source_catalog = pipeline.source.catalog.as_deref().unwrap_or("").to_string();
-        let source_tables: std::collections::HashSet<String> = warehouse_adapter
-            .list_tables(&source_catalog, &conn.schema)
-            .await
-            .map(|tables| {
-                tables
-                    .into_iter()
-                    .map(|table| table.to_lowercase())
-                    .collect()
-            })
-            .unwrap_or_else(|e| {
-                tracing::warn!(schema = %conn.schema, error = %e,
-                    "failed to list source tables, will process all discovered tables");
-                conn.tables
-                    .iter()
-                    .map(|table| table.name.to_lowercase())
-                    .collect()
-            });
         let effective_source_catalog = if supports_catalogs {
             source_catalog
         } else {
@@ -232,9 +216,6 @@ pub async fn plan(
         for table in &conn.tables {
             // PR-B3: CLI `--filter table=<literal>` consumed here.
             if !filter_table_matches(parsed_filter.as_ref(), &table.name) {
-                continue;
-            }
-            if !source_tables.contains(&table.name.to_lowercase()) {
                 continue;
             }
             let target_label = if effective_target_catalog.is_empty() {
@@ -288,11 +269,9 @@ pub async fn plan(
             };
             collision_check_pairs.push((check_table_name, conn.source_type.clone()));
 
-            // Resolved AFTER the exclusion branches, mirroring `rocky run`,
-            // which preflights the same value only for a table that survives
-            // the filter / missing-from-source / disabled skips. Resolving
-            // earlier would let `plan` refuse a source schema whose tables
-            // `run` never renders.
+            // Resolved AFTER the filter and disabled-override exclusions.
+            // Unlike `run`, plan does not query the warehouse to exclude
+            // tables missing from its current source listing.
             //
             // Same producer `run` uses, so the preview and the run cannot
             // disagree: it substitutes the warehouse-derived schema
@@ -3622,7 +3601,7 @@ threshold = 0
     async fn plan_collision_fixture(
         options: PlanRunOptions,
         separate_source: bool,
-        shadow_named_custom: bool,
+        custom_name: &str,
     ) -> anyhow::Result<()> {
         use rocky_core::traits::WarehouseAdapter;
         use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
@@ -3669,11 +3648,6 @@ table = "m"
             )?;
         }
         let config_path = dir.path().join("rocky.toml");
-        let custom_name = if shadow_named_custom {
-            "cross source overlap duckdb orders rocky shadow"
-        } else {
-            "cross source overlap duckdb orders"
-        };
         std::fs::write(
             &config_path,
             format!(
@@ -3738,7 +3712,7 @@ threshold = 0
                 ..Default::default()
             },
             false,
-            false,
+            "cross source overlap duckdb orders",
         )
         .await
         .expect("a selected model does not run replication checks");
@@ -3753,7 +3727,7 @@ threshold = 0
                 ..Default::default()
             },
             false,
-            false,
+            "cross source overlap duckdb orders",
         )
         .await
         .expect("the shadow name does not collide with the production check name");
@@ -3761,10 +3735,18 @@ threshold = 0
 
     #[cfg(feature = "duckdb")]
     #[tokio::test]
-    async fn plan_skips_check_collisions_for_tables_missing_from_source() {
-        plan_collision_fixture(PlanRunOptions::default(), true, false)
-            .await
-            .expect("a missing source sibling is not run or checked");
+    async fn plan_refuses_discovered_collision_without_listing_source_tables() {
+        let error = plan_collision_fixture(
+            PlanRunOptions::default(),
+            true,
+            "cross source overlap duckdb orders",
+        )
+        .await
+        .expect_err("plan checks discovered tables without a warehouse listing");
+        assert!(
+            format!("{error:#}").contains("cross_source_overlap:duckdb.orders"),
+            "{error:#}"
+        );
     }
 
     #[cfg(feature = "duckdb")]
@@ -3776,7 +3758,7 @@ threshold = 0
                 ..Default::default()
             },
             false,
-            true,
+            "cross source overlap duckdb orders rocky shadow",
         )
         .await
         .expect_err("the shadow check names collide");
@@ -3784,6 +3766,46 @@ threshold = 0
         assert!(
             message.contains("cross_source_overlap:duckdb.orders_rocky_shadow"),
             "{message}"
+        );
+    }
+
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn plan_shadow_schema_keeps_the_original_table_name_for_checks() {
+        let error = plan_collision_fixture(
+            PlanRunOptions {
+                shadow: true,
+                shadow_schema: Some("preview".into()),
+                ..Default::default()
+            },
+            false,
+            "cross source overlap duckdb orders",
+        )
+        .await
+        .expect_err("a shadow schema does not suffix table names");
+        assert!(
+            format!("{error:#}").contains("cross_source_overlap:duckdb.orders"),
+            "{error:#}"
+        );
+    }
+
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn plan_custom_shadow_suffix_uses_the_written_table_name_for_checks() {
+        let error = plan_collision_fixture(
+            PlanRunOptions {
+                shadow: true,
+                shadow_suffix: Some("_preview".into()),
+                ..Default::default()
+            },
+            false,
+            "cross source overlap duckdb orders preview",
+        )
+        .await
+        .expect_err("the custom suffix changes the collision name");
+        assert!(
+            format!("{error:#}").contains("cross_source_overlap:duckdb.orders_preview"),
+            "{error:#}"
         );
     }
 
