@@ -1002,21 +1002,21 @@ For the prune set, adapter copy methods, and diff coverage, see [How Preview Wor
 
 ```bash
 rocky preview create --base <ref> [--name <branch_name>]
-rocky preview diff   --name <branch_name> [--base <ref>] [--sample-size <N>]
-rocky preview cost   --name <branch_name> [--base <ref>]
+rocky preview diff   --name <branch_name> [--base <ref>]
+rocky preview cost   --name <branch_name>
 rocky preview rows   --model <name> [--cte <name>] [--limit <N>]
 ```
 
-`preview create`, `preview diff`, and `preview cost` accept `--output json|markdown`. The Markdown form is pre-rendered for posting to a PR comment; the JSON form embeds the same Markdown in a top-level `markdown` field for orchestrator use.
+`preview diff` and `preview cost` put a pre-rendered Markdown report in the `markdown` field of their JSON output. It is ready to post as a PR comment. `preview create` has no such field. There is no `--output markdown`: the valid values are `json`, `table`, and `md`, and `md` behaves like `table` here.
 
 ### `rocky preview create`
 
-Compute the prune set and copy the rest from the base schema into a per-PR branch. It does not run the prune set: it reports `run_status: "planned"` with an empty `run_id`. Run `rocky run --branch <name>` over the prune set before `preview diff` or `preview cost`. `preview diff` pairs the run by its recorded `rocky_branch`, the literal `--branch` value. The base run must be an ordinary production run, without `--branch` or `--shadow`.
+Compute the prune set and copy the rest from the base schema into a per-PR branch. It does not run the prune set: it reports `run_status: "planned"` with an empty `run_id`. Run `rocky run --branch <name>` before `preview diff` or `preview cost`. That command has no selector for a set of models: it builds the whole pipeline, or one model with `--model`. Both preview commands read only the newest branch run. They find it by its recorded `rocky_branch`, the literal `--branch` value, not by the git branch you have checked out. The base run must be an ordinary production run, without `--branch` or `--shadow`.
 
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
 | `--base <REF>` | `string` | `main` | Git ref the change-set is computed against. Rocky shells out to `git diff --name-only <base>...HEAD` against the models directory. |
-| `--name <NAME>` | `string` | derived from current branch | Branch name to register in the state store. The branch's `schema_prefix` becomes `branch__<name>` and is the target schema for the pruned run. |
+| `--name <NAME>` | `string` | `pr_preview_<current git branch>` | Branch name to register in the state store. Use 1 to 64 characters from `[A-Za-z0-9_]`. The default is `pr_preview_` plus the git branch name, with every other character replaced by `_`, cut to 64 characters. On a detached HEAD, it is `pr_preview_` plus a timestamp. The branch's `schema_prefix` becomes `branch__<name>` and is the target schema for the pruned run. |
 | `--models <PATH>` | `PathBuf` | `models` | Directory containing model files. |
 
 **Example.** Diff against `main` and create a preview branch:
@@ -1052,20 +1052,25 @@ rocky preview create --base main
 
 ### `rocky preview diff`
 
-Compare the branch run with the base run, for every model in the prune set.
+Compare the branch run with the base run, for every model the branch run executed.
+
+Rocky finds both runs in the state store. The branch run is the newest run recorded with `rocky run --branch <name>`. The base run is the newest run made without `--branch` on the git branch or commit that `--base` names. If there is no such base run, the diff stays empty and `base_note` says why.
 
 By default this compares the `rows_affected` the two run records hold. It reports `rows_added` and `rows_removed`, leaves `rows_changed` at 0, returns no samples and no column-level delta, and sets `coverage: "not_yet_sampled"` with `coverage_warning: true`.
 
-Two limits follow. A change that rewrites values without changing row counts shows nothing. And an ordinary transformation run records no `rows_affected` at all, which the diff reports as unknown rather than zero.
+Two limits follow. A change that rewrites values without changing row counts shows nothing. And an ordinary transformation run records no `rows_affected` at all.
+
+A model with no recorded row count has an unknown delta. When it ran on both sides, `rows_added` and `rows_removed` are `null`. When it ran only on the branch, `rows_added` is `null` and `rows_removed` is `0`. The Markdown shows `?` for `null`. `summary.models_unknown` counts these models. Rocky counts them as neither changed nor unchanged, and leaves them out of `total_rows_added` and `total_rows_removed`.
 
 Pass `--algorithm bisection` to compare row content. It needs a `Merge` model whose single `unique_key` holds whole numbers: the bounds are parsed as integers, so a decimal key falls back to the default comparison without saying so. Read each model's `algorithm.kind` before you treat its result as a content comparison.
 
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
-| `--name <NAME>` | `string` | **(required)** | Branch name created by `preview create`. |
-| `--base <REF>` | `string` | `main` | Git ref to compare against. Must match what `preview create` was invoked with. |
+| `--name <NAME>` | `string` | **(required)** | Branch name created by `preview create`. Rocky matches it against the `rocky_branch` recorded on each run. |
+| `--base <REF>` | `string` | `main` | Git branch name or commit that the base run was recorded on. A commit can be a full sha or a prefix of at least 7 characters. It must differ from `--name`. |
 | `--models <PATH>` | `PathBuf` | `models` | Models directory. Bisection reads each model's primary-key column from here. |
-| `--sample-size <N>` | `usize` | `1000` | Accepted and ignored today. The default comparison samples no rows, so this value changes nothing ([#2032](https://github.com/rocky-data/rocky/issues/2032)). |
+
+The old `--sample-size` flag is gone. Nothing read it, so Rocky removed it. A script that still passes it now fails to parse.
 
 **Example.** Print a Markdown report ready to post on a PR:
 
@@ -1077,11 +1082,11 @@ There is no `--output markdown`. The report lives in the `markdown` field of the
 
 ### `rocky preview cost`
 
-Per-model cost delta between the branch run and the latest base-schema `RunRecord`.
+Per-model cost delta between the branch run and a base run. The branch run is the newest run recorded with `rocky run --branch <name>`. The base run is the newest run other than the branch's own. A run made without `--branch` on a git branch with the same name counts as the branch's own. Any other run can be the base, including a run made with another `--branch` name. `preview cost` has no `--base` flag.
 
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
-| `--name <NAME>` | `string` | **(required)** | Branch name created by `preview create`. |
+| `--name <NAME>` | `string` | **(required)** | Branch name created by `preview create`. Rocky matches it against the `rocky_branch` recorded on each run. |
 | `--models <PATH>` | `PathBuf` | `models` | Models directory. Rocky reads per-model `[budget]` blocks from the sidecars here, so a projected breach can name a single model. |
 
 **Example.**
@@ -1090,7 +1095,7 @@ Per-model cost delta between the branch run and the latest base-schema `RunRecor
 rocky preview cost --name pr_preview_fix_price --output json | jq -r .markdown
 ```
 
-The JSON shape (`PreviewCostOutput`) carries the Markdown report in its `markdown` field. It reports per-model `delta_usd`, `branch_duration_ms`, `base_duration_ms`, and bytes scanned, plus an aggregate `summary.delta_usd`, `summary.savings_from_copy_usd`, and `models_skipped_via_copy`. Underlying cost math is identical to [`rocky cost`](/reference/commands/administration/#rocky-cost) (Databricks / Snowflake duration × DBU rate; BigQuery bytes × $/TB; DuckDB zero); fields fall back to `null` when no base `RunRecord` exists or when the adapter does not surface USD.
+The JSON shape (`PreviewCostOutput`) carries the Markdown report in its `markdown` field. It reports per-model `delta_usd`, `branch_duration_ms`, `base_duration_ms`, and bytes scanned, plus an aggregate `summary.delta_usd`, `summary.savings_from_copy_usd`, and `models_skipped_via_copy`. Underlying cost math is identical to [`rocky cost`](/reference/commands/administration/#rocky-cost) (Databricks / Snowflake duration × DBU rate; BigQuery bytes × $/TB; DuckDB zero). USD fields are left out when the adapter does not surface USD. With no base run, `base_run_id` is left out and `per_model` is empty.
 
 ### `rocky preview rows`
 

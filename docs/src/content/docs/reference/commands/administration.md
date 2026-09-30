@@ -65,6 +65,8 @@ rocky history
 }
 ```
 
+A run made with `rocky run --branch <name>` also carries `rocky_branch`, the literal `<name>`. Rocky leaves the field out of any other run. It is not an audit field, so it appears with or without `--audit`. `rocky preview diff` and `rocky preview cost` find a branch's run by it. It differs from `git_branch`, the git branch you had checked out, which appears only with `--audit`.
+
 Show one run by id. The document has the list's shape with `count` set to `1`; add `--audit` for its governance trail:
 
 ```bash
@@ -281,7 +283,7 @@ rocky metrics fct_revenue --column net_revenue --alerts
 
 ## `rocky optimize`
 
-Analyze materialization costs and recommend strategy changes. Reviews execution history, row counts, and query patterns to suggest whether a model should use incremental, full refresh, or table materialization.
+Analyze materialization costs and recommend strategy changes. Reviews each model's run history, output size, and downstream consumers to suggest whether it should be a `view` or a `table`.
 
 ```bash
 rocky optimize [flags]
@@ -292,10 +294,11 @@ rocky optimize [flags]
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
 | `--model <NAME>` | `string` | | Filter to a specific model. If omitted, analyzes all models. |
+| `--models <PATH>` | `string` | `models` | Models directory. Rocky reads each model's strategy and its downstream models from it. If the path is not a directory, every model reports `current_strategy: "unknown"` and gets no recommendation. |
 
 ### Examples
 
-Analyze all models. Each recommendation includes the current and recommended strategy, a free-text reasoning, and an estimated monthly compute savings. `current_strategy` comes from the model's own configuration, not a guess:
+Analyze all models. Each recommendation includes the current and recommended strategy, a free-text reasoning, and an estimated monthly saving. `current_strategy` comes from the model's own configuration, not a guess. A `full_refresh` model reads `table`. Every other strategy reads as its own name, such as `view`, `merge`, or `incremental`:
 
 ```bash
 rocky optimize
@@ -331,7 +334,7 @@ rocky optimize
 }
 ```
 
-`rocky optimize` recommends `table` or `view`. A model needs at least 5 recorded runs; with fewer, it keeps its current strategy. Prices come from the project's `[cost]` block when it sets one, and fall back to Rocky's built-in rates otherwise.
+`rocky optimize` recommends `table` or `view`. A model needs at least `min_history_runs` recorded runs, which is 5 unless `[cost]` says otherwise. With fewer, it keeps its current strategy. Prices come from the [`[cost]`](/reference/configuration/#cost) block in `rocky.toml`. Rocky falls back to its built-in rates when the project has no `rocky.toml` or no `[cost]` block. A `rocky.toml` that exists but fails to load stops the command with an error.
 
 `current_strategy` is `"unknown"` when Rocky cannot find the model in the compiled project, for example a model seen only in run history:
 

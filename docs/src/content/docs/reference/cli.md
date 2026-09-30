@@ -553,12 +553,15 @@ rocky compare [--filter <key=value>] [flags]
       "row_count_diff_pct": 0.0,
       "schema_match": true,
       "schema_diffs": [],
-      "verdict": "pass"
+      "verdict": "pass",
+      "reasons": []
     }
   ],
   "overall_verdict": "pass"
 }
 ```
+
+`verdict` is `pass`, `warn`, `fail`, or `error`. `reasons` says why a table is not `pass`. An `error` row means Rocky could not read a table or its schema on one side. The count it could not read is `null`, never `0`. `row_count_diff_pct` is `null` unless Rocky read both counts. Rocky counts an `error` row in `tables_failed`, so `overall_verdict` is `fail` and the command exits non-zero.
 
 ---
 

@@ -1094,13 +1094,14 @@ runs_per_month         history_runs ÷ the span in days of the last 100
 
 Two of those are rougher than they look. The size input reads the oldest recorded write, not the newest, so a model that grew will be costed as if it had not. The rate input mixes one model's execution count with the project's run span, so it is a per-project rate, not a per-model one.
 
-Prices come from built-in defaults: $0.023 per GB-month of storage and $0.002 per second of compute.
+Prices come from the `[cost]` block in `rocky.toml`. Without one, the defaults apply. Storage costs $0.023 per GB-month. Compute costs $0.40 per DBU, and a Medium warehouse uses 24 DBU per hour, so about $0.0027 per second. A `rocky.toml` that exists but fails to load stops the command with an error.
 
-It recommends one of three strategies, and never any other:
+It recommends `view` or `table`. When it has too little to go on, it keeps the current strategy instead. The history threshold, `min_history_runs`, is 5 unless `[cost]` says otherwise:
 
 ```
-history_runs < 5?                  →  keep the current strategy, reason
-                                      "insufficient history: N runs (need 5)"
+model not in the models dir?       →  "unknown", no recommendation
+history_runs < min_history_runs?   →  keep the current strategy, reason
+                                      "insufficient history: N runs (need M)"
 under 2s and at most 1 consumer?   →  view
 2 or more consumers?               →  table, unless recomputing for each
                                       consumer is cheaper than storing once,
@@ -1125,7 +1126,7 @@ Total estimated monthly savings: $0.01
 Models analyzed: 5
 ```
 
-Read `CURRENT` with care. The command does not read each model's declared strategy; it reports `table` for every model ([#2056](https://github.com/rocky-data/rocky/issues/2056)). It used to recommend `ephemeral` here. That strategy is refused now (`E038`), because Rocky never inlined such a model into its consumers.
+`CURRENT` is the strategy in each model's own configuration. A `full_refresh` model reads `table`, and every model in this run uses `full_refresh`. Other strategies read as their own name, such as `view`, `merge`, or `incremental`. A model that appears in run history but not in the models directory reads `unknown` and gets no recommendation. The command used to recommend `ephemeral` here. That strategy is refused now (`E038`), because Rocky never inlined such a model into its consumers.
 
 ---
 
@@ -1531,9 +1532,13 @@ Reference: [product commands](https://rocky-data.dev/reference/commands/products
 
 ## 35. Branches, Previews, and Run Forensics
 
-**Branches.** A branch is the named, persistent form of shadow mode. `rocky branch create <name>` records a `schema_prefix` in the state store; `rocky run --branch <name>` then applies that prefix to every model target. `branch list` and `branch show` report what exists, `branch compare` diffs the branch's tables against production, and `branch approve` writes an approval artifact stamped with a blake3 digest of its own canonical JSON (an integrity digest, not a cryptographic signature: nothing holds a key). `branch promote` then copies each table with `CREATE OR REPLACE TABLE <prod> AS SELECT * FROM <branch>`, so the branch tables stay where they are. `branch delete` removes the record and drops no warehouse table.
+**Branches.** A branch is the named, persistent form of shadow mode. `rocky branch create <name>` records a `schema_prefix` in the state store; `rocky run --branch <name>` then applies that prefix to every model target. A branch name is 1 to 64 characters from `[A-Za-z0-9_]`, because the schema is `branch__<name>`. `branch list` and `branch show` report what exists, and `branch compare` diffs the branch's tables against production. A table that `branch compare` cannot read reports `verdict: "error"` and a `null` count, never `0`.
 
-**Previews.** `rocky preview` is the PR workflow, and it plans more than it executes. `preview create` registers the branch, works out which models changed and which can be copied from the base schema, and reports `run_status: "planned"`. It runs nothing: you then run `rocky run --branch <name>` over the models in its `prune_set`. `preview diff` compares the two runs' recorded `rows_affected` counts by default, so it reports rows added and removed, leaves the structural arrays empty, reports `rows_changed: 0`, and marks its coverage `not_yet_sampled` with a warning. Pass `--algorithm=bisection` for a row-content diff. `preview cost` produces a per-model bytes, duration, and USD delta. The last two put a rendered PR comment in the `markdown` field of their JSON; there is no `--output markdown`. A fourth subcommand, `preview rows`, samples rows for one model with its classified columns masked inline (section 17).
+`branch approve` writes an approval artifact stamped with a blake3 digest of its own canonical JSON (an integrity digest, not a cryptographic signature: nothing holds a key). `branch promote` then copies each table with `CREATE OR REPLACE TABLE <prod> AS SELECT * FROM <branch>`, so the branch tables stay where they are. `branch delete` removes the record and drops no warehouse table.
+
+**Previews.** `rocky preview` is the PR workflow, and it plans more than it executes. `preview create` registers the branch, works out which models changed and which can be copied from the base schema, and reports `run_status: "planned"`. It runs nothing. You then run `rocky run --branch <name>`, which builds the whole pipeline, or one model with `--model`. That run records the name as `rocky_branch`. `preview diff` and `preview cost` find the newest branch run by it, not by the git branch you have checked out.
+
+`preview diff` compares the two runs' recorded `rows_affected` counts by default, so it reports rows added and removed, leaves the structural arrays empty, reports `rows_changed: 0`, and marks its coverage `not_yet_sampled` with a warning. A model whose run recorded no row count reports `null` rows added, never `0`, and `summary.models_unknown` counts it. Pass `--algorithm=bisection` for a row-content diff. `preview cost` produces a per-model bytes, duration, and USD delta. The last two put a rendered PR comment in the `markdown` field of their JSON; there is no `--output markdown`. A fourth subcommand, `preview rows`, samples rows for one model with its classified columns masked inline (section 17).
 
 **Forensics.** Three commands read a recorded run out of the state store. `rocky replay <run-id|latest>` shows what ran, with SQL hashes, row counts, and timings; `--check` audits whether the recording alone is enough to re-execute it. `rocky trace <run-id|latest>` renders the same run as a timeline with concurrency lanes. `rocky cost <run-id|latest>` rolls up per-model cost using the same formula the live run summary uses.
 

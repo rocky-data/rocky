@@ -303,6 +303,7 @@ Set the pass, warn, and fail thresholds:
 | **Pass** | All comparisons within thresholds |
 | **Warn** | Minor differences detected (e.g., row count within warn threshold, column order change) |
 | **Fail** | Significant differences (e.g., row count beyond fail threshold, missing columns, type changes) |
+| **Error** | Rocky could not read a table or its schema on one side. The count it could not read is `null`, and `reasons` in the JSON says why. Rocky counts an error as a failure. |
 
 ## Use cases
 
