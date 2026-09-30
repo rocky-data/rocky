@@ -69,6 +69,11 @@ pub enum QuarantineError {
     )]
     SplitNeedsStarExclusion { dialect: &'static str },
 
+    #[error(
+        "quarantine mode = \"tag\" is not supported on {dialect}: it rewrites its source table, and this dialect requires a pre-drop before CREATE TABLE AS; use mode = \"drop\""
+    )]
+    TagNeedsSourceReplacement { dialect: &'static str },
+
     /// Two tables a mode writes, or one it writes and the source it reads,
     /// resolve to the same name.
     #[error(
@@ -136,7 +141,7 @@ pub struct QuarantinePlan {
 #[derive(Debug, Clone)]
 pub struct QuarantineStatement {
     /// Human-readable role of this statement (`"label"`, `"quarantine"`,
-    /// `"valid"`, `"tag"`, `"drop_labels"`). Used for logging and row-effect
+    /// `"valid"`, `"tag"`, `"predrop_valid"`, `"drop_labels"`). Used for logging and row-effect
     /// attribution.
     pub role: StatementRole,
     /// Fully-qualified table name this statement writes to.
@@ -158,6 +163,9 @@ pub enum StatementRole {
     Valid,
     /// CTAS that rewrites the source table in-place with `_error_*` tags.
     Tag,
+    /// `drop` only: removes the previous valid table before a dialect's
+    /// non-replacing CTAS.
+    PredropValid,
     /// `split` only: drops the intermediate table the [`Self::Label`]
     /// statement wrote.
     DropLabels,
@@ -232,6 +240,12 @@ fn compile_with_token(
 
     if quarantinable.is_empty() {
         return Ok(None);
+    }
+
+    if matches!(config.mode, QuarantineMode::Tag) && dialect.full_refresh_needs_predrop() {
+        return Err(QuarantineError::TagNeedsSourceReplacement {
+            dialect: dialect.name(),
+        });
     }
 
     let source_table =
@@ -329,6 +343,13 @@ fn compile_with_token(
                 .map(|p| p.valid_pred.as_str())
                 .collect::<Vec<_>>()
                 .join(" AND ");
+            if dialect.full_refresh_needs_predrop() {
+                statements.push(QuarantineStatement {
+                    role: StatementRole::PredropValid,
+                    target: valid_table.clone(),
+                    sql: dialect.drop_table_sql(&valid_table),
+                });
+            }
             statements.push(build_valid_ctas(
                 &valid_table,
                 &source_table,
@@ -1565,6 +1586,11 @@ mod unit_tests {
             .unwrap();
         assert_eq!(plan.statements.len(), 1);
         assert_eq!(plan.statements[0].role, StatementRole::Valid);
+        assert_eq!(
+            plan.statements[0].sql,
+            "CREATE OR REPLACE TABLE poc.staging__orders.orders__valid AS\n\
+             SELECT * FROM poc.staging__orders.orders WHERE customer_id IS NOT NULL"
+        );
         assert!(plan.quarantine_table.is_empty());
     }
 

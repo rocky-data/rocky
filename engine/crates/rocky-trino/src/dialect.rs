@@ -307,6 +307,68 @@ fn is_safe_iceberg_decimal_widening(target: &str, source: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rocky_core::config::{QualityAssertion, QuarantineConfig, QuarantineMode};
+    use rocky_core::quarantine::{StatementRole, compile_quarantine_sql};
+    use rocky_core::tests::{TestDecl, TestSeverity, TestType};
+    use rocky_ir::TableRef;
+
+    fn quarantine_case(
+        mode: QuarantineMode,
+    ) -> (Vec<QualityAssertion>, TableRef, QuarantineConfig) {
+        (
+            vec![QualityAssertion {
+                table: "orders".into(),
+                name: None,
+                test: TestDecl {
+                    test_type: TestType::NotNull,
+                    column: Some("customer_id".into()),
+                    severity: TestSeverity::Error,
+                    filter: None,
+                },
+            }],
+            TableRef {
+                catalog: "iceberg".into(),
+                schema: "raw".into(),
+                table: "orders".into(),
+            },
+            QuarantineConfig {
+                enabled: true,
+                mode,
+                ..QuarantineConfig::default()
+            },
+        )
+    }
+
+    #[test]
+    fn quarantine_drop_predrops_valid_table_before_ctas() {
+        let (assertions, table, config) = quarantine_case(QuarantineMode::Drop);
+        let plan = compile_quarantine_sql(&assertions, "orders", &table, &TrinoDialect, &config)
+            .unwrap()
+            .unwrap();
+        assert_eq!(plan.statements.len(), 2);
+        assert_eq!(plan.statements[0].role, StatementRole::PredropValid);
+        assert_eq!(plan.statements[1].role, StatementRole::Valid);
+        assert_eq!(
+            plan.statements[0].sql,
+            "DROP TABLE IF EXISTS \"iceberg\".\"raw\".\"orders__valid\""
+        );
+        assert_eq!(
+            plan.statements[1].sql,
+            "CREATE TABLE \"iceberg\".\"raw\".\"orders__valid\" AS\n\
+             SELECT * FROM \"iceberg\".\"raw\".\"orders\" WHERE customer_id IS NOT NULL"
+        );
+    }
+
+    #[test]
+    fn quarantine_tag_is_refused_before_any_sql() {
+        let (assertions, table, config) = quarantine_case(QuarantineMode::Tag);
+        let error = compile_quarantine_sql(&assertions, "orders", &table, &TrinoDialect, &config)
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "quarantine mode = \"tag\" is not supported on trino: it rewrites its source table, and this dialect requires a pre-drop before CREATE TABLE AS; use mode = \"drop\""
+        );
+    }
 
     #[test]
     fn format_table_ref_uses_double_quotes() {

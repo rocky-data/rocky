@@ -105,6 +105,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **A `.rocky` string literal containing a backslash now fails compilation with E040 at the literal's file, line, and column.** DSL lowering has no target dialect, so it cannot preserve that value across warehouses that interpret backslashes differently. Use a `.sql` model with the target's own escaping for such values. This is a breaking change before 2.0: existing `.rocky` models with backslashes must move that expression to SQL. Literals without backslashes keep their existing SQL output. (#1596)
 
+- **Trino quarantine `drop` can write its valid table again on a later run.** Rocky now runs `DROP TABLE IF EXISTS` before Trino's plain `CREATE TABLE AS` for the valid table. Trino `tag` is refused during quarantine compilation with advice to use `drop`, because its output is also its source. `split` remains refused. Other dialects keep their existing SQL. (#2063)
+
 ### Added
 
 - **A selected transformation model can require its explicit contract during `rocky run`.** `rocky run --pipeline <name> --model <name> --contracts <dir>` checks that model's contract in the same compile result used for execution. A missing contract or an `E010` violation fails before replacing the selected table. This first guarded route supports one `full_refresh` model; it refuses defer, branch/shadow, partition, resume, idempotency, skip, governed apply, and post-compile surrogate keys. Other run routes do not gain this guarantee. Model-only run JSON now correctly reports `pipeline_type: "transformation"`. (#2182)
