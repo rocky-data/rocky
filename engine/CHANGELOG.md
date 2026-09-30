@@ -80,6 +80,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **`rocky plan` refuses to persist a plan when compilation reports an error for a planned model or its prerequisite.** The error names each refused model and diagnostic code, and exits with code 1 in text and JSON modes, with no plan ID or apply hint. Without `--model`, an error anywhere in the models directory refuses the plan. Warning-only projects still produce a plan. AI-authored proposals also refuse compile errors before writing a plan. (#2173)
 
+- **Shadow target overrides now require `--shadow` on `rocky run` and `rocky plan`.** An explicit `--shadow-suffix` or `--shadow-schema` without that flag is rejected by the command parser before any work starts. Both overrides conflict with `--branch`. `--shadow` alone uses `_rocky_shadow`. (#2192)
+
 ### Added
 
 - **A selected transformation model can require its explicit contract during `rocky run`.** `rocky run --pipeline <name> --model <name> --contracts <dir>` checks that model's contract in the same compile result used for execution. A missing contract or an `E010` violation fails before replacing the selected table. This first guarded route supports one `full_refresh` model; it refuses defer, branch/shadow, partition, resume, idempotency, skip, governed apply, and post-compile surrogate keys. Other run routes do not gain this guarantee. Model-only run JSON now correctly reports `pipeline_type: "transformation"`. (#2182)

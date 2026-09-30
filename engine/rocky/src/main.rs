@@ -819,19 +819,25 @@ enum Command {
         /// Applies to the default plan subcommand only.
         #[arg(long, global = false)]
         shadow: bool,
-        /// Suffix appended to table names in shadow mode (default: _rocky_shadow).
+        /// Suffix appended to table names. Requires --shadow; conflicts with --branch.
+        /// --shadow alone uses _rocky_shadow.
         /// Applies to the default plan subcommand only.
-        #[arg(long, default_value = "_rocky_shadow", global = false)]
+        #[arg(
+            long,
+            default_value = "_rocky_shadow",
+            requires = "shadow",
+            global = false
+        )]
         shadow_suffix: String,
-        /// Override schema for shadow tables (mutually exclusive with --shadow-suffix).
+        /// Override schema for shadow tables. Requires --shadow; conflicts with --branch.
         /// Applies to the default plan subcommand only.
-        #[arg(long, global = false)]
+        #[arg(long, requires = "shadow", global = false)]
         shadow_schema: Option<String>,
         /// Execute the run against a named branch created with `rocky branch
         /// create`. Internally equivalent to `--shadow --shadow-schema
         /// <branch.schema_prefix>`; mutually exclusive with the shadow flags.
         /// Applies to the default plan subcommand only.
-        #[arg(long, conflicts_with_all = ["shadow", "shadow_schema"], global = false)]
+        #[arg(long, conflicts_with_all = ["shadow", "shadow_schema", "shadow_suffix"], global = false)]
         branch: Option<String>,
 
         // ----- time_interval partition selection -----
@@ -987,16 +993,17 @@ enum Command {
         /// Run in shadow mode: write to shadow targets instead of production
         #[arg(long)]
         shadow: bool,
-        /// Suffix appended to table names in shadow mode (default: _rocky_shadow)
-        #[arg(long, default_value = "_rocky_shadow")]
+        /// Suffix appended to table names. Requires --shadow; conflicts with --branch.
+        /// --shadow alone uses _rocky_shadow.
+        #[arg(long, default_value = "_rocky_shadow", requires = "shadow")]
         shadow_suffix: String,
-        /// Override schema for shadow tables (mutually exclusive with --shadow-suffix)
-        #[arg(long)]
+        /// Override schema for shadow tables. Requires --shadow; conflicts with --branch.
+        #[arg(long, requires = "shadow")]
         shadow_schema: Option<String>,
         /// Execute the run against a named branch created with `rocky branch
         /// create`. Internally equivalent to `--shadow --shadow-schema
         /// <branch.schema_prefix>`; mutually exclusive with the shadow flags.
-        #[arg(long, conflicts_with_all = ["shadow", "shadow_schema"])]
+        #[arg(long, conflicts_with_all = ["shadow", "shadow_schema", "shadow_suffix"])]
         branch: Option<String>,
 
         // ----- time_interval partition selection -----
