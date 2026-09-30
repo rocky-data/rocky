@@ -44,7 +44,8 @@ export const LEDGER_REFRESH_MS = 30_000;
  * files on disk; `/models` reads the last compile, which `serve --watch`
  * replaces a moment after a file changes. A model marked "not compiled" only
  * because the compile had not caught up then opens within this interval,
- * without a Refresh.
+ * without a Refresh. A read slower than the interval is not dropped: the
+ * next one starts only after it lands (`useResource`).
  */
 export const COMPILE_RECHECK_MS = 5_000;
 

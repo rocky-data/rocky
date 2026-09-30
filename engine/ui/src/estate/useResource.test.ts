@@ -1,5 +1,5 @@
 import { act, renderHook } from "@testing-library/react";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { useResource } from "./useResource";
 
 /** A promise whose settlement the test holds. */
@@ -59,5 +59,37 @@ describe("useResource", () => {
 
     await act(async () => pending.resolve(2));
     expect(result.current).toMatchObject({ kind: "ready", value: 2 });
+  });
+
+  /// The interval does not start a read while one is out. A new read drops
+  /// the one before it, so a route slower than the interval would otherwise
+  /// never land a value after the first. `reload` still starts one at once.
+  it("does not let the interval drop a read that is still in flight", async () => {
+    vi.useFakeTimers();
+    try {
+      let pending = deferred<number>();
+      const load = vi.fn(() => pending.promise);
+      const { result } = renderHook(() => useResource(load, ["same"], 1_000));
+      await act(async () => pending.resolve(1));
+      expect(load).toHaveBeenCalledTimes(1);
+
+      pending = deferred<number>();
+      await act(() => vi.advanceTimersByTimeAsync(1_000));
+      expect(load).toHaveBeenCalledTimes(2);
+      await act(() => vi.advanceTimersByTimeAsync(3_000));
+      expect(load).toHaveBeenCalledTimes(2);
+
+      await act(async () => pending.resolve(2));
+      expect(result.current).toMatchObject({ kind: "ready", value: 2 });
+
+      // Settled, so the interval reads again; a reload never waits.
+      pending = deferred<number>();
+      await act(() => vi.advanceTimersByTimeAsync(1_000));
+      expect(load).toHaveBeenCalledTimes(3);
+      act(() => result.current.reload());
+      expect(load).toHaveBeenCalledTimes(4);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

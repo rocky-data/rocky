@@ -328,6 +328,41 @@ describe("EstateScreen", () => {
         expect(models).toHaveBeenCalledTimes(2);
       });
 
+      it("lets a recheck slower than the interval land, instead of dropping it", async () => {
+        // A read that takes longer than `recheckMs` must still land. If the
+        // next tick dropped it, every read would be dropped and the model
+        // would stay marked, and blocked, although the server now serves it.
+        let compiledYet = false;
+        const models = vi.fn(
+          () =>
+            new Promise<ModelListOutput>((resolve) => {
+              const answer = compiledYet ? withWeekly : partModels;
+              setTimeout(() => resolve(answer), compiledYet ? 12_000 : 0);
+            }),
+        );
+        render(
+          <EstateScreen
+            loaders={loaders({ dag: async () => partDag, models })}
+            refreshMs={0}
+            recheckMs={5_000}
+            now={NOW}
+          />,
+        );
+        await advance(0);
+        expect(line("weekly_revenue")).toContain(NOT_COMPILED);
+
+        compiledYet = true;
+        await advance(5_000);
+        expect(models).toHaveBeenCalledTimes(2);
+        // Two more ticks pass while that read is out; neither starts another.
+        await advance(10_000);
+        expect(models).toHaveBeenCalledTimes(2);
+        expect(line("weekly_revenue")).toContain(NOT_COMPILED);
+
+        await advance(2_000);
+        expect(line("weekly_revenue")).not.toContain(NOT_COMPILED);
+      });
+
       it("does not read the list again when every model in the graph is compiled", async () => {
         const models = vi.fn(async () => withWeekly);
         render(

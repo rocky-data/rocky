@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState, type DependencyList } from "react";
+import { useCallback, useEffect, useRef, useState, type DependencyList } from "react";
 import { ApiError } from "../api";
 
 /** One producer's state: the four ways a typed read can stand. */
@@ -29,6 +29,11 @@ function sameDeps(a: DependencyList, b: DependencyList): boolean {
  * frame: it is plan A's approve command under plan B's heading (#1815). A
  * reload of the SAME identity (the interval, a refresh button) keeps the old
  * value up until the new one lands, so a refresh never blinks.
+ *
+ * The interval does not start a read while one is still in flight. A new
+ * read drops the one before it, so an interval shorter than the route's
+ * answer time would drop every read and keep the first value up for good.
+ * A read that never settles stops the interval; `reload` still starts one.
  */
 export function useResource<T>(
   load: () => Promise<T>,
@@ -38,6 +43,7 @@ export function useResource<T>(
   const [settled, setSettled] = useState<Settled<T> | null>(null);
   const [tick, setTick] = useState(0);
   const reload = useCallback(() => setTick((t) => t + 1), []);
+  const inFlight = useRef(false);
 
   // Derived in render, not reset in an effect: an effect runs after the
   // frame with the stale value has already painted.
@@ -49,12 +55,16 @@ export function useResource<T>(
     // The identity this read is for. A late answer carries it, so even one
     // that slipped past `cancelled` cannot render under a different identity.
     const identity = deps;
+    inFlight.current = true;
     load()
       .then((value) => {
-        if (!cancelled) setSettled({ deps: identity, state: { kind: "ready", value } });
+        if (cancelled) return;
+        inFlight.current = false;
+        setSettled({ deps: identity, state: { kind: "ready", value } });
       })
       .catch((error: unknown) => {
         if (cancelled) return;
+        inFlight.current = false;
         const state: Resource<T> =
           error instanceof ApiError
             ? { kind: "refused", error }
@@ -69,7 +79,9 @@ export function useResource<T>(
 
   useEffect(() => {
     if (intervalMs === undefined || intervalMs <= 0) return;
-    const timer = setInterval(reload, intervalMs);
+    const timer = setInterval(() => {
+      if (!inFlight.current) reload();
+    }, intervalMs);
     return () => clearInterval(timer);
   }, [intervalMs, reload]);
 
