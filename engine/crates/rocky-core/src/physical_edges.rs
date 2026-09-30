@@ -225,12 +225,12 @@ pub fn bare_name_binds(model_name: &str, target_table: &str) -> bool {
 
 /// What a catalog-qualified read that missed the exact index can be bound to.
 enum Binding<'a> {
-    /// No catalogless producer could be the read's table.
+    /// No producer of that `schema.table` could be the read's table.
     Nothing,
-    /// Exactly one catalogless producer, established to live in the catalog
-    /// the read names.
+    /// The one producer of that `schema.table`, which declares no catalog and
+    /// is established to live in the catalog the read names.
     Producer(&'a str),
-    /// More than one could be, or which catalog they live in is unknown.
+    /// A producer could be the read's table, but it cannot be bound to it.
     Unbound {
         candidates: Vec<String>,
         reason: UnboundReason,
@@ -238,48 +238,48 @@ enum Binding<'a> {
 }
 
 /// Bind a `read_catalog.schema.table` read whose exact `(catalog, schema,
-/// table)` lookup missed to the ONE producer whose `[target]` names no
-/// catalog and that is established to live in `read_catalog` (#1629).
+/// table)` lookup missed to a producer of that `schema.table` — but only to
+/// the ONLY producer of it, when it declares no catalog and is established to
+/// live in `read_catalog` (#1629).
 ///
-/// `catalogless` are the catalogless producers of that `(schema, table)`.
-/// A producer whose `[target]` DOES name a catalog never reaches here: the
-/// exact lookup missed, so it names a different catalog than the read and the
-/// read is provably not its table. Likewise a catalogless producer established
-/// to live in another catalog. Only a producer whose catalog is unknown is a
-/// guess, and a guess across catalogs is the one thing this must never make:
-/// it can order a real dependency backwards.
-fn bind_catalogless<'a>(read_catalog: &str, catalogless: &[&PhysicalEdgeModel<'a>]) -> Binding<'a> {
-    let mut matching: Vec<&'a str> = Vec::new();
-    let mut unknown: Vec<&'a str> = Vec::new();
-    for p in catalogless {
-        match p.effective_catalog {
-            Some(effective) if fold_identifier(effective) == read_catalog => matching.push(p.name),
-            // Established to live in another catalog: not this read's table.
-            Some(_) => {}
-            None => unknown.push(p.name),
-        }
-    }
-    let names = |groups: &[&[&str]]| -> Vec<String> {
-        let mut names: Vec<String> = groups
-            .iter()
-            .flat_map(|g| g.iter())
-            .map(|n| (*n).to_string())
-            .collect();
-        names.sort_unstable();
-        names.dedup();
-        names
+/// `at_schema_table` is every producer of that `(schema, table)`, whatever
+/// catalog it declares, without the reader itself. A producer that declares a
+/// catalog is provably not the read's table (the exact lookup missed, so it
+/// names another catalog), and neither is a catalogless one established to live
+/// in another catalog. When none of them could be, there is nothing to bind and
+/// nothing to report. When one could be and it is not the only producer, or its
+/// catalog is not established, the read stays unbound: a guess across catalogs
+/// is the one thing this must never make, because it can order a real
+/// dependency backwards.
+fn bind_catalogless<'a>(
+    read_catalog: &str,
+    at_schema_table: &[&PhysicalEdgeModel<'a>],
+) -> Binding<'a> {
+    let could_be_the_read = |p: &&PhysicalEdgeModel<'_>| {
+        fold_identifier(p.catalog).is_empty()
+            && p.effective_catalog
+                .is_none_or(|effective| fold_identifier(effective) == read_catalog)
     };
-    match (matching.as_slice(), unknown.as_slice()) {
-        ([], []) => Binding::Nothing,
-        ([only], []) => Binding::Producer(only),
-        ([], unknown) => Binding::Unbound {
-            candidates: names(&[unknown]),
-            reason: UnboundReason::CatalogNotEstablished,
+    if !at_schema_table.iter().any(could_be_the_read) {
+        return Binding::Nothing;
+    }
+    match at_schema_table {
+        [only] => match only.effective_catalog {
+            Some(_) => Binding::Producer(only.name),
+            None => Binding::Unbound {
+                candidates: vec![only.name.to_string()],
+                reason: UnboundReason::CatalogNotEstablished,
+            },
         },
-        (matching, unknown) => Binding::Unbound {
-            candidates: names(&[matching, unknown]),
-            reason: UnboundReason::SeveralProducers,
-        },
+        several => {
+            let mut candidates: Vec<String> = several.iter().map(|p| p.name.to_string()).collect();
+            candidates.sort_unstable();
+            candidates.dedup();
+            Binding::Unbound {
+                candidates,
+                reason: UnboundReason::SeveralProducers,
+            }
+        }
     }
 }
 
@@ -303,12 +303,13 @@ fn bind_catalogless<'a>(read_catalog: &str, catalogless: &[&PhysicalEdgeModel<'a
 /// A model whose `[target]` names no catalog (`catalog = ""`) is indexed
 /// under an empty catalog, so a `cat.schema.table` read of it misses the
 /// exact index. That read is bound to it only when ALL of these hold: the
-/// exact lookup missed, exactly one catalogless producer writes
-/// `schema.table`, and the caller established which catalog it lives in
-/// ([`PhysicalEdgeModel::effective_catalog`]) and that is the catalog the read
-/// names. Anything else derives no edge. When a producer might be the read's
-/// table but cannot be bound to it, the read is reported in
-/// [`DerivedPhysicalEdges::unbound_reads`] rather than guessed at.
+/// exact lookup missed, exactly one producer writes `schema.table`, that
+/// producer's `[target]` names no catalog, and the caller established which
+/// catalog it lives in ([`PhysicalEdgeModel::effective_catalog`]) and that is
+/// the catalog the read names. Anything else derives no edge. When a
+/// catalogless producer might be the read's table but the read cannot be bound
+/// to it, the read is reported in [`DerivedPhysicalEdges::unbound_reads`],
+/// naming the candidates, rather than guessed at.
 #[must_use]
 pub fn derive_physical_edges(
     models: &[PhysicalEdgeModel<'_>],
@@ -322,9 +323,9 @@ pub fn derive_physical_edges(
     let mut by_three: BTreeMap<(String, String, String), Vec<&str>> = BTreeMap::new();
     let mut by_two: BTreeMap<(String, String), Vec<&str>> = BTreeMap::new();
     let mut by_table: BTreeMap<String, Vec<&str>> = BTreeMap::new();
-    // The producers a catalog-qualified read can only be bound to by way of
-    // their established catalog: those that declare none.
-    let mut catalogless_by_two: BTreeMap<(String, String), Vec<&PhysicalEdgeModel<'_>>> =
+    // Every producer of a `(schema, table)`, whatever catalog it declares: the
+    // catalog fallback needs the whole set to know whether it is the only one.
+    let mut models_by_two: BTreeMap<(String, String), Vec<&PhysicalEdgeModel<'_>>> =
         BTreeMap::new();
     for m in models {
         if !m.materializes {
@@ -337,9 +338,7 @@ pub fn derive_physical_edges(
         );
         let key2 = (key3.1.clone(), key3.2.clone());
         by_table.entry(key3.2.clone()).or_default().push(m.name);
-        if key3.0.is_empty() {
-            catalogless_by_two.entry(key2.clone()).or_default().push(m);
-        }
+        models_by_two.entry(key2.clone()).or_default().push(m);
         by_three.entry(key3).or_default().push(m.name);
         by_two.entry(key2).or_default().push(m.name);
     }
@@ -399,13 +398,13 @@ pub fn derive_physical_edges(
                         // table — or another catalog's table of the same name.
                         // Only an established catalog tells the two apart
                         // (#1629); a model never binds to its own read.
-                        let catalogless: Vec<&PhysicalEdgeModel<'_>> = catalogless_by_two
+                        let at_schema_table: Vec<&PhysicalEdgeModel<'_>> = models_by_two
                             .get(&(schema.clone(), table.clone()))
                             .map(|found| {
                                 found.iter().copied().filter(|p| p.name != m.name).collect()
                             })
                             .unwrap_or_default();
-                        match bind_catalogless(catalog, &catalogless) {
+                        match bind_catalogless(catalog, &at_schema_table) {
                             Binding::Nothing => continue,
                             Binding::Producer(producer) => (Evidence::Fallback, vec![producer]),
                             Binding::Unbound { candidates, reason } => {
@@ -800,6 +799,55 @@ mod tests {
                 .any(|w| w.contains("'first'") && w.contains("'second'")),
             "{warnings:?}"
         );
+    }
+
+    /// "Exactly one producer" counts every producer of the `schema.table`,
+    /// not only the catalogless ones: with a second model that declares a
+    /// catalog writing the same `schema.table`, the read stays unbound and
+    /// names both — even though the declared one provably is not `db`'s.
+    #[test]
+    fn a_catalogless_producer_is_bound_only_when_it_is_the_only_producer_of_the_schema_table() {
+        let models = [
+            catalogless("local", Some("db"), "main", "shared", "SELECT 1 AS x"),
+            m("remote", "prod", "main", "shared", "SELECT 2 AS x"),
+            m(
+                "reader",
+                "db",
+                "main",
+                "reader",
+                "SELECT x FROM db.main.shared",
+            ),
+        ];
+        let d = derive_physical_edges(&models, &[]);
+        assert!(d.edges.is_empty(), "{d:?}");
+        assert_eq!(d.unbound_reads.len(), 1, "{d:?}");
+        assert_eq!(d.unbound_reads[0].reason, UnboundReason::SeveralProducers);
+        assert_eq!(
+            d.unbound_reads[0].candidates,
+            vec!["local".to_string(), "remote".to_string()]
+        );
+    }
+
+    /// Producers that ALL declare a catalog can never be the table a read of
+    /// another catalog names, so nothing is bound and nothing is reported —
+    /// a warning here would be noise, and under `strict_scheduling` a refusal.
+    #[test]
+    fn producers_that_all_declare_a_catalog_are_never_reported() {
+        let models = [
+            m("prod_copy", "prod", "main", "shared", "SELECT 1 AS x"),
+            m("dev_copy", "dev", "main", "shared", "SELECT 2 AS x"),
+            m(
+                "reader",
+                "db",
+                "main",
+                "reader",
+                "SELECT x FROM external.main.shared",
+            ),
+        ];
+        let d = derive_physical_edges(&models, &[]);
+        assert!(d.edges.is_empty(), "{d:?}");
+        assert!(d.unbound_reads.is_empty(), "{d:?}");
+        assert!(derivation_warnings(&d).is_empty(), "{d:?}");
     }
 
     /// The review's P1 construction. `alpha` reads ANOTHER catalog's

@@ -3618,11 +3618,14 @@ mod tests {
         );
     }
 
-    /// Two pipelines, two DuckDB files: each catalogless target lives in ITS
-    /// adapter's catalog, so a read naming `alpha` binds to the model written
-    /// through the `alpha` file and not to the same-named table in `beta`.
+    /// Two pipelines, two DuckDB files, one `schema.table` written through
+    /// both. Each catalogless target lives in ITS adapter's catalog and a read
+    /// naming `alpha` can only mean the `alpha` file's — but "exactly one
+    /// producer of the `schema.table`" is the rule, and two write it, so the
+    /// read is left unbound and both are named. The order is what it was
+    /// before the fallback existed; nothing is guessed.
     #[test]
-    fn a_catalogless_read_binds_to_the_adapter_whose_catalog_it_names() {
+    fn a_schema_table_two_adapters_both_write_is_left_unbound() {
         let mut config = config_with_pipelines(vec![
             ("p_alpha", transform_pipeline_on("wh_alpha")),
             ("p_beta", transform_pipeline_on("wh_beta")),
@@ -3662,87 +3665,22 @@ mod tests {
         ]);
         let runtime = build_runtime_dag(&config, &by_pipeline, &[], &duckdb_stem_catalog)
             .expect("runtime dag");
-        assert!(
-            has_edge(
-                &runtime.dag,
-                "transformation:shared_alpha",
-                "transformation:reader"
-            ),
-            "{:?}",
-            runtime.physical
-        );
-        assert!(
-            !has_edge(
-                &runtime.dag,
-                "transformation:shared_beta",
-                "transformation:reader"
-            ),
-            "the read names alpha's catalog; beta's table is another object"
-        );
-        assert!(
-            runtime.physical.unbound_reads.is_empty(),
-            "the read is bound, not left unresolved: {:?}",
-            runtime.physical
-        );
-    }
-
-    /// The same two pipelines when both files give the SAME catalog name (as
-    /// `one/db.duckdb` and `two/db.duckdb` do): either model could be the
-    /// read's table, so no edge is guessed and both are named.
-    #[test]
-    fn a_read_that_two_adapters_catalogs_both_answer_to_is_not_guessed_at() {
-        let mut config = config_with_pipelines(vec![
-            ("p_one", transform_pipeline_on("wh_one")),
-            ("p_two", transform_pipeline_on("wh_two")),
-            ("p_read", transform_pipeline_on("wh_one")),
-        ]);
-        config
-            .adapters
-            .insert("wh_one".into(), duckdb_adapter("one/db.duckdb"));
-        config
-            .adapters
-            .insert("wh_two".into(), duckdb_adapter("two/db.duckdb"));
-        let by_pipeline = ModelsByPipeline::from([
-            (
-                "p_one".to_string(),
-                vec![model_reading(
-                    "shared_one",
-                    ("", "main", "shared"),
-                    "SELECT 1 AS x",
-                )],
-            ),
-            (
-                "p_two".to_string(),
-                vec![model_reading(
-                    "shared_two",
-                    ("", "main", "shared"),
-                    "SELECT 2 AS x",
-                )],
-            ),
-            (
-                "p_read".to_string(),
-                vec![model_reading(
-                    "reader",
-                    ("db", "main", "reader"),
-                    "SELECT x FROM db.main.shared",
-                )],
-            ),
-        ]);
-        let runtime = build_runtime_dag(&config, &by_pipeline, &[], &duckdb_stem_catalog)
-            .expect("runtime dag");
-        for producer in ["shared_one", "shared_two"] {
-            assert!(!has_edge(
-                &runtime.dag,
-                &format!("transformation:{producer}"),
-                "transformation:reader"
-            ));
+        for producer in ["shared_alpha", "shared_beta"] {
+            assert!(
+                !has_edge(
+                    &runtime.dag,
+                    &format!("transformation:{producer}"),
+                    "transformation:reader"
+                ),
+                "no edge is guessed for {producer}"
+            );
         }
         assert!(
             runtime
                 .warnings
                 .iter()
-                .any(|w| w.contains("'shared_one'") && w.contains("'shared_two'")),
-            "{:?}",
+                .any(|w| w.contains("'shared_alpha'") && w.contains("'shared_beta'")),
+            "both candidates are named: {:?}",
             runtime.warnings
         );
     }
@@ -4017,38 +3955,51 @@ mod tests {
         );
     }
 
-    /// And the inverse read: the reader names the MODEL's target, so the
-    /// model — not the load that shares its label — is what it runs after.
-    /// A "the model always wins" rule cannot tell this from the case above;
-    /// resolving by target gets both right.
+    /// And the inverse read: the reader names the MODEL's target
+    /// (`prod.silver.shared`, whose table is the label), so the model — not
+    /// the load that shares its label — is what it runs after, and the load is
+    /// not ordered before it. A rule that answers the case above by "the load
+    /// wins" cannot pass both; resolving by target gets both right, whichever
+    /// pipeline is built last.
     #[test]
     fn a_reader_of_a_colliding_label_is_ordered_after_the_model_it_names() {
-        let (config, mut by_pipeline) = shared_label_project(true);
-        let models = by_pipeline.get_mut("t").expect("pipeline t");
-        models
-            .iter_mut()
-            .find(|m| m.config.name == "reader")
-            .expect("reader")
-            .sql = "SELECT x FROM prod.silver.shared_output".to_string();
-        // The model `shared` no longer reads the reader (that would be a
-        // cycle now); it reads nothing.
-        models
-            .iter_mut()
-            .find(|m| m.config.name == "shared")
-            .expect("shared")
-            .sql = "SELECT 1 AS y".to_string();
-        let runtime = build_runtime_dag(&config, &by_pipeline, &[], &no_catalog)
-            .expect("the read names the model's exact target");
-        assert!(has_edge(
-            &runtime.dag,
-            "transformation:shared",
-            "transformation:reader"
-        ));
-        assert!(!has_edge(
-            &runtime.dag,
-            "load:shared",
-            "transformation:reader"
-        ));
+        for load_first in [true, false] {
+            let (config, mut by_pipeline) = shared_label_project(load_first);
+            let models = by_pipeline.get_mut("t").expect("pipeline t");
+            // The model `shared` writes a table called `shared`, so a read of
+            // it matches the label by its last segment and the collision is
+            // live; it reads nothing.
+            let model = models
+                .iter_mut()
+                .find(|m| m.config.name == "shared")
+                .expect("shared");
+            model.config.target.table = "shared".into();
+            model.sql = "SELECT 1 AS y".to_string();
+            models
+                .iter_mut()
+                .find(|m| m.config.name == "reader")
+                .expect("reader")
+                .sql = "SELECT x FROM prod.silver.shared".to_string();
+            let runtime = build_runtime_dag(&config, &by_pipeline, &[], &no_catalog)
+                .expect("the read names the model's exact target");
+            assert!(
+                has_edge(
+                    &runtime.dag,
+                    "transformation:shared",
+                    "transformation:reader"
+                ),
+                "load_first={load_first}"
+            );
+            assert!(
+                !has_edge(&runtime.dag, "load:shared", "transformation:reader"),
+                "load_first={load_first}: the reader does not read the load's table"
+            );
+            assert_eq!(
+                runtime.labels.label_collisions,
+                vec![("shared".to_string(), 2)],
+                "the label really collides, so the label pass had to choose"
+            );
+        }
     }
 
     /// A bare read of a label two producers share names neither by target,
