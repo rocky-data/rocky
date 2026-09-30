@@ -102,7 +102,7 @@ pub async fn run_seed(
     // schema. For non-replication pipelines or templates with placeholders,
     // fall back to "main".
     let default_catalog = default_seed_catalog(pipeline_cfg);
-    let default_schema = "seeds".to_string();
+    let default_schema = rocky_core::seeds::DEFAULT_SEED_SCHEMA.to_string();
 
     let mut table_results: Vec<SeedTableOutput> = Vec::new();
     let mut tables_loaded = 0usize;
