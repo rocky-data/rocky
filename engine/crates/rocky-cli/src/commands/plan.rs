@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -475,7 +475,6 @@ pub async fn plan(
         output.skipped = preview.skipped;
     }
     let mut run_plan_persisted = false;
-    let mut run_plan_built = false;
     let mut compile_refused = false;
     if blueprint_models_dir.exists() {
         match build_and_persist_run_plan(
@@ -488,44 +487,25 @@ pub async fn plan(
             base_ref,
             state_path,
         ) {
-            Ok(Some(RunPlanBuild {
-                plan: run_plan,
-                refused,
-                persisted,
-            })) => {
-                run_plan_built = true;
+            Ok(Some(RunPlanBuild::Persisted(run_plan, plan_id, persisted_at))) => {
                 output.models = run_plan.models.clone();
                 output.execution_layers = run_plan.execution_layers.clone();
-                compile_refused = !refused.is_empty();
-                if compile_refused && run_options.model.is_some() {
+                output.plan_id = Some(plan_id);
+                output.plan_kind = Some("run".to_string());
+                output.created_at = Some(persisted_at);
+                run_plan_persisted = true;
+            }
+            Ok(Some(RunPlanBuild::Refused(refused))) => {
+                compile_refused = true;
+                if run_options.model.is_some() {
                     output.statements.clear();
                 }
-                // A model-scoped SQL preview may already have reported a
-                // generator refusal. Replace that entry with *all* compiler
-                // diagnostics for the model, rather than keeping only the last.
                 let refused_names: BTreeSet<&str> =
                     refused.iter().map(|item| item.model.as_str()).collect();
                 output
                     .skipped
                     .retain(|item| !refused_names.contains(item.model.as_str()));
                 output.skipped.extend(refused);
-                match persisted {
-                    Ok((plan_id, persisted_at)) => {
-                        output.plan_id = Some(plan_id);
-                        output.plan_kind = Some("run".to_string());
-                        output.created_at = Some(persisted_at);
-                        run_plan_persisted = true;
-                    }
-                    Err(e) => {
-                        if run_options.model.is_some() && !compile_refused {
-                            return Err(e).context(
-                                "failed to persist a model-scoped run plan for --model; \
-                                 refusing to fall back to a replication plan",
-                            );
-                        }
-                        tracing::warn!(error = %e, "failed to persist run plan");
-                    }
-                }
             }
             Ok(None) => {
                 // `models/` exists but compile produced zero models.
@@ -583,7 +563,7 @@ pub async fn plan(
     // is content-addressed by the canonical `RockyConfig` snapshot + the
     // discovered source state (sorted connectors + tables), so identical
     // inputs produce an identical plan_id across machines.
-    if !run_plan_built {
+    if !run_plan_persisted && !compile_refused {
         match build_and_persist_replication_plan(
             &rocky_cfg,
             &connectors,
@@ -1248,70 +1228,50 @@ fn build_and_persist_run_plan(
         return Ok(None);
     }
 
-    let failed: BTreeSet<String> = result
+    // `--model` persists only that model. Include its declared prerequisites,
+    // since apply needs them, but ignore errors in unrelated models.
+    let mut needed = BTreeSet::new();
+    if let Some(selected) = run_options.model.as_deref() {
+        needed.insert(selected.to_string());
+        loop {
+            let before = needed.len();
+            for node in &result.project.dag_nodes {
+                if needed.contains(&node.name) {
+                    needed.extend(node.depends_on.iter().cloned());
+                }
+            }
+            if needed.len() == before {
+                break;
+            }
+        }
+    }
+    let refused: Vec<SkippedModel> = result
         .diagnostics
         .iter()
-        .filter(|diagnostic| diagnostic.is_error())
-        .map(|diagnostic| diagnostic.model.clone())
-        .collect();
-    let blocked = super::run::compile_error_descendant_blocks(
-        &result.project.dag_nodes,
-        &failed,
-        &BTreeMap::new(),
-    );
-    let mut refused: Vec<SkippedModel> = result
-        .diagnostics
-        .iter()
-        .filter(|diagnostic| diagnostic.is_error())
+        .filter(|diagnostic| {
+            diagnostic.is_error()
+                && (run_options.model.is_none() || needed.contains(&diagnostic.model))
+        })
         .map(|diagnostic| SkippedModel {
             model: diagnostic.model.clone(),
             reason: format!("[{}] {}", diagnostic.code, diagnostic.message),
         })
         .collect();
-    refused.extend(blocked.iter().map(|(model, blocked_by)| SkippedModel {
-        model: model.clone(),
-        reason: format!(
-            "withheld because upstream compile failure(s) affect: {}",
-            blocked_by.join(", ")
-        ),
-    }));
-    if let Some(selected) = run_options.model.as_deref() {
-        refused.retain(|item| item.model == selected);
+    if !refused.is_empty() {
+        return Ok(Some(RunPlanBuild::Refused(refused)));
     }
-    let excluded: BTreeSet<&str> = failed
-        .iter()
-        .map(String::as_str)
-        .chain(blocked.keys().map(String::as_str))
-        .collect();
 
     let (models, execution_layers) = if let Some(model) = run_options.model.as_deref() {
-        if excluded.contains(model) {
-            (Vec::new(), Vec::new())
-        } else {
-            (vec![model.to_string()], vec![vec![model.to_string()]])
-        }
+        (vec![model.to_string()], vec![vec![model.to_string()]])
     } else {
         (
             result
                 .project
                 .models
                 .iter()
-                .filter(|m| !excluded.contains(m.config.name.as_str()))
                 .map(|m| m.config.name.clone())
                 .collect(),
-            result
-                .project
-                .layers
-                .iter()
-                .map(|layer| {
-                    layer
-                        .iter()
-                        .filter(|name| !excluded.contains(name.as_str()))
-                        .cloned()
-                        .collect::<Vec<_>>()
-                })
-                .filter(|layer| !layer.is_empty())
-                .collect(),
+            result.project.layers.clone(),
         )
     };
 
@@ -1351,7 +1311,7 @@ fn build_and_persist_run_plan(
         spec_digest: None,
     };
 
-    let persisted = (|| -> Result<(String, chrono::DateTime<Utc>)> {
+    let (plan_id, persisted_at) = (|| -> Result<(String, chrono::DateTime<Utc>)> {
         let cwd = std::env::current_dir().context("failed to get current working directory")?;
 
         // policy seam 1 + capability-embed: stamp the authoring principal and embed the propose-time
@@ -1385,18 +1345,17 @@ fn build_and_persist_run_plan(
         let plan_id = write_plan_governed(&cwd, PlanKind::Run, &run_plan, principal, capabilities)
             .context("failed to write run plan")?;
         Ok((plan_id, Utc::now()))
-    })();
-    Ok(Some(RunPlanBuild {
-        plan: run_plan,
-        refused,
-        persisted,
-    }))
+    })()?;
+    Ok(Some(RunPlanBuild::Persisted(
+        Box::new(run_plan),
+        plan_id,
+        persisted_at,
+    )))
 }
 
-struct RunPlanBuild {
-    plan: RunPlan,
-    refused: Vec<SkippedModel>,
-    persisted: Result<(String, chrono::DateTime<Utc>)>,
+enum RunPlanBuild {
+    Refused(Vec<SkippedModel>),
+    Persisted(Box<RunPlan>, String, chrono::DateTime<Utc>),
 }
 
 /// Compute the propose-time change-classification (capability-embed) to embed in a governed

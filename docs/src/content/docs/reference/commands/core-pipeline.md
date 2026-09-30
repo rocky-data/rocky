@@ -265,6 +265,8 @@ Generate the replication SQL Rocky would run, without running it. The command ne
 
 `rocky plan` plus `rocky apply` is the canonical path for production and for gating a pull request. Nothing touches the warehouse between the two steps. For local iteration, [`rocky run`](#rocky-run) does the same work in one command and writes no plan file.
 
+If compilation reports an error for a planned model or a model it needs, `rocky plan` prints every relevant diagnostic and exits non-zero. It writes no plan file and returns no `plan_id` or apply hint. This applies with or without `--model`, in text and JSON output. Warnings alone do not stop the plan.
+
 ```bash
 rocky plan [flags]
 rocky plan promote <branch> [flags]
