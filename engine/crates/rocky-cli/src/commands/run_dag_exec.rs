@@ -3542,9 +3542,11 @@ mod tests {
 
     /// End to end: a catalogless producer and the read that names its
     /// catalog run in dependency order under `rocky run --dag` and the
-    /// consumer sees the producer's rows. (The order is asserted by the
-    /// planner tests above; this proves the whole run accepts and executes
-    /// the graph they build.)
+    /// consumer sees the producer's rows. Nodes run one at a time
+    /// (`--parallel 1`), in dispatch order, and the consumer sorts first: with
+    /// no edge between them it would be dispatched first and fail on a table
+    /// that does not exist yet, so the run only succeeds when the graph
+    /// orders the pair.
     #[tokio::test]
     async fn run_dag_builds_a_catalogless_producer_before_the_read_that_names_its_catalog() {
         let dir = tempfile::tempdir().unwrap();
@@ -3576,7 +3578,8 @@ mod tests {
             &PartitionRunOptions::default(),
             &crate::commands::run::SkipRunOptions::default(),
             None,
-            None,
+            // `--parallel 1`: one node at a time, in dispatch order.
+            Some(1),
         )
         .await
         .expect("run --dag should succeed");
