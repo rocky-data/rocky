@@ -47,6 +47,20 @@ fn rocky(dir: &Path, args: &[&str]) -> Output {
         .expect("spawn rocky")
 }
 
+fn rocky_with_principal(dir: &Path, args: &[&str], principal: &str) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_rocky"))
+        .args(["--output", "json", "--principal", principal])
+        .arg("--config")
+        .arg(dir.join("rocky.toml"))
+        .arg("--state-path")
+        .arg(dir.join("state.redb"))
+        .args(args)
+        .current_dir(dir)
+        .env("RUST_LOG", "error")
+        .output()
+        .expect("spawn rocky")
+}
+
 fn stderr(out: &Output) -> String {
     String::from_utf8_lossy(&out.stderr).into_owned()
 }
@@ -336,6 +350,103 @@ fn a_shadow_run_of_a_quality_pipeline_is_refused_too() {
     );
     assert_eq!(project.warehouse(), warehouse_before);
     assert_eq!(project.state_digest(), state_before);
+}
+
+/// Branch resolution opens a state store even when the named branch is absent.
+/// The pipeline-kind refusal must happen first, while the state file is absent.
+#[test]
+fn a_quality_branch_run_refuses_before_branch_lookup() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dir = tmp.path();
+    fs::write(dir.join("rocky.toml"), quality_config("split", "main"))
+        .expect("write quality config");
+
+    let refused = rocky(dir, &["run", "--branch", BRANCH]);
+
+    assert_eq!(refused.status.code(), Some(1), "{}", stderr(&refused));
+    assert!(
+        stderr(&refused).contains("not supported for quality pipeline 'dq'"),
+        "the quality gate runs before branch lookup: {}",
+        stderr(&refused)
+    );
+    assert!(
+        !dir.join("state.redb").exists(),
+        "no state store was opened"
+    );
+}
+
+/// A RunPlan compiled under replication can outlive a config edit that changes
+/// its named pipeline to quality. Apply must refuse before policy audits the
+/// compiled model, which would change the state file even though no run starts.
+#[test]
+fn a_stale_shadow_run_plan_refuses_before_policy_writes() {
+    let replication = r#"
+[adapter]
+type = "duckdb"
+path = "fixture.duckdb"
+
+[pipeline.ingest]
+strategy = "full_refresh"
+
+[pipeline.ingest.source.discovery]
+adapter = "default"
+
+[pipeline.ingest.source.schema_pattern]
+prefix = "raw__"
+separator = "__"
+components = ["source"]
+
+[pipeline.ingest.target]
+catalog_template = "fixture"
+schema_template = "staging__{source}"
+
+[pipeline.ingest.target.governance]
+auto_create_schemas = true
+
+[policy]
+version = 1
+default_agent_effect = "allow"
+"#;
+    let project = Project::new(replication, false);
+    let models = project.dir.join("models");
+    fs::create_dir(&models).expect("create models");
+    fs::write(models.join("summary.sql"), "SELECT 1 AS id\n").expect("write model");
+    fs::write(
+        models.join("summary.toml"),
+        "[strategy]\ntype = \"full_refresh\"\n\n\
+         [target]\ncatalog = \"fixture\"\nschema = \"main\"\ntable = \"summary\"\n",
+    )
+    .expect("write model config");
+
+    let planned = project.run(&["plan", "--pipeline", "ingest", "--shadow", "--all"]);
+    assert_eq!(planned.status.code(), Some(0), "{}", stderr(&planned));
+    let plan: serde_json::Value =
+        serde_json::from_slice(&planned.stdout).expect("plan output is JSON");
+    assert_eq!(plan["plan_kind"], "run", "a compiled RunPlan is required");
+    let plan_id = plan["plan_id"].as_str().expect("persisted plan ID");
+
+    fs::write(
+        project.dir.join("rocky.toml"),
+        format!(
+            "{}\n[policy]\nversion = 1\ndefault_agent_effect = \"allow\"\n",
+            quality_config("split", "main").replace("pipeline.dq", "pipeline.ingest")
+        ),
+    )
+    .expect("replace replication pipeline with quality");
+    let state_before = project.state_digest();
+    let refused = rocky_with_principal(&project.dir, &["apply", plan_id], "agent");
+
+    assert_eq!(refused.status.code(), Some(1), "{}", stderr(&refused));
+    assert!(
+        stderr(&refused).contains("not supported for quality pipeline 'ingest'"),
+        "the shadow refusal must precede policy evaluation: {}",
+        stderr(&refused)
+    );
+    assert_eq!(
+        project.state_digest(),
+        state_before,
+        "a refused stale plan must leave the state file byte-identical"
+    );
 }
 
 /// The refusal comes before the idempotency claim, not after it. A claim is a

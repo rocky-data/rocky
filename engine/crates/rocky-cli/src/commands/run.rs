@@ -2760,14 +2760,11 @@ pub async fn run_with_explicit_contracts(
     }
     // `--shadow` / `--branch` on a pipeline kind that cannot route it (#2161).
     //
-    // Decided HERE, once, for every caller of `run` — the inline `rocky run`,
-    // `rocky apply` of a stored plan, and `--watch` all arrive at this
-    // function — and before the idempotency claim, the Pipes channel, the
-    // adapters, and any write to the state store. (`--branch` itself is
-    // resolved from the state store by a read-only open in `main.rs`, before
-    // this function is entered.) A refusal taken later, inside a dispatch arm,
-    // still leaves an idempotency claim, a `Failed` stamp and the end-of-run
-    // retention sweep behind.
+    // Every caller of `run` reaches this check before the idempotency claim,
+    // Pipes channel, adapters, or state writes. The direct branch entry and
+    // persisted-plan apply also call this decision before their own state
+    // access. A refusal inside a dispatch arm would leave an idempotency
+    // claim, a `Failed` stamp, and the end-of-run retention sweep behind.
     //
     // A `--model` run without `--pipeline` is not gated here: it never selects
     // a quality, snapshot or load pipeline (`resolve_model_run_target` picks a
@@ -2778,12 +2775,13 @@ pub async fn run_with_explicit_contracts(
     // claim leaves a `Failed` stamp which skips the corrected retry. A
     // pipeline that does not resolve falls through, so the run body reports it
     // as it always did.
-    if let Some(shadow) = shadow_config
-        && (model_name_filter.is_none() || pipeline_name_arg.is_some())
-        && let Ok((pipeline_name, pipeline)) =
-            registry::resolve_pipeline(&loaded.config, pipeline_name_arg)
-    {
-        require_shadow_support(shadow, pipeline_name, pipeline)?;
+    if let Some(shadow) = shadow_config {
+        require_shadow_support_for_config(
+            &loaded.config,
+            pipeline_name_arg,
+            model_name_filter,
+            shadow,
+        )?;
     }
     // With `-o json` stdout is reserved for the JSON payload — route any
     // human-readable summary/progress line (e.g. a `depends_on` upstream
@@ -8945,6 +8943,24 @@ fn rewrite_quote_style(dialect: &dyn rocky_core::traits::SqlDialect) -> Result<O
              checking how its `format_table_ref` quotes each component"
         ),
     }
+}
+
+/// Check a shadow request against the selected pipeline in a loaded config.
+/// Callers before state access use the same selection as the run body: an
+/// unnamed `--model` run selects a transformation target separately, and an
+/// unresolved pipeline keeps its existing error from the run path.
+pub fn require_shadow_support_for_config(
+    config: &rocky_core::config::RockyConfig,
+    pipeline_name_arg: Option<&str>,
+    model_name_filter: Option<&str>,
+    shadow: &rocky_core::shadow::ShadowConfig,
+) -> Result<()> {
+    if (model_name_filter.is_none() || pipeline_name_arg.is_some())
+        && let Ok((pipeline_name, pipeline)) = registry::resolve_pipeline(config, pipeline_name_arg)
+    {
+        require_shadow_support(shadow, pipeline_name, pipeline)?;
+    }
+    Ok(())
 }
 
 /// Refuse `--shadow` / `--branch` when the selected pipeline's kind cannot be

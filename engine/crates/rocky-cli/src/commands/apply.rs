@@ -477,6 +477,7 @@ async fn run_apply_run_plan(
             )
         })?,
     );
+    preflight_run_plan_shadow_support(&loaded.config, &run_plan)?;
     let (models_dir, models_glob) = run_model_selection(&loaded.config, config_path, &run_plan)?;
     // Gate on the models this apply will ACTUALLY execute (fresh compile +
     // `--model` selection), not the plan's informational `models` list.
@@ -571,6 +572,33 @@ async fn run_apply_run_plan(
     )
     .await?;
     Ok(apply_outcome_for(termination, &apply_run_id))
+}
+
+/// Refuse a persisted shadow request against the current pipeline before
+/// policy synchronization or decision rows touch the state store. Branch
+/// lookup needs the store too, so this uses only the branch name here.
+fn preflight_run_plan_shadow_support(
+    config: &rocky_core::config::RockyConfig,
+    run_plan: &RunPlan,
+) -> Result<()> {
+    if run_plan.branch.is_none() && !run_plan.shadow {
+        return Ok(());
+    }
+    let shadow = rocky_core::shadow::ShadowConfig {
+        suffix: run_plan
+            .shadow_suffix
+            .clone()
+            .unwrap_or_else(|| "_rocky_shadow".to_string()),
+        schema_override: run_plan.shadow_schema.clone(),
+        cleanup_after: run_plan.branch.is_none(),
+        branch: run_plan.branch.clone(),
+    };
+    crate::commands::run::require_shadow_support_for_config(
+        config,
+        run_plan.pipeline.as_deref(),
+        run_plan.model.as_deref(),
+        &shadow,
+    )
 }
 
 /// Reject contradictory persisted run flags before an apply reads config or
@@ -3780,6 +3808,7 @@ async fn run_apply_ai_authored_plan(
             )
         })?,
     );
+    preflight_run_plan_shadow_support(&loaded.config, &run_plan)?;
     let (models_dir, models_glob) = run_model_selection(&loaded.config, config_path, &run_plan)?;
     // Gate on the models this apply will ACTUALLY execute (fresh compile +
     // `--model` selection), not the plan's informational `models` list.
@@ -5993,6 +6022,45 @@ mod tests {
             product_id: None,
             spec_digest: None,
         }
+    }
+
+    #[tokio::test]
+    async fn ai_authored_shadow_plan_checks_current_pipeline_before_review() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let config_path = dir.path().join("rocky.toml");
+        std::fs::write(
+            &config_path,
+            "[adapter]\ntype = \"duckdb\"\npath = \"fixture.duckdb\"\n\n\
+             [pipeline.dq]\ntype = \"quality\"\n\n\
+             [pipeline.dq.target]\nadapter = \"default\"\n\n\
+             [[pipeline.dq.tables]]\ncatalog = \"fixture\"\nschema = \"main\"\n\
+             table = \"orders\"\n\n[pipeline.dq.checks]\nenabled = true\n",
+        )?;
+        let mut plan = minimal_run_plan();
+        plan.pipeline = Some("dq".to_string());
+        plan.shadow = true;
+        let plan_id = write_plan(dir.path(), PlanKind::AiAuthored, &plan)?;
+        let state_path = dir.path().join("state.redb");
+
+        let error = super::run_apply_core_in(
+            dir.path(),
+            &config_path,
+            &plan_id,
+            &state_path,
+            PolicyPrincipal::Agent,
+            None,
+            true,
+        )
+        .await
+        .expect_err("current quality pipeline must refuse a stale shadow plan");
+        assert!(
+            error
+                .to_string()
+                .contains("--shadow is not supported for quality pipeline 'dq'"),
+            "the shadow guard must precede review and policy: {error:#}"
+        );
+        assert!(!state_path.exists(), "no state store was opened");
+        Ok(())
     }
 
     #[test]
