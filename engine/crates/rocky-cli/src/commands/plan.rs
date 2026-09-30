@@ -131,7 +131,8 @@ pub async fn plan(
     output.env = env.map(str::to_string);
 
     // #1941: one (target table name, source_type) pair per table that
-    // survives this loop's own skip conditions (filter, disabled override),
+    // survives this loop's own skip conditions (filter, source listing,
+    // disabled override),
     // collected below and checked once the loop ends — before this plan is
     // persisted (`output.plan_id`). Without this, `rocky plan` exits 0 and
     // persists a plan a later `rocky apply` (which re-executes `run()`,
@@ -206,6 +207,23 @@ pub async fn plan(
 
         // Per-table copy SQL
         let source_catalog = pipeline.source.catalog.as_deref().unwrap_or("").to_string();
+        let source_tables: std::collections::HashSet<String> = warehouse_adapter
+            .list_tables(&source_catalog, &conn.schema)
+            .await
+            .map(|tables| {
+                tables
+                    .into_iter()
+                    .map(|table| table.to_lowercase())
+                    .collect()
+            })
+            .unwrap_or_else(|e| {
+                tracing::warn!(schema = %conn.schema, error = %e,
+                    "failed to list source tables, will process all discovered tables");
+                conn.tables
+                    .iter()
+                    .map(|table| table.name.to_lowercase())
+                    .collect()
+            });
         let effective_source_catalog = if supports_catalogs {
             source_catalog
         } else {
@@ -214,6 +232,9 @@ pub async fn plan(
         for table in &conn.tables {
             // PR-B3: CLI `--filter table=<literal>` consumed here.
             if !filter_table_matches(parsed_filter.as_ref(), &table.name) {
+                continue;
+            }
+            if !source_tables.contains(&table.name.to_lowercase()) {
                 continue;
             }
             let target_label = if effective_target_catalog.is_empty() {
@@ -249,7 +270,23 @@ pub async fn plan(
                 });
                 continue;
             }
-            collision_check_pairs.push((table.name.clone(), conn.source_type.clone()));
+            let check_table_name = if run_options.shadow
+                && run_options.branch.is_none()
+                && run_options.shadow_schema.is_none()
+            {
+                format!(
+                    "{}{}",
+                    table.name,
+                    run_options
+                        .shadow_suffix
+                        .as_deref()
+                        .unwrap_or("_rocky_shadow")
+                )
+            } else {
+                // A branch or shadow schema override leaves the table name intact.
+                table.name.clone()
+            };
+            collision_check_pairs.push((check_table_name, conn.source_type.clone()));
 
             // Resolved AFTER the exclusion branches, mirroring `rocky run`,
             // which preflights the same value only for a table that survives
@@ -331,13 +368,15 @@ pub async fn plan(
 
     // #1941: refuse before this plan is persisted (`plan_id` below) — see
     // the comment where `collision_check_pairs` is declared above.
-    refuse_check_name_collisions(
-        name,
-        pipeline,
-        collision_check_pairs
-            .iter()
-            .map(|(t, s)| (t.as_str(), s.as_str())),
-    )?;
+    if run_options.model.is_none() {
+        refuse_check_name_collisions(
+            name,
+            pipeline,
+            collision_check_pairs
+                .iter()
+                .map(|(t, s)| (t.as_str(), s.as_str())),
+        )?;
+    }
 
     // --- Governance preview (Wave A + C-1 + C-2) -------------------------
     //
@@ -3576,6 +3615,175 @@ threshold = 0
         assert!(
             msg.contains("pipeline \"p\""),
             "the refusal must name the pipeline: {msg}"
+        );
+    }
+
+    #[cfg(feature = "duckdb")]
+    async fn plan_collision_fixture(
+        options: PlanRunOptions,
+        separate_source: bool,
+        shadow_named_custom: bool,
+    ) -> anyhow::Result<()> {
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        let dir = tempfile::tempdir()?;
+        let source_path = dir.path().join("source.duckdb");
+        let target_path = if separate_source {
+            dir.path().join("target.duckdb")
+        } else {
+            source_path.clone()
+        };
+        for (index, db_path) in [&source_path, &target_path].into_iter().enumerate() {
+            if index == 1 && !separate_source {
+                continue;
+            }
+            let warehouse = DuckDbWarehouseAdapter::open(db_path)?;
+            for schema in ["raw__acme", "raw__widgets"] {
+                warehouse
+                    .execute_statement(&format!("CREATE SCHEMA {schema}"))
+                    .await?;
+                if !separate_source || schema == "raw__acme" || db_path == &source_path {
+                    warehouse
+                        .execute_statement(&format!(
+                            "CREATE TABLE {schema}.orders AS SELECT 1 AS id"
+                        ))
+                        .await?;
+                }
+            }
+        }
+        if options.model.is_some() {
+            let models = dir.path().join("models");
+            std::fs::create_dir(&models)?;
+            std::fs::write(models.join("m.sql"), "-- model: m\nSELECT 1 AS id")?;
+            std::fs::write(
+                models.join("m.toml"),
+                r#"name = "m"
+[strategy]
+type = "full_refresh"
+[target]
+catalog = ""
+schema = "mart"
+table = "m"
+"#,
+            )?;
+        }
+        let config_path = dir.path().join("rocky.toml");
+        let custom_name = if shadow_named_custom {
+            "cross source overlap duckdb orders rocky shadow"
+        } else {
+            "cross source overlap duckdb orders"
+        };
+        std::fs::write(
+            &config_path,
+            format!(
+                r#"
+[adapter.source]
+type = "duckdb"
+path = "{}"
+
+[adapter.target]
+type = "duckdb"
+path = "{}"
+
+[pipeline.p]
+type = "replication"
+strategy = "full_refresh"
+
+[pipeline.p.source.discovery]
+adapter = "source"
+
+[pipeline.p.source.schema_pattern]
+prefix = "raw__"
+separator = "__"
+components = ["source"]
+
+[pipeline.p.target]
+adapter = "target"
+catalog_template = "x"
+schema_template = "staging__{{source}}"
+
+[pipeline.p.checks]
+cross_source_overlap = {{ keys = ["id"] }}
+
+[[pipeline.p.checks.custom]]
+name = "{custom_name}"
+sql = "SELECT 0"
+threshold = 0
+"#,
+                source_path.display(),
+                target_path.display()
+            ),
+        )?;
+        plan(
+            &config_path,
+            None,
+            None,
+            None,
+            &options,
+            false,
+            "HEAD",
+            &dir.path().join("state.redb"),
+            false,
+        )
+        .await
+    }
+
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn plan_model_filter_skips_replication_check_collisions() {
+        plan_collision_fixture(
+            PlanRunOptions {
+                model: Some("m".into()),
+                ..Default::default()
+            },
+            false,
+            false,
+        )
+        .await
+        .expect("a selected model does not run replication checks");
+    }
+
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn plan_shadow_suffix_uses_the_written_table_name_for_checks() {
+        plan_collision_fixture(
+            PlanRunOptions {
+                shadow: true,
+                ..Default::default()
+            },
+            false,
+            false,
+        )
+        .await
+        .expect("the shadow name does not collide with the production check name");
+    }
+
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn plan_skips_check_collisions_for_tables_missing_from_source() {
+        plan_collision_fixture(PlanRunOptions::default(), true, false)
+            .await
+            .expect("a missing source sibling is not run or checked");
+    }
+
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn plan_shadow_suffix_refuses_a_collision_on_the_written_table() {
+        let error = plan_collision_fixture(
+            PlanRunOptions {
+                shadow: true,
+                ..Default::default()
+            },
+            false,
+            true,
+        )
+        .await
+        .expect_err("the shadow check names collide");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("cross_source_overlap:duckdb.orders_rocky_shadow"),
+            "{message}"
         );
     }
 
