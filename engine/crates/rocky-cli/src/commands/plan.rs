@@ -1570,9 +1570,9 @@ pub(crate) fn build_source_state_snapshot(
 /// this function only canonicalizes the result and persists.
 /// Keep a shadow descriptor only when shadow routing is actually requested.
 ///
-/// `--shadow-suffix` / `--shadow-schema` are accepted without `--shadow`, where
-/// they are inert. Returning `None` there keeps a production plan's payload —
-/// and therefore its `plan_id` — exactly as it was before these fields existed.
+/// A plan without `--shadow` or `--branch` has no shadow override. Returning
+/// `None` there keeps a production plan's payload — and therefore its
+/// `plan_id` — exactly as it was before these fields existed.
 fn shadow_descriptor(run_options: &PlanRunOptions, value: Option<&String>) -> Option<String> {
     if run_options.shadow || run_options.branch.is_some() {
         value.cloned()
@@ -2761,9 +2761,8 @@ mod tests {
 
     /// #1403: an inert shadow descriptor must not reach the payload.
     ///
-    /// `--shadow-suffix` / `--shadow-schema` are accepted WITHOUT `--shadow`
-    /// (only `--branch` conflicts with them), and such a run is a production
-    /// run. Persisting the flag anyway adds a payload key to a plan whose
+    /// A plan without `--shadow` or `--branch` uses production routing.
+    /// Persisting an override anyway adds a payload key to a plan whose
     /// behaviour is unchanged, and `plan_id` is `blake3({kind, payload})` — so
     /// an existing project's plan id would move for a flag that does nothing.
     ///

@@ -69,7 +69,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **New branch names now use 1–64 ASCII letters, digits, or underscores at every unquoted SQL-backed entry point.** Invalid names fail before config or state I/O. Git-derived preview names use underscores. `branch compare` reports unreadable counts as null with an error reason instead of inventing zero. The preview action defaults to `pr_<PR number>_<head slug>` within the 64-character limit, so separate PRs cannot replace the same preview schema through slug collisions. Legacy names can still be listed, shown, approved, and promoted; deleting a branch record leaves warehouse tables and does not revoke an already persisted promote plan. (#2137)
 
-- **Shadow target overrides now require `--shadow` on `rocky run` and `rocky plan`.** An explicit `--shadow-suffix` or `--shadow-schema` without that flag is rejected by the command parser before any work starts. The default suffix still works when the flag is omitted. (#2192)
+- **Shadow target overrides now require `--shadow` on `rocky run` and `rocky plan`.** An explicit `--shadow-suffix` or `--shadow-schema` without that flag is rejected by the command parser before any work starts. Both overrides conflict with `--branch`. `--shadow` alone uses `_rocky_shadow`. (#2192)
 
 ### Added
 

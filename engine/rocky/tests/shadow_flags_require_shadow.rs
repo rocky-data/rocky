@@ -99,7 +99,7 @@ fn refused(verb: &str, flags: &[&str]) {
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("--shadow") && stderr.contains("Usage:"),
+        stderr.contains("the following required arguments were not provided:\n  --shadow"),
         "{stderr}"
     );
     assert!(
@@ -320,4 +320,35 @@ fn branch_conflicts_remain_on_plan_and_run() {
             String::from_utf8_lossy(&out.stderr)
         );
     }
+}
+
+#[test]
+fn plan_refuses_branch_with_shadow_suffix() {
+    refused_branch_suffix("plan");
+}
+
+#[test]
+fn run_refuses_branch_with_shadow_suffix() {
+    refused_branch_suffix("run");
+}
+
+fn refused_branch_suffix(verb: &str) {
+    let tmp = tempfile::tempdir().unwrap();
+    let out = command(
+        tmp.path(),
+        verb,
+        &["--branch", "feature", "--shadow-suffix", "_x"],
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "{verb}: stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("cannot be used with"),
+        "{verb}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
