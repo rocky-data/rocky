@@ -375,12 +375,90 @@ fn a_quality_branch_run_refuses_before_branch_lookup() {
     );
 }
 
-/// A RunPlan compiled under replication can outlive a config edit that changes
-/// its named pipeline to quality. Apply must refuse before policy audits the
-/// compiled model, which would change the state file even though no run starts.
+/// A RunPlan made against replication can outlive a config edit that changes
+/// its named pipeline to quality. The apply preflight must refuse either
+/// persisted shadow shape before policy records a decision.
 #[test]
-fn a_stale_shadow_run_plan_refuses_before_policy_writes() {
-    let replication = r#"
+fn stale_shadow_and_branch_run_plans_refuse_before_policy_writes() {
+    for flag in ["--shadow", "--branch"] {
+        let project = Project::new(replication_config(), false);
+        write_summary_model(&project.dir);
+        let args = if flag == "--branch" {
+            vec!["plan", "--pipeline", "ingest", flag, BRANCH, "--all"]
+        } else {
+            vec!["plan", "--pipeline", "ingest", flag, "--all"]
+        };
+        let planned = project.run(&args);
+        assert_eq!(
+            planned.status.code(),
+            Some(0),
+            "{flag}: {}",
+            stderr(&planned)
+        );
+        let plan: serde_json::Value =
+            serde_json::from_slice(&planned.stdout).expect("plan output is JSON");
+        assert_eq!(plan["plan_kind"], "run", "a compiled RunPlan is required");
+        let plan_id = plan["plan_id"].as_str().expect("persisted plan ID");
+        let stored: serde_json::Value = serde_json::from_slice(
+            &fs::read(
+                project
+                    .dir
+                    .join(".rocky/plans")
+                    .join(format!("{plan_id}.json")),
+            )
+            .expect("read persisted plan"),
+        )
+        .expect("persisted plan JSON");
+        if flag == "--branch" {
+            assert_eq!(stored["payload"]["shadow"], false);
+            assert_eq!(stored["payload"]["branch"], BRANCH);
+        }
+
+        fs::write(
+            project.dir.join("rocky.toml"),
+            format!(
+                "{}\n[policy]\nversion = 1\ndefault_agent_effect = \"deny\"\n",
+                quality_config("split", "main").replace("pipeline.dq", "pipeline.ingest")
+            ),
+        )
+        .expect("replace replication pipeline with quality");
+        let state_before = project.state_digest();
+        let warehouse_before = project.warehouse();
+        let refused = rocky_with_principal(&project.dir, &["apply", plan_id], "agent");
+
+        assert_eq!(
+            refused.status.code(),
+            Some(1),
+            "{flag}: {}",
+            stderr(&refused)
+        );
+        assert!(
+            stderr(&refused).contains(&format!(
+                "{flag}{} is not supported for quality pipeline 'ingest'",
+                if flag == "--branch" {
+                    format!(" {BRANCH}")
+                } else {
+                    String::new()
+                }
+            )),
+            "{flag}: the kind refusal must precede policy: {}",
+            stderr(&refused)
+        );
+        assert_eq!(
+            project.state_digest(),
+            state_before,
+            "{flag}: unchanged state"
+        );
+        assert_eq!(
+            project.warehouse(),
+            warehouse_before,
+            "{flag}: unchanged warehouse"
+        );
+    }
+}
+
+fn replication_config() -> &'static str {
+    r#"
 [adapter]
 type = "duckdb"
 path = "fixture.duckdb"
@@ -406,9 +484,11 @@ auto_create_schemas = true
 [policy]
 version = 1
 default_agent_effect = "allow"
-"#;
-    let project = Project::new(replication, false);
-    let models = project.dir.join("models");
+"#
+}
+
+fn write_summary_model(dir: &Path) {
+    let models = dir.join("models");
     fs::create_dir(&models).expect("create models");
     fs::write(models.join("summary.sql"), "SELECT 1 AS id\n").expect("write model");
     fs::write(
@@ -417,36 +497,42 @@ default_agent_effect = "allow"
          [target]\ncatalog = \"fixture\"\nschema = \"main\"\ntable = \"summary\"\n",
     )
     .expect("write model config");
+}
 
-    let planned = project.run(&["plan", "--pipeline", "ingest", "--shadow", "--all"]);
-    assert_eq!(planned.status.code(), Some(0), "{}", stderr(&planned));
-    let plan: serde_json::Value =
-        serde_json::from_slice(&planned.stdout).expect("plan output is JSON");
-    assert_eq!(plan["plan_kind"], "run", "a compiled RunPlan is required");
-    let plan_id = plan["plan_id"].as_str().expect("persisted plan ID");
-
-    fs::write(
-        project.dir.join("rocky.toml"),
-        format!(
-            "{}\n[policy]\nversion = 1\ndefault_agent_effect = \"allow\"\n",
-            quality_config("split", "main").replace("pipeline.dq", "pipeline.ingest")
-        ),
-    )
-    .expect("replace replication pipeline with quality");
-    let state_before = project.state_digest();
-    let refused = rocky_with_principal(&project.dir, &["apply", plan_id], "agent");
-
-    assert_eq!(refused.status.code(), Some(1), "{}", stderr(&refused));
-    assert!(
-        stderr(&refused).contains("not supported for quality pipeline 'ingest'"),
-        "the shadow refusal must precede policy evaluation: {}",
-        stderr(&refused)
-    );
-    assert_eq!(
-        project.state_digest(),
-        state_before,
-        "a refused stale plan must leave the state file byte-identical"
-    );
+/// Valid plans still pass the apply preflight. This drives the persisted plan
+/// through the CLI apply entry in both modes. The `rocky plan` CLI only
+/// accepts replication pipelines; transformation routing is covered by the
+/// direct-run test below.
+#[test]
+fn supported_shadow_and_branch_plans_apply() {
+    for flag in ["--shadow", "--branch"] {
+        let project = Project::new(replication_config(), true);
+        write_summary_model(&project.dir);
+        let args = if flag == "--branch" {
+            vec!["plan", "--pipeline", "ingest", flag, BRANCH, "--all"]
+        } else {
+            vec!["plan", "--pipeline", "ingest", flag, "--all"]
+        };
+        let planned = project.run(&args);
+        assert_eq!(
+            planned.status.code(),
+            Some(0),
+            "{flag}: {}",
+            stderr(&planned)
+        );
+        let plan: serde_json::Value =
+            serde_json::from_slice(&planned.stdout).expect("plan output is JSON");
+        assert_eq!(plan["plan_kind"], "run");
+        let plan_id = plan["plan_id"].as_str().expect("persisted plan ID");
+        let applied = project.run(&["apply", plan_id]);
+        assert_eq!(
+            applied.status.code(),
+            Some(0),
+            "{flag}: stdout: {} stderr: {}",
+            stdout(&applied),
+            stderr(&applied)
+        );
+    }
 }
 
 /// The refusal comes before the idempotency claim, not after it. A claim is a

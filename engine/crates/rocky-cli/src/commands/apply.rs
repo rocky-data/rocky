@@ -6025,6 +6025,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn transformation_shadow_and_branch_plans_pass_apply_preflight() -> anyhow::Result<()> {
+        for branch in [None, Some("fix_price")] {
+            let dir = tempfile::tempdir()?;
+            let config_path = dir.path().join("rocky.toml");
+            std::fs::write(
+                &config_path,
+                "[adapter]\ntype = \"duckdb\"\npath = \"fixture.duckdb\"\n\n\
+                 [pipeline.marts]\ntype = \"transformation\"\nmodels = \"models\"\n\n\
+                 [pipeline.marts.target.governance]\nauto_create_schemas = true\n",
+            )?;
+            let models = dir.path().join("models");
+            std::fs::create_dir(&models)?;
+            std::fs::write(models.join("summary.sql"), "SELECT 1 AS id\n")?;
+            std::fs::write(
+                models.join("summary.toml"),
+                "[strategy]\ntype = \"full_refresh\"\n\n\
+                 [target]\ncatalog = \"fixture\"\nschema = \"main\"\ntable = \"summary\"\n",
+            )?;
+            let state_path = dir.path().join("state.redb");
+            if let Some(name) = branch {
+                crate::commands::branch::run_branch_create(&state_path, name, None, false)?;
+            }
+            let mut plan = minimal_run_plan();
+            plan.pipeline = Some("marts".to_string());
+            plan.models_dir = Some(models.to_string_lossy().into_owned());
+            plan.models = vec!["summary".to_string()];
+            plan.execution_layers = vec![vec!["summary".to_string()]];
+            plan.branch = branch.map(str::to_string);
+            plan.shadow = branch.is_none();
+            let plan_id = write_plan(dir.path(), PlanKind::Run, &plan)?;
+
+            super::run_apply_core_in(
+                dir.path(),
+                &config_path,
+                &plan_id,
+                &state_path,
+                PolicyPrincipal::Human,
+                None,
+                true,
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn ai_authored_shadow_plan_checks_current_pipeline_before_review() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let config_path = dir.path().join("rocky.toml");
@@ -6034,11 +6080,15 @@ mod tests {
              [pipeline.dq]\ntype = \"quality\"\n\n\
              [pipeline.dq.target]\nadapter = \"default\"\n\n\
              [[pipeline.dq.tables]]\ncatalog = \"fixture\"\nschema = \"main\"\n\
-             table = \"orders\"\n\n[pipeline.dq.checks]\nenabled = true\n",
+             table = \"orders\"\n\n[pipeline.dq.checks]\nenabled = true\n\n\
+             [policy]\nversion = 1\ndefault_agent_effect = \"deny\"\n",
         )?;
+        let models_dir = dir.path().join("models");
+        write_min_model(&models_dir, "orders");
         let mut plan = minimal_run_plan();
         plan.pipeline = Some("dq".to_string());
         plan.shadow = true;
+        plan.models_dir = Some(models_dir.to_string_lossy().into_owned());
         let plan_id = write_plan(dir.path(), PlanKind::AiAuthored, &plan)?;
         let state_path = dir.path().join("state.redb");
 
