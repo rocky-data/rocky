@@ -69,6 +69,27 @@ pub async fn run_snapshot(
 
     let mut steps: Vec<SnapshotStepOutput> = Vec::new();
 
+    if snapshot_cfg.target.governance.auto_create_schemas
+        && let Some(sql_result) =
+            dialect.create_schema_sql(&config.target.catalog, &config.target.schema)
+    {
+        let sql = sql_result.context("failed to generate target schema SQL")?;
+        let step_start = Instant::now();
+        if !dry_run {
+            adapter
+                .execute_statement(&sql)
+                .await
+                .context("failed to create target schema")?;
+        }
+        steps.push(SnapshotStepOutput {
+            step: "create_schema".into(),
+            sql,
+            status: if dry_run { "dry_run" } else { "ok" }.into(),
+            duration_ms: step_start.elapsed().as_millis() as u64,
+            error: None,
+        });
+    }
+
     // Step 1: Ensure the target table exists (initial load DDL).
     let init_sql = generate_initial_load_sql(&config, dialect)
         .context("failed to generate initial load SQL")?;
