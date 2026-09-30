@@ -4460,10 +4460,9 @@ pub async fn run_with_explicit_contracts(
     //
     // #1941: the check-name-collision guard belongs in this SAME preflight, for
     // the SAME reason — `governance_setup` right below creates catalogs and
-    // schemas, sets tags, binds workspaces and applies grants before the run()
-    // pre-loop call further down (over the resume-filtered `tables_to_process`)
-    // ever runs, so that later call was refusing only after access control had
-    // already changed. `collision_check_pairs` collects one `(target_table_name,
+    // schemas, sets tags, binds workspaces and applies grants. A later check
+    // over the resume-filtered set cannot find a collision this one missed.
+    // `collision_check_pairs` collects one `(target_table_name,
     // source_type)` per table surviving the SAME three skip conditions, and the
     // call below runs after the loop, still before `governance_setup`.
     {
@@ -5235,31 +5234,6 @@ pub async fn run_with_explicit_contracts(
             "filtered resumed tables"
         );
     }
-
-    // #1941: refuse a check-name collision over the COMPLETE, final table
-    // set this invocation will copy — after resume-filtering above (so a
-    // resumed run's already-completed tables, which will not be
-    // re-materialized or re-checked, don't false-positive into the
-    // comparison), but before `init_run_progress` below writes anything and
-    // before the spawn loop further down copies a single row. `target_table_name`
-    // and `asset_key_prefix` are set once per task when `tables_to_process`
-    // is built and are not touched by anything between here and the spawn
-    // loop, so this sees exactly the table set / sibling grouping the run
-    // will actually use. `governance_setup` has already run by this point —
-    // the earlier call inside the `#1461` preflight block, over the
-    // unfiltered candidate set, is what stops a collision from mutating
-    // catalogs/schemas/tags/grants; this call is the authoritative one for
-    // what a resume will actually copy.
-    refuse_check_name_collisions(
-        pipeline_name,
-        pipeline,
-        tables_to_process.iter().map(|task| {
-            (
-                task.target_table_name.as_str(),
-                task.asset_key_prefix.first().map(String::as_str).unwrap_or(""),
-            )
-        }),
-    )?;
 
     // Initialize run progress tracking, stamped with this invocation's
     // pipeline scope so a later resume can prove the checkpoint is its own
@@ -7170,20 +7144,6 @@ async fn partition_overlap_key_carriers(
     partition
 }
 
-/// Runs the batched replication checks against the tables copied this run
-/// and appends the results to `pending_checks`.
-///
-/// Row count and freshness go through the warehouse's `BatchCheckAdapter`
-/// when it has one that says it can batch that leg (one UNION ALL query),
-/// and fall back to one query per table otherwise — no adapter, or an
-/// adapter whose `supports_row_counts` / `supports_freshness` says no. The
-/// decision is per leg (#1719). Assertions, custom checks, null-rate checks and the
-/// cross-source overlap check run per table through the plain
-/// `WarehouseAdapter`. Row-count anomalies detected on the way are pushed to
-/// `anomalies`, and every table the detector considered is recorded in
-/// `anomaly_evaluated`, evaluated or not — an empty `anomalies` list alone
-/// cannot say which happened (#1790).
-///
 /// Refuse if two check names THIS run will emit for the SAME table sanitize
 /// to the same Dagster check name (#1941).
 ///
@@ -7200,8 +7160,7 @@ async fn partition_overlap_key_carriers(
 ///
 /// `table_source_pairs` is one `(target table name, source_type)` pair per
 /// table this invocation will touch — duplicates on the same table signal a
-/// `cross_source_overlap` sibling group. Three callers supply this, at three
-/// different points in `run()`'s lifecycle:
+/// `cross_source_overlap` sibling group. Three callers supply this:
 ///
 /// - **Earliest**: called from inside the `#1461` preflight block, over
 ///   every table surviving that block's own three skip conditions — before
@@ -7209,17 +7168,9 @@ async fn partition_overlap_key_carriers(
 ///   tags, binds workspaces or applies grants. This is the call that
 ///   actually stops a collision from mutating access control; see that
 ///   block's own comment.
-/// - **Primary**: called from `run()` itself, over `tables_to_process`
-///   AFTER resume-filtering, immediately before the copy loop spawns any
-///   task and before `init_run_progress` writes anything. By this point
-///   `governance_setup` has already run — the earliest call above is what
-///   stops that — but this is the authoritative check over the exact table
-///   set a resume will actually copy (which the earliest call, running
-///   before resume-filtering, does not see), and it still refuses before
-///   any table is copied or any watermark advanced.
 /// - **Defense-in-depth**: called from the top of [`run_batched_checks`],
 ///   over `assertion_targets`. By the time that function runs, every table
-///   in THIS invocation has already been copied — both calls above already
+///   in THIS invocation has already been copied. The preflight call already
 ///   refused before that happened, so this only fires for a caller that
 ///   reaches `run_batched_checks` without going through `run()`'s pre-loop
 ///   gates (a test driving it directly, or a future second entrypoint).
@@ -7312,12 +7263,10 @@ async fn run_batched_checks(
     anomalies: &mut Vec<AnomalyOutput>,
     anomaly_evaluated: &mut Vec<AnomalyEvaluationOutput>,
 ) -> Result<()> {
-    // #1941: defense-in-depth. `run()`'s own caller already refused this
-    // run over the complete `tables_to_process` set BEFORE the copy loop —
-    // see `refuse_check_name_collisions` above and its call site before the
-    // spawn loop in `run()`. That earlier call sees every table this
-    // invocation WILL copy; this one sees only `assertion_targets`, which is
-    // populated per materialized table as the copy loop completes, so by the
+    // #1941: defense-in-depth. `run()` already refused this run over the
+    // preflight table set before warehouse setup. This call sees only
+    // `assertion_targets`, populated per materialized table as the copy loop
+    // completes, so by the
     // time this function runs the copies (and any watermark advance) have
     // already happened. Kept so a caller that reaches this function without
     // going through `run()`'s pre-loop gate (a test driving it directly, or
@@ -21462,7 +21411,8 @@ auto_create_schemas = true
     /// itself, but that call still runs AFTER `governance_setup`, so
     /// `auto_create_schemas` had already created both target schemas by the
     /// time it fired (a real review finding against the HEAD binary — the
-    /// schema-absence assertions below exist because of it).
+    /// schema-absence assertions below exist because of it). That post-resume
+    /// call has since been removed.
     ///
     /// Uses a `cross_source_overlap` collision deliberately: that check name
     /// depends on which tables discovery actually finds siblings for, so
@@ -21486,12 +21436,9 @@ auto_create_schemas = true
     /// Mutation that must turn this red: delete (or move to after
     /// `governance_setup`) the `refuse_check_name_collisions(pipeline_name,
     /// pipeline, collision_check_pairs...)` call inside the `#1461`
-    /// preflight block. The post-resume call and the `run_batched_checks`
-    /// call are both still in place and will still refuse the run before
-    /// any table is copied — only the NEW schema-absence assertion below
-    /// catches that regression; the pre-existing table-absence assertion
-    /// alone does not, because schema creation happens in `governance_setup`,
-    /// strictly before either of those two later calls runs.
+    /// preflight block. The `run_batched_checks` call would still refuse,
+    /// but only after the copy. The schema-absence assertion below catches
+    /// a refusal moved past `governance_setup`.
     #[cfg(feature = "duckdb")]
     #[tokio::test]
     async fn a_collision_refusal_writes_nothing_the_target_table_never_exists() {
