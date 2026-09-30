@@ -1125,6 +1125,7 @@ pub(crate) fn audit_to_record(ctx: &AuditContext) -> RunRecordAudit {
         hostname: ctx.hostname.clone(),
         rocky_version: ctx.rocky_version.clone(),
         rocky_branch: ctx.rocky_branch.clone(),
+        run_scope: ctx.run_scope.clone(),
     }
 }
 
@@ -3232,7 +3233,7 @@ pub async fn run_with_explicit_contracts(
         let audit_ctx = AuditContext::detect(
             idempotency_ctx.as_ref().map(|c| c.key.clone()),
             None,
-            shadow_config.and_then(|c| c.branch.clone()),
+            shadow_config,
         );
         let audit = audit_to_record(&audit_ctx);
         let custody = RecordCustody::from_persisted(persist_run_record(
@@ -3929,7 +3930,7 @@ pub async fn run_with_explicit_contracts(
     let audit_ctx = AuditContext::detect(
         idempotency_ctx.as_ref().map(|c| c.key.clone()),
         Some(pipeline.target.catalog_template.clone()),
-        shadow_config.and_then(|c| c.branch.clone()),
+        shadow_config,
     );
     let audit = audit_to_record(&audit_ctx);
 
@@ -32921,6 +32922,7 @@ auto_create_schemas = true
             check_gate_failed: false,
             verify_after_failed: false,
             rocky_branch: None,
+            run_scope: Some(rocky_core::state::RunScope::Production),
         };
         state.record_run(&failed).unwrap();
 
@@ -35307,6 +35309,7 @@ auto_create_schemas = true
             check_gate_failed: false,
             verify_after_failed: false,
             rocky_branch: None,
+            run_scope: Some(rocky_core::state::RunScope::Production),
         };
         store.record_run(&run).unwrap();
         // The prior build's LIVE artifact — the ledger row the liveness gate
@@ -35506,6 +35509,7 @@ auto_create_schemas = true
             check_gate_failed: false,
             verify_after_failed: false,
             rocky_branch: None,
+            run_scope: Some(rocky_core::state::RunScope::Production),
         };
         store.record_run(&base_run).unwrap();
         store
@@ -35636,6 +35640,7 @@ auto_create_schemas = true
             check_gate_failed: false,
             verify_after_failed: false,
             rocky_branch: None,
+            run_scope: Some(rocky_core::state::RunScope::Production),
         };
         store.record_run(&run).unwrap();
 
@@ -36623,6 +36628,7 @@ auto_create_schemas = true
                 check_gate_failed: false,
                 verify_after_failed: false,
                 rocky_branch: None,
+                run_scope: Some(rocky_core::state::RunScope::Production),
             };
             store.record_run(&run).unwrap();
             // The prior build's LIVE artifact row — the liveness gate resolves
@@ -36928,6 +36934,7 @@ auto_create_schemas = true
                     check_gate_failed: false,
                     verify_after_failed: false,
                     rocky_branch: None,
+                    run_scope: Some(rocky_core::state::RunScope::Production),
                 })
                 .unwrap();
             // The prior live_d build's LIVE artifact-ledger row — the liveness

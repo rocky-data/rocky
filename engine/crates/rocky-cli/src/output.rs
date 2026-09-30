@@ -5011,6 +5011,7 @@ pub struct RunRecordAudit {
     /// <name>`), or `None`. See `RunRecord::rocky_branch` (#2032) — this is
     /// NOT `git_branch`.
     pub rocky_branch: Option<String>,
+    pub run_scope: rocky_core::state::RunScope,
 }
 
 impl RunRecordAudit {
@@ -5030,6 +5031,7 @@ impl RunRecordAudit {
             hostname: "output-test-host".to_string(),
             rocky_version: "0.0.0-test".to_string(),
             rocky_branch: None,
+            run_scope: rocky_core::state::RunScope::Production,
         }
     }
 }
@@ -5423,6 +5425,7 @@ impl RunOutput {
             hostname: audit.hostname,
             rocky_version: audit.rocky_version,
             rocky_branch: audit.rocky_branch,
+            run_scope: Some(audit.run_scope),
             check_outcomes,
             pipeline: None,
             submission_id: None,

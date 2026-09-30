@@ -31,7 +31,10 @@
 
 use std::process::Command;
 
-use rocky_core::state::SessionSource;
+use rocky_core::{
+    shadow::ShadowConfig,
+    state::{RunScope, SessionSource},
+};
 
 /// Bundle of audit fields stamped onto every [`rocky_core::state::RunRecord`]
 /// at `rocky run` claim time. Required fields (`hostname`,
@@ -54,6 +57,7 @@ pub(crate) struct AuditContext {
     /// CLI flag. Distinct from `git_branch`: see
     /// [`rocky_core::state::RunRecord::rocky_branch`] (#2032).
     pub rocky_branch: Option<String>,
+    pub run_scope: RunScope,
 }
 
 impl AuditContext {
@@ -70,15 +74,22 @@ impl AuditContext {
     ///   transformation/quality/snapshot/load pipelines it's the fully
     ///   resolved `target.catalog`. `None` on model-only runs where no
     ///   pipeline context exists.
-    /// * `rocky_branch` — the `--branch <name>` value in force for this run,
-    ///   or `None` for a production / plain-`--shadow` run. Not detected
-    ///   from the environment (unlike every other field here): the caller
-    ///   already resolved it while building the run's `ShadowConfig`.
+    /// * `shadow_config` — resolved target routing, including a named branch
+    ///   or the schema of a plain shadow run.
     pub fn detect(
         idempotency_key: Option<String>,
         target_catalog: Option<String>,
-        rocky_branch: Option<String>,
+        shadow_config: Option<&ShadowConfig>,
     ) -> Self {
+        let run_scope = match shadow_config {
+            Some(config) => match &config.branch {
+                Some(name) => RunScope::Branch { name: name.clone() },
+                None => RunScope::Shadow {
+                    schema: config.schema_override.clone(),
+                },
+            },
+            None => RunScope::Production,
+        };
         Self {
             triggering_identity: detect_triggering_identity(),
             session_source: detect_session_source(),
@@ -88,7 +99,8 @@ impl AuditContext {
             target_catalog,
             hostname: detect_hostname(),
             rocky_version: ROCKY_VERSION.to_string(),
-            rocky_branch,
+            rocky_branch: shadow_config.and_then(|config| config.branch.clone()),
+            run_scope,
         }
     }
 }
@@ -329,10 +341,33 @@ mod tests {
     /// not this detector (#2032).
     #[test]
     fn rocky_branch_threaded_through() {
-        let ctx = AuditContext::detect(None, None, Some("pr-preview-fix-price".to_string()));
+        let config = ShadowConfig {
+            branch: Some("pr-preview-fix-price".to_string()),
+            ..ShadowConfig::default()
+        };
+        let ctx = AuditContext::detect(None, None, Some(&config));
         assert_eq!(ctx.rocky_branch, Some("pr-preview-fix-price".to_string()));
+        assert_eq!(
+            ctx.run_scope,
+            RunScope::Branch {
+                name: "pr-preview-fix-price".to_string()
+            }
+        );
 
         let ctx = AuditContext::detect(None, None, None);
         assert_eq!(ctx.rocky_branch, None);
+        assert_eq!(ctx.run_scope, RunScope::Production);
+
+        let config = ShadowConfig {
+            schema_override: Some("preview_tmp".to_string()),
+            ..ShadowConfig::default()
+        };
+        let ctx = AuditContext::detect(None, None, Some(&config));
+        assert_eq!(
+            ctx.run_scope,
+            RunScope::Shadow {
+                schema: Some("preview_tmp".to_string())
+            }
+        );
     }
 }

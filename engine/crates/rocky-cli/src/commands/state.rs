@@ -458,6 +458,7 @@ mod retention_sweep_config_tests {
             pipeline: None,
             submission_id: None,
             rocky_branch: None,
+            run_scope: Some(rocky_core::state::RunScope::Production),
         }
     }
 

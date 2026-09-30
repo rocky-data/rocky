@@ -294,6 +294,15 @@ fn newest_branch_and_base_runs(
     Option<rocky_core::state::RunRecord>,
     Option<String>,
 )> {
+    // Older records have no scope field. Keep their former eligibility and
+    // the legacy git-branch exclusion below; their write target is unknown.
+    fn base_eligible(run: &rocky_core::state::RunRecord) -> bool {
+        run.rocky_branch.is_none()
+            && matches!(
+                run.run_scope.as_ref(),
+                None | Some(rocky_core::state::RunScope::Production)
+            )
+    }
     // The branch side matches `RunRecord::rocky_branch` — the literal
     // `rocky run --branch <name>` value — NOT `git_branch` (`git
     // symbolic-ref --short HEAD`, the checkout's git branch). `--branch
@@ -340,7 +349,7 @@ fn newest_branch_and_base_runs(
                     r.git_commit
                         .as_deref()
                         .is_some_and(|c| c.eq_ignore_ascii_case(&base_lower))
-                        && r.rocky_branch.is_none()
+                        && base_eligible(r)
                 })?
                 .into_iter()
                 .next();
@@ -368,7 +377,7 @@ fn newest_branch_and_base_runs(
         // run instead of an ordinary main run.
         let by_branch = store
             .list_runs_matching(1, |r| {
-                r.git_branch.as_deref() == Some(base_ref) && r.rocky_branch.is_none()
+                r.git_branch.as_deref() == Some(base_ref) && base_eligible(r)
             })?
             .into_iter()
             .next();
@@ -381,7 +390,7 @@ fn newest_branch_and_base_runs(
                 r.git_commit
                     .as_deref()
                     .is_some_and(|c| c.eq_ignore_ascii_case(&base_lower))
-                    && r.rocky_branch.is_none()
+                    && base_eligible(r)
             })?
             .into_iter()
             .next();
@@ -404,7 +413,7 @@ fn newest_branch_and_base_runs(
                     r.git_commit
                         .as_deref()
                         .is_some_and(|c| c.to_ascii_lowercase().starts_with(&base_lower))
-                        && r.rocky_branch.is_none()
+                        && base_eligible(r)
                 })?
                 .into_iter()
                 .next();
@@ -419,7 +428,7 @@ fn newest_branch_and_base_runs(
                         r.git_commit.as_deref().is_some_and(|c| {
                             let lower = c.to_ascii_lowercase();
                             lower.starts_with(&base_lower) && lower != first_sha
-                        }) && r.rocky_branch.is_none()
+                        }) && base_eligible(r)
                     })?
                     .into_iter()
                     .next();
@@ -465,7 +474,7 @@ fn newest_branch_and_base_runs(
     // was the pairing key), so it must not become the ordinary base.
     let fallback = store
         .list_runs_matching(1, |r| {
-            r.rocky_branch.is_none() && r.git_branch.as_deref() != Some(branch_name)
+            base_eligible(r) && r.git_branch.as_deref() != Some(branch_name)
         })?
         .into_iter()
         .next();
@@ -3361,6 +3370,7 @@ mod tests {
             // `run_record()` test. `newest_branch_and_base_runs`'s
             // selection tests use `sample_run()` instead.
             rocky_branch: None,
+            run_scope: Some(rocky_core::state::RunScope::Production),
         }
     }
 

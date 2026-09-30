@@ -3894,7 +3894,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             // guarantees branch can't coexist with `shadow` / `shadow_schema`.
             let shadow_config = if let Some(config) = branch_shadow_config {
                 Some(config)
-            } else if shadow {
+            } else if shadow || shadow_schema.is_some() {
                 Some(rocky_core::shadow::ShadowConfig {
                     suffix: shadow_suffix,
                     schema_override: shadow_schema,
