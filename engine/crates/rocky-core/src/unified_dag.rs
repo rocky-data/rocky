@@ -1000,8 +1000,8 @@ pub struct RuntimeDag {
 /// producer whose target is not fully known (a load with no explicit `table`,
 /// or a seed whose catalog is unknown because no single pipeline could be
 /// chosen for the seed nodes) is not ruled out by a read that does not
-/// contradict it. A read that names none of them, several, or one while another
-/// could be the same table, is refused with
+/// contradict it. A read that names none of them adds no label edge. A read
+/// that could name several, or one while another could be the same table, is refused with
 /// [`UnifiedDagError::AmbiguousLabelProducer`] before anything runs.
 ///
 /// # Errors
@@ -1039,9 +1039,17 @@ pub fn build_runtime_dag(
             let catalog = pipeline_catalog
                 .get(pipeline.as_str())
                 .and_then(Option::as_deref);
-            models
-                .iter()
-                .map(move |m| PhysicalEdgeModel::from_model(m).with_effective_catalog(catalog))
+            let adapter = config
+                .pipelines
+                .get(pipeline.as_str())
+                .map(PipelineConfig::target_adapter);
+            models.iter().map(move |m| {
+                let input = PhysicalEdgeModel::from_model(m).with_effective_catalog(catalog);
+                match adapter {
+                    Some(adapter) => input.with_adapter(adapter),
+                    None => input,
+                }
+            })
         })
         .collect();
 
@@ -1365,6 +1373,11 @@ fn infer_label_dependencies(
                         })
                         .filter(|(_, found)| *found != ReadMatch::Not)
                         .collect();
+                    if possible.is_empty() {
+                        // The qualified read is of another table entirely.
+                        // None of these label claimants can supply it.
+                        continue;
+                    }
                     let [(named, ReadMatch::Named)] = possible.as_slice() else {
                         let mut described: Vec<String> = claimants
                             .iter()
@@ -3680,12 +3693,10 @@ mod tests {
 
     /// Two pipelines, two DuckDB files, one `schema.table` written through
     /// both. Each catalogless target lives in ITS adapter's catalog and a read
-    /// naming `alpha` can only mean the `alpha` file's — but "exactly one
-    /// producer of the `schema.table`" is the rule, and two write it, so the
-    /// read is left unbound and both are named. The order is what it was
-    /// before the fallback existed; nothing is guessed.
+    /// naming `alpha` can only mean the `alpha` file's. The producer on the
+    /// other adapter does not make that proven binding ambiguous.
     #[test]
-    fn a_schema_table_two_adapters_both_write_is_left_unbound() {
+    fn a_schema_table_two_adapters_bind_the_reader_to_its_adapter() {
         let mut config = config_with_pipelines(vec![
             ("p_alpha", transform_pipeline_on("wh_alpha")),
             ("p_beta", transform_pipeline_on("wh_beta")),
@@ -3725,22 +3736,19 @@ mod tests {
         ]);
         let runtime = build_runtime_dag(&config, &by_pipeline, &[], None, &duckdb_stem_catalog)
             .expect("runtime dag");
-        for producer in ["shared_alpha", "shared_beta"] {
-            assert!(
-                !has_edge(
-                    &runtime.dag,
-                    &format!("transformation:{producer}"),
-                    "transformation:reader"
-                ),
-                "no edge is guessed for {producer}"
-            );
-        }
+        assert!(has_edge(
+            &runtime.dag,
+            "transformation:shared_alpha",
+            "transformation:reader"
+        ));
+        assert!(!has_edge(
+            &runtime.dag,
+            "transformation:shared_beta",
+            "transformation:reader"
+        ));
         assert!(
-            runtime
-                .warnings
-                .iter()
-                .any(|w| w.contains("'shared_alpha'") && w.contains("'shared_beta'")),
-            "both candidates are named: {:?}",
+            runtime.warnings.is_empty(),
+            "the binding is settled: {:?}",
             runtime.warnings
         );
     }
@@ -4105,10 +4113,10 @@ mod tests {
         }
     }
 
-    /// A qualified read that names neither producer's target is just as
-    /// unresolvable as a bare one.
+    /// A qualified read that names neither claimant is a different table.
+    /// Another producer's exact physical edge must survive label inference.
     #[test]
-    fn a_read_naming_neither_colliding_producer_is_refused() {
+    fn a_read_naming_neither_colliding_producer_keeps_its_exact_edge() {
         let (config, mut by_pipeline) = shared_label_project(true);
         by_pipeline
             .get_mut("t")
@@ -4117,9 +4125,30 @@ mod tests {
             .find(|m| m.config.name == "reader")
             .expect("reader")
             .sql = "SELECT x FROM prod.elsewhere.shared".to_string();
-        assert!(matches!(
-            build_runtime_dag(&config, &by_pipeline, &[], None, &no_catalog),
-            Err(UnifiedDagError::AmbiguousLabelProducer { .. })
+        by_pipeline
+            .get_mut("t")
+            .expect("pipeline t")
+            .push(model_reading(
+                "external_source",
+                ("prod", "elsewhere", "shared"),
+                "SELECT 1 AS x",
+            ));
+        let runtime = build_runtime_dag(&config, &by_pipeline, &[], None, &no_catalog)
+            .expect("neither claimant can be this qualified read");
+        assert!(has_edge(
+            &runtime.dag,
+            "transformation:external_source",
+            "transformation:reader"
+        ));
+        assert!(!has_edge(
+            &runtime.dag,
+            "transformation:shared",
+            "transformation:reader"
+        ));
+        assert!(!has_edge(
+            &runtime.dag,
+            "load:shared",
+            "transformation:reader"
         ));
     }
 

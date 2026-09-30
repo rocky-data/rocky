@@ -39,6 +39,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 #[derive(Debug, Clone)]
 pub struct PhysicalEdgeModel<'a> {
     pub name: &'a str,
+    /// The configured adapter name for this model. Runtime scheduling treats
+    /// distinct names as distinct destinations, as target collision checks do.
+    pub adapter: Option<&'a str>,
     pub catalog: &'a str,
     pub schema: &'a str,
     pub table: &'a str,
@@ -75,6 +78,7 @@ impl<'a> PhysicalEdgeModel<'a> {
     pub fn from_model(m: &'a crate::models::Model) -> Self {
         Self {
             name: &m.config.name,
+            adapter: None,
             catalog: &m.config.target.catalog,
             schema: &m.config.target.schema,
             table: &m.config.target.table,
@@ -89,6 +93,12 @@ impl<'a> PhysicalEdgeModel<'a> {
     #[must_use]
     pub fn with_effective_catalog(mut self, catalog: Option<&'a str>) -> Self {
         self.effective_catalog = catalog.filter(|c| !fold_identifier(c).is_empty());
+        self
+    }
+
+    #[must_use]
+    pub fn with_adapter(mut self, adapter: &'a str) -> Self {
+        self.adapter = Some(adapter);
         self
     }
 }
@@ -243,27 +253,34 @@ enum Binding<'a> {
 /// live in `read_catalog` (#1629).
 ///
 /// `at_schema_table` is every producer of that `(schema, table)`, whatever
-/// catalog it declares, without the reader itself. A producer that declares a
-/// catalog is provably not the read's table (the exact lookup missed, so it
-/// names another catalog), and neither is a catalogless one established to live
-/// in another catalog. When none of them could be, there is nothing to bind and
-/// nothing to report. When one could be and it is not the only producer, or its
-/// catalog is not established, the read stays unbound: a guess across catalogs
-/// is the one thing this must never make, because it can order a real
-/// dependency backwards.
+/// catalog it declares, without the reader itself. A producer on another
+/// known adapter, one that declares a different catalog, or a catalogless one
+/// established in another catalog cannot be the read's table. Count only the
+/// remaining candidates. Bind the sole candidate only when its catalog is
+/// established; otherwise report the unbound read.
 fn bind_catalogless<'a>(
     read_catalog: &str,
+    reader_adapter: Option<&str>,
     at_schema_table: &[&PhysicalEdgeModel<'a>],
 ) -> Binding<'a> {
-    let could_be_the_read = |p: &&PhysicalEdgeModel<'_>| {
-        fold_identifier(p.catalog).is_empty()
-            && p.effective_catalog
-                .is_none_or(|effective| fold_identifier(effective) == read_catalog)
-    };
-    if !at_schema_table.iter().any(could_be_the_read) {
-        return Binding::Nothing;
-    }
-    match at_schema_table {
+    let possible: Vec<&PhysicalEdgeModel<'_>> = at_schema_table
+        .iter()
+        .copied()
+        .filter(|p| {
+            // An unknown adapter cannot rule a producer out. Runtime DAG
+            // inputs carry both adapters, while plain runs use one warehouse.
+            let same_adapter = !matches!(
+                (reader_adapter, p.adapter),
+                (Some(reader), Some(producer)) if reader != producer
+            );
+            same_adapter
+                && fold_identifier(p.catalog).is_empty()
+                && p.effective_catalog
+                    .is_none_or(|effective| fold_identifier(effective) == read_catalog)
+        })
+        .collect();
+    match possible.as_slice() {
+        [] => Binding::Nothing,
         [only] => match only.effective_catalog {
             Some(_) => Binding::Producer(only.name),
             None => Binding::Unbound {
@@ -303,8 +320,9 @@ fn bind_catalogless<'a>(
 /// A model whose `[target]` names no catalog (`catalog = ""`) is indexed
 /// under an empty catalog, so a `cat.schema.table` read of it misses the
 /// exact index. That read is bound to it only when ALL of these hold: the
-/// exact lookup missed, exactly one producer writes `schema.table`, that
-/// producer's `[target]` names no catalog, and the caller established which
+/// exact lookup missed, exactly one producer could write the read table after
+/// adapter and catalog exclusions, that producer's `[target]` names no catalog,
+/// and the caller established which
 /// catalog it lives in ([`PhysicalEdgeModel::effective_catalog`]) and that is
 /// the catalog the read names. Anything else derives no edge. When a
 /// catalogless producer might be the read's table but the read cannot be bound
@@ -320,7 +338,8 @@ pub fn derive_physical_edges(
     // Producer index: canonical (catalog, schema, table) and (schema, table)
     // → model names. Multi-maps — a collision must not silently drop a
     // producer (the label-heuristic HashMap overwrite bug class).
-    let mut by_three: BTreeMap<(String, String, String), Vec<&str>> = BTreeMap::new();
+    let mut by_three: BTreeMap<(String, String, String), Vec<&PhysicalEdgeModel<'_>>> =
+        BTreeMap::new();
     let mut by_two: BTreeMap<(String, String), Vec<&str>> = BTreeMap::new();
     let mut by_table: BTreeMap<String, Vec<&str>> = BTreeMap::new();
     // Every producer of a `(schema, table)`, whatever catalog it declares: the
@@ -339,14 +358,19 @@ pub fn derive_physical_edges(
         let key2 = (key3.1.clone(), key3.2.clone());
         by_table.entry(key3.2.clone()).or_default().push(m.name);
         models_by_two.entry(key2.clone()).or_default().push(m);
-        by_three.entry(key3).or_default().push(m.name);
+        by_three.entry(key3).or_default().push(m);
         by_two.entry(key2).or_default().push(m.name);
     }
-    for names in by_three.values() {
-        if names.len() > 1 {
-            for pair in names.windows(2) {
+    for same_target in by_three.values() {
+        for (index, first) in same_target.iter().enumerate() {
+            for second in same_target.iter().skip(index + 1) {
+                // Different configured adapters are separate destinations,
+                // as in the runtime DAG's duplicate-target check.
+                if matches!((first.adapter, second.adapter), (Some(a), Some(b)) if a != b) {
+                    continue;
+                }
                 out.target_collisions
-                    .push((pair[0].to_string(), pair[1].to_string()));
+                    .push((first.name.to_string(), second.name.to_string()));
             }
         }
     }
@@ -390,7 +414,7 @@ pub fn derive_physical_edges(
                     if let Some(exact) =
                         by_three.get(&(catalog.clone(), schema.clone(), table.clone()))
                     {
-                        (Evidence::Exact3, exact.clone())
+                        (Evidence::Exact3, exact.iter().map(|p| p.name).collect())
                     } else {
                         // The exact lookup missed: the read names a catalog
                         // that no producer DECLARES for this `(schema,
@@ -404,7 +428,7 @@ pub fn derive_physical_edges(
                                 found.iter().copied().filter(|p| p.name != m.name).collect()
                             })
                             .unwrap_or_default();
-                        match bind_catalogless(catalog, &at_schema_table) {
+                        match bind_catalogless(catalog, m.adapter, &at_schema_table) {
                             Binding::Nothing => continue,
                             Binding::Producer(producer) => (Evidence::Fallback, vec![producer]),
                             Binding::Unbound { candidates, reason } => {
@@ -623,6 +647,7 @@ mod tests {
     ) -> PhysicalEdgeModel<'a> {
         PhysicalEdgeModel {
             name,
+            adapter: None,
             catalog,
             schema,
             table,
@@ -801,12 +826,10 @@ mod tests {
         );
     }
 
-    /// "Exactly one producer" counts every producer of the `schema.table`,
-    /// not only the catalogless ones: with a second model that declares a
-    /// catalog writing the same `schema.table`, the read stays unbound and
-    /// names both — even though the declared one provably is not `db`'s.
+    /// A producer that declares another catalog cannot make a proven
+    /// catalogless match ambiguous.
     #[test]
-    fn a_catalogless_producer_is_bound_only_when_it_is_the_only_producer_of_the_schema_table() {
+    fn a_catalogless_producer_ignores_a_different_declared_catalog() {
         let models = [
             catalogless("local", Some("db"), "main", "shared", "SELECT 1 AS x"),
             m("remote", "prod", "main", "shared", "SELECT 2 AS x"),
@@ -819,13 +842,33 @@ mod tests {
             ),
         ];
         let d = derive_physical_edges(&models, &[]);
-        assert!(d.edges.is_empty(), "{d:?}");
-        assert_eq!(d.unbound_reads.len(), 1, "{d:?}");
-        assert_eq!(d.unbound_reads[0].reason, UnboundReason::SeveralProducers);
-        assert_eq!(
-            d.unbound_reads[0].candidates,
-            vec!["local".to_string(), "remote".to_string()]
-        );
+        assert_eq!(d.edges, vec![("reader".into(), "local".into())], "{d:?}");
+        assert!(d.unbound_reads.is_empty(), "{d:?}");
+        assert!(d.target_collisions.is_empty(), "{d:?}");
+    }
+
+    /// Equal catalog names on separate DuckDB connections are separate
+    /// tables. The reader can only consume from its own adapter.
+    #[test]
+    fn a_catalogless_producer_ignores_another_adapter() {
+        let models = [
+            catalogless("local", Some("db"), "main", "shared", "SELECT 1 AS x")
+                .with_adapter("local"),
+            catalogless("remote", Some("db"), "main", "shared", "SELECT 2 AS x")
+                .with_adapter("remote"),
+            m(
+                "reader",
+                "db",
+                "main",
+                "reader",
+                "SELECT x FROM db.main.shared",
+            )
+            .with_adapter("local"),
+        ];
+        let d = derive_physical_edges(&models, &[]);
+        assert_eq!(d.edges, vec![("reader".into(), "local".into())], "{d:?}");
+        assert!(d.unbound_reads.is_empty(), "{d:?}");
+        assert!(d.target_collisions.is_empty(), "{d:?}");
     }
 
     /// Producers that ALL declare a catalog can never be the table a read of

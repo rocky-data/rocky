@@ -3597,4 +3597,107 @@ mod tests {
             "the consumer read the producer's row"
         );
     }
+
+    /// A second adapter and a declared target in another catalog do not
+    /// compete with the catalogless producer of the reader's table. The
+    /// existing row makes a missing edge observable as a stale successful run.
+    #[tokio::test]
+    async fn run_dag_ignores_other_catalog_and_adapter_before_fallback_uniqueness() {
+        use rocky_core::traits::WarehouseAdapter;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        for name in ["reader", "producer", "other"] {
+            std::fs::create_dir_all(root.join(format!("models/{name}"))).unwrap();
+        }
+        std::fs::write(
+            root.join("rocky.toml"),
+            format!(
+                "[adapter.local]\ntype = \"duckdb\"\npath = \"{}\"\n\n\
+                 [adapter.other]\ntype = \"duckdb\"\npath = \"{}\"\n\n\
+                 [pipeline.reader]\ntype = \"transformation\"\nmodels = \"models/reader/**\"\n\n\
+                 [pipeline.reader.target]\nadapter = \"local\"\n\n\
+                 [pipeline.reader.target.governance]\nauto_create_schemas = true\n\n\
+                 [pipeline.producer]\ntype = \"transformation\"\nmodels = \"models/producer/**\"\n\n\
+                 [pipeline.producer.target]\nadapter = \"local\"\n\n\
+                 [pipeline.producer.target.governance]\nauto_create_schemas = true\n\n\
+                 [pipeline.other]\ntype = \"transformation\"\nmodels = \"models/other/**\"\n\n\
+                 [pipeline.other.target]\nadapter = \"other\"\n\n\
+                 [pipeline.other.target.governance]\nauto_create_schemas = true\n",
+                root.join("db.duckdb").display(),
+                root.join("other.duckdb").display()
+            ),
+        )
+        .unwrap();
+        for (directory, name, catalog, table, sql) in [
+            (
+                "reader",
+                "a_reader",
+                "db",
+                "result",
+                "SELECT id FROM db.silver.orders",
+            ),
+            ("producer", "z_producer", "", "orders", "SELECT 2 AS id"),
+            (
+                "other",
+                "other_producer",
+                "other",
+                "orders",
+                "SELECT 3 AS id",
+            ),
+        ] {
+            let model_dir = root.join(format!("models/{directory}"));
+            std::fs::write(model_dir.join(format!("{name}.sql")), sql).unwrap();
+            std::fs::write(
+                model_dir.join(format!("{name}.toml")),
+                format!(
+                    "name = \"{name}\"\n[strategy]\ntype = \"full_refresh\"\n\
+                     [target]\ncatalog = \"{catalog}\"\nschema = \"silver\"\ntable = \"{table}\"\n"
+                ),
+            )
+            .unwrap();
+        }
+
+        let local = DuckDbWarehouseAdapter::open(&root.join("db.duckdb")).unwrap();
+        local
+            .execute_statement("CREATE SCHEMA silver")
+            .await
+            .unwrap();
+        local
+            .execute_statement("CREATE TABLE silver.orders AS SELECT 1 AS id")
+            .await
+            .unwrap();
+        drop(local);
+
+        let planned = plan_fixture(root).expect("plan the same graph run_with_dag executes");
+        assert!(
+            planned_edge(
+                &planned,
+                "transformation:z_producer",
+                "transformation:a_reader"
+            ),
+            "{:?}",
+            planned.runtime.physical
+        );
+        run_with_dag(
+            &root.join("rocky.toml"),
+            dag_snapshot(&root.join("rocky.toml")),
+            &root.join(".rocky-state.redb"),
+            false,
+            &PartitionRunOptions::default(),
+            &crate::commands::run::SkipRunOptions::default(),
+            None,
+            Some(1),
+        )
+        .await
+        .expect("the read waits for the in-run producer");
+
+        let local = DuckDbWarehouseAdapter::open(&root.join("db.duckdb")).unwrap();
+        let conn = local.shared_connector();
+        let guard = conn.lock().unwrap();
+        let rows = guard
+            .execute_sql("SELECT id FROM db.silver.result")
+            .unwrap();
+        assert_eq!(cell_i64(&rows.rows[0][0]), 2, "stale row was consumed");
+    }
 }
