@@ -40,7 +40,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 pub struct PhysicalEdgeModel<'a> {
     pub name: &'a str,
     /// The configured adapter name for this model. Runtime scheduling treats
-    /// distinct names as distinct destinations, as target collision checks do.
+    /// distinct names as routing hints, not proof of distinct tables.
     pub adapter: Option<&'a str>,
     pub catalog: &'a str,
     pub schema: &'a str,
@@ -237,8 +237,8 @@ pub fn bare_name_binds(model_name: &str, target_table: &str) -> bool {
 enum Binding<'a> {
     /// No producer of that `schema.table` could be the read's table.
     Nothing,
-    /// The one producer of that `schema.table`, which declares no catalog and
-    /// is established to live in the catalog the read names.
+    /// The sole possible producer of that `schema.table`, which declares no
+    /// catalog and is established to live in the catalog the read names.
     Producer(&'a str),
     /// A producer could be the read's table, but it cannot be bound to it.
     Unbound {
@@ -249,32 +249,24 @@ enum Binding<'a> {
 
 /// Bind a `read_catalog.schema.table` read whose exact `(catalog, schema,
 /// table)` lookup missed to a producer of that `schema.table` — but only to
-/// the ONLY producer of it, when it declares no catalog and is established to
+/// the sole possible producer of it, when it declares no catalog and is established to
 /// live in `read_catalog` (#1629).
 ///
 /// `at_schema_table` is every producer of that `(schema, table)`, whatever
-/// catalog it declares, without the reader itself. A producer on another
-/// known adapter, one that declares a different catalog, or a catalogless one
-/// established in another catalog cannot be the read's table. Count only the
-/// remaining candidates. Bind the sole candidate only when its catalog is
+/// catalog it declares, without the reader itself. A producer with a
+/// different declared or established catalog cannot be the read's table.
+/// Adapter names alone do not establish that two tables differ. Count only
+/// the remaining candidates. Bind the sole candidate only when its catalog is
 /// established; otherwise report the unbound read.
 fn bind_catalogless<'a>(
     read_catalog: &str,
-    reader_adapter: Option<&str>,
     at_schema_table: &[&PhysicalEdgeModel<'a>],
 ) -> Binding<'a> {
     let possible: Vec<&PhysicalEdgeModel<'_>> = at_schema_table
         .iter()
         .copied()
         .filter(|p| {
-            // An unknown adapter cannot rule a producer out. Runtime DAG
-            // inputs carry both adapters, while plain runs use one warehouse.
-            let same_adapter = !matches!(
-                (reader_adapter, p.adapter),
-                (Some(reader), Some(producer)) if reader != producer
-            );
-            same_adapter
-                && fold_identifier(p.catalog).is_empty()
+            fold_identifier(p.catalog).is_empty()
                 && p.effective_catalog
                     .is_none_or(|effective| fold_identifier(effective) == read_catalog)
         })
@@ -321,7 +313,7 @@ fn bind_catalogless<'a>(
 /// under an empty catalog, so a `cat.schema.table` read of it misses the
 /// exact index. That read is bound to it only when ALL of these hold: the
 /// exact lookup missed, exactly one producer could write the read table after
-/// adapter and catalog exclusions, that producer's `[target]` names no catalog,
+/// catalog exclusions, that producer's `[target]` names no catalog,
 /// and the caller established which
 /// catalog it lives in ([`PhysicalEdgeModel::effective_catalog`]) and that is
 /// the catalog the read names. Anything else derives no edge. When a
@@ -364,9 +356,21 @@ pub fn derive_physical_edges(
     for same_target in by_three.values() {
         for (index, first) in same_target.iter().enumerate() {
             for second in same_target.iter().skip(index + 1) {
-                // Different configured adapters are separate destinations,
-                // as in the runtime DAG's duplicate-target check.
-                if matches!((first.adapter, second.adapter), (Some(a), Some(b)) if a != b) {
+                // Different adapter names can still address one metastore.
+                // Skip a collision only when both catalogs are known to differ.
+                let first_catalog = first
+                    .effective_catalog
+                    .filter(|_| fold_identifier(first.catalog).is_empty())
+                    .unwrap_or(first.catalog);
+                let second_catalog = second
+                    .effective_catalog
+                    .filter(|_| fold_identifier(second.catalog).is_empty())
+                    .unwrap_or(second.catalog);
+                if matches!((first.adapter, second.adapter), (Some(a), Some(b)) if a != b)
+                    && !first_catalog.is_empty()
+                    && !second_catalog.is_empty()
+                    && fold_identifier(first_catalog) != fold_identifier(second_catalog)
+                {
                     continue;
                 }
                 out.target_collisions
@@ -411,15 +415,20 @@ pub fn derive_physical_edges(
             let parts: Vec<String> = r.split('.').map(fold_identifier).collect();
             let (evidence, producers): (Evidence, Vec<&str>) = match parts.as_slice() {
                 [catalog, schema, table] => {
-                    if let Some(exact) =
-                        by_three.get(&(catalog.clone(), schema.clone(), table.clone()))
-                    {
-                        (Evidence::Exact3, exact.iter().map(|p| p.name).collect())
+                    let all_exact = by_three.get(&(catalog.clone(), schema.clone(), table.clone()));
+                    let exact: Vec<&str> = all_exact
+                        .into_iter()
+                        .flatten()
+                        .filter(|p| p.adapter == m.adapter)
+                        .map(|p| p.name)
+                        .collect();
+                    if !exact.is_empty() {
+                        (Evidence::Exact3, exact)
                     } else {
-                        // The exact lookup missed: the read names a catalog
-                        // that no producer DECLARES for this `(schema,
-                        // table)`. It may still be a catalogless producer's
-                        // table — or another catalog's table of the same name.
+                        // No producer on the reader's adapter declares this
+                        // target. Try a catalogless producer first. If none
+                        // could match, retain an exact hit on another adapter:
+                        // its name alone does not disprove shared storage.
                         // Only an established catalog tells the two apart
                         // (#1629); a model never binds to its own read.
                         let at_schema_table: Vec<&PhysicalEdgeModel<'_>> = models_by_two
@@ -428,8 +437,13 @@ pub fn derive_physical_edges(
                                 found.iter().copied().filter(|p| p.name != m.name).collect()
                             })
                             .unwrap_or_default();
-                        match bind_catalogless(catalog, m.adapter, &at_schema_table) {
-                            Binding::Nothing => continue,
+                        match bind_catalogless(catalog, &at_schema_table) {
+                            Binding::Nothing => match all_exact {
+                                Some(found) => {
+                                    (Evidence::Exact3, found.iter().map(|p| p.name).collect())
+                                }
+                                None => continue,
+                            },
                             Binding::Producer(producer) => (Evidence::Fallback, vec![producer]),
                             Binding::Unbound { candidates, reason } => {
                                 let read = parts.join(".");
@@ -847,10 +861,10 @@ mod tests {
         assert!(d.target_collisions.is_empty(), "{d:?}");
     }
 
-    /// Equal catalog names on separate DuckDB connections are separate
-    /// tables. The reader can only consume from its own adapter.
+    /// Equal catalog names on different adapters do not prove different
+    /// tables, even when the configured DuckDB files are separate.
     #[test]
-    fn a_catalogless_producer_ignores_another_adapter() {
+    fn a_catalogless_producer_on_another_adapter_remains_possible() {
         let models = [
             catalogless("local", Some("db"), "main", "shared", "SELECT 1 AS x")
                 .with_adapter("local"),
@@ -866,9 +880,10 @@ mod tests {
             .with_adapter("local"),
         ];
         let d = derive_physical_edges(&models, &[]);
-        assert_eq!(d.edges, vec![("reader".into(), "local".into())], "{d:?}");
-        assert!(d.unbound_reads.is_empty(), "{d:?}");
-        assert!(d.target_collisions.is_empty(), "{d:?}");
+        assert!(d.edges.is_empty(), "{d:?}");
+        assert_eq!(d.unbound_reads[0].reason, UnboundReason::SeveralProducers);
+        assert_eq!(d.unbound_reads[0].candidates, vec!["local", "remote"]);
+        assert_eq!(d.target_collisions, vec![("local".into(), "remote".into())]);
     }
 
     /// Producers that ALL declare a catalog can never be the table a read of

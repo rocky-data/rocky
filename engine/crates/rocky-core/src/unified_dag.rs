@@ -3689,6 +3689,154 @@ mod tests {
             "{:?}",
             runtime.warnings
         );
+        assert_eq!(
+            runtime.physical.target_collisions,
+            vec![("first".into(), "second".into())],
+            "two writers on one adapter still collide"
+        );
+    }
+
+    /// Two adapter names with the same DuckDB file stem have the same
+    /// established catalog. Neither name can exclude the other producer.
+    #[test]
+    fn equal_stem_adapters_leave_the_read_ambiguous_and_report_a_collision() {
+        let mut config = config_with_pipelines(vec![
+            ("p_one", transform_pipeline_on("wh_one")),
+            ("p_two", transform_pipeline_on("wh_two")),
+            ("p_read", transform_pipeline_on("wh_one")),
+        ]);
+        config
+            .adapters
+            .insert("wh_one".into(), duckdb_adapter("one/db.duckdb"));
+        config
+            .adapters
+            .insert("wh_two".into(), duckdb_adapter("two/db.duckdb"));
+        let by_pipeline = ModelsByPipeline::from([
+            (
+                "p_one".into(),
+                vec![model_reading("first", ("", "main", "shared"), "SELECT 1")],
+            ),
+            (
+                "p_two".into(),
+                vec![model_reading("second", ("", "main", "shared"), "SELECT 2")],
+            ),
+            (
+                "p_read".into(),
+                vec![model_reading(
+                    "reader",
+                    ("db", "main", "out"),
+                    "SELECT x FROM db.main.shared",
+                )],
+            ),
+        ]);
+        let runtime = build_runtime_dag(&config, &by_pipeline, &[], None, &duckdb_stem_catalog)
+            .expect("runtime dag");
+        assert!(runtime.physical.edges.is_empty(), "{:?}", runtime.physical);
+        assert_eq!(runtime.physical.unbound_reads.len(), 1);
+        assert_eq!(
+            runtime.physical.unbound_reads[0].candidates,
+            vec!["first", "second"]
+        );
+        assert_eq!(
+            runtime.physical.target_collisions,
+            vec![("first".into(), "second".into())]
+        );
+        assert!(
+            runtime
+                .warnings
+                .iter()
+                .any(|w| w.contains("'first'") && w.contains("'second'")),
+            "{:?}",
+            runtime.warnings
+        );
+    }
+
+    /// A declared target on another adapter must not consume the exact hit
+    /// before the reader's catalogless producer gets the fallback edge.
+    #[test]
+    fn another_adapters_exact_target_does_not_hide_the_local_fallback() {
+        let mut config = config_with_pipelines(vec![
+            ("p_local", transform_pipeline_on("wh_local")),
+            ("p_other", transform_pipeline_on("wh_other")),
+            ("p_read", transform_pipeline_on("wh_local")),
+        ]);
+        config
+            .adapters
+            .insert("wh_local".into(), duckdb_adapter("one/db.duckdb"));
+        config
+            .adapters
+            .insert("wh_other".into(), duckdb_adapter("two/other.duckdb"));
+        let by_pipeline = ModelsByPipeline::from([
+            (
+                "p_local".into(),
+                vec![model_reading("local", ("", "main", "shared"), "SELECT 1")],
+            ),
+            (
+                "p_other".into(),
+                vec![model_reading("other", ("db", "main", "shared"), "SELECT 2")],
+            ),
+            (
+                "p_read".into(),
+                vec![model_reading(
+                    "reader",
+                    ("db", "main", "out"),
+                    "SELECT x FROM db.main.shared",
+                )],
+            ),
+        ]);
+        let runtime = build_runtime_dag(&config, &by_pipeline, &[], None, &duckdb_stem_catalog)
+            .expect("runtime dag");
+        assert!(
+            has_edge(
+                &runtime.dag,
+                "transformation:local",
+                "transformation:reader"
+            ),
+            "{:?}",
+            runtime.physical
+        );
+        assert!(!has_edge(
+            &runtime.dag,
+            "transformation:other",
+            "transformation:reader"
+        ));
+    }
+
+    /// Another adapter name alone does not disprove an exact physical read.
+    /// Without a local fallback producer, keep that exact ordering edge.
+    #[test]
+    fn cross_adapter_exact_read_stays_ordered_without_a_local_fallback() {
+        let mut config = config_with_pipelines(vec![
+            ("p_other", transform_pipeline_on("wh_other")),
+            ("p_read", transform_pipeline_on("wh_local")),
+        ]);
+        config
+            .adapters
+            .insert("wh_local".into(), duckdb_adapter("one/db.duckdb"));
+        config
+            .adapters
+            .insert("wh_other".into(), duckdb_adapter("two/other.duckdb"));
+        let by_pipeline = ModelsByPipeline::from([
+            (
+                "p_other".into(),
+                vec![model_reading("other", ("db", "main", "shared"), "SELECT 1")],
+            ),
+            (
+                "p_read".into(),
+                vec![model_reading(
+                    "reader",
+                    ("db", "main", "out"),
+                    "SELECT x FROM db.main.shared",
+                )],
+            ),
+        ]);
+        let runtime = build_runtime_dag(&config, &by_pipeline, &[], None, &duckdb_stem_catalog)
+            .expect("runtime dag");
+        assert!(has_edge(
+            &runtime.dag,
+            "transformation:other",
+            "transformation:reader"
+        ));
     }
 
     /// Two pipelines, two DuckDB files, one `schema.table` written through
