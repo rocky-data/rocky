@@ -3558,7 +3558,9 @@ mod tests {
                 transformation_block("t")
             ),
             // The consumer sorts BEFORE the producer, so without the edge it
-            // is the one dispatched first.
+            // is the one dispatched first. The producer's table is not its
+            // model's name, so the by-name pass cannot order the pair by luck:
+            // only the catalog match can.
             &[
                 (
                     "a_mart",
@@ -3567,7 +3569,7 @@ mod tests {
                     "a_mart",
                     "SELECT id FROM db.silver.z_orders",
                 ),
-                ("z_orders", "", "silver", "z_orders", "SELECT 1 AS id"),
+                ("z_model", "", "silver", "z_orders", "SELECT 1 AS id"),
             ],
         );
         run_with_dag(
