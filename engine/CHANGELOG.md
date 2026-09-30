@@ -100,6 +100,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **A failed target-kind probe no longer stops a model run or permits a drop.** Rocky treats the kind as unknown and lets CREATE report its result. With an explicit drop permission, the run explains why the permission was unused. An adapter that cannot make DROP and CREATE atomic refuses a known kind switch before dropping anything. (#2037)
 - **A stuck `rocky.toml` read no longer holds the serve compile gate indefinitely.** Recompile reads it on a bounded blocking lane with a five-second deadline. A timeout keeps the previous compile available and reports the read failure through the compile response and project status. A later read can recover after the stuck reader finishes. (#2175)
 
+- **DuckDB snapshots now run through the CLI and keep changed row history.** The example uses a persistent database with the matching catalog, the target schema is created when auto-create is enabled, and DuckDB MERGE inserts the SCD2 columns by name. DuckDB's hard-delete statement now declares its target alias. (#2012)
+
 ### Added
 
 - **A selected transformation model can require its explicit contract during `rocky run`.** `rocky run --pipeline <name> --model <name> --contracts <dir>` checks that model's contract in the same compile result used for execution. A missing contract or an `E010` violation fails before replacing the selected table. This first guarded route supports one `full_refresh` model; it refuses defer, branch/shadow, partition, resume, idempotency, skip, governed apply, and post-compile surrogate keys. Other run routes do not gain this guarantee. Model-only run JSON now correctly reports `pipeline_type: "transformation"`. (#2182)

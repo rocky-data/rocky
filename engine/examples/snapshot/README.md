@@ -18,14 +18,16 @@ invalidate_hard_deletes = true
 - `updated_at` is the column Rocky compares to detect a change.
 - `invalidate_hard_deletes` closes rows that vanished from the source.
 
-The source is `main.raw.customers`. The target is
-`main.history.customers_history`.
+The source is `warehouse.raw.customers`. The target is
+`warehouse.history.customers_history` in `warehouse.duckdb`.
+Rocky creates the `history` schema when the snapshot runs.
 
-## The four statements Rocky generates
+## The snapshot steps Rocky generates
 
 ```
-  main.raw.customers                    main.history.customers_history
+  warehouse.raw.customers                    warehouse.history.customers_history
          │                                          │
+         │  create_schema ── CREATE SCHEMA IF NOT EXISTS history
          │  initial_load ─── CREATE TABLE IF NOT EXISTS, source columns
          │                   plus valid_from, valid_to, is_current, snapshot_id
          │                                          │
@@ -46,12 +48,17 @@ Run these from the repository root:
 
 ```bash
 cd engine/examples/snapshot
-rocky snapshot --dry-run
+duckdb warehouse.duckdb "CREATE SCHEMA IF NOT EXISTS raw; CREATE OR REPLACE TABLE raw.customers AS SELECT 1 AS customer_id, 'Alice' AS name, TIMESTAMP '2026-01-01' AS updated_at;"
+rocky snapshot
+duckdb warehouse.duckdb "UPDATE raw.customers SET name = 'Alicia', updated_at = TIMESTAMP '2026-02-01';"
+rocky snapshot
+duckdb warehouse.duckdb "SELECT name, valid_to, is_current FROM history.customers_history ORDER BY updated_at;"
 ```
 
-`--dry-run` prints the four statements and executes none of them. It still
+The final query shows the closed `Alice` version and current `Alicia` version.
+Use `rocky snapshot --dry-run` to print the statements without executing them. It still
 builds the target adapter, because the adapter chooses the SQL dialect. It
-reads no rows from `main.raw.customers`.
+reads no rows from `warehouse.raw.customers`.
 
 It does write one directory. Rocky creates `.rocky/` here and logs the run to
 `.rocky/traces/{timestamp}-{pid}.jsonl`, one file per process. It also writes
@@ -62,17 +69,7 @@ the whole directory. Delete `.rocky/` when you are done.
 rocky --output json snapshot --dry-run
 ```
 
-This example is dry-run only on DuckDB. Without `--dry-run`, `rocky snapshot`
-executes the statements against the configured adapter, and on DuckDB that
-fails:
-
-- DuckDB has no catalog named `main`, so `initial_load` stops with
-  `Catalog with name main does not exist!`.
-- `merge_1` uses `INSERT (*) VALUES (source.*, ...)`. DuckDB rejects it with
-  `Parser Error: syntax error at or near "*"`, even after you point the
-  pipeline at a real catalog and schema.
-
-Issue [#2012](https://github.com/rocky-data/rocky/issues/2012) tracks the fix.
+The example needs the `raw.customers` source table seeded before a live run.
 
 ## The four history columns
 

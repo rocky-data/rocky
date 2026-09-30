@@ -75,14 +75,63 @@ async fn duckdb_null_safe_neq_captures_null_value_transitions() {
     );
 }
 
+/// The snapshot generator must emit a MERGE form DuckDB parses and executes.
+#[tokio::test]
+async fn snapshot_merge_inserts_by_name_and_closes_changed_rows() {
+    let adapter = DuckDbWarehouseAdapter::in_memory().unwrap();
+    let dialect = DuckDbSqlDialect;
+    adapter.execute_statement("CREATE TABLE main.source (id INTEGER, name VARCHAR, updated_at TIMESTAMP); INSERT INTO main.source VALUES (1, 'Alice', TIMESTAMP '2026-01-01')").await.unwrap();
+    let config = SnapshotConfig {
+        source: SourceRef {
+            catalog: String::new(),
+            schema: "main".into(),
+            table: "source".into(),
+        },
+        target: TargetRef {
+            catalog: String::new(),
+            schema: "main".into(),
+            table: "history".into(),
+        },
+        unique_key: vec!["id".into()],
+        strategy: SnapshotStrategy::Timestamp {
+            updated_at: "updated_at".into(),
+        },
+        invalidate_hard_deletes: true,
+    };
+    let init = rocky_core::snapshots::generate_initial_load_sql(&config, &dialect).unwrap();
+    adapter.execute_statement(&init).await.unwrap();
+    let statements = generate_snapshot_sql(&config, &dialect).unwrap();
+    for sql in &statements {
+        adapter.execute_statement(sql).await.unwrap();
+    }
+    assert!(statements[0].contains("WHEN NOT MATCHED THEN INSERT BY NAME"));
+    assert!(statements[0].contains("USING (SELECT *"));
+    adapter
+        .execute_statement(
+            "UPDATE main.source SET name = 'Alicia', updated_at = TIMESTAMP '2026-02-01'",
+        )
+        .await
+        .unwrap();
+    for sql in generate_snapshot_sql(&config, &dialect).unwrap() {
+        adapter.execute_statement(&sql).await.unwrap();
+    }
+    let rows = adapter
+        .execute_query("SELECT name, is_current FROM main.history ORDER BY updated_at")
+        .await
+        .unwrap();
+    assert_eq!(rows.rows.len(), 2, "{rows:?}");
+    assert_eq!(rows.rows[0][0], "Alice");
+    assert_eq!(rows.rows[0][1], "false");
+    assert_eq!(rows.rows[1][0], "Alicia");
+    assert_eq!(rows.rows[1][1], "true");
+}
+
 /// End-to-end contract: a row whose tracked column transitions from
 /// NULL → value is captured by the generated SCD2 change predicate.
 /// Drives `generate_snapshot_sql` to produce the predicate against the
 /// DuckDB dialect, then exercises the predicate directly via a join +
-/// UPDATE (DuckDB's MERGE doesn't accept `INSERT (*) VALUES (source.*,
-/// ...)` — the SCD2 generator targets Databricks/Snowflake MERGE
-/// surfaces, where this lives in production). The UPDATE shape is the
-/// part this fix actually touched.
+/// UPDATE. The predicate is isolated here; the test above executes the
+/// complete DuckDB snapshot statements.
 #[tokio::test]
 async fn scd2_change_predicate_captures_null_to_value_on_duckdb() {
     let adapter = DuckDbWarehouseAdapter::in_memory().expect("in-memory DuckDB");

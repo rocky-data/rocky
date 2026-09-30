@@ -235,19 +235,36 @@ pub fn generate_snapshot_sql(
     let mut stmts = Vec::new();
 
     // Statement 1: MERGE — close changed rows and insert new keys.
+    let merge_source = if dialect.name() == "duckdb" {
+        format!(
+            "(SELECT *, CURRENT_TIMESTAMP AS {vf}, CAST(NULL AS TIMESTAMP) AS {vt}, \
+             TRUE AS {ic}, '{sid}' AS {snapshot_id_col} FROM {source})",
+            vf = COL_VALID_FROM,
+            vt = COL_VALID_TO,
+            ic = COL_IS_CURRENT,
+            sid = snapshot_id,
+            snapshot_id_col = COL_SNAPSHOT_ID,
+        )
+    } else {
+        source.clone()
+    };
+    let insert_clause = if dialect.name() == "duckdb" {
+        "INSERT BY NAME".to_string()
+    } else {
+        format!(
+            "INSERT (*) VALUES (source.*, CURRENT_TIMESTAMP, CAST(NULL AS TIMESTAMP), TRUE, '{snapshot_id}')"
+        )
+    };
     let merge = format!(
         "MERGE INTO {target} AS target \
-         USING {source} AS source \
+         USING {merge_source} AS source \
          ON {join_cond} AND target.{ic} = TRUE \
          WHEN MATCHED AND ({change_predicate}) THEN \
            UPDATE SET {vt} = CURRENT_TIMESTAMP, {ic} = FALSE \
          WHEN NOT MATCHED THEN \
-           INSERT (*) VALUES (\
-             source.*, CURRENT_TIMESTAMP, CAST(NULL AS TIMESTAMP), TRUE, '{sid}'\
-           )",
+           {insert_clause}",
         ic = COL_IS_CURRENT,
         vt = COL_VALID_TO,
-        sid = snapshot_id,
     );
     stmts.push(merge);
 
@@ -286,8 +303,13 @@ pub fn generate_snapshot_sql(
 
     // Statement 3 (optional): Invalidate hard-deleted rows.
     if config.invalidate_hard_deletes {
+        let update_target = if dialect.name() == "duckdb" {
+            format!("{target} AS target")
+        } else {
+            target.clone()
+        };
         let invalidate = format!(
-            "UPDATE {target} SET \
+            "UPDATE {update_target} SET \
              {vt} = CURRENT_TIMESTAMP, \
              {ic} = FALSE \
              WHERE {ic} = TRUE \
@@ -378,9 +400,15 @@ mod tests {
     use rocky_ir::{ColumnSelection, MetadataColumn};
 
     /// Test dialect mirroring Databricks behavior (three-part table refs).
-    struct TestDialect;
+    struct TestDialect {
+        name: &'static str,
+    }
 
     impl SqlDialect for TestDialect {
+        fn name(&self) -> &'static str {
+            self.name
+        }
+
         fn literal_escape(&self) -> crate::traits::LiteralEscape {
             crate::traits::LiteralEscape::Standard
         }
@@ -508,7 +536,7 @@ mod tests {
     }
 
     fn dialect() -> TestDialect {
-        TestDialect
+        TestDialect { name: "test" }
     }
 
     fn timestamp_config() -> SnapshotConfig {
@@ -639,6 +667,23 @@ mod tests {
             merge.contains("is_current = FALSE"),
             "MATCHED should set is_current = FALSE: {merge}"
         );
+    }
+
+    #[test]
+    fn test_duckdb_snapshot_merge_uses_supported_insert_form() {
+        let config = timestamp_config();
+        let duckdb = TestDialect { name: "duckdb" };
+        let stmts = generate_snapshot_sql(&config, &duckdb).unwrap();
+        assert!(stmts[0].contains("USING (SELECT *, CURRENT_TIMESTAMP AS valid_from"));
+        assert!(stmts[0].contains("TRUE AS is_current"));
+        assert!(
+            stmts[0].contains("AS snapshot_id FROM raw_catalog.raw__us_west__shopify.customers")
+        );
+        assert!(stmts[0].contains("WHEN NOT MATCHED THEN INSERT BY NAME"));
+        assert!(!stmts[0].contains("INSERT (*)"));
+        let other = generate_snapshot_sql(&config, &dialect()).unwrap();
+        assert!(other[0].contains("USING raw_catalog.raw__us_west__shopify.customers AS source"));
+        assert!(other[0].contains("WHEN NOT MATCHED THEN INSERT (*) VALUES"));
     }
 
     #[test]
