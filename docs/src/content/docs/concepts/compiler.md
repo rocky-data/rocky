@@ -285,6 +285,7 @@ span, and sometimes a suggested fix.
 | `E036` | Two or more models write the same target table |
 | `E037` | A transformation model declares `type = "incremental"`, which would append every row again on each run. Use `merge`, `delete_insert`, `time_interval` or `full_refresh` |
 | `E039` | A direct projection names a column absent from a complete in-project upstream model |
+| `E040` | A `.rocky` string literal contains a backslash; use a `.sql` model with the target's own escaping |
 | `W001` | Unused model (no downstream consumers) |
 | `W002` | Duplicate column in model output |
 | `W003` | `time_column` is TIMESTAMP where DATE is preferred for the granularity |

@@ -197,6 +197,16 @@ from source.fivetran.orders
 replicate
 ```
 
+## String literals
+
+Use single or double quotes for a string. A string ends at the matching quote,
+with no DSL escape sequences. Use double quotes to include an apostrophe:
+`"it's"` lowers to SQL `'it''s'`.
+
+A backslash in a `.rocky` string literal fails compilation with `E040` at the
+literal's file, line, and column. Use a `.sql` model with the target warehouse's
+own escaping when the value needs a backslash.
+
 ## Date literals
 
 The `@` prefix creates date literals without quoting:

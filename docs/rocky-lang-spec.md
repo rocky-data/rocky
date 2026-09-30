@@ -340,6 +340,9 @@ null                  -- null
 A string literal ends at its own quote character. It has no escape sequences,
 so write a double-quoted string to include an apostrophe. Rocky escapes the
 apostrophe for you: `"it's"` lowers to `'it''s'`.
+Backslashes in `.rocky` string literals are refused at compile time with `E040`,
+pointing to the literal. For a value that needs a backslash, use a `.sql` model
+and the target warehouse's own escaping.
 
 ### Date literals
 
