@@ -4033,6 +4033,7 @@ dependencies = [
  "clap",
  "clap_complete",
  "criterion",
+ "flate2",
  "fs4",
  "futures",
  "hostname",
@@ -4076,6 +4077,7 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "uuid",
+ "wiremock",
 ]
 
 [[package]]

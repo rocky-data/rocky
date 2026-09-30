@@ -289,6 +289,11 @@ class PermissionInfo(BaseModel):
 
 class DriftAction(BaseModel):
     table: str
+    #: Dagster-style asset key path, the same convention
+    #: :attr:`MaterializationInfo.asset_key` uses. Required, matching the
+    #: generated model and `schemas/run.schema.json` — no back-compat
+    #: default for an engine older than #2073 before 2.0. (#2073)
+    asset_key: list[str]
     action: str
     reason: str
 
@@ -312,6 +317,11 @@ class ContractResult(BaseModel):
 
 class AnomalyResult(BaseModel):
     table: str
+    #: Dagster-style asset key path, the same convention
+    #: :attr:`MaterializationInfo.asset_key` uses. Required, matching the
+    #: generated model and `schemas/run.schema.json` — no back-compat
+    #: default for an engine older than #2073 before 2.0. (#2073)
+    asset_key: list[str]
     current_count: int
     baseline_avg: float
     deviation_pct: float
@@ -330,6 +340,11 @@ class AnomalyEvaluation(BaseModel):
     """
 
     table: str
+    #: Dagster-style asset key path, the same convention
+    #: :attr:`MaterializationInfo.asset_key` uses. Required, matching the
+    #: generated model and `schemas/run.schema.json` — no back-compat
+    #: default for an engine older than #2073 before 2.0. (#2073)
+    asset_key: list[str]
     evaluated: bool
     not_evaluated_reason: str | None = None
 

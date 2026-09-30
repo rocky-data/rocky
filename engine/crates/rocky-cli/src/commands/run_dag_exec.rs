@@ -1311,6 +1311,7 @@ mod run_opts_threading_tests {
             suffix: "_pr1272_shadow".to_string(),
             schema_override: Some("isolated_ns".to_string()),
             cleanup_after: false,
+            branch: None,
         };
         let (dispatcher, node_ids) = dispatcher_with_nodes(
             test_loaded_config(),
@@ -2576,6 +2577,7 @@ mod tests {
             suffix: "_rocky_shadow".to_string(),
             schema_override: None,
             cleanup_after: false,
+            branch: None,
         };
         let err = run_with_dag(
             &config_path,
@@ -2688,6 +2690,7 @@ mod tests {
             suffix: "_shadow".to_string(),
             schema_override: None,
             cleanup_after: false,
+            branch: None,
         };
         run_with_dag(
             &config_path,

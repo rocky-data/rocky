@@ -29,6 +29,11 @@
   "anomaly_evaluated": [
     {
       "table": "poc.staging__orders.orders",
+      "asset_key": [
+        "duckdb",
+        "orders",
+        "orders"
+      ],
       "evaluated": false,
       "not_evaluated_reason": "row-count checks are off for this pipeline (`row_count = false` under `[pipeline.<name>.checks]`), so the anomaly detector did not run"
     }
@@ -68,6 +73,11 @@
     "actions_taken": [
       {
         "table": "poc.staging__orders.orders",
+        "asset_key": [
+          "duckdb",
+          "orders",
+          "orders"
+        ],
         "action": "drop_and_recreate",
         "reason": "column 'amount' changed DECIMAL(10,2) \u2192 VARCHAR"
       }

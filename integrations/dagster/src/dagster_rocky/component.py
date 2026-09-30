@@ -86,6 +86,7 @@ from .freshness import (
 from .observability import (
     ANOMALY_CHECK_NAME,
     COMPLIANCE_CHECK_NAME,
+    DRIFT_CHECK_NAME,
     anomaly_check_results,
     anomaly_evaluation_results,
     compliance_check_results,
@@ -2952,9 +2953,11 @@ def _run_filters_pipes(
 
     def asset_key_fn(path: list[str]) -> dg.AssetKey | None:
         # Exact tuple match — engine and component agree on the shape
-        # (``[source_type, *components, table]``). Fall through to the
-        # last-segment match for drift events, whose ``asset_key`` is
-        # just the source-side table identifier.
+        # (``[source_type, *components, table]``). Drift events carry this
+        # full shape too, as of #2073 (previously a bare source-side table
+        # identifier, which only the last-segment fallback below could
+        # resolve). The fallback stays for any single-segment path — e.g. a
+        # captured fixture or a binary older than #2073.
         key = rocky_key_to_dagster_key.get(tuple(path))
         if key is not None:
             return key
@@ -2993,6 +2996,19 @@ def _run_filters_pipes(
             include_keys=selected_keys,
         )
         for result in invocation.get_results():
+            # Drift is never a declared check spec (see DRIFT_CHECK_NAME) —
+            # convert it to the same AssetObservation shape the streaming
+            # path's `drift_observations` yields, before the generic
+            # undeclared-check path below, whose "declared specs are stale"
+            # warning is the wrong diagnosis for a check that was never
+            # meant to be declared (#2073).
+            if (
+                isinstance(result, dg.AssetCheckResult)
+                and result.asset_key is not None
+                and result.check_name == DRIFT_CHECK_NAME
+            ):
+                yield _drift_pipes_result_to_observation(result)
+                continue
             # Only ``AssetCheckResult`` is constrained by the declared specs.
             # Pipes reports a check as a TOP-LEVEL result (see
             # ``PipesMessageHandler._handle_report_asset_check``), never nested
@@ -3428,6 +3444,44 @@ def _undeclared_check_observation(
         asset_key=asset_key,
         description=f"Rocky check {check_name!r} ({verdict}) — not declared as an asset check",
         metadata=observation_metadata,
+    )
+
+
+def _drift_pipes_result_to_observation(result: dg.AssetCheckResult) -> dg.AssetObservation:
+    """Convert a Pipes ``drift`` check result into the ``AssetObservation``
+    shape :func:`drift_observations` yields on the streaming path.
+
+    ``drift`` (:data:`DRIFT_CHECK_NAME`) is intentionally never a declared
+    check spec, so left alone it would fall into
+    :func:`_undeclared_check_observation` below, whose "declared specs are
+    stale, refresh the state" warning is the wrong diagnosis for a check
+    that was never meant to be declared — Pipes has no separate
+    "observation" verb, so the engine reports drift as an
+    ``AssetCheckResult`` like any other ``report_asset_check`` message
+    (#2073).
+
+    ``rocky/drift_tables_checked`` / ``rocky/drift_tables_drifted``, which
+    :func:`drift_observations` also sets, are NOT included here — those are
+    run-level aggregates from ``RunResult.drift``, not available on a
+    single Pipes check message.
+    """
+    meta = result.metadata or {}
+    metadata: dict[str, Any] = {}
+    for source_key, target_key in (
+        ("action", "rocky/drift_action"),
+        ("reason", "rocky/drift_reason"),
+        ("table", "rocky/drift_table"),
+    ):
+        if source_key in meta:
+            metadata[target_key] = meta[source_key]
+    action_value = meta.get("action")
+    description = (
+        f"Schema drift: {action_value.value}" if action_value is not None else "Schema drift"
+    )
+    return dg.AssetObservation(
+        asset_key=result.asset_key,
+        description=description,
+        metadata=metadata,
     )
 
 

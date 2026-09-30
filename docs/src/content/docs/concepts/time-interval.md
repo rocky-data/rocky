@@ -160,6 +160,12 @@ returns a `Vec<String>`, so the runtime can issue more than one statement.
 Atomicity holds per partition. If a statement fails mid-batch, the runtime
 issues `ROLLBACK` and marks the partition `Failed` in the state store.
 
+Before it runs any partition, Rocky checks that the target table exists. If
+not, it creates it by running the model SQL over an empty window. The empty
+window means the model reads no upstream rows. A model with an ungrouped
+aggregate still writes one row; every other shape writes none. The table's
+columns come from that query. The partitions then run as below.
+
 ### Databricks (Delta Lake)
 
 Single statement using Delta's atomic `REPLACE WHERE`:
@@ -207,6 +213,24 @@ WHERE order_date >= '2026-04-07 00:00:00' AND order_date < '2026-04-08 00:00:00'
 INSERT INTO "marts"."fct_daily_orders"
 SELECT ... ;
 COMMIT;
+```
+
+### BigQuery
+
+One statement: a `BEGIN TRANSACTION` / `COMMIT TRANSACTION` script joining
+the delete and the insert into a single job. BigQuery's REST API is
+stateless. Each `jobs.query` call is its own session. Separate `BEGIN` and
+`COMMIT` statements fail with "Transaction control statements are supported
+only in scripts or sessions." One script keeps the delete and the insert
+atomic:
+
+```sql
+BEGIN TRANSACTION;
+DELETE FROM `warehouse`.`marts`.`fct_daily_orders`
+WHERE order_date >= '2026-04-07 00:00:00' AND order_date < '2026-04-08 00:00:00';
+INSERT INTO `warehouse`.`marts`.`fct_daily_orders`
+SELECT ... ;
+COMMIT TRANSACTION
 ```
 
 ## State store
@@ -291,14 +315,8 @@ The following are deferred:
 - **Rocky DSL placeholder syntax** — `@start_date` / `@end_date` are
   recognized in `.sql` files only. The `.rocky` parser will gain `@var`
   syntax in v1.1.
-- **Bootstrap on first run** — the target table must exist before the
-  first partition runs. The runtime currently emits `DELETE` against the
-  target, which fails if the table is missing. Either pre-create the
-  table once (recommended for now) or `full_refresh` an empty version
-  via a one-time migration. Bootstrap-on-first-run is a planned follow-up.
-- **BigQuery and Postgres adapters** — these adapters don't exist yet.
-  When they ship, BigQuery will use `MERGE ... WHEN NOT MATCHED BY SOURCE`
-  and Postgres will route via parent table + child partition truncate.
+- **Postgres adapter** — it doesn't exist yet. When it ships, `time_interval`
+  will route via a parent table plus a child-partition truncate.
 - **Sub-day granularities** below `hour` — belongs in streaming systems.
 - **Multi-column partitions** — single time column only in v1.
 - **Partition column transformations** — `time_column` must be a real

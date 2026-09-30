@@ -53,6 +53,10 @@ export interface RunHistoryRecord {
    */
   pipeline?: string | null;
   /**
+   * The named Rocky branch this run wrote to (`rocky run --branch <name>`), or `None` for a production / plain-`--shadow` run. Distinct from `git_branch` — see `RunRecord::rocky_branch` (#2032). Not audit-gated — like [`Self::pipeline`], it is an operational join key (`rocky preview diff`/`preview cost` pair a run by this field), always emitted when present.
+   */
+  rocky_branch?: string | null;
+  /**
    * `CARGO_PKG_VERSION` of the `rocky` binary, or `"<pre-audit>"` on schema-v5 rows that predate the audit trail.
    */
   rocky_version?: string | null;

@@ -80,6 +80,11 @@ fn record_to_history(run: &RunRecord, audit: bool) -> RunHistoryRecord {
         models,
         pipeline: run.pipeline.clone(),
         submission_id: run.submission_id.clone(),
+        // Not audit-gated, like `pipeline` above (#2158 drain review, finding
+        // 6): it is an operational join key `preview diff`/`preview cost`
+        // need to pair a run, not a governance-audit field, so it must not
+        // require `--audit` to appear.
+        rocky_branch: run.rocky_branch.clone(),
         triggering_identity,
         session_source,
         git_commit,
@@ -694,6 +699,9 @@ mod tests {
             submission_id: None,
             check_gate_failed: false,
             verify_after_failed: false,
+            // Deliberately different from `git_branch` — the two are
+            // independent fields (#2032).
+            rocky_branch: Some("pr-preview-governance".to_string()),
         }
     }
 
@@ -708,6 +716,14 @@ mod tests {
         assert!(history.git_commit.is_none());
         assert!(history.hostname.is_none());
         assert!(history.rocky_version.is_none());
+        // NOT an audit field (drain review of #2158, finding 6) — an
+        // operational join key like `pipeline`, so it survives the `!audit`
+        // gate that zeroes every true governance-audit field above.
+        assert_eq!(
+            history.rocky_branch.as_deref(),
+            Some("pr-preview-governance"),
+            "rocky_branch must be emitted even without --audit"
+        );
     }
 
     #[test]
@@ -725,6 +741,11 @@ mod tests {
         assert_eq!(history.target_catalog.as_deref(), Some("warehouse_main"));
         assert_eq!(history.hostname.as_deref(), Some("dev-laptop"));
         assert_eq!(history.rocky_version.as_deref(), Some("1.16.0"));
+        assert_eq!(
+            history.rocky_branch.as_deref(),
+            Some("pr-preview-governance"),
+            "rocky_branch must thread through independently of git_branch"
+        );
     }
 
     #[test]
@@ -785,6 +806,7 @@ mod tests {
             submission_id: None,
             check_gate_failed: false,
             verify_after_failed: false,
+            rocky_branch: None,
         }
     }
 

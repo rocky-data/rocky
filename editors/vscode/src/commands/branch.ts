@@ -10,8 +10,9 @@ import {
   promptForInput,
   showJsonInEditor,
 } from "./ui";
+import { BRANCH_NAME_EXAMPLE } from "./branchNames";
 
-const BRANCH_NAME_PLACEHOLDER = "e.g., fix-price";
+const BRANCH_NAME_PLACEHOLDER = `e.g., ${BRANCH_NAME_EXAMPLE}`;
 const FILTER_PLACEHOLDER = "e.g., client=acme";
 
 /** Branch name from a Branches-view tree item (or a string), else undefined. */

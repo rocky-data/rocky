@@ -15,7 +15,7 @@ use crate::plan_store::{
 };
 use crate::registry;
 
-use super::run::PartitionRunOptions;
+use super::run::{PartitionRunOptions, refuse_check_name_collisions};
 use super::{filter_table_matches, matches_filter, parse_filter};
 
 /// A model filter (`--model` / the MCP `plan_preview` `model` arg) named a model
@@ -98,6 +98,9 @@ pub async fn plan(
     state_path: &Path,
     output_json: bool,
 ) -> Result<()> {
+    if let Some(branch_name) = run_options.branch.as_deref() {
+        crate::commands::branch::validate_branch_name_pub(branch_name)?;
+    }
     let rocky_cfg = rocky_core::config::load_rocky_config(config_path).context(format!(
         "failed to load config from {}",
         config_path.display()
@@ -126,6 +129,16 @@ pub async fn plan(
 
     let mut output = PlanOutput::new(filter.unwrap_or("").to_string());
     output.env = env.map(str::to_string);
+
+    // #1941: one (target table name, source_type) pair per table that
+    // survives this loop's own skip conditions (filter, disabled override),
+    // collected below and checked once the loop ends — before this plan is
+    // persisted (`output.plan_id`). Without this, `rocky plan` exits 0 and
+    // persists a plan a later `rocky apply` (which re-executes `run()`,
+    // where the same collision refuses) would then reject — late, and
+    // outside the bounded, watchdog-covered plan step Dagster Pipes relies
+    // on for this check.
+    let mut collision_check_pairs: Vec<(String, String)> = Vec::new();
 
     // Detect whether this dialect supports catalogs. Dialects without catalog
     // support (DuckDB, Postgres, ...) return `None` from `create_catalog_sql`,
@@ -236,6 +249,7 @@ pub async fn plan(
                 });
                 continue;
             }
+            collision_check_pairs.push((table.name.clone(), conn.source_type.clone()));
 
             // Resolved AFTER the exclusion branches, mirroring `rocky run`,
             // which preflights the same value only for a table that survives
@@ -314,6 +328,16 @@ pub async fn plan(
             });
         }
     }
+
+    // #1941: refuse before this plan is persisted (`plan_id` below) — see
+    // the comment where `collision_check_pairs` is declared above.
+    refuse_check_name_collisions(
+        name,
+        pipeline,
+        collision_check_pairs
+            .iter()
+            .map(|(t, s)| (t.as_str(), s.as_str())),
+    )?;
 
     // --- Governance preview (Wave A + C-1 + C-2) -------------------------
     //
@@ -955,6 +979,7 @@ pub fn plan_preview_output(
     let config = CompilerConfig {
         models_dir: models_dir.to_path_buf(),
         contracts_dir: None,
+        required_explicit_contract_model: None,
         source_schemas: std::collections::HashMap::new(),
         mask: std::collections::BTreeMap::new(),
         allow_unmasked: vec![],
@@ -1160,6 +1185,7 @@ fn build_and_persist_run_plan(
     let config = CompilerConfig {
         models_dir: models_dir.to_path_buf(),
         contracts_dir: None,
+        required_explicit_contract_model: None,
         source_schemas: std::collections::HashMap::new(),
         mask: std::collections::BTreeMap::new(),
         allow_unmasked: vec![],
@@ -1785,6 +1811,7 @@ pub fn populate_governance_actions(
     let compile = rocky_compiler::compile::compile(&rocky_compiler::compile::CompilerConfig {
         models_dir: models_dir.to_path_buf(),
         contracts_dir: None,
+        required_explicit_contract_model: None,
         source_schemas: std::collections::HashMap::new(),
         mask: cfg.mask.clone(),
         allow_unmasked: cfg.classifications.allow_unmasked.clone(),
@@ -1886,6 +1913,7 @@ async fn check_plan_budget(
     let compile_cfg = rocky_compiler::compile::CompilerConfig {
         models_dir: models_dir.to_path_buf(),
         contracts_dir: None,
+        required_explicit_contract_model: None,
         source_schemas: HashMap::new(),
         mask: std::collections::BTreeMap::new(),
         allow_unmasked: vec![],
@@ -2466,11 +2494,11 @@ pub(crate) async fn build_promote_plan_inner(
     use crate::commands::branch::{
         APPROVAL_SKIP_ENV, approver_identity_pub, compute_branch_state_hash_pub,
         discover_branch_targets_for_plan, run_approval_gate, run_breaking_change_gate_for_plan,
-        validate_branch_name_pub,
+        validate_existing_branch_name,
     };
     use rocky_core::state::StateStore;
 
-    validate_branch_name_pub(branch_name)?;
+    validate_existing_branch_name(state_path, branch_name)?;
 
     // `state_path` is the namespace-aware path threaded from main.rs; the
     // branch record lives in whichever state file this invocation targets.
@@ -2645,6 +2673,34 @@ pub(crate) async fn build_promote_plan_inner(
 
 #[cfg(test)]
 mod tests {
+
+    #[tokio::test]
+    async fn plan_branch_refuses_hyphen_before_config_io() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing_config = temp.path().join("missing.toml");
+        let state = temp.path().join("missing.redb");
+        let options = super::PlanRunOptions {
+            branch: Some("pr-preview-x".to_string()),
+            ..Default::default()
+        };
+        let error = super::plan(
+            &missing_config,
+            None,
+            None,
+            None,
+            &options,
+            false,
+            "main",
+            &state,
+            false,
+        )
+        .await
+        .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("[A-Za-z0-9_]"), "{message}");
+        assert!(message.contains("pr_preview_x"), "{message}");
+        assert!(!message.contains("failed to load config"), "{message}");
+    }
 
     /// The identity must change across a state-schema version bump, because the
     /// remote ledger key embeds it. Without this a plan made under one version
@@ -3410,6 +3466,116 @@ auto_create_schemas = true
             result.is_ok(),
             "plan must succeed on an existing, empty models/ dir: {:?}",
             result.err()
+        );
+    }
+
+    /// #1941: `rocky plan` must refuse the SAME check-name collision `rocky
+    /// run` refuses, and refuse it BEFORE persisting a plan. Without this,
+    /// `rocky plan` exits 0 and persists a `plan_id` for a set `rocky apply`
+    /// — which re-executes `run()`, where the same collision refuses —
+    /// would then reject: late, and outside the bounded, watchdog-covered
+    /// plan step Dagster Pipes relies on for this check.
+    ///
+    /// Uses the same `cross_source_overlap` collision as
+    /// `a_collision_refusal_writes_nothing_the_target_table_never_exists`
+    /// in `commands::run`: config load cannot see it (no assertions are
+    /// declared here for it to hang a table off), so this drives all the
+    /// way through discovery and into `plan()`'s own guard call, not
+    /// config load.
+    ///
+    /// Mutation that must turn this red: delete the
+    /// `refuse_check_name_collisions(name, pipeline,
+    /// collision_check_pairs...)` call in `plan()`.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn plan_refuses_a_check_name_collision_before_persisting_a_plan() {
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("x.duckdb");
+        let config_path = dir.path().join("rocky.toml");
+        let state_path = dir.path().join("state.redb");
+
+        {
+            let warehouse = DuckDbWarehouseAdapter::open(&db_path).unwrap();
+            for schema in ["raw__acme", "raw__widgets"] {
+                warehouse
+                    .execute_statement(&format!("CREATE SCHEMA {schema}"))
+                    .await
+                    .unwrap();
+                warehouse
+                    .execute_statement(&format!("CREATE TABLE {schema}.orders AS SELECT 1 AS id"))
+                    .await
+                    .unwrap();
+            }
+        }
+
+        std::fs::write(
+            &config_path,
+            format!(
+                r#"
+[adapter]
+type = "duckdb"
+path = "{}"
+
+[pipeline.p]
+type = "replication"
+strategy = "full_refresh"
+
+[pipeline.p.source.discovery]
+adapter = "default"
+
+[pipeline.p.source.schema_pattern]
+prefix = "raw__"
+separator = "__"
+components = ["source"]
+
+[pipeline.p.target]
+adapter = "default"
+catalog_template = "x"
+schema_template = "staging__{{source}}"
+
+[pipeline.p.target.governance]
+auto_create_schemas = true
+
+[pipeline.p.checks]
+cross_source_overlap = {{ keys = ["id"] }}
+
+[[pipeline.p.checks.custom]]
+name = "cross source overlap duckdb orders"
+sql = "SELECT 0"
+threshold = 0
+"#,
+                db_path.display()
+            ),
+        )
+        .unwrap();
+
+        let run_options = PlanRunOptions::default();
+        let result = plan(
+            &config_path,
+            None,
+            None,
+            None,
+            &run_options,
+            false,
+            "HEAD",
+            &state_path,
+            false,
+        )
+        .await;
+
+        let err = result.expect_err("a check-name collision must refuse rocky plan");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("cross source overlap duckdb orders")
+                && msg.contains("cross_source_overlap:duckdb.orders"),
+            "the refusal must name both colliding sources: {msg}"
+        );
+        assert!(
+            msg.contains("pipeline \"p\""),
+            "the refusal must name the pipeline: {msg}"
         );
     }
 

@@ -1011,7 +1011,7 @@ rocky preview rows   --model <name> [--cte <name>] [--limit <N>]
 
 ### `rocky preview create`
 
-Compute the prune set and copy the rest from the base schema into a per-PR branch. It does not run the prune set: it reports `run_status: "planned"` with an empty `run_id`. Run `rocky run --branch <name>` over the prune set before `preview diff` or `preview cost`. Today `preview diff` looks for a run whose recorded git branch equals the preview branch name, and a run records the branch you are actually on, so the two only meet when your git branch carries the preview name. See [#2032](https://github.com/rocky-data/rocky/issues/2032).
+Compute the prune set and copy the rest from the base schema into a per-PR branch. It does not run the prune set: it reports `run_status: "planned"` with an empty `run_id`. Run `rocky run --branch <name>` over the prune set before `preview diff` or `preview cost`. `preview diff` pairs the run by its recorded `rocky_branch`, the literal `--branch` value. The base run excludes `--branch` runs.
 
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
@@ -1029,8 +1029,8 @@ rocky preview create --base main
 {
   "version": "1.18.0",
   "command": "preview-create",
-  "branch_name": "preview-fix-price",
-  "branch_schema": "branch__preview-fix-price",
+  "branch_name": "pr_preview_fix_price",
+  "branch_schema": "branch__pr_preview_fix_price",
   "base_ref": "main",
   "head_ref": "HEAD",
   "prune_set": [
@@ -1038,12 +1038,12 @@ rocky preview create --base main
     { "model_name": "rev_by_region", "reason": "downstream_of_changed" }
   ],
   "copy_set": [
-    { "model_name": "stg_orders",    "source_schema": "main", "target_schema": "branch__preview-fix-price", "copy_strategy": "ctas" },
-    { "model_name": "stg_customers", "source_schema": "main", "target_schema": "branch__preview-fix-price", "copy_strategy": "ctas" }
+    { "model_name": "stg_orders",    "source_schema": "main", "target_schema": "branch__pr_preview_fix_price", "copy_strategy": "ctas" },
+    { "model_name": "stg_customers", "source_schema": "main", "target_schema": "branch__pr_preview_fix_price", "copy_strategy": "ctas" }
   ],
   "skipped_set": [],
-  "run_id": "run-20260428-141033-002",
-  "run_status": "succeeded",
+  "run_id": "",
+  "run_status": "planned",
   "duration_ms": 4321
 }
 ```
@@ -1056,7 +1056,7 @@ Compare the branch run with the base run, for every model in the prune set.
 
 By default this compares the `rows_affected` the two run records hold. It reports `rows_added` and `rows_removed`, leaves `rows_changed` at 0, returns no samples and no column-level delta, and sets `coverage: "not_yet_sampled"` with `coverage_warning: true`.
 
-Two limits follow. A change that rewrites values without changing row counts shows nothing. And an ordinary transformation run records no `rows_affected` at all, which the diff reads as 0, so a model that goes from 10 rows to 20 can also report nothing.
+Two limits follow. A change that rewrites values without changing row counts shows nothing. And an ordinary transformation run records no `rows_affected` at all, which the diff reports as unknown rather than zero.
 
 Pass `--algorithm bisection` to compare row content. It needs a `Merge` model whose single `unique_key` holds whole numbers: the bounds are parsed as integers, so a decimal key falls back to the default comparison without saying so. Read each model's `algorithm.kind` before you treat its result as a content comparison.
 
@@ -1070,7 +1070,7 @@ Pass `--algorithm bisection` to compare row content. It needs a `Merge` model wh
 **Example.** Print a Markdown report ready to post on a PR:
 
 ```bash
-rocky preview diff --name preview-fix-price --output json | jq -r .markdown
+rocky preview diff --name pr_preview_fix_price --output json | jq -r .markdown
 ```
 
 There is no `--output markdown`. The report lives in the `markdown` field of the JSON output (`PreviewDiffOutput`). The same JSON also carries the per-model `sampling_window` block with `coverage_warning`.
@@ -1087,7 +1087,7 @@ Per-model cost delta between the branch run and the latest base-schema `RunRecor
 **Example.**
 
 ```bash
-rocky preview cost --name preview-fix-price --output json | jq -r .markdown
+rocky preview cost --name pr_preview_fix_price --output json | jq -r .markdown
 ```
 
 The JSON shape (`PreviewCostOutput`) carries the Markdown report in its `markdown` field. It reports per-model `delta_usd`, `branch_duration_ms`, `base_duration_ms`, and bytes scanned, plus an aggregate `summary.delta_usd`, `summary.savings_from_copy_usd`, and `models_skipped_via_copy`. Underlying cost math is identical to [`rocky cost`](/reference/commands/administration/#rocky-cost) (Databricks / Snowflake duration × DBU rate; BigQuery bytes × $/TB; DuckDB zero); fields fall back to `null` when no base `RunRecord` exists or when the adapter does not surface USD.

@@ -38,9 +38,8 @@ This does five things:
 
 `preview create` does **not** run the prune-set models itself. It emits `run_status: "planned"` with an empty `run_id`. Run `rocky run --branch <name>`, with a selector limited to the prune set, before `preview diff` or `preview cost`. That gives them a branch run to compare against.
 
-:::caution[The pairing does not work yet]
-`preview diff` and `preview cost` look for a run whose recorded branch equals the preview branch name, such as `pr-preview-fix-price`. A run records the branch you are actually on, such as `fix-price`, and `--branch` changes only where the run writes. So the two do not meet unless your branch carries the preview name. `--sample-size` is also accepted and ignored, and an ordinary transformation records no row count for the comparison to read. Track all three in [#2032](https://github.com/rocky-data/rocky/issues/2032).
-:::
+`preview diff` and `preview cost` pair the latest run whose `rocky_branch` is the preview name with a base run. Run `rocky run --branch pr_preview_fix_price` first. The current git branch can have a different name. The base selection excludes all `--branch` runs. An unmeasured row count stays unknown in the diff. `--sample-size` is accepted but ignored.
+
 
 The output is a `PreviewCreateOutput` JSON document:
 
@@ -48,8 +47,8 @@ The output is a `PreviewCreateOutput` JSON document:
 {
   "version": "1.18.0",
   "command": "preview-create",
-  "branch_name": "preview-fix-price",
-  "branch_schema": "branch__preview-fix-price",
+  "branch_name": "pr_preview_fix_price",
+  "branch_schema": "branch__pr_preview_fix_price",
   "base_ref": "main",
   "head_ref": "HEAD",
   "prune_set": [
@@ -57,8 +56,8 @@ The output is a `PreviewCreateOutput` JSON document:
     { "model_name": "rev_by_region", "reason": "downstream_of_changed", "changed_columns": [] }
   ],
   "copy_set": [
-    { "model_name": "stg_orders",    "source_schema": "main", "target_schema": "branch__preview-fix-price", "copy_strategy": "ctas" },
-    { "model_name": "stg_customers", "source_schema": "main", "target_schema": "branch__preview-fix-price", "copy_strategy": "ctas" }
+    { "model_name": "stg_orders",    "source_schema": "main", "target_schema": "branch__pr_preview_fix_price", "copy_strategy": "ctas" },
+    { "model_name": "stg_customers", "source_schema": "main", "target_schema": "branch__pr_preview_fix_price", "copy_strategy": "ctas" }
   ],
   "skipped_set": [],
   "run_id": "",
@@ -67,12 +66,12 @@ The output is a `PreviewCreateOutput` JSON document:
 }
 ```
 
-`run_id` comes back empty and `run_status` is `"planned"`, because `preview create` only registers the branch and copies the base tables. `preview diff` and `preview cost` do not key off this `run_id` anyway: they pair the latest run tagged to the branch name against base, over run history. So run `rocky run --branch preview-fix-price` before either one.
+`run_id` comes back empty and `run_status` is `"planned"`, because `preview create` only registers the branch and copies the base tables. `preview diff` and `preview cost` do not key off this `run_id` anyway: they pair the latest run tagged to the branch name against base, over run history. So run `rocky run --branch pr_preview_fix_price` before either one.
 
 ## Step 2: Diff the branch against base
 
 ```bash
-rocky preview diff --name preview-fix-price --output json | jq -r .markdown
+rocky preview diff --name pr_preview_fix_price --output json | jq -r .markdown
 ```
 
 This combines two layers into one report.
@@ -90,10 +89,10 @@ The full `PreviewDiffOutput` shape (`--output json`) carries the rendered PR-com
 
 ```bash
 # Default — sampled (fast, may miss out-of-window changes)
-rocky preview diff --name preview-fix-price
+rocky preview diff --name pr_preview_fix_price
 
 # Exhaustive — checksum-bisection (covers the whole table)
-rocky preview diff --name preview-fix-price --algorithm bisection
+rocky preview diff --name pr_preview_fix_price --algorithm bisection
 ```
 
 `--algorithm` is currently hidden from `rocky preview diff --help`, but it is accepted and stable.
@@ -124,7 +123,7 @@ A direct JSON consumer should read `model.algorithm.kind` first, then unpack the
 ## Step 3: Compare cost vs. base
 
 ```bash
-rocky preview cost --name preview-fix-price --output json | jq -r .markdown
+rocky preview cost --name pr_preview_fix_price --output json | jq -r .markdown
 ```
 
 This is a diff layer over [`rocky cost latest`](/reference/commands/administration/#rocky-cost). For each model in the prune set, Rocky looks up two `RunRecord`s from the state store: the latest one on the base schema, and the branch run's. It then subtracts the per-model duration, bytes scanned, and USD cost.
@@ -252,7 +251,6 @@ jobs:
       - uses: rocky-data/rocky/.github/actions/rocky-preview@main
         with:
           base_ref: ${{ github.event.pull_request.base.ref }}
-          branch_name: ${{ github.event.pull_request.head.ref }}
           github_token: ${{ github.token }}
           # working_directory: my-pipeline   # if rocky.toml lives in a subdir
           # models_dir: models               # default
@@ -266,7 +264,7 @@ The first PR after you wire this in installs Rocky and posts a comment with the 
 | Input | Default | Description |
 |---|---|---|
 | `base_ref` | (required) | Git ref to compare against. Typically `${{ github.event.pull_request.base.ref }}`. |
-| `branch_name` | PR head ref, slugged | Preview branch name passed to `rocky preview --name`. Pre-slug if you pass it explicitly: only `[A-Za-z0-9_-]` are preserved. |
+| `branch_name` | `pr_<PR number>_<head ref slug>` | Preview branch name passed to `rocky preview create --name`. The action maps characters outside `[A-Za-z0-9_]` to underscores and truncates the name to 64 characters. The default PR number prevents different PRs with equivalent slugs from sharing a schema. If you override this input, choose a unique name. |
 | `models_dir` | `models` | Directory containing model files. Passed to `rocky preview create --models`. |
 | `working_directory` | `.` | Directory containing `rocky.toml`. The action `cd`s here before each subcommand. |
 | `rocky_version` | `latest` | Engine version. `latest` resolves the highest `engine-v*` tag; otherwise pass `1.74.0` or `engine-v1.74.0`. |

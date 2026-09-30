@@ -110,8 +110,8 @@ pub use backfill::run_backfill;
 #[cfg(feature = "duckdb")]
 pub use bench::run_bench;
 pub use branch::{
-    compute_branch_list, compute_branch_show, run_branch_approve, run_branch_compare,
-    run_branch_create, run_branch_delete, run_branch_list, run_branch_promote,
+    compute_branch_list, compute_branch_show, resolve_branch_shadow_config, run_branch_approve,
+    run_branch_compare, run_branch_create, run_branch_delete, run_branch_list, run_branch_promote,
     run_branch_promote_from_plan, run_branch_show,
 };
 pub use brief::{BriefSince, compute_brief, run_brief};

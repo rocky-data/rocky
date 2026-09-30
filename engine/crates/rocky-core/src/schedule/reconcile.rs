@@ -1921,6 +1921,7 @@ cron = "also invalid"
             submission_id: submission_id.map(String::from),
             check_gate_failed: false,
             verify_after_failed: false,
+            rocky_branch: None,
         }
     }
 

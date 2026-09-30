@@ -498,6 +498,7 @@ impl RockyLsp {
         let config = CompilerConfig {
             models_dir: dir_path.clone(),
             contracts_dir: None,
+            required_explicit_contract_model: None,
             source_schemas,
             mask,
             allow_unmasked,
@@ -1412,6 +1413,7 @@ impl LanguageServer for RockyLsp {
                 let config = CompilerConfig {
                     models_dir: dir_path,
                     contracts_dir: None,
+                    required_explicit_contract_model: None,
                     source_schemas,
                     mask,
                     allow_unmasked,
@@ -6382,6 +6384,7 @@ mod tests {
         let compile_config = rocky_compiler::compile::CompilerConfig {
             models_dir: models_dir.clone(),
             contracts_dir: None,
+            required_explicit_contract_model: None,
             source_schemas: HashMap::new(),
             mask: cfg.mask,
             allow_unmasked: cfg.classifications.allow_unmasked,

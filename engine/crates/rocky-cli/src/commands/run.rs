@@ -464,19 +464,9 @@ pub(crate) fn run_status_exit_result(
 /// `RunOutput::new` default of `success`). A clean run still derives
 /// `Success`; a copy-only failure behaves exactly as before.
 fn merge_replication_compile_and_copy_errors(output: &mut RunOutput, table_errors: &[TableError]) {
-    // Retain `execute_models`' own records: compile failures (`CompileError`)
-    // and, when `[resilience] contain_failures` is on, contained-cause runtime
-    // failures (`Unknown` — the anyhow-erased bucket `record_contained_cause`
-    // uses). Copy failures arrive separately in `table_errors` and are appended
-    // below, so widening the retain never double-counts them. Byte-identical on
-    // the default fail-fast path: `execute_models` returns `Err` there, so no
-    // `Unknown` entry is ever present on `output.errors` before this merge.
-    output.errors.retain(|e| {
-        matches!(
-            e.failure_kind,
-            crate::output::FailureKind::CompileError | crate::output::FailureKind::Unknown
-        )
-    });
+    // Existing entries came from the model phase. Keep them regardless of
+    // failure kind: a contained connector error may be classified as auth or
+    // quota. Copy failures arrive separately in `table_errors` below.
     // Count distinct failed models from the retained entries rather than
     // inferring from `tables_failed`: the compile path records one `errors`
     // entry per diagnostic but bumps `tables_failed` once per model, so count
@@ -1134,6 +1124,7 @@ pub(crate) fn audit_to_record(ctx: &AuditContext) -> RunRecordAudit {
         target_catalog: ctx.target_catalog.clone(),
         hostname: ctx.hostname.clone(),
         rocky_version: ctx.rocky_version.clone(),
+        rocky_branch: ctx.rocky_branch.clone(),
     }
 }
 
@@ -1161,6 +1152,30 @@ fn run_trigger_from_env() -> rocky_core::state::RunTrigger {
 #[cfg(test)]
 pub(crate) static FAIL_RECORD_WRITE_FOR_TEST: std::sync::Mutex<Option<String>> =
     std::sync::Mutex::new(None);
+
+/// Test hook (#2143): after a successful JSON emit, snapshot the serialized
+/// payload under the run ID. The production `print_json` writer goes
+/// directly to stdout, so a same-process test cannot read those bytes.
+#[cfg(test)]
+pub(crate) static CAPTURED_RUN_OUTPUT_FOR_TEST: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, serde_json::Value>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// Snapshot the serialized output. This is called only after
+/// `print_json` succeeded; it costs nothing in a released binary.
+#[cfg(test)]
+pub(crate) fn capture_run_output_for_test(run_id: &str, output: &RunOutput) {
+    if let Ok(value) = serde_json::to_value(output) {
+        CAPTURED_RUN_OUTPUT_FOR_TEST
+            .lock()
+            .expect("capture mutex")
+            .insert(run_id.to_string(), value);
+    }
+}
+
+#[cfg(not(test))]
+#[inline]
+pub(crate) fn capture_run_output_for_test(_run_id: &str, _output: &RunOutput) {}
 
 /// Persist the run's terminal record, best-effort: a failed write is logged
 /// and the run goes on, because history is advisory for most of its readers.
@@ -2563,8 +2578,65 @@ fn resolve_resume_progress(
 
 /// Execute `rocky run` — full pipeline.
 #[allow(clippy::too_many_arguments)]
-#[tracing::instrument(skip_all, name = "run", fields(run_id))]
 pub async fn run(
+    config_path: &Path,
+    loaded: std::sync::Arc<rocky_core::config::LoadedConfig>,
+    filter: Option<&str>,
+    pipeline_name_arg: Option<&str>,
+    state_path: &Path,
+    governance_override: Option<&GovernanceOverride>,
+    output_json: bool,
+    models_dir: Option<&Path>,
+    run_all: bool,
+    resume_run_id: Option<&str>,
+    resume_latest: bool,
+    shadow_config: Option<&rocky_core::shadow::ShadowConfig>,
+    partition_opts: &PartitionRunOptions,
+    model_name_filter: Option<&str>,
+    cache_ttl_override: Option<u64>,
+    idempotency_key: Option<&str>,
+    env: Option<&str>,
+    defer_opts: &DeferOptions,
+    skip_opts: &SkipRunOptions,
+    run_vars: &rocky_core::run_vars::RunVars,
+    run_id_override: Option<&str>,
+    governed_ctx: Option<&crate::commands::apply::GovernedRunContext<'_>>,
+    assume_fresh_state: bool,
+    reviewed_source_state: Option<(&str, &[crate::output::ReplicationConnectorSnapshot])>,
+) -> Result<RunTermination> {
+    run_with_explicit_contracts(
+        config_path,
+        loaded,
+        filter,
+        pipeline_name_arg,
+        state_path,
+        governance_override,
+        output_json,
+        models_dir,
+        run_all,
+        resume_run_id,
+        resume_latest,
+        shadow_config,
+        partition_opts,
+        model_name_filter,
+        cache_ttl_override,
+        idempotency_key,
+        env,
+        defer_opts,
+        skip_opts,
+        run_vars,
+        run_id_override,
+        governed_ctx,
+        assume_fresh_state,
+        reviewed_source_state,
+        None,
+    )
+    .await
+}
+
+#[tracing::instrument(skip_all, name = "run", fields(run_id))]
+#[allow(clippy::too_many_arguments)]
+pub async fn run_with_explicit_contracts(
     // Kept for directory resolution and sub-paths (models dir defaults,
     // hooks, the DAG replay) — NEVER re-read as a config: the parsed config
     // and its fingerprint arrive via `loaded` below.
@@ -2652,7 +2724,40 @@ pub async fn run(
     // SAME `decide_drift_scope` rule at the point the work is actually built,
     // which keeps the filter-scope tolerance identical.
     reviewed_source_state: Option<(&str, &[crate::output::ReplicationConnectorSnapshot])>,
+    contracts_dir: Option<&Path>,
 ) -> Result<RunTermination> {
+    // This first explicit-contract route is deliberately model-only. Validate
+    // it before the idempotency claim, state session, adapter, or warehouse
+    // work. In particular, an old idempotency key must never skip reading a
+    // changed model or contract while reporting a guarded success.
+    if contracts_dir.is_some() {
+        anyhow::ensure!(
+            model_name_filter.is_some() && pipeline_name_arg.is_some(),
+            "--contracts requires both --model and --pipeline"
+        );
+        anyhow::ensure!(
+            filter.is_none()
+                && models_dir.is_none()
+                && !run_all
+                && resume_run_id.is_none()
+                && !resume_latest
+                && shadow_config.is_none()
+                && !partition_opts.any_set()
+                && !defer_opts.enabled
+                && defer_opts.defer_to.is_none()
+                && idempotency_key.is_none()
+                && !skip_opts.skip_unchanged
+                && !skip_opts.no_prune
+                && governed_ctx.is_none()
+                && run_id_override.is_none()
+                && reviewed_source_state.is_none()
+                && !assume_fresh_state,
+            "--contracts supports only a fresh selected-model run; remove filter, models override, mixed execution, resume, shadow/branch, partition, defer, skip, idempotency, and governed-apply options"
+        );
+        // The named pipeline must be a transformation pipeline. Do not fall
+        // back to another adapter when the operator asked for a guard.
+        resolve_model_run_target(&loaded.config, pipeline_name_arg)?;
+    }
     // With `-o json` stdout is reserved for the JSON payload — route any
     // human-readable summary/progress line (e.g. a `depends_on` upstream
     // pipeline's "Copied …") to stderr so it can't precede the JSON document.
@@ -2798,8 +2903,11 @@ pub async fn run(
     // Resolve the model-skip gate once. Shadow / branch runs are never
     // skip-eligible (they write to different targets), so a shadow config
     // forces the gate inert regardless of the flag / config.
-    let skip_gate =
+    let mut skip_gate =
         SkipGateConfig::resolve(skip_opts, &rocky_cfg.run, shadow_config.is_some());
+    if contracts_dir.is_some() {
+        skip_gate.force_rebuild = true;
+    }
 
     let resume_requested = resume_run_id.is_some() || resume_latest;
 
@@ -2967,6 +3075,7 @@ pub async fn run(
             0, // duration filled at end
             1, // concurrency
         );
+        output.pipeline_type = Some("transformation".to_string());
         if let Some(ctx) = &idempotency_ctx {
             output.idempotency_key = Some(ctx.key.clone());
         }
@@ -2975,7 +3084,7 @@ pub async fn run(
         // error / contained runtime failure that still returns `Ok`) skips
         // governance below, not just a hard `Err`.
         let failures_before = output.tables_failed;
-        let exec_result = execute_models(
+        let exec_result = execute_models_with_explicit_contracts(
             &mdir,
             models_glob.as_deref(),
             warehouse.as_ref(),
@@ -2996,13 +3105,13 @@ pub async fn run(
             // not passed (clause 1 of the fail-closed decision). `--no-reuse`
             // suppresses the whole reuse path for this invocation — both the
             // point-to decision and the spine population it would feed.
-            rocky_cfg.reuse.enabled && !skip_opts.no_reuse,
+            rocky_cfg.reuse.enabled && !skip_opts.no_reuse && contracts_dir.is_none(),
             // Content-addressed column-level skip — its own `[reuse]` sub-key,
             // orthogonal to the point-to switch above but also disabled by
             // `--no-reuse`: the flag is the documented "force every
             // content-addressed model to BUILD" escape hatch, and a column
             // skip is a content-addressed non-build.
-            rocky_cfg.reuse.column_level && !skip_opts.no_reuse,
+            rocky_cfg.reuse.column_level && !skip_opts.no_reuse && contracts_dir.is_none(),
             run_vars,
             rocky_cfg.resilience.clone(),
             rocky_cfg.run.strict_scheduling,
@@ -3011,6 +3120,7 @@ pub async fn run(
             Some(&freeze_fence),
             // Finding #4: the `--model` path reconciles no masks.
             false,
+            contracts_dir,
         )
         .await;
 
@@ -3086,11 +3196,16 @@ pub async fn run(
             Ok(_) => {}
             Err(e) => {
                 output.tables_failed += 1;
+                // #2143: classify the same way the replication-table failure
+                // path does, so a wrapped connector error (auth/quota/a
+                // tripped breaker) reports its real kind and cooldown here
+                // too, instead of hard-coding `Unknown`.
+                let (failure_kind, cooldown_seconds) = classify_anyhow_error_with_cooldown(&e);
                 output.errors.push(crate::output::TableErrorOutput {
                     asset_key: vec![target_model.to_string()],
                     error: format!("{e:#}"),
-                    failure_kind: crate::output::FailureKind::Unknown,
-                    cooldown_seconds: None,
+                    failure_kind,
+                    cooldown_seconds,
                 });
             }
         }
@@ -3112,10 +3227,12 @@ pub async fn run(
         // Audit context: model-only runs have no single target catalog
         // (we don't know which pipeline's templates are in scope), so
         // `target_catalog = None`. Every other audit field populates
-        // normally.
+        // normally, including `rocky_branch` when this model-only run was
+        // scoped with `--branch` (#2032).
         let audit_ctx = AuditContext::detect(
             idempotency_ctx.as_ref().map(|c| c.key.clone()),
             None,
+            shadow_config.and_then(|c| c.branch.clone()),
         );
         let audit = audit_to_record(&audit_ctx);
         let custody = RecordCustody::from_persisted(persist_run_record(
@@ -3158,6 +3275,7 @@ pub async fn run(
         output.status = output.derive_run_status();
         if output_json {
             print_json(&output)?;
+            capture_run_output_for_test(&run_id, &output);
         }
         budget_result?;
         // Same run-status exit contract as the transformation path: a
@@ -3811,6 +3929,7 @@ pub async fn run(
     let audit_ctx = AuditContext::detect(
         idempotency_ctx.as_ref().map(|c| c.key.clone()),
         Some(pipeline.target.catalog_template.clone()),
+        shadow_config.and_then(|c| c.branch.clone()),
     );
     let audit = audit_to_record(&audit_ctx);
 
@@ -4272,11 +4391,21 @@ pub async fn run(
     // call the SAME functions the collection loop calls. They must stay in sync
     // — a condition added there and not here would refuse a run that is fine.
     // `preflight_skips_a_disabled_table` pins the one most likely to drift.
+    //
+    // #1941: the check-name-collision guard belongs in this SAME preflight, for
+    // the SAME reason — `governance_setup` right below creates catalogs and
+    // schemas, sets tags, binds workspaces and applies grants before the run()
+    // pre-loop call further down (over the resume-filtered `tables_to_process`)
+    // ever runs, so that later call was refusing only after access control had
+    // already changed. `collision_check_pairs` collects one `(target_table_name,
+    // source_type)` per table surviving the SAME three skip conditions, and the
+    // call below runs after the loop, still before `governance_setup`.
     {
         let mut preflight_claims: HashMap<
             rocky_sql::defer::CollisionIdentity,
             (String, String),
         > = HashMap::new();
+        let mut collision_check_pairs: Vec<(String, String)> = Vec::new();
         for conn in &connectors {
             let Ok(parsed) = pattern.parse(&conn.schema) else {
                 continue;
@@ -4370,8 +4499,20 @@ pub async fn run(
                     );
                 }
                 preflight_claims.insert(id, this);
+                collision_check_pairs.push((target_table_name, conn.source_type.clone()));
             }
         }
+
+        // #1941: refuse before `governance_setup` (right below) creates
+        // catalogs/schemas, sets tags, binds workspaces or applies grants —
+        // see the comment on this preflight block above.
+        refuse_check_name_collisions(
+            pipeline_name,
+            pipeline,
+            collision_check_pairs
+                .iter()
+                .map(|(t, s)| (t.as_str(), s.as_str())),
+        )?;
     }
 
     // --- Sequential: catalog/schema setup + table collection ---
@@ -5028,6 +5169,31 @@ pub async fn run(
             "filtered resumed tables"
         );
     }
+
+    // #1941: refuse a check-name collision over the COMPLETE, final table
+    // set this invocation will copy — after resume-filtering above (so a
+    // resumed run's already-completed tables, which will not be
+    // re-materialized or re-checked, don't false-positive into the
+    // comparison), but before `init_run_progress` below writes anything and
+    // before the spawn loop further down copies a single row. `target_table_name`
+    // and `asset_key_prefix` are set once per task when `tables_to_process`
+    // is built and are not touched by anything between here and the spawn
+    // loop, so this sees exactly the table set / sibling grouping the run
+    // will actually use. `governance_setup` has already run by this point —
+    // the earlier call inside the `#1461` preflight block, over the
+    // unfiltered candidate set, is what stops a collision from mutating
+    // catalogs/schemas/tags/grants; this call is the authoritative one for
+    // what a resume will actually copy.
+    refuse_check_name_collisions(
+        pipeline_name,
+        pipeline,
+        tables_to_process.iter().map(|task| {
+            (
+                task.target_table_name.as_str(),
+                task.asset_key_prefix.first().map(String::as_str).unwrap_or(""),
+            )
+        }),
+    )?;
 
     // Initialize run progress tracking, stamped with this invocation's
     // pipeline scope so a later resume can prove the checkpoint is its own
@@ -6196,12 +6362,18 @@ pub async fn run(
                     // copy-failure block below fires `pipeline_error` + drains
                     // webhooks once for the accumulated failures), mirroring the
                     // model-only path.
+                    //
+                    // #2143: classify the same way the replication-table
+                    // failure path does, so a wrapped connector error
+                    // (auth/quota/a tripped breaker) reports its real kind
+                    // and cooldown here too, instead of hard-coding `Unknown`.
+                    let (failure_kind, cooldown_seconds) = classify_anyhow_error_with_cooldown(&e);
                     table_errors.push(TableError {
                         asset_key: vec![pipeline_name.to_string()],
                         error: format!("{e:#}"),
                         task_index: None,
-                        failure_kind: crate::output::FailureKind::Unknown,
-                        cooldown_seconds: None,
+                        failure_kind,
+                        cooldown_seconds,
                     });
                     None
                 }
@@ -6603,6 +6775,7 @@ pub async fn run(
 
     if output_json {
         print_json(&output)?;
+        capture_run_output_for_test(&run_id, &output);
     } else {
         if let Some(ref resumed_from) = output.resumed_from {
             crate::status_line!(
@@ -6674,18 +6847,13 @@ pub async fn run(
         );
     }
 
-    // Compile-only failure on the replication path. The block above only
-    // fires when at least one source *copy* failed; a `--models` run where a
-    // model fails to compile (E020) but every source copied cleanly leaves
-    // `table_errors` empty while `output.tables_failed` is non-zero from the
-    // merged compile errors. Without this guard such a run would print its
-    // JSON (already carrying the compile errors + a non-`success` status) and
-    // then fall through to `Ok(())` / exit 0 — exactly the silent skip this
-    // change closes. Re-derive the exit contract from the merged tallies so it
-    // fails loudly, matching the transformation / model-only paths.
+    // A compile failure or contained model runtime failure can leave every
+    // source copy clean. In that case `table_errors` is empty, but the model
+    // phase has already recorded a failure. Keep the nonzero exit and name
+    // both possible causes accurately; `errors[]` carries the specific one.
     if output.tables_failed > 0 {
         let msg = format!(
-            "{} model(s) failed to compile (run_id: {run_id}, see the `errors` array in the JSON output)",
+            "{} model(s) failed (run_id: {run_id}, see the `errors` array in the JSON output)",
             output.tables_failed
         );
         let _ = hook_registry
@@ -6698,7 +6866,7 @@ pub async fn run(
     // Check gate. Separate from both branches above on purpose: a failed
     // check is neither a failed table nor a failed model, so it is not folded
     // into `tables_failed` (a documented count of tables and models) and it
-    // never reaches the "N model(s) failed to compile" message above. The JSON
+    // never reaches the "N model(s) failed" message above. The JSON
     // `status` and the persisted `RunRecord` already say `PartialFailure` —
     // `output.check_gate_failed` fed `derive_run_status` before either was
     // written — so this is only the exit-code half of the same answer (#1598).
@@ -6951,6 +7119,113 @@ async fn partition_overlap_key_carriers(
 /// `anomaly_evaluated`, evaluated or not — an empty `anomalies` list alone
 /// cannot say which happened (#1790).
 ///
+/// Refuse if two check names THIS run will emit for the SAME table sanitize
+/// to the same Dagster check name (#1941).
+///
+/// `validate_checks` (config load, `rocky-core/src/config.rs`) already
+/// catches every TABLE-INDEPENDENT collision (custom checks and `null_rate`
+/// columns both run on every table, so a collision between them is refused
+/// before this function — before discovery, before materialization) and
+/// every collision on a table an assertion names explicitly — it walks
+/// every `[[checks.assertions]]` table, named or not, so no assertion table
+/// is unmentioned to it. What this function catches, that config load
+/// cannot, is the one case that genuinely needs the ACTUALLY discovered
+/// table set: a `cross_source_overlap` collision, since that name depends
+/// on runtime-discovered siblings.
+///
+/// `table_source_pairs` is one `(target table name, source_type)` pair per
+/// table this invocation will touch — duplicates on the same table signal a
+/// `cross_source_overlap` sibling group. Three callers supply this, at three
+/// different points in `run()`'s lifecycle:
+///
+/// - **Earliest**: called from inside the `#1461` preflight block, over
+///   every table surviving that block's own three skip conditions — before
+///   `governance_setup` (right below it) creates catalogs/schemas, sets
+///   tags, binds workspaces or applies grants. This is the call that
+///   actually stops a collision from mutating access control; see that
+///   block's own comment.
+/// - **Primary**: called from `run()` itself, over `tables_to_process`
+///   AFTER resume-filtering, immediately before the copy loop spawns any
+///   task and before `init_run_progress` writes anything. By this point
+///   `governance_setup` has already run — the earliest call above is what
+///   stops that — but this is the authoritative check over the exact table
+///   set a resume will actually copy (which the earliest call, running
+///   before resume-filtering, does not see), and it still refuses before
+///   any table is copied or any watermark advanced.
+/// - **Defense-in-depth**: called from the top of [`run_batched_checks`],
+///   over `assertion_targets`. By the time that function runs, every table
+///   in THIS invocation has already been copied — both calls above already
+///   refused before that happened, so this only fires for a caller that
+///   reaches `run_batched_checks` without going through `run()`'s pre-loop
+///   gates (a test driving it directly, or a future second entrypoint).
+/// - **`rocky plan`** (`commands/plan.rs`) calls this too, over the planned
+///   table set, for the same reason `apply`/Pipes needs it bounded to the
+///   plan step: without it, `rocky plan` exits 0 and persists a `plan_id`
+///   for a set `rocky apply` (which re-executes `run()`) then refuses —
+///   late, and outside the plan step's own watchdog/timeout budget.
+pub(crate) fn refuse_check_name_collisions<'a>(
+    pipeline_name: &str,
+    pipeline: &ReplicationPipelineConfig,
+    table_source_pairs: impl IntoIterator<Item = (&'a str, &'a str)>,
+) -> Result<()> {
+    use std::collections::BTreeMap;
+
+    // table -> one source_type per occurrence (duplicates signal siblings).
+    let mut siblings_by_table: BTreeMap<&str, Vec<String>> = BTreeMap::new();
+    for (table, source_type) in table_source_pairs {
+        siblings_by_table
+            .entry(table)
+            .or_default()
+            .push(source_type.to_string());
+    }
+
+    let mut messages = Vec::new();
+    for (&table, sibling_source_types) in &siblings_by_table {
+        let names = rocky_core::config::resolved_check_names_for_table(
+            &pipeline.checks,
+            ReplicationPipelineConfig::EXECUTED_CHECK_KINDS,
+            table,
+            sibling_source_types,
+        );
+        for (a, b, sanitized) in rocky_core::config::resolved_check_name_collisions(&names) {
+            messages.push(format!(
+                "table '{table}': {a_kind} '{a_name}' and {b_kind} '{b_name}' both sanitize \
+                 to Dagster check name '{sanitized}'",
+                a_kind = a.kind.as_str(),
+                a_name = a.name,
+                b_kind = b.kind.as_str(),
+                b_name = b.name,
+            ));
+        }
+    }
+
+    if !messages.is_empty() {
+        anyhow::bail!(
+            "refusing to run: {} check-name collision(s) in pipeline {pipeline_name:?} would \
+             sanitize to the same Dagster check name — Dagster keys check results by \
+             (asset_key, sanitized_name), so the first spec wins and the second is silently \
+             dropped. Rename one side of each pair.\n{}",
+            messages.len(),
+            messages.join("\n"),
+        );
+    }
+    Ok(())
+}
+
+/// Runs the batched replication checks against the tables copied this run
+/// and appends the results to `pending_checks`.
+///
+/// Row count and freshness go through the warehouse's `BatchCheckAdapter`
+/// when it has one that says it can batch that leg (one UNION ALL query),
+/// and fall back to one query per table otherwise — no adapter, or an
+/// adapter whose `supports_row_counts` / `supports_freshness` says no. The
+/// decision is per leg (#1719). Assertions, custom checks, null-rate checks and the
+/// cross-source overlap check run per table through the plain
+/// `WarehouseAdapter`. Row-count anomalies detected on the way are pushed to
+/// `anomalies`, and every table the detector considered is recorded in
+/// `anomaly_evaluated`, evaluated or not — an empty `anomalies` list alone
+/// cannot say which happened (#1790).
+///
 /// Lifted out of `run()` so a test can drive it with a warehouse that fails
 /// a specific query; `run()` itself builds its adapters from the config and
 /// offers no seam for that.
@@ -6972,6 +7247,27 @@ async fn run_batched_checks(
     anomalies: &mut Vec<AnomalyOutput>,
     anomaly_evaluated: &mut Vec<AnomalyEvaluationOutput>,
 ) -> Result<()> {
+    // #1941: defense-in-depth. `run()`'s own caller already refused this
+    // run over the complete `tables_to_process` set BEFORE the copy loop —
+    // see `refuse_check_name_collisions` above and its call site before the
+    // spawn loop in `run()`. That earlier call sees every table this
+    // invocation WILL copy; this one sees only `assertion_targets`, which is
+    // populated per materialized table as the copy loop completes, so by the
+    // time this function runs the copies (and any watermark advance) have
+    // already happened. Kept so a caller that reaches this function without
+    // going through `run()`'s pre-loop gate (a test driving it directly, or
+    // a future second entrypoint) still gets the refusal.
+    refuse_check_name_collisions(
+        pipeline_name,
+        pipeline,
+        assertion_targets.iter().map(|(tref, asset_key)| {
+            (
+                tref.table.as_str(),
+                asset_key.first().map(String::as_str).unwrap_or(""),
+            )
+        }),
+    )?;
+
     let row_count_enabled = pipeline.checks.row_count.enabled() && !source_batch_refs.is_empty();
     let freshness_enabled = pipeline.checks.freshness.is_some() && !freshness_batch_refs.is_empty();
 
@@ -7394,21 +7690,23 @@ async fn run_batched_checks(
         None
     };
     if let Some(reason) = detector_off_reason {
-        for (target_key, _) in batch_asset_keys {
+        for (target_key, asset_key) in batch_asset_keys {
             anomaly_evaluated.push(AnomalyEvaluationOutput {
                 table: target_key.clone(),
+                asset_key: asset_key.clone(),
                 evaluated: false,
                 not_evaluated_reason: Some(reason.clone()),
             });
         }
     } else if let Some(store) = state_store {
-        for (target_key, _) in batch_asset_keys {
+        for (target_key, asset_key) in batch_asset_keys {
             // Only a measured count enters the anomaly history. The 0 a
             // failed query used to record read as "the table emptied" and
             // skewed every later baseline.
             let Some(&tgt_count) = target_map.get(target_key) else {
                 anomaly_evaluated.push(AnomalyEvaluationOutput {
                     table: target_key.clone(),
+                    asset_key: asset_key.clone(),
                     evaluated: false,
                     not_evaluated_reason: Some(
                         "no row count was measured for this table, so there is nothing to \
@@ -7424,6 +7722,7 @@ async fn run_batched_checks(
             let Ok(history) = store.get_check_history(target_key) else {
                 anomaly_evaluated.push(AnomalyEvaluationOutput {
                     table: target_key.clone(),
+                    asset_key: asset_key.clone(),
                     evaluated: false,
                     not_evaluated_reason: Some(
                         "this table's row-count history could not be read from the state \
@@ -7436,6 +7735,7 @@ async fn run_batched_checks(
             {
                 anomaly_evaluated.push(AnomalyEvaluationOutput {
                     table: target_key.clone(),
+                    asset_key: asset_key.clone(),
                     evaluated: true,
                     not_evaluated_reason: None,
                 });
@@ -7465,6 +7765,7 @@ async fn run_batched_checks(
                         .await;
                     anomalies.push(AnomalyOutput {
                         table: anomaly.table,
+                        asset_key: asset_key.clone(),
                         current_count: anomaly.current_count,
                         baseline_avg: anomaly.baseline_avg,
                         deviation_pct: anomaly.deviation_pct,
@@ -8212,8 +8513,8 @@ async fn auto_sweep_retention_at_end_of_run(
     }
 }
 
-/// Emit Dagster Pipes messages for every materialization, check, and
-/// drift action in a completed `RunOutput`.
+/// Emit Dagster Pipes messages for every materialization, check, drift
+/// action, and row-count anomaly verdict in a completed `RunOutput`.
 ///
 /// This is the "batch at end of run" approach to Pipes streaming. The
 /// fully-streaming alternative (per-table events as they complete)
@@ -8295,8 +8596,15 @@ pub(super) fn emit_pipes_events(pipes: &crate::pipes::PipesEmitter, output: &Run
     // into metadata so the UI doesn't fragment by action type.
     // Also emit a log line for human-readable visibility.
     for action in &output.drift.actions_taken {
+        // The Pipes `asset_key` argument is a Dagster asset key
+        // (slash-joined path); `action.table` is a bare
+        // `catalog.schema.table` string, not one — passing it directly
+        // used to report drift against a key Dagster never declared
+        // (#2073, the same shape of bug `check_results` avoids by
+        // carrying its own `asset_key`).
+        let asset_key = action.asset_key.join("/");
         pipes.report_asset_check(
-            &action.table,
+            &asset_key,
             "drift",
             true,
             crate::pipes::PipesCheckSeverity::Warn,
@@ -8313,6 +8621,77 @@ pub(super) fn emit_pipes_events(pipes: &crate::pipes::PipesEmitter, output: &Run
                 action.table, action.action, action.reason,
             ),
         );
+    }
+
+    // Row-count anomalies → asset checks named "row_count_anomaly", matching
+    // `ANOMALY_CHECK_NAME` in `dagster_rocky/observability.py` and the
+    // streaming path's verdicts (#1790): a detected anomaly fails with the
+    // metric detail, an evaluated table with no anomaly passes, and a
+    // not-evaluated table reports why. Before this (#2073), Pipes mode
+    // emitted neither list, so a declared `row_count_anomaly` check was
+    // never reported at all — not even a false pass.
+    //
+    // Metadata keys match `anomaly_check_results` / `anomaly_evaluation_results`
+    // in `observability.py` exactly: the detected-anomaly metadata is fully
+    // `rocky/`-prefixed (`rocky/current_count`, `rocky/baseline_avg`,
+    // `rocky/deviation_pct`, `rocky/reason`); the evaluation verdicts keep
+    // `status` bare and prefix only `rocky/reason`, mirroring that module's
+    // own inconsistency rather than inventing a third convention.
+    //
+    // Anomalies are emitted first, and each anomalous table's RESOLVED
+    // asset key is recorded so the evaluation loop below can skip its
+    // `evaluated: true` entry: every anomalous table also appears in
+    // `anomaly_evaluated` (the detector did run), and reporting both would
+    // send a passing verdict for a table that just failed. Keyed on the
+    // resolved asset key, not the engine-native `table` string, because two
+    // native tables can fold onto the same Dagster asset key (the tenant
+    // coalesce); `_emit_results` on the streaming side dedups on the
+    // resolved `AssetKey` for the same reason (see `component.py`'s
+    // `yielded_checks` set).
+    let mut anomalous_asset_keys: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    for anomaly in &output.anomalies {
+        let asset_key = anomaly.asset_key.join("/");
+        anomalous_asset_keys.insert(asset_key.clone());
+        pipes.report_asset_check(
+            &asset_key,
+            "row_count_anomaly",
+            false,
+            crate::pipes::PipesCheckSeverity::Warn,
+            &json!({
+                "rocky/current_count": anomaly.current_count,
+                "rocky/baseline_avg": anomaly.baseline_avg,
+                "rocky/deviation_pct": anomaly.deviation_pct,
+                "rocky/reason": anomaly.reason,
+            }),
+        );
+    }
+    for evaluation in &output.anomaly_evaluated {
+        let asset_key = evaluation.asset_key.join("/");
+        if anomalous_asset_keys.contains(&asset_key) {
+            continue;
+        }
+        if evaluation.evaluated {
+            pipes.report_asset_check(
+                &asset_key,
+                "row_count_anomaly",
+                true,
+                crate::pipes::PipesCheckSeverity::Warn,
+                &json!({"status": "evaluated against the row-count history; no anomaly"}),
+            );
+        } else {
+            let reason = evaluation
+                .not_evaluated_reason
+                .as_deref()
+                .unwrap_or("the engine gave no reason");
+            pipes.report_asset_check(
+                &asset_key,
+                "row_count_anomaly",
+                false,
+                crate::pipes::PipesCheckSeverity::Warn,
+                &json!({"status": "not_evaluated", "rocky/reason": reason}),
+            );
+        }
     }
 }
 
@@ -9422,21 +9801,21 @@ fn collect_auto_create_targets(
 ///
 /// Used only on the `[resilience] contain_failures` path — the fail-fast
 /// default returns `Err` from `execute_models` instead of continuing. The
-/// `errors[]` entry carries [`crate::output::FailureKind::Unknown`], the enum's
-/// own bucket for an `anyhow`-erased runtime error reaching this layer; the
-/// replication-path error merge retains it alongside compile failures.
+/// The `errors[]` entry keeps a typed connector failure and its cooldown when
+/// present; the replication-path error merge retains it alongside compile failures.
 fn record_contained_cause(
     output: &mut RunOutput,
     containment: &mut super::containment::ContainmentLedger,
     model_name: &str,
     err: &anyhow::Error,
 ) {
+    let (failure_kind, cooldown_seconds) = classify_anyhow_error_with_cooldown(err);
     output.tables_failed += 1;
     output.errors.push(crate::output::TableErrorOutput {
         asset_key: vec![model_name.to_string()],
         error: format!("{err:#}"),
-        failure_kind: crate::output::FailureKind::Unknown,
-        cooldown_seconds: None,
+        failure_kind,
+        cooldown_seconds,
     });
     containment.poison(model_name);
 }
@@ -9687,12 +10066,13 @@ pub(crate) async fn execute_backfill_set(
             // Soft model failure — skip governance/manifest, fall through.
             Ok(_) => {}
             Err(e) => {
+                let (failure_kind, cooldown_seconds) = classify_anyhow_error_with_cooldown(&e);
                 output.tables_failed += 1;
                 output.errors.push(crate::output::TableErrorOutput {
                     asset_key: vec!["backfill".to_string()],
                     error: format!("{e:#}"),
-                    failure_kind: crate::output::FailureKind::Unknown,
-                    cooldown_seconds: None,
+                    failure_kind,
+                    cooldown_seconds,
                 });
             }
         }
@@ -9707,7 +10087,9 @@ pub(crate) async fn execute_backfill_set(
         output.populate_cost_summary(&adapter_type, &rocky_cfg.cost);
         let budget_result = output.check_and_record_budget(&rocky_cfg.budget, Some(&run_id));
 
-        let audit_ctx = AuditContext::detect(None, None);
+        // `rocky backfill` has no `--branch` / `ShadowConfig` parameter, so
+        // there is no Rocky branch to stamp here (#2032).
+        let audit_ctx = AuditContext::detect(None, None, None);
         let audit = audit_to_record(&audit_ctx);
         let custody = RecordCustody::from_persisted(persist_run_record(
             state_store.as_ref(),
@@ -9723,6 +10105,7 @@ pub(crate) async fn execute_backfill_set(
         output.status = output.derive_run_status();
         if output_json {
             print_json(&output)?;
+            capture_run_output_for_test(&run_id, &output);
         }
         budget_result?;
         run_status_exit_result(&output, &run_id, custody)
@@ -9939,9 +10322,68 @@ pub(crate) async fn reconcile_model_governance(
     }
 }
 
-#[tracing::instrument(skip_all, name = "execute_models")]
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn execute_models(
+    models_dir: &Path,
+    models_glob: Option<&str>,
+    warehouse: &dyn rocky_core::traits::WarehouseAdapter,
+    state_store: Option<&StateStore>,
+    partition_opts: &PartitionRunOptions,
+    run_id: &str,
+    model_name_filter: Option<&str>,
+    model_set: Option<&std::collections::BTreeSet<String>>,
+    output: &mut RunOutput,
+    hook_registry: Option<&HookRegistry>,
+    pipeline_name: Option<&str>,
+    schema_cache_config: &rocky_core::config::SchemaCacheConfig,
+    auto_create_schemas: bool,
+    shadow_config: Option<&rocky_core::shadow::ShadowConfig>,
+    defer_opts: &DeferOptions,
+    skip_gate: SkipGateConfig,
+    reuse_enabled: bool,
+    column_level_enabled: bool,
+    run_vars: &rocky_core::run_vars::RunVars,
+    resilience: rocky_core::config::ResilienceConfig,
+    strict_scheduling: bool,
+    retry_policy_allows: bool,
+    exec_fp_gate: Option<&crate::commands::apply::ExecFingerprintGate>,
+    freeze_fence: Option<&super::freeze_fence::FreezeFence>,
+    reconciles_masks: bool,
+) -> Result<GovernanceSnapshot> {
+    execute_models_with_explicit_contracts(
+        models_dir,
+        models_glob,
+        warehouse,
+        state_store,
+        partition_opts,
+        run_id,
+        model_name_filter,
+        model_set,
+        output,
+        hook_registry,
+        pipeline_name,
+        schema_cache_config,
+        auto_create_schemas,
+        shadow_config,
+        defer_opts,
+        skip_gate,
+        reuse_enabled,
+        column_level_enabled,
+        run_vars,
+        resilience,
+        strict_scheduling,
+        retry_policy_allows,
+        exec_fp_gate,
+        freeze_fence,
+        reconciles_masks,
+        None,
+    )
+    .await
+}
+
+#[tracing::instrument(skip_all, name = "execute_models")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn execute_models_with_explicit_contracts(
     models_dir: &Path,
     models_glob: Option<&str>,
     warehouse: &dyn rocky_core::traits::WarehouseAdapter,
@@ -10044,6 +10486,7 @@ pub(crate) async fn execute_models(
     // that path never masks would falsely refuse. The plan side computes the same
     // value from the resolved pipeline type, keeping the fingerprint symmetric.
     reconciles_masks: bool,
+    contracts_dir: Option<&Path>,
 ) -> Result<GovernanceSnapshot> {
     info!(models_dir = %models_dir.display(), "compiling and executing transformation models");
 
@@ -10111,7 +10554,9 @@ pub(crate) async fn execute_models(
 
     let compile_config = rocky_compiler::compile::CompilerConfig {
         models_dir: models_dir.to_path_buf(),
-        contracts_dir: None,
+        contracts_dir: contracts_dir.map(Path::to_path_buf),
+        required_explicit_contract_model: contracts_dir
+            .and_then(|_| model_name_filter.map(str::to_string)),
         source_schemas,
         // W004 wiring happens on the governance compile path later in
         // this function (it already holds the loaded `RockyConfig`).
@@ -10153,10 +10598,18 @@ pub(crate) async fn execute_models(
     };
 
     if let Some(name) = model_name_filter {
-        anyhow::ensure!(
-            compile_result.project.model(name).is_some(),
-            "model '{name}' not found (no transformation model with that name)"
-        );
+        let selected = compile_result.project.model(name).ok_or_else(|| {
+            anyhow::anyhow!("model '{name}' not found (no transformation model with that name)")
+        })?;
+        if contracts_dir.is_some() {
+            anyhow::ensure!(
+                matches!(
+                    selected.config.strategy,
+                    rocky_core::models::StrategyConfig::FullRefresh
+                ),
+                "--contracts currently supports only full_refresh models; '{name}' uses another strategy"
+            );
+        }
     }
 
     // #1291 is enforced by the E036 error diagnostic rather than a refusal
@@ -10183,6 +10636,14 @@ pub(crate) async fn execute_models(
             selected_model_paths.contains(path)
         })
         .context("invalid surrogate_key configuration")?;
+    if let Some(name) = model_name_filter
+        && contracts_dir.is_some()
+    {
+        anyhow::ensure!(
+            !surrogate_keys.contains_key(name),
+            "--contracts cannot yet guard model '{name}' because its surrogate_key changes the output after contract compilation"
+        );
+    }
 
     // ‼️ Governed-apply TOCTOU gate (E) — the single execution choke-point. The
     // fingerprint is recomputed over the EXACT compiled set about to execute
@@ -14009,6 +14470,7 @@ async fn process_table(
             let reason = drift_reason(&drift_result.drifted_columns, "changed");
             drift_action = Some(DriftActionOutput {
                 table: target_table.full_name(),
+                asset_key: asset_key.clone(),
                 action: "drop_and_recreate".into(),
                 reason,
             });
@@ -14054,6 +14516,7 @@ async fn process_table(
             let reason = drift_reason(&drift_result.drifted_columns, "widened");
             drift_action = Some(DriftActionOutput {
                 table: target_table.full_name(),
+                asset_key: asset_key.clone(),
                 action: "alter_column_types".into(),
                 reason,
             });
@@ -14091,6 +14554,7 @@ async fn process_table(
                 .join(", ");
             drift_action = Some(DriftActionOutput {
                 table: target_table.full_name(),
+                asset_key: asset_key.clone(),
                 action: "add_columns".into(),
                 reason,
             });
@@ -16316,6 +16780,7 @@ token = "dapi-SECRET"
             suffix: "_rocky_shadow".to_string(),
             schema_override: Some("branch__feature".to_string()),
             cleanup_after: false,
+            branch: Some("feature".to_string()),
         };
 
         let scope = replication_resume_scope(
@@ -16436,6 +16901,7 @@ token = "dapi-SECRET"
             suffix: "_rocky_shadow".to_string(),
             schema_override: None,
             cleanup_after: false,
+            branch: None,
         };
         let shadowed = replication_resume_scope(
             "p1",
@@ -16516,6 +16982,7 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
             suffix: "_rocky_shadow".to_string(),
             schema_override: Some("x".to_string()),
             cleanup_after: false,
+            branch: None,
         };
         let genuine = replication_resume_scope(
             "p1",
@@ -17487,6 +17954,7 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
             suffix: "_rocky_shadow".to_string(),
             schema_override: Some("x".to_string()),
             cleanup_after: false,
+            branch: None,
         };
         let genuine = replication_resume_scope(
             "p1",
@@ -17926,6 +18394,7 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
             suffix: "_rocky_shadow".to_string(),
             schema_override: Some("branch__feature".to_string()),
             cleanup_after: false,
+            branch: Some("feature".to_string()),
         };
         let adapter = test_duckdb_adapter(None);
         let pattern = test_schema_pattern();
@@ -18064,6 +18533,7 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
             suffix: "_rocky_shadow".to_string(),
             schema_override: Some("branch__feature".to_string()),
             cleanup_after: false,
+            branch: Some("feature".to_string()),
         };
         let adapter = test_duckdb_adapter(None);
         let pattern = test_schema_pattern();
@@ -18241,6 +18711,7 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
             suffix: "_rocky_shadow".to_string(),
             schema_override: Some("branch__feature".to_string()),
             cleanup_after: false,
+            branch: Some("feature".to_string()),
         };
         let adapter = test_duckdb_adapter(None);
         let scope = |pattern: &SchemaPattern| -> ResumeScope {
@@ -19040,6 +19511,7 @@ auto_create_schemas = true
             suffix: "_rocky_shadow".to_string(),
             schema_override: Some("branch__feature".to_string()),
             cleanup_after: false,
+            branch: Some("feature".to_string()),
         };
         let dir = tempfile::tempdir().unwrap();
         let (config_path, state_path, db_path) =
@@ -19481,7 +19953,7 @@ auto_create_schemas = true
             std::env::set_var("ROCKY_SUBMISSION_ID", "sub-xyz");
         }
         let output = RunOutput::new(String::new(), 0, 1);
-        let audit = audit_to_record(&AuditContext::detect(None, None));
+        let audit = audit_to_record(&AuditContext::detect(None, None, None));
         persist_run_record(
             Some(&store),
             &output,
@@ -20255,6 +20727,7 @@ auto_create_schemas = true
                 tables_drifted: 1,
                 actions_taken: vec![DriftActionOutput {
                     table: "acme.raw_orders".into(),
+                    asset_key: vec!["acme".into(), "raw_orders".into()],
                     action: "add_column".into(),
                     reason: "column 'email' found in source but not target".into(),
                 }],
@@ -20285,11 +20758,25 @@ auto_create_schemas = true
         // First: structured check
         let check = &lines[0];
         assert_eq!(check["method"], "report_asset_check");
+        // The asset key on the wire must be the Dagster-style path
+        // (slash-joined, #2073), not the bare `table` string — Pipes'
+        // `asset_key` argument is a Dagster asset key, and `action.table`
+        // ("acme.raw_orders") is not one.
+        assert_eq!(check["params"]["asset_key"], "acme/raw_orders");
         assert_eq!(check["params"]["check_name"], "drift");
         assert_eq!(check["params"]["passed"], true);
         assert_eq!(check["params"]["severity"], "WARN");
-        assert_eq!(check["params"]["metadata"]["table"], "acme.raw_orders");
-        assert_eq!(check["params"]["metadata"]["action"], "add_column");
+        // Wrapped shape (#2073) — pipes.rs's `wrap_metadata` puts every
+        // metadata value in the `{raw_value, type}` form Dagster's real
+        // message handler requires; a bare value crashes it.
+        assert_eq!(
+            check["params"]["metadata"]["table"],
+            serde_json::json!({"raw_value": "acme.raw_orders", "type": "__infer__"})
+        );
+        assert_eq!(
+            check["params"]["metadata"]["action"],
+            serde_json::json!({"raw_value": "add_column", "type": "__infer__"})
+        );
 
         // Second: human-readable log
         let log = &lines[1];
@@ -20298,6 +20785,154 @@ auto_create_schemas = true
         let msg = log["params"]["message"].as_str().unwrap();
         assert!(msg.contains("acme.raw_orders"));
         assert!(msg.contains("add_column"));
+    }
+
+    /// Row-count anomalies and evaluation verdicts reach the Pipes wire as
+    /// `row_count_anomaly` asset checks (#2073). Before this, Pipes mode
+    /// walked neither `output.anomalies` nor `output.anomaly_evaluated`, so
+    /// a detected anomaly reached nobody and the declared check was never
+    /// reported at all — not even a false pass.
+    ///
+    /// Covers the three verdict shapes `component.py::_emit_results` gives
+    /// on the streaming side (#1790), so a Pipes user sees the same thing:
+    ///   - a detected anomaly            -> passed=false, WARN, metric detail
+    ///   - an evaluated table, no anomaly -> passed=true
+    ///   - a not-evaluated table          -> passed=false, WARN, reason
+    ///
+    /// Metadata keys are pinned against `observability.py`'s
+    /// `anomaly_check_results` / `anomaly_evaluation_results`: fully
+    /// `rocky/`-prefixed for a detected anomaly, `status` bare plus
+    /// `rocky/reason` for a not-evaluated table.
+    ///
+    /// Also pins the dedup: `acme.raw_orders_v2` is a DIFFERENT engine-native
+    /// table string that resolves to the SAME asset key as the anomaly
+    /// (`acme/raw_orders`) — the tenant-coalesce shape, where two native
+    /// tables fold onto one Dagster asset. Deduping on `table` alone would
+    /// miss it and send a second, contradictory passing verdict for the
+    /// asset that just failed; deduping on the resolved asset key catches it.
+    #[test]
+    fn test_emit_pipes_anomaly_events_cover_all_three_verdicts() {
+        use crate::output::{AnomalyEvaluationOutput, AnomalyOutput, RunOutput};
+        use crate::pipes::PipesEmitter;
+        use std::io::Read;
+        use std::sync::Mutex;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pipes_anomaly.txt");
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .unwrap();
+        let emitter = PipesEmitter {
+            channel: Mutex::new(Box::new(file)),
+        };
+
+        let mut output = RunOutput::new("tenant=acme".into(), 0, 1);
+        output.anomalies = vec![AnomalyOutput {
+            table: "acme.raw_orders".into(),
+            asset_key: vec!["acme".into(), "raw_orders".into()],
+            current_count: 40,
+            baseline_avg: 100.0,
+            deviation_pct: -60.0,
+            reason: "row count dropped 60% below baseline".into(),
+        }];
+        output.anomaly_evaluated = vec![
+            // A DIFFERENT `table` string that folds onto the SAME asset key
+            // as the anomaly above — dedup must key on the resolved asset
+            // key, not `table`, or this sends a second, contradictory pass.
+            AnomalyEvaluationOutput {
+                table: "acme.raw_orders_v2".into(),
+                asset_key: vec!["acme".into(), "raw_orders".into()],
+                evaluated: true,
+                not_evaluated_reason: None,
+            },
+            AnomalyEvaluationOutput {
+                table: "acme.customers".into(),
+                asset_key: vec!["acme".into(), "customers".into()],
+                evaluated: true,
+                not_evaluated_reason: None,
+            },
+            AnomalyEvaluationOutput {
+                table: "acme.skipped".into(),
+                asset_key: vec!["acme".into(), "skipped".into()],
+                evaluated: false,
+                not_evaluated_reason: Some("no row count was measured for this table".into()),
+            },
+        ];
+
+        emit_pipes_events(&emitter, &output);
+
+        let mut content = String::new();
+        std::fs::File::open(&path)
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
+        let lines: Vec<serde_json::Value> = content
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+
+        // Exactly 3 messages: the anomaly, the clean evaluation, and the
+        // not-evaluated one. The duplicate `evaluated: true` entry for
+        // acme/raw_orders (under a different `table` string) must NOT
+        // produce a 4th message.
+        assert_eq!(lines.len(), 3, "unexpected messages: {content}");
+        for line in &lines {
+            assert_eq!(line["method"], "report_asset_check");
+            assert_eq!(line["params"]["check_name"], "row_count_anomaly");
+        }
+
+        // Detected anomaly: fails, with the metric detail, rocky/-prefixed
+        // to match `anomaly_check_results` in observability.py. Wrapped
+        // shape (#2073) — see `wrap_metadata` in pipes.rs: a bare value
+        // here crashes Dagster's real message handler.
+        let anomaly = &lines[0];
+        assert_eq!(anomaly["params"]["asset_key"], "acme/raw_orders");
+        assert_eq!(anomaly["params"]["passed"], false);
+        assert_eq!(anomaly["params"]["severity"], "WARN");
+        assert_eq!(
+            anomaly["params"]["metadata"]["rocky/current_count"],
+            serde_json::json!({"raw_value": 40, "type": "__infer__"})
+        );
+        assert_eq!(
+            anomaly["params"]["metadata"]["rocky/baseline_avg"],
+            serde_json::json!({"raw_value": 100.0, "type": "__infer__"})
+        );
+        assert_eq!(
+            anomaly["params"]["metadata"]["rocky/deviation_pct"],
+            serde_json::json!({"raw_value": -60.0, "type": "__infer__"})
+        );
+        assert_eq!(
+            anomaly["params"]["metadata"]["rocky/reason"],
+            serde_json::json!({
+                "raw_value": "row count dropped 60% below baseline",
+                "type": "__infer__"
+            })
+        );
+
+        // Evaluated, no anomaly: passes.
+        let clean = &lines[1];
+        assert_eq!(clean["params"]["asset_key"], "acme/customers");
+        assert_eq!(clean["params"]["passed"], true);
+
+        // Not evaluated: fails, with the engine's reason — not silence.
+        let not_evaluated = &lines[2];
+        assert_eq!(not_evaluated["params"]["asset_key"], "acme/skipped");
+        assert_eq!(not_evaluated["params"]["passed"], false);
+        assert_eq!(not_evaluated["params"]["severity"], "WARN");
+        assert_eq!(
+            not_evaluated["params"]["metadata"]["status"],
+            serde_json::json!({"raw_value": "not_evaluated", "type": "__infer__"})
+        );
+        assert_eq!(
+            not_evaluated["params"]["metadata"]["rocky/reason"],
+            serde_json::json!({
+                "raw_value": "no row count was measured for this table",
+                "type": "__infer__"
+            })
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -20645,6 +21280,197 @@ auto_create_schemas = true
         // warehouse statement.
     }
 
+    /// #1941: the check-name-collision refusal fires BEFORE any table is
+    /// copied AND before `governance_setup` creates a single catalog or
+    /// schema — not after, the way two earlier versions of this fix worked:
+    /// the first refused only inside `run_batched_checks`, reachable only
+    /// once every table's copy had already landed and its watermark had
+    /// already advanced; the second added a post-resume call in `run()`
+    /// itself, but that call still runs AFTER `governance_setup`, so
+    /// `auto_create_schemas` had already created both target schemas by the
+    /// time it fired (a real review finding against the HEAD binary — the
+    /// schema-absence assertions below exist because of it).
+    ///
+    /// Uses a `cross_source_overlap` collision deliberately: that check name
+    /// depends on which tables discovery actually finds siblings for, so
+    /// `validate_checks` at config load cannot see it (no assertions are
+    /// declared here for it to hang a table off), which is exactly the case
+    /// this test needs to drive all the way through discovery and into
+    /// the `#1461` preflight block's new pre-`governance_setup` gate, not
+    /// stop at config load. Two source schemas (`raw__acme`, `raw__widgets`)
+    /// both discover an `orders` table under the same `duckdb` source type
+    /// — a sibling pair — and a custom check is named to sanitize onto
+    /// `cross_source_overlap:duckdb.orders`.
+    ///
+    /// Proves nothing was written OR created: `auto_create_schemas = true`
+    /// would create both target schemas the moment `governance_setup` ran,
+    /// so their absence — checked directly via `information_schema.schemata`,
+    /// not inferred from the table check — proves `governance_setup` itself
+    /// never ran. The table-absence check is kept too: it proves the copy
+    /// loop, which runs strictly after `governance_setup`, never reached
+    /// either table.
+    ///
+    /// Mutation that must turn this red: delete (or move to after
+    /// `governance_setup`) the `refuse_check_name_collisions(pipeline_name,
+    /// pipeline, collision_check_pairs...)` call inside the `#1461`
+    /// preflight block. The post-resume call and the `run_batched_checks`
+    /// call are both still in place and will still refuse the run before
+    /// any table is copied — only the NEW schema-absence assertion below
+    /// catches that regression; the pre-existing table-absence assertion
+    /// alone does not, because schema creation happens in `governance_setup`,
+    /// strictly before either of those two later calls runs.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn a_collision_refusal_writes_nothing_the_target_table_never_exists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let db = dir.join("x.duckdb");
+        {
+            use rocky_core::traits::WarehouseAdapter;
+            let a = rocky_duckdb::adapter::DuckDbWarehouseAdapter::open(&db).unwrap();
+            for schema in ["raw__acme", "raw__widgets"] {
+                a.execute_statement(&format!("CREATE SCHEMA {schema}"))
+                    .await
+                    .unwrap();
+                a.execute_statement(&format!("CREATE TABLE {schema}.orders AS SELECT 1 AS id"))
+                    .await
+                    .unwrap();
+            }
+        }
+        let config_path = dir.join("rocky.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                r#"
+[adapter]
+type = "duckdb"
+path = "{}"
+
+[state]
+backend = "local"
+
+[pipeline.p]
+type = "replication"
+strategy = "full_refresh"
+
+[pipeline.p.source.discovery]
+adapter = "default"
+
+[pipeline.p.source.schema_pattern]
+prefix = "raw__"
+separator = "__"
+components = ["source"]
+
+[pipeline.p.target]
+adapter = "default"
+catalog_template = "x"
+schema_template = "staging__{{source}}"
+
+[pipeline.p.target.governance]
+auto_create_schemas = true
+
+[pipeline.p.checks]
+cross_source_overlap = {{ keys = ["id"] }}
+
+[[pipeline.p.checks.custom]]
+name = "cross source overlap duckdb orders"
+sql = "SELECT 0"
+threshold = 0
+"#,
+                db.display()
+            ),
+        )
+        .unwrap();
+
+        // Config load must NOT catch this one — it is the run-time-only
+        // collision this test exists to drive past config load.
+        let loaded = std::sync::Arc::new(
+            rocky_core::config::load_rocky_config_fingerprinted(&config_path)
+                .expect("a cross_source_overlap collision is invisible to config load"),
+        );
+
+        let state_path = dir.join("state.redb");
+        let opts = PartitionRunOptions::default();
+        let err = super::run(
+            &config_path,
+            loaded,
+            None,
+            None,
+            &state_path,
+            None,
+            false,
+            None,
+            false,
+            None,
+            false,
+            None,
+            &opts,
+            None,
+            None,
+            None,
+            None,
+            &DeferOptions::default(),
+            &SkipRunOptions::default(),
+            &rocky_core::run_vars::RunVars::new(),
+            None,
+            None,
+            false,
+            None,
+        )
+        .await
+        .expect_err("a check-name collision must refuse the run before copying anything");
+
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("cross source overlap duckdb orders")
+                && msg.contains("cross_source_overlap:duckdb.orders"),
+            "the refusal must name both colliding sources: {msg}"
+        );
+
+        let warehouse = rocky_duckdb::adapter::DuckDbWarehouseAdapter::open(&db).unwrap();
+        // The SCHEMA itself, not just the table inside it: `governance_setup`
+        // creates the schema (via `auto_create_schemas`) as a step separate
+        // from, and earlier than, copying the table into it. A guard that
+        // fires after `governance_setup` but before the copy loop would
+        // still pass the table-absence check below while having already
+        // created both schemas — exactly the gap a prior review found
+        // present on the HEAD binary.
+        for schema in ["staging__acme", "staging__widgets"] {
+            let result = warehouse
+                .execute_query(&format!(
+                    "SELECT COUNT(*) FROM information_schema.schemata \
+                     WHERE schema_name = '{schema}'"
+                ))
+                .await
+                .unwrap();
+            let count = result.rows[0][0]
+                .as_u64()
+                .or_else(|| result.rows[0][0].as_str().and_then(|v| v.parse().ok()));
+            assert_eq!(
+                count,
+                Some(0),
+                "schema {schema} must not exist — the refusal must fire before governance_setup"
+            );
+        }
+        for schema in ["staging__acme", "staging__widgets"] {
+            let result = warehouse
+                .execute_query(&format!(
+                    "SELECT COUNT(*) FROM information_schema.tables \
+                     WHERE table_schema = '{schema}' AND table_name = 'orders'"
+                ))
+                .await
+                .unwrap();
+            let count = result.rows[0][0]
+                .as_u64()
+                .or_else(|| result.rows[0][0].as_str().and_then(|v| v.parse().ok()));
+            assert_eq!(
+                count,
+                Some(0),
+                "{schema}.orders must not exist — the refusal must fire before any copy"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn transformation_success_stamps_idempotency_succeeded_not_inflight() {
         use rocky_core::idempotency::IdempotencyState;
@@ -20731,6 +21557,638 @@ adapter = "default"
             "success-path finalize on the Transformation dispatch arm must stamp \
              Succeeded, not leave the InFlight claim for the TTL sweep to reap \
              (FR-004 F2 regression guard)"
+        );
+    }
+
+    #[cfg(feature = "duckdb")]
+    fn classified_failure_cases() -> [(&'static str, &'static str, Option<u64>); 3] {
+        [
+            ("auth", "auth-failed", None),
+            ("rate-limit", "quota-exceeded", None),
+            ("breaker", "quota-exceeded", Some(180)),
+        ]
+    }
+
+    #[cfg(feature = "duckdb")]
+    async fn seed_content_addressed_test_table(
+        store: &object_store::memory::InMemory,
+        prefix: &str,
+    ) {
+        use object_store::{ObjectStoreExt as _, PutPayload, path::Path as ObjPath};
+
+        let protocol = serde_json::json!({"protocol": {
+            "minReaderVersion": 2,
+            "minWriterVersion": 7,
+            "writerFeatures": ["columnMapping", "icebergCompatV2", "invariants", "appendOnly"]
+        }});
+        let metadata = serde_json::json!({"metaData": {
+            "id": "00000000-0000-0000-0000-000000000000",
+            "format": {"provider": "parquet", "options": {}},
+            "schemaString": serde_json::to_string(&serde_json::json!({
+                "type": "struct", "fields": [{
+                    "name": "content_addressed_failure_probe", "type": "long",
+                    "nullable": false, "metadata": {
+                        "delta.columnMapping.id": 1,
+                        "delta.columnMapping.physicalName": "col-id-uuid"
+                    }
+                }]
+            })).unwrap(),
+            "partitionColumns": [],
+            "configuration": {
+                "delta.columnMapping.mode": "name",
+                "delta.universalFormat.enabledFormats": "iceberg",
+                "delta.enableIcebergCompatV2": "true"
+            },
+            "createdTime": 0
+        }});
+        let body = format!("{protocol}\n{metadata}\n");
+        store
+            .put(
+                &ObjPath::from(format!("{prefix}/_delta_log/00000000000000000000.json")),
+                PutPayload::from(body.into_bytes()),
+            )
+            .await
+            .unwrap();
+    }
+
+    /// The actual content-addressed executor, run classifier, and emitted
+    /// JSON must preserve a wrapped warehouse error across both SQL calls.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn content_addressed_warehouse_failures_emit_classified_json() {
+        use object_store::memory::InMemory;
+        use object_store::{ObjectStoreExt as _, path::Path as ObjPath};
+
+        let cases = [
+            (
+                "content-query-rate-limit",
+                "quota-exceeded",
+                None,
+                "execute_query failed",
+            ),
+            (
+                "content-query-breaker",
+                "quota-exceeded",
+                Some(180),
+                "execute_query failed",
+            ),
+            (
+                "content-msck-rate-limit",
+                "quota-exceeded",
+                None,
+                "MSCK REPAIR failed",
+            ),
+            (
+                "content-msck-breaker",
+                "quota-exceeded",
+                Some(180),
+                "MSCK REPAIR failed",
+            ),
+        ];
+        for contain_failures in [false, true] {
+            for (failure, expected_kind, expected_cooldown, context) in cases {
+                let tmp = tempfile::TempDir::new().unwrap();
+                let dir = tmp.path();
+                let models = dir.join("models");
+                std::fs::create_dir_all(&models).unwrap();
+                std::fs::write(
+                    models.join("m.sql"),
+                    "SELECT content_addressed_failure_probe FROM raw.events\n",
+                )
+                .unwrap();
+                let prefix = format!("ca_failure_{}", uuid::Uuid::new_v4().simple());
+                let storage_prefix = format!("s3://test-bucket/{prefix}");
+                std::fs::write(
+                    models.join("m.toml"),
+                    format!(
+                        "[[sources]]\ncatalog = \"c\"\nschema = \"raw\"\ntable = \"events\"\n\n\
+                         [strategy]\ntype = \"content_addressed\"\nstorage_prefix = \"{storage_prefix}\"\n\n\
+                         [target]\ncatalog = \"c\"\nschema = \"s\"\ntable = \"m\"\n"
+                    ),
+                )
+                .unwrap();
+                let store = std::sync::Arc::new(InMemory::new());
+                seed_content_addressed_test_table(&store, &prefix).await;
+                super::super::run_content_addressed::register_test_object_store(
+                    &storage_prefix,
+                    store.clone(),
+                );
+
+                let config_path = dir.join("rocky.toml");
+                std::fs::write(
+                    &config_path,
+                    format!(
+                        "[adapter]\ntype = \"test-fail-write\"\npath = \"{failure}\"\n\n\
+                         [state]\nbackend = \"local\"\n\n\
+                         [resilience]\ncontain_failures = {contain_failures}\n\n\
+                         [pipeline.tx]\ntype = \"transformation\"\nmodels = '{}'\n\n\
+                         [pipeline.tx.target]\nadapter = \"default\"\n",
+                        models.join("**").display(),
+                    ),
+                )
+                .unwrap();
+                let state_path = dir.join("state.redb");
+                {
+                    use rocky_core::schema_cache::{
+                        SchemaCacheEntry, StoredColumn, schema_cache_key,
+                    };
+                    let state = rocky_core::state::StateStore::open(&state_path).unwrap();
+                    state
+                        .write_schema_cache_entry(
+                            &schema_cache_key("c", "raw", "events"),
+                            &SchemaCacheEntry {
+                                columns: vec![StoredColumn {
+                                    name: "content_addressed_failure_probe".to_string(),
+                                    data_type: "BIGINT".to_string(),
+                                    nullable: false,
+                                }],
+                                cached_at: chrono::Utc::now(),
+                            },
+                        )
+                        .unwrap();
+                }
+                let run_id = format!("test-content-error-{}", uuid::Uuid::new_v4());
+                let loaded = std::sync::Arc::new(
+                    rocky_core::config::load_rocky_config_fingerprinted(&config_path).unwrap(),
+                );
+                let result = super::run(
+                    &config_path,
+                    loaded,
+                    None,
+                    None,
+                    &state_path,
+                    None,
+                    true,
+                    None,
+                    false,
+                    None,
+                    false,
+                    None,
+                    &PartitionRunOptions::default(),
+                    None,
+                    None,
+                    None,
+                    None,
+                    &DeferOptions::default(),
+                    &SkipRunOptions::default(),
+                    &rocky_core::run_vars::RunVars::new(),
+                    Some(&run_id),
+                    None,
+                    false,
+                    None,
+                )
+                .await;
+                let commit_path =
+                    ObjPath::from(format!("{prefix}/_delta_log/00000000000000000001.json"));
+                assert_eq!(
+                    store.head(&commit_path).await.is_ok(),
+                    failure.starts_with("content-msck"),
+                    "query failure must precede commit; MSCK failure must follow it"
+                );
+                assert!(
+                    result.is_err(),
+                    "{failure}, contain={contain_failures}: {result:?}"
+                );
+                let captured = super::CAPTURED_RUN_OUTPUT_FOR_TEST
+                    .lock()
+                    .unwrap()
+                    .remove(&run_id)
+                    .expect("run() must emit terminal JSON");
+                assert_eq!(captured["status"], "Failure", "{failure}");
+                assert_eq!(captured["tables_failed"], 1, "{failure}");
+                let errors = captured["errors"].as_array().unwrap();
+                assert_eq!(errors.len(), 1, "{failure}: {errors:?}");
+                assert_eq!(errors[0]["failure_kind"], expected_kind, "{failure}");
+                assert_eq!(
+                    errors[0]
+                        .get("cooldown_seconds")
+                        .and_then(serde_json::Value::as_u64),
+                    expected_cooldown,
+                    "{failure}"
+                );
+                assert!(
+                    errors[0]["error"].as_str().unwrap().contains(context),
+                    "{failure}: {errors:?}"
+                );
+
+                let loaded =
+                    rocky_core::config::load_rocky_config_fingerprinted(&config_path).unwrap();
+                let mut session = rocky_core::state_sync::RemoteStateSession::new(
+                    &loaded.config.state,
+                    &state_path,
+                    rocky_core::state_sync::FinalizeDurability::Durable,
+                    false,
+                );
+                let _authority = session.acquire().await.unwrap();
+                session.require_synced().unwrap();
+                let model_set = std::collections::BTreeSet::from(["m".to_string()]);
+                let backfill = super::execute_backfill_set(
+                    &loaded,
+                    session,
+                    &state_path,
+                    &models,
+                    &model_set,
+                    &PartitionRunOptions::default(),
+                    None,
+                    None,
+                    true,
+                )
+                .await;
+                super::super::run_content_addressed::remove_test_object_store(&storage_prefix);
+                assert!(backfill.is_err(), "backfill must fail: {failure}");
+                let state = rocky_core::state::StateStore::open(&state_path).unwrap();
+                let latest = state.list_runs(1).unwrap().remove(0);
+                let backfill_json = super::CAPTURED_RUN_OUTPUT_FOR_TEST
+                    .lock()
+                    .unwrap()
+                    .remove(&latest.run_id)
+                    .expect("backfill must emit terminal JSON");
+                assert_eq!(backfill_json["status"], "Failure", "{failure}");
+                let backfill_errors = backfill_json["errors"].as_array().unwrap();
+                assert_eq!(backfill_errors.len(), 1, "{failure}: {backfill_errors:?}");
+                assert_eq!(
+                    backfill_errors[0]["failure_kind"], expected_kind,
+                    "{failure}"
+                );
+                assert_eq!(
+                    backfill_errors[0]
+                        .get("cooldown_seconds")
+                        .and_then(serde_json::Value::as_u64),
+                    expected_cooldown,
+                    "{failure}"
+                );
+            }
+        }
+    }
+
+    /// Drives `run()` through the `--model` fail-fast path with a connector
+    /// error nested inside `rocky_core::traits::AdapterError`.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn model_only_runtime_failure_reports_classified_failure_kind() {
+        for (failure, expected_kind, expected_cooldown) in classified_failure_cases() {
+            assert_transformation_runtime_failure(failure, expected_kind, expected_cooldown, true)
+                .await;
+        }
+    }
+
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn normal_transformation_dispatch_emits_classified_failure() {
+        for (failure, expected_kind, expected_cooldown) in classified_failure_cases() {
+            assert_transformation_runtime_failure(failure, expected_kind, expected_cooldown, false)
+                .await;
+        }
+    }
+
+    #[cfg(feature = "duckdb")]
+    async fn assert_transformation_runtime_failure(
+        failure: &str,
+        expected_kind: &str,
+        expected_cooldown: Option<u64>,
+        model_only: bool,
+    ) {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let config_dir = tmp.path();
+        let models = config_dir.join("models");
+        std::fs::create_dir_all(&models).unwrap();
+        std::fs::write(models.join("m.sql"), "SELECT 1 AS x\n").unwrap();
+        std::fs::write(
+            models.join("m.toml"),
+            "[strategy]\ntype = \"full_refresh\"\n\n[target]\ncatalog = \"\"\nschema = \"main\"\n",
+        )
+        .unwrap();
+
+        let config_path = config_dir.join("rocky.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                r#"
+[adapter]
+type = "test-fail-write"
+path = "{failure}"
+
+[state]
+backend = "local"
+
+[pipeline.tx]
+type = "transformation"
+models = '{}'
+
+[pipeline.tx.target]
+adapter = "default"
+"#,
+                models.join("**").display(),
+            ),
+        )
+        .unwrap();
+
+        let state_path = config_dir.join("state.redb");
+        let run_id = format!("test-2143-transformation-{model_only}-{failure}");
+
+        let loaded = std::sync::Arc::new(
+            rocky_core::config::load_rocky_config_fingerprinted(&config_path).unwrap(),
+        );
+        let result = super::run(
+            &config_path,
+            loaded,
+            None,
+            None,
+            &state_path,
+            None,
+            true,
+            None,
+            false,
+            None,
+            false,
+            None,
+            &PartitionRunOptions::default(),
+            model_only.then_some("m"),
+            None,
+            None,
+            None,
+            &DeferOptions::default(),
+            &SkipRunOptions::default(),
+            &rocky_core::run_vars::RunVars::new(),
+            Some(&run_id),
+            None,
+            false,
+            None,
+        )
+        .await;
+        assert!(result.is_err(), "the model write must fail: {failure}");
+
+        let captured = super::CAPTURED_RUN_OUTPUT_FOR_TEST
+            .lock()
+            .unwrap()
+            .remove(&run_id)
+            .expect("run() must capture emitted JSON for this run_id");
+        assert_eq!(captured["status"], "Failure");
+        assert_eq!(captured["tables_failed"], 1);
+        let errors = captured["errors"]
+            .as_array()
+            .expect("errors is a JSON array");
+        assert_eq!(
+            errors.len(),
+            1,
+            "expected exactly one recorded error: {errors:?}"
+        );
+        assert_eq!(errors[0]["failure_kind"], expected_kind);
+        assert_eq!(
+            errors[0]
+                .get("cooldown_seconds")
+                .and_then(serde_json::Value::as_u64),
+            expected_cooldown
+        );
+        assert!(
+            errors[0]["error"]
+                .as_str()
+                .unwrap()
+                .contains(match failure {
+                    "auth" => "injected auth failure",
+                    "rate-limit" => "injected rate limit",
+                    "breaker" => "circuit breaker tripped",
+                    _ => unreachable!(),
+                })
+        );
+    }
+
+    /// Drives `run()` through the replication `--models` tail model build.
+    /// Discovery finds no tables, so the injected failure occurs on the
+    /// model's target write.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn replication_models_tail_runtime_failure_reports_classified_failure_kind() {
+        for (failure, expected_kind, expected_cooldown) in classified_failure_cases() {
+            assert_replication_models_tail_runtime_failure(
+                failure,
+                expected_kind,
+                expected_cooldown,
+                false,
+            )
+            .await;
+        }
+    }
+
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn contained_replication_failures_stay_failed_in_terminal_json() {
+        for (failure, expected_kind, expected_cooldown) in classified_failure_cases() {
+            assert_replication_models_tail_runtime_failure(
+                failure,
+                expected_kind,
+                expected_cooldown,
+                true,
+            )
+            .await;
+        }
+    }
+
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn supervised_backfill_failures_emit_classified_json() {
+        for (failure, expected_kind, expected_cooldown) in classified_failure_cases() {
+            assert_supervised_backfill_failure(failure, expected_kind, expected_cooldown).await;
+        }
+    }
+
+    #[cfg(feature = "duckdb")]
+    async fn assert_supervised_backfill_failure(
+        failure: &str,
+        expected_kind: &str,
+        expected_cooldown: Option<u64>,
+    ) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path();
+        let models = dir.join("models");
+        std::fs::create_dir(&models).unwrap();
+        std::fs::write(models.join("m.sql"), "SELECT 1 AS x\n").unwrap();
+        std::fs::write(
+            models.join("m.toml"),
+            "[strategy]\ntype = \"full_refresh\"\n\n[target]\ncatalog = \"\"\nschema = \"main\"\n",
+        )
+        .unwrap();
+        let config_path = dir.join("rocky.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "[adapter]\ntype = \"test-fail-write\"\npath = \"{failure}\"\n\n\
+                 [state]\nbackend = \"local\"\n\n[pipeline.tx]\ntype = \"transformation\"\n\
+                 models = '{}'\n\n[pipeline.tx.target]\nadapter = \"default\"\n",
+                models.join("**").display(),
+            ),
+        )
+        .unwrap();
+        let state_path = dir.join("state.redb");
+        let loaded = rocky_core::config::load_rocky_config_fingerprinted(&config_path).unwrap();
+        let mut session = rocky_core::state_sync::RemoteStateSession::new(
+            &loaded.config.state,
+            &state_path,
+            rocky_core::state_sync::FinalizeDurability::Durable,
+            false,
+        );
+        let _authority = session.acquire().await.unwrap();
+        session.require_synced().unwrap();
+        let model_set = std::collections::BTreeSet::from(["m".to_string()]);
+        let result = super::execute_backfill_set(
+            &loaded,
+            session,
+            &state_path,
+            &models,
+            &model_set,
+            &PartitionRunOptions::default(),
+            None,
+            None,
+            true,
+        )
+        .await;
+        assert!(result.is_err(), "backfill must exit with failure");
+
+        let store = rocky_core::state::StateStore::open(&state_path).unwrap();
+        let runs = store.list_runs(1).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].status, rocky_core::state::RunStatus::Failure);
+        let captured = super::CAPTURED_RUN_OUTPUT_FOR_TEST
+            .lock()
+            .unwrap()
+            .remove(&runs[0].run_id)
+            .expect("backfill must emit terminal JSON");
+        assert_eq!(captured["status"], "Failure");
+        assert_eq!(captured["tables_failed"], 1);
+        let errors = captured["errors"].as_array().unwrap();
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0]["failure_kind"], expected_kind);
+        assert_eq!(
+            errors[0]
+                .get("cooldown_seconds")
+                .and_then(serde_json::Value::as_u64),
+            expected_cooldown
+        );
+    }
+
+    #[cfg(feature = "duckdb")]
+    async fn assert_replication_models_tail_runtime_failure(
+        failure: &str,
+        expected_kind: &str,
+        expected_cooldown: Option<u64>,
+        contain_failures: bool,
+    ) {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let config_dir = tmp.path();
+        let models = config_dir.join("models");
+        std::fs::create_dir_all(&models).unwrap();
+        std::fs::write(models.join("m.sql"), "SELECT 1 AS x\n").unwrap();
+        std::fs::write(
+            models.join("m.toml"),
+            "[strategy]\ntype = \"full_refresh\"\n\n[target]\ncatalog = \"\"\nschema = \"main\"\n",
+        )
+        .unwrap();
+
+        let config_path = config_dir.join("rocky.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                r#"
+[adapter.src]
+type = "duckdb"
+
+[adapter.fail]
+type = "test-fail-write"
+path = "{failure}"
+
+[state]
+backend = "local"
+
+[resilience]
+contain_failures = {contain_failures}
+
+[pipeline.p]
+type = "replication"
+
+[pipeline.p.source.discovery]
+adapter = "src"
+
+[pipeline.p.source.schema_pattern]
+prefix = "raw__"
+separator = "__"
+components = ["source"]
+
+[pipeline.p.target]
+adapter = "fail"
+catalog_template = "x"
+schema_template = "staging__{{source}}"
+"#
+            ),
+        )
+        .unwrap();
+
+        let state_path = config_dir.join("state.redb");
+        let run_id = format!("test-2143-replication-models-tail-{contain_failures}-{failure}");
+
+        let loaded = std::sync::Arc::new(
+            rocky_core::config::load_rocky_config_fingerprinted(&config_path).unwrap(),
+        );
+        let result = super::run(
+            &config_path,
+            loaded,
+            None,
+            None,
+            &state_path,
+            None,
+            true,
+            Some(models.as_path()),
+            false,
+            None,
+            false,
+            None,
+            &PartitionRunOptions::default(),
+            None,
+            None,
+            None,
+            None,
+            &DeferOptions::default(),
+            &SkipRunOptions::default(),
+            &rocky_core::run_vars::RunVars::new(),
+            Some(&run_id),
+            None,
+            false,
+            None,
+        )
+        .await;
+        assert!(result.is_err(), "the model write must fail: {failure}");
+
+        let captured = super::CAPTURED_RUN_OUTPUT_FOR_TEST
+            .lock()
+            .unwrap()
+            .remove(&run_id)
+            .expect("run() must capture emitted JSON for this run_id");
+        assert_eq!(captured["status"], "Failure");
+        assert_eq!(captured["tables_failed"], 1);
+        let errors = captured["errors"]
+            .as_array()
+            .expect("errors is a JSON array");
+        assert_eq!(
+            errors.len(),
+            1,
+            "expected exactly one recorded error: {errors:?}"
+        );
+        assert_eq!(errors[0]["failure_kind"], expected_kind);
+        assert_eq!(
+            errors[0]
+                .get("cooldown_seconds")
+                .and_then(serde_json::Value::as_u64),
+            expected_cooldown
+        );
+        assert!(
+            errors[0]["error"]
+                .as_str()
+                .unwrap()
+                .contains(match failure {
+                    "auth" => "injected auth failure",
+                    "rate-limit" => "injected rate limit",
+                    "breaker" => "circuit breaker tripped",
+                    _ => unreachable!(),
+                })
         );
     }
 
@@ -24232,6 +25690,93 @@ timestamp_column = "ts"
         );
     }
 
+    /// BigQuery's scalar MAX(ts) response must cross the real connector,
+    /// watermark resolver, and redb store with exact year-3000 microseconds.
+    /// This probes the BigQuery int64 output path; Rocky's former decimal
+    /// parser used integer arithmetic. The next strict filter must use that
+    /// same value.
+    #[tokio::test]
+    async fn bigquery_target_max_persists_exact_microsecond_watermark() {
+        use rocky_bigquery::auth::BigQueryAuth;
+        use rocky_bigquery::connector::BigQueryAdapter;
+        use rocky_bigquery::dialect::BigQueryDialect;
+        use rocky_core::redacted::RedactedString;
+        use rocky_core::state::StateStore;
+        use rocky_core::traits::SqlDialect;
+        use rocky_ir::{MaterializationStrategy, TableRef, WatermarkState};
+        use wiremock::matchers::{body_partial_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/bigquery/v2/projects/test-project/queries"))
+            .and(body_partial_json(serde_json::json!({
+                "query": "SELECT MAX(ts) FROM `test-project`.`dataset`.`events`",
+                "formatOptions": {"useInt64Timestamp": true}
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "jobComplete": true,
+                "schema": {"fields": [{"name": "f0_", "type": "TIMESTAMP"}]},
+                "rows": [{"f": [{"v": "32503680000000002"}]}],
+                "totalRows": "1"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let auth = BigQueryAuth::Bearer(RedactedString::new("test-token".into()));
+        let adapter = BigQueryAdapter::new("test-project", "EU", auth).with_base_url(server.uri());
+        let dialect = BigQueryDialect;
+        let target = TableRef {
+            catalog: "test-project".into(),
+            schema: "dataset".into(),
+            table: "events".into(),
+        };
+        let expected = chrono::DateTime::parse_from_rfc3339("3000-01-01T00:00:00.000002Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let resolved = super::resolve_new_watermark(
+            &MaterializationStrategy::Incremental {
+                timestamp_column: "ts".into(),
+            },
+            &adapter,
+            &dialect,
+            &target,
+            "ts",
+            None,
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resolved, expected);
+
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("state.redb");
+        let state = StateStore::open(&state_path).unwrap();
+        state
+            .set_watermark(
+                &target.state_key(),
+                &WatermarkState {
+                    last_value: resolved,
+                    updated_at: chrono::Utc::now(),
+                },
+            )
+            .unwrap();
+        drop(state);
+        let persisted = StateStore::open(&state_path)
+            .unwrap()
+            .get_watermark(&target.state_key())
+            .unwrap()
+            .unwrap()
+            .last_value;
+        assert_eq!(persisted, expected);
+        assert_eq!(
+            dialect.watermark_where("ts", Some(&persisted)).unwrap(),
+            "WHERE ts > TIMESTAMP '3000-01-01 00:00:00.000002'"
+        );
+        server.verify().await;
+    }
+
     /// #2004: the shared cell parser (`parse_timestamp_cell`, used by both
     /// the incremental-watermark read and the freshness-check fallback)
     /// must keep a fractional second it receives, and must still accept a
@@ -25893,9 +27438,9 @@ backend = "local"
     }
 
     /// On the replication path with `[resilience] contain_failures = true`,
-    /// `execute_models` records a contained-cause runtime failure (`Unknown`
-    /// kind) on `output.errors` and returns `Ok`. The merge must retain that
-    /// entry — the pre-fix `retain(CompileError)` would have silently dropped
+    /// `execute_models` records a classified contained-cause runtime failure
+    /// on `output.errors` and returns `Ok`. The merge must retain that
+    /// entry — a kind-based retain would silently drop
     /// it, flipping a real failure back toward `Success` — and count it exactly
     /// once alongside any copy failures (no double-count).
     #[test]
@@ -25907,8 +27452,8 @@ backend = "local"
         out.errors.push(crate::output::TableErrorOutput {
             asset_key: vec!["bad".to_string()],
             error: "model 'bad' failed: warehouse rejected SQL".to_string(),
-            failure_kind: crate::output::FailureKind::Unknown,
-            cooldown_seconds: None,
+            failure_kind: crate::output::FailureKind::QuotaExceeded,
+            cooldown_seconds: Some(180),
         });
         // No copy failures on this run — the containment cause is the only one.
         let no_copy_errors: Vec<TableError> = Vec::new();
@@ -25922,9 +27467,14 @@ backend = "local"
         assert_eq!(
             out.errors.len(),
             1,
-            "the Unknown-kind runtime failure survives the merge: {:?}",
+            "the classified runtime failure survives the merge: {:?}",
             out.errors
         );
+        assert_eq!(
+            out.errors[0].failure_kind,
+            crate::output::FailureKind::QuotaExceeded
+        );
+        assert_eq!(out.errors[0].cooldown_seconds, Some(180));
         assert!(matches!(
             out.status,
             rocky_core::state::RunStatus::PartialFailure
@@ -26038,6 +27588,85 @@ backend = "local"
             conn.execute_sql("SELECT id FROM main.broken").is_err(),
             "the compile-failed model must not have been materialized"
         );
+    }
+
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn selected_contract_failure_preserves_the_existing_duckdb_table() {
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let models = dir.path().join("models");
+        let contracts = dir.path().join("contracts");
+        std::fs::create_dir(&models).expect("models dir");
+        std::fs::create_dir(&contracts).expect("contracts dir");
+        write_plain_model(&models, "protected", "SELECT 8 AS id");
+        std::fs::write(
+            contracts.join("protected.contract.toml"),
+            "[rules]\nrequired = [\"id\", \"amount\"]\n",
+        )
+        .expect("contract");
+
+        let db_path = dir.path().join("t.duckdb");
+        {
+            let conn = rocky_duckdb::DuckDbConnector::open(&db_path).expect("open db");
+            conn.execute_sql("CREATE TABLE main.protected AS SELECT 7 AS id, 99 AS amount")
+                .expect("existing table");
+        }
+        let adapter = DuckDbWarehouseAdapter::open(&db_path).expect("open warehouse");
+        let mut output = RunOutput::new(String::new(), 0, 1);
+        let result = super::execute_models_with_explicit_contracts(
+            &models,
+            None,
+            &adapter,
+            None,
+            &PartitionRunOptions::default(),
+            "guarded-test",
+            Some("protected"),
+            None,
+            &mut output,
+            None,
+            None,
+            &rocky_core::config::SchemaCacheConfig::default(),
+            false,
+            None,
+            &DeferOptions::default(),
+            super::SkipGateConfig::off(),
+            false,
+            false,
+            &rocky_core::run_vars::RunVars::new(),
+            rocky_core::config::ResilienceConfig::default(),
+            false,
+            true,
+            None,
+            None,
+            false,
+            Some(&contracts),
+        )
+        .await;
+        result.expect("compile rejection is carried in RunOutput");
+        assert_eq!(output.tables_failed, 1);
+        assert!(output.materializations.is_empty());
+        assert!(matches!(
+            output.derive_run_status(),
+            rocky_core::state::RunStatus::Failure
+        ));
+        assert!(
+            output.errors.iter().any(|error| {
+                error.failure_kind == crate::output::FailureKind::CompileError
+                    && error.error.contains("E010")
+                    && error.error.contains("amount")
+            }),
+            "E010 must reach the run's output errors: {:?}",
+            output.errors
+        );
+
+        drop(adapter);
+        let conn = rocky_duckdb::DuckDbConnector::open(&db_path).expect("reopen db");
+        let rows = conn
+            .execute_sql("SELECT 1 FROM main.protected WHERE id = 7 AND amount = 99")
+            .expect("original table must still have amount");
+        assert_eq!(rows.rows.len(), 1, "the original row must survive");
     }
 
     /// When every model fails to compile, the run is a total `Failure`:
@@ -26794,6 +28423,7 @@ backend = "local"
             suffix: "_shadow".to_string(),
             schema_override: None,
             cleanup_after: true,
+            branch: None,
         };
         assert_eq!(
             super::shadow_gate_target_names("orders", Some(&suffixed)),
@@ -26806,6 +28436,7 @@ backend = "local"
             suffix: "_shadow".to_string(),
             schema_override: Some("_rocky_shadow".to_string()),
             cleanup_after: true,
+            branch: None,
         };
         assert_eq!(
             super::shadow_gate_target_names("orders", Some(&schema_override)),
@@ -29369,6 +31000,7 @@ auto_create_schemas = true
             suffix: String::new(),
             cleanup_after: false,
             schema_override: None,
+            branch: None,
         };
         let err =
             super::apply_shadow_rewrite(&mut compiled, None, None, &empty_suffix, &dialect, false)
@@ -31288,6 +32920,7 @@ auto_create_schemas = true
             submission_id: None,
             check_gate_failed: false,
             verify_after_failed: false,
+            rocky_branch: None,
         };
         state.record_run(&failed).unwrap();
 
@@ -33673,6 +35306,7 @@ auto_create_schemas = true
             submission_id: None,
             check_gate_failed: false,
             verify_after_failed: false,
+            rocky_branch: None,
         };
         store.record_run(&run).unwrap();
         // The prior build's LIVE artifact — the ledger row the liveness gate
@@ -33871,6 +35505,7 @@ auto_create_schemas = true
             submission_id: None,
             check_gate_failed: false,
             verify_after_failed: false,
+            rocky_branch: None,
         };
         store.record_run(&base_run).unwrap();
         store
@@ -34000,6 +35635,7 @@ auto_create_schemas = true
             submission_id: None,
             check_gate_failed: false,
             verify_after_failed: false,
+            rocky_branch: None,
         };
         store.record_run(&run).unwrap();
 
@@ -34986,6 +36622,7 @@ auto_create_schemas = true
                 submission_id: None,
                 check_gate_failed: false,
                 verify_after_failed: false,
+                rocky_branch: None,
             };
             store.record_run(&run).unwrap();
             // The prior build's LIVE artifact row — the liveness gate resolves
@@ -35290,6 +36927,7 @@ auto_create_schemas = true
                     submission_id: None,
                     check_gate_failed: false,
                     verify_after_failed: false,
+                    rocky_branch: None,
                 })
                 .unwrap();
             // The prior live_d build's LIVE artifact-ledger row — the liveness
@@ -35966,6 +37604,49 @@ table = "fct_events"
             "expected exactly one `{name}` result for {target_key}, got {found:?}"
         );
         found[0]
+    }
+
+    /// #1941: a custom check named to sanitize onto the same Dagster check
+    /// name as `null_rate:id` must refuse BEFORE any check runs — not run
+    /// the checks and silently drop one of the two results. Both producers
+    /// are table-independent (`[[checks.custom]]` has no `table` field,
+    /// `null_rate.columns` is a flat list), so `validate_checks` at config
+    /// load already refuses this in production; this fixture bypasses
+    /// config load entirely (`parse_pipeline` calls `toml::from_str`
+    /// directly), so it proves `run_batched_checks`'s OWN refusal is a real,
+    /// independent second line of defense, not dead code.
+    ///
+    /// Mutation that must turn this red: delete the
+    /// `refuse_check_name_collisions(pipeline_name, pipeline,
+    /// assertion_targets)?;` call at the top of `run_batched_checks`.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn a_custom_check_colliding_with_a_null_rate_column_is_refused_before_any_check_runs() {
+        let inner = seeded_duckdb().await;
+        let fx = BatchedCheckFixture::new(
+            r#"
+null_rate = { columns = ["id"], threshold = 0.1 }
+
+[[pipeline.bronze.checks.custom]]
+name = "null rate id"
+sql = "SELECT 0"
+threshold = 0
+"#,
+        );
+
+        let err = match fx.try_run(&inner, None, None).await {
+            Err(e) => e,
+            Ok(_) => panic!("a colliding custom/null_rate name pair must refuse the run"),
+        };
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("null rate id") && message.contains("null_rate:id"),
+            "the refusal must name both colliding sources: {message}"
+        );
+        assert!(
+            message.contains("null_rate_id"),
+            "the refusal must name the shared sanitized name: {message}"
+        );
     }
 
     /// #1602: a side whose query failed defaulted to zero. When both sides

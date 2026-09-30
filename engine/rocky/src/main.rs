@@ -962,6 +962,10 @@ enum Command {
         /// Alternative to --filter for model-only execution.
         #[arg(long)]
         model: Option<String>,
+        /// Check an explicitly selected model contract in the same compile
+        /// that supplies the model executed by this run.
+        #[arg(long, requires_all = ["model", "pipeline"])]
+        contracts: Option<PathBuf>,
         /// Additional governance config (JSON or @file.json), merged with defaults
         #[arg(long)]
         governance_override: Option<String>,
@@ -2486,7 +2490,7 @@ enum PreviewAction {
         #[arg(long, default_value = "main")]
         base: String,
         /// Branch name. When omitted, derived from the current git
-        /// branch via `pr-preview/<branch>` so PRs that re-run inherit
+        /// branch via `pr_preview_<branch>` so PRs that re-run inherit
         /// the same branch entry.
         #[arg(long)]
         name: Option<String>,
@@ -2503,9 +2507,6 @@ enum PreviewAction {
         /// Git ref to compare data against (default: main)
         #[arg(long, default_value = "main")]
         base: String,
-        /// Maximum rows to sample per model (default: 1000)
-        #[arg(long, default_value_t = 1000)]
-        sample_size: usize,
         /// Diff algorithm: `sampled` (default — structural delta from the
         /// run records) or `bisection` (exhaustive checksum-bisection on
         /// each Merge-strategy model with a single integer / numeric
@@ -2788,7 +2789,7 @@ enum PlanSubcommand {
 enum BranchAction {
     /// Create a new branch
     Create {
-        /// Branch name (e.g., `fix-price`, `feature_new_join`)
+        /// Branch name (e.g., `fix_price`, `feature_new_join`)
         name: String,
         /// Optional description, surfaced in `rocky branch list`
         #[arg(long)]
@@ -3750,6 +3751,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             filter,
             pipeline,
             model,
+            contracts,
             governance_override,
             models: models_dir,
             all: run_all,
@@ -3779,10 +3781,51 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             var,
             assume_fresh_state,
         } => {
+            // Resolve branch names before config or warehouse work. This is
+            // also the single name-to-schema funnel used by apply and compare.
+            let branch_shadow_config = branch
+                .as_ref()
+                .map(|name| {
+                    rocky_cli::commands::resolve_branch_shadow_config(
+                        &state_path,
+                        name,
+                        shadow_suffix.clone(),
+                    )
+                })
+                .transpose()?;
             // Parse `--var name=value` pairs into the run-variable map. A
             // malformed pair (no `=`, empty/invalid name) is a clear CLI error.
             let run_vars = rocky_core::run_vars::RunVars::parse_pairs(&var)
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
+            if contracts.is_some() {
+                anyhow::ensure!(
+                    model.is_some()
+                        && pipeline.is_some()
+                        && filter.is_none()
+                        && models_dir.is_none()
+                        && !run_all
+                        && resume.is_none()
+                        && !resume_latest
+                        && !shadow
+                        && shadow_schema.is_none()
+                        && branch.is_none()
+                        && partition.is_none()
+                        && from.is_none()
+                        && to.is_none()
+                        && !latest
+                        && !missing
+                        && lookback.is_none()
+                        && !dag
+                        && !watch
+                        && !defer
+                        && defer_to.is_none()
+                        && !skip_unchanged
+                        && !no_prune
+                        && idempotency_key.is_none()
+                        && !assume_fresh_state,
+                    "--contracts supports only a fresh --model/--pipeline run; remove mixed, skip, defer, partition, shadow, resume, idempotency, and other unsupported flags"
+                );
+            }
             // `--var` is only threaded through the standard run path. The `--dag`
             // and `--watch` dispatch paths compile their sub-runs with an empty
             // `RunVars`, so a supplied `--var` would be silently dropped —
@@ -3849,21 +3892,8 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
 
             // Resolve --branch to the same machinery as --shadow. clap
             // guarantees branch can't coexist with `shadow` / `shadow_schema`.
-            let shadow_config = if let Some(name) = &branch {
-                let store = rocky_core::state::StateStore::open_read_only(&state_path)
-                    .with_context(|| {
-                        format!("failed to open state store at {}", state_path.display())
-                    })?;
-                let record = store.get_branch(name)?.with_context(|| {
-                    format!(
-                        "branch '{name}' not found — create it with `rocky branch create {name}`"
-                    )
-                })?;
-                Some(rocky_core::shadow::ShadowConfig {
-                    suffix: shadow_suffix,
-                    schema_override: Some(record.schema_prefix),
-                    cleanup_after: false,
-                })
+            let shadow_config = if let Some(config) = branch_shadow_config {
+                Some(config)
             } else if shadow {
                 Some(rocky_core::shadow::ShadowConfig {
                     suffix: shadow_suffix,
@@ -3877,6 +3907,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                     // `false` deliberately: a named branch's objects are the
                     // point of the branch.
                     cleanup_after: true,
+                    branch: None,
                 })
             } else {
                 None
@@ -3998,6 +4029,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                     &skip_opts,
                     &run_vars,
                     assume_fresh_state,
+                    contracts.as_deref(),
                 )
                 .await
             }
@@ -4019,6 +4051,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                 suffix: shadow_suffix,
                 schema_override: shadow_schema,
                 cleanup_after: false,
+                branch: None,
             };
             rocky_cli::commands::compare(
                 &cli.config,
@@ -4917,7 +4950,6 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             PreviewAction::Diff {
                 name,
                 base,
-                sample_size,
                 algorithm,
                 models,
             } => {
@@ -4935,7 +4967,6 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                     &models,
                     &name,
                     &base,
-                    sample_size,
                     algorithm,
                     json,
                 )
@@ -5277,6 +5308,67 @@ mod tests {
         assert!(
             help.contains("ignored"),
             "validate-migration --help must say sample-size is ignored: {help}"
+        );
+    }
+
+    /// #2032: `preview diff --sample-size` was accepted and silently
+    /// ignored (bound as `_sample_size`, never read). Unlike
+    /// `validate-migration --sample-size` (#2027, kept and documented as
+    /// ignored), no code path exists that the flag was ever meant to
+    /// drive, so it was REMOVED from clap rather than merely documented —
+    /// a caller passing it now gets a clear parse error instead of a
+    /// silently-discarded value. `--help` must not offer a flag that no
+    /// longer exists.
+    #[test]
+    fn preview_diff_help_does_not_offer_sample_size() {
+        let mut preview = command_with_big_stack()
+            .find_subcommand("preview")
+            .expect("preview subcommand exists")
+            .clone();
+        let diff = preview
+            .find_subcommand_mut("diff")
+            .expect("preview diff subcommand exists");
+        let help = diff.render_long_help().to_string();
+        assert!(
+            !help.contains("sample-size"),
+            "preview diff --help must not offer the removed --sample-size flag: {help}"
+        );
+    }
+
+    /// The removal is a hard parse error, not a quiet drop: a caller
+    /// (script, CI workflow) still passing `--sample-size` gets told so
+    /// immediately, rather than having the value silently discarded the
+    /// way it was before this fix (#2032).
+    #[test]
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "expects a PARSE FAILURE, which the Cli-returning helper cannot express; the \
+                  call already runs on an 8 MB spawned thread"
+    )]
+    fn preview_diff_rejects_removed_sample_size_flag() {
+        let result = std::thread::scope(|s| {
+            std::thread::Builder::new()
+                .stack_size(8 * 1024 * 1024)
+                .spawn_scoped(s, || {
+                    Cli::try_parse_from([
+                        "rocky",
+                        "preview",
+                        "diff",
+                        "--name",
+                        "pr_preview_fix_price",
+                        "--sample-size",
+                        "500",
+                    ])
+                    .map(|_| ())
+                    .map_err(|e| e.kind())
+                })
+                .expect("spawn parser thread")
+                .join()
+                .expect("parser thread panicked")
+        });
+        assert!(
+            result.is_err(),
+            "--sample-size must no longer parse for `preview diff`"
         );
     }
 

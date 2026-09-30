@@ -360,6 +360,38 @@ pub enum ConfigError {
         reserved: String,
     },
 
+    /// Two DIFFERENT check-name producers (a custom check, a `null_rate`
+    /// column, or an assertion — named or unnamed) resolve to names that
+    /// sanitize onto the same Dagster check name (#1941). Unlike
+    /// [`ConfigError::ReservedAssertionName`], neither side has to be a
+    /// fixed reserved word — the collision is between two pieces of user
+    /// input, and only exists once both are sanitized the same way Dagster
+    /// sanitizes them.
+    #[error(
+        "[checks] {source_a} and {source_b} {scope} both sanitize to the Dagster check name \
+         {sanitized:?}. Dagster keys check results by (asset_key, sanitized_name); the \
+         first spec wins and the second is silently dropped. Rename one of them."
+    )]
+    DuplicateCheckName {
+        /// The pipeline the collision was found in.
+        pipeline: String,
+        /// `"<kind> \"<name>\""`, e.g. `custom "null rate id"` — kind and
+        /// name folded into one field (rather than two) to keep this
+        /// variant's size down; `ConfigError` is returned by value on
+        /// every config-load path (`Result::Err`), and clippy's
+        /// `result_large_err` flags a variant this wide.
+        source_a: String,
+        source_b: String,
+        /// Where the collision applies, already naming `pipeline` in
+        /// prose: `"on table \"orders\" in pipeline \"p\""` for a
+        /// single-table pair (an assertion is involved), or `"on every
+        /// table pipeline \"p\" copies"` for two table-independent
+        /// producers (custom checks and `null_rate` columns run on EVERY
+        /// materialized table).
+        scope: String,
+        sanitized: String,
+    },
+
     #[error(
         "[policy] rules[{rule_index}] autonomy_budget.failures = 0 is invalid — a budget must \
          allow at least one failure before it degrades the rule (use `failures = 1` or higher)"
@@ -3632,6 +3664,216 @@ fn sanitized_check_name(name: &str) -> String {
         .collect()
 }
 
+/// Which check-name producer resolved a [`ResolvedCheckName`]. Mirrors the
+/// `kind` tag `rocky_cli::output::ResolvedCheckNameOutput` puts on the wire
+/// (`"custom" | "null_rate" | "assertion" | "cross_source_overlap"`) — kept
+/// as a typed enum here so the two collision guards below can match on it
+/// without re-parsing a string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckNameKind {
+    Custom,
+    NullRate,
+    Assertion,
+    CrossSourceOverlap,
+}
+
+impl CheckNameKind {
+    /// The wire-format tag. Must byte-match `ResolvedCheckNameOutput.kind`
+    /// in `rocky-cli/src/output.rs` — that projection now builds its list
+    /// by mapping over [`resolved_check_names_for_table`]'s output.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CheckNameKind::Custom => "custom",
+            CheckNameKind::NullRate => "null_rate",
+            CheckNameKind::Assertion => "assertion",
+            CheckNameKind::CrossSourceOverlap => "cross_source_overlap",
+        }
+    }
+}
+
+/// A single check name a pipeline will emit as `CheckResult.name`, plus the
+/// producer that resolved it. The un-sanitized, byte-exact name — sanitizing
+/// is [`resolved_check_name_collisions`]'s job, not this one's, so a caller
+/// that wants the raw resolved set (e.g. `rocky discover`'s projection) gets
+/// it untouched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedCheckName {
+    pub name: String,
+    pub kind: CheckNameKind,
+    /// `true` for a name whose existence depends on runtime-discovered
+    /// siblings (`cross_source_overlap`) and so may not be emitted on every
+    /// run. Mirrors `ResolvedCheckNameOutput.candidate`.
+    pub candidate: bool,
+    /// Disambiguates two entries whose `name` is byte-identical — chiefly
+    /// two UNNAMED assertions on the same table, same test kind, same (or
+    /// absent) column: `resolved_name()` synthesizes the same
+    /// `"{kind}:{column}"` for both (e.g. two unnamed `expression`
+    /// assertions both produce `"expression:-"`), so without this a
+    /// collision message naming both sides would print the identical
+    /// string twice, telling the author nothing about WHICH two assertions
+    /// collide. Populated only for [`CheckNameKind::Assertion`] — its
+    /// 1-based position among the table's own `[[checks.assertions]]`
+    /// entries, e.g. `"assertion #2 for table"`. Internal only; not part
+    /// of any JSON output — `rocky-cli`'s `ResolvedCheckNameOutput`
+    /// projection reads only `name`/`kind`/`candidate` and ignores this
+    /// field, so adding it here does not touch the wire schema.
+    pub detail: Option<String>,
+}
+
+/// Custom-check and `null_rate` names, independent of any specific table.
+///
+/// `[[checks.custom]]` has no `table` field — `run.rs` runs every custom
+/// check against every materialized table — and `NullRateConfig.columns` is
+/// a flat, un-scoped list, not chosen per table. A collision between two
+/// names drawn from these two producers therefore collides on EVERY table
+/// the pipeline touches, which is what lets [`validate_checks`] catch it at
+/// config load, before discovery has run and before anything is
+/// materialized (#1941).
+fn table_independent_check_names(
+    cfg: &ChecksConfig,
+    executed_kinds: &[crate::checks::CheckKind],
+) -> Vec<ResolvedCheckName> {
+    use crate::checks::CheckKind;
+    let runs = |k: CheckKind| executed_kinds.contains(&k);
+    let mut names = Vec::new();
+
+    if runs(CheckKind::Custom) {
+        for custom in &cfg.custom {
+            names.push(ResolvedCheckName {
+                name: custom.name.clone(),
+                kind: CheckNameKind::Custom,
+                candidate: false,
+                detail: None,
+            });
+        }
+    }
+
+    if runs(CheckKind::NullRate)
+        && let Some(nr) = cfg.null_rate.as_ref()
+    {
+        for col in &nr.columns {
+            names.push(ResolvedCheckName {
+                name: crate::checks::null_rate_check_name(col),
+                kind: CheckNameKind::NullRate,
+                candidate: false,
+                detail: None,
+            });
+        }
+    }
+
+    names
+}
+
+/// Every check name a single `table` will emit under `cfg`, given the check
+/// kinds this pipeline type actually executes (see
+/// [`PipelineConfig::executed_check_kinds`]) and the `source_type` this
+/// table was discovered under — one entry per occurrence, so a table
+/// discovered under the same source type twice (a sibling pair) has that
+/// source type twice in `sibling_source_types`.
+///
+/// This is the single derivation `rocky discover`'s `ChecksConfigOutput`
+/// projection (`rocky-cli/src/output.rs`) and the pre-run collision guards
+/// (here and in `rocky-cli/src/commands/run.rs`) all call, so none of them
+/// can enumerate a different set of names for the same config (#1941). It
+/// covers all four producers: every custom check (table-independent),
+/// `null_rate_check_name(col)` per configured `null_rate` column
+/// (table-independent), `assertion.resolved_name()` for every assertion
+/// targeting `table` (covers UNNAMED assertions — their synthesized name is
+/// exactly as collision-prone as an explicit one), and the
+/// `cross_source_overlap` name when `table` has ≥2 siblings under the same
+/// source type.
+///
+/// Returns the RAW resolved names — no sanitizing, no deduplication. A
+/// caller that wants to know whether two of them collide calls
+/// [`resolved_check_name_collisions`] on the result; silently deduplicating
+/// here would hide the exact collision this function exists to make
+/// visible (#1941).
+pub fn resolved_check_names_for_table(
+    cfg: &ChecksConfig,
+    executed_kinds: &[crate::checks::CheckKind],
+    table: &str,
+    sibling_source_types: &[String],
+) -> Vec<ResolvedCheckName> {
+    use crate::checks::CheckKind;
+    let runs = |k: CheckKind| executed_kinds.contains(&k);
+    let mut names = table_independent_check_names(cfg, executed_kinds);
+
+    if runs(CheckKind::Assertions) {
+        for (idx, assertion) in cfg
+            .assertions
+            .iter()
+            .filter(|a| a.table == table)
+            .enumerate()
+        {
+            names.push(ResolvedCheckName {
+                name: assertion.resolved_name(),
+                kind: CheckNameKind::Assertion,
+                candidate: false,
+                // 1-based, and scoped to THIS table's own assertions (not
+                // a global index into `cfg.assertions`) — see the doc
+                // comment on `ResolvedCheckName::detail`.
+                detail: Some(format!("assertion #{} for table {table:?}", idx + 1)),
+            });
+        }
+    }
+
+    if runs(CheckKind::CrossSourceOverlap) && cfg.cross_source_overlap.is_some() {
+        let mut counts: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+        for source_type in sibling_source_types {
+            *counts.entry(source_type.as_str()).or_default() += 1;
+        }
+        for (source_type, n) in counts {
+            if n >= 2 {
+                names.push(ResolvedCheckName {
+                    name: crate::checks::cross_source_overlap_name(source_type, table),
+                    kind: CheckNameKind::CrossSourceOverlap,
+                    candidate: true,
+                    detail: None,
+                });
+            }
+        }
+    }
+
+    names
+}
+
+/// Every pair in `names` whose entries sanitize to the same Dagster check
+/// name, alongside that shared sanitized name — in encounter order, first
+/// occurrence kept as the "earlier" side of each pair. Reports EVERY
+/// collision, including a raw exact-name duplicate: the previous resolver
+/// (`ChecksConfigOutput::from_engine`, before #1941) silently deduplicated
+/// those away, which is the bug this function exists to stop repeating.
+pub fn resolved_check_name_collisions(
+    names: &[ResolvedCheckName],
+) -> Vec<(ResolvedCheckName, ResolvedCheckName, String)> {
+    let mut seen: std::collections::BTreeMap<String, ResolvedCheckName> =
+        std::collections::BTreeMap::new();
+    let mut collisions = Vec::new();
+    for n in names {
+        let sanitized = sanitized_check_name(&n.name);
+        if let Some(existing) = seen.get(&sanitized) {
+            collisions.push((existing.clone(), n.clone(), sanitized));
+        } else {
+            seen.insert(sanitized, n.clone());
+        }
+    }
+    collisions
+}
+
+/// `"<kind> \"<name>\""` — one side of a [`ConfigError::DuplicateCheckName`],
+/// naming both the resolved name and the producer that resolved it. When
+/// `detail` is set (currently only for [`CheckNameKind::Assertion`]) it is
+/// appended in parentheses, so two unnamed assertions that synthesize the
+/// SAME name (e.g. two unnamed `expression` assertions both producing
+/// `"expression:-"`) still read as two distinguishable sides rather than
+/// the identical string twice.
+fn describe_resolved_check_name(n: &ResolvedCheckName) -> String {
+    match &n.detail {
+        Some(detail) => format!("{} {:?} ({detail})", n.kind.as_str(), n.name),
+        None => format!("{} {:?}", n.kind.as_str(), n.name),
+    }
+}
+
 /// Refuse a `metadata_columns[].value` that is not one parseable SQL
 /// expression calling only allowlisted scalar functions.
 ///
@@ -3735,6 +3977,64 @@ pub fn validate_checks(config: &RockyConfig) -> Vec<ConfigError> {
                     table,
                     name: declared.to_string(),
                     reserved: (*reserved).to_string(),
+                });
+            }
+        }
+
+        // #1941: two check names that sanitize alike collide in Dagster even
+        // when NEITHER is a reserved word — the loop above only catches a
+        // collision against the fixed list. This is the static half of that
+        // guard; the complete per-table check (every producer, on every
+        // ACTUALLY discovered table) runs at run start once discovery has
+        // run — see `refuse_check_name_collisions` in `rocky-cli`'s
+        // `run.rs`.
+        let checks = pipeline.checks();
+        let executed_kinds = pipeline.executed_check_kinds();
+
+        // Custom checks and `null_rate` columns are table-independent (both
+        // run on EVERY materialized table), so a collision between them is
+        // real regardless of which tables discovery eventually finds. Caught
+        // here, once per pipeline, before discovery has ever run.
+        let table_independent = table_independent_check_names(checks, executed_kinds);
+        for (a, b, sanitized) in resolved_check_name_collisions(&table_independent) {
+            errors.push(ConfigError::DuplicateCheckName {
+                pipeline: name.clone(),
+                source_a: describe_resolved_check_name(&a),
+                source_b: describe_resolved_check_name(&b),
+                // "checks", not "copies": a quality pipeline runs custom
+                // and null_rate checks against tables it never copies —
+                // "copies" was replication-specific wording on a sentence
+                // that applies to every pipeline type.
+                scope: format!("on every table pipeline {name:?} checks"),
+                sanitized,
+            });
+        }
+
+        // Every table an assertion names is known statically. Custom checks
+        // and `null_rate` columns are folded back in here too (via
+        // `resolved_check_names_for_table`) so a collision between an
+        // assertion and either of them is caught on the tables config
+        // already names — only the table-independent pair (both sides
+        // custom/null_rate) is skipped, since that pair was already reported
+        // once, above, without needing a table at all.
+        let mut tables: Vec<&str> = checks.assertions.iter().map(|a| a.table.as_str()).collect();
+        tables.sort_unstable();
+        tables.dedup();
+        for &table in &tables {
+            let names = resolved_check_names_for_table(checks, executed_kinds, table, &[]);
+            for (a, b, sanitized) in resolved_check_name_collisions(&names) {
+                let both_table_independent =
+                    matches!(a.kind, CheckNameKind::Custom | CheckNameKind::NullRate)
+                        && matches!(b.kind, CheckNameKind::Custom | CheckNameKind::NullRate);
+                if both_table_independent {
+                    continue;
+                }
+                errors.push(ConfigError::DuplicateCheckName {
+                    pipeline: name.clone(),
+                    source_a: describe_resolved_check_name(&a),
+                    source_b: describe_resolved_check_name(&b),
+                    scope: format!("on table {table:?} in pipeline {name:?}"),
+                    sanitized,
                 });
             }
         }
@@ -9258,6 +9558,372 @@ column = "name"
                 .any(|e| matches!(e, ConfigError::ReservedAssertionName { .. })),
             "an ordinary name must pass: {errors:?}"
         );
+    }
+
+    // -------------------------------------------------------------------
+    // #1941: the shared derivation + collision detection.
+    // -------------------------------------------------------------------
+
+    /// A minimal `ChecksConfig` exercising all four name producers: a custom
+    /// check, `null_rate` on one column, one NAMED assertion, and one
+    /// UNNAMED assertion (gap 1 from the issue's enumeration — the old
+    /// `validate_checks` candidate list dropped these with `filter_map`).
+    fn all_producers_checks_cfg() -> ChecksConfig {
+        toml::from_str(
+            r#"
+null_rate = { columns = ["amount"], threshold = 0.1 }
+cross_source_overlap = { keys = ["id"] }
+
+[[custom]]
+name = "has_rows"
+sql = "SELECT COUNT(*) FROM {table}"
+threshold = 1
+
+[[assertions]]
+table = "orders"
+name = "id_not_null"
+type = "not_null"
+column = "id"
+
+[[assertions]]
+table = "orders"
+type = "not_null"
+column = "email"
+"#,
+        )
+        .unwrap()
+    }
+
+    /// The derivation covers all four producers for one table, including
+    /// the UNNAMED assertion's synthesized name.
+    ///
+    /// Mutation that must turn this red: drop the `null_rate` arm (or any
+    /// other producer arm) from `resolved_check_names_for_table`.
+    #[test]
+    fn resolved_check_names_for_table_covers_all_four_producers() {
+        let cfg = all_producers_checks_cfg();
+        let names = resolved_check_names_for_table(
+            &cfg,
+            ReplicationPipelineConfig::EXECUTED_CHECK_KINDS,
+            "orders",
+            &[],
+        );
+        let by_name: std::collections::HashMap<&str, &ResolvedCheckName> =
+            names.iter().map(|n| (n.name.as_str(), n)).collect();
+
+        assert_eq!(
+            by_name["has_rows"].kind,
+            CheckNameKind::Custom,
+            "custom checks must be included: {names:?}"
+        );
+        assert_eq!(
+            by_name["null_rate:amount"].kind,
+            CheckNameKind::NullRate,
+            "null_rate columns must be included: {names:?}"
+        );
+        assert_eq!(
+            by_name["id_not_null"].kind,
+            CheckNameKind::Assertion,
+            "a NAMED assertion must be included: {names:?}"
+        );
+        // The unnamed assertion's synthesized name is "{kind}:{column}".
+        assert_eq!(
+            by_name.get("not_null:email").map(|n| n.kind),
+            Some(CheckNameKind::Assertion),
+            "an UNNAMED assertion's synthesized name must be included too: {names:?}"
+        );
+    }
+
+    /// A table with no discovered siblings gets no `cross_source_overlap`
+    /// name; a table discovered twice under the SAME source type does.
+    ///
+    /// Mutation that must turn this red: change the `n >= 2` threshold to
+    /// `n >= 1`, or drop the cross-source-overlap arm entirely.
+    #[test]
+    fn cross_source_overlap_name_only_appears_with_two_siblings() {
+        let cfg = all_producers_checks_cfg();
+        let kinds = ReplicationPipelineConfig::EXECUTED_CHECK_KINDS;
+
+        let alone = resolved_check_names_for_table(&cfg, kinds, "orders", &[]);
+        assert!(
+            !alone
+                .iter()
+                .any(|n| n.kind == CheckNameKind::CrossSourceOverlap),
+            "no cross_source_overlap name with zero siblings: {alone:?}"
+        );
+
+        let with_sibling = resolved_check_names_for_table(
+            &cfg,
+            kinds,
+            "orders",
+            &["duckdb".to_string(), "duckdb".to_string()],
+        );
+        let overlap = with_sibling
+            .iter()
+            .find(|n| n.kind == CheckNameKind::CrossSourceOverlap)
+            .expect("two same-source-type siblings must produce a cross_source_overlap name");
+        assert_eq!(overlap.name, "cross_source_overlap:duckdb.orders");
+        assert!(overlap.candidate, "overlap names must be marked candidate");
+    }
+
+    /// A pipeline type that does not execute a kind (e.g. quality never runs
+    /// `null_rate` or `cross_source_overlap`) must not resolve names for it.
+    #[test]
+    fn ungated_kinds_are_not_resolved() {
+        let cfg = all_producers_checks_cfg();
+        let quality_kinds: &[crate::checks::CheckKind] = &[
+            crate::checks::CheckKind::RowCount,
+            crate::checks::CheckKind::Custom,
+            crate::checks::CheckKind::Assertions,
+        ];
+        let names = resolved_check_names_for_table(&cfg, quality_kinds, "orders", &[]);
+        assert!(
+            !names.iter().any(|n| n.kind == CheckNameKind::NullRate),
+            "a kind the pipeline type does not execute must not be resolved: {names:?}"
+        );
+    }
+
+    /// Every ordered pair of producers collides once sanitized alike:
+    /// custom×null_rate, custom×assertion, null_rate×assertion, and
+    /// assertion×assertion (two assertions on the same table).
+    ///
+    /// Mutation that must turn this red: change
+    /// `resolved_check_name_collisions` to `retain`/dedup instead of
+    /// reporting pairs.
+    #[test]
+    fn every_producer_pair_collides_when_sanitized_alike() {
+        let kinds = ReplicationPipelineConfig::EXECUTED_CHECK_KINDS;
+
+        // custom x null_rate: "null rate amount" -> "null_rate_amount",
+        // same as null_rate_check_name("amount") -> "null_rate:amount" ->
+        // "null_rate_amount". This is the issue's own worked example.
+        let cfg: ChecksConfig = toml::from_str(
+            r#"
+null_rate = { columns = ["amount"], threshold = 0.1 }
+[[custom]]
+name = "null rate amount"
+sql = "SELECT 0"
+threshold = 0
+"#,
+        )
+        .unwrap();
+        let names = resolved_check_names_for_table(&cfg, kinds, "orders", &[]);
+        let collisions = resolved_check_name_collisions(&names);
+        assert_eq!(
+            collisions.len(),
+            1,
+            "custom x null_rate must collide: {collisions:?}"
+        );
+        assert_eq!(collisions[0].2, "null_rate_amount");
+
+        // custom x assertion, same table.
+        let cfg: ChecksConfig = toml::from_str(
+            r#"
+[[custom]]
+name = "orders check"
+sql = "SELECT 0"
+threshold = 0
+[[assertions]]
+table = "orders"
+name = "orders_check"
+type = "not_null"
+column = "id"
+"#,
+        )
+        .unwrap();
+        let names = resolved_check_names_for_table(&cfg, kinds, "orders", &[]);
+        let collisions = resolved_check_name_collisions(&names);
+        assert_eq!(
+            collisions.len(),
+            1,
+            "custom x assertion must collide: {collisions:?}"
+        );
+        assert_eq!(collisions[0].2, "orders_check");
+
+        // null_rate x assertion, same table.
+        let cfg: ChecksConfig = toml::from_str(
+            r#"
+null_rate = { columns = ["id"], threshold = 0.1 }
+[[assertions]]
+table = "orders"
+name = "null.rate.id"
+type = "not_null"
+column = "email"
+"#,
+        )
+        .unwrap();
+        let names = resolved_check_names_for_table(&cfg, kinds, "orders", &[]);
+        let collisions = resolved_check_name_collisions(&names);
+        assert_eq!(
+            collisions.len(),
+            1,
+            "null_rate x assertion must collide: {collisions:?}"
+        );
+        assert_eq!(collisions[0].2, "null_rate_id");
+
+        // assertion x assertion, same table, both named the same.
+        let cfg: ChecksConfig = toml::from_str(
+            r#"
+[[assertions]]
+table = "orders"
+name = "dup"
+type = "not_null"
+column = "id"
+[[assertions]]
+table = "orders"
+name = "dup"
+type = "not_null"
+column = "email"
+"#,
+        )
+        .unwrap();
+        let names = resolved_check_names_for_table(&cfg, kinds, "orders", &[]);
+        let collisions = resolved_check_name_collisions(&names);
+        assert_eq!(
+            collisions.len(),
+            1,
+            "assertion x assertion must collide: {collisions:?}"
+        );
+        assert_eq!(collisions[0].2, "dup");
+    }
+
+    /// A collision between two TABLE-INDEPENDENT producers (custom and
+    /// `null_rate`) is refused at `validate_checks` time, naming both
+    /// sources and the shared sanitized name — before discovery has run.
+    ///
+    /// Mutation that must turn this red: drop the `table_independent`
+    /// collision loop from `validate_checks`.
+    #[test]
+    fn validate_checks_refuses_a_table_independent_collision() {
+        let cfg = parse(
+            r#"
+[adapter]
+type = "duckdb"
+path = "x.duckdb"
+
+[pipeline.repl]
+strategy = "full_refresh"
+
+[pipeline.repl.source.schema_pattern]
+prefix = "src__"
+separator = "__"
+components = ["source"]
+
+[pipeline.repl.target]
+catalog_template = "wh"
+schema_template = "raw__{source}"
+
+[pipeline.repl.checks.null_rate]
+columns = ["amount"]
+threshold = 0.1
+
+[[pipeline.repl.checks.custom]]
+name = "null rate amount"
+sql = "SELECT 0"
+threshold = 0
+"#,
+        );
+        let errors = validate_checks(&cfg);
+        let found = errors.iter().find(|e| {
+            matches!(
+                e,
+                ConfigError::DuplicateCheckName { sanitized, .. } if sanitized == "null_rate_amount"
+            )
+        });
+        assert!(
+            found.is_some(),
+            "a table-independent collision must be refused: {errors:?}"
+        );
+        if let Some(ConfigError::DuplicateCheckName {
+            pipeline,
+            source_a,
+            source_b,
+            ..
+        }) = found
+        {
+            assert_eq!(pipeline, "repl", "must name the offending pipeline");
+            let sources = [source_a.as_str(), source_b.as_str()];
+            assert!(
+                sources.iter().any(|s| s.contains("null rate amount")),
+                "must name the custom-check source: {sources:?}"
+            );
+            assert!(
+                sources.iter().any(|s| s.contains("null_rate:amount")),
+                "must name the null_rate source: {sources:?}"
+            );
+        }
+    }
+
+    /// Two UNNAMED `expression` assertions on the same table both
+    /// synthesize the SAME name (`resolved_name()` -> `"expression:-"` for
+    /// both, since neither has a `column`), so the collision message must
+    /// not print the identical string twice — the reader would have no way
+    /// to tell WHICH two assertions collide. `describe_resolved_check_name`
+    /// appends each side's 1-based per-table assertion index to disambiguate
+    /// (#1941 review finding).
+    ///
+    /// Mutation that must turn this red: drop the `detail` field, or stop
+    /// populating it in `resolved_check_names_for_table`'s assertion loop,
+    /// or stop appending it in `describe_resolved_check_name`.
+    #[test]
+    fn validate_checks_disambiguates_two_unnamed_assertions_colliding() {
+        let cfg = parse(
+            r#"
+[adapter]
+type = "duckdb"
+path = "x.duckdb"
+
+[pipeline.repl]
+strategy = "full_refresh"
+
+[pipeline.repl.source.schema_pattern]
+prefix = "src__"
+separator = "__"
+components = ["source"]
+
+[pipeline.repl.target]
+catalog_template = "wh"
+schema_template = "raw__{source}"
+
+[[pipeline.repl.checks.assertions]]
+table = "orders"
+type = "expression"
+expression = "amount > 0"
+
+[[pipeline.repl.checks.assertions]]
+table = "orders"
+type = "expression"
+expression = "quantity > 0"
+"#,
+        );
+        let errors = validate_checks(&cfg);
+        let found = errors.iter().find(|e| {
+            matches!(
+                e,
+                ConfigError::DuplicateCheckName { sanitized, .. } if sanitized == "expression__"
+            )
+        });
+        assert!(
+            found.is_some(),
+            "two unnamed assertions colliding must be refused: {errors:?}"
+        );
+        if let Some(ConfigError::DuplicateCheckName {
+            source_a, source_b, ..
+        }) = found
+        {
+            assert_ne!(
+                source_a, source_b,
+                "the two sides must be distinguishable, not the identical string twice"
+            );
+            assert!(
+                source_a.contains('1') || source_b.contains('1'),
+                "one side must be identified as assertion #1: {source_a} / {source_b}"
+            );
+            assert!(
+                source_a.contains('2') || source_b.contains('2'),
+                "one side must be identified as assertion #2: {source_a} / {source_b}"
+            );
+        }
     }
 
     #[test]

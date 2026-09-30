@@ -212,14 +212,29 @@ no external dependency. On a run it:
 1. Detects `DAGSTER_PIPES_CONTEXT` and `DAGSTER_PIPES_MESSAGES` env
    vars at the start of `rocky run`.
 2. Opens the messages channel (file path or stderr stream) per the
-   protocol params.
+   protocol params, and writes `opened` immediately (`params: {"extras":
+   {}}`) — the handshake Dagster's reader needs before it will report
+   anything at all.
 3. Emits one JSON-line message per progress event:
    - `log` at run start and completion
    - `report_asset_materialization` per `output.materializations` entry
    - `report_asset_check` per `output.check_results` entry
+   - per `output.anomalies` entry: a `report_asset_check` (check name
+     `row_count_anomaly`, severity WARN, `passed=false`, with
+     `rocky/current_count`, `rocky/baseline_avg`, `rocky/deviation_pct`
+     and `rocky/reason` metadata)
+   - per `output.anomaly_evaluated` entry not already covered by an
+     anomaly above: a `report_asset_check` (check name
+     `row_count_anomaly`) — `passed=true` for a table the detector
+     evaluated with no anomaly, or `passed=false` with a `rocky/reason`
+     for a table it did not evaluate. Matches the same three verdicts
+     `execution_mode: streaming` gives.
    - per `output.drift.actions_taken` entry: a `report_asset_check`
      (check name `drift`, severity WARN, `passed=true`, with
-     table/action/reason metadata) plus a `log` at WARN level
+     table/action/reason metadata) plus a `log` at WARN level. `drift`
+     is never a declared check spec — `dagster-rocky` converts it to an
+     `AssetObservation` with `rocky/drift_*` metadata on receipt,
+     matching what `execution_mode: streaming` yields.
    - `closed` at run end
 4. When env vars are not set, the entire path is a no-op; zero
    overhead for non-Dagster callers.

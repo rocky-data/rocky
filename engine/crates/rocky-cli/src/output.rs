@@ -587,6 +587,13 @@ pub struct AnomalyEvaluationOutput {
     /// Fully-qualified table the entry is about, the same key
     /// [`AnomalyOutput::table`] uses.
     pub table: String,
+    /// Dagster-style asset key path (`[source_type, ...components, table]`),
+    /// the same value [`MaterializationOutput::asset_key`] carries for this
+    /// table. Added (#2073) so the Dagster Pipes emitter can report this
+    /// verdict as a `report_asset_check` without re-deriving the mapping
+    /// `batch_asset_keys` already has — the same reason
+    /// [`TableCheckOutput::asset_key`] exists.
+    pub asset_key: Vec<String>,
     /// `true` when the detector compared this table's count against its
     /// history. An anomaly, if any, is in [`RunOutput::anomalies`].
     pub evaluated: bool,
@@ -600,6 +607,9 @@ pub struct AnomalyEvaluationOutput {
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct AnomalyOutput {
     pub table: String,
+    /// Dagster-style asset key path, same convention as
+    /// [`AnomalyEvaluationOutput::asset_key`] (#2073).
+    pub asset_key: Vec<String>,
     pub current_count: u64,
     pub baseline_avg: f64,
     pub deviation_pct: f64,
@@ -1582,6 +1592,13 @@ pub struct DriftSummary {
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct DriftActionOutput {
     pub table: String,
+    /// Dagster-style asset key path (`[source_type, ...components, table]`)
+    /// for this table, the same value [`MaterializationOutput::asset_key`]
+    /// carries. Added (#2073) so the Dagster Pipes emitter can report drift
+    /// as a `report_asset_check` keyed on the asset, instead of passing
+    /// `table` (a bare `catalog.schema.table` string, not a Dagster asset
+    /// key) as the asset key.
+    pub asset_key: Vec<String>,
     pub action: String,
     pub reason: String,
 }
@@ -2537,6 +2554,14 @@ pub struct RunHistoryRecord {
     /// `TickOutput.executed[].submission_id`. `None` for manually launched runs.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub submission_id: Option<String>,
+    /// The named Rocky branch this run wrote to (`rocky run --branch
+    /// <name>`), or `None` for a production / plain-`--shadow` run. Distinct
+    /// from `git_branch` — see `RunRecord::rocky_branch` (#2032). Not
+    /// audit-gated — like [`Self::pipeline`], it is an operational join key
+    /// (`rocky preview diff`/`preview cost` pair a run by this field), always
+    /// emitted when present.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rocky_branch: Option<String>,
 
     // --- Governance audit trail (populated only with `--audit`) ---
     /// Resolved caller identity (Unix `$USER` / Windows `$USERNAME`).
@@ -3488,12 +3513,18 @@ pub struct TableCompareResult {
     pub production_table: String,
     pub shadow_table: String,
     pub row_count_match: bool,
-    pub production_count: u64,
-    pub shadow_count: u64,
-    pub row_count_diff_pct: f64,
+    /// Null when the warehouse count could not be read.
+    pub production_count: Option<u64>,
+    /// Null when the warehouse count could not be read.
+    pub shadow_count: Option<u64>,
+    /// Null unless both counts were read.
+    pub row_count_diff_pct: Option<f64>,
     pub schema_match: bool,
     pub schema_diffs: Vec<String>,
     pub verdict: String,
+    /// Read errors for an `error` row, or threshold reasons for `warn`/`fail`.
+    /// Empty for `pass`.
+    pub reasons: Vec<String>,
 }
 
 /// JSON output for `rocky compact`.
@@ -4781,7 +4812,6 @@ impl ChecksConfigOutput {
             threshold_seconds: f.threshold_seconds,
         });
 
-        let runs = |k: CheckKind| executed_kinds.contains(&k);
         let mut configured_checks: BTreeMap<String, Vec<ResolvedCheckNameOutput>> = BTreeMap::new();
 
         // (source_type, table) pairs across discovered sources.
@@ -4796,43 +4826,49 @@ impl ChecksConfigOutput {
         let unique_tables: std::collections::BTreeSet<&str> =
             pairs.iter().map(|(_, t)| t.as_str()).collect();
 
-        // Custom checks run against every materialized table.
-        if runs(CheckKind::Custom) {
-            for &table in &unique_tables {
-                for custom in &cfg.custom {
-                    configured_checks
-                        .entry(table.to_string())
-                        .or_default()
-                        .push(ResolvedCheckNameOutput {
-                            name: custom.name.clone(),
-                            kind: "custom".into(),
-                            candidate: false,
-                        });
-                }
+        // Every discovered table gets the full per-table derivation: custom,
+        // null_rate, assertions ON THIS TABLE, and cross_source_overlap when
+        // it has ≥2 siblings under the same source type. Shared with the
+        // pre-run collision guards (`rocky-core::config`, `rocky-cli`'s
+        // `run.rs`) so none of the three can disagree about which names a
+        // table emits (#1941).
+        for &table in &unique_tables {
+            let sibling_source_types: Vec<String> = pairs
+                .iter()
+                .filter(|(_, t)| t == table)
+                .map(|(source_type, _)| source_type.clone())
+                .collect();
+            let names = rocky_core::config::resolved_check_names_for_table(
+                cfg,
+                executed_kinds,
+                table,
+                &sibling_source_types,
+            );
+            if names.is_empty() {
+                continue;
             }
+            configured_checks
+                .entry(table.to_string())
+                .or_default()
+                .extend(names.into_iter().map(|n| ResolvedCheckNameOutput {
+                    name: n.name,
+                    kind: n.kind.as_str().to_string(),
+                    candidate: n.candidate,
+                }));
         }
 
-        // Null-rate: one result per configured column, per table.
-        if runs(CheckKind::NullRate)
-            && let Some(nr) = cfg.null_rate.as_ref()
-        {
-            for &table in &unique_tables {
-                for col in &nr.columns {
-                    configured_checks
-                        .entry(table.to_string())
-                        .or_default()
-                        .push(ResolvedCheckNameOutput {
-                            name: rocky_core::checks::null_rate_check_name(col),
-                            kind: "null_rate".into(),
-                            candidate: false,
-                        });
-                }
-            }
-        }
-
-        // Assertions attach to their specific target table.
-        if runs(CheckKind::Assertions) {
+        // An assertion whose table was NOT among the discovered tables still
+        // gets its resolved name projected — `rocky discover` declares the
+        // spec even though this snapshot didn't discover the table, so a
+        // consumer can pre-declare it before the table shows up. Unlike the
+        // discovered-table loop above this does not also add custom/null_rate
+        // entries for that table: those apply only once the table is
+        // actually materialized, which this snapshot has no evidence of.
+        if executed_kinds.contains(&CheckKind::Assertions) {
             for assertion in &cfg.assertions {
+                if unique_tables.contains(assertion.table.as_str()) {
+                    continue; // already covered by the loop above
+                }
                 configured_checks
                     .entry(assertion.table.clone())
                     .or_default()
@@ -4842,31 +4878,6 @@ impl ChecksConfigOutput {
                         candidate: false,
                     });
             }
-        }
-
-        // Cross-source overlap: candidate names for ≥2 (source_type, table)
-        // groups — marked `candidate` because the actual set depends on
-        // runtime-discovered siblings, which may differ from what discover sees.
-        if runs(CheckKind::CrossSourceOverlap) && cfg.cross_source_overlap.is_some() {
-            for (source_type, table) in
-                rocky_core::checks::cross_source_overlap_groups(pairs.iter().cloned())
-            {
-                configured_checks
-                    .entry(table.clone())
-                    .or_default()
-                    .push(ResolvedCheckNameOutput {
-                        name: rocky_core::checks::cross_source_overlap_name(&source_type, &table),
-                        kind: "cross_source_overlap".into(),
-                        candidate: true,
-                    });
-            }
-        }
-
-        // Dedup identical names per table (e.g. a custom check on a table name
-        // that appears under multiple sources), preserving declaration order.
-        for names in configured_checks.values_mut() {
-            let mut seen = std::collections::HashSet::new();
-            names.retain(|n| seen.insert(n.name.clone()));
         }
 
         if freshness.is_none() && configured_checks.is_empty() {
@@ -4996,6 +5007,10 @@ pub struct RunRecordAudit {
     pub target_catalog: Option<String>,
     pub hostname: String,
     pub rocky_version: String,
+    /// The named Rocky branch this run wrote to (`rocky run --branch
+    /// <name>`), or `None`. See `RunRecord::rocky_branch` (#2032) — this is
+    /// NOT `git_branch`.
+    pub rocky_branch: Option<String>,
 }
 
 impl RunRecordAudit {
@@ -5014,6 +5029,7 @@ impl RunRecordAudit {
             target_catalog: None,
             hostname: "output-test-host".to_string(),
             rocky_version: "0.0.0-test".to_string(),
+            rocky_branch: None,
         }
     }
 }
@@ -5406,6 +5422,7 @@ impl RunOutput {
             target_catalog: audit.target_catalog,
             hostname: audit.hostname,
             rocky_version: audit.rocky_version,
+            rocky_branch: audit.rocky_branch,
             check_outcomes,
             pipeline: None,
             submission_id: None,
@@ -10456,7 +10473,7 @@ pub struct PreviewCreateOutput {
     /// Branch name registered in the state store. Mirrors the `name`
     /// from `rocky branch create`.
     pub branch_name: String,
-    /// Schema prefix the branch run wrote into (e.g. `branch__fix-price`).
+    /// Schema prefix the branch run wrote into (e.g. `branch__fix_price`).
     pub branch_schema: String,
     /// Git ref the change set was computed against. Mirrors `--base`.
     pub base_ref: String,
@@ -10550,6 +10567,19 @@ pub struct PreviewDiffOutput {
 pub struct PreviewDiffSummary {
     pub models_with_changes: usize,
     pub models_unchanged: usize,
+    /// Models whose row-count delta could not be computed — the warehouse
+    /// adapter or materialization strategy reported no `rows_affected` on
+    /// the branch side, the base side, or both (#2032). These are counted
+    /// separately from `models_unchanged`: "no recorded delta" is not the
+    /// same claim as "no change", and folding the two together is exactly
+    /// the false-clean report this field exists to prevent. A model here
+    /// contributes `null` (not `0`) to its own `rows_added`/`rows_removed`
+    /// and is excluded from `total_rows_added`/`total_rows_removed`, so
+    /// those totals are a floor, not an exact count, whenever this is > 0.
+    pub models_unknown: usize,
+    /// Sum of `rows_added` over models with a KNOWN delta only — models
+    /// counted in `models_unknown` contribute nothing here (never `0`,
+    /// which would be indistinguishable from a genuine no-op).
     pub total_rows_added: u64,
     pub total_rows_removed: u64,
     pub total_rows_changed: u64,
@@ -10694,8 +10724,17 @@ pub struct PreviewColumnTypeChange {
 /// Sampled row-level diff. All counts are over the sampling window.
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct PreviewSampledRowDiff {
-    pub rows_added: u64,
-    pub rows_removed: u64,
+    /// `None` — emitted as JSON `null`, deliberately NOT omitted via
+    /// `skip_serializing_if` — when the row count needed to compute this
+    /// delta was unavailable on the branch side, the base side, or both
+    /// (an ordinary transformation run's adapter/strategy reports no
+    /// `rows_affected`). `Some(0)` means a genuine, measured no-op; `null`
+    /// means unmeasured. Collapsing the two into `0` is the exact defect
+    /// this field exists to prevent — a full-refresh model going from 10
+    /// rows to 20 must never report `rows_added: 0` (#2032).
+    pub rows_added: Option<u64>,
+    /// Same absent-vs-zero contract as `rows_added`.
+    pub rows_removed: Option<u64>,
     pub rows_changed: u64,
     /// Up to `--max-samples` (default 5) representative changed rows
     /// for human review. Pure noise when sampling found no change.

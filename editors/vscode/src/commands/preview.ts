@@ -7,9 +7,10 @@ import type {
 } from "../types/generated";
 import { firePreviewCreated } from "../views/previewView";
 import { ensureWorkspace, promptForInput, showJsonInEditor } from "./ui";
+import { PREVIEW_NAME_EXAMPLE } from "./branchNames";
 
 const BASE_PLACEHOLDER = "e.g., main";
-const BRANCH_PLACEHOLDER = "e.g., preview-fix-price";
+const BRANCH_PLACEHOLDER = `e.g., ${PREVIEW_NAME_EXAMPLE}`;
 
 export async function previewCreate(): Promise<void> {
   if (!ensureWorkspace()) return;
@@ -81,7 +82,9 @@ export async function previewDiff(): Promise<void> {
     );
 
     const summary = result.summary;
-    const message = `Rocky preview diff: ${summary?.models_with_changes ?? 0} changed, ${summary?.models_unchanged ?? 0} unchanged, +${summary?.total_rows_added ?? 0}/-${summary?.total_rows_removed ?? 0}/~${summary?.total_rows_changed ?? 0} rows`;
+    const unknownCount = summary?.models_unknown ?? 0;
+    const unknownSuffix = unknownCount > 0 ? `, ${unknownCount} unknown` : "";
+    const message = `Rocky preview diff: ${summary?.models_with_changes ?? 0} changed, ${summary?.models_unchanged ?? 0} unchanged${unknownSuffix}, +${summary?.total_rows_added ?? 0}/-${summary?.total_rows_removed ?? 0}/~${summary?.total_rows_changed ?? 0} rows`;
 
     if (result.base_note) {
       // A refused comparison (no run recorded for the named base) must not

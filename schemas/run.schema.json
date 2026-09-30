@@ -4,6 +4,13 @@
     "AnomalyEvaluationOutput": {
       "description": "Whether the row-count anomaly detector evaluated one table.\n\nOne entry per table in the run's batches, whatever happened. A consumer reading [`RunOutput::anomalies`] alone cannot tell \"the detector ran and found nothing\" from \"the detector never ran\": both are an empty list (#1790). Dagster read the empty list as a pass, so a run with `row_count = false` showed a green anomaly check for a detector that had not run.\n\nThe detector runs only when row-count checks are on, the run has a state store, the table's row count was measured, and its history could be read. `not_evaluated_reason` names which of those was missing, because the remedy differs: one is a config line, another is how the run was invoked.",
       "properties": {
+        "asset_key": {
+          "description": "Dagster-style asset key path (`[source_type, ...components, table]`), the same value [`MaterializationOutput::asset_key`] carries for this table. Added (#2073) so the Dagster Pipes emitter can report this verdict as a `report_asset_check` without re-deriving the mapping `batch_asset_keys` already has — the same reason [`TableCheckOutput::asset_key`] exists.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
         "evaluated": {
           "description": "`true` when the detector compared this table's count against its history. An anomaly, if any, is in [`RunOutput::anomalies`].",
           "type": "boolean"
@@ -21,6 +28,7 @@
         }
       },
       "required": [
+        "asset_key",
         "evaluated",
         "table"
       ],
@@ -29,6 +37,13 @@
     "AnomalyOutput": {
       "description": "Row count anomaly detected by historical baseline comparison.",
       "properties": {
+        "asset_key": {
+          "description": "Dagster-style asset key path, same convention as [`AnomalyEvaluationOutput::asset_key`] (#2073).",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
         "baseline_avg": {
           "format": "double",
           "type": "number"
@@ -50,6 +65,7 @@
         }
       },
       "required": [
+        "asset_key",
         "baseline_avg",
         "current_count",
         "deviation_pct",
@@ -369,6 +385,13 @@
         "action": {
           "type": "string"
         },
+        "asset_key": {
+          "description": "Dagster-style asset key path (`[source_type, ...components, table]`) for this table, the same value [`MaterializationOutput::asset_key`] carries. Added (#2073) so the Dagster Pipes emitter can report drift as a `report_asset_check` keyed on the asset, instead of passing `table` (a bare `catalog.schema.table` string, not a Dagster asset key) as the asset key.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
         "reason": {
           "type": "string"
         },
@@ -378,6 +401,7 @@
       },
       "required": [
         "action",
+        "asset_key",
         "reason",
         "table"
       ],

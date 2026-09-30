@@ -233,8 +233,8 @@ rocky compile --contracts contracts && rocky run
 ```
 
 The `&&` runs `rocky run` only when the contract compile exits `0`.
-`rocky run` has no `--contracts` option. A bare run can execute the model graph
-without this contract check.
+The two commands read the project separately. A model or contract edit between them can change what runs.
+For a selected `full_refresh` model, `rocky run --pipeline <NAME> --model <NAME> --contracts contracts` checks the contract in the run's own compile. This template runs the whole model graph here, so it still needs the separate compile gate.
 
 A failed compile leaves tables from a previous run in `playground.duckdb`.
 `rocky preview rows` shows those stored rows. It does not prove the current

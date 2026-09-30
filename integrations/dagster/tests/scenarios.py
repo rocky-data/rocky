@@ -227,6 +227,7 @@ RUN: dict[str, Any] = {
     "anomalies": [
         {
             "table": "acme_warehouse.staging__us_west__shopify.payments",
+            "asset_key": ["fivetran", "acme", "us_west", "shopify", "payments"],
             "current_count": 42000,
             "baseline_avg": 41500.0,
             "deviation_pct": 1.2,
@@ -265,6 +266,7 @@ RUN: dict[str, Any] = {
         "actions_taken": [
             {
                 "table": "acme_warehouse.staging__us_west__shopify.payments",
+                "asset_key": ["fivetran", "acme", "us_west", "shopify", "payments"],
                 "action": "drop_and_recreate",
                 "reason": "column 'status' changed STRING → INT",
             },

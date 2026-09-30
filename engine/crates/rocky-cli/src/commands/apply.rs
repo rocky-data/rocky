@@ -839,16 +839,11 @@ async fn execute_run_plan(
         .clone()
         .unwrap_or_else(|| "_rocky_shadow".to_string());
     let shadow_config = if let Some(ref name) = run_plan.branch {
-        let store = rocky_core::state::StateStore::open_read_only(state_path)
-            .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
-        let record = store.get_branch(name)?.with_context(|| {
-            format!("branch '{name}' not found — create it with `rocky branch create {name}`")
-        })?;
-        Some(rocky_core::shadow::ShadowConfig {
-            suffix: shadow_suffix,
-            schema_override: Some(record.schema_prefix),
-            cleanup_after: false,
-        })
+        Some(crate::commands::branch::resolve_branch_shadow_config(
+            state_path,
+            name,
+            shadow_suffix,
+        )?)
     } else if run_plan.shadow {
         Some(rocky_core::shadow::ShadowConfig {
             suffix: shadow_suffix,
@@ -858,6 +853,7 @@ async fn execute_run_plan(
             // that is what makes the ownership refusal sound. The branch
             // arm above stays persistent on purpose.
             cleanup_after: true,
+            branch: None,
         })
     } else {
         None
@@ -3029,6 +3025,7 @@ pub(crate) fn gate_promote_plan(
     promote_plan: &PromotePlan,
     state_path: &Path,
 ) -> Result<std::sync::Arc<rocky_core::config::LoadedConfig>> {
+    crate::commands::branch::validate_persisted_promote_branch_name(&promote_plan.branch_name)?;
     // THE single fingerprinted config snapshot for the promote (#1120): the
     // pre-gate sync decision, the policy gate, AND — via the returned `Arc` —
     // the promote executor's adapter resolution all read THIS instance, so a
@@ -4295,22 +4292,16 @@ fn replication_shadow_config(
         .unwrap_or_else(|| "_rocky_shadow".to_string());
 
     if let Some(ref name) = replication_plan.branch {
-        let store = rocky_core::state::StateStore::open_read_only(state_path)
-            .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
-        let record = store.get_branch(name)?.with_context(|| {
-            format!("branch '{name}' not found — create it with `rocky branch create {name}`")
-        })?;
-        return Ok(Some(rocky_core::shadow::ShadowConfig {
-            suffix,
-            schema_override: Some(record.schema_prefix),
-            cleanup_after: false,
-        }));
+        return Ok(Some(crate::commands::branch::resolve_branch_shadow_config(
+            state_path, name, suffix,
+        )?));
     }
     Ok(if replication_plan.shadow {
         Some(rocky_core::shadow::ShadowConfig {
             suffix,
             schema_override: replication_plan.shadow_schema.clone(),
             cleanup_after: false,
+            branch: None,
         })
     } else {
         None
@@ -5005,6 +4996,7 @@ pub async fn run_apply_inline_for_run(
     skip_opts: &crate::commands::run::SkipRunOptions,
     run_vars: &rocky_core::run_vars::RunVars,
     assume_fresh_state: bool,
+    contracts_dir: Option<&Path>,
 ) -> Result<()> {
     // THE single fingerprinted config load for a bare `rocky run` (#1120):
     // this entry point loaded nothing before this change (run() re-read the
@@ -5015,7 +5007,7 @@ pub async fn run_apply_inline_for_run(
             .with_context(|| format!("failed to load config from {}", config_path.display()))?,
     );
     // Thin passthrough — routes to the existing run implementation.
-    crate::commands::run::run(
+    crate::commands::run::run_with_explicit_contracts(
         config_path,
         loaded,
         filter,
@@ -5045,6 +5037,7 @@ pub async fn run_apply_inline_for_run(
         // validated it against the configured `[state]` backend).
         assume_fresh_state,
         None, // #1460: inline `rocky run`, not a persisted plan
+        contracts_dir,
     )
     .await
     .map(|_| ())
@@ -10616,6 +10609,7 @@ schema_template = "s__{source}"
             submission_id: None,
             check_gate_failed: false,
             verify_after_failed: false,
+            rocky_branch: None,
         };
         store.record_run(&record).unwrap();
     }
