@@ -406,6 +406,7 @@ pub async fn run_with_dag(
 
 /// What [`run_with_dag`] schedules from: the graph with every inferred edge,
 /// and the seeds it was built from.
+#[derive(Debug)]
 struct PlannedDag {
     runtime: unified_dag::RuntimeDag,
     seeds: Vec<rocky_core::seeds::SeedFile>,
@@ -3353,6 +3354,80 @@ mod tests {
                  load={load} reader={reader} model={model}"
             );
         }
+    }
+
+    /// Two writers of one table, through the production planner and real seed
+    /// discovery. A model `orders` writes `main.seeds.orders`, and so does the
+    /// sidecar-free seed `orders.csv`: the seed loader defaults it to the
+    /// `seeds` schema, and drops and recreates whatever is there. The graph is
+    /// built before the seed's catalog is chosen, so a read of
+    /// `main.seeds.orders` cannot be pinned to the model alone — it is refused,
+    /// not resolved to the one producer whose target happens to be known.
+    #[test]
+    fn a_sidecar_free_seed_and_a_model_writing_one_table_make_its_readers_ambiguous() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write_fixture_project(
+            root,
+            &transformation_block("t"),
+            &[
+                ("orders", "main", "seeds", "orders", "SELECT 1 AS id"),
+                (
+                    "mart",
+                    "main",
+                    "marts",
+                    "mart",
+                    "SELECT id FROM main.seeds.orders",
+                ),
+            ],
+        );
+        std::fs::create_dir_all(root.join("seeds")).unwrap();
+        std::fs::write(root.join("seeds/orders.csv"), "id\n1\n").unwrap();
+        let message = format!(
+            "{:#}",
+            plan_fixture(root).expect_err("two possible writers of one table must refuse")
+        );
+        assert!(
+            message.contains("model 'orders' (target main.seeds.orders)")
+                && message.contains("seed 'orders' (target ?.seeds.orders)"),
+            "the refusal names both writers and marks the unknown catalog: {message}"
+        );
+    }
+
+    /// The same project when the model writes a schema the seed's default
+    /// cannot be: the read names the model alone, so the plan is accepted and
+    /// the reader is ordered after the model, not the seed.
+    #[test]
+    fn a_read_naming_a_schema_a_sidecar_free_seed_cannot_be_in_resolves_to_the_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write_fixture_project(
+            root,
+            &transformation_block("t"),
+            &[
+                ("orders", "main", "silver", "orders", "SELECT 1 AS id"),
+                (
+                    "mart",
+                    "main",
+                    "marts",
+                    "mart",
+                    "SELECT id FROM main.silver.orders",
+                ),
+            ],
+        );
+        std::fs::create_dir_all(root.join("seeds")).unwrap();
+        std::fs::write(root.join("seeds/orders.csv"), "id\n1\n").unwrap();
+        let planned = plan_fixture(root).expect("the read cannot be the seed's table");
+        assert!(planned_edge(
+            &planned,
+            "transformation:orders",
+            "transformation:mart"
+        ));
+        assert!(!planned_edge(
+            &planned,
+            "seed:orders",
+            "transformation:mart"
+        ));
     }
 
     /// The refusal reaches `run --dag` itself: a bare read of a label a model

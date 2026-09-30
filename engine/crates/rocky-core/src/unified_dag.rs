@@ -105,10 +105,12 @@ pub enum UnifiedDagError {
     /// exactly one of them by its physical target. See [`build_runtime_dag`].
     #[error(
         "model '{reader}' reads '{read}', but the label '{label}' belongs to {}. The read does \
-         not name exactly one of them by its full `catalog.schema.table` target. Rocky cannot \
-         tell which one '{reader}' must run after, and a wrong choice could let it read a \
-         table that is not built yet. Rename one of the producers so each label is unique, or \
-         write the read as the intended producer's full target.",
+         not name exactly one of them by its full `catalog.schema.table` target, or another \
+         one could be the same table. Rocky cannot tell which one '{reader}' must run after, \
+         and a wrong choice could let it read a table that is not built yet. Rename one of the \
+         producers so each label is unique, or write the read as the intended producer's full \
+         target. A `?` marks a part of a target Rocky does not know: declare it in the seed's \
+         sidecar `[target]`, or set `table` on the load pipeline.",
         .producers.join(" and ")
     )]
     AmbiguousLabelProducer {
@@ -989,7 +991,11 @@ pub struct RuntimeDag {
 /// When a model and a seed or load pipeline share a label, node build order
 /// says nothing about which one a reader means, so it is not consulted. A read
 /// is ordered after the producer whose full `catalog.schema.table` target it
-/// names. A read that names none of them, or several, is refused with
+/// names, provided no other producer of the label could be the same table. A
+/// producer whose target is not fully known (a seed with no sidecar `[target]`
+/// is in the default seed schema but in a catalog chosen when it loads) is not
+/// ruled out by a read that does not contradict it. A read that names none of
+/// them, several, or one while another could be the same table, is refused with
 /// [`UnifiedDagError::AmbiguousLabelProducer`] before anything runs.
 ///
 /// # Errors
@@ -1080,14 +1086,28 @@ pub fn build_runtime_dag(
 
 /// Where a producing node writes, as far as that is declared or established.
 ///
-/// A component that is not declared, or cannot be established, is `None` and
-/// can never match a read: this answers "is this read EXACTLY that node's
-/// table", so an unknown part is an answer of no.
+/// A component that is not declared, or cannot be established, is `None`: it
+/// is UNKNOWN, which is not the same as "different". A read can rule a producer
+/// out only by a component that is known and does not match. See
+/// [`ProducerTarget::match_read`].
 #[derive(Debug, Clone, Default)]
 struct ProducerTarget {
     catalog: Option<String>,
     schema: Option<String>,
     table: Option<String>,
+}
+
+/// How one read relates to one producer's target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReadMatch {
+    /// Every component the read names is known for the producer and equal: the
+    /// read is that producer's table.
+    Named,
+    /// No known component contradicts the read, but some component the read
+    /// names is unknown for the producer, so the read could still be its table.
+    Possibly,
+    /// A known component differs: the read is not that producer's table.
+    Not,
 }
 
 impl ProducerTarget {
@@ -1103,22 +1123,37 @@ impl ProducerTarget {
     }
 
     /// Whether a read spelled `parts` (folded, `catalog.schema.table`,
-    /// `schema.table` or a bare `table`) names exactly this target.
+    /// `schema.table` or a bare `table`) is this producer's table.
     ///
     /// A two-part read resolves in the connection's current catalog, which
     /// Rocky cannot see, so it is compared on `(schema, table)` alone — the
-    /// same comparison the physical pass makes. A bare read names no schema
-    /// and identifies nothing.
-    fn is_named_by(&self, parts: &[String]) -> bool {
-        let known = |own: &Option<String>, read: &String| own.as_ref() == Some(read);
-        match parts {
-            [catalog, schema, table] => {
-                known(&self.catalog, catalog)
-                    && known(&self.schema, schema)
-                    && known(&self.table, table)
-            }
-            [schema, table] => known(&self.schema, schema) && known(&self.table, table),
-            _ => false,
+    /// same comparison the physical pass makes. A bare read names no schema and
+    /// cannot rule any producer out. A producer's unknown component never
+    /// rules it out either: a seed's real target is chosen when it loads, after
+    /// the graph is built, so "not known to match" must not be read as "does
+    /// not match".
+    fn match_read(&self, parts: &[String]) -> ReadMatch {
+        let compare = |own: &Option<String>, read: &String| match own {
+            Some(own) if own == read => ReadMatch::Named,
+            Some(_) => ReadMatch::Not,
+            None => ReadMatch::Possibly,
+        };
+        let components: Vec<ReadMatch> = match parts {
+            [catalog, schema, table] => vec![
+                compare(&self.catalog, catalog),
+                compare(&self.schema, schema),
+                compare(&self.table, table),
+            ],
+            [schema, table] => vec![compare(&self.schema, schema), compare(&self.table, table)],
+            // A bare read, or one with more parts than a table has.
+            _ => return ReadMatch::Possibly,
+        };
+        if components.contains(&ReadMatch::Not) {
+            ReadMatch::Not
+        } else if components.contains(&ReadMatch::Possibly) {
+            ReadMatch::Possibly
+        } else {
+            ReadMatch::Named
         }
     }
 
@@ -1138,10 +1173,12 @@ impl ProducerTarget {
 ///
 /// A model's own `[target]` (or, when it names no catalog, the catalog its
 /// adapter established); a seed's sidecar `[target]`; a load pipeline's
-/// `[target]`. A seed with no sidecar target has no known schema and a load
-/// with no explicit table has no known table, so neither can be named by a
-/// read — the honest answer, because their real target is chosen at load time.
-/// A replication pipeline's load writes templated targets and is unknown.
+/// `[target]`. What a target does not fix stays unknown: a seed with no sidecar
+/// target is in the default seed schema but in a catalog its loader picks from
+/// the pipeline it runs under, and a load with no explicit table writes tables
+/// named after its files. Such a producer is never named by a read, and never
+/// ruled out by one — see [`ProducerTarget::match_read`]. A replication
+/// pipeline's load writes templated targets and is entirely unknown.
 fn producer_targets(
     dag: &UnifiedDag,
     config: &RockyConfig,
@@ -1180,9 +1217,14 @@ fn producer_targets(
                 Some(&t.schema),
                 Some(t.table.as_deref().unwrap_or(&seed.name)),
             ),
-            // No sidecar target: the seed loader picks the schema and the
-            // catalog from the pipeline it runs under, which is not known here.
-            None => ProducerTarget::new(None, None, Some(&seed.name)),
+            // No sidecar target: the seed loader puts it in the default seed
+            // schema, in the catalog of the pipeline it runs under, which is
+            // not known here.
+            None => ProducerTarget::new(
+                None,
+                Some(crate::seeds::DEFAULT_SEED_SCHEMA),
+                Some(&seed.name),
+            ),
         };
         targets.insert(NodeId::new("seed", &seed.name), target);
     }
@@ -1222,8 +1264,9 @@ fn producer_targets(
 ///
 /// A label claimed by one node orders its readers after that node. A label
 /// claimed by several is resolved per reader by the physical target the read
-/// names, or refused. The others are never ordered by build order: which node
-/// was built last says nothing about which one a read means (#1629).
+/// names — when exactly one claimant is definitely that table and no other could
+/// be — or refused. Build order never decides: which node was built last says
+/// nothing about which one a read means (#1629).
 ///
 /// `physical` are the `(producer, consumer)` node pairs the physical pass
 /// settled. `targets` holds each producer's declared target. Inferred edges
@@ -1295,14 +1338,22 @@ fn infer_label_dependencies(
             let producer_id = match claimants.as_slice() {
                 [(only, _)] => only,
                 // Several nodes claim the label: the read must name exactly
-                // one of them by its physical target.
+                // one of them by its physical target, and no other claimant
+                // may be able to be the same table. A claimant whose target is
+                // not fully known is not ruled out by a read that does not
+                // contradict it.
                 _ => {
-                    let named: Vec<&NodeId> = claimants
+                    let possible: Vec<(&NodeId, ReadMatch)> = claimants
                         .iter()
-                        .map(|(id, _)| id)
-                        .filter(|id| targets.get(*id).is_some_and(|t| t.is_named_by(&parts)))
+                        .map(|(id, _)| {
+                            let found = targets
+                                .get(id)
+                                .map_or(ReadMatch::Possibly, |t| t.match_read(&parts));
+                            (id, found)
+                        })
+                        .filter(|(_, found)| *found != ReadMatch::Not)
                         .collect();
-                    let [named] = named.as_slice() else {
+                    let [(named, ReadMatch::Named)] = possible.as_slice() else {
                         let mut described: Vec<String> = claimants
                             .iter()
                             .map(|(id, kind)| {
@@ -3953,11 +4004,15 @@ mod tests {
     }
 
     /// And the inverse read: the reader names the MODEL's target
-    /// (`prod.silver.shared`, whose table is the label), so the model — not
-    /// the load that shares its label — is what it runs after, and the load is
-    /// not ordered before it. A rule that answers the case above by "the load
-    /// wins" cannot pass both; resolving by target gets both right, whichever
-    /// pipeline is built last.
+    /// (`prod.silver.shared`, whose table is the label), so the load that shares
+    /// its label is NOT ordered before the reader. A rule that answers the case
+    /// above by "the load wins" cannot pass both; resolving by target gets both
+    /// right, whichever pipeline is built last.
+    ///
+    /// The model's own edge is asserted as a sanity check only: the physical
+    /// pass derives it before the label pass runs, so it cannot tell a label
+    /// pass that adds it from one that does not. What this test pins is the
+    /// edge that must be ABSENT, and that the label really did collide.
     #[test]
     fn a_reader_of_a_colliding_label_is_ordered_after_the_model_it_names() {
         for load_first in [true, false] {
@@ -4052,6 +4107,113 @@ mod tests {
         assert!(matches!(
             build_runtime_dag(&config, &by_pipeline, &[], &no_catalog),
             Err(UnifiedDagError::AmbiguousLabelProducer { .. })
+        ));
+    }
+
+    /// A producer whose target is not fully known is not ruled out by a read
+    /// that does not contradict it. A seed with no sidecar `[target]` loads into
+    /// the default seed schema, in a catalog its loader picks later, so the read
+    /// `main.seeds.orders` may be the seed's table just as it is the model's:
+    /// two writers of one table, whose order nothing decides. The DAG is
+    /// refused rather than resolved to the one producer whose target is known.
+    #[test]
+    fn a_seed_whose_unknown_target_could_be_the_read_makes_the_read_ambiguous() {
+        let config = config_with_pipelines(vec![("t", transform_pipeline(vec![]))]);
+        let by_pipeline = owned_by_sole_transformation(
+            &config,
+            vec![
+                model_reading("orders", ("main", "seeds", "orders"), "SELECT 1 AS id"),
+                model_reading(
+                    "mart",
+                    ("main", "marts", "mart"),
+                    "SELECT id FROM main.seeds.orders",
+                ),
+            ],
+        );
+        let err = build_runtime_dag(&config, &by_pipeline, &[seed("orders")], &no_catalog)
+            .expect_err("two possible writers of the read table must refuse");
+        let message = err.to_string();
+        assert!(
+            matches!(err, UnifiedDagError::AmbiguousLabelProducer { .. })
+                && message.contains("model 'orders' (target main.seeds.orders)")
+                && message.contains("seed 'orders' (target ?.seeds.orders)"),
+            "the refusal names both writers and marks what is unknown: {message}"
+        );
+    }
+
+    /// The default seed schema rules a sidecar-free seed OUT of a read that
+    /// names another schema, so the read resolves to the one producer that is
+    /// definitely its table. Without that knowledge the seed's unknown schema
+    /// would keep every read of a shared label ambiguous.
+    #[test]
+    fn a_seed_with_no_sidecar_is_ruled_out_by_its_default_schema() {
+        let config = config_with_pipelines(vec![("t", transform_pipeline(vec![]))]);
+        let by_pipeline = owned_by_sole_transformation(
+            &config,
+            vec![
+                model_reading("orders", ("prod", "silver", "orders"), "SELECT 1 AS id"),
+                model_reading(
+                    "mart",
+                    ("prod", "marts", "mart"),
+                    "SELECT id FROM prod.silver.orders",
+                ),
+            ],
+        );
+        let runtime = build_runtime_dag(&config, &by_pipeline, &[seed("orders")], &no_catalog)
+            .expect("the read names silver, which the seed cannot be in");
+        assert!(
+            !has_edge(&runtime.dag, "seed:orders", "transformation:mart"),
+            "the seed is not what `prod.silver.orders` names"
+        );
+        assert!(has_edge(
+            &runtime.dag,
+            "transformation:orders",
+            "transformation:mart"
+        ));
+    }
+
+    /// A catalogless model whose catalog Rocky could not establish could be in
+    /// the catalog a read names, so it is not ruled out — and the read, which
+    /// also names the load's target exactly, is refused. Once the adapter
+    /// establishes the model's catalog as a different one, the model is ruled
+    /// out and the read resolves to the load.
+    #[test]
+    fn a_catalogless_claimant_is_ruled_out_only_by_an_established_catalog() {
+        let make = || {
+            let config = duckdb_config(vec![
+                ("shared", load_pipeline("prod", "bronze", Some("shared"))),
+                ("t", transform_pipeline(vec![])),
+            ]);
+            let by_pipeline = owned_by_sole_transformation(
+                &config,
+                vec![
+                    model_reading("shared", ("", "bronze", "shared"), "SELECT 1 AS y"),
+                    model_reading(
+                        "reader",
+                        ("prod", "silver", "reader_output"),
+                        "SELECT y FROM prod.bronze.shared",
+                    ),
+                ],
+            );
+            (config, by_pipeline)
+        };
+
+        let (config, by_pipeline) = make();
+        assert!(
+            matches!(
+                build_runtime_dag(&config, &by_pipeline, &[], &no_catalog),
+                Err(UnifiedDagError::AmbiguousLabelProducer { .. })
+            ),
+            "the model's catalog is unknown, so it could be `prod`"
+        );
+
+        let (config, by_pipeline) = make();
+        let runtime = build_runtime_dag(&config, &by_pipeline, &[], &duckdb_stem_catalog)
+            .expect("the model lives in `db`, so the read cannot be its table");
+        assert!(has_edge(
+            &runtime.dag,
+            "load:shared",
+            "transformation:reader"
         ));
     }
 

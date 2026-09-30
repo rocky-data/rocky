@@ -79,6 +79,15 @@ pub enum SeedFormat {
     Tsv,
 }
 
+/// The schema a seed loads into when its sidecar declares no `[target]`.
+///
+/// The seed loader (`rocky seed`, and the seed nodes of `rocky run --dag`)
+/// applies it, and the unified DAG reads it to know which schemas a seed with no
+/// sidecar can NOT be in — one constant, so the two cannot drift apart. The
+/// catalog of such a seed is not fixed: it comes from the pipeline the loader
+/// runs under.
+pub const DEFAULT_SEED_SCHEMA: &str = "seeds";
+
 /// Target coordinates for a seed table.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SeedTarget {
