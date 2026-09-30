@@ -83,7 +83,10 @@ fn preview_cost_names_the_missing_base_and_its_next_step() {
     assert!(output.get("base_run_id").is_none());
     let markdown = output["markdown"].as_str().unwrap();
     assert!(markdown.contains("No base run yet"), "{markdown}");
-    assert!(markdown.contains("without `--branch`"), "{markdown}");
+    assert!(
+        markdown.contains("without `--branch` or `--shadow`"),
+        "{markdown}"
+    );
     assert!(!markdown.contains("No branch run yet"), "{markdown}");
 }
 
@@ -198,6 +201,7 @@ fn real_runs_keep_shadow_and_branch_out_of_diff_and_cost_bases() {
             "run",
             "--pipeline",
             "probe",
+            "--shadow",
             "--shadow-schema",
             "scratch",
             "--output",
@@ -280,4 +284,22 @@ fn real_runs_keep_shadow_and_branch_out_of_diff_and_cost_bases() {
         assert!(diff.get("base_note").is_none(), "{diff}");
         assert_eq!(diff["summary"]["total_rows_added"], 2, "{diff}");
     }
+
+    // A schema descriptor without --shadow is inert on this run path.
+    // It must still write to the production target and record that scope.
+    rocky(
+        root,
+        &state,
+        &[
+            "run",
+            "--pipeline",
+            "probe",
+            "--shadow-schema",
+            "unused_scratch",
+            "--output",
+            "json",
+        ],
+    );
+    let latest = StateStore::open(&state).unwrap().list_runs(1).unwrap();
+    assert_eq!(latest[0].run_scope, Some(RunScope::Production));
 }

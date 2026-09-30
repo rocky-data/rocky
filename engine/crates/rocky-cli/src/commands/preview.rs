@@ -1646,7 +1646,7 @@ fn render_preview_cost_markdown(
                  then re-invoke `rocky preview cost`."
             )
         } else if !runs.base {
-            "No base run yet. Run the ordinary base pipeline without `--branch` against this state store, then re-invoke `rocky preview cost`.".to_string()
+            "No base run yet. Run the ordinary base pipeline without `--branch` or `--shadow` against this state store, then re-invoke `rocky preview cost`.".to_string()
         } else {
             "Both runs exist, but neither recorded a model execution to compare.".to_string()
         };
@@ -2984,6 +2984,45 @@ mod tests {
             "7-hex prefix: a --branch-scoped run at the same commit must not become the base"
         );
         assert!(note_prefix.is_none());
+    }
+
+    /// Both prefix scans ignore shadow runs: a newer shadow at the same
+    /// commit cannot become the base, and one at a second commit cannot
+    /// manufacture an ambiguity refusal.
+    #[test]
+    fn a_short_sha_base_excludes_shadow_runs_from_both_prefix_scans() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("state.redb");
+        let base = chrono::Utc::now();
+        {
+            let store = rocky_core::state::StateStore::open(&state_path).unwrap();
+            let mut production = sample_run("production", base);
+            production.git_commit = Some("abc1234aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string());
+            production.run_scope = Some(rocky_core::state::RunScope::Production);
+            store.record_run(&production).unwrap();
+
+            let mut same_commit_shadow =
+                sample_run("same-commit-shadow", base + chrono::Duration::minutes(1));
+            same_commit_shadow.git_commit = production.git_commit.clone();
+            same_commit_shadow.run_scope =
+                Some(rocky_core::state::RunScope::Shadow { schema: None });
+            store.record_run(&same_commit_shadow).unwrap();
+
+            let mut other_commit_shadow =
+                sample_run("other-commit-shadow", base + chrono::Duration::minutes(2));
+            other_commit_shadow.git_commit =
+                Some("abc1234bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string());
+            other_commit_shadow.run_scope = Some(rocky_core::state::RunScope::Shadow {
+                schema: Some("scratch".to_string()),
+            });
+            store.record_run(&other_commit_shadow).unwrap();
+        }
+
+        let store = rocky_core::state::StateStore::open_read_only(&state_path).unwrap();
+        let (_branch, base_run, note) =
+            newest_branch_and_base_runs(&store, "feature", Some("abc1234")).unwrap();
+        assert_eq!(base_run.unwrap().run_id, "production");
+        assert!(note.is_none());
     }
 
     /// The production preview workflow passes the base COMMIT SHA — records
