@@ -2509,6 +2509,15 @@ pub struct ModelExecution {
     pub attempts: Vec<AttemptRecord>,
 }
 
+/// Where a run wrote its results. Missing on records written before #2172.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunScope {
+    Production,
+    Shadow { schema: Option<String> },
+    Branch { name: String },
+}
+
 /// A complete pipeline run record.
 ///
 /// # Governance audit trail (schema v6)
@@ -2688,6 +2697,10 @@ pub struct RunRecord {
     /// Guarded by `test_pre_rocky_branch_run_record_forward_deserializes_to_none`.
     #[serde(default)]
     pub rocky_branch: Option<String>,
+
+    /// `None` means an older record whose write scope cannot be classified.
+    #[serde(default)]
+    pub run_scope: Option<RunScope>,
 }
 
 /// One executed data-quality check's pass/fail outcome, captured on a
@@ -7983,6 +7996,7 @@ mod tests {
             check_gate_failed: false,
             verify_after_failed: false,
             rocky_branch: None,
+            run_scope: Some(RunScope::Production),
         }
     }
 
@@ -8384,6 +8398,25 @@ mod tests {
             serde_json::from_slice(&serde_json::to_vec(&branched).unwrap()).unwrap();
         assert_eq!(round.git_branch.as_deref(), Some("fix-price"));
         assert_eq!(round.rocky_branch.as_deref(), Some("pr-preview-fix-price"));
+    }
+
+    #[test]
+    fn test_pre_run_scope_record_remains_unclassified() {
+        let mut value = serde_json::to_value(minimal_run_record("old", vec![])).unwrap();
+        value.as_object_mut().unwrap().remove("run_scope");
+        let blob = serde_json::to_vec(&value).unwrap();
+        let record: RunRecord = serde_json::from_slice(&blob).unwrap();
+        assert_eq!(record.run_scope, None);
+
+        let (store, _dir) = temp_store();
+        let txn = store.db.begin_write().unwrap();
+        {
+            let mut table = txn.open_table(RUN_HISTORY).unwrap();
+            table.insert("old", blob.as_slice()).unwrap();
+        }
+        txn.commit().unwrap();
+        assert_eq!(store.get_run("old").unwrap().unwrap().run_scope, None);
+        assert_eq!(store.list_runs(1).unwrap()[0].run_scope, None);
     }
 
     #[test]

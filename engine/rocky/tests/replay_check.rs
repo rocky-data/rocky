@@ -171,6 +171,7 @@ fn record_run(store: &StateStore, models: &[&str]) {
             check_gate_failed: false,
             verify_after_failed: false,
             rocky_branch: None,
+            run_scope: Some(rocky_core::state::RunScope::Production),
         })
         .expect("record run");
 }

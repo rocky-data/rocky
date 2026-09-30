@@ -1922,6 +1922,7 @@ cron = "also invalid"
             check_gate_failed: false,
             verify_after_failed: false,
             rocky_branch: None,
+            run_scope: Some(crate::state::RunScope::Production),
         }
     }
 

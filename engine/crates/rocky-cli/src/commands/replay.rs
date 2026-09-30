@@ -2104,6 +2104,7 @@ mod tests {
             check_gate_failed: false,
             verify_after_failed: false,
             rocky_branch: None,
+            run_scope: Some(rocky_core::state::RunScope::Production),
         }
     }
 
@@ -2838,6 +2839,7 @@ mod tests {
                 check_gate_failed: false,
                 verify_after_failed: false,
                 rocky_branch: None,
+                run_scope: Some(rocky_core::state::RunScope::Production),
             };
             store.record_run(&record).unwrap();
 
