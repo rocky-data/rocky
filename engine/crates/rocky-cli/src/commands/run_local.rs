@@ -913,13 +913,10 @@ pub async fn run_quality(
     // trigger are read from the environment inside `persist_run_record`.
     let store = StateStore::open(state_path)
         .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
-    // Quality pipelines ignore `--branch` today: unlike the snapshot/load
-    // dispatch (which calls `reject_unsupported_shadow` in `run.rs` and
-    // refuses the flag outright), the flag is never threaded into
-    // `run_quality` at all, so there is no `ShadowConfig` here to read a
-    // Rocky branch from and this run's record carries no branch. Nothing
-    // tells the caller their `--branch` was ignored — refusing it like
-    // snapshot/load do is tracked in #2161.
+    // `rocky run --branch` / `--shadow` on a quality pipeline is refused in
+    // `run.rs` (`require_shadow_support`) before this function runs (#2161), so
+    // there is no `ShadowConfig` here and no Rocky branch to record: a run that
+    // reached this function was never given one.
     let audit_ctx = super::run_audit::AuditContext::detect(None, None, None);
     let audit = super::run::audit_to_record(&audit_ctx);
     let recorded = super::run::persist_run_record(
@@ -1533,10 +1530,8 @@ pub async fn run_snapshot(
     let store = StateStore::open(state_path)
         .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
     // `rocky run --branch` / `--shadow` on a snapshot pipeline is refused in
-    // `run.rs` (`reject_unsupported_shadow`) before this function runs —
-    // unlike quality, which threads the flag through and silently ignores
-    // it (see the comment above `run_quality`'s own `AuditContext::detect`
-    // call). There is no `ShadowConfig` here because a run that reached
+    // `run.rs` (`require_shadow_support`) before this function runs, as it is
+    // for quality. There is no `ShadowConfig` here because a run that reached
     // this function was never given one.
     let audit_ctx = super::run_audit::AuditContext::detect(None, None, None);
     let audit = super::run::audit_to_record(&audit_ctx);

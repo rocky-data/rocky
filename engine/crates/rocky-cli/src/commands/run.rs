@@ -2758,6 +2758,25 @@ pub async fn run_with_explicit_contracts(
         // back to another adapter when the operator asked for a guard.
         resolve_model_run_target(&loaded.config, pipeline_name_arg)?;
     }
+    // `--shadow` / `--branch` on a pipeline kind that cannot route it (#2161).
+    //
+    // Decided HERE, once, for every caller of `run` — the inline `rocky run`,
+    // `rocky apply` of a stored plan, and `--watch` all arrive at this
+    // function — and before the idempotency claim, the Pipes channel, the
+    // adapters and the state store. A refusal taken later, inside a dispatch
+    // arm, still leaves an idempotency claim, a `Failed` stamp and the
+    // end-of-run retention sweep behind.
+    //
+    // A `--model` run is not gated here: it resolves its own transformation
+    // pipeline below and refuses any other kind. A pipeline that does not
+    // resolve falls through, so the run body reports it as it always did.
+    if let Some(shadow) = shadow_config
+        && model_name_filter.is_none()
+        && let Ok((pipeline_name, pipeline)) =
+            registry::resolve_pipeline(&loaded.config, pipeline_name_arg)
+    {
+        require_shadow_support(shadow, pipeline_name, pipeline)?;
+    }
     // With `-o json` stdout is reserved for the JSON payload — route any
     // human-readable summary/progress line (e.g. a `depends_on` upstream
     // pipeline's "Copied …") to stderr so it can't precede the JSON document.
@@ -3637,6 +3656,11 @@ pub async fn run_with_explicit_contracts(
             }
         }
         rocky_core::config::PipelineConfig::Quality(q) => {
+            // `--shadow` / `--branch` was refused above by
+            // `require_shadow_support` (#2161): a quality run reads and writes
+            // the tables its config names, so no shadow config reaches this arm
+            // or `run_quality`.
+            //
             // Wrap the quality dispatch in its OWN remote-state session (never
             // run()'s `session_opt`) so the `RunRecord` it now persists — for the
             // schedule reconciler's `after`/`freshness` demands and `rocky
@@ -3757,12 +3781,10 @@ pub async fn run_with_explicit_contracts(
             }
         }
         rocky_core::config::PipelineConfig::Snapshot(s) => {
-            // Snapshot execution does not route its target, so honouring the flag
-            // here is not a matter of passing the config down — the whole
-            // rewrite does not exist for this pipeline kind. Accepting it
-            // silently is what made `--shadow` write production (#1272), so
-            // refuse instead of pretending to isolate.
-            reject_unsupported_shadow(shadow_config, "snapshot")?;
+            // Snapshot execution does not route its target, so `--shadow` /
+            // `--branch` was refused above by `require_shadow_support` (#1272);
+            // no shadow config reaches this arm.
+            //
             // Same remote-state session wrapping as the quality arm above: the
             // snapshot run now persists a `RunRecord`, so its terminal upload must
             // ride a session for the reconciler to observe the pipeline's success.
@@ -3872,8 +3894,10 @@ pub async fn run_with_explicit_contracts(
         }
         rocky_core::config::PipelineConfig::Load(_) => {
             // `run_load` writes the configured target directly; nothing rewrites
-            // it for a shadow run. See the snapshot arm above (#1272).
-            reject_unsupported_shadow(shadow_config, "load")?;
+            // it for a shadow run, so `--shadow` / `--branch` was refused above
+            // by `require_shadow_support` (#1272); no shadow config reaches
+            // this arm.
+            //
             // Delegate to the `rocky load` command, driving with the pipeline's
             // own source_dir/format/target. This lets `rocky run --pipeline X`
             // work uniformly across all pipeline types.
@@ -8915,28 +8939,61 @@ fn rewrite_quote_style(dialect: &dyn rocky_core::traits::SqlDialect) -> Result<O
     }
 }
 
-/// Refuse `--shadow` / `--branch` on a pipeline kind whose targets are not
-/// routed.
+/// Refuse `--shadow` / `--branch` when the selected pipeline's kind cannot be
+/// routed to a shadow or branch target.
 ///
-/// Transformation and replication rewrite their targets for a shadow run;
-/// snapshot and load do not. Accepting the flag on those kinds was not a partial
-/// isolation, it was none at all — the run wrote production exactly as if the
-/// flag had been absent, which is the failure #1272 records. Refusing is the
-/// only honest answer until the routing exists: a user who asked to keep
-/// production untouched must not be told the run succeeded after touching it.
-fn reject_unsupported_shadow(
-    shadow_config: Option<&rocky_core::shadow::ShadowConfig>,
-    pipeline_kind: &str,
+/// The one place that decides, for each pipeline kind, whether a shadow run is
+/// isolated. The match names every kind and has no `_` arm, so a new kind does
+/// not compile until someone decides what a shadow run means for it. The
+/// decision used to live in the dispatch arms one by one, and the quality arm
+/// never got one: the flag was accepted and ignored, the checks read production
+/// and a quarantine mode wrote to it (#2161). Snapshot and load had the same
+/// flaw (#1272).
+///
+/// - Replication and transformation rewrite their targets for a shadow run.
+/// - Quality checks the tables its config lists, and a quarantine mode writes
+///   beside them (`split`, `drop`) or over them (`tag`). None of that is
+///   redirected. Nor is there a copy to redirect to: a branch keeps one schema,
+///   so two tables with the same name in different production schemas have no
+///   distinct branch copy, and a one-off `--shadow` object is dropped when the
+///   run that made it ends.
+/// - Snapshot and load write their configured target.
+///
+/// Accepting the flag on those kinds is not partial isolation, it is none: the
+/// run touches production exactly as if the flag were absent, and a user who
+/// asked to keep production untouched is told it succeeded. Refusing is the only
+/// honest answer until the routing exists.
+///
+/// Call it before the idempotency claim, the adapters and the state store, so a
+/// refused run has written nothing: no claim, no run record, no retention sweep.
+fn require_shadow_support(
+    shadow: &rocky_core::shadow::ShadowConfig,
+    pipeline_name: &str,
+    pipeline: &rocky_core::config::PipelineConfig,
 ) -> Result<()> {
-    if shadow_config.is_some() {
-        anyhow::bail!(
-            "--shadow / --branch is not supported for {pipeline_kind} pipelines: their targets \
-             are not rewritten, so the run would write production. Run the {pipeline_kind} \
-             pipeline without the flag, or scope the shadow run to the transformation and \
-             replication pipelines with --pipeline"
-        );
-    }
-    Ok(())
+    use rocky_core::config::PipelineConfig;
+
+    let why = match pipeline {
+        PipelineConfig::Replication(_) | PipelineConfig::Transformation(_) => return Ok(()),
+        PipelineConfig::Quality(_) => {
+            "it checks the tables it lists in production, and a quarantine mode would write there too"
+        }
+        PipelineConfig::Snapshot(_) | PipelineConfig::Load(_) => {
+            "its target is not rewritten, so the run would write production"
+        }
+    };
+    // Name the flag that was typed. A branch run carries its name; a one-off
+    // shadow run does not.
+    let flag = match &shadow.branch {
+        Some(branch) => format!("--branch {branch}"),
+        None => "--shadow".to_string(),
+    };
+    anyhow::bail!(
+        "{flag} is not supported for {kind} pipeline '{pipeline_name}': {why}. Rocky stopped \
+         before it ran anything. Run '{pipeline_name}' without the flag, or scope the run to a \
+         transformation or replication pipeline with --pipeline",
+        kind = pipeline.pipeline_type_str(),
+    )
 }
 
 /// Whether this dialect treats identifier case as part of object identity.
