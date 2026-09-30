@@ -7,7 +7,7 @@ sidebar:
 
 `rocky preview` runs only the models a PR's diff actually changes. It runs them against a per-PR branch schema and copies every other model from the base ref, rather than rebuilding it. It then reports a structural and row-level diff, plus the cost difference against base. This guide walks you through running it locally on a feature branch.
 
-For the design, see the [How Preview Works](/concepts/preview-internals/) concept page: how Rocky picks the prune set, why CTAS today and clones tomorrow, and how the sampling window works. For the full output schemas, see the [`rocky preview` CLI reference](/reference/commands/modeling/#rocky-preview).
+For the design, see [How Preview Works](/concepts/preview-internals/). It explains the prune set, adapter copy methods, and diff coverage. For the output schemas, see the [`rocky preview` CLI reference](/reference/commands/modeling/#rocky-preview).
 
 Preview surfaces the data and cost shape of a PR. It does not detect breaking schema changes. For that, pair it with [`rocky ci-diff --semantic`](/reference/commands/modeling/#rocky-ci-diff) on the same PR. A hard semantic gate then fires when the branch is promoted through `rocky plan promote` and `rocky apply` (or the legacy `rocky branch promote` alias). The [CI/CD integration guide](/guides/ci-cd/#semantic-breaking-change-findings-and-the-promote-gate) documents the full flow: PR-time detection, then the promote-time gate, then an audited override.
 
@@ -52,8 +52,8 @@ The output is a `PreviewCreateOutput` JSON document:
   "base_ref": "main",
   "head_ref": "HEAD",
   "prune_set": [
-    { "model_name": "fct_revenue", "reason": "changed", "changed_columns": [] },
-    { "model_name": "rev_by_region", "reason": "downstream_of_changed", "changed_columns": [] }
+    { "model_name": "fct_revenue", "reason": "changed" },
+    { "model_name": "rev_by_region", "reason": "downstream_of_changed" }
   ],
   "copy_set": [
     { "model_name": "stg_orders",    "source_schema": "main", "target_schema": "branch__pr_preview_fix_price", "copy_strategy": "ctas" },
@@ -178,7 +178,7 @@ The JSON carries a third field, `skipped_set`. It is reserved, and always empty 
 
 Two reasons put a model in the prune set:
 
-- `reason: "changed"`: the model file itself changed in the diff. (`changed_columns` is a placeholder that is always empty on the wire today.)
+- `reason: "changed"`: the model file itself changed in the diff. Rocky leaves `changed_columns` empty and omits it from JSON.
 - `reason: "downstream_of_changed"`: the model did not change, but it sits transitively downstream of a changed model via `depends_on`.
 
 If the prune set is empty, your PR changes no model output, a whitespace-only edit for example. The branch run is then a no-op, and `preview cost` reports a zero delta.
@@ -215,7 +215,7 @@ A clean sample with `coverage_warning: true` is **not** evidence the PR is a no-
 
 **`preview cost` reports `null` deltas.** Cost needs a prior `RunRecord` for each compared model on the base schema. If the base schema has never been run end to end, `base_run_id` is `null` and each per-model `delta_usd` falls back to `null`. Run `rocky plan` and `rocky apply` once on `main` to populate the state store, then re-run `preview cost`.
 
-**`preview cost` reports `null` for the branch.** The cost rollup uses the same adapter telemetry as [`rocky cost`](/reference/commands/administration/#rocky-cost). DuckDB and unconfigured adapters report `null` USD by design; duration and bytes still surface. Configure `[cost]` in `rocky.toml` to get dollar amounts on Databricks or Snowflake.
+**`preview cost` reports `null` for the branch.** Check that Rocky found both the branch and base runs. An unknown adapter can also leave USD cost unset. DuckDB reports `0.0` USD when both runs exist. Configure `[cost]` in `rocky.toml` to price Databricks or Snowflake runs.
 
 **Copy step is slow.** The copy substrate dispatches per adapter, through `WarehouseAdapter::clone_table_for_branch`. Databricks (`SHALLOW CLONE`), BigQuery (`CREATE TABLE … COPY`), and Snowflake (zero-copy `CREATE TABLE … CLONE`) all ship metadata-only overrides, so the per-PR branch table is effectively zero-cost at create time. Only DuckDB falls through to the portable CTAS default, which physically copies bytes. On large tables that is the dominant cost of `preview create`.
 
@@ -270,7 +270,7 @@ The first PR after you wire this in installs Rocky and posts a comment with the 
 | `rocky_version` | `latest` | Engine version. `latest` resolves the highest `engine-v*` tag; otherwise pass `1.74.0` or `engine-v1.74.0`. |
 | `comment_marker` | `<!-- rocky-preview -->` | Magic-string marker used for comment upsert. Override only if you run multiple preview workflows on the same PR. |
 | `fail_on_preview_error` | `false` | When `true`, fail the PR check if any `rocky preview` subcommand errors. The default keeps preview advisory: failures still post a section in the comment. |
-| `github_token` | (required) | Token used to read the PR and upsert the comment. Pass `${{ github.token }}` from the workflow (or a PAT for cross-repo permissions). Required because composite actions cannot reference `${{ github.token }}` in input defaults. |
+| `github_token` | empty | Token used to upsert the PR comment. Pass `${{ github.token }}` from a `pull_request` workflow. Without it, the action renders the comment body but skips the upsert. |
 
 ### Action outputs
 
