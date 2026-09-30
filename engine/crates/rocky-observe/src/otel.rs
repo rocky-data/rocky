@@ -5,9 +5,9 @@
 //! as Datadog Agent, Grafana Alloy, or Honeycomb).
 //!
 //! This module also builds the OTLP span and metric exporters
-//! ([`build_span_exporter`], [`build_metric_exporter`]). Every OTLP pipeline in
-//! the crate goes through them, so the transport and the retry policy are chosen
-//! in one place.
+//! (`build_span_exporter` and `build_metric_exporter`, both crate-private).
+//! Every OTLP pipeline in the crate goes through them, so the transport and the
+//! retry policy are chosen in one place.
 //!
 //! Gated behind the `otel` Cargo feature — when disabled, this module is not
 //! compiled and Rocky has zero OpenTelemetry dependencies.
