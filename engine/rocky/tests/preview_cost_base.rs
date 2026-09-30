@@ -285,20 +285,12 @@ fn real_runs_keep_shadow_and_branch_out_of_diff_and_cost_bases() {
         assert_eq!(diff["summary"]["total_rows_added"], 2, "{diff}");
     }
 
-    // A schema descriptor without --shadow is inert on this run path.
-    // It must still write to the production target and record that scope.
+    // An ordinary run writes the production target and records that scope.
+    // (`--shadow-schema` without `--shadow` is refused by the CLI, #2192.)
     rocky(
         root,
         &state,
-        &[
-            "run",
-            "--pipeline",
-            "probe",
-            "--shadow-schema",
-            "unused_scratch",
-            "--output",
-            "json",
-        ],
+        &["run", "--pipeline", "probe", "--output", "json"],
     );
     let latest = StateStore::open(&state).unwrap().list_runs(1).unwrap();
     assert_eq!(latest[0].run_scope, Some(RunScope::Production));
