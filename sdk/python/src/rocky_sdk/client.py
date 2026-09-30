@@ -950,9 +950,10 @@ class RockyClient:
     ) -> PlanResult:
         """Run ``rocky plan`` and return the parsed plan.
 
-        Every project shape content-addresses a plan and persists it to
-        ``.rocky/plans/<plan_id>.json``. Pass the returned ``plan_id`` to
-        :meth:`apply` to execute it.
+        When Rocky persists a plan, it writes a content-addressed file at
+        ``.rocky/plans/<plan_id>.json``. Pass its ``plan_id`` to
+        :meth:`apply` to execute it. A compile refusal raises
+        :class:`RockyCommandError` and persists no plan.
 
         Example:
 
@@ -967,10 +968,9 @@ class RockyClient:
                     print(statement.purpose, "->", statement.target)
                     print(statement.sql)
 
-                # Every project shape gets a content-addressed `plan_id` on
-                # the engines this SDK accepts (1.35.0 and newer), replication-
-                # only projects included, so it can be applied directly.
-                result = client.apply(plan.plan_id)
+                # Apply a persisted plan, including a replication-only plan.
+                if plan.plan_id is not None:
+                    result = client.apply(plan.plan_id)
 
             Governance previews (``classification_actions``, ``mask_actions``,
             ``retention_actions``) are empty on projects without the

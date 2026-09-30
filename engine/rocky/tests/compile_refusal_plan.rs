@@ -179,3 +179,36 @@ fn warning_only_project_still_persists_plan() {
     assert_eq!(value["models"], serde_json::json!(["dated"]));
     assert!(value["plan_id"].as_str().is_some(), "{value}");
 }
+
+#[test]
+fn plan_refuses_duplicate_targets_with_model_and_code_in_error() {
+    let tmp = tempfile::tempdir().unwrap();
+    project(tmp.path());
+    model(tmp.path(), "first", "SELECT 1 AS id", "full_refresh");
+    model(tmp.path(), "second", "SELECT 2 AS id", "full_refresh");
+    let second = tmp.path().join("models/second.toml");
+    let contents = fs::read_to_string(&second)
+        .unwrap()
+        .replace("table = \"second\"", "table = \"first\"");
+    fs::write(second, contents).unwrap();
+
+    for json in [true, false] {
+        let out = rocky(tmp.path(), &["plan"], json);
+        assert_eq!(out.status.code(), Some(1), "{out:?}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.lines().any(|line| line == "first: [E036]"),
+            "{stderr}"
+        );
+        assert!(
+            stderr.lines().any(|line| line == "second: [E036]"),
+            "{stderr}"
+        );
+        if json {
+            let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+            assert!(value["plan_id"].is_null(), "{value}");
+            assert_eq!(value["skipped"].as_array().unwrap().len(), 2, "{value}");
+        }
+        assert_no_plan(tmp.path());
+    }
+}

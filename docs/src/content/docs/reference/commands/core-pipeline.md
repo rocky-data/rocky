@@ -265,7 +265,7 @@ Generate the replication SQL Rocky would run, without running it. The command ne
 
 `rocky plan` plus `rocky apply` is the canonical path for production and for gating a pull request. Nothing touches the warehouse between the two steps. For local iteration, [`rocky run`](#rocky-run) does the same work in one command and writes no plan file.
 
-If compilation reports an error for a planned model or a model it needs, `rocky plan` prints every relevant diagnostic and exits non-zero. It writes no plan file and returns no `plan_id` or apply hint. This applies with or without `--model`, in text and JSON output. Warnings alone do not stop the plan.
+With `--model`, a compile error in that model or one reached through `depends_on` or a bare-name read refuses the plan. Without `--model`, Rocky compiles the whole models directory. An error in a model from another pipeline also refuses the plan. Rocky prints each relevant model and diagnostic code, exits with code `1`, and writes no plan file or `plan_id`. This applies to text and JSON output. Warnings alone do not stop the plan.
 
 ```bash
 rocky plan [flags]
@@ -404,18 +404,18 @@ rocky plan --filter client=acme
 }
 ```
 
-A model the preview could not render is listed in `skipped`, rather than left out silently:
+A model excluded from the preview or refused by compilation is listed in `skipped`:
 
 ```json
   "skipped": [
     {
       "model": "stg_events",
-      "reason": "invalid SQL generation request: model 'stg_events': `type = \"ephemeral\"` is not supported (E038) — an ephemeral model is not materialized and is not inlined into its consumers; use `type = \"view\"`"
+      "reason": "[E038] model 'stg_events' uses `type = \"ephemeral\"`, which is not supported: an ephemeral model is not materialized and is not inlined into its consumers, so a consumer reads whatever table already carries the name"
     }
   ]
 ```
 
-The `reason` is the generator's own error. A refused strategy puts a model there, and so does one that needs a live warehouse, such as a Snowflake dynamic table. The MCP `plan_preview` tool returns the same list. The key is absent when nothing was skipped.
+The `reason` gives the compiler diagnostic or SQL generation error. A refused strategy puts a model there, and so does one that needs a live warehouse, such as a Snowflake dynamic table. The MCP `plan_preview` tool reports preview exclusions. The key is absent when nothing was skipped.
 
 Plan with table output and a custom config:
 

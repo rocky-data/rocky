@@ -476,6 +476,7 @@ pub async fn plan(
     }
     let mut run_plan_persisted = false;
     let mut compile_refused = false;
+    let mut refusal_details = Vec::new();
     if blueprint_models_dir.exists() {
         match build_and_persist_run_plan(
             config_path,
@@ -497,6 +498,13 @@ pub async fn plan(
             }
             Ok(Some(RunPlanBuild::Refused(refused))) => {
                 compile_refused = true;
+                refusal_details = refused
+                    .iter()
+                    .map(|item| {
+                        let code = item.reason.split_whitespace().next().unwrap_or("unknown");
+                        format!("{}: {code}", item.model)
+                    })
+                    .collect();
                 if run_options.model.is_some() {
                     output.statements.clear();
                 }
@@ -625,7 +633,8 @@ pub async fn plan(
     }
     anyhow::ensure!(
         !compile_refused,
-        "one or more models were refused by the compiler"
+        "compiler refused the following models:\n{}",
+        refusal_details.join("\n")
     );
     Ok(())
 }
@@ -1203,18 +1212,14 @@ fn build_and_persist_run_plan(
 ) -> Result<Option<RunPlanBuild>> {
     use rocky_compiler::compile::{self, CompilerConfig};
 
-    let rocky_config = rocky_core::config::load_rocky_config(config_path)
-        .context("failed to load project config for run-plan compilation")?;
-    let source_schemas =
-        crate::source_schemas::load_cached_source_schemas(&rocky_config.cache.schemas, state_path);
     let config = CompilerConfig {
         models_dir: models_dir.to_path_buf(),
         contracts_dir: None,
         required_explicit_contract_model: None,
-        source_schemas,
+        source_schemas: std::collections::HashMap::new(),
         mask: std::collections::BTreeMap::new(),
         allow_unmasked: vec![],
-        project_freshness: rocky_config.freshness,
+        project_freshness: Default::default(),
         run_vars: rocky_core::run_vars::RunVars::new(),
     };
 
