@@ -5,10 +5,17 @@ sidebar:
   order: 7
 ---
 
-Rocky ships a real compiler, in the `rocky-compiler` crate. It analyses your SQL
-models before they reach the warehouse. It catches type mismatches, missing
-columns, contract violations, and broken lineage at compile time, not at
-execution time.
+Rocky ships a real compiler, in the `rocky-compiler` crate. It analyses SQL
+models before a later run sends generated SQL to the warehouse. It reports type
+mismatches, missing columns, contract violations, and lineage findings when the
+needed information is available.
+
+## What a clean compile means
+
+A clean compile means the enabled checks found no error in the information they
+could resolve. It does not establish general warehouse SQL validity, source data
+values, or business correctness. Run the relevant data checks and inspect a
+plan before execution.
 
 ## Compile pipeline
 
@@ -39,7 +46,7 @@ run after that. Then Rocky merges every diagnostic into one result.
           ┌──────────▼──────────┐
           │  4. Type check      │   propagate types through graph
           │                     │   INT + FLOAT → FLOAT
-          │                     │   String + INT → E001 error
+          │                     │   String + INT → Unknown
           └──────────┬──────────┘
                      │
           ┌──────────▼──────────┐
@@ -104,11 +111,11 @@ It infers types from:
 - Arithmetic operators (numeric promotion rules)
 - Literals (string, numeric, boolean, date)
 - `CASE`/`WHEN` branches (common supertype)
-- Comparison operators (both sides must be compatible)
-- Join keys (must have compatible types)
+- Comparison operators (infer a Boolean result; operand checks have limits)
+- Join keys (can report compatible-type problems when types are known)
 
-Every model comes out with a typed schema: a list of `TypedColumn` entries,
-each with a name, a `RockyType`, and a nullability flag.
+Each compiled model schema contains `TypedColumn` entries with a name, a
+`RockyType`, and a nullability flag. A type can remain `Unknown`.
 
 Outer joins can introduce nulls even when source columns are non-nullable.
 Rocky marks direct references and ordinary casts of those references from the right side of `LEFT JOIN` as nullable.
@@ -123,7 +130,7 @@ For `USING` and `NATURAL` joins, Rocky distinguishes merged join keys from quali
 ### 5. Validate contracts
 
 If a contracts directory exists, Rocky loads the `.contract.toml` files and
-checks them against the inferred schemas. The
+checks resolvable facts against the inferred schemas. The
 [Testing and Contracts](/concepts/testing) page has the contract format.
 
 ### 6. Lint passes and merge
@@ -155,9 +162,34 @@ whichever warehouse you target.
 | Semi-structured | `Variant` |
 | Unresolved | `Unknown` |
 
-`Unknown` is not an error. It means the compiler could not infer the type from
-what it had. `Unknown` is compatible with every other type during type checking,
-so it raises no false positives.
+`Unknown` is not an error. It means the compiler could not infer a type from
+what it had. A missing reference and unsupported inference can both lead to
+`Unknown`. `Unknown` is compatible with every other type during type checking,
+so checks that need the type can remain unresolved. A declared type does not
+validate an unresolved reference.
+
+Rocky reports `E039` for one bounded missing-reference shape. The consumer must
+directly project a name from one complete in-project model. The name must be
+absent from that model's output. Other shapes can remain `Unknown`. `E039`
+does not validate them.
+
+External source schemas do not prove completeness or freshness. Incomplete
+scopes, duplicate output names, struct field reads, and warehouse metadata
+columns remain conservative. The upstream output must use plain column
+projections or aliased columns and literals. Functions and other expressions
+remain conservative.
+
+During `rocky run`, a selected model with an `Error` diagnostic records a
+`compile-error`. Rocky withholds that model's declared DAG descendants. Healthy
+branches can still run. Retained target tables are old output, not validated
+output. `RunOutput.contained` lists the withheld descendants.
+
+With `rocky run --model <name> --defer`, a successful external rewrite
+suppresses local `E039` only for the rewritten reference. A qualified local
+reference or an unrewritten input remains local and keeps its normal blocking
+rules. The exemption requires a complete plain `SELECT` `FROM` or `JOIN` read
+set. CTEs, subqueries, and set operations keep local failure dependencies.
+An invalid external schema still fails when the warehouse runs the SQL.
 
 ### Numeric promotion
 
@@ -181,8 +213,8 @@ into a column of another. It allows a widening conversion, such as `Int32` into
 
 ## Semantic graph
 
-The semantic graph is a cross-model map of column lineage. It records where every
-column came from and how it was transformed, across the whole DAG.
+The semantic graph is a cross-model map of represented column lineage. It records
+where resolved columns came from and how they were transformed across the graph.
 
 ```
 raw_orders                  orders_enriched              orders_summary
@@ -252,6 +284,8 @@ span, and sometimes a suggested fix.
 | `E035` | Managed-Iceberg `format_options` declares a combination the warehouse rejects (e.g. `partition_by` + `cluster_by`) |
 | `E036` | Two or more models write the same target table |
 | `E037` | A transformation model declares `type = "incremental"`, which would append every row again on each run. Use `merge`, `delete_insert`, `time_interval` or `full_refresh` |
+| `E039` | A direct projection names a column absent from a complete in-project upstream model |
+| `E040` | A `.rocky` string literal contains a backslash; use a `.sql` model with the target's own escaping |
 | `W001` | Unused model (no downstream consumers) |
 | `W002` | Duplicate column in model output |
 | `W003` | `time_column` is TIMESTAMP where DATE is preferred for the granularity |
@@ -265,7 +299,7 @@ span, and sometimes a suggested fix.
 | `W030` | Imported producer added a column, surfaced only to consumers reading it via `SELECT *` |
 | `W031` | Imported producer widened the type of a column this project reads (cross-team contract) |
 | `I001` | Model dependency inferred from SQL |
-| `I002` | Some columns have unknown types — provide source schemas for full type checking |
+| `I002` | Some, but not all, output columns have unknown types — provide source schemas for more type checking |
 | `I003` | A contract declares a type for a column whose type Rocky could not infer, so `E011` did not check it |
 | `P001` | Construct not portable to the target dialect (opt-in via `--target-dialect`) |
 | `P002` | `SELECT *` model has downstream consumers that read specific columns |
@@ -331,6 +365,6 @@ if result.has_errors {
 }
 ```
 
-`CompileResult` gives you the resolved project, the semantic graph, the typed
-schemas, and every diagnostic. The test runner, the CI pipeline, and AI sync all
-build on it.
+`CompileResult` gives you the resolved project, semantic graph, inferred
+schemas, and diagnostics. Types can remain `Unknown`. The test runner, CI
+pipeline, and AI sync all build on it.

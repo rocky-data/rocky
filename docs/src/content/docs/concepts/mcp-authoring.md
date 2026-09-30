@@ -135,7 +135,7 @@ rules. A `draft_*` tool never applies a change to the warehouse.
 |---|---|
 | `draft_model` | `models/<name>.sql` + a sidecar carrying the intent. On an existing model it replaces the SQL but preserve-merges the sidecar: only `name` and `intent` change; classification, freshness, tests, target, strategy, and tags are kept. Comments are dropped on re-serialize; an unparseable sidecar is never overwritten. |
 | `draft_contract` | `models/<model>.contract.toml`, compile-validated against the model's inferred schema (a column the model doesn't produce comes back as a `W010` diagnostic). |
-| `draft_check` | one or more declarative `[[tests]]` blocks merged into the model's sidecar; run the `test` tool to execute them. |
+| `draft_check` | one or more declarative `[[tests]]` blocks merged into the model's sidecar. It infers the target SQL dialect when every pipeline uses the same one; otherwise pass `pipeline` to select one. After the target is applied, call `test` with `declarative = true` to execute the checks. Pass `pipeline` there when the project has multiple pipelines, as with `rocky test --declarative --pipeline`. |
 | `draft_metadata` | a structured freshness / classification patch, parse-merged into the model's sidecar as TOML. `freshness` replaces the `[freshness]` table; `classifications` merges per-column tags into `[classification]`. Comments in the sidecar are dropped on re-serialize; an unparseable sidecar is never overwritten. The policy check runs against the sidecar **as patched**, so a patch that adds the first `pii` tag is judged by that tag. |
 
 The split from the generators is deliberate. The `ai_*` generators *propose*

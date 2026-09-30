@@ -322,7 +322,7 @@ The filter is your SQL, and it must be valid in the target dialect. Rocky does n
 - a `unique_expr` `key_expr` and a `cross_source_overlap` `key_expr`;
 - the same `expression` and `filter` again when quarantine lowers that assertion into its own statements. `[checks.quarantine]` itself takes only `enabled`, `mode` and the two suffixes;
 - a `metadata_columns[].value`;
-- a check an agent drafts through the `draft_check` MCP tool, which parses under the generic dialect because it has no target yet.
+- a check an agent drafts through the `draft_check` MCP tool. Rocky validates under the target adapter's SQL dialect before writing. With several pipelines, it infers the dialect when they all agree; otherwise, pass `pipeline` to select one.
 
 One config field is **not** gated: a `[[checks.custom]]` `sql` query. Rocky substitutes `{target}` into it and runs it as written, so treat a custom check as code you are running.
 
@@ -342,6 +342,30 @@ Before that, Rocky refuses a fragment that could end the query it is building, o
 - a backslash inside a quoted literal, a triple-quoted string, a `$$…$$` dollar quote, a backtick, a `//` or `#` line comment, or a nested `/*`. Snowflake, Databricks, BigQuery, DuckDB and Trino do not agree on these, so Rocky refuses rather than guess which reading applies.
 
 Comparisons, `CASE`, `CAST`, `BETWEEN`, `IN (...)` with literals, and functions such as `coalesce`, `nullif`, `abs`, `round`, `length`, `lower`, `upper`, `trim`, `regexp_like`, `md5` and `date_trunc` pass. Functions that read a file, a secret, a session variable or a remote endpoint do not, whatever their name looks like — DuckDB's `read_text`, Snowflake's `GETVARIABLE` and Databricks' `secret` all sit in ordinary scalar position and are refused by name.
+
+That allowlist checks a function's name, not the code that name runs. A warehouse can let a session rebind a built-in under an unqualified call. Then an allowlisted call runs the rebound body instead of the built-in. On a persistent, file-backed DuckDB, creating that binding needs the same file-write access that already lets you edit the data. So the allowlist is not a boundary against that admin there. Rocky's in-memory DuckDB, Snowflake, BigQuery and Trino have not been probed, so the same privilege link is not established for them.
+
+Rocky measured this per target dialect instead of assuming it:
+
+| Dialect | Unqualified rebind wins over the built-in? | Measured on |
+|---|---|---|
+| DuckDB | Yes. Shadows the built-in, even for a new session. | v1.5.5, persistent file |
+| Databricks | No. A qualified override exists, but Rocky already refuses qualified names. | Unity Catalog |
+| Snowflake | Not probed. | No sandbox available |
+| BigQuery | Not probed. | No sandbox available |
+| Trino | Not probed. | No environment available |
+
+Six names on the allowlist are refused in one particular shape, because that shape reads a Snowflake session parameter instead of only its arguments:
+
+| Function | Refused | Accepted |
+|---|---|---|
+| `to_date`, `to_timestamp`, `to_char` | called with one argument, e.g. `to_date(order_date)`, reads a session default format | called with an explicit format, e.g. `to_date(order_date, 'YYYY-MM-DD')` |
+| `date_trunc`, `datediff` (and its `date_diff` spelling) | a `week` date part, or a synonym (`w`, `wk`, `weekofyear`, `woy`, `wy`), reads `WEEK_START` | any other date part, e.g. `day`, `month`, `year`, or the fixed, Monday-start `week_iso` |
+| `date_part` | a `week` (`w`, `wk`, `weekofyear`, `woy`, `wy`) part reads `WEEK_START`; a `dayofweek` (`weekday`, `dow`, `dw`) or `yearofweek` part reads `WEEK_OF_YEAR_POLICY` and `WEEK_START` | any other date part, including `dayofyear`, the `epoch_*` and `timezone_*` parts `date_trunc`/`datediff` don't take, and every ISO-fixed variant (`week_iso`, `dayofweekiso`, `yearofweekiso`) |
+
+`to_char` was off the allowlist entirely until this rule shipped; it is back on now that its risky shape is refused rather than its name.
+
+`EXTRACT(<part> FROM <expr>)` — Snowflake's own documented alternative spelling of `date_part`, and also accepted as `EXTRACT(<part>, <expr>)` on Snowflake — is refused on the identical three part families, even though it parses as its own SQL construct rather than a function call.
 
 One position adds a rule, because the expression is used differently there:
 
@@ -374,8 +398,8 @@ mode = "split"   # or "tag" or "drop"
 | Mode | Behavior |
 |---|---|
 | `split` | Rocky materializes two new tables: `<target>__valid` with the passing rows and `<target>__quarantine` with the failing rows (plus per-assertion `_error_<name>` label columns marking which assertion each row failed). When the run completes, and the two suffixes name two different tables in your warehouse, each row lands in exactly one of them. The original `<target>` is left untouched; point downstream models at `<target>__valid`. Not available on Trino. |
-| `tag` | Rocky rewrites `<target>` in place, adding a per-assertion `_error_<name>` column populated on failing rows (NULL on passing rows). Every row stays in the table. Useful for observation without a second table — rewrites the source, so use with care on a raw replication target. |
-| `drop` | Only `<target>__valid` (the passing rows) is written; failing rows are discarded. Quarantine count is still reported in `check_results[]`. |
+| `tag` | Rocky rewrites `<target>` in place, adding a per-assertion `_error_<name>` column populated on failing rows (NULL on passing rows). Every row stays in the table. Useful for observation without a second table — rewrites the source, so use with care on a raw replication target. Not available on Trino. |
+| `drop` | Only `<target>__valid` (the passing rows) is written; failing rows are discarded. Quarantine count is still reported in `check_results[]`. On Trino, Rocky drops the previous valid table before creating the new one. |
 
 Set-based, table-level, and referential assertions are never quarantinable. They run as after-the-fact checks whatever the mode.
 

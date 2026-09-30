@@ -443,6 +443,11 @@ mod tests {
     /// all three at once. The unbounded control is what makes the bounded case
     /// meaningful: without it, a peak of 1 could mean "the bound worked" or
     /// "these futures never overlapped anyway".
+    ///
+    /// This is also the non-flaky pin for "parallel beats sequential" (#1947):
+    /// it counts concurrent nodes via a high-water mark instead of timing
+    /// anything, so `benches/dag_execute.rs` is free to stay a bench (evidence
+    /// it still compiles and runs) without also being the correctness gate.
     #[tokio::test]
     async fn max_concurrency_bounds_intra_layer_fan_out() {
         assert_eq!(

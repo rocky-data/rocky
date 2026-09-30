@@ -466,7 +466,7 @@ pub fn compute_cost(
     model_filter: Option<&str>,
     group_by: Option<CostGroupBy>,
 ) -> Result<CostOutput> {
-    let store = StateStore::open_read_only(state_path)
+    let store = StateStore::open_read_only_or_empty(state_path)
         .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
 
     let record = resolve(&store, target)?;
@@ -594,6 +594,8 @@ mod tests {
             submission_id: None,
             check_gate_failed: false,
             verify_after_failed: false,
+            rocky_branch: None,
+            run_scope: Some(rocky_core::state::RunScope::Production),
         }
     }
 

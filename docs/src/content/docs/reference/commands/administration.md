@@ -65,6 +65,8 @@ rocky history
 }
 ```
 
+A run made with `rocky run --branch <name>` also carries `rocky_branch`, the literal `<name>`. Rocky leaves the field out of any other run. It is not an audit field, so it appears with or without `--audit`. `rocky preview diff` and `rocky preview cost` find a branch's run by it. It differs from `git_branch`, the git branch you had checked out, which appears only with `--audit`.
+
 Show one run by id. The document has the list's shape with `count` set to `1`; add `--audit` for its governance trail:
 
 ```bash
@@ -281,7 +283,7 @@ rocky metrics fct_revenue --column net_revenue --alerts
 
 ## `rocky optimize`
 
-Analyze materialization costs and recommend strategy changes. Reviews execution history, row counts, and query patterns to suggest whether a model should use incremental, full refresh, or table materialization.
+Analyze materialization costs and recommend strategy changes. Reviews each model's run history, output size, and downstream consumers to suggest whether it should be a `view` or a `table`.
 
 ```bash
 rocky optimize [flags]
@@ -292,10 +294,11 @@ rocky optimize [flags]
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
 | `--model <NAME>` | `string` | | Filter to a specific model. If omitted, analyzes all models. |
+| `--models <PATH>` | `string` | `models` | Models directory. Rocky reads each model's strategy and its downstream models from it. If the path is not a directory, every model reports `current_strategy: "unknown"` and gets no recommendation. |
 
 ### Examples
 
-Analyze all models. Each recommendation includes the current and suggested strategy, a free-text reasoning, and an estimated monthly compute savings:
+Analyze all models. Each recommendation includes the current and recommended strategy, a free-text reasoning, and an estimated monthly saving. `current_strategy` comes from the model's own configuration, not a guess. A `full_refresh` model reads `table`. Every other strategy reads as its own name, such as `view`, `merge`, or `incremental`:
 
 ```bash
 rocky optimize
@@ -308,45 +311,45 @@ rocky optimize
   "recommendations": [
     {
       "model_name": "stg_events",
-      "current_strategy": "table",
+      "current_strategy": "view",
       "recommended_strategy": "view",
-      "estimated_monthly_savings": 0.0023,
-      "reasoning": "fast execution (1.4s) with 1 downstream consumer(s); recompute on read instead of storing a table",
-      "compute_cost_per_run": 0.0028,
+      "estimated_monthly_savings": 0.0,
+      "reasoning": "insufficient history: 1 runs (need 5)",
+      "compute_cost_per_run": 2.6666666666666673e-6,
       "storage_cost_per_month": 0.0023,
       "downstream_references": 1
     },
     {
-      "model_name": "dim_customers",
+      "model_name": "user_metrics",
       "current_strategy": "table",
       "recommended_strategy": "table",
       "estimated_monthly_savings": 0.0,
-      "reasoning": "3 downstream consumers; materializing once ($1.1215/mo) is cheaper than recomputing for each ($3.3300/mo)",
-      "compute_cost_per_run": 0.037,
-      "storage_cost_per_month": 0.0115,
-      "downstream_references": 3
-    },
-    {
-      "model_name": "fct_revenue",
-      "current_strategy": "table",
-      "recommended_strategy": "view",
-      "estimated_monthly_savings": 0.092,
-      "reasoning": "compute cost ($0.1380/mo) is less than storage ($0.2300/mo); recompute on read instead of materializing",
-      "compute_cost_per_run": 0.0046,
-      "storage_cost_per_month": 0.23,
+      "reasoning": "insufficient history: 1 runs (need 5)",
+      "compute_cost_per_run": 8.000000000000001e-6,
+      "storage_cost_per_month": 0.0023,
       "downstream_references": 0
     }
   ],
-  "total_models_analyzed": 3
+  "total_models_analyzed": 2
 }
 ```
 
-`rocky optimize` recommends `table` or `view`. A model needs at least 5 recorded runs; with fewer, it keeps its current strategy.
+`rocky optimize` recommends `table` or `view`. A model needs at least `min_history_runs` recorded runs, which is 5 unless `[cost]` says otherwise. With fewer, it keeps its current strategy. Prices come from the [`[cost]`](/reference/configuration/#cost) block in `rocky.toml`. Rocky falls back to its built-in rates when the project has no `rocky.toml` or no `[cost]` block. A `rocky.toml` that exists but fails to load stops the command with an error.
 
-Two inputs are fixed rather than read from your project ([#2056](https://github.com/rocky-data/rocky/issues/2056)):
+`current_strategy` is `"unknown"` when Rocky cannot find the model in the compiled project, for example a model seen only in run history:
 
-- `current_strategy` is always `"table"`. Rocky assumes it rather than reading the strategy the model declares, so `estimated_monthly_savings` is `0.0` whenever the recommendation is `table`.
-- The prices are $0.002 per second of compute and $0.023 per GB-month of storage. The `[cost]` block does not change them.
+```json
+{
+  "model_name": "events",
+  "current_strategy": "unknown",
+  "recommended_strategy": "unknown",
+  "estimated_monthly_savings": 0.0,
+  "reasoning": "current strategy is unknown (model not found in the compiled project); no recommendation",
+  "compute_cost_per_run": 0.000010666666666666669,
+  "storage_cost_per_month": 0.0023,
+  "downstream_references": 0
+}
+```
 
 Analyze a single model:
 
@@ -902,7 +905,17 @@ parallelism: 2 lanes
 
 ## `rocky cost`
 
-Historical cost rollup for a completed run. Reads the same `RunRecord` as [`rocky replay`](#rocky-replay) and [`rocky trace`](#rocky-trace), then recomputes per-model cost via the adapter-appropriate formula (Databricks / Snowflake duration × DBU rate; BigQuery bytes × $/TB; DuckDB zero). The three are siblings: replay shows what ran, trace shows when, `cost` shows what it cost.
+Historical cost allocation for a completed run. `rocky cost` reads the same
+`RunRecord` as [`rocky replay`](#rocky-replay) and
+[`rocky trace`](#rocky-trace). It recomputes per-model dollar values from the
+recorded metrics and the current configuration's selected adapter and formula.
+
+The command does not contact the warehouse or read an invoice. Its dollar
+values can change when you change the configured rates or selected adapter. In
+the output, `cost_usd` is an allocation. It is not a billed amount.
+
+When a model lacks the metrics for its formula, its dollar value is `null`.
+The total includes only models with a dollar value. It is not a complete bill.
 
 ```bash
 rocky cost <target> [flags]
@@ -930,6 +943,9 @@ Roll up cost for the most recent run:
 ```bash
 rocky cost latest
 ```
+
+The dollar values in this example are illustrative allocations. They are not
+invoice amounts.
 
 ```json
 {
@@ -986,12 +1002,16 @@ status: success   adapter: databricks   total: $0.101
 
 ### Adapter coverage
 
-- **Databricks / Snowflake**: cost computed from recorded duration × DBU rate × `$/DBU`. Configure via `[cost]` in `rocky.toml` (see [configuration reference](/reference/configuration/#cost)).
-- **BigQuery**: computed from recorded `bytes_scanned` × `$6.25/TB`. `rocky cost` surfaces real dollars here even when the live `rocky apply` still reports `None` for BQ bytes on its own `RunOutput.cost_summary`, because the state-store record is written before that plumbing completes.
-- **DuckDB / local**: `$0.00` by definition (no billed compute).
+- **Databricks / Snowflake**: derived from recorded duration, the configured warehouse size, and `[cost].compute_cost_per_dbu`. The adapter does not report a billed amount. An omitted `[cost]` block uses Rocky's defaults.
+- **BigQuery**: the compiled bytes formula runs only when the saved run has `bytes_scanned`. Otherwise `cost_usd` is `null`.
+- **DuckDB / local**: the cost model reports `$0.00`. This excludes machine and infrastructure costs. DuckDB `EXPLAIN` supplies no numeric byte, row, or compute estimate.
 - **Discovery adapters (Fivetran, Airbyte, etc.)**: skipped; cost is `None`.
 
-Missing `adapter_type` or unconfigured `[cost]` degrades cleanly: the command still emits duration + bytes totals but leaves `cost_usd` as `null`.
+If the configuration file is missing, the command keeps recorded duration and
+bytes but leaves `cost_usd` as `null`. A discovery-only adapter also has no
+dollar allocation. A configured DuckDB adapter reports the local `$0.00`
+model. An unreadable configuration is an error. Missing BigQuery bytes is
+`null`, not zero.
 
 ### Related Commands
 

@@ -351,6 +351,31 @@ def test_run_cli_returns_stdout_on_success():
     assert out == DISCOVER_JSON
 
 
+def test_run_cli_strips_inherited_pipes_environment(monkeypatch):
+    monkeypatch.setenv("DAGSTER_PIPES_CONTEXT", "outer-context")
+    monkeypatch.setenv("DAGSTER_PIPES_MESSAGES", "outer-messages")
+    monkeypatch.setenv("DAGSTER_PIPES_FUTURE", "outer-future")
+    monkeypatch.setenv("ROCKY_TEST_PRESERVE", "ordinary-value")
+    client = _client()
+    proc = _fake_popen(stdout=DISCOVER_JSON)
+    with patch("rocky_sdk.client.subprocess.Popen", return_value=proc) as popen:
+        client.run_cli(["discover"])
+    child_env = popen.call_args.kwargs["env"]
+    assert not any(key.startswith("DAGSTER_PIPES_") for key in child_env)
+    assert child_env["ROCKY_TEST_PRESERVE"] == "ordinary-value"
+
+
+def test_version_probe_strips_inherited_pipes_environment(monkeypatch):
+    monkeypatch.setenv("DAGSTER_PIPES_CONTEXT", "outer-context")
+    monkeypatch.setenv("DAGSTER_PIPES_MESSAGES", "outer-messages")
+    client = RockyClient(binary_path="rocky")
+    with patch("rocky_sdk.client.subprocess.run") as run:
+        run.return_value.stdout = "rocky 99.0.0"
+        client._verify_engine_version()
+    child_env = run.call_args.kwargs["env"]
+    assert not any(key.startswith("DAGSTER_PIPES_") for key in child_env)
+
+
 def test_run_cli_partial_returned_when_allowed():
     client = _client()
     proc = _fake_popen(stdout='{"command": "run"}', returncode=2)

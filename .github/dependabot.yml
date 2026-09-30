@@ -15,6 +15,20 @@ updates:
         update-types:
           - minor
           - patch
+    ignore:
+      # arrow and parquet follow the duckdb crate's arrow major: engine/Cargo.toml
+      # pins duckdb 1.10503, which ships against arrow 58, and duckdb's
+      # RecordBatch is that arrow's type. A standalone arrow or parquet major
+      # bump does not compile (#2097, #2098). Bump all three by hand, in
+      # lockstep, when duckdb moves to the next arrow major.
+      - dependency-name: "arrow"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "parquet"
+        update-types: ["version-update:semver-major"]
+      # object_store 0.14.2's default resolver drops the scope id from a
+      # link-local IPv6 address (e.g. fe80::1%en0). See #2124.
+      - dependency-name: "object_store"
+        versions: ["0.14.2"]
 
   # --- Docs site (Astro / npm) ---
   - package-ecosystem: npm

@@ -16,7 +16,7 @@
 //! | Variable | Purpose |
 //! |---|---|
 //! | `DAGSTER_PIPES_CONTEXT` | If present, session source = Dagster |
-//! | `ROCKY_SESSION_SOURCE` | Explicit override (`cli` / `dagster` / `lsp` / `http_api`) |
+//! | `ROCKY_SESSION_SOURCE` | Explicit override (`cli` / `dagster` / `lsp` / `http_api`, `http-api`, or `httpapi`) |
 //! | `USER` (Unix) / `USERNAME` (Windows) | Triggering identity |
 //!
 //! # Subprocess usage
@@ -31,7 +31,10 @@
 
 use std::process::Command;
 
-use rocky_core::state::SessionSource;
+use rocky_core::{
+    shadow::ShadowConfig,
+    state::{RunScope, SessionSource},
+};
 
 /// Bundle of audit fields stamped onto every [`rocky_core::state::RunRecord`]
 /// at `rocky run` claim time. Required fields (`hostname`,
@@ -48,6 +51,13 @@ pub(crate) struct AuditContext {
     pub target_catalog: Option<String>,
     pub hostname: String,
     pub rocky_version: String,
+    /// The named Rocky branch this run wrote to (`rocky run --branch
+    /// <name>`), threaded in from [`rocky_core::shadow::ShadowConfig::branch`]
+    /// — not detected here, since the caller already resolved it from the
+    /// CLI flag. Distinct from `git_branch`: see
+    /// [`rocky_core::state::RunRecord::rocky_branch`] (#2032).
+    pub rocky_branch: Option<String>,
+    pub run_scope: RunScope,
 }
 
 impl AuditContext {
@@ -64,7 +74,22 @@ impl AuditContext {
     ///   transformation/quality/snapshot/load pipelines it's the fully
     ///   resolved `target.catalog`. `None` on model-only runs where no
     ///   pipeline context exists.
-    pub fn detect(idempotency_key: Option<String>, target_catalog: Option<String>) -> Self {
+    /// * `shadow_config` — resolved target routing, including a named branch
+    ///   or the schema of a plain shadow run.
+    pub fn detect(
+        idempotency_key: Option<String>,
+        target_catalog: Option<String>,
+        shadow_config: Option<&ShadowConfig>,
+    ) -> Self {
+        let run_scope = match shadow_config {
+            Some(config) => match &config.branch {
+                Some(name) => RunScope::Branch { name: name.clone() },
+                None => RunScope::Shadow {
+                    schema: config.schema_override.clone(),
+                },
+            },
+            None => RunScope::Production,
+        };
         Self {
             triggering_identity: detect_triggering_identity(),
             session_source: detect_session_source(),
@@ -74,6 +99,8 @@ impl AuditContext {
             target_catalog,
             hostname: detect_hostname(),
             rocky_version: ROCKY_VERSION.to_string(),
+            rocky_branch: shadow_config.and_then(|config| config.branch.clone()),
+            run_scope,
         }
     }
 }
@@ -115,10 +142,12 @@ fn detect_triggering_identity() -> Option<String> {
 /// 3. Default → [`SessionSource::Cli`].
 ///
 /// Values accepted for `ROCKY_SESSION_SOURCE` (case-insensitive):
-/// `"cli"`, `"dagster"`, `"lsp"`, `"http_api"`. Anything else is
+/// `"cli"`, `"dagster"`, `"lsp"`, `"http_api"`, `"http-api"`, or `"httpapi"`. Anything else is
 /// silently ignored — better to fall back to the env-detected default
 /// than to reject a run over a typo'd audit-stamp var.
 fn detect_session_source() -> SessionSource {
+    #[cfg(test)]
+    let _env_guard = crate::testing::lock_pipes_env();
     if let Ok(explicit) = std::env::var(ENV_ROCKY_SESSION_SOURCE) {
         match explicit.to_ascii_lowercase().as_str() {
             "cli" => return SessionSource::Cli,
@@ -154,7 +183,9 @@ fn detect_git_branch() -> Option<String> {
 /// available or the checkout isn't a git repo — those are both
 /// expected on production hosts.
 fn run_git(args: &[&str]) -> Option<String> {
-    let output = Command::new("git")
+    let mut command = Command::new("git");
+    rocky_core::process::strip_dagster_pipes_env(&mut command);
+    let output = command
         .args(args)
         .stdin(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -189,21 +220,21 @@ fn detect_hostname() -> String {
 mod tests {
     use super::*;
 
-    // The env-var tests mutate process-global state. `cargo test` runs
-    // them in parallel by default, so we serialise via a crate-local
-    // mutex. Each test takes the lock before touching env vars.
-    use std::sync::Mutex;
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    // The env-var tests mutate process-global state, including
+    // DAGSTER_PIPES_CONTEXT, which `pipes::tests` and
+    // `commands::run_local::tests` also read/set. `cargo test` runs a
+    // crate's tests in parallel by default, so all three modules
+    // serialise through the ONE shared `crate::testing::PIPES_ENV_LOCK`
+    // rather than a per-file lock — see that lock's doc comment: a
+    // per-file lock here left this module racing against the other two,
+    // which a real run of `run_local`'s #2166 tests then hit.
+    use crate::testing::lock_pipes_env;
 
-    /// SAFETY: these tests run under `ENV_LOCK`, which serialises every
-    /// env-mutating test in this module. Rust flags `std::env::set_var`
-    /// as unsafe from 2024 edition because it races with reads in
-    /// other threads; the lock closes that hole for *our* tests, not
-    /// for unrelated code running under `cargo test`. That's
-    /// considered acceptable here because (a) the remaining engine
-    /// test suite doesn't read these particular env vars in parallel,
-    /// and (b) the cost of a bug here is a misattributed audit stamp
-    /// in a unit test — not a production correctness issue.
+    /// SAFETY: these tests run under `crate::testing::PIPES_ENV_LOCK`,
+    /// which serialises every Pipes-env-mutating test in the crate, not
+    /// just this module. Rust flags `std::env::set_var` as unsafe from
+    /// 2024 edition because it races with reads in other threads; the
+    /// lock closes that hole.
     fn set_env(key: &str, value: &str) {
         unsafe {
             std::env::set_var(key, value);
@@ -218,20 +249,20 @@ mod tests {
 
     #[test]
     fn rocky_version_is_compile_time_constant() {
-        let ctx = AuditContext::detect(None, None);
+        let ctx = AuditContext::detect(None, None, None);
         assert_eq!(ctx.rocky_version, env!("CARGO_PKG_VERSION"));
         assert!(!ctx.rocky_version.is_empty());
     }
 
     #[test]
     fn hostname_is_always_populated() {
-        let ctx = AuditContext::detect(None, None);
+        let ctx = AuditContext::detect(None, None, None);
         assert!(!ctx.hostname.is_empty());
     }
 
     #[test]
     fn session_source_defaults_to_cli() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = lock_pipes_env();
         remove_env(ENV_ROCKY_SESSION_SOURCE);
         remove_env(ENV_DAGSTER_PIPES_CONTEXT);
         assert_eq!(detect_session_source(), SessionSource::Cli);
@@ -239,16 +270,20 @@ mod tests {
 
     #[test]
     fn session_source_dagster_from_pipes_env() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = lock_pipes_env();
         remove_env(ENV_ROCKY_SESSION_SOURCE);
-        set_env(ENV_DAGSTER_PIPES_CONTEXT, "{}");
+        // Valid Pipes values keep concurrent run() tests from spuriously
+        // refusing while this process-wide env value is present.
+        set_env(ENV_DAGSTER_PIPES_CONTEXT, "eJyrrgUAAXUA+Q==");
+        set_env("DAGSTER_PIPES_MESSAGES", "eJyrViouScnMV7IC0alFRUq1ADzXBnI=");
         assert_eq!(detect_session_source(), SessionSource::Dagster);
         remove_env(ENV_DAGSTER_PIPES_CONTEXT);
+        remove_env("DAGSTER_PIPES_MESSAGES");
     }
 
     #[test]
     fn session_source_explicit_override() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = lock_pipes_env();
         remove_env(ENV_DAGSTER_PIPES_CONTEXT);
 
         set_env(ENV_ROCKY_SESSION_SOURCE, "http_api");
@@ -269,8 +304,9 @@ mod tests {
 
     #[test]
     fn session_source_explicit_overrides_pipes_env() {
-        let _g = ENV_LOCK.lock().unwrap();
-        set_env(ENV_DAGSTER_PIPES_CONTEXT, "{}");
+        let _g = lock_pipes_env();
+        set_env(ENV_DAGSTER_PIPES_CONTEXT, "eJyrrgUAAXUA+Q==");
+        set_env("DAGSTER_PIPES_MESSAGES", "eJyrViouScnMV7IC0alFRUq1ADzXBnI=");
         set_env(ENV_ROCKY_SESSION_SOURCE, "cli");
         assert_eq!(
             detect_session_source(),
@@ -278,6 +314,7 @@ mod tests {
             "explicit ROCKY_SESSION_SOURCE=cli must override DAGSTER_PIPES_CONTEXT"
         );
         remove_env(ENV_DAGSTER_PIPES_CONTEXT);
+        remove_env("DAGSTER_PIPES_MESSAGES");
         remove_env(ENV_ROCKY_SESSION_SOURCE);
     }
 
@@ -303,8 +340,44 @@ mod tests {
         let ctx = AuditContext::detect(
             Some("my-idemp-key-123".to_string()),
             Some("warehouse_main".to_string()),
+            None,
         );
         assert_eq!(ctx.idempotency_key, Some("my-idemp-key-123".to_string()));
         assert_eq!(ctx.target_catalog, Some("warehouse_main".to_string()));
+    }
+
+    /// `rocky_branch` is threaded straight through, unlike every other
+    /// field here — the caller resolves it (from `ShadowConfig::branch`),
+    /// not this detector (#2032).
+    #[test]
+    fn rocky_branch_threaded_through() {
+        let config = ShadowConfig {
+            branch: Some("pr-preview-fix-price".to_string()),
+            ..ShadowConfig::default()
+        };
+        let ctx = AuditContext::detect(None, None, Some(&config));
+        assert_eq!(ctx.rocky_branch, Some("pr-preview-fix-price".to_string()));
+        assert_eq!(
+            ctx.run_scope,
+            RunScope::Branch {
+                name: "pr-preview-fix-price".to_string()
+            }
+        );
+
+        let ctx = AuditContext::detect(None, None, None);
+        assert_eq!(ctx.rocky_branch, None);
+        assert_eq!(ctx.run_scope, RunScope::Production);
+
+        let config = ShadowConfig {
+            schema_override: Some("preview_tmp".to_string()),
+            ..ShadowConfig::default()
+        };
+        let ctx = AuditContext::detect(None, None, Some(&config));
+        assert_eq!(
+            ctx.run_scope,
+            RunScope::Shadow {
+                schema: Some("preview_tmp".to_string())
+            }
+        );
     }
 }

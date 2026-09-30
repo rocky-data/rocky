@@ -80,6 +80,11 @@ fn record_to_history(run: &RunRecord, audit: bool) -> RunHistoryRecord {
         models,
         pipeline: run.pipeline.clone(),
         submission_id: run.submission_id.clone(),
+        // Not audit-gated, like `pipeline` above (#2158 drain review, finding
+        // 6): it is an operational join key `preview diff`/`preview cost`
+        // need to pair a run, not a governance-audit field, so it must not
+        // require `--audit` to appear.
+        rocky_branch: run.rocky_branch.clone(),
         triggering_identity,
         session_source,
         git_commit,
@@ -168,7 +173,8 @@ pub fn history_runs_output_filtered(
     audit: bool,
     trigger: Option<&str>,
 ) -> Result<HistoryOutput> {
-    let store = StateStore::open_read_only_with_cache(state_path, HISTORY_REQUEST_CACHE_BYTES)?;
+    let store =
+        StateStore::open_read_only_or_empty_with_cache(state_path, HISTORY_REQUEST_CACHE_BYTES)?;
     let since_ts = parse_since(since)?;
 
     let runs = match trigger {
@@ -202,7 +208,7 @@ pub fn history_runs_output_filtered(
 /// runs or one. A run the store does not hold is an error naming the id,
 /// never an empty list.
 pub fn history_run_output(state_path: &Path, run_id: &str, audit: bool) -> Result<HistoryOutput> {
-    let store = StateStore::open_read_only(state_path)?;
+    let store = StateStore::open_read_only_or_empty(state_path)?;
     let run = store
         .get_run(run_id)?
         .ok_or_else(|| anyhow::anyhow!("no run with id '{run_id}' in the state store"))?;
@@ -225,7 +231,7 @@ pub fn model_history_output(
     rolling_stats: bool,
     window: usize,
 ) -> Result<ModelHistoryOutput> {
-    let store = StateStore::open_read_only(state_path)?;
+    let store = StateStore::open_read_only_or_empty(state_path)?;
     let since_ts = parse_since(since)?;
 
     // Fetch a wide enough pool so that rolling stats can find `window`
@@ -292,7 +298,7 @@ pub fn recipe_history_output(
     recipe_hash: &str,
     since: Option<&str>,
 ) -> Result<RecipeHistoryOutput> {
-    let store = StateStore::open_read_only(state_path)?;
+    let store = StateStore::open_read_only_or_empty(state_path)?;
     let since_ts = parse_since(since)?;
 
     let runs = store.list_runs(RECIPE_SCAN_RUN_LIMIT)?;
@@ -359,7 +365,7 @@ pub fn run_history(
         } else {
             print_runs_table(&output);
             if audit {
-                let store = StateStore::open_read_only(state_path)?;
+                let store = StateStore::open_read_only_or_empty(state_path)?;
                 let record = store.get_run(run_id)?.ok_or_else(|| {
                     anyhow::anyhow!("no run with id '{run_id}' in the state store")
                 })?;
@@ -437,7 +443,7 @@ pub fn run_history(
                 // Re-read the raw records for the governance table — the typed
                 // output drops the audit-trail source fields when `audit` is
                 // false, and the text table wants the full `RunRecord`.
-                let store = StateStore::open_read_only(state_path)?;
+                let store = StateStore::open_read_only_or_empty(state_path)?;
                 let since_ts = parse_since(since)?;
                 let runs = store.list_runs(50)?;
                 let filtered: Vec<_> = if let Some(ts) = since_ts {
@@ -694,6 +700,12 @@ mod tests {
             submission_id: None,
             check_gate_failed: false,
             verify_after_failed: false,
+            // Deliberately different from `git_branch` — the two are
+            // independent fields (#2032).
+            rocky_branch: Some("pr-preview-governance".to_string()),
+            run_scope: Some(rocky_core::state::RunScope::Branch {
+                name: "pr-preview-governance".to_string(),
+            }),
         }
     }
 
@@ -708,6 +720,14 @@ mod tests {
         assert!(history.git_commit.is_none());
         assert!(history.hostname.is_none());
         assert!(history.rocky_version.is_none());
+        // NOT an audit field (drain review of #2158, finding 6) — an
+        // operational join key like `pipeline`, so it survives the `!audit`
+        // gate that zeroes every true governance-audit field above.
+        assert_eq!(
+            history.rocky_branch.as_deref(),
+            Some("pr-preview-governance"),
+            "rocky_branch must be emitted even without --audit"
+        );
     }
 
     #[test]
@@ -725,6 +745,11 @@ mod tests {
         assert_eq!(history.target_catalog.as_deref(), Some("warehouse_main"));
         assert_eq!(history.hostname.as_deref(), Some("dev-laptop"));
         assert_eq!(history.rocky_version.as_deref(), Some("1.16.0"));
+        assert_eq!(
+            history.rocky_branch.as_deref(),
+            Some("pr-preview-governance"),
+            "rocky_branch must thread through independently of git_branch"
+        );
     }
 
     #[test]
@@ -785,6 +810,8 @@ mod tests {
             submission_id: None,
             check_gate_failed: false,
             verify_after_failed: false,
+            rocky_branch: None,
+            run_scope: Some(rocky_core::state::RunScope::Production),
         }
     }
 

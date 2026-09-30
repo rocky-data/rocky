@@ -4,18 +4,35 @@
 //! [`dagster.PipesSubprocessClient`], the parent process sets two
 //! environment variables:
 //!
-//! * `DAGSTER_PIPES_CONTEXT` — base64-encoded JSON describing the run
-//!   context (asset keys, partition key, run id, etc.).
-//! * `DAGSTER_PIPES_MESSAGES` — base64-encoded JSON describing where to
-//!   write structured event messages. The most common shape is
+//! * `DAGSTER_PIPES_CONTEXT` — the run context (asset keys, partition
+//!   key, run id, etc.), encoded as below.
+//! * `DAGSTER_PIPES_MESSAGES` — where to write structured event
+//!   messages, encoded the same way. The most common decoded shape is
 //!   `{"path": "/tmp/dagster-pipes-messages-XYZ"}`.
 //!
-//! When both env vars are set, this module writes one JSON-line message
-//! per progress event to the messages channel. Dagster's
-//! `PipesSubprocessClient` tails the file and surfaces each message in
-//! the run viewer in real time — `report_asset_materialization` becomes
-//! a `MaterializationEvent`, `report_asset_check` becomes an
-//! `AssetCheckEvaluation`, `log` lines are forwarded to `context.log`.
+//! **Encoding: `base64(zlib(json))`, always — never plain
+//! `base64(json)`.** This is `dagster_pipes.encode_param` /
+//! `decode_param` (`dagster_pipes/__init__.py`, aliased as
+//! `encode_env_var`/`decode_env_var` pre-2.0): every real Dagster
+//! producer — `PipesSubprocessClient`, any context injector or message
+//! reader combination — routes env-var params through `encode_param`
+//! unconditionally (`dagster/_core/pipes/context.py`, every
+//! `encode_param(param_value)` call site that builds the child
+//! process's env). There is no plain-base64 fallback on the producer
+//! side, so [`PipesEmitter::detect`] doesn't accept one either — a
+//! value that doesn't zlib-decompress is exactly as malformed as one
+//! that doesn't base64-decode. (#2163: this crate used to skip the
+//! zlib step, which meant it could never decode a real Dagster-issued
+//! `DAGSTER_PIPES_MESSAGES` and silently ran every launch as if Pipes
+//! had never been requested.)
+//!
+//! When both env vars are set and decode successfully, this module
+//! writes one JSON-line message per progress event to the messages
+//! channel. Dagster's `PipesSubprocessClient` tails the file and
+//! surfaces each message in the run viewer in real time —
+//! `report_asset_materialization` becomes a `MaterializationEvent`,
+//! `report_asset_check` becomes an `AssetCheckEvaluation`, `log` lines
+//! are forwarded to `context.log`.
 //!
 //! When the env vars are NOT set (the common case for `rocky run` from
 //! the command line, scripts, or any non-Dagster caller),
@@ -25,16 +42,20 @@
 //!
 //! Protocol reference: see the [`dagster_pipes`] Python package's
 //! `__init__.py` — message envelope shape, method names, parameter
-//! schemas. The [`PIPES_PROTOCOL_VERSION`] constant must match.
+//! schemas, and `encode_param`/`decode_param` for the env-var encoding.
+//! The [`PIPES_PROTOCOL_VERSION`] constant must match.
 
 use std::env;
 use std::fs::OpenOptions;
+use std::io::Read;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
+use anyhow::{Result, anyhow, bail};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
+use flate2::read::ZlibDecoder;
 use serde::Serialize;
 use serde_json::{Value, json};
 
@@ -105,43 +126,57 @@ impl std::fmt::Debug for PipesEmitter {
 impl PipesEmitter {
     /// Detect Pipes mode from the environment.
     ///
-    /// Returns `Some(emitter)` when both `DAGSTER_PIPES_CONTEXT` and
-    /// `DAGSTER_PIPES_MESSAGES` are set AND the messages channel can
-    /// be opened successfully. Returns `None` otherwise — calls to
-    /// `log` / `report_*` on a `None` emitter are no-ops via the
-    /// caller's `Option::and_then` guard.
+    /// Returns `None` only when `DAGSTER_PIPES_CONTEXT` is absent.
+    /// If it is present, both params must decode and the channel must open.
     ///
-    /// Logs a warning via `tracing::warn!` if env vars are set but
-    /// the channel can't be opened (e.g. malformed base64, unsupported
-    /// writer params, file permission denied). Falls back to `None`
-    /// in that case so the run still completes — the user just loses
-    /// per-message streaming and falls back to stderr forwarding.
-    pub fn detect() -> Option<Self> {
-        if env::var(ENV_PIPES_CONTEXT).is_err() {
-            return None;
-        }
-        let raw_messages = env::var(ENV_PIPES_MESSAGES).ok()?;
-
-        let decoded = match B64.decode(raw_messages.as_bytes()) {
-            Ok(bytes) => bytes,
-            Err(e) => {
-                tracing::warn!(error = %e, "failed to base64-decode DAGSTER_PIPES_MESSAGES; falling back to non-Pipes mode");
-                return None;
-            }
+    /// Decodes `DAGSTER_PIPES_MESSAGES` as `base64(zlib(json))` —
+    /// `dagster_pipes.decode_param`'s exact shape, and the only shape a
+    /// real Dagster-issued Pipes launch ever produces (see the module
+    /// doc comment and #2163). There is deliberately no plain-JSON
+    /// fallback: a value that base64-decodes but doesn't
+    /// zlib-decompress is not a lenient variant of the protocol, it's
+    /// malformed, and is refused before pipeline execution.
+    pub fn detect() -> Result<Option<Self>> {
+        let Some(channel) = Self::requested_channel()? else {
+            return Ok(None);
         };
-
-        let params: Value = match serde_json::from_slice(&decoded) {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::warn!(error = %e, "failed to JSON-parse DAGSTER_PIPES_MESSAGES; falling back to non-Pipes mode");
-                return None;
-            }
-        };
-
-        let channel = Self::open_channel(&params)?;
-        Some(PipesEmitter {
+        let emitter = PipesEmitter {
             channel: Mutex::new(channel),
-        })
+        };
+        // Must be the first line ever written to the channel — see
+        // `opened`'s doc comment.
+        emitter.opened()?;
+        Ok(Some(emitter))
+    }
+
+    /// Check a requested channel before apply or DAG preparation can write
+    /// state. This does not send an `opened` handshake; `detect` does that
+    /// when execution starts.
+    pub fn validate_requested() -> Result<()> {
+        drop(Self::requested_channel()?);
+        Ok(())
+    }
+
+    fn requested_channel() -> Result<Option<Box<dyn Write + Send>>> {
+        // Unit tests mutate process-global Pipes vars. Serialize every read,
+        // including library callers that do not explicitly take the lock.
+        #[cfg(test)]
+        let _env_guard = crate::testing::lock_pipes_env();
+        let raw_context = match env::var(ENV_PIPES_CONTEXT) {
+            Ok(value) => value,
+            Err(env::VarError::NotPresent) => return Ok(None),
+            Err(env::VarError::NotUnicode(_)) => bail!("{ENV_PIPES_CONTEXT} is not valid Unicode"),
+        };
+        decode_pipes_param(&raw_context, ENV_PIPES_CONTEXT)?;
+        let raw_messages = match env::var(ENV_PIPES_MESSAGES) {
+            Ok(value) => value,
+            Err(env::VarError::NotPresent) => {
+                bail!("{ENV_PIPES_CONTEXT} is set but {ENV_PIPES_MESSAGES} is missing")
+            }
+            Err(env::VarError::NotUnicode(_)) => bail!("{ENV_PIPES_MESSAGES} is not valid Unicode"),
+        };
+        let params = decode_pipes_param(&raw_messages, ENV_PIPES_MESSAGES)?;
+        Self::open_channel(&params).map(Some)
     }
 
     /// Open the message channel based on the writer params.
@@ -150,46 +185,63 @@ impl PipesEmitter {
     /// - `{"path": "/some/file"}` — append-mode file writes
     /// - `{"stdio": "stderr"}` — write to the process's own stderr
     ///
-    /// Returns `None` for unsupported channel shapes (S3, GCS, etc. —
+    /// Refuses unsupported channel shapes (S3, GCS, etc. —
     /// those are uncommon for `rocky run` use cases and would
     /// require extra dependencies).
-    fn open_channel(params: &Value) -> Option<Box<dyn Write + Send>> {
+    fn open_channel(params: &Value) -> Result<Box<dyn Write + Send>> {
         if let Some(path) = params.get("path").and_then(Value::as_str) {
             let path = PathBuf::from(path);
-            match OpenOptions::new().create(true).append(true).open(&path) {
-                Ok(file) => Some(Box::new(file)),
-                Err(e) => {
-                    tracing::warn!(
-                        path = %path.display(),
-                        error = %e,
-                        "failed to open Pipes message channel file; falling back to non-Pipes mode",
-                    );
-                    None
-                }
-            }
+            let file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .map_err(|_| anyhow!("{ENV_PIPES_MESSAGES} path channel cannot be opened"))?;
+            Ok(Box::new(file))
         } else if let Some(stream) = params.get("stdio").and_then(Value::as_str) {
             match stream {
-                "stderr" => Some(Box::new(std::io::stderr())),
-                "stdout" => {
-                    // We never write Pipes messages to stdout because
-                    // stdout is reserved for the JSON RunOutput payload.
-                    // Treat as misconfigured and fall back.
-                    tracing::warn!(
-                        "Pipes channel requested stdout, but rocky-cli reserves stdout for JSON output; falling back to non-Pipes mode",
-                    );
-                    None
-                }
-                other => {
-                    tracing::warn!(stream = %other, "unknown Pipes stdio target; falling back to non-Pipes mode");
-                    None
-                }
+                "stderr" => Ok(Box::new(std::io::stderr())),
+                "stdout" => bail!(
+                    "{ENV_PIPES_MESSAGES} stdio 'stdout' is unsupported: stdout is reserved for Rocky output"
+                ),
+                _ => bail!("{ENV_PIPES_MESSAGES} stdio target is unsupported"),
             }
         } else {
-            tracing::warn!(
-                "DAGSTER_PIPES_MESSAGES has neither 'path' nor 'stdio' key; falling back to non-Pipes mode",
-            );
-            None
+            bail!(
+                "{ENV_PIPES_MESSAGES} has unsupported channel shape: expected a string 'path' or 'stdio' key"
+            )
         }
+    }
+
+    /// Emit the `opened` handshake message. Must be the first message
+    /// written to the channel — the real `dagster_pipes` SDK writes it
+    /// this way too (`PipesContext.__init__`,
+    /// `self._message_channel.write_message(_make_message("opened",
+    /// opened_payload))`, immediately after opening the message writer,
+    /// before any user code runs). Envelope matches exactly:
+    /// `{"__dagster_pipes_version": ..., "method": "opened", "params":
+    /// {"extras": {}}}` (`PipesOpenedData` — `extras` is always empty;
+    /// nothing in this crate populates it).
+    ///
+    /// Dagster's reader tracks `received_opened_message` specifically
+    /// (`dagster/_core/pipes/context.py`, `_handle_opened` increments a
+    /// counter this property reads) to decide whether to warn "did not
+    /// receive any messages from external process" — not whether it
+    /// received anything at all. This crate never sent `opened` before
+    /// #2166, so that warning fired on every single Pipes run,
+    /// including ones where every other message decoded and reported
+    /// correctly.
+    fn opened(&self) -> Result<()> {
+        let line = json!({
+            "__dagster_pipes_version": PIPES_PROTOCOL_VERSION,
+            "method": "opened",
+            "params": {"extras": {}},
+        });
+        let mut channel = self.channel.lock().map_err(|e| {
+            anyhow!("{ENV_PIPES_MESSAGES} channel lock failed before execution: {e}")
+        })?;
+        writeln!(channel, "{line}")
+            .and_then(|_| channel.flush())
+            .map_err(|e| anyhow!("{ENV_PIPES_MESSAGES} channel cannot write opened message: {e}"))
     }
 
     /// Emit a `log` message. Mirrors
@@ -209,15 +261,15 @@ impl PipesEmitter {
     ///
     /// `asset_key` is a slash-joined string (Dagster convention for
     /// the Pipes wire format), e.g. `"warehouse/marts/fct_orders"`.
-    /// `metadata` is a JSON object whose values are
-    /// [`PipesMetadataRawValue`](https://docs.dagster.io/api/dagster/pipes#dagster.PipesMetadataValue) —
-    /// in practice, plain JSON values that Dagster infers types for.
+    /// `metadata` is a JSON object of plain values — [`wrap_metadata`]
+    /// puts each one in the shape the wire protocol requires (see its
+    /// doc comment) before this is written.
     pub fn report_asset_materialization(&self, asset_key: &str, metadata: &Value) {
         self.write_message(
             "report_asset_materialization",
             &json!({
                 "asset_key": asset_key,
-                "metadata": metadata,
+                "metadata": wrap_metadata(metadata),
                 "data_version": Value::Null,
             }),
         );
@@ -256,7 +308,7 @@ impl PipesEmitter {
                 "check_name": check_name,
                 "passed": passed,
                 "severity": severity,
-                "metadata": metadata,
+                "metadata": wrap_metadata(metadata),
             }),
         );
     }
@@ -301,10 +353,97 @@ impl PipesEmitter {
     }
 }
 
+/// Decode a Dagster Pipes bootstrap param: `base64(zlib(json))`, the
+/// exact shape `dagster_pipes.decode_param` produces/consumes
+/// (`dagster_pipes/__init__.py:426-437`, aliased `decode_env_var`
+/// pre-2.0). Shared by [`PipesEmitter::detect`] and its tests so the
+/// decode logic has exactly one definition (#2163).
+///
+/// `env_var_name` is only for the error messages below — this
+/// function decodes the same shape regardless of which env var it
+/// came from, so it names whichever one the caller is decoding
+/// instead of hardcoding either variable's name.
+///
+/// Every real Dagster producer encodes with `encode_param` — plain
+/// `base64(json)`, with no zlib step, is not a value any real launch
+/// ever sends, so there is no fallback for it here. Returns an error
+/// naming the decode step and env var on base64, zlib, or JSON failure.
+fn decode_pipes_param(raw: &str, env_var_name: &str) -> Result<Value> {
+    let decoded = B64
+        .decode(raw.as_bytes())
+        .map_err(|_| anyhow!("{env_var_name} cannot be base64-decoded"))?;
+
+    let mut decompressed = Vec::new();
+    ZlibDecoder::new(decoded.as_slice())
+        .read_to_end(&mut decompressed)
+        .map_err(|_| anyhow!("{env_var_name} cannot be zlib-decompressed"))?;
+    serde_json::from_slice(&decompressed)
+        .map_err(|_| anyhow!("{env_var_name} cannot be JSON-decoded"))
+}
+
+/// Wrap every metadata value the way the real `dagster_pipes` SDK does
+/// before it reaches the wire.
+///
+/// Rocky implements the Pipes protocol natively rather than shelling out
+/// through the `dagster_pipes` Python package, so this crate is the only
+/// thing standing between a plain JSON value and the wire shape Dagster's
+/// reader expects. That reader — `PipesMessageHandler
+/// ::_handle_report_asset_check` / `_handle_report_asset_materialization`
+/// in `dagster/_core/pipes/context.py` — passes `metadata` straight to
+/// `metadata_map_from_external`
+/// (`dagster/_core/definitions/metadata/external_metadata.py`), which does
+/// `v["raw_value"]` and `v["type"]` on every value UNCONDITIONALLY. A bare
+/// value — what every `report_asset_check` / `report_asset_materialization`
+/// call sent before this fix — crashes it with `TypeError: '<type>' object
+/// is not subscriptable` the moment the message carries ANY non-empty
+/// metadata. That was already reachable on every materialization (its
+/// metadata is never empty — see `emit_pipes_events` in `commands/run.rs`)
+/// and on every declared check result, not just the anomaly/drift checks
+/// added in #2073.
+///
+/// The real SDK's own writer side normalizes the same way
+/// (`dagster_pipes/__init__.py::_normalize_param_metadata`, the installed
+/// 1.13.17 package, lines 379-403): a value that isn't already a dict with
+/// exactly `{raw_value, type}` becomes `{"raw_value": value, "type":
+/// "__infer__"}`. `"__infer__"` (`PIPES_METADATA_TYPE_INFER` on the SDK
+/// side, `EXTERNAL_METADATA_TYPE_INFER` on the reading side — the same
+/// string literal on both ends) tells Dagster to infer the `MetadataValue`
+/// subtype from the raw value's own JSON type, which is what this emitter
+/// wants: it never carries an explicit Dagster metadata type today.
+///
+/// Every value is wrapped, unconditionally — there is no pass-through for
+/// a value that already looks like `{raw_value, type}`. An earlier version
+/// of this function had one (to avoid double-wrapping a hypothetical
+/// future explicitly-typed value, a URL or a Markdown blob), but nothing
+/// in this crate has ever constructed one, and passing an untrusted `type`
+/// straight to Dagster is a hazard, not a convenience: `type` is not
+/// validated here, and `metadata_value_from_external`
+/// (`dagster/_core/definitions/metadata/external_metadata.py`) does
+/// `check.failed(...)` on an unrecognised one, which crashes the reader
+/// thread exactly like the bare-value bug this module exists to prevent.
+/// No back-compat burden before 2.0 — delete the branch instead of trying
+/// to validate a shape nothing produces.
+fn wrap_metadata(metadata: &Value) -> Value {
+    let Some(map) = metadata.as_object() else {
+        // Not an object (e.g. `Value::Null` for an empty/omitted
+        // metadata argument) — nothing to wrap per-key.
+        return metadata.clone();
+    };
+    let wrapped: serde_json::Map<String, Value> = map
+        .iter()
+        .map(|(key, value)| {
+            (
+                key.clone(),
+                json!({"raw_value": value, "type": "__infer__"}),
+            )
+        })
+        .collect();
+    Value::Object(wrapped)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Read;
 
     fn make_emitter_to(path: &std::path::Path) -> PipesEmitter {
         let file = OpenOptions::new()
@@ -330,11 +469,39 @@ mod tests {
             .collect()
     }
 
+    // `detect()` reads process-global env vars, and `cargo test` runs this
+    // crate's tests in parallel threads by default. Every test that touches
+    // DAGSTER_PIPES_CONTEXT / DAGSTER_PIPES_MESSAGES takes the SHARED
+    // `crate::testing::PIPES_ENV_LOCK` first — shared, not file-scoped,
+    // because `commands::run_local::tests` and `commands::run_audit::tests`
+    // read/set the same two vars (see that lock's doc comment for why a
+    // per-file lock wasn't enough).
+    use crate::testing::lock_pipes_env as lock_env;
+
+    /// base64(zlib(json)) of a small payload, matching what every real
+    /// Dagster Pipes producer sends (`decode_pipes_param`'s only accepted
+    /// shape). Used by tests that need `detect()` to actually decode
+    /// something, as opposed to the captured real-SDK constant in
+    /// `detect_decodes_a_real_dagster_pipes_encoded_messages_param`, which
+    /// pins the format assumption itself.
+    fn encode_like_dagster_pipes(value: &Value) -> String {
+        use std::io::Write as _;
+        let mut encoder =
+            flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder
+            .write_all(serde_json::to_string(value).unwrap().as_bytes())
+            .unwrap();
+        let compressed = encoder.finish().unwrap();
+        B64.encode(compressed)
+    }
+
     #[test]
     fn detect_returns_none_when_env_vars_unset() {
-        // SAFETY: tests run sequentially within the rocky-cli crate;
-        // not setting DAGSTER_PIPES_CONTEXT means detect() returns None.
-        // We don't unset because other tests may rely on baseline state.
+        let _g = lock_env();
+        // SAFETY: serialised by ENV_LOCK, this module's env lock (see its
+        // doc comment). Not setting DAGSTER_PIPES_CONTEXT means detect()
+        // returns None. We don't unset because other tests may rely on
+        // baseline state.
         let prior = env::var(ENV_PIPES_CONTEXT).ok();
         unsafe {
             env::remove_var(ENV_PIPES_CONTEXT);
@@ -345,7 +512,166 @@ mod tests {
                 env::set_var(ENV_PIPES_CONTEXT, value);
             }
         }
-        assert!(result.is_none());
+        assert!(result.unwrap().is_none());
+    }
+
+    /// Pins `decode_pipes_param` against a constant captured from the REAL
+    /// `dagster_pipes` package, not a hand-rolled encoding — the whole
+    /// point of #2163 is that this crate's assumption about the wire
+    /// encoding didn't match what Dagster actually sends.
+    ///
+    /// Captured with:
+    /// ```text
+    /// $ .venv/bin/python -c \
+    ///     'import dagster_pipes as dp; print(dp.encode_param({"path": "/tmp/dagster-pipes-messages-test"}))'
+    /// ```
+    /// against `integrations/dagster/.venv` — `dagster_pipes==1.13.17`
+    /// (confirmed via `importlib.metadata.version("dagster_pipes")`, the
+    /// same install `dagster==1.13.17` resolves).
+    #[test]
+    fn detect_decodes_a_real_dagster_pipes_encoded_messages_param() {
+        const CAPTURED_FROM_REAL_DAGSTER_PIPES: &str =
+            "eJyrVipILMlQslJQ0i/JLdBPSUwvLkkt0i3ILEgt1s1NLS5OTAcySlKLS5RqAVZhD+E=";
+
+        let decoded = decode_pipes_param(CAPTURED_FROM_REAL_DAGSTER_PIPES, ENV_PIPES_MESSAGES)
+            .expect("decode real Pipes param");
+
+        assert_eq!(decoded, json!({"path": "/tmp/dagster-pipes-messages-test"}));
+    }
+
+    /// A value that base64-decodes but was never zlib-compressed (the
+    /// shape this crate used to accept, pre-#2163) is now treated as
+    /// malformed, not as a lenient alternate encoding.
+    #[test]
+    fn decode_pipes_param_rejects_plain_base64_json_with_no_zlib_step() {
+        let plain = B64.encode(serde_json::to_vec(&json!({"path": "/tmp/x"})).unwrap());
+        assert!(decode_pipes_param(&plain, ENV_PIPES_MESSAGES).is_err());
+    }
+
+    #[test]
+    fn decode_failures_never_echo_input() {
+        let base64 = decode_pipes_param("secret!", ENV_PIPES_MESSAGES)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(base64, "DAGSTER_PIPES_MESSAGES cannot be base64-decoded");
+        let zlib = decode_pipes_param(&B64.encode(b"secret"), ENV_PIPES_CONTEXT)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(zlib, "DAGSTER_PIPES_CONTEXT cannot be zlib-decompressed");
+        // A syntactically invalid JSON document after valid zlib.
+        let mut encoder =
+            flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(b"secret").unwrap();
+        let json = decode_pipes_param(&B64.encode(encoder.finish().unwrap()), ENV_PIPES_CONTEXT)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(json, "DAGSTER_PIPES_CONTEXT cannot be JSON-decoded");
+        assert!(!json.contains("secret"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_unicode_environment_errors_never_echo_payload() {
+        use std::os::unix::ffi::OsStringExt;
+        struct RestorePipesEnv {
+            context: Option<std::ffi::OsString>,
+            messages: Option<std::ffi::OsString>,
+        }
+        impl Drop for RestorePipesEnv {
+            fn drop(&mut self) {
+                // SAFETY: the shared Pipes environment lock remains held until this guard drops.
+                unsafe {
+                    match self.context.take() {
+                        Some(value) => env::set_var(ENV_PIPES_CONTEXT, value),
+                        None => env::remove_var(ENV_PIPES_CONTEXT),
+                    }
+                    match self.messages.take() {
+                        Some(value) => env::set_var(ENV_PIPES_MESSAGES, value),
+                        None => env::remove_var(ENV_PIPES_MESSAGES),
+                    }
+                }
+            }
+        }
+        let _g = lock_env();
+        let _restore = RestorePipesEnv {
+            context: env::var_os(ENV_PIPES_CONTEXT),
+            messages: env::var_os(ENV_PIPES_MESSAGES),
+        };
+        let secret = std::ffi::OsString::from_vec(b"secret\xffpayload".to_vec());
+        // SAFETY: all Pipes environment readers in this crate take the shared lock.
+        unsafe {
+            env::set_var(ENV_PIPES_CONTEXT, &secret);
+            env::set_var(ENV_PIPES_MESSAGES, &secret);
+        }
+        let context_error = PipesEmitter::validate_requested().unwrap_err().to_string();
+        // SAFETY: the shared Pipes environment lock prevents concurrent readers in this crate.
+        unsafe { env::set_var(ENV_PIPES_CONTEXT, encode_like_dagster_pipes(&json!({}))) };
+        let messages_error = PipesEmitter::validate_requested().unwrap_err().to_string();
+        assert_eq!(context_error, "DAGSTER_PIPES_CONTEXT is not valid Unicode");
+        assert_eq!(
+            messages_error,
+            "DAGSTER_PIPES_MESSAGES is not valid Unicode"
+        );
+    }
+
+    /// End-to-end: `detect()` reads a zlib-encoded `DAGSTER_PIPES_MESSAGES`
+    /// (built the same way `encode_param` builds it) and opens a REAL
+    /// file channel from it — not just a non-`None` `Option`. Writing
+    /// through the returned emitter and reading the file back confirms
+    /// the channel is live.
+    #[test]
+    fn detect_opens_a_real_temp_file_channel_from_a_zlib_encoded_env_value() {
+        let _g = lock_env();
+
+        let dir = tempfile::tempdir().unwrap();
+        let messages_path = dir.path().join("messages.jsonl");
+
+        let context_env = encode_like_dagster_pipes(&json!({}));
+        let messages_env =
+            encode_like_dagster_pipes(&json!({"path": messages_path.to_str().unwrap()}));
+
+        let prior_context = env::var(ENV_PIPES_CONTEXT).ok();
+        let prior_messages = env::var(ENV_PIPES_MESSAGES).ok();
+        // SAFETY: serialised by ENV_LOCK.
+        unsafe {
+            env::set_var(ENV_PIPES_CONTEXT, &context_env);
+            env::set_var(ENV_PIPES_MESSAGES, &messages_env);
+        }
+
+        let emitter = PipesEmitter::detect().expect("detect Pipes env");
+
+        // Restore before any assertion can panic and skip the cleanup.
+        unsafe {
+            match prior_context {
+                Some(v) => env::set_var(ENV_PIPES_CONTEXT, v),
+                None => env::remove_var(ENV_PIPES_CONTEXT),
+            }
+            match prior_messages {
+                Some(v) => env::set_var(ENV_PIPES_MESSAGES, v),
+                None => env::remove_var(ENV_PIPES_MESSAGES),
+            }
+        }
+
+        let emitter =
+            emitter.expect("detect() should open a real channel from a zlib-encoded env value");
+        emitter.log("INFO", "hello from a real zlib-decoded channel");
+
+        let lines = read_lines(&messages_path);
+        assert_eq!(lines.len(), 2);
+        // `detect()` writes `opened` itself, as the very first line on the
+        // channel (#2166) — before any caller has a chance to `log` or
+        // `report_*` anything. Dagster's real reader tracks
+        // `received_opened_message` specifically to decide whether "did
+        // not receive any messages from external process" fires; every
+        // real Pipes run used to trip that warning because this line
+        // never existed.
+        assert_eq!(lines[0]["method"], "opened");
+        assert_eq!(lines[0]["params"], json!({"extras": {}}));
+        assert_eq!(lines[1]["method"], "log");
+        assert_eq!(
+            lines[1]["params"]["message"],
+            "hello from a real zlib-decoded channel"
+        );
     }
 
     #[test]
@@ -390,7 +716,40 @@ mod tests {
         assert_eq!(msg["method"], "report_asset_materialization");
         assert_eq!(msg["params"]["asset_key"], "warehouse/marts/fct_orders");
         assert_eq!(msg["params"]["data_version"], Value::Null);
-        assert_eq!(msg["params"]["metadata"]["rows_copied"], 1500);
+        // Wrapped shape (#2073) — see `wrap_metadata`'s doc comment. A bare
+        // `1500` here crashes Dagster's real message handler.
+        assert_eq!(
+            msg["params"]["metadata"]["rows_copied"],
+            json!({"raw_value": 1500, "type": "__infer__"})
+        );
+    }
+
+    /// Materialization metadata is never empty (`strategy` and
+    /// `duration_ms` are always set — see `emit_pipes_events` in
+    /// `commands/run.rs`), so this shape was the most commonly hit crash
+    /// before #2073's fix: every materialized table under Pipes mode hit
+    /// it, not just a check result.
+    #[test]
+    fn report_asset_materialization_wraps_metadata_for_the_wire() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("messages.txt");
+        let emitter = make_emitter_to(&path);
+
+        emitter.report_asset_materialization(
+            "warehouse/marts/fct_orders",
+            &json!({"strategy": "incremental", "duration_ms": 2300}),
+        );
+
+        let lines = read_lines(&path);
+        let metadata = &lines[0]["params"]["metadata"];
+        assert_eq!(
+            metadata["strategy"],
+            json!({"raw_value": "incremental", "type": "__infer__"})
+        );
+        assert_eq!(
+            metadata["duration_ms"],
+            json!({"raw_value": 2300, "type": "__infer__"})
+        );
     }
 
     #[test]
@@ -415,21 +774,56 @@ mod tests {
         assert_eq!(msg["params"]["severity"], "WARN");
     }
 
+    /// Pins the wrapped wire shape `wrap_metadata` produces
+    /// (`{"raw_value": <v>, "type": "__infer__"}` per value, #2073) against
+    /// the real `dagster_pipes` protocol — see that function's doc comment
+    /// for the exact source citation. Before this fix, every
+    /// `report_asset_check` with non-empty metadata (every declared check
+    /// result — `CheckResult`'s serialized form is never empty) crashed
+    /// Dagster's real message handler with `TypeError: 'int' object is not
+    /// subscriptable` the moment it tried to read a bare value as
+    /// `v["raw_value"]`.
     #[test]
-    fn open_channel_unsupported_params_returns_none() {
-        // S3 / GCS shapes aren't supported — fall back gracefully.
+    fn report_asset_check_wraps_metadata_for_the_wire() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("messages.txt");
+        let emitter = make_emitter_to(&path);
+
+        emitter.report_asset_check(
+            "warehouse/marts/fct_orders",
+            "row_count_anomaly",
+            false,
+            PipesCheckSeverity::Warn,
+            &json!({"current_count": 900, "reason": "deviated 40%"}),
+        );
+
+        let lines = read_lines(&path);
+        let metadata = &lines[0]["params"]["metadata"];
+        assert_eq!(
+            metadata["current_count"],
+            json!({"raw_value": 900, "type": "__infer__"})
+        );
+        assert_eq!(
+            metadata["reason"],
+            json!({"raw_value": "deviated 40%", "type": "__infer__"})
+        );
+    }
+
+    #[test]
+    fn open_channel_unsupported_params_returns_error() {
+        // S3 / GCS shapes are refused.
         let s3_params = json!({"bucket": "my-bucket", "key": "msgs"});
-        assert!(PipesEmitter::open_channel(&s3_params).is_none());
+        assert!(PipesEmitter::open_channel(&s3_params).is_err());
 
         // Unknown stdio target.
         let bogus_stdio = json!({"stdio": "bogus"});
-        assert!(PipesEmitter::open_channel(&bogus_stdio).is_none());
+        assert!(PipesEmitter::open_channel(&bogus_stdio).is_err());
     }
 
     #[test]
     fn open_channel_stdout_rejected() {
         // stdout is reserved for the JSON RunOutput payload.
         let stdout_params = json!({"stdio": "stdout"});
-        assert!(PipesEmitter::open_channel(&stdout_params).is_none());
+        assert!(PipesEmitter::open_channel(&stdout_params).is_err());
     }
 }

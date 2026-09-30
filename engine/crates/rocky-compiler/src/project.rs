@@ -722,8 +722,9 @@ fn load_single_rocky_model_with_db(
     // Sidecar config + contract resolution — unchanged from the
     // non-salsa path.
     let toml_path = path.with_extension("toml");
-    let config = if rocky_core::path_presence::entry_is_present(&toml_path) {
-        models::load_model_pair_with_context(path, &toml_path, defaults, ctx)?.config
+    let (config, drop_existing_kind) = if rocky_core::path_presence::entry_is_present(&toml_path) {
+        let sidecar = models::load_model_pair_with_context(path, &toml_path, defaults, ctx)?;
+        (sidecar.config, sidecar.drop_existing_kind)
     } else {
         let catalog = defaults
             .as_ref()
@@ -740,51 +741,55 @@ fn load_single_rocky_model_with_db(
             .and_then(|d| d.strategy.clone())
             .unwrap_or_default();
 
-        ModelConfig {
-            name: name.clone(),
-            depends_on: vec![],
-            strategy,
-            target: TargetConfig {
-                catalog,
-                schema,
-                table: name.clone(),
+        (
+            ModelConfig {
+                name: name.clone(),
+                depends_on: vec![],
+                strategy,
+                target: TargetConfig {
+                    catalog,
+                    schema,
+                    table: name.clone(),
+                },
+                sources: vec![],
+                adapter: None,
+                intent: defaults.as_ref().and_then(|d| d.intent.clone()),
+                // Same precedence as the sidecar path in
+                // `rocky_core::models::resolve_model_config`: directory
+                // `_defaults.toml` first, then the project `[freshness]` block
+                // (#1435). A `.rocky` model with no sidecar builds its config
+                // here instead of going through that function, so the project
+                // rung has to be repeated — without it, a DSL model would
+                // report no freshness where its `.sql` neighbour reports the
+                // inherited block.
+                freshness: defaults
+                    .as_ref()
+                    .and_then(|d| d.freshness.clone())
+                    .or_else(|| {
+                        ctx.project_freshness
+                            .and_then(models::ModelFreshnessConfig::from_project_default)
+                    }),
+                tests: vec![],
+                format: None,
+                format_options: None,
+                classification: Default::default(),
+                tags: Default::default(),
+                governance: Default::default(),
+                retention: None,
+                budget: None,
+                skip: None,
+                name_declared: String::new(),
+                target_table_declared: String::new(),
             },
-            sources: vec![],
-            adapter: None,
-            intent: defaults.as_ref().and_then(|d| d.intent.clone()),
-            // Same precedence as the sidecar path in
-            // `rocky_core::models::resolve_model_config`: directory
-            // `_defaults.toml` first, then the project `[freshness]` block
-            // (#1435). A `.rocky` model with no sidecar builds its config
-            // here instead of going through that function, so the project
-            // rung has to be repeated — without it, a DSL model would
-            // report no freshness where its `.sql` neighbour reports the
-            // inherited block.
-            freshness: defaults
-                .as_ref()
-                .and_then(|d| d.freshness.clone())
-                .or_else(|| {
-                    ctx.project_freshness
-                        .and_then(models::ModelFreshnessConfig::from_project_default)
-                }),
-            tests: vec![],
-            format: None,
-            format_options: None,
-            classification: Default::default(),
-            tags: Default::default(),
-            governance: Default::default(),
-            retention: None,
-            budget: None,
-            skip: None,
-            name_declared: String::new(),
-            target_table_declared: String::new(),
-        }
+            None,
+        )
     };
 
     // The one contract probe every loader shares (#1817).
     let contract_path = models::sibling_contract_path(path);
 
     Ok(Model {
+        drop_existing_kind,
         config,
         sql,
         // The second of the two lossy constructions #1730 names. Both are
@@ -802,6 +807,7 @@ mod tests {
 
     fn make_model(name: &str, sql: &str) -> Model {
         Model {
+            drop_existing_kind: None,
             config: ModelConfig {
                 name: name.to_string(),
                 depends_on: vec![],

@@ -47,22 +47,80 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// in the audit event and bypasses the gate.
 pub const APPROVAL_SKIP_ENV: &str = "ROCKY_BRANCH_APPROVAL_SKIP";
 
-/// Validate a branch name. Kept lenient (same charset as model/principal
-/// identifiers) so branches can be named after git branches like
-/// `fix-price` or `feature/new-join` — the slash is rejected because it
-/// collides with schema-prefix interpolation.
-fn validate_branch_name(name: &str) -> Result<()> {
+/// Validate a branch name before creation or use in unquoted SQL (#2137):
+/// `branch create/compare`, `run --branch`, `plan --branch`, and preview create.
+///
+/// A branch's schema is always `branch__<name>` (see [`run_branch_create`]),
+/// and that schema is read and written **unquoted** on the hot paths — `rocky
+/// run --branch`, `rocky branch compare` — through
+/// `rocky_sql::validation::format_table_ref` / `validate_identifier`, which
+/// enforces the stricter SQL-identifier rule `^[a-zA-Z0-9_]+$`. This used to be
+/// lenient (`[A-Za-z0-9_.-]`, matching model/principal identifiers), which let
+/// `branch create` accept a name — `pr-preview-fix-price`, `ci-demo` — that
+/// every unquoted consumer downstream then refused, either loudly with a raw
+/// SQL error naming a mangled schema (`run --branch`) or silently as a
+/// read failure defaulted to a zero count (`branch compare`, before #2137).
+/// Promote quotes the schema. Existing records with legacy names can still
+/// be approved and promoted; creation and unquoted consumers remain strict.
+///
+/// Refusing the wider charset at creation and unquoted lookups means no
+/// branch can reach an unquoted consumer with a name it can't handle.
+///
+/// `branch show`, `branch list`, and `branch delete` only access stored records.
+pub fn validate_branch_name(name: &str) -> Result<()> {
     if name.is_empty() {
-        anyhow::bail!("branch name cannot be empty");
+        anyhow::bail!(
+            "invalid branch name: use 1–64 [A-Za-z0-9_] characters (for example, pr_preview_x)"
+        );
+    }
+    if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        let suggestion: String = name
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+            .collect();
+        anyhow::bail!(
+            "invalid branch name '{name}': a branch's schema is `branch__<name>`, which must be \
+             a valid SQL identifier — only [A-Za-z0-9_] characters are allowed (no hyphens or \
+             dots). Try '{suggestion}' instead. Rename any existing branch with an old name \
+             before running under it. Existing legacy branches can still be approved and promoted."
+        );
     }
     if name.len() > 64 {
-        anyhow::bail!("branch name too long: {} chars (max 64)", name.len());
+        anyhow::bail!(
+            "branch name too long: {} chars (max 64); use a shorter [A-Za-z0-9_] name",
+            name.len()
+        );
     }
-    if !name
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
+    Ok(())
+}
+
+/// Validate the former branch-name alphabet for an already persisted promote
+/// plan. Its SQL was built with quoted schema components at plan time, and
+/// deleting the branch record does not revoke that plan.
+pub(crate) fn validate_persisted_promote_branch_name(name: &str) -> Result<()> {
+    if name.is_empty()
+        || name.len() > 64
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
     {
-        anyhow::bail!("invalid branch name '{name}': only [A-Za-z0-9_.-] characters are allowed");
+        return validate_branch_name(name);
+    }
+    Ok(())
+}
+
+/// Accept the former branch-name alphabet only for a record already stored.
+/// Callers here never interpolate its schema into unquoted SQL. Promote's
+/// `build_promote_sql` quotes every target part and checks unquotable delimiters.
+pub(crate) fn validate_existing_branch_name(state_path: &Path, name: &str) -> Result<()> {
+    if validate_branch_name(name).is_ok() {
+        return Ok(());
+    }
+    validate_persisted_promote_branch_name(name)?;
+    let store = StateStore::open_read_only_or_empty(state_path)
+        .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
+    if store.get_branch(name)?.is_none() {
+        anyhow::bail!("legacy branch '{name}' not found — see 'rocky branch list'");
     }
     Ok(())
 }
@@ -78,12 +136,11 @@ fn to_entry(record: &BranchRecord) -> BranchEntry {
 }
 
 /// `rocky branch create <name>` — register a new branch in the state store.
-pub fn run_branch_create(
+pub(crate) fn register_branch(
     state_path: &Path,
     name: &str,
     description: Option<&str>,
-    json: bool,
-) -> Result<()> {
+) -> Result<BranchRecord> {
     validate_branch_name(name)?;
 
     let store = StateStore::open(state_path)
@@ -103,6 +160,17 @@ pub fn run_branch_create(
     };
 
     store.put_branch(&record)?;
+    Ok(record)
+}
+
+/// `rocky branch create <name>` — register a new branch in the state store.
+pub fn run_branch_create(
+    state_path: &Path,
+    name: &str,
+    description: Option<&str>,
+    json: bool,
+) -> Result<()> {
+    let record = register_branch(state_path, name, description)?;
 
     if json {
         let output = BranchOutput {
@@ -138,7 +206,7 @@ pub fn run_branch_delete(state_path: &Path, name: &str, json: bool) -> Result<()
         };
         println!("{}", serde_json::to_string_pretty(&output)?);
     } else if removed {
-        println!("deleted branch '{name}'");
+        println!("deleted branch '{name}' from the state store; warehouse tables were not dropped");
     } else {
         println!("no branch named '{name}'");
     }
@@ -147,7 +215,7 @@ pub fn run_branch_delete(state_path: &Path, name: &str, json: bool) -> Result<()
 
 /// `rocky branch list` — list every branch in the state store.
 pub fn compute_branch_list(state_path: &Path) -> Result<BranchListOutput> {
-    let store = StateStore::open_read_only(state_path)
+    let store = StateStore::open_read_only_or_empty(state_path)
         .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
 
     let records = store.list_branches()?;
@@ -182,38 +250,78 @@ pub fn run_branch_list(state_path: &Path, json: bool) -> Result<()> {
     Ok(())
 }
 
+/// Resolve a `--branch <name>` argument into the [`ShadowConfig`] that routes
+/// a run, compare, or apply against the branch's schema.
+///
+/// The single funnel for every caller that turns a branch NAME into a schema
+/// override (#2137): validates the name against the exact rule `branch
+/// create` enforces *before* ever touching the state store, then looks up the
+/// branch record. A name that fails validation is refused immediately with
+/// the rule and an underscore-form suggestion — rather than surfacing later
+/// as a confusing "branch not found" (a pre-#2137 state store could still
+/// hold a hyphenated record that this name would otherwise resolve to) or,
+/// worse, reaching `sql_gen`/`compare` unquoted and failing as a raw SQL
+/// identifier error deep in a warehouse round trip.
+///
+/// Callers: `rocky run --branch` (`main.rs`), `rocky apply <plan>` for both a
+/// `RunPlan` and a `ReplicationPlan` (`apply.rs`), and `rocky branch compare`
+/// (below). `cleanup_after` is always `false` — a named branch's objects are
+/// the point of the branch, unlike a disposable one-off `--shadow` object.
+pub fn resolve_branch_shadow_config(
+    state_path: &Path,
+    name: &str,
+    suffix: String,
+) -> Result<ShadowConfig> {
+    validate_branch_name(name)?;
+    let store = StateStore::open_read_only_or_empty(state_path)
+        .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
+    let record = store.get_branch(name)?.with_context(|| {
+        format!("branch '{name}' not found — create it with `rocky branch create {name}`")
+    })?;
+    Ok(ShadowConfig {
+        suffix,
+        schema_override: Some(record.schema_prefix),
+        cleanup_after: false,
+        branch: Some(name.to_string()),
+    })
+}
+
 /// `rocky branch compare <name>` — diff a branch's table set against the
 /// main (production) targets.
 ///
-/// Looks up the branch's `schema_prefix` in the state store and reuses the
-/// existing `rocky compare` machinery by constructing a [`ShadowConfig`]
-/// whose `schema_override` points at the branch's schema. Mirrors how
-/// `rocky run --branch <name>` wires the same prefix into the write path.
+/// Looks up the branch's `schema_prefix` in the state store (via
+/// [`resolve_branch_shadow_config`]) and reuses the existing `rocky compare`
+/// machinery by constructing a [`ShadowConfig`] whose `schema_override`
+/// points at the branch's schema. Mirrors how `rocky run --branch <name>`
+/// wires the same prefix into the write path.
 ///
 /// Branches with no materialized tables yet surface as failed comparisons
 /// rather than crashing.
+///
+/// `pipeline_name` is `--pipeline`, required by `resolve_pipeline` (called
+/// inside `compare::compare`) when `rocky.toml` defines more than one
+/// pipeline — declared the same way as the sibling branch verbs (#2019).
 pub async fn run_branch_compare(
     state_path: &Path,
     config_path: &Path,
     branch_name: &str,
     filter: Option<&str>,
+    pipeline_name: Option<&str>,
     json: bool,
 ) -> Result<()> {
-    let store = StateStore::open_read_only(state_path)
-        .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
-
-    let record = store
-        .get_branch(branch_name)?
-        .with_context(|| format!("branch '{branch_name}' not found — see 'rocky branch list'"))?;
-
-    let shadow_config = ShadowConfig {
-        suffix: "_rocky_shadow".to_string(),
-        schema_override: Some(record.schema_prefix),
-        cleanup_after: false,
-    };
+    let shadow_config =
+        resolve_branch_shadow_config(state_path, branch_name, "_rocky_shadow".to_string())?;
     let thresholds = ComparisonThresholds::default();
 
-    super::compare::compare(config_path, filter, None, &shadow_config, &thresholds, json).await
+    super::compare::compare(
+        config_path,
+        filter,
+        pipeline_name,
+        &shadow_config,
+        &thresholds,
+        json,
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -262,7 +370,9 @@ fn git_identity() -> Result<(String, Option<String>)> {
 }
 
 fn run_git_config(key: &str) -> Result<String> {
-    let output = ProcessCommand::new("git")
+    let mut command = ProcessCommand::new("git");
+    rocky_core::process::strip_dagster_pipes_env(&mut command);
+    let output = command
         .args(["config", "--get", key])
         .output()
         .with_context(|| format!("invoking `git config --get {key}`"))?;
@@ -649,12 +759,17 @@ pub(crate) struct PlannedPromoteWithSql {
 /// pairs), this variant resolves the warehouse adapter, builds the SQL per
 /// target, and returns everything the plan needs to persist — so apply just
 /// calls `execute_statement` without re-running discovery.
+///
+/// Returns the RESOLVED pipeline name alongside the targets — never
+/// ambiguous, even when `pipeline_name` was `None` on a single-pipeline
+/// config — so the caller can persist it onto `PromotePlan.pipeline` and
+/// `rocky apply` never needs to re-resolve it from the config.
 pub(crate) async fn discover_branch_targets_for_plan(
     config_path: &Path,
     record: &BranchRecord,
     filter: Option<&str>,
     pipeline_name: Option<&str>,
-) -> Result<Vec<PlannedPromoteWithSql>> {
+) -> Result<(String, Vec<PlannedPromoteWithSql>)> {
     use crate::registry::AdapterRegistry;
 
     let rocky_cfg = rocky_core::config::load_rocky_config(config_path).context(format!(
@@ -662,17 +777,25 @@ pub(crate) async fn discover_branch_targets_for_plan(
         config_path.display()
     ))?;
     let registry = AdapterRegistry::from_config(&rocky_cfg)?;
-    let (_resolved_pipeline_name, pipeline) =
+    let (resolved_pipeline_name, pipeline) =
         crate::registry::resolve_pipeline(&rocky_cfg, pipeline_name)?;
+    let resolved_pipeline_name = resolved_pipeline_name.to_string();
     // `target_adapter()` is the pipeline-type-agnostic accessor; works for
     // both replication and transformation variants (and would error in
     // `discover_branch_targets` below for any other variant).
     let adapter = registry.warehouse_adapter(pipeline.target_adapter())?;
     let dialect = adapter.dialect();
 
-    let planned = discover_branch_targets(config_path, record, filter, pipeline_name).await?;
+    // Pass the ALREADY-RESOLVED name, not the raw (possibly `None`)
+    // `pipeline_name` argument: `discover_branch_targets` reloads the config
+    // and re-resolves independently, so passing the resolved name here
+    // guarantees the targets it builds and the name persisted onto
+    // `PromotePlan.pipeline` are provably one resolution, not two separate
+    // reads of a config that could — in principle — change between them.
+    let planned =
+        discover_branch_targets(config_path, record, filter, Some(&resolved_pipeline_name)).await?;
 
-    planned
+    let targets = planned
         .into_iter()
         .map(|p| {
             Ok(PlannedPromoteWithSql {
@@ -681,7 +804,9 @@ pub(crate) async fn discover_branch_targets_for_plan(
                 statement: build_promote_sql(dialect, &p.prod, &p.branch_source)?,
             })
         })
-        .collect()
+        .collect::<Result<Vec<_>>>()?;
+
+    Ok((resolved_pipeline_name, targets))
 }
 
 /// Run the approval gate for a branch, updating `audit` and returning
@@ -864,11 +989,14 @@ pub(crate) async fn run_promote_apply(
     // promote at a warehouse the gate never verified).
     loaded: &rocky_core::config::LoadedConfig,
     targets: &[crate::output::PromoteTargetPlan],
-    // The `--pipeline` selector, threaded so the executor resolves the SAME
+    // The pipeline selector, threaded so the executor resolves the SAME
     // pipeline the promote targets were built against — not an arbitrary one.
     // A multi-pipeline `rocky.toml` requires it (`resolve_pipeline` errors on
-    // `None`); `rocky apply <promote-plan>` has no selector and passes `None`
-    // (unchanged: it still errors on a multi-pipeline config, as before).
+    // `None`). `rocky branch promote --plan` passes the `--pipeline` flag
+    // (if given); `rocky apply <promote-plan>` has no such flag but passes
+    // the RESOLVED pipeline recorded on the plan (`PromotePlan.pipeline`,
+    // #2019) — `None` only for a plan written before that field existed,
+    // which still errors on a multi-pipeline config, as before.
     pipeline_name: Option<&str>,
 ) -> Result<(Vec<crate::output::PromoteTarget>, bool)> {
     use crate::registry::AdapterRegistry;
@@ -886,6 +1014,12 @@ pub(crate) async fn run_promote_apply(
     // unchanged, so the builder's guard does not reach a plan written before
     // it. Re-check the names here, against the dialect this apply resolved
     // (#1939).
+    //
+    // This check reads `target` / `source` as recorded on the plan, not names
+    // parsed back out of `statement` — the two are not re-bound to each
+    // other. That is deliberate: `.rocky/plans/` is a trusted input (#1943),
+    // so the recorded names are what apply is entitled to trust in the first
+    // place.
     reject_unquotable_promote_names(adapter.dialect(), targets)?;
 
     let mut targets_out: Vec<crate::output::PromoteTarget> = Vec::new();
@@ -936,9 +1070,9 @@ pub fn run_branch_approve(
     out_override: Option<&Path>,
     json: bool,
 ) -> Result<()> {
-    validate_branch_name(branch_name)?;
+    validate_existing_branch_name(state_path, branch_name)?;
 
-    let store = StateStore::open_read_only(state_path)
+    let store = StateStore::open_read_only_or_empty(state_path)
         .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
 
     let record = store
@@ -1054,8 +1188,14 @@ fn quote_fqn(dialect: &dyn rocky_core::traits::SqlDialect, target: &TargetRef) -
 ///   everywhere would break a working project.
 ///
 /// Every other character is contained by the quoting. That is why this is not
-/// the SQL-identifier allowlist: a branch name may carry `-` or `.` by design
-/// (`validate_branch_name`), and those still promote.
+/// the SQL-identifier allowlist. `validate_branch_name` refuses a hyphen or a
+/// dot in any NEW branch name since #2137, but a branch created before that
+/// rule tightened may still carry one in its `schema_prefix` (a state-store
+/// record `validate_branch_name` never re-checks) — and a name reaching this
+/// function from anywhere else (a raw `--shadow-schema` override, say) isn't
+/// governed by `validate_branch_name` at all. This function's job is narrower
+/// and permanent regardless: quote whatever schema/table name it is given
+/// safely, refusing only what quoting genuinely cannot contain.
 ///
 /// The delimiter is read back from the dialect rather than listed here, so
 /// there is no second table to keep in step. That read assumes the quoted form
@@ -1162,6 +1302,7 @@ async fn discover_replication_branch_targets(
         suffix: "_rocky_shadow".to_string(),
         schema_override: Some(record.schema_prefix.clone()),
         cleanup_after: false,
+        branch: Some(record.name.clone()),
     };
 
     let mut planned = Vec::new();
@@ -1244,6 +1385,7 @@ fn discover_transformation_branch_targets(
         suffix: "_rocky_shadow".to_string(),
         schema_override: Some(record.schema_prefix.clone()),
         cleanup_after: false,
+        branch: Some(record.name.clone()),
     };
 
     let mut planned = Vec::new();
@@ -1414,8 +1556,23 @@ pub async fn run_branch_promote(
         breaking_changes: None,
     });
 
-    let (targets_out, overall_success) =
-        run_promote_apply(&loaded, &promote_plan.targets, pipeline_name).await?;
+    // #2019 (Codex round 2 finding, gpt-5.6-terra, high confidence, 0.95):
+    // `promote_plan` was JUST built above by `build_promote_plan_inner`,
+    // which always resolves and records a concrete pipeline — so
+    // `promote_plan.pipeline` is never `None` here. Prefer it over the raw
+    // CLI `pipeline_name`: if `rocky.toml` were replaced between plan-build
+    // and this call (e.g. a one-pipeline `marts` config swapped for a
+    // one-pipeline `staging` config), re-resolving `pipeline_name` fresh
+    // would pick up `staging` and run the plan's `marts`-built SQL through
+    // staging's adapter. `.or(pipeline_name)` is defensive parity with the
+    // other two promote entrypoints, not a behavior this function can
+    // actually exercise (its `promote_plan` is always freshly built).
+    let (targets_out, overall_success) = run_promote_apply(
+        &loaded,
+        &promote_plan.targets,
+        promote_plan.pipeline.as_deref().or(pipeline_name),
+    )
+    .await?;
 
     audit.push(AuditEvent {
         kind: if overall_success {
@@ -1631,7 +1788,7 @@ fn compile_result_to_project_ir(result: &rocky_compiler::compile::CompileResult)
 
 /// `rocky branch show <name>` — inspect a single branch.
 pub fn compute_branch_show(state_path: &Path, name: &str) -> Result<BranchOutput> {
-    let store = StateStore::open_read_only(state_path)
+    let store = StateStore::open_read_only_or_empty(state_path)
         .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
 
     let record = store
@@ -1703,6 +1860,10 @@ pub async fn run_branch_promote_from_plan(
     use crate::output::{AuditEvent, AuditEventKind, PromotePlan, print_json};
     use crate::plan_store::{PlanKind, read_plan};
 
+    if let Some(name) = name {
+        validate_persisted_promote_branch_name(name)?;
+    }
+
     let plan =
         read_plan(root, plan_id).with_context(|| format!("failed to read plan '{plan_id}'"))?;
 
@@ -1727,6 +1888,7 @@ pub async fn run_branch_promote_from_plan(
 
     let promote_plan: PromotePlan = serde_json::from_value(plan.payload.clone())
         .context("failed to deserialize promote plan payload")?;
+    validate_persisted_promote_branch_name(&promote_plan.branch_name)?;
 
     if let Some(n) = name
         && n != promote_plan.branch_name
@@ -1735,6 +1897,24 @@ pub async fn run_branch_promote_from_plan(
             "branch name '{n}' does not match plan's branch name '{}'. \
                  Omit the positional arg or pass the correct name.",
             promote_plan.branch_name
+        );
+    }
+
+    // #2019: when the plan carries its own resolved pipeline, an explicit
+    // `--pipeline` on this call must agree with it — refused BEFORE the
+    // policy gate or any adapter resolution, mirroring the `branch_name`
+    // mismatch check above. Silently preferring the CLI value here would let
+    // `--pipeline staging` execute a `marts`-built plan's persisted SQL
+    // against staging's adapter — a destructive write at a destination other
+    // than the one the plan was built and reviewed against. A plan with no
+    // recorded pipeline (built before this field existed) falls back to the
+    // CLI selector unchanged, further down.
+    if let (Some(saved), Some(cli)) = (promote_plan.pipeline.as_deref(), pipeline_name)
+        && cli != saved
+    {
+        anyhow::bail!(
+            "--pipeline '{cli}' does not match the plan's recorded pipeline '{saved}'. \
+             Omit --pipeline or pass '{saved}'."
         );
     }
 
@@ -1780,8 +1960,23 @@ pub async fn run_branch_promote_from_plan(
         breaking_changes: None,
     });
 
-    let (targets_out, overall_success) =
-        run_promote_apply(&loaded, &promote_plan.targets, pipeline_name).await?;
+    // #2019 parity: the mismatch check above already refused a `--pipeline`
+    // that disagrees with the plan's recorded one, so by this point either
+    // they agree, or the CLI selector was omitted. Prefer the plan's own
+    // recorded pipeline (it is what the persisted SQL was built against);
+    // fall back to the CLI selector only for a plan with no recorded
+    // pipeline (built before this field existed). Without this fallback, the
+    // SAME plan_id applied via `rocky apply <plan-id>` (which always reads
+    // `promote_plan.pipeline`) and via `rocky branch promote --plan
+    // <plan-id>` (bare, no `--pipeline`) would disagree on a multi-pipeline
+    // project — exactly the inconsistency this fix exists to remove, on the
+    // one seam these entrypoints share.
+    let (targets_out, overall_success) = run_promote_apply(
+        &loaded,
+        &promote_plan.targets,
+        promote_plan.pipeline.as_deref().or(pipeline_name),
+    )
+    .await?;
 
     audit.push(AuditEvent {
         kind: if overall_success {
@@ -1838,9 +2033,9 @@ mod tests {
 
     #[test]
     fn validate_accepts_common_names() {
-        assert!(validate_branch_name("fix-price").is_ok());
+        assert!(validate_branch_name("fix_price").is_ok());
         assert!(validate_branch_name("feat_new_join").is_ok());
-        assert!(validate_branch_name("hotfix.2026-04-20").is_ok());
+        assert!(validate_branch_name("hotfix_2026_04_20").is_ok());
         assert!(validate_branch_name("a").is_ok());
     }
 
@@ -1869,37 +2064,52 @@ mod tests {
         assert!(validate_branch_name("has/slash").is_err());
         assert!(validate_branch_name("has;semi").is_err());
         assert!(validate_branch_name(&"x".repeat(65)).is_err());
+        let message = validate_branch_name("pr-preview-x")
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("[A-Za-z0-9_]"), "{message}");
+        assert!(message.contains("pr_preview_x"), "{message}");
+        assert!(validate_branch_name("hotfix.2026").is_err());
     }
 
-    /// `rocky branch compare` resolves the branch's `schema_prefix` from
-    /// the state store and wires it into a `ShadowConfig.schema_override` —
-    /// the same mapping used by `rocky run --branch`.
+    #[tokio::test]
+    async fn unquoted_branch_commands_refuse_hyphen_before_io() {
+        let temp = TempDir::new().unwrap();
+        let state = temp.path().join("missing.redb");
+        let config = temp.path().join("missing.toml");
+        let name = "pr-preview-x";
+        let errors = [
+            run_branch_create(&state, name, None, false).unwrap_err(),
+            run_branch_compare(&state, &config, name, None, None, false)
+                .await
+                .unwrap_err(),
+        ];
+        for error in errors {
+            let message = format!("{error:#}");
+            assert!(message.contains("[A-Za-z0-9_]"), "{message}");
+            assert!(!message.contains("failed to open state store"), "{message}");
+        }
+    }
+
+    /// The same resolver used by run, apply, and compare keeps the literal
+    /// branch tag needed for preview pairing (#2158).
     #[test]
-    fn branch_compare_maps_schema_prefix_to_shadow_override() {
+    fn branch_resolver_maps_schema_and_preserves_branch_tag() {
         let tmp = TempDir::new().unwrap();
         let state_path = tmp.path().join("state.redb");
 
         // Register a branch via the create path (populates the default
         // `branch__<name>` schema_prefix).
-        run_branch_create(&state_path, "fix-price", None, false).unwrap();
-
-        // Fetch it directly the way `run_branch_compare` does and build
-        // the ShadowConfig — asserting the wiring is exact.
-        let store = StateStore::open_read_only(&state_path).unwrap();
-        let record = store.get_branch("fix-price").unwrap().unwrap();
-
-        let shadow_config = ShadowConfig {
-            suffix: "_rocky_shadow".to_string(),
-            schema_override: Some(record.schema_prefix.clone()),
-            cleanup_after: false,
-        };
-
-        assert_eq!(record.schema_prefix, "branch__fix-price");
+        run_branch_create(&state_path, "fix_price", None, false).unwrap();
+        let shadow_config =
+            resolve_branch_shadow_config(&state_path, "fix_price", "_rocky_shadow".to_string())
+                .unwrap();
         assert_eq!(
             shadow_config.schema_override.as_deref(),
-            Some("branch__fix-price")
+            Some("branch__fix_price")
         );
         assert!(!shadow_config.cleanup_after);
+        assert_eq!(shadow_config.branch.as_deref(), Some("fix_price"));
     }
 
     /// A missing branch must surface a crisp error that steers the user
@@ -1916,7 +2126,7 @@ mod tests {
         // branch fails before the config is loaded.
         let config_path = tmp.path().join("rocky.toml");
 
-        let err = run_branch_compare(&state_path, &config_path, "ghost", None, false)
+        let err = run_branch_compare(&state_path, &config_path, "ghost", None, None, false)
             .await
             .expect_err("missing branch must be an error");
 
@@ -1926,9 +2136,91 @@ mod tests {
             "error must name the missing branch: {msg}"
         );
         assert!(
-            msg.contains("rocky branch list"),
-            "error must steer user to 'rocky branch list': {msg}"
+            msg.contains("rocky branch create"),
+            "error must steer user to 'rocky branch create': {msg}"
         );
+    }
+
+    /// #2019: `rocky branch compare <name> --pipeline <name>` must be
+    /// accepted — the flag exists on `Compare` (it previously did not) and
+    /// threads to the resolver — while the bare form still refuses on a
+    /// multi-pipeline config with the ambiguity error, proving `--pipeline`
+    /// disambiguates rather than a hardcoded default silently picking one.
+    #[tokio::test]
+    async fn branch_compare_pipeline_flag_disambiguates_multi_pipeline() {
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let duckdb_path = dir.join("warehouse.duckdb");
+        let config_path = dir.join("rocky.toml");
+        let state_path = dir.join("state.redb");
+        let models_dir = dir.join("models");
+        std::fs::create_dir_all(models_dir.join("marts")).unwrap();
+        std::fs::create_dir_all(models_dir.join("staging")).unwrap();
+
+        write_transformation_model(
+            &models_dir.join("marts"),
+            "fct_orders",
+            "warehouse",
+            "marts",
+            "fct_orders",
+            "SELECT 1 AS id",
+        );
+
+        // Two transformation pipelines — enough to make `resolve_pipeline(None)`
+        // ambiguous, mirroring the #2019 reproduction (`ingest` + `transform`).
+        std::fs::write(
+            &config_path,
+            format!(
+                "[adapter]\ntype = \"duckdb\"\npath = \"{}\"\n\n\
+                 [pipeline.marts]\ntype = \"transformation\"\nmodels = \"models/marts/**\"\n\n\
+                 [pipeline.marts.target]\nadapter = \"default\"\n\n\
+                 [pipeline.staging]\ntype = \"transformation\"\nmodels = \"models/staging/**\"\n\n\
+                 [pipeline.staging.target]\nadapter = \"default\"\n",
+                duckdb_path.display()
+            ),
+        )
+        .unwrap();
+
+        // A hyphen-free branch name: `compare`'s row-count query dialect-
+        // quotes catalog/schema/table through `validate_identifier`
+        // (`^[a-zA-Z0-9_]+$`, unlike promote's looser `quote_identifier`),
+        // so a hyphenated `schema_prefix` would fail identifier validation
+        // for reasons unrelated to this fix.
+        run_branch_create(&state_path, "fix", None, false).unwrap();
+
+        // Seed matching prod + branch (shadow) tables so `--pipeline marts`
+        // reaches a clean PASS, not just "past the resolver".
+        {
+            let adapter = DuckDbWarehouseAdapter::open(&duckdb_path).expect("open duckdb");
+            for stmt in [
+                "CREATE SCHEMA IF NOT EXISTS marts",
+                "CREATE SCHEMA IF NOT EXISTS branch__fix",
+                "CREATE TABLE marts.fct_orders AS SELECT 1 AS id",
+                "CREATE TABLE branch__fix.fct_orders AS SELECT 1 AS id",
+            ] {
+                adapter.execute_statement(stmt).await.expect("seed");
+            }
+        }
+
+        // Bare form: `resolve_pipeline(None)` is ambiguous — must still error,
+        // unchanged from before this fix.
+        let ambiguous = run_branch_compare(&state_path, &config_path, "fix", None, None, false)
+            .await
+            .expect_err("omitting --pipeline on a multi-pipeline config must error");
+        assert!(
+            ambiguous.to_string().contains("multiple pipelines defined"),
+            "expected the multi-pipeline disambiguation error, got: {ambiguous}"
+        );
+
+        // `--pipeline marts` disambiguates AND the comparison passes clean —
+        // proving `--pipeline` is genuinely accepted end-to-end, not merely
+        // past the resolver into some other failure.
+        run_branch_compare(&state_path, &config_path, "fix", None, Some("marts"), false)
+            .await
+            .expect("`--pipeline marts` must resolve the pipeline and pass the comparison");
     }
 
     // --- Approval / promote helpers ---------------------------------------
@@ -1966,7 +2258,7 @@ mod tests {
     fn branch_state_hash_is_deterministic() {
         let tmp = TempDir::new().unwrap();
         let cfg = write_minimal_config(tmp.path(), "# stable config\n");
-        let record = sample_record("fix-price");
+        let record = sample_record("fix_price");
 
         let h1 = compute_branch_state_hash(&record, &cfg).unwrap();
         let h2 = compute_branch_state_hash(&record, &cfg).unwrap();
@@ -1980,7 +2272,7 @@ mod tests {
     fn branch_state_hash_changes_on_config_edit() {
         let tmp = TempDir::new().unwrap();
         let cfg = write_minimal_config(tmp.path(), "# original\n");
-        let record = sample_record("fix-price");
+        let record = sample_record("fix_price");
         let before = compute_branch_state_hash(&record, &cfg).unwrap();
 
         std::fs::write(&cfg, "# edited\n").unwrap();
@@ -1998,10 +2290,10 @@ mod tests {
     fn branch_state_hash_changes_on_branch_metadata_edit() {
         let tmp = TempDir::new().unwrap();
         let cfg = write_minimal_config(tmp.path(), "# stable\n");
-        let mut record = sample_record("fix-price");
+        let mut record = sample_record("fix_price");
         let before = compute_branch_state_hash(&record, &cfg).unwrap();
 
-        record.schema_prefix = "branch__fix-price-v2".to_string();
+        record.schema_prefix = "branch__fix_price-v2".to_string();
         let after = compute_branch_state_hash(&record, &cfg).unwrap();
 
         assert_ne!(before, after);
@@ -2015,7 +2307,7 @@ mod tests {
         let cfg = write_minimal_config(tmp.path(), "# cfg\n");
         write_model(tmp.path(), "fct_orders.sql", "SELECT 1 AS id");
         write_model(tmp.path(), "sub/dim_customers.rocky", "from raw_customers");
-        let record = sample_record("fix-price");
+        let record = sample_record("fix_price");
 
         let h1 = compute_branch_state_hash(&record, &cfg).unwrap();
         let h2 = compute_branch_state_hash(&record, &cfg).unwrap();
@@ -2030,7 +2322,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let cfg = write_minimal_config(tmp.path(), "# cfg\n");
         write_model(tmp.path(), "fct_orders.sql", "SELECT 1 AS id");
-        let record = sample_record("fix-price");
+        let record = sample_record("fix_price");
         let before = compute_branch_state_hash(&record, &cfg).unwrap();
 
         write_model(tmp.path(), "fct_orders.sql", "SELECT 2 AS id");
@@ -2047,7 +2339,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let cfg = write_minimal_config(tmp.path(), "# cfg\n");
         write_model(tmp.path(), "a.sql", "SELECT 1");
-        let record = sample_record("fix-price");
+        let record = sample_record("fix_price");
         let before = compute_branch_state_hash(&record, &cfg).unwrap();
 
         write_model(tmp.path(), "b.sql", "SELECT 2");
@@ -2062,7 +2354,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let cfg = write_minimal_config(tmp.path(), "# cfg\n");
         write_model(tmp.path(), "a.sql", "SELECT 1");
-        let record = sample_record("fix-price");
+        let record = sample_record("fix_price");
         let before = compute_branch_state_hash(&record, &cfg).unwrap();
 
         std::fs::remove_file(tmp.path().join("models/a.sql")).unwrap();
@@ -2080,7 +2372,7 @@ mod tests {
     fn signature_digest_covers_every_payload_field() {
         let base = ApprovalArtifact {
             approval_id: "20260503T120000000000-aaaaaaaa".to_string(),
-            branch: "fix-price".to_string(),
+            branch: "fix_price".to_string(),
             branch_state_hash: "deadbeef".to_string(),
             approver: ApproverIdentity {
                 email: "alice@example.com".to_string(),
@@ -2125,7 +2417,7 @@ mod tests {
     fn verify_signature_accepts_fresh_rejects_tampered() {
         let mut artifact = ApprovalArtifact {
             approval_id: "20260503T120000000000-aaaaaaaa".to_string(),
-            branch: "fix-price".to_string(),
+            branch: "fix_price".to_string(),
             branch_state_hash: "deadbeef".to_string(),
             approver: ApproverIdentity {
                 email: "alice@example.com".to_string(),
@@ -2197,7 +2489,7 @@ mod tests {
     fn evaluate_artifact_rejects_state_hash_mismatch() {
         let mut artifact = ApprovalArtifact {
             approval_id: "20260503T120000000000-aaaaaaaa".to_string(),
-            branch: "fix-price".to_string(),
+            branch: "fix_price".to_string(),
             branch_state_hash: "old-hash".to_string(),
             approver: ApproverIdentity {
                 email: "alice@example.com".to_string(),
@@ -2226,7 +2518,7 @@ mod tests {
         let signed_at = Utc::now() - chrono::Duration::seconds(7200);
         let mut artifact = ApprovalArtifact {
             approval_id: "20260503T120000000000-aaaaaaaa".to_string(),
-            branch: "fix-price".to_string(),
+            branch: "fix_price".to_string(),
             branch_state_hash: "h".to_string(),
             approver: ApproverIdentity {
                 email: "alice@example.com".to_string(),
@@ -2257,7 +2549,7 @@ mod tests {
     fn evaluate_artifact_rejects_signer_not_in_allowlist() {
         let mut artifact = ApprovalArtifact {
             approval_id: "20260503T120000000000-aaaaaaaa".to_string(),
-            branch: "fix-price".to_string(),
+            branch: "fix_price".to_string(),
             branch_state_hash: "h".to_string(),
             approver: ApproverIdentity {
                 email: "carol@example.com".to_string(),
@@ -2289,7 +2581,7 @@ mod tests {
     fn evaluate_artifact_accepts_when_allowlist_empty_and_state_matches() {
         let mut artifact = ApprovalArtifact {
             approval_id: "20260503T120000000000-aaaaaaaa".to_string(),
-            branch: "fix-price".to_string(),
+            branch: "fix_price".to_string(),
             branch_state_hash: "h".to_string(),
             approver: ApproverIdentity {
                 email: "anyone@example.com".to_string(),
@@ -2378,15 +2670,20 @@ mod tests {
             table: "orders".to_string(),
         };
 
-        // Control: a hyphen is not a delimiter. Branch names carry hyphens by
-        // design — `validate_branch_name` allows [A-Za-z0-9_.-] — and the
-        // quoting is what makes them safe. This must keep working.
+        // Control: a hyphen is not a delimiter. Since #2137 `validate_branch_name`
+        // refuses a hyphen in any NEW branch name, but `build_promote_sql`
+        // quotes whatever `TargetRef` it is given — including a `schema_prefix`
+        // a state-store record persisted before that rule tightened. This must
+        // keep working so a pre-existing hyphenated record is still quotable
+        // (whether or not the higher-level `promote` verb still lets one reach
+        // this function is a separate, `validate_branch_name_pub`-gated
+        // question — see `validate_branch_name`'s doc comment).
         let sql = build_promote_sql(
             &duckdb,
             &plain("staging__orders"),
             &plain("branch__live-test"),
         )
-        .expect("a hyphenated branch name must still promote");
+        .expect("a hyphenated schema name must still quote safely");
         assert_eq!(
             sql,
             r#"CREATE OR REPLACE TABLE "playground"."staging__orders"."orders" AS SELECT * FROM "playground"."branch__live-test"."orders""#,
@@ -2761,7 +3058,7 @@ mod tests {
 
         let config_path = dir.join("rocky.toml");
         let mut audit: Vec<AuditEvent> = Vec::new();
-        let record = sample_record("fix-price");
+        let record = sample_record("fix_price");
 
         let saved_cwd = std::env::current_dir().unwrap();
         std::env::set_current_dir(dir).unwrap();
@@ -2842,7 +3139,7 @@ mod tests {
 
         let config_path = dir.join("rocky.toml");
         let mut audit: Vec<AuditEvent> = Vec::new();
-        let record = sample_record("fix-price");
+        let record = sample_record("fix_price");
 
         let saved_cwd = std::env::current_dir().unwrap();
         std::env::set_current_dir(dir).unwrap();
@@ -2897,7 +3194,7 @@ mod tests {
 
         let config_path = dir.join("rocky.toml");
         let mut audit: Vec<AuditEvent> = Vec::new();
-        let record = sample_record("fix-price");
+        let record = sample_record("fix_price");
 
         let saved_cwd = std::env::current_dir().unwrap();
         std::env::set_current_dir(dir).unwrap();
@@ -2955,7 +3252,7 @@ mod tests {
 
         let config_path = dir.join("rocky.toml");
         let mut audit: Vec<AuditEvent> = Vec::new();
-        let record = sample_record("fix-price");
+        let record = sample_record("fix_price");
 
         let saved_cwd = std::env::current_dir().unwrap();
         std::env::set_current_dir(dir).unwrap();
@@ -3002,7 +3299,7 @@ mod tests {
         std::fs::write(&config_path, "# stub\n").unwrap();
 
         let mut audit: Vec<AuditEvent> = Vec::new();
-        let record = sample_record("fix-price");
+        let record = sample_record("fix_price");
 
         let findings = evaluate_breaking_change_gate(
             &config_path,
@@ -3042,7 +3339,7 @@ mod tests {
             kind: AuditEventKind::BreakingChangesAllowed,
             at: Utc::now(),
             actor: dummy_actor(),
-            branch: "fix-price".to_string(),
+            branch: "fix_price".to_string(),
             branch_state_hash: "deadbeef".to_string(),
             reason: Some("--allow-breaking CLI flag".to_string()),
             breaking_changes: Some(findings.clone()),
@@ -3068,14 +3365,14 @@ mod tests {
         BranchPromoteOutput {
             version: "1.0.0".to_string(),
             command: "branch promote".to_string(),
-            branch: "fix-price".to_string(),
+            branch: "fix_price".to_string(),
             branch_state_hash: "deadbeef".repeat(8),
             approvals_used: vec![],
             approvals_rejected: vec![],
             breaking_changes: None,
             targets: vec![crate::output::PromoteTarget {
                 target: "cat.schema.orders".to_string(),
-                source: "cat.branch__fix-price.orders".to_string(),
+                source: "cat.branch__fix_price.orders".to_string(),
                 statement: "CREATE OR REPLACE TABLE ...".to_string(),
                 succeeded: true,
                 error: None,
@@ -3091,7 +3388,7 @@ mod tests {
                     host: "host".to_string(),
                     source: ApproverSource::Local,
                 },
-                branch: "fix-price".to_string(),
+                branch: "fix_price".to_string(),
                 branch_state_hash: "deadbeef".repeat(8),
                 reason: None,
                 breaking_changes: None,
@@ -3306,7 +3603,7 @@ adapter = "default"
             "SELECT 2 AS id, 'c' AS name",
         );
 
-        let record = sample_record("fix-price");
+        let record = sample_record("fix_price");
         let planned = discover_branch_targets(&config_path, &record, None, None)
             .await
             .expect("transformation-pipeline branch promote enumeration must succeed");
@@ -3320,14 +3617,14 @@ adapter = "default"
         );
 
         // Each prod target carries the model's [target] coordinates and the
-        // branch_source rewrites the schema to `branch__fix-price` per the
+        // branch_source rewrites the schema to `branch__fix_price` per the
         // shadow_target rule.
         let fqns: std::collections::BTreeSet<String> = planned
             .iter()
             .map(|p| format!("{} <- {}", p.prod.full_name(), p.branch_source.full_name()))
             .collect();
         assert!(
-            fqns.contains("warehouse.marts.fct_orders <- warehouse.branch__fix-price.fct_orders"),
+            fqns.contains("warehouse.marts.fct_orders <- warehouse.branch__fix_price.fct_orders"),
             "fct_orders pairing missing: {fqns:?}"
         );
         assert!(
@@ -3368,7 +3665,7 @@ adapter = "default"
         )
         .unwrap();
 
-        let error = discover_branch_targets(&config_path, &sample_record("fix-price"), None, None)
+        let error = discover_branch_targets(&config_path, &sample_record("fix_price"), None, None)
             .await
             .expect_err("branch target discovery must refuse an out-of-project glob");
         assert!(
@@ -3410,7 +3707,8 @@ adapter = "default"
         std::fs::write(&config_path, config_for(&a_db)).unwrap();
 
         let promote_plan = crate::output::PromotePlan {
-            branch_name: "fix-price".to_string(),
+            branch_name: "fix_price".to_string(),
+            pipeline: None,
             base_ref: "main".to_string(),
             head_ref: "deadbeef".to_string(),
             branch_state_hash: "hash".to_string(),
@@ -3469,7 +3767,7 @@ adapter = "default"
     /// an on-disk DuckDB warehouse.
     ///
     /// Seeds two branch-schema tables, materializes a branch state for the
-    /// `fix-price` branch, then drives the bare-verb `run_branch_promote`
+    /// `fix_price` branch, then drives the bare-verb `run_branch_promote`
     /// path. After the promote, the production schema must contain the same
     /// rows as the branch schema for every model — proving the model-glob
     /// walk drives real SQL dispatch through the adapter on a transformation
@@ -3485,7 +3783,7 @@ adapter = "default"
     /// the test level for that reason.
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
-    async fn run_branch_promote_transformation_e2e_succeeds() {
+    async fn legacy_branch_can_be_approved_planned_applied_and_promoted() {
         use rocky_core::traits::WarehouseAdapter;
         use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
 
@@ -3561,10 +3859,26 @@ auto_create_schemas = true
         )
         .unwrap();
 
-        // Register the branch in the state store.
-        run_branch_create(&state_path, "fix-price", None, false).unwrap();
+        // This record predates the stricter creation rule.
+        let legacy_name = "fix-price";
+        let error = run_branch_create(&state_path, legacy_name, None, false).unwrap_err();
+        assert!(error.to_string().contains("[A-Za-z0-9_]"));
+        let store = StateStore::open(&state_path).unwrap();
+        store
+            .put_branch(&BranchRecord {
+                name: legacy_name.to_string(),
+                schema_prefix: "branch__fix-price".to_string(),
+                created_by: "legacy".to_string(),
+                created_at: chrono::Utc::now(),
+                description: None,
+            })
+            .unwrap();
+        drop(store);
+        assert!(
+            resolve_branch_shadow_config(&state_path, legacy_name, "_rocky_shadow".into()).is_err()
+        );
 
-        // Seed the branch tables manually (simulates `rocky run --branch fix-price`):
+        // Seed the legacy branch tables manually (a pre-upgrade run).
         // both schemas are pre-created; the branch schema carries the rows
         // the promote will copy into prod.
         //
@@ -3606,13 +3920,118 @@ auto_create_schemas = true
         let _cwd_guard = cwd_lock();
         let saved_cwd = std::env::current_dir().unwrap();
         std::env::set_current_dir(dir).unwrap();
+        run_branch_approve(&state_path, &config_path, legacy_name, None, None, false)
+            .expect("approve the stored legacy branch");
+        let planned = crate::commands::plan::build_promote_plan_inner(
+            dir,
+            &config_path,
+            &models_dir,
+            "main",
+            legacy_name,
+            None,
+            None,
+            false,
+            true,
+            &state_path,
+            rocky_core::config::PolicyPrincipal::Human,
+        )
+        .await
+        .expect("plan a legacy branch promote");
+        assert_eq!(planned.plan.targets.len(), 2);
+        assert!(
+            planned
+                .plan
+                .targets
+                .iter()
+                .all(|target| target.statement.contains("\"branch__fix-price\""))
+        );
+        let plan_id = planned.plan_output.plan_id.expect("persisted promote plan");
+        // A persisted promote plan remains valid after the branch record is
+        // deleted. Its source schema is already quoted in the stored SQL.
+        let store = StateStore::open(&state_path).unwrap();
+        assert!(store.delete_branch(legacy_name).unwrap());
+        assert!(store.get_branch(legacy_name).unwrap().is_none());
+        drop(store);
+        crate::commands::apply::run_apply_in(
+            dir,
+            &config_path,
+            &plan_id,
+            &state_path,
+            rocky_core::config::PolicyPrincipal::Human,
+            None,
+            false,
+        )
+        .await
+        .expect("apply a legacy promote plan after its branch record was deleted");
+        let adapter = DuckDbWarehouseAdapter::open(&duckdb_path).expect("reopen duckdb");
+        let rows = adapter
+            .execute_query("SELECT CAST(COUNT(*) AS BIGINT) FROM warehouse.marts.fct_orders")
+            .await
+            .expect("query the table written by the persisted plan");
+        let count = rows.rows[0][0]
+            .as_i64()
+            .or_else(|| rows.rows[0][0].as_str().and_then(|s| s.parse::<i64>().ok()));
+        assert_eq!(count, Some(2));
+        drop(adapter);
+
+        // The alternate persisted-plan entry point uses the same rule, even
+        // when its optional positional name is supplied.
+        run_branch_promote_from_plan(
+            dir,
+            &config_path,
+            &plan_id,
+            Some(legacy_name),
+            None,
+            &state_path,
+            rocky_core::config::PolicyPrincipal::Human,
+            false,
+        )
+        .await
+        .expect("branch promote --plan must not require the deleted branch record");
+        run_branch_promote_from_plan(
+            dir,
+            &config_path,
+            &plan_id,
+            None,
+            None,
+            &state_path,
+            rocky_core::config::PolicyPrincipal::Human,
+            false,
+        )
+        .await
+        .expect("branch promote --plan without a name must not require the deleted record");
+
+        // Bare promote still builds a new plan and requires the live record.
+        let store = StateStore::open(&state_path).unwrap();
+        store
+            .put_branch(&BranchRecord {
+                name: legacy_name.to_string(),
+                schema_prefix: "branch__fix-price".to_string(),
+                created_by: "legacy".to_string(),
+                created_at: chrono::Utc::now(),
+                description: None,
+            })
+            .unwrap();
+        drop(store);
+        run_branch_promote_from_plan(
+            dir,
+            &config_path,
+            &plan_id,
+            Some(legacy_name),
+            None,
+            &state_path,
+            rocky_core::config::PolicyPrincipal::Human,
+            false,
+        )
+        .await
+        .expect("promote an existing plan by legacy name");
         let result = run_branch_promote(
             dir, // root for the internal plan store (cwd is set to `dir` here)
             &state_path,
             &config_path,
             &models_dir,
             "main", // base_ref — repo is uninitialized so the gate skips
-            "fix-price",
+            legacy_name,
             None,                                       // no filter
             None,  // pipeline — only one pipeline, no need to disambiguate
             false, // skip_approval_flag
@@ -3724,7 +4143,7 @@ auto_create_schemas = true
         )
         .unwrap();
 
-        run_branch_create(&state_path, "fix-price", None, false).unwrap();
+        run_branch_create(&state_path, "fix_price", None, false).unwrap();
 
         let _cwd_guard = cwd_lock();
         let saved_cwd = std::env::current_dir().unwrap();
@@ -3734,7 +4153,7 @@ auto_create_schemas = true
             &config_path,
             &models_dir,
             "main", // base_ref — repo is fresh so the breaking-change gate skips
-            "fix-price",
+            "fix_price",
             None,  // filter
             None,  // pipeline
             false, // skip_approval_flag
@@ -3839,7 +4258,7 @@ effect = "deny"
         )
         .unwrap();
 
-        run_branch_create(&state_path, "fix-price", None, false).unwrap();
+        run_branch_create(&state_path, "fix_price", None, false).unwrap();
 
         let _cwd_guard = cwd_lock();
         let saved_cwd = std::env::current_dir().unwrap();
@@ -3851,7 +4270,7 @@ effect = "deny"
             &config_path,
             &models_dir,
             "main",
-            "fix-price",
+            "fix_price",
             None,
             None,
             false, // skip_approval_flag
@@ -3983,7 +4402,7 @@ effect = "deny"
         )
         .unwrap();
 
-        run_branch_create(&state_path, "fix-price", None, false).unwrap();
+        run_branch_create(&state_path, "fix_price", None, false).unwrap();
 
         // Seed prod schemas + the branch source table (2 rows). `branch promote`
         // dispatches `CREATE OR REPLACE TABLE` directly and does NOT consult
@@ -3995,8 +4414,8 @@ effect = "deny"
             for stmt in [
                 "CREATE SCHEMA IF NOT EXISTS warehouse",
                 "CREATE SCHEMA IF NOT EXISTS marts",
-                "CREATE SCHEMA IF NOT EXISTS \"branch__fix-price\"",
-                "CREATE TABLE \"branch__fix-price\".fct_orders AS SELECT 1 AS id UNION ALL SELECT 2",
+                "CREATE SCHEMA IF NOT EXISTS \"branch__fix_price\"",
+                "CREATE TABLE \"branch__fix_price\".fct_orders AS SELECT 1 AS id UNION ALL SELECT 2",
             ] {
                 adapter.execute_statement(stmt).await.expect("seed");
             }
@@ -4012,7 +4431,7 @@ effect = "deny"
             &config_path,
             &models_dir,
             "main",
-            "fix-price",
+            "fix_price",
             None,
             None,
             false, // skip_approval_flag
@@ -4054,7 +4473,7 @@ effect = "deny"
             &config_path,
             &models_dir,
             "main",
-            "fix-price",
+            "fix_price",
             None,
             None,
             false, // skip_approval_flag
@@ -4121,7 +4540,7 @@ effect = "deny"
             &config_path,
             &models_dir,
             "main",
-            "fix-price",
+            "fix_price",
             None,
             None,
             false,
@@ -4304,6 +4723,338 @@ adapter = "default"
             count, 2,
             "`--pipeline marts` promote must copy both branch rows"
         );
+    }
+
+    /// #2019: `rocky apply <plan-id>` must read the pipeline from the
+    /// PERSISTED promote plan instead of re-resolving it from the config.
+    /// `rocky plan promote <branch> --pipeline marts` disambiguates at PLAN
+    /// time and now stores the resolved pipeline on `PromotePlan.pipeline`;
+    /// `rocky apply <plan-id>` has no `--pipeline` flag at all, so pre-fix it
+    /// re-resolved against the (still ambiguous) config and refused with
+    /// "multiple pipelines defined" even though the plan it is about to
+    /// apply already names one, unambiguously.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn apply_reads_pipeline_from_persisted_promote_plan_on_multi_pipeline_config() {
+        use rocky_core::config::PolicyPrincipal;
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let duckdb_path = dir.join("warehouse.duckdb");
+        let config_path = dir.join("rocky.toml");
+        let state_path = dir.join("state.redb");
+        let models_dir = dir.join("models");
+        std::fs::create_dir_all(models_dir.join("marts")).unwrap();
+        std::fs::create_dir_all(models_dir.join("staging")).unwrap();
+
+        for git_args in [
+            ["init", "-q", "."].as_slice(),
+            ["config", "user.email", "test@rocky.invalid"].as_slice(),
+            ["config", "user.name", "Rocky Test"].as_slice(),
+        ] {
+            let status = std::process::Command::new("git")
+                .args(git_args)
+                .current_dir(dir)
+                .status()
+                .expect("git setup");
+            assert!(status.success(), "git {git_args:?} failed");
+        }
+
+        write_transformation_model(
+            &models_dir.join("marts"),
+            "fct_orders",
+            "warehouse",
+            "marts",
+            "fct_orders",
+            "SELECT 1 AS id",
+        );
+
+        // Two transformation pipelines (both on the default duckdb adapter) —
+        // enough to make `resolve_pipeline(None)` ambiguous, mirroring the
+        // #2019 reproduction (`ingest` + `transform`).
+        std::fs::write(
+            &config_path,
+            format!(
+                r#"[adapter]
+type = "duckdb"
+path = "{}"
+
+[pipeline.marts]
+type = "transformation"
+models = "models/marts/**"
+
+[pipeline.marts.target]
+adapter = "default"
+
+[pipeline.marts.target.governance]
+auto_create_schemas = true
+
+[pipeline.staging]
+type = "transformation"
+models = "models/staging/**"
+
+[pipeline.staging.target]
+adapter = "default"
+"#,
+                duckdb_path.display()
+            ),
+        )
+        .unwrap();
+
+        run_branch_create(&state_path, "ci_demo", None, false).unwrap();
+
+        {
+            let adapter = DuckDbWarehouseAdapter::open(&duckdb_path).expect("open duckdb");
+            for stmt in [
+                "CREATE SCHEMA IF NOT EXISTS warehouse",
+                "CREATE SCHEMA IF NOT EXISTS marts",
+                "CREATE SCHEMA IF NOT EXISTS \"branch__ci_demo\"",
+                "CREATE TABLE \"branch__ci_demo\".fct_orders AS SELECT 1 AS id UNION ALL SELECT 2",
+            ] {
+                adapter.execute_statement(stmt).await.expect("seed");
+            }
+        }
+
+        let _cwd_guard = cwd_lock();
+        let saved_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir).unwrap();
+
+        // `rocky plan promote ci_demo --pipeline marts` — disambiguates at
+        // plan-build time.
+        let plan_id = crate::commands::plan::build_promote_plan_inner(
+            dir,
+            &config_path,
+            &models_dir,
+            "main",
+            "ci_demo",
+            None,
+            Some("marts"),
+            false, // skip_approval_flag
+            true,  // allow_breaking (gate skips fail-open on a commit-less repo)
+            &state_path,
+            PolicyPrincipal::Human,
+        )
+        .await
+        .expect("plan build must succeed with --pipeline marts")
+        .plan_output
+        .plan_id
+        .expect("plan_id");
+
+        // `rocky apply <plan-id>` — `apply` has no `--pipeline` flag at all.
+        // Before the fix this re-resolved against the config and failed with
+        // "multiple pipelines defined" even though the plan already names its
+        // pipeline.
+        let apply_result = crate::commands::apply::run_apply_in(
+            dir,
+            &config_path,
+            &plan_id,
+            &state_path,
+            PolicyPrincipal::Human,
+            None,
+            false,
+        )
+        .await;
+
+        std::env::set_current_dir(saved_cwd).unwrap();
+
+        apply_result.expect(
+            "`rocky apply <plan-id>` must read the pipeline from the persisted plan and \
+             succeed on a multi-pipeline config",
+        );
+
+        let adapter = DuckDbWarehouseAdapter::open(&duckdb_path).expect("reopen duckdb");
+        let rows = adapter
+            .execute_query("SELECT CAST(COUNT(*) AS BIGINT) FROM warehouse.marts.fct_orders")
+            .await
+            .expect("prod table must exist after `rocky apply` on the promote plan");
+        let v = &rows.rows[0][0];
+        let count = v
+            .as_i64()
+            .or_else(|| v.as_str().and_then(|s| s.parse::<i64>().ok()))
+            .unwrap_or_else(|| panic!("count value not parseable: {v:?}"));
+        assert_eq!(
+            count, 2,
+            "`rocky apply` on the promote plan must copy both branch rows"
+        );
+    }
+
+    /// #2019 (Codex finding, gpt-5.6-terra, high confidence): `rocky branch
+    /// promote <name> --plan <plan-id>` must behave exactly like `rocky apply
+    /// <plan-id>` on the SAME plan — read the plan's own recorded pipeline
+    /// rather than trusting a CLI `--pipeline` selector unconditionally.
+    ///
+    /// - Selector omitted: falls back to the plan's recorded pipeline and
+    ///   succeeds, even on a multi-pipeline config.
+    /// - Selector disagrees with the plan: refused BEFORE any adapter is
+    ///   opened or SQL executes. Silently preferring the CLI value would let
+    ///   `--pipeline staging` execute a `marts`-built plan's persisted SQL
+    ///   against staging's adapter — a destructive write at a destination
+    ///   other than the one the plan was built and reviewed against.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn branch_promote_from_plan_pipeline_selector_matches_or_refuses() {
+        use rocky_core::config::PolicyPrincipal;
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let duckdb_path = dir.join("warehouse.duckdb");
+        let config_path = dir.join("rocky.toml");
+        let state_path = dir.join("state.redb");
+        let models_dir = dir.join("models");
+        std::fs::create_dir_all(models_dir.join("marts")).unwrap();
+        std::fs::create_dir_all(models_dir.join("staging")).unwrap();
+
+        for git_args in [
+            ["init", "-q", "."].as_slice(),
+            ["config", "user.email", "test@rocky.invalid"].as_slice(),
+            ["config", "user.name", "Rocky Test"].as_slice(),
+        ] {
+            let status = std::process::Command::new("git")
+                .args(git_args)
+                .current_dir(dir)
+                .status()
+                .expect("git setup");
+            assert!(status.success(), "git {git_args:?} failed");
+        }
+
+        write_transformation_model(
+            &models_dir.join("marts"),
+            "fct_orders",
+            "warehouse",
+            "marts",
+            "fct_orders",
+            "SELECT 1 AS id",
+        );
+
+        std::fs::write(
+            &config_path,
+            format!(
+                r#"[adapter]
+type = "duckdb"
+path = "{}"
+
+[pipeline.marts]
+type = "transformation"
+models = "models/marts/**"
+
+[pipeline.marts.target]
+adapter = "default"
+
+[pipeline.marts.target.governance]
+auto_create_schemas = true
+
+[pipeline.staging]
+type = "transformation"
+models = "models/staging/**"
+
+[pipeline.staging.target]
+adapter = "default"
+"#,
+                duckdb_path.display()
+            ),
+        )
+        .unwrap();
+
+        run_branch_create(&state_path, "fix", None, false).unwrap();
+
+        {
+            let adapter = DuckDbWarehouseAdapter::open(&duckdb_path).expect("open duckdb");
+            for stmt in [
+                "CREATE SCHEMA IF NOT EXISTS warehouse",
+                "CREATE SCHEMA IF NOT EXISTS marts",
+                "CREATE SCHEMA IF NOT EXISTS branch__fix",
+                "CREATE TABLE branch__fix.fct_orders AS SELECT 1 AS id UNION ALL SELECT 2",
+            ] {
+                adapter.execute_statement(stmt).await.expect("seed");
+            }
+        }
+
+        let _cwd_guard = cwd_lock();
+        let saved_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir).unwrap();
+
+        // `rocky plan promote fix --pipeline marts` — disambiguates at
+        // plan-build time; the plan now records `pipeline: "marts"`.
+        let plan_id = crate::commands::plan::build_promote_plan_inner(
+            dir,
+            &config_path,
+            &models_dir,
+            "main",
+            "fix",
+            None,
+            Some("marts"),
+            false, // skip_approval_flag
+            true,  // allow_breaking (gate skips fail-open on a commit-less repo)
+            &state_path,
+            PolicyPrincipal::Human,
+        )
+        .await
+        .expect("plan build must succeed with --pipeline marts")
+        .plan_output
+        .plan_id
+        .expect("plan_id");
+
+        // Mismatch: `--pipeline staging` disagrees with the plan's recorded
+        // `marts` — must be refused, not silently executed against staging.
+        let mismatch = run_branch_promote_from_plan(
+            dir,
+            &config_path,
+            &plan_id,
+            None,
+            Some("staging"),
+            &state_path,
+            PolicyPrincipal::Human,
+            false,
+        )
+        .await;
+
+        // Omitted: falls back to the plan's recorded `marts` and succeeds —
+        // matching `rocky apply <plan-id>`'s behaviour on the same plan.
+        let omitted = run_branch_promote_from_plan(
+            dir,
+            &config_path,
+            &plan_id,
+            None,
+            None,
+            &state_path,
+            PolicyPrincipal::Human,
+            false,
+        )
+        .await;
+
+        std::env::set_current_dir(saved_cwd).unwrap();
+
+        let err =
+            mismatch.expect_err("--pipeline staging must be refused against a marts-built plan");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("does not match the plan's recorded pipeline"),
+            "expected the pipeline-mismatch refusal, got: {msg}"
+        );
+        assert!(
+            !msg.contains("multiple pipelines defined"),
+            "the mismatch must be its own refusal, not the generic ambiguity error: {msg}"
+        );
+
+        omitted.expect(
+            "omitting --pipeline must fall back to the plan's recorded pipeline and succeed",
+        );
+
+        let adapter = DuckDbWarehouseAdapter::open(&duckdb_path).expect("reopen duckdb");
+        let rows = adapter
+            .execute_query("SELECT CAST(COUNT(*) AS BIGINT) FROM warehouse.marts.fct_orders")
+            .await
+            .expect("prod table must exist after the fallback promote");
+        let v = &rows.rows[0][0];
+        let count = v
+            .as_i64()
+            .or_else(|| v.as_str().and_then(|s| s.parse::<i64>().ok()))
+            .unwrap_or_else(|| panic!("count value not parseable: {v:?}"));
+        assert_eq!(count, 2, "the fallback promote must copy both branch rows");
     }
 
     /// 🔴 BLOCKER 2 (content): the bare verb's breaking-change block must still
@@ -4514,7 +5265,7 @@ adapter = "default"
             "SELECT 1 AS id",
         );
 
-        let record = sample_record("fix-price");
+        let record = sample_record("fix_price");
         let err = discover_branch_targets(&config_path, &record, Some("client=acme"), None)
             .await
             .expect_err("client= filter must be rejected on transformation pipelines");
@@ -4601,7 +5352,7 @@ adapter = "default"
             "SELECT 1 AS id",
         );
 
-        let record = sample_record("fix-price");
+        let record = sample_record("fix_price");
 
         // Routing 1: --pipeline marts (transformation) walks the model glob.
         let planned = discover_branch_targets(&config_path, &record, None, Some("marts"))
@@ -4611,7 +5362,7 @@ adapter = "default"
         assert_eq!(planned[0].prod.full_name(), "warehouse.marts.fct_orders");
         assert_eq!(
             planned[0].branch_source.full_name(),
-            "warehouse.branch__fix-price.fct_orders"
+            "warehouse.branch__fix_price.fct_orders"
         );
 
         // Routing 2: --pipeline raw (replication) dispatches into the
@@ -4683,7 +5434,7 @@ adapter = "default"
             "SELECT 1 AS id",
         );
 
-        let record = sample_record("fix-price");
+        let record = sample_record("fix_price");
         let planned =
             discover_branch_targets(&config_path, &record, Some("model=fct_orders"), None)
                 .await
@@ -4698,26 +5449,71 @@ adapter = "default"
     fn compute_branch_list_and_show_serve_the_store() {
         let tmp = TempDir::new().unwrap();
         let state_path = tmp.path().join("state.redb");
-        run_branch_create(&state_path, "fix-price", Some("a description"), true).unwrap();
+        run_branch_create(&state_path, "fix_price", Some("a description"), true).unwrap();
 
         let list = compute_branch_list(&state_path).unwrap();
         assert_eq!(list.command, "branch list");
         assert_eq!(list.total, 1);
         assert_eq!(list.branches.len(), 1);
-        assert_eq!(list.branches[0].name, "fix-price");
+        assert_eq!(list.branches[0].name, "fix_price");
         assert_eq!(
             list.branches[0].description.as_deref(),
             Some("a description")
         );
 
-        let show = compute_branch_show(&state_path, "fix-price").unwrap();
+        let show = compute_branch_show(&state_path, "fix_price").unwrap();
         assert_eq!(show.command, "branch show");
-        assert_eq!(show.branch.name, "fix-price");
+        assert_eq!(show.branch.name, "fix_price");
         assert_eq!(show.branch.schema_prefix, list.branches[0].schema_prefix);
         assert_eq!(show.branch.created_at, list.branches[0].created_at);
 
         let err = compute_branch_show(&state_path, "nope").unwrap_err();
         assert!(err.to_string().contains("branch 'nope' not found"), "{err}");
+    }
+
+    #[test]
+    fn legacy_hyphenated_branch_can_be_listed_shown_and_deleted_but_not_created() {
+        let tmp = TempDir::new().unwrap();
+        let state_path = tmp.path().join("state.redb");
+        let name = "pr-preview-x";
+
+        let error = run_branch_create(&state_path, name, None, false).unwrap_err();
+        assert!(format!("{error:#}").contains("[A-Za-z0-9_]"));
+
+        let store = StateStore::open(&state_path).unwrap();
+        assert!(store.get_branch(name).unwrap().is_none());
+        let record = BranchRecord {
+            name: name.to_string(),
+            schema_prefix: format!("branch__{name}"),
+            created_by: "legacy".to_string(),
+            created_at: chrono::Utc::now(),
+            description: Some("created before #2137".to_string()),
+        };
+        store.put_branch(&record).unwrap();
+        drop(store);
+
+        let error = resolve_branch_shadow_config(&state_path, name, "_rocky_shadow".into())
+            .expect_err("run --branch must still refuse a legacy name");
+        assert!(format!("{error:#}").contains("[A-Za-z0-9_]"));
+
+        let list = compute_branch_list(&state_path).unwrap();
+        assert_eq!(list.total, 1);
+        assert_eq!(list.branches[0].name, name);
+        assert_eq!(list.branches[0].schema_prefix, record.schema_prefix);
+
+        let show = compute_branch_show(&state_path, name).unwrap();
+        assert_eq!(show.branch.name, name);
+        assert_eq!(show.branch.schema_prefix, record.schema_prefix);
+        assert_eq!(
+            show.branch.description.as_deref(),
+            record.description.as_deref()
+        );
+
+        run_branch_delete(&state_path, name, true).unwrap();
+        let store = StateStore::open_read_only(&state_path).unwrap();
+        assert!(store.get_branch(name).unwrap().is_none());
+        drop(store);
+        assert_eq!(compute_branch_list(&state_path).unwrap().total, 0);
     }
 }
 
@@ -4774,7 +5570,7 @@ mod duplicate_target_refusal_tests {
         let tmp = TempDir::new().unwrap();
         let config_path = project_with_targets(&tmp, ["shared", "Shared"]);
         let pipeline = transformation_pipeline(&config_path);
-        let record = sample_branch_record_for_promote("fix-price");
+        let record = sample_branch_record_for_promote("fix_price");
         let err = discover_transformation_branch_targets(&pipeline, &config_path, &record, None)
             .expect_err("a duplicate promote target must refuse, not plan");
         let msg = format!("{err:#}");
@@ -4792,7 +5588,7 @@ mod duplicate_target_refusal_tests {
         let tmp = TempDir::new().unwrap();
         let config_path = project_with_targets(&tmp, ["shared", "shared"]);
         let pipeline = transformation_pipeline(&config_path);
-        let record = sample_branch_record_for_promote("fix-price");
+        let record = sample_branch_record_for_promote("fix_price");
         let planned = discover_transformation_branch_targets(
             &pipeline,
             &config_path,
@@ -4907,7 +5703,7 @@ mod duplicate_target_refusal_tests {
         let tmp = TempDir::new().unwrap();
         let config_path = project_with_targets(&tmp, ["t_alpha", "t_beta"]);
         let pipeline = transformation_pipeline(&config_path);
-        let record = sample_branch_record_for_promote("fix-price");
+        let record = sample_branch_record_for_promote("fix_price");
         let planned =
             discover_transformation_branch_targets(&pipeline, &config_path, &record, None)
                 .expect("distinct targets must plan");
@@ -4937,7 +5733,7 @@ mod duplicate_target_refusal_tests {
         let tmp = TempDir::new().unwrap();
         let config_path = project_with_targets(&tmp, ["t_alpha", "t_beta"]);
         let pipeline = transformation_pipeline(&config_path);
-        let record = sample_branch_record_for_promote("fix-price");
+        let record = sample_branch_record_for_promote("fix_price");
         let planned =
             discover_transformation_branch_targets(&pipeline, &config_path, &record, None)
                 .expect("distinct targets must plan");

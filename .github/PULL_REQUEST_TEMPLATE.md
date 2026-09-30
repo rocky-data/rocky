@@ -25,6 +25,8 @@
 
 -
 
+If this is your first pull request from a fork, CI waits for a maintainer to approve its workflow runs. You do not need to take action. A new push needs new run approval.
+
 ## Checklist
 
 - [ ] Commit messages follow [conventional commits](https://www.conventionalcommits.org/), scoped by subproject when relevant (e.g. `feat(engine/rocky-databricks): ...`, `fix(dagster): ...`)
@@ -35,6 +37,7 @@
 - [ ] `cargo test --all-targets` passes
 - [ ] `cargo clippy --all-targets -- -D warnings` is clean
 - [ ] `cargo fmt --check` passes
+- [ ] Behaviour change: added an `engine/CHANGELOG.md` entry under `[Unreleased]`, or, if none is needed, said why in this body with a line shaped like "Changelog: none - test-only refactor, no behaviour change" (10+ character reason, `because` also accepted)
 
 ### Dagster (`integrations/dagster/`)
 - [ ] `uv run pytest` passes

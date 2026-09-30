@@ -7,12 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Worked `Example:` blocks on the six `product_*` client methods.** `product_verify`, `product_compile`, `product_approve`, `product_status`, `product_list` and `product_journal` now carry the same reST-style example the other typed methods use. `product_verify`'s example branches on `status` rather than a caught exception; `product_journal`'s distinguishes a known product with an empty journal from a product the project does not know, which raises `RockyCommandError`. (#1802)
+
 ### Changed
 
 - **`RunResult` gains `anomaly_evaluated`.** One `AnomalyEvaluation` entry per table the run considered for row-count anomaly detection, saying whether the detector evaluated it and, when it did not, why. `RunResult.anomalies` alone means both "nothing anomalous" and "nothing looked at" (#1790). Added to the hand-written runtime models and the generated ones; an engine that does not emit the field parses as before, with an empty list. (#1790)
 - **`ModelDetail` loses `incrementality_hint`, and `OptimizeResult` loses `incrementality_note`.** The generated models and the hand-written runtime models follow the engine, which stopped emitting both: the hint recommended `type = "incremental"` on transformation models, which the engine now refuses (E037). (#1990)
 - **`ReviewQueueEntry.classification_weight` is renamed `change_class_weight`.** The generated model follows the engine's rename: the weight is the change class of the escalated decision (a breaking schema change outranks a bare mutating verb, which outranks an additive or value-only change), and it never read a column classification. The field is required, so code that names it breaks at parse time rather than reading a `None`. Needs the engine release that carries the rename; against an older binary the SDK sees the old key and the model rejects it. (#2009)
 - **`MIN_ROCKY_VERSION` is `1.35.0`, up from `1.34.0`.** The floor is shared with `dagster-rocky`, whose plan/apply path needs a `plan_id` from `rocky plan` for every project shape, and a replication-only project first got a content-addressed `plan_id` in engine 1.35.0. Against a 1.34.x binary the old floor passed the version check and the run then failed with "rocky plan did not emit a plan_id", with a hint naming the version already installed. A 1.34.x binary is now refused by `RockyVersionError` before any command runs. (#1984)
+- **`DriftAction`, `AnomalyResult` and `AnomalyEvaluation` gain `asset_key`.** The Dagster-style asset key path, the same convention `MaterializationInfo`/`TableError` already carry, so a consumer can key off it without re-deriving it from `table`. Added to the hand-written runtime models and the generated ones, required on both — no back-compat default for an engine that predates this field, matching every other required field in `schemas/run.schema.json`. Needs engine #2073. (#2073)
+- **`RockyClient` no longer passes inherited `DAGSTER_PIPES_*` variables to the `rocky` it starts.** A script that Dagster launched through Pipes, and that calls `rocky` through `RockyClient`, used to hand `rocky` the script's own Pipes channel. From the next engine release, `rocky` refuses to run when it cannot open that channel. The client now removes every `DAGSTER_PIPES_*` variable from the child environment of its ordinary calls. Dagster's own Pipes launch of `rocky apply` (through `PipesSubprocessClient`) keeps them. (#2164)
 
 ## [0.15.0] — 2026-09-12
 

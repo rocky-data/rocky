@@ -10,7 +10,7 @@ import { Steps } from '@astrojs/starlight/components';
 This page builds a Rocky pipeline that copies Fivetran-landed source tables into Databricks. It takes about five minutes.
 
 :::tip[No warehouse credentials?]
-The [Playground](/guides/playground/) runs the same flow against a local DuckDB file, with nothing to configure. Start there if you just want to see Rocky work.
+The [Playground](/guides/playground/) runs a local DuckDB transformation project with nothing to configure. It can compile, review emitted SQL, run models, and preview rows. `rocky plan` currently supports replication pipelines only. Use the Playground's guarded local run instead.
 :::
 
 There are two ways to reach the warehouse. Both start the same way.
@@ -38,9 +38,9 @@ There are two ways to reach the warehouse. Both start the same way.
                  warehouse
 ```
 
-Steps 1 to 4 below are the shared setup. Steps 5 and 6 are the PR-gated path.
-The local path is one command, covered after the steps. Step 7 inspects what
-the run stored.
+Steps 1 to 4 below are the shared setup. Steps 5 and 6 are the PR-gated
+replication path. Step 7 inspects what the run stored. For a local
+transformation workflow, use the [Playground](/guides/playground/).
 
 <Steps>
 
@@ -150,7 +150,7 @@ the run stored.
 
 ## The one-command path
 
-`rocky run` does the work of steps 5 and 6 in one command. Use it for local iteration and for automation.
+`rocky run` does the work of steps 5 and 6 in one command. Use it for replication iteration and for automation.
 
 ```bash
 rocky run --filter tenant=acme

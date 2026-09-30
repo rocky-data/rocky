@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import type { ProductJournalOutput } from "@rocky-types/product_journal";
 import type { ProductListOutput } from "@rocky-types/product_list";
@@ -247,6 +247,17 @@ describe("ProductsScreen", () => {
     render(<ProductsScreen name="revenue_daily" loaders={loaders()} />);
     const link = await screen.findByRole("link", { name: /^plan / });
     expect(link.getAttribute("href")).toBe(`/ui/review/${PLAN}`);
+  });
+
+  it("opens the product-scoped audit view instead of an unresolved custody subject (#2003)", async () => {
+    render(<ProductsScreen name="revenue_daily" loaders={loaders()} />);
+
+    const link = await screen.findByRole("link", { name: "the ledger, scoped to this product" });
+    expect(link).toHaveAttribute("href", "/ui/governor/audit/revenue_daily");
+    expect(screen.queryByRole("link", { name: "product:revenue_daily" })).toBeNull();
+
+    fireEvent.click(link);
+    expect(window.location.pathname).toBe("/ui/governor/audit/revenue_daily");
   });
 
   it("says the loop has not run when the journal is empty", async () => {

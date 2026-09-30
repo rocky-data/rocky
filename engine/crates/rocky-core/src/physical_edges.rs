@@ -25,6 +25,12 @@
 //! reads) is SKIPPED deterministically and reported, so projects that run
 //! today keep running — serialized where possible, never refused. The
 //! schedulers' own cycle detection stays the backstop for declared edges.
+//!
+//! Precedence (#1629): candidate edges are decided in passes, strongest
+//! evidence first — every model's exact reads, then the catalog fallback,
+//! then bare-name guesses (`Evidence`). The cycle guard can therefore only
+//! ever skip a LATER, weaker edge: a guess never displaces an exact edge, and
+//! that does not depend on the order model names sort in.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
@@ -33,6 +39,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 #[derive(Debug, Clone)]
 pub struct PhysicalEdgeModel<'a> {
     pub name: &'a str,
+    /// The configured adapter name for this model. Runtime scheduling treats
+    /// distinct names as routing hints, not proof of distinct tables.
+    pub adapter: Option<&'a str>,
     pub catalog: &'a str,
     pub schema: &'a str,
     pub table: &'a str,
@@ -45,22 +54,78 @@ pub struct PhysicalEdgeModel<'a> {
     /// produces nothing, and could suppress the reader's true edges via the
     /// cycle guard.
     pub materializes: bool,
+    /// The catalog the warehouse resolves this model's target in when its
+    /// `[target]` names none (`catalog = ""` renders `schema.table`, which
+    /// the connection resolves against its current catalog).
+    ///
+    /// `None` means the caller could not establish it — which is the honest
+    /// answer for every adapter except DuckDB, and never means "no catalog".
+    /// It is ignored for a model whose `[target]` names a catalog. It is the
+    /// only thing that lets a `catalog.schema.table` read bind to a
+    /// catalogless producer: without it the read might name a different
+    /// catalog's table of the same `schema.table`, and guessing across
+    /// catalogs can order a real dependency backwards (#1629).
+    pub effective_catalog: Option<&'a str>,
 }
 
 impl<'a> PhysicalEdgeModel<'a> {
     /// Both consumers build inputs from the same loaded-model shape; one
     /// constructor keeps them from drifting.
+    ///
+    /// The effective catalog starts unknown; callers that can establish it
+    /// add it with [`Self::with_effective_catalog`].
     #[must_use]
     pub fn from_model(m: &'a crate::models::Model) -> Self {
         Self {
             name: &m.config.name,
+            adapter: None,
             catalog: &m.config.target.catalog,
             schema: &m.config.target.schema,
             table: &m.config.target.table,
             sql: &m.sql,
             materializes: !matches!(m.config.strategy, crate::models::StrategyConfig::Ephemeral),
+            effective_catalog: None,
         }
     }
+
+    /// Record the catalog this model's catalogless target resolves in. Pass
+    /// `None` when it is not established; an empty name counts as `None`.
+    #[must_use]
+    pub fn with_effective_catalog(mut self, catalog: Option<&'a str>) -> Self {
+        self.effective_catalog = catalog.filter(|c| !fold_identifier(c).is_empty());
+        self
+    }
+
+    #[must_use]
+    pub fn with_adapter(mut self, adapter: &'a str) -> Self {
+        self.adapter = Some(adapter);
+        self
+    }
+}
+
+/// How strongly a candidate edge is evidenced. The derivation decides
+/// candidates in this order, one full pass per variant, so a weaker
+/// candidate can never occupy the graph before a stronger one and cause the
+/// cycle guard to discard it (#1629).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+enum Evidence {
+    /// A three-part read that matches a producer's declared
+    /// `catalog.schema.table` exactly.
+    Exact3,
+    /// A two-part read that matches a producer's `(schema, table)`.
+    Exact2,
+    /// A three-part read whose exact lookup missed, bound to the only
+    /// producer of that `schema.table` — when it declares no catalog and is
+    /// established to live in the catalog the read names.
+    Fallback,
+    /// A bare read that matches a producer's table component alone — a
+    /// search-path guess.
+    Bare,
+}
+
+impl Evidence {
+    /// The order the passes run in: strongest first.
+    const STRONGEST_FIRST: [Self; 4] = [Self::Exact3, Self::Exact2, Self::Fallback, Self::Bare];
 }
 
 /// The derivation result. `edges` are `(consumer, producer)` pairs —
@@ -87,6 +152,39 @@ pub struct DerivedPhysicalEdges {
     /// producer edge, which is worse than today's undefined order. Neither
     /// edge is derived; the pair is surfaced for an explicit `depends_on`.
     pub ambiguous_bare_pairs: Vec<(String, String)>,
+    /// The same contradiction between two catalog-fallback edges (#1629):
+    /// each model reads the other's catalogless table by a catalog-qualified
+    /// name. Both are inferences, so neither direction is derived.
+    pub ambiguous_fallback_pairs: Vec<(String, String)>,
+    /// Three-part reads whose exact lookup missed and that Rocky could not
+    /// bind to one catalogless producer, so no edge was derived for them —
+    /// the ordering is exactly what it was before the fallback existed.
+    pub unbound_reads: Vec<UnboundRead>,
+}
+
+/// A catalog-qualified read that matched no producer exactly and could not
+/// safely be bound to a catalogless one (#1629).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnboundRead {
+    /// The model that issues the read.
+    pub consumer: String,
+    /// The read as compared: `catalog.schema.table`, folded.
+    pub read: String,
+    /// Models that write `schema.table` with no catalog and might be the
+    /// read's table. Sorted.
+    pub candidates: Vec<String>,
+    pub reason: UnboundReason,
+}
+
+/// Why a catalog-qualified read was not bound to a catalogless producer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnboundReason {
+    /// More than one catalogless producer could be the read's table.
+    SeveralProducers,
+    /// One or more catalogless producers share the read's `schema.table`,
+    /// but which catalog they live in was not established, so the read
+    /// might name a different catalog's table.
+    CatalogNotEstablished,
 }
 
 /// `referenced_tables` already lowercases and unquotes what the parser
@@ -135,6 +233,65 @@ pub fn bare_name_binds(model_name: &str, target_table: &str) -> bool {
     fold_identifier(model_name) == fold_identifier(target_table)
 }
 
+/// What a catalog-qualified read that missed the exact index can be bound to.
+enum Binding<'a> {
+    /// No producer of that `schema.table` could be the read's table.
+    Nothing,
+    /// The sole possible producer of that `schema.table`, which declares no
+    /// catalog and is established to live in the catalog the read names.
+    Producer(&'a str),
+    /// A producer could be the read's table, but it cannot be bound to it.
+    Unbound {
+        candidates: Vec<String>,
+        reason: UnboundReason,
+    },
+}
+
+/// Bind a `read_catalog.schema.table` read whose exact `(catalog, schema,
+/// table)` lookup missed to a producer of that `schema.table` — but only to
+/// the sole possible producer of it, when it declares no catalog and is established to
+/// live in `read_catalog` (#1629).
+///
+/// `at_schema_table` is every producer of that `(schema, table)`, whatever
+/// catalog it declares, without the reader itself. A producer with a
+/// different declared or established catalog cannot be the read's table.
+/// Adapter names alone do not establish that two tables differ. Count only
+/// the remaining candidates. Bind the sole candidate only when its catalog is
+/// established; otherwise report the unbound read.
+fn bind_catalogless<'a>(
+    read_catalog: &str,
+    at_schema_table: &[&PhysicalEdgeModel<'a>],
+) -> Binding<'a> {
+    let possible: Vec<&PhysicalEdgeModel<'_>> = at_schema_table
+        .iter()
+        .copied()
+        .filter(|p| {
+            fold_identifier(p.catalog).is_empty()
+                && p.effective_catalog
+                    .is_none_or(|effective| fold_identifier(effective) == read_catalog)
+        })
+        .collect();
+    match possible.as_slice() {
+        [] => Binding::Nothing,
+        [only] => match only.effective_catalog {
+            Some(_) => Binding::Producer(only.name),
+            None => Binding::Unbound {
+                candidates: vec![only.name.to_string()],
+                reason: UnboundReason::CatalogNotEstablished,
+            },
+        },
+        several => {
+            let mut candidates: Vec<String> = several.iter().map(|p| p.name.to_string()).collect();
+            candidates.sort_unstable();
+            candidates.dedup();
+            Binding::Unbound {
+                candidates,
+                reason: UnboundReason::SeveralProducers,
+            }
+        }
+    }
+}
+
 /// Derive physical-read ordering edges for `models`.
 ///
 /// `existing` is the name-level dependency relation already present in the
@@ -142,6 +299,27 @@ pub fn bare_name_binds(model_name: &str, target_table: &str) -> bool {
 /// plus compile-derived edges). Derived edges only ever connect two models
 /// from `models`, so a name-level cycle guard over `existing ∪ accepted`
 /// is sound: no derived cycle can pass through a non-model node.
+///
+/// # Precedence
+///
+/// Candidates are decided in `Evidence` order, one full pass per kind:
+/// every model's exact three-part reads, then exact two-part reads, then the
+/// catalog fallback, then bare-name guesses. A candidate that would close a
+/// cycle is skipped, so only a LATER, weaker edge is ever skipped.
+///
+/// # The catalog fallback
+///
+/// A model whose `[target]` names no catalog (`catalog = ""`) is indexed
+/// under an empty catalog, so a `cat.schema.table` read of it misses the
+/// exact index. That read is bound to it only when ALL of these hold: the
+/// exact lookup missed, exactly one producer could write the read table after
+/// catalog exclusions, that producer's `[target]` names no catalog,
+/// and the caller established which
+/// catalog it lives in ([`PhysicalEdgeModel::effective_catalog`]) and that is
+/// the catalog the read names. Anything else derives no edge. When a
+/// catalogless producer might be the read's table but the read cannot be bound
+/// to it, the read is reported in [`DerivedPhysicalEdges::unbound_reads`],
+/// naming the candidates, rather than guessed at.
 #[must_use]
 pub fn derive_physical_edges(
     models: &[PhysicalEdgeModel<'_>],
@@ -152,9 +330,14 @@ pub fn derive_physical_edges(
     // Producer index: canonical (catalog, schema, table) and (schema, table)
     // → model names. Multi-maps — a collision must not silently drop a
     // producer (the label-heuristic HashMap overwrite bug class).
-    let mut by_three: BTreeMap<(String, String, String), Vec<&str>> = BTreeMap::new();
+    let mut by_three: BTreeMap<(String, String, String), Vec<&PhysicalEdgeModel<'_>>> =
+        BTreeMap::new();
     let mut by_two: BTreeMap<(String, String), Vec<&str>> = BTreeMap::new();
     let mut by_table: BTreeMap<String, Vec<&str>> = BTreeMap::new();
+    // Every producer of a `(schema, table)`, whatever catalog it declares: the
+    // catalog fallback needs the whole set to know whether it is the only one.
+    let mut models_by_two: BTreeMap<(String, String), Vec<&PhysicalEdgeModel<'_>>> =
+        BTreeMap::new();
     for m in models {
         if !m.materializes {
             continue;
@@ -166,14 +349,32 @@ pub fn derive_physical_edges(
         );
         let key2 = (key3.1.clone(), key3.2.clone());
         by_table.entry(key3.2.clone()).or_default().push(m.name);
-        by_three.entry(key3).or_default().push(m.name);
+        models_by_two.entry(key2.clone()).or_default().push(m);
+        by_three.entry(key3).or_default().push(m);
         by_two.entry(key2).or_default().push(m.name);
     }
-    for names in by_three.values() {
-        if names.len() > 1 {
-            for pair in names.windows(2) {
+    for same_target in by_three.values() {
+        for (index, first) in same_target.iter().enumerate() {
+            for second in same_target.iter().skip(index + 1) {
+                // Different adapter names can still address one metastore.
+                // Skip a collision only when both catalogs are known to differ.
+                let first_catalog = first
+                    .effective_catalog
+                    .filter(|_| fold_identifier(first.catalog).is_empty())
+                    .unwrap_or(first.catalog);
+                let second_catalog = second
+                    .effective_catalog
+                    .filter(|_| fold_identifier(second.catalog).is_empty())
+                    .unwrap_or(second.catalog);
+                if matches!((first.adapter, second.adapter), (Some(a), Some(b)) if a != b)
+                    && !first_catalog.is_empty()
+                    && !second_catalog.is_empty()
+                    && fold_identifier(first_catalog) != fold_identifier(second_catalog)
+                {
+                    continue;
+                }
                 out.target_collisions
-                    .push((pair[0].to_string(), pair[1].to_string()));
+                    .push((first.name.to_string(), second.name.to_string()));
             }
         }
     }
@@ -196,13 +397,12 @@ pub fn derive_physical_edges(
         false
     }
 
-    // Candidate edges in deterministic order, MOST SPECIFIC FIRST: an exact
-    // three-part match is accepted before a two-part match, which is
-    // accepted before a bare table-component match. A loose (possibly
-    // spurious) candidate must never occupy the graph first and cause the
-    // cycle guard to discard a more specific true edge. Within a
-    // specificity tier, name order keeps mutual pairs deterministic.
-    let mut candidates: BTreeSet<(u8, String, String)> = BTreeSet::new();
+    // Candidate edges, each tagged with the evidence behind it. Within one
+    // kind of evidence, name order keeps mutual pairs deterministic.
+    let mut candidates: BTreeSet<(Evidence, String, String)> = BTreeSet::new();
+    // `(consumer, read)` pairs already reported as unbound, so a read the
+    // parser lists twice is reported once.
+    let mut reported_unbound: HashSet<(String, String)> = HashSet::new();
     for m in models {
         let refs = match rocky_sql::lineage::referenced_tables(m.sql) {
             Ok(refs) => refs,
@@ -213,36 +413,85 @@ pub fn derive_physical_edges(
         };
         for r in refs {
             let parts: Vec<String> = r.split('.').map(fold_identifier).collect();
-            let (tier, producers): (u8, Option<&Vec<&str>>) = match parts.len() {
-                3 => (
-                    0,
-                    by_three.get(&(parts[0].clone(), parts[1].clone(), parts[2].clone())),
-                ),
-                2 => (1, by_two.get(&(parts[0].clone(), parts[1].clone()))),
+            let (evidence, producers): (Evidence, Vec<&str>) = match parts.as_slice() {
+                [catalog, schema, table] => {
+                    let all_exact = by_three.get(&(catalog.clone(), schema.clone(), table.clone()));
+                    let exact: Vec<&str> = all_exact
+                        .into_iter()
+                        .flatten()
+                        .filter(|p| p.adapter == m.adapter)
+                        .map(|p| p.name)
+                        .collect();
+                    if !exact.is_empty() {
+                        (Evidence::Exact3, exact)
+                    } else {
+                        // No producer on the reader's adapter declares this
+                        // target. Try a catalogless producer first. If none
+                        // could match, retain an exact hit on another adapter:
+                        // its name alone does not disprove shared storage.
+                        // Only an established catalog tells the two apart
+                        // (#1629); a model never binds to its own read.
+                        let at_schema_table: Vec<&PhysicalEdgeModel<'_>> = models_by_two
+                            .get(&(schema.clone(), table.clone()))
+                            .map(|found| {
+                                found.iter().copied().filter(|p| p.name != m.name).collect()
+                            })
+                            .unwrap_or_default();
+                        match bind_catalogless(catalog, &at_schema_table) {
+                            Binding::Nothing => match all_exact {
+                                Some(found) => {
+                                    (Evidence::Exact3, found.iter().map(|p| p.name).collect())
+                                }
+                                None => continue,
+                            },
+                            Binding::Producer(producer) => (Evidence::Fallback, vec![producer]),
+                            Binding::Unbound { candidates, reason } => {
+                                let read = parts.join(".");
+                                if reported_unbound.insert((m.name.to_string(), read.clone())) {
+                                    out.unbound_reads.push(UnboundRead {
+                                        consumer: m.name.to_string(),
+                                        read,
+                                        candidates,
+                                        reason,
+                                    });
+                                }
+                                continue;
+                            }
+                        }
+                    }
+                }
+                [schema, table] => match by_two.get(&(schema.clone(), table.clone())) {
+                    Some(found) => (Evidence::Exact2, found.clone()),
+                    None => continue,
+                },
                 // A bare read resolves through connection state (search path /
                 // current schema) Rocky cannot observe. A bare MODEL-name
                 // read already has its compile-time edge; a bare read that
                 // matches an in-run model's TABLE component may be that very
                 // table — match on the table alone, in the loosest tier.
-                1 => (2, by_table.get(&parts[0])),
-                _ => (3, None),
+                [table] => match by_table.get(table) {
+                    Some(found) => (Evidence::Bare, found.clone()),
+                    None => continue,
+                },
+                _ => continue,
             };
-            let Some(producers) = producers else { continue };
             for p in producers {
-                if *p != m.name {
-                    candidates.insert((tier, m.name.to_string(), (*p).to_string()));
+                if p != m.name {
+                    candidates.insert((evidence, m.name.to_string(), p.to_string()));
                 }
             }
         }
     }
 
-    // Decision loop, run to a FIXPOINT. A bare↔bare contradiction WITHDRAWS
-    // an already-accepted edge, which can invalidate every skip decided
-    // while that edge was in the graph (a three-way bare chain skips a safe
-    // edge through the soon-withdrawn one). Each withdrawal moves one pair
-    // into the ambiguous set — monotone, so restarting the pass terminates
-    // in at most one restart per contradicting pair. Restart-from-scratch
-    // keeps every decision derived from a consistent graph.
+    // Decision loop, run to a FIXPOINT. A contradiction between two
+    // inferences of the same strength (bare↔bare, fallback↔fallback)
+    // WITHDRAWS an already-accepted edge, which can invalidate every skip
+    // decided while that edge was in the graph (a three-way bare chain skips a
+    // safe edge through the soon-withdrawn one). Each withdrawal moves one
+    // pair into the ambiguous set — monotone, so restarting the pass
+    // terminates in at most one restart per contradicting pair.
+    // Restart-from-scratch keeps every decision derived from a consistent
+    // graph.
     let mut ambiguous: HashSet<(String, String)> = HashSet::new();
     'fixpoint: loop {
         out.edges.clear();
@@ -253,46 +502,67 @@ pub fn derive_physical_edges(
             depends_on.entry(c.clone()).or_default().insert(p.clone());
         }
         let mut seen_pairs: HashSet<(String, String)> = HashSet::new();
-        let mut accepted_tier: HashMap<(String, String), u8> = HashMap::new();
-        for (tier, consumer, producer) in &candidates {
-            let (tier, consumer, producer) = (*tier, consumer.clone(), producer.clone());
-            if ambiguous.contains(&(consumer.clone(), producer.clone()))
-                || ambiguous.contains(&(producer.clone(), consumer.clone()))
-            {
-                continue;
-            }
-            if !seen_pairs.insert((consumer.clone(), producer.clone())) {
-                continue;
-            }
-            if edge_set.contains(&(consumer.clone(), producer.clone())) {
-                continue;
-            }
-            // Adding consumer→producer closes a cycle iff producer already
-            // (transitively) depends on consumer.
-            if reaches(&depends_on, &producer, &consumer) {
-                // A bare candidate blocked by an ACCEPTED bare opposite is
-                // not a cycle to serialize — it is two guesses contradicting
-                // each other. Name order must not pick the winner: a wrong
-                // pick deterministically reverses the real producer edge,
-                // WORSE than the undefined order it replaces. Mark the pair
-                // ambiguous and restart so no decision keeps depending on
-                // the withdrawn guess.
-                if tier == 2 && accepted_tier.get(&(producer.clone(), consumer.clone())) == Some(&2)
+        let mut accepted_evidence: HashMap<(String, String), Evidence> = HashMap::new();
+        // One full pass per kind of evidence, strongest first. This — not the
+        // sort order of the candidate set — is what guarantees a guess never
+        // occupies the graph before an exact edge: the cycle guard below can
+        // only ever skip a candidate decided AFTER the edge that blocks it.
+        for evidence in Evidence::STRONGEST_FIRST {
+            for (_, consumer, producer) in candidates.iter().filter(|(e, _, _)| *e == evidence) {
+                let (consumer, producer) = (consumer.clone(), producer.clone());
+                if ambiguous.contains(&(consumer.clone(), producer.clone()))
+                    || ambiguous.contains(&(producer.clone(), consumer.clone()))
                 {
-                    ambiguous.insert((consumer.clone(), producer.clone()));
-                    out.ambiguous_bare_pairs.push((consumer, producer));
-                    continue 'fixpoint;
+                    continue;
                 }
-                out.skipped_cycle_edges.push((consumer, producer));
-                continue;
+                if !seen_pairs.insert((consumer.clone(), producer.clone())) {
+                    continue;
+                }
+                if edge_set.contains(&(consumer.clone(), producer.clone())) {
+                    continue;
+                }
+                // Adding consumer→producer closes a cycle iff producer already
+                // (transitively) depends on consumer.
+                if reaches(&depends_on, &producer, &consumer) {
+                    // An inference blocked by an ACCEPTED opposite of the
+                    // SAME strength is not a cycle to serialize — it is two
+                    // guesses contradicting each other. Name order must not
+                    // pick the winner: a wrong pick deterministically
+                    // reverses the real producer edge, WORSE than the
+                    // undefined order it replaces. Mark the pair ambiguous
+                    // and restart so no decision keeps depending on the
+                    // withdrawn guess. An opposite of STRONGER evidence is
+                    // not a contradiction: that edge stands and this one is
+                    // the skipped closer.
+                    let contradicts = accepted_evidence.get(&(producer.clone(), consumer.clone()))
+                        == Some(&evidence);
+                    match evidence {
+                        Evidence::Bare if contradicts => {
+                            ambiguous.insert((consumer.clone(), producer.clone()));
+                            out.ambiguous_bare_pairs.push((consumer, producer));
+                            continue 'fixpoint;
+                        }
+                        Evidence::Fallback if contradicts => {
+                            ambiguous.insert((consumer.clone(), producer.clone()));
+                            out.ambiguous_fallback_pairs.push((consumer, producer));
+                            continue 'fixpoint;
+                        }
+                        Evidence::Exact3
+                        | Evidence::Exact2
+                        | Evidence::Fallback
+                        | Evidence::Bare => {}
+                    }
+                    out.skipped_cycle_edges.push((consumer, producer));
+                    continue;
+                }
+                edge_set.insert((consumer.clone(), producer.clone()));
+                depends_on
+                    .entry(consumer.clone())
+                    .or_default()
+                    .insert(producer.clone());
+                accepted_evidence.insert((consumer.clone(), producer.clone()), evidence);
+                out.edges.push((consumer, producer));
             }
-            edge_set.insert((consumer.clone(), producer.clone()));
-            depends_on
-                .entry(consumer.clone())
-                .or_default()
-                .insert(producer.clone());
-            accepted_tier.insert((consumer.clone(), producer.clone()), tier);
-            out.edges.push((consumer, producer));
         }
         break;
     }
@@ -327,6 +597,48 @@ pub fn derivation_warnings(derived: &DerivedPhysicalEdges) -> Vec<String> {
              declare depends_on to state the real direction"
         ));
     }
+    for (a, b) in &derived.ambiguous_fallback_pairs {
+        w.push(format!(
+            "models '{a}' and '{b}' each read the other's catalogless table by a \
+             catalog-qualified name — both matches are inferences and contradict, so neither \
+             ordering was derived; declare depends_on to state the real direction"
+        ));
+    }
+    for read in &derived.unbound_reads {
+        let candidates = read
+            .candidates
+            .iter()
+            .map(|c| format!("'{c}'"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let UnboundRead {
+            consumer,
+            read: name,
+            ..
+        } = read;
+        w.push(match read.reason {
+            UnboundReason::SeveralProducers => format!(
+                "model '{consumer}' reads '{name}', which matches no declared target exactly, \
+                 and several models write that schema.table with no catalog ({candidates}) — no \
+                 ordering was derived for the read; declare depends_on, or name a catalog in \
+                 each model's [target]"
+            ),
+            UnboundReason::CatalogNotEstablished => {
+                let (subject, verb) = if read.candidates.len() == 1 {
+                    ("model", "writes")
+                } else {
+                    ("models", "write")
+                };
+                format!(
+                    "model '{consumer}' reads '{name}', which matches no declared target \
+                     exactly; {subject} {candidates} {verb} that schema.table with no catalog, \
+                     and Rocky cannot tell which catalog the warehouse resolves it in — no \
+                     ordering was derived for the read; declare depends_on, or name the catalog \
+                     in the [target]"
+                )
+            }
+        });
+    }
     for (a, b) in &derived.target_collisions {
         w.push(format!(
             "models '{a}' and '{b}' render the same physical target — ordering between them \
@@ -349,12 +661,26 @@ mod tests {
     ) -> PhysicalEdgeModel<'a> {
         PhysicalEdgeModel {
             name,
+            adapter: None,
             catalog,
             schema,
             table,
             sql,
             materializes: true,
+            effective_catalog: None,
         }
+    }
+
+    /// A model whose `[target]` names no catalog and that is established to
+    /// live in `effective` (what a DuckDB adapter's own catalog name is).
+    fn catalogless<'a>(
+        name: &'a str,
+        effective: Option<&'a str>,
+        schema: &'a str,
+        table: &'a str,
+        sql: &'a str,
+    ) -> PhysicalEdgeModel<'a> {
+        m(name, "", schema, table, sql).with_effective_catalog(effective)
     }
 
     /// The bare-name rule shared by the compile-time resolver (which reports
@@ -395,6 +721,296 @@ mod tests {
             vec![("mart_qualified".to_string(), "orders".to_string())]
         );
         assert!(d.skipped_cycle_edges.is_empty() && d.unparsed.is_empty());
+    }
+
+    /// #1629 P1: a model whose `[target]` names no catalog (`catalog = ""`,
+    /// the DuckDB single-catalog shape) is indexed under an empty catalog, so
+    /// a three-part read of it misses the exact index. Once the caller has
+    /// established which catalog it lives in, the read that names that
+    /// catalog binds to it.
+    #[test]
+    fn a_three_part_read_binds_to_a_catalogless_producer_in_the_catalog_it_names() {
+        let models = [
+            catalogless("orders", Some("db"), "main", "orders", "SELECT 1 AS id"),
+            m(
+                "mart",
+                "db",
+                "main",
+                "mart",
+                "SELECT id FROM db.main.orders",
+            ),
+        ];
+        let d = derive_physical_edges(&models, &[]);
+        assert_eq!(
+            d.edges,
+            vec![("mart".to_string(), "orders".to_string())],
+            "{d:?}"
+        );
+        assert!(d.unbound_reads.is_empty(), "{d:?}");
+    }
+
+    /// Never guess across catalogs: a producer established to live in
+    /// `db` is not the table a read of `other.main.orders` names, so that
+    /// read derives no edge — and, being provably a different table, is not
+    /// even reported.
+    #[test]
+    fn a_read_naming_another_catalog_gets_no_fallback_edge() {
+        let models = [
+            catalogless("orders", Some("db"), "main", "orders", "SELECT 1 AS id"),
+            m(
+                "mart",
+                "db",
+                "main",
+                "mart",
+                "SELECT id FROM other.main.orders",
+            ),
+        ];
+        let d = derive_physical_edges(&models, &[]);
+        assert!(d.edges.is_empty(), "{d:?}");
+        assert!(d.unbound_reads.is_empty(), "{d:?}");
+        assert!(derivation_warnings(&d).is_empty(), "{d:?}");
+    }
+
+    /// When the caller could not establish the producer's catalog the read
+    /// might name a different catalog's table, so no edge is derived — the
+    /// ordering is exactly what it was before the fallback existed — and the
+    /// read is surfaced by name instead of being dropped silently.
+    #[test]
+    fn a_read_of_a_catalogless_producer_whose_catalog_is_unknown_is_reported_not_guessed() {
+        let models = [
+            catalogless("orders", None, "main", "orders", "SELECT 1 AS id"),
+            m(
+                "mart",
+                "db",
+                "main",
+                "mart",
+                "SELECT id FROM db.main.orders",
+            ),
+        ];
+        let d = derive_physical_edges(&models, &[]);
+        assert!(d.edges.is_empty(), "{d:?}");
+        assert_eq!(
+            d.unbound_reads,
+            vec![UnboundRead {
+                consumer: "mart".to_string(),
+                read: "db.main.orders".to_string(),
+                candidates: vec!["orders".to_string()],
+                reason: UnboundReason::CatalogNotEstablished,
+            }]
+        );
+        let warnings = derivation_warnings(&d);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains("'mart'")
+                && warnings[0].contains("db.main.orders")
+                && warnings[0].contains("'orders'"),
+            "the warning must name the read and the candidate: {warnings:?}"
+        );
+    }
+
+    /// Several catalogless producers could be the read's table: no edge, and
+    /// the warning names every candidate.
+    #[test]
+    fn several_catalogless_candidates_add_no_edge_and_are_named() {
+        let models = [
+            catalogless("first", Some("db"), "main", "shared", "SELECT 1 AS x"),
+            catalogless("second", Some("db"), "main", "shared", "SELECT 2 AS x"),
+            m(
+                "reader",
+                "db",
+                "main",
+                "reader",
+                "SELECT x FROM db.main.shared",
+            ),
+        ];
+        let d = derive_physical_edges(&models, &[]);
+        assert!(d.edges.is_empty(), "{d:?}");
+        assert_eq!(d.unbound_reads.len(), 1, "{d:?}");
+        assert_eq!(d.unbound_reads[0].reason, UnboundReason::SeveralProducers);
+        assert_eq!(
+            d.unbound_reads[0].candidates,
+            vec!["first".to_string(), "second".to_string()]
+        );
+        let warnings = derivation_warnings(&d);
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("'first'") && w.contains("'second'")),
+            "{warnings:?}"
+        );
+    }
+
+    /// A producer that declares another catalog cannot make a proven
+    /// catalogless match ambiguous.
+    #[test]
+    fn a_catalogless_producer_ignores_a_different_declared_catalog() {
+        let models = [
+            catalogless("local", Some("db"), "main", "shared", "SELECT 1 AS x"),
+            m("remote", "prod", "main", "shared", "SELECT 2 AS x"),
+            m(
+                "reader",
+                "db",
+                "main",
+                "reader",
+                "SELECT x FROM db.main.shared",
+            ),
+        ];
+        let d = derive_physical_edges(&models, &[]);
+        assert_eq!(d.edges, vec![("reader".into(), "local".into())], "{d:?}");
+        assert!(d.unbound_reads.is_empty(), "{d:?}");
+        assert!(d.target_collisions.is_empty(), "{d:?}");
+    }
+
+    /// Equal catalog names on different adapters do not prove different
+    /// tables, even when the configured DuckDB files are separate.
+    #[test]
+    fn a_catalogless_producer_on_another_adapter_remains_possible() {
+        let models = [
+            catalogless("local", Some("db"), "main", "shared", "SELECT 1 AS x")
+                .with_adapter("local"),
+            catalogless("remote", Some("db"), "main", "shared", "SELECT 2 AS x")
+                .with_adapter("remote"),
+            m(
+                "reader",
+                "db",
+                "main",
+                "reader",
+                "SELECT x FROM db.main.shared",
+            )
+            .with_adapter("local"),
+        ];
+        let d = derive_physical_edges(&models, &[]);
+        assert!(d.edges.is_empty(), "{d:?}");
+        assert_eq!(d.unbound_reads[0].reason, UnboundReason::SeveralProducers);
+        assert_eq!(d.unbound_reads[0].candidates, vec!["local", "remote"]);
+        assert_eq!(d.target_collisions, vec![("local".into(), "remote".into())]);
+    }
+
+    /// Producers that ALL declare a catalog can never be the table a read of
+    /// another catalog names, so nothing is bound and nothing is reported —
+    /// a warning here would be noise, and under `strict_scheduling` a refusal.
+    #[test]
+    fn producers_that_all_declare_a_catalog_are_never_reported() {
+        let models = [
+            m("prod_copy", "prod", "main", "shared", "SELECT 1 AS x"),
+            m("dev_copy", "dev", "main", "shared", "SELECT 2 AS x"),
+            m(
+                "reader",
+                "db",
+                "main",
+                "reader",
+                "SELECT x FROM external.main.shared",
+            ),
+        ];
+        let d = derive_physical_edges(&models, &[]);
+        assert!(d.edges.is_empty(), "{d:?}");
+        assert!(d.unbound_reads.is_empty(), "{d:?}");
+        assert!(derivation_warnings(&d).is_empty(), "{d:?}");
+    }
+
+    /// The review's P1 construction. `alpha` reads ANOTHER catalog's
+    /// `beta_table`; `beta` (which declares catalog `prod`) reads alpha's
+    /// table by a two-part name. The exact lookup of alpha's read misses —
+    /// legitimately — and it must NOT be answered by guessing on
+    /// `(schema, table)`: that fabricates `alpha -> beta`, which the cycle
+    /// guard then prefers over the real `beta -> alpha`.
+    #[test]
+    fn a_read_of_another_catalogs_table_never_reverses_a_real_edge() {
+        let models = [
+            m(
+                "alpha",
+                "prod",
+                "main",
+                "alpha_table",
+                "SELECT x FROM external.main.beta_table",
+            ),
+            m(
+                "beta",
+                "prod",
+                "main",
+                "beta_table",
+                "SELECT y FROM main.alpha_table",
+            ),
+        ];
+        let d = derive_physical_edges(&models, &[]);
+        assert_eq!(
+            d.edges,
+            vec![("beta".to_string(), "alpha".to_string())],
+            "{d:?}"
+        );
+        assert!(d.skipped_cycle_edges.is_empty(), "{d:?}");
+        assert!(d.unbound_reads.is_empty(), "{d:?}");
+    }
+
+    /// The passes are ordered by evidence, not by name. `a_reader`'s
+    /// fallback edge and `z_writer`'s exact edge contradict; `a_reader`
+    /// sorts first, so a name-ordered single pass would accept the guess and
+    /// discard the exact edge. The exact edge must stand.
+    #[test]
+    fn an_exact_edge_outranks_a_fallback_edge_whatever_the_names_sort_like() {
+        let models = [
+            // Bound by fallback to `z_writer` (catalogless, lives in `db`).
+            m(
+                "a_reader",
+                "db",
+                "main",
+                "a_out",
+                "SELECT x FROM db.main.z_out",
+            ),
+            // Reads a_out by an EXACT two-part name.
+            catalogless(
+                "z_writer",
+                Some("db"),
+                "main",
+                "z_out",
+                "SELECT x FROM main.a_out",
+            ),
+        ];
+        let d = derive_physical_edges(&models, &[]);
+        assert_eq!(
+            d.edges,
+            vec![("z_writer".to_string(), "a_reader".to_string())],
+            "{d:?}"
+        );
+        assert_eq!(
+            d.skipped_cycle_edges,
+            vec![("a_reader".to_string(), "z_writer".to_string())],
+            "the weaker, later edge is the one that is skipped: {d:?}"
+        );
+        assert!(d.ambiguous_fallback_pairs.is_empty(), "{d:?}");
+    }
+
+    /// Two fallback edges that contradict are two inferences of the same
+    /// strength: name order must not pick one. Neither is derived.
+    #[test]
+    fn reciprocal_fallback_reads_derive_nothing_and_are_surfaced() {
+        let models = [
+            catalogless(
+                "alpha",
+                Some("db"),
+                "main",
+                "t_alpha",
+                "SELECT x FROM db.main.t_beta",
+            ),
+            catalogless(
+                "beta",
+                Some("db"),
+                "main",
+                "t_beta",
+                "SELECT y FROM db.main.t_alpha",
+            ),
+        ];
+        let d = derive_physical_edges(&models, &[]);
+        assert!(d.edges.is_empty(), "{d:?}");
+        assert!(d.skipped_cycle_edges.is_empty(), "{d:?}");
+        assert_eq!(d.ambiguous_fallback_pairs.len(), 1, "{d:?}");
+        assert!(d.ambiguous_bare_pairs.is_empty(), "{d:?}");
+        assert!(
+            derivation_warnings(&d)
+                .iter()
+                .any(|w| w.contains("catalog-qualified")),
+            "{d:?}"
+        );
     }
 
     /// A renamed target (model name ≠ table name) still matches — the case

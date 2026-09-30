@@ -73,6 +73,22 @@ pub const KNOWN_ADAPTER_TYPES: &[&str] = &[
     "manual",
 ];
 
+/// The SQL dialect for a warehouse adapter type, without constructing an adapter.
+/// Draft validation uses this before any warehouse connection is opened.
+pub fn warehouse_dialect_for_type(
+    adapter_type: &str,
+) -> Option<&'static dyn rocky_core::traits::SqlDialect> {
+    match adapter_type {
+        #[cfg(feature = "duckdb")]
+        "duckdb" => Some(&rocky_duckdb::dialect::DuckDbSqlDialect),
+        "databricks" => Some(&rocky_databricks::dialect::DatabricksSqlDialect),
+        "snowflake" => Some(&rocky_snowflake::dialect::SnowflakeSqlDialect),
+        "bigquery" => Some(&rocky_bigquery::dialect::BigQueryDialect),
+        "trino" => Some(&rocky_trino::dialect::TrinoDialect),
+        _ => None,
+    }
+}
+
 /// Holds constructed adapter instances, keyed by name from the config.
 pub struct AdapterRegistry {
     warehouse: HashMap<String, Arc<dyn WarehouseAdapter>>,
@@ -512,6 +528,48 @@ impl AdapterRegistry {
                     let key = adapter_cfg.path.as_deref().unwrap_or_default();
                     let adapter = Arc::new(crate::testing::RecordingWarehouseAdapter::new(key));
                     warehouse.insert(name.clone(), adapter as Arc<dyn WarehouseAdapter>);
+                }
+                // Test-only, same exemption as "recording" above. Registers a
+                // `WarehouseAdapter` that wraps a real in-memory DuckDB
+                // adapter but fails the selected warehouse call with a typed
+                // Databricks `ConnectorError`, wrapped exactly the way
+                // production wraps a warehouse adapter's connector error
+                // (#2064) — so a test can drive a transformation model's
+                // runtime failure through the real `run()` entry point and
+                // assert the classified `failure_kind` (#2143). See
+                // `crate::testing::FailingWriteWarehouseAdapter`.
+                #[cfg(all(test, feature = "duckdb"))]
+                "test-fail-write" => {
+                    let inner = rocky_duckdb::adapter::DuckDbWarehouseAdapter::in_memory()
+                        .context(format!("adapters.{name}: in-memory DuckDB for test double"))?;
+                    let failure = match adapter_cfg.path.as_deref() {
+                        Some("auth") => crate::testing::FailingWriteKind::Auth,
+                        Some("rate-limit") => crate::testing::FailingWriteKind::RateLimit,
+                        Some("breaker") => crate::testing::FailingWriteKind::CircuitBreaker,
+                        Some("content-query-rate-limit") => {
+                            crate::testing::FailingWriteKind::ContentQueryRateLimit
+                        }
+                        Some("content-query-breaker") => {
+                            crate::testing::FailingWriteKind::ContentQueryCircuitBreaker
+                        }
+                        Some("content-msck-rate-limit") => {
+                            crate::testing::FailingWriteKind::ContentMsckRateLimit
+                        }
+                        Some("content-msck-breaker") => {
+                            crate::testing::FailingWriteKind::ContentMsckCircuitBreaker
+                        }
+                        other => bail!("adapters.{name}: unknown test failure {other:?}"),
+                    };
+                    let adapter = Arc::new(crate::testing::FailingWriteWarehouseAdapter::new(
+                        inner, failure,
+                    ));
+                    warehouse.insert(name.clone(), adapter as Arc<dyn WarehouseAdapter>);
+                }
+                #[cfg(all(test, not(feature = "duckdb")))]
+                "test-fail-write" => {
+                    bail!(
+                        "adapters.{name}: DuckDB support not compiled in (enable 'duckdb' feature)"
+                    );
                 }
                 other => {
                     let mut msg = format!(

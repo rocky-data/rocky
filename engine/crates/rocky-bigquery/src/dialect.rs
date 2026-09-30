@@ -633,6 +633,21 @@ mod tests {
     }
 
     #[test]
+    fn test_watermark_where_with_fractional_prior_keeps_the_fraction() {
+        use chrono::TimeZone;
+        let d = BigQueryDialect;
+        let prior = chrono::Utc.with_ymd_and_hms(2026, 9, 15, 10, 0, 0).unwrap()
+            + chrono::Duration::milliseconds(250);
+        let sql = d.watermark_where("_loaded_at", Some(&prior)).unwrap();
+        // #2004: a fractional-second watermark must render its fraction, or
+        // the row it was read from re-passes the next run's `>` filter.
+        assert_eq!(
+            sql,
+            "WHERE _loaded_at > TIMESTAMP '2026-09-15 10:00:00.250'"
+        );
+    }
+
+    #[test]
     fn test_create_catalog_returns_none() {
         let d = BigQueryDialect;
         assert!(d.create_catalog_sql("project").is_none());

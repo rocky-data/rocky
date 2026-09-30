@@ -32,6 +32,18 @@ pub enum DuckDbError {
     /// `concat_batches` against a schema mismatch).
     #[error("Arrow error: {0}")]
     Arrow(String),
+
+    #[error("DuckDB rolled back the DROP after the kind switch failed: {0}")]
+    KindSwitchRolledBack(duckdb::Error),
+
+    #[error("DuckDB kind switch failed: {cause}; rollback also failed: {rollback}")]
+    KindSwitchRollbackFailed {
+        cause: Box<duckdb::Error>,
+        rollback: Box<duckdb::Error>,
+    },
+
+    #[error("DuckDB kind switch COMMIT failed; target state is uncertain: {0}")]
+    KindSwitchCommitUncertain(duckdb::Error),
 }
 
 /// Query result matching the structure of rocky-databricks QueryResult.
@@ -98,15 +110,29 @@ impl DuckDbConnector {
                     Value::Double(n) => serde_json::Value::String(n.to_string()),
                     Value::Text(s) => serde_json::Value::String(s),
                     Value::Timestamp(unit, val) => {
-                        // Convert timestamp to string representation
-                        let secs = match unit {
-                            duckdb::types::TimeUnit::Second => val,
-                            duckdb::types::TimeUnit::Millisecond => val / 1_000,
-                            duckdb::types::TimeUnit::Microsecond => val / 1_000_000,
-                            duckdb::types::TimeUnit::Nanosecond => val / 1_000_000_000,
+                        // Convert timestamp to an RFC 3339 string, keeping
+                        // whatever sub-second precision `unit` carries. This
+                        // cell is the read side of `MAX(<timestamp_column>)`
+                        // for incremental replication watermarks
+                        // (`query_target_max_timestamp` in
+                        // rocky-cli/src/commands/run.rs) — truncating to
+                        // whole seconds here made every fractional-second
+                        // watermark re-copy the newest source rows on the
+                        // next run (#2004).
+                        let (secs, nanos) = match unit {
+                            duckdb::types::TimeUnit::Second => (val, 0),
+                            duckdb::types::TimeUnit::Millisecond => {
+                                (val.div_euclid(1_000), val.rem_euclid(1_000) * 1_000_000)
+                            }
+                            duckdb::types::TimeUnit::Microsecond => {
+                                (val.div_euclid(1_000_000), val.rem_euclid(1_000_000) * 1_000)
+                            }
+                            duckdb::types::TimeUnit::Nanosecond => {
+                                (val.div_euclid(1_000_000_000), val.rem_euclid(1_000_000_000))
+                            }
                         };
                         serde_json::Value::String(
-                            chrono::DateTime::from_timestamp(secs, 0)
+                            chrono::DateTime::from_timestamp(secs, nanos as u32)
                                 .map(|dt| dt.to_rfc3339())
                                 .unwrap_or_default(),
                         )
@@ -172,6 +198,32 @@ impl DuckDbConnector {
         debug!(sql = sql, "executing DuckDB statement");
         self.conn.execute_batch(sql)?;
         Ok(())
+    }
+
+    /// Keep both DDL statements on the same connection and roll back either
+    /// failure before another adapter call can acquire the connection lock.
+    pub fn atomic_drop_and_create(
+        &self,
+        drop_sql: &str,
+        create_sql: &str,
+    ) -> Result<(), DuckDbError> {
+        self.conn.execute_batch("BEGIN TRANSACTION")?;
+        let result = self
+            .conn
+            .execute_batch(drop_sql)
+            .and_then(|()| self.conn.execute_batch(create_sql));
+        if let Err(cause) = result {
+            return match self.conn.execute_batch("ROLLBACK") {
+                Ok(()) => Err(DuckDbError::KindSwitchRolledBack(cause)),
+                Err(rollback) => Err(DuckDbError::KindSwitchRollbackFailed {
+                    cause: Box::new(cause),
+                    rollback: Box::new(rollback),
+                }),
+            };
+        }
+        self.conn
+            .execute_batch("COMMIT")
+            .map_err(DuckDbError::KindSwitchCommitUncertain)
     }
 
     /// Execute `sql` via DuckDB's native `query_arrow` and return a single
@@ -379,6 +431,35 @@ mod tests {
             .execute_sql("SELECT COUNT(*) AS cnt FROM target")
             .unwrap();
         assert_eq!(result.rows[0][0], "2"); // 1 existing + 1 new
+    }
+
+    /// #2004: `MAX(<timestamp_column>)` on a fractional-second value must
+    /// round-trip its fraction as a string, not get integer-divided down to
+    /// whole seconds. `query_target_max_timestamp` / `resolve_new_watermark`
+    /// (rocky-cli/src/commands/run.rs) persist this cell verbatim as the
+    /// incremental-replication watermark — a truncated cell here silently
+    /// re-copies the newest source rows on the next run.
+    #[test]
+    fn test_max_timestamp_cell_keeps_fractional_seconds() {
+        let db = DuckDbConnector::in_memory().unwrap();
+        db.create_table("t", &[("id", "INTEGER"), ("ts", "TIMESTAMP")])
+            .unwrap();
+        db.insert_row("t", &["1", "TIMESTAMP '2026-09-15 10:00:00.250'"])
+            .unwrap();
+
+        let result = db.execute_sql("SELECT MAX(ts) FROM t").unwrap();
+        let cell = result.rows[0][0]
+            .as_str()
+            .expect("timestamp cell must be a JSON string");
+        let parsed: chrono::DateTime<chrono::Utc> =
+            cell.parse().expect("cell must be a valid RFC 3339 string");
+        assert_eq!(
+            parsed,
+            chrono::DateTime::parse_from_rfc3339("2026-09-15T10:00:00.250Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+            "MAX(ts) truncated the fractional second, got {cell:?}"
+        );
     }
 
     #[test]

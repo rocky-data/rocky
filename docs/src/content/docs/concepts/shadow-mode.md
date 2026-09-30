@@ -38,12 +38,19 @@ isolation:
   run is therefore not redirected to that upstream's shadow target. The
   downstream shadow table would be built from production data while the run
   reported success. Run the shadow pipeline without `--dag`.
-- **Snapshot and load pipelines** refuse it. Rocky does not rewrite their
-  targets.
+- **Quality, snapshot and load pipelines** refuse it. Rocky does not rewrite
+  their targets. A quality run would check the tables it lists in production,
+  and a quarantine mode would write there too. Rocky stops before it reads or
+  writes anything, and the message names the pipeline and the flag.
 - **Seeds** cause a `--dag` run to be refused along with the rest. `rocky seed`
   itself has no shadow mode and always writes its configured target.
 
 A stored `rocky plan --shadow` carries its routing into `rocky apply`.
+
+To quality-check a branch, list the branch's tables in a quality pipeline. Set
+`schema` to the branch schema, `branch__<name>`, and run the pipeline without
+the flag. Its quarantine tables then land in the branch schema, and production
+stays untouched.
 :::
 
 ## Who owns a shadow object, and how long it lives
@@ -296,6 +303,7 @@ Set the pass, warn, and fail thresholds:
 | **Pass** | All comparisons within thresholds |
 | **Warn** | Minor differences detected (e.g., row count within warn threshold, column order change) |
 | **Fail** | Significant differences (e.g., row count beyond fail threshold, missing columns, type changes) |
+| **Error** | Rocky could not read a table or its schema on one side. The count it could not read is `null`, and `reasons` in the JSON says why. Rocky counts an error as a failure. |
 
 ## Use cases
 

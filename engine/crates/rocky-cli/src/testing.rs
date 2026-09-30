@@ -301,6 +301,160 @@ impl SqlDialect for RecordingDialect {
     }
 }
 
+/// Serialises every test in this crate that mutates `DAGSTER_PIPES_CONTEXT`
+/// / `DAGSTER_PIPES_MESSAGES` and every Pipes-detecting entry point. The
+/// `pipes` and `run_audit` tests set them, and
+/// `cargo test` runs a crate's tests in parallel threads within ONE process
+/// by default, so env vars are shared, process-global state across all of
+/// them. Earlier file-local locks did not protect callers in other test
+/// modules. `PipesEmitter::requested_channel` and audit detection now take
+/// this lock on reads too; a test already holding it can re-enter on the
+/// same thread while setting its fixture.
+///
+/// A panic in one env-mutating test (deliberate, in a mutation-check)
+/// poisons this lock for every test after it in the same run; the lock
+/// exists to serialise access to shared env vars, not to propagate one
+/// test's panic into unrelated ones, so every acquisition recovers the
+/// guard instead of unwrapping it.
+pub(crate) static PIPES_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+thread_local! {
+    static HOLDS_PIPES_ENV_LOCK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub(crate) struct PipesEnvGuard(Option<std::sync::MutexGuard<'static, ()>>);
+
+impl Drop for PipesEnvGuard {
+    fn drop(&mut self) {
+        if self.0.is_some() {
+            HOLDS_PIPES_ENV_LOCK.with(|held| held.set(false));
+        }
+    }
+}
+
+pub(crate) fn lock_pipes_env() -> PipesEnvGuard {
+    if HOLDS_PIPES_ENV_LOCK.with(std::cell::Cell::get) {
+        return PipesEnvGuard(None);
+    }
+    let guard = PIPES_ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    HOLDS_PIPES_ENV_LOCK.with(|held| held.set(true));
+    PipesEnvGuard(Some(guard))
+}
+
+/// A warehouse adapter that wraps a real in-memory DuckDB adapter but fails
+/// the selected warehouse call with a typed
+/// Databricks `ConnectorError`, wrapped in
+/// `rocky_core::traits::AdapterError` — the same wrapper every
+/// `WarehouseAdapter` method actually returns in production (#2064).
+///
+/// Exists so a test can drive `rocky run`'s real `run()` entry point through
+/// a transformation model's runtime failure and assert the classified
+/// `failure_kind` / `cooldown_seconds` `run()` records (#2143), without a
+/// live Databricks credential. Content-addressed tests can instead fail the
+/// model query or post-commit MSCK. Unselected calls delegate to DuckDB,
+/// except the one source query the content-addressed fixture answers here.
+#[cfg(feature = "duckdb")]
+pub(crate) struct FailingWriteWarehouseAdapter {
+    inner: rocky_duckdb::adapter::DuckDbWarehouseAdapter,
+    failure: FailingWriteKind,
+}
+
+#[cfg(feature = "duckdb")]
+pub(crate) enum FailingWriteKind {
+    Auth,
+    RateLimit,
+    CircuitBreaker,
+    ContentQueryRateLimit,
+    ContentQueryCircuitBreaker,
+    ContentMsckRateLimit,
+    ContentMsckCircuitBreaker,
+}
+
+#[cfg(feature = "duckdb")]
+impl FailingWriteWarehouseAdapter {
+    pub(crate) fn new(
+        inner: rocky_duckdb::adapter::DuckDbWarehouseAdapter,
+        failure: FailingWriteKind,
+    ) -> Self {
+        Self { inner, failure }
+    }
+
+    fn injected_error(&self) -> AdapterError {
+        use rocky_databricks::connector::ConnectorError;
+        let error = match self.failure {
+            FailingWriteKind::Auth => ConnectorError::ApiError {
+                status: 401,
+                body: "injected auth failure".to_string(),
+            },
+            FailingWriteKind::RateLimit
+            | FailingWriteKind::ContentQueryRateLimit
+            | FailingWriteKind::ContentMsckRateLimit => ConnectorError::ApiError {
+                status: 429,
+                body: "injected rate limit".to_string(),
+            },
+            FailingWriteKind::CircuitBreaker
+            | FailingWriteKind::ContentQueryCircuitBreaker
+            | FailingWriteKind::ContentMsckCircuitBreaker => ConnectorError::CircuitBreakerOpen {
+                consecutive_failures: 5,
+                cooldown_seconds: Some(180),
+            },
+        };
+        AdapterError::new(error)
+    }
+}
+
+#[cfg(feature = "duckdb")]
+#[async_trait::async_trait]
+impl WarehouseAdapter for FailingWriteWarehouseAdapter {
+    fn dialect(&self) -> &dyn SqlDialect {
+        self.inner.dialect()
+    }
+
+    async fn execute_statement(&self, sql: &str) -> AdapterResult<()> {
+        if matches!(
+            self.failure,
+            FailingWriteKind::ContentQueryRateLimit | FailingWriteKind::ContentQueryCircuitBreaker
+        ) {
+            return self.inner.execute_statement(sql).await;
+        }
+        if matches!(
+            self.failure,
+            FailingWriteKind::ContentMsckRateLimit | FailingWriteKind::ContentMsckCircuitBreaker
+        ) && !sql.starts_with("MSCK REPAIR TABLE ")
+        {
+            return self.inner.execute_statement(sql).await;
+        }
+        Err(self.injected_error())
+    }
+
+    async fn execute_query(&self, sql: &str) -> AdapterResult<QueryResult> {
+        if matches!(
+            self.failure,
+            FailingWriteKind::ContentQueryRateLimit | FailingWriteKind::ContentQueryCircuitBreaker
+        ) && sql.contains("content_addressed_failure_probe")
+        {
+            return Err(self.injected_error());
+        }
+        if sql.contains("FROM raw.events") {
+            return Ok(QueryResult {
+                columns: vec!["content_addressed_failure_probe".to_string()],
+                rows: vec![vec![serde_json::json!(1)]],
+            });
+        }
+        self.inner.execute_query(sql).await
+    }
+
+    async fn describe_table(&self, table: &TableRef) -> AdapterResult<Vec<ColumnInfo>> {
+        self.inner.describe_table(table).await
+    }
+
+    fn classify_failure(&self, err: &AdapterError) -> rocky_core::failure_class::FailureClass {
+        self.inner.classify_failure(err)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

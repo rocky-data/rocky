@@ -34,6 +34,8 @@ tracing-opentelemetry = { workspace = true, optional = true }
 [dev-dependencies]
 tokio = { workspace = true }
 tempfile = "3"
+# The OTLP retry tests run a real gRPC collector that answers `UNAVAILABLE`.
+tonic = { workspace = true }
 
 [lints]
 workspace = true

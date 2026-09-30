@@ -334,6 +334,125 @@ Upstream output has `"direction": "upstream"` (the default shape, unchanged). Th
 
 ---
 
+## `rocky lineage-diff`
+
+Report the downstream blast radius of a change between two git refs, for PR review. It combines the structural diff from `rocky ci-diff` with the downstream consumers from `rocky lineage --downstream`. Together they show which downstream columns each changed column reaches.
+
+Git selects the changed paths from committed history between `base_ref` and HEAD. The column schemas and the downstream trace, though, come from the current working tree, not a git checkout of HEAD. For a report that must describe HEAD exactly, commit your changes first, so the working tree matches HEAD.
+
+```bash
+rocky lineage-diff [base_ref] [flags]
+```
+
+### Arguments
+
+| Argument | Type | Default | Description |
+|----------|------|---------|-------------|
+| `base_ref` | `string` | `main` | Git ref to compare against. Uses the same git-diff mechanism as [`rocky ci-diff`](#rocky-ci-diff). |
+
+### Flags
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--models <PATH>` | `PathBuf` | `models` | Directory containing model files. |
+| `-o, --output <FORMAT>` | `json` \| `table` \| `md` | terminal-aware | `json` emits the full payload, including the pre-rendered report in a `markdown` field. `table` and `md` print that same report directly. |
+
+### Examples
+
+Diff the current branch against `main` and print the Markdown report:
+
+```bash
+rocky lineage-diff main --output table
+```
+
+```text
+Rocky Lineage Diff (main...HEAD)
+
+### Rocky Lineage Diff
+
+**2 row(s) changed** (2 modified, 0 added, 0 removed, 0 unchanged)
+
+<details>
+<summary><b>fct_revenue</b> — modified (3 column changes)</summary>
+
+| Column | Change | Old Type | New Type | Downstream consumers |
+|--------|--------|----------|----------|----------------------|
+| `total_revenue` | added | - | Unknown | _none_ |
+| `total_tax` | added | - | Unknown | _none_ |
+| `total` | removed | Unknown | - | _(removed; not traceable on HEAD)_ |
+
+</details>
+
+<details>
+<summary><b>stg_orders</b> — modified (3 column changes)</summary>
+
+| Column | Change | Old Type | New Type | Downstream consumers |
+|--------|--------|----------|----------|----------------------|
+| `amount_usd` | added | - | Unknown | `fct_revenue.total_revenue` |
+| `tax_amount_usd` | added | - | Unknown | `fct_revenue.total_tax` |
+| `amount` | removed | Unknown | - | _(removed; not traceable on HEAD)_ |
+
+</details>
+```
+
+The same diff as JSON, for a CI pipeline:
+
+```bash
+rocky lineage-diff main -o json
+```
+
+```json
+{
+  "version": "1.74.0",
+  "command": "lineage-diff",
+  "base_ref": "main",
+  "head_ref": "HEAD",
+  "summary": { "total_models": 2, "unchanged": 0, "modified": 2, "added": 0, "removed": 0 },
+  "results": [
+    {
+      "model_name": "fct_revenue",
+      "status": "modified",
+      "column_changes": [
+        { "column_name": "total_revenue", "change_type": "added", "new_type": "Unknown" },
+        { "column_name": "total_tax", "change_type": "added", "new_type": "Unknown" },
+        { "column_name": "total", "change_type": "removed", "old_type": "Unknown" }
+      ]
+    },
+    {
+      "model_name": "stg_orders",
+      "status": "modified",
+      "column_changes": [
+        {
+          "column_name": "amount_usd",
+          "change_type": "added",
+          "new_type": "Unknown",
+          "downstream_consumers": [{ "model": "fct_revenue", "column": "total_revenue" }]
+        },
+        {
+          "column_name": "tax_amount_usd",
+          "change_type": "added",
+          "new_type": "Unknown",
+          "downstream_consumers": [{ "model": "fct_revenue", "column": "total_tax" }]
+        },
+        { "column_name": "amount", "change_type": "removed", "old_type": "Unknown" }
+      ]
+    }
+  ],
+  "markdown": "### Rocky Lineage Diff\n\n..."
+}
+```
+
+A removed column has no downstream trace. The column no longer exists on HEAD's compile, so Rocky cannot walk its downstream reach. JSON omits `downstream_consumers` when it is empty, so a consumer should default a missing key to an empty list. The structural diff still reports the removal.
+
+`rocky lineage-diff` reports; it does not fail a build. Finding changed columns, however many, does not change the exit code. Only an error makes it exit non-zero: an invalid `base_ref`, a `git diff` that fails, or invalid or unreadable project configuration.
+
+### Related Commands
+
+- [`rocky ci-diff`](#rocky-ci-diff) -- the structural diff alone, without the downstream trace
+- [`rocky lineage`](#rocky-lineage) -- trace a single column's lineage directly
+
+---
+
 ## `rocky catalog`
 
 Emit a project-wide column-level lineage snapshot to disk. Walks every model in the SemanticGraph and serializes the result as persisted catalog artifacts (a `catalog.json` front door plus `edges.parquet` / `assets.parquet`) so downstream consumers (BI tools, governance dashboards, AI review bots) can query lineage without re-invoking the engine.
@@ -779,7 +898,7 @@ rocky ci-diff [base_ref] [flags]
 
 | Argument | Type | Default | Description |
 |----------|------|---------|-------------|
-| `base_ref` | `string` | `main` | Git ref to compare against. Rocky shells out to `git diff --name-only <base_ref> HEAD` to find changed `.sql`, `.rocky`, and sidecar `.toml` files. |
+| `base_ref` | `string` | `main` | Git ref to compare against. Rocky shells out to `git diff --name-status <base_ref>...HEAD` to find changed `.sql`, `.rocky`, and sidecar `.toml` files. |
 
 ### Flags
 
@@ -875,29 +994,29 @@ The `breaking_findings` field is JSON-only: `--output table` still renders the s
 
 ## `rocky preview`
 
-Preview a change before it merges. Rocky re-executes only the changed models and their downstream column lineage on a per-pull-request branch, and copies everything else from the base ref.
+Preview a change before it merges. Rocky identifies changed model files and downstream models through sidecar `depends_on`. It copies the other models from the base schema into a per-PR branch.
 
 Three subcommands compose into one review artifact. `preview create` prepares the branch, `preview diff` reports what changed, and `preview cost` reports the cost delta against base. A fourth, `preview rows`, is separate: it samples the output rows of a single model.
 
-For the design (why CTAS today and warehouse-native clones tomorrow, how the column-level pruner works, what the sampling window's correctness ceiling is), see the [How Preview Works](/concepts/preview-internals/) concept page. For a step-by-step walkthrough on a feature branch, see the [Preview a PR](/guides/preview-a-pr/) how-to.
+For the prune set, adapter copy methods, and diff coverage, see [How Preview Works](/concepts/preview-internals/). For a walkthrough, see [Preview a PR](/guides/preview-a-pr/).
 
 ```bash
 rocky preview create --base <ref> [--name <branch_name>]
-rocky preview diff   --name <branch_name> [--base <ref>] [--sample-size <N>]
-rocky preview cost   --name <branch_name> [--base <ref>]
+rocky preview diff   --name <branch_name> [--base <ref>]
+rocky preview cost   --name <branch_name>
 rocky preview rows   --model <name> [--cte <name>] [--limit <N>]
 ```
 
-`preview create`, `preview diff`, and `preview cost` accept `--output json|markdown`. The Markdown form is pre-rendered for posting to a PR comment; the JSON form embeds the same Markdown in a top-level `markdown` field for orchestrator use.
+`preview diff` and `preview cost` put a pre-rendered Markdown report in the `markdown` field of their JSON output. It is ready to post as a PR comment. `preview create` has no such field. There is no `--output markdown`: the valid values are `json`, `table`, and `md`, and `md` behaves like `table` here.
 
 ### `rocky preview create`
 
-Compute the prune set and copy the rest from the base schema into a per-PR branch. It does not run the prune set: it reports `run_status: "planned"` with an empty `run_id`. Run `rocky run --branch <name>` over the prune set before `preview diff` or `preview cost`. Today `preview diff` looks for a run whose recorded git branch equals the preview branch name, and a run records the branch you are actually on, so the two only meet when your git branch carries the preview name. See [#2032](https://github.com/rocky-data/rocky/issues/2032).
+Compute the prune set and copy the rest from the base schema into a per-PR branch. It does not run the prune set: it reports `run_status: "planned"` with an empty `run_id`. Run `rocky run --branch <name>` before `preview diff` or `preview cost`. That command has no selector for a set of models: it builds the whole pipeline, or one model with `--model`. Both preview commands read only the newest branch run. They find it by its recorded `rocky_branch`, the literal `--branch` value, not by the git branch you have checked out. The base run must be an ordinary production run, without `--branch` or `--shadow`.
 
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
 | `--base <REF>` | `string` | `main` | Git ref the change-set is computed against. Rocky shells out to `git diff --name-only <base>...HEAD` against the models directory. |
-| `--name <NAME>` | `string` | derived from current branch | Branch name to register in the state store. The branch's `schema_prefix` becomes `branch__<name>` and is the target schema for the pruned run. |
+| `--name <NAME>` | `string` | `pr_preview_<current git branch>` | Branch name to register in the state store. Use 1 to 64 characters from `[A-Za-z0-9_]`. The default is `pr_preview_` plus the git branch name, with every other character replaced by `_`, cut to 64 characters. On a detached HEAD, it is `pr_preview_` plus a timestamp. The branch's `schema_prefix` becomes `branch__<name>` and is the target schema for the pruned run. |
 | `--models <PATH>` | `PathBuf` | `models` | Directory containing model files. |
 
 **Example.** Diff against `main` and create a preview branch:
@@ -910,68 +1029,73 @@ rocky preview create --base main
 {
   "version": "1.18.0",
   "command": "preview-create",
-  "branch_name": "preview-fix-price",
-  "branch_schema": "branch__preview-fix-price",
+  "branch_name": "pr_preview_fix_price",
+  "branch_schema": "branch__pr_preview_fix_price",
   "base_ref": "main",
   "head_ref": "HEAD",
   "prune_set": [
-    { "model_name": "fct_revenue", "reason": "changed", "changed_columns": ["amount_cents"] },
+    { "model_name": "fct_revenue", "reason": "changed" },
     { "model_name": "rev_by_region", "reason": "downstream_of_changed" }
   ],
   "copy_set": [
-    { "model_name": "stg_orders",    "source_schema": "main", "target_schema": "branch__preview-fix-price", "copy_strategy": "ctas" },
-    { "model_name": "stg_customers", "source_schema": "main", "target_schema": "branch__preview-fix-price", "copy_strategy": "ctas" }
+    { "model_name": "stg_orders",    "source_schema": "main", "target_schema": "branch__pr_preview_fix_price", "copy_strategy": "ctas" },
+    { "model_name": "stg_customers", "source_schema": "main", "target_schema": "branch__pr_preview_fix_price", "copy_strategy": "ctas" }
   ],
   "skipped_set": [],
-  "run_id": "run-20260428-141033-002",
-  "run_status": "succeeded",
+  "run_id": "",
+  "run_status": "planned",
   "duration_ms": 4321
 }
 ```
 
-`copy_strategy` reports `"ctas"` for every successful copy regardless of which SQL primitive the adapter actually emitted. As of `engine-v1.19.1`, Databricks uses `SHALLOW CLONE` and BigQuery uses `CREATE TABLE … COPY` (both metadata-only) under the hood; DuckDB and Snowflake fall through to the portable CTAS default. Surfacing the per-adapter strategy in the wire output is a follow-up.
+`changed_columns` exists in the output type, but Rocky leaves it empty and omits it from JSON today. `copy_strategy` reports `"ctas"` for every successful copy. Databricks uses `SHALLOW CLONE`, BigQuery uses `CREATE TABLE … COPY`, and Snowflake uses `CREATE TABLE … CLONE`. DuckDB uses CTAS. The output does not distinguish these methods yet.
 
 ### `rocky preview diff`
 
-Compare the branch run with the base run, for every model in the prune set.
+Compare the branch run with the base run, for every model the branch run executed.
+
+Rocky finds both runs in the state store. The branch run is the newest run recorded with `rocky run --branch <name>`. The base run is the newest run made without `--branch` on the git branch or commit that `--base` names. If there is no such base run, the diff stays empty and `base_note` says why.
 
 By default this compares the `rows_affected` the two run records hold. It reports `rows_added` and `rows_removed`, leaves `rows_changed` at 0, returns no samples and no column-level delta, and sets `coverage: "not_yet_sampled"` with `coverage_warning: true`.
 
-Two limits follow. A change that rewrites values without changing row counts shows nothing. And an ordinary transformation run records no `rows_affected` at all, which the diff reads as 0, so a model that goes from 10 rows to 20 can also report nothing.
+Two limits follow. A change that rewrites values without changing row counts shows nothing. And an ordinary transformation run records no `rows_affected` at all.
+
+A model with no recorded row count has an unknown delta. When it ran on both sides, `rows_added` and `rows_removed` are `null`. When it ran only on the branch, `rows_added` is `null` and `rows_removed` is `0`. The Markdown shows `?` for `null`. `summary.models_unknown` counts these models. Rocky counts them as neither changed nor unchanged, and leaves them out of `total_rows_added` and `total_rows_removed`.
 
 Pass `--algorithm bisection` to compare row content. It needs a `Merge` model whose single `unique_key` holds whole numbers: the bounds are parsed as integers, so a decimal key falls back to the default comparison without saying so. Read each model's `algorithm.kind` before you treat its result as a content comparison.
 
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
-| `--name <NAME>` | `string` | **(required)** | Branch name created by `preview create`. |
-| `--base <REF>` | `string` | `main` | Git ref to compare against. Must match what `preview create` was invoked with. |
+| `--name <NAME>` | `string` | **(required)** | Branch name created by `preview create`. Rocky matches it against the `rocky_branch` recorded on each run. |
+| `--base <REF>` | `string` | `main` | Git branch name or commit that the base run was recorded on. A commit can be a full sha or a prefix of at least 7 characters. It must differ from `--name`. |
 | `--models <PATH>` | `PathBuf` | `models` | Models directory. Bisection reads each model's primary-key column from here. |
-| `--sample-size <N>` | `usize` | `1000` | Accepted and ignored today. The default comparison samples no rows, so this value changes nothing ([#2032](https://github.com/rocky-data/rocky/issues/2032)). |
+
+The old `--sample-size` flag is gone. Nothing read it, so Rocky removed it. A script that still passes it now fails to parse.
 
 **Example.** Print a Markdown report ready to post on a PR:
 
 ```bash
-rocky preview diff --name preview-fix-price --output json | jq -r .markdown
+rocky preview diff --name pr_preview_fix_price --output json | jq -r .markdown
 ```
 
 There is no `--output markdown`. The report lives in the `markdown` field of the JSON output (`PreviewDiffOutput`). The same JSON also carries the per-model `sampling_window` block with `coverage_warning`.
 
 ### `rocky preview cost`
 
-Per-model cost delta between the branch run and the latest base-schema `RunRecord`.
+Per-model cost delta between the branch run and a base run. The branch run is the newest run recorded with `rocky run --branch <name>`. The base run is the newest run other than the branch's own. A run made without `--branch` on a git branch with the same name counts as the branch's own. Any other run can be the base, including a run made with another `--branch` name. `preview cost` has no `--base` flag.
 
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
-| `--name <NAME>` | `string` | **(required)** | Branch name created by `preview create`. |
+| `--name <NAME>` | `string` | **(required)** | Branch name created by `preview create`. Rocky matches it against the `rocky_branch` recorded on each run. |
 | `--models <PATH>` | `PathBuf` | `models` | Models directory. Rocky reads per-model `[budget]` blocks from the sidecars here, so a projected breach can name a single model. |
 
 **Example.**
 
 ```bash
-rocky preview cost --name preview-fix-price --output json | jq -r .markdown
+rocky preview cost --name pr_preview_fix_price --output json | jq -r .markdown
 ```
 
-The JSON shape (`PreviewCostOutput`) carries the Markdown report in its `markdown` field. It reports per-model `delta_usd`, `branch_duration_ms`, `base_duration_ms`, and bytes scanned, plus an aggregate `summary.delta_usd`, `summary.savings_from_copy_usd`, and `models_skipped_via_copy`. Underlying cost math is identical to [`rocky cost`](/reference/commands/administration/#rocky-cost) (Databricks / Snowflake duration × DBU rate; BigQuery bytes × $/TB; DuckDB zero); fields fall back to `null` when no base `RunRecord` exists or when the adapter does not surface USD.
+The JSON shape (`PreviewCostOutput`) carries the Markdown report in its `markdown` field. It reports per-model `delta_usd`, `branch_duration_ms`, `base_duration_ms`, and bytes scanned, plus an aggregate `summary.delta_usd`, `summary.savings_from_copy_usd`, and `models_skipped_via_copy`. Underlying cost math is identical to [`rocky cost`](/reference/commands/administration/#rocky-cost) (Databricks / Snowflake duration × DBU rate; BigQuery bytes × $/TB; DuckDB zero). USD fields are left out when the adapter does not surface USD. With no base run, `base_run_id` is left out and `per_model` is empty.
 
 ### `rocky preview rows`
 

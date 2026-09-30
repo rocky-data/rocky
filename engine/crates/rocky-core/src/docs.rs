@@ -769,6 +769,7 @@ mod tests {
 
         let models = vec![
             Model {
+                drop_existing_kind: None,
                 config: crate::models::ModelConfig {
                     name: "z_model".into(),
                     depends_on: vec![],
@@ -799,6 +800,7 @@ mod tests {
                 contract_path: None,
             },
             Model {
+                drop_existing_kind: None,
                 config: crate::models::ModelConfig {
                     name: "a_model".into(),
                     depends_on: vec![],
@@ -870,6 +872,7 @@ mod tests {
         };
 
         let models = vec![Model {
+            drop_existing_kind: None,
             config: crate::models::ModelConfig {
                 name: "my_model".into(),
                 depends_on: vec![],

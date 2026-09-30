@@ -21,7 +21,7 @@ pub fn state_show(state_path: &Path, output_json: bool) -> Result<()> {
     let schema_version_on_disk =
         StateStore::peek_schema_version(state_path).map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    let entries: Vec<WatermarkEntry> = match StateStore::open_read_only(state_path) {
+    let entries: Vec<WatermarkEntry> = match StateStore::open_read_only_or_empty(state_path) {
         Ok(store) => store
             .list_watermarks()
             .map_err(|e| anyhow::anyhow!("{e}"))?
@@ -457,6 +457,8 @@ mod retention_sweep_config_tests {
             check_outcomes: Vec::new(),
             pipeline: None,
             submission_id: None,
+            rocky_branch: None,
+            run_scope: Some(rocky_core::state::RunScope::Production),
         }
     }
 

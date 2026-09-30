@@ -25,9 +25,11 @@
 //! | [`StateBackend::S3`] | S3 `PutObject` with `If-None-Match: "*"` |
 //! | [`StateBackend::Gcs`] | GCS `insertObject` with `x-goog-if-generation-match: 0` |
 //!
-//! The `s3` / `gcs` backends are not yet wired through this module — calls
-//! return [`IdempotencyError::UnsupportedBackend`], consumed by `rocky run`
-//! at flag-parse time with a clear "switch to tiered" error message.
+//! The `s3` / `gcs` backends route through [`IdempotencyBackend::ObjectStore`]
+//! using the conditional-PUT primitives in the table above — every
+//! [`StateBackend`] variant maps to a working claim path.
+//! [`IdempotencyError::UnsupportedBackend`] exists as a defensive error arm
+//! consumed by `rocky run`, but nothing in this module constructs it.
 //!
 //! # Key storage
 //!

@@ -41,7 +41,7 @@ An entry whose `failure_kind` is `"compile-error"` is a compile-time failure tha
 
 An entry can also be a governance failure. Those classify as `failure_kind: "unknown"`, so check `permissions` before you treat one as an adapter failure. [Section 9](#9-governance-failures) covers it.
 
-Entries on `contained[*]` are not a failure of their own. They name the models Rocky withheld because an upstream model failed. See [Failure containment across the model graph](#failure-containment-across-the-model-graph).
+Entries on `contained[*]` are not failures of their own. They name models Rocky withheld after an upstream compile failure, or during configured runtime containment. If `--model` selects a descendant withheld by a compile failure, it also gets a `compile-error` entry and increments `tables_failed`. See [Failure containment across the model graph](#failure-containment-across-the-model-graph).
 
 ## The nine categories
 
@@ -220,7 +220,12 @@ There is a consequence for orchestrators. By the time a `failure_kind: "transien
 
 By default a transformation run **fails fast**. A model that fails while it runs stops the run: no later layer starts. Models already running beside it still finish, because `--parallel` is 4 by default. Only DuckDB runs one model at a time.
 
-A type error is the exception. If a model parses but fails type-checking, Rocky excludes that model and builds the others. `rocky compile` reports these as an `E` code, such as `E037`. The run reports `Failure`, or `PartialFailure` when another model succeeded.
+A compile error is the exception. A selected model with an `Error`-severity
+diagnostic records `failure_kind: "compile-error"`. Rocky withholds that
+model's declared DAG descendants and lists them in `contained[*]`. Healthy
+branches can still build. Targets of failed or withheld models stay unchanged.
+If `--model` selects only a withheld descendant, the run records `compile-error` and
+`tables_failed`, so it cannot report `Success`.
 
 A project that cannot compile at all is not an exception. Nothing builds, and the run reports one error keyed `<compile>`. These are the causes:
 
@@ -231,12 +236,14 @@ A project that cannot compile at all is not an exception. Nothing builds, and th
 - A `depends_on` entry that names a model that does not exist.
 
 ```
-model parses, type error   ->  that model is excluded, the others build
+model has compile error    ->  model fails; declared descendants are withheld
 project does not compile   ->  nothing builds
 model fails while running  ->  no later layer starts
 ```
 
-Nothing holds back a model downstream of an excluded one. It builds from the table an earlier run left. With no such table, it fails. `rocky run --dag` differs: each model is its own sub-run, so the failed node's descendants are skipped.
+The default compile-error boundary follows declared DAG edges. An undeclared
+read can still use a retained table. Add `depends_on` when that relationship
+must be withheld. `rocky run --dag` runs each model as a separate sub-run.
 
 This is the model graph only. Replicated tables have their own switch, [`[execution] fail_fast`](/reference/configuration/#pipelinenameexecution), which is `false` by default: one table that fails does not stop the others. A second switch still can. `error_rate_abort_pct` defaults to 50, so once 4 or more tables finish, a failure rate at or above half aborts the rest.
 
@@ -247,7 +254,12 @@ Turn on containment to let unrelated work continue:
 contain_failures = true   # default: false
 ```
 
-With containment on, Rocky withholds the failed model and its whole downstream closure. Unrelated subtrees still materialize. The run reports `PartialFailure`. It lists the withheld models on `RunOutput.contained[*]`, each naming what blocked it plus an unblock hint, and the causes on `RunOutput.errors[*]`. For a partitioned (`time_interval`) model, a failed partition withholds the downstream while the healthy partitions still land.
+With containment on, Rocky also withholds the failed model and its whole
+downstream closure after a runtime failure. Unrelated subtrees still
+materialize. The run reports `PartialFailure`. It lists the withheld models on
+`RunOutput.contained[*]`, each naming what blocked it plus an unblock hint, and
+the causes on `RunOutput.errors[*]`. For a partitioned (`time_interval`) model,
+a failed partition withholds the downstream while the healthy partitions land.
 
 **Guarantee scope.** Containment is *guaranteed* for two kinds of dependency. The first is a dependency listed in the model's `depends_on`. The second is a physical read Rocky can resolve statically: `schema.table` or `catalog.schema.table`, quoted or unquoted.
 
@@ -259,7 +271,8 @@ Such a model is still withheld when a *known* upstream of it failed. But its rea
 
 This is a documented boundary, not a regression. Containment never materializes anything a fail-fast run would not. **List the dependency in the model's `depends_on` when you need a hard containment guarantee.**
 
-Containment is off by default. The fail-fast behaviour described elsewhere on this page is unchanged unless you set `contain_failures = true`.
+Containment is off by default for runtime failures. Compile-error containment
+for declared DAG descendants is always on.
 
 ---
 

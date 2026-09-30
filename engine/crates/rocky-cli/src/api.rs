@@ -263,10 +263,16 @@ pub fn router(state: Arc<ServerState>) -> Router {
 
 /// Start the HTTP server.
 ///
-/// Before the router serves, persisted jobs stranded in a non-terminal state
-/// by a previous sidecar process are swept to `failed` (see
-/// [`sweep_interrupted_jobs`]) so embedders polling `GET /api/v1/jobs/{id}`
-/// until a terminal state never poll a dead job forever.
+/// Before the router serves, persisted jobs left IN FLIGHT — `running` or
+/// `queued` — by a previous sidecar process are swept to `failed` (see
+/// [`sweep_interrupted_jobs`]).
+///
+/// A record in any other non-terminal state is deliberately left alone. It was
+/// written by a version this one does not know, and rewriting it would destroy
+/// a payload this version cannot reproduce. Nothing is stranded either way:
+/// `job_status_from` renders an unrecognized state as terminal `failed`, so a
+/// poller on `GET /api/v1/jobs/{id}` sees a terminal state whether or not the
+/// sweep touched the record.
 ///
 /// # Errors
 ///
@@ -960,6 +966,7 @@ async fn health() -> PrettyJson<HealthOutput> {
 async fn project(
     State(state): State<Arc<ServerState>>,
 ) -> Result<PrettyJson<ProjectOutput>, ApiError> {
+    let read_failure = state.config_read_failure.read().await.clone();
     let (name, config_path, pipelines, adapters, config_error) = match state.config_path.as_deref()
     {
         None => ("rocky".to_string(), None, Vec::new(), Vec::new(), None),
@@ -970,27 +977,31 @@ async fn project(
                 .map(|dir| dir.to_string_lossy().to_string())
                 .unwrap_or_else(|| "rocky".to_string());
             let shown = Some(path.display().to_string());
-            match rocky_core::config::load_rocky_config(path) {
-                Ok(config) => {
-                    let pipelines = config
-                        .pipelines
-                        .iter()
-                        .map(|(pipeline, cfg)| crate::output::ProjectPipelineOutput {
-                            name: pipeline.clone(),
-                            pipeline_type: pipeline_type_label(cfg).to_string(),
-                        })
-                        .collect();
-                    let adapters = config
-                        .adapters
-                        .iter()
-                        .map(|(adapter, cfg)| crate::output::ProjectAdapterOutput {
-                            name: adapter.clone(),
-                            adapter_type: cfg.adapter_type.clone(),
-                        })
-                        .collect();
-                    (name, shown, pipelines, adapters, None)
+            if let Some(reason) = read_failure {
+                (name, shown, Vec::new(), Vec::new(), Some(reason))
+            } else {
+                match rocky_core::config::load_rocky_config(path) {
+                    Ok(config) => {
+                        let pipelines = config
+                            .pipelines
+                            .iter()
+                            .map(|(pipeline, cfg)| crate::output::ProjectPipelineOutput {
+                                name: pipeline.clone(),
+                                pipeline_type: pipeline_type_label(cfg).to_string(),
+                            })
+                            .collect();
+                        let adapters = config
+                            .adapters
+                            .iter()
+                            .map(|(adapter, cfg)| crate::output::ProjectAdapterOutput {
+                                name: adapter.clone(),
+                                adapter_type: cfg.adapter_type.clone(),
+                            })
+                            .collect();
+                        (name, shown, pipelines, adapters, None)
+                    }
+                    Err(e) => (name, shown, Vec::new(), Vec::new(), Some(format!("{e:#}"))),
                 }
-                Err(e) => (name, shown, Vec::new(), Vec::new(), Some(format!("{e:#}"))),
             }
         }
     };
@@ -1047,7 +1058,7 @@ async fn project(
                 if !state_path.exists() {
                     return Ok(None);
                 }
-                let store = rocky_core::state::StateStore::open_read_only(&state_path)?;
+                let store = rocky_core::state::StateStore::open_read_only_or_empty(&state_path)?;
                 Ok(store.list_runs(1)?.into_iter().next().map(|run| {
                     crate::output::ProjectRunOutput {
                         run_id: run.run_id,
@@ -2215,7 +2226,7 @@ async fn settings(
 /// How long the one `rocky.toml` read behind this route may take before the
 /// caller is told to retry. Generous for a local file; the point is that it
 /// ends, not that it is tight.
-const SETTINGS_CONFIG_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const SETTINGS_CONFIG_READ_TIMEOUT: std::time::Duration = rocky_server::state::CONFIG_READ_TIMEOUT;
 
 /// The `[state]` labels, read from `rocky.toml` once and then fixed.
 ///
@@ -2645,10 +2656,118 @@ pub(crate) fn job_state_str(state: JobState) -> &'static str {
     }
 }
 
-/// Build the API presentation type from the durable record. Unknown persisted
-/// `kind`/`state` strings (only reachable from a malformed record) fall back to
-/// safe defaults rather than failing the read.
+/// Strip resolved `${VAR}` values from a job's terminal outcome, before it is
+/// cached or written (#1897).
+///
+/// A pure function on purpose. The alternative is scrubbing inside the spawn
+/// path, and nothing in `cargo test -p rocky-cli --lib` can reach that: the
+/// subprocess is `current_exe`, which is the test harness. Here the seam is
+/// callable directly, so the behaviour is pinned by unit test rather than by
+/// an end-to-end run nobody can drive.
+///
+/// Both API and scheduler completion use this outcome scrub. The whole-record
+/// cache and durable write checks below also cover other fields.
+///
+/// `result` is the child's stdout verbatim — a whole `RunOutput` carrying
+/// targets, model names and attempt trails. It is rewritten as text and
+/// re-parsed; if the rewrite breaks the JSON (a registered value in a
+/// non-string position), the payload is REPLACED rather than stored, because
+/// an unparseable blob on disk is worse than a named absence.
+pub(crate) fn scrub_job_outcome(
+    result: Option<serde_json::Value>,
+    error: Option<String>,
+) -> (Option<serde_json::Value>, Option<String>, u32) {
+    let scrub = |text: &str| {
+        crate::secret_filter::redact_truncated_tail(&crate::secret_filter::redact(text))
+    };
+
+    let withheld =
+        || serde_json::json!({ "redaction": "result_withheld_unparseable_after_redaction" });
+
+    let result = result.map(|value| {
+        // A registered value inside an object KEY cannot be rewritten safely.
+        // Two distinct keys whose names both carry one collapse to the same
+        // replacement, and re-parsing then keeps only one of them — a silently
+        // truncated record that still looks complete. Withhold instead.
+        if crate::secret_filter::any_key_carries_a_value(&value) {
+            return withheld();
+        }
+        let Ok(text) = serde_json::to_string(&value) else {
+            return serde_json::json!({ "redaction": "result_unserializable" });
+        };
+        match serde_json::from_str::<serde_json::Value>(&scrub(&text)) {
+            Ok(scrubbed) => scrubbed,
+            Err(_) => withheld(),
+        }
+    });
+    let error = error.map(|text| scrub(&text));
+
+    // THE FINAL CHECK, and its absence was a defect. Everything above is
+    // replacement GENERATION, and #1920 established that no generator can be
+    // trusted: a fallback marker can itself be a registered value, and two
+    // overlapping replacements can concatenate into one. The response filter
+    // ends with this check for exactly that reason; the durable path had no
+    // equivalent, so a surviving value was stamped trusted and written to
+    // disk (#1897).
+    let survives = result
+        .as_ref()
+        .and_then(|v| serde_json::to_string(v).ok())
+        .is_some_and(|t| crate::secret_filter::any_value_survives(&t))
+        || error
+            .as_deref()
+            .is_some_and(crate::secret_filter::any_value_survives);
+    if survives {
+        // The fallback must not be the thing that leaked. Both the marker and
+        // this message are fixed text an operator can register, and this is
+        // the LAST step — nothing scans what it returns — so each is checked
+        // and dropped entirely if it would carry a value. Storing nothing is
+        // always available and cannot leak, which is what makes this
+        // terminate (#1897).
+        let safe = |v: &serde_json::Value| {
+            serde_json::to_string(v)
+                .ok()
+                .is_some_and(|t| !crate::secret_filter::any_value_survives(&t))
+        };
+
+        // Prefer the descriptive marker. If its own text is registered, fall
+        // back to one whose SERIALIZED form is shorter than the floor.
+        //
+        // The invariant is about the serialized bytes, not about tokens.
+        // `any_value_survives` scans a string; token boundaries do not exist
+        // at that layer, so a short-token marker can still contain a
+        // registerable substring spanning them — the same concatenation
+        // fallacy the comment above warns about. `{"h":1}` is SEVEN bytes, so
+        // every substring of it is shorter than the eight-byte floor and the
+        // registry cannot hold any of them. True by construction, not by odds.
+        //
+        // `SHORT_MARKER_IS_UNREGISTERABLE` in the tests pins the length, so
+        // changing the marker or lowering the floor fails there rather than
+        // silently making this claim false.
+        let short = serde_json::json!({ "h": 1 });
+        let marker = withheld();
+        let result = Some(if safe(&marker) { marker } else { short });
+
+        // Same rule for the note: `held` is four bytes raw and six quoted,
+        // both under the floor.
+        const NOTE: &str = "withheld: a resolved value survived redaction";
+        let error = Some(if crate::secret_filter::any_value_survives(NOTE) {
+            "held".to_string()
+        } else {
+            NOTE.to_string()
+        });
+        return (result, error, rocky_core::state::CURRENT_REDACTION_VERSION);
+    }
+
+    (result, error, rocky_core::state::CURRENT_REDACTION_VERSION)
+}
+
 fn job_status_from(job: PersistedJob) -> JobStatus {
+    // A record written before the scrub existed may hold an unredacted result
+    // or error, and nothing distinguishes a safe legacy string from one
+    // carrying a resolved value. Lifecycle fields still answer — a poller
+    // waiting for a terminal state is not left hanging — but the two payload
+    // fields are withheld (#1897).
+    let legacy = job.redaction_is_legacy();
     JobStatus {
         kind: JobKind::parse(&job.kind).unwrap_or(JobKind::Run),
         state: JobState::parse(&job.state).unwrap_or(JobState::Failed),
@@ -2657,8 +2776,8 @@ fn job_status_from(job: PersistedJob) -> JobStatus {
         started_at: job.started_at,
         finished_at: job.finished_at,
         principal: job.principal,
-        error: job.error,
-        result: job.result,
+        error: if legacy { None } else { job.error },
+        result: if legacy { None } else { job.result },
     }
 }
 
@@ -2689,9 +2808,13 @@ fn principal_from_headers(headers: &HeaderMap) -> Result<Option<String>, ApiErro
     Ok(Some(value.to_string()))
 }
 
-/// Mark every persisted job stranded in a non-terminal state (`running` /
-/// `queued`) as `failed` with the error `"interrupted by engine restart"`,
-/// returning how many records were reconciled.
+/// Mark every persisted job stranded [in flight](rocky_core::state::PersistedJob::is_in_flight)
+/// — `running` or `queued` — as `failed` with the error
+/// `"interrupted by engine restart"`, returning how many records were
+/// reconciled.
+///
+/// A record in any OTHER non-terminal state is left untouched; see the loop for
+/// why that is both safe and necessary.
 ///
 /// A job's terminal-state write lives in the background task of the process
 /// that accepted the submission (see [`submit_job`]); when a sidecar dies
@@ -2710,14 +2833,81 @@ pub(crate) fn sweep_interrupted_jobs(state_path: &std::path::Path) -> anyhow::Re
     let store = rocky_core::state::StateStore::open(state_path)?;
     let mut swept = 0;
     for job in store.list_jobs()? {
-        if job.is_terminal() {
+        // IN FLIGHT, not "not terminal". The two are deliberately not
+        // complements: an unrecognized `state` is neither. Sweeping those was a
+        // DOWNGRADE DATA-LOSS path — `state` is a plain string precisely so a
+        // newer sidecar can add a state, so a newer binary's terminal
+        // `"cancelled"` record, carrying a real result, reads as non-terminal
+        // here and the clear below would delete that result. That contradicts
+        // the preservation contract on `MIN_TRUSTED_REDACTION_VERSION`.
+        //
+        // Skipping them costs nothing ON THE HTTP SURFACE: `job_status_from`
+        // renders `JobState::parse(&job.state).unwrap_or(JobState::Failed)`,
+        // the only parse site in the workspace, and every route renders
+        // through it. So an unrecognized state ALREADY reads as terminal
+        // `failed` to a polling embedder whether or not this sweep runs.
+        //
+        // NOT "nothing observable anywhere", which is a claim this cannot
+        // support: `StateStore::{get_job,list_jobs}` and `JobRegistry::get`
+        // return the raw record, so an in-process Rust consumer sees the
+        // stored string itself. That is the intended outcome. The state
+        // belongs to the version that wrote it, and leaving it verbatim is
+        // the only answer this version can give honestly.
+        if !job.is_in_flight() {
             continue;
         }
-        let mut done = job;
-        done.state = job_state_str(JobState::Failed).to_string();
-        done.finished_at = Some(chrono::Utc::now().to_rfc3339());
-        done.error = Some("interrupted by engine restart".to_string());
-        store.record_job(&done)?;
+        // Through the scrub, and RE-STAMPED. This is a terminal writer: it
+        // mutates `error` and persists, so without the scrub it wrote an
+        // unchecked string while inheriting the record's existing trusted
+        // stamp — a durable record claiming current redaction while holding a
+        // registered value. The message is a fixed literal, but an operator
+        // can register any string, including this one (#1897).
+        //
+        // The inherited `result` goes too, and the reason is stronger than
+        // "a previous process wrote it":
+        //
+        // **AT THIS POINT IN STARTUP THE VERIFIER IS NOT TRUSTWORTHY.** The
+        // registry is populated by `substitute_env_vars_inner`, which runs
+        // only on a config LOAD. `build_serve_state` does not load — it
+        // derives paths — so in plain `rocky serve` this sweep is the first
+        // thing after the bind check and the registry may be EMPTY, or
+        // partially filled by the watcher's initial compile, which is a race
+        // rather than an ordering. Scheduler mode is NOT reliably better:
+        // `resolved_poll_interval` returns without loading config when an
+        // explicit interval is supplied (`serve.rs`), so that path can reach
+        // here with an empty registry too.
+        //
+        // `any_value_survives` against an empty registry answers "nothing
+        // survived" and would stamp the record current — a false assertion
+        // produced by the check meant to prevent one.
+        //
+        // **WHAT THE STAMP SPEAKS FOR IS `result` AND `error`** — that is the
+        // pair `job_status_from` withholds on a legacy record, and the pair
+        // this sweep replaces with process-local values. It does NOT speak for
+        // `principal`, which is inherited here: caller-supplied, advisory,
+        // served unconditionally, redacted on the wire by the response filter,
+        // and durable-record exposure disclosed under #1919.
+        //
+        // The literal below is EXPLICIT on every field rather than
+        // `..job`/`let mut done = job`, so adding a field to `PersistedJob`
+        // stops compiling here instead of being inherited silently.
+        let (_, error, version) =
+            scrub_job_outcome(None, Some("interrupted by engine restart".to_string()));
+        let done = rocky_core::state::PersistedJob {
+            state: job_state_str(JobState::Failed).to_string(),
+            finished_at: Some(chrono::Utc::now().to_rfc3339()),
+            result: None,
+            error,
+            redaction_version: Some(version),
+            job_id: job.job_id,
+            kind: job.kind,
+            submitted_at: job.submitted_at,
+            started_at: job.started_at,
+            principal: job.principal,
+        };
+        // The sweep writes directly rather than through `persist_job`, so it
+        // needs the same sink check.
+        store.record_job(&sanitize_for_storage(done))?;
         swept += 1;
     }
     Ok(swept)
@@ -2740,6 +2930,81 @@ pub(crate) fn sweep_interrupted_jobs(state_path: &std::path::Path) -> anyhow::Re
 /// run-download. (Merely being stripped on upload would NOT be enough on its
 /// own: without the download-side preservation, a run-download's wholesale file
 /// replace would still wipe the local `jobs` rows.)
+/// Check the record that is actually about to be WRITTEN, and withhold its
+/// payload if a registered value survives in it.
+///
+/// **The layer is the point.** `scrub_job_outcome` checks the `result` and
+/// `error` FIELDS; what reaches disk is the SERIALIZED RECORD, produced later
+/// by `serde_json::to_vec` inside `record_job`. Three things slip through that
+/// gap, and the first two were reported against the field-level check:
+///
+/// ```text
+/// escaping     register `ABCDEFGH\"`; return the raw error `ABCDEFGH"`.
+///              The raw scan misses it; serializing the record escapes the
+///              quote and writes exactly the registered bytes.
+///
+/// other fields `principal` comes from a caller-supplied X-Rocky-Principal
+///              header and was never scanned at all. Nor is any field added
+///              to this struct in future.
+///
+/// field seams  a value can span two fields — `null,"result":null` sits
+///              across the `error` value and the `result` key that follows
+///              it. No single field contains it; the record does.
+/// ```
+///
+/// Checking the serialized record catches those three ways a caller-supplied
+/// or job-derived value can survive the field scrub.
+///
+/// **Withholding replaces the record, it does not patch it.** Blanking
+/// `result` and `error` would not help when the survivor is in `principal`, so
+/// the fields that are kept are named explicitly and everything else is
+/// dropped. That is also why this is a full literal rather than `..job`: a
+/// field added to `PersistedJob` stops compiling here instead of being
+/// forwarded into a record this function claims to have cleaned.
+///
+/// **Why it terminates.** The withheld record can itself contain a registered
+/// value, including the generated `redaction_version` key or a fixed state.
+/// It is not re-scanned: every retained field is generated by this process
+/// (`new_job_id`, fixed kind and state, timestamps, and fixed replacements).
+/// The guarantee is that caller-supplied and job-derived fields are dropped
+/// when the serialized record matches, not that no registered value survives
+/// in generated fields. Both the cache and durable writers use this scrub.
+pub(crate) fn sanitize_for_storage(job: PersistedJob) -> PersistedJob {
+    let Ok(serialized) = serde_json::to_string(&job) else {
+        // Unserializable here means `record_job` would fail too; leave it for
+        // that to report rather than silently altering the record.
+        return job;
+    };
+    if !crate::secret_filter::any_value_survives(&serialized) {
+        return job;
+    }
+
+    PersistedJob {
+        // Kept: generated by this process, never by a caller.
+        job_id: job.job_id,
+        kind: job.kind,
+        state: job.state,
+        submitted_at: job.submitted_at,
+        started_at: job.started_at,
+        finished_at: job.finished_at,
+        // Dropped: caller-supplied, and advisory rather than load-bearing.
+        principal: None,
+        // The same fallbacks `scrub_job_outcome` uses, and safe for the same
+        // reason: `{"h":1}` serializes to seven bytes, below the eight-byte
+        // floor, so it has no substring the registry could hold.
+        error: Some("held".to_string()),
+        result: Some(serde_json::json!({ "h": 1 })),
+        redaction_version: Some(rocky_core::state::CURRENT_REDACTION_VERSION),
+    }
+}
+
+/// The only CLI entry point for writing a job to the live cache. Sanitize the
+/// full record here so a new producer cannot omit the check at its call site.
+pub(crate) async fn cache_job(state: &ServerState, job: PersistedJob) {
+    state.jobs.upsert(sanitize_for_storage(job)).await;
+}
+
+/// Persist a job after the same whole-record check used by [`cache_job`].
 pub(crate) async fn persist_job(
     state: &ServerState,
     state_path: std::path::PathBuf,
@@ -2751,7 +3016,9 @@ pub(crate) async fn persist_job(
     tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
         let _held = permit;
         let store = rocky_core::state::StateStore::open(&state_path)?;
-        store.record_job(&job)?;
+        // Checked HERE, on the record about to be serialized, not on the
+        // fields that composed it.
+        store.record_job(&sanitize_for_storage(job))?;
         Ok(())
     })
     .await?
@@ -2830,6 +3097,8 @@ async fn submit_job(
         principal,
         error: None,
         result: None,
+        // Stamped at creation; the terminal write re-stamps after scrubbing.
+        redaction_version: Some(rocky_core::state::CURRENT_REDACTION_VERSION),
     };
 
     let state_path = state_path_for(&state);
@@ -2860,23 +3129,14 @@ async fn submit_job(
     // Background task: run the subprocess, then record the terminal state. The
     // permit is moved in and released when the task ends. Nothing between the
     // cache write and `tokio::spawn` may await.
-    state.jobs.upsert(record.clone()).await;
+    cache_job(&state, record.clone()).await;
     let task_state = state.clone();
     tokio::spawn(async move {
         let _permit = permit;
         let (final_state, result, error) =
             execute_job_subprocess(kind, config_path, state_path.clone(), request).await;
 
-        let mut done = record;
-        done.state = job_state_str(final_state).to_string();
-        done.finished_at = Some(chrono::Utc::now().to_rfc3339());
-        done.result = result;
-        done.error = error;
-        task_state.jobs.upsert(done.clone()).await;
-        if let Err(e) = persist_job(&task_state, state_path, done.clone()).await {
-            tracing::warn!(error = %e, job_id = %done.job_id,
-                "could not persist terminal job record; /runs is the reconcile surface");
-        }
+        finish_job(task_state, state_path, record, final_state, result, error).await;
     });
 
     Ok((
@@ -2884,6 +3144,29 @@ async fn submit_job(
         PrettyJson(serde_json::json!({ "job_id": job_id })),
     )
         .into_response())
+}
+
+async fn finish_job(
+    state: Arc<ServerState>,
+    state_path: std::path::PathBuf,
+    mut done: PersistedJob,
+    final_state: JobState,
+    result: Option<serde_json::Value>,
+    error: Option<String>,
+) {
+    done.state = job_state_str(final_state).to_string();
+    done.finished_at = Some(chrono::Utc::now().to_rfc3339());
+    let (result, error, version) = scrub_job_outcome(result, error);
+    done.result = result;
+    done.error = error;
+    done.redaction_version = Some(version);
+    // The outcome scrub checks its two fields. Check the whole record before
+    // either sink so a cache hit and a restart serve the same held payload.
+    cache_job(&state, done.clone()).await;
+    if let Err(e) = persist_job(&state, state_path, done.clone()).await {
+        tracing::warn!(error = %e, job_id = %done.job_id,
+            "could not persist terminal job record; /runs is the reconcile surface");
+    }
 }
 
 /// Build the full `rocky` argv (minus the binary path) for a job subprocess.
@@ -2965,10 +3248,7 @@ async fn execute_job_subprocess(
         }
     };
 
-    let mut cmd = tokio::process::Command::new(exe);
-    for arg in job_subprocess_args(kind, config_path.as_deref(), &state_path, &request) {
-        cmd.arg(arg);
-    }
+    let mut cmd = job_subprocess_command(exe, kind, config_path.as_deref(), &state_path, &request);
 
     let output = match cmd.output().await {
         Ok(output) => output,
@@ -3001,6 +3281,21 @@ async fn execute_job_subprocess(
     }
 }
 
+fn job_subprocess_command(
+    exe: std::path::PathBuf,
+    kind: JobKind,
+    config_path: Option<&std::path::Path>,
+    state_path: &std::path::Path,
+    request: &JobRequest,
+) -> tokio::process::Command {
+    let mut cmd = tokio::process::Command::new(exe);
+    rocky_core::process::strip_dagster_pipes_env(cmd.as_std_mut());
+    for arg in job_subprocess_args(kind, config_path, state_path, request) {
+        cmd.arg(arg);
+    }
+    cmd
+}
+
 /// `GET /api/v1/jobs/{id}` — job status, with the embedded canonical result once
 /// terminal.
 ///
@@ -3011,6 +3306,9 @@ async fn get_job(
     State(state): State<Arc<ServerState>>,
     ApiPath(id): ApiPath<String>,
 ) -> Result<PrettyJson<JobStatus>, ApiError> {
+    // A cache hit returns the record as it was stored. A value registered
+    // after that write is not scrubbed from the cached or durable copy here;
+    // that known limit is tracked by #1919 and #1920.
     if let Some(record) = state.jobs.get(&id).await {
         return Ok(PrettyJson(job_status_from(record)));
     }
@@ -3022,7 +3320,7 @@ async fn get_job(
 
     let lookup_id = id.clone();
     let record = store_read(&state, move || {
-        let store = rocky_core::state::StateStore::open_read_only(&state_path)?;
+        let store = rocky_core::state::StateStore::open_read_only_or_empty(&state_path)?;
         store.get_job(&lookup_id)
     })
     .await?
@@ -3030,6 +3328,7 @@ async fn get_job(
 
     match record {
         Some(record) => {
+            let record = sanitize_for_storage(record);
             // Warm the cache so subsequent reads are hot — but only for a
             // finished record.
             //
@@ -3047,7 +3346,7 @@ async fn get_job(
             // exists to stop. Re-reading instead also lets the answer improve if
             // a later write settles, rather than pinning `running` in memory.
             if !record.is_in_flight() {
-                state.jobs.upsert(record.clone()).await;
+                cache_job(&state, record.clone()).await;
             }
             Ok(PrettyJson(job_status_from(record)))
         }
@@ -3060,6 +3359,48 @@ mod tests {
     use super::*;
     use std::io::Write;
     use std::path::PathBuf;
+    use tower::ServiceExt;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn serve_job_child_does_not_inherit_pipes_environment() {
+        use std::os::unix::fs::PermissionsExt;
+        const KEY: &str = "DAGSTER_PIPES_SERVE_PROBE";
+        struct Restore(Option<std::ffi::OsString>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                // SAFETY: restore this test's unique environment variable.
+                unsafe {
+                    match self.0.take() {
+                        Some(value) => std::env::set_var(KEY, value),
+                        None => std::env::remove_var(KEY),
+                    }
+                }
+            }
+        }
+        let _restore = Restore(std::env::var_os(KEY));
+        // SAFETY: no other test reads this probe variable.
+        unsafe { std::env::set_var(KEY, "outer") };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let probe = dir.path().join("probe.sh");
+        std::fs::write(
+            &probe,
+            "#!/bin/sh\nprintf '%s' \"$DAGSTER_PIPES_SERVE_PROBE\"\n",
+        )
+        .expect("write probe");
+        std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o700))
+            .expect("chmod probe");
+        let mut command = job_subprocess_command(
+            probe,
+            JobKind::Run,
+            None,
+            &dir.path().join("state.redb"),
+            &JobRequest::default(),
+        );
+        let output = command.output().await.expect("spawn serve job child");
+        assert!(output.status.success());
+        assert!(output.stdout.is_empty(), "serve child inherited Pipes");
+    }
 
     use rocky_server::auth::{ServeToken, is_safe_method};
 
@@ -3229,6 +3570,503 @@ mod tests {
              failed. Body length: {} bytes",
             body.len()
         );
+    }
+
+    /// #1897 PR2. The child's stdout is scrubbed before it is cached or
+    /// written, so neither the in-memory record nor the durable one holds a
+    /// resolved value.
+    #[test]
+    fn a_job_result_is_scrubbed_before_it_is_stored() {
+        let secret = "JOBSCRUB-PROBE-8e26660e-VALUE";
+        rocky_core::secret_registry::register_substitution("ROCKY_JOBSCRUB", secret);
+
+        let child_stdout = serde_json::json!({
+            "version": "1",
+            "command": "run",
+            "materializations": [{ "target": format!("{secret}.marts.orders") }],
+        });
+        let (result, error, version) =
+            scrub_job_outcome(Some(child_stdout), Some(format!("failed at {secret}")));
+
+        let rendered = serde_json::to_string(&result.expect("a result")).expect("serializes");
+        assert!(
+            !rendered.contains(secret),
+            "the stored result still holds it: {rendered}"
+        );
+        assert!(rendered.contains("${ROCKY_JOBSCRUB}"), "{rendered}");
+
+        let error = error.expect("an error");
+        assert!(
+            !error.contains(secret),
+            "the stored error still holds it: {error}"
+        );
+        assert_eq!(version, rocky_core::state::CURRENT_REDACTION_VERSION);
+    }
+
+    /// A result the rewrite would break is REPLACED, not stored. An
+    /// unparseable blob on disk is worse than a named absence, and it would
+    /// fail every later read rather than this one write.
+    #[test]
+    fn a_result_that_cannot_survive_the_rewrite_is_withheld_not_corrupted() {
+        // 10 digits: above the floor, and it lands in a NUMERIC position.
+        let numeric = "1234509876";
+        rocky_core::secret_registry::register_substitution("ROCKY_JOBSCRUB_NUM", numeric);
+
+        let child_stdout = serde_json::json!({ "max_downstreams": 1234509876u64 });
+        let (result, _, _) = scrub_job_outcome(Some(child_stdout), None);
+
+        // Withheld as the marker, or as nothing at all when the marker's own
+        // text is registered by another test — the registry is process-global,
+        // so the exact fallback depends on ordering. The property is that the
+        // original payload is gone and nothing registered survived.
+        let stored = serde_json::to_string(&result).expect("serializes");
+        assert!(
+            !stored.contains("1234509876"),
+            "the numeric value survived into the stored result"
+        );
+        assert!(!crate::secret_filter::any_value_survives(&stored));
+    }
+
+    /// Codex E, the regression this PR introduced and the worst of the round.
+    ///
+    /// `state` is a plain string so a newer sidecar can add a state. Such a
+    /// state reads as non-terminal here, so the sweep used to claim it — and
+    /// once the sweep started clearing `result`, claiming it DELETED a newer
+    /// binary's data on a downgrade.
+    ///
+    /// The record must come back byte-for-byte, and the sweep must not count it.
+    #[test]
+    fn the_sweep_leaves_an_unrecognized_state_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("state.redb");
+
+        // Terminal in a NEWER binary, unrecognized here, and carrying a real
+        // result — exactly the downgrade case.
+        let mut newer = persisted_job("from-a-newer-binary", "cancelled");
+        newer.finished_at = Some("2026-07-07T00:00:10Z".to_string());
+        newer.result = Some(serde_json::json!({ "tables_copied": 3 }));
+        assert!(
+            !newer.is_terminal() && !newer.is_in_flight(),
+            "PRECONDITION: the state must fall in the gap between the two \
+             predicates, or this test is not exercising the downgrade case"
+        );
+        {
+            let store = rocky_core::state::StateStore::open(&state_path).unwrap();
+            store.record_job(&newer).unwrap();
+        }
+
+        assert_eq!(
+            sweep_interrupted_jobs(&state_path).expect("sweep"),
+            0,
+            "a state this version does not recognise must not be swept"
+        );
+
+        let store = rocky_core::state::StateStore::open(&state_path).unwrap();
+        let after = store
+            .get_job("from-a-newer-binary")
+            .unwrap()
+            .expect("record");
+        assert_eq!(
+            after, newer,
+            "the record must survive the sweep unchanged — the result above is \
+             the newer binary's data and this version cannot reproduce it"
+        );
+    }
+
+    /// Codex A, the layer above the field check. A value that only appears
+    /// once the RECORD is serialized.
+    ///
+    /// Register the ESCAPED form. The raw error does not contain it, so the
+    /// field-level scan passes — and then `serde_json` escapes the quote while
+    /// serializing the record, writing exactly the registered bytes.
+    #[test]
+    fn a_value_that_appears_only_after_record_serialization_is_caught() {
+        let escaped = "SINKESC-8e26660e\\\"";
+        rocky_core::secret_registry::register_substitution("ROCKY_SINK_ESCAPED", escaped);
+
+        let raw = "SINKESC-8e26660e\"";
+        assert!(
+            !raw.contains(escaped),
+            "PRECONDITION: the raw text must NOT contain the registered form, \
+             or the field-level scan would already catch it"
+        );
+
+        let mut job = persisted_job("sink-esc", "failed");
+        job.error = Some(raw.to_string());
+        assert!(
+            serde_json::to_string(&job)
+                .expect("serializes")
+                .contains(escaped),
+            "PRECONDITION: serializing the record must produce the registered \
+             form, or this test proves nothing"
+        );
+
+        let held = sanitize_for_storage(job);
+        let after = serde_json::to_string(&held).expect("serializes");
+        assert!(
+            !crate::secret_filter::any_value_survives(&after),
+            "a value appearing only in the serialized record must be caught"
+        );
+    }
+
+    /// Codex A, second instance. `principal` comes from a caller-supplied
+    /// header and was never scanned. Withholding the PAYLOAD does not help
+    /// here, which is why the sink replaces the record instead of blanking two
+    /// fields.
+    #[test]
+    fn a_value_in_a_non_outcome_field_is_caught_at_the_sink() {
+        // Inside the header's own charset, so this is a value a caller can send.
+        let secret = "SINKPRINCIPAL-8e26660e";
+        rocky_core::secret_registry::register_substitution("ROCKY_SINK_PRINCIPAL", secret);
+
+        let mut job = persisted_job("sink-principal", "running");
+        job.principal = Some(secret.to_string());
+
+        // **The survivor must be the principal and nothing else.** The registry
+        // is process-global and monotonic, so a value registered by any other
+        // test in this binary could trip the sink instead and this test would
+        // still pass — it would just be proving something else. Ordering
+        // experiments cannot close that; this can. The same record with
+        // `principal` cleared must be clean.
+        let mut without = job.clone();
+        without.principal = None;
+        assert!(
+            !crate::secret_filter::any_value_survives(
+                &serde_json::to_string(&without).expect("serializes")
+            ),
+            "PRECONDITION: this record must trip the sink ONLY through \
+             `principal`. Something else registered in this process is \
+             matching it, so this test is no longer testing principal."
+        );
+
+        let held = sanitize_for_storage(job);
+        assert_eq!(held.principal, None, "a caller-supplied field is dropped");
+        let after = serde_json::to_string(&held).expect("serializes");
+        assert!(
+            !crate::secret_filter::any_value_survives(&after),
+            "a registered value in ANY field must not reach the store"
+        );
+    }
+
+    /// Codex B. A value that no single field contains and the RECORD does,
+    /// because serialization composes them.
+    ///
+    /// `principal` and `error` are adjacent, so the span below sits across the
+    /// END of the principal value and the `error` key that follows it. A
+    /// field-level check cannot see it: it is in neither field, nor in the
+    /// `(result, error)` tuple the earlier test serializes, which carries
+    /// neither field names nor order.
+    ///
+    /// **The span carries its own entropy on purpose.** A structural span like
+    /// `null,"result":null` would also work here and would be far worse: the
+    /// registry is process-global and monotonic, so registering a generic
+    /// structural string permanently changes every later test whose record has
+    /// those fields empty — including the principal test above, whose sink
+    /// would then fire for the wrong reason while still passing.
+    #[test]
+    fn a_value_spanning_two_record_fields_is_caught_at_the_sink() {
+        let principal = "SPANBOUNDARY-4f1a77c3";
+        let span = "4f1a77c3\",\"error\":null";
+        assert!(
+            span.len() >= rocky_core::secret_registry::SECRET_LENGTH_FLOOR,
+            "PRECONDITION: the span must be registerable"
+        );
+        rocky_core::secret_registry::register_substitution("ROCKY_SINK_SPAN", span);
+
+        let mut job = persisted_job("sink-span", "failed");
+        job.principal = Some(principal.to_string());
+        job.error = None;
+        assert!(
+            !principal.contains(span),
+            "PRECONDITION: no single field may contain the span, or this is \
+             not testing the seam"
+        );
+        let serialized = serde_json::to_string(&job).expect("serializes");
+        assert!(
+            serialized.contains(span),
+            "PRECONDITION: the record must actually compose the span, or the \
+             field order this test depends on has changed"
+        );
+
+        let held = sanitize_for_storage(job);
+        let after = serde_json::to_string(&held).expect("serializes");
+        assert!(
+            !crate::secret_filter::any_value_survives(&after),
+            "a value spanning two fields must be caught at the record level"
+        );
+    }
+
+    /// The ordinary case passes through untouched, or every record would be
+    /// withheld and the tests above would pass vacuously.
+    #[test]
+    fn a_clean_record_is_stored_unchanged() {
+        let mut job = persisted_job("sink-clean", "succeeded");
+        job.principal = Some("an-operator".to_string());
+        job.result = Some(serde_json::json!({ "tables_copied": 3 }));
+
+        assert_eq!(
+            sanitize_for_storage(job.clone()),
+            job,
+            "a clean record must not be altered at the sink"
+        );
+    }
+
+    /// A generated JSON key may equal a registered value. The storage rule
+    /// still withholds caller-supplied and job-derived fields. Run this in a
+    /// child test process: the registry is monotonic, and registering a common
+    /// key in the main test process would change unrelated tests.
+    #[tokio::test]
+    async fn generated_redaction_key_can_survive_without_payload() {
+        const CHILD: &str = "ROCKY_GENERATED_KEY_COLLISION_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("generated_redaction_key_can_survive_without_payload")
+                .arg("--nocapture")
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "isolated collision test failed: {}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                stdout.contains("1 passed; 0 failed;"),
+                "child must run exactly this test: {stdout}"
+            );
+            return;
+        }
+
+        rocky_core::secret_registry::register_substitution(
+            "ROCKY_GENERATED_KEY",
+            "redaction_version",
+        );
+        let supplied = "COLLISION-SUPPLIED-6b4f82d1";
+        rocky_core::secret_registry::register_substitution("ROCKY_SUPPLIED", supplied);
+        let dir = tempfile::tempdir().unwrap();
+        let models_dir = dir.path().join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        let path = pinned_state_path(&models_dir);
+        let state = pinned_server(models_dir, None, &path);
+        let mut raw = persisted_job("collision-record", "failed");
+        raw.principal = Some(supplied.to_string());
+        raw.error = Some(supplied.to_string());
+        raw.result = Some(serde_json::json!({ "detail": supplied }));
+        persist_job(&state, path.clone(), raw).await.unwrap();
+
+        let stored = rocky_core::state::StateStore::open(&path)
+            .unwrap()
+            .get_job("collision-record")
+            .unwrap()
+            .unwrap();
+        let bytes = serde_json::to_string(&stored).unwrap();
+        assert!(bytes.contains("redaction_version"), "generated key remains");
+        assert!(!bytes.contains(supplied), "caller payload must be withheld");
+        assert!(stored.principal.is_none());
+        assert_eq!(stored.result, Some(serde_json::json!({ "h": 1 })));
+        assert_eq!(stored.state, "failed", "polling must still terminate");
+        let redacted = crate::secret_filter::redact(&bytes);
+        let parsed: serde_json::Value = serde_json::from_str(&redacted).unwrap();
+        assert!(parsed.get("redaction_version").is_none());
+        assert_eq!(
+            parsed["${ROCKY_GENERATED_KEY}"],
+            rocky_core::state::CURRENT_REDACTION_VERSION
+        );
+        assert!(!crate::secret_filter::any_value_survives(&redacted));
+    }
+
+    /// #1897. The last-resort marker is unregisterable BY LENGTH.
+    ///
+    /// `any_value_survives` scans serialized bytes, so the property has to be
+    /// about those bytes and not about token boundaries — a marker of short
+    /// tokens can still contain a registerable substring spanning them. A
+    /// marker whose whole serialized form is shorter than the floor has no
+    /// substring the registry could hold.
+    ///
+    /// This fails if the marker grows or the floor shrinks, which is the point:
+    /// the claim in `scrub_job_outcome` stops being true at exactly that moment.
+    #[test]
+    fn the_last_resort_marker_is_shorter_than_the_secret_floor() {
+        let short = serde_json::json!({ "h": 1 });
+        let serialized = serde_json::to_string(&short).expect("serializes");
+        assert_eq!(serialized, r#"{"h":1}"#);
+        assert!(
+            serialized.len() < rocky_core::secret_registry::SECRET_LENGTH_FLOOR,
+            "the last-resort marker serializes to {} bytes, which is not below \
+             the {}-byte floor — it can therefore contain a registered value",
+            serialized.len(),
+            rocky_core::secret_registry::SECRET_LENGTH_FLOOR
+        );
+        // The note's fallback, quoted as it appears in a JSON body.
+        assert!(
+            serde_json::to_string("held").expect("serializes").len()
+                < rocky_core::secret_registry::SECRET_LENGTH_FLOOR
+        );
+    }
+
+    /// Codex C, the blocking one. `scrub_job_outcome` stamped without ever
+    /// checking whether a value survived its own rewriting.
+    ///
+    /// The trigger is the fallback marker: register the marker's own text and
+    /// a value that forces the marker to be produced. The marker is
+    /// constructed AFTER all rewriting, so nothing scanned it — it was
+    /// stamped current and written to disk carrying a registered value.
+    #[test]
+    fn a_value_surviving_the_scrub_is_withheld_rather_than_stamped() {
+        // Forces the unparseable path: 10 digits in a numeric position.
+        rocky_core::secret_registry::register_substitution("ROCKY_SURV_NUM", "1029384756");
+        // And the marker's own text is registerable.
+        rocky_core::secret_registry::register_substitution(
+            "ROCKY_SURV_MARKER",
+            "result_withheld_unparseable_after_redaction",
+        );
+
+        let child = serde_json::json!({ "duration_ms": 1029384756u64 });
+        let (result, error, _) = scrub_job_outcome(Some(child), None);
+
+        // The marker's own text is registered, so the descriptive marker
+        // cannot be used — but the reader still gets a POSITIVE signal, not a
+        // bare null. The fallback is safe because its WHOLE SERIALIZED FORM is
+        // shorter than SECRET_LENGTH_FLOOR, so it has no substring the
+        // registry could hold. Not because its tokens are short: the check
+        // scans serialized bytes, where token boundaries do not exist.
+        let result = result.expect("a withheld result is still a signal, never null");
+        assert_eq!(
+            result,
+            serde_json::json!({ "h": 1 }),
+            "when the descriptive marker is unusable, the one that is shorter \
+             than the floor is used"
+        );
+        let result = Some(result);
+        let stored = serde_json::to_string(&(result, error)).expect("serializes");
+        assert!(
+            !crate::secret_filter::any_value_survives(&stored),
+            "a registered value survived into the stored record"
+        );
+    }
+
+    /// Codex C, non-blocking. Two distinct object KEYS whose names both carry
+    /// a registered value rewrite to the SAME replacement; re-parsing then
+    /// keeps only one, so the record silently loses a field while still
+    /// parsing cleanly.
+    #[test]
+    fn a_result_whose_keys_carry_a_value_is_withheld_not_silently_truncated() {
+        let shared = "KEYCOLLIDE-8e26660e";
+        rocky_core::secret_registry::register_substitution("ROCKY_KEYCOLLIDE", shared);
+
+        let child = serde_json::json!({
+            format!("{shared}_copied"): 1,
+            format!("{shared}_failed"): 2,
+        });
+        let (result, _, _) = scrub_job_outcome(Some(child), None);
+
+        // Withheld either as the marker or, if the marker text is itself
+        // registered by another test in this process, as nothing at all. The
+        // property is that the ORIGINAL keys are gone, not which fallback was
+        // chosen — the registry is process-global, so asserting the exact
+        // shape would depend on test ordering.
+        let stored = serde_json::to_string(&result).expect("serializes");
+        assert!(
+            !stored.contains("_copied") && !stored.contains("_failed"),
+            "a key collision must withhold, not store a record missing a field"
+        );
+        assert!(!crate::secret_filter::any_value_survives(&stored));
+    }
+
+    /// Codex A/D. The restart sweep mutates `error` and persists. Before this
+    /// it kept the record's existing trusted stamp, so a durable record could
+    /// claim current redaction while holding an unchecked string.
+    #[test]
+    fn the_restart_sweep_scrubs_and_restamps() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("state.redb");
+        {
+            let store = rocky_core::state::StateStore::open(&state_path).unwrap();
+            let mut running = persisted_job("swept-1", "running");
+            // A pre-existing result this process cannot re-verify.
+            running.result = Some(serde_json::json!({ "from": "a previous process" }));
+            store.record_job(&running).unwrap();
+        }
+
+        let swept = sweep_interrupted_jobs(&state_path).expect("sweep");
+        assert_eq!(swept, 1);
+
+        let store = rocky_core::state::StateStore::open(&state_path).unwrap();
+        let done = store.get_job("swept-1").unwrap().expect("record");
+        assert_eq!(
+            done.redaction_version,
+            Some(rocky_core::state::CURRENT_REDACTION_VERSION),
+            "the sweep must RE-STAMP, not inherit"
+        );
+        assert!(
+            done.result.is_none(),
+            "an inherited result cannot be re-verified by this process, so it \
+             must not be carried forward under a current stamp"
+        );
+        assert!(!done.redaction_is_legacy());
+    }
+
+    /// #1897 PR2. A record written before the scrub existed serves its
+    /// lifecycle fields and withholds both payload fields — nothing
+    /// distinguishes a safe legacy string from one carrying a resolved value.
+    ///
+    /// Legacy is ABSENT **or** BELOW the floor. Pinning both means the
+    /// comparison is live from the start, instead of the first tightening
+    /// needing a second marker.
+    #[test]
+    fn a_legacy_job_record_serves_status_and_withholds_its_payload() {
+        let base = PersistedJob {
+            job_id: "job-legacy".to_string(),
+            kind: "run".to_string(),
+            state: "failed".to_string(),
+            submitted_at: "2026-09-11T00:00:00Z".to_string(),
+            started_at: Some("2026-09-11T00:00:01Z".to_string()),
+            finished_at: Some("2026-09-11T00:00:02Z".to_string()),
+            principal: Some("someone".to_string()),
+            error: Some("PRE-FIX-ERROR-TEXT".to_string()),
+            result: Some(serde_json::json!({ "pre": "fix" })),
+            redaction_version: None,
+        };
+
+        for version in [None, Some(0)] {
+            let job = PersistedJob {
+                redaction_version: version,
+                ..base.clone()
+            };
+            let status = job_status_from(job);
+            assert!(
+                status.result.is_none(),
+                "legacy {version:?} served a result"
+            );
+            assert!(status.error.is_none(), "legacy {version:?} served an error");
+            // The lifecycle half still answers, so a poller waiting for a
+            // terminal state is not left hanging.
+            assert_eq!(status.job_id, "job-legacy");
+            assert!(status.finished_at.is_some());
+        }
+
+        // At or above the floor, INCLUDING a version this binary does not know:
+        // the monotonic-strictness contract says a newer rule redacts at least
+        // as hard, so refusing it would lose data that is not at risk.
+        for version in [
+            Some(rocky_core::state::MIN_TRUSTED_REDACTION_VERSION),
+            Some(999),
+        ] {
+            let job = PersistedJob {
+                redaction_version: version,
+                ..base.clone()
+            };
+            let status = job_status_from(job);
+            assert!(
+                status.result.is_some(),
+                "trusted {version:?} withheld a result"
+            );
+            assert!(
+                status.error.is_some(),
+                "trusted {version:?} withheld an error"
+            );
+        }
     }
 
     /// Reference bytes for a canonical output: exactly what
@@ -4231,6 +5069,8 @@ mod tests {
                 submission_id: None,
                 check_gate_failed: false,
                 verify_after_failed: false,
+                rocky_branch: None,
+                run_scope: Some(rocky_core::state::RunScope::Production),
             })
             .expect("run recorded");
         store
@@ -5085,6 +5925,38 @@ mod tests {
         assert_eq!(project["pipelines"], serde_json::json!([]));
     }
 
+    /// The project route must expose a skipped recompile without replacing
+    /// the last successful compile or retrying the problematic config read.
+    #[tokio::test]
+    async fn project_route_shows_a_recorded_config_read_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = ServerState::new(
+            simple_project_models(),
+            None,
+            Some(dir.path().to_path_buf()),
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while state.compile_result.read().await.is_none() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("initial compile finishes");
+        let expected = "reading rocky.toml did not finish within 5s";
+        *state.config_read_failure.write().await = Some(expected.to_string());
+
+        let output = project(State(state))
+            .await
+            .ok()
+            .expect("project response")
+            .0;
+        assert_eq!(output.config_error.as_deref(), Some(expected));
+        assert!(
+            output.models_compiled.is_some(),
+            "the earlier compile remains available"
+        );
+    }
+
     /// #1823. The background compile failed — the project's `models` entry
     /// is a dangling symlink, which the walker refuses since #1817 — and the
     /// route read the absent result as a clean project: `diagnostics: []`,
@@ -5391,6 +6263,69 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), 200, "without --ui the guard is off");
+    }
+
+    /// Raw HTTP requests exercise the parser and the outer Host/Origin guard
+    /// together. A client library may reject or rewrite these authorities.
+    #[tokio::test]
+    async fn ui_mode_refuses_malformed_bracketed_hosts_and_origins_over_tcp() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let base = spawn_router(ui_state(&["rocky.internal"], &[])).await;
+        let addr = base.trim_start_matches("http://");
+        for (header, expected_status, expected_code) in [
+            ("Host: [rocky.internal]evil", "421", "host_not_allowed"),
+            ("Host: [::1]:x", "421", "host_not_allowed"),
+            ("Host: [::1", "421", "host_not_allowed"),
+            (
+                "Host: 127.0.0.1\r\nOrigin: http://[rocky.internal]evil",
+                "403",
+                "origin_not_allowed",
+            ),
+            (
+                "Host: 127.0.0.1\r\nOrigin: http://[::1]:x",
+                "403",
+                "origin_not_allowed",
+            ),
+            (
+                "Host: 127.0.0.1\r\nOrigin: http://[::1",
+                "403",
+                "origin_not_allowed",
+            ),
+        ] {
+            let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+            stream
+                .write_all(format!("GET /ui/ HTTP/1.0\r\n{header}\r\n\r\n").as_bytes())
+                .await
+                .unwrap();
+            let mut raw = Vec::new();
+            stream.read_to_end(&mut raw).await.unwrap();
+            let response = String::from_utf8(raw).unwrap();
+            let (head, body) = response.split_once("\r\n\r\n").unwrap();
+            assert_eq!(
+                head.split_whitespace().nth(1),
+                Some(expected_status),
+                "{header}: {response}"
+            );
+            let envelope: ErrorEnvelope = serde_json::from_str(body).unwrap();
+            assert_eq!(envelope.code, expected_code, "{header}: {response}");
+        }
+
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        stream
+            .write_all(
+                b"GET /ui/ HTTP/1.0\r\nHost: [::1]:8080\r\nOrigin: http://[::1]:8080\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let mut raw = Vec::new();
+        stream.read_to_end(&mut raw).await.unwrap();
+        let response = String::from_utf8(raw).unwrap();
+        assert_eq!(
+            response.split_whitespace().nth(1),
+            Some("200"),
+            "{response}"
+        );
     }
 
     /// A body over the limit is refused with the envelope before any
@@ -6076,39 +7011,50 @@ mod tests {
         let models_dir = dir.path().join("models");
         std::fs::create_dir_all(&models_dir).unwrap();
         let state_path = pinned_state_path(&models_dir);
-        // Create + init the (empty) store so open_read_only succeeds.
-        drop(rocky_core::state::StateStore::open(&state_path).unwrap());
+        assert!(!state_path.exists(), "precondition: never-run project");
 
-        let state = pinned_server(models_dir.clone(), None, &state_path);
-        let base = spawn_router(state).await;
+        let app = router(pinned_server(models_dir.clone(), None, &state_path));
+
+        async fn get(app: &Router, path: &str) -> String {
+            let response = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri(path)
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), axum::http::StatusCode::OK);
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            String::from_utf8(bytes.to_vec()).unwrap()
+        }
 
         // /runs
-        let resp = get_retrying_on_busy(&format!("{base}/api/v1/runs")).await;
-        assert_eq!(resp.status(), 200);
         assert_eq!(
-            resp.text().await.unwrap(),
+            get(&app, "/api/v1/runs").await,
             reference_bytes(&history_runs_output(&state_path, None, false).unwrap())
         );
 
         // /models/{name}/history
-        let resp = get_retrying_on_busy(&format!("{base}/api/v1/models/some_model/history")).await;
-        assert_eq!(resp.status(), 200);
         assert_eq!(
-            resp.text().await.unwrap(),
+            get(&app, "/api/v1/models/some_model/history").await,
             reference_bytes(
                 &model_history_output(&state_path, "some_model", None, false, 20).unwrap()
             )
         );
 
         // /models/{name}/metrics
-        let resp = get_retrying_on_busy(&format!("{base}/api/v1/models/some_model/metrics")).await;
-        assert_eq!(resp.status(), 200);
         assert_eq!(
-            resp.text().await.unwrap(),
+            get(&app, "/api/v1/models/some_model/metrics").await,
             reference_bytes(
                 &metrics_output(&state_path, "some_model", false, None, false).unwrap()
             )
         );
+        assert!(!state_path.exists(), "GET routes must not create state");
     }
 
     /// Minimal on-disk transformation project (rocky.toml + one model) for the
@@ -6391,15 +7337,79 @@ mod tests {
     ///   request 3   -> 200, the route recovers
     /// ```
     ///
-    /// The writer is unconditional and starts before the first assertion, so a
-    /// failing run still unblocks the read and the test FAILS rather than
-    /// hanging.
+    /// # #2153 / #2133: outliving this test is not the same as failing it
+    ///
+    /// `spawn_blocking` cannot be cancelled, so request 1's read above is
+    /// ABANDONED, not stopped, once its deadline fires: it keeps running on its
+    /// own OS thread. Dropping a `tokio::Runtime` waits, with no timeout, for
+    /// every such thread to finish. A one-shot writer (write once, then exit)
+    /// only answers that first, abandoned read -- sampling the hung test
+    /// binaries directly caught a SECOND read of this FIFO starting after this
+    /// test's writer had already exited, from the server's background
+    /// `recompile()`. That read found no writer, blocked forever, and the
+    /// runtime's drop hung the whole test BINARY with it (#2153; #2133 is the
+    /// duplicate that first hit it under load and killed the binary after it
+    /// sat hung for about 53 minutes).
+    ///
+    /// So the fix has two independent parts:
+    ///
+    /// - The writer is PERSISTENT: it keeps answering opens of the FIFO, not
+    ///   just the first one, for as long as this function lets it run.
+    /// - The runtime is built and dropped EXPLICITLY here (not via
+    ///   `#[tokio::test]`'s invisible epilogue), so this function -- not a
+    ///   macro -- controls exactly when that unbounded wait happens, and keeps
+    ///   the writer alive across it. Only once `drop(runtime)` has returned is
+    ///   the writer released and joined.
+    ///
+    /// A wall-clock watchdog thread is the backstop: if this function does not
+    /// finish within 60s regardless, it aborts the process so a regression here
+    /// fails the `Test` job in about a minute instead of hanging it for hours.
     ///
     /// Unix-only: it needs a FIFO. The repo already guards filesystem-shape
     /// tests this way.
     #[cfg(unix)]
-    #[tokio::test(flavor = "multi_thread")]
-    async fn a_stuck_config_read_is_bounded_refused_and_recovers() {
+    #[test]
+    fn a_stuck_config_read_is_bounded_refused_and_recovers() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        // THE WATCHDOG. Its own OS thread, independent of the tokio runtime
+        // built below, so it can still act if THAT is what hangs.
+        // `_cancel_watchdog`'s `Drop` sends "done" on every exit from this
+        // function -- normal return, the re-raised panic at the bottom, or a
+        // panic in the setup before `catch_unwind` -- because unwinding runs
+        // local destructors. Only a genuine hang leaves it undropped, which is
+        // exactly when the watchdog must fire.
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        struct CancelWatchdog(Option<std::sync::mpsc::Sender<()>>);
+        impl Drop for CancelWatchdog {
+            fn drop(&mut self) {
+                if let Some(tx) = self.0.take() {
+                    let _ = tx.send(());
+                }
+            }
+        }
+        let _cancel_watchdog = CancelWatchdog(Some(done_tx));
+        std::thread::spawn(move || {
+            let bound = std::time::Duration::from_secs(60);
+            if done_rx.recv_timeout(bound).is_err() {
+                // libtest's output capture is inherited by a spawned thread,
+                // so a captured `eprintln!` here would sit in a buffer that
+                // only gets printed once the test function returns -- which,
+                // on the abort below, never happens, so the message would be
+                // lost with it. Writing the raw fd instead bypasses that
+                // capture and lands in the log immediately.
+                let _ = std::io::stderr().write_all(
+                    format!(
+                        "\nWATCHDOG: a_stuck_config_read_is_bounded_refused_and_recovers \
+                         did not finish within {bound:?}; aborting so CI fails fast instead \
+                         of hanging on Runtime::drop (#2153, #2133).\n"
+                    )
+                    .as_bytes(),
+                );
+                std::process::abort();
+            }
+        });
+
         // `keep()`, so the directory OUTLIVES A PANIC.
         //
         // With an ordinary `TempDir`, a failed assertion drops it during
@@ -6429,111 +7439,173 @@ mod tests {
             "could not create the FIFO this test needs"
         );
 
-        // THE FIFO MUST ALWAYS BE UNBLOCKED, including on a failed assertion.
+        // THE PERSISTENT WRITER. Answers every open of the FIFO for write, not
+        // just the first -- see "outliving this test" above for why one-shot
+        // was not enough: whatever reads the FIFO after this test's own body
+        // finishes, including the abandoned request-1 read once its deadline
+        // fires, still finds an answer, for as long as this thread runs. Only
+        // the explicit release at the bottom of this function stops it, and
+        // that happens after `drop(runtime)` -- the wait that used to be
+        // unbounded AND invisible -- has already returned.
         //
-        // `spawn_blocking` cannot be cancelled, and dropping a tokio runtime
-        // waits for its blocking tasks. So a panic while request 1 is parked in
-        // `read_to_string` leaves that task blocked forever and the test BINARY
-        // hangs instead of failing — which is how the first version of this
-        // test sat stuck for eight hours under a mutation rather than reporting
-        // the mutation.
-        //
-        // An unconditional writer, started before anything that can panic,
-        // removes that: whatever the test does, the read completes and the
-        // runtime can drop. It writes after the deadline below has elapsed, so
-        // it does not shorten the timeout it is there to let us observe.
-        let writer_path = fifo.clone();
-        std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_secs(7));
-            // Opening a FIFO for write blocks until a reader is present; the
-            // parked read IS that reader. If it already finished, this errors
-            // rather than blocking the process, and either way we ignore it.
-            // This only works because `root` is kept: a deleted FIFO would make
-            // this a silent no-op and strand the reader.
-            let _ = std::fs::write(&writer_path, "[adapter]\ntype = \"duckdb\"\n");
-        });
+        // The first write still waits 7s, same as before, so it does not
+        // shorten the deadline under test; every write after that answers as
+        // soon as a new reader shows up.
+        let stop_writer = std::sync::Arc::new(AtomicBool::new(false));
+        let writer_handle = {
+            let stop_writer = std::sync::Arc::clone(&stop_writer);
+            let writer_path = fifo.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_secs(7));
+                loop {
+                    if stop_writer.load(Ordering::Acquire) {
+                        break;
+                    }
+                    // Opening a FIFO for write blocks until a reader is
+                    // present -- including, at release time below, the
+                    // read+write handle opened deliberately to unstick this
+                    // call. This only works because `root` is kept: a deleted
+                    // FIFO would make this a silent no-op and strand a reader.
+                    let _ = std::fs::write(&writer_path, "[adapter]\ntype = \"duckdb\"\n");
+                    // A real reader needs a moment to drain before the next
+                    // writer reopens, or it can be handed the payload twice
+                    // across two of its own read() calls.
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+            })
+        };
 
-        // No token configured, so the requests below need no header.
-        let state = ServerState::with_auth_and_webhook(
-            models_dir,
-            false,
-            None,
-            Some(fifo.clone()),
-            None,
-            Vec::new(),
-            None,
-            None,
-            None,
-            rocky_server::state::SettingsSnapshot {
-                bind_host: "127.0.0.1".to_string(),
-                ..Default::default()
-            },
-        );
-        assert!(state.settings.config_labels.get().is_none());
+        // The scenario itself runs on a runtime built here, not via
+        // `#[tokio::test]` -- see the doc comment above. `catch_unwind` means
+        // a failing assertion below still reaches the shutdown further down,
+        // rather than skipping straight to an unguarded `Runtime::drop` inside
+        // an invisible macro epilogue.
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let body_fifo = fifo.clone();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            runtime.block_on(async move {
+                let fifo = body_fifo;
+                // No token configured, so the requests below need no header.
+                let state = ServerState::with_auth_and_webhook(
+                    models_dir,
+                    false,
+                    None,
+                    Some(fifo.clone()),
+                    None,
+                    Vec::new(),
+                    None,
+                    None,
+                    None,
+                    rocky_server::state::SettingsSnapshot {
+                        bind_host: "127.0.0.1".to_string(),
+                        ..Default::default()
+                    },
+                );
+                assert!(state.settings.config_labels.get().is_none());
 
-        let base = spawn_router(state.clone()).await;
-        let client = reqwest::Client::new();
-        let url = format!("{base}/api/v1/settings");
+                let base = spawn_router(state.clone()).await;
+                let client = reqwest::Client::new();
+                let url = format!("{base}/api/v1/settings");
 
-        // Request 1 parks inside the read, holding the permit.
-        let first = tokio::spawn({
-            let client = client.clone();
-            let url = url.clone();
-            async move { client.get(url).send().await.unwrap().status() }
-        });
+                // Request 1 parks inside the read, holding the permit.
+                let first = tokio::spawn({
+                    let client = client.clone();
+                    let url = url.clone();
+                    async move { client.get(url).send().await.unwrap().status() }
+                });
 
-        // Wait for it to actually take the lane.
-        let mut taken = false;
-        for _ in 0..400 {
-            if Arc::clone(&state.settings_reads)
-                .try_acquire_owned()
-                .is_err()
-            {
-                taken = true;
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        assert!(taken, "the read never took the admission lane");
+                // Wait for it to actually take the lane.
+                let mut taken = false;
+                for _ in 0..400 {
+                    if Arc::clone(&state.settings_reads)
+                        .try_acquire_owned()
+                        .is_err()
+                    {
+                        taken = true;
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                assert!(taken, "the read never took the admission lane");
 
-        // THE BOUND: a second caller is refused at once, not queued behind a
-        // read that may never return.
-        let second = client.get(&url).send().await.unwrap();
-        assert_eq!(
-            second.status(),
-            503,
-            "a second read must be refused, not queued"
-        );
-        assert!(second.headers().contains_key("retry-after"));
+                // THE BOUND: a second caller is refused at once, not queued
+                // behind a read that may never return.
+                let second = client.get(&url).send().await.unwrap();
+                assert_eq!(
+                    second.status(),
+                    503,
+                    "a second read must be refused, not queued"
+                );
+                assert!(second.headers().contains_key("retry-after"));
 
-        // The first caller gets its own deadline back -- 504, and deliberately
-        // NOT 503 with a retry hint, because this read will not finish on its
-        // own.
-        assert_eq!(
-            first.await.unwrap(),
-            504,
-            "the parked caller must time out rather than hang forever"
-        );
+                // The first caller gets its own deadline back -- 504, and
+                // deliberately NOT 503 with a retry hint, because this read
+                // will not finish on its own.
+                assert_eq!(
+                    first.await.unwrap(),
+                    504,
+                    "the parked caller must time out rather than hang forever"
+                );
 
-        // RECOVERY: once the writer above unblocks the read, it completes,
-        // caches, frees the lane, and the route works again.
-        let mut recovered = 0;
-        for _ in 0..600 {
-            let status = client.get(&url).send().await.unwrap().status();
-            if status == 200 {
-                recovered = 200;
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-        }
-        assert_eq!(
-            recovered, 200,
-            "the route must recover once the stuck read finally returns"
-        );
+                // RECOVERY: once the writer above unblocks the read, it
+                // completes, caches, frees the lane, and the route works
+                // again.
+                let mut recovered = 0;
+                for _ in 0..600 {
+                    let status = client.get(&url).send().await.unwrap().status();
+                    if status == 200 {
+                        recovered = 200;
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                }
+                assert_eq!(
+                    recovered, 200,
+                    "the route must recover once the stuck read finally returns"
+                );
+            });
+        }));
+
+        // Drop the runtime EXPLICITLY, with the writer still answering opens
+        // -- this is the wait that used to be unbounded and invisible, run via
+        // an ordinary macro epilogue after a one-shot writer had already
+        // exited. Whatever reads the FIFO after the body above, the writer is
+        // still there to answer it, so this returns instead of hanging; the
+        // watchdog is the backstop if it somehow doesn't.
+        drop(runtime);
+
+        // Only now release the writer: set the flag, then open the FIFO
+        // read+write -- the one open mode a FIFO never blocks on, for either
+        // side -- to unstick a writer parked in `open(O_WRONLY)` waiting for a
+        // reader that will never come now. HOLD this handle across the join,
+        // not just the open call: if the writer hasn't reached its own
+        // `open(O_WRONLY)` yet, closing ours immediately would let it go back
+        // to sleep and try again with no reader left, hanging `join()` below
+        // (the watchdog would still catch that, but it would take down this
+        // whole ~2000-test binary over a bug in the cleanup, not the fix).
+        // Held open, it also gives the writer's last `write()` a reader, so
+        // that call cannot return `EPIPE`.
+        stop_writer.store(true, Ordering::Release);
+        let unstick = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&fifo);
+        writer_handle.join().unwrap();
+        drop(unstick);
 
         // Reached only when every assertion above passed; a failing run leaves
-        // the directory behind on purpose.
-        let _ = std::fs::remove_dir_all(&root);
+        // the directory behind on purpose (see `keep()` above) -- and, now
+        // that the writer answers every read, it does so without stranding
+        // anything.
+        if result.is_ok() {
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
     }
 
     /// **Red team, round 1.** `build_cors_layer` drops an origin that is not a
@@ -7615,7 +8687,115 @@ mod tests {
             principal: None,
             error: None,
             result: None,
+            // A fixture for lifecycle tests, so it is stamped current: an
+            // unstamped one would read as pre-redaction and have its payload
+            // withheld, which is a different behaviour than these tests mean
+            // to exercise.
+            redaction_version: Some(rocky_core::state::CURRENT_REDACTION_VERSION),
         }
+    }
+
+    #[tokio::test]
+    async fn submit_caches_the_scrubbed_running_record() {
+        let supplied = "CACHE-RUNNING-62df184a";
+        rocky_core::secret_registry::register_substitution("ROCKY_CACHE_RUNNING", supplied);
+        let dir = tempfile::tempdir().unwrap();
+        let models_dir = dir.path().join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        let path = pinned_state_path(&models_dir);
+        let state = pinned_server(models_dir, None, &path);
+        let mut headers = HeaderMap::new();
+        headers.insert("x-rocky-principal", supplied.parse().unwrap());
+
+        // A current-thread runtime does not poll the spawned subprocess task
+        // before this handler returns, so this observes the running write.
+        let response = submit_job(JobKind::Plan, state.clone(), &headers, &Bytes::new())
+            .await
+            .unwrap_or_else(|_| panic!("job submission failed"));
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let id = serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["job_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let cached = state.jobs.get(&id).await.unwrap();
+        assert_eq!(cached.state, "running");
+        assert!(
+            cached.principal.is_none(),
+            "caller value reached running cache"
+        );
+        assert!(!serde_json::to_string(&cached).unwrap().contains(supplied));
+    }
+
+    #[tokio::test]
+    async fn completion_caches_the_same_scrubbed_record_as_disk() {
+        let supplied = "CACHE-FINISHED-86d439ab";
+        rocky_core::secret_registry::register_substitution("ROCKY_CACHE_FINISHED", supplied);
+        let dir = tempfile::tempdir().unwrap();
+        let models_dir = dir.path().join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        let path = pinned_state_path(&models_dir);
+        let state = pinned_server(models_dir, None, &path);
+        let mut record = persisted_job("finished-scrub", "running");
+        record.principal = Some(supplied.to_string());
+
+        finish_job(
+            state.clone(),
+            path.clone(),
+            record,
+            JobState::Failed,
+            None,
+            Some("ordinary failure".to_string()),
+        )
+        .await;
+        let cached = state.jobs.get("finished-scrub").await.unwrap();
+        let durable = rocky_core::state::StateStore::open(&path)
+            .unwrap()
+            .get_job("finished-scrub")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            cached, durable,
+            "cache and restart must serve the same record"
+        );
+        assert!(
+            cached.principal.is_none(),
+            "caller value reached terminal cache"
+        );
+        assert_eq!(cached.state, "failed");
+        assert!(!serde_json::to_string(&cached).unwrap().contains(supplied));
+    }
+
+    #[tokio::test]
+    async fn durable_read_scrubs_before_warming_the_cache() {
+        let supplied = "CACHE-WARMING-82a1df56";
+        rocky_core::secret_registry::register_substitution("ROCKY_CACHE_WARMING", supplied);
+        let dir = tempfile::tempdir().unwrap();
+        let models_dir = dir.path().join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        let path = pinned_state_path(&models_dir);
+        let mut raw = persisted_job("cold-scrub", "failed");
+        raw.principal = Some(supplied.to_string());
+        rocky_core::state::StateStore::open(&path)
+            .unwrap()
+            .record_job(&raw)
+            .unwrap();
+        let state = pinned_server(models_dir, None, &path);
+        assert!(state.jobs.get("cold-scrub").await.is_none());
+
+        let response = get_job(State(state.clone()), ApiPath("cold-scrub".to_string()))
+            .await
+            .unwrap_or_else(|_| panic!("job read failed"));
+        assert!(
+            response.0.principal.is_none(),
+            "cold read must be presentable"
+        );
+        let cached = state.jobs.get("cold-scrub").await.unwrap();
+        assert!(cached.principal.is_none(), "durable read warmed raw cache");
+        assert_eq!(cached.state, "failed");
+        assert!(!serde_json::to_string(&cached).unwrap().contains(supplied));
     }
 
     /// The restart contract: a job persisted as `running` by a sidecar that
@@ -7741,12 +8921,14 @@ mod tests {
         );
     }
 
-    /// The sweep reconciles ONLY non-terminal records: `running` and `queued`
+    /// The sweep reconciles ONLY in-flight records: `running` and `queued`
     /// flip to `failed` with the documented error, while terminal
-    /// `succeeded`/`failed` history is untouched. A missing state file is a
+    /// `succeeded`/`failed` history is untouched. An unrecognized state is
+    /// neither, and `the_sweep_leaves_an_unrecognized_state_untouched` covers
+    /// that third case. A missing state file is a
     /// no-op, not an error (fresh project, nothing ever persisted).
     #[test]
-    fn sweep_marks_only_nonterminal_jobs_failed() {
+    fn sweep_marks_only_in_flight_jobs_failed() {
         use rocky_core::state::StateStore;
 
         let dir = tempfile::tempdir().unwrap();
@@ -7787,7 +8969,7 @@ mod tests {
         );
         drop(store);
 
-        // Idempotent: a second sweep finds nothing non-terminal.
+        // Idempotent: a second sweep finds nothing in flight.
         assert_eq!(sweep_interrupted_jobs(&state_path).unwrap(), 0);
         // A state file that never existed is a clean no-op.
         assert_eq!(
@@ -7817,7 +8999,7 @@ mod tests {
         // A live submission in THIS process, after the sweep.
         let state = pinned_server(models_dir, None, &state_path);
         let record = persisted_job("job_live", "running");
-        state.jobs.upsert(record.clone()).await;
+        cache_job(&state, record.clone()).await;
         StateStore::open(&state_path)
             .unwrap()
             .record_job(&record)
@@ -7862,7 +9044,7 @@ mod tests {
         }
 
         let state = pinned_server(models_dir, None, &state_path);
-        state.jobs.upsert(record).await;
+        cache_job(&state, record).await;
         let base = spawn_router(state.clone()).await;
 
         // The hot answer, straight from the cache.
@@ -7874,10 +9056,7 @@ mod tests {
 
         // Exactly one capacity's worth of newer finished jobs displaces it.
         for i in 0..DEFAULT_JOB_CACHE_CAPACITY {
-            state
-                .jobs
-                .upsert(persisted_job(&format!("filler{i}"), "succeeded"))
-                .await;
+            cache_job(&state, persisted_job(&format!("filler{i}"), "succeeded")).await;
         }
         assert!(
             state.jobs.get("job_evicted").await.is_none(),
@@ -7963,7 +9142,10 @@ mod tests {
     /// It also pins the asymmetry: the two predicates are complements for the
     /// four known states and deliberately are NOT for anything else — an
     /// unrecognized string is neither in flight (so it can never defeat the
-    /// cache's capacity bound) nor terminal (so the restart sweep reconciles it).
+    /// cache's capacity bound) nor terminal (so this version never CLAIMS such
+    /// a job finished). The gap between them is the set of records this version
+    /// must not touch; `the_sweep_leaves_an_unrecognized_state_untouched` pins
+    /// that the restart sweep honours it.
     #[test]
     fn every_job_state_is_classified_for_both_the_cache_and_the_sweep() {
         for state in [
@@ -7998,7 +9180,11 @@ mod tests {
         );
         assert!(
             !unknown.is_terminal(),
-            "an unrecognized state must still be swept, or an embedder polls it forever"
+            "an unrecognized state must not read as terminal TO THIS \
+             PREDICATE, which classifies the stored string and makes no claim \
+             about a state this version does not know. `job_status_from` \
+             separately renders it as `failed` — a rendering fallback at the \
+             API boundary, not this classification"
         );
     }
 

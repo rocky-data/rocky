@@ -265,6 +265,8 @@ Generate the replication SQL Rocky would run, without running it. The command ne
 
 `rocky plan` plus `rocky apply` is the canonical path for production and for gating a pull request. Nothing touches the warehouse between the two steps. For local iteration, [`rocky run`](#rocky-run) does the same work in one command and writes no plan file.
 
+With `--model`, a compile error in that model or one reached through `depends_on` or a bare-name read refuses the plan. Without `--model`, Rocky compiles the whole models directory. An error in a model from another pipeline also refuses the plan. Rocky prints each relevant model and diagnostic code, exits with code `1`, and writes no plan file or `plan_id`. This applies to text and JSON output. Warnings alone do not stop the plan.
+
 ```bash
 rocky plan [flags]
 rocky plan promote <branch> [flags]
@@ -325,9 +327,9 @@ Rocky records the execution flags in the plan file, so `rocky apply` replays the
 | `--resume <RUN_ID>` | `string` | | Resume a specific previous replication run from its last checkpoint. Mints a new `run_id` and records the prior one as `resumed_from`. Rejected with `--dag`, which does not replay the resume into its sub-runs (rejected at parse time). |
 | `--resume-latest` | `bool` | `false` | Resume the most recent failed replication run from its last checkpoint. Which run that is gets resolved at apply time, not plan time. Rejected with `--dag`, which does not replay the resume into its sub-runs (rejected at parse time). |
 | `--shadow` | `bool` | `false` | Write to shadow targets instead of production. |
-| `--shadow-suffix <SUFFIX>` | `string` | `_rocky_shadow` | Suffix appended to table names in shadow mode. |
-| `--shadow-schema <NAME>` | `string` | | Override the schema for shadow tables. Mutually exclusive with `--shadow-suffix`. |
-| `--branch <NAME>` | `string` | | Plan against a branch created with `rocky branch create`. Equivalent to `--shadow --shadow-schema <branch.schema_prefix>`. Mutually exclusive with `--shadow` and `--shadow-schema`. |
+| `--shadow-suffix <SUFFIX>` | `string` | `_rocky_shadow` | Requires `--shadow`. Appends a suffix to table names. Conflicts with `--branch`. `--shadow` alone uses `_rocky_shadow`. |
+| `--shadow-schema <NAME>` | `string` | | Requires `--shadow`. Overrides the schema for shadow tables. Conflicts with `--branch`. |
+| `--branch <NAME>` | `string` | | Plan against a branch created with `rocky branch create`. Equivalent to `--shadow --shadow-schema <branch.schema_prefix>`. Conflicts with `--shadow`, `--shadow-schema`, and `--shadow-suffix`. |
 | `--partition <KEY>` | `string` | | Plan one partition by its canonical key (`2026-04-07` for daily, `2026-04` for monthly). Errors if the format does not match the model's granularity. Mutually exclusive with `--from`, `--to`, `--latest`, `--missing`. |
 | `--from <KEY>` | `string` | | Lower bound of a closed partition range, inclusive. Requires `--to`. Both bounds must align to the model's grain. |
 | `--to <KEY>` | `string` | | Upper bound of a closed partition range, inclusive. Requires `--from`. |
@@ -402,18 +404,18 @@ rocky plan --filter client=acme
 }
 ```
 
-A model the preview could not render is listed in `skipped`, rather than left out silently:
+A model excluded from the preview or refused by compilation is listed in `skipped`:
 
 ```json
   "skipped": [
     {
       "model": "stg_events",
-      "reason": "invalid SQL generation request: model 'stg_events': `type = \"ephemeral\"` is not supported (E038) — an ephemeral model is not materialized and is not inlined into its consumers; use `type = \"view\"`"
+      "reason": "[E038] model 'stg_events' uses `type = \"ephemeral\"`, which is not supported: an ephemeral model is not materialized and is not inlined into its consumers, so a consumer reads whatever table already carries the name"
     }
   ]
 ```
 
-The `reason` is the generator's own error. A refused strategy puts a model there, and so does one that needs a live warehouse, such as a Snowflake dynamic table. The MCP `plan_preview` tool returns the same list. The key is absent when nothing was skipped.
+The `reason` gives the compiler diagnostic or SQL generation error. A refused strategy puts a model there, and so does one that needs a live warehouse, such as a Snowflake dynamic table. The MCP `plan_preview` tool reports preview exclusions. The key is absent when nothing was skipped.
 
 Plan with table output and a custom config:
 
@@ -561,15 +563,16 @@ rocky run [flags]
 | `--filter <key=value>` | `string` | | Filter sources by component value (e.g., `client=acme`). |
 | `--pipeline <NAME>` | `string` | | Pipeline name (required if multiple pipelines are defined). |
 | `--model <NAME>` | `string` | | Execute a single compiled model by name and skip replication. An alternative to `--filter` for model-only execution. |
+| `--contracts <PATH>` | `PathBuf` | | Check the selected model against its contract in this directory during the run's own compile. Requires `--model` and `--pipeline`. |
 | `--governance-override <JSON>` | `string` | | Additional governance config as inline JSON or `@file.json`, merged with defaults. |
 | `--models <PATH>` | `PathBuf` | | Models directory for transformation execution. |
 | `--all` | `bool` | `false` | Execute both replication and compiled models. |
 | `--resume <RUN_ID>` | `string` | | Resume a specific previous replication run from its last checkpoint; mints a new `run_id` and records the prior one as `resumed_from`. Rejected with `--dag`, which does not replay the resume into its sub-runs (rejected at parse time). |
 | `--resume-latest` | `bool` | `false` | Resume the most recent failed replication run from its last checkpoint; mints a new `run_id` and records the prior one as `resumed_from`. Rejected with `--dag`, which does not replay the resume into its sub-runs (rejected at parse time). |
 | `--shadow` | `bool` | `false` | Run in shadow mode: write to shadow targets instead of production. |
-| `--shadow-suffix <SUFFIX>` | `string` | `_rocky_shadow` | Suffix appended to table names in shadow mode. |
-| `--shadow-schema <NAME>` | `string` | | Override schema for shadow tables (mutually exclusive with `--shadow-suffix`). |
-| `--branch <NAME>` | `string` | | Execute against a named branch previously registered with `rocky branch create`. Applies the branch's `schema_prefix` to every target (internally equivalent to `--shadow --shadow-schema <branch.schema_prefix>`). Mutually exclusive with `--shadow` / `--shadow-schema`. |
+| `--shadow-suffix <SUFFIX>` | `string` | `_rocky_shadow` | Requires `--shadow`. Appends a suffix to table names. Conflicts with `--branch`. `--shadow` alone uses `_rocky_shadow`. |
+| `--shadow-schema <NAME>` | `string` | | Requires `--shadow`. Overrides the schema for shadow tables. Conflicts with `--branch`. |
+| `--branch <NAME>` | `string` | | Execute against a named branch previously registered with `rocky branch create`. Applies the branch's `schema_prefix` to every target (internally equivalent to `--shadow --shadow-schema <branch.schema_prefix>`). Conflicts with `--shadow`, `--shadow-schema`, and `--shadow-suffix`. The run records `<NAME>` as `rocky_branch` in [run history](/reference/commands/administration/#rocky-history). |
 | `--watch` | `bool` | `false` | Wrap the run in a filesystem watcher: re-execute the pipeline on every change to `rocky.toml` or any file under `models/`, debounced to 200 ms so editor save bursts coalesce into a single re-run. Failed runs do not exit the loop; Ctrl-C exits cleanly between runs. **v0 limitations:** mutually exclusive with `--dag`, `--resume`, `--resume-latest`, `--idempotency-key`, and `--model` (rejected at parse time). |
 | `--defer` | `bool` | `false` | Build only the `--model`-selected models locally, resolving unbuilt upstream models to an existing (production) schema — the dbt-Core-style defer convenience. Takes effect **only together with `--model`**: a full run builds everything, so the flag is inert. Applies to transformation models; mutually exclusive with `--dag`. See the limitation note below. |
 | `--defer-to <SCHEMA>` | `string` | | Schema the deferred upstream models resolve to. Requires `--defer`. Defaults to each unbuilt upstream's own configured target schema (its production home); pass this to point every deferred reference at a single schema instead (catalog + table are preserved). |
@@ -581,6 +584,18 @@ rocky run [flags]
 :::caution[`--defer` SQL-rewrite limitation]
 `--defer` rewrites each selected model's SQL to qualify deferred upstream references, and the rewrite parses the model with the Databricks dialect. Constructs the parser does not support (`SELECT * EXCEPT (...)`, trailing-comma select lists, and `STRUCT(...)` literals) cannot be rewritten and fail with a clear error. Build those models without `--defer`. With `--defer` off (the default), runs are byte-identical to before the flag existed.
 :::
+
+### Guard one model with a contract
+
+Use `--contracts` when you build one `full_refresh` transformation model:
+
+```bash
+rocky run --pipeline transform --model int_order_lines --contracts contracts -o json
+```
+
+The directory must exist and contain `int_order_lines.contract.toml`. Rocky checks that contract in the compile that supplies the model SQL for this run. An error such as `E010` fails the run before Rocky replaces the selected table. The failure JSON includes the compile error and has no materialization for that model.
+
+This first route does not cover a whole pipeline, `--dag`, `--all`, `rocky apply`, a branch, or a deferred run. It refuses selected models that use a strategy other than `full_refresh` or add a `surrogate_key` after compilation. It also refuses idempotency and skip options that could report success without rebuilding. A failed contract can still update run history or state synchronization. `I003` means Rocky could not infer a declared column type and did not check that type; required-column checks still run.
 
 ### Pipeline Stages
 
@@ -687,13 +702,13 @@ That last case deserves a word. To such a warehouse the two targets are distinct
 
 This rule is not about whether the dialect quotes identifiers. Rocky renders Trino targets double-quoted, yet treats two Trino targets that differ only by case as one object, so such a run proceeds there.
 
-`--shadow` and `--branch` isolate `rocky run` for transformation pipelines only. `rocky run --dag`, the snapshot pipeline kind, and the load pipeline kind accept both flags but still write production targets.
+`--shadow` and `--branch` isolate `rocky run` for transformation pipelines, and for replication pipelines in either mode. Rocky refuses both flags on `rocky run --dag`, and on quality, snapshot and load pipelines. A refused quality, snapshot or load run stops before it opens a warehouse adapter, writes to the state store, or claims an idempotency key, so it writes nothing. See [Shadow mode](/concepts/shadow-mode/) for the reasons and for how to quality-check a branch.
 
 Or run against a named branch:
 
 ```bash
-rocky branch create fix-price --description "testing reprice migration"
-rocky run --filter client=acme --branch fix-price
+rocky branch create fix_price --description "testing reprice migration"
+rocky run --filter client=acme --branch fix_price
 ```
 
 Run in watch mode for the inner-loop developer workflow, where every save re-materializes the pipeline against the local DuckDB warehouse:
@@ -777,20 +792,22 @@ acme_warehouse.staging__eu_central__stripe.charges    | 2026-03-29T22:15:00Z    
 
 Manage named virtual branches. A branch is the persistent, named form of shadow mode. Creating one records a `schema_prefix` in the state store. Every later run that names the branch applies that prefix to each model target. That holds whether you run `rocky plan --branch <name>` plus `rocky apply <plan-id>` or the one-step `rocky run --branch <name>`. Schema-prefix branches behave the same on every adapter today. Warehouse-native clones (Delta `SHALLOW CLONE`, Snowflake zero-copy `CLONE`) are a follow-up.
 
+`rocky plan` accepts replication pipelines only. A transformation pipeline uses `rocky run --branch <name>`.
+
 ```bash
 rocky branch create <name> [--description <text>]
 rocky branch delete <name>
 rocky branch list
 rocky branch show <name>
-rocky branch compare <name> [--filter <key=value>]
+rocky branch compare <name> [--filter <key=value>] [--pipeline <name>]
 rocky branch approve <name> [--message <text>] [--out <path>]
 rocky branch promote <name> [--allow-breaking] [--base-ref <ref>]
                             [--models <path>] [--skip-approval]
-                            [--filter <key=value>]
-rocky branch promote <name> --plan <plan-id>   # canonical: plan + apply
+                            [--pipeline <name>] [--filter <key=value>]
+rocky branch promote <name> --plan <plan-id> [--pipeline <name>]   # canonical: plan + apply
 ```
 
-Branch names accept `[A-Za-z0-9_.\-]` up to 64 characters. The default schema prefix is `branch__<name>`. Deleting a branch removes the state-store entry but does **not** drop warehouse tables that were materialized under it.
+Branch names accept 1–64 `[A-Za-z0-9_]` characters. Rocky refuses other characters at the command entry point and suggests underscores. The default schema prefix is `branch__<name>`. Deleting a branch removes its state-store entry but leaves its warehouse tables.
 
 **Target names have their own limit.** `branch promote` writes each name into a `CREATE OR REPLACE TABLE` statement, quoted the way the warehouse quotes identifiers. Quoting is not escaping, so one character cannot survive it: the warehouse's own identifier quote. Promote refuses a catalog, schema or table name containing it, and names the character.
 
@@ -800,14 +817,21 @@ Branch names accept `[A-Za-z0-9_.\-]` up to 64 characters. The default schema pr
 | Databricks | `` ` `` | |
 | BigQuery | `` ` `` | `\` — BigQuery reads escape sequences inside a quoted identifier, so a trailing backslash consumes the closing quote |
 
-**No other character is refused by this check.** A hyphen or a dot passes it, which matters because branch names allow both. A backslash passes it everywhere except BigQuery.
+**No other character is refused by this quote check.** A hyphen or a dot in a target name passes it. Branch names follow the stricter rule above. A backslash passes it everywhere except BigQuery.
 
 Two limits sit outside this check and still apply:
 
-- A transformation model that takes its schema from its group's `schema_template` goes through the stricter identifier rule, `[A-Za-z0-9_]` only — whether or not the template carries a placeholder. A hyphen or a dot there is refused while the plan is being built, before promote quotes anything.
+- A transformation model that takes its schema from its group's `schema_template` follows `[A-Za-z0-9_]` too. This applies with or without a placeholder. A hyphen or a dot is refused while Rocky builds the plan, before promote quotes anything.
 - Promote also refuses a plan in which two steps replace the same production table, whatever the names look like.
 
 The check runs when a promote plan is built and again when one is applied, because a plan stores its statement as ready-made text.
+
+### `branch compare` flags
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--filter <key=value>` | `string` | (none) | Filter the compared targets. See [the shared filter reference](/reference/filters/). |
+| `--pipeline <name>` | `string` | (none) | Which pipeline to compare, in a multi-pipeline project. Required when the project defines more than one pipeline. |
 
 ### `branch approve` flags
 
@@ -830,7 +854,7 @@ Writes a content-addressed approval artifact that binds the approver's git ident
 | `--base-ref <ref>` | `string` | `main` | Git ref to diff against for the breaking-change gate. |
 | `--models <path>` | `PathBuf` | `models` | Models directory used by the breaking-change gate. |
 | `--skip-approval` | flag | off | Bypass the approval gate. Always emits an `approval_skipped` audit event so the bypass leaves a paper trail. |
-| `--pipeline <name>` | `string` | (none) | Which pipeline to promote, in a multi-pipeline project. Optional when the project defines a single pipeline. |
+| `--pipeline <name>` | `string` | (none) | Which pipeline to promote, in a multi-pipeline project. Optional when the project defines a single pipeline, or when `--plan` names a promote plan that already recorded one — omit it to use the plan's pipeline. A value that disagrees with the plan's recorded pipeline is refused. |
 | `--filter <key=value>` | `string` | (none) | Filter the promote targets. Replication pipelines filter sources by schema-pattern component (e.g. `--filter client=acme`); transformation pipelines filter models by `table`, `model`, `catalog`, or `schema`. |
 
 `rocky branch promote` enumerates the pipeline's production targets and promotes each one. A replication pipeline finds the source connector's tables through the schema-pattern templates. A transformation pipeline walks the configured `models` glob and promotes one target per model, skipping ephemeral models. Rocky then runs the optional `[branch.approval]` gate, followed by the semantic breaking-change gate against `--base-ref`. For each target it dispatches `CREATE OR REPLACE TABLE prod.<x> AS SELECT * FROM branch__<name>.<x>`. Quality and snapshot pipelines are not supported and return a clear error.
@@ -842,7 +866,7 @@ The breaking-change gate vetoes the promote and exits non-zero when any finding 
 Create, list, run against, and delete a branch:
 
 ```bash
-rocky branch create fix-price --description "testing reprice migration"
+rocky branch create fix_price --description "testing reprice migration"
 ```
 
 ```json
@@ -850,8 +874,8 @@ rocky branch create fix-price --description "testing reprice migration"
   "version": "1.11.0",
   "command": "branch create",
   "branch": {
-    "name": "fix-price",
-    "schema_prefix": "branch__fix-price",
+    "name": "fix_price",
+    "schema_prefix": "branch__fix_price",
     "created_by": "hugo",
     "created_at": "2026-04-20T14:22:11+00:00",
     "description": "testing reprice migration"
@@ -869,24 +893,27 @@ rocky branch list
   "command": "branch list",
   "total": 2,
   "branches": [
-    { "name": "fix-price", "schema_prefix": "branch__fix-price", "created_by": "hugo", "created_at": "2026-04-20T14:22:11+00:00", "description": "testing reprice migration" },
-    { "name": "ingest-v2", "schema_prefix": "branch__ingest-v2", "created_by": "ci",   "created_at": "2026-04-18T09:05:00+00:00", "description": null }
+    { "name": "fix_price", "schema_prefix": "branch__fix_price", "created_by": "hugo", "created_at": "2026-04-20T14:22:11+00:00", "description": "testing reprice migration" },
+    { "name": "ingest_v2", "schema_prefix": "branch__ingest_v2", "created_by": "ci",   "created_at": "2026-04-18T09:05:00+00:00", "description": null }
   ]
 }
 ```
 
 ```bash
-rocky run --filter client=acme --branch fix-price
-rocky branch delete fix-price
+rocky run --filter client=acme --branch fix_price
+rocky branch delete fix_price
 ```
 
 Diff a branch's materialized tables against production (row counts + schemas):
 
 ```bash
-rocky branch compare fix-price
+rocky branch compare fix_price
+rocky branch compare fix_price --pipeline shopify_us   # multi-pipeline project
 ```
 
-Internally this is `rocky compare` pointed at the branch's `schema_prefix` via `ShadowConfig.schema_override`, the same mechanism `rocky run --branch` uses for writes, so compare always hits exactly the tables the branch produced. Accepts the shared [`--filter`](/reference/filters/) flag.
+Internally this is `rocky compare` pointed at the branch's `schema_prefix` via `ShadowConfig.schema_override`, the same mechanism `rocky run --branch` uses for writes, so compare always hits exactly the tables the branch produced. Accepts the shared [`--filter`](/reference/filters/) flag, and `--pipeline <name>` to select the pipeline in a multi-pipeline project.
+
+When Rocky cannot read a table or its schema on either side, that table reports `verdict: "error"` with the reason in `reasons`. Its unreadable row count is `null`, never `0`. An `error` row counts as failed, so the command exits non-zero. See [`rocky compare`](/reference/cli/#rocky-compare).
 
 ### Related Commands
 

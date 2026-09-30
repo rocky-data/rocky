@@ -392,6 +392,7 @@ fn build_generated_model(
     strategy: rocky_core::models::StrategyConfig,
 ) -> Model {
     rocky_core::models::Model {
+        drop_existing_kind: None,
         config: rocky_core::models::ModelConfig {
             name: name.to_string(),
             depends_on: vec![],
@@ -509,6 +510,7 @@ mod tests {
     /// Build an upstream `Model` by hand. Used in project-aware validation tests.
     fn upstream_model(name: &str, sql: &str) -> Model {
         rocky_core::models::Model {
+            drop_existing_kind: None,
             config: rocky_core::models::ModelConfig {
                 name: name.to_string(),
                 depends_on: vec![],

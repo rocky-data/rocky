@@ -308,7 +308,7 @@ unlike `compliance`, because retention is not scoped to an environment.
 
 ### `validate_migration(dbt_project, rocky_project=None, *, sample_size=None) -> ValidateMigrationResult`
 
-Compare a dbt project against a Rocky import to check that the migration is correct.
+Compare dbt model names with a Rocky import. The CLI does not compare warehouse data.
 
 **Wraps**: `rocky validate-migration --dbt-project <path> --output json`
 
@@ -316,7 +316,7 @@ Compare a dbt project against a Rocky import to check that the migration is corr
 |---|---|---|---|
 | `dbt_project` | `str` | required | Path to the dbt project directory |
 | `rocky_project` | `str \| None` | `None` | Path to the Rocky project directory |
-| `sample_size` | `int \| None` | `None` | Number of rows to sample for comparison |
+| `sample_size` | `int \| None` | `None` | Passed as `--sample-size`. The CLI accepts it but does not sample rows. |
 
 ### `test_adapter(adapter=None, command=None) -> ConformanceResult`
 

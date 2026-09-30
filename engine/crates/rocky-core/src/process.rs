@@ -13,6 +13,24 @@
 //! pairs the pid with the start time this module returns, which is what
 //! makes a stamp reuse-proof.
 
+/// Remove an outer Dagster Pipes session from a child Rocky starts. A child
+/// does not own the outer process's message channel, even when it runs `rocky`.
+pub fn strip_dagster_pipes_env(command: &mut std::process::Command) {
+    let keys: Vec<_> = std::env::vars_os()
+        .map(|(key, _)| key)
+        .chain(command.get_envs().map(|(key, _)| key.to_os_string()))
+        .collect();
+    for key in keys {
+        if key
+            .to_string_lossy()
+            .to_ascii_uppercase()
+            .starts_with("DAGSTER_PIPES_")
+        {
+            command.env_remove(key);
+        }
+    }
+}
+
 /// The start time of a live process, or `None` when no such pid exists.
 ///
 /// The value's unit is platform-specific (macOS: microseconds since the
@@ -131,5 +149,38 @@ pub fn stamp_is_this_process(owner_pid: Option<u32>, owner_start_time: Option<u6
     match process_liveness(pid) {
         Ok(Some(start_time)) => owner_start_time == Some(start_time),
         Ok(None) | Err(_) => false,
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strip_removes_inherited_pipes_variables_from_child() {
+        const KEY: &str = "DAGSTER_PIPES_CORE_INHERITED_PROBE";
+        struct Restore(Option<std::ffi::OsString>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                // SAFETY: restore this test's unique environment variable.
+                unsafe {
+                    match self.0.take() {
+                        Some(value) => std::env::set_var(KEY, value),
+                        None => std::env::remove_var(KEY),
+                    }
+                }
+            }
+        }
+        let _restore = Restore(std::env::var_os(KEY));
+        // SAFETY: no other test reads this probe variable.
+        unsafe { std::env::set_var(KEY, "outer") };
+        let mut command = std::process::Command::new("/bin/sh");
+        strip_dagster_pipes_env(&mut command);
+        let output = command
+            .args(["-c", "printf '%s' \"$DAGSTER_PIPES_CORE_INHERITED_PROBE\""])
+            .output()
+            .expect("spawn probe child");
+        assert!(output.status.success());
+        assert!(output.stdout.is_empty(), "child inherited Pipes variable");
     }
 }

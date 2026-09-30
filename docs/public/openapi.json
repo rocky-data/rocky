@@ -747,6 +747,13 @@
       "AnomalyEvaluationOutput": {
         "description": "Whether the row-count anomaly detector evaluated one table.\n\nOne entry per table in the run's batches, whatever happened. A consumer reading [`RunOutput::anomalies`] alone cannot tell \"the detector ran and found nothing\" from \"the detector never ran\": both are an empty list (#1790). Dagster read the empty list as a pass, so a run with `row_count = false` showed a green anomaly check for a detector that had not run.\n\nThe detector runs only when row-count checks are on, the run has a state store, the table's row count was measured, and its history could be read. `not_evaluated_reason` names which of those was missing, because the remedy differs: one is a config line, another is how the run was invoked.",
         "properties": {
+          "asset_key": {
+            "description": "Dagster-style asset key path (`[source_type, ...components, table]`), the same value [`MaterializationOutput::asset_key`] carries for this table. Added (#2073) so the Dagster Pipes emitter can report this verdict as a `report_asset_check` without re-deriving the mapping `batch_asset_keys` already has — the same reason [`TableCheckOutput::asset_key`] exists.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
           "evaluated": {
             "description": "`true` when the detector compared this table's count against its history. An anomaly, if any, is in [`RunOutput::anomalies`].",
             "type": "boolean"
@@ -764,6 +771,7 @@
           }
         },
         "required": [
+          "asset_key",
           "evaluated",
           "table"
         ],
@@ -772,6 +780,13 @@
       "AnomalyOutput": {
         "description": "Row count anomaly detected by historical baseline comparison.",
         "properties": {
+          "asset_key": {
+            "description": "Dagster-style asset key path, same convention as [`AnomalyEvaluationOutput::asset_key`] (#2073).",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
           "baseline_avg": {
             "format": "double",
             "type": "number"
@@ -793,6 +808,7 @@
           }
         },
         "required": [
+          "asset_key",
           "baseline_avg",
           "current_count",
           "deviation_pct",
@@ -6918,6 +6934,13 @@
           "action": {
             "type": "string"
           },
+          "asset_key": {
+            "description": "Dagster-style asset key path (`[source_type, ...components, table]`) for this table, the same value [`MaterializationOutput::asset_key`] carries. Added (#2073) so the Dagster Pipes emitter can report drift as a `report_asset_check` keyed on the asset, instead of passing `table` (a bare `catalog.schema.table` string, not a Dagster asset key) as the asset key.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
           "reason": {
             "type": "string"
           },
@@ -6927,6 +6950,7 @@
         },
         "required": [
           "action",
+          "asset_key",
           "reason",
           "table"
         ],
@@ -7919,18 +7943,8 @@
       },
       "FreshnessConfig": {
         "additionalProperties": false,
-        "description": "Freshness check configuration with optional per-schema overrides.",
+        "description": "Freshness check configuration.\n\nA single scalar `threshold_seconds` applies to every checked table. There used to be an `overrides` key for per-schema thresholds; it parsed and validated but nothing on the check path ever read it, so it is now refused with a message naming the remedy (#1620).",
         "properties": {
-          "overrides": {
-            "additionalProperties": {
-              "format": "uint64",
-              "minimum": 0.0,
-              "type": "integer"
-            },
-            "default": {},
-            "description": "Per-schema freshness overrides. Key is a schema pattern (e.g., \"raw__us_west__shopify\"), value overrides threshold_seconds for matching schemas.",
-            "type": "object"
-          },
           "severity": {
             "allOf": [
               {
@@ -7952,7 +7966,7 @@
         "type": "object"
       },
       "FreshnessConfigOutput": {
-        "description": "Freshness check configuration projected into the discover output.\n\nPer-schema `overrides` from `rocky_core::config::FreshnessConfig` are intentionally not exposed yet — the override-key semantics need to be nailed down before integrations can rely on them.",
+        "description": "Freshness check configuration projected into the discover output.\n\nJust the scalar threshold: `[checks.freshness]` has no per-schema `overrides` key. One existed and parsed but nothing on the check path ever read it, so it was removed rather than exposed here (#1620).",
         "properties": {
           "threshold_seconds": {
             "format": "uint64",
@@ -10762,6 +10776,13 @@
           "metadata": {
             "$ref": "#/components/schemas/MaterializationMetadata"
           },
+          "notes": {
+            "description": "Operator-visible actions taken while materializing this model.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
           "partition": {
             "anyOf": [
               {
@@ -12594,7 +12615,7 @@
             "type": "array"
           },
           "skipped": {
-            "description": "Models the preview could not render, one entry each, with the reason. A model whose SQL cannot be rendered offline lands here (a Snowflake dynamic table needs a live compute-warehouse name), and so does one whose strategy is refused, such as `ephemeral` (E038). Before, such a model left no trace: an ephemeral-only project previewed as an empty plan and exit 0.",
+            "description": "Models excluded from the SQL preview or refused by compilation, with the reason for each. This includes SQL that needs a live warehouse to render and compiler errors such as E038 for an `ephemeral` model.",
             "items": {
               "$ref": "#/components/schemas/SkippedModel"
             },
@@ -13934,7 +13955,7 @@
             "type": "string"
           },
           "branch_schema": {
-            "description": "Schema prefix the branch run wrote into (e.g. `branch__fix-price`).",
+            "description": "Schema prefix the branch run wrote into (e.g. `branch__fix_price`).",
             "type": "string"
           },
           "command": {
@@ -14057,12 +14078,19 @@
             "minimum": 0.0,
             "type": "integer"
           },
+          "models_unknown": {
+            "description": "Models whose row-count delta could not be computed — the warehouse adapter or materialization strategy reported no `rows_affected` on the branch side, the base side, or both (#2032). These are counted separately from `models_unchanged`: \"no recorded delta\" is not the same claim as \"no change\", and folding the two together is exactly the false-clean report this field exists to prevent. A model here contributes `null` (not `0`) to its own `rows_added`/`rows_removed` and is excluded from `total_rows_added`/`total_rows_removed`, so those totals are a floor, not an exact count, whenever this is > 0.",
+            "format": "uint",
+            "minimum": 0.0,
+            "type": "integer"
+          },
           "models_with_changes": {
             "format": "uint",
             "minimum": 0.0,
             "type": "integer"
           },
           "total_rows_added": {
+            "description": "Sum of `rows_added` over models with a KNOWN delta only — models counted in `models_unknown` contribute nothing here (never `0`, which would be indistinguishable from a genuine no-op).",
             "format": "uint64",
             "minimum": 0.0,
             "type": "integer"
@@ -14081,6 +14109,7 @@
         "required": [
           "any_coverage_warning",
           "models_unchanged",
+          "models_unknown",
           "models_with_changes",
           "total_rows_added",
           "total_rows_changed",
@@ -14378,9 +14407,13 @@
         "description": "Sampled row-level diff. All counts are over the sampling window.",
         "properties": {
           "rows_added": {
+            "description": "`None` — emitted as JSON `null`, deliberately NOT omitted via `skip_serializing_if` — when the row count needed to compute this delta was unavailable on the branch side, the base side, or both (an ordinary transformation run's adapter/strategy reports no `rows_affected`). `Some(0)` means a genuine, measured no-op; `null` means unmeasured. Collapsing the two into `0` is the exact defect this field exists to prevent — a full-refresh model going from 10 rows to 20 must never report `rows_added: 0` (#2032).",
             "format": "uint64",
             "minimum": 0.0,
-            "type": "integer"
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "rows_changed": {
             "format": "uint64",
@@ -14388,9 +14421,13 @@
             "type": "integer"
           },
           "rows_removed": {
+            "description": "Same absent-vs-zero contract as `rows_added`.",
             "format": "uint64",
             "minimum": 0.0,
-            "type": "integer"
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "samples": {
             "description": "Up to `--max-samples` (default 5) representative changed rows for human review. Pure noise when sampling found no change.",
@@ -14401,9 +14438,7 @@
           }
         },
         "required": [
-          "rows_added",
-          "rows_changed",
-          "rows_removed"
+          "rows_changed"
         ],
         "type": "object"
       },
@@ -15513,6 +15548,13 @@
           "head_ref": {
             "description": "Git HEAD SHA at plan time — informational for audit purposes.",
             "type": "string"
+          },
+          "pipeline": {
+            "description": "The resolved pipeline the promote targets were built against (`resolve_pipeline`'s output at plan time — never ambiguous, even on a single-pipeline config where `--pipeline` was omitted). `rocky apply <plan-id>` reads this instead of re-resolving from the config, so applying a promote plan is never ambiguous on a multi-pipeline project. Absent on plans written before this field existed; apply falls back to `resolve_pipeline(None)` for those, unchanged from before this field was added.",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "plan_audit": {
             "description": "Plan-time audit events (approvals gate + breaking-change gate outcomes). Apply-time events (`PromoteStarted`, `PromoteCompleted`, `PromoteFailed`) are appended in `BranchPromoteOutput.audit` at apply time.",
@@ -18389,6 +18431,13 @@
               "null"
             ]
           },
+          "rocky_branch": {
+            "description": "The named Rocky branch this run wrote to (`rocky run --branch <name>`), or `None` for a production / plain-`--shadow` run. Distinct from `git_branch` — see `RunRecord::rocky_branch` (#2032). Not audit-gated — like [`Self::pipeline`], it is an operational join key (`rocky preview diff`/`preview cost` pair a run by this field), always emitted when present.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "rocky_version": {
             "description": "`CARGO_PKG_VERSION` of the `rocky` binary, or `\"<pre-audit>\"` on schema-v5 rows that predate the audit trail.",
             "type": [
@@ -18527,7 +18576,7 @@
             "type": "string"
           },
           "contained": {
-            "description": "Models withheld this run because an upstream failed (or was itself withheld) and `[resilience] contain_failures` continued the disjoint subgraphs — the blast radius of the failures named in `errors[]`. Empty (and omitted) for a run that did not withhold anything: the default fail-fast run, and any successful run, record nothing here.",
+            "description": "Models withheld this run after an upstream compile failure, or while `[resilience] contain_failures` continues disjoint subgraphs after a runtime failure. This is the blast radius of failures in `errors[]`. Empty (and omitted) when no model was withheld.",
             "items": {
               "$ref": "#/components/schemas/ContainedModelOutput"
             },
@@ -20974,16 +21023,31 @@
       "TableCompareResult": {
         "properties": {
           "production_count": {
+            "description": "Null when the warehouse count could not be read.",
             "format": "uint64",
             "minimum": 0.0,
-            "type": "integer"
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "production_table": {
             "type": "string"
           },
+          "reasons": {
+            "description": "Read errors for an `error` row, or threshold reasons for `warn`/`fail`. Empty for `pass`.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
           "row_count_diff_pct": {
+            "description": "Null unless both counts were read.",
             "format": "double",
-            "type": "number"
+            "type": [
+              "number",
+              "null"
+            ]
           },
           "row_count_match": {
             "type": "boolean"
@@ -20998,9 +21062,13 @@
             "type": "boolean"
           },
           "shadow_count": {
+            "description": "Null when the warehouse count could not be read.",
             "format": "uint64",
             "minimum": 0.0,
-            "type": "integer"
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "shadow_table": {
             "type": "string"
@@ -21010,13 +21078,11 @@
           }
         },
         "required": [
-          "production_count",
           "production_table",
-          "row_count_diff_pct",
+          "reasons",
           "row_count_match",
           "schema_diffs",
           "schema_match",
-          "shadow_count",
           "shadow_table",
           "verdict"
         ],

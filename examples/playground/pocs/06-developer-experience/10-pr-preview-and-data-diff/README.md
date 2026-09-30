@@ -14,17 +14,21 @@ driven end-to-end on a 5-model DuckDB transformation pipeline:
    identifies the model files that changed *between two committed refs*;
    those changed models plus their transitive downstream form the
    **prune set**; every model *not* in the prune set is copied from the
-   base schema via CTAS into a per-PR branch schema (`branch__<name>`);
-   the prune set re-executes against the branch.
-2. **`rocky preview diff`** — structural (column added/removed/type
-   changed) plus row-level diff between branch and base for every
-   model in the prune set. A `--sample-size N` sampled row diff is the
-   default; `--algorithm bisection` switches on exhaustive
+   base schema via CTAS into a per-PR branch schema (`branch__<name>`).
+   `preview create` runs no model itself. You run the branch with
+   `rocky run --branch <name>`, which builds the whole pipeline, or one
+   model with `--model`.
+2. **`rocky preview diff`** — a row-level diff between the branch run
+   and the base run, for every model the branch run executed. By
+   default it compares the row counts the two runs recorded and reads
+   no rows. A model whose run recorded no row count reports `null`,
+   never `0`. The structural arrays (column added/removed/type changed)
+   stay empty today. `--algorithm bisection` switches on exhaustive
    checksum-bisection for models declaring a single-column integer /
    numeric `unique_key` on a `Merge` strategy. The POC runs both
    invocations to demonstrate the two entry points.
 3. **`rocky preview cost`** — per-model bytes / duration / USD delta
-   versus the latest base-schema run. Copied models contribute cost
+   versus the newest run that is not the branch's own. Copied models contribute cost
    savings; only re-run models contribute to the delta. When `[budget]`
    is configured, the output surfaces projected budget breaches so a
    reviewer (and the CI gate) sees *"this PR would breach `max_usd` if
@@ -49,16 +53,19 @@ without committing it (POCs don't create commits). So in a local run:
 - With an empty prune set, `preview create` copies **all 5** models from
   the base schema via CTAS (`copy_strategy: "ctas"`) and re-runs none;
   `run_status` is `"planned"` with an empty `run_id`.
-- Because no model was re-run on the branch, there is no branch run in
-  the state store, so `preview diff` reports `models: []` (*"No paired
-  runs in the state store"*) and `preview cost` reports an empty
-  `branch_run_id` (*"No branch run yet"*).
+- Because nothing ran `rocky run --branch pr_preview_poc_10`, there is
+  no branch run in the state store, so `preview diff` reports
+  `models: []` (*"No paired runs in the state store"*) and
+  `preview cost` reports an empty `branch_run_id` (*"No branch run
+  yet"*).
 
 The local run therefore exercises the **CLI surface, branch
-registration, CTAS copy-from-base, and all three output schemas** — but
-the non-empty prune set, the row-level data diff, and the cost delta
-only light up when the change is a committed diff, which is how the
-composite GitHub Action drives `preview` in CI.
+registration, CTAS copy-from-base, and all three output schemas**. A
+non-empty prune set needs a committed diff. The row-level data diff and
+the cost delta also need a run recorded with `rocky run --branch
+<name>`. Neither `run.sh` nor the composite GitHub Action runs it yet
+([#2162](https://github.com/rocky-data/rocky/issues/2162)), so both
+stay empty.
 
 ## Why it's distinctive
 
@@ -179,11 +186,12 @@ cd examples/playground/pocs/06-developer-experience/10-pr-preview-and-data-diff
    registers the branch and, with an empty prune set, copies all 5
    models from the base schema via DuckDB CTAS
    (`copy_strategy: "ctas"`).
-8. `rocky preview diff --name pr_preview_poc_10` — structural + sampled
-   row diff between branch and base. Re-invoked with `--algorithm
-   bisection`. Both report no paired branch run in a local run.
+8. `rocky preview diff --name pr_preview_poc_10` — row-count diff
+   between the branch run and the base run. Re-invoked with
+   `--algorithm bisection`. Both report no paired branch run in a
+   local run.
 9. `rocky preview cost --name pr_preview_poc_10` — per-model bytes /
-   duration / USD delta vs. the latest base run.
+   duration / USD delta vs. the newest run that is not the branch's own.
 10. Reverts the synthetic change (`trap`-protected, idempotent).
 
 ## Related

@@ -11,7 +11,7 @@ sidebar:
 
 - **A v1 plan no longer loads.** Compact and archive plans written before engine-v1.35.0, the v1 default era, fail at `rocky apply <plan-id>`. The error carries a migration message. Re-run `rocky compact` or `rocky archive` to write a fresh v2 plan.
 - **The `[plan_store]` block has been removed.** A project that still carries it fails to parse `rocky.toml` with an "unknown field" error. That usually means a project pinned to `format = "v1"` after the v1.35.0 default flip. Delete the block.
-- **`Run` / `Replication` / `Promote` plans are untouched.** They never used the inline-SQL envelope. They carry operational metadata (run and replication), or per-target SQL as a documented governance-audit exception (promote). Their on-disk shape is unchanged.
+- **`Run` / `Replication` / `Promote` plans are untouched by this change.** They never used the inline-SQL envelope. They carry operational metadata (run and replication), or per-target SQL as a documented governance-audit exception (promote). `Run` and `Replication` plans keep their original on-disk shape. `Promote` plans later gained an optional `pipeline` field (the resolved pipeline the plan was built against); a plan written before that field existed still loads.
 
 Stdout JSON is **unchanged**. `rocky plan --output json`, `rocky compact --output json`, and `rocky archive --output json` all still carry inline SQL for human and CI consumers. Only the persisted on-disk shape was simplified.
 

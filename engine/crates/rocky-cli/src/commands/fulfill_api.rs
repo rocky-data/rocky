@@ -265,7 +265,7 @@ fn load_source_schemas_best_effort(
     if !cfg.cache.schemas.enabled {
         return std::collections::HashMap::new();
     }
-    let Ok(store) = StateStore::open_read_only(state_path) else {
+    let Ok(store) = StateStore::open_read_only_or_empty(state_path) else {
         return std::collections::HashMap::new();
     };
     load_source_schemas_from_cache(&store, chrono::Utc::now(), cfg.cache.schemas.ttl())
@@ -282,7 +282,21 @@ pub(crate) fn build_ai_run_plan(
     product_id: Option<String>,
     spec_digest: Option<String>,
     idempotency_key: Option<String>,
-) -> RunPlan {
+) -> Result<RunPlan, ProposeError> {
+    let errors: Vec<String> = result
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.is_error())
+        .map(|diagnostic| {
+            format!(
+                "{} [{}] {}",
+                diagnostic.model, diagnostic.code, diagnostic.message
+            )
+        })
+        .collect();
+    if !errors.is_empty() {
+        return Err(ProposeError::Compile(errors.join("\n")));
+    }
     let models: Vec<String> = result
         .project
         .models
@@ -290,7 +304,7 @@ pub(crate) fn build_ai_run_plan(
         .map(|m| m.config.name.clone())
         .collect();
     let execution_layers: Vec<Vec<String>> = result.project.layers.clone();
-    RunPlan {
+    Ok(RunPlan {
         filter: None,
         pipeline: None,
         model,
@@ -317,7 +331,7 @@ pub(crate) fn build_ai_run_plan(
         execution_layers,
         product_id,
         spec_digest,
-    }
+    })
 }
 
 /// The ONE governed propose sequence, shared by the MCP `propose` tool
@@ -392,7 +406,7 @@ pub async fn propose_governed_run_plan(
         product_id.clone(),
         spec_digest.clone(),
         idempotency_key,
-    );
+    )?;
 
     // Embed the propose-time change-classification so the reviewed
     // capabilities bind to the plan_id (a creds-free / non-git project
@@ -677,7 +691,7 @@ pub fn lookup_apply_receipt(
         }
     };
 
-    let store = rocky_core::state::StateStore::open_read_only(state_path)
+    let store = rocky_core::state::StateStore::open_read_only_or_empty(state_path)
         .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
     let entry = store.idempotency_get(idempotency_key)?;
     let lookup = match (mirrored, entry) {
@@ -810,15 +824,7 @@ pub async fn observe_max_time_column(
         let raw = value.as_str().ok_or_else(|| {
             anyhow::anyhow!("staleness observation returned a non-string value: {value}")
         })?;
-        let parsed = raw
-            .parse::<chrono::DateTime<chrono::Utc>>()
-            .ok()
-            .or_else(|| {
-                chrono::NaiveDateTime::parse_from_str(raw, "%Y-%m-%d %H:%M:%S%.f")
-                    .or_else(|_| chrono::NaiveDateTime::parse_from_str(raw, "%Y-%m-%d %H:%M:%S"))
-                    .ok()
-                    .map(|naive| naive.and_utc())
-            })
+        let parsed = super::run::parse_timestamp_cell(raw)
             .with_context(|| format!("could not parse observed MAX({time_column}): {raw}"))?;
         Some(parsed)
     };
@@ -1115,6 +1121,44 @@ pub use crate::plan_store::EmbeddedCapabilities as ProposeCapabilities;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn propose_refuses_compile_diagnostics_before_plan_write() {
+        for model in [None, Some("bad".to_string())] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let root = dir.path();
+            let models_dir = root.join("models");
+            write_file(&models_dir.join("bad.sql"), b"SELECT 1 AS id\n");
+            write_file(
+                &models_dir.join("bad.toml"),
+                b"name = \"bad\"\n[strategy]\ntype = \"ephemeral\"\n[target]\ncatalog = \"warehouse\"\nschema = \"main\"\ntable = \"bad\"\n",
+            );
+            let config_path = root.join("rocky.toml");
+            write_file(
+                &config_path,
+                b"[adapter]\ntype = \"duckdb\"\npath = \"warehouse.duckdb\"\n",
+            );
+
+            let outcome = propose_governed_run_plan(ProposeRequest {
+                root,
+                config_path: &config_path,
+                models_dir: &models_dir,
+                state_path: &root.join("state.redb"),
+                model,
+                product: None,
+                idempotency_key: None,
+            })
+            .await;
+            assert!(
+                matches!(&outcome, Err(ProposeError::Compile(reason)) if reason.contains("E038")),
+                "{outcome:?}"
+            );
+            assert!(
+                !root.join(".rocky/plans").exists(),
+                "refused propose wrote a plan"
+            );
+        }
+    }
 
     /// A propose must refuse when the config exists but cannot be read: any
     /// `[policy]` block in it is then unenforceable, and writing an

@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -15,7 +16,7 @@ use crate::plan_store::{
 };
 use crate::registry;
 
-use super::run::PartitionRunOptions;
+use super::run::{PartitionRunOptions, refuse_check_name_collisions};
 use super::{filter_table_matches, matches_filter, parse_filter};
 
 /// A model filter (`--model` / the MCP `plan_preview` `model` arg) named a model
@@ -98,6 +99,9 @@ pub async fn plan(
     state_path: &Path,
     output_json: bool,
 ) -> Result<()> {
+    if let Some(branch_name) = run_options.branch.as_deref() {
+        crate::commands::branch::validate_branch_name_pub(branch_name)?;
+    }
     let rocky_cfg = rocky_core::config::load_rocky_config(config_path).context(format!(
         "failed to load config from {}",
         config_path.display()
@@ -126,6 +130,18 @@ pub async fn plan(
 
     let mut output = PlanOutput::new(filter.unwrap_or("").to_string());
     output.env = env.map(str::to_string);
+
+    // #1941: one (target table name, source_type) pair per table that
+    // survives this loop's own skip conditions (filter, disabled override),
+    // collected below and checked once the loop ends — before this plan is
+    // persisted (`output.plan_id`). Without this, `rocky plan` exits 0 and
+    // persists a plan a later `rocky apply` (which re-executes `run()`,
+    // where the same collision refuses) would then reject — late, and
+    // outside the bounded, watchdog-covered plan step Dagster Pipes relies
+    // on for this check. Plan does not list source tables: it can refuse a
+    // collision for a discovered table that run later skips as missing from
+    // the source, but it cannot miss a collision that run would check.
+    let mut collision_check_pairs: Vec<(String, String)> = Vec::new();
 
     // Detect whether this dialect supports catalogs. Dialects without catalog
     // support (DuckDB, Postgres, ...) return `None` from `create_catalog_sql`,
@@ -236,12 +252,27 @@ pub async fn plan(
                 });
                 continue;
             }
+            let check_table_name = if run_options.shadow
+                && run_options.branch.is_none()
+                && run_options.shadow_schema.is_none()
+            {
+                format!(
+                    "{}{}",
+                    table.name,
+                    run_options
+                        .shadow_suffix
+                        .as_deref()
+                        .unwrap_or("_rocky_shadow")
+                )
+            } else {
+                // A branch or shadow schema override leaves the table name intact.
+                table.name.clone()
+            };
+            collision_check_pairs.push((check_table_name, conn.source_type.clone()));
 
-            // Resolved AFTER the exclusion branches, mirroring `rocky run`,
-            // which preflights the same value only for a table that survives
-            // the filter / missing-from-source / disabled skips. Resolving
-            // earlier would let `plan` refuse a source schema whose tables
-            // `run` never renders.
+            // Resolved AFTER the filter and disabled-override exclusions.
+            // Unlike `run`, plan does not query the warehouse to exclude
+            // tables missing from its current source listing.
             //
             // Same producer `run` uses, so the preview and the run cannot
             // disagree: it substitutes the warehouse-derived schema
@@ -315,6 +346,18 @@ pub async fn plan(
         }
     }
 
+    // #1941: refuse before this plan is persisted (`plan_id` below) — see
+    // the comment where `collision_check_pairs` is declared above.
+    if run_options.model.is_none() {
+        refuse_check_name_collisions(
+            name,
+            pipeline,
+            collision_check_pairs
+                .iter()
+                .map(|(t, s)| (t.as_str(), s.as_str())),
+        )?;
+    }
+
     // --- Governance preview (Wave A + C-1 + C-2) -------------------------
     //
     // The post-DAG reconcile loop at `rocky run` (see commands/run.rs) walks
@@ -323,8 +366,11 @@ pub async fn plan(
     // adapter — the action rows parallel `statements` but represent
     // control-plane operations rather than warehouse SQL. Models are loaded
     // from the conventional `models/` directory next to the config; a
-    // missing directory is not an error (projects without models produce
-    // empty action arrays and the three fields omit themselves from JSON).
+    // missing directory is not an error, and neither is an existing but
+    // empty one (a replication-only project that keeps `models/.gitkeep`
+    // in git — the dagster scaffold does this on purpose, #1991). Both
+    // produce empty action arrays and the three fields omit themselves
+    // from JSON (#1997).
     let models_dir = config_path
         .parent()
         .unwrap_or_else(|| Path::new("."))
@@ -334,7 +380,7 @@ pub async fn plan(
         models_dir_exists = models_dir.exists(),
         "plan: models_dir check"
     );
-    if models_dir.exists() {
+    if models_dir.exists() && models_dir_has_model_source(&models_dir) {
         let adapter_type = rocky_cfg
             .adapters
             .get(&pipeline.target.adapter)
@@ -447,6 +493,8 @@ pub async fn plan(
         output.skipped = preview.skipped;
     }
     let mut run_plan_persisted = false;
+    let mut compile_refused = false;
+    let mut refusal_details = Vec::new();
     if blueprint_models_dir.exists() {
         match build_and_persist_run_plan(
             config_path,
@@ -458,13 +506,32 @@ pub async fn plan(
             base_ref,
             state_path,
         ) {
-            Ok(Some((run_plan, plan_id, persisted_at))) => {
+            Ok(Some(RunPlanBuild::Persisted(run_plan, plan_id, persisted_at))) => {
+                output.models = run_plan.models.clone();
+                output.execution_layers = run_plan.execution_layers.clone();
                 output.plan_id = Some(plan_id);
                 output.plan_kind = Some("run".to_string());
                 output.created_at = Some(persisted_at);
-                output.models = run_plan.models.clone();
-                output.execution_layers = run_plan.execution_layers.clone();
                 run_plan_persisted = true;
+            }
+            Ok(Some(RunPlanBuild::Refused(refused))) => {
+                compile_refused = true;
+                refusal_details = refused
+                    .iter()
+                    .map(|item| {
+                        let code = item.reason.split_whitespace().next().unwrap_or("unknown");
+                        format!("{}: {code}", item.model)
+                    })
+                    .collect();
+                if run_options.model.is_some() {
+                    output.statements.clear();
+                }
+                let refused_names: BTreeSet<&str> =
+                    refused.iter().map(|item| item.model.as_str()).collect();
+                output
+                    .skipped
+                    .retain(|item| !refused_names.contains(item.model.as_str()));
+                output.skipped.extend(refused);
             }
             Ok(None) => {
                 // `models/` exists but compile produced zero models.
@@ -507,7 +574,7 @@ pub async fn plan(
     // any residual path — e.g. a models-directory TOCTOU that flips the
     // `exists()` check between the preview and persistence — so replication is
     // provably unreachable whenever `--model` is set.
-    if run_options.model.is_some() && !run_plan_persisted {
+    if run_options.model.is_some() && !run_plan_persisted && !compile_refused {
         anyhow::bail!(
             "failed to build a model-scoped run plan for --model; \
              refusing to fall back to a replication plan"
@@ -522,7 +589,7 @@ pub async fn plan(
     // is content-addressed by the canonical `RockyConfig` snapshot + the
     // discovered source state (sorted connectors + tables), so identical
     // inputs produce an identical plan_id across machines.
-    if !run_plan_persisted {
+    if !run_plan_persisted && !compile_refused {
         match build_and_persist_replication_plan(
             &rocky_cfg,
             &connectors,
@@ -557,6 +624,9 @@ pub async fn plan(
         render_governance_preview_text(&output);
         render_budget_diagnostics_text(&output);
         render_semantic_verdict_text(&output);
+        for skipped in &output.skipped {
+            eprintln!("Skipped model '{}': {}", skipped.model, skipped.reason);
+        }
         if let Some(ref plan_id) = output.plan_id {
             println!();
             match output.plan_kind.as_deref() {
@@ -579,6 +649,11 @@ pub async fn plan(
             println!("Apply with: rocky apply {plan_id}");
         }
     }
+    anyhow::ensure!(
+        !compile_refused,
+        "compiler refused the following models:\n{}",
+        refusal_details.join("\n")
+    );
     Ok(())
 }
 
@@ -952,6 +1027,7 @@ pub fn plan_preview_output(
     let config = CompilerConfig {
         models_dir: models_dir.to_path_buf(),
         contracts_dir: None,
+        required_explicit_contract_model: None,
         source_schemas: std::collections::HashMap::new(),
         mask: std::collections::BTreeMap::new(),
         allow_unmasked: vec![],
@@ -1133,7 +1209,7 @@ pub fn plan_preview_output(
 
 /// Compile the models directory, build a `RunPlan` payload, persist it to
 /// `.rocky/plans/<plan_id>.json`, and return
-/// `Some((payload, plan_id, persisted_at))`.
+/// `Some(RunPlanBuild)`.
 ///
 /// Returns `Ok(None)` when the compile succeeds but produces zero models —
 /// the caller falls through to the replication-plan branch in that case.
@@ -1151,12 +1227,13 @@ fn build_and_persist_run_plan(
     run_options: &PlanRunOptions,
     base_ref: &str,
     state_path: &Path,
-) -> Result<Option<(RunPlan, String, chrono::DateTime<Utc>)>> {
+) -> Result<Option<RunPlanBuild>> {
     use rocky_compiler::compile::{self, CompilerConfig};
 
     let config = CompilerConfig {
         models_dir: models_dir.to_path_buf(),
         contracts_dir: None,
+        required_explicit_contract_model: None,
         source_schemas: std::collections::HashMap::new(),
         mask: std::collections::BTreeMap::new(),
         allow_unmasked: vec![],
@@ -1172,6 +1249,39 @@ fn build_and_persist_run_plan(
         // `_defaults.toml` or stub files). Let the caller take the
         // replication-plan path.
         return Ok(None);
+    }
+
+    // `--model` persists only that model. Include its declared prerequisites,
+    // since apply needs them, but ignore errors in unrelated models.
+    let mut needed = BTreeSet::new();
+    if let Some(selected) = run_options.model.as_deref() {
+        needed.insert(selected.to_string());
+        loop {
+            let before = needed.len();
+            for node in &result.project.dag_nodes {
+                if needed.contains(&node.name) {
+                    needed.extend(node.depends_on.iter().cloned());
+                }
+            }
+            if needed.len() == before {
+                break;
+            }
+        }
+    }
+    let refused: Vec<SkippedModel> = result
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic.is_error()
+                && (run_options.model.is_none() || needed.contains(&diagnostic.model))
+        })
+        .map(|diagnostic| SkippedModel {
+            model: diagnostic.model.clone(),
+            reason: format!("[{}] {}", diagnostic.code, diagnostic.message),
+        })
+        .collect();
+    if !refused.is_empty() {
+        return Ok(Some(RunPlanBuild::Refused(refused)));
     }
 
     let (models, execution_layers) = if let Some(model) = run_options.model.as_deref() {
@@ -1224,41 +1334,51 @@ fn build_and_persist_run_plan(
         spec_digest: None,
     };
 
-    let cwd = std::env::current_dir().context("failed to get current working directory")?;
+    let (plan_id, persisted_at) = (|| -> Result<(String, chrono::DateTime<Utc>)> {
+        let cwd = std::env::current_dir().context("failed to get current working directory")?;
 
-    // policy seam 1 + capability-embed: stamp the authoring principal and embed the propose-time
-    // change-classification into the plan payload, so a later `rocky apply`
-    // evaluates the plan against the identity that authored it and the exact
-    // capabilities that were reviewed.
-    let principal = run_options.principal.unwrap_or(PolicyPrincipal::Human);
-    // Finding #4: bind the mask iff the apply reaches the mask-reconciling path —
-    // a Replication pipeline whose model leg runs (`--all` / `--models`) on a full
-    // (`--model`-less) run. Resolved with the SAME `resolve_pipeline` `run()` uses,
-    // and the SAME `run_all || models_dir` predicate `run.rs` gates the model leg
-    // with, so it matches the apply-side literal `reconciles_masks`. A resolution
-    // failure ⇒ `false` (fail-safe: apply that doesn't reach the leg never checks
-    // the gate, so a wrong-`true` is harmless; a wrong-`false` would false-refuse).
-    let bind_masks = rocky_core::config::load_rocky_config(config_path)
-        .ok()
-        .map(|cfg| {
-            crate::commands::apply::pipeline_is_replication(&cfg, pipeline)
-                && (run_options.all || run_options.models_dir.is_some())
-                && run_options.model.is_none()
-        })
-        .unwrap_or(false);
-    let capabilities = compute_embedded_capabilities(
-        config_path,
-        models_dir,
-        base_ref,
-        Some(state_path),
-        env,
-        bind_masks,
-    )?;
-    let plan_id = write_plan_governed(&cwd, PlanKind::Run, &run_plan, principal, capabilities)
-        .context("failed to write run plan")?;
+        // policy seam 1 + capability-embed: stamp the authoring principal and embed the propose-time
+        // change-classification into the plan payload, so a later `rocky apply`
+        // evaluates the plan against the identity that authored it and the exact
+        // capabilities that were reviewed.
+        let principal = run_options.principal.unwrap_or(PolicyPrincipal::Human);
+        // Finding #4: bind the mask iff the apply reaches the mask-reconciling path —
+        // a Replication pipeline whose model leg runs (`--all` / `--models`) on a full
+        // (`--model`-less) run. Resolved with the SAME `resolve_pipeline` `run()` uses,
+        // and the SAME `run_all || models_dir` predicate `run.rs` gates the model leg
+        // with, so it matches the apply-side literal `reconciles_masks`. A resolution
+        // failure ⇒ `false` (fail-safe: apply that doesn't reach the leg never checks
+        // the gate, so a wrong-`true` is harmless; a wrong-`false` would false-refuse).
+        let bind_masks = rocky_core::config::load_rocky_config(config_path)
+            .ok()
+            .map(|cfg| {
+                crate::commands::apply::pipeline_is_replication(&cfg, pipeline)
+                    && (run_options.all || run_options.models_dir.is_some())
+                    && run_options.model.is_none()
+            })
+            .unwrap_or(false);
+        let capabilities = compute_embedded_capabilities(
+            config_path,
+            models_dir,
+            base_ref,
+            Some(state_path),
+            env,
+            bind_masks,
+        )?;
+        let plan_id = write_plan_governed(&cwd, PlanKind::Run, &run_plan, principal, capabilities)
+            .context("failed to write run plan")?;
+        Ok((plan_id, Utc::now()))
+    })()?;
+    Ok(Some(RunPlanBuild::Persisted(
+        Box::new(run_plan),
+        plan_id,
+        persisted_at,
+    )))
+}
 
-    let persisted_at = Utc::now();
-    Ok(Some((run_plan, plan_id, persisted_at)))
+enum RunPlanBuild {
+    Refused(Vec<SkippedModel>),
+    Persisted(Box<RunPlan>, String, chrono::DateTime<Utc>),
 }
 
 /// Compute the propose-time change-classification (capability-embed) to embed in a governed
@@ -1541,9 +1661,9 @@ pub(crate) fn build_source_state_snapshot(
 /// this function only canonicalizes the result and persists.
 /// Keep a shadow descriptor only when shadow routing is actually requested.
 ///
-/// `--shadow-suffix` / `--shadow-schema` are accepted without `--shadow`, where
-/// they are inert. Returning `None` there keeps a production plan's payload —
-/// and therefore its `plan_id` — exactly as it was before these fields existed.
+/// A plan without `--shadow` or `--branch` has no shadow override. Returning
+/// `None` there keeps a production plan's payload — and therefore its
+/// `plan_id` — exactly as it was before these fields existed.
 fn shadow_descriptor(run_options: &PlanRunOptions, value: Option<&String>) -> Option<String> {
     if run_options.shadow || run_options.branch.is_some() {
         value.cloned()
@@ -1660,15 +1780,11 @@ fn build_and_persist_replication_plan(
         // Success. That is the #1272 defect shape, one plan kind over.
         shadow: run_options.shadow,
         // Only carry the descriptors when the plan is actually a shadow plan.
-        // `--shadow-schema` and `--shadow-suffix` are accepted WITHOUT
-        // `--shadow` (only `--branch` conflicts with them), and such a run is
-        // still a production run. Persisting an inert flag would add a payload
-        // key — and so a new `plan_id` — to a plan whose behaviour is
-        // unchanged. `main.rs` already applies exactly this normalisation to
-        // `shadow_suffix` before it reaches `PlanRunOptions`, and for the same
-        // stated reason; `shadow_schema` is not normalised there, so it is
-        // handled here rather than widening that path and shifting `RunPlan`
-        // ids too.
+        // Clap now requires `--shadow` with either explicit descriptor, but
+        // `PlanRunOptions` can also be constructed by internal callers. Keep
+        // non-shadow replication plan payloads free of inert descriptors so
+        // their plan IDs remain stable. `main.rs` already normalises the
+        // default suffix before it reaches this point.
         shadow_suffix: shadow_descriptor(run_options, run_options.shadow_suffix.as_ref()),
         shadow_schema: shadow_descriptor(run_options, run_options.shadow_schema.as_ref()),
         branch: run_options.branch.clone(),
@@ -1684,6 +1800,71 @@ fn build_and_persist_replication_plan(
 
     let persisted_at = Utc::now();
     Ok((replication_plan, plan_id, persisted_at))
+}
+
+/// True when `models_dir` (or a subdirectory) holds at least one `.sql` or
+/// `.rocky` model source file, checked recursively through the one shared
+/// models-tree walk (`rocky_core::model_walk::walk_model_dirs`, #1262) — the
+/// same directory set the compiler itself loads from.
+///
+/// This is the #1997 gate: it lets the governance preview tell "no models
+/// yet" (an existing but empty `models/`, e.g. the dagster scaffold's
+/// `models/.gitkeep`, #1991) apart from "a broken project" without
+/// softening [`rocky_compiler::project::ProjectError::NoModels`] itself —
+/// other callers of the compiler still treat an empty directory as an
+/// error, on purpose.
+///
+/// A tree the walk cannot fully read (permission error, dangling symlink,
+/// depth ceiling), or one this function's own per-directory listing cannot
+/// read — including a `models_dir` that exists but is a regular file, which
+/// `walk_model_dirs` treats as "nothing to descend into" rather than an
+/// error — is conservatively treated as "has a model": this function only
+/// decides whether to SKIP compiling, never whether to report an
+/// unreadable tree as success. A broken tree still reaches
+/// `populate_governance_actions` → `compile(..)`, which surfaces the real
+/// [`rocky_core::model_walk::ModelWalkError`] or
+/// [`rocky_compiler::project::ProjectError::NoModels`].
+fn models_dir_has_model_source(models_dir: &Path) -> bool {
+    let (dirs, walk_errors) = rocky_core::model_walk::walk_model_dirs(models_dir);
+    if !walk_errors.is_empty() {
+        return true;
+    }
+    for dir in &dirs {
+        // This second `read_dir` is independent of the walk above and can
+        // fail where the walk did not: `walk_model_dirs` silently skips
+        // (with no error) a root that exists but is not a directory — the
+        // "nothing to descend into" branch that also covers a proven-absent
+        // path — so a `models/` that collides with a regular file reaches
+        // here with an empty `walk_errors`. A `read_dir` failure, or a
+        // failed directory entry, must not read as "no model here" UNLESS
+        // it is a proven absence: that would turn an unreadable or
+        // misconfigured `models/` into a silent "nothing to preview"
+        // instead of the real compiler error. `NotFound` alone conflates a
+        // never-created path with a dangling symlink (#1668, #1707), so it
+        // goes through the same disambiguation `walk_model_dirs` uses.
+        let entries = match std::fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                match rocky_core::path_presence::classify_not_found(dir) {
+                    rocky_core::path_presence::PathPresence::Absent => continue,
+                    rocky_core::path_presence::PathPresence::Present { .. } => return true,
+                }
+            }
+            Err(_) => return true,
+        };
+        for entry in entries {
+            let Ok(entry) = entry else {
+                return true;
+            };
+            if matches!(
+                entry.path().extension().and_then(|e| e.to_str()),
+                Some("sql" | "rocky")
+            ) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Compile the project and populate `classification_actions`,
@@ -1717,6 +1898,7 @@ pub fn populate_governance_actions(
     let compile = rocky_compiler::compile::compile(&rocky_compiler::compile::CompilerConfig {
         models_dir: models_dir.to_path_buf(),
         contracts_dir: None,
+        required_explicit_contract_model: None,
         source_schemas: std::collections::HashMap::new(),
         mask: cfg.mask.clone(),
         allow_unmasked: cfg.classifications.allow_unmasked.clone(),
@@ -1818,6 +2000,7 @@ async fn check_plan_budget(
     let compile_cfg = rocky_compiler::compile::CompilerConfig {
         models_dir: models_dir.to_path_buf(),
         contracts_dir: None,
+        required_explicit_contract_model: None,
         source_schemas: HashMap::new(),
         mask: std::collections::BTreeMap::new(),
         allow_unmasked: vec![],
@@ -2398,15 +2581,15 @@ pub(crate) async fn build_promote_plan_inner(
     use crate::commands::branch::{
         APPROVAL_SKIP_ENV, approver_identity_pub, compute_branch_state_hash_pub,
         discover_branch_targets_for_plan, run_approval_gate, run_breaking_change_gate_for_plan,
-        validate_branch_name_pub,
+        validate_existing_branch_name,
     };
     use rocky_core::state::StateStore;
 
-    validate_branch_name_pub(branch_name)?;
+    validate_existing_branch_name(state_path, branch_name)?;
 
     // `state_path` is the namespace-aware path threaded from main.rs; the
     // branch record lives in whichever state file this invocation targets.
-    let store = StateStore::open_read_only(state_path).with_context(|| {
+    let store = StateStore::open_read_only_or_empty(state_path).with_context(|| {
         format!(
             "failed to open state store at {} — run `rocky branch create {}` first",
             state_path.display(),
@@ -2505,10 +2688,15 @@ pub(crate) async fn build_promote_plan_inner(
     }
 
     // Discover targets + build SQL at plan time (dialect-quoted, deterministic).
-    let planned_targets =
+    // The resolved pipeline name comes back too — never ambiguous, even when
+    // `pipeline_name` was `None` on a single-pipeline config — and is
+    // persisted onto the plan below so `rocky apply` never re-resolves it.
+    let (resolved_pipeline_name, planned_targets) =
         discover_branch_targets_for_plan(config_path, &record, filter, pipeline_name).await?;
 
-    let head_ref = std::process::Command::new("git")
+    let mut git = std::process::Command::new("git");
+    rocky_core::process::strip_dagster_pipes_env(&mut git);
+    let head_ref = git
         .args(["rev-parse", "HEAD"])
         .output()
         .ok()
@@ -2545,6 +2733,7 @@ pub(crate) async fn build_promote_plan_inner(
 
     let promote_plan = PromotePlan {
         branch_name: branch_name.to_string(),
+        pipeline: Some(resolved_pipeline_name),
         base_ref: base_ref.to_string(),
         head_ref,
         branch_state_hash: branch_state_hash.clone(),
@@ -2573,6 +2762,34 @@ pub(crate) async fn build_promote_plan_inner(
 
 #[cfg(test)]
 mod tests {
+
+    #[tokio::test]
+    async fn plan_branch_refuses_hyphen_before_config_io() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing_config = temp.path().join("missing.toml");
+        let state = temp.path().join("missing.redb");
+        let options = super::PlanRunOptions {
+            branch: Some("pr-preview-x".to_string()),
+            ..Default::default()
+        };
+        let error = super::plan(
+            &missing_config,
+            None,
+            None,
+            None,
+            &options,
+            false,
+            "main",
+            &state,
+            false,
+        )
+        .await
+        .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("[A-Za-z0-9_]"), "{message}");
+        assert!(message.contains("pr_preview_x"), "{message}");
+        assert!(!message.contains("failed to load config"), "{message}");
+    }
 
     /// The identity must change across a state-schema version bump, because the
     /// remote ledger key embeds it. Without this a plan made under one version
@@ -2637,9 +2854,8 @@ mod tests {
 
     /// #1403: an inert shadow descriptor must not reach the payload.
     ///
-    /// `--shadow-suffix` / `--shadow-schema` are accepted WITHOUT `--shadow`
-    /// (only `--branch` conflicts with them), and such a run is a production
-    /// run. Persisting the flag anyway adds a payload key to a plan whose
+    /// A plan without `--shadow` or `--branch` uses production routing.
+    /// Persisting an override anyway adds a payload key to a plan whose
     /// behaviour is unchanged, and `plan_id` is `blake3({kind, payload})` — so
     /// an existing project's plan id would move for a flag that does nothing.
     ///
@@ -3115,6 +3331,552 @@ ssn = "confidential"
         assert!(out.mask_actions.is_empty());
         // Retention absent too — no sidecar declares it here.
         assert!(out.retention_actions.is_empty());
+    }
+
+    // ------------------------------------------------------------------
+    // #1997 — an existing, empty `models/` directory is "no governance
+    // actions", not a compile failure.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn models_dir_has_model_source_false_for_empty_dir_with_gitkeep() {
+        let tmp = TempDir::new().unwrap();
+        let models_dir = tmp.path().join("models");
+        fs::create_dir_all(&models_dir).unwrap();
+        // The realistic shape: `dagster-rocky`'s `init_rocky_project()`
+        // writes `models/.gitkeep` on purpose (#1991) so the directory
+        // exists in git with nothing else in it.
+        fs::write(models_dir.join(".gitkeep"), "").unwrap();
+
+        assert!(!models_dir_has_model_source(&models_dir));
+    }
+
+    #[test]
+    fn models_dir_has_model_source_false_for_missing_dir() {
+        let tmp = TempDir::new().unwrap();
+        let models_dir = tmp.path().join("models");
+        assert!(!models_dir_has_model_source(&models_dir));
+    }
+
+    #[test]
+    fn models_dir_has_model_source_true_for_sql_file() {
+        let tmp = TempDir::new().unwrap();
+        let (_cfg_path, models_dir) = write_project(&tmp, "", &[("t", "name = \"t\"\n")]);
+        assert!(models_dir_has_model_source(&models_dir));
+    }
+
+    /// The walk is recursive: a `.sql` file two levels below `models/` must
+    /// still count.
+    #[test]
+    fn models_dir_has_model_source_true_for_nested_sql_file() {
+        let tmp = TempDir::new().unwrap();
+        let models_dir = tmp.path().join("models");
+        let nested = models_dir.join("staging").join("shop");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(nested.join("orders.sql"), "SELECT 1 AS id").unwrap();
+
+        assert!(models_dir_has_model_source(&models_dir));
+    }
+
+    /// The gate must not silently swallow a broken tree: an unreadable
+    /// subtree keeps reaching `populate_governance_actions` → `compile`,
+    /// which is where `ModelWalkError` gets surfaced today.
+    #[cfg(unix)]
+    #[test]
+    fn models_dir_has_model_source_true_when_walk_cannot_read_a_subdirectory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = TempDir::new().unwrap();
+        let models_dir = tmp.path().join("models");
+        let unreadable = models_dir.join("locked");
+        fs::create_dir_all(&unreadable).unwrap();
+        let mut perms = fs::metadata(&unreadable).unwrap().permissions();
+        perms.set_mode(0o000);
+        fs::set_permissions(&unreadable, perms.clone()).unwrap();
+
+        let has_source = models_dir_has_model_source(&models_dir);
+
+        // Restore permissions so TempDir can clean up the directory.
+        perms.set_mode(0o755);
+        fs::set_permissions(&unreadable, perms).unwrap();
+
+        assert!(
+            has_source,
+            "an unreadable subtree must not be reported as ok-to-skip"
+        );
+    }
+
+    /// Codex adversarial review (#2118): `walk_model_dirs` treats a root
+    /// that exists but is not a directory as "nothing to descend into" —
+    /// not an error — so a `models/` that collides with a regular file
+    /// (or a symlink to one) sailed past the `walk_errors` check with an
+    /// empty error list. The gate's own second scan must independently
+    /// refuse to read that as "no model here": a `read_dir` failure must
+    /// still force the real compiler error rather than a silent skip.
+    #[test]
+    fn models_dir_has_model_source_true_when_models_dir_is_a_regular_file() {
+        let tmp = TempDir::new().unwrap();
+        let models_dir = tmp.path().join("models");
+        fs::write(&models_dir, "not a directory").unwrap();
+
+        assert!(
+            models_dir_has_model_source(&models_dir),
+            "a models/ path that is a regular file must not be read as ok-to-skip"
+        );
+    }
+
+    /// The #1997 gate composed with the real downstream call: a non-empty
+    /// `models/` directory must still reach `populate_governance_actions`
+    /// and populate its action arrays — proves the fix does not become a
+    /// blanket skip.
+    #[test]
+    fn non_empty_models_dir_still_runs_the_governance_preview() {
+        let tmp = TempDir::new().unwrap();
+        let (cfg_path, models_dir) = write_project(
+            &tmp,
+            r#"
+[adapter.default]
+type = "duckdb"
+database = ":memory:"
+"#,
+            &[(
+                "t",
+                r#"name = "t"
+[target]
+catalog = "c"
+schema = "s"
+table = "t"
+
+[classification]
+ssn = "confidential"
+"#,
+            )],
+        );
+
+        assert!(
+            models_dir_has_model_source(&models_dir),
+            "a directory holding a .sql/.toml pair must report a model source"
+        );
+
+        let cfg = rocky_core::config::load_rocky_config(&cfg_path).unwrap();
+        let mut out = PlanOutput::new(String::new());
+        populate_governance_actions(&cfg, &models_dir, None, "duckdb", &mut out).unwrap();
+        assert_eq!(
+            out.classification_actions.len(),
+            1,
+            "the preview must still run for a non-empty models/ dir"
+        );
+    }
+
+    /// End-to-end reproduction of #1997: `rocky plan` on a replication-only
+    /// project whose `models/` directory exists but holds no model source
+    /// must exit 0, exactly like `rocky validate` and `rocky run` on the
+    /// same project (`rocky run` never compiles `models/` for a
+    /// replication-only pipeline, which is why only `plan` failed).
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn plan_succeeds_with_existing_empty_models_dir_on_replication_only_project() {
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("warehouse.duckdb");
+        let config_path = dir.path().join("rocky.toml");
+        let state_path = dir.path().join("state.redb");
+
+        {
+            let warehouse = DuckDbWarehouseAdapter::open(&db_path).unwrap();
+            warehouse
+                .execute_statement("CREATE SCHEMA src__shop")
+                .await
+                .unwrap();
+            warehouse
+                .execute_statement(
+                    "CREATE TABLE src__shop.orders AS SELECT 1 AS id, now() AS _loaded_at",
+                )
+                .await
+                .unwrap();
+        }
+
+        std::fs::write(
+            &config_path,
+            format!(
+                r#"
+[adapter]
+type = "duckdb"
+path = "{}"
+
+[pipeline.main]
+strategy = "incremental"
+timestamp_column = "_loaded_at"
+
+[pipeline.main.source.discovery]
+adapter = "default"
+
+[pipeline.main.source.schema_pattern]
+prefix = "src__"
+separator = "__"
+components = ["source"]
+
+[pipeline.main.target]
+catalog_template = "warehouse"
+schema_template = "raw__{{source}}"
+
+[pipeline.main.target.governance]
+auto_create_schemas = true
+"#,
+                db_path.display()
+            ),
+        )
+        .unwrap();
+
+        // The realistic shape (#1991): the directory exists, tracked in git
+        // via `.gitkeep`, and holds no `.sql` / `.rocky` model.
+        let models_dir = dir.path().join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        std::fs::write(models_dir.join(".gitkeep"), "").unwrap();
+
+        let run_options = PlanRunOptions::default();
+        let result = plan(
+            &config_path,
+            None,
+            None,
+            None,
+            &run_options,
+            false,
+            "HEAD",
+            &state_path,
+            false,
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "plan must succeed on an existing, empty models/ dir: {:?}",
+            result.err()
+        );
+    }
+
+    /// #1941: `rocky plan` must refuse the SAME check-name collision `rocky
+    /// run` refuses, and refuse it BEFORE persisting a plan. Without this,
+    /// `rocky plan` exits 0 and persists a `plan_id` for a set `rocky apply`
+    /// — which re-executes `run()`, where the same collision refuses —
+    /// would then reject: late, and outside the bounded, watchdog-covered
+    /// plan step Dagster Pipes relies on for this check.
+    ///
+    /// Uses the same `cross_source_overlap` collision as
+    /// `a_collision_refusal_writes_nothing_the_target_table_never_exists`
+    /// in `commands::run`: config load cannot see it (no assertions are
+    /// declared here for it to hang a table off), so this drives all the
+    /// way through discovery and into `plan()`'s own guard call, not
+    /// config load.
+    ///
+    /// Mutation that must turn this red: delete the
+    /// `refuse_check_name_collisions(name, pipeline,
+    /// collision_check_pairs...)` call in `plan()`.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn plan_refuses_a_check_name_collision_before_persisting_a_plan() {
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("x.duckdb");
+        let config_path = dir.path().join("rocky.toml");
+        let state_path = dir.path().join("state.redb");
+
+        {
+            let warehouse = DuckDbWarehouseAdapter::open(&db_path).unwrap();
+            for schema in ["raw__acme", "raw__widgets"] {
+                warehouse
+                    .execute_statement(&format!("CREATE SCHEMA {schema}"))
+                    .await
+                    .unwrap();
+                warehouse
+                    .execute_statement(&format!("CREATE TABLE {schema}.orders AS SELECT 1 AS id"))
+                    .await
+                    .unwrap();
+            }
+        }
+
+        std::fs::write(
+            &config_path,
+            format!(
+                r#"
+[adapter]
+type = "duckdb"
+path = "{}"
+
+[pipeline.p]
+type = "replication"
+strategy = "full_refresh"
+
+[pipeline.p.source.discovery]
+adapter = "default"
+
+[pipeline.p.source.schema_pattern]
+prefix = "raw__"
+separator = "__"
+components = ["source"]
+
+[pipeline.p.target]
+adapter = "default"
+catalog_template = "x"
+schema_template = "staging__{{source}}"
+
+[pipeline.p.target.governance]
+auto_create_schemas = true
+
+[pipeline.p.checks]
+cross_source_overlap = {{ keys = ["id"] }}
+
+[[pipeline.p.checks.custom]]
+name = "cross source overlap duckdb orders"
+sql = "SELECT 0"
+threshold = 0
+"#,
+                db_path.display()
+            ),
+        )
+        .unwrap();
+
+        let run_options = PlanRunOptions::default();
+        let result = plan(
+            &config_path,
+            None,
+            None,
+            None,
+            &run_options,
+            false,
+            "HEAD",
+            &state_path,
+            false,
+        )
+        .await;
+
+        let err = result.expect_err("a check-name collision must refuse rocky plan");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("cross source overlap duckdb orders")
+                && msg.contains("cross_source_overlap:duckdb.orders"),
+            "the refusal must name both colliding sources: {msg}"
+        );
+        assert!(
+            msg.contains("pipeline \"p\""),
+            "the refusal must name the pipeline: {msg}"
+        );
+    }
+
+    #[cfg(feature = "duckdb")]
+    async fn plan_collision_fixture(
+        options: PlanRunOptions,
+        separate_source: bool,
+        custom_name: &str,
+    ) -> anyhow::Result<()> {
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        let dir = tempfile::tempdir()?;
+        let source_path = dir.path().join("source.duckdb");
+        let target_path = if separate_source {
+            dir.path().join("target.duckdb")
+        } else {
+            source_path.clone()
+        };
+        for (index, db_path) in [&source_path, &target_path].into_iter().enumerate() {
+            if index == 1 && !separate_source {
+                continue;
+            }
+            let warehouse = DuckDbWarehouseAdapter::open(db_path)?;
+            for schema in ["raw__acme", "raw__widgets"] {
+                warehouse
+                    .execute_statement(&format!("CREATE SCHEMA {schema}"))
+                    .await?;
+                if !separate_source || schema == "raw__acme" || db_path == &source_path {
+                    warehouse
+                        .execute_statement(&format!(
+                            "CREATE TABLE {schema}.orders AS SELECT 1 AS id"
+                        ))
+                        .await?;
+                }
+            }
+        }
+        if options.model.is_some() {
+            let models = dir.path().join("models");
+            std::fs::create_dir(&models)?;
+            std::fs::write(models.join("m.sql"), "-- model: m\nSELECT 1 AS id")?;
+            std::fs::write(
+                models.join("m.toml"),
+                r#"name = "m"
+[strategy]
+type = "full_refresh"
+[target]
+catalog = ""
+schema = "mart"
+table = "m"
+"#,
+            )?;
+        }
+        let config_path = dir.path().join("rocky.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                r#"
+[adapter.source]
+type = "duckdb"
+path = "{}"
+
+[adapter.target]
+type = "duckdb"
+path = "{}"
+
+[pipeline.p]
+type = "replication"
+strategy = "full_refresh"
+
+[pipeline.p.source.discovery]
+adapter = "source"
+
+[pipeline.p.source.schema_pattern]
+prefix = "raw__"
+separator = "__"
+components = ["source"]
+
+[pipeline.p.target]
+adapter = "target"
+catalog_template = "x"
+schema_template = "staging__{{source}}"
+
+[pipeline.p.checks]
+cross_source_overlap = {{ keys = ["id"] }}
+
+[[pipeline.p.checks.custom]]
+name = "{custom_name}"
+sql = "SELECT 0"
+threshold = 0
+"#,
+                source_path.display(),
+                target_path.display()
+            ),
+        )?;
+        plan(
+            &config_path,
+            None,
+            None,
+            None,
+            &options,
+            false,
+            "HEAD",
+            &dir.path().join("state.redb"),
+            false,
+        )
+        .await
+    }
+
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn plan_model_filter_skips_replication_check_collisions() {
+        plan_collision_fixture(
+            PlanRunOptions {
+                model: Some("m".into()),
+                ..Default::default()
+            },
+            false,
+            "cross source overlap duckdb orders",
+        )
+        .await
+        .expect("a selected model does not run replication checks");
+    }
+
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn plan_shadow_suffix_uses_the_written_table_name_for_checks() {
+        plan_collision_fixture(
+            PlanRunOptions {
+                shadow: true,
+                ..Default::default()
+            },
+            false,
+            "cross source overlap duckdb orders",
+        )
+        .await
+        .expect("the shadow name does not collide with the production check name");
+    }
+
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn plan_refuses_discovered_collision_without_listing_source_tables() {
+        let error = plan_collision_fixture(
+            PlanRunOptions::default(),
+            true,
+            "cross source overlap duckdb orders",
+        )
+        .await
+        .expect_err("plan checks discovered tables without a warehouse listing");
+        assert!(
+            format!("{error:#}").contains("cross_source_overlap:duckdb.orders"),
+            "{error:#}"
+        );
+    }
+
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn plan_shadow_suffix_refuses_a_collision_on_the_written_table() {
+        let error = plan_collision_fixture(
+            PlanRunOptions {
+                shadow: true,
+                ..Default::default()
+            },
+            false,
+            "cross source overlap duckdb orders rocky shadow",
+        )
+        .await
+        .expect_err("the shadow check names collide");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("cross_source_overlap:duckdb.orders_rocky_shadow"),
+            "{message}"
+        );
+    }
+
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn plan_shadow_schema_keeps_the_original_table_name_for_checks() {
+        let error = plan_collision_fixture(
+            PlanRunOptions {
+                shadow: true,
+                shadow_schema: Some("preview".into()),
+                ..Default::default()
+            },
+            false,
+            "cross source overlap duckdb orders",
+        )
+        .await
+        .expect_err("a shadow schema does not suffix table names");
+        assert!(
+            format!("{error:#}").contains("cross_source_overlap:duckdb.orders"),
+            "{error:#}"
+        );
+    }
+
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn plan_custom_shadow_suffix_uses_the_written_table_name_for_checks() {
+        let error = plan_collision_fixture(
+            PlanRunOptions {
+                shadow: true,
+                shadow_suffix: Some("_preview".into()),
+                ..Default::default()
+            },
+            false,
+            "cross source overlap duckdb orders preview",
+        )
+        .await
+        .expect_err("the custom suffix changes the collision name");
+        assert!(
+            format!("{error:#}").contains("cross_source_overlap:duckdb.orders_preview"),
+            "{error:#}"
+        );
     }
 
     #[test]
@@ -3921,6 +4683,7 @@ token = "${ROCKY_T_1625_PREVIEW_UNSET_2}"
     fn minimal_promote_plan(branch_name: &str) -> PromotePlan {
         PromotePlan {
             branch_name: branch_name.to_string(),
+            pipeline: None,
             base_ref: "main".to_string(),
             head_ref: "abc1234".to_string(),
             branch_state_hash: "deadbeef".repeat(8),

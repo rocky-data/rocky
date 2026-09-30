@@ -14,12 +14,25 @@ from rocky_sdk.exceptions import RockyOutputParseError
 from rocky_sdk.types import (
     CheckResult,
     GcApplyOutput,
+    MaterializationInfo,
     RestoreApplyOutput,
     RunResult,
     ScheduleSpoolOutput,
 )
 
 DISCOVER_JSON = '{"version": "1.0.0", "command": "discover", "sources": []}'
+
+
+def test_materialization_keeps_kind_switch_note():
+    materialization = MaterializationInfo.model_validate(
+        {
+            "asset_key": ["warehouse", "main", "orders"],
+            "duration_ms": 1,
+            "metadata": {"strategy": "full_refresh"},
+            "notes": ["Dropped view warehouse.main.orders"],
+        }
+    )
+    assert materialization.notes == ["Dropped view warehouse.main.orders"]
 
 
 def test_parse_rocky_output_dispatches_discover():

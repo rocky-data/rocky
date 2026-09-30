@@ -272,7 +272,7 @@ pub(crate) fn run_restore_plan_in(
     json: bool,
 ) -> Result<()> {
     let (tombstones, live_artifacts) = {
-        let store = StateStore::open_read_only(state_path)
+        let store = StateStore::open_read_only_or_empty(state_path)
             .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
         let tombs = store
             .list_tombstones()
@@ -465,7 +465,7 @@ async fn rebuild_artifact_bytes(
     let result = warehouse
         .execute_query(&ir.sql)
         .await
-        .map_err(|e| anyhow!("re-execution query failed: {e}"))?;
+        .context("re-execution query failed")?;
     let batch = crate::commands::run_content_addressed::query_result_to_record_batch(
         &ir.typed_columns,
         &result,
@@ -1431,6 +1431,8 @@ mod tests {
                     submission_id: None,
                     check_gate_failed: false,
                     verify_after_failed: false,
+                    rocky_branch: None,
+                    run_scope: Some(rocky_core::state::RunScope::Production),
                 })
                 .unwrap();
         }
@@ -2494,6 +2496,8 @@ mod tests {
                         submission_id: None,
                         check_gate_failed: false,
                         verify_after_failed: false,
+                        rocky_branch: None,
+                        run_scope: Some(rocky_core::state::RunScope::Production),
                     })
                     .unwrap();
 

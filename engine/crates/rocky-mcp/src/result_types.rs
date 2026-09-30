@@ -131,13 +131,13 @@ pub struct LineageResult {
 /// One failing test in a `test` result.
 ///
 /// `name` is the model name for a model-execution failure, and
-/// `<model>::<test>` for a fixture `[[test]]` failure. `suite` says which of
-/// the two produced it, so a caller never has to guess from the name shape.
+/// `<model>::<test>` for a fixture or declarative check failure. `suite`
+/// identifies `model`, `unit`, or `declarative`.
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct TestFailureLite {
     pub name: String,
     pub error: String,
-    /// `"model"` or `"unit"` — which suite this failure came from.
+    /// `"model"`, `"unit"`, or `"declarative"`.
     pub suite: String,
 }
 
@@ -149,7 +149,7 @@ pub struct TestSuiteCounts {
     pub failed: usize,
 }
 
-/// `test` result — BOTH DuckDB-backed local suites, in one shape.
+/// `test` result. The default mode aggregates both DuckDB-backed local suites.
 ///
 /// `rocky test` runs two things, and this result used to report one of them.
 /// `commands::test_output` returns model-execution counts (`total`, `passed`,
@@ -167,8 +167,8 @@ pub struct TestSuiteCounts {
 ///
 /// - `total` / `passed` are the sum across both suites.
 /// - `failures` carries failures from both, tagged by `suite`.
-/// - `all_passed` is the single field to branch on. It is true only when
-///   both suites are clean.
+/// - `all_passed` is the single field to branch on. Declarative warning
+///   failures are reported but do not block it, matching the CLI.
 /// - `models` and `unit_tests` break the totals back down, so nothing is
 ///   lost by summing them.
 ///
@@ -178,18 +178,42 @@ pub struct TestSuiteCounts {
 /// absent field states neither.
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct TestResult {
-    /// Model executions plus fixture unit tests.
+    /// Tests run in the chosen mode.
     pub total: usize,
-    /// Model executions plus fixture unit tests that passed.
+    /// Tests that passed in the chosen mode.
     pub passed: usize,
-    /// Every failure from both suites.
+    /// Every failure or warning in the chosen mode.
     pub failures: Vec<TestFailureLite>,
-    /// True only when both suites are clean. Branch on this.
+    /// True when the chosen mode has no hard failure or execution error.
+    /// Warning-severity declarative failures follow the CLI and are allowed.
     pub all_passed: bool,
     /// The model-execution suite on its own.
     pub models: TestSuiteCounts,
     /// The fixture `[[test]]` suite on its own.
     pub unit_tests: TestSuiteCounts,
+    /// Present when `test` was called with `declarative = true`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub declarative: Option<DeclarativeSuiteLite>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct DeclarativeSuiteLite {
+    pub total: usize,
+    pub passed: usize,
+    pub failed: usize,
+    pub warned: usize,
+    pub errored: usize,
+    pub results: Vec<DeclarativeCheckLite>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct DeclarativeCheckLite {
+    pub model: String,
+    pub test_type: String,
+    pub column: Option<String>,
+    pub status: String,
+    pub severity: String,
+    pub detail: Option<String>,
 }
 
 /// One row in a `list` result. Each `kind` populates a distinct subset of
@@ -495,9 +519,8 @@ pub struct DraftContractResult {
 /// The write-path sibling of `draft_model`: the agent supplies one or more
 /// `[[tests]]` blocks, the tool appends them to the model's sidecar
 /// (`models/<model>.toml`), compiles so a malformed block fails structurally, and
-/// gates the write through the agent-policy plane. The check *executes* via the
-/// `test` tool (compile validates the sidecar's structure; column-reference
-/// validity is proven when the check runs). Distinct from `ai_test`, which asks
+/// gates the write through the agent-policy plane. Run the check against an
+/// applied target with the `test` tool and `declarative = true`. Distinct from `ai_test`, which asks
 /// an LLM to *generate* assertions and returns them without writing.
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct DraftCheckResult {
@@ -512,11 +535,12 @@ pub struct DraftCheckResult {
     /// Count of warning-severity diagnostics.
     pub warning_count: usize,
     /// The immediate compile's diagnostics, scoped to the model. Compile proves
-    /// the merged sidecar is structurally sound; run the `test` tool to execute
+    /// the merged sidecar is structurally sound; run the `test` tool with
+    /// `declarative = true` to execute
     /// the check against the data.
     pub diagnostics: Vec<DiagnosticLite>,
     /// The authoring-loop reminder: a draft is not applied. It restates the flow
-    /// (write → compile → `test` → `propose` → human review → apply).
+    /// (write → compile → `propose` → human review → apply → declarative `test`).
     pub next_steps: String,
 }
 

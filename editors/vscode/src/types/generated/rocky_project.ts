@@ -1280,15 +1280,11 @@ export interface CustomCheckConfig {
   threshold?: number;
 }
 /**
- * Freshness check configuration with optional per-schema overrides.
+ * Freshness check configuration.
+ *
+ * A single scalar `threshold_seconds` applies to every checked table. There used to be an `overrides` key for per-schema thresholds; it parsed and validated but nothing on the check path ever read it, so it is now refused with a message naming the remedy (#1620).
  */
 export interface FreshnessConfig {
-  /**
-   * Per-schema freshness overrides. Key is a schema pattern (e.g., "raw__us_west__shopify"), value overrides threshold_seconds for matching schemas.
-   */
-  overrides?: {
-    [k: string]: number;
-  };
   /**
    * Severity reported when freshness lag exceeds the threshold.
    */

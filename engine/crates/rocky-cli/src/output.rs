@@ -168,9 +168,9 @@ pub struct ResolvedCheckNameOutput {
 
 /// Freshness check configuration projected into the discover output.
 ///
-/// Per-schema `overrides` from `rocky_core::config::FreshnessConfig` are
-/// intentionally not exposed yet — the override-key semantics need to be
-/// nailed down before integrations can rely on them.
+/// Just the scalar threshold: `[checks.freshness]` has no per-schema
+/// `overrides` key. One existed and parsed but nothing on the check path
+/// ever read it, so it was removed rather than exposed here (#1620).
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct FreshnessConfigOutput {
     pub threshold_seconds: u64,
@@ -355,11 +355,10 @@ pub struct RunOutput {
     /// omitted) for a default run, which stays byte-identical.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub model_decisions: Vec<ModelDecisionOutput>,
-    /// Models withheld this run because an upstream failed (or was itself
-    /// withheld) and `[resilience] contain_failures` continued the disjoint
-    /// subgraphs — the blast radius of the failures named in `errors[]`. Empty
-    /// (and omitted) for a run that did not withhold anything: the default
-    /// fail-fast run, and any successful run, record nothing here.
+    /// Models withheld this run after an upstream compile failure, or while
+    /// `[resilience] contain_failures` continues disjoint subgraphs after a
+    /// runtime failure. This is the blast radius of failures in `errors[]`.
+    /// Empty (and omitted) when no model was withheld.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub contained: Vec<ContainedModelOutput>,
     pub check_results: Vec<TableCheckOutput>,
@@ -588,6 +587,13 @@ pub struct AnomalyEvaluationOutput {
     /// Fully-qualified table the entry is about, the same key
     /// [`AnomalyOutput::table`] uses.
     pub table: String,
+    /// Dagster-style asset key path (`[source_type, ...components, table]`),
+    /// the same value [`MaterializationOutput::asset_key`] carries for this
+    /// table. Added (#2073) so the Dagster Pipes emitter can report this
+    /// verdict as a `report_asset_check` without re-deriving the mapping
+    /// `batch_asset_keys` already has — the same reason
+    /// [`TableCheckOutput::asset_key`] exists.
+    pub asset_key: Vec<String>,
     /// `true` when the detector compared this table's count against its
     /// history. An anomaly, if any, is in [`RunOutput::anomalies`].
     pub evaluated: bool,
@@ -601,6 +607,9 @@ pub struct AnomalyEvaluationOutput {
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct AnomalyOutput {
     pub table: String,
+    /// Dagster-style asset key path, same convention as
+    /// [`AnomalyEvaluationOutput::asset_key`] (#2073).
+    pub asset_key: Vec<String>,
     pub current_count: u64,
     pub baseline_avg: f64,
     pub deviation_pct: f64,
@@ -728,6 +737,68 @@ impl From<&rocky_snowflake::connector::ConnectorError> for FailureKind {
     }
 }
 
+impl From<&rocky_trino::connector::TrinoError> for FailureKind {
+    fn from(err: &rocky_trino::connector::TrinoError) -> Self {
+        use rocky_trino::connector::TrinoError as E;
+        match err {
+            E::Auth(_) => Self::AuthFailed,
+            E::Http(e) if e.is_timeout() => Self::Transient,
+            E::Http(_) => Self::ConnectionFailed,
+            E::HttpStatus { status, .. } => match status {
+                401 | 403 => Self::AuthFailed,
+                404 => Self::NotFound,
+                429 => Self::QuotaExceeded,
+                500..=599 => Self::Transient,
+                _ => Self::QueryRejected,
+            },
+            E::QueryFailed { error_name, .. } => match error_name.as_str() {
+                "TABLE_NOT_FOUND" => Self::NotFound,
+                "NO_NODES_AVAILABLE"
+                | "REMOTE_TASK_ERROR"
+                | "REMOTE_TASK_MISMATCH"
+                | "REMOTE_HOST_GONE"
+                | "PAGE_TRANSPORT_ERROR"
+                | "PAGE_TRANSPORT_TIMEOUT"
+                | "SERVER_STARTING_UP"
+                | "SERVER_SHUTTING_DOWN" => Self::Transient,
+                _ => Self::QueryRejected,
+            },
+            E::Timeout { .. } => Self::Transient,
+            E::MalformedResponse(_)
+            | E::UntrustedNextUri { .. }
+            | E::ArrowEncodingUnavailable
+            | E::ArrowDecode(_) => Self::Unknown,
+        }
+    }
+}
+
+impl From<&rocky_bigquery::connector::BigQueryError> for FailureKind {
+    fn from(err: &rocky_bigquery::connector::BigQueryError) -> Self {
+        type E = rocky_bigquery::connector::BigQueryError;
+        match err {
+            E::Auth(_) => Self::AuthFailed,
+            E::Http(e) if e.is_timeout() => Self::Transient,
+            E::Http(_) => Self::ConnectionFailed,
+            E::ApiError { status, .. } => match status
+                .split_whitespace()
+                .next()
+                .and_then(|code| code.parse::<u16>().ok())
+            {
+                Some(401 | 403) => Self::AuthFailed,
+                Some(404) => Self::NotFound,
+                Some(429) => Self::QuotaExceeded,
+                Some(500..=599) => Self::Transient,
+                Some(_) => Self::QueryRejected,
+                None => Self::Unknown,
+            },
+            E::JobError { .. } | E::LoadJobError { .. } => Self::QueryRejected,
+            E::Timeout { .. } => Self::Transient,
+            E::RetryBudgetExhausted { .. } => Self::QuotaExceeded,
+            E::StorageRead(_) => Self::Unknown,
+        }
+    }
+}
+
 /// Extract the warehouse-reported cooldown (in whole seconds) from a
 /// typed connector error, when the variant carries one. Populated only
 /// for `CircuitBreakerOpen` against breakers configured with timed
@@ -758,16 +829,20 @@ fn cooldown_from_snowflake(err: &rocky_snowflake::connector::ConnectorError) -> 
 
 /// Walk an `anyhow::Error`'s `chain()` looking for a typed
 /// `ConnectorError` and classify it via [`FailureKind`]. Returns
-/// [`FailureKind::Unknown`] when neither connector enum is reachable.
+/// [`FailureKind::Unknown`] when no recognised connector enum is reachable.
 ///
-/// Production-path note: adapter calls go through
-/// [`rocky_adapter_sdk::AdapterError`], a `Box<dyn Error>` wrapper
-/// whose `Error::source()` impl returns the *inner*'s source — so a
-/// bare `chain()` walk skips past the wrapper straight to whatever the
+/// Production-path note: adapter calls go through one of two `Box<dyn
+/// Error>` wrapper types — [`rocky_adapter_sdk::AdapterError`] (the
+/// adapter-SDK trait boundary; used for e.g. Databricks volume / Snowflake
+/// stage file staging) or [`rocky_core::traits::AdapterError`] (what every
+/// `WarehouseAdapter` method, including the databricks/snowflake/trino/
+/// bigquery `execute_statement*` path, actually returns) — and both
+/// wrappers' `Error::source()` impl returns the *inner*'s source, so a bare
+/// `chain()` walk skips past either wrapper straight to whatever the
 /// `ConnectorError` carries (e.g. `reqwest::Error`) and never sees the
-/// connector variant itself. To handle that, each cause is also
-/// downcast to `AdapterError`; when matched, its
-/// [`AdapterError::inner`] is probed for the typed `ConnectorError`.
+/// connector variant itself (#2064). To handle that, each cause is also
+/// downcast to both wrapper types via [`probe_wrapped_adapter_cause`];
+/// when matched, its inner error is probed for the typed `ConnectorError`.
 ///
 /// Many existing call sites in `run.rs` still build their `anyhow`
 /// errors via `anyhow::anyhow!("…{e}")`, which stringifies the
@@ -779,6 +854,12 @@ fn classify_cause(cause: &(dyn std::error::Error + 'static)) -> Option<FailureKi
         return Some(e.into());
     }
     if let Some(e) = cause.downcast_ref::<rocky_snowflake::connector::ConnectorError>() {
+        return Some(e.into());
+    }
+    if let Some(e) = cause.downcast_ref::<rocky_trino::connector::TrinoError>() {
+        return Some(e.into());
+    }
+    if let Some(e) = cause.downcast_ref::<rocky_bigquery::connector::BigQueryError>() {
         return Some(e.into());
     }
     None
@@ -799,6 +880,42 @@ fn classify_cause_with_cooldown(
     if let Some(e) = cause.downcast_ref::<rocky_snowflake::connector::ConnectorError>() {
         return Some((e.into(), cooldown_from_snowflake(e)));
     }
+    if let Some(e) = cause.downcast_ref::<rocky_trino::connector::TrinoError>() {
+        return Some((e.into(), None));
+    }
+    if let Some(e) = cause.downcast_ref::<rocky_bigquery::connector::BigQueryError>() {
+        return Some((e.into(), None));
+    }
+    None
+}
+
+/// Downcast a single chain link to whichever `AdapterError` wrapper type
+/// Rocky's adapters use — [`rocky_adapter_sdk::AdapterError`] or
+/// [`rocky_core::traits::AdapterError`] (#2064: warehouse adapters return
+/// the latter, not the former the classifiers previously assumed) — and
+/// walk from its `inner()` through `source()` the same way
+/// [`classify_adapter_error_with_cooldown`] does. The caller's probe can
+/// extract either a failure classification or a status from the same chain.
+/// Returns `None` when no wrapper or matching inner cause is found.
+fn probe_wrapped_adapter_cause<T>(
+    cause: &(dyn std::error::Error + 'static),
+    probe: impl Fn(&(dyn std::error::Error + 'static)) -> Option<T>,
+) -> Option<T> {
+    let inner: &(dyn std::error::Error + 'static) =
+        if let Some(e) = cause.downcast_ref::<rocky_adapter_sdk::AdapterError>() {
+            e.inner()
+        } else {
+            cause
+                .downcast_ref::<rocky_core::traits::AdapterError>()?
+                .inner()
+        };
+    let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(inner);
+    while let Some(c) = cause {
+        if let Some(value) = probe(c) {
+            return Some(value);
+        }
+        cause = c.source();
+    }
     None
 }
 
@@ -807,9 +924,7 @@ pub fn classify_anyhow_error(err: &anyhow::Error) -> FailureKind {
         if let Some(kind) = classify_cause(cause) {
             return kind;
         }
-        if let Some(adapter_err) = cause.downcast_ref::<rocky_adapter_sdk::AdapterError>()
-            && let Some(kind) = classify_cause(adapter_err.inner())
-        {
+        if let Some((kind, _)) = probe_wrapped_adapter_cause(cause, classify_cause_with_cooldown) {
             return kind;
         }
     }
@@ -830,9 +945,7 @@ pub fn classify_anyhow_error_with_cooldown(err: &anyhow::Error) -> (FailureKind,
         if let Some(pair) = classify_cause_with_cooldown(cause) {
             return pair;
         }
-        if let Some(adapter_err) = cause.downcast_ref::<rocky_adapter_sdk::AdapterError>()
-            && let Some(pair) = classify_cause_with_cooldown(adapter_err.inner())
-        {
+        if let Some(pair) = probe_wrapped_adapter_cause(cause, classify_cause_with_cooldown) {
             return pair;
         }
     }
@@ -842,11 +955,12 @@ pub fn classify_anyhow_error_with_cooldown(err: &anyhow::Error) -> (FailureKind,
 /// [`classify_anyhow_error_with_cooldown`] for a bare
 /// [`rocky_core::traits::AdapterError`], as `WarehouseAdapter` methods return.
 ///
-/// The anyhow walks above cannot see a typed connector error inside one. They
-/// unwrap `rocky_adapter_sdk::AdapterError`, a different type, and
 /// `rocky_core`'s `AdapterError::source()` returns its inner error's source,
-/// skipping the inner error itself. This starts at [`inner`] and walks
-/// `source()` from there.
+/// skipping the inner error itself, so this starts at [`inner`] and walks
+/// `source()` from there — the same walk [`probe_wrapped_adapter_cause`]
+/// now runs on a *wrapped* `AdapterError` found inside an `anyhow::Error`
+/// chain; this is the entry point for a caller holding the bare type
+/// directly, with no `anyhow::Error` to walk.
 ///
 /// [`inner`]: rocky_core::traits::AdapterError::inner
 pub fn classify_adapter_error_with_cooldown(
@@ -902,17 +1016,14 @@ fn frame_status(status: u16, target: &str) -> Option<String> {
     }
 }
 
-/// Walk an `anyhow` error chain (including any `rocky_adapter_sdk::
-/// AdapterError` inner) for a recognised warehouse auth status and frame
-/// it. See [`frame_status`].
+/// Walk an `anyhow` error chain, including both adapter wrappers, for a
+/// recognised warehouse auth status. See [`frame_status`].
 pub fn frame_warehouse_anyhow_error(err: &anyhow::Error, target: &str) -> Option<String> {
     for cause in err.chain() {
         if let Some(status) = api_status_from_cause(cause) {
             return frame_status(status, target);
         }
-        if let Some(adapter_err) = cause.downcast_ref::<rocky_adapter_sdk::AdapterError>()
-            && let Some(status) = api_status_from_cause(adapter_err.inner())
-        {
+        if let Some(status) = probe_wrapped_adapter_cause(cause, api_status_from_cause) {
             return frame_status(status, target);
         }
     }
@@ -1029,6 +1140,9 @@ impl FailedSourceOutput {
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct MaterializationOutput {
     pub asset_key: Vec<String>,
+    /// Operator-visible actions taken while materializing this model.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
     pub rows_copied: Option<u64>,
     pub duration_ms: u64,
     /// Wall-clock timestamp captured at the moment the engine began
@@ -1552,6 +1666,13 @@ pub struct DriftSummary {
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct DriftActionOutput {
     pub table: String,
+    /// Dagster-style asset key path (`[source_type, ...components, table]`)
+    /// for this table, the same value [`MaterializationOutput::asset_key`]
+    /// carries. Added (#2073) so the Dagster Pipes emitter can report drift
+    /// as a `report_asset_check` keyed on the asset, instead of passing
+    /// `table` (a bare `catalog.schema.table` string, not a Dagster asset
+    /// key) as the asset key.
+    pub asset_key: Vec<String>,
     pub action: String,
     pub reason: String,
 }
@@ -1617,12 +1738,9 @@ pub struct PlanOutput {
     /// warehouses without a first-class retention knob.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub retention_actions: Vec<RetentionAction>,
-    /// Models the preview could not render, one entry each, with the
-    /// reason. A model whose SQL cannot be rendered offline lands here
-    /// (a Snowflake dynamic table needs a live compute-warehouse name),
-    /// and so does one whose strategy is refused, such as `ephemeral`
-    /// (E038). Before, such a model left no trace: an ephemeral-only
-    /// project previewed as an empty plan and exit 0.
+    /// Models excluded from the SQL preview or refused by compilation, with
+    /// the reason for each. This includes SQL that needs a live warehouse to
+    /// render and compiler errors such as E038 for an `ephemeral` model.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub skipped: Vec<SkippedModel>,
 
@@ -2507,6 +2625,14 @@ pub struct RunHistoryRecord {
     /// `TickOutput.executed[].submission_id`. `None` for manually launched runs.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub submission_id: Option<String>,
+    /// The named Rocky branch this run wrote to (`rocky run --branch
+    /// <name>`), or `None` for a production / plain-`--shadow` run. Distinct
+    /// from `git_branch` — see `RunRecord::rocky_branch` (#2032). Not
+    /// audit-gated — like [`Self::pipeline`], it is an operational join key
+    /// (`rocky preview diff`/`preview cost` pair a run by this field), always
+    /// emitted when present.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rocky_branch: Option<String>,
 
     // --- Governance audit trail (populated only with `--audit`) ---
     /// Resolved caller identity (Unix `$USER` / Windows `$USERNAME`).
@@ -3458,12 +3584,18 @@ pub struct TableCompareResult {
     pub production_table: String,
     pub shadow_table: String,
     pub row_count_match: bool,
-    pub production_count: u64,
-    pub shadow_count: u64,
-    pub row_count_diff_pct: f64,
+    /// Null when the warehouse count could not be read.
+    pub production_count: Option<u64>,
+    /// Null when the warehouse count could not be read.
+    pub shadow_count: Option<u64>,
+    /// Null unless both counts were read.
+    pub row_count_diff_pct: Option<f64>,
     pub schema_match: bool,
     pub schema_diffs: Vec<String>,
     pub verdict: String,
+    /// Read errors for an `error` row, or threshold reasons for `warn`/`fail`.
+    /// Empty for `pass`.
+    pub reasons: Vec<String>,
 }
 
 /// JSON output for `rocky compact`.
@@ -4751,7 +4883,6 @@ impl ChecksConfigOutput {
             threshold_seconds: f.threshold_seconds,
         });
 
-        let runs = |k: CheckKind| executed_kinds.contains(&k);
         let mut configured_checks: BTreeMap<String, Vec<ResolvedCheckNameOutput>> = BTreeMap::new();
 
         // (source_type, table) pairs across discovered sources.
@@ -4766,43 +4897,49 @@ impl ChecksConfigOutput {
         let unique_tables: std::collections::BTreeSet<&str> =
             pairs.iter().map(|(_, t)| t.as_str()).collect();
 
-        // Custom checks run against every materialized table.
-        if runs(CheckKind::Custom) {
-            for &table in &unique_tables {
-                for custom in &cfg.custom {
-                    configured_checks
-                        .entry(table.to_string())
-                        .or_default()
-                        .push(ResolvedCheckNameOutput {
-                            name: custom.name.clone(),
-                            kind: "custom".into(),
-                            candidate: false,
-                        });
-                }
+        // Every discovered table gets the full per-table derivation: custom,
+        // null_rate, assertions ON THIS TABLE, and cross_source_overlap when
+        // it has ≥2 siblings under the same source type. Shared with the
+        // pre-run collision guards (`rocky-core::config`, `rocky-cli`'s
+        // `run.rs`) so none of the three can disagree about which names a
+        // table emits (#1941).
+        for &table in &unique_tables {
+            let sibling_source_types: Vec<String> = pairs
+                .iter()
+                .filter(|(_, t)| t == table)
+                .map(|(source_type, _)| source_type.clone())
+                .collect();
+            let names = rocky_core::config::resolved_check_names_for_table(
+                cfg,
+                executed_kinds,
+                table,
+                &sibling_source_types,
+            );
+            if names.is_empty() {
+                continue;
             }
+            configured_checks
+                .entry(table.to_string())
+                .or_default()
+                .extend(names.into_iter().map(|n| ResolvedCheckNameOutput {
+                    name: n.name,
+                    kind: n.kind.as_str().to_string(),
+                    candidate: n.candidate,
+                }));
         }
 
-        // Null-rate: one result per configured column, per table.
-        if runs(CheckKind::NullRate)
-            && let Some(nr) = cfg.null_rate.as_ref()
-        {
-            for &table in &unique_tables {
-                for col in &nr.columns {
-                    configured_checks
-                        .entry(table.to_string())
-                        .or_default()
-                        .push(ResolvedCheckNameOutput {
-                            name: rocky_core::checks::null_rate_check_name(col),
-                            kind: "null_rate".into(),
-                            candidate: false,
-                        });
-                }
-            }
-        }
-
-        // Assertions attach to their specific target table.
-        if runs(CheckKind::Assertions) {
+        // An assertion whose table was NOT among the discovered tables still
+        // gets its resolved name projected — `rocky discover` declares the
+        // spec even though this snapshot didn't discover the table, so a
+        // consumer can pre-declare it before the table shows up. Unlike the
+        // discovered-table loop above this does not also add custom/null_rate
+        // entries for that table: those apply only once the table is
+        // actually materialized, which this snapshot has no evidence of.
+        if executed_kinds.contains(&CheckKind::Assertions) {
             for assertion in &cfg.assertions {
+                if unique_tables.contains(assertion.table.as_str()) {
+                    continue; // already covered by the loop above
+                }
                 configured_checks
                     .entry(assertion.table.clone())
                     .or_default()
@@ -4812,31 +4949,6 @@ impl ChecksConfigOutput {
                         candidate: false,
                     });
             }
-        }
-
-        // Cross-source overlap: candidate names for ≥2 (source_type, table)
-        // groups — marked `candidate` because the actual set depends on
-        // runtime-discovered siblings, which may differ from what discover sees.
-        if runs(CheckKind::CrossSourceOverlap) && cfg.cross_source_overlap.is_some() {
-            for (source_type, table) in
-                rocky_core::checks::cross_source_overlap_groups(pairs.iter().cloned())
-            {
-                configured_checks
-                    .entry(table.clone())
-                    .or_default()
-                    .push(ResolvedCheckNameOutput {
-                        name: rocky_core::checks::cross_source_overlap_name(&source_type, &table),
-                        kind: "cross_source_overlap".into(),
-                        candidate: true,
-                    });
-            }
-        }
-
-        // Dedup identical names per table (e.g. a custom check on a table name
-        // that appears under multiple sources), preserving declaration order.
-        for names in configured_checks.values_mut() {
-            let mut seen = std::collections::HashSet::new();
-            names.retain(|n| seen.insert(n.name.clone()));
         }
 
         if freshness.is_none() && configured_checks.is_empty() {
@@ -4966,6 +5078,11 @@ pub struct RunRecordAudit {
     pub target_catalog: Option<String>,
     pub hostname: String,
     pub rocky_version: String,
+    /// The named Rocky branch this run wrote to (`rocky run --branch
+    /// <name>`), or `None`. See `RunRecord::rocky_branch` (#2032) — this is
+    /// NOT `git_branch`.
+    pub rocky_branch: Option<String>,
+    pub run_scope: rocky_core::state::RunScope,
 }
 
 impl RunRecordAudit {
@@ -4984,6 +5101,8 @@ impl RunRecordAudit {
             target_catalog: None,
             hostname: "output-test-host".to_string(),
             rocky_version: "0.0.0-test".to_string(),
+            rocky_branch: None,
+            run_scope: rocky_core::state::RunScope::Production,
         }
     }
 }
@@ -5376,6 +5495,8 @@ impl RunOutput {
             target_catalog: audit.target_catalog,
             hostname: audit.hostname,
             rocky_version: audit.rocky_version,
+            rocky_branch: audit.rocky_branch,
+            run_scope: Some(audit.run_scope),
             check_outcomes,
             pipeline: None,
             submission_id: None,
@@ -6548,6 +6669,7 @@ mod cost_finalize_tests {
     fn mat(asset_key: &[&str], duration_ms: u64) -> MaterializationOutput {
         MaterializationOutput {
             asset_key: asset_key.iter().map(|s| (*s).to_string()).collect(),
+            notes: vec![],
             attempts: Vec::new(),
             rows_copied: None,
             duration_ms,
@@ -6841,6 +6963,7 @@ mod run_record_tests {
     ) -> MaterializationOutput {
         MaterializationOutput {
             asset_key: asset_key.iter().map(|s| (*s).to_string()).collect(),
+            notes: vec![],
             attempts: Vec::new(),
             rows_copied: Some(42),
             duration_ms,
@@ -7886,6 +8009,16 @@ pub struct PromoteTargetPlan {
 pub struct PromotePlan {
     /// Branch name being promoted.
     pub branch_name: String,
+    /// The resolved pipeline the promote targets were built against
+    /// (`resolve_pipeline`'s output at plan time — never ambiguous, even on a
+    /// single-pipeline config where `--pipeline` was omitted). `rocky apply
+    /// <plan-id>` reads this instead of re-resolving from the config, so
+    /// applying a promote plan is never ambiguous on a multi-pipeline
+    /// project. Absent on plans written before this field existed; apply
+    /// falls back to `resolve_pipeline(None)` for those, unchanged from
+    /// before this field was added.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pipeline: Option<String>,
     /// Git ref that `base_ref` was resolved to at plan time (e.g. `"main"`).
     pub base_ref: String,
     /// Git HEAD SHA at plan time — informational for audit purposes.
@@ -10416,7 +10549,7 @@ pub struct PreviewCreateOutput {
     /// Branch name registered in the state store. Mirrors the `name`
     /// from `rocky branch create`.
     pub branch_name: String,
-    /// Schema prefix the branch run wrote into (e.g. `branch__fix-price`).
+    /// Schema prefix the branch run wrote into (e.g. `branch__fix_price`).
     pub branch_schema: String,
     /// Git ref the change set was computed against. Mirrors `--base`.
     pub base_ref: String,
@@ -10510,6 +10643,19 @@ pub struct PreviewDiffOutput {
 pub struct PreviewDiffSummary {
     pub models_with_changes: usize,
     pub models_unchanged: usize,
+    /// Models whose row-count delta could not be computed — the warehouse
+    /// adapter or materialization strategy reported no `rows_affected` on
+    /// the branch side, the base side, or both (#2032). These are counted
+    /// separately from `models_unchanged`: "no recorded delta" is not the
+    /// same claim as "no change", and folding the two together is exactly
+    /// the false-clean report this field exists to prevent. A model here
+    /// contributes `null` (not `0`) to its own `rows_added`/`rows_removed`
+    /// and is excluded from `total_rows_added`/`total_rows_removed`, so
+    /// those totals are a floor, not an exact count, whenever this is > 0.
+    pub models_unknown: usize,
+    /// Sum of `rows_added` over models with a KNOWN delta only — models
+    /// counted in `models_unknown` contribute nothing here (never `0`,
+    /// which would be indistinguishable from a genuine no-op).
     pub total_rows_added: u64,
     pub total_rows_removed: u64,
     pub total_rows_changed: u64,
@@ -10654,8 +10800,17 @@ pub struct PreviewColumnTypeChange {
 /// Sampled row-level diff. All counts are over the sampling window.
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct PreviewSampledRowDiff {
-    pub rows_added: u64,
-    pub rows_removed: u64,
+    /// `None` — emitted as JSON `null`, deliberately NOT omitted via
+    /// `skip_serializing_if` — when the row count needed to compute this
+    /// delta was unavailable on the branch side, the base side, or both
+    /// (an ordinary transformation run's adapter/strategy reports no
+    /// `rows_affected`). `Some(0)` means a genuine, measured no-op; `null`
+    /// means unmeasured. Collapsing the two into `0` is the exact defect
+    /// this field exists to prevent — a full-refresh model going from 10
+    /// rows to 20 must never report `rows_added: 0` (#2032).
+    pub rows_added: Option<u64>,
+    /// Same absent-vs-zero contract as `rows_added`.
+    pub rows_removed: Option<u64>,
     pub rows_changed: u64,
     /// Up to `--max-samples` (default 5) representative changed rows
     /// for human review. Pure noise when sampling found no change.
@@ -11514,14 +11669,199 @@ mod ci_diff_markdown_tests {
 
 #[cfg(test)]
 mod failure_kind_tests {
-    //! Mapping coverage for [`FailureKind`] against every variant of
-    //! Databricks and Snowflake [`ConnectorError`]. The `Http(reqwest::Error)`
-    //! variant is not directly constructed here (reqwest exposes no public
-    //! constructor) — its mapping is exercised end-to-end inside the
-    //! `classify_anyhow_error` path.
+    //! Mapping coverage for [`FailureKind`] against the warehouse connector
+    //! enums. Each new Trino and BigQuery case crosses the core adapter
+    //! wrapper used by warehouse methods.
     use super::*;
+    type BqE = rocky_bigquery::connector::BigQueryError;
     use rocky_databricks::connector::ConnectorError as DbE;
     use rocky_snowflake::connector::ConnectorError as SnE;
+    use rocky_trino::connector::TrinoError as TrE;
+
+    fn assert_core_wrapped<E: std::error::Error + Send + Sync + 'static>(
+        connector: E,
+        kind: FailureKind,
+    ) {
+        let err = anyhow::Error::new(rocky_core::traits::AdapterError::new(connector))
+            .context("warehouse statement failed");
+        assert_eq!(classify_anyhow_error(&err), kind);
+        assert_eq!(classify_anyhow_error_with_cooldown(&err), (kind, None));
+    }
+
+    #[test]
+    fn trino_variants_classify_through_core_wrapper() {
+        let cases = [
+            (
+                TrE::Auth(rocky_trino::auth::AuthError::NoAuth),
+                FailureKind::AuthFailed,
+            ),
+            (
+                TrE::HttpStatus {
+                    status: 401,
+                    message: String::new(),
+                },
+                FailureKind::AuthFailed,
+            ),
+            (
+                TrE::HttpStatus {
+                    status: 403,
+                    message: String::new(),
+                },
+                FailureKind::AuthFailed,
+            ),
+            (
+                TrE::HttpStatus {
+                    status: 404,
+                    message: String::new(),
+                },
+                FailureKind::NotFound,
+            ),
+            (
+                TrE::HttpStatus {
+                    status: 429,
+                    message: String::new(),
+                },
+                FailureKind::QuotaExceeded,
+            ),
+            (
+                TrE::HttpStatus {
+                    status: 503,
+                    message: String::new(),
+                },
+                FailureKind::Transient,
+            ),
+            (
+                TrE::HttpStatus {
+                    status: 400,
+                    message: String::new(),
+                },
+                FailureKind::QueryRejected,
+            ),
+            (
+                TrE::QueryFailed {
+                    state: String::new(),
+                    error_code: 1,
+                    error_name: "TABLE_NOT_FOUND".into(),
+                    message: String::new(),
+                },
+                FailureKind::NotFound,
+            ),
+            (
+                TrE::QueryFailed {
+                    state: String::new(),
+                    error_code: 1,
+                    error_name: "REMOTE_HOST_GONE".into(),
+                    message: String::new(),
+                },
+                FailureKind::Transient,
+            ),
+            (
+                TrE::QueryFailed {
+                    state: String::new(),
+                    error_code: 1,
+                    error_name: "SYNTAX_ERROR".into(),
+                    message: String::new(),
+                },
+                FailureKind::QueryRejected,
+            ),
+            (
+                TrE::Timeout {
+                    timeout_secs: 30,
+                    last_state: "RUNNING".into(),
+                },
+                FailureKind::Transient,
+            ),
+            (
+                TrE::MalformedResponse("missing rows".into()),
+                FailureKind::Unknown,
+            ),
+            (
+                TrE::UntrustedNextUri {
+                    coordinator: "a".into(),
+                    next: "b".into(),
+                },
+                FailureKind::Unknown,
+            ),
+            (TrE::ArrowEncodingUnavailable, FailureKind::Unknown),
+            (TrE::ArrowDecode("bad IPC".into()), FailureKind::Unknown),
+        ];
+        for (error, kind) in cases {
+            assert_core_wrapped(error, kind);
+        }
+        let http = reqwest::Client::new()
+            .get("://invalid")
+            .build()
+            .unwrap_err();
+        assert_core_wrapped(TrE::Http(http), FailureKind::ConnectionFailed);
+    }
+
+    #[test]
+    fn bigquery_variants_classify_through_core_wrapper() {
+        let api = |status: &str| BqE::ApiError {
+            status: status.into(),
+            message: String::new(),
+        };
+        let cases = [
+            (
+                BqE::Auth(rocky_bigquery::auth::AuthError::NoAuth),
+                FailureKind::AuthFailed,
+            ),
+            (api("401 Unauthorized"), FailureKind::AuthFailed),
+            (api("403 Forbidden"), FailureKind::AuthFailed),
+            (api("404 Not Found"), FailureKind::NotFound),
+            (api("429 Too Many Requests"), FailureKind::QuotaExceeded),
+            (api("503 Service Unavailable"), FailureKind::Transient),
+            (api("400 Bad Request"), FailureKind::QueryRejected),
+            (api("missing jobReference"), FailureKind::Unknown),
+            (
+                BqE::JobError {
+                    reason: "invalidQuery".into(),
+                    message: String::new(),
+                },
+                FailureKind::QueryRejected,
+            ),
+            (
+                BqE::LoadJobError {
+                    reason: "invalid".into(),
+                    message: String::new(),
+                },
+                FailureKind::QueryRejected,
+            ),
+            (BqE::Timeout { timeout_secs: 30 }, FailureKind::Transient),
+            (
+                BqE::RetryBudgetExhausted { limit: 3 },
+                FailureKind::QuotaExceeded,
+            ),
+            (
+                BqE::StorageRead(rocky_bigquery::storage_read::StorageReadError::NoStreams),
+                FailureKind::Unknown,
+            ),
+        ];
+        for (error, kind) in cases {
+            assert_core_wrapped(error, kind);
+        }
+        let http = reqwest::Client::new()
+            .get("://invalid")
+            .build()
+            .unwrap_err();
+        assert_core_wrapped(BqE::Http(http), FailureKind::ConnectionFailed);
+    }
+
+    #[test]
+    fn framing_walks_core_wrapper_for_both_warehouses() {
+        for (connector, status) in [(db_api(401), 401), (db_api(403), 403)] {
+            let err = anyhow::Error::new(rocky_core::traits::AdapterError::new(connector))
+                .context("running materialization");
+            let framed = frame_warehouse_anyhow_error(&err, "cat.sch.tbl").unwrap();
+            assert!(framed.contains(&format!("HTTP {status}")));
+        }
+        for (connector, status) in [(sn_api(401), 401), (sn_api(403), 403)] {
+            let err = anyhow::Error::new(rocky_core::traits::AdapterError::new(connector))
+                .context("running materialization");
+            let framed = frame_warehouse_anyhow_error(&err, "cat.sch.tbl").unwrap();
+            assert!(framed.contains(&format!("HTTP {status}")));
+        }
+    }
 
     fn db_api(status: u16) -> DbE {
         DbE::ApiError {
@@ -11751,7 +12091,10 @@ mod failure_kind_tests {
     // ---- classify_anyhow_error_with_cooldown chain walk ------------------
 
     /// A typed breaker error inside a `rocky_core` `AdapterError`, as a
-    /// warehouse adapter returns it, keeps its kind and cooldown.
+    /// warehouse adapter returns it, keeps its kind and cooldown — both
+    /// through the bare-`AdapterError` entry point and (#2064) through the
+    /// `anyhow::Error` chain walk a warehouse failure actually crosses on
+    /// its way to `TableErrorOutput`.
     #[test]
     fn classify_adapter_error_with_cooldown_sees_the_connector_error_inside() {
         let err = rocky_core::traits::AdapterError::new(DbE::CircuitBreakerOpen {
@@ -11762,7 +12105,9 @@ mod failure_kind_tests {
             classify_adapter_error_with_cooldown(&err),
             (FailureKind::QuotaExceeded, Some(180)),
         );
-        // Control: the anyhow walk does not see it, which is why this exists.
+        // The anyhow walk sees the SAME wrapper the bare check above does —
+        // `classify_wrapped_adapter_cause` downcasts to `rocky_core`'s
+        // `AdapterError` too, not only the SDK's.
         assert_eq!(
             classify_anyhow_error_with_cooldown(&anyhow::Error::new(
                 rocky_core::traits::AdapterError::new(DbE::CircuitBreakerOpen {
@@ -11770,7 +12115,7 @@ mod failure_kind_tests {
                     cooldown_seconds: Some(180),
                 })
             )),
-            (FailureKind::Unknown, None),
+            (FailureKind::QuotaExceeded, Some(180)),
         );
         assert_eq!(
             classify_adapter_error_with_cooldown(&rocky_core::traits::AdapterError::msg("boom")),
@@ -11835,15 +12180,16 @@ mod failure_kind_tests {
 
     #[test]
     fn classify_anyhow_with_cooldown_unwraps_adapter_error_wrapping_breaker() {
-        // Mirrors the production path: ConnectorError is wrapped in
-        // AdapterError (boxed) before crossing into anyhow — the
-        // cooldown walker must descend through the wrapper just like
-        // its FailureKind-only counterpart.
+        // Mirrors the production path (#2064): a `WarehouseAdapter` method
+        // wraps its `ConnectorError` in `rocky_core::traits::AdapterError`
+        // (not the SDK's) before it crosses into anyhow — the cooldown
+        // walker must descend through THIS wrapper just like its
+        // FailureKind-only counterpart.
         let conn_err = DbE::CircuitBreakerOpen {
             consecutive_failures: 5,
             cooldown_seconds: Some(300),
         };
-        let adapter_err = rocky_adapter_sdk::AdapterError::new(conn_err);
+        let adapter_err = rocky_core::traits::AdapterError::new(conn_err);
         let err = anyhow::Error::new(adapter_err);
         assert_eq!(
             classify_anyhow_error_with_cooldown(&err),
@@ -11853,17 +12199,23 @@ mod failure_kind_tests {
 
     #[test]
     fn classify_anyhow_unwraps_adapter_error_wrapping_databricks_connector() {
-        // Mirrors the production path: ConnectorError is wrapped in
-        // AdapterError (boxed) before crossing into anyhow.
+        // Mirrors the production path (#2064): `execute_statement` et al.
+        // wrap their `ConnectorError` in `rocky_core::traits::AdapterError`,
+        // the type `WarehouseAdapter` methods actually return.
         let conn_err = DbE::ApiError {
             status: 429,
             body: String::new(),
         };
-        let adapter_err = rocky_adapter_sdk::AdapterError::new(conn_err);
+        let adapter_err = rocky_core::traits::AdapterError::new(conn_err);
         let err = anyhow::Error::new(adapter_err).context("execute_statement failed");
         assert_eq!(classify_anyhow_error(&err), FailureKind::QuotaExceeded);
     }
 
+    /// The OTHER wrapper: `rocky_adapter_sdk::AdapterError` is not the
+    /// `WarehouseAdapter` return type, but it is still a real production
+    /// path (Databricks volume / Snowflake stage file staging — see
+    /// `rocky-databricks/src/volume.rs`, `rocky-snowflake/src/stage.rs`), so
+    /// the classifier must keep unwrapping it too.
     #[test]
     fn classify_anyhow_unwraps_adapter_error_wrapping_snowflake_connector() {
         let conn_err = SnE::Timeout {

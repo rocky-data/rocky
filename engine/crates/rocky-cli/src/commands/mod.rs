@@ -49,6 +49,8 @@ mod load;
 mod lsp;
 mod metrics;
 mod optimize;
+#[cfg(test)]
+mod pipes_guard_tests;
 pub mod plan;
 mod playground;
 mod policy;
@@ -110,9 +112,9 @@ pub use backfill::run_backfill;
 #[cfg(feature = "duckdb")]
 pub use bench::run_bench;
 pub use branch::{
-    compute_branch_list, compute_branch_show, run_branch_approve, run_branch_compare,
-    run_branch_create, run_branch_delete, run_branch_list, run_branch_promote,
-    run_branch_promote_from_plan, run_branch_show,
+    compute_branch_list, compute_branch_show, resolve_branch_shadow_config, run_branch_approve,
+    run_branch_compare, run_branch_create, run_branch_delete, run_branch_list, run_branch_promote,
+    run_branch_promote_from_plan, run_branch_show, validate_branch_name,
 };
 pub use brief::{BriefSince, compute_brief, run_brief};
 pub use catalog::{
@@ -198,7 +200,7 @@ pub use schedule_status::{ScheduleStatusError, schedule_status_output};
 pub use rocky_sql::transpile::Dialect;
 pub use run::{
     CheckGateFailure, DeferOptions, Interrupted, PartialFailure, PartitionRunOptions,
-    SkipRunOptions, run,
+    SkipRunOptions, require_shadow_support_for_config, run,
 };
 pub use run_dag_exec::run_with_dag;
 pub use run_watch::run_watch as run_with_watch;
@@ -207,6 +209,7 @@ pub use serve::{resolve_serve_config_path, run_serve};
 pub use shell::run_shell;
 pub use snapshot::run_snapshot;
 pub use state::{state_clear_schema_cache, state_retention_sweep, state_schedule_hold, state_show};
+pub use test::declarative_test_output;
 #[cfg(feature = "duckdb")]
 pub use test::run_declarative_tests;
 #[cfg(feature = "duckdb")]

@@ -167,7 +167,15 @@ pub fn file_typecheck(db: &dyn salsa::Database, src: SourceFile) -> Arc<FileType
                 })
             }
             Err(err) => {
-                CompileDiagnostic(format!("lower error: {err}")).accumulate(db);
+                let detail = if err == rocky_lang::lower::BACKSLASH_LITERAL_ERROR {
+                    match rocky_lang::lower::backslash_literal_position(src.text(db)) {
+                        Some((line, column)) => format!("{err} at line {line}, column {column}"),
+                        None => err,
+                    }
+                } else {
+                    err
+                };
+                CompileDiagnostic(format!("lower error: {detail}")).accumulate(db);
                 Arc::new(FileTypecheck {
                     sql: String::new(),
                     output_columns: Vec::new(),
@@ -286,6 +294,58 @@ pub(crate) mod tests {
         source_signature,
     };
     use rocky_lang::incremental::SourceFile;
+
+    #[test]
+    fn backslash_literal_reports_file_line_column_and_sql_escape_hatch() {
+        let _guard = TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let tmp = TempDir::new().expect("tempdir");
+        let path = write_model(
+            &tmp,
+            "backslash.rocky",
+            "from orders\nwhere status == \"C:\\tmp\"\n",
+        );
+
+        let err = crate::project::Project::load(tmp.path(), None)
+            .expect_err("a backslash literal must fail compilation");
+        let message = err.to_string();
+        assert!(
+            message.contains(path.to_str().expect("utf-8 path")),
+            "{message}"
+        );
+        assert!(message.contains("E040"), "{message}");
+        assert!(message.contains("line 2, column 17"), "{message}");
+        assert!(
+            message.contains(".sql model with the target's own escaping"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn ordinary_string_literal_still_lowers_through_compile() {
+        let _guard = TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let tmp = TempDir::new().expect("tempdir");
+        let path = write_model(
+            &tmp,
+            "ordinary.rocky",
+            "from orders\nwhere status == \"it's fine\"\n",
+        );
+        let mut db = RockyDatabase::default();
+        let src = read_source(&mut db, path).expect("read");
+        let result = file_typecheck(&db, src);
+        assert!(
+            result.sql.contains("WHERE status = 'it''s fine'"),
+            "{}",
+            result.sql
+        );
+        assert!(
+            file_typecheck::accumulated::<CompileDiagnostic>(&db, src).is_empty(),
+            "ordinary literal must not emit a diagnostic"
+        );
+    }
 
     fn write_model(dir: &TempDir, name: &str, body: &str) -> PathBuf {
         let path = dir.path().join(name);

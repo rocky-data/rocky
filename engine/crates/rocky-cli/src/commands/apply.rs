@@ -131,6 +131,9 @@ pub(crate) async fn run_apply_core_in(
     expect_spec_digest: Option<&str>,
     output_json: bool,
 ) -> Result<ApplyOutcome> {
+    // A run plan can sync or write policy state before it delegates to run().
+    // The binary checks this too; keep the direct apply API fail-fast.
+    crate::pipes::PipesEmitter::validate_requested()?;
     let plan =
         read_plan(root, plan_id).with_context(|| format!("failed to read plan '{plan_id}'"))?;
 
@@ -477,6 +480,7 @@ async fn run_apply_run_plan(
             )
         })?,
     );
+    preflight_run_plan_shadow_support(&loaded.config, &run_plan)?;
     let (models_dir, models_glob) = run_model_selection(&loaded.config, config_path, &run_plan)?;
     // Gate on the models this apply will ACTUALLY execute (fresh compile +
     // `--model` selection), not the plan's informational `models` list.
@@ -571,6 +575,33 @@ async fn run_apply_run_plan(
     )
     .await?;
     Ok(apply_outcome_for(termination, &apply_run_id))
+}
+
+/// Refuse a persisted shadow request against the current pipeline before
+/// policy synchronization or decision rows touch the state store. Branch
+/// lookup needs the store too, so this uses only the branch name here.
+fn preflight_run_plan_shadow_support(
+    config: &rocky_core::config::RockyConfig,
+    run_plan: &RunPlan,
+) -> Result<()> {
+    if run_plan.branch.is_none() && !run_plan.shadow {
+        return Ok(());
+    }
+    let shadow = rocky_core::shadow::ShadowConfig {
+        suffix: run_plan
+            .shadow_suffix
+            .clone()
+            .unwrap_or_else(|| "_rocky_shadow".to_string()),
+        schema_override: run_plan.shadow_schema.clone(),
+        cleanup_after: run_plan.branch.is_none(),
+        branch: run_plan.branch.clone(),
+    };
+    crate::commands::run::require_shadow_support_for_config(
+        config,
+        run_plan.pipeline.as_deref(),
+        run_plan.model.as_deref(),
+        &shadow,
+    )
 }
 
 /// Reject contradictory persisted run flags before an apply reads config or
@@ -839,16 +870,11 @@ async fn execute_run_plan(
         .clone()
         .unwrap_or_else(|| "_rocky_shadow".to_string());
     let shadow_config = if let Some(ref name) = run_plan.branch {
-        let store = rocky_core::state::StateStore::open_read_only(state_path)
-            .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
-        let record = store.get_branch(name)?.with_context(|| {
-            format!("branch '{name}' not found — create it with `rocky branch create {name}`")
-        })?;
-        Some(rocky_core::shadow::ShadowConfig {
-            suffix: shadow_suffix,
-            schema_override: Some(record.schema_prefix),
-            cleanup_after: false,
-        })
+        Some(crate::commands::branch::resolve_branch_shadow_config(
+            state_path,
+            name,
+            shadow_suffix,
+        )?)
     } else if run_plan.shadow {
         Some(rocky_core::shadow::ShadowConfig {
             suffix: shadow_suffix,
@@ -858,6 +884,7 @@ async fn execute_run_plan(
             // that is what makes the ownership refusal sound. The branch
             // arm above stays persistent on purpose.
             cleanup_after: true,
+            branch: None,
         })
     } else {
         None
@@ -3029,6 +3056,7 @@ pub(crate) fn gate_promote_plan(
     promote_plan: &PromotePlan,
     state_path: &Path,
 ) -> Result<std::sync::Arc<rocky_core::config::LoadedConfig>> {
+    crate::commands::branch::validate_persisted_promote_branch_name(&promote_plan.branch_name)?;
     // THE single fingerprinted config snapshot for the promote (#1120): the
     // pre-gate sync decision, the policy gate, AND — via the returned `Arc` —
     // the promote executor's adapter resolution all read THIS instance, so a
@@ -3783,6 +3811,7 @@ async fn run_apply_ai_authored_plan(
             )
         })?,
     );
+    preflight_run_plan_shadow_support(&loaded.config, &run_plan)?;
     let (models_dir, models_glob) = run_model_selection(&loaded.config, config_path, &run_plan)?;
     // Gate on the models this apply will ACTUALLY execute (fresh compile +
     // `--model` selection), not the plan's informational `models` list.
@@ -4295,22 +4324,16 @@ fn replication_shadow_config(
         .unwrap_or_else(|| "_rocky_shadow".to_string());
 
     if let Some(ref name) = replication_plan.branch {
-        let store = rocky_core::state::StateStore::open_read_only(state_path)
-            .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
-        let record = store.get_branch(name)?.with_context(|| {
-            format!("branch '{name}' not found — create it with `rocky branch create {name}`")
-        })?;
-        return Ok(Some(rocky_core::shadow::ShadowConfig {
-            suffix,
-            schema_override: Some(record.schema_prefix),
-            cleanup_after: false,
-        }));
+        return Ok(Some(crate::commands::branch::resolve_branch_shadow_config(
+            state_path, name, suffix,
+        )?));
     }
     Ok(if replication_plan.shadow {
         Some(rocky_core::shadow::ShadowConfig {
             suffix,
             schema_override: replication_plan.shadow_schema.clone(),
             cleanup_after: false,
+            branch: None,
         })
     } else {
         None
@@ -4910,11 +4933,19 @@ async fn run_apply_promote_plan(
         breaking_changes: None,
     });
 
-    // `rocky apply <promote-plan>` has no `--pipeline` selector, so the executor
-    // resolves the default pipeline's adapter (`None`) — a multi-pipeline config
-    // still requires the branch-promote entrypoints to disambiguate.
-    let (targets_out, overall_success) =
-        crate::commands::branch::run_promote_apply(&loaded, &promote_plan.targets, None).await?;
+    // `rocky apply <promote-plan>` has no `--pipeline` selector, but the plan
+    // carries the RESOLVED pipeline it was built against (#2019) — nothing
+    // about applying a recorded plan is ambiguous, so we thread that through
+    // instead of re-resolving from the config. A plan written before this
+    // field existed carries `None` and falls back to the old resolver
+    // behavior for that specific legacy plan (unchanged: still errors on a
+    // multi-pipeline config, as before).
+    let (targets_out, overall_success) = crate::commands::branch::run_promote_apply(
+        &loaded,
+        &promote_plan.targets,
+        promote_plan.pipeline.as_deref(),
+    )
+    .await?;
 
     audit.push(AuditEvent {
         kind: if overall_success {
@@ -4997,6 +5028,7 @@ pub async fn run_apply_inline_for_run(
     skip_opts: &crate::commands::run::SkipRunOptions,
     run_vars: &rocky_core::run_vars::RunVars,
     assume_fresh_state: bool,
+    contracts_dir: Option<&Path>,
 ) -> Result<()> {
     // THE single fingerprinted config load for a bare `rocky run` (#1120):
     // this entry point loaded nothing before this change (run() re-read the
@@ -5007,7 +5039,7 @@ pub async fn run_apply_inline_for_run(
             .with_context(|| format!("failed to load config from {}", config_path.display()))?,
     );
     // Thin passthrough — routes to the existing run implementation.
-    crate::commands::run::run(
+    crate::commands::run::run_with_explicit_contracts(
         config_path,
         loaded,
         filter,
@@ -5037,6 +5069,7 @@ pub async fn run_apply_inline_for_run(
         // validated it against the configured `[state]` backend).
         assume_fresh_state,
         None, // #1460: inline `rocky run`, not a persisted plan
+        contracts_dir,
     )
     .await
     .map(|_| ())
@@ -5992,6 +6025,95 @@ mod tests {
             product_id: None,
             spec_digest: None,
         }
+    }
+
+    #[tokio::test]
+    async fn transformation_shadow_and_branch_plans_pass_apply_preflight() -> anyhow::Result<()> {
+        for branch in [None, Some("fix_price")] {
+            let dir = tempfile::tempdir()?;
+            let config_path = dir.path().join("rocky.toml");
+            std::fs::write(
+                &config_path,
+                "[adapter]\ntype = \"duckdb\"\npath = \"fixture.duckdb\"\n\n\
+                 [pipeline.marts]\ntype = \"transformation\"\nmodels = \"models\"\n\n\
+                 [pipeline.marts.target.governance]\nauto_create_schemas = true\n",
+            )?;
+            let models = dir.path().join("models");
+            std::fs::create_dir(&models)?;
+            std::fs::write(models.join("summary.sql"), "SELECT 1 AS id\n")?;
+            std::fs::write(
+                models.join("summary.toml"),
+                "[strategy]\ntype = \"full_refresh\"\n\n\
+                 [target]\ncatalog = \"fixture\"\nschema = \"main\"\ntable = \"summary\"\n",
+            )?;
+            let state_path = dir.path().join("state.redb");
+            if let Some(name) = branch {
+                crate::commands::branch::run_branch_create(&state_path, name, None, false)?;
+            }
+            let mut plan = minimal_run_plan();
+            plan.pipeline = Some("marts".to_string());
+            plan.models_dir = Some(models.to_string_lossy().into_owned());
+            plan.models = vec!["summary".to_string()];
+            plan.execution_layers = vec![vec!["summary".to_string()]];
+            plan.branch = branch.map(str::to_string);
+            plan.shadow = branch.is_none();
+            let plan_id = write_plan(dir.path(), PlanKind::Run, &plan)?;
+
+            super::run_apply_core_in(
+                dir.path(),
+                &config_path,
+                &plan_id,
+                &state_path,
+                PolicyPrincipal::Human,
+                None,
+                true,
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ai_authored_shadow_plan_checks_current_pipeline_before_review() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let config_path = dir.path().join("rocky.toml");
+        std::fs::write(
+            &config_path,
+            "[adapter]\ntype = \"duckdb\"\npath = \"fixture.duckdb\"\n\n\
+             [pipeline.dq]\ntype = \"quality\"\n\n\
+             [pipeline.dq.target]\nadapter = \"default\"\n\n\
+             [[pipeline.dq.tables]]\ncatalog = \"fixture\"\nschema = \"main\"\n\
+             table = \"orders\"\n\n[pipeline.dq.checks]\nenabled = true\n\n\
+             [policy]\nversion = 1\ndefault_agent_effect = \"deny\"\n",
+        )?;
+        let models_dir = dir.path().join("models");
+        write_min_model(&models_dir, "orders");
+        let mut plan = minimal_run_plan();
+        plan.pipeline = Some("dq".to_string());
+        plan.shadow = true;
+        plan.models_dir = Some(models_dir.to_string_lossy().into_owned());
+        let plan_id = write_plan(dir.path(), PlanKind::AiAuthored, &plan)?;
+        let state_path = dir.path().join("state.redb");
+
+        let error = super::run_apply_core_in(
+            dir.path(),
+            &config_path,
+            &plan_id,
+            &state_path,
+            PolicyPrincipal::Agent,
+            None,
+            true,
+        )
+        .await
+        .expect_err("current quality pipeline must refuse a stale shadow plan");
+        assert!(
+            error
+                .to_string()
+                .contains("--shadow is not supported for quality pipeline 'dq'"),
+            "the shadow guard must precede review and policy: {error:#}"
+        );
+        assert!(!state_path.exists(), "no state store was opened");
+        Ok(())
     }
 
     #[test]
@@ -7030,6 +7152,7 @@ effect = "deny"
         // once per entrypoint is a no-op.
         let make_plan = |table: &str| crate::output::PromotePlan {
             branch_name: "fix".to_string(),
+            pipeline: None,
             base_ref: "main".to_string(),
             head_ref: "deadbeef".to_string(),
             branch_state_hash: "hash".to_string(),
@@ -7755,6 +7878,7 @@ effect = "allow"
     fn promote_without_findings_gates_its_targets() {
         let promote = crate::output::PromotePlan {
             branch_name: "fix".to_string(),
+            pipeline: None,
             base_ref: "main".to_string(),
             head_ref: "abc".to_string(),
             branch_state_hash: "h".to_string(),
@@ -7789,6 +7913,7 @@ effect = "allow"
         use rocky_core::breaking_change::{BreakingChange, BreakingFinding, BreakingSeverity};
         let promote = crate::output::PromotePlan {
             branch_name: "fix".to_string(),
+            pipeline: None,
             base_ref: "main".to_string(),
             head_ref: "abc".to_string(),
             branch_state_hash: "h".to_string(),
@@ -7824,6 +7949,7 @@ effect = "allow"
     fn promote_with_no_targets_and_no_findings_is_empty() {
         let promote = crate::output::PromotePlan {
             branch_name: "fix".to_string(),
+            pipeline: None,
             base_ref: "main".to_string(),
             head_ref: "abc".to_string(),
             branch_state_hash: "h".to_string(),
@@ -7857,6 +7983,7 @@ effect = "allow"
 
         let promote = crate::output::PromotePlan {
             branch_name: "fix".to_string(),
+            pipeline: None,
             base_ref: "main".to_string(),
             head_ref: "abc".to_string(),
             branch_state_hash: "h".to_string(),
@@ -7909,6 +8036,7 @@ effect = "allow"
 
         let promote = crate::output::PromotePlan {
             branch_name: "fix".to_string(),
+            pipeline: None,
             base_ref: "main".to_string(),
             head_ref: "abc".to_string(),
             branch_state_hash: "h".to_string(),
@@ -7960,6 +8088,7 @@ effect = "allow"
 
         let promote = crate::output::PromotePlan {
             branch_name: "fix".to_string(),
+            pipeline: None,
             base_ref: "main".to_string(),
             head_ref: "abc".to_string(),
             branch_state_hash: "h".to_string(),
@@ -10601,6 +10730,8 @@ schema_template = "s__{source}"
             submission_id: None,
             check_gate_failed: false,
             verify_after_failed: false,
+            rocky_branch: None,
+            run_scope: Some(rocky_core::state::RunScope::Production),
         };
         store.record_run(&record).unwrap();
     }

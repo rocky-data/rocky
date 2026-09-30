@@ -8,6 +8,31 @@
 //! attacker-recomputable), and enforcement evaluates the apply-time runtime
 //! principal, not the stored field. See [`PersistedPlan::principal`].
 //!
+//! ## Trust boundary (#1943)
+//!
+//! `.rocky/plans/` is a trusted input. Ruled 2026-09-17: anyone who can write
+//! that directory can already write the project's models and its config,
+//! which decide more than a plan does, so the plans directory gets no
+//! narrower a trust boundary than the rest of the project.
+//!
+//! The `plan_id` digest and the [`PlanKind::AiAuthored`] review marker follow
+//! from that ruling rather than substituting for it. Both are recomputable by
+//! anyone who can already write the file, and neither is signed — see
+//! [`read_plan`] and the caveat on [`PlanKind`]. What they catch is a plan
+//! that no longer matches what was written: accidental corruption, a
+//! truncated write, or a stale plan from a build that predates a guard. They
+//! are not tamper checks against a hostile edit — `.rocky/plans/` is trusted
+//! because the party writing it can already write the models and config that
+//! decide more, not because a hostile write there has no consequence. The
+//! consequence path for a hostile write is the same as for any other trusted
+//! input: for `Promote`, the policy gate still runs at apply, against the
+//! principal applying it.
+//!
+//! That is also why a `Promote` plan's `statement` is not re-derived from the
+//! `target` / `source` names recorded beside it. Rebuilding and comparing SQL
+//! only earns its cost if the plan file itself might be adversarial, and by
+//! this ruling it is not.
+//!
 //! ## Determinism guarantee
 //!
 //! The blake3 digest is computed over `serde_json::to_vec` applied to the
@@ -108,7 +133,10 @@ use serde::{Deserialize, Serialize};
 /// well-formed marker names this plan. It does not establish that a person
 /// approved: the marker is unsigned, its `approver` field is a best-effort git
 /// identity the gate never reads, and anything that can write the plans
-/// directory can produce one. Treat it as a floor against an unreviewed
+/// directory can produce one. That is a ruled boundary, not an open gap
+/// (#1943): `.rocky/plans/` is a trusted input, so a marker that anyone who
+/// can already write the directory could produce is exactly the guarantee on
+/// offer. Treat it as a floor against an unreviewed
 /// machine-authored apply, not as proof of human intent.
 ///
 /// | Kind | Load-bearing plan-time invariant | Re-established at apply? |

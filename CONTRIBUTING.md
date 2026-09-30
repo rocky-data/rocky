@@ -11,6 +11,16 @@ Rocky is a monorepo. Every subproject shares one repository, one issue tracker, 
 | Documentation site | `docs/` | Astro | `npm` |
 | POC catalog | `examples/playground/` | TOML / SQL config | none |
 
+## Share a first attempt
+
+You can contribute without writing code.
+Use the [first-run feedback form](https://github.com/rocky-data/rocky/issues/new?template=first_run_feedback.yml) to describe a completed workflow or where you stopped.
+Include your goal, Rocky version, installation method, and the step that helped or blocked you.
+A feature proposal is optional. A small example with synthetic data is enough.
+
+The form creates a public issue only when you submit it. Remove credentials, private data, and internal addresses before posting.
+Use [private security reporting](https://github.com/rocky-data/rocky/security/advisories/new) for vulnerabilities.
+
 ## Getting started
 
 Clone once, then work anywhere in the tree.
@@ -202,6 +212,8 @@ Prefer the tag-driven flow for a normal release. The `rocky-release` skill, mirr
 - Conventional commits required: `feat:`, `fix:`, `refactor:`, `test:`, `docs:`, `chore:`. Scope by subproject or crate where it helps: `feat(engine/rocky-databricks): add OAuth M2M auth`, `fix(dagster): handle partial-success exit codes`, `docs(vscode): update README screenshots`.
 - **Never** include `Co-Authored-By` trailers in commit messages.
 
+If this is your first pull request from a fork, GitHub holds its CI workflow runs until a maintainer approves them. Required checks may be missing while the runs wait. You do not need to approve anything. A maintainer will approve the held runs. If you push another commit, the new runs need approval too.
+
 ### What CI runs
 
 CI is path-filtered. The paths your PR touches decide which workflows run. Every required check must pass before merge.
@@ -225,6 +237,17 @@ The table covers the common cases, not every path. Each workflow in `.github/wor
 Expect more than one workflow on most PRs. Any `engine/**` change triggers at least `engine-ci.yml` and `codegen-drift.yml`, and a narrower engine path can add more. `schemas/**` triggers `engine-ci.yml`, `sdk-ci.yml`, `dagster-ci.yml`, and `vscode-ci.yml`, plus `codegen-drift.yml`. `sdk/python/**` also triggers `dagster-ci.yml`, because the Dagster integration depends on the SDK. The credential-containment policy checks run on every PR, whatever it touches.
 
 Benchmarks run only on a PR labelled `perf` (`engine-bench.yml`). Coverage, the dependency audit, and a POC smoke run happen weekly (`engine-weekly.yml`).
+
+### Maintainer: approve CI for a first-time fork contributor
+
+Check a first-time fork contributor's pull request for held workflow runs. Match each run to the pull request and current head commit before approving it. Run these commands for each held run:
+
+```bash
+gh api 'repos/rocky-data/rocky/actions/runs?status=action_required'
+gh api --method POST repos/rocky-data/rocky/actions/runs/<id>/approve
+```
+
+Approve new held runs after each push. A fork does not add a separate approving-review requirement. The ruleset's extra approval for unattributed Copilot pull requests is a different rule.
 
 ### Merge strategy
 

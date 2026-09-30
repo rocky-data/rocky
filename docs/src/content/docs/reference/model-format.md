@@ -53,9 +53,12 @@ The `.toml` file names the model, lists what it depends on, picks a materializat
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `name` | string | Yes | Model identifier. Must be unique across all models. |
+| `drop_existing_kind` | `"table"` or `"view"` | No | Standing permission to drop a target of this existing kind when switching between `full_refresh` and `view`. DuckDB only today. |
 | `depends_on` | list of strings | No | Names of upstream models that must run before this one. Defaults to `[]`. |
 | `group` | string | No | Name of a [config group](#config-groups) (`models/groups/<name>.toml`) this model opts into for shared routing and materialization. |
 | `retention` | string | No | Data retention policy for this model. Grammar `^\d+[dy]$` — e.g. `"90d"` or `"1y"`. See [Retention](#retention). |
+
+`drop_existing_kind` applies only when a `full_refresh` model finds a view, or a `view` model finds a table. Rocky checks the existing kind before using the permission. On DuckDB, the DROP and CREATE run in one transaction. Rocky refuses a `full_refresh` or `view` model carrying this key on every other adapter. The key is a standing permission on the model, not a one-time approval. Rocky keeps no ownership record for the old object; confirm the target belongs to this model before setting the key.
 
 **`[args]`** -- Placeholder values for a config group's `schema_template` (only meaningful when the model declares a `group`):
 
@@ -618,9 +621,13 @@ A transformation model cannot use `type = "incremental"`. Rocky has no watermark
 
 > model 'fct_orders' uses `type = "incremental"`, which is not supported on transformation models: it emits an unfiltered INSERT and appends every row again on each run
 
-`rocky test`, `rocky ci` and `rocky emit-sql` fail on the same error. The SQL generator refuses the model too, so `rocky plan --model` and `rocky estimate` cannot produce SQL for it.
+`rocky test`, `rocky ci` and `rocky emit-sql` fail on the same error. `rocky plan` also refuses to write a plan when this model is in scope. The SQL generator refuses the model too, so `rocky estimate` cannot produce SQL for it.
 
-`rocky run` records the model as a failed table and leaves its existing table alone. If an earlier run built that table, it keeps the rows those runs appended again. By default, a model downstream still builds from it. With no earlier table, that downstream model fails instead. Under `rocky run --dag`, Rocky skips the downstream model instead of building it. Set `contain_failures = true` under `[resilience]` to hold back everything downstream of the failed model instead. That also holds back any model whose reads Rocky cannot prove are unrelated. Rebuild the table before you trust it, for example with one `full_refresh` run.
+`rocky run` records the model as a failed table and leaves its existing table alone. If an earlier run built that table, it keeps the rows those runs appended again. By default, Rocky also withholds every model that depends on the failed one, directly or through another model. That includes an explicit `depends_on` entry and a bare, unqualified SQL read of the failed model's name. None of them build from that stale or missing table.
+
+This boundary follows the model graph: `depends_on` plus a bare-name read of another model. Under plain `rocky run`, a read of the same table by its qualified physical name (`schema.table` or `catalog.schema.table`) still escapes it. Add `depends_on` when that relationship must be withheld too. `rocky run --dag` also matches a read's last name segment against every model, so it withholds a qualified read of a failed model.
+
+Set `contain_failures = true` under `[resilience]` to widen the hold to any model whose reads Rocky cannot prove are unrelated. It also contains a runtime failure the same way, reporting `PartialFailure` instead of stopping the run. See [`[resilience]`](/reference/configuration/#resilience). Rebuild the table before you trust it, for example with one `full_refresh` run.
 
 Pick the strategy that matches what you need. These are the four the error names:
 

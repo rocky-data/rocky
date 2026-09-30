@@ -5035,6 +5035,7 @@ FROM {{ ref('stg_events') }}
             .imported
             .iter()
             .map(|im| Model {
+                drop_existing_kind: None,
                 config: im.config.clone(),
                 sql: im.sql.clone(),
                 file_path: format!("models/{}.sql", im.name).into(),

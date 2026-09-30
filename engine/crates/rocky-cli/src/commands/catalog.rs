@@ -404,7 +404,7 @@ const STATE_RUN_LIMIT: usize = 50;
 /// before the first `rocky run` has ever populated state, and a hard
 /// error there would be hostile.
 fn enrich_with_state_store(state_path: &Path, assets: &mut [CatalogAsset]) -> Option<String> {
-    let store = StateStore::open_read_only(state_path).ok()?;
+    let store = StateStore::open_read_only_or_empty(state_path).ok()?;
     let runs = store.list_runs(STATE_RUN_LIMIT).ok()?;
 
     // Project-level: first successful run, newest-first.
@@ -1232,6 +1232,8 @@ mod tests {
                 submission_id: None,
                 check_gate_failed: false,
                 verify_after_failed: false,
+                rocky_branch: None,
+                run_scope: Some(rocky_core::state::RunScope::Production),
             }
         }
 

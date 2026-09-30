@@ -1007,6 +1007,7 @@ mod tests {
 
     fn make_model(name: &str, adapter_override: Option<&str>) -> crate::models::Model {
         crate::models::Model {
+            drop_existing_kind: None,
             config: crate::models::ModelConfig {
                 name: name.to_owned(),
                 depends_on: vec![],

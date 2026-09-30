@@ -9,30 +9,30 @@ sidebar:
 
 It answers a reviewer's question before merge: *what does this PR change in the warehouse, and what does it cost?* It does that on a small fraction of a full run's bytes. It produces three artifacts you can attach to the PR: a comparison of the `rows_affected` the two runs recorded, a row-content diff when you ask for `--algorithm bisection`, and a cost delta against base. The column-level delta is an open follow-up, so the structural arrays come back empty.
 
-The sampling described below is the design, not what 1.74.0 runs. The default path samples no rows: it reports `limit: 0` and `coverage: "not_yet_sampled"`, and `--sample-size` has no effect. See [#2032](https://github.com/rocky-data/rocky/issues/2032).
+The sampling described below is the design, not what the default path runs. The default path samples no rows. It compares the `rows_affected` the two runs recorded, and it reports `limit: 0` and `coverage: "not_yet_sampled"`. `rocky preview diff` has no `--sample-size` flag, because nothing read it.
 
 ## The prune-and-copy substrate
 
-`rocky preview create` chains four existing Rocky primitives into one workflow.
+The workflow has four steps. `rocky preview create` performs the first three, and you run the fourth.
 
 ```
   ┌──────────────┐  git diff --name-only  ┌──────────────────┐
   │ --base ref   │───────────────────────►│ changed model    │
   │ (e.g. main)  │        vs HEAD         │ files            │
   └──────────────┘                        └────────┬─────────┘
-                                                   │ load into the
-                                                   │ compiler: a
-                                                   ▼ column-level DAG
+                                                   │ scan model sidecars
+                                                   │ for depends_on
+                                                   ▼ model-level DAG
   ┌────────────────────────────────────────────────────────────┐
   │  every model in the working DAG lands in one of two sets   │
   ├──────────────────────────────┬─────────────────────────────┤
   │ PRUNE SET                    │ COPY SET                    │
   │ the changed models, plus     │ everything else. Logically  │
   │ every model downstream of a  │ identical to its --base     │
-  │ changed COLUMN               │ counterpart                 │
+  │ changed model via depends_on │ counterpart                 │
   └──────────────┬───────────────┴──────────────┬──────────────┘
-                 │ rocky plan --branch <name>   │ clone_table_for_
-                 │ + rocky apply <plan-id>      │ branch, per adapter
+                 │ you run: rocky run           │ preview create runs
+                 │ --branch <name>              │ clone_table_for_branch
                  ▼                              ▼
         ┌───────────────────────────────────────────────┐
         │  the PR branch's schema (its schema_prefix)   │
@@ -43,11 +43,13 @@ The sampling described below is the design, not what 1.74.0 runs. The default pa
 
 1. **Identify the change set.** Rocky shells out to `git diff --name-only <base_ref> HEAD` against the models directory, the same plumbing [`rocky ci-diff`](/reference/commands/modeling/#rocky-ci-diff) uses. The output is the set of model files that changed between `--base` and `HEAD`.
 
-2. **Compute the prune set from the compiler IR.** Loading the working-tree models into the [compiler](/concepts/compiler/) gives a column-level dependency graph. The prune set is every changed model **plus** every model that transitively depends on a changed column. A model downstream of an *unchanged* column on a changed model is not pulled in. That makes column-level pruning strictly tighter than git-diff alone.
+2. **Compute the prune set from model dependencies.** Rocky scans the working-tree model sidecars for `depends_on`. It includes every changed model and every model transitively downstream of one. The prune set does not use column lineage.
 
 3. **Compute the copy set.** Every model in the working DAG that is not in the prune set is a copy candidate. It is logically identical to its counterpart on `--base`, so re-running it would produce the same bytes. Rocky issues `CREATE TABLE <branch_schema>.<model> AS SELECT * FROM <base_schema>.<model>` against the configured adapter, with the per-adapter overrides described below.
 
-4. **Run the prune set.** Rocky calls the existing branch run path with a model selector limited to the prune set. That path is [`rocky plan --branch <name>`](/reference/commands/core-pipeline/#rocky-run) followed by `rocky apply <plan-id>`. The single-step `rocky run --branch <name>` alias does the same in one invocation. [`rocky branch create`](/reference/commands/core-pipeline/#rocky-branch) registers the branch, and the run writes into the branch's `schema_prefix`.
+4. **Run the prune set yourself.** `preview create` does not run these models: it reports `run_status: "planned"` with an empty `run_id`. You run them with [`rocky run --branch <name>`](/reference/commands/core-pipeline/#rocky-run). `preview create` has already registered the branch, as [`rocky branch create`](/reference/commands/core-pipeline/#rocky-branch) does, so the run writes into its `schema_prefix` and records the branch name. That name is how `preview diff` and `preview cost` find the run.
+
+`rocky run` has no selector for a set of models. It builds the whole pipeline, or one model with `--model`. `preview diff` and `preview cost` read only the newest branch run. So a prune set of one model can run alone. A prune set of several models needs one whole-pipeline run, which also rebuilds the copy set. Separate `--model` runs leave only the last model in the comparison.
 
 The final output ([`PreviewCreateOutput`](#output-shapes)) records `prune_set`, `copy_set`, and `skipped_set`, so the decision is auditable from the JSON alone.
 
@@ -58,9 +60,26 @@ The copy step dispatches per adapter through the `WarehouseAdapter::clone_table_
 - **Databricks** — `CREATE OR REPLACE TABLE … SHALLOW CLONE …`. Metadata-only; the branch table references the source's underlying files until either side mutates.
 - **BigQuery** — `CREATE OR REPLACE TABLE … COPY …`. Metadata-only; same single-project scope as the source dataset.
 - **DuckDB** — `CREATE OR REPLACE TABLE … AS SELECT *` (CTAS). Bytes-copying but trivially portable; matches the trait's default impl, so the same code path works on any future adapter that doesn't override.
-- **Snowflake** — falls through to the CTAS default. Native zero-copy `CLONE TABLE` is a planned override. It switches in once a Snowflake consumer drives the integration test against a workspace.
+- **Snowflake** — `CREATE TABLE … CLONE …`. The adapter uses Snowflake's native zero-copy clone.
 
-On Databricks and BigQuery, `clone_table_for_branch` turns the copy step from a bytes-bearing CTAS into a metadata operation. That makes preview cheap enough to run on tables you could not afford to CTAS today.
+On Databricks, BigQuery, and Snowflake, `clone_table_for_branch` uses a metadata-only copy. DuckDB uses CTAS to copy the table data.
+
+## How diff and cost pair the runs
+
+`preview diff` and `preview cost` pair a branch run with a base run. They find both in run history in the state store. Each run record holds two branch fields, and only one of them finds the branch run.
+
+| Run | `rocky_branch` | `git_branch` |
+|---|---|---|
+| `rocky run --branch pr_preview_fix_price`, from git branch `fix-price` | `pr_preview_fix_price` | `fix-price` |
+| `rocky run`, from git branch `main` | none | `main` |
+
+`rocky_branch` is the literal `--branch` name. `git_branch` is the git branch checked out when the run started.
+
+- **Branch run.** The newest run whose `rocky_branch` equals `--name`. `git_branch` cannot find it: it holds `fix-price`, not the preview name. Only this one run is compared.
+- **Base run for `preview diff`.** The newest run with no `rocky_branch` whose `git_branch` equals `--base`, or whose `git_commit` matches it. Rocky refuses a commit prefix that matches more than one commit. It never falls back to another run. With none found, the diff stays empty and `base_note` says why.
+- **Base run for `preview cost`.** `preview cost` has no `--base` flag. It takes the newest run whose `rocky_branch` is not `--name`. It also skips a run with no `rocky_branch` whose `git_branch` is `--name`, the shape of a branch run recorded before Rocky added `rocky_branch`. Any other run can be the base: a run on another git branch, or a run made with another `--branch` name.
+
+A run recorded before Rocky added `rocky_branch` has none, so it never matches as a branch run. Run `rocky run --branch <name>` again to record one. `rocky history --output json` shows `rocky_branch` on every run that has one.
 
 ## Comparison to Fivetran's Smart Run
 
@@ -68,27 +87,31 @@ The closest published commercial analogue is Fivetran's [Smart Run for dbt Core]
 
 | Property | Fivetran Smart Run (per article) | Rocky `preview` |
 |---|---|---|
-| Change detection | "Manifest-independent" — mechanism not specified in the article | git-diff plus compiler-IR type-equivalence (the compiler can tell that two textually different models produce identical column types and lineage) |
-| Pruning granularity | Model-level (per the article's red / I-node / R-node example) | Column-level — derived from the compiler IR; a column added to an unused tail of a wide table prunes to zero downstream |
-| Copy substrate | `COPY` ("the COPY command is free" per article) | Per-adapter dispatch: Databricks `SHALLOW CLONE`, BigQuery `CREATE TABLE … COPY` (both metadata-only), DuckDB CTAS, Snowflake CTAS pending native `CLONE` override |
+| Change detection | "Manifest-independent" — mechanism not specified in the article | Git diff identifies changed model files; sidecar `depends_on` links identify downstream models |
+| Pruning granularity | Model-level (per the article's red / I-node / R-node example) | Model-level; a changed model pulls in all downstream models linked by `depends_on` |
+| Copy substrate | `COPY` ("the COPY command is free" per article) | Per-adapter dispatch: Databricks `SHALLOW CLONE`, BigQuery `CREATE TABLE … COPY`, Snowflake `CREATE TABLE … CLONE`, DuckDB CTAS |
 | Cost delta | Not surfaced in the article | First-class output ([`PreviewCostOutput`](#output-shapes)) |
 | Data diff | Not surfaced in the article | First-class output ([`PreviewDiffOutput`](#output-shapes)) |
 | PR comment | Not described in the article | Pre-rendered Markdown in every output |
 
-The article does not document Smart Run's internal mechanism beyond a conceptual diagram and the "manifest-independent" claim. The rows above hedge accordingly. Rocky's column-level pruning follows from owning the compiler that builds the graph.
+The article does not document Smart Run's internal mechanism beyond a conceptual diagram and the "manifest-independent" claim. The rows above hedge accordingly.
 
 ## Two diff algorithms
 
-`rocky preview diff` produces a row-level diff per model in the prune set. It uses one of two algorithms, and a `kind` discriminator on each per-model entry says which one ran.
+`rocky preview diff` produces a row-level diff per model the branch run executed. It uses one of two algorithms, and a `kind` discriminator on each per-model entry says which one ran.
 
 ### `--algorithm sampled` (default)
 
+**What runs today.** The default reads no rows. It subtracts the `rows_affected` the two runs recorded. When a run recorded no count for a model, that model's row delta is `null`, and `summary.models_unknown` counts it. The `sampling_window` block reports `limit: 0` and `coverage: "not_yet_sampled"`.
+
+**The design.** The intended algorithm reads a window of rows from both sides:
+
 ```
 ORDER BY <primary_key>     -- or first column if no PK declared
-LIMIT <sample_size>        -- default 1000, override with --sample-size
+LIMIT <sample_size>        -- design default 1000; no flag sets it today
 ```
 
-This is fast, deterministic, and bounded. It has one known blind spot: a row that changed outside the sampling window reads as no change. The diff layer flags that risk explicitly. Each per-model `Sampled` variant carries a `sampling_window` block:
+This is fast, deterministic, and bounded. It has one known blind spot: a row that changed outside the sampling window reads as no change. The diff layer flags that risk explicitly. Each per-model `Sampled` variant carries a `sampling_window` block. With the design in place, it reads:
 
 ```jsonc
 {
@@ -162,6 +185,6 @@ The [codegen pipeline](/reference/json-output/) generates the Pydantic (Dagster)
 
 ## Related concepts
 
-- [The Rocky Compiler](/concepts/compiler/) — the IR `preview` queries to build the prune set.
+- [The Rocky Compiler](/concepts/compiler/) — type checks models; preview builds its prune set from sidecar dependencies.
 - [Shadow Mode](/concepts/shadow-mode/) — the comparison kernel `preview diff` extends with sampled row-level diffing.
 - [State Management](/concepts/state-management/) — the `RunRecord` store `preview cost` reads to compute base-vs-branch deltas.

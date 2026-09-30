@@ -35,7 +35,7 @@ One line each, for finding the right command. Commands with a section on this pa
 | `branch` | Create, list, promote, and drop isolated output branches. |
 | `compile` | Resolve dependencies, type-check, and validate contracts. |
 | `lineage` | Trace a column back through every transformation that feeds it. |
-| `lineage-diff` | Report the downstream blast radius of a change, for PR review. |
+| [`lineage-diff`](/reference/commands/modeling/#rocky-lineage-diff) | Report the downstream blast radius of a change, for PR review. |
 | `test` | Run declarative tests and fixture-driven unit tests. |
 | `ci` | Compile plus test, for a CI runner with no warehouse credentials. |
 | `ci-diff` | Compare a branch against a base and report what changed. |
@@ -300,9 +300,9 @@ rocky run [--filter <key=value>] [flags]
 | `--resume <RUN_ID>` | | Resume a specific previous replication run from its last checkpoint; mints a new `run_id` and records the prior one as `resumed_from`. Rejected with `--dag`, which does not replay the resume into its sub-runs (rejected at parse time). |
 | `--resume-latest` | | Resume the most recent failed replication run from its last checkpoint; mints a new `run_id` and records the prior one as `resumed_from`. Rejected with `--dag`, which does not replay the resume into its sub-runs (rejected at parse time). |
 | `--shadow` | | Run in shadow mode: write to shadow targets instead of production. |
-| `--shadow-suffix <SUFFIX>` | | Suffix appended to table names in shadow mode (default `_rocky_shadow`). |
-| `--shadow-schema <NAME>` | | Override schema for shadow tables (mutually exclusive with `--shadow-suffix`). |
-| `--branch <NAME>` | | Execute against a named branch created with `rocky branch create`. Mutually exclusive with `--shadow` / `--shadow-schema`. See [`rocky branch`](/reference/commands/core-pipeline/#rocky-branch). |
+| `--shadow-suffix <SUFFIX>` | Requires `--shadow` | Suffix appended to table names. Conflicts with `--branch`. `--shadow` alone uses `_rocky_shadow`. |
+| `--shadow-schema <NAME>` | Requires `--shadow` | Override schema for shadow tables. Conflicts with `--branch`. |
+| `--branch <NAME>` | | Execute against a named branch created with `rocky branch create`. Conflicts with `--shadow`, `--shadow-schema`, and `--shadow-suffix`. See [`rocky branch`](/reference/commands/core-pipeline/#rocky-branch). |
 | `--idempotency-key <KEY>` | | Caller-supplied opaque key used to dedup this run against prior runs with the same key. Three outcomes: a prior run succeeded (or reached a terminal state under `dedup_on = "any"`) → exit 0 with `status = "skipped_idempotent"` and the prior `skipped_by_run_id`; another caller currently holds the claim within `in_flight_ttl_hours` → exit 0 with `status = "skipped_in_flight"`; otherwise proceed normally. Rejected when combined with `--resume` / `--resume-latest` (resume is an explicit override). Stamps are stored verbatim; do not put secrets in the key. See [`[state.idempotency]`](/reference/configuration/) for tuning. |
 
 **Pipeline stages (in order):**
@@ -553,12 +553,15 @@ rocky compare [--filter <key=value>] [flags]
       "row_count_diff_pct": 0.0,
       "schema_match": true,
       "schema_diffs": [],
-      "verdict": "pass"
+      "verdict": "pass",
+      "reasons": []
     }
   ],
   "overall_verdict": "pass"
 }
 ```
+
+`verdict` is `pass`, `warn`, `fail`, or `error`. `reasons` says why a table is not `pass`. An `error` row means Rocky could not read a table or its schema on one side. The count it could not read is `null`, never `0`. `row_count_diff_pct` is `null` unless Rocky read both counts. Rocky counts an `error` row in `tables_failed`, so `overall_verdict` is `fail` and the command exits non-zero.
 
 ---
 

@@ -84,7 +84,7 @@ pub fn run_replay(
     model_filter: Option<&str>,
     json: bool,
 ) -> Result<()> {
-    let store = StateStore::open_read_only(state_path)
+    let store = StateStore::open_read_only_or_empty(state_path)
         .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
 
     let record = resolve(&store, target)?;
@@ -358,7 +358,7 @@ pub fn compute_replay_check(
     target: &str,
     model_filter: Option<&str>,
 ) -> Result<ReplayCheckOutput> {
-    let store = StateStore::open_read_only(state_path)
+    let store = StateStore::open_read_only_or_empty(state_path)
         .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
 
     let record = resolve(&store, target)?;
@@ -490,7 +490,7 @@ async fn execute_and_hash(
     let result = adapter
         .execute_query(&ir.sql)
         .await
-        .map_err(|e| anyhow::anyhow!("re-execution query failed: {e}"))?;
+        .context("re-execution query failed")?;
     let rows = result.rows.len() as u64;
     let batch = crate::commands::run_content_addressed::query_result_to_record_batch(
         &ir.typed_columns,
@@ -1351,7 +1351,7 @@ pub async fn run_replay_execute(
     verify: bool,
     json: bool,
 ) -> Result<()> {
-    let store = StateStore::open_read_only(state_path)
+    let store = StateStore::open_read_only_or_empty(state_path)
         .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
 
     let record = resolve(&store, target)?;
@@ -1933,7 +1933,7 @@ pub async fn run_replay_execute_warehouse(
     keep: bool,
     json: bool,
 ) -> Result<()> {
-    let store = StateStore::open_read_only(state_path)
+    let store = StateStore::open_read_only_or_empty(state_path)
         .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
 
     let record = resolve(&store, target)?;
@@ -2103,6 +2103,8 @@ mod tests {
             submission_id: None,
             check_gate_failed: false,
             verify_after_failed: false,
+            rocky_branch: None,
+            run_scope: Some(rocky_core::state::RunScope::Production),
         }
     }
 
@@ -2836,6 +2838,8 @@ mod tests {
                 submission_id: None,
                 check_gate_failed: false,
                 verify_after_failed: false,
+                rocky_branch: None,
+                run_scope: Some(rocky_core::state::RunScope::Production),
             };
             store.record_run(&record).unwrap();
 

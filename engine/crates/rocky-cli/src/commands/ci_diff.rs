@@ -130,6 +130,7 @@ pub(crate) fn validate_base_ref(base_ref: &str) -> Result<()> {
 /// commands that resolve relative paths).
 fn git_in(repo_dir: Option<&Path>) -> Command {
     let mut cmd = Command::new("git");
+    rocky_core::process::strip_dagster_pipes_env(&mut cmd);
     if let Some(dir) = repo_dir {
         cmd.current_dir(dir);
     }

@@ -6,9 +6,12 @@ Everything Rocky does, from the outside in, with ASCII diagrams.
 
 ## 1. What Is Rocky?
 
-Rocky is a **typed, compiled data platform**. You write SQL. Rocky compiles it, checks it for mistakes, then runs it against your warehouse. A SQL-like DSL is available for people who want it, but raw SQL is the primary input.
+Rocky is a **typed, compiled data platform**. You write SQL. Rocky compiles it
+and reports supported static problems. A later command runs generated SQL
+against your warehouse. A SQL-like DSL is available for people who want it, but
+raw SQL is the primary input.
 
-Rocky has a real compiler. There is no Jinja templating and no string-substitution trick. Rocky parses your SQL into a typed tree. It then checks types across the whole DAG at once — the DAG being the graph of which model reads which. Only after every check passes does Rocky generate warehouse SQL.
+Rocky has a real compiler. There is no Jinja templating and no string-substitution trick. Rocky parses your SQL into a typed tree. It checks supported types, references, and contracts across the project graph when it can resolve the needed information. A successful compile generates warehouse SQL. It does not prove that every warehouse query is valid or that the result values are correct.
 
 ```
 You write this:            Rocky does this:              Warehouse gets this:
@@ -23,7 +26,7 @@ GROUP BY order_id          5. Generate dialect SQL         SUM(amount) AS total
                                                          GROUP BY order_id
 ```
 
-Key idea: **Rocky is a program that compiles other programs** (your SQL models). Compilation produces verified, typed SQL. Rocky sends that SQL to the warehouse. A type mismatch, a missing column, or a broken dependency stops the build before anything runs.
+Key idea: **Rocky is a program that compiles other programs** (your SQL models). Compilation produces typed SQL and diagnostics. A type mismatch, missing column, or broken dependency that Rocky can resolve stops that compile. A separate run can still encounter warehouse errors or produce an incorrect result.
 
 Rocky's terms are collected in the [glossary](https://rocky-data.dev/reference/glossary/).
 
@@ -33,7 +36,7 @@ Rocky's terms are collected in the [glossary](https://rocky-data.dev/reference/g
 
 | Feature | What it means |
 |---|---|
-| **Typed compiler** | Catches type mismatches and missing columns before any SQL runs |
+| **Typed compiler** | Reports resolvable type mismatches and missing columns before the compile succeeds |
 | **DAG-aware** | Knows which models depend on which; runs them in the right order |
 | **Multiple materialization strategies** | `full_refresh`, `merge`, `time_interval`, `microbatch`, `delete_insert`, `view`, `materialized_view`, `dynamic_table`, `content_addressed` |
 | **Incremental loads** | A replication pipeline copies only the rows newer than a stored watermark. A transformation model cannot use `incremental` (`E037`); use `merge` or `time_interval` |
@@ -707,7 +710,7 @@ Use these exact key names. Rocky ignores a key it does not recognise, and both s
 
 The `[rules]` block also accepts `no_new_nullable = true`. It is off by default. When it is on, every nullable output column the contract does not declare under `[[columns]]` is an E014 error. A contract that sets it with no `[[columns]]` at all is also E014: there is no baseline, so "new" would mean nothing.
 
-At compile time, Rocky checks every model against its contract:
+At compile time, Rocky checks contract facts it can resolve for each model:
 
 ```
 Compile time check:
@@ -1005,9 +1008,11 @@ Two steps, not one:
 
 The client sets two env vars on the child. Rocky reads them at
 startup (pipes.rs): it checks that DAGSTER_PIPES_CONTEXT is set,
-and decodes DAGSTER_PIPES_MESSAGES as base64-encoded JSON saying
-where to write messages, usually {"path": "…"}. A payload it
-cannot decode is a warning, and Rocky falls back to plain output.
+and decodes DAGSTER_PIPES_MESSAGES as base64+zlib-encoded JSON
+saying where to write messages, usually {"path": "…"} — the exact
+shape dagster_pipes.decode_param produces. A payload it cannot
+decode fails the command before pipeline work begins. Rocky also
+refuses a missing or unsupported message channel.
 Rocky emits structured messages (asset materialization events,
 check results, metadata) to that channel as JSON lines.
 Dagster reads them back in real time.
@@ -1089,13 +1094,14 @@ runs_per_month         history_runs ÷ the span in days of the last 100
 
 Two of those are rougher than they look. The size input reads the oldest recorded write, not the newest, so a model that grew will be costed as if it had not. The rate input mixes one model's execution count with the project's run span, so it is a per-project rate, not a per-model one.
 
-Prices come from built-in defaults: $0.023 per GB-month of storage and $0.002 per second of compute.
+Prices come from the `[cost]` block in `rocky.toml`. Without one, the defaults apply. Storage costs $0.023 per GB-month. Compute costs $0.40 per DBU, and a Medium warehouse uses 24 DBU per hour, so about $0.0027 per second. A `rocky.toml` that exists but fails to load stops the command with an error.
 
-It recommends one of three strategies, and never any other:
+It recommends `view` or `table`. When it has too little to go on, it keeps the current strategy instead. The history threshold, `min_history_runs`, is 5 unless `[cost]` says otherwise:
 
 ```
-history_runs < 5?                  →  keep the current strategy, reason
-                                      "insufficient history: N runs (need 5)"
+model not in the models dir?       →  "unknown", no recommendation
+history_runs < min_history_runs?   →  keep the current strategy, reason
+                                      "insufficient history: N runs (need M)"
 under 2s and at most 1 consumer?   →  view
 2 or more consumers?               →  table, unless recomputing for each
                                       consumer is cheaper than storing once,
@@ -1120,7 +1126,7 @@ Total estimated monthly savings: $0.01
 Models analyzed: 5
 ```
 
-Read `CURRENT` with care. The command does not read each model's declared strategy; it reports `table` for every model ([#2056](https://github.com/rocky-data/rocky/issues/2056)). It used to recommend `ephemeral` here. That strategy is refused now (`E038`), because Rocky never inlined such a model into its consumers.
+`CURRENT` is the strategy in each model's own configuration. A `full_refresh` model reads `table`, and every model in this run uses `full_refresh`. Other strategies read as their own name, such as `view`, `merge`, or `incremental`. A model that appears in run history but not in the models directory reads `unknown` and gets no recommendation. The command used to recommend `ephemeral` here. That strategy is refused now (`E038`), because Rocky never inlined such a model into its consumers.
 
 ---
 
@@ -1249,12 +1255,13 @@ Everything Rocky does, in one ASCII map:
  models/*.toml ──────────▶        │
                            ┌──────▼──────┐
  *.contract.toml ────────▶ │  Compiler   │ ── diagnostics (E/W/D/P/I codes)
-                           │  10 stages  │    ↓ errors → stop here
-                           └──────┬──────┘    ↓ clean → continue
+                           │  10 stages  │    ↓ errors → compile exits nonzero
+                           └──────┬──────┘    ↓ clean → a later run can execute
                                   │
                            ┌──────▼──────┐
                            │  ProjectIr  │  ModelIr × N
-                           │  (all typed)│
+                           │  (types may  │
+                           │   be Unknown)│
                            └──────┬──────┘
                                   │
                            ┌──────▼──────────────────────┐
@@ -1517,7 +1524,7 @@ A product spec at `products/<name>.toml` declares what a data product must be: i
 
 The other subcommands are `verify` (the frozen `propose_only` trust posture), `status`, `list`, `journal` (every persisted transition, in order), and `approve` (a human authority transition on the current spec revision).
 
-`rocky fulfill <product>` drives the loop: elicit → approve-spec → lower → draft → verify → governed propose → human review → digest-gated apply → observe. One invocation advances it as far as it can without a human, then stops and prints the state, why it stopped, and the exact next command. Its exit codes are their own vocabulary: `0` clean stop, `2` blocked, `3` parked for a human, `4` applied but failing a check the product declares about itself.
+`rocky fulfill <product>` drives the loop: elicit → approve-spec → lower → draft → verify → governed propose → human review → digest-gated apply → observe. One invocation advances it as far as it can without a human, then stops and prints the state, why it stopped, and the exact next command. Observation follows `apply`, so a failing output can already be live. Its exit codes are their own vocabulary: `0` clean stop, `2` blocked, `3` parked for a human, `4` applied but failing a check the product declares about itself.
 
 Reference: [product commands](https://rocky-data.dev/reference/commands/products/) and [`rocky fulfill`](https://rocky-data.dev/reference/commands/fulfill/).
 
@@ -1525,9 +1532,13 @@ Reference: [product commands](https://rocky-data.dev/reference/commands/products
 
 ## 35. Branches, Previews, and Run Forensics
 
-**Branches.** A branch is the named, persistent form of shadow mode. `rocky branch create <name>` records a `schema_prefix` in the state store; `rocky run --branch <name>` then applies that prefix to every model target. `branch list` and `branch show` report what exists, `branch compare` diffs the branch's tables against production, and `branch approve` writes an approval artifact stamped with a blake3 digest of its own canonical JSON (an integrity digest, not a cryptographic signature: nothing holds a key). `branch promote` then copies each table with `CREATE OR REPLACE TABLE <prod> AS SELECT * FROM <branch>`, so the branch tables stay where they are. `branch delete` removes the record and drops no warehouse table.
+**Branches.** A branch is the named, persistent form of shadow mode. `rocky branch create <name>` records a `schema_prefix` in the state store; `rocky run --branch <name>` then applies that prefix to every model target. A branch name is 1 to 64 characters from `[A-Za-z0-9_]`, because the schema is `branch__<name>`. `branch list` and `branch show` report what exists, and `branch compare` diffs the branch's tables against production. A table that `branch compare` cannot read reports `verdict: "error"` and a `null` count, never `0`.
 
-**Previews.** `rocky preview` is the PR workflow, and it plans more than it executes. `preview create` registers the branch, works out which models changed and which can be copied from the base schema, and reports `run_status: "planned"`. It runs nothing: you then run `rocky run --branch <name>` over the models in its `prune_set`. `preview diff` compares the two runs' recorded `rows_affected` counts by default, so it reports rows added and removed, leaves the structural arrays empty, reports `rows_changed: 0`, and marks its coverage `not_yet_sampled` with a warning. Pass `--algorithm=bisection` for a row-content diff. `preview cost` produces a per-model bytes, duration, and USD delta. The last two put a rendered PR comment in the `markdown` field of their JSON; there is no `--output markdown`. A fourth subcommand, `preview rows`, samples rows for one model with its classified columns masked inline (section 17).
+`branch approve` writes an approval artifact stamped with a blake3 digest of its own canonical JSON (an integrity digest, not a cryptographic signature: nothing holds a key). `branch promote` then copies each table with `CREATE OR REPLACE TABLE <prod> AS SELECT * FROM <branch>`, so the branch tables stay where they are. `branch delete` removes the record and drops no warehouse table.
+
+**Previews.** `rocky preview` is the PR workflow, and it plans more than it executes. `preview create` registers the branch, works out which models changed and which can be copied from the base schema, and reports `run_status: "planned"`. It runs nothing. You then run `rocky run --branch <name>`, which builds the whole pipeline, or one model with `--model`. That run records the name as `rocky_branch`. `preview diff` and `preview cost` find the newest branch run by it, not by the git branch you have checked out.
+
+`preview diff` compares the two runs' recorded `rows_affected` counts by default, so it reports rows added and removed, leaves the structural arrays empty, reports `rows_changed: 0`, and marks its coverage `not_yet_sampled` with a warning. A model whose run recorded no row count reports `null` rows added, never `0`, and `summary.models_unknown` counts it. Pass `--algorithm=bisection` for a row-content diff. `preview cost` produces a per-model bytes, duration, and USD delta. The last two put a rendered PR comment in the `markdown` field of their JSON; there is no `--output markdown`. A fourth subcommand, `preview rows`, samples rows for one model with its classified columns masked inline (section 17).
 
 **Forensics.** Three commands read a recorded run out of the state store. `rocky replay <run-id|latest>` shows what ran, with SQL hashes, row counts, and timings; `--check` audits whether the recording alone is enough to re-execute it. `rocky trace <run-id|latest>` renders the same run as a timeline with concurrency lanes. `rocky cost <run-id|latest>` rolls up per-model cost using the same formula the live run summary uses.
 

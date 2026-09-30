@@ -20,14 +20,17 @@
 //!
 //! [`PipelineConfig`]: crate::config::PipelineConfig
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::config::{PipelineConfig, RockyConfig};
+use crate::config::{AdapterConfig, PipelineConfig, RockyConfig};
 use crate::models::Model;
+use crate::physical_edges::{
+    DerivedPhysicalEdges, PhysicalEdgeModel, derivation_warnings, fold_identifier,
+};
 use crate::seeds::SeedFile;
 
 // ---------------------------------------------------------------------------
@@ -95,6 +98,31 @@ pub enum UnifiedDagError {
         adapter: String,
         /// `(pipeline, model)` pairs, sorted, so the message is deterministic.
         claimants: Vec<(String, String)>,
+    },
+
+    /// A model reads a name that more than one producer claims — a model and
+    /// a seed or load pipeline share a label — and the read does not name
+    /// exactly one of them by its physical target. See [`build_runtime_dag`].
+    #[error(
+        "model '{reader}' reads '{read}', but the label '{label}' belongs to {}. The read does \
+         not name exactly one of them by its full `catalog.schema.table` target, or another \
+         one could be the same table. Rocky cannot tell which one '{reader}' must run after, \
+         and a wrong choice could let it read a table that is not built yet. Rename one of the \
+         producers so each label is unique, or write the read as the intended producer's full \
+         target. A `?` marks a part of a target Rocky does not know: declare it in the seed's \
+         sidecar `[target]`, or set `table` on the load pipeline.",
+        .producers.join(" and ")
+    )]
+    AmbiguousLabelProducer {
+        /// The lowercased label the read matched.
+        label: String,
+        /// The model that issues the read.
+        reader: String,
+        /// The read as the SQL spells it (lowercased by the extractor).
+        read: String,
+        /// Every producer of the label, described with its target, sorted so
+        /// the message is deterministic.
+        producers: Vec<String>,
     },
 }
 
@@ -910,88 +938,399 @@ fn format_test_label(model_name: &str, test: &crate::tests::TestDecl, index: usi
         None => format!("{model_name}::{type_str}_{index}"),
     }
 }
-
 // ---------------------------------------------------------------------------
-// Runtime cross-pipeline dependency inference
+// Runtime dependency inference
 // ---------------------------------------------------------------------------
 
-/// Augment a DAG with edges inferred from model SQL `FROM` references.
+/// The graph `rocky run --dag` executes: the unified DAG plus every ordering
+/// edge Rocky can infer from what each model reads, and what that inference
+/// could not settle.
+#[derive(Debug)]
+pub struct RuntimeDag {
+    pub dag: UnifiedDag,
+    /// Scheduling warnings, ready to show. `[run] strict_scheduling` turns a
+    /// non-empty list into a refusal.
+    pub warnings: Vec<String>,
+    /// What the physical-read pass derived and what it declined to guess.
+    pub physical: DerivedPhysicalEdges,
+    /// What the label pass found: collisions, unparsed models, skipped edges.
+    pub labels: LabelInferenceReport,
+}
+
+/// Build the unified DAG and infer every runtime ordering edge on it, in one
+/// place and in one order.
 ///
-/// `build_unified_dag` resolves only edges from explicit `depends_on` config.
-/// This pass parses each model's SQL, extracts the tables it references by
-/// bare name, and adds an [`EdgeType::DataDependency`] edge from ONE
-/// producing node per referenced label — the last claimant in build order,
-/// byte-for-byte the single-slot heuristic's graph — to the consuming model.
-/// When several nodes claim one label, the OTHERS are deliberately not
-/// ordered: every scheme for ordering them was shown to be able to suppress
-/// exact physical-pass evidence until the cross-pass provenance contract
-/// exists (#1357). The collision is reported instead, alongside models
-/// whose SQL could not be parsed, via the returned
-/// [`LabelInferenceReport`].
+/// `rocky run --dag` and a governed `rocky apply` of a `--dag` plan both build
+/// their graph here, so they cannot see different edges.
 ///
-/// `model_sql_by_name` maps model name → compiled SQL text. The caller is
-/// responsible for compiling models first; this function does no IO.
+/// `default_catalog_of` names the catalog a warehouse resolves a catalogless
+/// `[target]` in, given the adapter's config — `None` when it cannot say,
+/// which is the answer for every adapter but DuckDB. See
+/// [`PhysicalEdgeModel::effective_catalog`] for why it is asked for at all.
 ///
-/// Inferred edges are de-duplicated against existing ones, so calling this
-/// repeatedly is idempotent.
-pub fn infer_runtime_dependencies(
+/// `seed_default_catalog` is the catalog the seed loader gives a seed whose
+/// sidecar names none, for the pipeline the seed nodes run under — `None` when
+/// no single pipeline could be chosen, in which case those seeds fail when they
+/// are dispatched and their catalog is unknown here.
+///
+/// # Precedence
+///
+/// Edges join the graph in passes, strongest evidence first, and a later pass
+/// may only skip an edge that would contradict what an earlier one settled. A
+/// guess therefore never displaces an exact edge, and that does not depend on
+/// the order names sort in.
+///
+/// 1. **Declared** — `depends_on` and pipeline chaining ([`build_unified_dag`]).
+/// 2. **Physical reads** — a model reads another model's `[target]` by name:
+///    exact three-part and two-part reads, then the catalog fallback, then
+///    bare-name guesses ([`crate::physical_edges::derive_physical_edges`]).
+/// 3. **Label reads** — a model reads a name that is a model's, seed's or
+///    load's label. This is the weakest evidence: it matches the last segment
+///    of the read and ignores its schema and catalog. A label edge that would
+///    close a cycle through a physical edge is skipped and reported. A cycle
+///    made only of declared and label edges is not skipped — it is a genuine
+///    cycle, and it keeps its loud refusal.
+///
+/// # Label collisions
+///
+/// When a model and a seed or load pipeline share a label, node build order
+/// says nothing about which one a reader means, so it is not consulted. A read
+/// is ordered after the producer whose full `catalog.schema.table` target it
+/// names, provided no other producer of the label could be the same table. A
+/// producer whose target is not fully known (a load with no explicit `table`,
+/// or a seed whose catalog is unknown because no single pipeline could be
+/// chosen for the seed nodes) is not ruled out by a read that does not
+/// contradict it. A read that names none of them adds no label edge. A read
+/// that could name several, or one while another could be the same table, is refused with
+/// [`UnifiedDagError::AmbiguousLabelProducer`] before anything runs.
+///
+/// # Errors
+///
+/// Everything [`build_unified_dag`] refuses, plus
+/// [`UnifiedDagError::AmbiguousLabelProducer`].
+pub fn build_runtime_dag(
+    config: &RockyConfig,
+    models_by_pipeline: &ModelsByPipeline,
+    seeds: &[SeedFile],
+    seed_default_catalog: Option<&str>,
+    default_catalog_of: &dyn Fn(&AdapterConfig) -> Option<String>,
+) -> Result<RuntimeDag, UnifiedDagError> {
+    let mut dag = build_unified_dag(config, models_by_pipeline, seeds)?;
+
+    // The catalog a catalogless `[target]` resolves in is a property of the
+    // adapter the target writes through, so it is asked per adapter name.
+    let established = |adapter: &str| -> Option<String> {
+        config.adapters.get(adapter).and_then(default_catalog_of)
+    };
+    let pipeline_catalog: HashMap<&str, Option<String>> = models_by_pipeline
+        .keys()
+        .map(|pipeline| {
+            let catalog = config
+                .pipelines
+                .get(pipeline.as_str())
+                .and_then(|p| established(p.target_adapter()));
+            (pipeline.as_str(), catalog)
+        })
+        .collect();
+
+    let inputs: Vec<PhysicalEdgeModel<'_>> = models_by_pipeline
+        .iter()
+        .flat_map(|(pipeline, models)| {
+            let catalog = pipeline_catalog
+                .get(pipeline.as_str())
+                .and_then(Option::as_deref);
+            let adapter = config
+                .pipelines
+                .get(pipeline.as_str())
+                .map(PipelineConfig::target_adapter);
+            models.iter().map(move |m| {
+                let input = PhysicalEdgeModel::from_model(m).with_effective_catalog(catalog);
+                match adapter {
+                    Some(adapter) => input.with_adapter(adapter),
+                    None => input,
+                }
+            })
+        })
+        .collect();
+
+    // Pass 2: physical reads.
+    let physical = infer_physical_dependencies(&mut dag, &inputs);
+    let physical_edges: HashSet<(NodeId, NodeId)> = {
+        let by_label: HashMap<&str, &NodeId> = dag
+            .nodes
+            .iter()
+            .filter(|n| n.kind == NodeKind::Transformation)
+            .map(|n| (n.label.as_str(), &n.id))
+            .collect();
+        physical
+            .edges
+            .iter()
+            .filter_map(|(consumer, producer)| {
+                let from = (*by_label.get(producer.as_str())?).clone();
+                let to = (*by_label.get(consumer.as_str())?).clone();
+                Some((from, to))
+            })
+            .collect()
+    };
+
+    // Pass 3: label reads.
+    let sql_by_name: HashMap<String, String> = models_by_pipeline
+        .values()
+        .flatten()
+        .map(|m| (m.config.name.clone(), m.sql.clone()))
+        .collect();
+    let targets = producer_targets(
+        &dag,
+        config,
+        models_by_pipeline,
+        seeds,
+        seed_default_catalog,
+        &pipeline_catalog,
+        &established,
+    );
+    let labels = infer_label_dependencies(&mut dag, &sql_by_name, &targets, &physical_edges)?;
+
+    let mut warnings = labels.warnings();
+    warnings.extend(derivation_warnings(&physical));
+    Ok(RuntimeDag {
+        dag,
+        warnings,
+        physical,
+        labels,
+    })
+}
+
+/// Where a producing node writes, as far as that is declared or established.
+///
+/// A component that is not declared, or cannot be established, is `None`: it
+/// is UNKNOWN, which is not the same as "different". A read can rule a producer
+/// out only by a component that is known and does not match. See
+/// [`ProducerTarget::match_read`].
+#[derive(Debug, Clone, Default)]
+struct ProducerTarget {
+    catalog: Option<String>,
+    schema: Option<String>,
+    table: Option<String>,
+}
+
+/// How one read relates to one producer's target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReadMatch {
+    /// Every component the read names is known for the producer and equal: the
+    /// read is that producer's table.
+    Named,
+    /// No known component contradicts the read, but some component the read
+    /// names is unknown for the producer, so the read could still be its table.
+    Possibly,
+    /// A known component differs: the read is not that producer's table.
+    Not,
+}
+
+impl ProducerTarget {
+    /// Fold each component the way [`crate::physical_edges::derive_physical_edges`] folds both
+    /// sides; an empty component is an unknown one.
+    fn new(catalog: Option<&str>, schema: Option<&str>, table: Option<&str>) -> Self {
+        let fold = |c: Option<&str>| c.map(fold_identifier).filter(|c| !c.is_empty());
+        Self {
+            catalog: fold(catalog),
+            schema: fold(schema),
+            table: fold(table),
+        }
+    }
+
+    /// Whether a read spelled `parts` (folded, `catalog.schema.table`,
+    /// `schema.table` or a bare `table`) is this producer's table.
+    ///
+    /// A two-part read resolves in the connection's current catalog, which
+    /// Rocky cannot see, so it is compared on `(schema, table)` alone — the
+    /// same comparison the physical pass makes. A bare read names no schema and
+    /// cannot rule any producer out. A producer's unknown component never
+    /// rules it out either: a seed's real target is chosen when it loads, after
+    /// the graph is built, so "not known to match" must not be read as "does
+    /// not match".
+    fn match_read(&self, parts: &[String]) -> ReadMatch {
+        let compare = |own: &Option<String>, read: &String| match own {
+            Some(own) if own == read => ReadMatch::Named,
+            Some(_) => ReadMatch::Not,
+            None => ReadMatch::Possibly,
+        };
+        let components: Vec<ReadMatch> = match parts {
+            [catalog, schema, table] => vec![
+                compare(&self.catalog, catalog),
+                compare(&self.schema, schema),
+                compare(&self.table, table),
+            ],
+            [schema, table] => vec![compare(&self.schema, schema), compare(&self.table, table)],
+            // A bare read, or one with more parts than a table has.
+            _ => return ReadMatch::Possibly,
+        };
+        if components.contains(&ReadMatch::Not) {
+            ReadMatch::Not
+        } else if components.contains(&ReadMatch::Possibly) {
+            ReadMatch::Possibly
+        } else {
+            ReadMatch::Named
+        }
+    }
+
+    /// The target for a message, an unknown component shown as `?`.
+    fn describe(&self) -> String {
+        let part = |p: &Option<String>| p.as_deref().unwrap_or("?").to_string();
+        format!(
+            "{}.{}.{}",
+            part(&self.catalog),
+            part(&self.schema),
+            part(&self.table)
+        )
+    }
+}
+
+/// The declared target of every node that can produce a table a model reads.
+///
+/// A model's own `[target]` (or, when it names no catalog, the catalog its
+/// adapter established); a seed's sidecar `[target]`, with the seed loader's
+/// defaults for what it leaves out; a load pipeline's `[target]`. What a target
+/// does not fix stays unknown: a seed's catalog when no single pipeline could
+/// be chosen for the seed nodes, and a load with no explicit table, which
+/// writes tables named after its files. Such a producer is never named by a
+/// read, and never ruled out by one — see [`ProducerTarget::match_read`]. A
+/// replication pipeline's load writes templated targets and is entirely
+/// unknown.
+fn producer_targets(
+    dag: &UnifiedDag,
+    config: &RockyConfig,
+    models_by_pipeline: &ModelsByPipeline,
+    seeds: &[SeedFile],
+    seed_default_catalog: Option<&str>,
+    pipeline_catalog: &HashMap<&str, Option<String>>,
+    established: &dyn Fn(&str) -> Option<String>,
+) -> HashMap<NodeId, ProducerTarget> {
+    let mut targets: HashMap<NodeId, ProducerTarget> = HashMap::new();
+
+    for (pipeline, models) in models_by_pipeline {
+        let effective = pipeline_catalog
+            .get(pipeline.as_str())
+            .and_then(Option::as_deref);
+        for model in models {
+            // An ephemeral model creates no table, so its configured target
+            // is a name nothing can read.
+            let target = if matches!(
+                model.config.strategy,
+                crate::models::StrategyConfig::Ephemeral
+            ) {
+                ProducerTarget::default()
+            } else {
+                let t = &model.config.target;
+                let declared = Some(t.catalog.as_str()).filter(|c| !fold_identifier(c).is_empty());
+                ProducerTarget::new(declared.or(effective), Some(&t.schema), Some(&t.table))
+            };
+            targets.insert(NodeId::new("transformation", &model.config.name), target);
+        }
+    }
+
+    // The seed loader's own rule: a sidecar `[target]` names the schema, and the
+    // catalog and table where it says so; whatever it leaves out defaults — the
+    // catalog to the one chosen for the seed nodes' pipeline, the schema to the
+    // default seed schema, the table to the seed's name. A sidecar catalog that
+    // is spelled empty is taken as spelled, and stays unknown.
+    for seed in seeds {
+        let target = match &seed.config.target {
+            Some(t) => ProducerTarget::new(
+                t.catalog.as_deref().or(seed_default_catalog),
+                Some(&t.schema),
+                Some(t.table.as_deref().unwrap_or(&seed.name)),
+            ),
+            None => ProducerTarget::new(
+                seed_default_catalog,
+                Some(crate::seeds::DEFAULT_SEED_SCHEMA),
+                Some(&seed.name),
+            ),
+        };
+        targets.insert(NodeId::new("seed", &seed.name), target);
+    }
+
+    for node in &dag.nodes {
+        if node.kind != NodeKind::Load {
+            continue;
+        }
+        let Some(PipelineConfig::Load(load)) = node
+            .pipeline
+            .as_deref()
+            .and_then(|p| config.pipelines.get(p))
+        else {
+            continue;
+        };
+        let t = &load.target;
+        let declared = Some(t.catalog.as_str()).filter(|c| !fold_identifier(c).is_empty());
+        let catalog = declared
+            .map(str::to_owned)
+            .or_else(|| established(&t.adapter));
+        targets.insert(
+            node.id.clone(),
+            ProducerTarget::new(catalog.as_deref(), Some(&t.schema), t.table.as_deref()),
+        );
+    }
+
+    targets
+}
+
+/// Add the edges implied by a model reading a name that is a node's label.
+///
+/// This pass parses each model's SQL, extracts the tables it reads, and
+/// matches the LAST segment of each read against the labels of the nodes that
+/// produce tables (transformations, seeds, loads). It is the weakest evidence
+/// the runtime has — it ignores the read's schema and catalog — so it runs
+/// after the physical pass and never displaces it: see [`build_runtime_dag`].
+///
+/// A label claimed by one node orders its readers after that node. A label
+/// claimed by several is resolved per reader by the physical target the read
+/// names — when exactly one claimant is definitely that table and no other could
+/// be — or refused. Build order never decides: which node was built last says
+/// nothing about which one a read means (#1629).
+///
+/// `physical` are the `(producer, consumer)` node pairs the physical pass
+/// settled. `targets` holds each producer's declared target. Inferred edges
+/// are de-duplicated against existing ones, so calling this repeatedly is
+/// idempotent.
+fn infer_label_dependencies(
     dag: &mut UnifiedDag,
     model_sql_by_name: &HashMap<String, String>,
-) -> LabelInferenceReport {
+    targets: &HashMap<NodeId, ProducerTarget>,
+    physical: &HashSet<(NodeId, NodeId)>,
+) -> Result<LabelInferenceReport, UnifiedDagError> {
     let mut report = LabelInferenceReport::default();
-    // Build a set of producing node names (everything that creates a table:
-    // transformations, seeds, loads). Maps logical table name → the FULL set
-    // of claimants — used as a COLLISION DETECTOR only: edges derive solely
-    // from the legacy winner (last in build order, identical to the old
-    // single-slot map), and colliding claimants are reported, not ordered
-    // (#1351 observability; ordering them awaits #1357).
+    // Every node that creates a table, by lowercase label so case-insensitive
+    // SQL refs match. Several claimants of one label are a collision.
     let mut producers: HashMap<String, Vec<(NodeId, NodeKind)>> = HashMap::new();
     for node in &dag.nodes {
         match node.kind {
             NodeKind::Transformation | NodeKind::Seed | NodeKind::Load | NodeKind::Replication => {
-                // Index by lowercase label so case-insensitive SQL refs match.
                 producers
                     .entry(node.label.to_lowercase())
                     .or_default()
                     .push((node.id.clone(), node.kind));
             }
-            _ => {}
+            NodeKind::Source | NodeKind::Quality | NodeKind::Snapshot | NodeKind::Test => {}
         }
     }
-    let mut legacy_winner: HashMap<&str, NodeId> = HashMap::new();
     for (label, claimants) in &producers {
         if claimants.len() > 1 {
             report
                 .label_collisions
                 .push((label.clone(), claimants.len()));
         }
-        // The single-slot map's insert order made the LAST claimant the one
-        // whose edges the old code produced.
-        if let Some((last, _)) = claimants.last() {
-            legacy_winner.insert(label.as_str(), last.clone());
-        }
     }
     report.label_collisions.sort();
 
-    // Existing edges as a set so we don't double-add.
-    let mut existing: HashSet<(NodeId, NodeId)> = dag
-        .edges
+    let labels: HashMap<&NodeId, &str> = dag
+        .nodes
         .iter()
-        .map(|e| (e.from.clone(), e.to.clone()))
+        .map(|n| (&n.id, n.label.as_str()))
         .collect();
-    // The graph below is byte-for-byte the single-slot heuristic's: only the
-    // legacy winner's edges derive, unguarded, so genuine reciprocal label
-    // reads keep their loud refusal exactly as before.
-    let mut new_edges = Vec::new();
 
-    // Resolve every reader's candidates once, splitting legacy from fan-out.
-    // TWO-PHASE insertion: all legacy edges first (unguarded — byte-for-byte
-    // the graph the single-slot heuristic produced, so refusals are exactly
-    // the old refusals), THEN the fan-out additions guarded against the
-    // COMPLETE graph. Interleaving would let an earlier reader's fan-out
-    // edge make a later reader's unguarded legacy edge closing — a refusal
-    // the old behavior never had.
-    let mut legacy_candidates: Vec<(NodeId, String, NodeId)> = Vec::new();
+    // `(reader id, producer id)`, sorted so every decision below is made in
+    // the same order every run.
+    let mut candidates: BTreeSet<(String, String)> = BTreeSet::new();
     for node in &dag.nodes {
         if node.kind != NodeKind::Transformation {
             continue;
@@ -1009,46 +1348,107 @@ pub fn infer_runtime_dependencies(
                 continue;
             }
         };
-        for table_name in refs {
+        for read in refs {
+            let parts: Vec<String> = read.split('.').map(fold_identifier).collect();
             // Match by the bare table name (last segment of any qualified ref).
-            let bare = table_name
-                .rsplit('.')
-                .next()
-                .unwrap_or(&table_name)
-                .to_lowercase();
-            let Some(claimants) = producers.get(&bare) else {
+            let Some(label) = parts.last() else { continue };
+            let Some(claimants) = producers.get(label) else {
                 continue;
             };
-            // ONLY the legacy winner's edge is derived — byte-for-byte the
-            // single-slot heuristic's graph. Ordering readers after the
-            // OTHER claimants was tried and reverted four review rounds
-            // running: any edge added beyond main's graph can suppress an
-            // exact physical dependency through the shared cycle guards
-            // until the cross-pass provenance contract exists (#1357). The
-            // collision is REPORTED so the un-ordered claimants are visible
-            // instead of silent.
-            for (producer_id, _kind) in claimants {
-                if *producer_id == node.id {
-                    continue;
+            let producer_id = match claimants.as_slice() {
+                [(only, _)] => only,
+                // Several nodes claim the label: the read must name exactly
+                // one of them by its physical target, and no other claimant
+                // may be able to be the same table. A claimant whose target is
+                // not fully known is not ruled out by a read that does not
+                // contradict it.
+                _ => {
+                    let possible: Vec<(&NodeId, ReadMatch)> = claimants
+                        .iter()
+                        .map(|(id, _)| {
+                            let found = targets
+                                .get(id)
+                                .map_or(ReadMatch::Possibly, |t| t.match_read(&parts));
+                            (id, found)
+                        })
+                        .filter(|(_, found)| *found != ReadMatch::Not)
+                        .collect();
+                    if possible.is_empty() {
+                        // The qualified read is of another table entirely.
+                        // None of these label claimants can supply it.
+                        continue;
+                    }
+                    let [(named, ReadMatch::Named)] = possible.as_slice() else {
+                        let mut described: Vec<String> = claimants
+                            .iter()
+                            .map(|(id, kind)| {
+                                let name = labels.get(id).copied().unwrap_or_default();
+                                let target = targets
+                                    .get(id)
+                                    .map(ProducerTarget::describe)
+                                    .unwrap_or_else(|| ProducerTarget::default().describe());
+                                format!("{} '{name}' (target {target})", producer_kind(*kind))
+                            })
+                            .collect();
+                        described.sort();
+                        return Err(UnifiedDagError::AmbiguousLabelProducer {
+                            label: label.clone(),
+                            reader: node.label.clone(),
+                            read,
+                            producers: described,
+                        });
+                    };
+                    *named
                 }
-                if legacy_winner.get(bare.as_str()) == Some(producer_id) {
-                    legacy_candidates.push((
-                        node.id.clone(),
-                        node.label.clone(),
-                        producer_id.clone(),
-                    ));
-                }
+            };
+            // A model never depends on itself.
+            if *producer_id != node.id {
+                candidates.insert((node.id.0.clone(), producer_id.0.clone()));
             }
         }
     }
 
-    // Phase 1 — legacy edges, unguarded (status-quo graph; genuine SQL
-    // cycles keep their loud refusal).
-    for (reader_id, _label, producer_id) in legacy_candidates {
+    // Existing edges as a set so we don't double-add; adjacency carries whether
+    // each edge is one the physical pass settled.
+    let mut existing: HashSet<(NodeId, NodeId)> = dag
+        .edges
+        .iter()
+        .map(|e| (e.from.clone(), e.to.clone()))
+        .collect();
+    let mut adjacency: HashMap<NodeId, Vec<(NodeId, bool)>> = HashMap::new();
+    for e in &dag.edges {
+        let is_physical = physical.contains(&(e.from.clone(), e.to.clone()));
+        adjacency
+            .entry(e.from.clone())
+            .or_default()
+            .push((e.to.clone(), is_physical));
+    }
+    let label_of = |id: &NodeId| labels.get(id).copied().unwrap_or_default().to_string();
+
+    let mut new_edges = Vec::new();
+    for (reader, producer) in candidates {
+        let (reader_id, producer_id) = (NodeId(reader), NodeId(producer));
         let key = (producer_id.clone(), reader_id.clone());
-        if !existing.insert(key) {
+        if existing.contains(&key) {
             continue;
         }
+        // Ordering the producer first closes a cycle iff the producer already
+        // runs after the reader. When that path runs through a physical edge,
+        // the physical evidence is the stronger and this guess is the one to
+        // drop. A cycle of declared and label edges alone stays: genuine
+        // reciprocal reads keep their loud refusal, and a guard here must not
+        // downgrade a real SQL cycle into a silent stale-read success.
+        if closes_a_cycle_through_a_physical_edge(&adjacency, &reader_id, &producer_id) {
+            report
+                .skipped_cycle_edges
+                .push((label_of(&reader_id), label_of(&producer_id)));
+            continue;
+        }
+        existing.insert(key);
+        adjacency
+            .entry(producer_id.clone())
+            .or_default()
+            .push((reader_id.clone(), false));
         new_edges.push(UnifiedEdge {
             from: producer_id,
             to: reader_id,
@@ -1058,22 +1458,68 @@ pub fn infer_runtime_dependencies(
 
     dag.edges.extend(new_edges);
     report.unparsed.sort();
-    report
+    Ok(report)
 }
 
-/// What [`infer_runtime_dependencies`] could not resolve — surfaced by the
+/// Whether ordering `producer` before `reader` would close a cycle that runs
+/// through at least one physical edge: is there a path `reader ⇝ producer`
+/// that uses one?
+///
+/// `adjacency` maps a node to the nodes that run after it, each flagged when
+/// the edge is one the physical pass settled.
+fn closes_a_cycle_through_a_physical_edge(
+    adjacency: &HashMap<NodeId, Vec<(NodeId, bool)>>,
+    reader: &NodeId,
+    producer: &NodeId,
+) -> bool {
+    let mut seen: HashSet<(&NodeId, bool)> = HashSet::new();
+    let mut stack: Vec<(&NodeId, bool)> = vec![(reader, false)];
+    while let Some((current, through_physical)) = stack.pop() {
+        if current == producer {
+            // The path ends here: walking on would revisit the producer.
+            if through_physical {
+                return true;
+            }
+            continue;
+        }
+        if !seen.insert((current, through_physical)) {
+            continue;
+        }
+        if let Some(next) = adjacency.get(current) {
+            stack.extend(
+                next.iter()
+                    .map(|(to, is_physical)| (to, through_physical || *is_physical)),
+            );
+        }
+    }
+    false
+}
+
+/// A producer's kind, for a message.
+fn producer_kind(kind: NodeKind) -> &'static str {
+    match kind {
+        NodeKind::Transformation => "model",
+        NodeKind::Seed => "seed",
+        NodeKind::Load => "load pipeline",
+        NodeKind::Replication => "replication pipeline",
+        NodeKind::Source | NodeKind::Quality | NodeKind::Snapshot | NodeKind::Test => "node",
+    }
+}
+
+/// What the label pass (`infer_label_dependencies`) could not settle — surfaced by the
 /// `run --dag` caller as scheduling warnings instead of silently dropping
 /// edges (#1351).
 #[derive(Debug, Default)]
 pub struct LabelInferenceReport {
     /// Lowercased labels claimed by more than one producing node, with the
-    /// claimant count. Readers of such a label are ordered after ONE of
-    /// them (the last in build order); the rest are NOT ordered — the
-    /// collision is surfaced so the ambiguity is visible (#1357 owns
-    /// actually ordering them).
+    /// claimant count. A read of such a label is ordered after the producer
+    /// whose full target it names, or refused — never by build order (#1629).
     pub label_collisions: Vec<(String, usize)>,
     /// Transformation labels whose SQL failed table-reference extraction.
     pub unparsed: Vec<String>,
+    /// `(reader, producer)` labels of by-name edges skipped because ordering
+    /// the producer first would close a cycle through a physical-read edge.
+    pub skipped_cycle_edges: Vec<(String, String)>,
 }
 
 impl LabelInferenceReport {
@@ -1083,10 +1529,18 @@ impl LabelInferenceReport {
         let mut w = Vec::new();
         for (label, n) in &self.label_collisions {
             w.push(format!(
-                "label '{label}' is produced by {n} nodes — label inference orders readers \
-                 after ONE of them (the last in build order); the others are NOT ordered. \
-                 Rename the colliding producers so each label is unique (depends_on cannot \
-                 order a model against a seed or load)"
+                "label '{label}' is produced by {n} nodes — a read of it is ordered after the \
+                 producer whose full catalog.schema.table target it names, and refused when it \
+                 names none or several. Rename the colliding producers so each label is unique \
+                 (depends_on cannot order a model against a seed or load)"
+            ));
+        }
+        for (reader, producer) in &self.skipped_cycle_edges {
+            w.push(format!(
+                "label-based ordering: '{reader}' reads the name '{producer}', but ordering \
+                 '{producer}' first would close a dependency cycle through an exact \
+                 physical-read edge, so that edge was skipped and the pair executes in the \
+                 physical-read order. Declare depends_on to choose the order explicitly"
             ));
         }
         for m in &self.unparsed {
@@ -1099,40 +1553,31 @@ impl LabelInferenceReport {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Execution phases (parallel layers)
-// ---------------------------------------------------------------------------
-
-/// Computes parallel execution phases from the unified DAG.
-///
-/// Returns groups of node references that can execute concurrently. Within
-/// each phase, all upstream dependencies (across all edge types) have been
-/// satisfied by previous phases. This is the unified-DAG equivalent of
-/// [`rocky_ir::dag::execution_layers`].
-///
-/// Returns an error if the DAG contains a cycle.
 /// Target-aware physical-read edges for transformation nodes (#1275).
 ///
-/// [`infer_runtime_dependencies`] matches reads against node LABELS — it
-/// orders a model after a seed/load it reads by name, but is blind to
-/// configured `[target]`s: a model reading another model's physical
-/// `schema.table` derives nothing there unless the table happens to equal
-/// the model name. This pass derives those edges from rendered target
-/// components via [`crate::physical_edges::derive_physical_edges`] — the
-/// same derivation the plain-run layer computation uses, so both
-/// schedulers order the same pairs.
+/// [`infer_label_dependencies`] matches reads against node LABELS — it orders
+/// a model after a seed/load it reads by name, but is blind to configured
+/// `[target]`s: a model reading another model's physical `schema.table`
+/// derives nothing there unless the table happens to equal the model name.
+/// This pass derives those edges from rendered target components via
+/// [`crate::physical_edges::derive_physical_edges`] — the same derivation the
+/// plain-run layer computation uses, so both schedulers order the same pairs.
+///
+/// It runs BEFORE the label pass ([`build_runtime_dag`]): exact physical
+/// evidence outranks a by-name guess, so the guess must never occupy the graph
+/// first.
 ///
 /// Cycle-closing candidates are skipped deterministically inside the
 /// derivation (the executor's `execution_phases` hard-errors on cycles, and
 /// a derived edge must never turn a runnable project into a refused one).
 /// Returns the derivation so the caller can surface its warnings.
-pub fn infer_physical_dependencies(
+fn infer_physical_dependencies(
     dag: &mut UnifiedDag,
-    models: &[crate::physical_edges::PhysicalEdgeModel<'_>],
-) -> crate::physical_edges::DerivedPhysicalEdges {
+    models: &[PhysicalEdgeModel<'_>],
+) -> DerivedPhysicalEdges {
     use std::collections::HashMap as Map;
     // Transformation-node index by label (label == model name for
-    // transformation nodes — the same contract infer_runtime_dependencies
+    // transformation nodes — the same contract infer_label_dependencies
     // relies on for SQL lookup).
     let by_label: Map<&str, NodeId> = dag
         .nodes
@@ -1264,6 +1709,18 @@ pub fn infer_physical_dependencies(
     derived
 }
 
+// ---------------------------------------------------------------------------
+// Execution phases (parallel layers)
+// ---------------------------------------------------------------------------
+
+/// Computes parallel execution phases from the unified DAG.
+///
+/// Returns groups of node references that can execute concurrently. Within
+/// each phase, all upstream dependencies (across all edge types) have been
+/// satisfied by previous phases. This is the unified-DAG equivalent of
+/// [`rocky_ir::dag::execution_layers`].
+///
+/// Returns an error if the DAG contains a cycle.
 pub fn execution_phases(dag: &UnifiedDag) -> Result<Vec<Vec<&UnifiedNode>>, UnifiedDagError> {
     // Build adjacency structures keyed by NodeId.
     let node_map: HashMap<&NodeId, &UnifiedNode> = dag.nodes.iter().map(|n| (&n.id, n)).collect();
@@ -1581,6 +2038,7 @@ mod tests {
     /// Helper: build a minimal Model.
     fn model(name: &str, depends_on: Vec<&str>, tests: Vec<TestDecl>) -> Model {
         Model {
+            drop_existing_kind: None,
             config: ModelConfig {
                 name: name.into(),
                 depends_on: depends_on.into_iter().map(String::from).collect(),
@@ -2845,7 +3303,15 @@ mod tests {
         );
     }
 
-    // ---------- infer_runtime_dependencies ----------
+    // ---------- the label pass ----------
+
+    /// The label pass alone over a hand-built DAG: no producer targets, no
+    /// physical edges. Fixtures here have no label collision, so it cannot
+    /// refuse; the collision cases go through [`build_runtime_dag`].
+    fn infer_labels(dag: &mut UnifiedDag, sql: &HashMap<String, String>) -> LabelInferenceReport {
+        infer_label_dependencies(dag, sql, &HashMap::new(), &HashSet::new())
+            .expect("a fixture without a label collision cannot be refused")
+    }
 
     fn dag_with_models(models: &[(&str, NodeKind)]) -> UnifiedDag {
         let nodes = models
@@ -2873,7 +3339,7 @@ mod tests {
         let mut sql = HashMap::new();
         sql.insert("stg_orders".into(), "SELECT * FROM orders".into());
 
-        infer_runtime_dependencies(&mut dag, &sql);
+        infer_labels(&mut dag, &sql);
 
         assert_eq!(dag.edges.len(), 1);
         assert_eq!(dag.edges[0].from, NodeId::new("transformation", "orders"));
@@ -2894,7 +3360,7 @@ mod tests {
             "SELECT * FROM main.raw.customers".into(),
         );
 
-        infer_runtime_dependencies(&mut dag, &sql);
+        infer_labels(&mut dag, &sql);
         assert_eq!(dag.edges.len(), 1);
         assert_eq!(dag.edges[0].from, NodeId::new("seed", "customers"));
     }
@@ -2915,7 +3381,7 @@ mod tests {
         let mut sql = HashMap::new();
         sql.insert("stg_orders".into(), "SELECT * FROM orders".into());
 
-        infer_runtime_dependencies(&mut dag, &sql);
+        infer_labels(&mut dag, &sql);
 
         // No duplicate added.
         assert_eq!(dag.edges.len(), 1);
@@ -2927,7 +3393,7 @@ mod tests {
         let mut sql = HashMap::new();
         sql.insert("loop_model".into(), "SELECT * FROM loop_model".into());
 
-        infer_runtime_dependencies(&mut dag, &sql);
+        infer_labels(&mut dag, &sql);
         assert_eq!(dag.edges.len(), 0);
     }
 
@@ -2941,8 +3407,8 @@ mod tests {
         let mut sql = HashMap::new();
         sql.insert("stg_orders".into(), "SELECT * FROM orders".into());
 
-        infer_runtime_dependencies(&mut dag, &sql);
-        infer_runtime_dependencies(&mut dag, &sql);
+        infer_labels(&mut dag, &sql);
+        infer_labels(&mut dag, &sql);
 
         assert_eq!(dag.edges.len(), 1);
     }
@@ -2957,7 +3423,7 @@ mod tests {
             "SELECT * FROM nonexistent_external_table".into(),
         );
 
-        infer_runtime_dependencies(&mut dag, &sql);
+        infer_labels(&mut dag, &sql);
         assert_eq!(dag.edges.len(), 0);
     }
 
@@ -2968,7 +3434,7 @@ mod tests {
         sql.insert("model_a".into(), "this is not sql".into());
 
         // Should not panic; invalid SQL just yields no inferred edges.
-        infer_runtime_dependencies(&mut dag, &sql);
+        infer_labels(&mut dag, &sql);
         assert_eq!(dag.edges.len(), 0);
     }
 
@@ -2993,7 +3459,7 @@ mod tests {
             .iter()
             .map(|m| (m.config.name.clone(), m.sql.clone()))
             .collect();
-        infer_runtime_dependencies(&mut dag, &sql_by_name);
+        infer_labels(&mut dag, &sql_by_name);
         let phases = execution_phases(&dag).expect("phases");
         let phase_of = |label: &str, phases: &Vec<Vec<&UnifiedNode>>| -> usize {
             phases
@@ -3007,16 +3473,1097 @@ mod tests {
             "precondition: the label heuristic is blind to the renamed target"
         );
 
-        let inputs: Vec<crate::physical_edges::PhysicalEdgeModel<'_>> = models
-            .iter()
-            .map(crate::physical_edges::PhysicalEdgeModel::from_model)
-            .collect();
-        let derived = infer_physical_dependencies(&mut dag, &inputs);
-        assert_eq!(derived.edges.len(), 1, "{derived:?}");
-        let phases = execution_phases(&dag).expect("phases after augmentation");
+        // The graph `run --dag` actually schedules from.
+        let runtime =
+            build_runtime_dag(&config, &by_pipeline, &[], None, &no_catalog).expect("runtime dag");
+        assert_eq!(runtime.physical.edges.len(), 1, "{:?}", runtime.physical);
+        let phases = execution_phases(&runtime.dag).expect("phases after augmentation");
         assert!(
             phase_of("orders_model", &phases) < phase_of("mart", &phases),
             "producer must phase strictly before its physical reader"
+        );
+    }
+
+    // ---------- build_runtime_dag: the entry point `run --dag` uses ----------
+
+    /// A catalog resolver that establishes nothing — every adapter but DuckDB.
+    fn no_catalog(_: &AdapterConfig) -> Option<String> {
+        None
+    }
+
+    /// What a DuckDB adapter's own catalog is: its database file's stem.
+    fn duckdb_stem_catalog(adapter: &AdapterConfig) -> Option<String> {
+        adapter
+            .path
+            .as_deref()
+            .and_then(|p| std::path::Path::new(p).file_stem())
+            .and_then(std::ffi::OsStr::to_str)
+            .map(str::to_owned)
+    }
+
+    /// `[pipeline.X] type = "load"` writing `catalog.schema[.table]`.
+    fn load_pipeline(catalog: &str, schema: &str, table: Option<&str>) -> PipelineConfig {
+        let table = table.map_or(String::new(), |t| format!("table = \"{t}\"\n"));
+        toml::from_str(&format!(
+            "type = \"load\"\nsource_dir = \"data/\"\n\n[target]\ncatalog = \"{catalog}\"\n\
+             schema = \"{schema}\"\n{table}"
+        ))
+        .expect("load pipeline fixture must deserialize")
+    }
+
+    /// A config whose `default` adapter is a DuckDB file `db.duckdb`.
+    fn duckdb_config(pipelines: Vec<(&str, PipelineConfig)>) -> RockyConfig {
+        let mut config = config_with_pipelines(pipelines);
+        config
+            .adapters
+            .insert("default".into(), duckdb_adapter("db.duckdb"));
+        config
+    }
+
+    /// A model writing `catalog.schema.table` and reading `sql`.
+    fn model_reading(name: &str, target: (&str, &str, &str), sql: &str) -> Model {
+        let mut m = model_targeting(name, target.0, target.1, target.2);
+        m.sql = sql.to_string();
+        m
+    }
+
+    /// The execution phase of the node with this id (`kind:name`).
+    fn phase_index(dag: &UnifiedDag, id: &str) -> usize {
+        execution_phases(dag)
+            .expect("phases")
+            .iter()
+            .position(|phase| phase.iter().any(|n| n.id.0 == id))
+            .unwrap_or_else(|| panic!("no node {id}"))
+    }
+
+    /// Whether `from` must complete before `to` (node ids, `kind:name`).
+    fn has_edge(dag: &UnifiedDag, from: &str, to: &str) -> bool {
+        dag.edges.iter().any(|e| e.from.0 == from && e.to.0 == to)
+    }
+
+    /// #1629 P1: a producer whose `[target]` omits its catalog (`catalog =
+    /// ""`, the DuckDB single-catalog shape) is indexed under an empty
+    /// catalog, so a three-part read of it misses the exact index. Through
+    /// the graph `run --dag` builds: once the adapter establishes the
+    /// producer's catalog, the read that names it still orders the pair.
+    #[test]
+    fn a_catalogless_producer_is_ordered_before_a_read_that_names_its_catalog() {
+        let config = duckdb_config(vec![("t", transform_pipeline(vec![]))]);
+        let by_pipeline = owned_by_sole_transformation(
+            &config,
+            vec![
+                model_reading(
+                    "orders_model",
+                    ("", "silver", "orders_v2"),
+                    "SELECT 1 AS id",
+                ),
+                model_reading(
+                    "mart",
+                    ("db", "silver", "mart"),
+                    "SELECT id FROM db.silver.orders_v2",
+                ),
+            ],
+        );
+        let runtime = build_runtime_dag(&config, &by_pipeline, &[], None, &duckdb_stem_catalog)
+            .expect("runtime dag");
+        assert!(
+            has_edge(
+                &runtime.dag,
+                "transformation:orders_model",
+                "transformation:mart"
+            ),
+            "{:?}",
+            runtime.physical
+        );
+        assert!(runtime.warnings.is_empty(), "{:?}", runtime.warnings);
+        assert!(
+            phase_index(&runtime.dag, "transformation:orders_model")
+                < phase_index(&runtime.dag, "transformation:mart")
+        );
+    }
+
+    /// The same project on an adapter that cannot say which catalog its
+    /// catalogless targets live in. The read might name another catalog's
+    /// table, so no edge is guessed — and the read is surfaced, not dropped.
+    #[test]
+    fn a_catalogless_producer_on_an_adapter_that_cannot_say_is_not_guessed_at() {
+        let config = duckdb_config(vec![("t", transform_pipeline(vec![]))]);
+        let by_pipeline = owned_by_sole_transformation(
+            &config,
+            vec![
+                model_reading(
+                    "orders_model",
+                    ("", "silver", "orders_v2"),
+                    "SELECT 1 AS id",
+                ),
+                model_reading(
+                    "mart",
+                    ("db", "silver", "mart"),
+                    "SELECT id FROM db.silver.orders_v2",
+                ),
+            ],
+        );
+        let runtime =
+            build_runtime_dag(&config, &by_pipeline, &[], None, &no_catalog).expect("runtime dag");
+        assert!(
+            !has_edge(
+                &runtime.dag,
+                "transformation:orders_model",
+                "transformation:mart"
+            ),
+            "no edge without an established catalog"
+        );
+        assert!(
+            runtime
+                .warnings
+                .iter()
+                .any(|w| w.contains("'mart'") && w.contains("db.silver.orders_v2")),
+            "the unbound read is named: {:?}",
+            runtime.warnings
+        );
+    }
+
+    /// Never guess across catalogs: the producer is established to live in
+    /// `db`, so a read of `other.silver.orders_v2` is another catalog's table.
+    #[test]
+    fn a_read_naming_another_catalog_gets_no_edge_in_the_runtime_dag() {
+        let config = duckdb_config(vec![("t", transform_pipeline(vec![]))]);
+        let by_pipeline = owned_by_sole_transformation(
+            &config,
+            vec![
+                model_reading(
+                    "orders_model",
+                    ("", "silver", "orders_v2"),
+                    "SELECT 1 AS id",
+                ),
+                model_reading(
+                    "mart",
+                    ("db", "silver", "mart"),
+                    "SELECT id FROM other.silver.orders_v2",
+                ),
+            ],
+        );
+        let runtime = build_runtime_dag(&config, &by_pipeline, &[], None, &duckdb_stem_catalog)
+            .expect("runtime dag");
+        assert!(!has_edge(
+            &runtime.dag,
+            "transformation:orders_model",
+            "transformation:mart"
+        ));
+        assert!(runtime.warnings.is_empty(), "{:?}", runtime.warnings);
+    }
+
+    /// Several catalogless producers could be the read's table: no edge, and
+    /// the warning names every candidate.
+    #[test]
+    fn several_catalogless_candidates_add_no_edge_and_are_named_in_the_runtime_dag() {
+        let config = duckdb_config(vec![("t", transform_pipeline(vec![]))]);
+        let by_pipeline = owned_by_sole_transformation(
+            &config,
+            vec![
+                model_reading("first", ("", "silver", "shared"), "SELECT 1 AS x"),
+                model_reading("second", ("", "silver", "shared"), "SELECT 2 AS x"),
+                model_reading(
+                    "reader",
+                    ("db", "silver", "reader"),
+                    "SELECT x FROM db.silver.shared",
+                ),
+            ],
+        );
+        let runtime = build_runtime_dag(&config, &by_pipeline, &[], None, &duckdb_stem_catalog)
+            .expect("runtime dag");
+        assert!(!has_edge(
+            &runtime.dag,
+            "transformation:first",
+            "transformation:reader"
+        ));
+        assert!(!has_edge(
+            &runtime.dag,
+            "transformation:second",
+            "transformation:reader"
+        ));
+        assert!(
+            runtime
+                .warnings
+                .iter()
+                .any(|w| w.contains("'first'") && w.contains("'second'")),
+            "{:?}",
+            runtime.warnings
+        );
+        assert_eq!(
+            runtime.physical.target_collisions,
+            vec![("first".into(), "second".into())],
+            "two writers on one adapter still collide"
+        );
+    }
+
+    /// Two adapter names with the same DuckDB file stem have the same
+    /// established catalog. Neither name can exclude the other producer.
+    #[test]
+    fn equal_stem_adapters_leave_the_read_ambiguous_and_report_a_collision() {
+        let mut config = config_with_pipelines(vec![
+            ("p_one", transform_pipeline_on("wh_one")),
+            ("p_two", transform_pipeline_on("wh_two")),
+            ("p_read", transform_pipeline_on("wh_one")),
+        ]);
+        config
+            .adapters
+            .insert("wh_one".into(), duckdb_adapter("one/db.duckdb"));
+        config
+            .adapters
+            .insert("wh_two".into(), duckdb_adapter("two/db.duckdb"));
+        let by_pipeline = ModelsByPipeline::from([
+            (
+                "p_one".into(),
+                vec![model_reading("first", ("", "main", "shared"), "SELECT 1")],
+            ),
+            (
+                "p_two".into(),
+                vec![model_reading("second", ("", "main", "shared"), "SELECT 2")],
+            ),
+            (
+                "p_read".into(),
+                vec![model_reading(
+                    "reader",
+                    ("db", "main", "out"),
+                    "SELECT x FROM db.main.shared",
+                )],
+            ),
+        ]);
+        let runtime = build_runtime_dag(&config, &by_pipeline, &[], None, &duckdb_stem_catalog)
+            .expect("runtime dag");
+        assert!(runtime.physical.edges.is_empty(), "{:?}", runtime.physical);
+        assert_eq!(runtime.physical.unbound_reads.len(), 1);
+        assert_eq!(
+            runtime.physical.unbound_reads[0].candidates,
+            vec!["first", "second"]
+        );
+        assert_eq!(
+            runtime.physical.target_collisions,
+            vec![("first".into(), "second".into())]
+        );
+        assert!(
+            runtime
+                .warnings
+                .iter()
+                .any(|w| w.contains("'first'") && w.contains("'second'")),
+            "{:?}",
+            runtime.warnings
+        );
+    }
+
+    /// A declared target on another adapter must not consume the exact hit
+    /// before the reader's catalogless producer gets the fallback edge.
+    #[test]
+    fn another_adapters_exact_target_does_not_hide_the_local_fallback() {
+        let mut config = config_with_pipelines(vec![
+            ("p_local", transform_pipeline_on("wh_local")),
+            ("p_other", transform_pipeline_on("wh_other")),
+            ("p_read", transform_pipeline_on("wh_local")),
+        ]);
+        config
+            .adapters
+            .insert("wh_local".into(), duckdb_adapter("one/db.duckdb"));
+        config
+            .adapters
+            .insert("wh_other".into(), duckdb_adapter("two/other.duckdb"));
+        let by_pipeline = ModelsByPipeline::from([
+            (
+                "p_local".into(),
+                vec![model_reading("local", ("", "main", "shared"), "SELECT 1")],
+            ),
+            (
+                "p_other".into(),
+                vec![model_reading("other", ("db", "main", "shared"), "SELECT 2")],
+            ),
+            (
+                "p_read".into(),
+                vec![model_reading(
+                    "reader",
+                    ("db", "main", "out"),
+                    "SELECT x FROM db.main.shared",
+                )],
+            ),
+        ]);
+        let runtime = build_runtime_dag(&config, &by_pipeline, &[], None, &duckdb_stem_catalog)
+            .expect("runtime dag");
+        assert!(
+            has_edge(
+                &runtime.dag,
+                "transformation:local",
+                "transformation:reader"
+            ),
+            "{:?}",
+            runtime.physical
+        );
+        assert!(!has_edge(
+            &runtime.dag,
+            "transformation:other",
+            "transformation:reader"
+        ));
+    }
+
+    /// Another adapter name alone does not disprove an exact physical read.
+    /// Without a local fallback producer, keep that exact ordering edge.
+    #[test]
+    fn cross_adapter_exact_read_stays_ordered_without_a_local_fallback() {
+        let mut config = config_with_pipelines(vec![
+            ("p_other", transform_pipeline_on("wh_other")),
+            ("p_read", transform_pipeline_on("wh_local")),
+        ]);
+        config
+            .adapters
+            .insert("wh_local".into(), duckdb_adapter("one/db.duckdb"));
+        config
+            .adapters
+            .insert("wh_other".into(), duckdb_adapter("two/other.duckdb"));
+        let by_pipeline = ModelsByPipeline::from([
+            (
+                "p_other".into(),
+                vec![model_reading("other", ("db", "main", "shared"), "SELECT 1")],
+            ),
+            (
+                "p_read".into(),
+                vec![model_reading(
+                    "reader",
+                    ("db", "main", "out"),
+                    "SELECT x FROM db.main.shared",
+                )],
+            ),
+        ]);
+        let runtime = build_runtime_dag(&config, &by_pipeline, &[], None, &duckdb_stem_catalog)
+            .expect("runtime dag");
+        assert!(has_edge(
+            &runtime.dag,
+            "transformation:other",
+            "transformation:reader"
+        ));
+    }
+
+    /// Two pipelines, two DuckDB files, one `schema.table` written through
+    /// both. Each catalogless target lives in ITS adapter's catalog and a read
+    /// naming `alpha` can only mean the `alpha` file's. The producer on the
+    /// other adapter does not make that proven binding ambiguous.
+    #[test]
+    fn a_schema_table_two_adapters_bind_the_reader_to_its_adapter() {
+        let mut config = config_with_pipelines(vec![
+            ("p_alpha", transform_pipeline_on("wh_alpha")),
+            ("p_beta", transform_pipeline_on("wh_beta")),
+            ("p_read", transform_pipeline_on("wh_alpha")),
+        ]);
+        config
+            .adapters
+            .insert("wh_alpha".into(), duckdb_adapter("one/alpha.duckdb"));
+        config
+            .adapters
+            .insert("wh_beta".into(), duckdb_adapter("two/beta.duckdb"));
+        let by_pipeline = ModelsByPipeline::from([
+            (
+                "p_alpha".to_string(),
+                vec![model_reading(
+                    "shared_alpha",
+                    ("", "main", "shared"),
+                    "SELECT 1 AS x",
+                )],
+            ),
+            (
+                "p_beta".to_string(),
+                vec![model_reading(
+                    "shared_beta",
+                    ("", "main", "shared"),
+                    "SELECT 2 AS x",
+                )],
+            ),
+            (
+                "p_read".to_string(),
+                vec![model_reading(
+                    "reader",
+                    ("alpha", "main", "reader"),
+                    "SELECT x FROM alpha.main.shared",
+                )],
+            ),
+        ]);
+        let runtime = build_runtime_dag(&config, &by_pipeline, &[], None, &duckdb_stem_catalog)
+            .expect("runtime dag");
+        assert!(has_edge(
+            &runtime.dag,
+            "transformation:shared_alpha",
+            "transformation:reader"
+        ));
+        assert!(!has_edge(
+            &runtime.dag,
+            "transformation:shared_beta",
+            "transformation:reader"
+        ));
+        assert!(
+            runtime.warnings.is_empty(),
+            "the binding is settled: {:?}",
+            runtime.warnings
+        );
+    }
+
+    /// The review's P1 construction, through the graph `run --dag` builds.
+    /// `alpha` reads ANOTHER catalog's `beta_table` and `beta` (catalog
+    /// `prod`) reads alpha's table by a two-part name. The real edge is
+    /// beta-after-alpha; guessing on `(schema, table)` would fabricate
+    /// alpha-after-beta and let the cycle guard discard the real one.
+    #[test]
+    fn a_read_of_another_catalogs_table_never_reverses_a_real_edge_in_the_runtime_dag() {
+        let config = duckdb_config(vec![("t", transform_pipeline(vec![]))]);
+        let by_pipeline = owned_by_sole_transformation(
+            &config,
+            vec![
+                model_reading(
+                    "alpha",
+                    ("prod", "main", "alpha_table"),
+                    "SELECT x FROM external.main.beta_table",
+                ),
+                model_reading(
+                    "beta",
+                    ("prod", "main", "beta_table"),
+                    "SELECT y FROM main.alpha_table",
+                ),
+            ],
+        );
+        let runtime = build_runtime_dag(&config, &by_pipeline, &[], None, &duckdb_stem_catalog)
+            .expect("runtime dag");
+        assert!(
+            has_edge(&runtime.dag, "transformation:alpha", "transformation:beta"),
+            "beta reads alpha's table: {:?}",
+            runtime.physical
+        );
+        assert!(
+            !has_edge(&runtime.dag, "transformation:beta", "transformation:alpha"),
+            "alpha reads a table in ANOTHER catalog, not beta's"
+        );
+        assert!(
+            phase_index(&runtime.dag, "transformation:alpha")
+                < phase_index(&runtime.dag, "transformation:beta")
+        );
+    }
+
+    /// An exact physical edge is decided before any inference, whatever the
+    /// names sort like: `a_reader`'s catalog fallback and `z_writer`'s exact
+    /// read contradict, and the guess must be the one skipped.
+    #[test]
+    fn an_exact_read_outranks_a_catalog_fallback_in_the_runtime_dag() {
+        let config = duckdb_config(vec![("t", transform_pipeline(vec![]))]);
+        let by_pipeline = owned_by_sole_transformation(
+            &config,
+            vec![
+                model_reading(
+                    "a_reader",
+                    ("db", "main", "a_out"),
+                    "SELECT x FROM db.main.z_out",
+                ),
+                model_reading(
+                    "z_writer",
+                    ("", "main", "z_out"),
+                    "SELECT x FROM main.a_out",
+                ),
+            ],
+        );
+        let runtime = build_runtime_dag(&config, &by_pipeline, &[], None, &duckdb_stem_catalog)
+            .expect("runtime dag");
+        assert!(
+            has_edge(
+                &runtime.dag,
+                "transformation:a_reader",
+                "transformation:z_writer"
+            ),
+            "z_writer reads a_reader's table exactly: {:?}",
+            runtime.physical
+        );
+        assert!(!has_edge(
+            &runtime.dag,
+            "transformation:z_writer",
+            "transformation:a_reader"
+        ));
+        assert!(
+            phase_index(&runtime.dag, "transformation:a_reader")
+                < phase_index(&runtime.dag, "transformation:z_writer")
+        );
+    }
+
+    /// The repro shape from #1629's body. `customers` reads
+    /// `warehouse.silver.rollup` — exactly `rollup`'s target — and `rollup`
+    /// bare-reads `customers`, a name that matches only by label (the model
+    /// writes `customers_v2`). The label match is the weakest evidence in the
+    /// graph: it must not displace the exact read, so `rollup` runs first.
+    /// Before, the label edge was laid down first, the exact edge was skipped
+    /// as its cycle-closer, and `run --dag` refused the project.
+    #[test]
+    fn an_exact_physical_read_outranks_a_contradicting_label_read() {
+        let config = config_with_pipelines(vec![("t", transform_pipeline(vec![]))]);
+        let by_pipeline = owned_by_sole_transformation(
+            &config,
+            vec![
+                model_reading(
+                    "customers",
+                    ("warehouse", "prod", "customers_v2"),
+                    "SELECT y FROM warehouse.silver.rollup",
+                ),
+                model_reading(
+                    "rollup",
+                    ("warehouse", "silver", "rollup"),
+                    "SELECT x FROM customers",
+                ),
+            ],
+        );
+        let runtime = build_runtime_dag(&config, &by_pipeline, &[], None, &no_catalog)
+            .expect("the exact edge stands and the guess is dropped, not refused");
+        assert!(has_edge(
+            &runtime.dag,
+            "transformation:rollup",
+            "transformation:customers"
+        ));
+        assert!(!has_edge(
+            &runtime.dag,
+            "transformation:customers",
+            "transformation:rollup"
+        ));
+        assert!(
+            phase_index(&runtime.dag, "transformation:rollup")
+                < phase_index(&runtime.dag, "transformation:customers")
+        );
+        assert_eq!(
+            runtime.labels.skipped_cycle_edges,
+            vec![("rollup".to_string(), "customers".to_string())]
+        );
+        assert!(
+            runtime
+                .warnings
+                .iter()
+                .any(|w| w.contains("label-based ordering") && w.contains("'customers'")),
+            "the dropped guess is reported: {:?}",
+            runtime.warnings
+        );
+    }
+
+    /// A cycle made only of a declared edge and a label edge is a genuine
+    /// cycle — no physical evidence says which side is wrong — so it keeps its
+    /// loud refusal instead of being downgraded to a silent stale read.
+    #[test]
+    fn a_label_edge_closing_a_cycle_with_only_a_declared_edge_is_still_refused() {
+        let config = config_with_pipelines(vec![("t", transform_pipeline(vec![]))]);
+        let mut a = model("a", vec!["b"], vec![]);
+        a.sql = "SELECT 1 AS x".into();
+        let mut b = model("b", vec![], vec![]);
+        b.sql = "SELECT y FROM a".into();
+        let by_pipeline = owned_by_sole_transformation(&config, vec![a, b]);
+        let runtime = build_runtime_dag(&config, &by_pipeline, &[], None, &no_catalog)
+            .expect("the DAG builds; the cycle is the executor's to refuse");
+        assert!(
+            execution_phases(&runtime.dag).is_err(),
+            "a genuine cycle keeps its loud refusal"
+        );
+        assert!(runtime.labels.skipped_cycle_edges.is_empty());
+    }
+
+    // ---------- P2: a label two producers share ----------
+
+    /// The review's P2 construction. A transformation pipeline owns model
+    /// `shared` (writes `prod.silver.shared_output`, reads the reader's
+    /// output) and model `reader` (reads `prod.bronze.shared`). A LOAD
+    /// pipeline named `shared` writes `prod.bronze.shared`. The reader means
+    /// the load: the order is load, reader, model `shared` — whichever
+    /// pipeline the config lists first.
+    fn shared_label_project(load_first: bool) -> (RockyConfig, ModelsByPipeline) {
+        let transform = ("t", transform_pipeline(vec![]));
+        let load = ("shared", load_pipeline("prod", "bronze", Some("shared")));
+        let config = config_with_pipelines(if load_first {
+            vec![load, transform]
+        } else {
+            vec![transform, load]
+        });
+        let by_pipeline = owned_by_sole_transformation(
+            &config,
+            vec![
+                model_reading(
+                    "shared",
+                    ("prod", "silver", "shared_output"),
+                    "SELECT y FROM prod.silver.reader_output",
+                ),
+                model_reading(
+                    "reader",
+                    ("prod", "silver", "reader_output"),
+                    "SELECT x FROM prod.bronze.shared",
+                ),
+            ],
+        );
+        (config, by_pipeline)
+    }
+
+    #[test]
+    fn a_reader_of_a_colliding_label_is_ordered_after_the_load_it_names() {
+        for load_first in [true, false] {
+            let (config, by_pipeline) = shared_label_project(load_first);
+            let runtime = build_runtime_dag(&config, &by_pipeline, &[], None, &no_catalog)
+                .expect("the read names the load's exact target");
+            let dag = &runtime.dag;
+            assert!(
+                has_edge(dag, "load:shared", "transformation:reader"),
+                "load_first={load_first}: the reader reads the load's table"
+            );
+            assert!(
+                has_edge(dag, "transformation:reader", "transformation:shared"),
+                "load_first={load_first}: model `shared` reads the reader's exact target"
+            );
+            assert!(
+                !has_edge(dag, "transformation:shared", "transformation:reader"),
+                "load_first={load_first}: the reader must never wait for model `shared`"
+            );
+            assert!(
+                !has_edge(dag, "transformation:shared", "load:shared")
+                    && !has_edge(dag, "load:shared", "transformation:shared"),
+                "load_first={load_first}: the two producers are not ordered against each other"
+            );
+            // The order that matters: no model runs before its input exists.
+            let load = phase_index(dag, "load:shared");
+            let reader = phase_index(dag, "transformation:reader");
+            let model = phase_index(dag, "transformation:shared");
+            assert!(
+                load < reader && reader < model,
+                "load_first={load_first}: load={load} reader={reader} model={model}"
+            );
+        }
+    }
+
+    /// The same construction with a SEED that has a sidecar target: it too
+    /// is named by the read's full target, and node build order (seeds are
+    /// always built first) decides nothing.
+    #[test]
+    fn a_reader_of_a_colliding_label_is_ordered_after_the_seed_it_names() {
+        let config = config_with_pipelines(vec![("t", transform_pipeline(vec![]))]);
+        let by_pipeline = owned_by_sole_transformation(
+            &config,
+            vec![
+                model_reading(
+                    "shared",
+                    ("prod", "silver", "shared_output"),
+                    "SELECT y FROM prod.silver.reader_output",
+                ),
+                model_reading(
+                    "reader",
+                    ("prod", "silver", "reader_output"),
+                    "SELECT x FROM prod.bronze.shared",
+                ),
+            ],
+        );
+        let mut colliding_seed = seed("shared");
+        colliding_seed.config.target = Some(crate::seeds::SeedTarget {
+            catalog: Some("prod".into()),
+            schema: "bronze".into(),
+            table: Some("shared".into()),
+        });
+        let runtime =
+            build_runtime_dag(&config, &by_pipeline, &[colliding_seed], None, &no_catalog)
+                .expect("the read names the seed's exact target");
+        let dag = &runtime.dag;
+        assert!(has_edge(dag, "seed:shared", "transformation:reader"));
+        assert!(!has_edge(
+            dag,
+            "transformation:shared",
+            "transformation:reader"
+        ));
+        assert!(
+            phase_index(dag, "seed:shared") < phase_index(dag, "transformation:reader")
+                && phase_index(dag, "transformation:reader")
+                    < phase_index(dag, "transformation:shared")
+        );
+    }
+
+    /// And the inverse read: the reader names the MODEL's target
+    /// (`prod.silver.shared`, whose table is the label), so the load that shares
+    /// its label is NOT ordered before the reader. A rule that answers the case
+    /// above by "the load wins" cannot pass both; resolving by target gets both
+    /// right, whichever pipeline is built last.
+    ///
+    /// The model's own edge is asserted as a sanity check only: the physical
+    /// pass derives it before the label pass runs, so it cannot tell a label
+    /// pass that adds it from one that does not. What this test pins is the
+    /// edge that must be ABSENT, and that the label really did collide.
+    #[test]
+    fn a_reader_of_a_colliding_label_is_ordered_after_the_model_it_names() {
+        for load_first in [true, false] {
+            let (config, mut by_pipeline) = shared_label_project(load_first);
+            let models = by_pipeline.get_mut("t").expect("pipeline t");
+            // The model `shared` writes a table called `shared`, so a read of
+            // it matches the label by its last segment and the collision is
+            // live; it reads nothing.
+            let model = models
+                .iter_mut()
+                .find(|m| m.config.name == "shared")
+                .expect("shared");
+            model.config.target.table = "shared".into();
+            model.sql = "SELECT 1 AS y".to_string();
+            models
+                .iter_mut()
+                .find(|m| m.config.name == "reader")
+                .expect("reader")
+                .sql = "SELECT x FROM prod.silver.shared".to_string();
+            let runtime = build_runtime_dag(&config, &by_pipeline, &[], None, &no_catalog)
+                .expect("the read names the model's exact target");
+            assert!(
+                has_edge(
+                    &runtime.dag,
+                    "transformation:shared",
+                    "transformation:reader"
+                ),
+                "load_first={load_first}"
+            );
+            assert!(
+                !has_edge(&runtime.dag, "load:shared", "transformation:reader"),
+                "load_first={load_first}: the reader does not read the load's table"
+            );
+            assert_eq!(
+                runtime.labels.label_collisions,
+                vec![("shared".to_string(), 2)],
+                "the label really collides, so the label pass had to choose"
+            );
+        }
+    }
+
+    /// A bare read of a label two producers share names neither by target,
+    /// so it cannot be resolved: the DAG is refused, naming both.
+    #[test]
+    fn a_bare_read_of_a_colliding_label_is_refused_naming_both_producers() {
+        for load_first in [true, false] {
+            let (config, mut by_pipeline) = shared_label_project(load_first);
+            by_pipeline
+                .get_mut("t")
+                .expect("pipeline t")
+                .iter_mut()
+                .find(|m| m.config.name == "reader")
+                .expect("reader")
+                .sql = "SELECT x FROM shared".to_string();
+            let err = build_runtime_dag(&config, &by_pipeline, &[], None, &no_catalog)
+                .expect_err("an unresolvable collision must refuse");
+            let UnifiedDagError::AmbiguousLabelProducer {
+                label,
+                reader,
+                read,
+                producers,
+            } = &err
+            else {
+                panic!("wrong refusal: {err}");
+            };
+            assert_eq!(
+                (label.as_str(), reader.as_str(), read.as_str()),
+                ("shared", "reader", "shared")
+            );
+            assert_eq!(producers.len(), 2, "{producers:?}");
+            let message = err.to_string();
+            assert!(
+                message.contains("model 'shared' (target prod.silver.shared_output)")
+                    && message.contains("load pipeline 'shared' (target prod.bronze.shared)"),
+                "the refusal names both producers with their targets: {message}"
+            );
+        }
+    }
+
+    /// A qualified read that names neither claimant is a different table.
+    /// Another producer's exact physical edge must survive label inference.
+    #[test]
+    fn a_read_naming_neither_colliding_producer_keeps_its_exact_edge() {
+        let (config, mut by_pipeline) = shared_label_project(true);
+        by_pipeline
+            .get_mut("t")
+            .expect("pipeline t")
+            .iter_mut()
+            .find(|m| m.config.name == "reader")
+            .expect("reader")
+            .sql = "SELECT x FROM prod.elsewhere.shared".to_string();
+        by_pipeline
+            .get_mut("t")
+            .expect("pipeline t")
+            .push(model_reading(
+                "external_source",
+                ("prod", "elsewhere", "shared"),
+                "SELECT 1 AS x",
+            ));
+        let runtime = build_runtime_dag(&config, &by_pipeline, &[], None, &no_catalog)
+            .expect("neither claimant can be this qualified read");
+        assert!(has_edge(
+            &runtime.dag,
+            "transformation:external_source",
+            "transformation:reader"
+        ));
+        assert!(!has_edge(
+            &runtime.dag,
+            "transformation:shared",
+            "transformation:reader"
+        ));
+        assert!(!has_edge(
+            &runtime.dag,
+            "load:shared",
+            "transformation:reader"
+        ));
+    }
+
+    /// A producer whose target is not fully known is not ruled out by a read
+    /// that does not contradict it. A seed with no sidecar `[target]` loads into
+    /// the default seed schema, in a catalog its loader picks later, so the read
+    /// `main.seeds.orders` may be the seed's table just as it is the model's:
+    /// two writers of one table, whose order nothing decides. The DAG is
+    /// refused rather than resolved to the one producer whose target is known.
+    #[test]
+    fn a_seed_whose_unknown_target_could_be_the_read_makes_the_read_ambiguous() {
+        let config = config_with_pipelines(vec![("t", transform_pipeline(vec![]))]);
+        let by_pipeline = owned_by_sole_transformation(
+            &config,
+            vec![
+                model_reading("orders", ("main", "seeds", "orders"), "SELECT 1 AS id"),
+                model_reading(
+                    "mart",
+                    ("main", "marts", "mart"),
+                    "SELECT id FROM main.seeds.orders",
+                ),
+            ],
+        );
+        let err = build_runtime_dag(&config, &by_pipeline, &[seed("orders")], None, &no_catalog)
+            .expect_err("two possible writers of the read table must refuse");
+        let message = err.to_string();
+        assert!(
+            matches!(err, UnifiedDagError::AmbiguousLabelProducer { .. })
+                && message.contains("model 'orders' (target main.seeds.orders)")
+                && message.contains("seed 'orders' (target ?.seeds.orders)"),
+            "the refusal names both writers and marks what is unknown: {message}"
+        );
+    }
+
+    /// The default seed schema rules a sidecar-free seed OUT of a read that
+    /// names another schema, so the read resolves to the one producer that is
+    /// definitely its table. Without that knowledge the seed's unknown schema
+    /// would keep every read of a shared label ambiguous.
+    #[test]
+    fn a_seed_with_no_sidecar_is_ruled_out_by_its_default_schema() {
+        let config = config_with_pipelines(vec![("t", transform_pipeline(vec![]))]);
+        let by_pipeline = owned_by_sole_transformation(
+            &config,
+            vec![
+                model_reading("orders", ("prod", "silver", "orders"), "SELECT 1 AS id"),
+                model_reading(
+                    "mart",
+                    ("prod", "marts", "mart"),
+                    "SELECT id FROM prod.silver.orders",
+                ),
+            ],
+        );
+        let runtime =
+            build_runtime_dag(&config, &by_pipeline, &[seed("orders")], None, &no_catalog)
+                .expect("the read names silver, which the seed cannot be in");
+        assert!(
+            !has_edge(&runtime.dag, "seed:orders", "transformation:mart"),
+            "the seed is not what `prod.silver.orders` names"
+        );
+        assert!(has_edge(
+            &runtime.dag,
+            "transformation:orders",
+            "transformation:mart"
+        ));
+    }
+
+    /// When the seed nodes' pipeline is known, so is the catalog a sidecar-free
+    /// seed loads into (`main` here, the seed loader's fallback). A model writing
+    /// `prod.seeds.orders` is then the only producer a read of that table can
+    /// mean — the seed is in `main.seeds.orders` — and the read resolves. With
+    /// the seed's catalog unknown the same read is refused: the seed could be in
+    /// `prod` too.
+    #[test]
+    fn a_sidecar_free_seed_in_another_catalog_is_ruled_out_by_its_default_catalog() {
+        let make = || {
+            let config = config_with_pipelines(vec![("t", transform_pipeline(vec![]))]);
+            let by_pipeline = owned_by_sole_transformation(
+                &config,
+                vec![
+                    model_reading("orders", ("prod", "seeds", "orders"), "SELECT 1 AS id"),
+                    model_reading(
+                        "mart",
+                        ("prod", "marts", "mart"),
+                        "SELECT id FROM prod.seeds.orders",
+                    ),
+                ],
+            );
+            (config, by_pipeline)
+        };
+
+        let (config, by_pipeline) = make();
+        let runtime = build_runtime_dag(
+            &config,
+            &by_pipeline,
+            &[seed("orders")],
+            Some("main"),
+            &no_catalog,
+        )
+        .expect("the seed is in `main`, so `prod.seeds.orders` cannot be its table");
+        assert!(
+            !has_edge(&runtime.dag, "seed:orders", "transformation:mart"),
+            "the read names the model's table, not the seed's"
+        );
+
+        let (config, by_pipeline) = make();
+        assert!(
+            matches!(
+                build_runtime_dag(&config, &by_pipeline, &[seed("orders")], None, &no_catalog),
+                Err(UnifiedDagError::AmbiguousLabelProducer { .. })
+            ),
+            "with the seed's catalog unknown it could be `prod`"
+        );
+    }
+
+    /// The same catalog on both sides is two writers of one table, and it is
+    /// still refused now that the seed's catalog is known: both are definitely
+    /// the table the read names.
+    #[test]
+    fn a_sidecar_free_seed_and_a_model_in_one_catalog_still_make_the_read_ambiguous() {
+        let config = config_with_pipelines(vec![("t", transform_pipeline(vec![]))]);
+        let by_pipeline = owned_by_sole_transformation(
+            &config,
+            vec![
+                model_reading("orders", ("main", "seeds", "orders"), "SELECT 1 AS id"),
+                model_reading(
+                    "mart",
+                    ("main", "marts", "mart"),
+                    "SELECT id FROM main.seeds.orders",
+                ),
+            ],
+        );
+        let err = build_runtime_dag(
+            &config,
+            &by_pipeline,
+            &[seed("orders")],
+            Some("main"),
+            &no_catalog,
+        )
+        .expect_err("two definite writers of the read table must refuse");
+        let message = err.to_string();
+        assert!(
+            message.contains("model 'orders' (target main.seeds.orders)")
+                && message.contains("seed 'orders' (target main.seeds.orders)"),
+            "both writers are fully known: {message}"
+        );
+    }
+
+    /// A seed's sidecar `[target]` that names a schema but no catalog takes the
+    /// same default catalog as one with no sidecar, as the seed loader gives it.
+    /// The model is in another catalog, so the read of `prod.bronze.shared` is
+    /// the seed's alone — an edge only the label pass can add.
+    #[test]
+    fn a_sidecar_target_with_no_catalog_takes_the_seed_default_catalog() {
+        let make = || {
+            let config = config_with_pipelines(vec![("t", transform_pipeline(vec![]))]);
+            let by_pipeline = owned_by_sole_transformation(
+                &config,
+                vec![
+                    model_reading("shared", ("other", "bronze", "shared"), "SELECT 1 AS y"),
+                    model_reading(
+                        "reader",
+                        ("prod", "silver", "reader_output"),
+                        "SELECT y FROM prod.bronze.shared",
+                    ),
+                ],
+            );
+            let mut sidecar_seed = seed("shared");
+            sidecar_seed.config.target = Some(crate::seeds::SeedTarget {
+                catalog: None,
+                schema: "bronze".into(),
+                table: None,
+            });
+            (config, by_pipeline, sidecar_seed)
+        };
+
+        let (config, by_pipeline, sidecar_seed) = make();
+        let runtime = build_runtime_dag(
+            &config,
+            &by_pipeline,
+            &[sidecar_seed],
+            Some("prod"),
+            &no_catalog,
+        )
+        .expect("the seed is in `prod`, the model is not");
+        assert!(has_edge(
+            &runtime.dag,
+            "seed:shared",
+            "transformation:reader"
+        ));
+
+        let (config, by_pipeline, sidecar_seed) = make();
+        assert!(
+            matches!(
+                build_runtime_dag(&config, &by_pipeline, &[sidecar_seed], None, &no_catalog),
+                Err(UnifiedDagError::AmbiguousLabelProducer { .. })
+            ),
+            "with no default catalog the seed could be anywhere, so it is not named"
+        );
+    }
+
+    /// A catalogless model whose catalog Rocky could not establish could be in
+    /// the catalog a read names, so it is not ruled out — and the read, which
+    /// also names the load's target exactly, is refused. Once the adapter
+    /// establishes the model's catalog as a different one, the model is ruled
+    /// out and the read resolves to the load.
+    #[test]
+    fn a_catalogless_claimant_is_ruled_out_only_by_an_established_catalog() {
+        let make = || {
+            let config = duckdb_config(vec![
+                ("shared", load_pipeline("prod", "bronze", Some("shared"))),
+                ("t", transform_pipeline(vec![])),
+            ]);
+            let by_pipeline = owned_by_sole_transformation(
+                &config,
+                vec![
+                    model_reading("shared", ("", "bronze", "shared"), "SELECT 1 AS y"),
+                    model_reading(
+                        "reader",
+                        ("prod", "silver", "reader_output"),
+                        "SELECT y FROM prod.bronze.shared",
+                    ),
+                ],
+            );
+            (config, by_pipeline)
+        };
+
+        let (config, by_pipeline) = make();
+        assert!(
+            matches!(
+                build_runtime_dag(&config, &by_pipeline, &[], None, &no_catalog),
+                Err(UnifiedDagError::AmbiguousLabelProducer { .. })
+            ),
+            "the model's catalog is unknown, so it could be `prod`"
+        );
+
+        let (config, by_pipeline) = make();
+        let runtime = build_runtime_dag(&config, &by_pipeline, &[], None, &duckdb_stem_catalog)
+            .expect("the model lives in `db`, so the read cannot be its table");
+        assert!(has_edge(
+            &runtime.dag,
+            "load:shared",
+            "transformation:reader"
+        ));
+    }
+
+    /// A collision nobody reads orders nothing, so there is nothing to
+    /// refuse: it is reported and the run goes on.
+    #[test]
+    fn a_colliding_label_nobody_reads_is_reported_not_refused() {
+        let (config, mut by_pipeline) = shared_label_project(true);
+        for m in by_pipeline.get_mut("t").expect("pipeline t") {
+            m.sql = "SELECT 1 AS x".to_string();
+        }
+        let runtime = build_runtime_dag(&config, &by_pipeline, &[], None, &no_catalog)
+            .expect("no reader, no ambiguity");
+        assert_eq!(
+            runtime.labels.label_collisions,
+            vec![("shared".to_string(), 2)]
+        );
+        assert!(
+            runtime
+                .warnings
+                .iter()
+                .any(|w| w.contains("label 'shared'")),
+            "{:?}",
+            runtime.warnings
         );
     }
 
@@ -3193,54 +4740,9 @@ mod tests {
         let mut dag = build_unified_dag(&config, &by_pipeline, &[]).expect("build dag");
         let sql: HashMap<String, String> =
             HashMap::from([("broken".to_string(), broken.sql.clone())]);
-        let report = infer_runtime_dependencies(&mut dag, &sql);
+        let report = infer_labels(&mut dag, &sql);
         assert_eq!(report.unparsed, vec!["broken".to_string()]);
         assert!(!report.warnings().is_empty());
-    }
-
-    /// #1351 observability: a label collision derives ONLY the legacy
-    /// winner's edge (byte-for-byte main's graph — no new edges until the
-    /// #1357 provenance contract exists) and REPORTS the collision so the
-    /// un-ordered claimants are visible instead of silent.
-    #[test]
-    fn label_collisions_are_reported_and_only_the_legacy_edge_derives() {
-        let config = config_with_pipelines(vec![("t", transform_pipeline(vec![]))]);
-        let mut reader = model("reader", vec![], vec![]);
-        reader.sql = "SELECT x FROM shared".into();
-        let by_pipeline = owned_by_sole_transformation(&config, vec![reader.clone()]);
-        let mut dag = build_unified_dag(&config, &by_pipeline, &[]).expect("build dag");
-        let p0 = NodeId("p0:shared".to_string());
-        let p1 = NodeId("p1:shared".to_string());
-        dag.nodes.push(UnifiedNode {
-            id: p0.clone(),
-            kind: NodeKind::Seed,
-            label: "shared".into(),
-            pipeline: Some("t".into()),
-        });
-        dag.nodes.push(UnifiedNode {
-            id: p1.clone(),
-            kind: NodeKind::Load,
-            label: "shared".into(),
-            pipeline: Some("t".into()),
-        });
-        let sql: HashMap<String, String> =
-            HashMap::from([("reader".to_string(), reader.sql.clone())]);
-        let report = infer_runtime_dependencies(&mut dag, &sql);
-        assert_eq!(report.label_collisions, vec![("shared".to_string(), 2)]);
-        assert!(!report.warnings().is_empty());
-        let reader_id = dag
-            .nodes
-            .iter()
-            .find(|n| n.label == "reader" && n.kind == NodeKind::Transformation)
-            .unwrap()
-            .id
-            .clone();
-        let from_p0 = dag.edges.iter().any(|e| e.from == p0 && e.to == reader_id);
-        let from_p1 = dag.edges.iter().any(|e| e.from == p1 && e.to == reader_id);
-        assert!(
-            !from_p0 && from_p1,
-            "exactly the legacy (last) claimant's edge — main's graph"
-        );
     }
 
     /// Status quo pinned: genuinely reciprocal label reads REFUSE loudly
@@ -3255,18 +4757,17 @@ mod tests {
         b.sql = "SELECT y FROM a".into();
         let models = vec![a.clone(), b.clone()];
         let by_pipeline = owned_by_sole_transformation(&config, models);
-        let mut dag = build_unified_dag(&config, &by_pipeline, &[]).expect("build dag");
-        let sql: HashMap<String, String> = HashMap::from([
-            ("a".to_string(), a.sql.clone()),
-            ("b".to_string(), b.sql.clone()),
-        ]);
-        let report = infer_runtime_dependencies(&mut dag, &sql);
+        let runtime = build_runtime_dag(&config, &by_pipeline, &[], None, &no_catalog)
+            .expect("the DAG builds; the cycle is the executor's to refuse");
         assert!(
-            report.label_collisions.is_empty() && report.unparsed.is_empty(),
-            "nothing to report for a clean mutual pair: {report:?}"
+            runtime.labels.label_collisions.is_empty()
+                && runtime.labels.unparsed.is_empty()
+                && runtime.labels.skipped_cycle_edges.is_empty(),
+            "nothing to report for a clean mutual pair: {:?}",
+            runtime.labels
         );
         assert!(
-            execution_phases(&dag).is_err(),
+            execution_phases(&runtime.dag).is_err(),
             "a genuine SQL cycle keeps its loud refusal"
         );
     }

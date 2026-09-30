@@ -4,10 +4,10 @@
   "recommendations": [
     {
       "model_name": "orders",
-      "current_strategy": "table",
-      "recommended_strategy": "table",
+      "current_strategy": "unknown",
+      "recommended_strategy": "unknown",
       "estimated_monthly_savings": 0.0,
-      "reasoning": "insufficient history: 2 runs (need 5)",
+      "reasoning": "current strategy is unknown (model not found in the compiled project); no recommendation",
       "compute_cost_per_run": 0.0,
       "storage_cost_per_month": 0.0023,
       "downstream_references": 0

@@ -47,8 +47,9 @@ class SourceInfo(BaseModel):
 class FreshnessConfig(BaseModel):
     """Freshness check configuration projected from ``rocky.toml`` ``[checks.freshness]``.
 
-    Per-schema overrides are intentionally not exposed yet — the Rocky-side
-    output omits them until the override-key semantics are nailed down.
+    Just the scalar threshold: ``[checks.freshness]`` has no per-schema
+    ``overrides`` key. One existed and parsed but nothing on the check path
+    ever read it, so it was removed rather than exposed here (#1620).
     """
 
     threshold_seconds: int
@@ -201,6 +202,8 @@ class PartitionSummary(BaseModel):
 
 class MaterializationInfo(BaseModel):
     asset_key: list[str]
+    #: Operator-visible actions taken while materializing this model.
+    notes: list[str] = Field(default_factory=list)
     rows_copied: int | None = None
     duration_ms: int
     metadata: MaterializationMetadata
@@ -288,6 +291,11 @@ class PermissionInfo(BaseModel):
 
 class DriftAction(BaseModel):
     table: str
+    #: Dagster-style asset key path, the same convention
+    #: :attr:`MaterializationInfo.asset_key` uses. Required, matching the
+    #: generated model and `schemas/run.schema.json` — no back-compat
+    #: default for an engine older than #2073 before 2.0. (#2073)
+    asset_key: list[str]
     action: str
     reason: str
 
@@ -311,6 +319,11 @@ class ContractResult(BaseModel):
 
 class AnomalyResult(BaseModel):
     table: str
+    #: Dagster-style asset key path, the same convention
+    #: :attr:`MaterializationInfo.asset_key` uses. Required, matching the
+    #: generated model and `schemas/run.schema.json` — no back-compat
+    #: default for an engine older than #2073 before 2.0. (#2073)
+    asset_key: list[str]
     current_count: int
     baseline_avg: float
     deviation_pct: float
@@ -329,6 +342,11 @@ class AnomalyEvaluation(BaseModel):
     """
 
     table: str
+    #: Dagster-style asset key path, the same convention
+    #: :attr:`MaterializationInfo.asset_key` uses. Required, matching the
+    #: generated model and `schemas/run.schema.json` — no back-compat
+    #: default for an engine older than #2073 before 2.0. (#2073)
+    asset_key: list[str]
     evaluated: bool
     not_evaluated_reason: str | None = None
 
@@ -441,12 +459,11 @@ class MetricsSnapshot(BaseModel):
 class ContainedModel(BaseModel):
     """A model Rocky withheld this run because an upstream failed.
 
-    Emitted only under ``[resilience] contain_failures``: when a model (or one
-    of its upstreams) fails, the engine continues the disjoint subgraphs and
-    records every withheld model here — the blast radius of the failures named
-    in :attr:`RunResult.errors`. A withheld model was **not built**; its target
-    was left untouched. Empty (and omitted from the wire) for a default
-    fail-fast run and for any successful run.
+    Emitted after an upstream compile failure, or when ``[resilience]
+    contain_failures`` continues disjoint subgraphs after a runtime failure.
+    Rocky records every withheld model here — the blast radius of failures in
+    :attr:`RunResult.errors`. A withheld model was **not built**; its target was
+    left untouched. Empty and omitted from the wire when no model was withheld.
 
     Hand-written to match the wire field names emitted by the engine's
     ``ContainedModelOutput``. It is not re-exported from the generated barrel,
@@ -532,11 +549,11 @@ class RunResult(BaseModel):
     #: Run id this run resumed from, when invoked with ``--resume``. ``None``
     #: for a fresh run.
     resumed_from: str | None = None
-    #: Models withheld this run because an upstream failed (or was itself
-    #: withheld) and ``[resilience] contain_failures`` continued the disjoint
-    #: subgraphs — the blast radius of the failures in :attr:`errors`. Empty
-    #: (and omitted on the wire) for a default fail-fast run and for any
-    #: successful run. Without this field declared, Pydantic's default
+    #: Models withheld after an upstream compile failure, or while
+    #: ``[resilience] contain_failures`` continues disjoint subgraphs after a
+    #: runtime failure. This is the blast radius of failures in :attr:`errors`.
+    #: Empty and omitted on the wire when no model was withheld. Without this
+    #: field declared, Pydantic's default
     #: ``extra="ignore"`` would silently drop the wire value (the runtime
     #: ``RunResult`` is the hand-written dispatch target, not the generated
     #: ``RunOutput``), so a consumer mapping it — e.g. dagster-rocky surfacing

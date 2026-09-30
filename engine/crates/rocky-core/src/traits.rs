@@ -337,6 +337,41 @@ pub enum CaseSignificance {
     Insignificant,
 }
 
+/// The warehouse-visible kind of an object already occupying a target, as
+/// reported by [`WarehouseAdapter::object_kind`] (#2037).
+///
+/// Backs the strategy/target reconciliation check in `rocky-cli`:
+/// `CREATE OR REPLACE <kind>` only ever replaces an object of that same
+/// kind, so switching a model between `view` and a table-shaped strategy
+/// (or back) hits the warehouse's own "Existing object X is of type Y,
+/// trying to replace with type Z" error with no explanation. That check
+/// compares this value against what the strategy implies and, on a real
+/// mismatch, either refuses with a Rocky diagnostic or applies the model's
+/// exact-kind drop permission before the replacement statement.
+///
+/// Unlike [`CaseSignificance`], this deliberately has a third state.
+/// `CaseSignificance` has no `Unknown` because no state there would
+/// truthfully mean "could not determine" (#1240 — a stray `Unknown`
+/// satisfied a compatibility gate unconditionally). Here "could not
+/// determine" IS a real, common outcome — the target may not exist yet, or
+/// the adapter may not implement the probe at all (the default below
+/// returns it) — and the caller's only correct response is to skip the
+/// reconciliation check, not to treat it as a match or a mismatch. Match
+/// this enum exhaustively (no `_ =>`) wherever it's compared, so a future
+/// object kind fails to compile instead of silently falling into either
+/// bucket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObjectKind {
+    /// A base table — what `CREATE OR REPLACE TABLE` targets.
+    Table,
+    /// A view — what `CREATE OR REPLACE VIEW` targets.
+    View,
+    /// Could not be determined: the adapter doesn't implement the probe, or
+    /// the query found no matching object. Callers must treat this as
+    /// "skip the check", never as an implicit match or mismatch.
+    Unknown,
+}
+
 /// Executes SQL against a warehouse and provides dialect information.
 #[async_trait]
 pub trait WarehouseAdapter: Send + Sync {
@@ -387,6 +422,25 @@ pub trait WarehouseAdapter: Send + Sync {
         ))
     }
 
+    /// The catalog this connection resolves a catalogless target in, when the
+    /// adapter can name it without a round trip.
+    ///
+    /// A model whose `[target]` sets no `catalog` renders as `schema.table`,
+    /// which the warehouse resolves against the connection's current catalog.
+    /// Rocky needs that name to decide whether a `catalog.schema.table` read
+    /// in another model is that model's table or another catalog's table of
+    /// the same `schema.table` (#1629) — a guess across catalogs can order a
+    /// real dependency backwards.
+    ///
+    /// **`None` means "not established", never "no catalog".** The default is
+    /// `None`, and that is load-bearing: a consumer treats it as unknown and
+    /// derives nothing from it. Only an adapter that can state the answer
+    /// exactly, without connecting, overrides it. DuckDB does: the catalog is
+    /// the database file's name, which its own configuration determines.
+    fn default_catalog(&self) -> Option<String> {
+        None
+    }
+
     /// Execute a SQL statement (DDL/DML) without returning rows.
     async fn execute_statement(&self, sql: &str) -> AdapterResult<()>;
 
@@ -408,6 +462,23 @@ pub trait WarehouseAdapter: Send + Sync {
         self.execute_statement(sql)
             .await
             .map(|()| ExecutionStats::default())
+    }
+
+    /// Execute a kind switch in one transaction when supported. `None` means
+    /// unsupported; the caller must not drop the old object. If CREATE fails,
+    /// the adapter rolls back the DROP before returning an error. A failed
+    /// COMMIT can leave target state uncertain and must say so in its error.
+    async fn atomic_drop_and_create(
+        &self,
+        _drop_sql: &str,
+        _create_sql: &str,
+    ) -> AdapterResult<Option<ExecutionStats>> {
+        Ok(None)
+    }
+
+    /// Whether `object_kind` can distinguish table from view on this adapter.
+    fn supports_object_kind_probe(&self) -> bool {
+        false
     }
 
     /// Classify an error this adapter returned into a run-loop
@@ -461,6 +532,28 @@ pub trait WarehouseAdapter: Send + Sync {
 
     /// Describe a table's columns (name, type, nullable).
     async fn describe_table(&self, table: &TableRef) -> AdapterResult<Vec<ColumnInfo>>;
+
+    /// The existing target's warehouse-visible kind (table vs view) — see
+    /// [`ObjectKind`] (#2037).
+    ///
+    /// Default: `Ok(ObjectKind::Unknown)`. Every adapter but `rocky-duckdb`
+    /// reports this today, which makes the reconciliation check this backs
+    /// a no-op for them: their `CREATE OR REPLACE <kind>` runs exactly as
+    /// it always has. A failed probe is also Unknown and never authorizes a
+    /// drop; with explicit permission the run reports why it was unused.
+    /// Extending this to
+    /// another adapter is a follow-up, not a prerequisite.
+    ///
+    /// # Errors
+    ///
+    /// Return `AdapterError` only for a transport/permission failure asking
+    /// the warehouse. This probe is advisory, never safety-critical: the
+    /// caller treats any `Err` the same as `Ok(ObjectKind::Unknown)` — a
+    /// failure to determine the kind never blocks a run that would
+    /// otherwise proceed.
+    async fn object_kind(&self, _table: &TableRef) -> AdapterResult<ObjectKind> {
+        Ok(ObjectKind::Unknown)
+    }
 
     /// A cheap, opaque change-marker for a source table, used by the
     /// replication runner's skip-unchanged pruning (`prune_unchanged`) to
