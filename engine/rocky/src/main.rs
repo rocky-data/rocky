@@ -3462,21 +3462,29 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             subcommand,
             product,
             retry,
-        } => match subcommand {
-            Some(FulfillSubcommand::ApproveSpec { product }) => {
-                rocky_fulfill::run_fulfill_approve_spec(&cli.config, &state_path, &product, json)
-            }
-            None => match product {
-                Some(product) => {
-                    rocky_fulfill::run_fulfill(&cli.config, &state_path, &product, retry, json)
-                        .await
+        } => {
+            rocky_cli::pipes::PipesEmitter::validate_requested()?;
+            match subcommand {
+                Some(FulfillSubcommand::ApproveSpec { product }) => {
+                    rocky_fulfill::run_fulfill_approve_spec(
+                        &cli.config,
+                        &state_path,
+                        &product,
+                        json,
+                    )
                 }
-                None => anyhow::bail!(
-                    "usage: rocky fulfill <product> [--retry] | rocky fulfill approve-spec \
+                None => match product {
+                    Some(product) => {
+                        rocky_fulfill::run_fulfill(&cli.config, &state_path, &product, retry, json)
+                            .await
+                    }
+                    None => anyhow::bail!(
+                        "usage: rocky fulfill <product> [--retry] | rocky fulfill approve-spec \
                      <product>"
-                ),
-            },
-        },
+                    ),
+                },
+            }
+        }
         Command::Product { subcommand } => match subcommand {
             ProductSubcommand::Verify { product } => {
                 rocky_cli::commands::run_product_verify(&cli.config, &product, json)
@@ -4120,6 +4128,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             .await
         }
         Command::Snapshot { pipeline, dry_run } => {
+            rocky_cli::pipes::PipesEmitter::validate_requested()?;
             rocky_cli::commands::run_snapshot(&cli.config, pipeline.as_deref(), dry_run, json).await
         }
         Command::Docs {

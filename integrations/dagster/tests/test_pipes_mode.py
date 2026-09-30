@@ -311,6 +311,10 @@ def test_run_pipes_uses_default_client_when_no_translation_kwargs():
 
     # The default construction takes no kwargs — same as the pre-FR-001 path.
     client_cls.assert_called_once_with()
+    # Apply stays on Dagster's Pipes subprocess, outside RockyClient's
+    # ordinary subprocess path that strips inherited Pipes variables.
+    instance.run.assert_called_once()
+    assert "apply" in instance.run.call_args.kwargs["command"]
 
 
 def test_run_pipes_caller_supplied_client_wins_over_translation_kwargs():

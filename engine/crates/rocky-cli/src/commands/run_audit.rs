@@ -134,6 +134,8 @@ fn detect_triggering_identity() -> Option<String> {
 /// silently ignored — better to fall back to the env-detected default
 /// than to reject a run over a typo'd audit-stamp var.
 fn detect_session_source() -> SessionSource {
+    #[cfg(test)]
+    let _env_guard = crate::testing::lock_pipes_env();
     if let Ok(explicit) = std::env::var(ENV_ROCKY_SESSION_SOURCE) {
         match explicit.to_ascii_lowercase().as_str() {
             "cli" => return SessionSource::Cli,
@@ -256,9 +258,13 @@ mod tests {
     fn session_source_dagster_from_pipes_env() {
         let _g = lock_pipes_env();
         remove_env(ENV_ROCKY_SESSION_SOURCE);
-        set_env(ENV_DAGSTER_PIPES_CONTEXT, "{}");
+        // Valid Pipes values keep concurrent run() tests from spuriously
+        // refusing while this process-wide env value is present.
+        set_env(ENV_DAGSTER_PIPES_CONTEXT, "eJyrrgUAAXUA+Q==");
+        set_env("DAGSTER_PIPES_MESSAGES", "eJyrViouScnMV7IC0alFRUq1ADzXBnI=");
         assert_eq!(detect_session_source(), SessionSource::Dagster);
         remove_env(ENV_DAGSTER_PIPES_CONTEXT);
+        remove_env("DAGSTER_PIPES_MESSAGES");
     }
 
     #[test]
@@ -285,7 +291,8 @@ mod tests {
     #[test]
     fn session_source_explicit_overrides_pipes_env() {
         let _g = lock_pipes_env();
-        set_env(ENV_DAGSTER_PIPES_CONTEXT, "{}");
+        set_env(ENV_DAGSTER_PIPES_CONTEXT, "eJyrrgUAAXUA+Q==");
+        set_env("DAGSTER_PIPES_MESSAGES", "eJyrViouScnMV7IC0alFRUq1ADzXBnI=");
         set_env(ENV_ROCKY_SESSION_SOURCE, "cli");
         assert_eq!(
             detect_session_source(),
@@ -293,6 +300,7 @@ mod tests {
             "explicit ROCKY_SESSION_SOURCE=cli must override DAGSTER_PIPES_CONTEXT"
         );
         remove_env(ENV_DAGSTER_PIPES_CONTEXT);
+        remove_env("DAGSTER_PIPES_MESSAGES");
         remove_env(ENV_ROCKY_SESSION_SOURCE);
     }
 

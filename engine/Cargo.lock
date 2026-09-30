@@ -3894,10 +3894,12 @@ name = "rocky"
 version = "1.74.0"
 dependencies = [
  "anyhow",
+ "base64 0.23.1",
  "chrono",
  "clap",
  "clap_complete",
  "duckdb",
+ "flate2",
  "libc",
  "miette",
  "rmcp",

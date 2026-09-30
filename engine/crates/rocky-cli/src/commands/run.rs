@@ -2728,10 +2728,7 @@ pub async fn run_with_explicit_contracts(
 ) -> Result<RunTermination> {
     // Refuse a broken Dagster Pipes launch before an idempotency claim, state
     // session, hook, or warehouse statement can run.
-    let pipes = crate::pipes::PipesEmitter::detect()?;
-    if let Some(p) = &pipes {
-        p.log("INFO", "rocky run starting");
-    }
+    crate::pipes::PipesEmitter::validate_requested()?;
 
     // This first explicit-contract route is deliberately model-only. Validate
     // it before the idempotency claim, state session, adapter, or warehouse
@@ -2835,6 +2832,11 @@ pub async fn run_with_explicit_contracts(
         }
         None => None,
     };
+
+    let pipes = crate::pipes::PipesEmitter::detect()?;
+    if let Some(p) = &pipes {
+        p.log("INFO", "rocky run starting");
+    }
 
     // WP-01 PR-B (stage 2a): the replication path's remote-state lifecycle
     // owner. Declared OUTSIDE the `run_result` body so both terminal consumers

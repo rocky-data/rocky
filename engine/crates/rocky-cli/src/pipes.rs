@@ -158,14 +158,23 @@ impl PipesEmitter {
     }
 
     fn requested_channel() -> Result<Option<Box<dyn Write + Send>>> {
+        // Unit tests mutate process-global Pipes vars. Serialize every read,
+        // including library callers that do not explicitly take the lock.
+        #[cfg(test)]
+        let _env_guard = crate::testing::lock_pipes_env();
         let raw_context = match env::var(ENV_PIPES_CONTEXT) {
             Ok(value) => value,
             Err(env::VarError::NotPresent) => return Ok(None),
-            Err(e) => return Err(anyhow!("{ENV_PIPES_CONTEXT} cannot be read: {e}")),
+            Err(env::VarError::NotUnicode(_)) => bail!("{ENV_PIPES_CONTEXT} is not valid Unicode"),
         };
         decode_pipes_param(&raw_context, ENV_PIPES_CONTEXT)?;
-        let raw_messages = env::var(ENV_PIPES_MESSAGES)
-            .map_err(|e| anyhow!("{ENV_PIPES_MESSAGES} is missing or cannot be read: {e}"))?;
+        let raw_messages = match env::var(ENV_PIPES_MESSAGES) {
+            Ok(value) => value,
+            Err(env::VarError::NotPresent) => {
+                bail!("{ENV_PIPES_CONTEXT} is set but {ENV_PIPES_MESSAGES} is missing")
+            }
+            Err(env::VarError::NotUnicode(_)) => bail!("{ENV_PIPES_MESSAGES} is not valid Unicode"),
+        };
         let params = decode_pipes_param(&raw_messages, ENV_PIPES_MESSAGES)?;
         Self::open_channel(&params).map(Some)
     }
@@ -186,12 +195,7 @@ impl PipesEmitter {
                 .create(true)
                 .append(true)
                 .open(&path)
-                .map_err(|e| {
-                    anyhow!(
-                        "{ENV_PIPES_MESSAGES} path {:?} cannot be opened: {e}",
-                        path.display()
-                    )
-                })?;
+                .map_err(|_| anyhow!("{ENV_PIPES_MESSAGES} path channel cannot be opened"))?;
             Ok(Box::new(file))
         } else if let Some(stream) = params.get("stdio").and_then(Value::as_str) {
             match stream {
@@ -199,7 +203,7 @@ impl PipesEmitter {
                 "stdout" => bail!(
                     "{ENV_PIPES_MESSAGES} stdio 'stdout' is unsupported: stdout is reserved for Rocky output"
                 ),
-                other => bail!("{ENV_PIPES_MESSAGES} stdio target {other:?} is unsupported"),
+                _ => bail!("{ENV_PIPES_MESSAGES} stdio target is unsupported"),
             }
         } else {
             bail!(
@@ -367,14 +371,14 @@ impl PipesEmitter {
 fn decode_pipes_param(raw: &str, env_var_name: &str) -> Result<Value> {
     let decoded = B64
         .decode(raw.as_bytes())
-        .map_err(|e| anyhow!("{env_var_name} cannot be base64-decoded: {e}"))?;
+        .map_err(|_| anyhow!("{env_var_name} cannot be base64-decoded"))?;
 
     let mut decompressed = Vec::new();
     ZlibDecoder::new(decoded.as_slice())
         .read_to_end(&mut decompressed)
-        .map_err(|e| anyhow!("{env_var_name} cannot be zlib-decompressed: {e}"))?;
+        .map_err(|_| anyhow!("{env_var_name} cannot be zlib-decompressed"))?;
     serde_json::from_slice(&decompressed)
-        .map_err(|e| anyhow!("{env_var_name} cannot be JSON-decoded: {e}"))
+        .map_err(|_| anyhow!("{env_var_name} cannot be JSON-decoded"))
 }
 
 /// Wrap every metadata value the way the real `dagster_pipes` SDK does
@@ -542,6 +546,61 @@ mod tests {
     fn decode_pipes_param_rejects_plain_base64_json_with_no_zlib_step() {
         let plain = B64.encode(serde_json::to_vec(&json!({"path": "/tmp/x"})).unwrap());
         assert!(decode_pipes_param(&plain, ENV_PIPES_MESSAGES).is_err());
+    }
+
+    #[test]
+    fn decode_failures_never_echo_input() {
+        let base64 = decode_pipes_param("secret!", ENV_PIPES_MESSAGES)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(base64, "DAGSTER_PIPES_MESSAGES cannot be base64-decoded");
+        let zlib = decode_pipes_param(&B64.encode(b"secret"), ENV_PIPES_CONTEXT)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(zlib, "DAGSTER_PIPES_CONTEXT cannot be zlib-decompressed");
+        // A syntactically invalid JSON document after valid zlib.
+        let mut encoder =
+            flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(b"secret").unwrap();
+        let json = decode_pipes_param(&B64.encode(encoder.finish().unwrap()), ENV_PIPES_CONTEXT)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(json, "DAGSTER_PIPES_CONTEXT cannot be JSON-decoded");
+        assert!(!json.contains("secret"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_unicode_environment_errors_never_echo_payload() {
+        use std::os::unix::ffi::OsStringExt;
+        let _g = lock_env();
+        let prior_context = env::var_os(ENV_PIPES_CONTEXT);
+        let prior_messages = env::var_os(ENV_PIPES_MESSAGES);
+        let secret = std::ffi::OsString::from_vec(b"secret\xffpayload".to_vec());
+        // SAFETY: all Pipes environment readers in this crate take the shared lock.
+        unsafe {
+            env::set_var(ENV_PIPES_CONTEXT, &secret);
+            env::set_var(ENV_PIPES_MESSAGES, &secret);
+        }
+        let context_error = PipesEmitter::validate_requested().unwrap_err().to_string();
+        unsafe { env::set_var(ENV_PIPES_CONTEXT, encode_like_dagster_pipes(&json!({}))) };
+        let messages_error = PipesEmitter::validate_requested().unwrap_err().to_string();
+        // SAFETY: restore process-global environment while holding the shared lock.
+        unsafe {
+            match prior_context {
+                Some(value) => env::set_var(ENV_PIPES_CONTEXT, value),
+                None => env::remove_var(ENV_PIPES_CONTEXT),
+            }
+            match prior_messages {
+                Some(value) => env::set_var(ENV_PIPES_MESSAGES, value),
+                None => env::remove_var(ENV_PIPES_MESSAGES),
+            }
+        }
+        assert_eq!(context_error, "DAGSTER_PIPES_CONTEXT is not valid Unicode");
+        assert_eq!(
+            messages_error,
+            "DAGSTER_PIPES_MESSAGES is not valid Unicode"
+        );
     }
 
     /// End-to-end: `detect()` reads a zlib-encoded `DAGSTER_PIPES_MESSAGES`

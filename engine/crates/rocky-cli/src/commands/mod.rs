@@ -49,6 +49,8 @@ mod load;
 mod lsp;
 mod metrics;
 mod optimize;
+#[cfg(test)]
+mod pipes_guard_tests;
 pub mod plan;
 mod playground;
 mod policy;
