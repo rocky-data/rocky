@@ -1927,6 +1927,10 @@ pub struct DraftCheckArgs {
     /// at the `ai_test` tool.
     #[serde(default)]
     pub spec: Option<String>,
+    /// Pipeline whose target adapter supplies the SQL dialect. Required when
+    /// the project's pipelines use different dialects.
+    #[serde(default)]
+    pub pipeline: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -4783,7 +4787,9 @@ impl RockyMcpServer {
          Path-gated to the models directory and policy-aware: a governed scope returns a \
          structured policy_denied / policy_review_required error, and a denied draft restores the \
          prior sidecar. Omit `spec` and this returns an error pointing you at `ai_test`, the LLM \
-         generator that drafts assertions for you to pass here."
+         generator that drafts assertions for you to pass here. Pass `pipeline` when \
+         the project's pipelines use different SQL dialects; it selects the \
+         target dialect as in `rocky test --declarative`."
     )]
     async fn draft_check(
         &self,
@@ -4817,7 +4823,7 @@ impl RockyMcpServer {
         // (#1524, #2144): refuse a bad `expression`, `filter`, or `key_expr`
         // when it is WRITTEN, not when it is later refused at
         // `rocky test --declarative`.
-        validate_check_spec_expressions(&spec, Some(&self.config_path))?;
+        validate_check_spec_expressions(&spec, &self.config_path, args.pipeline.as_deref())?;
         let paths = self.resolve_draft_paths(&args.model)?;
         if !self.model_source_exists(&paths.stem) {
             return Err(ToolError::model_not_found(&paths.stem));
@@ -7587,7 +7593,8 @@ fn validate_check_spec(spec: &str) -> Result<(), Json<ToolError>> {
 /// required columns, numeric bounds, and adapter-specific SQL.
 fn validate_check_spec_expressions(
     spec: &str,
-    config_path: Option<&Path>,
+    config_path: &Path,
+    pipeline_name: Option<&str>,
 ) -> Result<(), Json<ToolError>> {
     // The structural gate ran first; malformed typed blocks remain compile
     // errors. A successfully parsed declaration must also generate SQL.
@@ -7607,29 +7614,49 @@ fn validate_check_spec_expressions(
                 "Add a `[[tests]]` block with a test type and its required fields.",
             )
         })?;
-    let path = config_path.ok_or_else(|| {
-        ToolError::config_invalid("draft_check cannot resolve the project config path")
-    })?;
-    let cfg = rocky_core::config::load_rocky_config(path)
+    let cfg = rocky_core::config::load_rocky_config(config_path)
         .map_err(|e| ToolError::config_invalid(format!("draft_check cannot load config: {e:#}")))?;
-    let (_, pipeline) = rocky_cli::registry::resolve_pipeline(&cfg, None).map_err(|e| {
-        ToolError::config_invalid(format!(
-            "draft_check cannot resolve the target pipeline: {e:#}"
-        ))
-    })?;
-    let target = pipeline.target_adapter();
-    let adapter = cfg.adapters.get(target).ok_or_else(|| {
-        ToolError::config_invalid(format!(
-            "draft_check target adapter '{target}' is not configured"
-        ))
-    })?;
-    let dialect = rocky_cli::registry::warehouse_dialect_for_type(&adapter.adapter_type)
-        .ok_or_else(|| {
+    let dialect_for = |pipeline: &rocky_core::config::PipelineConfig| {
+        let target = pipeline.target_adapter();
+        let adapter = cfg.adapters.get(target).ok_or_else(|| {
+            ToolError::config_invalid(format!(
+                "draft_check target adapter '{target}' is not configured"
+            ))
+        })?;
+        rocky_cli::registry::warehouse_dialect_for_type(&adapter.adapter_type).ok_or_else(|| {
             ToolError::config_invalid(format!(
                 "draft_check target adapter '{target}' has unsupported warehouse type '{}'",
                 adapter.adapter_type
             ))
+        })
+    };
+    let dialect = if let Some(name) = pipeline_name {
+        let (_, pipeline) =
+            rocky_cli::registry::resolve_pipeline(&cfg, Some(name)).map_err(|e| {
+                ToolError::config_invalid(format!(
+                    "draft_check cannot resolve the target pipeline: {e:#}"
+                ))
+            })?;
+        dialect_for(pipeline)?
+    } else {
+        let mut candidates = cfg.pipelines.values();
+        let first = candidates.next().ok_or_else(|| {
+            ToolError::config_invalid(
+                "draft_check cannot resolve the target pipeline: no pipelines defined in config",
+            )
         })?;
+        let dialect = dialect_for(first)?;
+        for pipeline in candidates {
+            if dialect_for(pipeline)?.name() != dialect.name() {
+                let names = cfg.pipelines.keys().cloned().collect::<Vec<_>>().join(", ");
+                return Err(ToolError::invalid_argument(
+                    format!("draft_check pipelines use different SQL dialects ({names})"),
+                    "Pass `pipeline` with one of the named pipelines to select its target dialect.",
+                ));
+            }
+        }
+        dialect
+    };
     for (index, value) in tests.iter().enumerate() {
         let Some(table) = value.as_table() else {
             continue;

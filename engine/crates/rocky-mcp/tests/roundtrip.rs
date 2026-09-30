@@ -2751,6 +2751,95 @@ async fn draft_check_uses_target_adapter_without_creating_duckdb_file() {
     client.cancel().await.unwrap();
 }
 
+fn add_check_pipeline(dir: &Path, other_type: &str) {
+    let path = dir.join("rocky.toml");
+    let config = std::fs::read_to_string(&path).unwrap();
+    let config = config.replace(
+        "[adapter]\ntype = \"duckdb\"",
+        "[adapter.default]\ntype = \"duckdb\"",
+    );
+    let pipeline = config[config.find("[pipeline.p]").unwrap()..]
+        .replace("pipeline.p", "pipeline.other")
+        .replace(
+            "[pipeline.other.target]\n",
+            "[pipeline.other.target]\nadapter = \"other\"\n",
+        );
+    std::fs::write(
+        path,
+        format!(
+            "{config}\n[adapter.other]\ntype = \"{other_type}\"\nhost = \"localhost\"\n\n{pipeline}"
+        ),
+    )
+    .unwrap();
+}
+
+#[tokio::test]
+async fn draft_check_accepts_multiple_pipelines_with_same_dialect() {
+    let dir = TempDir::new().unwrap();
+    write_project(dir.path(), &dir.path().join("absent.duckdb"));
+    add_check_pipeline(dir.path(), "duckdb");
+    let before = std::fs::read(dir.path().join("models/orders.toml")).unwrap();
+    let client = connect(RockyMcpServer::new(dir.path().join("rocky.toml"))).await;
+    let args = object(
+        serde_json::json!({"model": "orders", "spec": "[[tests]]\ntype = \"not_null\"\ncolumn = \"id\"\n"}),
+    );
+    let result = client
+        .call_tool(CallToolRequestParams::new("draft_check").with_arguments(args))
+        .await
+        .unwrap();
+    assert_ne!(result.is_error, Some(true), "{result:?}");
+    assert_ne!(
+        std::fs::read(dir.path().join("models/orders.toml")).unwrap(),
+        before
+    );
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn draft_check_requires_pipeline_only_for_different_dialects() {
+    let dir = TempDir::new().unwrap();
+    write_project(dir.path(), &dir.path().join("absent.duckdb"));
+    add_check_pipeline(dir.path(), "trino");
+    let before = std::fs::read(dir.path().join("models/orders.toml")).unwrap();
+    let client = connect(RockyMcpServer::new(dir.path().join("rocky.toml"))).await;
+    let spec = "[[tests]]\ntype = \"not_null\"\ncolumn = \"id\"\n";
+    let args = object(serde_json::json!({"model": "orders", "spec": spec}));
+    let result = client
+        .call_tool(CallToolRequestParams::new("draft_check").with_arguments(args))
+        .await
+        .unwrap();
+    assert_eq!(result.is_error, Some(true));
+    let err = result.structured_content.unwrap();
+    assert_eq!(err["code"], "invalid_argument");
+    let message = err["message"].as_str().unwrap();
+    assert!(
+        message.contains("(other, p)") || message.contains("(p, other)"),
+        "{message}"
+    );
+    assert_eq!(
+        std::fs::read(dir.path().join("models/orders.toml")).unwrap(),
+        before
+    );
+
+    let args = object(serde_json::json!({"model": "orders", "spec": spec, "pipeline": "p"}));
+    let result = client
+        .call_tool(CallToolRequestParams::new("draft_check").with_arguments(args))
+        .await
+        .unwrap();
+    assert_ne!(result.is_error, Some(true), "{result:?}");
+    assert_ne!(
+        std::fs::read(dir.path().join("models/orders.toml")).unwrap(),
+        before
+    );
+    let args = object(serde_json::json!({"model": "orders", "spec": spec, "pipeline": "other"}));
+    let result = client
+        .call_tool(CallToolRequestParams::new("draft_check").with_arguments(args))
+        .await
+        .unwrap();
+    assert_ne!(result.is_error, Some(true), "{result:?}");
+    client.cancel().await.unwrap();
+}
+
 #[tokio::test]
 async fn draft_check_refuses_unresolved_target_adapter() {
     let dir = TempDir::new().unwrap();
