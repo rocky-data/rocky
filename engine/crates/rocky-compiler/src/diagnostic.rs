@@ -168,6 +168,10 @@ pub const E038: &str = "E038";
 /// provenance, so their unresolved references remain conservative `Unknown`s.
 pub const E039: &str = "E039";
 
+/// A `.rocky` string literal contains a backslash, whose SQL meaning varies
+/// by target dialect. Use a `.sql` model with the target's own escaping.
+pub const E040: &str = "E040";
+
 // Warnings
 /// Unused model (no downstream consumers).
 pub const W001: &str = "W001";

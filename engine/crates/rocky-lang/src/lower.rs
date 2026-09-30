@@ -12,17 +12,102 @@
 //! [`rocky_sql::validation::validate_identifier`]. A `Token::Ident` cannot
 //! contain quotes, semicolons, dots, spaces, or any other SQL metacharacter.
 //!
-//! String literals are escaped (`'` → `''`) at the `Expr::StringLit` site;
+//! String literals without backslashes are escaped (`'` → `''`) at the
+//! `Expr::StringLit` site. Backslashes are refused before lowering because
+//! their SQL meaning depends on the target dialect;
 //! number and date literals are grammar-constrained. No `validate_*` call is
 //! threaded through this module because there is no reachable path from the
 //! parser to a `format!` here that admits an unsafe identifier.
 
 use std::sync::Arc;
 
+use logos::Logos;
+
 use crate::ast::*;
+use crate::token::Token;
+
+/// A backslash-bearing DSL literal cannot be lowered without a dialect.
+pub const BACKSLASH_LITERAL_ERROR: &str = "E040: a .rocky string literal cannot contain a backslash; use a .sql model with the target's own escaping";
+
+/// Return the one-based line and column of the first backslash-bearing literal.
+/// The lexer excludes comments and preserves the literal's source span.
+pub fn backslash_literal_position(source: &str) -> Option<(usize, usize)> {
+    let mut lexer = Token::lexer(source);
+    while let Some(token) = lexer.next() {
+        if let Ok(Token::StringLit(value)) = token
+            && value.contains('\\')
+        {
+            let offset = lexer.span().start;
+            let before = &source[..offset];
+            let line = before.bytes().filter(|b| *b == b'\n').count() + 1;
+            let column = before.rsplit('\n').next().unwrap_or("").chars().count() + 1;
+            return Some((line, column));
+        }
+    }
+    None
+}
+
+fn expr_has_backslash_literal(expr: &Expr) -> bool {
+    match expr {
+        Expr::StringLit(value) => value.contains('\\'),
+        Expr::BinaryOp { left, right, .. } => {
+            expr_has_backslash_literal(left) || expr_has_backslash_literal(right)
+        }
+        Expr::UnaryOp { expr, .. } | Expr::IsNull { expr, .. } => expr_has_backslash_literal(expr),
+        Expr::FunctionCall { args, .. } | Expr::WindowFunction { args, .. } => {
+            args.iter().any(expr_has_backslash_literal)
+        }
+        Expr::InList { expr, list, .. } => {
+            expr_has_backslash_literal(expr) || list.iter().any(expr_has_backslash_literal)
+        }
+        Expr::Match { expr, arms } => {
+            expr_has_backslash_literal(expr)
+                || arms.iter().any(|arm| {
+                    (match &arm.pattern {
+                        MatchPattern::Comparison(_, value) => expr_has_backslash_literal(value),
+                        MatchPattern::Wildcard => false,
+                    }) || expr_has_backslash_literal(&arm.result)
+                })
+        }
+        Expr::Column(_)
+        | Expr::QualifiedColumn(_, _)
+        | Expr::NumberLit(_)
+        | Expr::DateLit(_)
+        | Expr::BoolLit(_)
+        | Expr::Null => false,
+    }
+}
+
+fn pipeline_has_backslash_literal(pipeline: &[PipelineStep]) -> bool {
+    pipeline.iter().any(|step| match step {
+        PipelineStep::Where(expr) => expr_has_backslash_literal(expr),
+        PipelineStep::Group(group) => group
+            .aggregations
+            .iter()
+            .any(|(_, expr)| expr_has_backslash_literal(expr)),
+        PipelineStep::Derive(derivations) => derivations
+            .iter()
+            .any(|(_, expr)| expr_has_backslash_literal(expr)),
+        PipelineStep::From(_)
+        | PipelineStep::Select(_)
+        | PipelineStep::Join(_)
+        | PipelineStep::Sort(_)
+        | PipelineStep::Take(_)
+        | PipelineStep::Distinct
+        | PipelineStep::Replicate => false,
+    })
+}
 
 /// Lower a Rocky DSL file to a SQL string.
 pub fn lower_to_sql(file: &RockyFile) -> Result<String, String> {
+    if file
+        .let_bindings
+        .iter()
+        .any(|binding| pipeline_has_backslash_literal(&binding.pipeline))
+        || pipeline_has_backslash_literal(&file.pipeline)
+    {
+        return Err(BACKSLASH_LITERAL_ERROR.to_string());
+    }
     // Lower let bindings to CTEs.
     let mut cte_parts = Vec::new();
     for binding in &file.let_bindings {
