@@ -2651,9 +2651,6 @@ pub(crate) fn job_state_str(state: JobState) -> &'static str {
     }
 }
 
-/// Build the API presentation type from the durable record. Unknown persisted
-/// `kind`/`state` strings (only reachable from a malformed record) fall back to
-/// safe defaults rather than failing the read.
 /// Strip resolved `${VAR}` values from a job's terminal outcome, before it is
 /// cached or written (#1897).
 ///
@@ -2663,8 +2660,8 @@ pub(crate) fn job_state_str(state: JobState) -> &'static str {
 /// callable directly, so the behaviour is pinned by unit test rather than by
 /// an end-to-end run nobody can drive.
 ///
-/// It is also the chokepoint rather than one caller: the spawn path is the only
-/// writer today, and a second one would otherwise be unscrubbed.
+/// Both API and scheduler completion use this outcome scrub. The whole-record
+/// cache and durable write checks below also cover other fields.
 ///
 /// `result` is the child's stdout verbatim — a whole `RunOutput` carrying
 /// targets, model names and attempt trails. It is rewritten as text and
@@ -2996,6 +2993,13 @@ pub(crate) fn sanitize_for_storage(job: PersistedJob) -> PersistedJob {
     }
 }
 
+/// The only CLI entry point for writing a job to the live cache. Sanitize the
+/// full record here so a new producer cannot omit the check at its call site.
+pub(crate) async fn cache_job(state: &ServerState, job: PersistedJob) {
+    state.jobs.upsert(sanitize_for_storage(job)).await;
+}
+
+/// Persist a job after the same whole-record check used by [`cache_job`].
 pub(crate) async fn persist_job(
     state: &ServerState,
     state_path: std::path::PathBuf,
@@ -3120,10 +3124,7 @@ async fn submit_job(
     // Background task: run the subprocess, then record the terminal state. The
     // permit is moved in and released when the task ends. Nothing between the
     // cache write and `tokio::spawn` may await.
-    state
-        .jobs
-        .upsert(sanitize_for_storage(record.clone()))
-        .await;
+    cache_job(&state, record.clone()).await;
     let task_state = state.clone();
     tokio::spawn(async move {
         let _permit = permit;
@@ -3156,8 +3157,7 @@ async fn finish_job(
     done.redaction_version = Some(version);
     // The outcome scrub checks its two fields. Check the whole record before
     // either sink so a cache hit and a restart serve the same held payload.
-    let done = sanitize_for_storage(done);
-    state.jobs.upsert(done.clone()).await;
+    cache_job(&state, done.clone()).await;
     if let Err(e) = persist_job(&state, state_path, done.clone()).await {
         tracing::warn!(error = %e, job_id = %done.job_id,
             "could not persist terminal job record; /runs is the reconcile surface");
@@ -3289,6 +3289,9 @@ async fn get_job(
     State(state): State<Arc<ServerState>>,
     ApiPath(id): ApiPath<String>,
 ) -> Result<PrettyJson<JobStatus>, ApiError> {
+    // A cache hit returns the record as it was stored. A value registered
+    // after that write is not scrubbed from the cached or durable copy here;
+    // that known limit is tracked by #1919 and #1920.
     if let Some(record) = state.jobs.get(&id).await {
         return Ok(PrettyJson(job_status_from(record)));
     }
@@ -3326,7 +3329,7 @@ async fn get_job(
             // exists to stop. Re-reading instead also lets the answer improve if
             // a later write settles, rather than pinning `running` in memory.
             if !record.is_in_flight() {
-                state.jobs.upsert(record.clone()).await;
+                cache_job(&state, record.clone()).await;
             }
             Ok(PrettyJson(job_status_from(record)))
         }
@@ -3768,6 +3771,11 @@ mod tests {
                 "isolated collision test failed: {}",
                 String::from_utf8_lossy(&output.stdout)
             );
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                stdout.contains("1 passed; 0 failed;"),
+                "child must run exactly this test: {stdout}"
+            );
             return;
         }
 
@@ -3799,6 +3807,14 @@ mod tests {
         assert!(stored.principal.is_none());
         assert_eq!(stored.result, Some(serde_json::json!({ "h": 1 })));
         assert_eq!(stored.state, "failed", "polling must still terminate");
+        let redacted = crate::secret_filter::redact(&bytes);
+        let parsed: serde_json::Value = serde_json::from_str(&redacted).unwrap();
+        assert!(parsed.get("redaction_version").is_none());
+        assert_eq!(
+            parsed["${ROCKY_GENERATED_KEY}"],
+            rocky_core::state::CURRENT_REDACTION_VERSION
+        );
+        assert!(!crate::secret_filter::any_value_survives(&redacted));
     }
 
     /// #1897. The last-resort marker is unregisterable BY LENGTH.
@@ -8817,7 +8833,7 @@ mod tests {
         // A live submission in THIS process, after the sweep.
         let state = pinned_server(models_dir, None, &state_path);
         let record = persisted_job("job_live", "running");
-        state.jobs.upsert(record.clone()).await;
+        cache_job(&state, record.clone()).await;
         StateStore::open(&state_path)
             .unwrap()
             .record_job(&record)
@@ -8862,7 +8878,7 @@ mod tests {
         }
 
         let state = pinned_server(models_dir, None, &state_path);
-        state.jobs.upsert(record).await;
+        cache_job(&state, record).await;
         let base = spawn_router(state.clone()).await;
 
         // The hot answer, straight from the cache.
@@ -8874,10 +8890,7 @@ mod tests {
 
         // Exactly one capacity's worth of newer finished jobs displaces it.
         for i in 0..DEFAULT_JOB_CACHE_CAPACITY {
-            state
-                .jobs
-                .upsert(persisted_job(&format!("filler{i}"), "succeeded"))
-                .await;
+            cache_job(&state, persisted_job(&format!("filler{i}"), "succeeded")).await;
         }
         assert!(
             state.jobs.get("job_evicted").await.is_none(),

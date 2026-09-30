@@ -21,7 +21,7 @@ use rocky_core::schedule::{Drain, RunOutcome, SpawnRequest, Spawner, SubprocessS
 use rocky_core::state::PersistedJob;
 use rocky_server::state::ServerState;
 
-use crate::api::{job_state_str, persist_job, state_path_for};
+use crate::api::{cache_job, job_state_str, persist_job, state_path_for};
 use crate::output::JobState;
 
 /// The `principal` attributed to scheduler-launched jobs. Advisory attribution
@@ -52,7 +52,7 @@ impl JobsModelSpawner {
     /// under lock contention is non-fatal — the in-memory registry is
     /// authoritative for the live session and embedders reconcile via `/runs`.
     async fn record(&self, job: PersistedJob) {
-        self.state.jobs.upsert(job.clone()).await;
+        cache_job(&self.state, job.clone()).await;
         // The tick has released the store, and its gate permit with it, for
         // the child's window (see `PhaseStore::close`), so taking the gate here
         // waits only for the server's reads, never for the tick itself.
@@ -189,5 +189,38 @@ mod tests {
         assert!(!done.redaction_is_legacy());
         assert_eq!(done.error, None);
         assert_eq!(done.state, "succeeded");
+    }
+
+    /// The scheduler writes both running and terminal records through `record`.
+    #[tokio::test]
+    async fn scheduler_record_scrubs_both_cache_writes() {
+        let supplied = "SCHEDULER-CACHE-8c29f1a4";
+        rocky_core::secret_registry::register_substitution("ROCKY_SCHEDULER_PRINCIPAL", supplied);
+        let dir = tempfile::tempdir().unwrap();
+        let state = ServerState::with_auth(
+            dir.path().join("models"),
+            None,
+            None,
+            None,
+            Vec::new(),
+            Some(dir.path().join("state.redb")),
+        );
+        let spawner = JobsModelSpawner::new(state.clone(), Drain::new(), Duration::from_secs(1));
+        let mut running = running_record();
+        running.principal = Some(supplied.to_string());
+        spawner.record(running.clone()).await;
+        let cached = state.jobs.get(&running.job_id).await.unwrap();
+        assert!(
+            cached.principal.is_none(),
+            "scheduler value reached running cache"
+        );
+
+        spawner.record(finish_scheduler_job(running, 1)).await;
+        let cached = state.jobs.get("sched-1").await.unwrap();
+        assert!(
+            cached.principal.is_none(),
+            "scheduler value reached terminal cache"
+        );
+        assert_eq!(cached.state, "failed");
     }
 }
