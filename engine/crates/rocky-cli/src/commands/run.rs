@@ -13,6 +13,7 @@ use rocky_adapter_sdk::throttle::AdaptiveThrottle;
 
 use rocky_catalog_core::{GovernanceCatalogClient, Grant as CatalogGrant, Securable};
 use rocky_core::checks;
+use rocky_core::column_map;
 use rocky_core::config::{
     GovernanceOverride, ReplicationPipelineConfig, ResolvedTableOverride, resolve_table_override,
 };
@@ -47,6 +48,35 @@ struct PendingCheck {
 enum TableOutcome {
     Materialized(Box<TableResult>),
     Pruned(PrunedTable),
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "source `{source_table}` has no column `{timestamp_column}` (the pipeline's timestamp_column); columns: {columns}"
+)]
+struct MissingTimestampColumn {
+    source_table: String,
+    timestamp_column: String,
+    columns: String,
+}
+
+fn classify_table_error(err: &anyhow::Error) -> (FailureKind, Option<u64>) {
+    if err.is::<MissingTimestampColumn>() {
+        (FailureKind::CompileError, None)
+    } else {
+        classify_anyhow_error_with_cooldown(err)
+    }
+}
+
+fn source_has_timestamp_column(source_cols: &[ColumnInfo], timestamp_column: &str) -> bool {
+    // This precheck can only refuse a column clearly absent from discovery.
+    // Snowflake and the BigQuery/Databricks batch paths lowercase discovered
+    // names. The other built-in paths preserve names, but none establishes
+    // both case-preserving discovery and case-sensitive watermark resolution.
+    // Unknown adapters also get the conservative comparison.
+    source_cols
+        .iter()
+        .any(|col| column_map::CiStr::new(&col.name) == column_map::CiStr::new(timestamp_column))
 }
 
 /// A table skipped by `prune_unchanged` pruning because its source is unchanged
@@ -5694,7 +5724,7 @@ pub async fn run_with_explicit_contracts(
                 // variant is preserved on `TableError.failure_kind` and
                 // the optional engine-supplied cooldown hint
                 // (warehouse-side breaker trip) is captured.
-                let (failure_kind, cooldown_seconds) = classify_anyhow_error_with_cooldown(&e);
+                let (failure_kind, cooldown_seconds) = classify_table_error(&e);
                 let raw = format!("{e:#}");
                 if raw.contains("TABLE_OR_VIEW_NOT_FOUND") {
                     warn!(
@@ -6058,8 +6088,7 @@ pub async fn run_with_explicit_contracts(
                         info!(table = task.target_table_name.as_str(), "retry succeeded");
                     }
                     Err(e) => {
-                        let (failure_kind, cooldown_seconds) =
-                            classify_anyhow_error_with_cooldown(&e);
+                        let (failure_kind, cooldown_seconds) = classify_table_error(&e);
                         let msg = format!("{e:#}");
                         warn!(
                             table = task.target_table_name.as_str(),
@@ -14519,6 +14548,37 @@ async fn process_table(
             };
             (src.unwrap_or_default(), target_cols)
         };
+    // The batch source prefetch is useful even if the target prefetch missed
+    // and drift detection fell back to per-table probes for both sides.
+    // An empty description can also mean the source probe was unavailable.
+    let discovered_source_cols = task
+        .prefetched_source_cols
+        .as_deref()
+        .filter(|cols| !cols.is_empty())
+        .unwrap_or(&source_cols);
+    if uses_watermark && !discovered_source_cols.is_empty() {
+        let timestamp_column = task
+            .effective_override
+            .timestamp_column
+            .as_deref()
+            .unwrap_or(pipeline.timestamp_column.as_str());
+        if !source_has_timestamp_column(discovered_source_cols, timestamp_column) {
+            return Err(MissingTimestampColumn {
+                source_table: if source_table.catalog.is_empty() {
+                    format!("{}.{}", source_table.schema, source_table.table)
+                } else {
+                    source_table.full_name()
+                },
+                timestamp_column: timestamp_column.to_string(),
+                columns: discovered_source_cols
+                    .iter()
+                    .map(|col| col.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            }
+            .into());
+        }
+    }
     let target_exists = !target_cols.is_empty();
 
     let mut use_full_refresh = !target_exists || (uses_watermark && prior_watermark.is_none());
@@ -15466,7 +15526,7 @@ async fn process_completed_result(
             // Classify before stringification so the typed connector
             // variant is preserved on `TableError.failure_kind` (plus
             // the optional warehouse-breaker cooldown hint).
-            let (failure_kind, cooldown_seconds) = classify_anyhow_error_with_cooldown(&e);
+            let (failure_kind, cooldown_seconds) = classify_table_error(&e);
             let raw = format!("{e:#}");
             if raw.contains("TABLE_OR_VIEW_NOT_FOUND") {
                 warn!(
@@ -15735,6 +15795,18 @@ fn post_copy_column_match(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn timestamp_column_match_accepts_folded_snowflake_names_and_rejects_absence() {
+        let cols = vec![rocky_ir::ColumnInfo {
+            name: "loaded_at".into(),
+            data_type: "TIMESTAMP".into(),
+            nullable: false,
+        }];
+        assert!(super::source_has_timestamp_column(&cols, "LOADED_AT"));
+        assert!(super::source_has_timestamp_column(&cols, "Loaded_At"));
+        assert!(!super::source_has_timestamp_column(&cols, "missing_at"));
+    }
 
     #[test]
     fn compile_error_blocks_declared_descendants_but_not_disjoint_or_deferred_selection() {
