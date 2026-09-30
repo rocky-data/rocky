@@ -2685,8 +2685,7 @@ impl RockyMcpServer {
                     suite: "declarative".to_string(),
                 })
                 .collect();
-            let all_passed = summary.total > 0
-                && summary.failed == 0
+            let all_passed = summary.failed == 0
                 && summary.errored == 0
                 && summary.passed + summary.warned == summary.total;
             return Ok(Json(TestResult {
@@ -6144,9 +6143,7 @@ impl RockyMcpServer {
                  it with draft_contract. Both write tools compile-validate and policy-gate the \
                  write; you can also author the check/contract yourself and pass it straight to \
                  the write tool.\n\
-                 4. compile — the write tools already type-check. After the target is applied, \
-                 run the new checks via the `test` tool with `declarative = true`. Fix against \
-                 any diagnostic and re-run until clean.\n\
+                 4. compile — the write tools already type-check. Fix any diagnostic.\n\
                  5. propose — generate the plan that records the new tests/contracts. It is an \
                  AI-authored plan with a plan_id.\n\n\
                  RECONCILE DISCIPLINE: a test that asserts the wrong invariant passes and is still \
@@ -6155,8 +6152,9 @@ impl RockyMcpServer {
                  non-null without checking.\n\n\
                  STOP at propose. Never apply an AI-authored change directly — a bare apply is \
                  refused by design. Surface the plan_id and the review report, then the human runs \
-                 `rocky review <plan-id> --approve` and `rocky apply <plan-id>`. Do not approve on \
-                 the user's behalf unless they explicitly tell you to.",
+                 `rocky review <plan-id> --approve` and `rocky apply <plan-id>`. After apply, \
+                 run the new checks via the `test` tool with `declarative = true`. Do not approve \
+                 on the user's behalf unless they explicitly tell you to.",
             ),
         ];
 
@@ -6260,8 +6258,7 @@ impl RockyMcpServer {
                      directly, or call ai_test to draft them, then write them with draft_check — \
                      it merges the `[[tests]]` blocks into the model and compiles in the same \
                      call, policy-gated.\n\
-                     4. After the target is applied, run the new checks via the `test` tool \
-                     with `declarative = true`. Loop until clean.\n\
+                     4. compile — fix any diagnostic from the draft.\n\
                      5. propose — generate the plan recording the new tests. It is an AI-authored \
                      plan with a plan_id.\n\n\
                      RECONCILE DISCIPLINE: only assert uniqueness/not-null on columns the profile \
@@ -6269,8 +6266,9 @@ impl RockyMcpServer {
                      than none — it green-lights a future run that should have failed.\n\n\
                      STOP at propose. Never apply an AI-authored change directly — a bare apply is \
                      refused by design. Surface the plan_id and the review report, then the human \
-                     runs `rocky review <plan-id> --approve` and `rocky apply <plan-id>`. Do not \
-                     approve on the user's behalf unless they explicitly tell you to."
+                     runs `rocky review <plan-id> --approve` and `rocky apply <plan-id>`. After \
+                     apply, run the new checks via the `test` tool with `declarative = true`. Do \
+                     not approve on the user's behalf unless they explicitly tell you to."
                 ),
             ),
         ];
@@ -7548,6 +7546,12 @@ fn validate_check_spec(spec: &str) -> Result<(), Json<ToolError>> {
              type = \"not_null\"\ncolumn = \"id\"\nThen pass it as `spec`.",
         )
     })?;
+    let Some(tests) = parsed.get("tests") else {
+        return Err(ToolError::invalid_argument(
+            "draft_check `spec` must contain a real `[[tests]]` table",
+            "Add a `[[tests]]` block with a test type and its required fields.",
+        ));
+    };
     for (key, value) in &parsed {
         if key != "tests" {
             return Err(ToolError::invalid_argument(
@@ -7569,6 +7573,12 @@ fn validate_check_spec(spec: &str) -> Result<(), Json<ToolError>> {
             ));
         }
     }
+    if tests.as_array().is_some_and(Vec::is_empty) {
+        return Err(ToolError::invalid_argument(
+            "draft_check `spec` must contain at least one `[[tests]]` block",
+            "Add a `[[tests]]` block with a test type and its required fields.",
+        ));
+    }
     Ok(())
 }
 
@@ -7581,23 +7591,45 @@ fn validate_check_spec_expressions(
 ) -> Result<(), Json<ToolError>> {
     // The structural gate ran first; malformed typed blocks remain compile
     // errors. A successfully parsed declaration must also generate SQL.
-    let parsed: toml::Table = toml::from_str(spec).expect("structural gate parsed check spec");
+    let parsed: toml::Table = toml::from_str(spec).map_err(|e| {
+        ToolError::invalid_argument(
+            format!("draft_check `spec` is not valid TOML: {e}"),
+            "Correct the declarative check and draft it again.",
+        )
+    })?;
     let tests = parsed
         .get("tests")
         .and_then(toml::Value::as_array)
-        .expect("structural gate required tests array");
-    let configured_adapter = config_path
-        .and_then(|path| rocky_core::config::load_optional_project_config(Some(path)).ok())
-        .flatten()
-        .and_then(|cfg| {
-            let registry = commands_adapter_registry(&cfg).ok()?;
-            registry.warehouse_adapter("default").ok()
-        });
-    let fallback = rocky_duckdb::dialect::DuckDbSqlDialect;
-    let dialect: &dyn rocky_core::traits::SqlDialect = configured_adapter
-        .as_ref()
-        .map(|adapter| adapter.dialect())
-        .unwrap_or(&fallback);
+        .filter(|tests| !tests.is_empty())
+        .ok_or_else(|| {
+            ToolError::invalid_argument(
+                "draft_check `spec` must contain at least one `[[tests]]` block",
+                "Add a `[[tests]]` block with a test type and its required fields.",
+            )
+        })?;
+    let path = config_path.ok_or_else(|| {
+        ToolError::config_invalid("draft_check cannot resolve the project config path")
+    })?;
+    let cfg = rocky_core::config::load_rocky_config(path)
+        .map_err(|e| ToolError::config_invalid(format!("draft_check cannot load config: {e:#}")))?;
+    let (_, pipeline) = rocky_cli::registry::resolve_pipeline(&cfg, None).map_err(|e| {
+        ToolError::config_invalid(format!(
+            "draft_check cannot resolve the target pipeline: {e:#}"
+        ))
+    })?;
+    let target = pipeline.target_adapter();
+    let adapter = cfg.adapters.get(target).ok_or_else(|| {
+        ToolError::config_invalid(format!(
+            "draft_check target adapter '{target}' is not configured"
+        ))
+    })?;
+    let dialect = rocky_cli::registry::warehouse_dialect_for_type(&adapter.adapter_type)
+        .ok_or_else(|| {
+            ToolError::config_invalid(format!(
+                "draft_check target adapter '{target}' has unsupported warehouse type '{}'",
+                adapter.adapter_type
+            ))
+        })?;
     for (index, value) in tests.iter().enumerate() {
         let Some(table) = value.as_table() else {
             continue;

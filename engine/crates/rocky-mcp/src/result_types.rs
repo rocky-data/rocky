@@ -519,9 +519,8 @@ pub struct DraftContractResult {
 /// The write-path sibling of `draft_model`: the agent supplies one or more
 /// `[[tests]]` blocks, the tool appends them to the model's sidecar
 /// (`models/<model>.toml`), compiles so a malformed block fails structurally, and
-/// gates the write through the agent-policy plane. The check *executes* via the
-/// `test` tool (compile validates the sidecar's structure; column-reference
-/// validity is proven when the check runs). Distinct from `ai_test`, which asks
+/// gates the write through the agent-policy plane. Run the check against an
+/// applied target with the `test` tool and `declarative = true`. Distinct from `ai_test`, which asks
 /// an LLM to *generate* assertions and returns them without writing.
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct DraftCheckResult {
@@ -536,11 +535,12 @@ pub struct DraftCheckResult {
     /// Count of warning-severity diagnostics.
     pub warning_count: usize,
     /// The immediate compile's diagnostics, scoped to the model. Compile proves
-    /// the merged sidecar is structurally sound; run the `test` tool to execute
+    /// the merged sidecar is structurally sound; run the `test` tool with
+    /// `declarative = true` to execute
     /// the check against the data.
     pub diagnostics: Vec<DiagnosticLite>,
     /// The authoring-loop reminder: a draft is not applied. It restates the flow
-    /// (write → compile → `test` → `propose` → human review → apply).
+    /// (write → compile → `propose` → human review → apply → declarative `test`).
     pub next_steps: String,
 }
 

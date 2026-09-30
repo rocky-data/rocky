@@ -322,7 +322,7 @@ The filter is your SQL, and it must be valid in the target dialect. Rocky does n
 - a `unique_expr` `key_expr` and a `cross_source_overlap` `key_expr`;
 - the same `expression` and `filter` again when quarantine lowers that assertion into its own statements. `[checks.quarantine]` itself takes only `enabled`, `mode` and the two suffixes;
 - a `metadata_columns[].value`;
-- a check an agent drafts through the `draft_check` MCP tool, which parses under the generic dialect because it has no target yet.
+- a check an agent drafts through the `draft_check` MCP tool. Rocky resolves the pipeline's target adapter from `rocky.toml` and validates under its dialect before writing.
 
 One config field is **not** gated: a `[[checks.custom]]` `sql` query. Rocky substitutes `{target}` into it and runs it as written, so treat a custom check as code you are running.
 
