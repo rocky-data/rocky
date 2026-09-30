@@ -1,0 +1,47 @@
+name: First-run feedback
+description: Share a completed workflow or where your first attempt stopped
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Tell us what you tried. Successful attempts and abandoned attempts both help.
+        This is a public issue. Remove credentials, private data, and internal addresses.
+        Report vulnerabilities through [private security reporting](https://github.com/rocky-data/rocky/security/advisories/new) or security@rocky-data.dev.
+  - type: textarea
+    id: goal
+    attributes:
+      label: What did you want to do?
+      description: Describe the job. You do not need to propose a feature.
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Version and installation
+      description: If available, include rocky --version, your operating system, and how you installed Rocky. For source builds, include the commit.
+    validations:
+      required: false
+  - type: dropdown
+    id: outcome
+    attributes:
+      label: How far did you get?
+      options:
+        - Completed the workflow
+        - Completed part of it
+        - Stopped before getting a result
+    validations:
+      required: true
+  - type: textarea
+    id: experience
+    attributes:
+      label: What happened?
+      description: Which step helped or blocked you? Include a guide link or a small example with synthetic data if useful.
+    validations:
+      required: true
+  - type: textarea
+    id: repeat_use
+    attributes:
+      label: Have you tried it again?
+      description: Optional. Describe what changed on another attempt, or what would make you try again.
+    validations:
+      required: false

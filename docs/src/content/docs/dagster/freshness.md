@@ -61,8 +61,7 @@ name = "fct_daily_orders"
 depends_on = ["stg_orders"]
 
 [strategy]
-type = "incremental"
-timestamp_column = "updated_at"
+type = "full_refresh"
 
 [target]
 catalog = "warehouse"

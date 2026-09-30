@@ -63,7 +63,7 @@ of finding them later.
 
 Rocky infers column-level types across the whole DAG. It reports problems as
 diagnostic codes you can grep in a CI log. The error codes run from `E001` to
-`E036`, with `W` warnings and `P` lints alongside.
+`E037`, with `W` warnings and `P` lints alongside.
 
 Compilation fails on any error-level diagnostic. That is the whole point: the
 failure becomes a non-zero exit code at PR time, not a wrong number in
@@ -130,6 +130,21 @@ re-hashed. It authenticates nobody: the approver's email is a self-asserted git
 identity hashed with the rest of the artifact, and a writer can set it to
 anything.
 
+The plans directory, `.rocky/plans/`, is a trusted input for the same reason. A
+plan's id is the blake3 digest of its kind and payload. Rocky recomputes that
+digest on every read and refuses a plan that no longer matches its own id. The id
+is unkeyed, so it catches a file changed without re-hashing, not a plan written
+whole. A promote plan runs the SQL statement it records. The checks at apply read
+the table names recorded beside it, not names parsed from the SQL. The
+`AiAuthored` review marker is unsigned too. Anyone who can write `.rocky/plans/`
+can therefore author a plan that `rocky apply` runs with the applier's warehouse
+credentials. For a promote plan, the policy gate still runs at apply, against
+the principal applying it. It judges the plan by the table names it records, not
+by the table the SQL writes. Rocky tries to keep `.rocky/` out of git by writing a
+`.gitignore` there. It skips that when one already exists, and ignores a failed
+write, so check what your repository excludes. Protect write access to the
+directory as you would the project itself.
+
 What you get today is schema-prefix isolation, not a warehouse-native zero-copy
 clone. Delta `SHALLOW CLONE` and Snowflake zero-copy `CLONE` would make branch
 creation near-instant and free of storage cost. That integration is a follow-up,
@@ -153,17 +168,18 @@ The accuracy depends on the warehouse:
 ### Compile-time contracts
 
 A `.contract.toml` declares what a model must produce. The compiler checks the
-model's inferred schema against it. Four codes cover the intra-project case:
+model's inferred schema against it. Five codes cover the intra-project case:
 
 - `E010`: a required column is missing from the model output.
 - `E011`: a column's type does not match the contract.
 - `E012`: the contract says non-nullable and the model output is nullable.
 - `E013`: a protected column has been removed.
+- `E014`: the model output holds a nullable column the contract does not declare, while `[rules] no_new_nullable` is on. That rule is off by default.
 
 Any of these fails compilation, so a broken contract is a red CI check rather
 than a production surprise.
 
-Those four are intra-project: they check a model against a contract inside one
+Those five are intra-project: they check a model against a contract inside one
 Rocky project. Enforcement across a project boundary also ships, through a
 **vendored snapshot**. Vendored means the consuming team keeps its own committed
 copy of the producing team's compiled schema, and diffs against that copy.
@@ -185,7 +201,7 @@ change:
 type. See [Cross-Team Contracts](/concepts/cross-team-contracts/) for the full
 workflow.
 
-**Shipped.** Intra-project (`E010`–`E013`) and cross-team via published-IR snapshots (`E030`–`E034`, enforced at the consumer's compile).
+**Shipped.** Intra-project (`E010`–`E014`) and cross-team via published-IR snapshots (`E030`–`E034`, enforced at the consumer's compile).
 
 ### Declarative governance
 
@@ -207,11 +223,26 @@ warehouse-neutral. The depth is not yet portable.
 
 ### Schema drift handling
 
-When a source schema changes under a materialized model, Rocky does not quietly
-keep going. It picks one of three responses: ignore the change, apply a safe
-column-type widening, or drop and recreate the table. A grace period runs before
-any destructive action. Drift becomes an explicit, graded decision instead of a
-silent divergence.
+Rocky checks for drift as it copies each table, whenever the target already
+exists. By default it grades the response and applies it in the same run. A new
+source column becomes `ALTER TABLE ADD COLUMN`. A safe type widening becomes
+`ALTER COLUMN TYPE`, which keeps the data. Any other type change drops the target
+and rebuilds it with a full refresh.
+
+Set `auto_apply_additive_drift = true` under `[resilience]` to route drift through
+the policy plane instead. The run then applies only a nullable new column, and
+only when policy resolves to `allow` for `schema_change.additive`. A matching rule
+can grant that, and so can `default_agent_effect = "allow"`. With no `[policy]`
+block, nothing is granted. Every other change is refused before it touches the
+target, including a safe widening.
+
+Three limits matter. The drop happens in the same run that finds the change: no
+grace period runs first. Rocky does not detect a column that disappeared from the
+source. And the run's `drift` output lists only the actions of an attempt that
+finished. If the rebuild fails after the drop, that entry is lost. A retry, one by
+default, can then rebuild the table and report it as materialized, with no sign of
+the drop. See [Failure modes](/advanced/failure-modes/) for each action and its
+recovery.
 
 **Shipped.**
 
@@ -294,7 +325,7 @@ surprised.
 | Compile-time column-level types and diagnostics (`E###` errors) | Shipped | Compilation fails on any error-level diagnostic. |
 | Compile-time column-level lineage + `lineage-diff` blast radius | Shipped | Intra-project; computed at compile time. |
 | Compile-time contracts (`E010`–`E013`) | Shipped | Intra-project contract validation against inferred schema. |
-| Schema drift handling (ignore / safe widen / drop-and-recreate) | Shipped | Explicit graded response with a grace period. |
+| Schema drift handling (add column / safe widen / drop-and-recreate) | Shipped | Graded response, applied in the run that detects it by default; with `auto_apply_additive_drift`, only a nullable addition that policy resolves to `allow`. No grace period before a drop. A column removed from the source is not detected. The `drift` output can omit a drop whose first rebuild failed. |
 | Dialect-divergence lint (`P001`) | Shipped | Opt-in via `--target-dialect`; error severity. |
 | VS Code trust overlays | Shipped | Exactly four: Drift, Breaking, Replay, Governance. |
 | Branches | Partial | Schema-prefix isolation with promotion. The approval gate is opt-in (`[branch.approval] required = true`) and checks an unkeyed digest: an integrity checksum, not a tamper boundary, and it authenticates nobody. No warehouse-native zero-copy clones yet. |

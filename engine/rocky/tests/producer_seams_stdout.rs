@@ -97,6 +97,7 @@ fn seed_state(state_path: &Path) {
             submission_id: None,
             check_gate_failed: false,
             verify_after_failed: false,
+            rocky_branch: None,
         })
         .unwrap();
 }
@@ -292,7 +293,7 @@ fn branch_list_and_show_print_what_their_seams_return() {
     let state_path = dir.path().join("state.redb");
     // Seeded through the production create path, in process; its own JSON
     // goes to this test's stdout and is not under test.
-    run_branch_create(&state_path, "fix-price", Some("a description"), true).unwrap();
+    run_branch_create(&state_path, "fix_price", Some("a description"), true).unwrap();
     let state = state_path.to_str().unwrap();
 
     let list = rocky_stdout(
@@ -304,7 +305,7 @@ fn branch_list_and_show_print_what_their_seams_return() {
         reference_bytes!(compute_branch_list(&state_path).unwrap())
     );
     assert!(
-        list.contains("fix-price"),
+        list.contains("fix_price"),
         "the list names the branch: {list}"
     );
 
@@ -315,14 +316,14 @@ fn branch_list_and_show_print_what_their_seams_return() {
             state,
             "branch",
             "show",
-            "fix-price",
+            "fix_price",
             "--output",
             "json",
         ],
     );
     assert_eq!(
         show,
-        reference_bytes!(compute_branch_show(&state_path, "fix-price").unwrap())
+        reference_bytes!(compute_branch_show(&state_path, "fix_price").unwrap())
     );
     assert!(
         show.contains("\"command\": \"branch show\""),
@@ -795,14 +796,14 @@ fn history_run_text_prints_the_run_table_then_the_audit_table() {
     let state = state_path.to_str().unwrap();
 
     let expected_table = format!(
-        "{:<12} {:<24} {:<10} {:<8} {:<10}\n{}\n{:<12} {:<24} {:<10} {:<8} {:<10}\n\nTotal runs: 1\n",
+        "{:<24} {:<24} {:<10} {:<8} {:<10}\n{}\n{:<24} {:<24} {:<10} {:<8} {:<10}\n\nTotal runs: 1\n",
         "RUN ID",
         "STARTED",
         "STATUS",
         "MODELS",
         "TRIGGER",
-        "-".repeat(66),
-        "run-under-t",
+        "-".repeat(78),
+        RUN_ID,
         "2026-04-21 12:00:00",
         "Success",
         2,
@@ -854,11 +855,16 @@ fn history_run_text_prints_the_run_table_then_the_audit_table() {
         "then the audit table:\n{rest}"
     );
     assert!(
-        rest.contains("run-under-t  seams-test         cli      -          -                -                    seams-test-"),
+        rest.contains(&format!(
+            "{:<24} {:<18} {:<8} {:<10} {:<16} {:<20} ",
+            RUN_ID, "seams-test", "cli", "-", "-", "-"
+        )),
         "the audit row carries the identity, source and host:\n{rest}"
     );
     assert!(
-        rest.contains("  run-under-t  version=0.0.0-test  idempotency_key=-\n"),
+        rest.contains(&format!(
+            "  {RUN_ID}  version=0.0.0-test  idempotency_key=-\n"
+        )),
         "the detail line carries the version:\n{rest}"
     );
 }

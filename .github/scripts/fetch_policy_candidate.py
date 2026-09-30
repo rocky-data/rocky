@@ -14,12 +14,15 @@ from __future__ import annotations
 import argparse
 import base64
 import binascii
+import http.client
 import json
 import os
 import re
 import shutil
+import ssl
 import sys
 import tempfile
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -35,6 +38,16 @@ MAX_TOTAL_BYTES = 4 * 1024 * 1024
 MAX_API_RESPONSE_BYTES = 8 * 1024 * 1024
 MAX_PATH_BYTES = 512
 REQUEST_TIMEOUT_SECONDS = 30
+# A transient GitHub API error used to fail the whole required check before it
+# looked at any diff, costing a human re-run each time. Retrying does not weaken
+# the gate: the candidate is still fetched exactly once, every validation below
+# still runs on it, and a failure that persists still fails the job.
+REQUEST_ATTEMPTS = 3
+RETRY_BACKOFF_SECONDS = (2.0, 6.0)
+# 5xx is the server failing, 429 is the documented rate-limit status, and 403
+# carries the rate limit when the quota is exhausted. A 401, 404 or 422 is the
+# request being wrong, which repeating cannot fix.
+RETRYABLE_STATUSES = frozenset({429, 500, 502, 503, 504})
 
 REPOSITORY_RE = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 SHA_RE = re.compile(r"[0-9a-fA-F]{40}")
@@ -94,6 +107,42 @@ def _validate_sha(value: object, *, field: str) -> str:
     return value.lower()
 
 
+def _is_rate_limited(error: urllib.error.HTTPError) -> bool:
+    """Tell a rate-limited 403 from a 403 that means the token cannot do this."""
+
+    headers = getattr(error, "headers", None)
+    if headers is None:
+        return False
+    return headers.get("x-ratelimit-remaining") == "0" or bool(
+        headers.get("retry-after")
+    )
+
+
+def _describe_failure(error: BaseException) -> tuple[bool, str]:
+    """Say whether one failed attempt is worth repeating, and name what happened.
+
+    The description is what reaches the log. Every failure used to print the
+    same line, so a 502, a DNS failure and an exhausted rate limit were
+    indistinguishable and nobody could tell whether a retry would have helped.
+    """
+
+    if isinstance(error, urllib.error.HTTPError):
+        if error.code == 403 and _is_rate_limited(error):
+            return True, "HTTP 403 (rate limit exhausted)"
+        return error.code in RETRYABLE_STATUSES, f"HTTP {error.code}"
+    reason = getattr(error, "reason", None)
+    # A certificate that does not verify is not a blip. Retrying would say
+    # "transient" in the log for a failed TLS identity check, and would give an
+    # intermittent interceptor three chances instead of one.
+    if isinstance(error, ssl.SSLCertVerificationError) or isinstance(
+        reason, ssl.SSLCertVerificationError
+    ):
+        return False, f"TLS certificate verification failed: {reason or error}"
+    detail = f"{type(error).__name__}: {reason}" if reason else type(error).__name__
+    # A connection that never produced a response: DNS, TLS, reset, timeout.
+    return True, detail
+
+
 def _request_json(api_url: str, endpoint: str, token: str) -> dict[str, Any]:
     url = f"{api_url}/{endpoint.lstrip('/')}"
     request = urllib.request.Request(
@@ -106,11 +155,25 @@ def _request_json(api_url: str, endpoint: str, token: str) -> dict[str, Any]:
         },
     )
     opener = urllib.request.build_opener(_RejectRedirects())
-    try:
-        with opener.open(request, timeout=REQUEST_TIMEOUT_SECONDS) as response:
-            payload = response.read(MAX_API_RESPONSE_BYTES + 1)
-    except (OSError, urllib.error.URLError) as error:
-        raise PolicyCandidateError("GitHub API request failed") from error
+    attempts: list[str] = []
+    for attempt in range(1, REQUEST_ATTEMPTS + 1):
+        try:
+            with opener.open(request, timeout=REQUEST_TIMEOUT_SECONDS) as response:
+                payload = response.read(MAX_API_RESPONSE_BYTES + 1)
+            break
+        # http.client.HTTPException is NOT an OSError, so a response that dies
+        # mid-body (IncompleteRead) would otherwise escape as a traceback: no
+        # retry, and no line saying which call failed. That is the failure this
+        # change exists to remove, so it must be caught here too.
+        except (OSError, urllib.error.URLError, http.client.HTTPException) as error:
+            retryable, detail = _describe_failure(error)
+            attempts.append(f"attempt {attempt}: {detail}")
+            if not retryable or attempt == REQUEST_ATTEMPTS:
+                raise PolicyCandidateError(
+                    f"GitHub API request failed for {endpoint} "
+                    f"({'; '.join(attempts)})"
+                ) from error
+            time.sleep(RETRY_BACKOFF_SECONDS[attempt - 1])
     if len(payload) > MAX_API_RESPONSE_BYTES:
         raise PolicyCandidateError("GitHub API response exceeds the byte limit")
     try:
@@ -334,6 +397,15 @@ def main() -> int:
         )
     except PolicyCandidateError as error:
         print(f"::error::{error}", file=sys.stderr)
+        # The cause carries the status or the connection reason. Discarding it
+        # is why three separate failures once produced one identical line and
+        # nobody could tell which call had failed, or why.
+        if error.__cause__ is not None:
+            print(
+                f"::error::caused by {type(error.__cause__).__name__}: "
+                f"{error.__cause__}",
+                file=sys.stderr,
+            )
         return 1
     print(f"materialized {count} candidate policy files")
     return 0

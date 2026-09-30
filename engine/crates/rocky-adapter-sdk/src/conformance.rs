@@ -332,14 +332,15 @@ fn test_specs() -> Vec<TestSpec> {
 /// collects results. Specs whose required capability is missing are reported
 /// as `Skipped`.
 ///
-/// When `dialect` is `Some`, the harness executes one real trait call
-/// (`SqlDialect::format_table_ref`) as the first incremental live check.
+/// When `dialect` is `Some`, the harness executes three real trait calls —
+/// `SqlDialect::format_table_ref`, `SqlDialect::watermark_where`, and
+/// `SqlDialect::row_hash_expr` — as the current incremental live checks.
 /// When `dialect` is `None` — for example on the built-in path
 /// (`rocky test-adapter --adapter <name>`), which validates the test plan
-/// without constructing a live adapter — that spec is
-/// reported as `Skipped` rather than executed against a stub. Remaining
-/// specs return placeholder passes; broader live execution lands in future
-/// SDK releases.
+/// without constructing a live adapter — those specs are reported as
+/// `Skipped` rather than executed against a stub. Every other spec is also
+/// `Skipped`, not a placeholder pass; broader live execution lands in
+/// future SDK releases.
 pub fn run_conformance(
     manifest: &AdapterManifest,
     dialect: Option<&dyn SqlDialect>,
@@ -421,11 +422,49 @@ fn run_test_spec(spec: &TestSpec, dialect: Option<&dyn SqlDialect>) -> TestOutco
                 Err(e) => TestOutcome::Fail(e.to_string()),
             }
         }
+        "watermark_where" => {
+            let Some(dialect) = dialect else {
+                return TestOutcome::Skip(NO_DIALECT_SKIP_MESSAGE.into());
+            };
+            // Exercise both branches the trait doc distinguishes: `None`
+            // (first run / after `delete_watermark`, the `1970-01-01`
+            // sentinel) and `Some` (the literal-formatting path where
+            // dialects actually diverge). A dialect that only handles the
+            // sentinel would otherwise pass conformance untested.
+            let Some(watermark) = chrono::DateTime::from_timestamp(1_700_000_000, 0) else {
+                return TestOutcome::Fail("could not construct a fixed test watermark".into());
+            };
+            for last_watermark in [None, Some(&watermark)] {
+                match dialect.watermark_where("updated_at", last_watermark) {
+                    Ok(clause) if clause.trim().is_empty() => {
+                        return TestOutcome::Fail(
+                            "watermark_where returned an empty WHERE clause".into(),
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(e) => return TestOutcome::Fail(e.to_string()),
+                }
+            }
+            TestOutcome::Pass
+        }
+        "row_hash" => {
+            let Some(dialect) = dialect else {
+                return TestOutcome::Skip(NO_DIALECT_SKIP_MESSAGE.into());
+            };
+            let columns = vec!["id".to_string(), "updated_at".to_string()];
+            let expr = dialect.row_hash_expr(&columns);
+            if expr.trim().is_empty() {
+                TestOutcome::Fail("row_hash_expr returned an empty expression".into())
+            } else {
+                TestOutcome::Pass
+            }
+        }
         // Every spec without an arm above. Reporting `Pass` here meant
         // `rocky test-adapter` printed green for work it never did: only
-        // `format_table_ref` is actually exercised, so connect, statement
-        // execution, schema/table lifecycle, grants, batch checks and
-        // discovery all counted as passing conformance (#475).
+        // `format_table_ref`, `watermark_where` and `row_hash` are actually
+        // exercised, so connect, statement execution, schema/table
+        // lifecycle, grants, batch checks and discovery all counted as
+        // passing conformance (#475).
         //
         // `Skipped` is the honest answer — the spec is declared, the check
         // is not written. It also keeps `tests_run` (passed + failed) from
@@ -440,17 +479,28 @@ mod tests {
     use crate::manifest::{AdapterCapabilities, AdapterManifest};
     use crate::traits::{AdapterError, AdapterResult, ColumnSelection, MetadataColumn};
 
-    /// In-crate `SqlDialect` stub. `format_table_ref` is delegated through a
-    /// function pointer so individual tests can swap in empty-string or `Err`
-    /// behavior without duplicating the rest of the trait surface.
+    /// In-crate `SqlDialect` stub. `format_table_ref`, `watermark_where` and
+    /// `row_hash_expr` are each delegated through a function pointer so
+    /// individual tests can swap in empty-string or `Err` behavior without
+    /// duplicating the rest of the trait surface.
     struct TestDialect {
         format_table_ref_impl: fn(&str, &str, &str) -> AdapterResult<String>,
+        watermark_where_impl:
+            fn(&str, Option<&chrono::DateTime<chrono::Utc>>) -> AdapterResult<String>,
+        row_hash_expr_impl: fn(&[String]) -> String,
     }
 
     impl Default for TestDialect {
         fn default() -> Self {
             Self {
                 format_table_ref_impl: |c, s, t| Ok(format!("{c}.{s}.{t}")),
+                watermark_where_impl: |timestamp_col, last_watermark| {
+                    let literal = last_watermark
+                        .map(|t| t.format("%Y-%m-%d %H:%M:%S%.f").to_string())
+                        .unwrap_or_else(|| "1970-01-01 00:00:00".to_string());
+                    Ok(format!("WHERE {timestamp_col} > TIMESTAMP '{literal}'"))
+                },
+                row_hash_expr_impl: |columns| format!("hash({})", columns.join(", ")),
             }
         }
     }
@@ -459,6 +509,23 @@ mod tests {
         fn with_format_table_ref(f: fn(&str, &str, &str) -> AdapterResult<String>) -> Self {
             Self {
                 format_table_ref_impl: f,
+                ..Self::default()
+            }
+        }
+
+        fn with_watermark_where(
+            f: fn(&str, Option<&chrono::DateTime<chrono::Utc>>) -> AdapterResult<String>,
+        ) -> Self {
+            Self {
+                watermark_where_impl: f,
+                ..Self::default()
+            }
+        }
+
+        fn with_row_hash_expr(f: fn(&[String]) -> String) -> Self {
+            Self {
+                row_hash_expr_impl: f,
+                ..Self::default()
             }
         }
     }
@@ -512,7 +579,7 @@ mod tests {
         }
 
         fn row_hash_expr(&self, columns: &[String]) -> String {
-            format!("hash({})", columns.join(", "))
+            (self.row_hash_expr_impl)(columns)
         }
 
         fn tablesample_clause(&self, percent: u32) -> Option<String> {
@@ -539,10 +606,7 @@ mod tests {
             timestamp_col: &str,
             last_watermark: Option<&chrono::DateTime<chrono::Utc>>,
         ) -> AdapterResult<String> {
-            let literal = last_watermark
-                .map(|t| t.format("%Y-%m-%d %H:%M:%S%.f").to_string())
-                .unwrap_or_else(|| "1970-01-01 00:00:00".to_string());
-            Ok(format!("WHERE {timestamp_col} > TIMESTAMP '{literal}'"))
+            (self.watermark_where_impl)(timestamp_col, last_watermark)
         }
 
         fn insert_overwrite_partition(
@@ -637,26 +701,31 @@ mod tests {
         assert_eq!(result.adapter, "test-adapter");
         assert_eq!(result.tests_failed, 0);
 
-        // 26 specs are declared; only `format_table_ref` has an
-        // implementation, and this run mode supplies no dialect — so it
-        // skips too. `tests_run` counts passed + failed, i.e. real work.
+        // 26 specs are declared; `format_table_ref`, `watermark_where` and
+        // `row_hash` have implementations, and `run_test_conformance`
+        // supplies a live dialect, so those three run for real. `tests_run`
+        // counts passed + failed, i.e. real work.
         assert_eq!(
             result.tests_run + result.tests_skipped,
             26,
             "every declared spec must be accounted for"
         );
         assert!(
-            result.tests_skipped >= 25,
+            result.tests_skipped >= 23,
             "specs with no implemented check must report Skipped, not Passed \
              (got {} skipped)",
             result.tests_skipped
         );
 
         // The property, stated without counting: a Passed result means a
-        // check ran. Only `format_table_ref` can produce one today.
+        // check ran. Only these three specs can produce one today.
         for r in &result.results {
             assert!(
-                r.status != TestStatus::Passed || r.name == "format_table_ref",
+                r.status != TestStatus::Passed
+                    || matches!(
+                        r.name.as_str(),
+                        "format_table_ref" | "watermark_where" | "row_hash"
+                    ),
                 "spec '{}' reported Passed but has no implemented check",
                 r.name
             );
@@ -708,6 +777,97 @@ mod tests {
         assert_eq!(format_result.status, TestStatus::Skipped);
         assert_eq!(
             format_result.message.as_deref(),
+            Some(NO_DIALECT_SKIP_MESSAGE)
+        );
+        assert_eq!(result.tests_failed, 0);
+    }
+
+    #[test]
+    fn test_conformance_executes_watermark_where_pass() {
+        let manifest = test_manifest(AdapterCapabilities::warehouse_only());
+        let result = run_conformance(&manifest, Some(&TestDialect::default()));
+
+        let watermark_result = find_result(&result, "watermark_where");
+        assert_eq!(watermark_result.status, TestStatus::Passed);
+    }
+
+    #[test]
+    fn test_conformance_fails_watermark_where_when_empty() {
+        let dialect = TestDialect::with_watermark_where(|_, _| Ok(String::new()));
+        let manifest = test_manifest(AdapterCapabilities::warehouse_only());
+        let result = run_conformance(&manifest, Some(&dialect));
+
+        let watermark_result = find_result(&result, "watermark_where");
+        assert_eq!(watermark_result.status, TestStatus::Failed);
+        assert_eq!(result.tests_failed, 1);
+    }
+
+    /// A dialect that only handles the `None` (first-run sentinel) branch
+    /// and goes empty on `Some(watermark)` — the literal-formatting path
+    /// where dialects actually diverge — must still fail conformance, not
+    /// pass on the strength of the trivial branch alone.
+    #[test]
+    fn test_conformance_fails_watermark_where_when_prior_watermark_produces_empty() {
+        let dialect = TestDialect::with_watermark_where(|timestamp_col, last_watermark| {
+            if last_watermark.is_some() {
+                Ok(String::new())
+            } else {
+                Ok(format!(
+                    "WHERE {timestamp_col} > TIMESTAMP '1970-01-01 00:00:00'"
+                ))
+            }
+        });
+        let manifest = test_manifest(AdapterCapabilities::warehouse_only());
+        let result = run_conformance(&manifest, Some(&dialect));
+
+        let watermark_result = find_result(&result, "watermark_where");
+        assert_eq!(watermark_result.status, TestStatus::Failed);
+        assert_eq!(result.tests_failed, 1);
+    }
+
+    #[test]
+    fn test_conformance_skips_watermark_where_when_no_dialect() {
+        let manifest = test_manifest(AdapterCapabilities::warehouse_only());
+        let result = run_conformance(&manifest, None);
+
+        let watermark_result = find_result(&result, "watermark_where");
+        assert_eq!(watermark_result.status, TestStatus::Skipped);
+        assert_eq!(
+            watermark_result.message.as_deref(),
+            Some(NO_DIALECT_SKIP_MESSAGE)
+        );
+        assert_eq!(result.tests_failed, 0);
+    }
+
+    #[test]
+    fn test_conformance_executes_row_hash_pass() {
+        let manifest = test_manifest(AdapterCapabilities::warehouse_only());
+        let result = run_conformance(&manifest, Some(&TestDialect::default()));
+
+        let row_hash_result = find_result(&result, "row_hash");
+        assert_eq!(row_hash_result.status, TestStatus::Passed);
+    }
+
+    #[test]
+    fn test_conformance_fails_row_hash_when_empty() {
+        let dialect = TestDialect::with_row_hash_expr(|_| String::new());
+        let manifest = test_manifest(AdapterCapabilities::warehouse_only());
+        let result = run_conformance(&manifest, Some(&dialect));
+
+        let row_hash_result = find_result(&result, "row_hash");
+        assert_eq!(row_hash_result.status, TestStatus::Failed);
+        assert_eq!(result.tests_failed, 1);
+    }
+
+    #[test]
+    fn test_conformance_skips_row_hash_when_no_dialect() {
+        let manifest = test_manifest(AdapterCapabilities::warehouse_only());
+        let result = run_conformance(&manifest, None);
+
+        let row_hash_result = find_result(&result, "row_hash");
+        assert_eq!(row_hash_result.status, TestStatus::Skipped);
+        assert_eq!(
+            row_hash_result.message.as_deref(),
             Some(NO_DIALECT_SKIP_MESSAGE)
         );
         assert_eq!(result.tests_failed, 0);

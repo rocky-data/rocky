@@ -145,5 +145,25 @@ export async function compare(): Promise<void> {
     await showJsonInEditor(JSON.stringify(result));
   } catch (err) {
     showRockyError("Compare failed", err);
+    const failed = failedCompareOutput(err);
+    if (failed) {
+      await showJsonInEditor(JSON.stringify(failed));
+    }
+  }
+}
+
+/** A failed compare still writes its per-table JSON before exiting non-zero. */
+function failedCompareOutput(err: unknown): CompareResult | undefined {
+  if (!err || typeof err !== "object" || !("stdout" in err) || !("kind" in err)) return;
+  if (err.kind !== "exit" || typeof err.stdout !== "string") return;
+  try {
+    const value: unknown = JSON.parse(err.stdout);
+    if (!value || typeof value !== "object") return;
+    if (!("command" in value) || value.command !== "compare") return;
+    if (!("results" in value) || !Array.isArray(value.results)) return;
+    if (!("tables_failed" in value) || typeof value.tables_failed !== "number") return;
+    return value as CompareResult;
+  } catch {
+    return;
   }
 }

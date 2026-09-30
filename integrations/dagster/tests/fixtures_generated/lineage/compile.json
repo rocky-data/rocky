@@ -49,14 +49,6 @@
         "schema": "staging",
         "table": "raw_orders"
       },
-      "incrementality_hint": {
-        "is_candidate": true,
-        "recommended_column": "order_id",
-        "confidence": "medium",
-        "signals": [
-          "column name 'order_id' matches auto-increment ID pattern"
-        ]
-      },
       "cost_hint": {
         "estimated_rows": 10000,
         "estimated_bytes": 2560000,
@@ -74,14 +66,6 @@
         "schema": "demo",
         "table": "fct_revenue"
       },
-      "incrementality_hint": {
-        "is_candidate": true,
-        "recommended_column": "customer_id",
-        "confidence": "medium",
-        "signals": [
-          "column name 'customer_id' matches auto-increment ID pattern"
-        ]
-      },
       "cost_hint": {
         "estimated_rows": 6400,
         "estimated_bytes": 1638400,
@@ -98,14 +82,6 @@
         "catalog": "poc",
         "schema": "demo",
         "table": "stg_orders"
-      },
-      "incrementality_hint": {
-        "is_candidate": true,
-        "recommended_column": "order_id",
-        "confidence": "medium",
-        "signals": [
-          "column name 'order_id' matches auto-increment ID pattern"
-        ]
       },
       "cost_hint": {
         "estimated_rows": 8000,

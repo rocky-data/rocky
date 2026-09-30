@@ -26,7 +26,9 @@ Rocky generates that output through the same code path `rocky run` uses, includi
 
 A full-refresh model emits a complete `CREATE OR REPLACE TABLE … AS …`. That statement runs as-is, and it matches what a run executes.
 
-An incremental or merge model emits its steady-state statement instead: a bare `INSERT` or `MERGE` against an existing target. `rocky run` creates that target on the first build, and it threads the incremental [watermark](/reference/glossary/#watermark) (the timestamp of the newest row already loaded) from its state store. A static SQL file can carry neither, so those files include a short note. Treat them as the recurring operation, not as a from-scratch build.
+A merge or `delete_insert` model emits its steady-state statement instead, against an existing target. `rocky run` creates that target on the first build. A static SQL file cannot, so those files include a short note. Treat them as the recurring operation, not as a from-scratch build.
+
+The export needs a project that compiles cleanly. A transformation model with `type = "incremental"` fails with `E037` and stops the whole export.
 
 Rocky emits models in dependency order: a model never appears before one it reads. The stdout form is therefore a single ordered script you can pipe straight to your warehouse:
 
@@ -59,7 +61,7 @@ For full-refresh models this path is exact. A CI test emits the SQL and executes
 
 Replication pipelines are incremental source-to-target copies driven by the engine's watermark state. Their SQL preview lives behind the live `rocky plan` path instead.
 
-Some models produce no standalone statement. Rocky reports those on stderr rather than dropping them silently. Two cases produce no statement. One is an ephemeral model, which is inlined as a CTE. The other is a strategy that needs a live connection to render. A Snowflake dynamic table is one example: it resolves its compute-warehouse name at runtime.
+Some models produce no standalone statement. Rocky reports those on stderr rather than dropping them silently. That happens when a strategy needs a live connection to render. A Snowflake dynamic table is one example: it resolves its compute-warehouse name at runtime.
 
 ## Related
 

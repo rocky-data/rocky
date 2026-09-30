@@ -133,7 +133,7 @@
           ],
           "description": "The capability that was evaluated (its `schema_change.*` refinement is the change class the ranking weighs)."
         },
-        "classification_weight": {
+        "change_class_weight": {
           "description": "The change-class weight the ranking used (breaking > bare verb > additive / value-only).",
           "format": "uint32",
           "minimum": 0.0,
@@ -204,7 +204,7 @@
       "required": [
         "approve_command",
         "capability",
-        "classification_weight",
+        "change_class_weight",
         "decision_ref",
         "model",
         "models",
@@ -237,7 +237,7 @@
       "type": "array"
     },
     "ranking": {
-      "description": "Human-readable description of the ordering, e.g. `\"blast_radius × classification × staleness\"`.",
+      "description": "Human-readable description of the ordering, e.g. `\"blast_radius × change_class × staleness\"`.",
       "type": "string"
     },
     "total": {

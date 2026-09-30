@@ -168,9 +168,9 @@ pub struct ResolvedCheckNameOutput {
 
 /// Freshness check configuration projected into the discover output.
 ///
-/// Per-schema `overrides` from `rocky_core::config::FreshnessConfig` are
-/// intentionally not exposed yet — the override-key semantics need to be
-/// nailed down before integrations can rely on them.
+/// Just the scalar threshold: `[checks.freshness]` has no per-schema
+/// `overrides` key. One existed and parsed but nothing on the check path
+/// ever read it, so it was removed rather than exposed here (#1620).
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct FreshnessConfigOutput {
     pub threshold_seconds: u64,
@@ -355,11 +355,10 @@ pub struct RunOutput {
     /// omitted) for a default run, which stays byte-identical.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub model_decisions: Vec<ModelDecisionOutput>,
-    /// Models withheld this run because an upstream failed (or was itself
-    /// withheld) and `[resilience] contain_failures` continued the disjoint
-    /// subgraphs — the blast radius of the failures named in `errors[]`. Empty
-    /// (and omitted) for a run that did not withhold anything: the default
-    /// fail-fast run, and any successful run, record nothing here.
+    /// Models withheld this run after an upstream compile failure, or while
+    /// `[resilience] contain_failures` continues disjoint subgraphs after a
+    /// runtime failure. This is the blast radius of failures in `errors[]`.
+    /// Empty (and omitted) when no model was withheld.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub contained: Vec<ContainedModelOutput>,
     pub check_results: Vec<TableCheckOutput>,
@@ -370,6 +369,13 @@ pub struct RunOutput {
     pub quarantine: Vec<QuarantineOutput>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub anomalies: Vec<AnomalyOutput>,
+    /// One entry per table the run considered for row-count anomaly
+    /// detection, saying whether the detector evaluated it. Empty for a run
+    /// with no batched checks. See [`AnomalyEvaluationOutput`] — without it,
+    /// an empty `anomalies` list means both "nothing anomalous" and "nothing
+    /// was looked at" (#1790).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub anomaly_evaluated: Vec<AnomalyEvaluationOutput>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub errors: Vec<TableErrorOutput>,
     pub execution: ExecutionSummary,
@@ -563,10 +569,47 @@ pub struct ExecutionSummary {
     pub rate_limits_detected: Option<u64>,
 }
 
+/// Whether the row-count anomaly detector evaluated one table.
+///
+/// One entry per table in the run's batches, whatever happened. A consumer
+/// reading [`RunOutput::anomalies`] alone cannot tell "the detector ran and
+/// found nothing" from "the detector never ran": both are an empty list
+/// (#1790). Dagster read the empty list as a pass, so a run with
+/// `row_count = false` showed a green anomaly check for a detector that had
+/// not run.
+///
+/// The detector runs only when row-count checks are on, the run has a state
+/// store, the table's row count was measured, and its history could be read.
+/// `not_evaluated_reason` names which of those was missing, because the
+/// remedy differs: one is a config line, another is how the run was invoked.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct AnomalyEvaluationOutput {
+    /// Fully-qualified table the entry is about, the same key
+    /// [`AnomalyOutput::table`] uses.
+    pub table: String,
+    /// Dagster-style asset key path (`[source_type, ...components, table]`),
+    /// the same value [`MaterializationOutput::asset_key`] carries for this
+    /// table. Added (#2073) so the Dagster Pipes emitter can report this
+    /// verdict as a `report_asset_check` without re-deriving the mapping
+    /// `batch_asset_keys` already has — the same reason
+    /// [`TableCheckOutput::asset_key`] exists.
+    pub asset_key: Vec<String>,
+    /// `true` when the detector compared this table's count against its
+    /// history. An anomaly, if any, is in [`RunOutput::anomalies`].
+    pub evaluated: bool,
+    /// Why the detector did not evaluate this table. Set exactly when
+    /// `evaluated` is `false`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub not_evaluated_reason: Option<String>,
+}
+
 /// Row count anomaly detected by historical baseline comparison.
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct AnomalyOutput {
     pub table: String,
+    /// Dagster-style asset key path, same convention as
+    /// [`AnomalyEvaluationOutput::asset_key`] (#2073).
+    pub asset_key: Vec<String>,
     pub current_count: u64,
     pub baseline_avg: f64,
     pub deviation_pct: f64,
@@ -726,14 +769,18 @@ fn cooldown_from_snowflake(err: &rocky_snowflake::connector::ConnectorError) -> 
 /// `ConnectorError` and classify it via [`FailureKind`]. Returns
 /// [`FailureKind::Unknown`] when neither connector enum is reachable.
 ///
-/// Production-path note: adapter calls go through
-/// [`rocky_adapter_sdk::AdapterError`], a `Box<dyn Error>` wrapper
-/// whose `Error::source()` impl returns the *inner*'s source — so a
-/// bare `chain()` walk skips past the wrapper straight to whatever the
+/// Production-path note: adapter calls go through one of two `Box<dyn
+/// Error>` wrapper types — [`rocky_adapter_sdk::AdapterError`] (the
+/// adapter-SDK trait boundary; used for e.g. Databricks volume / Snowflake
+/// stage file staging) or [`rocky_core::traits::AdapterError`] (what every
+/// `WarehouseAdapter` method, including the databricks/snowflake/trino/
+/// bigquery `execute_statement*` path, actually returns) — and both
+/// wrappers' `Error::source()` impl returns the *inner*'s source, so a bare
+/// `chain()` walk skips past either wrapper straight to whatever the
 /// `ConnectorError` carries (e.g. `reqwest::Error`) and never sees the
-/// connector variant itself. To handle that, each cause is also
-/// downcast to `AdapterError`; when matched, its
-/// [`AdapterError::inner`] is probed for the typed `ConnectorError`.
+/// connector variant itself (#2064). To handle that, each cause is also
+/// downcast to both wrapper types via [`classify_wrapped_adapter_cause`];
+/// when matched, its inner error is probed for the typed `ConnectorError`.
 ///
 /// Many existing call sites in `run.rs` still build their `anyhow`
 /// errors via `anyhow::anyhow!("…{e}")`, which stringifies the
@@ -768,14 +815,42 @@ fn classify_cause_with_cooldown(
     None
 }
 
+/// Downcast a single chain link to whichever `AdapterError` wrapper type
+/// Rocky's adapters use — [`rocky_adapter_sdk::AdapterError`] or
+/// [`rocky_core::traits::AdapterError`] (#2064: warehouse adapters return
+/// the latter, not the former the classifiers previously assumed) — and
+/// walk from its `inner()` through `source()` the same way
+/// [`classify_adapter_error_with_cooldown`] does, so a typed connector
+/// error nested at any depth inside either wrapper is found. Returns
+/// `None` when `cause` is neither wrapper type, or neither wrapper's inner
+/// chain holds a typed connector error.
+fn classify_wrapped_adapter_cause(
+    cause: &(dyn std::error::Error + 'static),
+) -> Option<(FailureKind, Option<u64>)> {
+    let inner: &(dyn std::error::Error + 'static) =
+        if let Some(e) = cause.downcast_ref::<rocky_adapter_sdk::AdapterError>() {
+            e.inner()
+        } else {
+            cause
+                .downcast_ref::<rocky_core::traits::AdapterError>()?
+                .inner()
+        };
+    let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(inner);
+    while let Some(c) = cause {
+        if let Some(pair) = classify_cause_with_cooldown(c) {
+            return Some(pair);
+        }
+        cause = c.source();
+    }
+    None
+}
+
 pub fn classify_anyhow_error(err: &anyhow::Error) -> FailureKind {
     for cause in err.chain() {
         if let Some(kind) = classify_cause(cause) {
             return kind;
         }
-        if let Some(adapter_err) = cause.downcast_ref::<rocky_adapter_sdk::AdapterError>()
-            && let Some(kind) = classify_cause(adapter_err.inner())
-        {
+        if let Some((kind, _)) = classify_wrapped_adapter_cause(cause) {
             return kind;
         }
     }
@@ -796,11 +871,33 @@ pub fn classify_anyhow_error_with_cooldown(err: &anyhow::Error) -> (FailureKind,
         if let Some(pair) = classify_cause_with_cooldown(cause) {
             return pair;
         }
-        if let Some(adapter_err) = cause.downcast_ref::<rocky_adapter_sdk::AdapterError>()
-            && let Some(pair) = classify_cause_with_cooldown(adapter_err.inner())
-        {
+        if let Some(pair) = classify_wrapped_adapter_cause(cause) {
             return pair;
         }
+    }
+    (FailureKind::Unknown, None)
+}
+
+/// [`classify_anyhow_error_with_cooldown`] for a bare
+/// [`rocky_core::traits::AdapterError`], as `WarehouseAdapter` methods return.
+///
+/// `rocky_core`'s `AdapterError::source()` returns its inner error's source,
+/// skipping the inner error itself, so this starts at [`inner`] and walks
+/// `source()` from there — the same walk [`classify_wrapped_adapter_cause`]
+/// now runs on a *wrapped* `AdapterError` found inside an `anyhow::Error`
+/// chain; this is the entry point for a caller holding the bare type
+/// directly, with no `anyhow::Error` to walk.
+///
+/// [`inner`]: rocky_core::traits::AdapterError::inner
+pub fn classify_adapter_error_with_cooldown(
+    err: &rocky_core::traits::AdapterError,
+) -> (FailureKind, Option<u64>) {
+    let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(err.inner());
+    while let Some(c) = cause {
+        if let Some(pair) = classify_cause_with_cooldown(c) {
+            return pair;
+        }
+        cause = c.source();
     }
     (FailureKind::Unknown, None)
 }
@@ -1464,10 +1561,15 @@ pub struct QuarantineOutput {
     /// can report it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub quarantined_rows: Option<u64>,
-    /// `true` when every quarantine statement executed successfully.
-    /// `false` means a partial failure — inspect `error` for details.
+    /// `true` when every quarantine statement executed successfully and,
+    /// for `mode = "split"`, the intermediate label table was dropped.
+    /// `false` also adds a failing `quarantine:execute` check, counts the
+    /// table in `tables_failed` and itemises it in `errors`, so the run fails
+    /// whatever `fail_on_error` says; inspect `error` for details.
     pub ok: bool,
-    /// Error message from the first failing statement, if any.
+    /// The first failing statement's role and error, if any. For
+    /// `mode = "split"`, a failure to drop the intermediate label table is
+    /// appended after it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -1490,6 +1592,13 @@ pub struct DriftSummary {
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct DriftActionOutput {
     pub table: String,
+    /// Dagster-style asset key path (`[source_type, ...components, table]`)
+    /// for this table, the same value [`MaterializationOutput::asset_key`]
+    /// carries. Added (#2073) so the Dagster Pipes emitter can report drift
+    /// as a `report_asset_check` keyed on the asset, instead of passing
+    /// `table` (a bare `catalog.schema.table` string, not a Dagster asset
+    /// key) as the asset key.
+    pub asset_key: Vec<String>,
     pub action: String,
     pub reason: String,
 }
@@ -1514,6 +1623,15 @@ pub struct DriftActionOutput {
 /// consumers that do not include a compile step remain byte-stable. When
 /// `rocky plan` runs against a project with a `models/` directory, these
 /// fields are populated and the plan is persisted to `.rocky/plans/`.
+/// One model `rocky plan` left out of the preview, and why.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct SkippedModel {
+    /// The model's name, as declared in its sidecar.
+    pub model: String,
+    /// Why no statement was previewed for it.
+    pub reason: String,
+}
+
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct PlanOutput {
     pub version: String,
@@ -1546,6 +1664,14 @@ pub struct PlanOutput {
     /// warehouses without a first-class retention knob.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub retention_actions: Vec<RetentionAction>,
+    /// Models the preview could not render, one entry each, with the
+    /// reason. A model whose SQL cannot be rendered offline lands here
+    /// (a Snowflake dynamic table needs a live compute-warehouse name),
+    /// and so does one whose strategy is refused, such as `ephemeral`
+    /// (E038). Before, such a model left no trace: an ephemeral-only
+    /// project previewed as an empty plan and exit 0.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skipped: Vec<SkippedModel>,
 
     // ---- D-3 stage 2: pre-execution budget diagnostics ------------------
     //
@@ -1798,12 +1924,6 @@ pub struct ModelDetail {
     /// `"explicit"` (via `--contracts` flag), or absent when no contract.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub contract_source: Option<String>,
-    /// When the model uses `full_refresh` and has columns that look monotonic,
-    /// this hint suggests switching to incremental materialization. `None`
-    /// when the model already uses an incremental strategy or no candidates
-    /// were found.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub incrementality_hint: Option<rocky_compiler::incrementality::IncrementalityHint>,
     /// DAG-propagated cost estimate for this model. Populated at compile
     /// time using heuristic cardinality propagation (no warehouse round-trip).
     /// `None` when no upstream table statistics are available.
@@ -2207,12 +2327,6 @@ pub struct OptimizeOutput {
     pub total_models_analyzed: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
-    /// Hint pointing users to `rocky compile --output json` for
-    /// inferred incrementality recommendations on `full_refresh` models.
-    /// Only populated when the optimize command detects that compile-time
-    /// analysis could provide additional optimization opportunities.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub incrementality_note: Option<String>,
 }
 
 /// One materialization-strategy recommendation. Mirrors
@@ -2247,11 +2361,6 @@ impl OptimizeOutput {
             recommendations,
             total_models_analyzed: count,
             message: None,
-            incrementality_note: Some(
-                "Run `rocky compile --output json` for inferred incrementality \
-                 hints on full_refresh models"
-                    .to_string(),
-            ),
         }
     }
 
@@ -2262,7 +2371,6 @@ impl OptimizeOutput {
             recommendations: vec![],
             total_models_analyzed: 0,
             message: Some(message.into()),
-            incrementality_note: None,
         }
     }
 }
@@ -2446,6 +2554,14 @@ pub struct RunHistoryRecord {
     /// `TickOutput.executed[].submission_id`. `None` for manually launched runs.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub submission_id: Option<String>,
+    /// The named Rocky branch this run wrote to (`rocky run --branch
+    /// <name>`), or `None` for a production / plain-`--shadow` run. Distinct
+    /// from `git_branch` — see `RunRecord::rocky_branch` (#2032). Not
+    /// audit-gated — like [`Self::pipeline`], it is an operational join key
+    /// (`rocky preview diff`/`preview cost` pair a run by this field), always
+    /// emitted when present.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rocky_branch: Option<String>,
 
     // --- Governance audit trail (populated only with `--audit`) ---
     /// Resolved caller identity (Unix `$USER` / Windows `$USERNAME`).
@@ -3397,12 +3513,18 @@ pub struct TableCompareResult {
     pub production_table: String,
     pub shadow_table: String,
     pub row_count_match: bool,
-    pub production_count: u64,
-    pub shadow_count: u64,
-    pub row_count_diff_pct: f64,
+    /// Null when the warehouse count could not be read.
+    pub production_count: Option<u64>,
+    /// Null when the warehouse count could not be read.
+    pub shadow_count: Option<u64>,
+    /// Null unless both counts were read.
+    pub row_count_diff_pct: Option<f64>,
     pub schema_match: bool,
     pub schema_diffs: Vec<String>,
     pub verdict: String,
+    /// Read errors for an `error` row, or threshold reasons for `warn`/`fail`.
+    /// Empty for `pass`.
+    pub reasons: Vec<String>,
 }
 
 /// JSON output for `rocky compact`.
@@ -4690,7 +4812,6 @@ impl ChecksConfigOutput {
             threshold_seconds: f.threshold_seconds,
         });
 
-        let runs = |k: CheckKind| executed_kinds.contains(&k);
         let mut configured_checks: BTreeMap<String, Vec<ResolvedCheckNameOutput>> = BTreeMap::new();
 
         // (source_type, table) pairs across discovered sources.
@@ -4705,43 +4826,49 @@ impl ChecksConfigOutput {
         let unique_tables: std::collections::BTreeSet<&str> =
             pairs.iter().map(|(_, t)| t.as_str()).collect();
 
-        // Custom checks run against every materialized table.
-        if runs(CheckKind::Custom) {
-            for &table in &unique_tables {
-                for custom in &cfg.custom {
-                    configured_checks
-                        .entry(table.to_string())
-                        .or_default()
-                        .push(ResolvedCheckNameOutput {
-                            name: custom.name.clone(),
-                            kind: "custom".into(),
-                            candidate: false,
-                        });
-                }
+        // Every discovered table gets the full per-table derivation: custom,
+        // null_rate, assertions ON THIS TABLE, and cross_source_overlap when
+        // it has ≥2 siblings under the same source type. Shared with the
+        // pre-run collision guards (`rocky-core::config`, `rocky-cli`'s
+        // `run.rs`) so none of the three can disagree about which names a
+        // table emits (#1941).
+        for &table in &unique_tables {
+            let sibling_source_types: Vec<String> = pairs
+                .iter()
+                .filter(|(_, t)| t == table)
+                .map(|(source_type, _)| source_type.clone())
+                .collect();
+            let names = rocky_core::config::resolved_check_names_for_table(
+                cfg,
+                executed_kinds,
+                table,
+                &sibling_source_types,
+            );
+            if names.is_empty() {
+                continue;
             }
+            configured_checks
+                .entry(table.to_string())
+                .or_default()
+                .extend(names.into_iter().map(|n| ResolvedCheckNameOutput {
+                    name: n.name,
+                    kind: n.kind.as_str().to_string(),
+                    candidate: n.candidate,
+                }));
         }
 
-        // Null-rate: one result per configured column, per table.
-        if runs(CheckKind::NullRate)
-            && let Some(nr) = cfg.null_rate.as_ref()
-        {
-            for &table in &unique_tables {
-                for col in &nr.columns {
-                    configured_checks
-                        .entry(table.to_string())
-                        .or_default()
-                        .push(ResolvedCheckNameOutput {
-                            name: rocky_core::checks::null_rate_check_name(col),
-                            kind: "null_rate".into(),
-                            candidate: false,
-                        });
-                }
-            }
-        }
-
-        // Assertions attach to their specific target table.
-        if runs(CheckKind::Assertions) {
+        // An assertion whose table was NOT among the discovered tables still
+        // gets its resolved name projected — `rocky discover` declares the
+        // spec even though this snapshot didn't discover the table, so a
+        // consumer can pre-declare it before the table shows up. Unlike the
+        // discovered-table loop above this does not also add custom/null_rate
+        // entries for that table: those apply only once the table is
+        // actually materialized, which this snapshot has no evidence of.
+        if executed_kinds.contains(&CheckKind::Assertions) {
             for assertion in &cfg.assertions {
+                if unique_tables.contains(assertion.table.as_str()) {
+                    continue; // already covered by the loop above
+                }
                 configured_checks
                     .entry(assertion.table.clone())
                     .or_default()
@@ -4751,31 +4878,6 @@ impl ChecksConfigOutput {
                         candidate: false,
                     });
             }
-        }
-
-        // Cross-source overlap: candidate names for ≥2 (source_type, table)
-        // groups — marked `candidate` because the actual set depends on
-        // runtime-discovered siblings, which may differ from what discover sees.
-        if runs(CheckKind::CrossSourceOverlap) && cfg.cross_source_overlap.is_some() {
-            for (source_type, table) in
-                rocky_core::checks::cross_source_overlap_groups(pairs.iter().cloned())
-            {
-                configured_checks
-                    .entry(table.clone())
-                    .or_default()
-                    .push(ResolvedCheckNameOutput {
-                        name: rocky_core::checks::cross_source_overlap_name(&source_type, &table),
-                        kind: "cross_source_overlap".into(),
-                        candidate: true,
-                    });
-            }
-        }
-
-        // Dedup identical names per table (e.g. a custom check on a table name
-        // that appears under multiple sources), preserving declaration order.
-        for names in configured_checks.values_mut() {
-            let mut seen = std::collections::HashSet::new();
-            names.retain(|n| seen.insert(n.name.clone()));
         }
 
         if freshness.is_none() && configured_checks.is_empty() {
@@ -4905,6 +5007,10 @@ pub struct RunRecordAudit {
     pub target_catalog: Option<String>,
     pub hostname: String,
     pub rocky_version: String,
+    /// The named Rocky branch this run wrote to (`rocky run --branch
+    /// <name>`), or `None`. See `RunRecord::rocky_branch` (#2032) — this is
+    /// NOT `git_branch`.
+    pub rocky_branch: Option<String>,
 }
 
 impl RunRecordAudit {
@@ -4923,6 +5029,7 @@ impl RunRecordAudit {
             target_catalog: None,
             hostname: "output-test-host".to_string(),
             rocky_version: "0.0.0-test".to_string(),
+            rocky_branch: None,
         }
     }
 }
@@ -4953,6 +5060,7 @@ impl RunOutput {
             check_results: vec![],
             quarantine: vec![],
             anomalies: vec![],
+            anomaly_evaluated: vec![],
             errors: vec![],
             execution: ExecutionSummary {
                 concurrency,
@@ -5314,6 +5422,7 @@ impl RunOutput {
             target_catalog: audit.target_catalog,
             hostname: audit.hostname,
             rocky_version: audit.rocky_version,
+            rocky_branch: audit.rocky_branch,
             check_outcomes,
             pipeline: None,
             submission_id: None,
@@ -5445,6 +5554,7 @@ impl PlanOutput {
             classification_actions: vec![],
             mask_actions: vec![],
             retention_actions: vec![],
+            skipped: vec![],
             budget_diagnostics: vec![],
             has_budget_errors: false,
             plan_id: None,
@@ -6183,6 +6293,156 @@ pub struct SpoolCounts {
     /// in `pending` or `skipped` — the queue has set them aside — but a
     /// non-zero count means demands were accepted and never ran.
     pub corrupt: usize,
+}
+
+/// The running server's posture, served by `GET /api/v1/settings`.
+///
+/// **An allowlist, not a config dump.** Every field below is projected
+/// individually, by hand, in `crate::api::settings_output` — from a
+/// [`rocky_server::state::SettingsSnapshot`] of primitives plus two fieldless
+/// enum labels taken out of the config file, after which the config is dropped.
+/// No `RockyConfig` is serialised or `Debug`-printed anywhere on that path:
+/// `AdapterConfig`'s `Debug` prints its `.extra` map, which is unbounded
+/// caller-supplied TOML, so a config that merely *passed through* this type
+/// would be a disclosure surface.
+///
+/// No secret appears — not the Bearer token, not `ROCKY_WEBHOOK_SECRET`. The
+/// token is reported as its name and scope; the webhook secret as whether it is
+/// usable.
+///
+/// To be exact about what enforces that: the **projection function** does, not
+/// the type. Rust would happily let a future field carry a secret. What makes
+/// it hold is that the projection names every field explicitly, and three tests
+/// stand behind it — `settings_reports_exactly_the_allowlisted_fields` fails
+/// when a field is *added*, `settings_never_discloses_a_configured_secret`
+/// greps this document for three real configured secrets, and
+/// `no_safe_route_discloses_a_configured_secret` greps every safe route for the
+/// same three.
+///
+/// **API-only, deliberately.** There is no `rocky settings` verb, because this
+/// document describes *a server that is running* and a one-shot CLI invocation
+/// would have to invent one. [`ScheduleStatusOutput`] is the established
+/// precedent for a route with no CLI oracle.
+///
+/// **Freshness.** Everything except `state_backend` and `concurrency_control`
+/// is fixed when the process starts and cannot change while it runs.
+///
+/// Those two come from `rocky.toml`, and are read **once, on the first request
+/// to this route**, then fixed for the life of the process. Deliberately not at
+/// startup: on a plain `rocky serve` nothing on the path to binding the
+/// listener reads a file, and an eager read would put one there — letting a
+/// `rocky.toml` that is a FIFO or sits on a stalled mount stop the server
+/// binding at all. (`--scheduler` without an explicit `--poll-interval` already
+/// reads the config before binding; that path is unchanged.)
+///
+/// That read is bounded by one permit and a deadline, so a stuck file cannot
+/// starve the server either: a caller that finds it busy gets `503
+/// engine_busy`, and one whose read blows the deadline gets `504
+/// settings_config_timeout`. Every other field is unaffected.
+///
+/// So they are a snapshot, not a live view, and the scheduler re-reads that
+/// same file every tick — a config edited after the first request to this route
+/// is not reflected here, while the scheduler acts on the new one.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct SettingsOutput {
+    /// The host the listener is bound to, verbatim (`127.0.0.1`, `0.0.0.0`, …).
+    ///
+    /// The same `String` `ServeConfig` binds — `serve` lends one value to both,
+    /// so this cannot name a host the server is not actually on.
+    pub bind_host: String,
+    /// Extra `Host` header values the UI guard accepts.
+    ///
+    /// This is what is **enforced**, not what was typed: `--allowed-host` is
+    /// only wired into a guard when `--ui` is on, so this is `[]` whenever `ui`
+    /// is `false`. Reporting the raw flag list would claim a guard that is not
+    /// running.
+    pub allowed_hosts: Vec<String>,
+    /// The CORS allowlist actually installed. Empty means same-origin only.
+    ///
+    /// Like `allowed_hosts`, this is what is **enforced**: `build_cors_layer`
+    /// drops an `--allowed-origin` that is not a valid header value, and an
+    /// origin it could not install grants nothing. Both this and the layer come
+    /// from one derivation, so the report cannot drift from the layer.
+    pub allowed_origins: Vec<String>,
+    /// Whether a resident reconciler is running (`--scheduler`).
+    pub scheduler: bool,
+    /// Whether the embedded browser UI is served at `/ui/` (`--ui`).
+    pub ui: bool,
+    /// Whether `ROCKY_WEBHOOK_SECRET` can sign a webhook.
+    ///
+    /// Reported even when `scheduler` is `false`, which is the point: it tells
+    /// an operator what will happen when they turn the scheduler on.
+    pub webhook_secret: WebhookSecretStatus,
+    /// The configured Bearer token, as its name and scope — never its value.
+    ///
+    /// `null` means **no token is configured**, which the server permits only on
+    /// a loopback bind (`api::serve` refuses to bind a non-loopback host with no
+    /// auth). That is the most exposure-relevant answer this route gives, so it
+    /// is a distinguishable `null` rather than a token named "none".
+    pub token: Option<TokenSettings>,
+    /// `[state] backend`, as read on the first request to this route. `null`
+    /// when there was no readable config — `config_status` says which.
+    pub state_backend: Option<rocky_core::config::StateBackend>,
+    /// `[state] concurrency_control`, read at the same moment as
+    /// `state_backend`. `null` on the same condition.
+    pub concurrency_control: Option<rocky_core::config::ConcurrencyControl>,
+    /// What happened when `rocky.toml` was read.
+    ///
+    /// Carried so a `null` backend is explainable: a project with no config and
+    /// a project whose config is broken are different facts, and no other HTTP
+    /// route distinguishes them today.
+    pub config_status: ConfigStatus,
+}
+
+/// Whether `ROCKY_WEBHOOK_SECRET` can actually sign a webhook.
+///
+/// Named by operator consequence rather than by error kind — the question this
+/// answers is "what happens if I turn the scheduler on?".
+#[derive(Debug, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WebhookSecretStatus {
+    /// Set, non-blank, readable. Webhook requests must carry a signature.
+    Present,
+    /// Not set. On a loopback bind the webhook accepts UNSIGNED requests; on a
+    /// non-loopback bind the route answers `404`.
+    Absent,
+    /// Set, but blank or not valid UTF-8. `--scheduler` will refuse to start —
+    /// the startup gate rejects both.
+    SetButUnusable,
+}
+
+/// What happened when `rocky.toml` was read at server start.
+#[derive(Debug, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfigStatus {
+    /// Read and parsed.
+    Loaded,
+    /// No `rocky.toml`. An ordinary fact about the project, not a failure.
+    Absent,
+    /// Present, but could not be read or parsed. The server still started —
+    /// `rocky serve` does not require a config — but the scheduler will skip
+    /// every tick until it parses.
+    Unreadable,
+}
+
+/// The configured Bearer token, described without disclosing it.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct TokenSettings {
+    /// Always `default`. `rocky serve` holds exactly one token; the name exists
+    /// so a future multi-token server does not have to change this shape.
+    pub name: String,
+    /// What the token may do.
+    pub scope: TokenScopeLabel,
+}
+
+/// The spellings `--token-scope` accepts.
+#[derive(Debug, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum TokenScopeLabel {
+    /// Every route, mutating included.
+    Full,
+    /// Safe HTTP methods only; anything else is refused `403`.
+    ReadOnly,
 }
 
 /// When set, [`print_json`] emits compact (single-line) JSON instead of
@@ -7673,6 +7933,16 @@ pub struct PromoteTargetPlan {
 pub struct PromotePlan {
     /// Branch name being promoted.
     pub branch_name: String,
+    /// The resolved pipeline the promote targets were built against
+    /// (`resolve_pipeline`'s output at plan time — never ambiguous, even on a
+    /// single-pipeline config where `--pipeline` was omitted). `rocky apply
+    /// <plan-id>` reads this instead of re-resolving from the config, so
+    /// applying a promote plan is never ambiguous on a multi-pipeline
+    /// project. Absent on plans written before this field existed; apply
+    /// falls back to `resolve_pipeline(None)` for those, unchanged from
+    /// before this field was added.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pipeline: Option<String>,
     /// Git ref that `base_ref` was resolved to at plan time (e.g. `"main"`).
     pub base_ref: String,
     /// Git HEAD SHA at plan time — informational for audit purposes.
@@ -7826,7 +8096,7 @@ pub struct ReviewQueueOutput {
     pub version: String,
     pub command: String,
     /// Human-readable description of the ordering, e.g.
-    /// `"blast_radius × classification × staleness"`.
+    /// `"blast_radius × change_class × staleness"`.
     pub ranking: String,
     /// Count of pending escalations in the queue.
     pub total: u64,
@@ -7902,7 +8172,7 @@ pub struct ReviewQueueEntry {
     pub blast_radius: Option<u64>,
     /// The change-class weight the ranking used (breaking > bare verb >
     /// additive / value-only).
-    pub classification_weight: u32,
+    pub change_class_weight: u32,
     /// How long the escalation has waited, in whole seconds.
     pub staleness_seconds: i64,
     /// The composite priority score. Higher sorts first. Reported so a
@@ -10155,8 +10425,12 @@ impl RetentionStatusOutput {
 /// A sample of result rows for a single transformation model (or one of its
 /// CTEs), executed against the pipeline's configured adapter. Classified
 /// columns are masked inline before execution, so the rows match what the
-/// materialized target would expose. `truncated` is `true` when the model
-/// produced at least `limit_applied` rows.
+/// materialized target would expose; a classified column whose tag resolves
+/// to no mask strategy refuses the preview (`masking_unresolved`) rather than
+/// returning raw values, unless the project lists that tag under
+/// `[classifications.allow_unmasked]`, which returns it unmasked on purpose.
+/// `truncated` is `true` when the model produced at least `limit_applied`
+/// rows.
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct PreviewRowsOutput {
     pub version: String,
@@ -10199,7 +10473,7 @@ pub struct PreviewCreateOutput {
     /// Branch name registered in the state store. Mirrors the `name`
     /// from `rocky branch create`.
     pub branch_name: String,
-    /// Schema prefix the branch run wrote into (e.g. `branch__fix-price`).
+    /// Schema prefix the branch run wrote into (e.g. `branch__fix_price`).
     pub branch_schema: String,
     /// Git ref the change set was computed against. Mirrors `--base`.
     pub base_ref: String,
@@ -10293,6 +10567,19 @@ pub struct PreviewDiffOutput {
 pub struct PreviewDiffSummary {
     pub models_with_changes: usize,
     pub models_unchanged: usize,
+    /// Models whose row-count delta could not be computed — the warehouse
+    /// adapter or materialization strategy reported no `rows_affected` on
+    /// the branch side, the base side, or both (#2032). These are counted
+    /// separately from `models_unchanged`: "no recorded delta" is not the
+    /// same claim as "no change", and folding the two together is exactly
+    /// the false-clean report this field exists to prevent. A model here
+    /// contributes `null` (not `0`) to its own `rows_added`/`rows_removed`
+    /// and is excluded from `total_rows_added`/`total_rows_removed`, so
+    /// those totals are a floor, not an exact count, whenever this is > 0.
+    pub models_unknown: usize,
+    /// Sum of `rows_added` over models with a KNOWN delta only — models
+    /// counted in `models_unknown` contribute nothing here (never `0`,
+    /// which would be indistinguishable from a genuine no-op).
     pub total_rows_added: u64,
     pub total_rows_removed: u64,
     pub total_rows_changed: u64,
@@ -10437,8 +10724,17 @@ pub struct PreviewColumnTypeChange {
 /// Sampled row-level diff. All counts are over the sampling window.
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct PreviewSampledRowDiff {
-    pub rows_added: u64,
-    pub rows_removed: u64,
+    /// `None` — emitted as JSON `null`, deliberately NOT omitted via
+    /// `skip_serializing_if` — when the row count needed to compute this
+    /// delta was unavailable on the branch side, the base side, or both
+    /// (an ordinary transformation run's adapter/strategy reports no
+    /// `rows_affected`). `Some(0)` means a genuine, measured no-op; `null`
+    /// means unmeasured. Collapsing the two into `0` is the exact defect
+    /// this field exists to prevent — a full-refresh model going from 10
+    /// rows to 20 must never report `rows_added: 0` (#2032).
+    pub rows_added: Option<u64>,
+    /// Same absent-vs-zero contract as `rows_added`.
+    pub rows_removed: Option<u64>,
     pub rows_changed: u64,
     /// Up to `--max-samples` (default 5) representative changed rows
     /// for human review. Pure noise when sampling found no change.
@@ -10680,8 +10976,11 @@ impl PreviewCostOutput {
 ///
 /// Stable codes emitted today: `engine_not_ready` (no compile available
 /// yet), `engine_busy` (state locked by a running job — retryable),
-/// `model_not_found`, `job_not_found`, `mutation_in_progress` (a `run`/`apply`
-/// job already holds the mutation permit — carries [`running_job_id`](Self::running_job_id)),
+/// `state_needs_migration` (`409`: the state store lacks tables this server
+/// reads and a read never creates them; one read-write command — a
+/// `rocky run` — migrates it; not retryable), `model_not_found`,
+/// `job_not_found`, `mutation_in_progress` (a `run`/`apply` job already holds
+/// the mutation permit — carries [`running_job_id`](Self::running_job_id)),
 /// `bad_request`, `unauthorized`, `internal_error`.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ErrorEnvelope {
@@ -11530,6 +11829,39 @@ mod failure_kind_tests {
 
     // ---- classify_anyhow_error_with_cooldown chain walk ------------------
 
+    /// A typed breaker error inside a `rocky_core` `AdapterError`, as a
+    /// warehouse adapter returns it, keeps its kind and cooldown — both
+    /// through the bare-`AdapterError` entry point and (#2064) through the
+    /// `anyhow::Error` chain walk a warehouse failure actually crosses on
+    /// its way to `TableErrorOutput`.
+    #[test]
+    fn classify_adapter_error_with_cooldown_sees_the_connector_error_inside() {
+        let err = rocky_core::traits::AdapterError::new(DbE::CircuitBreakerOpen {
+            consecutive_failures: 5,
+            cooldown_seconds: Some(180),
+        });
+        assert_eq!(
+            classify_adapter_error_with_cooldown(&err),
+            (FailureKind::QuotaExceeded, Some(180)),
+        );
+        // The anyhow walk sees the SAME wrapper the bare check above does —
+        // `classify_wrapped_adapter_cause` downcasts to `rocky_core`'s
+        // `AdapterError` too, not only the SDK's.
+        assert_eq!(
+            classify_anyhow_error_with_cooldown(&anyhow::Error::new(
+                rocky_core::traits::AdapterError::new(DbE::CircuitBreakerOpen {
+                    consecutive_failures: 5,
+                    cooldown_seconds: Some(180),
+                })
+            )),
+            (FailureKind::QuotaExceeded, Some(180)),
+        );
+        assert_eq!(
+            classify_adapter_error_with_cooldown(&rocky_core::traits::AdapterError::msg("boom")),
+            (FailureKind::Unknown, None),
+        );
+    }
+
     #[test]
     fn classify_anyhow_with_cooldown_extracts_databricks_breaker_cooldown() {
         let conn_err = DbE::CircuitBreakerOpen {
@@ -11587,15 +11919,16 @@ mod failure_kind_tests {
 
     #[test]
     fn classify_anyhow_with_cooldown_unwraps_adapter_error_wrapping_breaker() {
-        // Mirrors the production path: ConnectorError is wrapped in
-        // AdapterError (boxed) before crossing into anyhow — the
-        // cooldown walker must descend through the wrapper just like
-        // its FailureKind-only counterpart.
+        // Mirrors the production path (#2064): a `WarehouseAdapter` method
+        // wraps its `ConnectorError` in `rocky_core::traits::AdapterError`
+        // (not the SDK's) before it crosses into anyhow — the cooldown
+        // walker must descend through THIS wrapper just like its
+        // FailureKind-only counterpart.
         let conn_err = DbE::CircuitBreakerOpen {
             consecutive_failures: 5,
             cooldown_seconds: Some(300),
         };
-        let adapter_err = rocky_adapter_sdk::AdapterError::new(conn_err);
+        let adapter_err = rocky_core::traits::AdapterError::new(conn_err);
         let err = anyhow::Error::new(adapter_err);
         assert_eq!(
             classify_anyhow_error_with_cooldown(&err),
@@ -11605,17 +11938,23 @@ mod failure_kind_tests {
 
     #[test]
     fn classify_anyhow_unwraps_adapter_error_wrapping_databricks_connector() {
-        // Mirrors the production path: ConnectorError is wrapped in
-        // AdapterError (boxed) before crossing into anyhow.
+        // Mirrors the production path (#2064): `execute_statement` et al.
+        // wrap their `ConnectorError` in `rocky_core::traits::AdapterError`,
+        // the type `WarehouseAdapter` methods actually return.
         let conn_err = DbE::ApiError {
             status: 429,
             body: String::new(),
         };
-        let adapter_err = rocky_adapter_sdk::AdapterError::new(conn_err);
+        let adapter_err = rocky_core::traits::AdapterError::new(conn_err);
         let err = anyhow::Error::new(adapter_err).context("execute_statement failed");
         assert_eq!(classify_anyhow_error(&err), FailureKind::QuotaExceeded);
     }
 
+    /// The OTHER wrapper: `rocky_adapter_sdk::AdapterError` is not the
+    /// `WarehouseAdapter` return type, but it is still a real production
+    /// path (Databricks volume / Snowflake stage file staging — see
+    /// `rocky-databricks/src/volume.rs`, `rocky-snowflake/src/stage.rs`), so
+    /// the classifier must keep unwrapping it too.
     #[test]
     fn classify_anyhow_unwraps_adapter_error_wrapping_snowflake_connector() {
         let conn_err = SnE::Timeout {

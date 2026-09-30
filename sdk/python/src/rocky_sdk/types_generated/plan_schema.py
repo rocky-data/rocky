@@ -358,6 +358,27 @@ class Severity(StrEnum):
     Info = "Info"
 
 
+class SkippedModel(BaseModel):
+    """
+    JSON output for `rocky plan`.
+
+    `statements` enumerates the warehouse SQL Rocky would emit. The three `*_actions` collections are a parallel view of the control-plane governance work `rocky run` would do *after* a successful DAG — the classification / masking / retention reconcile pass. These never show up as SQL; they fire through [`rocky_core::traits::GovernanceAdapter`] methods (e.g. `apply_column_tags`, `apply_masking_policy`, `apply_retention_policy`). Projects without any `[classification]`, `[mask]`, or `retention` config get empty lists — the fields `skip_serializing_if = Vec::is_empty`, so JSON consumers written against the earlier shape are byte-stable.
+
+    ## Plan-persistence additions
+
+    `plan_id`, `plan_kind`, `created_at`, `models`, and `execution_layers` are additive — all have `skip_serializing_if` so existing fixtures and consumers that do not include a compile step remain byte-stable. When `rocky plan` runs against a project with a `models/` directory, these fields are populated and the plan is persisted to `.rocky/plans/`. One model `rocky plan` left out of the preview, and why.
+    """
+
+    model: str
+    """
+    The model's name, as declared in its sidecar.
+    """
+    reason: str
+    """
+    Why no statement was previewed for it.
+    """
+
+
 class SourceSpan(BaseModel):
     """
     Location in a source file.
@@ -463,16 +484,6 @@ class SemanticPlanVerdict(BaseModel):
 
 
 class PlanOutput(BaseModel):
-    """
-    JSON output for `rocky plan`.
-
-    `statements` enumerates the warehouse SQL Rocky would emit. The three `*_actions` collections are a parallel view of the control-plane governance work `rocky run` would do *after* a successful DAG — the classification / masking / retention reconcile pass. These never show up as SQL; they fire through [`rocky_core::traits::GovernanceAdapter`] methods (e.g. `apply_column_tags`, `apply_masking_policy`, `apply_retention_policy`). Projects without any `[classification]`, `[mask]`, or `retention` config get empty lists — the fields `skip_serializing_if = Vec::is_empty`, so JSON consumers written against the earlier shape are byte-stable.
-
-    ## Plan-persistence additions
-
-    `plan_id`, `plan_kind`, `created_at`, `models`, and `execution_layers` are additive — all have `skip_serializing_if` so existing fixtures and consumers that do not include a compile step remain byte-stable. When `rocky plan` runs against a project with a `models/` directory, these fields are populated and the plan is persisted to `.rocky/plans/`.
-    """
-
     breaking_verdict: SemanticPlanVerdict | None = None
     """
     Semantic change-impact verdict from the typed-IR breaking-change classifier, surfaced as decision-support at plan time. Present only when `--semantic` ran with a usable baseline. See [`SemanticPlanVerdict`] — note its `caveat`: the classifier diffs OUTPUT SCHEMA only and is blind to schema-stable value changes.
@@ -522,6 +533,10 @@ class PlanOutput(BaseModel):
     retention_actions: list[RetentionAction] | None = None
     """
     Retention-policy applications the governance reconciler would issue via `apply_retention_policy`. One row per model whose sidecar declares `retention = "<N>[dy]"`. `warehouse_preview` shows the warehouse-native SQL that the current adapter would compile the policy to (Databricks / Snowflake); `None` on warehouses without a first-class retention knob.
+    """
+    skipped: list[SkippedModel] | None = None
+    """
+    Models the preview could not render, one entry each, with the reason. A model whose SQL cannot be rendered offline lands here (a Snowflake dynamic table needs a live compute-warehouse name), and so does one whose strategy is refused, such as `ephemeral` (E038). Before, such a model left no trace: an ephemeral-only project previewed as an empty plan and exit 0.
     """
     statements: list[PlannedStatement]
     version: str

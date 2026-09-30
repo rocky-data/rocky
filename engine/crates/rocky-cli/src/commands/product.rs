@@ -1392,9 +1392,11 @@ fn open_state_store(state_path: &Path) -> Result<StateStore> {
 const PRODUCT_READ_CACHE_BYTES: usize = 1 << 20;
 
 /// Open the store for a read: `product status` and `product list`, on the
-/// CLI and over HTTP. A store at the current schema version is opened with
-/// a read transaction and never written; an older one is migrated forward,
-/// as every read command does; one written by a newer engine is refused.
+/// CLI and over HTTP. A store that carries every table is opened with a read
+/// transaction and never written, whatever its version stamp says; an older
+/// one keeps its stamp (a read-only open never stamps, upgrades, or creates
+/// a table — a store missing one is refused with `ReadOnlyNeedsInit`); one
+/// written by a newer engine is refused.
 fn open_state_store_read_only(state_path: &Path) -> Result<StateStore> {
     StateStore::open_read_only_with_cache(state_path, PRODUCT_READ_CACHE_BYTES).with_context(|| {
         format!(
@@ -3952,6 +3954,7 @@ effect = "require_review"
             compile::compile(&CompilerConfig {
                 models_dir: root.join("models"),
                 contracts_dir: None,
+                required_explicit_contract_model: None,
                 source_schemas,
                 mask: cfg.mask.clone(),
                 allow_unmasked: cfg.classifications.allow_unmasked.clone(),

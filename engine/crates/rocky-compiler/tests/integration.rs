@@ -904,3 +904,162 @@ fn leaf_star_over_a_known_external_source_expands_to_its_columns() {
         names.len()
     );
 }
+
+// ---- #1990: `incremental` is refused on transformation models ----
+
+/// Write a two-model project whose leaf declares `leaf_strategy`.
+fn write_strategy_project(dir: &std::path::Path, leaf_strategy: &str) {
+    use std::fs;
+    let models_dir = dir.join("models");
+    fs::create_dir_all(&models_dir).unwrap();
+    fs::write(
+        models_dir.join("src.sql"),
+        "SELECT 1 AS id, CAST('2026-01-01' AS DATE) AS updated_at",
+    )
+    .unwrap();
+    fs::write(
+        models_dir.join("src.toml"),
+        "name = \"src\"\n\n[strategy]\ntype = \"full_refresh\"\n\n[target]\ncatalog = \"warehouse\"\nschema = \"s\"\ntable = \"src\"\n",
+    )
+    .unwrap();
+    fs::write(
+        models_dir.join("leaf.sql"),
+        "SELECT id, updated_at FROM src",
+    )
+    .unwrap();
+    fs::write(
+        models_dir.join("leaf.toml"),
+        format!(
+            "name = \"leaf\"\ndepends_on = [\"src\"]\n\n[strategy]\n{leaf_strategy}\n\n[target]\ncatalog = \"warehouse\"\nschema = \"s\"\ntable = \"leaf\"\n"
+        ),
+    )
+    .unwrap();
+}
+
+fn compile_strategy_project(leaf_strategy: &str) -> rocky_compiler::compile::CompileResult {
+    let dir = tempfile::tempdir().unwrap();
+    write_strategy_project(dir.path(), leaf_strategy);
+    let config = CompilerConfig {
+        models_dir: dir.path().join("models"),
+        contracts_dir: None,
+        source_schemas: HashMap::new(),
+        ..Default::default()
+    };
+    compile(&config).unwrap()
+}
+
+/// The refusal must be an ERROR on the model that declares the strategy:
+/// `rocky run` excludes a model from execution only for error-severity
+/// diagnostics keyed on its name, and `rocky test` / `emit-sql` refuse on
+/// `has_errors`. A warning would leave the duplicating INSERT running.
+#[test]
+fn an_incremental_transformation_model_is_refused_with_e037() {
+    let result =
+        compile_strategy_project("type = \"incremental\"\ntimestamp_column = \"updated_at\"");
+
+    let e037: Vec<_> = result
+        .diagnostics
+        .iter()
+        .filter(|d| &*d.code == "E037")
+        .collect();
+    assert_eq!(
+        e037.len(),
+        1,
+        "exactly one E037, got: {:?}",
+        result.diagnostics
+    );
+    let d = e037[0];
+    assert!(
+        d.is_error(),
+        "E037 must be an error so the model is excluded from execution"
+    );
+    assert_eq!(
+        d.model, "leaf",
+        "the diagnostic names the model that declares the strategy"
+    );
+    let suggestion = d.suggestion.as_deref().unwrap_or_default();
+    for working in ["merge", "delete_insert", "time_interval", "full_refresh"] {
+        assert!(
+            suggestion.contains(working),
+            "suggestion names `{working}`: {suggestion}"
+        );
+    }
+    assert!(
+        !suggestion.contains("microbatch"),
+        "microbatch duplicates rows the same way (#2054) and must not be offered"
+    );
+    assert!(result.has_errors, "an E037 must make the compile fail");
+}
+
+/// #1996: an ephemeral model is never materialized and never inlined, so a
+/// consumer reads whatever physical table carries the name. The refusal must
+/// be an ERROR on the model that declares the strategy, for the same reason
+/// E037 must: `rocky run` excludes a model from execution only on an
+/// error-severity diagnostic keyed on its name.
+#[test]
+fn an_ephemeral_model_is_refused_with_e038() {
+    let result = compile_strategy_project("type = \"ephemeral\"");
+
+    let e038: Vec<_> = result
+        .diagnostics
+        .iter()
+        .filter(|d| &*d.code == "E038")
+        .collect();
+    assert_eq!(
+        e038.len(),
+        1,
+        "exactly one E038, got: {:?}",
+        result.diagnostics
+    );
+    let d = e038[0];
+    assert!(
+        d.is_error(),
+        "E038 must be an error so the model is excluded from execution"
+    );
+    assert_eq!(
+        d.model, "leaf",
+        "the diagnostic names the model that declares the strategy"
+    );
+    let suggestion = d.suggestion.as_deref().unwrap_or_default();
+    assert!(
+        suggestion.contains("view"),
+        "the suggestion names the strategy that works: {suggestion}"
+    );
+    assert!(result.has_errors, "an E038 must make the compile fail");
+}
+
+/// Boundary: the refusal is scoped to `ephemeral`. Every other strategy a
+/// model can declare compiles clean of E038.
+#[test]
+fn e038_does_not_fire_for_other_strategies() {
+    for strategy in [
+        "type = \"full_refresh\"",
+        "type = \"view\"",
+        "type = \"merge\"\nunique_key = [\"id\"]",
+    ] {
+        let result = compile_strategy_project(strategy);
+        assert!(
+            !result.diagnostics.iter().any(|d| &*d.code == "E038"),
+            "{strategy}: unexpected E038 in {:?}",
+            result.diagnostics
+        );
+    }
+}
+
+/// Boundary: the refusal is scoped to `incremental`. A `full_refresh` leaf
+/// compiles clean of E037, and `microbatch` is not refused by this check:
+/// its ruling is pending in #2054, so a change here must be deliberate.
+#[test]
+fn e037_does_not_fire_for_other_strategies() {
+    for strategy in [
+        "type = \"full_refresh\"",
+        "type = \"microbatch\"\ntimestamp_column = \"updated_at\"\ngranularity = \"day\"",
+    ] {
+        let result = compile_strategy_project(strategy);
+        assert!(
+            !result.diagnostics.iter().any(|d| &*d.code == "E037"),
+            "{strategy}: unexpected E037 in {:?}",
+            result.diagnostics
+        );
+    }
+}

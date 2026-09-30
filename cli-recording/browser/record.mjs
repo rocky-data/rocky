@@ -63,8 +63,9 @@ const context = await browser.newContext({
   recordVideo: { dir: outDir, size },
   deviceScaleFactor: 2,
   // The engine serves one theme per the viewer's preference; pin it so two
-  // recordings on two machines look the same.
-  colorScheme: scene.colorScheme ?? "light",
+  // recordings on two machines look the same. Dark is the theme the docs
+  // show; a scene may still ask for light.
+  colorScheme: scene.colorScheme ?? "dark",
 });
 const page = await context.newPage();
 

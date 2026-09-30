@@ -422,6 +422,42 @@ pub fn inline_separators(template: &str) -> Vec<String> {
     found
 }
 
+/// Every placeholder NAME referenced in `template` — the `{name}` in
+/// `{name}` / `{name:SEP}`, in the order they appear, duplicates included.
+///
+/// Walks the template with the same parser that renders it, so this and
+/// what actually resolves at runtime cannot drift. Used by `rocky
+/// validate` (#2005) to catch a `catalog_template` / `schema_template`
+/// placeholder that names no component the pipeline's `schema_pattern`
+/// binds — [`render_placeholders`] otherwise passes an unknown
+/// placeholder through unchanged, so the mistake would only surface at run
+/// time as an invalid-identifier refusal on the literal, unresolved
+/// `{typo}` text (`validate_identifier` rejects `{`/`}`).
+pub fn template_placeholder_names(template: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    render_placeholders(template, |name, _sep, _out| {
+        found.push(name.to_string());
+        // Leave the placeholder alone: this walk reads the template, it does
+        // not render it.
+        false
+    });
+    found
+}
+
+/// Whether `template` contains a `{` with no `}` anywhere after it.
+///
+/// [`render_placeholders`] requires a matching `}` to recognize `{...}` as a
+/// placeholder at all — an unclosed brace like `"{source"` is silently
+/// copied through as literal text, so [`template_placeholder_names`] reports
+/// NO name for it and `rocky validate`'s V049 (unknown-placeholder check)
+/// has nothing to flag. This is a narrower, purely textual signal for that
+/// gap: a stray `{` a typo left unterminated, used by `rocky validate`
+/// (#2005 review) to warn on it directly rather than stay silent.
+pub fn has_unclosed_placeholder_brace(template: &str) -> bool {
+    let bytes = template.as_bytes();
+    (0..bytes.len()).any(|i| bytes[i] == b'{' && template[i + 1..].find('}').is_none())
+}
+
 /// Walks `template` the way a name is rendered from it, so every reader of
 /// the placeholder grammar shares one implementation.
 ///
@@ -1359,5 +1395,27 @@ mod tests {
                 "source mismatch for {schema_name}"
             );
         }
+    }
+
+    /// #2152 review: `render_placeholders` requires a closing `}` to
+    /// recognize a placeholder at all, so `template_placeholder_names`
+    /// reports nothing for `"{source"` — V049 has no signal to flag. This
+    /// pins the narrower textual check that catches it directly.
+    #[test]
+    fn has_unclosed_placeholder_brace_detects_a_stray_open_brace() {
+        assert!(has_unclosed_placeholder_brace("{source"));
+        assert!(has_unclosed_placeholder_brace("staging__{source"));
+        assert!(has_unclosed_placeholder_brace("{tenant}_{oops"));
+    }
+
+    #[test]
+    fn has_unclosed_placeholder_brace_is_false_for_well_formed_templates() {
+        assert!(!has_unclosed_placeholder_brace("{tenant}_warehouse"));
+        assert!(!has_unclosed_placeholder_brace("{tenant:_}"));
+        assert!(!has_unclosed_placeholder_brace("no_placeholder_at_all"));
+        assert!(!has_unclosed_placeholder_brace(""));
+        // An unknown placeholder that HAS a closing brace is not a stray
+        // brace — V049 (unknown-placeholder) is the check for that case.
+        assert!(!has_unclosed_placeholder_brace("{nope}"));
     }
 }

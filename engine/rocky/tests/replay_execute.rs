@@ -174,6 +174,7 @@ fn record_run(store: &StateStore, models: &[&str]) {
             submission_id: None,
             check_gate_failed: false,
             verify_after_failed: false,
+            rocky_branch: None,
         })
         .expect("record run");
 }

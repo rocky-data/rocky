@@ -22,7 +22,6 @@ pub mod contracts;
 pub mod cost_check;
 pub mod diagnostic;
 pub mod import;
-pub mod incrementality;
 pub mod limits;
 pub mod partial;
 pub mod project;

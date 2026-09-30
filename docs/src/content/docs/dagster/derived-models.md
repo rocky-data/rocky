@@ -51,7 +51,7 @@ Each derived-model asset gets:
   max_lag_seconds` in the model's TOML frontmatter).
 - **Partitions definition:** from the model's `time_interval` strategy
   via `partitions_def_for_model_detail`. `None` for `full_refresh` /
-  `incremental` / `merge`.
+  `merge`.
 - **Optimize metadata:** when `surface_optimize_metadata=True`, the
   `rocky optimize` recommendations for matching models are merged into
   `AssetSpec.metadata`.
@@ -76,7 +76,7 @@ fct_hourly_metrics.toml   time_interval,   →  rocky_models_hourly
                           hourly              (HourlyPartitionsDefinition)
 
 dim_customers.toml        full_refresh     →  rocky_models_unpartitioned
-dim_products.toml         incremental      →  rocky_models_unpartitioned
+dim_products.toml         merge            →  rocky_models_unpartitioned
                                               (no partition definition)
 ```
 

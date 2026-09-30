@@ -315,6 +315,11 @@ impl SqlDialect for SnowflakeSqlDialect {
         format!("\"{name}\"")
     }
 
+    /// `* EXCLUDE (a, b)`.
+    fn star_excluding(&self, columns: &[&str]) -> Option<String> {
+        Some(format!("* EXCLUDE ({})", columns.join(", ")))
+    }
+
     fn materialized_view_ddl(&self, target: &str, select_sql: &str) -> AdapterResult<String> {
         Ok(format!(
             "CREATE OR REPLACE MATERIALIZED VIEW {target} AS\n{select_sql}"
@@ -623,6 +628,21 @@ mod tests {
         assert_eq!(
             sql,
             "WHERE \"_fivetran_synced\" > '2026-04-17 09:30:00'::TIMESTAMP_NTZ"
+        );
+    }
+
+    #[test]
+    fn test_watermark_where_with_fractional_prior_keeps_the_fraction() {
+        use chrono::TimeZone;
+        let d = dialect();
+        let prior = chrono::Utc.with_ymd_and_hms(2026, 9, 15, 10, 0, 0).unwrap()
+            + chrono::Duration::milliseconds(250);
+        let sql = d.watermark_where("_loaded_at", Some(&prior)).unwrap();
+        // #2004: a fractional-second watermark must render its fraction, or
+        // the row it was read from re-passes the next run's `>` filter.
+        assert_eq!(
+            sql,
+            "WHERE \"_loaded_at\" > '2026-09-15 10:00:00.250'::TIMESTAMP_NTZ"
         );
     }
 

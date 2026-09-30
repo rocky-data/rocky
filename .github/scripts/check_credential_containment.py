@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import re
 import sys
 from dataclasses import dataclass
@@ -26,61 +27,53 @@ PINNED_CHECKOUT_RE = re.compile(r"actions/checkout@[0-9a-f]{40}")
 PINNED_REMOTE_ACTION_RE = re.compile(
     r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.\-/]+@[0-9a-f]{40}"
 )
-CHECKOUT_SOURCE = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
-GITHUB_SCRIPT_SOURCE = (
-    "actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3"
-)
-UPLOAD_ARTIFACT_SOURCE = (
-    "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a"
-)
-# The browser UI is built once per release and handed to every target as an
-# artifact (engine-release.yml `ui` -> `build`), so the release matrix reads
-# one artifact with the same pinned first-party action family that writes it.
-DOWNLOAD_ARTIFACT_SOURCE = (
-    "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c"
-)
-RUST_TOOLCHAIN_SOURCE = (
-    "dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8"
-)
-RUST_CACHE_SOURCE = (
-    "Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6"
-)
-SETUP_UV_SOURCE = "astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d"
-SETUP_NODE_SOURCE = (
-    "actions/setup-node@820762786026740c76f36085b0efc47a31fe5020"
-)
-# The container image the engine release publishes (engine-release.yml, job
-# `image`): buildx, the GHCR login, and the build-and-push. Pinned like every
-# other release source; the image tags derive from the release tag in a `run`
-# step, so no tag-parsing action is needed here.
-DOCKER_BUILD_PUSH_SOURCE = (
-    "docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a"
-)
-DOCKER_LOGIN_SOURCE = (
-    "docker/login-action@dbcb813823bdd20940b903addbd779551569679f"
-)
-DOCKER_SETUP_BUILDX_SOURCE = (
-    "docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e"
-)
-DEPLOY_PAGES_SOURCE = (
-    "actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346"
-)
-UPLOAD_PAGES_ARTIFACT_SOURCE = (
-    "actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9"
-)
-SETUP_NASM_SOURCE = "ilammy/setup-nasm@72793074d3c8cdda771dba85f6deafe00623038b"
-WASM_PACK_SOURCE = (
-    "jetli/wasm-pack-action@0d096b08b4e5a7de8c28de67e11e945404e9eefa"
-)
-SETUP_ZIG_SOURCE = "mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29"
-PYPI_PUBLISH_SOURCE = (
-    "pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33"
-)
-GH_RELEASE_SOURCE = (
-    "softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228"
-)
-TAIKI_INSTALL_SOURCE = (
-    "taiki-e/install-action@5bf6ce016fd2e72eefc647cbca1e4213f65955b8"
+# Every pinned action commit lives in .github/policy/action-pins.json, which is
+# deliberately NOT a frozen trust root: each value is a commit SHA that rotates
+# whenever the upstream action moves, and freezing it meant a routine bump could
+# only land by administrator merge. The rules that use the pins stay frozen here
+# — which job runs which action, in which order, and which actions a release job
+# may run at all.
+#
+# Each name maps to the commits accepted for that action, so a rotation is two
+# ordinary pull requests instead of one administrator merge:
+#
+#   PR 1  add the new commit beside the old one. Workflows still carry the old
+#         pin, so nothing is un-allow-listed and main stays green.
+#   PR 2  bump the workflows. Main's pin file already accepts the new commit.
+#   PR 3  drop the retired commit.
+#
+# The rules read this file from the TRUSTED checkout, never from the candidate.
+# A candidate that supplied its own pins would be supplying the permission for
+# them, and the gate would be comparing the candidate against itself.
+ACTION_PINS_RELATIVE_PATH = ".github/policy/action-pins.json"
+ACTION_PIN_SOURCE_RE = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.\-/]+@[0-9a-f]{40}")
+# Two is enough to hold the retiring commit beside its replacement for the length
+# of one rotation. A larger cap would let retired commits accumulate, so PR 3
+# above would never have to happen and the allow-list would slowly stop meaning
+# "the commit this project runs".
+MAX_COMMITS_PER_ACTION = 2
+REQUIRED_PIN_NAMES = frozenset(
+    {
+        "CHECKOUT_SOURCE",
+        "DEPLOY_PAGES_SOURCE",
+        "DOCKER_BUILD_PUSH_SOURCE",
+        "DOCKER_LOGIN_SOURCE",
+        "DOCKER_SETUP_BUILDX_SOURCE",
+        "DOWNLOAD_ARTIFACT_SOURCE",
+        "GH_RELEASE_SOURCE",
+        "GITHUB_SCRIPT_SOURCE",
+        "PYPI_PUBLISH_SOURCE",
+        "RUST_CACHE_SOURCE",
+        "RUST_TOOLCHAIN_SOURCE",
+        "SETUP_NASM_SOURCE",
+        "SETUP_NODE_SOURCE",
+        "SETUP_UV_SOURCE",
+        "SETUP_ZIG_SOURCE",
+        "TAIKI_INSTALL_SOURCE",
+        "UPLOAD_ARTIFACT_SOURCE",
+        "UPLOAD_PAGES_ARTIFACT_SOURCE",
+        "WASM_PACK_SOURCE",
+    }
 )
 # Actions a job may run when it is not reachable from a pull request. Release,
 # publish and deployment workflows never execute candidate code, so the
@@ -88,28 +81,148 @@ TAIKI_INSTALL_SOURCE = (
 # do hold is a write token and the publishing secrets. That makes an unreviewed
 # action source in one of their steps a direct supply-chain path into the
 # artifacts this project ships, which nothing else in this checker examined.
+# Every pinned action is allowed there today. The set is named separately so a
+# future pin used only inside a pull-request job is not allow-listed for release
+# jobs merely by being added to the pin file.
+RELEASE_PIN_NAMES = frozenset(REQUIRED_PIN_NAMES)
+
+
+def load_action_pins(
+    repository_root: Path, label: str
+) -> tuple[dict[str, frozenset[str]], list[str]]:
+    """Read the commits accepted for each pinned action.
+
+    Returns the pins and the violations found reading them. Any problem returns
+    no pins at all, so a partly valid file cannot leave some rules comparing
+    against real commits and others against nothing. An empty accepted set
+    matches no `uses:` value, so every rule that consults it fails closed.
+    """
+
+    relative = Path(ACTION_PINS_RELATIVE_PATH)
+    current = repository_root
+    for part in relative.parts[:-1]:
+        current /= part
+        if current.is_symlink() or not current.is_dir():
+            return {}, [f"{label}: action pin directory is missing or unsafe"]
+    path = repository_root / relative
+    if path.is_symlink() or not path.is_file():
+        return {}, [f"{label}: action pin file is missing or unsafe"]
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError:
+        return {}, [f"{label}: action pin file is unreadable"]
+    try:
+        parsed = json.loads(raw)
+    except ValueError:
+        return {}, [f"{label}: action pin file is not valid JSON"]
+    if not isinstance(parsed, dict):
+        return {}, [f"{label}: action pin file must be a JSON object"]
+
+    violations: list[str] = []
+    present = set(parsed)
+    for name in sorted(present - REQUIRED_PIN_NAMES):
+        violations.append(f"{label}: {name} is not a known action pin")
+    for name in sorted(REQUIRED_PIN_NAMES - present):
+        violations.append(f"{label}: {name} is missing")
+
+    pins: dict[str, frozenset[str]] = {}
+    for name in sorted(REQUIRED_PIN_NAMES & present):
+        commits = parsed[name]
+        if not isinstance(commits, list) or not commits:
+            violations.append(f"{label}: {name} must list at least one commit")
+            continue
+        if len(commits) > MAX_COMMITS_PER_ACTION:
+            violations.append(
+                f"{label}: {name} accepts more than {MAX_COMMITS_PER_ACTION} commits"
+            )
+            continue
+        if any(
+            not isinstance(value, str) or not ACTION_PIN_SOURCE_RE.fullmatch(value)
+            for value in commits
+        ):
+            violations.append(
+                f"{label}: {name} is not pinned as owner/repo@<40-hex commit>"
+            )
+            continue
+        if len(set(commits)) != len(commits):
+            violations.append(f"{label}: {name} repeats a commit")
+            continue
+        # Every commit under one name must belong to the same action. Without
+        # this, PR 1 of a rotation could add an unrelated action beside the real
+        # one and PR 2 could point the workflow at it — two ordinary pull
+        # requests, and an action nobody approved runs holding a write token.
+        if len({value.partition("@")[0] for value in commits}) != 1:
+            violations.append(f"{label}: {name} mixes commits from different actions")
+            continue
+        pins[name] = frozenset(commits)
+
+    name_by_sha: dict[str, str] = {}
+    for name in sorted(pins):
+        for source in sorted(pins[name]):
+            sha = source.partition("@")[2]
+            if name_by_sha.setdefault(sha, name) != name:
+                violations.append(
+                    f"{label}: {name} repeats the commit pinned by {name_by_sha[sha]}"
+                )
+
+    if violations:
+        return {}, violations
+    return pins, []
+
+
+def _sources_match(actual: list[str], expected: list[object]) -> bool:
+    """Compare a job's action sources against the sources the policy expects.
+
+    Each expected entry is either a literal source — a local action path, which
+    carries no commit pin — or the set of commits accepted for one pinned
+    action. Order and length still have to match exactly.
+    """
+
+    if len(actual) != len(expected):
+        return False
+    for found, allowed in zip(actual, expected):
+        if isinstance(allowed, str):
+            if found != allowed:
+                return False
+        elif found not in allowed:
+            return False
+    return True
+
+
+TRUSTED_ACTION_PINS, ACTION_PIN_VIOLATIONS = load_action_pins(
+    Path(__file__).resolve().parents[2], f"{ACTION_PINS_RELATIVE_PATH} (trusted base)"
+)
+CHECKOUT_SOURCES = TRUSTED_ACTION_PINS.get("CHECKOUT_SOURCE", frozenset())
+DEPLOY_PAGES_SOURCES = TRUSTED_ACTION_PINS.get("DEPLOY_PAGES_SOURCE", frozenset())
+DOCKER_BUILD_PUSH_SOURCES = TRUSTED_ACTION_PINS.get(
+    "DOCKER_BUILD_PUSH_SOURCE", frozenset()
+)
+DOCKER_LOGIN_SOURCES = TRUSTED_ACTION_PINS.get("DOCKER_LOGIN_SOURCE", frozenset())
+DOCKER_SETUP_BUILDX_SOURCES = TRUSTED_ACTION_PINS.get(
+    "DOCKER_SETUP_BUILDX_SOURCE", frozenset()
+)
+DOWNLOAD_ARTIFACT_SOURCES = TRUSTED_ACTION_PINS.get(
+    "DOWNLOAD_ARTIFACT_SOURCE", frozenset()
+)
+GH_RELEASE_SOURCES = TRUSTED_ACTION_PINS.get("GH_RELEASE_SOURCE", frozenset())
+GITHUB_SCRIPT_SOURCES = TRUSTED_ACTION_PINS.get("GITHUB_SCRIPT_SOURCE", frozenset())
+PYPI_PUBLISH_SOURCES = TRUSTED_ACTION_PINS.get("PYPI_PUBLISH_SOURCE", frozenset())
+RUST_CACHE_SOURCES = TRUSTED_ACTION_PINS.get("RUST_CACHE_SOURCE", frozenset())
+RUST_TOOLCHAIN_SOURCES = TRUSTED_ACTION_PINS.get("RUST_TOOLCHAIN_SOURCE", frozenset())
+SETUP_NASM_SOURCES = TRUSTED_ACTION_PINS.get("SETUP_NASM_SOURCE", frozenset())
+SETUP_NODE_SOURCES = TRUSTED_ACTION_PINS.get("SETUP_NODE_SOURCE", frozenset())
+SETUP_UV_SOURCES = TRUSTED_ACTION_PINS.get("SETUP_UV_SOURCE", frozenset())
+SETUP_ZIG_SOURCES = TRUSTED_ACTION_PINS.get("SETUP_ZIG_SOURCE", frozenset())
+TAIKI_INSTALL_SOURCES = TRUSTED_ACTION_PINS.get("TAIKI_INSTALL_SOURCE", frozenset())
+UPLOAD_ARTIFACT_SOURCES = TRUSTED_ACTION_PINS.get("UPLOAD_ARTIFACT_SOURCE", frozenset())
+UPLOAD_PAGES_ARTIFACT_SOURCES = TRUSTED_ACTION_PINS.get(
+    "UPLOAD_PAGES_ARTIFACT_SOURCE", frozenset()
+)
+WASM_PACK_SOURCES = TRUSTED_ACTION_PINS.get("WASM_PACK_SOURCE", frozenset())
 RELEASE_ACTION_SOURCES = frozenset(
-    {
-        CHECKOUT_SOURCE,
-        DEPLOY_PAGES_SOURCE,
-        DOCKER_BUILD_PUSH_SOURCE,
-        DOCKER_LOGIN_SOURCE,
-        DOCKER_SETUP_BUILDX_SOURCE,
-        DOWNLOAD_ARTIFACT_SOURCE,
-        GH_RELEASE_SOURCE,
-        GITHUB_SCRIPT_SOURCE,
-        PYPI_PUBLISH_SOURCE,
-        RUST_CACHE_SOURCE,
-        RUST_TOOLCHAIN_SOURCE,
-        SETUP_NASM_SOURCE,
-        SETUP_NODE_SOURCE,
-        SETUP_UV_SOURCE,
-        SETUP_ZIG_SOURCE,
-        TAIKI_INSTALL_SOURCE,
-        UPLOAD_ARTIFACT_SOURCE,
-        UPLOAD_PAGES_ARTIFACT_SOURCE,
-        WASM_PACK_SOURCE,
-    }
+    source
+    for name in RELEASE_PIN_NAMES
+    for source in TRUSTED_ACTION_PINS.get(name, frozenset())
 )
 STEP_USES_RE = re.compile(r"(?m)^\s+(?:-\s+)?uses:\s*([^\s#]+)")
 MODEL_SECRET_RE = re.compile(r"\bANTHROPIC_API_KEY\b", re.IGNORECASE)
@@ -697,7 +810,7 @@ def _check_ai_review(workflow: Workflow, job: str) -> list[str]:
 
     sources = _uses_sources(job)
     allowed_local_action = "./trusted/.github/actions/rocky-ai-review"
-    if sources != [CHECKOUT_SOURCE, allowed_local_action]:
+    if not _sources_match(sources, [CHECKOUT_SOURCES, allowed_local_action]):
         violations.append("AI review executes a non-allow-listed action source")
 
     steps = _step_blocks(job)
@@ -796,7 +909,10 @@ def _check_ai_context(job: str) -> list[str]:
     ]:
         violations.append("AI context steps are not exact")
         return violations
-    if _uses_sources(job) != [CHECKOUT_SOURCE, CHECKOUT_SOURCE, UPLOAD_ARTIFACT_SOURCE]:
+    if not _sources_match(
+        _uses_sources(job),
+        [CHECKOUT_SOURCES, CHECKOUT_SOURCES, UPLOAD_ARTIFACT_SOURCES],
+    ):
         violations.append("AI context action sources are not exact")
     expected_keys = [
         ["name", "uses", "with"],
@@ -881,7 +997,7 @@ def _check_invalidate_approval(job: str) -> list[str]:
         violations.append("approval invalidation step shape is not exact")
     if _mapping_keys(step, "with", indent=8) != ["script"]:
         violations.append("approval invalidation inputs are not exact")
-    if _uses_sources(step) != [GITHUB_SCRIPT_SOURCE]:
+    if not _sources_match(_uses_sources(step), [GITHUB_SCRIPT_SOURCES]):
         violations.append("approval invalidation action source is not exact")
     executable = "\n".join(
         line for line in job.splitlines() if not line.lstrip().startswith("#")
@@ -956,11 +1072,14 @@ def _check_preview_producer(workflow: Workflow, job: str) -> list[str]:
     ]:
         violations.append("preview producer steps are not exact")
         return violations
-    if _uses_sources(job) != [
-        CHECKOUT_SOURCE,
-        "./.github/actions/rocky-preview",
-        UPLOAD_ARTIFACT_SOURCE,
-    ]:
+    if not _sources_match(
+        _uses_sources(job),
+        [
+            CHECKOUT_SOURCES,
+            "./.github/actions/rocky-preview",
+            UPLOAD_ARTIFACT_SOURCES,
+        ],
+    ):
         violations.append("preview producer action sources are not exact")
     if _step_keys(steps[0]) != ["name", "uses", "with"] or _scalar_mapping(
         steps[0], "with", indent=8
@@ -1068,7 +1187,7 @@ def _check_preview_comment(workflow: Workflow, job: str) -> list[str]:
     ]:
         violations.append("preview comment job steps are not exact")
         return violations
-    if _uses_sources(job) != [CHECKOUT_SOURCE]:
+    if not _sources_match(_uses_sources(job), [CHECKOUT_SOURCES]):
         violations.append("preview comment action sources are not exact")
     if _step_keys(steps[0]) != ["name", "uses", "with"] or _scalar_mapping(
         steps[0], "with", indent=8
@@ -1134,7 +1253,7 @@ def _check_policy_workflow(workflow: Workflow, job: str) -> list[str]:
     ]:
         violations.append("security policy steps are not exact")
         return violations
-    if _uses_sources(job) != [CHECKOUT_SOURCE]:
+    if not _sources_match(_uses_sources(job), [CHECKOUT_SOURCES]):
         violations.append("security policy action sources are not exact")
     if _step_keys(steps[0]) != ["name", "uses", "with"] or _scalar_mapping(
         steps[0], "with", indent=8
@@ -1205,7 +1324,7 @@ def _check_policy_tests_workflow(workflow: Workflow, job: str) -> list[str]:
     ]:
         violations.append("security policy test steps are not exact")
         return violations
-    if _uses_sources(job) != [CHECKOUT_SOURCE]:
+    if not _sources_match(_uses_sources(job), [CHECKOUT_SOURCES]):
         violations.append("security policy test action sources are not exact")
     if _step_keys(steps[0]) != ["name", "uses", "with"] or _scalar_mapping(
         steps[0], "with", indent=8
@@ -1332,7 +1451,10 @@ def _check_unprivileged_job(
         if {"token", "ssh-key", "github-server-url"}.intersection(mapping):
             violations.append(f"candidate job {job_name} checkout overrides a credential input")
     if allowed_checkout_maps is not None:
-        if any(_step_action_source(step) != CHECKOUT_SOURCE for step in checkout_steps):
+        if any(
+            _step_action_source(step) not in CHECKOUT_SOURCES
+            for step in checkout_steps
+        ):
             violations.append(f"candidate job {job_name} checkout source is not exact")
         if tuple(checkout_maps) != allowed_checkout_maps:
             violations.append(f"candidate job {job_name} has no exact candidate checkout")
@@ -1462,14 +1584,14 @@ def _check_live_evals(workflow: Workflow, job: str) -> list[str]:
         violations.append("live eval job consumes an unexpected GitHub token")
 
     expected_sources = [
-        CHECKOUT_SOURCE,
-        RUST_TOOLCHAIN_SOURCE,
-        RUST_CACHE_SOURCE,
-        SETUP_UV_SOURCE,
-        SETUP_NODE_SOURCE,
-        UPLOAD_ARTIFACT_SOURCE,
+        CHECKOUT_SOURCES,
+        RUST_TOOLCHAIN_SOURCES,
+        RUST_CACHE_SOURCES,
+        SETUP_UV_SOURCES,
+        SETUP_NODE_SOURCES,
+        UPLOAD_ARTIFACT_SOURCES,
     ]
-    if _uses_sources(job) != expected_sources:
+    if not _sources_match(_uses_sources(job), expected_sources):
         violations.append("live eval action sources are not exact")
     steps = _step_blocks(job)
     expected_names = [
@@ -1729,11 +1851,19 @@ def check_workflow(workflow: Workflow) -> list[str]:
 def check_repository(repository_root: Path) -> list[str]:
     github_directory = repository_root / ".github"
     workflows = github_directory / "workflows"
-    violations: list[str] = []
+    # The rules below compare candidate workflows against the TRUSTED pins, so a
+    # trusted pin file that did not load has to be reported here rather than left
+    # to surface as a pile of unexplained source mismatches. The candidate's own
+    # pin file is validated too: it is not a frozen trust root, so a pull request
+    # may change it, and a malformed one that merged would fail every run after.
+    violations: list[str] = list(ACTION_PIN_VIOLATIONS)
+    violations.extend(load_action_pins(repository_root, ACTION_PINS_RELATIVE_PATH)[1])
     if github_directory.is_symlink() or not github_directory.is_dir():
-        return [".github must be a real directory"]
+        violations.append(".github must be a real directory")
+        return violations
     if workflows.is_symlink() or not workflows.is_dir():
-        return [".github/workflows must be a real directory"]
+        violations.append(".github/workflows must be a real directory")
+        return violations
     if (workflows / ".git").exists() or (workflows / ".git").is_symlink():
         violations.append(".github/workflows must not be a gitlink")
     scripts = github_directory / "scripts"

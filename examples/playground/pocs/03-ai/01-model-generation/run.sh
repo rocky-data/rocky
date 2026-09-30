@@ -29,30 +29,30 @@ echo
 echo "==> Sidecar contents (full_refresh):"
 cat models/monthly_revenue.toml | tee expected/monthly_revenue.toml.txt
 
-# --- 2. Incremental materialization with --watermark --------------------------
+# --- 2. Merge materialization with --unique-key --------------------------------
 #
-# Exercises the v1.26.0 sidecar emission unlock: --materialization=incremental
-# requires --watermark and the emitted sidecar carries [strategy].type =
-# "incremental" + timestamp_column = <watermark>.
+# The emitted sidecar carries [strategy].type = "merge" + unique_key. A daily
+# aggregate has one row per order_date, so that is the key. (`incremental` is
+# refused on transformation models, E037, so it is not offered here.)
 echo
-echo "=== generate (incremental + watermark) ==="
-rocky ai "daily order facts from raw_orders, watermarked by ordered_at" \
+echo "=== generate (merge + unique key) ==="
+rocky ai "daily order totals from raw_orders, one row per order_date" \
     --format rocky \
-    --materialization incremental \
-    --watermark ordered_at \
+    --materialization merge \
+    --unique-key order_date \
     --target poc.demo.orders_daily \
     --overwrite \
-    2>&1 | tee expected/generation-incremental.log
+    2>&1 | tee expected/generation-merge.log
 
 echo
-echo "==> Generated artifacts (incremental):"
-ls -1 models/orders_daily.* | tee expected/generated_files_incremental.txt
+echo "==> Generated artifacts (merge):"
+ls -1 models/orders_daily.* | tee expected/generated_files_merge.txt
 
 echo
-echo "==> Sidecar contents (incremental — note [strategy] timestamp_column):"
+echo "==> Sidecar contents (merge — note [strategy] unique_key):"
 cat models/orders_daily.toml | tee expected/orders_daily.toml.txt
 
 echo
 echo "POC complete: two pairs of body + sidecar landed under models/."
 echo "  - monthly_revenue.{rocky,toml}  — full_refresh"
-echo "  - orders_daily.{rocky,toml}     — incremental, watermark = ordered_at"
+echo "  - orders_daily.{rocky,toml}     — merge, unique_key = order_date"

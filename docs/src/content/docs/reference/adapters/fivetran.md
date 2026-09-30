@@ -11,6 +11,7 @@ The Fivetran source adapter calls the Fivetran REST API to list connectors and t
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
+| `kind` | string | Yes | Must be `"discovery"`. Fivetran lists tables and moves no data, so Rocky refuses the block without it (`V032`). |
 | `destination_id` | string | Yes | Fivetran destination ID. |
 | `api_key` | string | Yes | Fivetran API key (Basic Auth). |
 | `api_secret` | string | Yes | Fivetran API secret (Basic Auth). |
@@ -18,9 +19,20 @@ The Fivetran source adapter calls the Fivetran REST API to list connectors and t
 ```toml
 [adapter.fivetran]
 type = "fivetran"
+kind = "discovery"
 destination_id = "${FIVETRAN_DESTINATION_ID}"
 api_key = "${FIVETRAN_API_KEY}"
 api_secret = "${FIVETRAN_API_SECRET}"
+```
+
+A pipeline names this adapter in `source.discovery`, not in `source.adapter`. The warehouse that Fivetran writes to reads the rows (`V033` refuses a discovery-only `source.adapter`):
+
+```toml
+[pipeline.bronze.source]
+adapter = "prod"            # the warehouse Fivetran lands tables in
+
+[pipeline.bronze.source.discovery]
+adapter = "fivetran"
 ```
 
 ## Authentication

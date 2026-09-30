@@ -69,7 +69,8 @@ Rocky's quality pipeline type is a dedicated pipeline that runs data quality che
 ## Expected output
 
 `run.sh` runs `nightly_dq` with `-o json` and pipes the result through `jq`.
-The summary looks like:
+The output below is abbreviated. `jq` prints each object on several lines, and
+DuckDB prints its results as box tables.
 
 ```text
 === Summary ===
@@ -77,41 +78,47 @@ The summary looks like:
   "pipeline_type": "quality",
   "check_results": [
     { "table": "poc.staging__orders.orders", "checks": [
-        { "name": "row_count",                         "severity": "error",   "passed": true  },
-        { "name": "orders_customer_id_required",       "severity": "error",   "passed": false },
-        { "name": "orders_status_allowed",             "severity": "error",   "passed": false },
-        { "name": "expression:-",                      "severity": "warning", "passed": false },
-        { "name": "orders_amount_in_range",            "severity": "error",   "passed": false },
+        { "name": "row_count",                          "severity": "error",   "passed": true  },
+        { "name": "orders_customer_id_required",        "severity": "error",   "passed": false },
+        { "name": "orders_status_allowed",              "severity": "error",   "passed": false },
+        { "name": "expression:-",                       "severity": "warning", "passed": false },
+        { "name": "orders_amount_in_range",             "severity": "error",   "passed": false },
         { "name": "orders_shipped_customer_id_present", "severity": "warning", "passed": true  },
-        { "name": "orders_positive_total",             "severity": "warning", "passed": true  },
-        { "name": "orders_composite_unique",           "severity": "warning", "passed": true  },
-        { "name": "orders_created_at_not_in_future",   "severity": "error",   "passed": true  }
+        { "name": "orders_positive_total",              "severity": "warning", "passed": true  },
+        { "name": "orders_composite_unique",            "severity": "warning", "passed": true  },
+        { "name": "orders_created_at_not_in_future",    "severity": "warning", "passed": true  }
     ]},
     { "table": "poc.staging__customers.customers", "checks": [
-        { "name": "row_count",             "severity": "error",   "passed": true },
-        { "name": "unique:customer_id",    "severity": "error",   "passed": true },
-        { "name": "not_null:email",        "severity": "error",   "passed": true },
-        { "name": "row_count_range:-",     "severity": "error",   "passed": true },
+        { "name": "row_count",              "severity": "error",   "passed": true },
+        { "name": "unique:customer_id",     "severity": "error",   "passed": true },
+        { "name": "not_null:email",         "severity": "error",   "passed": true },
+        { "name": "row_count_range:-",      "severity": "error",   "passed": true },
         { "name": "customers_email_format", "severity": "warning", "passed": true }
     ]}
   ],
   "quarantine": [
-    { "table": "poc.staging__orders.orders",       "valid_rows": 196, "quarantined_rows": 4 },
-    { "table": "poc.staging__customers.customers",  "valid_rows": 50,  "quarantined_rows": 0 }
+    { "asset_key": ["poc", "staging__orders", "orders"], "mode": "split",
+      "valid_table": "poc.staging__orders.orders__valid",
+      "quarantine_table": "poc.staging__orders.orders__quarantine",
+      "valid_rows": 196, "quarantined_rows": 4, "ok": true },
+    { "asset_key": ["poc", "staging__customers", "customers"], "mode": "split",
+      "valid_table": "poc.staging__customers.customers__valid",
+      "quarantine_table": "poc.staging__customers.customers__quarantine",
+      "valid_rows": 50, "quarantined_rows": 0, "ok": true }
   ]
 }
 
 === Quarantine split (orders) ===
 orders__valid row count: 196
 order_id | customer_id | status    | _error_orders_customer_id_required | _error_orders_status_allowed
-7        |             | cancelled | _error_orders_customer_id_required |
-13       | 14          | unknown   |                                    | _error_orders_status_allowed
-42       |             | delivered | _error_orders_customer_id_required |
-99       | 50          | cancelled |                                    |
+7        | NULL        | cancelled | _error_orders_customer_id_required | NULL
+13       | 14          | unknown   | NULL                               | _error_orders_status_allowed
+42       | NULL        | delivered | _error_orders_customer_id_required | NULL
+99       | 50          | cancelled | NULL                               | NULL
 ```
 
-`fail_on_error = false` → the pipeline exits 0 even though four error-severity
-checks on `orders` fail.
+The pipeline exits 0 because of `fail_on_error = false`. Without it, the three
+failing error-severity checks on `orders` make the run exit non-zero.
 
 ## What happened
 
@@ -125,9 +132,9 @@ checks on `orders` fail.
    - **`[[checks.assertions]]`:** unified `TestDecl`-style row-level checks
      (`not_null`, `accepted_values`, `expression`, `in_range`, `unique`,
      `row_count_range`, `regex_match`, `aggregate`, `composite`, `not_in_future`),
-     each with its own `severity`. On `orders`, four error-severity assertions
+     each with its own `severity`. On `orders`, three error-severity assertions
      fail (`orders_customer_id_required`, `orders_status_allowed`,
-     `orders_amount_in_range`) plus the warning-severity `expression:-`.
+     `orders_amount_in_range`). The warning-severity `expression:-` also fails.
 4. `fail_on_error = false` suppresses the non-zero exit so the POC stays green.
    Remove it (or set `true`) to wire the quality pipeline into CI as a gate.
 5. **Row quarantine on `orders`:** `[checks.quarantine] mode = "split"` writes

@@ -17,7 +17,6 @@
 //! - The translated models pass `rocky-core` model loading (the closest "compiles"
 //!   signal we get without spinning up DuckDB, and what `rocky compile` walks first).
 
-use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use rocky_compiler::import::{
@@ -82,7 +81,6 @@ fn emit_runnable_repo_from_rich_fixture() {
         default_catalog: &default_target.catalog,
         default_schema: &default_target.schema,
         import: &result,
-        view_models_to_make_ephemeral: BTreeSet::new(),
         adapter_override_label: None,
     })
     .expect("emit_repo writes a runnable repo");
@@ -158,11 +156,12 @@ fn emit_runnable_repo_from_rich_fixture() {
         "view → view mapping must apply, got: {stg_customers_toml}"
     );
     let stg_orders_toml = std::fs::read_to_string(models_dir.join("stg_orders.toml")).unwrap();
-    // incremental + unique_key → merge in the existing importer
+    // incremental + unique_key → merge. The importer never emits
+    // `incremental`: it is a compile error on a transformation model (E037).
     assert!(
         stg_orders_toml.contains("type = \"merge\"")
-            || stg_orders_toml.contains("type = \"incremental\""),
-        "incremental → merge|incremental mapping must apply, got: {stg_orders_toml}"
+            && !stg_orders_toml.contains("type = \"incremental\""),
+        "incremental + unique_key → merge mapping must apply, got: {stg_orders_toml}"
     );
     let fct_orders_toml = std::fs::read_to_string(models_dir.join("fct_orders.toml")).unwrap();
     assert!(

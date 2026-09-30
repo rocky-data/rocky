@@ -107,7 +107,7 @@ values vary per run; the Parquet size depends on DuckDB's writer):
 
 ## Related
 
-- `rocky load` source: [`engine/crates/rocky-cli/src/commands/load.rs`](../../../../engine/crates/rocky-cli/src/commands/load.rs)
-- DuckDB loader: [`engine/crates/rocky-duckdb/src/loader.rs`](../../../../engine/crates/rocky-duckdb/src/loader.rs) (`load_sql` + `create_table_sql`)
+- `rocky load` source: [`engine/crates/rocky-cli/src/commands/load.rs`](../../../../../engine/crates/rocky-cli/src/commands/load.rs)
+- DuckDB loader: [`engine/crates/rocky-duckdb/src/loader.rs`](../../../../../engine/crates/rocky-duckdb/src/loader.rs) (`load_sql` + `create_table_sql`)
 - Same shape against Snowflake or Databricks: swap the `[adapter]` block; the
   pipeline definition is unchanged.

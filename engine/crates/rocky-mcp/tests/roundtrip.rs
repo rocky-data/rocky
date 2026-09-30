@@ -55,8 +55,8 @@ schema_template = "out"
 
 /// Spawn `server` on one end of a duplex pipe and return a connected client.
 ///
-/// The `()` handler requests `ClientInfo::default()`, whose `protocol_version`
-/// is rmcp 3.1.2's `ProtocolVersion::LATEST` — `2025-11-25` today. Every test
+/// The `()` handler requests `ClientConfig::default()`, whose `protocol_version`
+/// is rmcp's `ProtocolVersion::LATEST` — `2025-11-25` today. Every test
 /// in this file that uses `connect` is therefore describing THAT negotiated
 /// version, which matters for `resultType`: see
 /// [`result_type_reaches_a_2026_07_28_client_and_no_other`].
@@ -70,26 +70,41 @@ async fn connect(server: RockyMcpServer) -> rmcp::service::RunningService<rmcp::
     ().serve(client_io).await.expect("client connects")
 }
 
-/// [`connect`], but the client asks for a SPECIFIC protocol version instead of
-/// taking rmcp's default.
+/// A peer on `2026-07-28`, reached the way rmcp 3.2+ allows a client to: over
+/// the `server/discover` lifecycle, with no `initialize` at all.
 ///
-/// `impl ClientHandler for ClientInfo` returns the value itself from
-/// `get_info`, so handing `serve` a `ClientInfo` is the whole mechanism — no
+/// `impl ClientHandler for ClientConfig` returns the value itself from
+/// `get_info`, so handing rmcp a `ClientConfig` is the whole mechanism — no
 /// custom handler type is needed.
-async fn connect_at_version(
+///
+/// Under rmcp 3.1 this helper sent an `initialize` naming `2026-07-28` and
+/// the server echoed it. rmcp 3.2 follows the 2026-07-28 versioning spec:
+/// that revision replaced the handshake, so an `initialize` request is a
+/// legacy client whatever version it names, and the server answers it with
+/// its fallback. Naming the version over `initialize` therefore cannot
+/// reach a modern session any more (#1965).
+async fn connect_modern(
     server: RockyMcpServer,
-    protocol_version: rmcp::model::ProtocolVersion,
-) -> rmcp::service::RunningService<rmcp::RoleClient, rmcp::model::ClientInfo> {
+) -> rmcp::service::RunningService<rmcp::RoleClient, rmcp::model::ClientConfig> {
+    use rmcp::service::{ClientLifecycleMode, ClientServiceExt};
+
     let (server_io, client_io) = tokio::io::duplex(64 * 1024);
     tokio::spawn(async move {
         if let Ok(svc) = server.serve(server_io).await {
             let _ = svc.waiting().await;
         }
     });
-    // `ClientInfo::default()` is exactly what the `()` handler in [`connect`]
-    // sends, so the ONLY difference between the two clients is the version.
-    let info = rmcp::model::ClientInfo::default().with_protocol_version(protocol_version);
-    info.serve(client_io).await.expect("client connects")
+    // `ClientConfig::default()` is exactly what the `()` handler in [`connect`]
+    // sends, so the ONLY difference between the two clients is the lifecycle.
+    rmcp::model::ClientConfig::default()
+        .serve_with_lifecycle(
+            client_io,
+            ClientLifecycleMode::Discover {
+                preferred_versions: vec![rmcp::model::ProtocolVersion::V_2026_07_28],
+            },
+        )
+        .await
+        .expect("modern client connects over discover")
 }
 
 #[tokio::test]
@@ -2296,6 +2311,244 @@ async fn draft_check_rejects_an_unbounded_expression_before_the_write() {
     client.cancel().await.unwrap();
 }
 
+/// #2144: a `filter` is spliced into the SAME generated statement as the
+/// check it scopes, on EVERY test kind, not just `expression` — so it must
+/// be gated regardless of `type`. This drafts a `not_null` test (which has
+/// no `expression` field at all) to prove the gate is not hiding behind the
+/// `type == "expression"` branch. An unparsable `filter` is refused with the
+/// same message `rocky test` would print for the same content.
+#[tokio::test]
+async fn draft_check_rejects_an_unparsable_filter_before_the_write() {
+    let dir = TempDir::new().unwrap();
+    write_project(dir.path(), &dir.path().join("test.duckdb"));
+    let server = RockyMcpServer::new(dir.path().join("rocky.toml"));
+    let client = connect(server).await;
+
+    let before = std::fs::read_to_string(dir.path().join("models").join("orders.toml")).unwrap();
+    let spec = "[[tests]]\ntype = \"not_null\"\ncolumn = \"id\"\nfilter = \"status = \"\n";
+    let args = serde_json::json!({ "model": "orders", "spec": spec })
+        .as_object()
+        .unwrap()
+        .clone();
+    let result = client
+        .call_tool(CallToolRequestParams::new("draft_check").with_arguments(args))
+        .await
+        .expect("draft_check call");
+
+    assert_eq!(
+        result.is_error,
+        Some(true),
+        "an unparsable filter is an error, even on a not_null test"
+    );
+    let err = result.structured_content.expect("structured envelope");
+    assert_eq!(err["code"], serde_json::json!("invalid_argument"));
+    assert!(
+        err["message"].as_str().unwrap().contains("does not parse"),
+        "the engine's own parse-failure message is surfaced: {err:?}"
+    );
+
+    let after = std::fs::read_to_string(dir.path().join("models").join("orders.toml")).unwrap();
+    assert_eq!(after, before, "a refused filter writes nothing");
+
+    client.cancel().await.unwrap();
+}
+
+/// #2144: a `unique_expr` test's `key_expr` is a GROUPING key, so a volatile
+/// function is refused there even though the same call is fine in an
+/// `expression` check (`now() IS NOT NULL` is a legitimate freshness
+/// predicate). Before this fix, `draft_check` wrote this straight into the
+/// sidecar and only `rocky test` refused it -- a green draft for a red run.
+#[tokio::test]
+async fn draft_check_rejects_a_volatile_key_expr_before_the_write() {
+    let dir = TempDir::new().unwrap();
+    write_project(dir.path(), &dir.path().join("test.duckdb"));
+    let server = RockyMcpServer::new(dir.path().join("rocky.toml"));
+    let client = connect(server).await;
+
+    let before = std::fs::read_to_string(dir.path().join("models").join("orders.toml")).unwrap();
+    let spec = "[[tests]]\ntype = \"unique_expr\"\nkey_expr = \"now()\"\n";
+    let args = serde_json::json!({ "model": "orders", "spec": spec })
+        .as_object()
+        .unwrap()
+        .clone();
+    let result = client
+        .call_tool(CallToolRequestParams::new("draft_check").with_arguments(args))
+        .await
+        .expect("draft_check call");
+
+    assert_eq!(
+        result.is_error,
+        Some(true),
+        "a volatile key_expr is an error"
+    );
+    let err = result.structured_content.expect("structured envelope");
+    assert_eq!(err["code"], serde_json::json!("invalid_argument"));
+    let message = err["message"].as_str().unwrap();
+    assert!(
+        message.contains("now") && message.contains("cannot be a key"),
+        "the engine's own volatile-key message is surfaced: {err:?}"
+    );
+
+    let after = std::fs::read_to_string(dir.path().join("models").join("orders.toml")).unwrap();
+    assert_eq!(after, before, "a refused key_expr writes nothing");
+
+    client.cancel().await.unwrap();
+}
+
+/// #2144, the other side: a `filter` and a `key_expr` that pass the SAME
+/// boundary are written, not just accepted structurally -- this is what
+/// distinguishes "gated" from "everything now refused".
+#[tokio::test]
+async fn draft_check_writes_a_valid_filter_and_key_expr() {
+    let dir = TempDir::new().unwrap();
+    write_project(dir.path(), &dir.path().join("test.duckdb"));
+    let server = RockyMcpServer::new(dir.path().join("rocky.toml"));
+    let client = connect(server).await;
+
+    let before = std::fs::read_to_string(dir.path().join("models").join("orders.toml")).unwrap();
+    let spec = "[[tests]]\ntype = \"unique_expr\"\nkey_expr = \"lower(status)\"\n\
+                filter = \"status = 'COMPLETE'\"\n";
+    let args = serde_json::json!({ "model": "orders", "spec": spec })
+        .as_object()
+        .unwrap()
+        .clone();
+    let result = client
+        .call_tool(CallToolRequestParams::new("draft_check").with_arguments(args))
+        .await
+        .expect("draft_check call");
+
+    assert_ne!(
+        result.is_error,
+        Some(true),
+        "a deterministic key_expr and a parseable filter must be accepted: {:?}",
+        result.structured_content
+    );
+    let after = std::fs::read_to_string(dir.path().join("models").join("orders.toml")).unwrap();
+    assert_ne!(after, before, "a valid spec must actually be written");
+    assert!(after.contains("lower(status)") && after.contains("status = 'COMPLETE'"));
+
+    client.cancel().await.unwrap();
+}
+
+/// #2144, round 2: sqlparser accepts a backtick-quoted identifier (a
+/// generic-dialect reading of Databricks/BigQuery quoting), but
+/// `reject_statement_terminator` -- the scanner `rocky test --declarative`
+/// also runs, before the parser -- refuses it outright, regardless of
+/// dialect, because the warehouses read it differently. Gating only with
+/// `validate_check_expression` would let this through as a green draft and
+/// a red run; both gates must run, in the engine's order.
+#[tokio::test]
+async fn draft_check_rejects_a_backtick_quoted_filter_before_the_write() {
+    let dir = TempDir::new().unwrap();
+    write_project(dir.path(), &dir.path().join("test.duckdb"));
+    let server = RockyMcpServer::new(dir.path().join("rocky.toml"));
+    let client = connect(server).await;
+
+    let before = std::fs::read_to_string(dir.path().join("models").join("orders.toml")).unwrap();
+    let spec = "[[tests]]\ntype = \"not_null\"\ncolumn = \"id\"\n\
+                filter = \"`status` = 'COMPLETE'\"\n";
+    let args = serde_json::json!({ "model": "orders", "spec": spec })
+        .as_object()
+        .unwrap()
+        .clone();
+    let result = client
+        .call_tool(CallToolRequestParams::new("draft_check").with_arguments(args))
+        .await
+        .expect("draft_check call");
+
+    assert_eq!(
+        result.is_error,
+        Some(true),
+        "a backtick-quoted identifier is refused, even though it parses"
+    );
+    let err = result.structured_content.expect("structured envelope");
+    assert_eq!(err["code"], serde_json::json!("invalid_argument"));
+    assert!(
+        err["message"]
+            .as_str()
+            .unwrap()
+            .contains("backtick-quoted identifier"),
+        "the engine's own scanner refusal is surfaced: {err:?}"
+    );
+
+    let after = std::fs::read_to_string(dir.path().join("models").join("orders.toml")).unwrap();
+    assert_eq!(after, before, "a refused filter writes nothing");
+
+    client.cancel().await.unwrap();
+}
+
+/// #2144, round 2, the `//` half of the same gap: a Snowflake-only line
+/// comment. Every other warehouse keeps reading the rest of the line as
+/// live SQL, so `reject_statement_terminator` refuses it rather than guess
+/// which reading applies -- on a `key_expr`, not `filter`, to cover a
+/// different one of the three call sites this fix touches.
+#[tokio::test]
+async fn draft_check_rejects_a_key_expr_with_a_line_comment_before_the_write() {
+    let dir = TempDir::new().unwrap();
+    write_project(dir.path(), &dir.path().join("test.duckdb"));
+    let server = RockyMcpServer::new(dir.path().join("rocky.toml"));
+    let client = connect(server).await;
+
+    let before = std::fs::read_to_string(dir.path().join("models").join("orders.toml")).unwrap();
+    let spec = "[[tests]]\ntype = \"unique_expr\"\nkey_expr = \"status // nasty\"\n";
+    let args = serde_json::json!({ "model": "orders", "spec": spec })
+        .as_object()
+        .unwrap()
+        .clone();
+    let result = client
+        .call_tool(CallToolRequestParams::new("draft_check").with_arguments(args))
+        .await
+        .expect("draft_check call");
+
+    assert_eq!(
+        result.is_error,
+        Some(true),
+        "a `//` line comment is refused"
+    );
+    let err = result.structured_content.expect("structured envelope");
+    assert_eq!(err["code"], serde_json::json!("invalid_argument"));
+    assert!(
+        err["message"].as_str().unwrap().contains("line comment"),
+        "the engine's own scanner refusal is surfaced: {err:?}"
+    );
+
+    let after = std::fs::read_to_string(dir.path().join("models").join("orders.toml")).unwrap();
+    assert_eq!(after, before, "a refused key_expr writes nothing");
+
+    client.cancel().await.unwrap();
+}
+
+/// #2144, round 2: the generator treats a blank `filter` as ABSENT
+/// (`tests.rs` trims it and skips the field entirely), so this gate must
+/// not refuse `filter = ""` as an unparsable expression -- that would
+/// refuse a spec the engine accepts.
+#[tokio::test]
+async fn draft_check_writes_an_empty_filter_as_absent() {
+    let dir = TempDir::new().unwrap();
+    write_project(dir.path(), &dir.path().join("test.duckdb"));
+    let server = RockyMcpServer::new(dir.path().join("rocky.toml"));
+    let client = connect(server).await;
+
+    let spec = "[[tests]]\ntype = \"not_null\"\ncolumn = \"id\"\nfilter = \"\"\n";
+    let args = serde_json::json!({ "model": "orders", "spec": spec })
+        .as_object()
+        .unwrap()
+        .clone();
+    let result = client
+        .call_tool(CallToolRequestParams::new("draft_check").with_arguments(args))
+        .await
+        .expect("draft_check call");
+
+    assert_ne!(
+        result.is_error,
+        Some(true),
+        "a blank filter is absent, not a refusal: {:?}",
+        result.structured_content
+    );
+
+    client.cancel().await.unwrap();
+}
+
 /// A product spec whose output model is `orders`, so a worker draft of
 /// `orders` is a fulfillment draft with a loop waiting on it.
 fn write_owning_product(dir: &Path) {
@@ -3393,17 +3646,17 @@ async fn worker_profile_prompts_end_at_the_runner_handoff() {
         let whole = serde_json::to_string(&result).expect("prompt result serializes");
         // ELEVENTH ROUND, finding 4 — the row's field list in
         // `WORKER_GUIDANCE_SURFACES` named only `messages` and
-        // `description`, while rmcp 3.1.2's `GetPromptResult` also carries
+        // `description`, while rmcp's `GetPromptResult` also carries
         // `resultType` and `_meta`. The list was stale, not the coverage:
         // the sweep below reads the whole value.
         //
         // AND `resultType` IS NOT ON THE WIRE, which the first attempt at
         // this correction asserted the opposite of. `GetPromptResult::new`
-        // does set `Some(ResultType::COMPLETE)`, but `get_info` pins
-        // `ProtocolVersion::V_2024_11_05`, and rmcp's server handler calls
-        // `strip_result_type_for_legacy_peer()` for any peer older than
-        // `2026-07-28`. So the field is defined, set, and then cleared
-        // before it is serialized.
+        // does set `Some(ResultType::COMPLETE)`, but this client connected
+        // with `initialize`, which rmcp 3.2+ always answers with a version
+        // older than `2026-07-28`, and rmcp's server handler calls
+        // `strip_result_type_for_legacy_peer()` for such a peer. So the
+        // field is defined, set, and then cleared before it is serialized.
         //
         // Pinned in the direction that is TRUE, so a protocol-version bump
         // fails here and the row gets re-read rather than quietly gaining a
@@ -3418,8 +3671,9 @@ async fn worker_profile_prompts_end_at_the_runner_handoff() {
         );
         assert!(
             shape.get("resultType").is_none(),
-            "`resultType` is stripped for peers older than 2026-07-28, and this server \
-             pins 2024-11-05 — if it is on the wire the negotiated version moved, and \
+            "`resultType` is stripped for peers older than 2026-07-28, and an \
+             `initialize` peer always negotiates one — if it is on the wire this client \
+             discovered instead, or a request declared 2026-07-28 in its own _meta, and \
              row 3's field list needs re-reading: {whole}"
         );
         assert_eq!(
@@ -3812,9 +4066,10 @@ async fn worker_profile_guidance_surfaces_name_no_excluded_tool() {
     // `protocolVersion`, `capabilities` and `serverInfo`, whose
     // `Implementation` has `title` / `description` / `icons` / `websiteUrl`
     // — free text a worker reads before anything else. All four are `None`
-    // under `from_build_env()`, so nothing leaks; the unbacked guarantee was
-    // the defect. The banner is spliced out and nothing else is, because it
-    // is the one surface that names excluded tools on purpose.
+    // under the hand-built `Implementation::new(SERVER_NAME, ..)`, so nothing
+    // leaks; the unbacked guarantee was the defect. The banner is spliced out
+    // and nothing else is, because it is the one surface that names excluded
+    // tools on purpose.
     let mut handshake = serde_json::to_value(
         client
             .peer_info()
@@ -4441,6 +4696,7 @@ fn seed_run_history(models_dir: &Path) {
         submission_id: None,
         check_gate_failed: false,
         verify_after_failed: false,
+        rocky_branch: None,
     };
     store.record_run(&run).expect("record run");
 
@@ -4969,11 +5225,14 @@ async fn compile_rejects_unknown_target_dialect() {
 ///
 /// The fifteenth round corrected a false justification in `tools.rs`: the
 /// server does NOT pin `2024-11-05`, it advertises rmcp's whole
-/// `KNOWN_VERSIONS` list, and `negotiate_protocol_version` hands a client back
-/// whatever it asked for when the server supports it. So a client that
-/// requests `2026-07-28` gets it, `sep_2322_supported` is true,
-/// `strip_result_type_for_legacy_peer()` is skipped, and `resultType` reaches
-/// that client.
+/// `KNOWN_VERSIONS` list, and under rmcp 3.1 `negotiate_protocol_version`
+/// handed a client back whatever it asked for when the server supported it.
+/// So a client that requested `2026-07-28` over `initialize` got it,
+/// `sep_2322_supported` was true, `strip_result_type_for_legacy_peer()` was
+/// skipped, and `resultType` reached that client. (Since rmcp 3.2 the same
+/// request over `initialize` is answered with a handshake version; a peer
+/// reaches `2026-07-28` over the discover lifecycle, `Discover` or `Auto`,
+/// or by declaring it in a request's own `_meta`. See `connect_modern`.)
 ///
 /// That correction was right and completely unexercised: every roundtrip in
 /// this file connects with rmcp's default `()` handler, which asks for
@@ -4997,8 +5256,9 @@ async fn compile_rejects_unknown_target_dialect() {
 /// Only the pair distinguishes "negotiated per peer" from either extreme.
 ///
 /// The negotiated version is asserted first on each connection, because
-/// `result_type` says nothing if the handshake did not land where the test
-/// thinks it did.
+/// `result_type` says nothing if the lifecycle did not land where the test
+/// thinks it did. The modern peer discovers rather than initializes, which
+/// is the only route to `2026-07-28` since rmcp 3.2 (see `connect_modern`).
 ///
 /// This does not change what the server SPEAKS. Closing the gap by
 /// construction would mean narrowing `supported_protocol_versions`, which is a
@@ -5011,22 +5271,21 @@ async fn result_type_reaches_a_2026_07_28_client_and_no_other() {
     write_project(dir.path(), &dir.path().join("test.duckdb"));
     let config_path = dir.path().join("rocky.toml");
 
-    // 1. A client that ASKS for 2026-07-28 is given it, and keeps `resultType`.
-    let modern = connect_at_version(
-        RockyMcpServer::new(config_path.clone()),
-        ProtocolVersion::V_2026_07_28,
-    )
-    .await;
+    // 1. A client that DISCOVERS at 2026-07-28 is given it, and keeps
+    //    `resultType`. Over `initialize` the same request would be answered
+    //    with the server's legacy fallback (rmcp 3.2+), so the discover
+    //    lifecycle is the only way to reach this branch.
+    let modern = connect_modern(RockyMcpServer::new(config_path.clone())).await;
     let negotiated = modern
         .peer_info()
-        .expect("the server returned an initialize result")
+        .expect("the server answered discover")
         .protocol_version
         .clone();
     assert_eq!(
         negotiated,
         ProtocolVersion::V_2026_07_28,
         "the server advertises rmcp's whole KNOWN_VERSIONS list and does not \
-         override supported_protocol_versions, so a client asking for \
+         override supported_protocol_versions, so a client discovering at \
          2026-07-28 must be given it; if this fails the rest of the test is \
          measuring the wrong session"
     );
@@ -5089,6 +5348,59 @@ async fn result_type_reaches_a_2026_07_28_client_and_no_other() {
     legacy.cancel().await.unwrap();
 }
 
+/// The fallback `get_info` supplies is what an `initialize` naming
+/// `2026-07-28` gets under rmcp 3.2+, and it is the NEWEST handshake version,
+/// not the oldest (#1965). Nothing else exercised that value: the default
+/// client names `2025-11-25` and is echoed, the discover peer never sees the
+/// fallback, and rocky-fulfill's driver names `2024-11-05` and is echoed. So
+/// reverting the fallback to `V_2024_11_05` passed every other test; this one
+/// fails on it.
+///
+/// Such a client is also a legacy peer once answered, so `resultType` is
+/// withheld from it, which is the half of the claim the changelog makes.
+#[tokio::test]
+async fn an_initialize_that_names_2026_07_28_is_answered_with_the_newest_handshake_version() {
+    use rmcp::model::ProtocolVersion;
+
+    let dir = TempDir::new().unwrap();
+    write_project(dir.path(), &dir.path().join("test.duckdb"));
+    let server = RockyMcpServer::new(dir.path().join("rocky.toml"));
+
+    let (server_io, client_io) = tokio::io::duplex(64 * 1024);
+    tokio::spawn(async move {
+        if let Ok(svc) = server.serve(server_io).await {
+            let _ = svc.waiting().await;
+        }
+    });
+    let asked_too_much = rmcp::model::ClientConfig::default()
+        .with_protocol_version(ProtocolVersion::V_2026_07_28)
+        .serve(client_io)
+        .await
+        .expect("an initialize naming 2026-07-28 is still answered");
+
+    let negotiated = asked_too_much
+        .peer_info()
+        .expect("the server returned an initialize result")
+        .protocol_version
+        .clone();
+    assert_eq!(
+        negotiated,
+        ProtocolVersion::V_2025_11_25,
+        "an `initialize` cannot land on 2026-07-28 (rmcp 3.2+), and the fallback this \
+         server supplies is the newest version that still has a handshake, not the oldest"
+    );
+    let result = asked_too_much
+        .call_tool(CallToolRequestParams::new("compile"))
+        .await
+        .expect("compile call returns a result");
+    assert_eq!(
+        result.result_type, None,
+        "a peer answered with a handshake version is legacy, so resultType is withheld: \
+         {result:?}"
+    );
+    asked_too_much.cancel().await.unwrap();
+}
+
 /// SIXTEENTH ROUND, finding 1 — the two tools that read `self.config_path`
 /// disagreed about a `rocky.toml` that exists but does not load.
 ///
@@ -5108,6 +5420,52 @@ async fn result_type_reaches_a_2026_07_28_client_and_no_other() {
 /// swallowed it would return `is_error: None` and a `CREATE OR REPLACE TABLE`
 /// in the wrong dialect, and every other assertion in this file would stay
 /// green.
+/// #1996 — a model `plan_preview` cannot render is NAMED in the result.
+///
+/// It used to leave no trace: `commands::plan_preview_output` logged the
+/// reason at debug level and `PlanPreviewResult` carried `statements` and
+/// nothing else. An agent that drafted an ephemeral model got a successful
+/// draft and an empty preview, with nothing connecting the two. The end of
+/// that chain is this call result, so it is pinned here rather than at the
+/// helper.
+#[tokio::test]
+async fn plan_preview_names_a_model_it_could_not_render() {
+    let dir = TempDir::new().unwrap();
+    write_project(dir.path(), &dir.path().join("test.duckdb"));
+    let config_path = dir.path().join("rocky.toml");
+    std::fs::write(
+        dir.path().join("models").join("stg_orders.sql"),
+        "SELECT 1 AS id\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("models").join("stg_orders.toml"),
+        "name = \"stg_orders\"\n\n[strategy]\ntype = \"ephemeral\"\n\n\
+         [target]\ncatalog = \"warehouse\"\nschema = \"out\"\ntable = \"stg_orders\"\n",
+    )
+    .unwrap();
+
+    let server = RockyMcpServer::new(config_path);
+    let client = connect(server).await;
+    let result = client
+        .call_tool(CallToolRequestParams::new("plan_preview"))
+        .await
+        .expect("plan_preview returns a result");
+    assert_ne!(
+        result.is_error,
+        Some(true),
+        "the preview still succeeds — the refusal is reported, not raised: {result:?}"
+    );
+
+    let json = serde_json::to_string(&result).expect("result serializes");
+    assert!(
+        json.contains("stg_orders") && json.contains("E038"),
+        "the skipped model and its reason must reach the caller: {json}"
+    );
+
+    client.cancel().await.unwrap();
+}
+
 #[tokio::test]
 async fn a_malformed_config_refuses_on_plan_preview_the_way_it_does_on_compile() {
     let dir = TempDir::new().unwrap();
@@ -5910,11 +6268,22 @@ async fn served_text_digests(
     // under the old key it moved without moving the golden.
     //
     // Pinning the whole value is CHEAP here, which is why there is no
-    // carve-out. `Implementation::from_build_env()` expands `env!` inside
-    // rmcp, so `serverInfo` is rmcp's own name and version — NOT
-    // rocky-mcp's — and the row therefore does not churn on a Rocky release
-    // bump. It moves on an rmcp upgrade, which is a change that should
-    // force someone to re-read what this server announces.
+    // carve-out — but read what it now costs. Until #1973, `serverInfo` was
+    // built by `Implementation::from_build_env()`, which expands `env!`
+    // inside rmcp, so the value was rmcp's own name and version and this row
+    // moved on an rmcp upgrade and never on a Rocky release. It now carries
+    // Rocky's name and THIS CRATE'S version, so the trade is reversed: an
+    // rmcp bump no longer moves it, and every engine release does.
+    //
+    // That churn is deliberate and it is not a rubber stamp. The version is
+    // served text: a client asking which Rocky it is talking to reads this
+    // field, so a release that changes it SHOULD need someone to say so. The
+    // re-bless is one line of `ROCKY_BLESS_MCP_SERVED_TEXT=1` per release,
+    // and it fails loudly in `just test` during the release pre-flight rather
+    // than silently. What it must never become is reflex: if this row and the
+    // worker one are the only two that moved, and the version is the only
+    // difference, that is the expected release diff — anything else in the
+    // payload moving with them is a real change to read.
     //
     // The banner is NOT spliced out: this golden is about drift, and a
     // banner that changes because the allowlist changed is exactly the kind

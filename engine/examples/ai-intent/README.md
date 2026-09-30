@@ -127,7 +127,7 @@ rocky ai "Monthly active customers who placed at least one order"
 ```
 
 The intent is a positional argument. `--models` supplies the schema context
-and the destination directory. `--materialization`, `--watermark`,
+and the destination directory. `--materialization`,
 `--unique-key`, and `--target` fill in the generated sidecar. An existing file
 at the destination stops the command unless you pass `--overwrite`.
 

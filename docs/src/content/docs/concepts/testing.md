@@ -10,7 +10,7 @@ Rocky checks a model at several points, and each check runs somewhere different.
 ```
   your model
       │
-      ├─► rocky compile             ─► contracts E010 E011 E012 E013,
+      ├─► rocky compile             ─► contracts E010 E011 E012 E013 E014,
       │                                checked against the inferred
       │                                schema, before anything reaches
       │                                a warehouse
@@ -83,7 +83,7 @@ The `[rules]` section enforces schema-level constraints:
 |------|-------------|
 | `required` | Columns that must exist in the model's output. Missing required columns produce error `E010`. |
 | `protected` | Columns that must never be removed. If a protected column disappears from the output, it produces error `E013`. |
-| `no_new_nullable` | Parsed but not enforced today. The compiler accepts the key and checks nothing ([#1467](https://github.com/rocky-data/rocky/issues/1467)). Leave it out. |
+| `no_new_nullable` | Opt-in, off by default. With it on, a nullable output column that the contract's `[[columns]]` do not declare produces error `E014`. A contract that sets the rule and declares no `[[columns]]` also produces `E014`, because there is no baseline for what counts as new. |
 
 ### Diagnostic codes
 
@@ -93,6 +93,7 @@ The `[rules]` section enforces schema-level constraints:
 | `E011` | Error | Column type mismatch (contract expects one type, model produces another) |
 | `E012` | Error | Nullability violation (contract says non-nullable, model says nullable) |
 | `E013` | Error | Protected column has been removed |
+| `E014` | Error | A nullable column the contract does not declare, while `[rules] no_new_nullable` is on |
 | `W010` | Warning | Contract defines a column that is not in the model output (but not required) |
 | `W011` | Warning | Contract exists for a model that was not found in the project |
 
@@ -101,6 +102,10 @@ A column can end up with type `Unknown`, which means the compiler could not infe
 ## rocky test
 
 `rocky test` compiles your models and executes them on a local DuckDB. It needs no warehouse connection, so you get fast feedback while you write.
+
+:::caution[A time-interval model cannot run under `rocky test`]
+`rocky test` does not substitute the `@start_date` and `@end_date` bounds, so a `time_interval` model reaches DuckDB with the placeholders still in the SQL. DuckDB then reports `Binder Error: Referenced column "start_date" not found in FROM clause!`, and `rocky test` and `rocky ci` fail. `rocky run` substitutes the bounds correctly. Track it in [#2020](https://github.com/rocky-data/rocky/issues/2020).
+:::
 
 ### What each step does
 

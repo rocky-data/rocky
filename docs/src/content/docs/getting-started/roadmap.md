@@ -95,6 +95,10 @@ else.
   rates per principal or rule, and `rocky review --queue` ranks pending
   escalations. A signal the ledger does not hold renders as *not recorded*,
   never as a fabricated number.
+- **A browser UI.** `rocky serve --ui` serves a read-only view of the same
+  data: the estate and its DAG, the review queue with one plan in full, and the
+  governor's brief, scorecard, custody, audit and product journal. See the
+  [browser UI guide](/guides/browser-ui/).
 - **An embeddable engine.** `rocky serve` exposes `/api/v1` with outputs
   byte-identical to the CLI's `--output json`, an async job model, and a
   generated OpenAPI 3.1 document. The [Embedding guide](/guides/embedding/)

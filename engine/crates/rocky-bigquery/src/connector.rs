@@ -380,6 +380,9 @@ impl BigQueryAdapter {
             location: self.location.clone(),
             timeout_ms: self.timeout_secs * 1000,
             max_results: MAX_RESULTS_PER_PAGE,
+            format_options: DataFormatOptions {
+                use_int64_timestamp: true,
+            },
         };
 
         debug!(sql = sql, project = %self.project_id, "executing BigQuery query");
@@ -468,6 +471,7 @@ impl BigQueryAdapter {
                     ("location", self.location.as_str()),
                     ("maxResults", "10000"),
                     ("timeoutMs", "10000"),
+                    ("formatOptions.useInt64Timestamp", "true"),
                 ])
                 .send()
                 .await?;
@@ -583,6 +587,7 @@ impl BigQueryAdapter {
                         ("location", self.location.as_str()),
                         ("maxResults", "10000"),
                         ("pageToken", page_token),
+                        ("formatOptions.useInt64Timestamp", "true"),
                     ])
                     .send()
                     .await?;
@@ -1079,6 +1084,11 @@ impl WarehouseAdapter for BigQueryAdapter {
             .map(|s| s.fields.iter().map(|f| f.name.clone()).collect())
             .unwrap_or_default();
 
+        // `f[]` and `schema.fields[]` share position at every RECORD depth.
+        // Decode only schema-identified TIMESTAMP leaves, including those in
+        // REPEATED fields, after all inline/polled/paged rows are collected.
+        let fields = response.schema.as_ref().map(|s| s.fields.as_slice());
+
         let rows: Vec<Vec<serde_json::Value>> = response
             .rows
             .unwrap_or_default()
@@ -1086,7 +1096,14 @@ impl WarehouseAdapter for BigQueryAdapter {
             .map(|row| {
                 row.f
                     .iter()
-                    .map(|cell| cell.v.clone().unwrap_or(serde_json::Value::Null))
+                    .enumerate()
+                    .map(|(i, cell)| {
+                        let value = cell.v.clone().unwrap_or(serde_json::Value::Null);
+                        match fields.and_then(|fields| fields.get(i)) {
+                            Some(field) => convert_bigquery_field(value, field),
+                            None => value,
+                        }
+                    })
                     .collect()
             })
             .collect();
@@ -1274,6 +1291,86 @@ impl WarehouseAdapter for BigQueryAdapter {
         );
         self.execute_statement(&sql).await
     }
+}
+
+/// Walk the BigQuery `v` representation using its field schema. REPEATED
+/// values are arrays of `{ "v": ... }` cells; RECORD/STRUCT values contain
+/// positional `{ "f": [{ "v": ... }, ...] }` cells. Unknown shapes and
+/// non-TIMESTAMP leaves pass through unchanged.
+fn convert_bigquery_field(value: serde_json::Value, field: &TableFieldSchema) -> serde_json::Value {
+    if field
+        .mode
+        .as_deref()
+        .is_some_and(|mode| mode.eq_ignore_ascii_case("REPEATED"))
+    {
+        let serde_json::Value::Array(mut elements) = value else {
+            return value;
+        };
+        for element in &mut elements {
+            if let Some(inner) = element.get_mut("v") {
+                *inner = convert_bigquery_non_repeated(std::mem::take(inner), field);
+            }
+        }
+        return serde_json::Value::Array(elements);
+    }
+    convert_bigquery_non_repeated(value, field)
+}
+
+fn convert_bigquery_non_repeated(
+    value: serde_json::Value,
+    field: &TableFieldSchema,
+) -> serde_json::Value {
+    if field.field_type.eq_ignore_ascii_case("TIMESTAMP") {
+        return convert_bigquery_timestamp_cell(value);
+    }
+    if !field.field_type.eq_ignore_ascii_case("RECORD")
+        && !field.field_type.eq_ignore_ascii_case("STRUCT")
+    {
+        return value;
+    }
+    let serde_json::Value::Object(mut record) = value else {
+        return value;
+    };
+    if let Some(serde_json::Value::Array(cells)) = record.get_mut("f") {
+        for (cell, child_field) in cells.iter_mut().zip(&field.fields) {
+            if let Some(inner) = cell.get_mut("v") {
+                *inner = convert_bigquery_field(std::mem::take(inner), child_field);
+            }
+        }
+    }
+    serde_json::Value::Object(record)
+}
+
+/// Converts one schema-identified `TIMESTAMP` leaf from BigQuery's REST
+/// `jobs.query` / `jobs.getQueryResults` shape to an RFC 3339 UTC string.
+///
+/// Every row-returning request sets `formatOptions.useInt64Timestamp=true`,
+/// so a TIMESTAMP cell is a signed int64 count of **microseconds** since the
+/// Unix epoch. Convert it before the shared CLI watermark reader sees it.
+///
+/// A cell that is not a JSON string, or a string [`parse_bigquery_epoch_timestamp`]
+/// cannot read as signed int64 microseconds, is returned unconverted —
+/// a conversion this function cannot do must not manufacture a fact (e.g.
+/// `null`) the caller did not have before.
+fn convert_bigquery_timestamp_cell(value: serde_json::Value) -> serde_json::Value {
+    let serde_json::Value::String(raw) = &value else {
+        return value;
+    };
+    match parse_bigquery_epoch_timestamp(raw) {
+        Some(dt) => {
+            serde_json::Value::String(dt.to_rfc3339_opts(chrono::SecondsFormat::Micros, true))
+        }
+        None => value,
+    }
+}
+
+/// Parses a signed int64 count of **microseconds** since the Unix epoch.
+/// The unit is fixed by `formatOptions.useInt64Timestamp=true` on each
+/// row-returning request. No floating-point or magnitude inference is used.
+/// An invalid or out-of-range value remains unconverted for the caller to
+/// reject rather than being silently rounded into a different watermark.
+fn parse_bigquery_epoch_timestamp(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    chrono::DateTime::from_timestamp_micros(s.parse::<i64>().ok()?)
 }
 
 /// Verify the bisection runner passed K contiguous IntRange chunks and
@@ -1565,6 +1662,13 @@ struct QueryRequest {
     location: String,
     timeout_ms: u64,
     max_results: u32,
+    format_options: DataFormatOptions,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DataFormatOptions {
+    use_int64_timestamp: bool,
 }
 
 // -- load-job (`jobs.insert`) wire request --
@@ -1986,12 +2090,15 @@ struct TableSchema {
 #[derive(Debug, Deserialize)]
 struct TableFieldSchema {
     name: String,
+    /// BigQuery's standard SQL type name (`"TIMESTAMP"`, `"STRING"`,
+    /// `"INTEGER"`, ...), used with mode and nested fields to locate
+    /// TIMESTAMP leaves without converting other numeric strings (#2150).
     #[serde(rename = "type")]
-    #[allow(dead_code)]
     field_type: String,
-    #[allow(dead_code)]
     #[serde(default)]
     mode: Option<String>,
+    #[serde(default)]
+    fields: Vec<TableFieldSchema>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2016,10 +2123,14 @@ mod tests {
             location: "US".to_string(),
             timeout_ms: 30000,
             max_results: MAX_RESULTS_PER_PAGE,
+            format_options: DataFormatOptions {
+                use_int64_timestamp: true,
+            },
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("useLegacySql"));
         assert!(json.contains("timeoutMs"));
+        assert!(json.contains("\"formatOptions\":{\"useInt64Timestamp\":true}"));
     }
 
     #[test]
@@ -2050,6 +2161,92 @@ mod tests {
         assert!(resp.job_complete);
         assert!(resp.schema.is_none());
         assert!(resp.rows.is_none());
+    }
+
+    /// The exact wire shape #2150 is about: a `TIMESTAMP` cell in a response
+    /// this crate's own `TableSchema`/`TableRow` types deserialize, then run
+    /// end to end through the two functions `execute_query` calls, keeping
+    /// the fraction that `parse_timestamp_cell` (rocky-cli, #2149) must be
+    /// able to read back.
+    #[test]
+    fn timestamp_cell_from_a_real_response_shape_converts_to_rfc3339() {
+        let json = r#"{
+            "jobComplete": true,
+            "schema": {
+                "fields": [
+                    {"name": "id", "type": "INTEGER"},
+                    {"name": "loaded_at", "type": "TIMESTAMP"}
+                ]
+            },
+            "rows": [
+                {"f": [{"v": "1"}, {"v": "1757930400250000"}]}
+            ]
+        }"#;
+        let resp: BigQueryResponse = serde_json::from_str(json).unwrap();
+        let fields = &resp.schema.as_ref().unwrap().fields;
+        assert!(!fields[0].field_type.eq_ignore_ascii_case("TIMESTAMP"));
+        assert!(fields[1].field_type.eq_ignore_ascii_case("TIMESTAMP"));
+
+        let cell = resp.rows.as_ref().unwrap()[0].f[1].v.clone().unwrap();
+        let converted = convert_bigquery_timestamp_cell(cell);
+        assert_eq!(
+            converted,
+            serde_json::Value::String("2025-09-15T10:00:00.250000Z".to_string())
+        );
+    }
+
+    #[test]
+    fn epoch_timestamp_is_always_signed_microseconds() {
+        for (raw, expected) in [
+            ("-1", "1969-12-31T23:59:59.999999Z"),
+            ("0", "1970-01-01T00:00:00.000000Z"),
+            ("1", "1970-01-01T00:00:00.000001Z"),
+            ("1757930400250001", "2025-09-15T10:00:00.250001Z"),
+            ("32503680000000002", "3000-01-01T00:00:00.000002Z"),
+        ] {
+            assert_eq!(
+                convert_bigquery_timestamp_cell(serde_json::Value::String(raw.into())),
+                serde_json::Value::String(expected.into()),
+                "wrong conversion for {raw} microseconds"
+            );
+        }
+    }
+
+    /// A malformed cell (not signed int64 microseconds) is left
+    /// completely unconverted rather than turned into `null` — a
+    /// conversion this function cannot do must not manufacture a fact the
+    /// caller did not have before.
+    #[test]
+    fn epoch_timestamp_unparseable_returns_none_and_cell_passes_through() {
+        assert!(parse_bigquery_epoch_timestamp("not-a-number").is_none());
+        assert!(parse_bigquery_epoch_timestamp("").is_none());
+        assert!(parse_bigquery_epoch_timestamp("1.2.3").is_none());
+        assert!(parse_bigquery_epoch_timestamp("1.").is_none());
+        assert!(parse_bigquery_epoch_timestamp(".5").is_none());
+        assert!(parse_bigquery_epoch_timestamp("32503680000.000002").is_none());
+        assert!(parse_bigquery_epoch_timestamp("9223372036854775808").is_none());
+
+        // Already-RFC-3339 input (not a shape this connector's own
+        // requests ever produce) is not a decimal number either, so it
+        // passes through unconverted rather than being rejected.
+        let already_rfc3339 = serde_json::Value::String("2025-09-15T10:00:00.250Z".to_string());
+        assert_eq!(
+            convert_bigquery_timestamp_cell(already_rfc3339.clone()),
+            already_rfc3339
+        );
+    }
+
+    /// A NULL timestamp cell (`Value::Null`, from a SQL NULL) is not a JSON
+    /// string, so `convert_bigquery_timestamp_cell` must not attempt to
+    /// convert it — only a matched positional TIMESTAMP column ever reaches
+    /// this function, and it must return NULL unchanged, not `"null"` or an
+    /// error.
+    #[test]
+    fn convert_timestamp_cell_passes_null_through_unchanged() {
+        assert_eq!(
+            convert_bigquery_timestamp_cell(serde_json::Value::Null),
+            serde_json::Value::Null
+        );
     }
 
     #[test]

@@ -12,10 +12,6 @@
  */
 export interface OptimizeOutput {
   command: string;
-  /**
-   * Hint pointing users to `rocky compile --output json` for inferred incrementality recommendations on `full_refresh` models. Only populated when the optimize command detects that compile-time analysis could provide additional optimization opportunities.
-   */
-  incrementality_note?: string | null;
   message?: string | null;
   recommendations: OptimizeRecommendation[];
   total_models_analyzed: number;

@@ -52,12 +52,6 @@ rocky compile
       "target": { "catalog": "acme_warehouse", "schema": "gold", "table": "fct_revenue" },
       "freshness": { "max_lag_seconds": 86400, "time_column": "order_date", "severity": "warning" },
       "contract_source": "auto",
-      "incrementality_hint": {
-        "is_candidate": true,
-        "recommended_column": "order_date",
-        "confidence": "medium",
-        "signals": ["column name 'order_date' ends with '_date' (timestamp pattern)"]
-      },
       "cost_hint": {
         "estimated_rows": 10000,
         "estimated_bytes": 2560000,
@@ -74,11 +68,10 @@ rocky compile
 
 `models_detail` carries each compiled model's declarative shape. Four fields are always there: `name`, the materialization `strategy` (wire form `{"type": "..."}`), the `target` coordinates, and the direct `depends_on` list.
 
-Four more appear only when they apply:
+Three more appear only when they apply:
 
 - `freshness` — the model's freshness expectation.
 - `contract_source` — `"auto"` for a sibling `.contract.toml`, `"explicit"` for one passed via `--contracts`.
-- `incrementality_hint` — set on a `full_refresh` model that has a monotonic-looking column.
 - `cost_hint` — set when the upstream statistics support an estimate.
 
 The `tags` object holds the model's `[tags]` merged over any config-group baseline, with the sidecar winning. Rocky omits an empty `tags`, an empty `depends_on`, and any absent optional field.
@@ -193,7 +186,7 @@ Compile with seeded source schemas so leaf `.sql` models pick up real types:
 rocky compile --with-seed
 ```
 
-`--with-seed` looks for `data/seed.sql` relative to the project root (one level up from `--models`). It opens an in-memory DuckDB, runs the seed, and feeds the resulting `information_schema.columns` back into the compiler so downstream incrementality and type-inference get concrete types instead of `RockyType::Unknown`. Bails if `data/seed.sql` is missing or fails to execute.
+`--with-seed` looks for `data/seed.sql` relative to the project root (one level up from `--models`). It opens an in-memory DuckDB, runs the seed, and feeds the resulting `information_schema.columns` back into the compiler so type inference gets concrete types instead of `RockyType::Unknown`. Bails if `data/seed.sql` is missing or fails to execute.
 
 ### Related Commands
 
@@ -338,6 +331,125 @@ Upstream output has `"direction": "upstream"` (the default shape, unchanged). Th
 
 - [`rocky compile`](#rocky-compile) -- build the semantic graph that lineage reads
 - [`rocky ai-explain`](/reference/commands/ai/#rocky-ai-explain) -- generate natural language descriptions of model logic
+
+---
+
+## `rocky lineage-diff`
+
+Report the downstream blast radius of a change between two git refs, for PR review. It combines the structural diff from `rocky ci-diff` with the downstream consumers from `rocky lineage --downstream`. Together they show which downstream columns each changed column reaches.
+
+Git selects the changed paths from committed history between `base_ref` and HEAD. The column schemas and the downstream trace, though, come from the current working tree, not a git checkout of HEAD. For a report that must describe HEAD exactly, commit your changes first, so the working tree matches HEAD.
+
+```bash
+rocky lineage-diff [base_ref] [flags]
+```
+
+### Arguments
+
+| Argument | Type | Default | Description |
+|----------|------|---------|-------------|
+| `base_ref` | `string` | `main` | Git ref to compare against. Uses the same git-diff mechanism as [`rocky ci-diff`](#rocky-ci-diff). |
+
+### Flags
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--models <PATH>` | `PathBuf` | `models` | Directory containing model files. |
+| `-o, --output <FORMAT>` | `json` \| `table` \| `md` | terminal-aware | `json` emits the full payload, including the pre-rendered report in a `markdown` field. `table` and `md` print that same report directly. |
+
+### Examples
+
+Diff the current branch against `main` and print the Markdown report:
+
+```bash
+rocky lineage-diff main --output table
+```
+
+```text
+Rocky Lineage Diff (main...HEAD)
+
+### Rocky Lineage Diff
+
+**2 row(s) changed** (2 modified, 0 added, 0 removed, 0 unchanged)
+
+<details>
+<summary><b>fct_revenue</b> — modified (3 column changes)</summary>
+
+| Column | Change | Old Type | New Type | Downstream consumers |
+|--------|--------|----------|----------|----------------------|
+| `total_revenue` | added | - | Unknown | _none_ |
+| `total_tax` | added | - | Unknown | _none_ |
+| `total` | removed | Unknown | - | _(removed; not traceable on HEAD)_ |
+
+</details>
+
+<details>
+<summary><b>stg_orders</b> — modified (3 column changes)</summary>
+
+| Column | Change | Old Type | New Type | Downstream consumers |
+|--------|--------|----------|----------|----------------------|
+| `amount_usd` | added | - | Unknown | `fct_revenue.total_revenue` |
+| `tax_amount_usd` | added | - | Unknown | `fct_revenue.total_tax` |
+| `amount` | removed | Unknown | - | _(removed; not traceable on HEAD)_ |
+
+</details>
+```
+
+The same diff as JSON, for a CI pipeline:
+
+```bash
+rocky lineage-diff main -o json
+```
+
+```json
+{
+  "version": "1.74.0",
+  "command": "lineage-diff",
+  "base_ref": "main",
+  "head_ref": "HEAD",
+  "summary": { "total_models": 2, "unchanged": 0, "modified": 2, "added": 0, "removed": 0 },
+  "results": [
+    {
+      "model_name": "fct_revenue",
+      "status": "modified",
+      "column_changes": [
+        { "column_name": "total_revenue", "change_type": "added", "new_type": "Unknown" },
+        { "column_name": "total_tax", "change_type": "added", "new_type": "Unknown" },
+        { "column_name": "total", "change_type": "removed", "old_type": "Unknown" }
+      ]
+    },
+    {
+      "model_name": "stg_orders",
+      "status": "modified",
+      "column_changes": [
+        {
+          "column_name": "amount_usd",
+          "change_type": "added",
+          "new_type": "Unknown",
+          "downstream_consumers": [{ "model": "fct_revenue", "column": "total_revenue" }]
+        },
+        {
+          "column_name": "tax_amount_usd",
+          "change_type": "added",
+          "new_type": "Unknown",
+          "downstream_consumers": [{ "model": "fct_revenue", "column": "total_tax" }]
+        },
+        { "column_name": "amount", "change_type": "removed", "old_type": "Unknown" }
+      ]
+    }
+  ],
+  "markdown": "### Rocky Lineage Diff\n\n..."
+}
+```
+
+A removed column has no downstream trace. The column no longer exists on HEAD's compile, so Rocky cannot walk its downstream reach. JSON omits `downstream_consumers` when it is empty, so a consumer should default a missing key to an empty list. The structural diff still reports the removal.
+
+`rocky lineage-diff` reports; it does not fail a build. Finding changed columns, however many, does not change the exit code. Only an error makes it exit non-zero: an invalid `base_ref`, a `git diff` that fails, or invalid or unreadable project configuration.
+
+### Related Commands
+
+- [`rocky ci-diff`](#rocky-ci-diff) -- the structural diff alone, without the downstream trace
+- [`rocky lineage`](#rocky-lineage) -- trace a single column's lineage directly
 
 ---
 
@@ -521,16 +633,17 @@ Three outcomes, and the middle one is the point of the no-credentials promise:
 
 One exception sits under row two: a placeholder written as a bare value, such as `port = ${PORT}`, is not valid TOML whether or not the variable is set. That is row three, and the error names `PORT`.
 
-Full-refresh models emit a complete `CREATE OR REPLACE TABLE … AS …` that runs as-is against a fresh warehouse and matches what a run executes in the resolved dialect. Incremental and merge models emit their steady-state statement instead: a bare `INSERT` or `MERGE` that operates on an existing target. `rocky run` bootstraps the target table on first build and threads the incremental watermark from state, neither of which a static emit can reproduce, so those files carry a leading note to that effect:
+Full-refresh models emit a complete `CREATE OR REPLACE TABLE … AS …` that runs as-is against a fresh warehouse and matches what a run executes in the resolved dialect. Merge and `delete_insert` models emit their steady-state statement instead, which operates on an existing target. `rocky run` bootstraps the target table on first build, which a static emit cannot reproduce, so those files carry a leading note:
 
 ```sql
--- NOTE: incremental/merge statement — operates on an existing target.
--- `rocky run` bootstraps the table on first build and threads the
--- incremental watermark from state; this static SQL does neither.
+-- NOTE: merge/delete_insert statement — operates on an existing target.
+-- `rocky run` creates the table on first build; this static SQL does not.
 MERGE INTO ...
 ```
 
-Models that produce no standalone SQL are reported on stderr rather than silently dropped, so you never mistake the emitted set for the complete project. Two cases are skipped this way: ephemeral models (inlined as CTEs upstream, so they have no statement of their own) and strategies that cannot render offline, such as a Snowflake dynamic table that needs a live compute-warehouse name.
+`emit-sql` refuses a project with any compile error, before it filters by model. `type = "incremental"` on a transformation model fails with `E037`, and `type = "ephemeral"` fails with `E038`. Either stops the whole export, even when `--model` names a different model.
+
+A model whose SQL cannot be rendered offline is reported on stderr rather than silently dropped. So you never mistake the emitted set for the complete project. A Snowflake dynamic table is one: it needs a live compute-warehouse name.
 
 ### Examples
 
@@ -571,7 +684,7 @@ When some models cannot be emitted as standalone SQL, the skip report goes to st
 
 ```text
 emit-sql: 1 model(s) not emitted:
-  - dim_session (ephemeral — inlined as a CTE)
+  - dim_session (cannot render offline: <the dialect's reason>)
 ```
 
 ### Related Commands
@@ -785,7 +898,7 @@ rocky ci-diff [base_ref] [flags]
 
 | Argument | Type | Default | Description |
 |----------|------|---------|-------------|
-| `base_ref` | `string` | `main` | Git ref to compare against. Rocky shells out to `git diff --name-only <base_ref> HEAD` to find changed `.sql`, `.rocky`, and sidecar `.toml` files. |
+| `base_ref` | `string` | `main` | Git ref to compare against. Rocky shells out to `git diff --name-status <base_ref>...HEAD` to find changed `.sql`, `.rocky`, and sidecar `.toml` files. |
 
 ### Flags
 
@@ -883,7 +996,7 @@ The `breaking_findings` field is JSON-only: `--output table` still renders the s
 
 Preview a change before it merges. Rocky re-executes only the changed models and their downstream column lineage on a per-pull-request branch, and copies everything else from the base ref.
 
-Three subcommands compose into one review artifact. `preview create` runs the workflow, `preview diff` reports the structural and sampled row-level diff, and `preview cost` reports the cost delta against base. A fourth, `preview rows`, is separate: it samples the output rows of a single model.
+Three subcommands compose into one review artifact. `preview create` prepares the branch, `preview diff` reports what changed, and `preview cost` reports the cost delta against base. A fourth, `preview rows`, is separate: it samples the output rows of a single model.
 
 For the design (why CTAS today and warehouse-native clones tomorrow, how the column-level pruner works, what the sampling window's correctness ceiling is), see the [How Preview Works](/concepts/preview-internals/) concept page. For a step-by-step walkthrough on a feature branch, see the [Preview a PR](/guides/preview-a-pr/) how-to.
 
@@ -898,7 +1011,7 @@ rocky preview rows   --model <name> [--cte <name>] [--limit <N>]
 
 ### `rocky preview create`
 
-Compute the prune set, copy the rest from the base schema, run only the prune set against a per-PR branch.
+Compute the prune set and copy the rest from the base schema into a per-PR branch. It does not run the prune set: it reports `run_status: "planned"` with an empty `run_id`. Run `rocky run --branch <name>` over the prune set before `preview diff` or `preview cost`. `preview diff` pairs the run by its recorded `rocky_branch`, the literal `--branch` value. The base run excludes `--branch` runs.
 
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
@@ -916,8 +1029,8 @@ rocky preview create --base main
 {
   "version": "1.18.0",
   "command": "preview-create",
-  "branch_name": "preview-fix-price",
-  "branch_schema": "branch__preview-fix-price",
+  "branch_name": "pr_preview_fix_price",
+  "branch_schema": "branch__pr_preview_fix_price",
   "base_ref": "main",
   "head_ref": "HEAD",
   "prune_set": [
@@ -925,12 +1038,12 @@ rocky preview create --base main
     { "model_name": "rev_by_region", "reason": "downstream_of_changed" }
   ],
   "copy_set": [
-    { "model_name": "stg_orders",    "source_schema": "main", "target_schema": "branch__preview-fix-price", "copy_strategy": "ctas" },
-    { "model_name": "stg_customers", "source_schema": "main", "target_schema": "branch__preview-fix-price", "copy_strategy": "ctas" }
+    { "model_name": "stg_orders",    "source_schema": "main", "target_schema": "branch__pr_preview_fix_price", "copy_strategy": "ctas" },
+    { "model_name": "stg_customers", "source_schema": "main", "target_schema": "branch__pr_preview_fix_price", "copy_strategy": "ctas" }
   ],
   "skipped_set": [],
-  "run_id": "run-20260428-141033-002",
-  "run_status": "succeeded",
+  "run_id": "",
+  "run_status": "planned",
   "duration_ms": 4321
 }
 ```
@@ -939,21 +1052,28 @@ rocky preview create --base main
 
 ### `rocky preview diff`
 
-Sampled row-level diff plus structural (column-level) diff for every model in the prune set.
+Compare the branch run with the base run, for every model in the prune set.
+
+By default this compares the `rows_affected` the two run records hold. It reports `rows_added` and `rows_removed`, leaves `rows_changed` at 0, returns no samples and no column-level delta, and sets `coverage: "not_yet_sampled"` with `coverage_warning: true`.
+
+Two limits follow. A change that rewrites values without changing row counts shows nothing. And an ordinary transformation run records no `rows_affected` at all, which the diff reports as unknown rather than zero.
+
+Pass `--algorithm bisection` to compare row content. It needs a `Merge` model whose single `unique_key` holds whole numbers: the bounds are parsed as integers, so a decimal key falls back to the default comparison without saying so. Read each model's `algorithm.kind` before you treat its result as a content comparison.
 
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
 | `--name <NAME>` | `string` | **(required)** | Branch name created by `preview create`. |
 | `--base <REF>` | `string` | `main` | Git ref to compare against. Must match what `preview create` was invoked with. |
-| `--sample-size <N>` | `usize` | `1000` | Number of rows to sample per model for row-level diffing. Larger windows reduce false-negative risk; see [coverage warning](/concepts/preview-internals/#coverage-warning-roll-up). |
+| `--models <PATH>` | `PathBuf` | `models` | Models directory. Bisection reads each model's primary-key column from here. |
+| `--sample-size <N>` | `usize` | `1000` | Accepted and ignored today. The default comparison samples no rows, so this value changes nothing ([#2032](https://github.com/rocky-data/rocky/issues/2032)). |
 
-**Example.** Render a Markdown report ready to post on a PR:
+**Example.** Print a Markdown report ready to post on a PR:
 
 ```bash
-rocky preview diff --name preview-fix-price --output markdown
+rocky preview diff --name pr_preview_fix_price --output json | jq -r .markdown
 ```
 
-The JSON shape (`PreviewDiffOutput`) carries the same data plus the per-model `sampling_window` block with `coverage_warning`, and `rocky preview diff --output json | jq -r .markdown` reproduces the `--output markdown` report.
+There is no `--output markdown`. The report lives in the `markdown` field of the JSON output (`PreviewDiffOutput`). The same JSON also carries the per-model `sampling_window` block with `coverage_warning`.
 
 ### `rocky preview cost`
 
@@ -962,15 +1082,15 @@ Per-model cost delta between the branch run and the latest base-schema `RunRecor
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
 | `--name <NAME>` | `string` | **(required)** | Branch name created by `preview create`. |
-| `--base <REF>` | `string` | `main` | Git ref the base run is identified by. |
+| `--models <PATH>` | `PathBuf` | `models` | Models directory. Rocky reads per-model `[budget]` blocks from the sidecars here, so a projected breach can name a single model. |
 
 **Example.**
 
 ```bash
-rocky preview cost --name preview-fix-price --output markdown
+rocky preview cost --name pr_preview_fix_price --output json | jq -r .markdown
 ```
 
-The JSON shape (`PreviewCostOutput`) reports per-model `delta_usd`, `branch_duration_ms`, `base_duration_ms`, and bytes scanned, plus an aggregate `summary.delta_usd`, `summary.savings_from_copy_usd`, and `models_skipped_via_copy`. Underlying cost math is identical to [`rocky cost`](/reference/commands/administration/#rocky-cost) (Databricks / Snowflake duration × DBU rate; BigQuery bytes × $/TB; DuckDB zero); fields fall back to `null` when no base `RunRecord` exists or when the adapter does not surface USD.
+The JSON shape (`PreviewCostOutput`) carries the Markdown report in its `markdown` field. It reports per-model `delta_usd`, `branch_duration_ms`, `base_duration_ms`, and bytes scanned, plus an aggregate `summary.delta_usd`, `summary.savings_from_copy_usd`, and `models_skipped_via_copy`. Underlying cost math is identical to [`rocky cost`](/reference/commands/administration/#rocky-cost) (Databricks / Snowflake duration × DBU rate; BigQuery bytes × $/TB; DuckDB zero); fields fall back to `null` when no base `RunRecord` exists or when the adapter does not surface USD.
 
 ### `rocky preview rows`
 

@@ -65,3 +65,7 @@ tmp/
 
 # 24h scheduler soak output (scripts/soak-scheduler.sh)
 .soak/
+# Playwright CLI output (may contain credentials)
+.playwright-cli/
+# Playwright CLI local config: names a browser binary on this machine
+.playwright/

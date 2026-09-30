@@ -85,6 +85,81 @@ lint-vscode:
 lint-ui:
     cd engine/ui && npm run lint
 
+# The server below is a debug build of this checkout, started in `dir` with a
+# read-only token, without `--ui` (the page comes from Vite). Vite starts only
+# once `/api/v1/health` answers. Ctrl-C stops both; if either process dies the
+# other is stopped and the recipe fails. The API port is the ONE source for
+# Vite's proxy target: `engine/ui/vite.config.ts` reads it from `ROCKY_API`,
+# which this recipe sets. Override with ROCKY_UI_DEV_PORT and ROCKY_UI_DEV_TOKEN.
+
+# The UI development loop in one command: `rocky serve` + `npm run dev`.
+ui-dev dir="examples/playground/pocs/00-foundations/00-playground-default":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # Job control: each child gets its own process group, so a Ctrl-C reaches
+    # this script alone and the trap below stops both groups deliberately —
+    # `npm run dev` and `cargo`-built `rocky` alike, with every child they
+    # spawned. Without it a killed `npm` can leave Vite's node process behind.
+    set -m
+    root="$(pwd)"
+    port="${ROCKY_UI_DEV_PORT:-8080}"
+    token="${ROCKY_UI_DEV_TOKEN:-dev}"
+    target="${CARGO_TARGET_DIR:-$root/engine/target}"
+    (cd engine && cargo build --quiet --bin rocky)
+    # `</dev/null` on BOTH jobs. Under job control a background job keeps the
+    # terminal as its stdin; Vite reads stdin for its keyboard shortcuts, and a
+    # background read of the terminal stops the process (SIGTTIN) on the first
+    # Enter — a frozen dev server with no message. With no terminal on stdin
+    # the shortcuts stay off and nothing reads.
+    (cd "{{dir}}" && exec "$target/debug/rocky" serve --port "$port" --token "$token" --token-scope read-only) </dev/null &
+    server=$!
+    vite=""
+    stop() {
+        # TERM, then CONT: a stopped process group only sees the TERM once it
+        # is continued. Without the CONT a stopped job would hold `wait` forever.
+        kill -TERM -- "-$server" 2>/dev/null || true
+        kill -CONT -- "-$server" 2>/dev/null || true
+        if [ -n "$vite" ]; then
+            kill -TERM -- "-$vite" 2>/dev/null || true
+            kill -CONT -- "-$vite" 2>/dev/null || true
+        fi
+        wait 2>/dev/null || true
+    }
+    # Ctrl-C: under job control the terminal delivers it to the foreground
+    # child (the `sleep` in the watch loop), `set -e` then ends this script on
+    # the interrupted `sleep`, and the EXIT trap stops both groups. The INT and
+    # TERM traps cover a signal sent to this script itself; each ENDS the
+    # recipe, so bash never carries on to a `wait` on a pid it already reaped.
+    trap stop EXIT
+    trap 'stop; exit 130' INT
+    trap 'stop; exit 143' TERM
+    for _ in $(seq 1 60); do
+        # The liveness check FIRST: a health answer from a server that is not
+        # ours (the port already held) must not read as ours coming up.
+        if ! kill -0 "$server" 2>/dev/null; then
+            echo "ui-dev: rocky serve exited before it answered on :$port (is the port already in use?)" >&2
+            exit 1
+        fi
+        curl -sf "http://127.0.0.1:$port/api/v1/health" >/dev/null 2>&1 && break
+        sleep 0.5
+    done
+    curl -sf "http://127.0.0.1:$port/api/v1/health" >/dev/null 2>&1 || {
+        echo "ui-dev: rocky serve did not answer on :$port within 30s" >&2
+        exit 1
+    }
+    echo "ui-dev: API on http://127.0.0.1:$port — open http://localhost:5173/ui/#token=$token"
+    (cd engine/ui && ROCKY_API="http://127.0.0.1:$port" exec npm run dev -- --strictPort --port 5173) </dev/null &
+    vite=$!
+    # Watch both. Whichever dies first ends the loop; the trap stops the other.
+    while kill -0 "$server" 2>/dev/null && kill -0 "$vite" 2>/dev/null; do
+        sleep 1
+    done
+    if kill -0 "$vite" 2>/dev/null; then
+        echo "ui-dev: rocky serve exited (is :$port already in use?); stopping Vite" >&2
+        exit 1
+    fi
+    wait "$vite"
+
 # --- Phase 2 schema codegen ---
 
 # Run the full codegen pipeline: rust → JSON schemas → Pydantic + TypeScript + VS Code project schema

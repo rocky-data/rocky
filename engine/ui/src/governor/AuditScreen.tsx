@@ -1,10 +1,11 @@
-import { useCallback, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import type { AuditOutput } from "@rocky-types/audit";
 import type { ProductListOutput } from "@rocky-types/product_list";
 import { apiGet } from "../api";
 import { EmptyState, StatusCard } from "../components";
 import { useResource } from "../estate/useResource";
 import { formatInstant } from "../format";
+import { auditPath, navigateTo } from "../router";
 import { CustodyLink } from "./links";
 import { Rows } from "./SectionCard";
 
@@ -25,9 +26,28 @@ export const defaultAuditLoaders: AuditLoaders = {
  * The policy-decision ledger, `GET /api/v1/audit`, whole or scoped to one
  * product's output model with `?product=`. Oldest first, as the CLI prints
  * it. Every plan id links to its custody chain.
+ *
+ * `product` seeds the scope from the route (`/ui/governor/audit/<product>`),
+ * so a link can land here already filtered — that is where the Products tab
+ * sends a reader, custody having no answer for a product (#2003). Changing the
+ * selector navigates, so the address bar keeps saying what is on screen.
  */
-export function AuditScreen({ loaders = defaultAuditLoaders, now }: { loaders?: AuditLoaders; now?: number }) {
-  const [product, setProduct] = useState<string | null>(null);
+export function AuditScreen({
+  loaders = defaultAuditLoaders,
+  now,
+  product: routeProduct = null,
+}: {
+  loaders?: AuditLoaders;
+  now?: number;
+  product?: string | null;
+}) {
+  const [product, setProduct] = useState<string | null>(routeProduct);
+  // Follow the route when it moves under us — a deep link, or the back button.
+  // Rendered without a router (tests, embedders) `routeProduct` never changes,
+  // so the selector below stays the only driver.
+  useEffect(() => {
+    setProduct(routeProduct);
+  }, [routeProduct]);
   const products = useResource(loaders.products, [loaders]);
   const ledgerLoader = useCallback(() => loaders.ledger(product), [loaders, product]);
   const ledger = useResource(ledgerLoader, [ledgerLoader]);
@@ -43,7 +63,11 @@ export function AuditScreen({ loaders = defaultAuditLoaders, now }: { loaders?: 
         <select
           id="audit-product"
           value={product ?? ""}
-          onChange={(event) => setProduct(event.target.value === "" ? null : event.target.value)}
+          onChange={(event) => {
+            const chosen = event.target.value === "" ? null : event.target.value;
+            setProduct(chosen);
+            navigateTo(auditPath(chosen));
+          }}
           className="rounded border border-zinc-300 bg-white px-2 py-1 text-xs dark:border-zinc-700 dark:bg-zinc-900"
         >
           <option value="">all decisions</option>

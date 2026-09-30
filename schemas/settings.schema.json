@@ -1,0 +1,246 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "ConcurrencyControl": {
+      "description": "Concurrency control for remote `[state]` object writes.\n\nGuards the cross-process lost update where two writers sharing one `[state]` location race: one reads the state, the other commits, and the first's upload silently overwrites the second (last-writer-wins). See [`StateConfig::concurrency_control`].\n\n**Scope:** `docs/adr/ADR-CONCURRENCY.md` governs. It *requires* every write of the shared state object to compare-and-swap, split by writer class (runs refuse on conflict; single-record ledger seams retry). That requirement covers the shared object only: the sibling objects written under their own keys — freeze markers, idempotency records, the doctor read/write probe — are create-once or self-keyed, cannot lose an update, and stay outside compare-and-swap by design rather than as a gap.\n\n`cas` satisfies that requirement today for the end-of-run upload, for the `rocky policy` freeze/unfreeze ledger write (whose markers are create-once and must never be replayed, so they stay outside the retry), and — since #1372 — for `rocky gc`. It does not yet for `rocky restore`, which uploads the shared object unconditionally on every remote backend, nor for `rocky apply`'s verify-after custody rows, which take that path only when `verify_after` is configured. So `cas` does not yet make a deployment fully safe against lost updates. Issue #1228 tracks closing that half; `rocky doctor --check state_concurrency` reports the residual exposure in the meantime.",
+      "oneOf": [
+        {
+          "description": "Unconditional last-writer-wins upload (default) — byte-identical to the pre-CAS behaviour. Correct for single-writer-per-prefix deployments (one run at a time, orchestrator-serialized).",
+          "enum": [
+            "off"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Compare-and-swap: the end-of-run upload is conditional on the remote object still carrying the generation the run downloaded. A run that lost a cross-pod race fail-closes (nonzero exit) instead of erasing the winner. Requires a backend with a durable conditional-write object tier (`s3`, `gcs`, or `tiered`); auto-downgrades to `off` (with a warn) on `local` and `valkey`, which have no such tier.\n\nOn `tiered` the compare-and-swap runs against the durable S3 leg and the Valkey tier is kept coherent with it: a cached copy is stored together with the generation it was committed at, and a read may only use it after that generation is confirmed to still be the durable object's. Enabling `cas` also disables the mid-run periodic state uploader, on every backend. It protects the end-of-run upload only — see the type-level note on the ledger-seam writers that still bypass it.",
+          "enum": [
+            "cas"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "ConfigStatus": {
+      "description": "What happened when `rocky.toml` was read at server start.",
+      "oneOf": [
+        {
+          "description": "Read and parsed.",
+          "enum": [
+            "loaded"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "No `rocky.toml`. An ordinary fact about the project, not a failure.",
+          "enum": [
+            "absent"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Present, but could not be read or parsed. The server still started — `rocky serve` does not require a config — but the scheduler will skip every tick until it parses.",
+          "enum": [
+            "unreadable"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "StateBackend": {
+      "description": "State storage backend variants.",
+      "oneOf": [
+        {
+          "description": "State stored on local disk (default). No sync needed.",
+          "enum": [
+            "local"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "State synced to/from an S3 bucket via the `object_store` crate.",
+          "enum": [
+            "s3"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "State synced to/from a Google Cloud Storage bucket.",
+          "enum": [
+            "gcs"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "State synced to/from a Valkey/Redis instance.",
+          "enum": [
+            "valkey"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Tiered: Valkey (fast) with S3 fallback (durable).",
+          "enum": [
+            "tiered"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "TokenScopeLabel": {
+      "description": "The spellings `--token-scope` accepts.",
+      "oneOf": [
+        {
+          "description": "Every route, mutating included.",
+          "enum": [
+            "full"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Safe HTTP methods only; anything else is refused `403`.",
+          "enum": [
+            "read-only"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "TokenSettings": {
+      "description": "The configured Bearer token, described without disclosing it.",
+      "properties": {
+        "name": {
+          "description": "Always `default`. `rocky serve` holds exactly one token; the name exists so a future multi-token server does not have to change this shape.",
+          "type": "string"
+        },
+        "scope": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/TokenScopeLabel"
+            }
+          ],
+          "description": "What the token may do."
+        }
+      },
+      "required": [
+        "name",
+        "scope"
+      ],
+      "type": "object"
+    },
+    "WebhookSecretStatus": {
+      "description": "Whether `ROCKY_WEBHOOK_SECRET` can actually sign a webhook.\n\nNamed by operator consequence rather than by error kind — the question this answers is \"what happens if I turn the scheduler on?\".",
+      "oneOf": [
+        {
+          "description": "Set, non-blank, readable. Webhook requests must carry a signature.",
+          "enum": [
+            "present"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Not set. On a loopback bind the webhook accepts UNSIGNED requests; on a non-loopback bind the route answers `404`.",
+          "enum": [
+            "absent"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Set, but blank or not valid UTF-8. `--scheduler` will refuse to start — the startup gate rejects both.",
+          "enum": [
+            "set_but_unusable"
+          ],
+          "type": "string"
+        }
+      ]
+    }
+  },
+  "description": "The running server's posture, served by `GET /api/v1/settings`.\n\n**An allowlist, not a config dump.** Every field below is projected individually, by hand, in `crate::api::settings_output` — from a [`rocky_server::state::SettingsSnapshot`] of primitives plus two fieldless enum labels taken out of the config file, after which the config is dropped. No `RockyConfig` is serialised or `Debug`-printed anywhere on that path: `AdapterConfig`'s `Debug` prints its `.extra` map, which is unbounded caller-supplied TOML, so a config that merely *passed through* this type would be a disclosure surface.\n\nNo secret appears — not the Bearer token, not `ROCKY_WEBHOOK_SECRET`. The token is reported as its name and scope; the webhook secret as whether it is usable.\n\nTo be exact about what enforces that: the **projection function** does, not the type. Rust would happily let a future field carry a secret. What makes it hold is that the projection names every field explicitly, and three tests stand behind it — `settings_reports_exactly_the_allowlisted_fields` fails when a field is *added*, `settings_never_discloses_a_configured_secret` greps this document for three real configured secrets, and `no_safe_route_discloses_a_configured_secret` greps every safe route for the same three.\n\n**API-only, deliberately.** There is no `rocky settings` verb, because this document describes *a server that is running* and a one-shot CLI invocation would have to invent one. [`ScheduleStatusOutput`] is the established precedent for a route with no CLI oracle.\n\n**Freshness.** Everything except `state_backend` and `concurrency_control` is fixed when the process starts and cannot change while it runs.\n\nThose two come from `rocky.toml`, and are read **once, on the first request to this route**, then fixed for the life of the process. Deliberately not at startup: on a plain `rocky serve` nothing on the path to binding the listener reads a file, and an eager read would put one there — letting a `rocky.toml` that is a FIFO or sits on a stalled mount stop the server binding at all. (`--scheduler` without an explicit `--poll-interval` already reads the config before binding; that path is unchanged.)\n\nThat read is bounded by one permit and a deadline, so a stuck file cannot starve the server either: a caller that finds it busy gets `503 engine_busy`, and one whose read blows the deadline gets `504 settings_config_timeout`. Every other field is unaffected.\n\nSo they are a snapshot, not a live view, and the scheduler re-reads that same file every tick — a config edited after the first request to this route is not reflected here, while the scheduler acts on the new one.",
+  "properties": {
+    "allowed_hosts": {
+      "description": "Extra `Host` header values the UI guard accepts.\n\nThis is what is **enforced**, not what was typed: `--allowed-host` is only wired into a guard when `--ui` is on, so this is `[]` whenever `ui` is `false`. Reporting the raw flag list would claim a guard that is not running.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "allowed_origins": {
+      "description": "The CORS allowlist actually installed. Empty means same-origin only.\n\nLike `allowed_hosts`, this is what is **enforced**: `build_cors_layer` drops an `--allowed-origin` that is not a valid header value, and an origin it could not install grants nothing. Both this and the layer come from one derivation, so the report cannot drift from the layer.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "bind_host": {
+      "description": "The host the listener is bound to, verbatim (`127.0.0.1`, `0.0.0.0`, …).\n\nThe same `String` `ServeConfig` binds — `serve` lends one value to both, so this cannot name a host the server is not actually on.",
+      "type": "string"
+    },
+    "concurrency_control": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/ConcurrencyControl"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "`[state] concurrency_control`, read at the same moment as `state_backend`. `null` on the same condition."
+    },
+    "config_status": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/ConfigStatus"
+        }
+      ],
+      "description": "What happened when `rocky.toml` was read.\n\nCarried so a `null` backend is explainable: a project with no config and a project whose config is broken are different facts, and no other HTTP route distinguishes them today."
+    },
+    "scheduler": {
+      "description": "Whether a resident reconciler is running (`--scheduler`).",
+      "type": "boolean"
+    },
+    "state_backend": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/StateBackend"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "`[state] backend`, as read on the first request to this route. `null` when there was no readable config — `config_status` says which."
+    },
+    "token": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/TokenSettings"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "The configured Bearer token, as its name and scope — never its value.\n\n`null` means **no token is configured**, which the server permits only on a loopback bind (`api::serve` refuses to bind a non-loopback host with no auth). That is the most exposure-relevant answer this route gives, so it is a distinguishable `null` rather than a token named \"none\"."
+    },
+    "ui": {
+      "description": "Whether the embedded browser UI is served at `/ui/` (`--ui`).",
+      "type": "boolean"
+    },
+    "webhook_secret": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/WebhookSecretStatus"
+        }
+      ],
+      "description": "Whether `ROCKY_WEBHOOK_SECRET` can sign a webhook.\n\nReported even when `scheduler` is `false`, which is the point: it tells an operator what will happen when they turn the scheduler on."
+    }
+  },
+  "required": [
+    "allowed_hosts",
+    "allowed_origins",
+    "bind_host",
+    "config_status",
+    "scheduler",
+    "ui",
+    "webhook_secret"
+  ],
+  "title": "SettingsOutput",
+  "type": "object"
+}

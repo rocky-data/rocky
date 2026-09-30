@@ -70,6 +70,7 @@ _LAZY: dict[str, tuple[str, str]] = {
     "AiTestAssertion": ("ai_test_schema", "AiTestAssertion"),
     "AiTestModelResult": ("ai_test_schema", "AiTestModelResult"),
     "AiTestOutput": ("ai_test_schema", "AiTestOutput"),
+    "AnomalyEvaluationOutput": ("run_schema", "AnomalyEvaluationOutput"),
     "AnomalyOutput": ("run_schema", "AnomalyOutput"),
     "ApplyOutput": ("apply_schema", "ApplyOutput"),
     "ApprovalArtifact": ("branch_approve_schema", "ApprovalArtifact"),
@@ -344,6 +345,8 @@ _LAZY: dict[str, tuple[str, str]] = {
     "ScheduleSpoolOutput": ("schedule_spool_schema", "ScheduleSpoolOutput"),
     "ScheduleStatusOutput": ("schedule_status_schema", "ScheduleStatusOutput"),
     "ScheduleThrottleStatus": ("schedule_status_schema", "ScheduleThrottleStatus"),
+    "SettingsOutput": ("settings_schema", "SettingsOutput"),
+    "TokenSettings": ("settings_schema", "TokenSettings"),
     "SpoolCounts": ("schedule_spool_schema", "SpoolCounts"),
     "SpoolPendingEntry": ("schedule_spool_schema", "SpoolPendingEntry"),
     "SpoolSkippedEntry": ("schedule_spool_schema", "SpoolSkippedEntry"),
@@ -522,6 +525,7 @@ if TYPE_CHECKING:
         PlanOutput,
     )
     from .run_schema import (
+        AnomalyEvaluationOutput,
         AnomalyOutput,
         BudgetBreachOutput,
         ContainedModelOutput,
@@ -799,6 +803,10 @@ if TYPE_CHECKING:
         SpoolPendingEntry,
         SpoolSkippedEntry,
     )
+    from .settings_schema import (
+        SettingsOutput,
+        TokenSettings,
+    )
     from .schedule_status_schema import (
         ScheduleClaimStatus,
         ScheduleLockStatus,
@@ -935,6 +943,7 @@ __all__ = [
     "TableCheckOutput",
     "PermissionSummary",
     "ExecutionSummary",
+    "AnomalyEvaluationOutput",
     "AnomalyOutput",
     "TableErrorOutput",
     "MetricsSnapshot",
@@ -1115,6 +1124,8 @@ __all__ = [
     "ScheduleSpoolOutput",
     "ScheduleStatusOutput",
     "ScheduleThrottleStatus",
+    "SettingsOutput",
+    "TokenSettings",
     "SpoolCounts",
     "SpoolPendingEntry",
     "SpoolSkippedEntry",

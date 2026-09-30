@@ -42,6 +42,8 @@ Rocky runs the check inside each table's copy, whenever the target already exist
 Two cases bypass the check.
 
 - **The source has not changed and `prune_unchanged` is on.** This opt-in optimization skips the whole table when the source reports the same change-marker as the last successful copy. That skips the copy, the drift check, and the data checks. Rocky re-evaluates drift once the source changes again.
+
+  Three things have to line up, so a table you expect to be pruned may still be copied. The adapter has to offer a change-marker at all — one that cannot says so, and Rocky copies. `--no-prune` on the command line turns it off for that run. And an `incremental` table is never pruned until it has a recorded watermark, so its first run always copies.
 - **`DESCRIBE TABLE` fails.** Rocky swallows the error instead of failing the run. It treats an unreadable target as absent and rebuilds it with a full refresh. An unreadable source produces no drift result for that run, so the copy proceeds unchecked.
 
 ## Graduated Evolution
@@ -91,7 +93,7 @@ Examples: `STRING` to `INT`, `BIGINT` to `INT` (narrowing), `DATE` to `TIMESTAMP
 ## What Is NOT Drift
 
 - **New columns in the source.** Rocky adds them rather than treating them as drift. Before the copy it issues one `ALTER TABLE ADD COLUMN` per new column, each nullable, so historical rows keep `NULL`. The run reports an `add_columns` action.
-- **Columns removed from the source.** Rocky ignores extra columns in the target table.
+- **Columns removed from the source.** The drift check does not flag a target column the source no longer has. It does not schedule a DROP COLUMN for that column, and there is no opt-in for that today. A full refresh, covered above, can still discard it: it rebuilds the table from only the source's current columns.
 
 ## Output
 

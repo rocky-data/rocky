@@ -46,10 +46,26 @@
   "anomalies": [
     {
       "table": "poc.staging__events.events",
+      "asset_key": [
+        "duckdb",
+        "events",
+        "events"
+      ],
       "current_count": 5,
       "baseline_avg": 376.25,
       "deviation_pct": 98.67109634551495,
       "reason": "row count dropped 98.7% (expected ~376, got 5)"
+    }
+  ],
+  "anomaly_evaluated": [
+    {
+      "table": "poc.staging__events.events",
+      "asset_key": [
+        "duckdb",
+        "events",
+        "events"
+      ],
+      "evaluated": true
     }
   ],
   "execution": {

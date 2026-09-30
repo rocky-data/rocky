@@ -28,9 +28,17 @@ export function StatusCard({
   tone?: Tone;
   sub?: ReactNode;
 }) {
+  // `border-zinc-200`/`dark:border-zinc-700` used to set the CSS
+  // `border-color` shorthand, which applies to all four sides, including
+  // left -- and the built stylesheet compiles the `dark:` rule after every
+  // `TONE_CLASS` entry's `border-l-{colour}-500` rule, so every tone card
+  // showed the same grey left border in dark mode (#2123, same shape as
+  // #1859's `ModelNode` fix in #2110). The neutral border is now three
+  // directional utilities that never touch the left side, so only
+  // `TONE_CLASS` ever sets it.
   return (
     <div
-      className={`rounded-md border border-zinc-200 border-l-4 bg-white p-3 dark:border-zinc-700 dark:bg-zinc-900 ${TONE_CLASS[tone]}`}
+      className={`rounded-md border border-t-zinc-200 border-r-zinc-200 border-b-zinc-200 border-l-4 bg-white p-3 dark:border-t-zinc-700 dark:border-r-zinc-700 dark:border-b-zinc-700 dark:bg-zinc-900 ${TONE_CLASS[tone]}`}
     >
       <div className="text-[11px] uppercase tracking-wide text-zinc-500 dark:text-zinc-400">
         {label}

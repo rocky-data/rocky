@@ -82,7 +82,6 @@ table, append to it, merge into it, or something else. See
 | Materialized View | Yes | No | No | Yes |
 | Dynamic Table | **Yes** | No | No | No |
 | Time Interval | **Yes** | No | No | No |
-| Ephemeral (CTE) | Yes | No | No | No |
 | Microbatch | Yes | No | No | No |
 | Delete+Insert | Yes | No | No | No |
 

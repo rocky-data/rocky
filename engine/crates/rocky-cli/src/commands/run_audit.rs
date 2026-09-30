@@ -48,6 +48,12 @@ pub(crate) struct AuditContext {
     pub target_catalog: Option<String>,
     pub hostname: String,
     pub rocky_version: String,
+    /// The named Rocky branch this run wrote to (`rocky run --branch
+    /// <name>`), threaded in from [`rocky_core::shadow::ShadowConfig::branch`]
+    /// — not detected here, since the caller already resolved it from the
+    /// CLI flag. Distinct from `git_branch`: see
+    /// [`rocky_core::state::RunRecord::rocky_branch`] (#2032).
+    pub rocky_branch: Option<String>,
 }
 
 impl AuditContext {
@@ -64,7 +70,15 @@ impl AuditContext {
     ///   transformation/quality/snapshot/load pipelines it's the fully
     ///   resolved `target.catalog`. `None` on model-only runs where no
     ///   pipeline context exists.
-    pub fn detect(idempotency_key: Option<String>, target_catalog: Option<String>) -> Self {
+    /// * `rocky_branch` — the `--branch <name>` value in force for this run,
+    ///   or `None` for a production / plain-`--shadow` run. Not detected
+    ///   from the environment (unlike every other field here): the caller
+    ///   already resolved it while building the run's `ShadowConfig`.
+    pub fn detect(
+        idempotency_key: Option<String>,
+        target_catalog: Option<String>,
+        rocky_branch: Option<String>,
+    ) -> Self {
         Self {
             triggering_identity: detect_triggering_identity(),
             session_source: detect_session_source(),
@@ -74,6 +88,7 @@ impl AuditContext {
             target_catalog,
             hostname: detect_hostname(),
             rocky_version: ROCKY_VERSION.to_string(),
+            rocky_branch,
         }
     }
 }
@@ -189,21 +204,21 @@ fn detect_hostname() -> String {
 mod tests {
     use super::*;
 
-    // The env-var tests mutate process-global state. `cargo test` runs
-    // them in parallel by default, so we serialise via a crate-local
-    // mutex. Each test takes the lock before touching env vars.
-    use std::sync::Mutex;
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    // The env-var tests mutate process-global state, including
+    // DAGSTER_PIPES_CONTEXT, which `pipes::tests` and
+    // `commands::run_local::tests` also read/set. `cargo test` runs a
+    // crate's tests in parallel by default, so all three modules
+    // serialise through the ONE shared `crate::testing::PIPES_ENV_LOCK`
+    // rather than a per-file lock — see that lock's doc comment: a
+    // per-file lock here left this module racing against the other two,
+    // which a real run of `run_local`'s #2166 tests then hit.
+    use crate::testing::lock_pipes_env;
 
-    /// SAFETY: these tests run under `ENV_LOCK`, which serialises every
-    /// env-mutating test in this module. Rust flags `std::env::set_var`
-    /// as unsafe from 2024 edition because it races with reads in
-    /// other threads; the lock closes that hole for *our* tests, not
-    /// for unrelated code running under `cargo test`. That's
-    /// considered acceptable here because (a) the remaining engine
-    /// test suite doesn't read these particular env vars in parallel,
-    /// and (b) the cost of a bug here is a misattributed audit stamp
-    /// in a unit test — not a production correctness issue.
+    /// SAFETY: these tests run under `crate::testing::PIPES_ENV_LOCK`,
+    /// which serialises every Pipes-env-mutating test in the crate, not
+    /// just this module. Rust flags `std::env::set_var` as unsafe from
+    /// 2024 edition because it races with reads in other threads; the
+    /// lock closes that hole.
     fn set_env(key: &str, value: &str) {
         unsafe {
             std::env::set_var(key, value);
@@ -218,20 +233,20 @@ mod tests {
 
     #[test]
     fn rocky_version_is_compile_time_constant() {
-        let ctx = AuditContext::detect(None, None);
+        let ctx = AuditContext::detect(None, None, None);
         assert_eq!(ctx.rocky_version, env!("CARGO_PKG_VERSION"));
         assert!(!ctx.rocky_version.is_empty());
     }
 
     #[test]
     fn hostname_is_always_populated() {
-        let ctx = AuditContext::detect(None, None);
+        let ctx = AuditContext::detect(None, None, None);
         assert!(!ctx.hostname.is_empty());
     }
 
     #[test]
     fn session_source_defaults_to_cli() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = lock_pipes_env();
         remove_env(ENV_ROCKY_SESSION_SOURCE);
         remove_env(ENV_DAGSTER_PIPES_CONTEXT);
         assert_eq!(detect_session_source(), SessionSource::Cli);
@@ -239,7 +254,7 @@ mod tests {
 
     #[test]
     fn session_source_dagster_from_pipes_env() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = lock_pipes_env();
         remove_env(ENV_ROCKY_SESSION_SOURCE);
         set_env(ENV_DAGSTER_PIPES_CONTEXT, "{}");
         assert_eq!(detect_session_source(), SessionSource::Dagster);
@@ -248,7 +263,7 @@ mod tests {
 
     #[test]
     fn session_source_explicit_override() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = lock_pipes_env();
         remove_env(ENV_DAGSTER_PIPES_CONTEXT);
 
         set_env(ENV_ROCKY_SESSION_SOURCE, "http_api");
@@ -269,7 +284,7 @@ mod tests {
 
     #[test]
     fn session_source_explicit_overrides_pipes_env() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = lock_pipes_env();
         set_env(ENV_DAGSTER_PIPES_CONTEXT, "{}");
         set_env(ENV_ROCKY_SESSION_SOURCE, "cli");
         assert_eq!(
@@ -303,8 +318,21 @@ mod tests {
         let ctx = AuditContext::detect(
             Some("my-idemp-key-123".to_string()),
             Some("warehouse_main".to_string()),
+            None,
         );
         assert_eq!(ctx.idempotency_key, Some("my-idemp-key-123".to_string()));
         assert_eq!(ctx.target_catalog, Some("warehouse_main".to_string()));
+    }
+
+    /// `rocky_branch` is threaded straight through, unlike every other
+    /// field here — the caller resolves it (from `ShadowConfig::branch`),
+    /// not this detector (#2032).
+    #[test]
+    fn rocky_branch_threaded_through() {
+        let ctx = AuditContext::detect(None, None, Some("pr-preview-fix-price".to_string()));
+        assert_eq!(ctx.rocky_branch, Some("pr-preview-fix-price".to_string()));
+
+        let ctx = AuditContext::detect(None, None, None);
+        assert_eq!(ctx.rocky_branch, None);
     }
 }

@@ -70,5 +70,5 @@ Rocky lowered the DSL filter (filter_dsl) to:
 
 ## Related
 
-- DSL spec: `rocky/crates/rocky-lang/src/lower.rs` (search for `IS DISTINCT FROM`)
-- Documented in `rocky/docs/.../guides/playground.md`
+- DSL lowering: `engine/crates/rocky-lang/src/lower.rs` (search for `IS DISTINCT FROM`)
+- Documented in `docs/src/content/docs/concepts/rocky-dsl.md` (the "NULL-safe operators" section)

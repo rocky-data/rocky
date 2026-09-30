@@ -89,14 +89,6 @@
         "schema": "demo",
         "table": "broken_metrics"
       },
-      "incrementality_hint": {
-        "is_candidate": true,
-        "recommended_column": "order_id",
-        "confidence": "medium",
-        "signals": [
-          "column name 'order_id' matches auto-increment ID pattern"
-        ]
-      },
       "cost_hint": {
         "estimated_rows": 8000,
         "estimated_bytes": 2048000,
@@ -114,14 +106,6 @@
         "schema": "demo",
         "table": "good_metrics"
       },
-      "incrementality_hint": {
-        "is_candidate": true,
-        "recommended_column": "order_id",
-        "confidence": "medium",
-        "signals": [
-          "column name 'order_id' matches auto-increment ID pattern"
-        ]
-      },
       "cost_hint": {
         "estimated_rows": 8000,
         "estimated_bytes": 2048000,
@@ -138,14 +122,6 @@
         "catalog": "poc",
         "schema": "staging",
         "table": "raw_orders"
-      },
-      "incrementality_hint": {
-        "is_candidate": true,
-        "recommended_column": "order_id",
-        "confidence": "medium",
-        "signals": [
-          "column name 'order_id' matches auto-increment ID pattern"
-        ]
       },
       "cost_hint": {
         "estimated_rows": 10000,

@@ -126,8 +126,6 @@ it. That is the property to **preserve**, and it means the finding to look for i
   surface is the **`reference_map` seeding**: a mis-seeded or retained entry from an edited file makes the
   incremental run diverge from a from-scratch run. Invariant to hold: incremental output == from-scratch
   output for the same final state.
-  *(Note: `incrementality.rs` is unrelated — it is inferred-incrementality **detection** that recommends a
-  materialization strategy + watermark column. It is not a compilation-caching surface.)*
 
 ### Executor (`rocky-core/src/{dag_executor.rs, unified_dag.rs, state.rs}`, `rocky-cli/src/commands/{run.rs, run_content_addressed.rs}`)
 - Execution respects the dependency DAG **topologically**; no node runs before its inputs
@@ -147,6 +145,14 @@ it. That is the property to **preserve**, and it means the finding to look for i
   commits via an **atomic S3 conditional PUT (`If-None-Match: *`, retry on 412)**. This is a real
   write-atomicity boundary — review any change to the commit / conditional-put ordering or version
   sequencing for duplicate or dropped commits.
+
+### Plan store trust boundary (`rocky-cli/src/plan_store.rs`, promote apply in `commands/branch.rs`)
+- **`.rocky/plans/` is a trusted input, ruled 2026-09-17 (#1943).** The `plan_id` blake3 digest and the
+  `AiAuthored` review marker are unkeyed and attacker-recomputable by anyone who can already write the
+  directory — that is documented, not a defect. Do not flag: a `Promote` plan's `statement` not being
+  re-derived from its recorded `target`/`source` names, or the marker not authenticating an approver.
+  Do flag: the digest failing to catch accidental corruption or a stale plan, which is what it is
+  actually for.
 
 ## Rust correctness hazards (compiler-grade bar)
 - **No `unwrap()`/`expect()`/`panic!` on any path reachable from user input.** A compiler *rejects* bad

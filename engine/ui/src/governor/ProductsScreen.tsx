@@ -9,7 +9,7 @@ import { formatInstant } from "../format";
 import { navigateTo, pathForLane } from "../router";
 import { ResourceState } from "../review/ResourceState";
 import { reviewPath } from "../review/paths";
-import { CustodyLink } from "./links";
+import { AuditProductLink } from "./links";
 
 export interface ProductLoaders {
   list: () => Promise<ProductListOutput>;
@@ -339,7 +339,8 @@ export function ProductTimeline({
       <div className="flex flex-wrap items-baseline justify-between gap-2">
         <h2 className="font-mono text-sm font-semibold text-zinc-900 dark:text-zinc-100">{name}</h2>
         <span className="text-xs text-zinc-600 dark:text-zinc-300">
-          every decision about it: <CustodyLink subject={`product:${name}`} />
+          decisions about its output model:{" "}
+          <AuditProductLink product={name} label="the ledger, scoped to this product" />
         </span>
       </div>
 

@@ -67,7 +67,7 @@ and a nullability flag, plus two rules:
 - `protected` lists `user_id`. It must also appear in the output, so dropping
   it from the model is a violation.
 
-The compiler runs four checks and raises a different code for each:
+The compiler raises a different error code for each contract check:
 
 | Check | Code | Raised when |
 |---|---|---|
@@ -75,15 +75,25 @@ The compiler runs four checks and raises a different code for each:
 | `protected` column present | `E013` | a `protected` column is missing from the model output |
 | declared `type` matches | `E011` | the inferred type differs from the declared one |
 | declared `nullable` matches | `E012` | the column is nullable and the contract declares `nullable = false` |
+| no new nullable column | `E014` | `[rules] no_new_nullable = true` and the model outputs a nullable column the contract does not declare |
 
-The type check has one gap. When Rocky cannot infer a column's type, it skips
-that column rather than report a mismatch. So `E011` means the two types
-disagree, never that Rocky could not tell.
+`E014` is opt-in. This contract does not set `no_new_nullable`, so it never
+fires here.
+
+The type check does not guess. When Rocky cannot infer a column's type, it
+does not compare types. It reports `I003` instead, at info severity, and the
+compile does not fail on it. So `E011` means the two types disagree, never that
+Rocky could not tell.
 
 A declared column that the model does not output is a warning, not an error,
 unless `required` lists it. The code is `W010` and the message is
 `contract column '<name>' not found in model output`. This contract declares
-nine columns and the model outputs all nine, so no `W010` appears here.
+nine columns, and all nine are in the model output, so no `W010` appears here.
+
+The plain `rocky compile` line above reports 12 columns for
+`fct_user_activity`, not nine. The
+`keep` block in the join outputs `full_name`, `email`, and `country`, and the
+`group` block outputs them again, so each name appears twice.
 
 A contract is loaded only when a command receives `--contracts <dir>`. The
 commands that accept the flag are `compile`, `test`, `ci`, `dag`, `publish-ir`,
@@ -98,19 +108,28 @@ rocky compile --contracts contracts/
 
 The contract marks four columns `nullable = false`. The compiler infers all
 four as nullable in `fct_user_activity`. The compile therefore reports `E012`
-four times and exits `1`:
+four times and exits `1`.
+
+The example ships no source schemas, so Rocky cannot infer any of the nine
+declared types. It also reports `I003` once per declared column, nine times in
+all. Those lines are info, not errors:
 
 ```
   ✓ raw_events (9 columns)
   ✓ stg_events (10 columns)
   ✓ stg_users (6 columns)
   ✗ fct_user_activity
+  x info[I003]: column 'user_id' declares type Int64 in the contract, but Rocky could not work out the column's type, so it did not check the declared type
+  help: give `rocky compile` source schemas so `user_id`'s type resolves — ...
+
   x error[E012]: column 'user_id' must be non-nullable per contract, but is nullable
   help: filter out NULLs (e.g. `WHERE user_id IS NOT NULL`) or COALESCE `user_id` to a default, or relax `nullable = true` in the contract
 
-  (the same error repeats for total_events, first_event_date, last_event_date)
+  (I003 repeats for the other eight declared columns; E012 repeats for
+   total_events, first_event_date, last_event_date)
 
   Compiled: 4 models, 4 errors, 0 warnings
+Error: compilation failed with errors
 ```
 
 That is the gate doing its job. Follow either branch of the `help` line to

@@ -1,0 +1,67 @@
+{{- include "rocky.guards" . }}
+{{- if eq .Values.scheduling.mode "cron" }}
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "rocky.fullname" . }}-tick
+  labels:
+    {{- include "rocky.labels" . | nindent 4 }}
+spec:
+  schedule: {{ .Values.scheduling.cron.schedule | quote }}
+  # Forbid. A tick that starts while the last one runs is a second scheduler,
+  # and the flock on .rocky/tick.lock is contention avoidance, not the
+  # correctness boundary.
+  concurrencyPolicy: {{ .Values.scheduling.cron.concurrencyPolicy }}
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      # One pod per fire. A retry that overlaps the next fire is the same
+      # second scheduler by another route.
+      backoffLimit: 0
+      template:
+        metadata:
+          labels:
+            {{- include "rocky.selectorLabels" . | nindent 12 }}
+            app.kubernetes.io/component: tick
+        spec:
+          restartPolicy: Never
+          {{- with .Values.imagePullSecrets }}
+          imagePullSecrets:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            runAsGroup: 65532
+            fsGroup: 65532
+          containers:
+            - name: tick
+              image: {{ include "rocky.image" . }}
+              imagePullPolicy: {{ .Values.image.pullPolicy }}
+              args: ["tick"]
+              env:
+                {{- if .Values.existingSecret.webhookSecretKey }}
+                - name: ROCKY_WEBHOOK_SECRET
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ .Values.existingSecret.name }}
+                      key: {{ .Values.existingSecret.webhookSecretKey }}
+                {{- end }}
+                {{- with .Values.extraEnv }}
+                {{- toYaml . | nindent 16 }}
+                {{- end }}
+              {{- with .Values.resources }}
+              resources:
+                {{- toYaml . | nindent 16 }}
+              {{- end }}
+              volumeMounts:
+                # The SAME claim the Deployment mounts. A tick reads and writes
+                # the state store, the cursors, the claims and the spool.
+                - name: data
+                  mountPath: /data
+          volumes:
+            - name: data
+              persistentVolumeClaim:
+                claimName: {{ include "rocky.claimName" . }}
+{{- end }}

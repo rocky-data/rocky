@@ -7,13 +7,26 @@ from pydantic import BaseModel, conint
 
 
 class TableCompareResult(BaseModel):
-    production_count: conint(ge=0)
+    production_count: conint(ge=0) | None = None
+    """
+    Null when the warehouse count could not be read.
+    """
     production_table: str
-    row_count_diff_pct: float
+    reasons: list[str]
+    """
+    Read errors for an `error` row, or threshold reasons for `warn`/`fail`. Empty for `pass`.
+    """
+    row_count_diff_pct: float | None = None
+    """
+    Null unless both counts were read.
+    """
     row_count_match: bool
     schema_diffs: list[str]
     schema_match: bool
-    shadow_count: conint(ge=0)
+    shadow_count: conint(ge=0) | None = None
+    """
+    Null when the warehouse count could not be read.
+    """
     shadow_table: str
     verdict: str
 

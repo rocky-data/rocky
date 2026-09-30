@@ -32,6 +32,12 @@ irm https://raw.githubusercontent.com/rocky-data/rocky/main/engine/install.ps1 |
 </TabItem>
 </Tabs>
 
+## Published releases and source builds
+
+The installer downloads a published engine release. Merged changes on `main` can arrive before the next release.
+Check `rocky --version` and the [release notes](https://github.com/rocky-data/rocky/releases) before relying on a new capability.
+For a source build, also record `git rev-parse HEAD`. Different source revisions can print the same version before a release bump.
+
 ## Options
 
 The install script takes these settings, both optional.
@@ -90,4 +96,7 @@ Confirm the binary is on your `PATH` and prints a version:
 rocky --version
 ```
 
-That is the install done. Next, run the [Quickstart](/getting-started/quickstart/). No warehouse handy? The [Playground](/guides/playground/) runs the same flow on a local DuckDB file, with no credentials needed.
+Next, use the [Playground](/guides/playground/) for a local DuckDB transformation workflow without warehouse credentials.
+The [Quickstart](/getting-started/quickstart/) configures a separate replication workflow with external services.
+
+[Share your first-run experience](https://github.com/rocky-data/rocky/issues/new?template=first_run_feedback.yml) if you complete the workflow or stop along the way.

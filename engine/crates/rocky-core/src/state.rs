@@ -57,6 +57,10 @@ const RUN_PROGRESS_ENTRIES: TableDefinition<&str, &[u8]> =
 const PARTITIONS: TableDefinition<&str, &[u8]> = TableDefinition::new("partitions");
 /// Grace-period tracking for columns dropped from the source.
 ///
+/// This describes the designed lifecycle, not current behavior: left
+/// unwired by decision (rocky-data/rocky#1616, 2026-09-17), so nothing
+/// writes a record here today.
+///
 /// Key format: `"{table_key}|{column_name}"` (e.g.
 /// `"acme_warehouse.staging.orders|old_col"`). Value: serialized
 /// `GracePeriodRecord`. When a column reappears in the source the record
@@ -896,6 +900,30 @@ pub enum StateError {
         path: String,
     },
 
+    /// A read-only open found a store that holds something but lacks tables
+    /// this binary reads.
+    ///
+    /// A read transaction cannot create a table, and a read-only open never
+    /// escalates to a write to create one in a store that holds anything
+    /// (#1545, C1-P1b). Only a store written by a Rocky older than schema
+    /// v22 — the last table addition — can be in this state; an empty
+    /// database is bootstrapped instead, and a remote restore keeps every
+    /// table. Any read-write open (a `rocky run`, `rocky load`, `rocky apply`)
+    /// creates the tables and stamps the version; reads work from then on.
+    #[error(
+        "state store at {path} lacks tables this binary reads ({}); it is stamped {}. \
+         A read-only open never creates tables. Open it read-write once — any `rocky run` — \
+         to migrate it to v{expected}.",
+        .missing.join(", "),
+        .found.map_or_else(|| "unversioned".to_string(), |v| format!("v{v}"))
+    )]
+    ReadOnlyNeedsInit {
+        path: String,
+        found: Option<u32>,
+        expected: u32,
+        missing: Vec<String>,
+    },
+
     #[error("state schema version is corrupt: expected an integer, found {0:?}")]
     VersionParse(String),
 
@@ -1116,18 +1144,21 @@ enum InitOutcome {
 /// `schema_version` metadata.
 ///
 /// A [`ReadOnly`][OpenMode::ReadOnly] open (inspection commands, the LSP, server
-/// read APIs) must be side-effect-free with respect to the version stamp: it
-/// still materializes the tables the read methods require, but it must NOT bump
-/// a store written by an older binary forward to [`CURRENT_SCHEMA_VERSION`].
-/// Stamping on a read would let a `rocky state show` silently rewrite the very
-/// version it is reporting, and would defeat forward/backward-compat probes that
-/// depend on the on-disk version staying put until a real write occurs.
+/// read APIs) takes no write transaction against a store that holds anything:
+/// it never stamps, never upgrades, never creates a table, and refuses a store
+/// that lacks one ([`StateStore::init_db_read_only`]). It must NOT bump a store
+/// written by an older binary forward to [`CURRENT_SCHEMA_VERSION`]: stamping
+/// on a read would let a `rocky state show` silently rewrite the very version
+/// it is reporting, and would defeat forward/backward-compat probes that depend
+/// on the on-disk version staying put until a real write occurs. The one write
+/// it still performs is bootstrapping an EMPTY database (#1980).
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum OpenMode {
     /// Read-write open: take the advisory lock and stamp/upgrade the version.
     ReadWrite,
-    /// Read-only open: no advisory lock, and never stamp/upgrade the version
-    /// (tables are still created so read methods work).
+    /// Read-only open: no advisory lock, never a write transaction — no stamp,
+    /// no upgrade, no table creation. A store missing a table is refused with
+    /// [`StateError::ReadOnlyNeedsInit`].
     ReadOnly,
 }
 
@@ -1187,6 +1218,15 @@ impl StateStore {
     /// APIs) — they don't need exclusivity and the retry hides the
     /// millisecond-scale collisions the LSP creates on every debounced
     /// keystroke.
+    ///
+    /// **Never writes to a store that holds anything.** No version stamp, no
+    /// upgrade, no table creation, whatever the store's stamp says. A store
+    /// that lacks a table this binary reads is refused with
+    /// [`StateError::ReadOnlyNeedsInit`], which names the tables; the next
+    /// read-write open creates them. A store stamped at an older version but
+    /// carrying every table opens normally and keeps its stamp. The one write
+    /// left is bootstrapping an EMPTY database — a path with no state file is
+    /// created and given its tables, unstamped, as before (#1980).
     pub fn open_read_only(path: &Path) -> Result<Self, StateError> {
         Self::open_inner(path, OpenMode::ReadOnly, SchemaMismatchPolicy::Fail, None)
     }
@@ -1420,64 +1460,136 @@ impl StateStore {
     /// [`StateError::SchemaMismatch`]. Otherwise creates the tables, commits,
     /// and returns [`InitOutcome::Ready`].
     ///
-    /// The `schema_version` stamp/upgrade is written **only** under
-    /// [`OpenMode::ReadWrite`]. A [`OpenMode::ReadOnly`] open still creates the
-    /// tables (read methods require them) but leaves the on-disk version
-    /// untouched — it never bumps an older store forward and never downgrades.
-    /// The forward-incompatible check (`found > CURRENT`) runs in **both** modes,
+    /// The `schema_version` stamp/upgrade and the table creation are written
+    /// **only** under [`OpenMode::ReadWrite`]. A [`OpenMode::ReadOnly`] open
+    /// never writes: it leaves the on-disk version untouched — it never bumps
+    /// an older store forward and never downgrades — and it refuses a store
+    /// that lacks a table rather than creating it
+    /// ([`init_db_read_only`][Self::init_db_read_only]). The
+    /// forward-incompatible check (`found > CURRENT`) runs in **both** modes,
     /// so a read-only open of a newer store still fails with
     /// [`StateError::SchemaMismatch`] rather than silently misreading it.
-    /// Satisfy a read-only open without a write transaction, when possible.
+    /// Every table this binary reads or writes, by name — the same set
+    /// [`init_db`][Self::init_db] creates eagerly on a read-write open, and
+    /// the set the `on_disk_state_schema_format_is_pinned` golden pins.
     ///
-    /// `Ok(None)` means "escalate": the caller falls through to the write path,
-    /// which is the pre-#1545 behaviour. Only a store stamped at exactly
-    /// [`CURRENT_SCHEMA_VERSION`] takes the fast path — see the note at the
-    /// call site for why that version equality is what makes it safe.
-    ///
-    /// A forward-incompatible stamp is still classified here rather than
-    /// deferred, so `SchemaMismatchPolicy` behaves identically on both paths.
-    fn init_db_read_only(
-        db: &Database,
-        path: &Path,
-        policy: SchemaMismatchPolicy,
-    ) -> Result<Option<InitOutcome>, StateError> {
-        let txn = db.begin_read()?;
-        // A brand-new database has no METADATA table yet. That is an
-        // initialization case, not an error — escalate.
-        let Ok(metadata) = txn.open_table(METADATA) else {
-            return Ok(None);
-        };
-        let Some(version_str) = metadata
-            .get("schema_version")?
-            .map(|g| g.value().to_string())
-        else {
-            // Unstamped (fresh or pre-versioning): the write path handles it.
-            return Ok(None);
-        };
-        let found = version_str
-            .parse::<u32>()
-            .map_err(|_| StateError::VersionParse(version_str.clone()))?;
+    /// The read-only open path checks a store against this list directly,
+    /// rather than inferring the table set from the version stamp: the stamp
+    /// says which binary wrote the store last, the list says what is on disk.
+    pub fn table_names() -> Vec<&'static str> {
+        vec![
+            METADATA.name(),
+            WATERMARKS.name(),
+            SOURCE_MARKERS.name(),
+            CHECK_HISTORY.name(),
+            RUN_HISTORY.name(),
+            QUALITY_HISTORY.name(),
+            DAG_SNAPSHOTS.name(),
+            RUN_PROGRESS.name(),
+            RUN_PROGRESS_ENTRIES.name(),
+            PARTITIONS.name(),
+            GRACE_PERIODS.name(),
+            LOADED_FILES.name(),
+            BRANCHES.name(),
+            SCHEMA_CACHE.name(),
+            IDEMPOTENCY_KEYS.name(),
+            OUTPUT_ARTIFACTS.name(),
+            INPUT_INDEX.name(),
+            INPUT_PROVENANCE.name(),
+            DISCOVER_SNAPSHOTS.name(),
+            POLICY_DECISIONS.name(),
+            JOBS.name(),
+            TOMBSTONES.name(),
+            SCHEDULE_STATE.name(),
+            SCHEDULE_CLAIMS.name(),
+            FULFILL_STATE.name(),
+            PRODUCT_APPROVALS.name(),
+        ]
+    }
 
-        if found > CURRENT_SCHEMA_VERSION {
-            return match policy {
-                SchemaMismatchPolicy::Fail => Err(StateError::SchemaMismatch {
-                    found,
-                    expected: CURRENT_SCHEMA_VERSION,
-                    path: path.display().to_string(),
-                }),
-                SchemaMismatchPolicy::Recreate => {
-                    Ok(Some(InitOutcome::RecreateForwardIncompat { found }))
-                }
-            };
+    /// Satisfy a read-only open of an existing store with a read transaction
+    /// only. Never writes to a store that holds anything.
+    ///
+    /// A read method opens its table inside a read transaction, which cannot
+    /// create it, so the store must already carry every table in
+    /// [`table_names`][Self::table_names]. That is checked here directly with
+    /// `list_tables()` instead of being inferred from the version stamp: a
+    /// store stamped at an older version still carries every table when no
+    /// table was added since (the last one was at v22), and a store the stamp
+    /// says nothing about — unversioned — is judged by what is on disk.
+    ///
+    /// Before this, any stamp other than exactly [`CURRENT_SCHEMA_VERSION`]
+    /// fell through to the write path, which took a redb WRITE transaction
+    /// from a read-only open: after every schema bump, every `GET` on
+    /// `rocky serve` wrote to the store it was reporting on until a
+    /// read-write open re-stamped it (C1-P1b).
+    ///
+    /// `Ok(None)` means the database is EMPTY — no table at all. That is a
+    /// file this very open has just created ([`open_redb_with_retry`] uses
+    /// `Database::create`, so a read-only open of a path with no state file
+    /// lands here) or one nothing has initialised, and the caller bootstraps
+    /// it through the write path exactly as before: `rocky doctor`,
+    /// `rocky history` and `GET /api/v1/runs` on a never-run project answer
+    /// "nothing yet", not an error. That is the one write a read-only open
+    /// still performs, on a store that holds nothing; #1980 tracks replacing
+    /// it with a typed absence so a read never creates the file either.
+    ///
+    /// A store that holds something but lacks a table is refused with
+    /// [`StateError::ReadOnlyNeedsInit`] naming the missing tables; the next
+    /// read-write open creates them. Only a store written by a Rocky older
+    /// than schema v22 can be in that state: a remote restore keeps every
+    /// table (it empties the local-only ones, it does not drop them —
+    /// `state_sync::clear_named_tables`). A forward-incompatible stamp is
+    /// always [`StateError::SchemaMismatch`] here: no read-only caller
+    /// threads [`SchemaMismatchPolicy::Recreate`], and recreating from a read
+    /// would delete a user's store.
+    fn init_db_read_only(db: &Database, path: &Path) -> Result<Option<InitOutcome>, StateError> {
+        let txn = db.begin_read()?;
+        let present: std::collections::HashSet<String> = txn
+            .list_tables()?
+            .map(|handle| handle.name().to_string())
+            .collect();
+        if present.is_empty() {
+            return Ok(None);
         }
 
-        if found == CURRENT_SCHEMA_VERSION {
+        let found = match txn.open_table(METADATA) {
+            Ok(metadata) => metadata
+                .get("schema_version")?
+                .map(|g| g.value().to_string()),
+            // Tables exist but no METADATA: a store no Rocky wrote. The table
+            // check below names `metadata` among the missing.
+            Err(redb::TableError::TableDoesNotExist(_)) => None,
+            Err(e) => return Err(StateError::Table(e)),
+        };
+        let found = found
+            .map(|s| s.parse::<u32>().map_err(|_| StateError::VersionParse(s)))
+            .transpose()?;
+
+        if let Some(found) = found
+            && found > CURRENT_SCHEMA_VERSION
+        {
+            return Err(StateError::SchemaMismatch {
+                found,
+                expected: CURRENT_SCHEMA_VERSION,
+                path: path.display().to_string(),
+            });
+        }
+
+        let missing: Vec<String> = Self::table_names()
+            .into_iter()
+            .filter(|name| !present.contains(*name))
+            .map(str::to_string)
+            .collect();
+        if missing.is_empty() {
             Ok(Some(InitOutcome::Ready))
         } else {
-            // Older stamp: a newer binary may have added tables this store does
-            // not carry. Escalate so the write path materializes them, exactly
-            // as it did before.
-            Ok(None)
+            Err(StateError::ReadOnlyNeedsInit {
+                path: path.display().to_string(),
+                found,
+                expected: CURRENT_SCHEMA_VERSION,
+                missing,
+            })
         }
     }
 
@@ -1492,18 +1604,13 @@ impl StateStore {
         // `GET` on `rocky serve` serialized against the scheduler and against
         // real `run` / `apply` writers on the same state file — a dashboard
         // polling `/api/v1/runs` contended with the work it was reporting on
-        // (#1545).
-        //
-        // The fast path is deliberately narrow: it applies only when the stamp
-        // reads EXACTLY the current version. The stamp and the eager table
-        // creation below happen in one transaction, so a store stamped at this
-        // version was initialized by a binary with exactly this table set —
-        // every table a read method can touch already exists. Any other state
-        // (unstamped, older, or unreadable) falls through to the write path and
-        // behaves exactly as before, including materializing tables a newer
-        // binary added.
+        // (#1545). The read-only path answers from a read transaction alone
+        // for any store that holds something, and refuses rather than escalate
+        // here when a table is missing. The one case it hands down is an EMPTY
+        // database — the file this open has just created, or one nothing has
+        // initialised — which is bootstrapped below exactly as before (#1980).
         if matches!(mode, OpenMode::ReadOnly)
-            && let Some(outcome) = Self::init_db_read_only(db, path, policy)?
+            && let Some(outcome) = Self::init_db_read_only(db, path)?
         {
             return Ok(outcome);
         }
@@ -1547,10 +1654,10 @@ impl StateStore {
                     }
                 }
                 None => {
-                    // Fresh database or pre-versioning database — stamp the
-                    // version, but only on a read-write open. A read-only open
-                    // leaves an unversioned store unstamped (tables are still
-                    // created below so read methods work).
+                    // Fresh database — including an EMPTY one a read-only open
+                    // is bootstrapping, see `init_db_read_only` — or a
+                    // pre-versioning database: stamp the version, but only on
+                    // a read-write open. A read-only open never stamps.
                     if matches!(mode, OpenMode::ReadWrite) {
                         metadata.insert("schema_version", &*CURRENT_SCHEMA_VERSION.to_string())?;
                     }
@@ -2561,6 +2668,26 @@ pub struct RunRecord {
     /// `test_v25_run_record_forward_deserializes_verify_after_failed_false`.
     #[serde(default)]
     pub verify_after_failed: bool,
+
+    /// The named Rocky branch this run wrote to, when it ran with
+    /// `rocky run --branch <name>` (#2032). This is the literal `--branch`
+    /// value ([`crate::shadow::ShadowConfig::branch`]) — **not**
+    /// [`Self::git_branch`], which records `git symbolic-ref --short HEAD`
+    /// (the checkout's git branch) and is unrelated when `--branch` names a
+    /// PR-preview branch that differs from the checked-out git branch, e.g.
+    /// a PR's `fix-price` git branch running against the `pr-preview-fix-price`
+    /// Rocky branch. `None` for a production run, a `--shadow` /
+    /// `--shadow-schema` run, or a record written before this field existed.
+    ///
+    /// `rocky preview diff` / `rocky preview cost` select the branch-side run
+    /// by matching this field, not `git_branch`, so a run and its preview
+    /// pair correctly regardless of which git branch produced it.
+    ///
+    /// Serde-defaulted so records written before this field existed
+    /// forward-deserialize to `None` — no `CURRENT_SCHEMA_VERSION` bump.
+    /// Guarded by `test_pre_rocky_branch_run_record_forward_deserializes_to_none`.
+    #[serde(default)]
+    pub rocky_branch: Option<String>,
 }
 
 /// One executed data-quality check's pass/fail outcome, captured on a
@@ -3337,13 +3464,10 @@ impl StateStore {
     /// the cap. A `started_at` bound is safe because it agrees with the
     /// ordering; nothing else is.
     ///
-    /// Two callers already do this and are wrong for it, both pre-existing:
-    /// `preview` scans the newest 50 for a run matching `git_branch`, so a
-    /// branch whose newest run is rank 51 reports as having none; and
-    /// [`Self::get_model_history`] filters `list_runs(100)` by model name, so
-    /// a model absent from the last 100 runs looks like it has no history.
-    /// Both need the predicate pushed into the scan rather than applied to
-    /// its result; tracked separately from the cost fix in #1304.
+    /// [`Self::get_model_history`] does this and is wrong for it, pre-existing:
+    /// it filters `list_runs(100)` by model name, so a model absent from the
+    /// last 100 runs looks like it has no history. It needs the predicate
+    /// pushed into the scan rather than applied to its result.
     pub fn list_runs(&self, limit: usize) -> Result<Vec<RunRecord>, StateError> {
         // Deliberately NOT `list_runs_matching(limit, |_| true)`. That variant
         // takes a predicate over a whole `RunRecord`, so it must decode a row
@@ -5086,6 +5210,12 @@ impl StateStore {
 // ---------------------------------------------------------------------------
 // Grace-period column drop tracking
 // ---------------------------------------------------------------------------
+//
+// Built but unwired by decision (2026-09-17, rocky-data/rocky#1616): no
+// production code path detects a source-side column removal, so no record
+// is ever written here. The table is still created eagerly and is listed
+// in SNAPSHOT_TABLE_REGISTRY, so removing it would be a state-shape change.
+// Do not wire this path without revisiting that decision.
 
 /// Record for a column that exists in the target but has been dropped from
 /// the source. Stored in the `GRACE_PERIODS` redb table.
@@ -6378,6 +6508,96 @@ pub struct PolicyDecisionRecord {
     pub auto_apply: Option<AutoApplyCustody>,
 }
 
+/// What kind of event a [`PolicyDecisionRecord`] row records.
+///
+/// The `policy_decisions` table is documented as one row per policy
+/// *evaluation*, and [`StateStore::record_policy_decision`] says so. It is not:
+/// the table has accumulated several event kinds, each distinguished a
+/// different way, and a reader that switches on `effect` alone treats them all
+/// as evaluations.
+///
+/// ```text
+///   Evaluation           the default — a gate decided something about a plan
+///   VerifyAfterCustody   `verify_after` non-empty; `effect` is the
+///                        VERIFICATION verdict, not a policy verdict
+///   Freeze / Unfreeze    `plan_id` prefixed "freeze:" / "unfreeze:";
+///                        `effect` is Deny / Allow as an administrative act
+/// ```
+///
+/// # Why this is derived rather than stored
+///
+/// A persisted tag would be stronger: an unclassified row would be
+/// unrepresentable rather than merely unusual. It is not worth its price here.
+/// Adding a field to this record means a schema-version bump, and a bump shifts
+/// the remote state key segment, after which the download path finds no object
+/// and empties every replicated table — including this one (#1955). Fixing how
+/// the ledger is *counted* is not worth making the ledger unreachable on every
+/// remote deployment.
+///
+/// So the kind is computed from evidence the row already carries. That is
+/// weaker in one specific way, stated plainly: a future event kind that this
+/// function does not know about is classified `Evaluation` and counted as one.
+/// The mitigation is that there is now exactly ONE place to teach, instead of
+/// the three separate ad-hoc predicates that let this reach three kinds
+/// unnoticed. When a schema bump happens for some other reason, or #1955 is
+/// resolved, this should become a stored tag.
+// Not serialized, by construction: this is derived from the row on read and
+// never written, which is the whole point (#1955). No serde, no schema, no
+// binding to regenerate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecisionKind {
+    /// A policy gate evaluated a plan. The only kind whose `effect` is a
+    /// policy verdict, and so the only kind the acceptance/denial rates may
+    /// count.
+    Evaluation,
+    /// A post-apply verification custody row. `effect` records whether the
+    /// named checks passed, which is not a statement about policy.
+    VerifyAfterCustody,
+    /// An operator froze a scope. `effect` is `Deny` as an administrative act,
+    /// not because a plan was denied.
+    Freeze,
+    /// An operator lifted a freeze. `effect` is `Allow` for the mirror reason.
+    Unfreeze,
+}
+
+impl PolicyDecisionRecord {
+    /// What kind of event this row records — see [`DecisionKind`].
+    ///
+    /// Order matters. The freeze prefixes are checked first because a freeze
+    /// row carries no `verify_after` and would otherwise fall through to
+    /// `Evaluation`, which is exactly the misclassification that let
+    /// `rocky policy freeze` raise the reported denial rate.
+    ///
+    /// `auto_apply` is deliberately NOT a discriminator. It is an orthogonal
+    /// payload: the initial governed auto-apply row is a genuine evaluation
+    /// that happens to carry custody detail, and its later verification row
+    /// carries both `auto_apply` and a non-empty `verify_after`. Treating the
+    /// payload as a kind would take real evaluations out of the rates.
+    #[must_use]
+    pub fn kind(&self) -> DecisionKind {
+        if self.plan_id.starts_with(crate::policy::FREEZE_PLAN_PREFIX) {
+            return DecisionKind::Freeze;
+        }
+        if self
+            .plan_id
+            .starts_with(crate::policy::UNFREEZE_PLAN_PREFIX)
+        {
+            return DecisionKind::Unfreeze;
+        }
+        if !self.verify_after.is_empty() {
+            return DecisionKind::VerifyAfterCustody;
+        }
+        DecisionKind::Evaluation
+    }
+
+    /// Whether this row is a policy evaluation, and so may count toward the
+    /// acceptance, review and denial rates.
+    #[must_use]
+    pub fn is_evaluation(&self) -> bool {
+        self.kind() == DecisionKind::Evaluation
+    }
+}
+
 impl PolicyDecisionRecord {
     /// Every key this decision can be looked up or matched by: the
     /// [`Self::models`] set, then [`Self::model`].
@@ -7099,6 +7319,156 @@ mod tests {
         );
     }
 
+    /// A store that lacks a table this binary reads is REFUSED by a read-only
+    /// open, by name, without a write — never silently initialised from a
+    /// `GET`. The read-write open that follows creates the table and stamps
+    /// the version, and the read-only open then succeeds.
+    ///
+    /// Mutation, both directions: drop the `list_tables` check and this test
+    /// fails at the refusal (the open succeeds, then reads fail on the missing
+    /// table); make the read-only path refuse on any older stamp instead and
+    /// `open_read_only_does_not_bump_schema_version_stamp` fails, because that
+    /// store carries every table.
+    #[test]
+    fn a_read_only_open_of_a_store_missing_a_table_refuses_and_does_not_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.redb");
+        drop(StateStore::open(&path).expect("initial read-write open"));
+
+        // A store written by a binary that predates `tombstones` (added at
+        // v19): stamp it older FIRST — `force_schema_version` opens read-write
+        // and would recreate the table — then drop the table with raw redb.
+        force_schema_version(&path, "18");
+        {
+            let db = Database::open(&path).expect("reopen");
+            let txn = db.begin_write().expect("write txn");
+            assert!(
+                txn.delete_table(TOMBSTONES).expect("delete table"),
+                "precondition: the table existed"
+            );
+            txn.commit().expect("commit");
+        }
+        let before = std::fs::read(&path).expect("read state file");
+
+        let err = StateStore::open_read_only(&path)
+            .map(|_| ())
+            .expect_err("a store missing a table must be refused, not initialised");
+        match &err {
+            StateError::ReadOnlyNeedsInit {
+                found,
+                expected,
+                missing,
+                ..
+            } => {
+                assert_eq!(*found, Some(18), "the refusal names the on-disk stamp");
+                assert_eq!(*expected, CURRENT_SCHEMA_VERSION);
+                assert_eq!(
+                    missing,
+                    &vec!["tombstones".to_string()],
+                    "the refusal names exactly the missing table"
+                );
+            }
+            other => panic!("expected ReadOnlyNeedsInit, got {other:?}"),
+        }
+        assert!(
+            err.to_string().contains("tombstones") && err.to_string().contains("v18"),
+            "the message names the table and the stamp: {err}"
+        );
+        assert!(
+            before == std::fs::read(&path).expect("read state file"),
+            "the refused read-only open changed the file, so it wrote"
+        );
+        assert_eq!(
+            StateStore::peek_schema_version(&path).unwrap(),
+            Some(18),
+            "the refusal left the stamp alone"
+        );
+
+        // The read-write open creates the table and stamps the version; the
+        // read-only open then succeeds and stays on the read transaction.
+        drop(StateStore::open(&path).expect("read-write open migrates"));
+        assert_eq!(
+            StateStore::peek_schema_version(&path).unwrap(),
+            Some(CURRENT_SCHEMA_VERSION)
+        );
+        let after_migration = std::fs::read(&path).expect("read state file");
+        let store = StateStore::open_read_only(&path).expect("read-only open after migration");
+        assert!(store.list_tombstones().unwrap().is_empty());
+        drop(store);
+        assert!(after_migration == std::fs::read(&path).expect("read state file"));
+    }
+
+    /// A read-only open of a path with NO state file bootstraps an empty store
+    /// — the file, every table, no stamp — exactly as before this change:
+    /// `rocky doctor`, `rocky history` and `GET /api/v1/runs` on a never-run
+    /// project answer "nothing yet", not an error. That is the one write a
+    /// read-only open still performs, on a store that holds nothing (#1980).
+    /// The second read-only open then writes nothing.
+    #[test]
+    fn a_read_only_open_of_a_missing_file_bootstraps_an_empty_store_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.redb");
+        assert!(!path.exists(), "precondition: no state file");
+
+        {
+            let store = StateStore::open_read_only(&path).expect("bootstrap from a read-only open");
+            assert!(store.get_watermark("cat.sch.tbl").unwrap().is_none());
+            assert!(store.list_jobs().unwrap().is_empty());
+            assert!(store.list_tombstones().unwrap().is_empty());
+        }
+        assert!(path.exists(), "the bootstrap created the file");
+        assert_eq!(
+            StateStore::peek_schema_version(&path).unwrap(),
+            None,
+            "a read-only bootstrap never stamps the version"
+        );
+
+        let before = std::fs::read(&path).expect("read state file");
+        drop(StateStore::open_read_only(&path).expect("second read-only open"));
+        assert!(
+            before == std::fs::read(&path).expect("read state file"),
+            "the second read-only open of the bootstrapped store wrote"
+        );
+    }
+
+    /// An unversioned store (no `schema_version` key) that carries every
+    /// table opens read-only without a write and stays unversioned: the stamp
+    /// is not what the read-only path judges by.
+    #[test]
+    fn a_read_only_open_of_an_unversioned_store_with_every_table_never_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.redb");
+        drop(StateStore::open(&path).expect("initial read-write open"));
+        {
+            let db = Database::open(&path).expect("reopen");
+            let txn = db.begin_write().expect("write txn");
+            {
+                let mut metadata = txn.open_table(METADATA).expect("metadata");
+                assert!(
+                    metadata.remove("schema_version").expect("remove").is_some(),
+                    "precondition: the store was stamped"
+                );
+            }
+            txn.commit().expect("commit");
+        }
+        assert_eq!(StateStore::peek_schema_version(&path).unwrap(), None);
+        let before = std::fs::read(&path).expect("read state file");
+
+        {
+            let store = StateStore::open_read_only(&path).expect("read-only open");
+            assert!(store.get_watermark("cat.sch.tbl").unwrap().is_none());
+        }
+        assert!(
+            before == std::fs::read(&path).expect("read state file"),
+            "a read-only open of an unversioned store that carries every table wrote"
+        );
+        assert_eq!(
+            StateStore::peek_schema_version(&path).unwrap(),
+            None,
+            "a read-only open must not stamp an unversioned store"
+        );
+    }
+
     /// The fast path must not swallow a forward-incompatible store: a
     /// read-only open of a newer database still fails under the default policy,
     /// exactly as the write path did.
@@ -7692,6 +8062,7 @@ mod tests {
             submission_id: None,
             check_gate_failed: false,
             verify_after_failed: false,
+            rocky_branch: None,
         }
     }
 
@@ -8058,6 +8429,41 @@ mod tests {
                 .check_gate_failed,
             "a run with no gate must read back false"
         );
+    }
+
+    /// A `RunRecord` blob written before `rocky_branch` existed (#2032) has
+    /// no `rocky_branch` key at all. It must forward-deserialize with the
+    /// field `None` — never crash the read, and never fabricate a branch
+    /// name for a pre-upgrade record.
+    #[test]
+    fn test_pre_rocky_branch_run_record_forward_deserializes_to_none() {
+        let mut value = serde_json::to_value(minimal_run_record("run-pre-branch", vec![]))
+            .expect("serialize run record");
+        let obj = value.as_object_mut().expect("record is an object");
+        assert!(
+            obj.remove("rocky_branch").is_some(),
+            "precondition: the field is serialized, so removing it models a pre-upgrade blob"
+        );
+        let blob = serde_json::to_vec(&value).expect("reserialize without the field");
+
+        let record: RunRecord = serde_json::from_slice(&blob)
+            .expect("a pre-rocky_branch RunRecord must forward-deserialize");
+        assert_eq!(record.run_id, "run-pre-branch");
+        assert!(
+            record.rocky_branch.is_none(),
+            "a pre-upgrade record reads as no recorded Rocky branch"
+        );
+
+        // A record carrying the branch round-trips losslessly, and
+        // independently of `git_branch` — the two fields can legitimately
+        // disagree (a PR's git branch differs from its preview branch).
+        let mut branched = minimal_run_record("run-branched", vec![]);
+        branched.git_branch = Some("fix-price".to_string());
+        branched.rocky_branch = Some("pr-preview-fix-price".to_string());
+        let round: RunRecord =
+            serde_json::from_slice(&serde_json::to_vec(&branched).unwrap()).unwrap();
+        assert_eq!(round.git_branch.as_deref(), Some("fix-price"));
+        assert_eq!(round.rocky_branch.as_deref(), Some("pr-preview-fix-price"));
     }
 
     #[test]
@@ -12989,19 +13395,27 @@ mod tests {
             "precondition: the store is stamped at the older version"
         );
 
-        // Read-only open must leave the stamp untouched...
+        // Read-only open must leave the stamp untouched, and — since every
+        // table is present — must not write at all: an older stamp alone is no
+        // reason to escalate to the write path (C1-P1b).
+        let before = std::fs::read(&path).unwrap();
         {
             let store = StateStore::open_read_only(&path).unwrap();
-            // ...and read methods still work (tables exist).
+            // ...and read methods still work (the tables were already there).
             assert!(
                 store.get_watermark("cat.sch.tbl").unwrap().is_none(),
-                "a read method must succeed against the read-only store (tables were created)"
+                "a read method must succeed against the read-only store"
             );
         }
         assert_eq!(
             StateStore::peek_schema_version(&path).unwrap(),
             Some(CURRENT_SCHEMA_VERSION - 1),
             "read-only open must NOT bump the on-disk schema_version stamp"
+        );
+        assert!(
+            before == std::fs::read(&path).unwrap(),
+            "a read-only open of an OLDER-stamped store that carries every table committed a \
+             write transaction — the stamp is not what decides the read-only path, the table set is"
         );
 
         // Contrast: a read-WRITE open still upgrades the stamp (no regression to
@@ -13328,6 +13742,17 @@ mod tests {
             "the on-disk state schema version changed. Update EXPECTED_VERSION here, and \
              confirm the version-mismatch migration path (open_with_policy_* tests) handles \
              the bump, in the same PR."
+        );
+
+        // The read-only open path judges a store by `StateStore::table_names()`,
+        // so that list must be the pinned set — a table added to the eager
+        // creation in `init_db` but not to `table_names()` would let a read-only
+        // open of an older store pass the check and then fail on the read.
+        let mut declared: Vec<&str> = StateStore::table_names();
+        declared.sort_unstable();
+        assert_eq!(
+            declared, EXPECTED_TABLES,
+            "StateStore::table_names() must list exactly the pinned table set"
         );
 
         let dir = TempDir::new().unwrap();

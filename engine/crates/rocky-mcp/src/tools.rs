@@ -11,7 +11,7 @@ use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
     GetPromptResult, Implementation, PromptMessage, ProtocolVersion, Role, ServerCapabilities,
-    ServerInfo,
+    ServerConfig,
 };
 use rmcp::service::RequestContext;
 use rmcp::{
@@ -35,6 +35,23 @@ use crate::result_types::*;
 /// [`RockyMcpServer::get_info`]) — the skill file itself stays canonical and
 /// untouched.
 const INSTRUCTIONS: &str = include_str!("../../../../.claude/skills/rocky-ai-workflow/SKILL.md");
+
+/// What `rocky mcp` calls itself in the `initialize` result's
+/// `serverInfo.name` (#1973).
+pub const SERVER_NAME: &str = "rocky";
+
+/// The version `rocky mcp` announces beside [`SERVER_NAME`].
+///
+/// This is `rocky-mcp`'s own crate version. Every crate in the workspace
+/// carries the engine's version as a literal in its `Cargo.toml` and a
+/// release bumps them by hand, so this can only be the engine's version for
+/// as long as the bump does not miss this crate. Three workspace crates have
+/// already fallen off the shared version that way, and the release check for
+/// it greps for the OLD version, which cannot see a crate that is already
+/// behind. So the lockstep is pinned from the binary side instead:
+/// `engine/rocky/tests/mcp_server_identity.rs` fails the build when this and
+/// `rocky --version` disagree.
+pub const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Prepended to the served `instructions` under the worker profile.
 ///
@@ -300,8 +317,9 @@ const WORKER_INSTRUCTIONS_REWRITES: &[(&str, &str)] = &[
     // one. The rewrite carried "exactly what would execute" straight from
     // the CLI sentence onto the tool, which is the surface the claim is
     // least true of: `commands::plan_preview_output` renders offline and
-    // DROPS any model `sql_gen` cannot render, and `PlanPreviewResult` has
-    // no field that names one.
+    // DROPS any model `sql_gen` cannot render. `PlanPreviewResult` names
+    // such a model in `skipped` since #1996; the description still has to
+    // say the statement list is not the whole plan.
     //
     // The needle is now the whole step, because the default sentence it
     // replaces carries three CLI routes (`rocky emit-sql`, `rocky plan` and
@@ -379,8 +397,9 @@ const WORKER_INSTRUCTIONS_REWRITES: &[(&str, &str)] = &[
          matches your intent.",
         "Call the `plan_preview` tool and read the SQL it returns. It renders offline. It \
          is not the whole plan: a model whose SQL cannot be rendered offline is SKIPPED, \
-         and the result does not name it. So a model missing from the statements means \
-         'not renderable offline', never 'nothing to do'. Three are skipped by \
+         and named in `skipped` with the reason. So a model missing from \
+         the statements means 'not renderable offline', never 'nothing to do' — read \
+         `skipped` to see which. Three are skipped by \
          construction: a Snowflake dynamic table needs a live compute warehouse, a \
          time-interval model needs a runtime window, and a content-addressed model never \
          goes through SQL generation. Confirm the SQL it does return matches your intent.",
@@ -1086,30 +1105,43 @@ fn worker_tools_that_read_the_warehouse<'a>(table: &[(&'a str, WorkerToolEffect)
 /// wire version. It supplies the server's FALLBACK, and rmcp's
 /// `serve_server` then overwrites `init_response.protocol_version` with
 /// `negotiate_protocol_version(client_requested, server_fallback,
-/// supported)` — which returns the CLIENT's request whenever the server
-/// supports it. `RockyMcpServer` does not override
+/// supported)`. `RockyMcpServer` does not override
 /// `Service::supported_protocol_versions`, so it advertises rmcp's whole
-/// `KNOWN_VERSIONS` list, `V_2026_07_28` included. A client that asks for
-/// `2026-07-28` is given it, `sep_2322_supported` is then true, the strip
-/// call is skipped, and `resultType` DOES reach that client.
+/// `KNOWN_VERSIONS` list, `V_2026_07_28` included.
 ///
-/// The stripping therefore holds because no PRODUCTION client asks for
-/// `2026-07-28` yet, not because this server refuses to speak it. The
-/// negotiated version is `2025-11-25` against rmcp 3.1.2's own client —
-/// which is now BLESSED, as part of row 1's `initialize` payload in
+/// HOW A PEER REACHES `2026-07-28` CHANGED WITH rmcp 3.2 (#1965). Under
+/// rmcp 3.1 the negotiation returned the client's request whenever the
+/// server supported it, `initialize` included. rmcp 3.2 follows the
+/// 2026-07-28 versioning spec instead: that revision replaced the handshake
+/// with per-request metadata, so ANY `initialize` request is a legacy
+/// client, and one that names `2026-07-28` is answered with the server's
+/// fallback (`V_2025_11_25` here, the newest version that has a handshake).
+/// A modern peer reaches `2026-07-28` through the `server/discover`
+/// lifecycle (`ClientLifecycleMode::Discover` or `Auto`), which sends no
+/// `initialize` at all, or by declaring `2026-07-28` and its capabilities in
+/// a request's own `_meta`, which rmcp honours even inside an `initialize`
+/// session (rmcp's own client never does the latter after `initialize`; a
+/// hand-rolled one can). For such a request `sep_2322_supported` is true,
+/// the strip call is skipped, and `resultType` DOES reach it.
+///
+/// The stripping therefore holds because no PRODUCTION client discovers or
+/// declares yet, not because this server refuses to speak `2026-07-28`. The
+/// negotiated version is `2025-11-25` against rmcp's own default client —
+/// BLESSED, as part of row 1's `initialize` payload in
 /// `served_text_golden_pins_every_worded_surface`, so the day it moves the
 /// golden moves with it and this paragraph gets re-read. Closing the gap by
 /// construction would mean narrowing `supported_protocol_versions`, which is
 /// a behaviour change to what this server speaks and is not made here.
 ///
 /// SIXTEENTH ROUND, finding 3 — THAT IS NOW GUARDED, NOT MERELY OBSERVED.
-/// The two paragraphs above were correct and completely unexercised: every
+/// The paragraphs above were correct and completely unexercised: every
 /// roundtrip connected with rmcp's default `()` handler, so the branch they
-/// describe — a peer that DOES negotiate `2026-07-28` — was reached by no
+/// describe — a peer that DOES speak `2026-07-28` — was reached by no
 /// test. `result_type_reaches_a_2026_07_28_client_and_no_other` (in
-/// `tests/roundtrip.rs`) now drives both peers and asserts the negotiated
-/// version on each before reading `result_type`, so "stripped for the
-/// default client, served to a modern one" is a checked claim.
+/// `tests/roundtrip.rs`) now drives both peers, the modern one over the
+/// discover lifecycle, and asserts the negotiated version on each before
+/// reading `result_type`, so "stripped for the default client, served to a
+/// modern one" is a checked claim.
 ///
 /// It asserts BOTH directions on purpose, and each one covers the extreme
 /// the other cannot see. Present-only survives the field being ON
@@ -1169,8 +1201,8 @@ fn worker_tools_that_read_the_warehouse<'a>(table: &[(&'a str, WorkerToolEffect)
 /// independently settable, and a mutation into `title` is caught by the
 /// widened sweep and was invisible to the field-selecting one. Row 1 sits
 /// with rows 8 and 9 on this axis rather than with 2 and 4/5: its newly
-/// covered fields are all `None` under
-/// `Implementation::from_build_env()`, so widening it found nothing either.
+/// covered fields are all `None` under the hand-built
+/// `Implementation::new(SERVER_NAME, ..)`, so widening it found nothing either.
 /// The mutation that proves the sweep works has to POPULATE one first.
 ///
 /// So the honest form of the guarantee is about the SWEEPS, not the row
@@ -2494,9 +2526,10 @@ impl RockyMcpServer {
     // execute", and the preview is offline: it passes no warehouse to
     // `sql_gen::generate_transformation_sql_with_warehouse`, and
     // `commands::plan_preview_output` logs and SKIPS any model whose SQL
-    // that call cannot render. `PlanPreviewResult` carries `statements` and
-    // nothing else, so a skipped model leaves no trace in the result at
-    // all. Three strategies are skipped by construction — a Snowflake
+    // that call cannot render. `PlanPreviewResult` now carries `skipped`
+    // beside `statements`, so such a model is named with its reason instead
+    // of leaving no trace (#1996). Three strategies are skipped by
+    // construction — a Snowflake
     // `DynamicTable` needs a compute warehouse, a `TimeInterval` model
     // needs a runtime window that static planning leaves `None`, and
     // `ContentAddressed` never reaches SQL generation — and any other
@@ -2504,12 +2537,14 @@ impl RockyMcpServer {
     #[tool(
         description = "Render the SQL Rocky generates for the project's transformation models, \
          offline and with no warehouse connection. It is not the whole plan: a model whose SQL \
-         cannot be rendered offline is SKIPPED, and the result does not name it, so a short or \
-         empty statement list is not proof the project has nothing else to do. Skipped by \
-         construction: a Snowflake dynamic table (it needs a live compute warehouse), a \
-         time-interval model (it needs a runtime window), and a content-addressed model (it \
-         never goes through SQL generation). Read the statements it does return to confirm the \
-         generated SQL matches intent before proposing a materialization."
+         cannot be rendered offline is SKIPPED, and named in `skipped` with the reason, so a \
+         short or empty statement list is not proof the project has nothing else to do — read \
+         `skipped` too. Skipped by construction: a Snowflake dynamic table (it needs a live \
+         compute warehouse), a time-interval model (it needs a runtime window), and a \
+         content-addressed model (it never goes through SQL generation). A model whose \
+         strategy Rocky refuses, such as `ephemeral`, is skipped with its diagnostic code as \
+         the reason. Read the statements it does return to confirm the generated SQL matches \
+         intent before proposing a materialization."
     )]
     async fn plan_preview(
         &self,
@@ -2535,7 +2570,21 @@ impl RockyMcpServer {
                 sql: s.sql,
             })
             .collect();
-        Ok(Json(PlanPreviewResult { statements }))
+        // A model that rendered nothing is named here with its reason. It
+        // used to leave no trace, so an agent holding a successful draft and
+        // an empty preview had nothing to connect the two (#1996).
+        let skipped = output
+            .skipped
+            .into_iter()
+            .map(|s| SkippedModelLite {
+                model: s.model,
+                reason: s.reason,
+            })
+            .collect();
+        Ok(Json(PlanPreviewResult {
+            statements,
+            skipped,
+        }))
     }
 
     #[tool(
@@ -3065,6 +3114,7 @@ impl RockyMcpServer {
     async fn optimize(&self, params: Parameters<OptimizeArgs>) -> ToolResult<OptimizeResult> {
         let out = commands::optimize_output(
             &self.state_path(),
+            &self.config_path,
             Some(&self.models_dir),
             params.0.model.as_deref(),
         )
@@ -4674,9 +4724,11 @@ impl RockyMcpServer {
         // bare top-level key) smuggled alongside a valid `[[tests]]` block is
         // rejected instead of being appended verbatim into the model's sidecar.
         validate_check_spec(&spec)?;
-        // Content gate for `expression` checks (#1524): refuse a bad
-        // expression when it is WRITTEN, not when it is later run.
-        validate_check_spec_expressions(&spec)?;
+        // Content gate for the user-supplied SQL fragments in the spec
+        // (#1524, #2144): refuse a bad `expression`, `filter`, or `key_expr`
+        // when it is WRITTEN, not when it is later refused at
+        // `rocky test --declarative`.
+        validate_check_spec_expressions(&spec, Some(&self.config_path))?;
         let paths = self.resolve_draft_paths(&args.model)?;
         if !self.model_source_exists(&paths.stem) {
             return Err(ToolError::model_not_found(&paths.stem));
@@ -5503,7 +5555,7 @@ impl RockyMcpServer {
     #[tool(
         description = "The ranked pending-review queue, and an OPT-IN approve action. With no \
          `approve_plan_id`, lists every `require_review` escalation not yet signed off, ranked by \
-         blast_radius × classification × staleness, each carrying its decision_ref, plan_id, and \
+         blast_radius × change_class × staleness, each carrying its decision_ref, plan_id, and \
          `approve_command`. Listing works on every profile. APPROVING is different: it writes the \
          human sign-off marker that unblocks `rocky apply`, and MOST SERVERS DO NOT SERVE IT — it \
          is refused with `approve_not_enabled` unless the operator started this server as `rocky \
@@ -6330,7 +6382,7 @@ impl RockyMcpServer {
 #[tool_handler(router = self.tool_router)]
 #[prompt_handler(router = self.prompt_router)]
 impl ServerHandler for RockyMcpServer {
-    fn get_info(&self) -> ServerInfo {
+    fn get_info(&self) -> ServerConfig {
         // FF-WP1 fix round 2 (item 5a): the compiled skill is the FULL
         // authoring workflow, served to both profiles so the guidance never
         // forks from the canonical file — but under the worker profile it is
@@ -6345,14 +6397,29 @@ impl ServerHandler for RockyMcpServer {
         // default and approver profiles carry the skill text byte-unchanged,
         // the worker carries the derived banner + the projected body.
         let instructions = self.instructions.clone();
-        ServerInfo::new(
+        ServerConfig::new(
             ServerCapabilities::builder()
                 .enable_tools()
                 .enable_prompts()
                 .build(),
         )
-        .with_server_info(Implementation::from_build_env())
-        .with_protocol_version(ProtocolVersion::V_2024_11_05)
+        // Rocky's own name and version, not the library's. rmcp's
+        // `Implementation::from_build_env()` reads `CARGO_PKG_NAME` /
+        // `CARGO_PKG_VERSION` where IT is compiled, so it announced
+        // "rmcp 3.3.0" to every client and moved the served-text golden on
+        // every library bump for a reason that had nothing to do with Rocky
+        // (#1973). This crate's version is the engine's.
+        .with_server_info(Implementation::new(SERVER_NAME, SERVER_VERSION))
+        // The server's FALLBACK, not the wire version: rmcp echoes any
+        // version a client names that still has an `initialize` handshake
+        // and this server supports, and answers with this one otherwise.
+        // Since rmcp 3.2 "otherwise" includes every client that names
+        // `2026-07-28` or later over `initialize` (that revision replaced the
+        // handshake, so an `initialize` request is legacy by definition), so
+        // the fallback is the NEWEST version with a handshake rather than the
+        // oldest: a client that asked for more is not sent back to 2024. See
+        // the negotiation note on the served-text sweep above.
+        .with_protocol_version(ProtocolVersion::V_2025_11_25)
         .with_instructions(instructions)
     }
 }
@@ -6780,17 +6847,19 @@ fn render_cell(v: serde_json::Value) -> String {
 /// reach either. The harm is concrete and this is the surface that delivers
 /// it: a dynamic-table draft SUCCEEDS, receives this guidance, and is then
 /// absent from the preview it was just told to read, because
-/// `commands::plan_preview_output` skips what it cannot render offline and
-/// `PlanPreviewResult` carries no field naming a skipped model. The agent
-/// is holding a successful draft and an empty preview with nothing to tell
-/// it the two are about the same model.
+/// `commands::plan_preview_output` skips what it cannot render offline.
+/// The agent was holding a successful draft and an empty preview with
+/// nothing to tell it the two are about the same model; `PlanPreviewResult`
+/// names such a model in `skipped` since #1996, and this text sends the
+/// agent to look there.
 const DRAFT_NEXT_STEPS: &str = "This is a draft — Rocky has NOT applied it or touched the \
      warehouse. Continue the authoring loop: fix any error diagnostics above and re-draft (or \
      `compile`) until it is clean, `plan_preview` to read the SQL that renders offline, then \
      `propose` to record an AI-authored plan for a human to `rocky review <plan_id> --approve` \
      and `rocky apply`. The preview is not the whole plan: a model it cannot render offline is \
-     skipped and is not named, so a draft that succeeded here and is missing from the preview \
-     is unrenderable offline, not absent from the project. Never apply a draft directly.";
+     skipped and named in `skipped`, so a draft that succeeded here and is missing from the \
+     statements is unrenderable offline, not absent from the project. Never apply a draft \
+     directly.";
 
 /// The worker-profile variant of [`DRAFT_NEXT_STEPS`] (FF-WP1 fix round 2,
 /// item 5c): the default reminder instructs `propose`, a tool this profile
@@ -6811,8 +6880,8 @@ const DRAFT_NEXT_STEPS: &str = "This is a draft — Rocky has NOT applied it or 
 const WORKER_DRAFT_NEXT_STEPS: &str = "This is a draft — Rocky has NOT applied it or touched \
      the warehouse. Continue the drafting loop: fix any error diagnostics above and re-draft \
      (or `compile`) until it is clean, `plan_preview` to read the SQL that renders offline \
-     (the preview is not the whole plan — a model it cannot render offline is skipped and is \
-     not named, so a draft that succeeded here and is missing from the preview is \
+     (the preview is not the whole plan — a model it cannot render offline is skipped and \
+     named in `skipped`, so a draft that succeeded here and is missing from the statements is \
      unrenderable offline, not absent from the project), and the \
      `test` tool to run the project's LOCAL tests. Those local tests are the only suite you \
      can run here. The checks the product spec declares — its grain, its not-null columns, its \
@@ -7409,20 +7478,42 @@ fn validate_check_spec(spec: &str) -> Result<(), Json<ToolError>> {
     Ok(())
 }
 
-/// Content gate for the `expression` checks in a `draft_check` spec (#1524).
+/// Content gate for the user-supplied SQL fragments in a `draft_check` spec
+/// (#1524, #2144): an `expression` check's `expression`, any test's
+/// `filter`, and a `unique_expr` test's `key_expr`.
 ///
-/// Applies the same boundary `rocky test` enforces at generation time —
-/// one boolean expression, no subquery, no qualified function, only
-/// allowlisted pure scalar functions — but BEFORE the sidecar write, so an
-/// expression that can never run is refused at authoring time with the
-/// reason, rather than committed and refused later. Direct file writers
-/// bypass this tool entirely; the generation-time check is the backstop
-/// for them.
+/// Applies the same TWO gates `rocky test --declarative` runs at generation
+/// time, in the same order (`rocky-core/src/tests.rs`): first
+/// [`rocky_sql::validation::reject_statement_terminator`], a pre-parse scan
+/// that refuses a construct the warehouses read differently regardless of
+/// dialect (a backtick-quoted identifier, a `//`/`#` line comment, ...);
+/// then [`rocky_sql::check_expression::validate_check_expression`] — one
+/// boolean expression, no subquery, no qualified function, only allowlisted
+/// pure scalar functions, plus the stricter grouping-key rules (no volatile
+/// function, no `COLLATE`) for `key_expr`. Running the parse gate ALONE
+/// would miss the first: sqlparser accepts backtick identifiers the scanner
+/// refuses, so a filter or key using one would be a green draft and a red
+/// `rocky test --declarative` (#2144, round 2). Both gates run BEFORE the
+/// sidecar write, so a fragment that can never run is refused at authoring
+/// time with the reason, rather than committed and refused later. Direct
+/// file writers bypass this tool entirely; the generation-time checks are
+/// the backstop for them.
 ///
-/// Parses under the generic dialect: the MCP server does not resolve the
-/// target warehouse here. A broader dialect can only accept MORE syntax,
-/// and acceptance still has to clear the function and subquery walk.
-fn validate_check_spec_expressions(spec: &str) -> Result<(), Json<ToolError>> {
+/// Parses under the project's resolved default adapter dialect when
+/// `rocky.toml` loads and declares one (matching what generation itself
+/// parses under), falling back to the generic dialect otherwise — an
+/// absent, unresolvable, or ambiguous (no `default` key) config, same as no
+/// config at all. GENERIC IS THE PERMISSIVE ONE: it is not a safe stand-in
+/// for a stricter target dialect, because it can accept what a real target
+/// dialect would refuse outright (a construct a target's own parser does
+/// not have, or reads differently) — the opposite of the safe direction.
+/// This does not resolve a per-model adapter override (`ModelConfig.adapter`
+/// in a model's own sidecar): that needs `draft_check` to read the model's
+/// sidecar before this gate runs, which is a bigger change than this one.
+fn validate_check_spec_expressions(
+    spec: &str,
+    config_path: Option<&Path>,
+) -> Result<(), Json<ToolError>> {
     // `validate_check_spec` already proved this parses and holds a `tests`
     // array; a second parse is cheaper than threading the table through.
     let Ok(parsed) = toml::from_str::<toml::Table>(spec) else {
@@ -7431,12 +7522,89 @@ fn validate_check_spec_expressions(spec: &str) -> Result<(), Json<ToolError>> {
     let Some(tests) = parsed.get("tests").and_then(toml::Value::as_array) else {
         return Ok(());
     };
-    let dialect = rocky_sql::check_expression::dialect_for("generic");
+    // The project's default adapter (`[adapter]`, unnamed, wraps to this
+    // key), when the config loads and declares one; generic otherwise. A
+    // config that fails to load, or declares no `default` adapter, falls
+    // back the same way an absent config does -- this gate's job is
+    // content, not reporting a broken `rocky.toml` a caller already sees
+    // elsewhere.
+    let adapter_type = config_path
+        .and_then(|p| rocky_core::config::load_optional_project_config(Some(p)).ok())
+        .flatten()
+        .and_then(|cfg| cfg.adapters.get("default").map(|a| a.adapter_type.clone()))
+        .unwrap_or_else(|| "generic".to_string());
+    let dialect = rocky_sql::check_expression::dialect_for(&adapter_type);
     for (index, test) in tests.iter().enumerate() {
         let Some(table) = test.as_table() else {
             continue;
         };
-        if table.get("type").and_then(toml::Value::as_str) != Some("expression") {
+        let test_type = table.get("type").and_then(toml::Value::as_str);
+
+        // `filter` scopes which rows a check applies to and is spliced into
+        // the same generated statement for every test kind (`tests.rs`'s
+        // per-check `filter` handling), so it is gated regardless of `type`
+        // — unlike `expression` and `key_expr` below, this is NOT behind a
+        // `type` match. Trimmed and treated as absent when blank, mirroring
+        // `tests.rs`'s own `filter` handling exactly: the generator accepts
+        // `filter = ""` as "no filter", so this gate must not refuse it as
+        // an unparsable expression.
+        if let Some(filter) = table
+            .get("filter")
+            .and_then(toml::Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            let context = format!("draft_check `tests[{index}]` filter");
+            let advice = "A filter is one boolean expression over the row's columns \
+                 — comparisons, CASE, CAST, and pure scalar functions such as coalesce, \
+                 length, lower or date_trunc. It may not contain a subquery, a qualified \
+                 function, or a warehouse function that reads files, secrets, session state \
+                 or remote endpoints. It scopes which rows the check applies to; it does \
+                 not repeat the check's own condition.";
+            rocky_sql::validation::reject_statement_terminator(&context, filter)
+                .map_err(|err| ToolError::invalid_argument(err.to_string(), advice))?;
+            rocky_sql::check_expression::validate_check_expression(
+                &context,
+                filter,
+                dialect.as_ref(),
+                // Same boundary as `expression`: a filter is spliced into
+                // the same statement as the predicate it scopes, evaluated
+                // once. Separate variant only so a refusal names `filter`.
+                rocky_sql::check_expression::ExpressionUse::Filter,
+            )
+            .map_err(|err| ToolError::invalid_argument(err.to_string(), advice))?;
+        }
+
+        if test_type == Some("unique_expr") {
+            // A missing `key_expr` is the generator's own `EmptyKeyExpr`;
+            // this gate judges content, not presence.
+            if let Some(key_expr) = table.get("key_expr").and_then(toml::Value::as_str) {
+                let context = format!("draft_check `tests[{index}]` key_expr");
+                let advice = "A key expression is one expression over the row's own columns \
+                     that rows can be grouped by, e.g. `lower(email)`. It may not contain a \
+                     subquery, a qualified function, a warehouse function that reads \
+                     files, secrets, session state or remote endpoints, a volatile \
+                     function such as `now()` or `random()` (the key must not change \
+                     between evaluations), or an explicit `COLLATE` (it would change what \
+                     equality means for the grouping).";
+                rocky_sql::validation::reject_statement_terminator(&context, key_expr)
+                    .map_err(|err| ToolError::invalid_argument(err.to_string(), advice))?;
+                rocky_sql::check_expression::validate_check_expression(
+                    &context,
+                    key_expr,
+                    dialect.as_ref(),
+                    // A grouping key: unlike `expression`/`filter`, a
+                    // volatile value is refused (rows must group by
+                    // something that does not change between evaluations),
+                    // and so is `COLLATE` (it would change what equality
+                    // means for the grouping).
+                    rocky_sql::check_expression::ExpressionUse::GroupingKey,
+                )
+                .map_err(|err| ToolError::invalid_argument(err.to_string(), advice))?;
+            }
+        }
+
+        if test_type != Some("expression") {
             continue;
         }
         // A missing `expression` is the generator's `MissingExpression`;
@@ -7445,21 +7613,23 @@ fn validate_check_spec_expressions(spec: &str) -> Result<(), Json<ToolError>> {
             continue;
         };
         let context = format!("draft_check `tests[{index}]` expression");
+        let advice = "An expression check is one boolean expression over the model's own \
+                 columns — comparisons, CASE, CAST, and pure scalar functions such as \
+                 coalesce, length, lower or date_trunc. It may not contain a subquery, a \
+                 qualified function, or a warehouse function that reads files, secrets, \
+                 session state or remote endpoints.";
+        rocky_sql::validation::reject_statement_terminator(&context, expression)
+            .map_err(|err| ToolError::invalid_argument(err.to_string(), advice))?;
         rocky_sql::check_expression::validate_check_expression(
             &context,
             expression,
             dialect.as_ref(),
+            // `draft_check` writes an `expression` test, which is evaluated
+            // once in one statement — the same position as the checks path
+            // this mirrors.
+            rocky_sql::check_expression::ExpressionUse::SinglePredicate,
         )
-        .map_err(|err| {
-            ToolError::invalid_argument(
-                err.to_string(),
-                "An expression check is one boolean expression over the model's own columns \
-                 — comparisons, CASE, CAST, and pure scalar functions such as coalesce, \
-                 length, lower or date_trunc. It may not contain a subquery, a qualified \
-                 function, or a warehouse function that reads files, secrets, session state \
-                 or remote endpoints.",
-            )
-        })?;
+        .map_err(|err| ToolError::invalid_argument(err.to_string(), advice))?;
     }
     Ok(())
 }
@@ -9215,8 +9385,8 @@ database = ":memory:"
         // carries `title`, `description`, `icons` and `websiteUrl` besides
         // `name` and `version` — four free-text fields on the channel a
         // worker reads at handshake, before it reads anything else.
-        // `Implementation::from_build_env()` leaves all four `None`, so
-        // nothing leaks today. The UNBACKED GUARANTEE was the defect, the
+        // The hand-built `Implementation::new(SERVER_NAME, ..)` leaves all
+        // four `None`, so nothing leaks today. The UNBACKED GUARANTEE was the defect, the
         // same shape as rows 2 and 4/5: no leak, a claim the sweep did not
         // support.
         //
@@ -9448,10 +9618,10 @@ database = ":memory:"
              it renders offline and silently drops what it cannot render: {body}"
         );
         assert!(
-            body.contains("SKIPPED, and the result does not name it"),
-            "the projected body must say a model the preview cannot render offline is \
-             dropped WITHOUT being named, or an empty preview reads as an empty project: \
-             {body}"
+            body.contains("SKIPPED, and named in `skipped` with the reason"),
+            "the projected body must say a model the preview cannot render offline is left \
+             out of the statements and named in `skipped`, or an empty statement list reads \
+             as an empty project: {body}"
         );
         // FINDING 1C — the retry steer. It presumed materializing a pipeline
         // through a route this profile does not serve; no worker tool runs
@@ -9786,8 +9956,9 @@ database = ":memory:"
             // test's original family. `plan_preview` called its output "the
             // exact SQL Rocky would execute" while
             // `commands::plan_preview_output` passes no warehouse and skips
-            // every model `sql_gen` cannot render offline, and
-            // `PlanPreviewResult` has no field that names a skipped model.
+            // every model `sql_gen` cannot render offline. Since #1996 the
+            // result names such a model in `skipped`; the description still
+            // must not promise the statements are the whole plan.
             //
             // Pinned in BOTH directions and on BOTH profiles: the removed
             // exactness claim must stay gone, and the disclosure that
@@ -9802,10 +9973,10 @@ database = ":memory:"
                  {plan_preview}"
             );
             assert!(
-                plan_preview.contains("SKIPPED, and the result does not name it"),
+                plan_preview.contains("SKIPPED, and named in `skipped` with the reason"),
                 "{profile:?}: `plan_preview`'s description must say that a model it cannot \
-                 render offline is dropped WITHOUT being named, or an empty preview reads as \
-                 an empty project: {plan_preview}"
+                 render offline is left out of the statements and named in `skipped`, or an \
+                 empty statement list reads as an empty project: {plan_preview}"
             );
         }
     }
@@ -10399,9 +10570,9 @@ database = ":memory:"
              it is clean, `plan_preview` to read the SQL that renders offline, then `propose` \
              to record an AI-authored plan for a human to `rocky review <plan_id> --approve` \
              and `rocky apply`. The preview is not the whole plan: a model it cannot render \
-             offline is skipped and is not named, so a draft that succeeded here and is \
-             missing from the preview is unrenderable offline, not absent from the project. \
-             Never apply a draft directly.",
+             offline is skipped and named in `skipped`, so a draft that succeeded here and is \
+             missing from the statements is unrenderable offline, not absent from the \
+             project. Never apply a draft directly.",
             "default draft_model next_steps are pinned byte-for-byte"
         );
         assert_eq!(
@@ -10443,10 +10614,10 @@ database = ":memory:"
         // property is being held rather than leaving it to a diff.
         //
         // The harm is specific to this surface. A dynamic-table draft
-        // SUCCEEDS, carries this text, and is then absent from the preview
-        // it names — `commands::plan_preview_output` passes no warehouse and
-        // skips what `sql_gen` cannot render, and `PlanPreviewResult` has no
-        // field that names a skipped model.
+        // SUCCEEDS, carries this text, and is then absent from the preview's
+        // statements — `commands::plan_preview_output` passes no warehouse
+        // and skips what `sql_gen` cannot render. Since #1996 `skipped`
+        // names it, and this text has to send the agent there.
         for (profile, next_steps) in [
             (McpProfile::Default, default_server.draft_model_next_steps()),
             (McpProfile::Worker, worker_server.draft_model_next_steps()),
@@ -10458,11 +10629,11 @@ database = ":memory:"
                  {next_steps}"
             );
             assert!(
-                next_steps.contains("skipped and is not named"),
+                next_steps.contains("skipped and named in `skipped`"),
                 "{profile:?}: `draft_model`'s next_steps must say a model the preview cannot \
-                 render offline is dropped WITHOUT being named — a draft can succeed here \
-                 and then be missing from the preview this text sends the agent to read: \
-                 {next_steps}"
+                 render offline is left out of the statements and named in `skipped` — a \
+                 draft can succeed here and then be missing from the preview this text sends \
+                 the agent to read: {next_steps}"
             );
         }
     }
@@ -10680,6 +10851,27 @@ database = ":memory:"
                 !description.contains("draft_check"),
                 "worker prompt `{name}` steers toward a tool this profile does not \
                  serve: {description}"
+            );
+        }
+    }
+
+    /// `serverInfo` names Rocky and the engine's version, not the MCP
+    /// library's (#1973). Every profile serves the same identity, and it is
+    /// what the served-text golden's two `initialize` rows now pin: the
+    /// golden moves when Rocky's version moves, not when rmcp's does.
+    #[test]
+    fn server_info_names_rocky_and_the_engine_version() {
+        for profile in [
+            McpProfile::Default,
+            McpProfile::Worker,
+            McpProfile::Approver,
+        ] {
+            let info = server_with(profile).get_info().server_info;
+            assert_eq!(info.name, SERVER_NAME, "{profile:?}");
+            assert_eq!(info.version, SERVER_VERSION, "{profile:?}");
+            assert_ne!(
+                info.name, "rmcp",
+                "{profile:?} must not introduce itself as the library"
             );
         }
     }

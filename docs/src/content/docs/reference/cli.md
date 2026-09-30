@@ -35,7 +35,7 @@ One line each, for finding the right command. Commands with a section on this pa
 | `branch` | Create, list, promote, and drop isolated output branches. |
 | `compile` | Resolve dependencies, type-check, and validate contracts. |
 | `lineage` | Trace a column back through every transformation that feeds it. |
-| `lineage-diff` | Report the downstream blast radius of a change, for PR review. |
+| [`lineage-diff`](/reference/commands/modeling/#rocky-lineage-diff) | Report the downstream blast radius of a change, for PR review. |
 | `test` | Run declarative tests and fixture-driven unit tests. |
 | `ci` | Compile plus test, for a CI runner with no warehouse credentials. |
 | `ci-diff` | Compare a branch against a base and report what changed. |
@@ -60,7 +60,7 @@ One line each, for finding the right command. Commands with a section on this pa
 | [`watch`](#rocky-watch) | Recompile when a file in the models directory changes. |
 | [`fmt`](#rocky-fmt) | Format `.rocky` files: normalize indentation, trim whitespace. |
 | [`list`](#rocky-list) | List pipelines, adapters, models, sources, and dependency relationships. |
-| `serve` | Start the HTTP API server exposing the compiler's semantic graph. |
+| `serve` | Start the HTTP API server (`/api/v1`), with an optional browser UI (`--ui`) and resident scheduler (`--scheduler`). |
 | `lsp` | Start the Language Server Protocol server for IDE integration. |
 | `mcp` | Serve Rocky's tools to an AI agent over MCP. |
 | `import-dbt` | Convert a dbt project into Rocky models. |
@@ -92,14 +92,22 @@ One line each, for finding the right command. Commands with a section on this pa
 
 ## Global Flags
 
-These flags apply to all commands.
+These flags apply to all commands. Three of them go **before** the subcommand: `--config`, `--state-path` and `--state-namespace`. The other three are accepted before or after it.
 
-| Flag | Short | Default | Description |
-|------|-------|---------|-------------|
-| `--config <PATH>` | `-c` | `rocky.toml` | Path to the pipeline configuration file. |
-| `--output <FORMAT>` | `-o` | terminal-aware | Output format. Accepted values: `json`, `table` (plus `md`, which only `rocky brief` renders distinctly — every other command treats it as `table`). When unset, Rocky picks `table` if stdout is an interactive terminal and `json` otherwise, so piped consumers (Dagster, the LSP, CI) still receive JSON. |
-| `--state-path <PATH>` | | resolved (see below) | Path to the embedded state store. When omitted, Rocky resolves to `<models>/.rocky-state.redb` (canonical) or a legacy CWD `.rocky-state.redb` (deprecated, warns on stderr). Passing the flag explicitly is always a hard override. See [`rocky state`](/reference/commands/administration/#rocky-state). |
-| `--cache-ttl <SECONDS>` | | `[cache.schemas] ttl_seconds` or `86400` | Override the `DESCRIBE TABLE` schema-cache TTL for this invocation. Precedence: `--cache-ttl` > `rocky.toml` > `86400` (24 h). `--cache-ttl 0` treats every entry as instantly stale. To disable the cache entirely, set `[cache.schemas] enabled = false` in `rocky.toml`. Applies to the CLI read path only (`rocky compile`, `rocky plan`, `rocky apply`, `rocky run`, …); `rocky lsp` / `rocky serve` keep the config-derived TTL. |
+```
+rocky --config prod.toml run      # works
+rocky run --config prod.toml      # error: unexpected argument '--config' found
+rocky run --output json           # works: --output is accepted anywhere
+```
+
+| Flag | Short | Placement | Default | Description |
+|------|-------|-----------|---------|-------------|
+| `--config <PATH>` | `-c` | before the subcommand | `rocky.toml` | Path to the pipeline configuration file. `rocky mcp` also takes its own `--config` after the subcommand. |
+| `--output <FORMAT>` | `-o` | anywhere | terminal-aware | Output format. Accepted values: `json`, `table` (plus `md`, which only `rocky brief` renders distinctly — every other command treats it as `table`). When unset, Rocky picks `table` if stdout is an interactive terminal and `json` otherwise, so piped consumers (Dagster, the LSP, CI) still receive JSON. |
+| `--state-path <PATH>` | | before the subcommand | resolved (see below) | Path to the embedded state store. When omitted, Rocky resolves to `<models>/.rocky-state.redb` (canonical) or a legacy CWD `.rocky-state.redb` (deprecated, warns on stderr). Passing the flag explicitly is always a hard override. See [`rocky state`](/reference/commands/administration/#rocky-state). |
+| `--state-namespace <KEY>` | | before the subcommand | (none) | Use a separate state file, `<models>/.rocky-state/<KEY>.redb`, for this invocation. See [`--state-namespace`](/reference/commands/core-pipeline/#--state-namespace). |
+| `--principal <PRINCIPAL>` | | anywhere | `human` | Who is acting: `human` or `agent`. The `[policy]` gates take the more restrictive of this identity and the plan's own kind, so `--principal human` does not ungate an agent-authored plan. `ROCKY_PRINCIPAL=agent` raises it to `agent`; only an explicit `--principal` can lower it. Without a `[policy]` block the flag has no effect. |
+| `--cache-ttl <SECONDS>` | | anywhere | `[cache.schemas] ttl_seconds` or `86400` | Override the `DESCRIBE TABLE` schema-cache TTL for this invocation. Precedence: `--cache-ttl` > `rocky.toml` > `86400` (24 h). `--cache-ttl 0` treats every entry as instantly stale. To disable the cache entirely, set `[cache.schemas] enabled = false` in `rocky.toml`. Applies to the CLI read path only (`rocky compile`, `rocky plan`, `rocky apply`, `rocky run`, …); `rocky lsp` / `rocky serve` keep the config-derived TTL. |
 
 ```bash
 # Example: use a custom config and table output
@@ -313,7 +321,7 @@ rocky run [--filter <key=value>] [flags]
    - Copy data (incremental or full refresh SQL)
    - Apply table tags
    - Update watermark in state store
-4. **Batched checks.** Row count, column match, freshness (batched with UNION ALL for efficiency)
+4. **Checks.** Row count, column match, freshness. Batched with `UNION ALL` on Databricks; one query per table everywhere else
 5. **Retry.** Failed tables retried sequentially (configurable via `execution.table_retries`)
 
 :::note
@@ -748,8 +756,9 @@ rocky emit-sql --model stg_orders --out-dir sql/ # Emit a single model
 - Compiles the project offline and generates SQL through the same path `rocky run` uses, including declared surrogate-key columns, so the emitted statements match what a run executes.
 - The dialect is the project's configured target adapter type, resolved from `rocky.toml` without credentials. With no resolvable config it defaults to DuckDB. All models render in this one resolved dialect, so for a project whose models target more than one adapter, the emitted SQL matches `rocky run` only for the models whose target uses that dialect.
 - **Full-refresh models.** Emit a complete `CREATE OR REPLACE TABLE … AS …` that runs as-is against a fresh warehouse and matches what a run executes in the resolved dialect.
-- **Incremental and merge models.** Emit their steady-state statement (a bare `INSERT` / `MERGE` against an existing target). `rocky run` bootstraps the target table on first build and threads the incremental watermark from state, neither of which a static emit can reproduce, so each such file carries a leading `-- NOTE:` comment to that effect.
-- Models that produce no standalone SQL are reported on stderr rather than silently dropped. This covers ephemeral models (inlined as CTEs) and strategies that cannot render offline, such as Snowflake dynamic tables, which need a live compute-warehouse name.
+- **Merge and `delete_insert` models.** Emit their steady-state statement against an existing target. `rocky run` bootstraps the target table on first build, which a static emit cannot reproduce, so each such file carries a leading `-- NOTE:` comment.
+- **Compile errors.** Any error stops the whole export, before `--model` filters. `type = "incremental"` on a transformation model fails with `E037`, and `type = "ephemeral"` fails with `E038`. Either blocks every model.
+- A model whose SQL cannot be rendered offline is reported on stderr rather than silently dropped. A Snowflake dynamic table is one: it needs a live compute-warehouse name.
 
 This command prints SQL or writes files; it has no JSON output mode.
 

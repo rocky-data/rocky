@@ -37,7 +37,21 @@ pip install rocky-sdk
 The `rocky` binary is not bundled. Install it separately and put it on `$PATH`,
 or pass `binary_path=` to the client. See the
 [releases page](https://github.com/rocky-data/rocky/releases). The SDK requires
-engine **v1.34.0 or newer** and checks the version on first use.
+engine **v1.35.0 or newer** and checks the version on first use.
+
+Some methods need a newer engine than that floor:
+
+| Method | Needs engine |
+|---|---|
+| `dag(models_dir=None)` | 1.68.0 |
+| `run_model(..., pipeline=...)` | 1.69.0 |
+| `review_status()`, `apply(..., expect_spec_digest=...)` | 1.71.0 |
+| `product_verify()`, `product_compile()`, `product_approve()`, `product_status()` | 1.72.0 |
+| `product_list()`, `product_journal()`, `schedule_spool()` | 1.74.0 |
+
+Only `dag(models_dir=None)` and `run_model(pipeline=...)` check the engine
+version first and raise `RockyVersionError`. The others run the command, and
+an older engine refuses it, so the call raises a `RockyError` subclass.
 
 ## Usage
 

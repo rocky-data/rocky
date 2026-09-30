@@ -128,7 +128,7 @@ The full `[run]` reference is in the [configuration reference](/reference/config
 
 ## `--defer`: develop against production upstreams
 
-`--defer` is a developer convenience modeled on dbt's defer. You build only your changed models locally, and Rocky resolves their unbuilt upstream `ref()`s against an existing production schema instead of failing on a missing local table.
+`--defer` is a developer convenience modeled on dbt's defer. You build only your changed models locally, and Rocky resolves their unbuilt upstream models against an existing production schema instead of failing on a missing local table.
 
 It only takes effect **together with `--model`**. A full run builds every model, so there are no unbuilt upstreams to defer, and the flag is inert.
 

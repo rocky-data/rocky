@@ -137,6 +137,8 @@ metadata_columns = [
 
 Rocky appends them to the SELECT: `SELECT *, CAST(NULL AS STRING) AS _loaded_by`.
 
+Because `value` becomes part of that statement, Rocky checks it when the config loads: it must be one expression, and any function it calls must be on the scalar-function allowlist. See [`metadata_columns`](/reference/configuration/#pipelinename) for what passes and what does not.
+
 ## Filtering
 
 Scope a run to one tenant:

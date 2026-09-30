@@ -51,7 +51,7 @@ Rocky Lineage Diff (main...HEAD)
 
 ### Rocky Lineage Diff
 
-**2 model(s) changed** (2 modified, 0 added, 0 removed, 0 unchanged)
+**2 row(s) changed** (2 modified, 0 added, 0 removed, 0 unchanged)
 
 <details>
 <summary><b>fct_revenue</b> — modified (3 column changes)</summary>

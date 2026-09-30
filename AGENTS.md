@@ -27,7 +27,7 @@ Write for a person who is busy. These rules apply to chat replies, PR descriptio
 
 | Path | Language | What it is |
 |---|---|---|
-| `engine/` | Rust | Core CLI + engine — SQL transformation, schema drift, incremental loads, adapters. Also carries spec-driven data products: `rocky product` (parse, verify, lower, approve) and the `rocky fulfill` loop (experimental), in the `rocky-fulfill` crate. Multi-crate Cargo workspace. |
+| `engine/` | Rust | Core CLI + engine — SQL transformation, schema drift, incremental loads, adapters. Also carries spec-driven data products: `rocky product` (verify, compile, approve, status, list, journal) and the `rocky fulfill` loop (experimental), in the `rocky-fulfill` crate. Multi-crate Cargo workspace. |
 | `sdk/python/` | Python | `rocky-sdk` — standalone typed Python client (`RockyClient`) over the `rocky` CLI. Owns the generated Pydantic models. For notebooks, scripts, and orchestrators. |
 | `integrations/dagster/` | Python | Dagster integration — a thin `ConfigurableResource` adapter over `rocky-sdk`'s `RockyClient`; maps results to assets/checks. Depends on `rocky-sdk`. |
 | `editors/vscode/` | TypeScript | VS Code extension — LSP client (stdio to `rocky lsp`), syntax highlighting, commands for AI features. |
@@ -50,7 +50,7 @@ Each subproject has its own `AGENTS.md` with build commands, coding standards, a
 editors/vscode  ──(LSP stdio)──▶  engine (rocky lsp)
 sdk/python (rocky-sdk) ──(subprocess)──▶  engine (rocky discover/plan/run/...)
 integrations/dagster ──(RockyClient)──▶  sdk/python ──▶  engine
-examples/playground ──(config)──▶  engine (rocky run --config rocky.toml)
+examples/playground ──(config)──▶  engine (rocky --config rocky.toml run)
 ```
 
 - `sdk/python` (`rocky-sdk`) invokes the `rocky` CLI via subprocess and parses JSON output into Pydantic models. The Python side does not depend on Rust source — only on the binary on `$PATH`.

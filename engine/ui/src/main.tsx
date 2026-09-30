@@ -1,9 +1,5 @@
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
-// Tailwind Plus Elements registers its web components (`<el-dialog>`, …) as a
-// side effect. Bundled, never fetched: the server's CSP allows scripts from
-// the SPA's own origin only.
-import "@tailwindplus/elements";
 import "./styles/base.css";
 import { App } from "./App";
 import { bootstrapToken } from "./token";

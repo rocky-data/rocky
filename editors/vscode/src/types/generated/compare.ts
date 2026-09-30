@@ -21,13 +21,26 @@ export interface CompareOutput {
   [k: string]: unknown;
 }
 export interface TableCompareResult {
-  production_count: number;
+  /**
+   * Null when the warehouse count could not be read.
+   */
+  production_count?: number | null;
   production_table: string;
-  row_count_diff_pct: number;
+  /**
+   * Read errors for an `error` row, or threshold reasons for `warn`/`fail`. Empty for `pass`.
+   */
+  reasons: string[];
+  /**
+   * Null unless both counts were read.
+   */
+  row_count_diff_pct?: number | null;
   row_count_match: boolean;
   schema_diffs: string[];
   schema_match: boolean;
-  shadow_count: number;
+  /**
+   * Null when the warehouse count could not be read.
+   */
+  shadow_count?: number | null;
   shadow_table: string;
   verdict: string;
   [k: string]: unknown;

@@ -13,11 +13,12 @@
 //! Full-refresh models emit a complete `CREATE OR REPLACE TABLE … AS …` that
 //! runs as-is against a fresh warehouse and matches what a run executes in the
 //! resolved dialect (see the dialect note below).
-//! Incremental and merge models emit their **steady-state** statement (a bare
-//! `INSERT` / `MERGE` that operates on an existing target); `rocky run`
-//! bootstraps the target table on first build and threads the incremental
-//! watermark from state, neither of which a static emit can reproduce. Those
-//! files carry a leading note to that effect.
+//! Merge and delete_insert models emit their **steady-state** statement (a bare
+//! `MERGE` / `DELETE` + `INSERT` that operates on an existing target); `rocky
+//! run` creates the target table on first build, which a static emit cannot
+//! reproduce. Those files carry a leading note to that effect. (`incremental`
+//! is refused on transformation models, E037, and `ephemeral` is refused
+//! outright, E038; neither reaches this file.)
 //!
 //! The dialect is the project's configured target adapter type (resolved from
 //! `rocky.toml` without credentials); with no project file at all it defaults
@@ -27,10 +28,9 @@
 //! `rocky run` only for the models whose target uses that dialect. Output is
 //! one `<model>.sql` file per model when `--out-dir` is given,
 //! otherwise the concatenated SQL is printed to stdout, both in dependency
-//! order. Models that produce no standalone SQL — ephemeral (inlined as CTEs)
-//! or strategies that cannot render offline (e.g. Snowflake `DynamicTable`,
-//! which needs a live compute-warehouse name) — are reported on stderr rather
-//! than silently dropped.
+//! order. Models whose SQL cannot be rendered offline (e.g. Snowflake
+//! `DynamicTable`, which needs a live compute-warehouse name) are reported on
+//! stderr rather than silently dropped.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -66,16 +66,15 @@ fn resolve_dialect(
 struct EmittedModel {
     name: String,
     sql: String,
-    /// `true` for incremental/merge-style statements that operate on an
-    /// existing target (bare `INSERT`/`MERGE`). `rocky run` bootstraps the
-    /// target table on first build and threads the incremental watermark from
-    /// state — neither of which a static emit reproduces — so this SQL is the
-    /// steady-state operation, not a from-scratch build.
+    /// `true` for merge/delete_insert statements that operate on an existing
+    /// target. `rocky run` creates the target table on first build, which a
+    /// static emit does not reproduce, so this SQL is the steady-state
+    /// operation, not a from-scratch build.
     assumes_existing_target: bool,
 }
 
 /// The result of an emit: the rendered models plus any that produced no
-/// standalone SQL (ephemeral, or strategies that cannot render offline), so the
+/// standalone SQL (strategies that cannot render offline), so the
 /// caller can surface what was *not* written rather than silently dropping it.
 struct EmitResult {
     models: Vec<EmittedModel>,
@@ -120,6 +119,7 @@ fn emit_models(
     let config = CompilerConfig {
         models_dir: models_dir.to_path_buf(),
         contracts_dir: None,
+        required_explicit_contract_model: None,
         source_schemas: std::collections::HashMap::new(),
         mask: std::collections::BTreeMap::new(),
         allow_unmasked: vec![],
@@ -242,14 +242,6 @@ fn emit_models(
 
         match sql_gen::generate_transformation_sql_with_warehouse(&model_ir, dialect.as_ref(), None)
         {
-            Ok(stmts) if stmts.is_empty() => {
-                // Ephemeral models inline as CTEs — no standalone statement.
-                debug!(
-                    model = model_name,
-                    "emit-sql: no standalone statement (ephemeral)"
-                );
-                skipped.push(format!("{model_name} (ephemeral — inlined as a CTE)"));
-            }
             Ok(stmts) => {
                 // Join multi-statement strategies (e.g. predrop + CTAS) into one
                 // runnable script, each statement terminated with `;`.
@@ -361,16 +353,16 @@ pub fn run_emit_sql(
     Ok(())
 }
 
-/// The SQL written for one model, prefixed with a note for incremental/merge
-/// statements that operate on an existing target (so a reader running the file
-/// against a fresh warehouse understands why a bare `INSERT`/`MERGE` expects the
-/// table to already exist).
+/// The SQL written for one model, prefixed with a note for merge and
+/// delete_insert statements that operate on an existing target (so a reader
+/// running the file against a fresh warehouse understands why a bare
+/// `MERGE`/`DELETE` expects the table to already exist). `incremental` never
+/// reaches here: it is refused on transformation models (#1990).
 fn file_body(m: &EmittedModel) -> String {
     if m.assumes_existing_target {
         format!(
-            "-- NOTE: incremental/merge statement — operates on an existing target.\n\
-             -- `rocky run` bootstraps the table on first build and threads the\n\
-             -- incremental watermark from state; this static SQL does neither.\n{}",
+            "-- NOTE: merge/delete_insert statement — operates on an existing target.\n\
+             -- `rocky run` creates the table on first build; this static SQL does not.\n{}",
             m.sql
         )
     } else {
@@ -860,13 +852,17 @@ mod tests {
         .models;
         assert_eq!(emitted.len(), 1);
         // A merge emits a statement operating on an existing target, so it is
-        // flagged and the written file carries the bootstrap/watermark caveat.
+        // flagged and the written file carries the existing-target note.
         assert!(emitted[0].assumes_existing_target);
         assert!(emitted[0].sql.starts_with("MERGE INTO"));
         let body = file_body(&emitted[0]);
         assert!(
-            body.contains("-- NOTE: incremental/merge"),
+            body.contains("-- NOTE: merge/delete_insert statement"),
             "merge file must carry the existing-target note:\n{body}"
+        );
+        assert!(
+            !body.contains("watermark"),
+            "no watermark applies to merge or delete_insert:\n{body}"
         );
     }
 

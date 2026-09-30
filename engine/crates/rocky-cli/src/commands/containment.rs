@@ -49,8 +49,10 @@
 //!
 //! # Guarantee scope
 //!
-//! Failure containment is **guaranteed** for dependencies declared via `ref()`
-//! and for physical reads Rocky can statically resolve — 2-part `schema.table`,
+//! Failure containment is **guaranteed** for dependencies declared with
+//! `depends_on` in a model's sidecar — Rocky has no `ref()`; that is dbt's, and
+//! only the dbt importer parses it — and for physical reads Rocky can
+//! statically resolve — 2-part `schema.table`,
 //! 3-part `catalog.schema.table`, quoted or unquoted. Those are folded into both
 //! the closure and the execution ordering, so a downstream of a failure is never
 //! built on its stale/missing output.

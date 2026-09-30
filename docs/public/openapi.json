@@ -744,9 +744,49 @@
         ],
         "type": "object"
       },
+      "AnomalyEvaluationOutput": {
+        "description": "Whether the row-count anomaly detector evaluated one table.\n\nOne entry per table in the run's batches, whatever happened. A consumer reading [`RunOutput::anomalies`] alone cannot tell \"the detector ran and found nothing\" from \"the detector never ran\": both are an empty list (#1790). Dagster read the empty list as a pass, so a run with `row_count = false` showed a green anomaly check for a detector that had not run.\n\nThe detector runs only when row-count checks are on, the run has a state store, the table's row count was measured, and its history could be read. `not_evaluated_reason` names which of those was missing, because the remedy differs: one is a config line, another is how the run was invoked.",
+        "properties": {
+          "asset_key": {
+            "description": "Dagster-style asset key path (`[source_type, ...components, table]`), the same value [`MaterializationOutput::asset_key`] carries for this table. Added (#2073) so the Dagster Pipes emitter can report this verdict as a `report_asset_check` without re-deriving the mapping `batch_asset_keys` already has — the same reason [`TableCheckOutput::asset_key`] exists.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "evaluated": {
+            "description": "`true` when the detector compared this table's count against its history. An anomaly, if any, is in [`RunOutput::anomalies`].",
+            "type": "boolean"
+          },
+          "not_evaluated_reason": {
+            "description": "Why the detector did not evaluate this table. Set exactly when `evaluated` is `false`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "table": {
+            "description": "Fully-qualified table the entry is about, the same key [`AnomalyOutput::table`] uses.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "asset_key",
+          "evaluated",
+          "table"
+        ],
+        "type": "object"
+      },
       "AnomalyOutput": {
         "description": "Row count anomaly detected by historical baseline comparison.",
         "properties": {
+          "asset_key": {
+            "description": "Dagster-style asset key path, same convention as [`AnomalyEvaluationOutput::asset_key`] (#2073).",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
           "baseline_avg": {
             "format": "double",
             "type": "number"
@@ -768,6 +808,7 @@
           }
         },
         "required": [
+          "asset_key",
           "baseline_avg",
           "current_count",
           "deviation_pct",
@@ -5420,27 +5461,27 @@
         ],
         "description": "Concurrency strategy: the literal `\"adaptive\"` for AIMD-based throttling, or a positive integer for fixed concurrency."
       },
-      "Confidence": {
-        "description": "Confidence level for an incrementality recommendation.",
+      "ConfigStatus": {
+        "description": "What happened when `rocky.toml` was read at server start.",
         "oneOf": [
           {
-            "description": "Multiple strong signals (name + type + SQL context).",
+            "description": "Read and parsed.",
             "enum": [
-              "high"
+              "loaded"
             ],
             "type": "string"
           },
           {
-            "description": "Two signals (e.g., name + type, or name + SQL context).",
+            "description": "No `rocky.toml`. An ordinary fact about the project, not a failure.",
             "enum": [
-              "medium"
+              "absent"
             ],
             "type": "string"
           },
           {
-            "description": "Single signal (e.g., name pattern only).",
+            "description": "Present, but could not be read or parsed. The server still started — `rocky serve` does not require a config — but the scheduler will skip every tick until it parses.",
             "enum": [
-              "low"
+              "unreadable"
             ],
             "type": "string"
           }
@@ -6893,6 +6934,13 @@
           "action": {
             "type": "string"
           },
+          "asset_key": {
+            "description": "Dagster-style asset key path (`[source_type, ...components, table]`) for this table, the same value [`MaterializationOutput::asset_key`] carries. Added (#2073) so the Dagster Pipes emitter can report drift as a `report_asset_check` keyed on the asset, instead of passing `table` (a bare `catalog.schema.table` string, not a Dagster asset key) as the asset key.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
           "reason": {
             "type": "string"
           },
@@ -6902,6 +6950,7 @@
         },
         "required": [
           "action",
+          "asset_key",
           "reason",
           "table"
         ],
@@ -7005,7 +7054,7 @@
         ]
       },
       "ErrorEnvelope": {
-        "description": "Structured error body returned by the `rocky serve` HTTP API.\n\nEvery non-2xx `/api/v1` response carries this envelope: the HTTP status line carries the error *class* (`400`/`401`/`404`/`409`/`500`/`503`) and the body carries a stable machine token plus a human message and an optional actionable hint. Embedders switch on [`code`](Self::code) and surface [`message`](Self::message) / [`remediation_hint`](Self::remediation_hint) to operators.\n\nStable codes emitted today: `engine_not_ready` (no compile available yet), `engine_busy` (state locked by a running job — retryable), `model_not_found`, `job_not_found`, `mutation_in_progress` (a `run`/`apply` job already holds the mutation permit — carries [`running_job_id`](Self::running_job_id)), `bad_request`, `unauthorized`, `internal_error`.",
+        "description": "Structured error body returned by the `rocky serve` HTTP API.\n\nEvery non-2xx `/api/v1` response carries this envelope: the HTTP status line carries the error *class* (`400`/`401`/`404`/`409`/`500`/`503`) and the body carries a stable machine token plus a human message and an optional actionable hint. Embedders switch on [`code`](Self::code) and surface [`message`](Self::message) / [`remediation_hint`](Self::remediation_hint) to operators.\n\nStable codes emitted today: `engine_not_ready` (no compile available yet), `engine_busy` (state locked by a running job — retryable), `state_needs_migration` (`409`: the state store lacks tables this server reads and a read never creates them; one read-write command — a `rocky run` — migrates it; not retryable), `model_not_found`, `job_not_found`, `mutation_in_progress` (a `run`/`apply` job already holds the mutation permit — carries [`running_job_id`](Self::running_job_id)), `bad_request`, `unauthorized`, `internal_error`.",
         "properties": {
           "code": {
             "description": "Stable machine token, e.g. `\"model_not_found\"`.",
@@ -7894,18 +7943,8 @@
       },
       "FreshnessConfig": {
         "additionalProperties": false,
-        "description": "Freshness check configuration with optional per-schema overrides.",
+        "description": "Freshness check configuration.\n\nA single scalar `threshold_seconds` applies to every checked table. There used to be an `overrides` key for per-schema thresholds; it parsed and validated but nothing on the check path ever read it, so it is now refused with a message naming the remedy (#1620).",
         "properties": {
-          "overrides": {
-            "additionalProperties": {
-              "format": "uint64",
-              "minimum": 0.0,
-              "type": "integer"
-            },
-            "default": {},
-            "description": "Per-schema freshness overrides. Key is a schema pattern (e.g., \"raw__us_west__shopify\"), value overrides threshold_seconds for matching schemas.",
-            "type": "object"
-          },
           "severity": {
             "allOf": [
               {
@@ -7927,7 +7966,7 @@
         "type": "object"
       },
       "FreshnessConfigOutput": {
-        "description": "Freshness check configuration projected into the discover output.\n\nPer-schema `overrides` from `rocky_core::config::FreshnessConfig` are intentionally not exposed yet — the override-key semantics need to be nailed down before integrations can rely on them.",
+        "description": "Freshness check configuration projected into the discover output.\n\nJust the scalar threshold: `[checks.freshness]` has no per-schema `overrides` key. One existed and parsed but nothing on the check path ever read it, so it was removed rather than exposed here (#1620).",
         "properties": {
           "threshold_seconds": {
             "format": "uint64",
@@ -9587,41 +9626,6 @@
         ],
         "type": "object"
       },
-      "IncrementalityHint": {
-        "description": "A hint that a model could benefit from incremental materialization.\n\nReturned by [`infer_incrementality`] when a `full_refresh` model has columns that look monotonic. Surfaced in `rocky compile --output json` as part of each model's detail.",
-        "properties": {
-          "confidence": {
-            "allOf": [
-              {
-                "$ref": "#/components/schemas/Confidence"
-              }
-            ],
-            "description": "How confident the detector is in this recommendation."
-          },
-          "is_candidate": {
-            "description": "Whether the model is a candidate for incremental materialization.",
-            "type": "boolean"
-          },
-          "recommended_column": {
-            "description": "The column recommended as the watermark / timestamp column.",
-            "type": "string"
-          },
-          "signals": {
-            "description": "Human-readable reasons why this column was chosen.",
-            "items": {
-              "type": "string"
-            },
-            "type": "array"
-          }
-        },
-        "required": [
-          "confidence",
-          "is_candidate",
-          "recommended_column",
-          "signals"
-        ],
-        "type": "object"
-      },
       "IsolationConfig": {
         "additionalProperties": false,
         "description": "Workspace isolation configuration (Databricks-specific).\n\n```toml [governance.isolation] enabled = true\n\n[[governance.isolation.workspace_ids]] id = 7474656540609532 binding_type = \"READ_WRITE\"\n\n[[governance.isolation.workspace_ids]] id = 7474647537929812 binding_type = \"READ_ONLY\" ```",
@@ -10432,12 +10436,12 @@
               }
             ],
             "default": {
-              "anomaly_threshold_pct": 0.0,
+              "anomaly_threshold_pct": 50.0,
               "assertions": [],
               "column_match": false,
               "custom": [],
               "enabled": false,
-              "fail_on_error": false,
+              "fail_on_error": true,
               "freshness": null,
               "null_rate": null,
               "quarantine": null,
@@ -11251,17 +11255,6 @@
             ],
             "description": "Per-model freshness expectation, when declared in the model's TOML frontmatter. `None` when not configured."
           },
-          "incrementality_hint": {
-            "anyOf": [
-              {
-                "$ref": "#/components/schemas/IncrementalityHint"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "description": "When the model uses `full_refresh` and has columns that look monotonic, this hint suggests switching to incremental materialization. `None` when the model already uses an incremental strategy or no candidates were found."
-          },
           "name": {
             "type": "string"
           },
@@ -11827,13 +11820,6 @@
         "properties": {
           "command": {
             "type": "string"
-          },
-          "incrementality_note": {
-            "description": "Hint pointing users to `rocky compile --output json` for inferred incrementality recommendations on `full_refresh` models. Only populated when the optimize command detects that compile-time analysis could provide additional optimization opportunities.",
-            "type": [
-              "string",
-              "null"
-            ]
           },
           "message": {
             "type": [
@@ -12525,7 +12511,6 @@
         "description": "Schema-only helper mirroring [`AdaptersFieldSchema`] for `[pipeline.*]`.\n\nThe flat-pipeline shorthand exists in [`normalize_toml_shorthands`] but is unused across all committed POCs; including it in the schema is defensive — a user typing `[pipeline] source = ...` shouldn't see a false IDE error. The pipeline payload references [`PipelineConfig`] directly, whose hand-written `JsonSchema` impl emits an `anyOf` of the five pipeline variants."
       },
       "PlanOutput": {
-        "description": "JSON output for `rocky plan`.\n\n`statements` enumerates the warehouse SQL Rocky would emit. The three `*_actions` collections are a parallel view of the control-plane governance work `rocky run` would do *after* a successful DAG — the classification / masking / retention reconcile pass. These never show up as SQL; they fire through [`rocky_core::traits::GovernanceAdapter`] methods (e.g. `apply_column_tags`, `apply_masking_policy`, `apply_retention_policy`). Projects without any `[classification]`, `[mask]`, or `retention` config get empty lists — the fields `skip_serializing_if = Vec::is_empty`, so JSON consumers written against the earlier shape are byte-stable.\n\n## Plan-persistence additions\n\n`plan_id`, `plan_kind`, `created_at`, `models`, and `execution_layers` are additive — all have `skip_serializing_if` so existing fixtures and consumers that do not include a compile step remain byte-stable. When `rocky plan` runs against a project with a `models/` directory, these fields are populated and the plan is persisted to `.rocky/plans/`.",
         "properties": {
           "breaking_verdict": {
             "anyOf": [
@@ -12619,6 +12604,13 @@
             "description": "Retention-policy applications the governance reconciler would issue via `apply_retention_policy`. One row per model whose sidecar declares `retention = \"<N>[dy]\"`. `warehouse_preview` shows the warehouse-native SQL that the current adapter would compile the policy to (Databricks / Snowflake); `None` on warehouses without a first-class retention knob.",
             "items": {
               "$ref": "#/components/schemas/RetentionAction"
+            },
+            "type": "array"
+          },
+          "skipped": {
+            "description": "Models the preview could not render, one entry each, with the reason. A model whose SQL cannot be rendered offline lands here (a Snowflake dynamic table needs a live compute-warehouse name), and so does one whose strategy is refused, such as `ephemeral` (E038). Before, such a model left no trace: an ephemeral-only project previewed as an empty plan and exit 0.",
+            "items": {
+              "$ref": "#/components/schemas/SkippedModel"
             },
             "type": "array"
           },
@@ -13956,7 +13948,7 @@
             "type": "string"
           },
           "branch_schema": {
-            "description": "Schema prefix the branch run wrote into (e.g. `branch__fix-price`).",
+            "description": "Schema prefix the branch run wrote into (e.g. `branch__fix_price`).",
             "type": "string"
           },
           "command": {
@@ -14079,12 +14071,19 @@
             "minimum": 0.0,
             "type": "integer"
           },
+          "models_unknown": {
+            "description": "Models whose row-count delta could not be computed — the warehouse adapter or materialization strategy reported no `rows_affected` on the branch side, the base side, or both (#2032). These are counted separately from `models_unchanged`: \"no recorded delta\" is not the same claim as \"no change\", and folding the two together is exactly the false-clean report this field exists to prevent. A model here contributes `null` (not `0`) to its own `rows_added`/`rows_removed` and is excluded from `total_rows_added`/`total_rows_removed`, so those totals are a floor, not an exact count, whenever this is > 0.",
+            "format": "uint",
+            "minimum": 0.0,
+            "type": "integer"
+          },
           "models_with_changes": {
             "format": "uint",
             "minimum": 0.0,
             "type": "integer"
           },
           "total_rows_added": {
+            "description": "Sum of `rows_added` over models with a KNOWN delta only — models counted in `models_unknown` contribute nothing here (never `0`, which would be indistinguishable from a genuine no-op).",
             "format": "uint64",
             "minimum": 0.0,
             "type": "integer"
@@ -14103,6 +14102,7 @@
         "required": [
           "any_coverage_warning",
           "models_unchanged",
+          "models_unknown",
           "models_with_changes",
           "total_rows_added",
           "total_rows_changed",
@@ -14317,7 +14317,7 @@
         "type": "object"
       },
       "PreviewRowsOutput": {
-        "description": "JSON output for `rocky preview rows`.\n\nA sample of result rows for a single transformation model (or one of its CTEs), executed against the pipeline's configured adapter. Classified columns are masked inline before execution, so the rows match what the materialized target would expose. `truncated` is `true` when the model produced at least `limit_applied` rows.",
+        "description": "JSON output for `rocky preview rows`.\n\nA sample of result rows for a single transformation model (or one of its CTEs), executed against the pipeline's configured adapter. Classified columns are masked inline before execution, so the rows match what the materialized target would expose; a classified column whose tag resolves to no mask strategy refuses the preview (`masking_unresolved`) rather than returning raw values, unless the project lists that tag under `[classifications.allow_unmasked]`, which returns it unmasked on purpose. `truncated` is `true` when the model produced at least `limit_applied` rows.",
         "properties": {
           "adapter_kind": {
             "description": "Adapter the preview ran against (e.g. `\"duckdb\"`, `\"databricks\"`).",
@@ -14400,9 +14400,13 @@
         "description": "Sampled row-level diff. All counts are over the sampling window.",
         "properties": {
           "rows_added": {
+            "description": "`None` — emitted as JSON `null`, deliberately NOT omitted via `skip_serializing_if` — when the row count needed to compute this delta was unavailable on the branch side, the base side, or both (an ordinary transformation run's adapter/strategy reports no `rows_affected`). `Some(0)` means a genuine, measured no-op; `null` means unmeasured. Collapsing the two into `0` is the exact defect this field exists to prevent — a full-refresh model going from 10 rows to 20 must never report `rows_added: 0` (#2032).",
             "format": "uint64",
             "minimum": 0.0,
-            "type": "integer"
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "rows_changed": {
             "format": "uint64",
@@ -14410,9 +14414,13 @@
             "type": "integer"
           },
           "rows_removed": {
+            "description": "Same absent-vs-zero contract as `rows_added`.",
             "format": "uint64",
             "minimum": 0.0,
-            "type": "integer"
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "samples": {
             "description": "Up to `--max-samples` (default 5) representative changed rows for human review. Pure noise when sampling found no change.",
@@ -14423,9 +14431,7 @@
           }
         },
         "required": [
-          "rows_added",
-          "rows_changed",
-          "rows_removed"
+          "rows_changed"
         ],
         "type": "object"
       },
@@ -15536,6 +15542,13 @@
             "description": "Git HEAD SHA at plan time — informational for audit purposes.",
             "type": "string"
           },
+          "pipeline": {
+            "description": "The resolved pipeline the promote targets were built against (`resolve_pipeline`'s output at plan time — never ambiguous, even on a single-pipeline config where `--pipeline` was omitted). `rocky apply <plan-id>` reads this instead of re-resolving from the config, so applying a promote plan is never ambiguous on a multi-pipeline project. Absent on plans written before this field existed; apply falls back to `resolve_pipeline(None)` for those, unchanged from before this field was added.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "plan_audit": {
             "description": "Plan-time audit events (approvals gate + breaking-change gate outcomes). Apply-time events (`PromoteStarted`, `PromoteCompleted`, `PromoteFailed`) are appended in `BranchPromoteOutput.audit` at apply time.",
             "items": {
@@ -16128,7 +16141,7 @@
             "type": "array"
           },
           "error": {
-            "description": "Error message from the first failing statement, if any.",
+            "description": "The first failing statement's role and error, if any. For `mode = \"split\"`, a failure to drop the intermediate label table is appended after it.",
             "type": [
               "string",
               "null"
@@ -16139,7 +16152,7 @@
             "type": "string"
           },
           "ok": {
-            "description": "`true` when every quarantine statement executed successfully. `false` means a partial failure — inspect `error` for details.",
+            "description": "`true` when every quarantine statement executed successfully and, for `mode = \"split\"`, the intermediate label table was dropped. `false` also adds a failing `quarantine:execute` check, counts the table in `tables_failed` and itemises it in `errors`, so the run fails whatever `fail_on_error` says; inspect `error` for details.",
             "type": "boolean"
           },
           "quarantine_table": {
@@ -16702,12 +16715,12 @@
               }
             ],
             "default": {
-              "anomaly_threshold_pct": 0.0,
+              "anomaly_threshold_pct": 50.0,
               "assertions": [],
               "column_match": false,
               "custom": [],
               "enabled": false,
-              "fail_on_error": false,
+              "fail_on_error": true,
               "freshness": null,
               "null_rate": null,
               "quarantine": null,
@@ -16767,7 +16780,7 @@
           },
           "prune_unchanged": {
             "default": false,
-            "description": "When `true`, the replication runner skips (\"prunes\") any table whose source is provably unchanged since the last successful copy — detected via the adapter's `source_change_marker` (a `DESCRIBE DETAIL`-derived marker on Databricks; adapters without a cheap change signal always copy). A pruned table runs no copy and no data checks: the runner emits no materialization and records it under `excluded_tables` with reason `\"unchanged_since_last_copy\"`.\n\nDownstream continuity — and preserving the table's prior check results — is then the orchestrator's job. The Dagster integration treats a pruned, unmaterialized key as unchanged via `satisfy_empty_outputs`; enabling pruning without an orchestrator that handles unmaterialized keys drops the table from the run.\n\nDefaults to `false` — opt in per pipeline, since silently skipping copies is a behavior change. The marker is compared against the target's recorded last-copied value (never wall-clock), so a failed prior run cannot cause a false skip. Pass `--no-prune` to `rocky run` to force a full pass (e.g. after a manual target-side mutation).",
+            "description": "When `true`, the replication runner skips (\"prunes\") any table whose source is provably unchanged since the last successful copy — detected via the adapter's `source_change_marker` (a `DESCRIBE DETAIL`-derived marker on Databricks; adapters without a cheap change signal always copy). A pruned table runs no copy and no data checks: the runner emits no materialization and records it under `excluded_tables` with reason `\"unchanged_since_last_copy\"`.\n\nDownstream continuity — and preserving the table's prior check results — is then the orchestrator's job. The Dagster integration treats a pruned, unmaterialized key as unchanged via `satisfy_empty_outputs`; enabling pruning without an orchestrator that handles unmaterialized keys drops the table from the run.\n\nDefaults to `false` — opt in per pipeline, since silently skipping copies is a behavior change. The marker is compared against the target's recorded last-copied value (never wall-clock), so a failed prior run cannot cause a false skip. Pass `--no-prune` to `rocky run` to force a full pass (e.g. after a manual target-side mutation).\n\nAn `incremental` table is never pruned until it has a recorded watermark: its first run always copies, even when the marker matches, because a table with no watermark has nothing recorded for the next incremental run to append from. A `full_refresh` table has no such condition.",
             "type": "boolean"
           },
           "schedule": {
@@ -17532,7 +17545,7 @@
             ],
             "description": "The capability that was evaluated (its `schema_change.*` refinement is the change class the ranking weighs)."
           },
-          "classification_weight": {
+          "change_class_weight": {
             "description": "The change-class weight the ranking used (breaking > bare verb > additive / value-only).",
             "format": "uint32",
             "minimum": 0.0,
@@ -17603,7 +17616,7 @@
         "required": [
           "approve_command",
           "capability",
-          "classification_weight",
+          "change_class_weight",
           "decision_ref",
           "model",
           "models",
@@ -17636,7 +17649,7 @@
             "type": "array"
           },
           "ranking": {
-            "description": "Human-readable description of the ordering, e.g. `\"blast_radius × classification × staleness\"`.",
+            "description": "Human-readable description of the ordering, e.g. `\"blast_radius × change_class × staleness\"`.",
             "type": "string"
           },
           "total": {
@@ -18411,6 +18424,13 @@
               "null"
             ]
           },
+          "rocky_branch": {
+            "description": "The named Rocky branch this run wrote to (`rocky run --branch <name>`), or `None` for a production / plain-`--shadow` run. Distinct from `git_branch` — see `RunRecord::rocky_branch` (#2032). Not audit-gated — like [`Self::pipeline`], it is an operational join key (`rocky preview diff`/`preview cost` pair a run by this field), always emitted when present.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "rocky_version": {
             "description": "`CARGO_PKG_VERSION` of the `rocky` binary, or `\"<pre-audit>\"` on schema-v5 rows that predate the audit trail.",
             "type": [
@@ -18521,6 +18541,13 @@
             },
             "type": "array"
           },
+          "anomaly_evaluated": {
+            "description": "One entry per table the run considered for row-count anomaly detection, saying whether the detector evaluated it. Empty for a run with no batched checks. See [`AnomalyEvaluationOutput`] — without it, an empty `anomalies` list means both \"nothing anomalous\" and \"nothing was looked at\" (#1790).",
+            "items": {
+              "$ref": "#/components/schemas/AnomalyEvaluationOutput"
+            },
+            "type": "array"
+          },
           "budget_breaches": {
             "description": "Budget breaches detected at end of run. Empty when no `[budget]` block is configured or all configured limits were respected. Each breach is also emitted as a `budget_breach` [`rocky_observe::events::PipelineEvent`] and fires the `on_budget_breach` hook so subscribers see them live.",
             "items": {
@@ -18542,7 +18569,7 @@
             "type": "string"
           },
           "contained": {
-            "description": "Models withheld this run because an upstream failed (or was itself withheld) and `[resilience] contain_failures` continued the disjoint subgraphs — the blast radius of the failures named in `errors[]`. Empty (and omitted) for a run that did not withhold anything: the default fail-fast run, and any successful run, record nothing here.",
+            "description": "Models withheld this run after an upstream compile failure, or while `[resilience] contain_failures` continues disjoint subgraphs after a runtime failure. This is the blast radius of failures in `errors[]`. Empty (and omitted) when no model was withheld.",
             "items": {
               "$ref": "#/components/schemas/ContainedModelOutput"
             },
@@ -19633,6 +19660,96 @@
         ],
         "type": "object"
       },
+      "SettingsOutput": {
+        "description": "The running server's posture, served by `GET /api/v1/settings`.\n\n**An allowlist, not a config dump.** Every field below is projected individually, by hand, in `crate::api::settings_output` — from a [`rocky_server::state::SettingsSnapshot`] of primitives plus two fieldless enum labels taken out of the config file, after which the config is dropped. No `RockyConfig` is serialised or `Debug`-printed anywhere on that path: `AdapterConfig`'s `Debug` prints its `.extra` map, which is unbounded caller-supplied TOML, so a config that merely *passed through* this type would be a disclosure surface.\n\nNo secret appears — not the Bearer token, not `ROCKY_WEBHOOK_SECRET`. The token is reported as its name and scope; the webhook secret as whether it is usable.\n\nTo be exact about what enforces that: the **projection function** does, not the type. Rust would happily let a future field carry a secret. What makes it hold is that the projection names every field explicitly, and three tests stand behind it — `settings_reports_exactly_the_allowlisted_fields` fails when a field is *added*, `settings_never_discloses_a_configured_secret` greps this document for three real configured secrets, and `no_safe_route_discloses_a_configured_secret` greps every safe route for the same three.\n\n**API-only, deliberately.** There is no `rocky settings` verb, because this document describes *a server that is running* and a one-shot CLI invocation would have to invent one. [`ScheduleStatusOutput`] is the established precedent for a route with no CLI oracle.\n\n**Freshness.** Everything except `state_backend` and `concurrency_control` is fixed when the process starts and cannot change while it runs.\n\nThose two come from `rocky.toml`, and are read **once, on the first request to this route**, then fixed for the life of the process. Deliberately not at startup: on a plain `rocky serve` nothing on the path to binding the listener reads a file, and an eager read would put one there — letting a `rocky.toml` that is a FIFO or sits on a stalled mount stop the server binding at all. (`--scheduler` without an explicit `--poll-interval` already reads the config before binding; that path is unchanged.)\n\nThat read is bounded by one permit and a deadline, so a stuck file cannot starve the server either: a caller that finds it busy gets `503 engine_busy`, and one whose read blows the deadline gets `504 settings_config_timeout`. Every other field is unaffected.\n\nSo they are a snapshot, not a live view, and the scheduler re-reads that same file every tick — a config edited after the first request to this route is not reflected here, while the scheduler acts on the new one.",
+        "properties": {
+          "allowed_hosts": {
+            "description": "Extra `Host` header values the UI guard accepts.\n\nThis is what is **enforced**, not what was typed: `--allowed-host` is only wired into a guard when `--ui` is on, so this is `[]` whenever `ui` is `false`. Reporting the raw flag list would claim a guard that is not running.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "allowed_origins": {
+            "description": "The CORS allowlist actually installed. Empty means same-origin only.\n\nLike `allowed_hosts`, this is what is **enforced**: `build_cors_layer` drops an `--allowed-origin` that is not a valid header value, and an origin it could not install grants nothing. Both this and the layer come from one derivation, so the report cannot drift from the layer.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "bind_host": {
+            "description": "The host the listener is bound to, verbatim (`127.0.0.1`, `0.0.0.0`, …).\n\nThe same `String` `ServeConfig` binds — `serve` lends one value to both, so this cannot name a host the server is not actually on.",
+            "type": "string"
+          },
+          "concurrency_control": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ConcurrencyControl"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "`[state] concurrency_control`, read at the same moment as `state_backend`. `null` on the same condition."
+          },
+          "config_status": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ConfigStatus"
+              }
+            ],
+            "description": "What happened when `rocky.toml` was read.\n\nCarried so a `null` backend is explainable: a project with no config and a project whose config is broken are different facts, and no other HTTP route distinguishes them today."
+          },
+          "scheduler": {
+            "description": "Whether a resident reconciler is running (`--scheduler`).",
+            "type": "boolean"
+          },
+          "state_backend": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/StateBackend"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "`[state] backend`, as read on the first request to this route. `null` when there was no readable config — `config_status` says which."
+          },
+          "token": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TokenSettings"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The configured Bearer token, as its name and scope — never its value.\n\n`null` means **no token is configured**, which the server permits only on a loopback bind (`api::serve` refuses to bind a non-loopback host with no auth). That is the most exposure-relevant answer this route gives, so it is a distinguishable `null` rather than a token named \"none\"."
+          },
+          "ui": {
+            "description": "Whether the embedded browser UI is served at `/ui/` (`--ui`).",
+            "type": "boolean"
+          },
+          "webhook_secret": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/WebhookSecretStatus"
+              }
+            ],
+            "description": "Whether `ROCKY_WEBHOOK_SECRET` can sign a webhook.\n\nReported even when `scheduler` is `false`, which is the point: it tells an operator what will happen when they turn the scheduler on."
+          }
+        },
+        "required": [
+          "allowed_hosts",
+          "allowed_origins",
+          "bind_host",
+          "config_status",
+          "scheduler",
+          "ui",
+          "webhook_secret"
+        ],
+        "type": "object"
+      },
       "Severity": {
         "description": "Severity level of a diagnostic.\n\nSerialized in PascalCase (`\"Error\"`, `\"Warning\"`, `\"Info\"`) to stay compatible with existing dagster fixtures and the hand-written `Severity` StrEnum in `integrations/dagster/src/dagster_rocky/types.py`.",
         "enum": [
@@ -19694,6 +19811,24 @@
           }
         },
         "required": [
+          "reason"
+        ],
+        "type": "object"
+      },
+      "SkippedModel": {
+        "description": "JSON output for `rocky plan`.\n\n`statements` enumerates the warehouse SQL Rocky would emit. The three `*_actions` collections are a parallel view of the control-plane governance work `rocky run` would do *after* a successful DAG — the classification / masking / retention reconcile pass. These never show up as SQL; they fire through [`rocky_core::traits::GovernanceAdapter`] methods (e.g. `apply_column_tags`, `apply_masking_policy`, `apply_retention_policy`). Projects without any `[classification]`, `[mask]`, or `retention` config get empty lists — the fields `skip_serializing_if = Vec::is_empty`, so JSON consumers written against the earlier shape are byte-stable.\n\n## Plan-persistence additions\n\n`plan_id`, `plan_kind`, `created_at`, `models`, and `execution_layers` are additive — all have `skip_serializing_if` so existing fixtures and consumers that do not include a compile step remain byte-stable. When `rocky plan` runs against a project with a `models/` directory, these fields are populated and the plan is persisted to `.rocky/plans/`. One model `rocky plan` left out of the preview, and why.",
+        "properties": {
+          "model": {
+            "description": "The model's name, as declared in its sidecar.",
+            "type": "string"
+          },
+          "reason": {
+            "description": "Why no statement was previewed for it.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "model",
           "reason"
         ],
         "type": "object"
@@ -19765,12 +19900,12 @@
               }
             ],
             "default": {
-              "anomaly_threshold_pct": 0.0,
+              "anomaly_threshold_pct": 50.0,
               "assertions": [],
               "column_match": false,
               "custom": [],
               "enabled": false,
-              "fail_on_error": false,
+              "fail_on_error": true,
               "freshness": null,
               "null_rate": null,
               "quarantine": null,
@@ -20246,7 +20381,7 @@
               }
             ],
             "default": "off",
-            "description": "Concurrency control for remote state writes. Default [`ConcurrencyControl::Off`] (unconditional last-writer-wins, byte- identical to pre-CAS). Set to `\"cas\"` on live multi-pod deployments with a durable object tier (`s3`, `gcs`, `tiered`) so a writer that lost a cross-pod race is reconciled by writer class instead of silently overwriting the winner: the end-of-run upload fail-closes, and the `rocky policy` freeze/unfreeze ledger write replays onto the winner. `rocky gc` and `rocky apply` still write unconditionally (issue #1228), so `cas` reduces but does not yet eliminate lost updates. On `tiered` it additionally makes the Valkey tier coherent with the durable object. Auto-downgrades to `off` (with a warn) on `local` and `valkey`."
+            "description": "Concurrency control for remote state writes. Default [`ConcurrencyControl::Off`] (unconditional last-writer-wins, byte- identical to pre-CAS). Set to `\"cas\"` on live multi-pod deployments with a durable object tier (`s3`, `gcs`, `tiered`) so a writer that lost a cross-pod race is reconciled by writer class instead of silently overwriting the winner: the end-of-run upload fail-closes, the `rocky policy` freeze/unfreeze ledger write replays onto the winner, and `rocky gc` commits through the same seam (since #1372). `rocky restore` still uploads unconditionally on every remote backend, `rocky apply` of a restore plan routes through that same path and so uploads unconditionally too, and `rocky apply` elsewhere does so only for its verify-after custody rows (issue #1228), so `cas` reduces but does not yet eliminate lost updates. On `tiered` it additionally makes the Valkey tier coherent with the durable object. Auto-downgrades to `off` (with a warn) on `local` and `valkey`."
           },
           "freeze_marker_writes": {
             "default": false,
@@ -20691,7 +20826,7 @@
             "type": "object"
           },
           {
-            "description": "Ephemeral model — inlined as CTE in downstream queries, no table created.",
+            "description": "Ephemeral model — refused at compile time (E038). No table is created and no consumer inlines it, so it is kept only to name the refusal.",
             "properties": {
               "type": {
                 "enum": [
@@ -20881,16 +21016,31 @@
       "TableCompareResult": {
         "properties": {
           "production_count": {
+            "description": "Null when the warehouse count could not be read.",
             "format": "uint64",
             "minimum": 0.0,
-            "type": "integer"
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "production_table": {
             "type": "string"
           },
+          "reasons": {
+            "description": "Read errors for an `error` row, or threshold reasons for `warn`/`fail`. Empty for `pass`.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
           "row_count_diff_pct": {
+            "description": "Null unless both counts were read.",
             "format": "double",
-            "type": "number"
+            "type": [
+              "number",
+              "null"
+            ]
           },
           "row_count_match": {
             "type": "boolean"
@@ -20905,9 +21055,13 @@
             "type": "boolean"
           },
           "shadow_count": {
+            "description": "Null when the warehouse count could not be read.",
             "format": "uint64",
             "minimum": 0.0,
-            "type": "integer"
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "shadow_table": {
             "type": "string"
@@ -20917,13 +21071,11 @@
           }
         },
         "required": [
-          "production_count",
           "production_table",
-          "row_count_diff_pct",
+          "reasons",
           "row_count_match",
           "schema_diffs",
           "schema_match",
-          "shadow_count",
           "shadow_table",
           "verdict"
         ],
@@ -21508,6 +21660,47 @@
         ],
         "type": "string"
       },
+      "TokenScopeLabel": {
+        "description": "The spellings `--token-scope` accepts.",
+        "oneOf": [
+          {
+            "description": "Every route, mutating included.",
+            "enum": [
+              "full"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "Safe HTTP methods only; anything else is refused `403`.",
+            "enum": [
+              "read-only"
+            ],
+            "type": "string"
+          }
+        ]
+      },
+      "TokenSettings": {
+        "description": "The configured Bearer token, described without disclosing it.",
+        "properties": {
+          "name": {
+            "description": "Always `default`. `rocky serve` holds exactly one token; the name exists so a future multi-token server does not have to change this shape.",
+            "type": "string"
+          },
+          "scope": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/TokenScopeLabel"
+              }
+            ],
+            "description": "What the token may do."
+          }
+        },
+        "required": [
+          "name",
+          "scope"
+        ],
+        "type": "object"
+      },
       "TraceModelEntry": {
         "description": "One model execution entry inside [`TraceOutput`]. `start_offset_ms` is the wall-clock offset from the run start; `lane` identifies the concurrency lane for Gantt rendering (entries on the same lane never overlap in time).",
         "properties": {
@@ -21649,12 +21842,12 @@
               }
             ],
             "default": {
-              "anomaly_threshold_pct": 0.0,
+              "anomaly_threshold_pct": 50.0,
               "assertions": [],
               "column_match": false,
               "custom": [],
               "enabled": false,
-              "fail_on_error": false,
+              "fail_on_error": true,
               "freshness": null,
               "null_rate": null,
               "quarantine": null,
@@ -22229,6 +22422,32 @@
         ],
         "description": "Supports both single-webhook and multi-webhook syntax per event.\n\nSingle: `[hook.webhooks.on_pipeline_start]` Multiple: `[[hook.webhooks.on_pipeline_start]]`"
       },
+      "WebhookSecretStatus": {
+        "description": "Whether `ROCKY_WEBHOOK_SECRET` can actually sign a webhook.\n\nNamed by operator consequence rather than by error kind — the question this answers is \"what happens if I turn the scheduler on?\".",
+        "oneOf": [
+          {
+            "description": "Set, non-blank, readable. Webhook requests must carry a signature.",
+            "enum": [
+              "present"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "Not set. On a loopback bind the webhook accepts UNSIGNED requests; on a non-loopback bind the route answers `404`.",
+            "enum": [
+              "absent"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "Set, but blank or not valid UTF-8. `--scheduler` will refuse to start — the startup gate rejects both.",
+            "enum": [
+              "set_but_unusable"
+            ],
+            "type": "string"
+          }
+        ]
+      },
       "WorkspaceBindingConfig": {
         "additionalProperties": false,
         "description": "A workspace binding with ID and access level.",
@@ -22320,7 +22539,7 @@
                 }
               }
             },
-            "description": "`products/<name>.toml` exists but the spec loader rejects it, so the product's output model cannot be resolved. The body carries the loader's code and reason."
+            "description": "The state store on disk lacks tables this server reads, and a read never creates them. `rocky serve` migrates the store at startup (its job sweep opens it read-write), so this means the file changed under a running server, or that sweep could not open it. Restart `rocky serve`, or run any read-write command such as `rocky run`, once. Not retryable."
           },
           "500": {
             "content": {
@@ -22399,6 +22618,16 @@
             },
             "description": "A query parameter is not one of its documented values, or the subject is longer than 512 bytes."
           },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The state store on disk lacks tables this server reads, and a read never creates them. `rocky serve` migrates the store at startup (its job sweep opens it read-write), so this means the file changed under a running server, or that sweep could not open it. Restart `rocky serve`, or run any read-write command such as `rocky run`, once. Not retryable."
+          },
           "500": {
             "content": {
               "application/json": {
@@ -22466,6 +22695,16 @@
               }
             },
             "description": "A query parameter is not one of its documented values, or the subject is longer than 512 bytes."
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The state store on disk lacks tables this server reads, and a read never creates them. `rocky serve` migrates the store at startup (its job sweep opens it read-write), so this means the file changed under a running server, or that sweep could not open it. Restart `rocky serve`, or run any read-write command such as `rocky run`, once. Not retryable."
           },
           "500": {
             "content": {
@@ -22583,6 +22822,16 @@
               }
             },
             "description": "A query parameter is not one of its documented values, or the subject is longer than 512 bytes."
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The state store on disk lacks tables this server reads, and a read never creates them. `rocky serve` migrates the store at startup (its job sweep opens it read-write), so this means the file changed under a running server, or that sweep could not open it. Restart `rocky serve`, or run any read-write command such as `rocky run`, once. Not retryable."
           },
           "500": {
             "content": {
@@ -23055,6 +23304,16 @@
               }
             },
             "description": "No job with this id (neither in-memory nor persisted)."
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The state store on disk lacks tables this server reads, and a read never creates them. `rocky serve` migrates the store at startup (its job sweep opens it read-write), so this means the file changed under a running server, or that sweep could not open it. Restart `rocky serve`, or run any read-write command such as `rocky run`, once. Not retryable."
           }
         },
         "summary": "Job status",
@@ -23195,6 +23454,16 @@
               }
             },
             "description": "The model's run history."
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The state store on disk lacks tables this server reads, and a read never creates them. `rocky serve` migrates the store at startup (its job sweep opens it read-write), so this means the file changed under a running server, or that sweep could not open it. Restart `rocky serve`, or run any read-write command such as `rocky run`, once. Not retryable."
           },
           "503": {
             "content": {
@@ -23353,6 +23622,16 @@
               }
             },
             "description": "The model's quality snapshots."
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The state store on disk lacks tables this server reads, and a read never creates them. `rocky serve` migrates the store at startup (its job sweep opens it read-write), so this means the file changed under a running server, or that sweep could not open it. Restart `rocky serve`, or run any read-write command such as `rocky run`, once. Not retryable."
           },
           "503": {
             "content": {
@@ -23535,6 +23814,16 @@
             },
             "description": "The policy plane as configured and as it stands."
           },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The state store on disk lacks tables this server reads, and a read never creates them. `rocky serve` migrates the store at startup (its job sweep opens it read-write), so this means the file changed under a running server, or that sweep could not open it. Restart `rocky serve`, or run any read-write command such as `rocky run`, once. Not retryable."
+          },
           "500": {
             "content": {
               "application/json": {
@@ -23576,6 +23865,16 @@
               }
             },
             "description": "The product list."
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The state store on disk lacks tables this server reads, and a read never creates them. `rocky serve` migrates the store at startup (its job sweep opens it read-write), so this means the file changed under a running server, or that sweep could not open it. Restart `rocky serve`, or run any read-write command such as `rocky run`, once. Not retryable."
           },
           "500": {
             "content": {
@@ -23640,6 +23939,16 @@
             },
             "description": "No spec file and no state record exists under this product name."
           },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The state store on disk lacks tables this server reads, and a read never creates them. `rocky serve` migrates the store at startup (its job sweep opens it read-write), so this means the file changed under a running server, or that sweep could not open it. Restart `rocky serve`, or run any read-write command such as `rocky run`, once. Not retryable."
+          },
           "500": {
             "content": {
               "application/json": {
@@ -23703,6 +24012,16 @@
             },
             "description": "No spec file and no state record exists under this product name."
           },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The state store on disk lacks tables this server reads, and a read never creates them. `rocky serve` migrates the store at startup (its job sweep opens it read-write), so this means the file changed under a running server, or that sweep could not open it. Restart `rocky serve`, or run any read-write command such as `rocky run`, once. Not retryable."
+          },
           "500": {
             "content": {
               "application/json": {
@@ -23745,6 +24064,16 @@
             },
             "description": "The project."
           },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The state store on disk lacks tables this server reads, and a read never creates them. `rocky serve` migrates the store at startup (its job sweep opens it read-write), so this means the file changed under a running server, or that sweep could not open it. Restart `rocky serve`, or run any read-write command such as `rocky run`, once. Not retryable."
+          },
           "500": {
             "content": {
               "application/json": {
@@ -23786,6 +24115,16 @@
               }
             },
             "description": "The ranked queue."
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The state store on disk lacks tables this server reads, and a read never creates them. `rocky serve` migrates the store at startup (its job sweep opens it read-write), so this means the file changed under a running server, or that sweep could not open it. Restart `rocky serve`, or run any read-write command such as `rocky run`, once. Not retryable."
           },
           "500": {
             "content": {
@@ -23931,7 +24270,7 @@
                 }
               }
             },
-            "description": "A review marker exists for the plan but does not parse, or names another plan. Re-approve with `rocky review <plan-id> --approve` to rewrite it."
+            "description": "The state store on disk lacks tables this server reads, and a read never creates them. `rocky serve` migrates the store at startup (its job sweep opens it read-write), so this means the file changed under a running server, or that sweep could not open it. Restart `rocky serve`, or run any read-write command such as `rocky run`, once. Not retryable."
           },
           "500": {
             "content": {
@@ -23975,6 +24314,16 @@
             },
             "description": "The project run history."
           },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The state store on disk lacks tables this server reads, and a read never creates them. `rocky serve` migrates the store at startup (its job sweep opens it read-write), so this means the file changed under a running server, or that sweep could not open it. Restart `rocky serve`, or run any read-write command such as `rocky run`, once. Not retryable."
+          },
           "503": {
             "content": {
               "application/json": {
@@ -24006,6 +24355,16 @@
               }
             },
             "description": "The scheduler status snapshot."
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The state store on disk lacks tables this server reads, and a read never creates them. `rocky serve` migrates the store at startup (its job sweep opens it read-write), so this means the file changed under a running server, or that sweep could not open it. Restart `rocky serve`, or run any read-write command such as `rocky run`, once. Not retryable."
           },
           "500": {
             "content": {
@@ -24073,6 +24432,58 @@
         "summary": "Queued webhook demands",
         "tags": [
           "schedule"
+        ]
+      }
+    },
+    "/api/v1/settings": {
+      "get": {
+        "description": "How this server is bound and what it will accept: bind host, the CORS allowlist, the `Host` values the UI guard accepts, whether the scheduler and the UI are on, whether `ROCKY_WEBHOOK_SECRET` can sign a webhook, and the token's scope. An allowlist, not a config dump — no secret appears, and nothing is reached through serde of `RockyConfig`. `webhook_secret` is reported even with the scheduler off, which is the point: it says what will happen when you turn the scheduler on. `state_backend` and `concurrency_control` are read from `rocky.toml` when the server starts and are `null` when there was no readable config — `config_status` says which. Everything else is fixed for the life of the process.",
+        "operationId": "getSettings",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SettingsOutput"
+                }
+              }
+            },
+            "description": "The running server's posture."
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "That config read panicked. Distinct from `config_status: unreadable`, which means the file WAS read and would not parse."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The one `rocky.toml` read this route needs is already in flight. Only `state_backend` and `concurrency_control` need the file; every other value was resolved at startup. Retry."
+          },
+          "504": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "That read did not finish inside its deadline — usually a `rocky.toml` that will not return, so a retry is unlikely to help. Distinct from `503`, which is ordinary contention."
+          }
+        },
+        "summary": "Server posture",
+        "tags": [
+          "meta"
         ]
       }
     }

@@ -80,6 +80,11 @@ fn record_to_history(run: &RunRecord, audit: bool) -> RunHistoryRecord {
         models,
         pipeline: run.pipeline.clone(),
         submission_id: run.submission_id.clone(),
+        // Not audit-gated, like `pipeline` above (#2158 drain review, finding
+        // 6): it is an operational join key `preview diff`/`preview cost`
+        // need to pair a run, not a governance-audit field, so it must not
+        // require `--audit` to appear.
+        rocky_branch: run.rocky_branch.clone(),
         triggering_identity,
         session_source,
         git_commit,
@@ -376,10 +381,10 @@ pub fn run_history(
             let short = prefix_on_char_boundary(recipe_hash, 16);
             println!("Executions of recipe {short}…:");
             println!(
-                "{:<14} {:<24} {:<24} {:<10} {:<12} {:<10}",
+                "{:<24} {:<24} {:<24} {:<10} {:<12} {:<10}",
                 "RUN ID", "MODEL", "STARTED", "DURATION", "STATUS", "INPUT"
             );
-            println!("{}", "-".repeat(96));
+            println!("{}", "-".repeat(106));
             for exec in &output.executions {
                 let input_class = exec
                     .recipe_identity
@@ -387,8 +392,8 @@ pub fn run_history(
                     .and_then(|r| r.input_proof_class.as_deref())
                     .unwrap_or("-");
                 println!(
-                    "{:<14} {:<24} {:<24} {:<10} {:<12} {:<10}",
-                    &exec.run_id[..exec.run_id.len().min(13)],
+                    "{:<24} {:<24} {:<24} {:<10} {:<12} {:<10}",
+                    exec.run_id,
                     truncate_cell(&exec.model_name, 23),
                     exec.started_at.format("%Y-%m-%d %H:%M:%S"),
                     format!("{}ms", exec.duration_ms),
@@ -463,15 +468,15 @@ pub fn run_history(
 /// The run summary table `rocky history` prints, one row per run.
 fn print_runs_table(output: &HistoryOutput) {
     println!(
-        "{:<12} {:<24} {:<10} {:<8} {:<10}",
+        "{:<24} {:<24} {:<10} {:<8} {:<10}",
         "RUN ID", "STARTED", "STATUS", "MODELS", "TRIGGER"
     );
-    println!("{}", "-".repeat(66));
+    println!("{}", "-".repeat(78));
 
     for run in &output.runs {
         println!(
-            "{:<12} {:<24} {:<10} {:<8} {:<10}",
-            &run.run_id[..run.run_id.len().min(11)],
+            "{:<24} {:<24} {:<10} {:<8} {:<10}",
+            run.run_id,
             run.started_at.format("%Y-%m-%d %H:%M:%S"),
             run.status,
             run.models_executed,
@@ -488,12 +493,12 @@ fn print_audit_table(runs: &[RunRecord]) {
     println!();
     println!("Governance audit trail (--audit):");
     println!(
-        "{:<12} {:<18} {:<8} {:<10} {:<16} {:<20} {:<12}",
+        "{:<24} {:<18} {:<8} {:<10} {:<16} {:<20} {:<12}",
         "RUN ID", "IDENTITY", "SOURCE", "COMMIT", "BRANCH", "CATALOG", "HOST"
     );
-    println!("{}", "-".repeat(100));
+    println!("{}", "-".repeat(112));
     for run in runs {
-        let run_id = &run.run_id[..run.run_id.len().min(11)];
+        let run_id = &run.run_id;
         let identity = run.triggering_identity.as_deref().unwrap_or("-");
         let identity = if identity.len() > 17 {
             &identity[..17]
@@ -525,7 +530,7 @@ fn print_audit_table(runs: &[RunRecord]) {
             host_full
         };
         println!(
-            "{:<12} {:<18} {:<8} {:<10} {:<16} {:<20} {:<12}",
+            "{:<24} {:<18} {:<8} {:<10} {:<16} {:<20} {:<12}",
             run_id, identity, source, commit, branch, catalog, host
         );
     }
@@ -533,7 +538,7 @@ fn print_audit_table(runs: &[RunRecord]) {
     // Emit version + idempotency key as an extra per-run detail line
     // because they don't fit a fixed-column layout cleanly.
     for run in runs {
-        let run_id = &run.run_id[..run.run_id.len().min(11)];
+        let run_id = &run.run_id;
         let key = run.idempotency_key.as_deref().unwrap_or("-");
         println!(
             "  {}  version={}  idempotency_key={}",
@@ -694,6 +699,9 @@ mod tests {
             submission_id: None,
             check_gate_failed: false,
             verify_after_failed: false,
+            // Deliberately different from `git_branch` — the two are
+            // independent fields (#2032).
+            rocky_branch: Some("pr-preview-governance".to_string()),
         }
     }
 
@@ -708,6 +716,14 @@ mod tests {
         assert!(history.git_commit.is_none());
         assert!(history.hostname.is_none());
         assert!(history.rocky_version.is_none());
+        // NOT an audit field (drain review of #2158, finding 6) — an
+        // operational join key like `pipeline`, so it survives the `!audit`
+        // gate that zeroes every true governance-audit field above.
+        assert_eq!(
+            history.rocky_branch.as_deref(),
+            Some("pr-preview-governance"),
+            "rocky_branch must be emitted even without --audit"
+        );
     }
 
     #[test]
@@ -725,6 +741,11 @@ mod tests {
         assert_eq!(history.target_catalog.as_deref(), Some("warehouse_main"));
         assert_eq!(history.hostname.as_deref(), Some("dev-laptop"));
         assert_eq!(history.rocky_version.as_deref(), Some("1.16.0"));
+        assert_eq!(
+            history.rocky_branch.as_deref(),
+            Some("pr-preview-governance"),
+            "rocky_branch must thread through independently of git_branch"
+        );
     }
 
     #[test]
@@ -785,6 +806,7 @@ mod tests {
             submission_id: None,
             check_gate_failed: false,
             verify_after_failed: false,
+            rocky_branch: None,
         }
     }
 

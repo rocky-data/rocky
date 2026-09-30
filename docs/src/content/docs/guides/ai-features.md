@@ -5,7 +5,10 @@ sidebar:
   order: 6
 ---
 
-Rocky's AI commands call Claude to generate models, describe existing models, propagate schema changes, and write test assertions. Rocky compiles every generated model before you see it. That compile-verify loop is what keeps a bad answer out of your project, and section 4 describes it.
+Rocky's AI commands call Claude to generate models, describe existing models,
+propagate schema changes, and write test assertions. `rocky ai` validates a
+candidate against the project context it has, then writes generated files. Treat
+those files as a draft. Review them and run relevant checks before execution.
 
 ## 1. Setup
 
@@ -88,27 +91,27 @@ GROUP BY DATE_TRUNC('month', o.order_date), p.category
 
 ### Pick a materialization + target
 
-Pair `--materialization` with `--watermark` for an incremental model. `--watermark` names the timestamp column Rocky compares against the last run's high-water mark (see the [glossary](/reference/glossary/)). Add `--target` to land the output in a real catalog and schema instead of the `generated.ai.*` default:
+`--materialization` takes `full_refresh` (the default) or `merge`. `incremental` and `ephemeral` fail before any LLM call, with `E037` and `E038`. Pair `merge` with `--unique-key`, the columns that identify a row. Add `--target` to land the output in a real catalog and schema instead of the `generated.ai.*` default:
 
 ```bash
 rocky ai "daily order facts from stg_orders" \
-  --materialization incremental --watermark order_date \
+  --materialization merge --unique-key order_date \
   --target analytics.marts.fct_orders_daily
 ```
 
-The sidecar (`models/fct_orders_daily.toml`) then carries the materialization, the watermark, and the target:
+The sidecar (`models/fct_orders_daily.toml`) then carries the materialization, the key, and the target:
 
 ```toml
 name = "fct_orders_daily"
 
 [strategy]
-type = "incremental"
-timestamp_column = "order_date"
+type = "merge"
+unique_key = ["order_date"]
 
 [target]
 catalog = "analytics"
-schema  = "marts"
-table   = "fct_orders_daily"
+schema = "marts"
+table = "fct_orders_daily"
 ```
 
 Pass `--overwrite` to replace a body or sidecar that already exists at the destination. Without that flag the command fails instead of overwriting a model you wrote yourself. See [`rocky ai`](/reference/commands/ai/#rocky-ai) for the full flag table, including the v1 `--materialization merge` limitation.
@@ -137,47 +140,57 @@ rocky ai "monthly revenue by category" -o json
 
 ## 3. Schema-Grounded Prompts
 
-`rocky ai` compiles your project before it sends your intent to the LLM, and puts the resulting typed schemas in the prompt. The LLM therefore sees your real column names, real types, and real model graph. The code it writes references columns that exist, with the types they have.
+`rocky ai` tries to compile your project before it sends your intent to the LLM.
+When that compile succeeds, it puts typed schemas in the prompt. This can give
+the model useful column names, types, and graph context. It does not guarantee
+that generated SQL references real columns or returns correct values.
 
 ```bash
 rocky ai "monthly revenue by category" --models models
 ```
 
-`--models <PATH>` names the directory to compile for this grounding step. It defaults to `models`. If that directory is missing, or fails to compile, `rocky ai` falls back to generating without schemas rather than failing outright. The compile-verify loop in the next section still guards the output.
+`--models <PATH>` names the directory to compile for this grounding step. It defaults to `models`. If that directory is missing or fails to compile, `rocky ai` falls back to generation without schemas rather than refusing.
 
-A second check runs after generation. `rocky ai`'s `ValidationContext` typechecks the candidate SQL against the live project graph. If the LLM names a model or column that does not exist, that diagnostic goes back into the compile-verify loop as retry feedback. It never reaches your files.
+A second validation step can type-check candidate SQL against the compiled
+project graph. Its errors become retry feedback. A candidate that introduces no
+new validation error is written. Absent context or unresolved inference can let
+a candidate meet that condition.
 
-The typechecker is lenient about unresolved columns today. Schema grounding in the prompt is therefore the main guard against an invented column name.
+The type checker is lenient about unresolved columns. A missing reference or
+unsupported inference can produce `Unknown`, which can suppress type-based
+findings. `I002` reports only a partially unknown output schema. An entirely
+unknown output need not emit `I002`.
 
-## 4. The Compile-Verify Loop
+## 4. Candidate validation and review
 
-The compile-verify loop is what makes AI-generated code safe to accept. Rocky compiles every generated model before it shows the model to you:
+Candidate validation gives the model feedback about some structural problems. It
+does not make AI-generated code safe to accept on its own:
 
 ```
    your intent
         │
         ▼
   ┌─────────────────┐   candidate    ┌───────────────────┐
-  │ LLM writes      │───  model  ───►│ Rocky compiler    │
-  │ the model       │                │ type-checks it    │
-  └─────────────────┘                └─────────┬─────────┘
+  │ LLM writes      │───  model  ───►│ Rocky validator   │
+  │ the model       │                │ checks available  │
+  └─────────────────┘                │ project context   │
+                                     └─────────┬─────────┘
         ▲                                      │
-        │  the errors, as retry feedback       │
-        └──────────────  fails  ───────────────┤
-           (up to 3 attempts in total)         │
-                                             passes
-                                               │
-                                               ▼
-                                        shown to you
+        │ errors become retry feedback         │ no new error
+        └──────────────  error  ───────────────┤
+           (up to 3 attempts)                  ▼
+       exhausted: refuse, no files      files written for review
 ```
 
-The compiler catches:
-- **Syntax errors**: invalid SQL or Rocky DSL syntax
-- **Type mismatches**: a column used as the wrong type, such as a string compared to an integer
-- **Missing references**: a column or table that does not exist in the project
-- **Invalid functions**: an unrecognized SQL function, or the wrong number of arguments
+The validator can report syntax errors, type mismatches, and some resolvable
+references. It does not establish that a warehouse supports every function or
+that the SQL returns the intended values. A candidate can still contain
+unresolved types or a plausible wrong-result query.
 
-If all 3 attempts fail, Rocky reports the best attempt together with the errors that remain. No AI-generated code reaches your warehouse without passing the type checker.
+If all three attempts introduce validation errors, Rocky refuses and writes no
+generated files. Generating a model does not execute warehouse SQL. Review the
+files, run the relevant tests, and use `rocky plan` and `rocky apply` for
+controlled execution.
 
 ## 5. Add Intent to Existing Models
 
@@ -201,8 +214,7 @@ Grain: one row per date per category.
 depends_on = ["stg_orders", "dim_products"]
 
 [strategy]
-type = "incremental"
-timestamp_column = "order_date"
+type = "full_refresh"
 
 [target]
 catalog = "analytics"
@@ -305,7 +317,10 @@ Rocky skips a model with no intent, because the LLM would have no context for a 
 
 ### Example scenario
 
-An upstream model `stg_orders` renames `unit_price` to `unit_price_local`. `rocky compile` now fails, because the models downstream still reference `unit_price`. `rocky ai-sync --models models` finds the rename and proposes a small diff:
+An upstream model `stg_orders` renames `unit_price` to `unit_price_local`. A
+downstream reference can become unresolved. When the compiler can resolve that
+reference, it reports a diagnostic. `rocky ai-sync --models models` can use the
+recorded schema change to propose a small diff:
 
 ```diff
 --- models/fct_daily_revenue.sql

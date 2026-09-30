@@ -15,7 +15,7 @@ and prod.
 ## Why it's distinctive
 
 - **Safe to run on prod data** — no overwriting of the real tables.
-- The diff is structured (row count delta, schema delta, sample mismatches).
+- The diff is structured (row count delta and schema delta, with a verdict per table).
 
 ## Run
 
@@ -25,23 +25,16 @@ and prod.
 
 ## Status
 
-Partially end-to-end on the local DuckDB path — the POC runs to
-completion (`run.sh` exits 0), but the shadow half is blocked by an
-engine bug:
+The POC runs end to end on the local DuckDB path, and `run.sh` exits 0:
 
-- **Prod run works.** `rocky run --filter source=orders` creates the
+- **The prod run works.** `rocky run --filter source=orders` creates the
   real target `poc.staging__orders.orders` (100 rows).
-- **`--shadow` run currently fails.** On the DuckDB replication path the
-  shadow suffix is appended to the table identity that source *and*
-  target share, so the copy tries to read from the non-existent suffixed
-  **source** table (`FROM raw__orders.orders_rocky_shadow`) instead of
-  writing to a suffixed target. The suffix should apply to the target
-  write only. `run.sh` tolerates this (`|| true`) and captures the
-  failure in `expected/run_shadow.json`.
-- **`rocky compare` runs**, but because the shadow table was never
-  written it reports 100 (prod) vs 0 (shadow) with `verdict: fail` in
-  `expected/compare.json`.
+- **The `--shadow` run works.** It reads the unsuffixed source
+  `raw__orders.orders` and writes `poc.staging__orders.orders_rocky_shadow`.
+  The real target is not touched. The result is in
+  `expected/run_shadow.json`.
+- **`rocky compare` passes.** `expected/compare.json` reports 100 rows in
+  both tables, `schema_match: true` and `overall_verdict: "pass"`.
 
-The `--shadow` / `--shadow-suffix` / `--shadow-schema` flags and the
-`rocky compare` command all exist and are wired; the demo becomes fully
-green once the replication run path stops suffixing the source read.
+`run.sh` still ends the shadow and compare steps with `|| true`, so it does
+not fail if either step fails. Read the two JSON files to see the result.

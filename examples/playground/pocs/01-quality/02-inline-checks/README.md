@@ -3,7 +3,7 @@
 > **Category:** 01-quality
 > **Credentials:** none (DuckDB)
 > **Runtime:** < 5s
-> **Rocky features:** `[pipeline.NAME.checks]` row_count, column_match, freshness, null_rate
+> **Rocky features:** `[pipeline.NAME.checks]` row_count, column_match (freshness and null_rate are commented out in `rocky.toml`)
 
 ## What it shows
 
@@ -59,23 +59,16 @@ and `expected/run.json` carries one `check_results` entry per table:
   {
     "asset_key": ["duckdb", "events", "events"],
     "checks": [
-      { "name": "row_count",    "passed": true,  "source_count": 500, "target_count": 500 },
-      { "name": "column_match", "passed": false, "missing": ["user_id","event_type","occurred_at","event_id"], "extra": [] }
+      { "name": "column_match", "passed": true, "severity": "error", "missing": [], "extra": [] },
+      { "name": "row_count",    "passed": true, "severity": "error", "source_count": 500, "target_count": 500 }
     ]
   }
 ]
 ```
 
-`row_count` compares source vs. target cardinality (500 == 500) and passes.
-
-## Known limitation: column_match on the DuckDB local path
-
-`column_match` currently reports `passed: false` with all four columns listed
-as `missing`, even though the target `poc.staging__events.events` was just
-full-refreshed from the source and physically contains every column (verify
-with `duckdb poc.duckdb "PRAGMA table_info('staging__events.events')"`). On the
-local path the check resolves the target under catalog `duckdb` (see the
-`asset_key` above) instead of the pipeline's configured catalog `poc`, so it
-reads zero columns and treats them all as absent. This is an engine-side bug in
-the local column_match resolution, not a config problem — `run.sh` therefore
-does not assert that every check passes. The row_count check is unaffected.
+Both checks pass. `row_count` compares the source and target row counts
+(500 == 500). `column_match` finds no missing and no extra columns. You can
+list the target columns with
+`duckdb poc.duckdb "PRAGMA table_info('staging__events.events')"`.
+`run.sh` does not assert the check results. It only writes them to
+`expected/run.json`.

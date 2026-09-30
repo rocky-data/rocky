@@ -1,7 +1,5 @@
 # 12-catalog-emit — `rocky catalog`: column-level lineage as JSON + Parquet
 
-![rocky catalog walks the SemanticGraph and writes catalog.json + edges.parquet + assets.parquet under .rocky/catalog/](../../../../../docs/public/demo-rocky-catalog.gif)
-
 > **Category:** 06-developer-experience
 > **Credentials:** none (DuckDB)
 > **Runtime:** < 5s

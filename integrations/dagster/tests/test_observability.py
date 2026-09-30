@@ -10,12 +10,14 @@ from dagster_rocky.observability import (
     COMPLIANCE_FALLBACK_ASSET_KEY,
     RETENTION_OBSERVATION_NAME,
     anomaly_check_results,
+    anomaly_evaluation_results,
     compliance_check_results,
     drift_observations,
     optimize_metadata_for_keys,
     retention_observations,
 )
 from dagster_rocky.types import (
+    AnomalyEvaluation,
     AnomalyResult,
     ComplianceOutput,
     DriftAction,
@@ -37,6 +39,7 @@ def _build_run_result(
     *,
     drift: DriftInfo | None = None,
     anomalies: list[AnomalyResult] | None = None,
+    anomaly_evaluated: list[AnomalyEvaluation] | None = None,
 ) -> RunResult:
     return RunResult(
         version="0.3.0",
@@ -53,6 +56,7 @@ def _build_run_result(
         ),
         drift=drift or DriftInfo(tables_checked=0, tables_drifted=0, actions_taken=[]),
         anomalies=anomalies or [],
+        anomaly_evaluated=anomaly_evaluated or [],
     )
 
 
@@ -72,8 +76,12 @@ def test_drift_observations_yields_one_per_action():
             tables_checked=10,
             tables_drifted=2,
             actions_taken=[
-                DriftAction(table="orders", action="ALTER ADD COLUMN", reason="new col"),
-                DriftAction(table="payments", action="DROP+RECREATE", reason="type change"),
+                DriftAction(
+                    table="orders", asset_key=[], action="ALTER ADD COLUMN", reason="new col"
+                ),
+                DriftAction(
+                    table="payments", asset_key=[], action="DROP+RECREATE", reason="type change"
+                ),
             ],
         ),
     )
@@ -102,8 +110,8 @@ def test_drift_observations_skips_unresolved_tables():
             tables_checked=2,
             tables_drifted=2,
             actions_taken=[
-                DriftAction(table="orders", action="ALTER", reason="x"),
-                DriftAction(table="unknown", action="ALTER", reason="y"),
+                DriftAction(table="orders", asset_key=[], action="ALTER", reason="x"),
+                DriftAction(table="unknown", asset_key=[], action="ALTER", reason="y"),
             ],
         ),
     )
@@ -131,6 +139,7 @@ def test_anomaly_check_results_yields_warn_severity():
         anomalies=[
             AnomalyResult(
                 table="orders",
+                asset_key=[],
                 current_count=900,
                 baseline_avg=1500.0,
                 deviation_pct=40.0,
@@ -154,11 +163,84 @@ def test_anomaly_check_results_yields_warn_severity():
     assert "below baseline" in r.metadata["rocky/reason"].value
 
 
+def test_an_evaluated_table_with_no_anomaly_passes():
+    """#1790: the detector ran and found nothing — an honest green."""
+    run = _build_run_result(
+        anomaly_evaluated=[AnomalyEvaluation(table="orders", asset_key=[], evaluated=True)]
+    )
+    resolver = _resolver({"orders": dg.AssetKey(["fivetran", "acme", "orders"])})
+
+    results = list(anomaly_evaluation_results(run, key_resolver=resolver))
+
+    assert len(results) == 1
+    r = results[0]
+    assert r.check_name == ANOMALY_CHECK_NAME
+    assert r.passed is True
+    assert "no anomaly" in r.metadata["status"].value
+
+
+def test_a_table_the_detector_skipped_is_not_a_pass():
+    """#1790: the defect. `row_count = false` meant no detector ran at all,
+    and the pass-by-absence placeholder badged the check green.
+
+    The engine's own reason is carried through, because the remedies differ:
+    a config line, a missing state store, and an unmeasured count send the
+    operator to three different places.
+    """
+    run = _build_run_result(
+        anomaly_evaluated=[
+            AnomalyEvaluation(
+                table="orders",
+                asset_key=[],
+                evaluated=False,
+                not_evaluated_reason=(
+                    "row-count checks are off for this pipeline "
+                    "(`row_count = false` under `[pipeline.<name>.checks]`), "
+                    "so the anomaly detector did not run"
+                ),
+            )
+        ]
+    )
+    resolver = _resolver({"orders": dg.AssetKey(["fivetran", "acme", "orders"])})
+
+    results = list(anomaly_evaluation_results(run, key_resolver=resolver))
+
+    assert len(results) == 1
+    r = results[0]
+    assert r.check_name == ANOMALY_CHECK_NAME
+    assert r.passed is False
+    assert r.severity == dg.AssetCheckSeverity.WARN
+    assert r.metadata["status"].value == "not_evaluated"
+    assert "row_count = false" in r.metadata["rocky/reason"].value
+
+
+def test_an_evaluation_without_a_reason_still_reports_not_evaluated():
+    """A missing reason must not turn a not-evaluated verdict into a pass."""
+    run = _build_run_result(
+        anomaly_evaluated=[AnomalyEvaluation(table="orders", asset_key=[], evaluated=False)]
+    )
+    resolver = _resolver({"orders": dg.AssetKey(["fivetran", "acme", "orders"])})
+
+    results = list(anomaly_evaluation_results(run, key_resolver=resolver))
+
+    assert len(results) == 1
+    assert results[0].passed is False
+    assert results[0].metadata["rocky/reason"].value
+
+
+def test_anomaly_evaluation_results_skips_unresolved_tables():
+    run = _build_run_result(
+        anomaly_evaluated=[AnomalyEvaluation(table="ghost", asset_key=[], evaluated=True)]
+    )
+    assert list(anomaly_evaluation_results(run, key_resolver=_resolver({}))) == []
+
+
 def test_anomaly_check_results_skips_unresolved_tables():
     run = _build_run_result(
         anomalies=[
             AnomalyResult(
                 table="ghost",
+                asset_key=[],
                 current_count=0,
                 baseline_avg=1.0,
                 deviation_pct=100.0,

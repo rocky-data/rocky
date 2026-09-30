@@ -166,8 +166,12 @@ fn incremental_iceberg_model(
             schema: tgt_schema.to_string(),
             table: table.to_string(),
         },
-        MaterializationStrategy::Incremental {
+        // An append strategy that is still legal on transformation models:
+        // `incremental` is refused there (#1990); `microbatch` takes the same
+        // bootstrap-then-INSERT path and is pending its own ruling (#2054).
+        MaterializationStrategy::Microbatch {
             timestamp_column: "updated_at".into(),
+            granularity: rocky_ir::TimeGrain::Hour,
         },
         vec![SourceRef {
             catalog: catalog.to_string(),

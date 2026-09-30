@@ -176,9 +176,8 @@ async fn run_executes_the_loaded_snapshot() {
 
 /// Parity pin: for an unswapped file, the fingerprint captured by
 /// `load_rocky_config_fingerprinted` is byte-identical to rocky-cli's
-/// path-based `output::config_fingerprint` — including for a config whose
-/// `freshness.overrides` `HashMap` carries multiple keys (both sides hash the
-/// raw bytes, so map iteration order cannot diverge them).
+/// path-based `output::config_fingerprint` (both sides hash the raw bytes,
+/// never a serde serialization of the parsed config).
 #[test]
 fn fingerprint_parity_with_path_based_config_fingerprint() {
     let dir = tempfile::tempdir().expect("create temp dir");
@@ -202,10 +201,6 @@ enabled = true
 
 [pipeline.silver.checks.freshness]
 threshold_seconds = 3600
-
-[pipeline.silver.checks.freshness.overrides]
-"raw__us_west__shopify" = 7200
-"raw__eu__stripe" = 1800
 "#,
     )
     .expect("write config");

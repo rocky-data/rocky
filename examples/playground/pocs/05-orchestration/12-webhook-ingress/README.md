@@ -46,4 +46,4 @@ Webhook delivery is at-most-once: the one loss window is a reconciler crash
 *after* it has claimed a demand *and* the child run also dying before it records
 an outcome. For a webhook-only pipeline, pair the trigger with a `freshness`
 schedule as a backstop. See
-[Running without an orchestrator](../../../../docs/src/content/docs/guides/running-without-an-orchestrator.md).
+[Running without an orchestrator](../../../../../docs/src/content/docs/guides/running-without-an-orchestrator.md).

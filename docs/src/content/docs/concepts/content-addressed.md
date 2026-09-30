@@ -27,7 +27,7 @@ explicitly **not** own the readers. Three cases fit:
 - **You commit into a managed Delta or Iceberg catalog.** Unity Catalog managed tables with UniForm exposed, Iceberg REST catalogs, and the like. UniForm is a Delta feature that also publishes Iceberg metadata, so an Iceberg reader can read the Delta table.
 - **You want stable, de-duplicatable file names.** The same logical batch hashes to the same file name, which helps replay, audit, and storage de-dup against an external lake.
 
-Stay on `full_refresh`, `incremental`, or `merge` when you have a single
+Stay on `full_refresh` or `merge` when you have a single
 warehouse, or when the runner has no direct object-store access.
 
 ## How a write happens

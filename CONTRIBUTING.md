@@ -11,6 +11,16 @@ Rocky is a monorepo. Every subproject shares one repository, one issue tracker, 
 | Documentation site | `docs/` | Astro | `npm` |
 | POC catalog | `examples/playground/` | TOML / SQL config | none |
 
+## Share a first attempt
+
+You can contribute without writing code.
+Use the [first-run feedback form](https://github.com/rocky-data/rocky/issues/new?template=first_run_feedback.yml) to describe a completed workflow or where you stopped.
+Include your goal, Rocky version, installation method, and the step that helped or blocked you.
+A feature proposal is optional. A small example with synthetic data is enough.
+
+The form creates a public issue only when you submit it. Remove credentials, private data, and internal addresses before posting.
+Use [private security reporting](https://github.com/rocky-data/rocky/security/advisories/new) for vulnerabilities.
+
 ## Getting started
 
 Clone once, then work anywhere in the tree.

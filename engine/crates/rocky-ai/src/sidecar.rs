@@ -32,13 +32,24 @@ pub enum SidecarError {
     #[error("failed to serialize sidecar TOML: {0}")]
     Serialize(#[from] toml::ser::Error),
 
-    #[error(
-        "unknown materialization '{value}'; expected one of: full_refresh, incremental, merge, ephemeral"
-    )]
+    #[error("unknown materialization '{value}'; expected one of: full_refresh, merge")]
     UnknownMaterialization { value: String },
 
-    #[error("--watermark is required when --materialization=incremental")]
-    MissingWatermark,
+    /// `incremental` is refused on transformation models (#1990, E037), and a
+    /// generated model is always a transformation model.
+    #[error(
+        "--materialization incremental is not supported: on a transformation model it re-inserts \
+         every row on each run (E037). Use `merge` with --unique-key, or `full_refresh`"
+    )]
+    IncrementalRefused,
+
+    /// `ephemeral` is refused for every model (#1996, E038).
+    #[error(
+        "--materialization ephemeral is not supported: an ephemeral model is not materialized \
+         and is not inlined into its consumers, so a consumer reads whatever table already \
+         carries the name (E038). Use `view`, or `full_refresh`"
+    )]
+    EphemeralRefused,
 
     #[error("invalid --target '{value}': expected catalog.schema.table")]
     InvalidTarget { value: String },
@@ -46,17 +57,16 @@ pub enum SidecarError {
 
 /// Materialization strategy authorable from the `rocky ai --materialization`
 /// flag. A deliberately narrow subset of [`rocky_core::models::StrategyConfig`]:
-/// the four shapes a generated model is most likely to want today.
+/// the shapes a generated model is most likely to want today.
 ///
 /// `time_interval`, `delete_insert`, and `microbatch` exist in the engine's
 /// strategy enum but require richer flag plumbing (granularity, partition
 /// columns) than this first cut bothers with — adding them is a follow-up.
+/// `incremental` is refused on transformation models (#1990) and `ephemeral`
+/// is refused outright (#1996), so neither is offered here.
 #[derive(Debug, Clone)]
 pub enum SidecarMaterialization {
     FullRefresh,
-    Incremental {
-        watermark: String,
-    },
     Merge {
         /// Columns that uniquely identify a row for upsert. Maps to
         /// `[strategy] unique_key` in the emitted TOML, which Rocky's
@@ -65,32 +75,23 @@ pub enum SidecarMaterialization {
         /// sidecar that the user has to fill in before `rocky run`.
         unique_key: Option<Vec<String>>,
     },
-    Ephemeral,
 }
 
 impl SidecarMaterialization {
-    /// Parse the `--materialization` CLI value. `watermark` is required when
-    /// `value == "incremental"` and ignored otherwise. `unique_key` is
-    /// carried through verbatim for `value == "merge"` and ignored
-    /// otherwise — an empty `Vec` is treated as "not provided" so the
-    /// emitted TOML omits the field rather than writing `unique_key = []`.
-    pub fn parse(
-        value: &str,
-        watermark: Option<&str>,
-        unique_key: Option<Vec<String>>,
-    ) -> Result<Self, SidecarError> {
+    /// Parse the `--materialization` CLI value. `unique_key` is carried
+    /// through verbatim for `value == "merge"` and ignored otherwise — an
+    /// empty `Vec` is treated as "not provided" so the emitted TOML omits the
+    /// field rather than writing `unique_key = []`. `incremental` and
+    /// `ephemeral` each get their own refusal, not "unknown", so the user
+    /// learns why and what to use instead.
+    pub fn parse(value: &str, unique_key: Option<Vec<String>>) -> Result<Self, SidecarError> {
         match value {
             "full_refresh" => Ok(Self::FullRefresh),
-            "incremental" => {
-                let w = watermark.ok_or(SidecarError::MissingWatermark)?;
-                Ok(Self::Incremental {
-                    watermark: w.to_string(),
-                })
-            }
+            "incremental" => Err(SidecarError::IncrementalRefused),
             "merge" => Ok(Self::Merge {
                 unique_key: unique_key.filter(|v| !v.is_empty()),
             }),
-            "ephemeral" => Ok(Self::Ephemeral),
+            "ephemeral" => Err(SidecarError::EphemeralRefused),
             other => Err(SidecarError::UnknownMaterialization {
                 value: other.to_string(),
             }),
@@ -101,19 +102,15 @@ impl SidecarMaterialization {
 impl SidecarMaterialization {
     /// The in-memory strategy this materialization becomes on disk.
     ///
-    /// Verification needs it because strategy is not cosmetic: the compiler
-    /// excludes `ephemeral` models from duplicate-target detection, since they
-    /// materialize nothing and cannot be a second writer. Verifying an
-    /// ephemeral model as `full_refresh` therefore rejects a target collision
-    /// that will not exist once the sidecar is written (#1302).
+    /// Verification needs it because strategy is not cosmetic: the compiler's
+    /// checks read it. A `merge` model without a `unique_key` naming real
+    /// output columns is refused, for one, so verifying it as `full_refresh`
+    /// would pass a sidecar that does not run (#1302).
     #[must_use]
     pub fn to_strategy(&self) -> rocky_core::models::StrategyConfig {
         use rocky_core::models::StrategyConfig;
         match self {
             Self::FullRefresh => StrategyConfig::FullRefresh,
-            Self::Incremental { watermark } => StrategyConfig::Incremental {
-                timestamp_column: watermark.clone(),
-            },
             // `unique_key: None` is the incomplete-sidecar case the CLI warns
             // about, and it is the one arm with no faithful mapping: the key
             // is *skipped* from the emitted TOML, so the file that gets
@@ -125,7 +122,6 @@ impl SidecarMaterialization {
                 unique_key: unique_key.clone().unwrap_or_default(),
                 update_columns: None,
             },
-            Self::Ephemeral => StrategyConfig::Ephemeral,
         }
     }
 }
@@ -188,8 +184,6 @@ struct SidecarToml<'a> {
 enum SidecarStrategyToml<'a> {
     #[serde(rename = "full_refresh")]
     FullRefresh,
-    #[serde(rename = "incremental")]
-    Incremental { timestamp_column: &'a str },
     #[serde(rename = "merge")]
     Merge {
         /// Mirrors `StrategyConfig::Merge { unique_key, .. }` in
@@ -200,8 +194,6 @@ enum SidecarStrategyToml<'a> {
         #[serde(skip_serializing_if = "Option::is_none")]
         unique_key: Option<&'a [String]>,
     },
-    #[serde(rename = "ephemeral")]
-    Ephemeral,
 }
 
 #[derive(Debug, Serialize)]
@@ -226,13 +218,9 @@ pub fn render_sidecar_toml(
 ) -> Result<String, SidecarError> {
     let strategy = match materialization {
         SidecarMaterialization::FullRefresh => SidecarStrategyToml::FullRefresh,
-        SidecarMaterialization::Incremental { watermark } => SidecarStrategyToml::Incremental {
-            timestamp_column: watermark,
-        },
         SidecarMaterialization::Merge { unique_key } => SidecarStrategyToml::Merge {
             unique_key: unique_key.as_deref(),
         },
-        SidecarMaterialization::Ephemeral => SidecarStrategyToml::Ephemeral,
     };
 
     let toml = SidecarToml {
@@ -347,21 +335,6 @@ mod tests {
     }
 
     #[test]
-    fn render_incremental_carries_watermark_as_timestamp_column() {
-        let target = SidecarTarget::default_for("events");
-        let toml = render_sidecar_toml(
-            "events",
-            &SidecarMaterialization::Incremental {
-                watermark: "_synced_at".to_string(),
-            },
-            &target,
-        )
-        .unwrap();
-        assert!(toml.contains("type = \"incremental\""));
-        assert!(toml.contains("timestamp_column = \"_synced_at\""));
-    }
-
-    #[test]
     fn parse_target_rejects_two_part() {
         let err = SidecarTarget::parse("schema.table").unwrap_err();
         assert!(matches!(err, SidecarError::InvalidTarget { .. }));
@@ -375,21 +348,25 @@ mod tests {
 
     #[test]
     fn parse_materialization_unknown_rejected() {
-        let err = SidecarMaterialization::parse("materialized_view", None, None).unwrap_err();
+        let err = SidecarMaterialization::parse("materialized_view", None).unwrap_err();
         assert!(matches!(err, SidecarError::UnknownMaterialization { .. }));
     }
 
+    /// #1990: a generated model is a transformation model, where `incremental`
+    /// re-inserts every row on each run. Refused up front, with a reason and
+    /// the alternatives, before any LLM call.
     #[test]
-    fn parse_incremental_requires_watermark() {
-        let err = SidecarMaterialization::parse("incremental", None, None).unwrap_err();
-        assert!(matches!(err, SidecarError::MissingWatermark));
+    fn parse_incremental_is_refused_with_a_reason() {
+        let err = SidecarMaterialization::parse("incremental", None).unwrap_err();
+        assert!(matches!(err, SidecarError::IncrementalRefused));
+        let msg = err.to_string();
+        assert!(msg.contains("E037") && msg.contains("merge"), "{msg}");
     }
 
     #[test]
     fn parse_merge_carries_unique_key() {
         let parsed = SidecarMaterialization::parse(
             "merge",
-            None,
             Some(vec!["id".to_string(), "created_at".to_string()]),
         )
         .unwrap();
@@ -409,7 +386,7 @@ mod tests {
         // An empty Vec from clap (no `--unique-key` passed, or `--unique-key ""`
         // collapsed by the delimiter) should fall back to None so the emitted
         // TOML omits the field rather than writing `unique_key = []`.
-        let parsed = SidecarMaterialization::parse("merge", None, Some(Vec::new())).unwrap();
+        let parsed = SidecarMaterialization::parse("merge", Some(Vec::new())).unwrap();
         match parsed {
             SidecarMaterialization::Merge { unique_key } => assert!(unique_key.is_none()),
             other => panic!("expected Merge, got {other:?}"),
@@ -507,44 +484,14 @@ mod tests {
         assert!(matches!(model.config.strategy, StrategyConfig::FullRefresh));
     }
 
+    /// `--materialization ephemeral` is refused, not written: the sidecar it
+    /// would have produced does not compile (E038, #1996).
     #[test]
-    fn emitted_sidecar_loads_via_rocky_core_incremental() {
-        let target = SidecarTarget {
-            catalog: "warehouse".to_string(),
-            schema: "raw".to_string(),
-            table: "events".to_string(),
-        };
-        let sidecar = render_sidecar_toml(
-            "events",
-            &SidecarMaterialization::Incremental {
-                watermark: "_synced_at".to_string(),
-            },
-            &target,
-        )
-        .unwrap();
-
-        let inline = format!("---toml\n{sidecar}---\n\nSELECT 1\n");
-        let model = parse_model_inline(&inline, Path::new("events.sql"), None).unwrap();
-
-        match model.config.strategy {
-            StrategyConfig::Incremental { timestamp_column } => {
-                assert_eq!(timestamp_column, "_synced_at");
-            }
-            other => panic!("expected Incremental, got {other:?}"),
-        }
-        assert_eq!(model.config.target.catalog, "warehouse");
-    }
-
-    #[test]
-    fn emitted_sidecar_loads_via_rocky_core_ephemeral() {
-        let target = SidecarTarget::default_for("staging_users");
-        let sidecar =
-            render_sidecar_toml("staging_users", &SidecarMaterialization::Ephemeral, &target)
-                .unwrap();
-
-        let inline = format!("---toml\n{sidecar}---\n\nSELECT 1\n");
-        let model = parse_model_inline(&inline, Path::new("staging_users.sql"), None).unwrap();
-        assert!(matches!(model.config.strategy, StrategyConfig::Ephemeral));
+    fn ephemeral_is_refused_with_the_strategy_that_works() {
+        let err = SidecarMaterialization::parse("ephemeral", None)
+            .expect_err("ephemeral must be refused");
+        let msg = err.to_string();
+        assert!(msg.contains("E038") && msg.contains("view"), "{msg}");
     }
 
     #[test]

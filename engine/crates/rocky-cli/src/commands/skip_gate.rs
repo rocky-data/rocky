@@ -540,7 +540,7 @@ async fn query_max_ts(
     let sql = format!("SELECT MAX({ts_column}) FROM {table_ref}");
     let result = warehouse.execute_query(&sql).await.ok()?;
     let cell = result.rows.first().and_then(|r| r.first())?;
-    parse_timestamp_cell(cell)
+    cell.as_str().and_then(super::run::parse_timestamp_cell)
 }
 
 /// `SELECT COUNT(*) FROM <ref>`. `None` on any failure / unparseable value.
@@ -553,19 +553,6 @@ async fn query_row_count(warehouse: &dyn WarehouseAdapter, table_ref: &str) -> O
         serde_json::Value::String(s) => s.parse::<u64>().ok(),
         _ => None,
     }
-}
-
-/// Parse a JSON cell into a UTC timestamp, accepting RFC 3339 and the common
-/// `YYYY-MM-DD HH:MM:SS[.fff]` warehouse rendering. Mirrors the parsing the
-/// replication watermark path uses.
-fn parse_timestamp_cell(cell: &serde_json::Value) -> Option<chrono::DateTime<chrono::Utc>> {
-    let s = cell.as_str()?;
-    s.parse::<chrono::DateTime<chrono::Utc>>().ok().or_else(|| {
-        chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f")
-            .or_else(|_| chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S"))
-            .ok()
-            .map(|naive| naive.and_utc())
-    })
 }
 
 #[cfg(test)]

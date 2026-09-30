@@ -86,7 +86,9 @@ from .freshness import (
 from .observability import (
     ANOMALY_CHECK_NAME,
     COMPLIANCE_CHECK_NAME,
+    DRIFT_CHECK_NAME,
     anomaly_check_results,
+    anomaly_evaluation_results,
     compliance_check_results,
     drift_observations,
     optimize_metadata_for_keys,
@@ -214,16 +216,29 @@ DEFAULT_CHECK_NAMES: tuple[str, ...] = (
 )
 
 #: The checks for which "the engine reported nothing" genuinely means "nothing
-#: is wrong". Both are EVENT checks: the engine emits a result only when it has
-#: an anomaly or an exception to report, so silence is the clean verdict and a
-#: passing placeholder states the truth.
+#: is wrong". An EVENT check: the engine emits a result only when it has an
+#: exception to report, so silence is the clean verdict and a passing
+#: placeholder states the truth.
 #:
 #: Every other check is a MEASUREMENT. Silence there means the measurement was
 #: not taken, which is not the same as taking it and finding nothing — so its
 #: placeholder reports ``passed=False`` (#1645). This is the same rule the
 #: engine settled in #1741 one layer down: a check that did not run is not a
 #: check that passed.
-PASS_BY_ABSENCE_CHECK_NAMES: frozenset[str] = frozenset({ANOMALY_CHECK_NAME, COMPLIANCE_CHECK_NAME})
+#:
+#: ``row_count_anomaly`` was here too, and that was wrong (#1790). The
+#: reasoning holds only if the PRODUCER is unconditional, and the anomaly
+#: detector is not: it runs only when row-count checks are on, the run has a
+#: state store, the count was measured and the history could be read. With
+#: ``row_count = false`` the detector never ran and this list reported it
+#: green. The engine now says per table whether it evaluated one
+#: (``RunResult.anomaly_evaluated``), so the name does not need to be here.
+#:
+#: ``compliance_exception`` stays, and its producer IS checked: a crashed
+#: ``rocky compliance`` yields an explicit not-evaluated result rather than
+#: nothing (see ``_emit_governance_events``), so silence here means a scan
+#: that ran and found no exception.
+PASS_BY_ABSENCE_CHECK_NAMES: frozenset[str] = frozenset({COMPLIANCE_CHECK_NAME})
 
 
 @dataclass(frozen=True)
@@ -2938,9 +2953,11 @@ def _run_filters_pipes(
 
     def asset_key_fn(path: list[str]) -> dg.AssetKey | None:
         # Exact tuple match — engine and component agree on the shape
-        # (``[source_type, *components, table]``). Fall through to the
-        # last-segment match for drift events, whose ``asset_key`` is
-        # just the source-side table identifier.
+        # (``[source_type, *components, table]``). Drift events carry this
+        # full shape too, as of #2073 (previously a bare source-side table
+        # identifier, which only the last-segment fallback below could
+        # resolve). The fallback stays for any single-segment path — e.g. a
+        # captured fixture or a binary older than #2073.
         key = rocky_key_to_dagster_key.get(tuple(path))
         if key is not None:
             return key
@@ -2979,6 +2996,19 @@ def _run_filters_pipes(
             include_keys=selected_keys,
         )
         for result in invocation.get_results():
+            # Drift is never a declared check spec (see DRIFT_CHECK_NAME) —
+            # convert it to the same AssetObservation shape the streaming
+            # path's `drift_observations` yields, before the generic
+            # undeclared-check path below, whose "declared specs are stale"
+            # warning is the wrong diagnosis for a check that was never
+            # meant to be declared (#2073).
+            if (
+                isinstance(result, dg.AssetCheckResult)
+                and result.asset_key is not None
+                and result.check_name == DRIFT_CHECK_NAME
+            ):
+                yield _drift_pipes_result_to_observation(result)
+                continue
             # Only ``AssetCheckResult`` is constrained by the declared specs.
             # Pipes reports a check as a TOP-LEVEL result (see
             # ``PipesMessageHandler._handle_report_asset_check``), never nested
@@ -3417,6 +3447,44 @@ def _undeclared_check_observation(
     )
 
 
+def _drift_pipes_result_to_observation(result: dg.AssetCheckResult) -> dg.AssetObservation:
+    """Convert a Pipes ``drift`` check result into the ``AssetObservation``
+    shape :func:`drift_observations` yields on the streaming path.
+
+    ``drift`` (:data:`DRIFT_CHECK_NAME`) is intentionally never a declared
+    check spec, so left alone it would fall into
+    :func:`_undeclared_check_observation` below, whose "declared specs are
+    stale, refresh the state" warning is the wrong diagnosis for a check
+    that was never meant to be declared — Pipes has no separate
+    "observation" verb, so the engine reports drift as an
+    ``AssetCheckResult`` like any other ``report_asset_check`` message
+    (#2073).
+
+    ``rocky/drift_tables_checked`` / ``rocky/drift_tables_drifted``, which
+    :func:`drift_observations` also sets, are NOT included here — those are
+    run-level aggregates from ``RunResult.drift``, not available on a
+    single Pipes check message.
+    """
+    meta = result.metadata or {}
+    metadata: dict[str, Any] = {}
+    for source_key, target_key in (
+        ("action", "rocky/drift_action"),
+        ("reason", "rocky/drift_reason"),
+        ("table", "rocky/drift_table"),
+    ):
+        if source_key in meta:
+            metadata[target_key] = meta[source_key]
+    action_value = meta.get("action")
+    description = (
+        f"Schema drift: {action_value.value}" if action_value is not None else "Schema drift"
+    )
+    return dg.AssetObservation(
+        asset_key=result.asset_key,
+        description=description,
+        metadata=metadata,
+    )
+
+
 def _emit_results(
     *,
     results: list[RunResult],
@@ -3639,7 +3707,10 @@ def _emit_results(
 
     # Anomalies → AssetCheckResult with severity WARN. The check name is
     # pre-declared in DEFAULT_CHECK_NAMES so the spec is visible in the UI
-    # before any run; placeholders below cover the no-anomaly case.
+    # before any run. A table with no anomaly gets its verdict from
+    # `anomaly_evaluation_results` below, not from a placeholder — this check
+    # left PASS_BY_ABSENCE_CHECK_NAMES, so its placeholder now reports
+    # `passed=False` (#1790).
     for run_result in results:
         for anomaly_result in anomaly_check_results(run_result, key_resolver=selected_resolver):
             spec_key = (anomaly_result.asset_key, ANOMALY_CHECK_NAME)
@@ -3654,6 +3725,20 @@ def _emit_results(
                 continue
             yielded_checks.add(spec_key)
             yield anomaly_result
+
+    # The verdict for every OTHER table the detector considered: evaluated and
+    # clean, or not evaluated and why. Yielded after the anomalies so a table
+    # that has one keeps its `passed=False` — the dedup below drops the pass
+    # this would otherwise add for the same (asset, check) pair (#1790).
+    for run_result in results:
+        for evaluation_result in anomaly_evaluation_results(
+            run_result, key_resolver=selected_resolver
+        ):
+            spec_key = (evaluation_result.asset_key, ANOMALY_CHECK_NAME)
+            if spec_key not in declared_checks or spec_key in yielded_checks:
+                continue
+            yielded_checks.add(spec_key)
+            yield evaluation_result
 
     # Model-failure containment → AssetObservation. A model in ``contained``
     # was withheld this run because an upstream failed (or was itself withheld)

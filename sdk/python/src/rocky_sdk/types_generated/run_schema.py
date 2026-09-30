@@ -8,11 +8,42 @@ from enum import StrEnum
 from pydantic import AwareDatetime, BaseModel, conint
 
 
+class AnomalyEvaluationOutput(BaseModel):
+    """
+    Whether the row-count anomaly detector evaluated one table.
+
+    One entry per table in the run's batches, whatever happened. A consumer reading [`RunOutput::anomalies`] alone cannot tell "the detector ran and found nothing" from "the detector never ran": both are an empty list (#1790). Dagster read the empty list as a pass, so a run with `row_count = false` showed a green anomaly check for a detector that had not run.
+
+    The detector runs only when row-count checks are on, the run has a state store, the table's row count was measured, and its history could be read. `not_evaluated_reason` names which of those was missing, because the remedy differs: one is a config line, another is how the run was invoked.
+    """
+
+    asset_key: list[str]
+    """
+    Dagster-style asset key path (`[source_type, ...components, table]`), the same value [`MaterializationOutput::asset_key`] carries for this table. Added (#2073) so the Dagster Pipes emitter can report this verdict as a `report_asset_check` without re-deriving the mapping `batch_asset_keys` already has — the same reason [`TableCheckOutput::asset_key`] exists.
+    """
+    evaluated: bool
+    """
+    `true` when the detector compared this table's count against its history. An anomaly, if any, is in [`RunOutput::anomalies`].
+    """
+    not_evaluated_reason: str | None = None
+    """
+    Why the detector did not evaluate this table. Set exactly when `evaluated` is `false`.
+    """
+    table: str
+    """
+    Fully-qualified table the entry is about, the same key [`AnomalyOutput::table`] uses.
+    """
+
+
 class AnomalyOutput(BaseModel):
     """
     Row count anomaly detected by historical baseline comparison.
     """
 
+    asset_key: list[str]
+    """
+    Dagster-style asset key path, same convention as [`AnomalyEvaluationOutput::asset_key`] (#2073).
+    """
     baseline_avg: float
     current_count: conint(ge=0)
     deviation_pct: float
@@ -97,6 +128,10 @@ class ContainedModelOutput(BaseModel):
 
 class DriftActionOutput(BaseModel):
     action: str
+    asset_key: list[str]
+    """
+    Dagster-style asset key path (`[source_type, ...components, table]`) for this table, the same value [`MaterializationOutput::asset_key`] carries. Added (#2073) so the Dagster Pipes emitter can report drift as a `report_asset_check` keyed on the asset, instead of passing `table` (a bare `catalog.schema.table` string, not a Dagster asset key) as the asset key.
+    """
     reason: str
     table: str
 
@@ -400,7 +435,7 @@ class QuarantineOutput(BaseModel):
     """
     error: str | None = None
     """
-    Error message from the first failing statement, if any.
+    The first failing statement's role and error, if any. For `mode = "split"`, a failure to drop the intermediate label table is appended after it.
     """
     mode: str
     """
@@ -408,7 +443,7 @@ class QuarantineOutput(BaseModel):
     """
     ok: bool
     """
-    `true` when every quarantine statement executed successfully. `false` means a partial failure — inspect `error` for details.
+    `true` when every quarantine statement executed successfully and, for `mode = "split"`, the intermediate label table was dropped. `false` also adds a failing `quarantine:execute` check, counts the table in `tables_failed` and itemises it in `errors`, so the run fails whatever `fail_on_error` says; inspect `error` for details.
     """
     quarantine_table: str | None = None
     """
@@ -775,6 +810,10 @@ class RunOutput(BaseModel):
     """
 
     anomalies: list[AnomalyOutput] | None = None
+    anomaly_evaluated: list[AnomalyEvaluationOutput] | None = None
+    """
+    One entry per table the run considered for row-count anomaly detection, saying whether the detector evaluated it. Empty for a run with no batched checks. See [`AnomalyEvaluationOutput`] — without it, an empty `anomalies` list means both "nothing anomalous" and "nothing was looked at" (#1790).
+    """
     budget_breaches: list[BudgetBreachOutput] | None = None
     """
     Budget breaches detected at end of run. Empty when no `[budget]` block is configured or all configured limits were respected. Each breach is also emitted as a `budget_breach` [`rocky_observe::events::PipelineEvent`] and fires the `on_budget_breach` hook so subscribers see them live.
@@ -799,7 +838,7 @@ class RunOutput(BaseModel):
     command: str
     contained: list[ContainedModelOutput] | None = None
     """
-    Models withheld this run because an upstream failed (or was itself withheld) and `[resilience] contain_failures` continued the disjoint subgraphs — the blast radius of the failures named in `errors[]`. Empty (and omitted) for a run that did not withhold anything: the default fail-fast run, and any successful run, record nothing here.
+    Models withheld this run after an upstream compile failure, or while `[resilience] contain_failures` continues disjoint subgraphs after a runtime failure. This is the blast radius of failures in `errors[]`. Empty (and omitted) when no model was withheld.
     """
     cost_summary: RunCostSummary | None = None
     """

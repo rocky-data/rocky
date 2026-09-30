@@ -124,7 +124,7 @@ When Rocky is producing JSON output, it writes logs to stderr as JSON, one objec
 `RUST_LOG` controls log verbosity. The default keeps Rocky's own spans at `info` and quiets the query-cache trace:
 
 ```bash
-RUST_LOG=info rocky run -c rocky.toml
+RUST_LOG=info rocky -c rocky.toml run
 ```
 
 ### Local trace files
@@ -143,7 +143,7 @@ Export activates when `OTEL_EXPORTER_OTLP_ENDPOINT` is set. That single variable
 ```bash
 export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317
 export OTEL_SERVICE_NAME=rocky   # optional; defaults to "rocky"
-rocky run -c rocky.toml
+rocky -c rocky.toml run
 ```
 
 - `OTEL_EXPORTER_OTLP_ENDPOINT` is the gRPC endpoint of your OTLP collector.
@@ -166,7 +166,7 @@ docker compose up -d
 # 2. Run a pipeline with export pointed at Alloy's OTLP receiver.
 OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317 \
 OTEL_SERVICE_NAME=rocky \
-  rocky run -c rocky.toml
+  rocky -c rocky.toml run
 
 # 3. Open Grafana at http://localhost:3000.
 ```
@@ -184,7 +184,7 @@ Traces and metrics reach the backend over OTLP. To get Rocky's structured JSON l
 Capture Rocky's stderr to a file, for example when cron or a systemd unit runs it:
 
 ```bash
-rocky run -c rocky.toml 2>> /var/log/rocky/run.jsonl
+rocky -c rocky.toml run 2>> /var/log/rocky/run.jsonl
 ```
 
 Then have Alloy tail that file, parse each JSON line, and label it by `run_id`, which the `run` span carries in the span context:

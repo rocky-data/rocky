@@ -15,7 +15,7 @@ use crate::plan_store::{
 };
 use crate::registry;
 
-use super::run::PartitionRunOptions;
+use super::run::{PartitionRunOptions, refuse_check_name_collisions};
 use super::{filter_table_matches, matches_filter, parse_filter};
 
 /// A model filter (`--model` / the MCP `plan_preview` `model` arg) named a model
@@ -98,6 +98,9 @@ pub async fn plan(
     state_path: &Path,
     output_json: bool,
 ) -> Result<()> {
+    if let Some(branch_name) = run_options.branch.as_deref() {
+        crate::commands::branch::validate_branch_name_pub(branch_name)?;
+    }
     let rocky_cfg = rocky_core::config::load_rocky_config(config_path).context(format!(
         "failed to load config from {}",
         config_path.display()
@@ -126,6 +129,16 @@ pub async fn plan(
 
     let mut output = PlanOutput::new(filter.unwrap_or("").to_string());
     output.env = env.map(str::to_string);
+
+    // #1941: one (target table name, source_type) pair per table that
+    // survives this loop's own skip conditions (filter, disabled override),
+    // collected below and checked once the loop ends — before this plan is
+    // persisted (`output.plan_id`). Without this, `rocky plan` exits 0 and
+    // persists a plan a later `rocky apply` (which re-executes `run()`,
+    // where the same collision refuses) would then reject — late, and
+    // outside the bounded, watchdog-covered plan step Dagster Pipes relies
+    // on for this check.
+    let mut collision_check_pairs: Vec<(String, String)> = Vec::new();
 
     // Detect whether this dialect supports catalogs. Dialects without catalog
     // support (DuckDB, Postgres, ...) return `None` from `create_catalog_sql`,
@@ -236,6 +249,7 @@ pub async fn plan(
                 });
                 continue;
             }
+            collision_check_pairs.push((table.name.clone(), conn.source_type.clone()));
 
             // Resolved AFTER the exclusion branches, mirroring `rocky run`,
             // which preflights the same value only for a table that survives
@@ -315,6 +329,16 @@ pub async fn plan(
         }
     }
 
+    // #1941: refuse before this plan is persisted (`plan_id` below) — see
+    // the comment where `collision_check_pairs` is declared above.
+    refuse_check_name_collisions(
+        name,
+        pipeline,
+        collision_check_pairs
+            .iter()
+            .map(|(t, s)| (t.as_str(), s.as_str())),
+    )?;
+
     // --- Governance preview (Wave A + C-1 + C-2) -------------------------
     //
     // The post-DAG reconcile loop at `rocky run` (see commands/run.rs) walks
@@ -323,8 +347,11 @@ pub async fn plan(
     // adapter — the action rows parallel `statements` but represent
     // control-plane operations rather than warehouse SQL. Models are loaded
     // from the conventional `models/` directory next to the config; a
-    // missing directory is not an error (projects without models produce
-    // empty action arrays and the three fields omit themselves from JSON).
+    // missing directory is not an error, and neither is an existing but
+    // empty one (a replication-only project that keeps `models/.gitkeep`
+    // in git — the dagster scaffold does this on purpose, #1991). Both
+    // produce empty action arrays and the three fields omit themselves
+    // from JSON (#1997).
     let models_dir = config_path
         .parent()
         .unwrap_or_else(|| Path::new("."))
@@ -334,7 +361,7 @@ pub async fn plan(
         models_dir_exists = models_dir.exists(),
         "plan: models_dir check"
     );
-    if models_dir.exists() {
+    if models_dir.exists() && models_dir_has_model_source(&models_dir) {
         let adapter_type = rocky_cfg
             .adapters
             .get(&pipeline.target.adapter)
@@ -437,9 +464,14 @@ pub async fn plan(
             "models directory '{}' not found (required for --model)",
             blueprint_models_dir.display()
         );
-        output.statements =
-            plan_preview_output(Some(config_path), &blueprint_models_dir, Some(model), env)?
-                .statements;
+        // Both halves of the preview, not just the statements: a model the
+        // preview could not render is named in `skipped`, and dropping it
+        // here left `rocky plan --model <refused>` reporting an empty plan
+        // with nothing to say why (#1996).
+        let preview =
+            plan_preview_output(Some(config_path), &blueprint_models_dir, Some(model), env)?;
+        output.statements = preview.statements;
+        output.skipped = preview.skipped;
     }
     let mut run_plan_persisted = false;
     if blueprint_models_dir.exists() {
@@ -947,6 +979,7 @@ pub fn plan_preview_output(
     let config = CompilerConfig {
         models_dir: models_dir.to_path_buf(),
         contracts_dir: None,
+        required_explicit_contract_model: None,
         source_schemas: std::collections::HashMap::new(),
         mask: std::collections::BTreeMap::new(),
         allow_unmasked: vec![],
@@ -1096,9 +1129,8 @@ pub fn plan_preview_output(
         match sql_gen::generate_transformation_sql_with_warehouse(model_ir, dialect.as_ref(), None)
         {
             Ok(stmts) => {
-                // Ephemeral models return `Ok(vec![])` (inlined as CTEs) — no
-                // statement to preview. Multi-statement strategies
-                // (DeleteInsert, lakehouse DDL) emit one row each.
+                // Multi-statement strategies (DeleteInsert, lakehouse DDL)
+                // emit one row each.
                 for sql in stmts {
                     output.statements.push(PlannedStatement {
                         purpose: purpose.to_string(),
@@ -1114,6 +1146,12 @@ pub fn plan_preview_output(
                     error = %e,
                     "plan_preview: skipping model whose SQL cannot be rendered offline"
                 );
+                // The debug log was the only trace this left, so a refused
+                // or unrenderable model previewed as nothing at all (#1996).
+                output.skipped.push(crate::output::SkippedModel {
+                    model: model_name.to_string(),
+                    reason: e.to_string(),
+                });
             }
         }
     }
@@ -1147,6 +1185,7 @@ fn build_and_persist_run_plan(
     let config = CompilerConfig {
         models_dir: models_dir.to_path_buf(),
         contracts_dir: None,
+        required_explicit_contract_model: None,
         source_schemas: std::collections::HashMap::new(),
         mask: std::collections::BTreeMap::new(),
         allow_unmasked: vec![],
@@ -1676,6 +1715,71 @@ fn build_and_persist_replication_plan(
     Ok((replication_plan, plan_id, persisted_at))
 }
 
+/// True when `models_dir` (or a subdirectory) holds at least one `.sql` or
+/// `.rocky` model source file, checked recursively through the one shared
+/// models-tree walk (`rocky_core::model_walk::walk_model_dirs`, #1262) — the
+/// same directory set the compiler itself loads from.
+///
+/// This is the #1997 gate: it lets the governance preview tell "no models
+/// yet" (an existing but empty `models/`, e.g. the dagster scaffold's
+/// `models/.gitkeep`, #1991) apart from "a broken project" without
+/// softening [`rocky_compiler::project::ProjectError::NoModels`] itself —
+/// other callers of the compiler still treat an empty directory as an
+/// error, on purpose.
+///
+/// A tree the walk cannot fully read (permission error, dangling symlink,
+/// depth ceiling), or one this function's own per-directory listing cannot
+/// read — including a `models_dir` that exists but is a regular file, which
+/// `walk_model_dirs` treats as "nothing to descend into" rather than an
+/// error — is conservatively treated as "has a model": this function only
+/// decides whether to SKIP compiling, never whether to report an
+/// unreadable tree as success. A broken tree still reaches
+/// `populate_governance_actions` → `compile(..)`, which surfaces the real
+/// [`rocky_core::model_walk::ModelWalkError`] or
+/// [`rocky_compiler::project::ProjectError::NoModels`].
+fn models_dir_has_model_source(models_dir: &Path) -> bool {
+    let (dirs, walk_errors) = rocky_core::model_walk::walk_model_dirs(models_dir);
+    if !walk_errors.is_empty() {
+        return true;
+    }
+    for dir in &dirs {
+        // This second `read_dir` is independent of the walk above and can
+        // fail where the walk did not: `walk_model_dirs` silently skips
+        // (with no error) a root that exists but is not a directory — the
+        // "nothing to descend into" branch that also covers a proven-absent
+        // path — so a `models/` that collides with a regular file reaches
+        // here with an empty `walk_errors`. A `read_dir` failure, or a
+        // failed directory entry, must not read as "no model here" UNLESS
+        // it is a proven absence: that would turn an unreadable or
+        // misconfigured `models/` into a silent "nothing to preview"
+        // instead of the real compiler error. `NotFound` alone conflates a
+        // never-created path with a dangling symlink (#1668, #1707), so it
+        // goes through the same disambiguation `walk_model_dirs` uses.
+        let entries = match std::fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                match rocky_core::path_presence::classify_not_found(dir) {
+                    rocky_core::path_presence::PathPresence::Absent => continue,
+                    rocky_core::path_presence::PathPresence::Present { .. } => return true,
+                }
+            }
+            Err(_) => return true,
+        };
+        for entry in entries {
+            let Ok(entry) = entry else {
+                return true;
+            };
+            if matches!(
+                entry.path().extension().and_then(|e| e.to_str()),
+                Some("sql" | "rocky")
+            ) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Compile the project and populate `classification_actions`,
 /// `mask_actions`, and `retention_actions` on `output`.
 ///
@@ -1707,6 +1811,7 @@ pub fn populate_governance_actions(
     let compile = rocky_compiler::compile::compile(&rocky_compiler::compile::CompilerConfig {
         models_dir: models_dir.to_path_buf(),
         contracts_dir: None,
+        required_explicit_contract_model: None,
         source_schemas: std::collections::HashMap::new(),
         mask: cfg.mask.clone(),
         allow_unmasked: cfg.classifications.allow_unmasked.clone(),
@@ -1808,6 +1913,7 @@ async fn check_plan_budget(
     let compile_cfg = rocky_compiler::compile::CompilerConfig {
         models_dir: models_dir.to_path_buf(),
         contracts_dir: None,
+        required_explicit_contract_model: None,
         source_schemas: HashMap::new(),
         mask: std::collections::BTreeMap::new(),
         allow_unmasked: vec![],
@@ -2388,11 +2494,11 @@ pub(crate) async fn build_promote_plan_inner(
     use crate::commands::branch::{
         APPROVAL_SKIP_ENV, approver_identity_pub, compute_branch_state_hash_pub,
         discover_branch_targets_for_plan, run_approval_gate, run_breaking_change_gate_for_plan,
-        validate_branch_name_pub,
+        validate_existing_branch_name,
     };
     use rocky_core::state::StateStore;
 
-    validate_branch_name_pub(branch_name)?;
+    validate_existing_branch_name(state_path, branch_name)?;
 
     // `state_path` is the namespace-aware path threaded from main.rs; the
     // branch record lives in whichever state file this invocation targets.
@@ -2495,7 +2601,10 @@ pub(crate) async fn build_promote_plan_inner(
     }
 
     // Discover targets + build SQL at plan time (dialect-quoted, deterministic).
-    let planned_targets =
+    // The resolved pipeline name comes back too — never ambiguous, even when
+    // `pipeline_name` was `None` on a single-pipeline config — and is
+    // persisted onto the plan below so `rocky apply` never re-resolves it.
+    let (resolved_pipeline_name, planned_targets) =
         discover_branch_targets_for_plan(config_path, &record, filter, pipeline_name).await?;
 
     let head_ref = std::process::Command::new("git")
@@ -2535,6 +2644,7 @@ pub(crate) async fn build_promote_plan_inner(
 
     let promote_plan = PromotePlan {
         branch_name: branch_name.to_string(),
+        pipeline: Some(resolved_pipeline_name),
         base_ref: base_ref.to_string(),
         head_ref,
         branch_state_hash: branch_state_hash.clone(),
@@ -2563,6 +2673,34 @@ pub(crate) async fn build_promote_plan_inner(
 
 #[cfg(test)]
 mod tests {
+
+    #[tokio::test]
+    async fn plan_branch_refuses_hyphen_before_config_io() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing_config = temp.path().join("missing.toml");
+        let state = temp.path().join("missing.redb");
+        let options = super::PlanRunOptions {
+            branch: Some("pr-preview-x".to_string()),
+            ..Default::default()
+        };
+        let error = super::plan(
+            &missing_config,
+            None,
+            None,
+            None,
+            &options,
+            false,
+            "main",
+            &state,
+            false,
+        )
+        .await
+        .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("[A-Za-z0-9_]"), "{message}");
+        assert!(message.contains("pr_preview_x"), "{message}");
+        assert!(!message.contains("failed to load config"), "{message}");
+    }
 
     /// The identity must change across a state-schema version bump, because the
     /// remote ledger key embeds it. Without this a plan made under one version
@@ -3107,6 +3245,340 @@ ssn = "confidential"
         assert!(out.retention_actions.is_empty());
     }
 
+    // ------------------------------------------------------------------
+    // #1997 — an existing, empty `models/` directory is "no governance
+    // actions", not a compile failure.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn models_dir_has_model_source_false_for_empty_dir_with_gitkeep() {
+        let tmp = TempDir::new().unwrap();
+        let models_dir = tmp.path().join("models");
+        fs::create_dir_all(&models_dir).unwrap();
+        // The realistic shape: `dagster-rocky`'s `init_rocky_project()`
+        // writes `models/.gitkeep` on purpose (#1991) so the directory
+        // exists in git with nothing else in it.
+        fs::write(models_dir.join(".gitkeep"), "").unwrap();
+
+        assert!(!models_dir_has_model_source(&models_dir));
+    }
+
+    #[test]
+    fn models_dir_has_model_source_false_for_missing_dir() {
+        let tmp = TempDir::new().unwrap();
+        let models_dir = tmp.path().join("models");
+        assert!(!models_dir_has_model_source(&models_dir));
+    }
+
+    #[test]
+    fn models_dir_has_model_source_true_for_sql_file() {
+        let tmp = TempDir::new().unwrap();
+        let (_cfg_path, models_dir) = write_project(&tmp, "", &[("t", "name = \"t\"\n")]);
+        assert!(models_dir_has_model_source(&models_dir));
+    }
+
+    /// The walk is recursive: a `.sql` file two levels below `models/` must
+    /// still count.
+    #[test]
+    fn models_dir_has_model_source_true_for_nested_sql_file() {
+        let tmp = TempDir::new().unwrap();
+        let models_dir = tmp.path().join("models");
+        let nested = models_dir.join("staging").join("shop");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(nested.join("orders.sql"), "SELECT 1 AS id").unwrap();
+
+        assert!(models_dir_has_model_source(&models_dir));
+    }
+
+    /// The gate must not silently swallow a broken tree: an unreadable
+    /// subtree keeps reaching `populate_governance_actions` → `compile`,
+    /// which is where `ModelWalkError` gets surfaced today.
+    #[cfg(unix)]
+    #[test]
+    fn models_dir_has_model_source_true_when_walk_cannot_read_a_subdirectory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = TempDir::new().unwrap();
+        let models_dir = tmp.path().join("models");
+        let unreadable = models_dir.join("locked");
+        fs::create_dir_all(&unreadable).unwrap();
+        let mut perms = fs::metadata(&unreadable).unwrap().permissions();
+        perms.set_mode(0o000);
+        fs::set_permissions(&unreadable, perms.clone()).unwrap();
+
+        let has_source = models_dir_has_model_source(&models_dir);
+
+        // Restore permissions so TempDir can clean up the directory.
+        perms.set_mode(0o755);
+        fs::set_permissions(&unreadable, perms).unwrap();
+
+        assert!(
+            has_source,
+            "an unreadable subtree must not be reported as ok-to-skip"
+        );
+    }
+
+    /// Codex adversarial review (#2118): `walk_model_dirs` treats a root
+    /// that exists but is not a directory as "nothing to descend into" —
+    /// not an error — so a `models/` that collides with a regular file
+    /// (or a symlink to one) sailed past the `walk_errors` check with an
+    /// empty error list. The gate's own second scan must independently
+    /// refuse to read that as "no model here": a `read_dir` failure must
+    /// still force the real compiler error rather than a silent skip.
+    #[test]
+    fn models_dir_has_model_source_true_when_models_dir_is_a_regular_file() {
+        let tmp = TempDir::new().unwrap();
+        let models_dir = tmp.path().join("models");
+        fs::write(&models_dir, "not a directory").unwrap();
+
+        assert!(
+            models_dir_has_model_source(&models_dir),
+            "a models/ path that is a regular file must not be read as ok-to-skip"
+        );
+    }
+
+    /// The #1997 gate composed with the real downstream call: a non-empty
+    /// `models/` directory must still reach `populate_governance_actions`
+    /// and populate its action arrays — proves the fix does not become a
+    /// blanket skip.
+    #[test]
+    fn non_empty_models_dir_still_runs_the_governance_preview() {
+        let tmp = TempDir::new().unwrap();
+        let (cfg_path, models_dir) = write_project(
+            &tmp,
+            r#"
+[adapter.default]
+type = "duckdb"
+database = ":memory:"
+"#,
+            &[(
+                "t",
+                r#"name = "t"
+[target]
+catalog = "c"
+schema = "s"
+table = "t"
+
+[classification]
+ssn = "confidential"
+"#,
+            )],
+        );
+
+        assert!(
+            models_dir_has_model_source(&models_dir),
+            "a directory holding a .sql/.toml pair must report a model source"
+        );
+
+        let cfg = rocky_core::config::load_rocky_config(&cfg_path).unwrap();
+        let mut out = PlanOutput::new(String::new());
+        populate_governance_actions(&cfg, &models_dir, None, "duckdb", &mut out).unwrap();
+        assert_eq!(
+            out.classification_actions.len(),
+            1,
+            "the preview must still run for a non-empty models/ dir"
+        );
+    }
+
+    /// End-to-end reproduction of #1997: `rocky plan` on a replication-only
+    /// project whose `models/` directory exists but holds no model source
+    /// must exit 0, exactly like `rocky validate` and `rocky run` on the
+    /// same project (`rocky run` never compiles `models/` for a
+    /// replication-only pipeline, which is why only `plan` failed).
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn plan_succeeds_with_existing_empty_models_dir_on_replication_only_project() {
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("warehouse.duckdb");
+        let config_path = dir.path().join("rocky.toml");
+        let state_path = dir.path().join("state.redb");
+
+        {
+            let warehouse = DuckDbWarehouseAdapter::open(&db_path).unwrap();
+            warehouse
+                .execute_statement("CREATE SCHEMA src__shop")
+                .await
+                .unwrap();
+            warehouse
+                .execute_statement(
+                    "CREATE TABLE src__shop.orders AS SELECT 1 AS id, now() AS _loaded_at",
+                )
+                .await
+                .unwrap();
+        }
+
+        std::fs::write(
+            &config_path,
+            format!(
+                r#"
+[adapter]
+type = "duckdb"
+path = "{}"
+
+[pipeline.main]
+strategy = "incremental"
+timestamp_column = "_loaded_at"
+
+[pipeline.main.source.discovery]
+adapter = "default"
+
+[pipeline.main.source.schema_pattern]
+prefix = "src__"
+separator = "__"
+components = ["source"]
+
+[pipeline.main.target]
+catalog_template = "warehouse"
+schema_template = "raw__{{source}}"
+
+[pipeline.main.target.governance]
+auto_create_schemas = true
+"#,
+                db_path.display()
+            ),
+        )
+        .unwrap();
+
+        // The realistic shape (#1991): the directory exists, tracked in git
+        // via `.gitkeep`, and holds no `.sql` / `.rocky` model.
+        let models_dir = dir.path().join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        std::fs::write(models_dir.join(".gitkeep"), "").unwrap();
+
+        let run_options = PlanRunOptions::default();
+        let result = plan(
+            &config_path,
+            None,
+            None,
+            None,
+            &run_options,
+            false,
+            "HEAD",
+            &state_path,
+            false,
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "plan must succeed on an existing, empty models/ dir: {:?}",
+            result.err()
+        );
+    }
+
+    /// #1941: `rocky plan` must refuse the SAME check-name collision `rocky
+    /// run` refuses, and refuse it BEFORE persisting a plan. Without this,
+    /// `rocky plan` exits 0 and persists a `plan_id` for a set `rocky apply`
+    /// — which re-executes `run()`, where the same collision refuses —
+    /// would then reject: late, and outside the bounded, watchdog-covered
+    /// plan step Dagster Pipes relies on for this check.
+    ///
+    /// Uses the same `cross_source_overlap` collision as
+    /// `a_collision_refusal_writes_nothing_the_target_table_never_exists`
+    /// in `commands::run`: config load cannot see it (no assertions are
+    /// declared here for it to hang a table off), so this drives all the
+    /// way through discovery and into `plan()`'s own guard call, not
+    /// config load.
+    ///
+    /// Mutation that must turn this red: delete the
+    /// `refuse_check_name_collisions(name, pipeline,
+    /// collision_check_pairs...)` call in `plan()`.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn plan_refuses_a_check_name_collision_before_persisting_a_plan() {
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("x.duckdb");
+        let config_path = dir.path().join("rocky.toml");
+        let state_path = dir.path().join("state.redb");
+
+        {
+            let warehouse = DuckDbWarehouseAdapter::open(&db_path).unwrap();
+            for schema in ["raw__acme", "raw__widgets"] {
+                warehouse
+                    .execute_statement(&format!("CREATE SCHEMA {schema}"))
+                    .await
+                    .unwrap();
+                warehouse
+                    .execute_statement(&format!("CREATE TABLE {schema}.orders AS SELECT 1 AS id"))
+                    .await
+                    .unwrap();
+            }
+        }
+
+        std::fs::write(
+            &config_path,
+            format!(
+                r#"
+[adapter]
+type = "duckdb"
+path = "{}"
+
+[pipeline.p]
+type = "replication"
+strategy = "full_refresh"
+
+[pipeline.p.source.discovery]
+adapter = "default"
+
+[pipeline.p.source.schema_pattern]
+prefix = "raw__"
+separator = "__"
+components = ["source"]
+
+[pipeline.p.target]
+adapter = "default"
+catalog_template = "x"
+schema_template = "staging__{{source}}"
+
+[pipeline.p.target.governance]
+auto_create_schemas = true
+
+[pipeline.p.checks]
+cross_source_overlap = {{ keys = ["id"] }}
+
+[[pipeline.p.checks.custom]]
+name = "cross source overlap duckdb orders"
+sql = "SELECT 0"
+threshold = 0
+"#,
+                db_path.display()
+            ),
+        )
+        .unwrap();
+
+        let run_options = PlanRunOptions::default();
+        let result = plan(
+            &config_path,
+            None,
+            None,
+            None,
+            &run_options,
+            false,
+            "HEAD",
+            &state_path,
+            false,
+        )
+        .await;
+
+        let err = result.expect_err("a check-name collision must refuse rocky plan");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("cross source overlap duckdb orders")
+                && msg.contains("cross_source_overlap:duckdb.orders"),
+            "the refusal must name both colliding sources: {msg}"
+        );
+        assert!(
+            msg.contains("pipeline \"p\""),
+            "the refusal must name the pipeline: {msg}"
+        );
+    }
+
     #[test]
     fn mask_strategy_wire_names_match_adapter() {
         // Guard against the preview string drifting from the enum's
@@ -3166,6 +3638,59 @@ table = "users"
         assert!(out.retention_actions.is_empty());
         assert!(out.plan_id.is_none());
         assert!(out.execution_layers.is_empty());
+    }
+
+    /// #1996: an ephemeral model renders no statement, and the preview used
+    /// to drop it into a `debug!` log. An ephemeral-only project previewed as
+    /// an empty plan with exit 0 — the same silence that let the strategy
+    /// look like it worked. The model is now named in `skipped`, with the
+    /// refusal as its reason.
+    #[test]
+    fn plan_preview_names_a_model_it_could_not_render() {
+        let tmp = TempDir::new().unwrap();
+        let (cfg_path, models_dir) = write_project(
+            &tmp,
+            r#"
+[adapter.default]
+type = "duckdb"
+database = ":memory:"
+"#,
+            &[(
+                "stg_users",
+                r#"name = "stg_users"
+
+[strategy]
+type = "ephemeral"
+
+[target]
+catalog = "c"
+schema = "s"
+table = "stg_users"
+"#,
+            )],
+        );
+
+        let out = plan_preview_output(Some(&cfg_path), &models_dir, None, None).unwrap();
+        assert!(
+            out.statements.is_empty(),
+            "an ephemeral model renders nothing: {:?}",
+            out.statements
+        );
+        assert_eq!(out.skipped.len(), 1, "got {:?}", out.skipped);
+        assert_eq!(out.skipped[0].model, "stg_users");
+        // The WHOLE string, prefix included. `reason` is
+        // `SqlGenError::InvalidRequest`'s Display, so it carries the
+        // `invalid SQL generation request: ` prefix its `#[error]` adds, and
+        // `plan.rs` stores it verbatim. A `contains("E038")` assertion would
+        // not notice that prefix changing, and the reference docs quote this
+        // string in full — pinning it is what keeps the page and the engine
+        // from drifting apart silently.
+        assert_eq!(
+            out.skipped[0].reason,
+            "invalid SQL generation request: model 'stg_users': `type = \"ephemeral\"` is not \
+             supported (E038) — an ephemeral model is not materialized and is not inlined into \
+             its consumers; use `type = \"view\"`"
+        );
     }
 
     /// The `filter` arg narrows the preview to a single model by name and is
@@ -3858,6 +4383,7 @@ token = "${ROCKY_T_1625_PREVIEW_UNSET_2}"
     fn minimal_promote_plan(branch_name: &str) -> PromotePlan {
         PromotePlan {
             branch_name: branch_name.to_string(),
+            pipeline: None,
             base_ref: "main".to_string(),
             head_ref: "abc1234".to_string(),
             branch_state_hash: "deadbeef".repeat(8),

@@ -425,7 +425,8 @@ enum Command {
         /// Project directory name
         #[arg(default_value = ".")]
         path: String,
-        /// Project template: duckdb (default), databricks-fivetran, snowflake
+        /// Project template: duckdb (default), databricks-fivetran,
+        /// snowflake, bigquery, trino
         #[arg(long, default_value = "duckdb")]
         template: String,
     },
@@ -889,9 +890,11 @@ enum Command {
         /// is a content-hash of the payload, so plans differing only by
         /// idempotency-key get distinct plan_ids — the hash discriminates.
         ///
-        /// Supported on `local`, `valkey`, and `tiered` state backends.
-        /// `s3`-only and `gcs`-only backends error at flag-parse time — use
-        /// `tiered` for multi-pod deployments.
+        /// Supported on every state backend: `local` (a redb write
+        /// transaction), `valkey`/`tiered` (`SET NX EX`), and `s3`/`gcs`
+        /// (a conditional PUT). The initial claim is race-free on every
+        /// backend; recovery from a crashed prior claim is best-effort —
+        /// two callers can both adopt one stale claim.
         ///
         /// ⚠️ Keys are stored verbatim in the state store; do NOT put
         /// secrets in idempotency keys.
@@ -959,6 +962,10 @@ enum Command {
         /// Alternative to --filter for model-only execution.
         #[arg(long)]
         model: Option<String>,
+        /// Check an explicitly selected model contract in the same compile
+        /// that supplies the model executed by this run.
+        #[arg(long, requires_all = ["model", "pipeline"])]
+        contracts: Option<PathBuf>,
         /// Additional governance config (JSON or @file.json), merged with defaults
         #[arg(long)]
         governance_override: Option<String>,
@@ -1063,9 +1070,11 @@ enum Command {
         /// work is done. If another caller currently holds the key's
         /// in-flight claim, exits with `skipped_in_flight`.
         ///
-        /// Supported on `local`, `valkey`, and `tiered` state backends.
-        /// `s3`-only and `gcs`-only backends error at flag-parse time — use
-        /// `tiered` for multi-pod deployments.
+        /// Supported on every state backend: `local` (a redb write
+        /// transaction), `valkey`/`tiered` (`SET NX EX`), and `s3`/`gcs`
+        /// (a conditional PUT). The initial claim is race-free on every
+        /// backend; recovery from a crashed prior claim is best-effort —
+        /// two callers can both adopt one stale claim.
         ///
         /// ⚠️ Keys are stored verbatim in the state store; do NOT put
         /// secrets in idempotency keys.
@@ -1489,19 +1498,15 @@ enum Command {
         /// Materialization strategy for the generated model. Written into
         /// the emitted `.toml` sidecar's `[strategy]` block.
         ///
-        /// Accepted: `full_refresh` (default), `incremental`, `merge`,
-        /// `ephemeral`. Other strategies in `StrategyConfig`
-        /// (`time_interval`, `delete_insert`, `microbatch`) require richer
-        /// flag plumbing and are deliberately out of scope for this first
-        /// cut.
+        /// Accepted: `full_refresh` (default), `merge`.
+        /// `incremental` is refused: on a transformation model it re-inserts
+        /// every row on each run (E037). `ephemeral` is refused: it is not
+        /// materialized and not inlined into its consumers (E038). Other
+        /// strategies in `StrategyConfig` (`time_interval`, `delete_insert`,
+        /// `microbatch`) require richer flag plumbing and are deliberately
+        /// out of scope for this first cut.
         #[arg(long, default_value = "full_refresh")]
         materialization: String,
-        /// Watermark column for `--materialization=incremental`. Maps to
-        /// `[strategy] timestamp_column` in the emitted sidecar TOML.
-        /// Required when materialization is `incremental`; ignored
-        /// otherwise.
-        #[arg(long)]
-        watermark: Option<String>,
         /// Required for `--materialization merge`. Columns that uniquely
         /// identify a row for upsert. Maps to `[strategy] unique_key` in
         /// the emitted sidecar TOML.
@@ -1623,7 +1628,11 @@ enum Command {
         /// Path to Rocky project directory (optional, for side-by-side comparison)
         #[arg(long)]
         rocky_project: Option<PathBuf>,
-        /// Number of rows to sample per table (for warehouse-based validation)
+        /// Number of rows to sample per table. Accepted but currently
+        /// ignored: `validate-migration` imports the dbt project,
+        /// compares model names against the optional Rocky project, and
+        /// reports which dbt tests convert to Rocky contracts — it does
+        /// not verify Rocky-side checks and opens no warehouse adapter.
         #[arg(long)]
         sample_size: Option<usize>,
     },
@@ -1731,6 +1740,17 @@ enum Command {
         /// bind host are always accepted; any other `Host` is refused `421`.
         #[arg(long = "allowed-host", value_name = "HOST")]
         allowed_hosts: Vec<String>,
+        /// With `--ui`: open the printed address in the default browser once
+        /// the listener is bound — after the startup sweep, never before, so
+        /// the page lands on a server that answers. The address, token
+        /// included, is handed to the system opener (`open`, `xdg-open`,
+        /// `rundll32`) as an argument, so it is visible in the process list
+        /// while the opener runs — the same secret the terminal shows. A
+        /// missing opener, or one that exits non-zero, is a warning; the
+        /// server still starts and still prints the address. Refused without
+        /// `--ui`.
+        #[arg(long)]
+        open: bool,
         /// Run the resident scheduler alongside the API: a timer-driven loop
         /// that evaluates every pipeline's `[schedule]` and runs what is due,
         /// exactly like `rocky tick` on a cron, but in-process (experimental).
@@ -2470,7 +2490,7 @@ enum PreviewAction {
         #[arg(long, default_value = "main")]
         base: String,
         /// Branch name. When omitted, derived from the current git
-        /// branch via `pr-preview/<branch>` so PRs that re-run inherit
+        /// branch via `pr_preview_<branch>` so PRs that re-run inherit
         /// the same branch entry.
         #[arg(long)]
         name: Option<String>,
@@ -2487,9 +2507,6 @@ enum PreviewAction {
         /// Git ref to compare data against (default: main)
         #[arg(long, default_value = "main")]
         base: String,
-        /// Maximum rows to sample per model (default: 1000)
-        #[arg(long, default_value_t = 1000)]
-        sample_size: usize,
         /// Diff algorithm: `sampled` (default — structural delta from the
         /// run records) or `bisection` (exhaustive checksum-bisection on
         /// each Merge-strategy model with a single integer / numeric
@@ -2772,7 +2789,7 @@ enum PlanSubcommand {
 enum BranchAction {
     /// Create a new branch
     Create {
-        /// Branch name (e.g., `fix-price`, `feature_new_join`)
+        /// Branch name (e.g., `fix_price`, `feature_new_join`)
         name: String,
         /// Optional description, surfaced in `rocky branch list`
         #[arg(long)]
@@ -2802,6 +2819,9 @@ enum BranchAction {
         /// Filter sources by component value (e.g., --filter client=acme)
         #[arg(long)]
         filter: Option<String>,
+        /// Pipeline name (required if multiple pipelines are defined)
+        #[arg(long)]
+        pipeline: Option<String>,
     },
     /// Sign a content-addressed approval artifact for a branch.
     ///
@@ -3731,6 +3751,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             filter,
             pipeline,
             model,
+            contracts,
             governance_override,
             models: models_dir,
             all: run_all,
@@ -3760,10 +3781,51 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             var,
             assume_fresh_state,
         } => {
+            // Resolve branch names before config or warehouse work. This is
+            // also the single name-to-schema funnel used by apply and compare.
+            let branch_shadow_config = branch
+                .as_ref()
+                .map(|name| {
+                    rocky_cli::commands::resolve_branch_shadow_config(
+                        &state_path,
+                        name,
+                        shadow_suffix.clone(),
+                    )
+                })
+                .transpose()?;
             // Parse `--var name=value` pairs into the run-variable map. A
             // malformed pair (no `=`, empty/invalid name) is a clear CLI error.
             let run_vars = rocky_core::run_vars::RunVars::parse_pairs(&var)
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
+            if contracts.is_some() {
+                anyhow::ensure!(
+                    model.is_some()
+                        && pipeline.is_some()
+                        && filter.is_none()
+                        && models_dir.is_none()
+                        && !run_all
+                        && resume.is_none()
+                        && !resume_latest
+                        && !shadow
+                        && shadow_schema.is_none()
+                        && branch.is_none()
+                        && partition.is_none()
+                        && from.is_none()
+                        && to.is_none()
+                        && !latest
+                        && !missing
+                        && lookback.is_none()
+                        && !dag
+                        && !watch
+                        && !defer
+                        && defer_to.is_none()
+                        && !skip_unchanged
+                        && !no_prune
+                        && idempotency_key.is_none()
+                        && !assume_fresh_state,
+                    "--contracts supports only a fresh --model/--pipeline run; remove mixed, skip, defer, partition, shadow, resume, idempotency, and other unsupported flags"
+                );
+            }
             // `--var` is only threaded through the standard run path. The `--dag`
             // and `--watch` dispatch paths compile their sub-runs with an empty
             // `RunVars`, so a supplied `--var` would be silently dropped —
@@ -3830,21 +3892,8 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
 
             // Resolve --branch to the same machinery as --shadow. clap
             // guarantees branch can't coexist with `shadow` / `shadow_schema`.
-            let shadow_config = if let Some(name) = &branch {
-                let store = rocky_core::state::StateStore::open_read_only(&state_path)
-                    .with_context(|| {
-                        format!("failed to open state store at {}", state_path.display())
-                    })?;
-                let record = store.get_branch(name)?.with_context(|| {
-                    format!(
-                        "branch '{name}' not found — create it with `rocky branch create {name}`"
-                    )
-                })?;
-                Some(rocky_core::shadow::ShadowConfig {
-                    suffix: shadow_suffix,
-                    schema_override: Some(record.schema_prefix),
-                    cleanup_after: false,
-                })
+            let shadow_config = if let Some(config) = branch_shadow_config {
+                Some(config)
             } else if shadow {
                 Some(rocky_core::shadow::ShadowConfig {
                     suffix: shadow_suffix,
@@ -3858,6 +3907,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                     // `false` deliberately: a named branch's objects are the
                     // point of the branch.
                     cleanup_after: true,
+                    branch: None,
                 })
             } else {
                 None
@@ -3979,6 +4029,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                     &skip_opts,
                     &run_vars,
                     assume_fresh_state,
+                    contracts.as_deref(),
                 )
                 .await
             }
@@ -4000,6 +4051,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                 suffix: shadow_suffix,
                 schema_override: shadow_schema,
                 cleanup_after: false,
+                branch: None,
             };
             rocky_cli::commands::compare(
                 &cli.config,
@@ -4223,7 +4275,6 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             format,
             models,
             materialization,
-            watermark,
             unique_key,
             target,
             overwrite,
@@ -4246,7 +4297,6 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                 json,
                 cli.cache_ttl,
                 &materialization,
-                watermark.as_deref(),
                 unique_key,
                 target.as_deref(),
                 overwrite,
@@ -4388,6 +4438,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             allowed_origins,
             ui,
             allowed_hosts,
+            open,
             scheduler,
             poll_interval_seconds,
             drain_timeout_seconds,
@@ -4438,6 +4489,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                 allowed_origins,
                 ui,
                 allowed_hosts,
+                open,
                 scheduler,
                 poll_interval_seconds,
                 drain_timeout_seconds,
@@ -4577,7 +4629,13 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             } else {
                 None
             };
-            rocky_cli::commands::run_optimize(&state_path, models_dir, model.as_deref(), json)
+            rocky_cli::commands::run_optimize(
+                &state_path,
+                &cli.config,
+                models_dir,
+                model.as_deref(),
+                json,
+            )
         }
         Command::Estimate {
             models,
@@ -4681,12 +4739,17 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             BranchAction::Show { name } => {
                 rocky_cli::commands::run_branch_show(&state_path, &name, json)
             }
-            BranchAction::Compare { name, filter } => {
+            BranchAction::Compare {
+                name,
+                filter,
+                pipeline,
+            } => {
                 rocky_cli::commands::run_branch_compare(
                     &state_path,
                     &cli.config,
                     &name,
                     filter.as_deref(),
+                    pipeline.as_deref(),
                     json,
                 )
                 .await
@@ -4887,7 +4950,6 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             PreviewAction::Diff {
                 name,
                 base,
-                sample_size,
                 algorithm,
                 models,
             } => {
@@ -4905,7 +4967,6 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                     &models,
                     &name,
                     &base,
-                    sample_size,
                     algorithm,
                     json,
                 )
@@ -5149,7 +5210,7 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clap::Parser;
+    use clap::{CommandFactory, Parser};
     use std::sync::Mutex;
 
     // -----------------------------------------------------------------------
@@ -5208,6 +5269,122 @@ mod tests {
         assert_eq!(
             rocky_mcp::McpProfile::from(profile),
             rocky_mcp::McpProfile::Worker,
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // #2027 — `--help` strings must describe the behaviour the code has
+    // -----------------------------------------------------------------------
+
+    /// `rocky init --help` must list every template `commands/init.rs`
+    /// actually accepts, not just three of the five.
+    #[test]
+    fn init_help_lists_all_five_templates() {
+        let mut init_cmd = command_with_big_stack()
+            .find_subcommand("init")
+            .expect("init subcommand exists")
+            .clone();
+        let help = init_cmd.render_long_help().to_string();
+        assert!(
+            help.contains("trino"),
+            "init --help must list trino: {help}"
+        );
+        assert!(
+            help.contains("bigquery"),
+            "init --help must list bigquery: {help}"
+        );
+    }
+
+    /// `rocky validate-migration --help` must say `--sample-size` is
+    /// ignored, not promise warehouse-based sampling that
+    /// `run_validate_migration` never performs (`_sample_size` is unused).
+    #[test]
+    fn validate_migration_help_says_sample_size_is_ignored() {
+        let mut sub = command_with_big_stack()
+            .find_subcommand("validate-migration")
+            .expect("validate-migration subcommand exists")
+            .clone();
+        let help = sub.render_long_help().to_string();
+        assert!(
+            help.contains("ignored"),
+            "validate-migration --help must say sample-size is ignored: {help}"
+        );
+    }
+
+    /// #2032: `preview diff --sample-size` was accepted and silently
+    /// ignored (bound as `_sample_size`, never read). Unlike
+    /// `validate-migration --sample-size` (#2027, kept and documented as
+    /// ignored), no code path exists that the flag was ever meant to
+    /// drive, so it was REMOVED from clap rather than merely documented —
+    /// a caller passing it now gets a clear parse error instead of a
+    /// silently-discarded value. `--help` must not offer a flag that no
+    /// longer exists.
+    #[test]
+    fn preview_diff_help_does_not_offer_sample_size() {
+        let mut preview = command_with_big_stack()
+            .find_subcommand("preview")
+            .expect("preview subcommand exists")
+            .clone();
+        let diff = preview
+            .find_subcommand_mut("diff")
+            .expect("preview diff subcommand exists");
+        let help = diff.render_long_help().to_string();
+        assert!(
+            !help.contains("sample-size"),
+            "preview diff --help must not offer the removed --sample-size flag: {help}"
+        );
+    }
+
+    /// The removal is a hard parse error, not a quiet drop: a caller
+    /// (script, CI workflow) still passing `--sample-size` gets told so
+    /// immediately, rather than having the value silently discarded the
+    /// way it was before this fix (#2032).
+    #[test]
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "expects a PARSE FAILURE, which the Cli-returning helper cannot express; the \
+                  call already runs on an 8 MB spawned thread"
+    )]
+    fn preview_diff_rejects_removed_sample_size_flag() {
+        let result = std::thread::scope(|s| {
+            std::thread::Builder::new()
+                .stack_size(8 * 1024 * 1024)
+                .spawn_scoped(s, || {
+                    Cli::try_parse_from([
+                        "rocky",
+                        "preview",
+                        "diff",
+                        "--name",
+                        "pr_preview_fix_price",
+                        "--sample-size",
+                        "500",
+                    ])
+                    .map(|_| ())
+                    .map_err(|e| e.kind())
+                })
+                .expect("spawn parser thread")
+                .join()
+                .expect("parser thread panicked")
+        });
+        assert!(
+            result.is_err(),
+            "--sample-size must no longer parse for `preview diff`"
+        );
+    }
+
+    /// `rocky run --help` must not claim `s3`/`gcs` idempotency backends
+    /// error at flag-parse time — `IdempotencyBackend::from_state_config`
+    /// maps both to `ObjectStore` and attempts a conditional PUT instead.
+    #[test]
+    fn run_help_does_not_claim_object_store_backends_error_at_parse_time() {
+        let mut sub = command_with_big_stack()
+            .find_subcommand("run")
+            .expect("run subcommand exists")
+            .clone();
+        let help = sub.render_long_help().to_string();
+        assert!(
+            !help.contains("error at flag-parse time"),
+            "run --help must not claim s3/gcs error at parse time: {help}"
         );
     }
 
@@ -5299,6 +5476,22 @@ mod tests {
                 .expect("spawn parser thread")
                 .join()
                 .expect("parser thread panicked")
+        })
+    }
+
+    /// Same overflow, same fix, for building the `clap::Command` graph
+    /// itself rather than parsing through it (`Cli::command()` walks the
+    /// same subcommand tree `try_parse_with_big_stack` above documents —
+    /// confirmed by a `SIGABRT: stack overflow` on the default test-thread
+    /// stack when a `--help`-snapshot test called `Cli::command()` directly).
+    fn command_with_big_stack() -> clap::Command {
+        std::thread::scope(|s| {
+            std::thread::Builder::new()
+                .stack_size(8 * 1024 * 1024)
+                .spawn_scoped(s, Cli::command)
+                .expect("spawn command-builder thread")
+                .join()
+                .expect("command-builder thread panicked")
         })
     }
 
@@ -5499,6 +5692,76 @@ mod tests {
             } => assert_eq!(expect_spec_digest, None),
             _ => panic!("expected Apply subcommand"),
         }
+    }
+
+    /// #2019: `rocky branch compare <name> --pipeline <name>` must parse —
+    /// clap rejected `--pipeline` on `branch compare` entirely before this
+    /// fix (`error: unexpected argument '--pipeline' found`), the flag
+    /// stays optional (a bare `branch compare <name>` still parses to
+    /// `pipeline: None`), and `rocky apply <plan-id>` still has NO
+    /// `--pipeline` flag — the fix reads it from the persisted plan instead,
+    /// per the issue's "don't add `--pipeline` to `apply`" constraint.
+    #[test]
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the apply/--pipeline half expects a PARSE FAILURE, which the Cli-returning \
+                  big-stack helper cannot express; run on a scoped 8 MB thread instead"
+    )]
+    fn branch_compare_pipeline_flag_parses_and_apply_still_has_none() {
+        let cli = try_parse_with_big_stack(&[
+            "rocky",
+            "branch",
+            "compare",
+            "ci-demo",
+            "--pipeline",
+            "transform",
+        ]);
+        match cli.command {
+            Command::Branch { action } => match action {
+                BranchAction::Compare { name, pipeline, .. } => {
+                    assert_eq!(name, "ci-demo");
+                    assert_eq!(pipeline.as_deref(), Some("transform"));
+                }
+                _ => panic!("expected BranchAction::Compare"),
+            },
+            _ => panic!("expected Branch subcommand"),
+        }
+
+        // The flag stays optional.
+        let cli = try_parse_with_big_stack(&["rocky", "branch", "compare", "ci-demo"]);
+        match cli.command {
+            Command::Branch { action } => match action {
+                BranchAction::Compare { pipeline, .. } => assert_eq!(pipeline, None),
+                _ => panic!("expected BranchAction::Compare"),
+            },
+            _ => panic!("expected Branch subcommand"),
+        }
+
+        // `rocky apply <plan-id> --pipeline transform` must still be REJECTED
+        // — `apply` carries no such flag.
+        let msg = std::thread::scope(|s| {
+            std::thread::Builder::new()
+                .stack_size(8 * 1024 * 1024)
+                .spawn_scoped(s, || {
+                    match Cli::try_parse_from([
+                        "rocky",
+                        "apply",
+                        "abc123",
+                        "--pipeline",
+                        "transform",
+                    ]) {
+                        Ok(_) => panic!("`apply` must not accept `--pipeline`"),
+                        Err(e) => e.to_string(),
+                    }
+                })
+                .expect("spawn parser thread")
+                .join()
+                .expect("parser thread panicked")
+        });
+        assert!(
+            msg.contains("unexpected argument") || msg.contains("--pipeline"),
+            "expected an unrecognized-argument error naming --pipeline, got: {msg}"
+        );
     }
 
     /// FF-WP1: `rocky review --status` parses by its literal flag name, and

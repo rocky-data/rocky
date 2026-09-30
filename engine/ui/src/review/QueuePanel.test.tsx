@@ -9,7 +9,7 @@ const NOW = Date.parse("2026-09-06T12:00:00Z");
 const QUEUE: ReviewQueueOutput = {
   version: "1.74.0",
   command: "review",
-  ranking: "blast_radius × classification × staleness",
+  ranking: "blast_radius × change_class × staleness",
   total: 2,
   excluded_non_plan_rows: 3,
   pending: [
@@ -25,7 +25,7 @@ const QUEUE: ReviewQueueOutput = {
       rule_id: 2,
       reason: "a breaking schema change needs a human",
       blast_radius: 7,
-      classification_weight: 3,
+      change_class_weight: 3,
       staleness_seconds: 10_800,
       score: 42.5,
       approve_command: `rocky review ${"a".repeat(64)} --approve`,
@@ -42,7 +42,7 @@ const QUEUE: ReviewQueueOutput = {
       rule_id: null,
       reason: "the default effect asks for review",
       blast_radius: null,
-      classification_weight: 1,
+      change_class_weight: 1,
       staleness_seconds: 30,
       score: 3.25,
       approve_command: `rocky review ${"b".repeat(64)} --approve`,

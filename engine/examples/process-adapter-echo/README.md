@@ -91,21 +91,34 @@ Adapter Conformance: echo (SDK 0.1.0)
 ==================================================
 
 Connection:
-  + connect                       0ms
+  - connect                       SKIPPED (no conformance check is implemented for this spec yet)
 
 DDL:
-  + create_table                  0ms
-  + drop_table                    0ms
+  - create_table                  SKIPPED (no conformance check is implemented for this spec yet)
+  - drop_table                    SKIPPED (no conformance check is implemented for this spec yet)
   - create_catalog                SKIPPED (not supported)
-  + create_schema                 0ms
+  - create_schema                 SKIPPED (no conformance check is implemented for this spec yet)
 ...
-Result: 19 passed, 0 failed, 7 skipped
+Dialect:
+  + format_table_ref              0ms
+...
+Result: 1 passed, 0 failed, 25 skipped
 ```
 
-Seven tests are skipped: `create_catalog`, `merge_into`, `set_tags`,
-`get_grants`, `batch_row_counts`, `batch_freshness`, and `discover`. Each one is
-guarded by a capability the manifest reports as `false`. Flip a capability to
-`true` in the script and its tests run.
+The suite declares 26 tests. Only one of them, `format_table_ref`, has a check
+today. It passes. The other 25 are skipped, for one of two reasons:
+
+- `not supported`: the test needs a capability that the manifest reports as
+  `false`. Seven tests skip for this reason: `create_catalog`, `merge_into`,
+  `set_tags`, `get_grants`, `batch_row_counts`, `batch_freshness`, and
+  `discover`.
+- `no conformance check is implemented for this spec yet`: the test has no
+  check. The other 18 tests skip for this reason, whatever the manifest says.
+
+If you flip a capability to `true` in the script, the result does not change.
+The tests behind that capability move from the first reason to the second, and
+they still skip. The pass count stays at 1. Pipe the command or pass
+`--output json` to get the same result as JSON.
 
 The built-in list is `databricks`, `snowflake`, and `duckdb`. `--adapter echo`
 works because a name outside that list falls back to a `rocky-<name>` binary on

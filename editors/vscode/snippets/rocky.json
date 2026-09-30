@@ -134,15 +134,6 @@
     "body": "-- @depends_on: ${1:upstream_model}",
     "description": "Explicit dependency hint"
   },
-  "Incremental strategy": {
-    "prefix": "strategy-incremental",
-    "body": [
-      "[strategy]",
-      "type = \"incremental\"",
-      "timestamp_column = \"${1:updated_at}\""
-    ],
-    "description": "Incremental materialization in *.rocky.toml"
-  },
   "Merge strategy": {
     "prefix": "strategy-merge",
     "body": [

@@ -370,7 +370,7 @@ const ECOM_STG_ORDERS_SQL: &str = r#"SELECT
 FROM raw_orders
 WHERE status != 'cancelled'
 "#;
-const ECOM_STG_ORDERS_TOML: &str = "name = \"stg_orders\"\ndepends_on = [\"raw_orders\"]\n\n[strategy]\ntype = \"incremental\"\ntimestamp_column = \"_fivetran_synced\"\n\n[target]\ncatalog = \"warehouse\"\nschema = \"staging\"\ntable = \"stg_orders\"\n";
+const ECOM_STG_ORDERS_TOML: &str = "name = \"stg_orders\"\ndepends_on = [\"raw_orders\"]\n\n[strategy]\ntype = \"merge\"\nunique_key = [\"order_id\"]\n\n[target]\ncatalog = \"warehouse\"\nschema = \"staging\"\ntable = \"stg_orders\"\n";
 
 const ECOM_STG_CUSTOMERS_SQL: &str = r#"SELECT
     customer_id,
@@ -409,7 +409,7 @@ const ECOM_FCT_ORDERS_SQL: &str = r#"SELECT
 FROM stg_orders o
 JOIN stg_customers c ON o.customer_id = c.customer_id
 "#;
-const ECOM_FCT_ORDERS_TOML: &str = "name = \"fct_orders\"\ndepends_on = [\"stg_orders\", \"stg_customers\"]\n\n[strategy]\ntype = \"incremental\"\ntimestamp_column = \"_fivetran_synced\"\n\n[target]\ncatalog = \"warehouse\"\nschema = \"marts\"\ntable = \"fct_orders\"\n";
+const ECOM_FCT_ORDERS_TOML: &str = "name = \"fct_orders\"\ndepends_on = [\"stg_orders\", \"stg_customers\"]\n\n[strategy]\ntype = \"merge\"\nunique_key = [\"order_id\"]\n\n[target]\ncatalog = \"warehouse\"\nschema = \"marts\"\ntable = \"fct_orders\"\n";
 
 const ECOM_DIM_CUSTOMERS_SQL: &str = r#"SELECT
     c.customer_id,

@@ -16,7 +16,8 @@ use tokio::task::spawn_blocking;
 
 use rocky_core::failure_class::{FailureClass, TransientKind};
 use rocky_core::traits::{
-    AdapterError, AdapterResult, ExplainResult, QueryResult, SqlDialect, WarehouseAdapter,
+    AdapterError, AdapterResult, ExplainResult, ObjectKind, QueryResult, SqlDialect,
+    WarehouseAdapter,
 };
 use rocky_ir::{ColumnInfo, TableRef};
 use rocky_sql::validation;
@@ -218,6 +219,78 @@ impl WarehouseAdapter for DuckDbWarehouseAdapter {
                 .collect();
 
             Ok(columns)
+        })
+        .await
+        .map_err(|e| join_error(&e))?
+    }
+
+    /// `information_schema.tables.table_type` distinguishes `'BASE TABLE'`
+    /// from `'VIEW'` for any attached catalog (#2037) — verified live:
+    /// `SELECT table_catalog, table_schema, table_name, table_type FROM
+    /// information_schema.tables` returns `BASE TABLE` / `VIEW` rows across
+    /// `ATTACH`ed databases, not just the default `memory` catalog. Mirrors
+    /// [`SqlDialect::list_tables_sql`]'s two-part vs three-part handling.
+    ///
+    /// Two things a literal, case-sensitive equality would get wrong —
+    /// both verified live on DuckDB 1.5.5:
+    ///
+    /// - DuckDB resolves and collides identifiers case-insensitively (the
+    ///   sibling [`Self::describe_table`]'s `DESCRIBE` goes through the
+    ///   same resolution), but `information_schema.tables` reports the
+    ///   name in whatever case it was created with. A target created as
+    ///   `"Orders_View"` and configured as `orders_view` would otherwise
+    ///   match no row — `Unknown` — and skip the check. Every column
+    ///   compares `lower(...) = lower('...')`.
+    /// - An empty `catalog` (unqualified target — the shape
+    ///   `CREATE OR REPLACE TABLE schema.table` runs under) omits the
+    ///   `table_catalog` filter rather than matching a literal empty
+    ///   string, but two same-named `schema.table` pairs in different
+    ///   `ATTACH`ed catalogs then return two rows in undefined order, and
+    ///   `.first()` could report either one's kind. `current_catalog()` is
+    ///   exactly what DuckDB itself resolves that unqualified statement
+    ///   against, so it disambiguates the same way the real DDL would.
+    async fn object_kind(&self, table: &TableRef) -> AdapterResult<ObjectKind> {
+        validation::validate_identifier(&table.schema).map_err(AdapterError::new)?;
+        validation::validate_identifier(&table.table).map_err(AdapterError::new)?;
+        let sql = if table.catalog.is_empty() {
+            format!(
+                "SELECT table_type FROM information_schema.tables \
+                 WHERE lower(table_schema) = lower('{}') \
+                 AND lower(table_name) = lower('{}') \
+                 AND table_catalog = current_catalog()",
+                table.schema, table.table
+            )
+        } else {
+            validation::validate_identifier(&table.catalog).map_err(AdapterError::new)?;
+            format!(
+                "SELECT table_type FROM information_schema.tables \
+                 WHERE lower(table_catalog) = lower('{}') \
+                 AND lower(table_schema) = lower('{}') \
+                 AND lower(table_name) = lower('{}')",
+                table.catalog, table.schema, table.table
+            )
+        };
+
+        let conn = Arc::clone(&self.connector);
+        spawn_blocking(move || {
+            let conn = conn
+                .lock()
+                .map_err(|e| AdapterError::msg(format!("mutex poisoned: {e}")))?;
+            let result = conn.execute_sql(&sql).map_err(AdapterError::new)?;
+            let kind = result
+                .rows
+                .first()
+                .and_then(|row| row.first())
+                .and_then(|v| v.as_str())
+                .map(|table_type| match table_type {
+                    "VIEW" => ObjectKind::View,
+                    "BASE TABLE" => ObjectKind::Table,
+                    // A DuckDB `table_type` Rocky doesn't model (e.g. a
+                    // temporary table) — unknown, not a guess.
+                    _ => ObjectKind::Unknown,
+                })
+                .unwrap_or(ObjectKind::Unknown); // no row: target doesn't exist yet.
+            Ok(kind)
         })
         .await
         .map_err(|e| join_error(&e))?
@@ -542,5 +615,80 @@ mod tests {
             .downcast_ref::<StringArray>()
             .expect("column 1 must downcast to StringArray");
         assert_eq!(s.value(0), "foo");
+    }
+
+    /// Codex review of #2142 (fresh-context, live on DuckDB 1.5.5): a target
+    /// created with a quoted mixed-case identifier stores that exact case in
+    /// `information_schema.tables.table_name`, but a Rocky model targets it
+    /// by its configured (typically lowercase) name — `DESCRIBE`, which
+    /// `describe_table` uses, resolves that case-insensitively, same as any
+    /// unquoted DuckDB reference. A literal-case `object_kind` query would
+    /// find no row for `"Orders_View"` when asked about `orders_view` —
+    /// `Unknown` — silently skipping the #2037 reconciliation check.
+    #[tokio::test]
+    async fn object_kind_matches_case_insensitively() {
+        let adapter = DuckDbWarehouseAdapter::in_memory().unwrap();
+        for ddl in [
+            "CREATE SCHEMA tgt",
+            // Quoted so DuckDB preserves this exact mixed case in
+            // information_schema, instead of folding it like an unquoted
+            // identifier would.
+            r#"CREATE VIEW tgt."Orders_View" AS SELECT 1 AS id"#,
+        ] {
+            adapter.execute_statement(ddl).await.unwrap();
+        }
+
+        let kind = adapter
+            .object_kind(&TableRef {
+                catalog: String::new(),
+                schema: "TGT".into(),
+                table: "orders_view".into(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            kind,
+            ObjectKind::View,
+            "a mixed-case stored name must still resolve, matching DESCRIBE's own \
+             case-insensitive lookup"
+        );
+    }
+
+    /// Codex review of #2142: both prior tests used an empty `catalog`
+    /// (two-part `schema.table`, resolved against `current_catalog()`).
+    /// #2037's own repro names a three-part target (`vs.main.orders_view`)
+    /// in an `ATTACH`ed catalog — the branch that filters on
+    /// `table_catalog` explicitly. Exercise that branch directly, for both
+    /// object kinds, so it is not the untested one.
+    #[tokio::test]
+    async fn object_kind_resolves_a_three_part_attached_catalog_target() {
+        let adapter = DuckDbWarehouseAdapter::in_memory().unwrap();
+        for ddl in [
+            "ATTACH ':memory:' AS vs",
+            "CREATE TABLE vs.main.orders AS SELECT 1 AS id",
+            "CREATE VIEW vs.main.orders_view AS SELECT * FROM vs.main.orders",
+        ] {
+            adapter.execute_statement(ddl).await.unwrap();
+        }
+
+        let table_kind = adapter
+            .object_kind(&TableRef {
+                catalog: "vs".into(),
+                schema: "main".into(),
+                table: "orders".into(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(table_kind, ObjectKind::Table);
+
+        let view_kind = adapter
+            .object_kind(&TableRef {
+                catalog: "vs".into(),
+                schema: "main".into(),
+                table: "orders_view".into(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(view_kind, ObjectKind::View);
     }
 }

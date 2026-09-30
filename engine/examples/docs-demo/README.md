@@ -51,11 +51,19 @@ Click a model name to expand a panel below it. The panel shows the model's
 The search box filters rows by model name. It does not search descriptions,
 targets, or column names.
 
-## Why the Columns section is empty here
+## Where the Columns section comes from
 
-`rocky docs` builds the page from `rocky.toml` and the model files. It opens no
-warehouse adapter, so it has no column types to show. Every model in this
-example therefore reports `No column metadata available`.
+`rocky docs` compiles the project offline, the same way `rocky compile` does.
+The Columns section lists each column the compiler infers, with its type and
+whether it is nullable. The command opens no warehouse adapter. In this example
+no source schemas are cached, so every type shows as `?` and every column as
+nullable.
+
+If every model loads but the project does not compile, the page still
+renders. Rocky logs a warning, and each model shows
+`No column metadata available`. A model that cannot be PARSED is different:
+the loader is strict, so a malformed `.sql`, `.rocky` or sidecar `.toml` fails
+`rocky docs` before it renders anything.
 
 `rocky.toml` is not optional. The command reads it before it reads a model, and
 it counts the configured pipelines and adapters for the banner. Run `rocky docs`
@@ -79,7 +87,15 @@ in a directory that holds `models/` but no config and it stops with exit 1:
 | `[target]` | Renders as the Target column, as `catalog.schema.table` |
 | `[[tests]]` | Fills the Tests count and the Tests list, with each test's severity |
 
-A sidecar may also carry a `[columns]` table of per-column descriptions. Rocky
-parses that table, but `rocky docs` does not render it today. Each description
-hangs off a column entry, and the page has no column entries to hang one on. No
-flag and no earlier command changes that.
+A sidecar may also carry a `[columns]` table of per-column descriptions. The
+models in this example have none. Add one and `rocky docs` renders the
+description under the column name in the Columns section:
+
+```toml
+[columns.customer_id]
+description = "Stable customer key from the source system."
+```
+
+The column must be one the compiler infers for that model. Matching ignores
+ASCII case. If a description names a column the compiler does not see, Rocky
+logs a warning and does not render that description.

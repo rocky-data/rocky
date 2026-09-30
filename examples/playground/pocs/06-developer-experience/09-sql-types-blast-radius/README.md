@@ -3,7 +3,7 @@
 > **Category:** 06-developer-experience
 > **Credentials:** none (DuckDB, ephemeral)
 > **Runtime:** < 2s
-> **Rocky features:** `rocky compile --with-seed`, `SELECT *` lints (`I001` info / `P002` blast-radius)
+> **Rocky features:** `rocky compile --with-seed`, contract type checks (`I003`), `SELECT *` lints (`I001` info / `P002` blast-radius)
 
 ## What it shows
 
@@ -13,8 +13,8 @@ Raw `.sql` models become first-class in Rocky's semantic graph.
    in-memory DuckDB, introspect `information_schema`, and use the
    result as the source of truth for raw source schemas. Leaf `.sql`
    models that read from `raw__*` tables go from `Unknown` columns to
-   concrete types, which cascades into incrementality hints, cost
-   estimates, and downstream type inference.
+   concrete types, which lets a data contract's type check run and
+   cascades into downstream type inference.
 2. **`SELECT *` lint** — the `orders_star` leaf trips the always-on
    `I001` (Info) `SELECT *` lint, which carries a source span so VS
    Code can flag it. The stronger `P002` blast-radius lint (Warning) is
@@ -43,6 +43,8 @@ Raw `.sql` models become first-class in Rocky's semantic graph.
 ├── rocky.toml               DuckDB pipeline
 ├── run.sh                   compile with + without --with-seed; diff the result
 ├── data/seed.sql            raw__orders.orders with typed columns
+├── contracts/
+│   └── orders_typed.contract.toml   typed contract checked once types are known
 └── models/
     ├── _defaults.toml       catalog=poc, schema=demo
     ├── orders_typed.sql     leaf .sql — column types cascade from the seed
@@ -57,12 +59,14 @@ Raw `.sql` models become first-class in Rocky's semantic graph.
 
 ## What happened
 
-1. **Compile without `--with-seed`** — `orders_typed.incrementality_hint`
-   has `confidence = medium`, signals reference only the column name.
+1. **Compile without `--with-seed`** — every column of `raw__orders.orders`
+   is `Unknown`, so the contract's type check cannot run: `orders_typed`
+   reports `I003` for `order_id` and `amount`.
 2. **Compile with `--with-seed`** — Rocky spun up an in-memory DuckDB,
    ran `data/seed.sql`, introspected `information_schema`, and fed
-   those columns into the semantic graph. `orders_typed` now reports
-   `confidence = high`, signals include the actual integer type.
+   those columns into the semantic graph. The columns resolve to
+   `Int32` and `Decimal`, the contract type check runs and passes, and
+   the `I003` diagnostics are gone.
 3. **`SELECT *` lint** — `orders_star.sql` fires `I001` (Info,
    "SELECT * used…") with a source span pointing at the model file
    (editor-integration ready). The `P002` blast-radius lint stays quiet

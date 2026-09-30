@@ -2,6 +2,10 @@
 
 In-browser compiler explorer for Rocky's WASM bindings.
 
+This page is not the `rocky playground` command. That command writes a sample
+DuckDB project to disk. This page runs the compiler in the browser and touches
+no warehouse.
+
 ## Prerequisites
 
 - Rust toolchain with `wasm32-unknown-unknown` target
@@ -24,22 +28,35 @@ Open <http://localhost:8080> in your browser.
 
 ## Features
 
-| Button | WASM function | Input | Output |
-|--------|--------------|-------|--------|
-| **Compile SQL** | `compile_sql` | SQL SELECT statement | Column-level lineage (JSON) |
-| **Parse Rocky** | `parse_rocky` | Rocky DSL source | AST (JSON) |
-| **Lower to SQL** | `lower_rocky_to_sql` | Rocky DSL source | Generated SQL |
-| **Validate** | `validate_identifier` | Any string | Valid / invalid |
+The page has four mode tabs: **SQL**, **Rocky DSL**, **Transpile** and
+**Identifier**. Each tab enables its own action buttons and disables the
+others. The button in bold in the table is the tab's primary action.
+
+| Tab | Button | WASM function | Output |
+|-----|--------|---------------|--------|
+| SQL | **Compile SQL** | `compile_sql` | Column-level lineage (JSON) |
+| Rocky DSL | Parse Rocky | `parse_rocky` | AST (JSON) |
+| Rocky DSL | Lower to SQL | `lower_rocky_to_sql` | Generated SQL |
+| Rocky DSL | Check Syntax | `get_parse_errors` | The first parse error, or none |
+| Rocky DSL | Format | `format_rocky` | Formats the editor source in place |
+| Rocky DSL | **Compile Model** | `compile_rocky_model` | Parse, lower and lineage in one call |
+| Transpile | **Transpile** | `transpile_sql` | SQL in the target dialect, with warnings |
+| Identifier | **Validate** | `validate_identifier` | Valid / invalid |
+
+The Transpile tab shows a source and a target dialect picker: Snowflake,
+Databricks, BigQuery and DuckDB. **Clear Output** empties the output panel. On
+the Rocky DSL tab, the page also checks the source for parse errors 500 ms after
+you stop typing.
 
 ### Keyboard shortcuts
 
-- **Ctrl/Cmd + Enter** -- run Compile SQL
+- **Ctrl/Cmd + Enter** -- run the primary action of the current tab
 - **Tab** -- insert two spaces (no focus jump)
 
 ### Snippet picker
 
-The dropdown loads pre-built examples for each action so you can try things
-immediately without typing.
+The dropdown lists sample snippets for the current tab. Picking one switches to
+its tab and loads it into the editor.
 
 ## Architecture
 

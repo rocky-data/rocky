@@ -260,13 +260,6 @@ const FIXTURES: &[Fixture] = &[
         recipe_hash: "b3ee0334c2abd6c61f2e740cd2d7910c68e34258913022c0f541c1570ae5aa12",
     },
     Fixture {
-        name: "06-transformation-ephemeral",
-        builder: build_06_transformation_ephemeral,
-        entry: Entry::Transformation,
-        dialects: DialectKind::ALL,
-        recipe_hash: "810ece48173ec2caf99b0a1ebba89dd9859bdc56710d7157d9ffe39399d45d8a",
-    },
-    Fixture {
         name: "07-transformation-materialized-view",
         builder: build_07_transformation_materialized_view,
         entry: Entry::MaterializedView,
@@ -524,24 +517,6 @@ fn build_05_transformation_merge() -> ModelIr {
         },
         transform: TransformKind::Direct,
     }];
-    ir
-}
-
-fn build_06_transformation_ephemeral() -> ModelIr {
-    let mut ir = ModelIr::transformation(
-        marts_target("active_orders"),
-        MaterializationStrategy::Ephemeral,
-        vec![SourceRef {
-            catalog: TGT_CATALOG.into(),
-            schema: "marts__demo".into(),
-            table: "fct_orders".into(),
-        }],
-        "SELECT * FROM tgtwarehouse.marts__demo.fct_orders WHERE status = 'active'".into(),
-        baseline_governance(),
-        None,
-        None,
-    );
-    ir.name = Arc::from("active_orders");
     ir
 }
 
@@ -820,6 +795,40 @@ fn ir_recipe_hash_pinned() {
         !fail,
         "one or more fixtures drifted from their pinned recipe-hash"
     );
+}
+
+/// `ephemeral` had a fixture here, and its four snapshots were one byte
+/// each: the generator returned no statement, and the empty file read as a
+/// strategy that worked. It is refused now (E038, #1996) — not materialized,
+/// and never inlined into a consumer — so the refusal is what gets pinned,
+/// on every dialect, and no empty snapshot can pass for SQL again.
+#[test]
+fn ephemeral_is_refused_on_every_dialect() {
+    let mut ir = ModelIr::transformation(
+        marts_target("active_orders"),
+        MaterializationStrategy::Ephemeral,
+        vec![SourceRef {
+            catalog: TGT_CATALOG.into(),
+            schema: "marts__demo".into(),
+            table: "fct_orders".into(),
+        }],
+        "SELECT * FROM tgtwarehouse.marts__demo.fct_orders WHERE status = 'active'".into(),
+        baseline_governance(),
+        None,
+        None,
+    );
+    ir.name = Arc::from("active_orders");
+
+    for &dialect in DialectKind::ALL {
+        let err = run_entry(Entry::Transformation, &ir, &*dialect.instance())
+            .expect_err("an ephemeral model must not produce SQL");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("active_orders") && msg.contains("E038") && msg.contains("view"),
+            "{}: {msg}",
+            dialect.name()
+        );
+    }
 }
 
 /// Property: running each fixture's `Entry` against each declared dialect

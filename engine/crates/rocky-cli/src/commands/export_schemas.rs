@@ -81,8 +81,11 @@ pub(crate) fn schemas() -> Vec<(&'static str, serde_json::Value)> {
         // HTTP-only: the five estate routes (`/health`, `/models`,
         // `/models/{name}`, `/dag/layers`, `/dag/status`) have no CLI verb;
         // their payloads are typed here so a UI and the OpenAPI document
-        // share one contract.
+        // share one contract. `/settings` is HTTP-only for a different reason:
+        // it describes a server that is RUNNING, which a one-shot CLI
+        // invocation would have to invent.
         entry::<HealthOutput>("health"),
+        entry::<crate::output::SettingsOutput>("settings"),
         entry::<ModelListOutput>("model_list"),
         entry::<ModelDetailOutput>("model_detail"),
         entry::<DagLayersOutput>("dag_layers"),

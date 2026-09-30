@@ -337,6 +337,41 @@ pub enum CaseSignificance {
     Insignificant,
 }
 
+/// The warehouse-visible kind of an object already occupying a target, as
+/// reported by [`WarehouseAdapter::object_kind`] (#2037).
+///
+/// Backs the strategy/target reconciliation check in `rocky-cli`:
+/// `CREATE OR REPLACE <kind>` only ever replaces an object of that same
+/// kind, so switching a model between `view` and a table-shaped strategy
+/// (or back) hits the warehouse's own "Existing object X is of type Y,
+/// trying to replace with type Z" error with no explanation. That check
+/// compares this value against what the strategy implies and, on a real
+/// mismatch, fails the model with a Rocky diagnostic before the statement
+/// is ever sent.
+///
+/// Unlike [`CaseSignificance`], this deliberately has a third state.
+/// `CaseSignificance` has no `Unknown` because no state there would
+/// truthfully mean "could not determine" (#1240 — a stray `Unknown`
+/// satisfied a compatibility gate unconditionally). Here "could not
+/// determine" IS a real, common outcome — the target may not exist yet, or
+/// the adapter may not implement the probe at all (the default below
+/// returns it) — and the caller's only correct response is to skip the
+/// reconciliation check, not to treat it as a match or a mismatch. Match
+/// this enum exhaustively (no `_ =>`) wherever it's compared, so a future
+/// object kind fails to compile instead of silently falling into either
+/// bucket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObjectKind {
+    /// A base table — what `CREATE OR REPLACE TABLE` targets.
+    Table,
+    /// A view — what `CREATE OR REPLACE VIEW` targets.
+    View,
+    /// Could not be determined: the adapter doesn't implement the probe, or
+    /// the query found no matching object. Callers must treat this as
+    /// "skip the check", never as an implicit match or mismatch.
+    Unknown,
+}
+
 /// Executes SQL against a warehouse and provides dialect information.
 #[async_trait]
 pub trait WarehouseAdapter: Send + Sync {
@@ -461,6 +496,27 @@ pub trait WarehouseAdapter: Send + Sync {
 
     /// Describe a table's columns (name, type, nullable).
     async fn describe_table(&self, table: &TableRef) -> AdapterResult<Vec<ColumnInfo>>;
+
+    /// The existing target's warehouse-visible kind (table vs view) — see
+    /// [`ObjectKind`] (#2037).
+    ///
+    /// Default: `Ok(ObjectKind::Unknown)`. Every adapter but `rocky-duckdb`
+    /// reports this today, which makes the reconciliation check this backs
+    /// a no-op for them: their `CREATE OR REPLACE <kind>` runs exactly as
+    /// it always has, and a genuine mismatch still surfaces — just as the
+    /// warehouse's own error, not yet a Rocky diagnostic. Extending this to
+    /// another adapter is a follow-up, not a prerequisite.
+    ///
+    /// # Errors
+    ///
+    /// Return `AdapterError` only for a transport/permission failure asking
+    /// the warehouse. This probe is advisory, never safety-critical: the
+    /// caller treats any `Err` the same as `Ok(ObjectKind::Unknown)` — a
+    /// failure to determine the kind never blocks a run that would
+    /// otherwise proceed.
+    async fn object_kind(&self, _table: &TableRef) -> AdapterResult<ObjectKind> {
+        Ok(ObjectKind::Unknown)
+    }
 
     /// A cheap, opaque change-marker for a source table, used by the
     /// replication runner's skip-unchanged pruning (`prune_unchanged`) to
@@ -1233,6 +1289,39 @@ pub trait SqlDialect: Send + Sync {
     /// numeric comparisons.
     fn quote_identifier(&self, name: &str) -> String {
         format!("\"{name}\"")
+    }
+
+    /// A select-list `*` that leaves out the named columns, or `None` when
+    /// the warehouse has no form for it.
+    ///
+    /// DuckDB and Snowflake spell it `* EXCLUDE (a, b)`. Databricks and
+    /// BigQuery spell it `* EXCEPT (a, b)`. Trino has neither, so the default
+    /// is `None`, and a caller that needs one refuses instead of guessing.
+    ///
+    /// The names are emitted as given, without quotes. Callers pass validated
+    /// identifiers that they also created without quotes, so both references
+    /// fold the same way. Snowflake, for example, upper-cases both.
+    ///
+    /// Quarantine `split` mode uses it to keep its label columns out of the
+    /// valid table (#1937).
+    fn star_excluding(&self, columns: &[&str]) -> Option<String> {
+        let _ = columns;
+        None
+    }
+
+    /// Does this warehouse read backslash escape sequences inside a QUOTED
+    /// identifier?
+    ///
+    /// `false` for every dialect but BigQuery. DuckDB, Snowflake, Databricks
+    /// and Trino treat a backslash as an ordinary character there and escape
+    /// the delimiter by doubling it, so `raw\` is an ordinary schema name.
+    /// BigQuery's quoted identifiers take string-literal escapes, so a name
+    /// ending in a backslash consumes the closing backtick (#1939).
+    ///
+    /// Callers that build an identifier from a name they did not validate
+    /// need this to know whether a backslash ends the identifier early.
+    fn identifier_takes_backslash_escapes(&self) -> bool {
+        false
     }
 
     /// How this warehouse's lexer reads a single-quoted string literal.
@@ -2160,7 +2249,18 @@ pub struct RowCountResult {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FreshnessResult {
     pub table: TableRef,
+    /// `MAX(<timestamp_column>)`. `None` is a SQL NULL, which the warehouse
+    /// answers both for an empty table and for a non-empty table whose
+    /// timestamp column holds no value; `row_count` is what tells them apart.
     pub max_timestamp: Option<DateTime<Utc>>,
+    /// `COUNT(*)` measured in the same query as `max_timestamp`, when the
+    /// adapter asked for it. `None` means the adapter did not report a count
+    /// (a query written before #1930), so a NULL `max_timestamp` cannot be
+    /// told apart from an empty table and the caller treats it as one. An
+    /// adapter that counts must report the count on EVERY row it answers,
+    /// so the absent case stays distinguishable from a zero.
+    #[serde(default)]
+    pub row_count: Option<u64>,
 }
 
 /// Optional batch check execution for warehouses that support
@@ -2198,7 +2298,7 @@ pub trait BatchCheckAdapter: Send + Sync {
     /// Defaults to `true`, on the same reasoning as
     /// [`supports_row_counts`](Self::supports_row_counts). An adapter that
     /// returns `false` is never asked, and the caller falls back to one
-    /// `SELECT MAX(<timestamp_column>)` per table.
+    /// `SELECT COUNT(*), MAX(<timestamp_column>)` per table.
     fn supports_freshness(&self) -> bool {
         true
     }

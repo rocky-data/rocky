@@ -11,6 +11,9 @@ signals into the corresponding Dagster primitive:
   a pass/fail, so observation is the right primitive — it shows up on the
   asset timeline as a discrete event without affecting check status.
 
+* :func:`anomaly_evaluation_results` — yields the verdict for every table
+  the detector considered, so "found nothing" and "never ran" are different
+  results rather than the same silence (#1790).
 * :func:`anomaly_check_results` — yields one :class:`dg.AssetCheckResult`
   with severity ``WARN`` per row-count anomaly. The check name is
   :data:`ANOMALY_CHECK_NAME` so callers can pre-declare a matching
@@ -54,6 +57,15 @@ if TYPE_CHECKING:
 #: a matching :class:`dg.AssetCheckSpec` with this name on every Rocky asset
 #: that should expose anomaly detection in the UI before any run.
 ANOMALY_CHECK_NAME: str = "row_count_anomaly"
+
+#: Check name the engine uses for drift over Dagster Pipes (see
+#: ``emit_pipes_events`` in ``engine/crates/rocky-cli/src/commands/run.rs``).
+#: Never a declared check spec — drift is a structural change, not a
+#: pass/fail, so on the streaming path it is reported as an
+#: :class:`dg.AssetObservation` via :func:`drift_observations`, never as an
+#: :class:`dg.AssetCheckResult`. The Pipes path converts it the same way;
+#: see ``_drift_pipes_result_to_observation`` in ``component.py`` (#2073).
+DRIFT_CHECK_NAME: str = "drift"
 
 #: Canonical Dagster check name used to surface compliance exceptions from
 #: ``rocky compliance`` (governance Wave B). One check result is emitted per
@@ -167,6 +179,70 @@ def anomaly_check_results(
                 "rocky/baseline_avg": dg.MetadataValue.float(anomaly.baseline_avg),
                 "rocky/deviation_pct": dg.MetadataValue.float(anomaly.deviation_pct),
                 "rocky/reason": dg.MetadataValue.text(anomaly.reason),
+            },
+        )
+
+
+def anomaly_evaluation_results(
+    run_result: RunResult,
+    *,
+    key_resolver: KeyResolver,
+) -> Iterator[dg.AssetCheckResult]:
+    """Yield the verdict for each table the anomaly detector considered.
+
+    :func:`anomaly_check_results` covers the tables that HAVE an anomaly. This
+    covers the rest, and it is the reason the check is no longer a
+    "pass by absence" name: an empty ``anomalies`` list means both "the
+    detector ran and found nothing" and "the detector never ran", and Dagster
+    reported the second as a green badge (#1790).
+
+    ``RunResult.anomaly_evaluated`` carries one entry per table the run
+    considered, so the two cases separate::
+
+        evaluated = True   ->  passed = True   (the detector found nothing)
+        evaluated = False  ->  passed = False, WARN, with the engine's reason
+
+    The not-evaluated result is WARN, not ERROR, for the reason the
+    placeholder path gives: a missing measurement is a gap in evidence, not a
+    detected fault, and it should not fail a run that was otherwise fine.
+
+    A table with an anomaly appears in BOTH lists — evaluated, and anomalous.
+    The caller yields :func:`anomaly_check_results` first and skips a check it
+    has already emitted, so the anomaly's ``passed=False`` wins over the pass
+    this function would yield.
+
+    Args:
+        run_result: The run result to inspect.
+        key_resolver: Same shape as :func:`drift_observations`.
+
+    Yields:
+        ``dg.AssetCheckResult`` events named ``ANOMALY_CHECK_NAME``.
+    """
+    for evaluation in run_result.anomaly_evaluated:
+        asset_key = key_resolver(evaluation.table)
+        if asset_key is None:
+            continue
+        if evaluation.evaluated:
+            yield dg.AssetCheckResult(
+                asset_key=asset_key,
+                check_name=ANOMALY_CHECK_NAME,
+                passed=True,
+                metadata={
+                    "status": dg.MetadataValue.text(
+                        "evaluated against the row-count history; no anomaly"
+                    ),
+                },
+            )
+            continue
+        reason = evaluation.not_evaluated_reason or "the engine gave no reason"
+        yield dg.AssetCheckResult(
+            asset_key=asset_key,
+            check_name=ANOMALY_CHECK_NAME,
+            passed=False,
+            severity=dg.AssetCheckSeverity.WARN,
+            metadata={
+                "status": dg.MetadataValue.text("not_evaluated"),
+                "rocky/reason": dg.MetadataValue.text(reason),
             },
         )
 

@@ -490,7 +490,7 @@ async fn execute_and_hash(
     let result = adapter
         .execute_query(&ir.sql)
         .await
-        .map_err(|e| anyhow::anyhow!("re-execution query failed: {e}"))?;
+        .context("re-execution query failed")?;
     let rows = result.rows.len() as u64;
     let batch = crate::commands::run_content_addressed::query_result_to_record_batch(
         &ir.typed_columns,
@@ -2103,6 +2103,7 @@ mod tests {
             submission_id: None,
             check_gate_failed: false,
             verify_after_failed: false,
+            rocky_branch: None,
         }
     }
 
@@ -2836,6 +2837,7 @@ mod tests {
                 submission_id: None,
                 check_gate_failed: false,
                 verify_after_failed: false,
+                rocky_branch: None,
             };
             store.record_run(&record).unwrap();
 

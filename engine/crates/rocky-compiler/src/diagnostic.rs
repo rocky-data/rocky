@@ -19,7 +19,8 @@ use serde::{Deserialize, Serialize};
 // ---------------------------------------------------------------------------
 
 // Errors — type checking
-/// Unresolved model reference.
+/// Join key type mismatch between two upstream models, with no common
+/// supertype. The same comparison emits [`W001`] instead when one exists.
 pub const E001: &str = "E001";
 
 // Errors — contract validation
@@ -136,6 +137,36 @@ pub const E034: &str = "E034";
 /// [`rocky_ir::lakehouse::validate_managed_iceberg_options`], so the two checks
 /// can never drift. (FR-044)
 pub const E035: &str = "E035";
+
+/// A transformation model declares `type = "incremental"`.
+///
+/// Emitted by `rocky compile` (`check_incremental_strategy` in `typecheck.rs`).
+/// On a transformation model the strategy lowers to a plain
+/// `INSERT INTO <target> <model SQL>` with no watermark filter, so every run
+/// after the first appends the whole result again (#1990). Replication
+/// pipelines are unaffected: their `incremental` copy does apply a watermark.
+/// The error names the strategies that work instead. `E036` is taken by the
+/// target-collision check in `compile.rs`, which emits it as a literal.
+pub const E037: &str = "E037";
+
+/// A model declares `type = "ephemeral"`.
+///
+/// Emitted by `rocky compile` (`check_ephemeral_strategy` in `typecheck.rs`).
+/// An ephemeral model is never materialized, and nothing inlines it: no pass
+/// in `rocky-compiler` or `rocky-sql` rewrites a consumer's `FROM <model>`
+/// into a CTE (#1996). A consumer therefore reads whatever physical table
+/// happens to carry that name — a catalog error when none exists, a silent
+/// read of a stale or unrelated table when one does. The error names
+/// `type = "view"`, which gives the same always-fresh reads with no copied
+/// data, on every dialect.
+pub const E038: &str = "E038";
+
+/// A direct projection reads a column absent from a complete in-project model.
+///
+/// Emitted only when Rocky can prove the upstream model's output names are
+/// complete. External source schemas do not carry completeness or freshness
+/// provenance, so their unresolved references remain conservative `Unknown`s.
+pub const E039: &str = "E039";
 
 // Warnings
 /// Unused model (no downstream consumers).

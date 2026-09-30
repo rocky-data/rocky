@@ -44,7 +44,7 @@ that does compile end-to-end is
 ## Why it's distinctive vs `03-import-dbt-validate`
 
 `03-import-dbt-validate` shows the **happy path** (clean translation,
-canonical tests, the `view → ephemeral` mapping). This POC is the
+canonical tests, the materialization mapping). This POC is the
 **failure-mode counterpart**: it documents exactly what the importer
 will and won't do when fed a dbt project that uses features outside
 the supported set, so users can predict the importer's behaviour

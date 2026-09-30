@@ -272,7 +272,7 @@ def test_verify_version_raises_on_old_binary():
     ):
         client._verify_engine_version()
     assert exc.value.detected_version == "1.2.0"
-    assert exc.value.min_version == "1.34.0"
+    assert exc.value.min_version == "1.35.0"
 
 
 def test_verify_version_accepts_dev_suffix_at_or_above_floor():
@@ -289,7 +289,7 @@ def test_verify_version_accepts_dev_suffix_at_or_above_floor():
 def test_verify_version_accepts_two_component_version_at_floor():
     """A short "X.Y" version compares as "X.Y.0", not below it."""
     client = RockyClient(binary_path="rocky")
-    completed = MagicMock(stdout="rocky 1.34\n")
+    completed = MagicMock(stdout="rocky 1.35\n")
     with (
         patch("rocky_sdk.client.shutil.which", return_value="/bin/rocky"),
         patch("rocky_sdk.client.subprocess.run", return_value=completed),
@@ -308,7 +308,24 @@ def test_verify_version_enforces_despite_trailing_build_metadata():
         pytest.raises(RockyVersionError) as exc,
     ):
         client._verify_engine_version()
-    assert exc.value.min_version == "1.34.0"
+    assert exc.value.min_version == "1.35.0"
+
+
+def test_verify_version_refuses_the_last_engine_without_a_replication_plan_id():
+    """1.34.x passes a 1.34.0 floor and then fails at run time in the dagster
+    adapter with "rocky plan did not emit a plan_id", because a replication-only
+    project first got a content-addressed plan_id in 1.35.0 (#1984). The floor
+    has to refuse it up front."""
+    client = RockyClient(binary_path="rocky")
+    completed = MagicMock(stdout="rocky 1.34.9\n")
+    with (
+        patch("rocky_sdk.client.shutil.which", return_value="/bin/rocky"),
+        patch("rocky_sdk.client.subprocess.run", return_value=completed),
+        pytest.raises(RockyVersionError) as exc,
+    ):
+        client._verify_engine_version()
+    assert exc.value.detected_version == "1.34.9"
+    assert exc.value.min_version == "1.35.0"
 
 
 def test_verify_version_missing_binary():
@@ -1311,7 +1328,7 @@ def test_per_pipeline_mode_refuses_an_engine_that_predates_it():
     """An accepted-but-older binary does something different, silently.
 
     Per-pipeline DAG resolution shipped in engine 1.68.0 and pipeline-scoped
-    model execution in 1.69.0, but ``MIN_ROCKY_VERSION`` is 1.34.0 — so both
+    model execution in 1.69.0, but ``MIN_ROCKY_VERSION`` is 1.35.0 — so both
     opt-ins have to state their own floor. Without this, a 1.68 binary would
     discover a pipeline's configured root and then execute from ``models/``
     relative to the process CWD, which can build a same-named decoy.

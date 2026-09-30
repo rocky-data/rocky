@@ -8,7 +8,7 @@ sidebar:
 Rocky reads one `rocky.toml` file for everything. You name your adapters (`[adapter.NAME]`) and your pipelines (`[pipeline.NAME]`), so one file can hold several sources, several warehouses, and several pipelines side by side.
 
 :::caution[A key that does not exist is usually an error, not a no-op]
-Rocky rejects an unrecognized key in most blocks. A typo (`tooken` for `token`, `retires` for `retries`) fails the config load with a message naming the key. This is deliberate: a silently ignored setting looks like it is working. Two blocks are exceptions. `[hook.*]` ignores an unknown event key silently, and `[adapter.NAME.extra]` passes every key through untouched. Check a key against this page before you add it.
+Rocky rejects an unrecognized key in most blocks. A typo (`tooken` for `token`, `retires` for `retries`) fails the config load with a message naming the key. This is deliberate: a silently ignored setting looks like it is working. The pipeline section is where this is weakest. `[hook.*]` ignores an unknown event key silently, and `[adapter.NAME.extra]` passes every key through untouched. A key written **directly under `[pipeline.NAME]`** is accepted and ignored, on every pipeline type: `strategyy = "x"` there loads and `rocky validate` reports the config valid. Two nested blocks are lenient as well: a check toggle such as `[pipeline.NAME.checks.row_count]` ignores an unknown key (`severty = "warning"` is dropped), and so does an `[[pipeline.NAME.checks.assertions]]` entry. `[pipeline.NAME.source]`, `[pipeline.NAME.target]` and `[pipeline.NAME.checks.quarantine]` do refuse one, naming the key. Check a key against this page before you add it. In the lenient blocks a clean `rocky validate` is not evidence that Rocky read your key.
 :::
 
 ## Config Inference and Defaults
@@ -119,6 +119,7 @@ Declare a connection once, then reference it by name from any number of pipeline
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `type` | string | Yes | Adapter type. One of `"databricks"`, `"snowflake"`, `"duckdb"`, `"bigquery"`, `"trino"`, `"fivetran"`, `"airbyte"`, `"iceberg"`, `"manual"`. An unrecognized value is a hard error. |
+| `kind` | `"data"` \| `"discovery"` | See description | The role of this block. `"discovery"` is **required** for the discovery-only types: `fivetran`, `airbyte`, `iceberg` and `manual`. Leave it out for `databricks` and `snowflake`, which move data only. For `duckdb` and `bigquery`, which can do both, leaving it out registers both roles. Rocky does not check `kind` for `trino`. |
 | `retry` | table | No | Retry policy (see [`[adapter.NAME.retry]`](#adapternameretry)). |
 | `extra` | table | No | Escape hatch for adapter-specific keys Rocky's typed config doesn't model (see below). |
 
@@ -186,7 +187,7 @@ Declare a unit of work: what it reads, where it writes, and how. Each `[pipeline
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
 | `type` | string | No | `"replication"` | Pipeline type. One of `"replication"`, `"transformation"`, `"quality"`, `"snapshot"`, `"load"`. The remaining fields depend on the type; the fields below apply to `"replication"` (the default). |
-| `strategy` | string | No | `"incremental"` | Replication strategy: `"incremental"` or `"full_refresh"`. |
+| `strategy` | string | No | `"incremental"` | Replication strategy. The runner recognizes `"incremental"`, `"full_refresh"`, `"merge"`, `"view"`, `"materialized_view"` and `"dynamic_table"`. `"merge"` needs `merge_keys` (or `merge_keys_fallback`); without them the config load fails. `"dynamic_table"` is recognized but not usable here: the pipeline block exposes no `target_lag`, so a run errors and asks you to declare it on a transformation model's sidecar instead. Any other value is **not** an error. `rocky validate` warns (`V035`) and the run silently falls back to `full_refresh`. |
 | `timestamp_column` | string | No | `"_fivetran_synced"` | Watermark column for incremental strategy. |
 | `metadata_columns` | list | No | `[]` | Extra columns to add to copied data (see below). |
 
@@ -201,7 +202,34 @@ metadata_columns = [
 ]
 ```
 
-Rocky inserts the `value` field as a SQL expression, so write `"NULL"` for a null and a function call like `"CURRENT_TIMESTAMP()"` for a computed value.
+Rocky inserts the `value` field into the copy statement as a SQL expression, so write `"NULL"` for a null and a function call like `"CURRENT_TIMESTAMP()"` for a computed value.
+
+Because that text goes into generated SQL, Rocky checks it when the config loads. A `value` must be **one** expression, and any function it calls must be on Rocky's scalar-function allowlist. These all pass:
+
+```toml
+value = "NULL"
+value = "'rocky'"
+value = "1"
+value = "CURRENT_TIMESTAMP"
+value = "current_timestamp()"
+value = "CAST('x' AS VARCHAR)"
+value = "'{source}'"                 # a placeholder, quoted
+value = "CONCAT('{tenant}', '_', '{source}')"
+```
+
+A function that is not on the list is refused, and the message names the list so you can see what is allowed:
+
+```toml
+value = "my_udf(1)"                  # refused: not on the allowlist
+```
+
+A **placeholder in a `value` must be quoted**. `value = "'{tenant}'"` is a string literal, which parses. `value = "{tenant}"` is not valid SQL at all, so the config is refused at load with a parse error.
+
+This applies to `value` only, because `value` is SQL. A placeholder in a **name** template is not SQL and stays unquoted: `schema_template = "stage__{source}"` is correct as written.
+
+The check parses against the pipeline's **target** adapter, not its source, since the target is the warehouse the expression is sent to.
+
+DuckDB, Snowflake, BigQuery and Databricks each parse under their own dialect. Trino has none of its own in Rocky's parser, so a Trino target parses under a generic dialect, which accepts more than those four share. A `value` that passes here can still be rejected by Trino itself. The allowlist applies either way.
 
 ### `[pipeline.NAME.source]`
 
@@ -209,12 +237,17 @@ Point the pipeline at the system it reads from.
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `adapter` | string | Yes | Name of the adapter that owns the source data. Must match a `[adapter.NAME]` key. |
+| `adapter` | string | Yes | Name of the adapter that reads the source rows. Must match a `[adapter.NAME]` key, and that adapter must move data. A discovery-only adapter such as Fivetran goes in [`source.discovery`](#pipelinenamesourcediscovery) instead. |
 | `catalog` | string | No | Source catalog name (used by warehouse-resident sources like Databricks). |
+
+Fivetran lands its tables in your warehouse. So the warehouse adapter reads the rows, and the Fivetran adapter only lists what exists:
 
 ```toml
 [pipeline.bronze.source]
-adapter = "fivetran"
+adapter = "prod"            # the warehouse adapter
+
+[pipeline.bronze.source.discovery]
+adapter = "fivetran"        # an adapter with kind = "discovery"
 ```
 
 ### `[pipeline.NAME.source.discovery]`
@@ -383,11 +416,11 @@ See [Data quality checks](/concepts/data-quality-checks/) for what each one mean
 | `fail_on_error` | bool | `true` | When `false`, downgrades every `error`-severity assertion to a non-fatal result. |
 | `row_count` | bool | `false` | Compare row counts between source and target. |
 | `column_match` | bool | `false` | Verify source and target have the same column sets. |
-| `freshness` | table | | `{ threshold_seconds = N, overrides = { ... } }`. |
+| `freshness` | table | | `{ threshold_seconds = N }`. Every table is checked against the single `threshold_seconds`. There is no per-schema override. |
 | `null_rate` | table | | `{ columns = [...], threshold = 0.0–1.0, sample_percent = 10 }`. |
 | `custom` | list | `[]` | Custom SQL checks. Each entry has `name`, `sql`, and optional `threshold`. |
 | `anomaly_threshold_pct` | float | `50.0` | Row count deviation percentage that triggers an anomaly. Set to 0 (or a negative value) to disable detection. Must be a finite number: `nan` and `inf` are refused when the config loads. |
-| `quarantine` | table | | `{ mode = "split" \| "tag" \| "drop" }`. See below. |
+| `quarantine` | table | | `{ enabled = true, mode = "split" \| "tag" \| "drop" }`. Off unless `enabled = true`. See below. |
 | `assertions` | list | `[]` | Repeated `[[assertions]]` blocks (DQX parity). See below. |
 | `cross_source_overlap` | table | | Flags the same business key appearing across sibling sources that feed one consolidation target. See [Cross-source duplicate detection](#cross-source-duplicate-detection). |
 
@@ -407,7 +440,7 @@ Declarative model-level assertions. Each block declares a `type` and type-specif
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `table` | string | (required) | Unqualified target table the assertion runs against. When assertions live in a model's sidecar TOML the table is implied; in pipeline-level `[[checks.assertions]]` blocks (shown below) it must be set explicitly. |
-| `name` | string | | Optional identifier used as the result's `name`; synthesized from `{kind}:{column}` when unset. Set it to disambiguate multiple assertions on the same table/kind/column. |
+| `name` | string | | Optional identifier used as the result's `name`; synthesized from `{kind}:{column}` when unset. Set it to disambiguate multiple assertions on the same table/kind/column. Five names are reserved for the engine's own results and refused at config load: `quarantine:compile`, `quarantine:execute`, `row_count`, `column_match` and `row_count_anomaly`, plus `freshness` when the pipeline declares `[checks.freshness]`. The comparison maps every non-alphanumeric character to `_` first, the way Dagster keys a check, so `quarantine_compile` and `quarantine.execute` are refused too. A `[[checks.custom]]` name is checked by the same rule. Beyond those reserved names, two check names that sanitize alike are refused too — a custom check, a `null_rate` column, or an assertion (named or unnamed) colliding with another. Config load catches every case it can see (any table-independent pair, or a pair sharing a table an assertion names explicitly); `rocky run` and `rocky plan` refuse the complete set again once discovery has resolved the real table set, catching a `cross_source_overlap` collision config load cannot see. |
 | `type` | string | (required) | One of: `not_null`, `unique`, `unique_expr`, `accepted_values`, `relationships`, `expression`, `row_count_range`, `in_range`, `regex_match`, `aggregate`, `composite`, `not_in_future`, `older_than_n_days`. |
 | `column` | string | | Required for row-level column kinds (`not_null`, `unique`, `accepted_values`, `relationships`, `in_range`, `regex_match`, `not_in_future`, `older_than_n_days`). |
 | `severity` | string | `"error"` | `error` fails the pipeline (subject to `fail_on_error`); `warning` reports but never fails. |
@@ -425,7 +458,7 @@ Type-specific parameters:
 | `regex_match` | `pattern: String` (dialect-specific regex; no single quotes, backticks, or semicolons) |
 | `aggregate` | `op: sum\|count\|avg\|min\|max`, `cmp: lt\|lte\|gt\|gte\|eq\|ne`, `value: String` |
 | `composite` | `kind: "unique"`, `columns: [String]` (≥2) |
-| `unique_expr` | `key_expr: String` (derived SQL key, e.g. `md5(tenant \|\| '-' \|\| id)`; passed through as written, minus the statement-terminator refusal) |
+| `unique_expr` | `key_expr: String` (derived SQL key, e.g. `md5(tenant \|\| '-' \|\| id)`; one expression over the row, allowlisted functions only, and no volatile function or `COLLATE`; see [Per-assertion `filter`](/concepts/data-quality-checks/#per-assertion-filter)) |
 | `older_than_n_days` | `days: u32` |
 
 ```toml
@@ -472,15 +505,28 @@ Use `unique_expr` when the meaningful identity is a *computed* value rather than
 
 #### `[pipeline.NAME.checks.quarantine]`
 
-Keep the bad rows out of the clean table instead of only counting them. Pick a mode and Rocky routes rows that fail a row-level assertion into their own table, or marks them in place.
+Keep the bad rows out of the clean table instead of only counting them. Rocky takes the rows that fail an `error`-severity row-level assertion and puts them in their own table, or marks them in place. Quarantine runs in `quality` pipelines only. Rocky accepts the block on other pipeline types and ignores it there, with no warning.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `enabled` | bool | `false` | Turn quarantine on. Without `enabled = true`, the block does nothing. |
+| `mode` | `"split"` \| `"tag"` \| `"drop"` | `"split"` | What Rocky does with the failing rows. See the table below. |
+| `suffix_valid` | string | `"__valid"` | Suffix for the table of passing rows. `split` and `drop` refuse a suffix that makes this name match the source table, so an empty suffix is refused. Names are compared exactly. |
+| `suffix_quarantine` | string | `"__quarantine"` | Suffix for the table of failing rows. `split` refuses a suffix that makes this name match the source table or the valid table. `drop` writes no quarantine table, so it does not check this one. Names are compared exactly, so suffixes that differ only in case are not refused. On a warehouse that ignores case in a table name, such as DuckDB or Databricks, the two name one table, and the valid write replaces the quarantine rows there. |
+
+```toml
+[pipeline.dq.checks.quarantine]
+enabled = true
+mode = "split"
+```
 
 | Mode | Behavior |
 |---|---|
-| `split` | Materializes `<target>` (valid rows) and `<target>__quarantine` (failing rows). Downstream models see only the clean table. |
-| `tag` | Adds `__dqx_valid` boolean column; failing rows stay with `__dqx_valid = FALSE`. |
-| `drop` | Drops failing rows from `<target>`. |
+| `split` | Writes `<table>__valid` with the passing rows and `<table>__quarantine` with the failing rows. When the run completes, and the two suffixes name two different tables in your warehouse, each row lands in exactly one of them. Each failing row carries an `_error_<name>` column per assertion. The original `<table>` stays as it is. Point downstream models at `<table>__valid`. Refused on a dialect with no `SELECT * EXCEPT` form, such as Trino. |
+| `tag` | Rewrites `<table>` in place and adds an `_error_<name>` column per assertion, set on the failing rows. Every row stays. This rewrites the source, so take care on a raw replication target. |
+| `drop` | Writes only `<table>__valid`. Rocky discards the failing rows. |
 
-Set-based and table-level assertions (`unique`, `unique_expr`, `composite`, `row_count_range`, `aggregate`) run as post-hoc checks regardless of mode.
+Only these row-level kinds are quarantined: `not_null`, `accepted_values`, `expression`, `in_range`, `regex_match`, `not_in_future` and `older_than_n_days`. All three modes accept all of them, and a clock function in an `expression` or `filter`: `split` evaluates each predicate once. A quarantine that is refused (`quarantine:compile`) or fails at the warehouse (`quarantine:execute`) fails the run, whatever `fail_on_error` says. Set-based, table-level and referential assertions (`unique`, `unique_expr`, `composite`, `relationships`, `row_count_range`, `aggregate`) run as ordinary checks whatever the mode.
 
 #### Cross-source duplicate detection
 
@@ -491,7 +537,7 @@ For the cross-*table* case (the same business key arriving through two **sibling
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `keys` | list of strings | `[]` | Business-key columns whose shared value across sibling tables signals a duplicate. Mutually exclusive with `key_expr`. |
-| `key_expr` | string | | Derived business-key expression (e.g. `md5(a \|\| '-' \|\| b)`) for sources without a single natural key. Mutually exclusive with `keys`. Passed through verbatim. |
+| `key_expr` | string | | Derived business-key expression (e.g. `md5(a \|\| '-' \|\| b)`) for sources without a single natural key. Mutually exclusive with `keys`. Same gate as `unique_expr`'s `key_expr`: one expression over the row, allowlisted functions only, no volatile function and no `COLLATE`. |
 | `severity` | string | `"error"` | `error` fails the pipeline (subject to `fail_on_error`); `warning` reports but never fails. |
 | `max_overlap_rows` | integer | `0` | Overlap-key count above which the check fails. `0` means any overlap fails. |
 | `sample` | integer | `20` | Maximum overlapping keys attached to the result for triage. |
@@ -649,7 +695,7 @@ What it does not do is reconcile the two runs. You re-run the loser yourself. Ro
 
 It needs a backend with a durable object tier: `s3`, `gcs`, or `tiered`. On `local` and `valkey` it downgrades to `off` with a warning, because neither offers a conditional write. Turning it on also stops the mid-run periodic uploader on every backend. A crashed run then leaves the remote ledger at its last committed generation instead of a partial mid-run snapshot.
 
-**What `cas` does not yet cover.** It protects the end-of-run state upload and the `rocky policy freeze` / `unfreeze` ledger write, which retries onto the winner when it loses a race. The remaining single-record ledger seams — the state writes made by `gc apply` and `apply` — still upload unconditionally on every backend, so a concurrent `gc apply` can overwrite a run's committed state without raising a conflict and still exit zero. This is tracked as [issue #1228](https://github.com/rocky-data/rocky/issues/1228) and applies equally to `s3`, `gcs`, and `tiered`. Until it is closed, keep the orchestrator-level rule of one writer per `[state]` prefix for the seam commands.
+**What `cas` does not yet cover.** It protects the end-of-run state upload, the `rocky policy freeze` / `unfreeze` ledger write, which retries onto the winner when it loses a race, and `rocky gc`, which commits through the same seam. Two writers stay outside it. The **restore** path uploads unconditionally on every remote backend, after execution, including a failed one. That path is the same whether you reach it with `rocky restore` or by applying its plan with `rocky apply <plan-id>`, so a restore-shaped `rocky apply` is unconditional too. A **run-shaped** `rocky apply` uploads unconditionally only for the rows it writes when a `[policy]` rule sets `verify_after`. Either can overwrite a run's committed state without raising a conflict and still exit zero. This is tracked as [issue #1228](https://github.com/rocky-data/rocky/issues/1228) and applies equally to `s3`, `gcs`, and `tiered`. Until it is closed, keep the orchestrator-level rule of one writer per `[state]` prefix for `rocky restore` and `rocky apply`.
 
 **On `tiered`,** `cas` additionally makes the Valkey tier coherent with the durable object. The compare-and-swap runs against S3 first; only after it commits is the Valkey copy written, stored together with the generation it was committed at. A read may use the cached copy only after confirming that generation is still the durable object's — otherwise it reads S3. So a Valkey write that fails, a process that dies between the two, or a cache entry left over from an earlier run can no longer shadow durable state. Cached copies are held under a separate key from the `off` path's, so a fleet can move pods from `off` to `cas` one at a time.
 
@@ -1151,15 +1197,12 @@ This block is separate from the [`[pipeline.NAME.checks]`](#pipelinenamechecks) 
 This block is gone. A config that still declares it fails to load, and the error says what to delete.
 
 ```
-the `[schema_evolution]` section was removed because nothing ever read it: drift
-detection never reported a column that disappeared from the source, so Rocky never
-dropped one and `grace_period_days` never took effect. Delete the
-`[schema_evolution]` section from this config; removing it changes no behaviour.
+the `[schema_evolution]` section was removed because nothing ever read it: drift detection never reported a column that disappeared from the source, so Rocky never dropped one and `grace_period_days` never took effect. Delete the `[schema_evolution]` section from this config; removing it changes no behaviour. A source-side column removal alone never schedules a DROP COLUMN, and there is no opt-in for that; a full refresh or a drift-driven table recreation can still discard a target-only column. See https://github.com/rocky-data/rocky/issues/1616.
 ```
 
 **What to do:** delete the section. Nothing about your pipeline changes. Rocky never dropped a column on the strength of that key, so there is no behaviour to replace.
 
-Grace-period column drops are tracked as their own feature. The detector, the `ALTER TABLE ... DROP COLUMN` generator, and the state-store record all exist; only the call site is missing. It will come back behind an explicit opt-in, because dropping a column is destructive and must not be a default.
+A source-side column removal alone never schedules `ALTER TABLE ... DROP COLUMN`. The detector and generator for that exist in the engine. So does a state table for tracking a grace period. Nothing calls either function, and nothing writes a record to the table. There is no opt-in for that today. A full refresh or a drift-driven table recreation can still discard a target-only column. Both rebuild the table from only the source's current columns.
 
 See [Schema drift](/concepts/schema-drift/) for the changes Rocky does detect and act on.
 
@@ -1183,8 +1226,8 @@ Rocky classifies each failure before deciding. Only a failure it can prove is tr
 | `jitter` | bool | `true` | Add ±25% jitter so concurrent runs do not retry in lockstep. |
 | `circuit_breaker_threshold` | integer | `3` | Stop retrying for the rest of the run after this many consecutive transient model failures. Each model still gets its one attempt. `0` disables the breaker. |
 | `max_retries_per_run` | integer \| null | `8` | Ceiling on total retries across every model in one run. `null` removes the ceiling; `0` forbids all retries. |
-| `contain_failures` | bool | `false` | `false` stops the run at the first failing model. `true` withholds the failed model and everything downstream of it, and lets unrelated subtrees finish. It reports `PartialFailure` with a manifest naming what failed and its blast radius. |
-| `auto_apply_additive_drift` | bool | `false` | `false` evolves the target for a new nullable upstream column with no policy gate, as Rocky has always done. `true` routes the mutation through the [`[policy]`](#policy) plane first. Rocky applies only a provably additive change with an `allow` verdict on the `schema_change.additive` capability, and leaves anything else for review. Changing behaviour needs both this switch and a matching policy rule. |
+| `contain_failures` | bool | `false` | `false` stops the run at a model that fails **while it runs**: no later layer starts, though models already running beside it finish. Every error-severity compile failure withholds its declared DAG descendants by default; unrelated branches can build. A project that does not compile at all builds nothing. See [Failure containment](/advanced/failure-modes/#failure-containment-across-the-model-graph). `true` also withholds the failed model and downstream closure after a runtime failure, then lets unrelated subtrees finish. It reports `PartialFailure` with the failure and its blast radius. |
+| `auto_apply_additive_drift` | bool | `false` | `false` evolves the target for a new nullable upstream column with no policy gate, as Rocky has always done. `true` routes the mutation through the [`[policy]`](#policy) plane first. Rocky applies only a provably additive change with an `allow` verdict on the `schema_change.additive` capability, and leaves anything else for review. The verdict starts from a matching rule, or from `default_agent_effect` when no rule matches, so `default_agent_effect = "allow"` can grant it without one. A freeze, an exhausted autonomy budget, an unreadable or untrusted decision ledger, or a decision row that fails to persist still refuses. With no `[policy]` block, nothing is granted. |
 
 ```toml
 [resilience]
@@ -1277,10 +1320,10 @@ physical_delete = false   # the only supported value today
 
 ## `[policy]`
 
-State who may change what, and let Rocky enforce it. Each rule maps a `(principal, capability, scope)` triple to one of three effects. Rocky evaluates the rules at the mutating [seams](/reference/glossary/#seam) — `rocky apply`, branch promote, and the MCP write tools — and records every decision in the audit ledger.
+State who may change what, and let Rocky enforce it. Each rule maps a `(principal, capability, scope)` triple to one of three effects. Rocky evaluates the rules at the mutating [seams](/reference/glossary/#seam) — `rocky apply`, branch promote, the MCP write tools, and drift auto-apply in `rocky run` when [`auto_apply_additive_drift`](#resilience) is on — and records every decision in the audit ledger.
 
 :::caution[An absent block does not gate agents]
-With no `[policy]` block, the gate returns `NotConfigured` and allows the action whoever the principal is. One surface differs. `rocky policy check` *predicts* against the safe default posture: agents on mutating actions require review, and humans are never gated. With no block, its prediction is stricter than what enforcement actually does.
+With no `[policy]` block, the gate returns `NotConfigured` and allows the action whoever the principal is. Two surfaces differ. `rocky policy check` *predicts* against the safe default posture: agents on mutating actions require review, and humans are never gated. With no block, its prediction is stricter than what enforcement actually does. Drift auto-apply with `auto_apply_additive_drift = true` also governs as `require_review` with no block, so it refuses every drift change.
 :::
 
 | Field | Type | Required | Description |
@@ -1359,6 +1402,7 @@ A complete Fivetran → Databricks pipeline with governance:
 # ──────────────────────────────────────────────────
 [adapter.fivetran]
 type = "fivetran"
+kind = "discovery"
 destination_id = "${FIVETRAN_DESTINATION_ID}"
 api_key = "${FIVETRAN_API_KEY}"
 api_secret = "${FIVETRAN_API_SECRET}"
@@ -1381,6 +1425,9 @@ metadata_columns = [
 ]
 
 [pipeline.bronze.source]
+adapter = "prod"
+
+[pipeline.bronze.source.discovery]
 adapter = "fivetran"
 
 [pipeline.bronze.source.schema_pattern]

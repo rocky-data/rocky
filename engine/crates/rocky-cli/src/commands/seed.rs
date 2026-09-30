@@ -20,6 +20,26 @@ use crate::registry::{AdapterRegistry, resolve_pipeline};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// The default seed target catalog for a chosen pipeline, when a seed's own
+/// sidecar `[target]` carries no explicit `catalog` — the pipeline's
+/// placeholder-free replication `catalog_template`, else `"main"`.
+///
+/// Pulled out of [`run_seed`] (#2018) so `run_dag_exec.rs`'s
+/// `sole_adapter_pipeline` can check, before ever calling `run_seed`,
+/// whether every pipeline candidate for a given seed would resolve the SAME
+/// default catalog — not just the same warehouse adapter. Two replication
+/// pipelines on one adapter with different fixed `catalog_template`s give
+/// different answers here, and which one `run_seed` receives silently
+/// decides where a seed with no explicit catalog lands.
+pub(crate) fn default_seed_catalog(pipeline_cfg: &rocky_core::config::PipelineConfig) -> String {
+    pipeline_cfg
+        .as_replication()
+        .map(|r| &r.target.catalog_template)
+        .filter(|t| !t.contains('{'))
+        .cloned()
+        .unwrap_or_else(|| "main".to_string())
+}
+
 /// Execute `rocky seed`: discover, infer, create, and load seed tables.
 ///
 /// Executes from the caller's threaded, fingerprinted config snapshot —
@@ -81,12 +101,7 @@ pub async fn run_seed(
     // template as the catalog (stripped of placeholders), and "seeds" as the
     // schema. For non-replication pipelines or templates with placeholders,
     // fall back to "main".
-    let default_catalog = pipeline_cfg
-        .as_replication()
-        .map(|r| &r.target.catalog_template)
-        .filter(|t| !t.contains('{'))
-        .cloned()
-        .unwrap_or_else(|| "main".to_string());
+    let default_catalog = default_seed_catalog(pipeline_cfg);
     let default_schema = "seeds".to_string();
 
     let mut table_results: Vec<SeedTableOutput> = Vec::new();

@@ -146,7 +146,7 @@ code.
 | Structured `MaterializationEvent` from Pipes | ❌ | ❌ | ✅ |
 | Returns | `RunResult` | `RunResult` | `PipesClientCompletedInvocation` |
 | Needs Dagster context | no | yes | yes |
-| Engine Pipes support required | no | no | yes (engine ≥1.34) |
+| Engine Pipes support required | no | no | yes (the SDK's engine floor is 1.35.0) |
 
 ### `run()`: buffered (non-Dagster callers)
 
@@ -179,7 +179,7 @@ def my_asset(context: dg.AssetExecutionContext, rocky: RockyResource):
 
 Spawns rocky via [`dg.PipesSubprocessClient`](https://docs.dagster.io/api/dagster/pipes#dagster.PipesSubprocessClient),
 which sets the `DAGSTER_PIPES_CONTEXT` and `DAGSTER_PIPES_MESSAGES` env
-vars. As of `dagster-rocky` v1.30, the client runs `rocky plan` first to
+vars. As of `dagster-rocky` v1.31, the client runs `rocky plan` first to
 write `.rocky/plans/<plan-id>.json`. It then runs `rocky apply <plan-id>`
 as the Pipes subprocess. The plan id travels along as
 `extras={"plan_id": plan_id}`, so the run viewer shows it as run
@@ -187,8 +187,8 @@ metadata. A reviewer can click from the materialization straight back to
 the plan artifact that produced it.
 
 The rocky engine detects those env vars and emits structured Pipes
-messages on the messages channel. This needs engine ≥1.34, which the
-SDK's `MIN_ROCKY_VERSION` floor verifies. See [Engine-side
+messages on the messages channel. The SDK's `MIN_ROCKY_VERSION` floor
+(1.35.0) checks the engine version before the first call. See [Engine-side
 emission](#engine-side-dagster-pipes-message-emission) for the message
 types. In the run viewer they arrive as `MaterializationEvent`s, carrying
 strategy, duration_ms, rows_copied, sql_hash, and partition_key, plus
@@ -198,9 +198,9 @@ Returns a `PipesClientCompletedInvocation`. Call `.get_results()` to
 extract the materialization events Dagster built from the Pipes
 messages.
 
-`run_pipes` requires engine ≥1.34. That version content-addresses and
-persists a plan for every project shape, including replication-only
-projects with no `models/` directory. There is no fallback. If
+`run_pipes` requires engine ≥1.35.0 for a replication-only project (one
+with no `models/` directory, or with zero compiled models). Engine 1.35.0 is the first version that
+content-addresses and persists a plan for every project shape. There is no fallback. If
 `rocky plan` emits no `plan_id`, `run_pipes` raises `dg.Failure` rather
 than running without one.
 
@@ -212,14 +212,29 @@ no external dependency. On a run it:
 1. Detects `DAGSTER_PIPES_CONTEXT` and `DAGSTER_PIPES_MESSAGES` env
    vars at the start of `rocky run`.
 2. Opens the messages channel (file path or stderr stream) per the
-   protocol params.
+   protocol params, and writes `opened` immediately (`params: {"extras":
+   {}}`) — the handshake Dagster's reader needs before it will report
+   anything at all.
 3. Emits one JSON-line message per progress event:
    - `log` at run start and completion
    - `report_asset_materialization` per `output.materializations` entry
    - `report_asset_check` per `output.check_results` entry
+   - per `output.anomalies` entry: a `report_asset_check` (check name
+     `row_count_anomaly`, severity WARN, `passed=false`, with
+     `rocky/current_count`, `rocky/baseline_avg`, `rocky/deviation_pct`
+     and `rocky/reason` metadata)
+   - per `output.anomaly_evaluated` entry not already covered by an
+     anomaly above: a `report_asset_check` (check name
+     `row_count_anomaly`) — `passed=true` for a table the detector
+     evaluated with no anomaly, or `passed=false` with a `rocky/reason`
+     for a table it did not evaluate. Matches the same three verdicts
+     `execution_mode: streaming` gives.
    - per `output.drift.actions_taken` entry: a `report_asset_check`
      (check name `drift`, severity WARN, `passed=true`, with
-     table/action/reason metadata) plus a `log` at WARN level
+     table/action/reason metadata) plus a `log` at WARN level. `drift`
+     is never a declared check spec — `dagster-rocky` converts it to an
+     `AssetObservation` with `rocky/drift_*` metadata on receipt,
+     matching what `execution_mode: streaming` yields.
    - `closed` at run end
 4. When env vars are not set, the entire path is a no-op; zero
    overhead for non-Dagster callers.

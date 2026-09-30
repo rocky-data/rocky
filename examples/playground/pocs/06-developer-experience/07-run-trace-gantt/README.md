@@ -3,7 +3,7 @@
 > **Category:** 06-developer-experience
 > **Credentials:** none (DuckDB)
 > **Runtime:** < 5s
-> **Rocky features:** `rocky trace`, feature-gated OTLP exporter
+> **Rocky features:** `rocky trace`, OTLP span export (`otel` feature, on by default)
 
 ## What it shows
 
@@ -13,19 +13,20 @@ concurrency lanes. Same backing store as `rocky replay`, different
 view: replay is *"what exactly ran?"*, trace is *"show me the shape
 of the run"*.
 
-When built with the `otlp` feature flag, Rocky streams the same
-timeline as OpenTelemetry spans: one `pipeline_run` span per run and
-child spans per-model, so the Gantt chart is the same artefact your
-platform's existing OpenTelemetry collector already consumes.
+The default `rocky` build includes the `otel` Cargo feature. Set
+`OTEL_EXPORTER_OTLP_ENDPOINT` and Rocky also exports its tracing spans
+over OTLP: a `run` span for the run, with child spans for its steps.
+Your OpenTelemetry collector receives them as ordinary spans.
 
 ## Why it's distinctive
 
 - **The Gantt is trace data, not render metadata.** Other orchestrators
   reconstruct a timeline from logs post-hoc; Rocky produces it from the
   primary RunRecord, so it always matches reality.
-- **OTLP is the on-ramp**: `rocky trace` is the local-inspection view;
-  bolt on `--features otlp` and the same data flows to Grafana Tempo /
-  Honeycomb / Datadog as ordinary OTel spans.
+- **OTLP is the on-ramp**: `rocky trace` is the local-inspection view.
+  No special build is needed. Set `OTEL_EXPORTER_OTLP_ENDPOINT` and the
+  run's spans go to Grafana Tempo / Honeycomb / Datadog as ordinary
+  OTel spans.
 
 ## Layout
 
@@ -62,4 +63,4 @@ platform's existing OpenTelemetry collector already consumes.
 
 - Engine source: `engine/crates/rocky-cli/src/commands/trace.rs`
 - Sibling POC: [`00-foundations/06-branches-replay-lineage`](../../00-foundations/06-branches-replay-lineage/)
-- OpenTelemetry integration notes: `engine/crates/rocky-cli/src/otlp.rs`
+- OpenTelemetry integration notes: `engine/crates/rocky-observe/src/tracing_setup.rs`

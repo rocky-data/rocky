@@ -238,8 +238,10 @@ FROM <catalog>.<schema>.<table>
 **Freshness**:
 
 ```sql
-SELECT MAX(<timestamp_column>) FROM <catalog>.<schema>.<table>
+SELECT COUNT(*), MAX(<timestamp_column>) FROM <catalog>.<schema>.<table>
 ```
+
+The count rides beside the maximum so that a NULL maximum can be told apart: zero rows is an empty table with nothing to measure, one or more rows with no value in the column is a check Rocky could not evaluate.
 
 **Null rate** (sampled):
 

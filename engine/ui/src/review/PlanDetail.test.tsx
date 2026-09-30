@@ -41,7 +41,7 @@ const DIFF: ReviewOutput = {
 const QUEUE: ReviewQueueOutput = {
   version: "1.74.0",
   command: "review",
-  ranking: "blast_radius × classification × staleness",
+  ranking: "blast_radius × change_class × staleness",
   total: 1,
   excluded_non_plan_rows: 0,
   pending: [
@@ -57,7 +57,7 @@ const QUEUE: ReviewQueueOutput = {
       rule_id: 2,
       reason: "a breaking schema change needs a human",
       blast_radius: 7,
-      classification_weight: 3,
+      change_class_weight: 3,
       staleness_seconds: 10_800,
       score: 42.5,
       approve_command: `rocky review ${PLAN} --approve`,
@@ -570,7 +570,11 @@ describe("PlanDetail", () => {
       />,
     );
     await screen.findByText("the spec moved");
-    expect(screen.getByText(/Applying this plan would be refused/)).toBeTruthy();
+    // The card must not claim apply refuses a stale plan outright (#2001):
+    // apply compares the flag with the plan's OWN digest, so passing the digest
+    // the plan was planned against applies it. Both directions are named.
+    expect(screen.getByText(/not with the spec\s+on disk/)).toBeTruthy();
+    expect(screen.getByText(/applies it, stale/)).toBeTruthy();
     moved.unmount();
 
     render(
@@ -684,6 +688,38 @@ describe("PlanDetail", () => {
           nullable: false,
         },
         "orders.total is added (INT64, not null)",
+      ],
+      [
+        { kind: "column_dropped", model: "orders", column: "total", data_type: "?" },
+        "orders.total is dropped (type not recorded)",
+      ],
+      [
+        {
+          kind: "column_added",
+          model: "orders",
+          column: "total",
+          nullable: false,
+        },
+        "orders.total is added (type not recorded, not null)",
+      ],
+      [
+        {
+          kind: "column_type_changed",
+          model: "orders",
+          column: "total",
+          old_type: "?",
+          new_type: "STRING",
+        },
+        "orders.total changes type, type not recorded to STRING",
+      ],
+      [
+        {
+          kind: "column_type_changed",
+          model: "orders",
+          column: "total",
+          old_type: "INT64",
+        },
+        "orders.total changes type, INT64 to type not recorded",
       ],
       [
         {

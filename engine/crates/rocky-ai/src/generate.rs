@@ -58,10 +58,9 @@ pub struct Verification<'a> {
     /// The materialization the model will be written with. `None` is
     /// `full_refresh`, the sidecar writer's own default.
     ///
-    /// Not cosmetic: the compiler excludes `ephemeral` models from
-    /// duplicate-target detection because they materialize nothing, so
-    /// verifying an ephemeral model as `full_refresh` rejects a collision
-    /// that will not exist on disk.
+    /// Threaded so verification sees the model the sidecar will actually
+    /// write: the compiler's checks read the strategy, and a model verified
+    /// under a strategy it will not be written with is a different model.
     pub materialization: Option<&'a crate::sidecar::SidecarMaterialization>,
 }
 
@@ -602,43 +601,6 @@ mod tests {
         assert!(
             result.is_ok(),
             "expected Ok for a free target, got {result:?}"
-        );
-    }
-
-    /// An `ephemeral` model cannot collide, so verifying it as `full_refresh`
-    /// would reject a target conflict that will not exist on disk.
-    ///
-    /// The compiler excludes ephemerals from duplicate-target detection —
-    /// they materialize nothing and are never a second writer — so the
-    /// materialization has to reach verification for the same reason the
-    /// target does. Without it, `--materialization ephemeral --target
-    /// c.s.shared` fails on E036 while the sidecar it would have written is
-    /// harmless.
-    #[test]
-    fn an_ephemeral_generation_does_not_collide_with_an_existing_target() {
-        let upstream_models = vec![upstream_model(
-            "orders",
-            "SELECT CAST(1 AS BIGINT) AS id, CAST('x' AS VARCHAR) AS name",
-        )];
-        let empty_schemas = HashMap::new();
-        let ctx = ValidationContext {
-            project_models: &upstream_models,
-            source_schemas: &empty_schemas,
-        };
-        let collides = crate::sidecar::SidecarTarget::parse("test.test.orders").unwrap();
-
-        // Same target that fails as full_refresh, above.
-        let result = validate_generated_code(
-            "from orders\nselect { id, name }",
-            "rocky",
-            Some(&ctx),
-            Some(&collides),
-            Some(&crate::sidecar::SidecarMaterialization::Ephemeral),
-            None,
-        );
-        assert!(
-            result.is_ok(),
-            "an ephemeral model materializes nothing and cannot collide, got {result:?}"
         );
     }
 

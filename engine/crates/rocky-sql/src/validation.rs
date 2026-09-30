@@ -1,3 +1,4 @@
+use crate::check_expression::ExpressionUse;
 use regex::Regex;
 use std::sync::LazyLock;
 use thiserror::Error;
@@ -77,42 +78,122 @@ pub enum ValidationError {
 
     // ---- `expression` check content (#1524) -------------------------------
     // An expression check is interpolated into `WHERE NOT (<expression>)` and
-    // executed with the project's warehouse credentials. These four refuse
-    // anything that is not one boolean expression over the model's own
+    // executed with the project's warehouse credentials. The first five below
+    // refuse anything that is not one expression over the model's own
     // columns. See `crate::check_expression`.
+    //
+    // The same validator judges a metadata column value, a filter and a
+    // grouping key, so the advice beside each refusal comes from `use_`
+    // rather than being written for `[checks.assertions]` alone: telling the
+    // author of a metadata column value to write "one boolean expression"
+    // states a rule that position does not apply (#1959), and telling the
+    // author of a `filter` it wrote "an expression check" names the wrong
+    // field (#1971).
+    //
+    // `ExpressionVolatileInKey` and `ExpressionCollateInKey` refuse a
+    // different thing: content refused only because of where it sits (a
+    // grouping key), not because the name is off some list. They are their
+    // own variants rather than more `ExpressionFunctionNotAllowed` cases
+    // because "add it to CHECK_EXPRESSION_FUNCTIONS" is false advice for
+    // either — a volatile name may already be on the list (`now()` is), and
+    // even one that isn't would still be refused here, because the walker
+    // checks volatility before it consults the allowlist; COLLATE is not a
+    // function at all (#1971).
     #[error(
-        "{context}: expression does not parse as a single SQL expression ({detail}). An \
-         expression check is one boolean expression over the model's columns, e.g. \
-         `amount >= 0`"
+        "{context}: expression does not parse as a single SQL expression ({detail}). {} is {}",
+        .use_.noun(),
+        .use_.accepted_shape()
     )]
-    ExpressionUnparseable { context: String, detail: String },
+    ExpressionUnparseable {
+        context: String,
+        detail: String,
+        use_: ExpressionUse,
+    },
 
     #[error(
-        "{context}: expression continues past the end of one expression. Only a single \
-         boolean expression is accepted — no trailing clauses, commas or operators"
+        "{context}: expression continues past the end of one expression. Only a single {} \
+         is accepted — no trailing clauses, commas or operators",
+        .use_.single_kind()
     )]
-    ExpressionTrailingTokens { context: String },
+    ExpressionTrailingTokens {
+        context: String,
+        use_: ExpressionUse,
+    },
 
     #[error(
-        "{context}: expression contains a subquery. An expression check may only read the \
-         row's own columns; it cannot read other tables"
+        "{context}: expression contains a subquery. {} may only read the row's own columns; \
+         it cannot read other tables",
+        .use_.noun()
     )]
-    ExpressionSubquery { context: String },
+    ExpressionSubquery {
+        context: String,
+        use_: ExpressionUse,
+    },
 
     #[error(
         "{context}: expression calls `{function}`, which is not on the allowlist of pure \
-         scalar functions an expression check may use. Warehouse functions can read files, \
-         secrets, session state or remote endpoints, so only a named set is permitted. To \
-         extend it, add the function to `CHECK_EXPRESSION_FUNCTIONS` in rocky-sql"
+         scalar functions {} may use. Warehouse functions can read files, secrets, session \
+         state or remote endpoints, so only a named set is permitted. To extend it, add the \
+         function to `CHECK_EXPRESSION_FUNCTIONS` in rocky-sql",
+        .use_.noun_lowercase()
     )]
-    ExpressionFunctionNotAllowed { context: String, function: String },
+    ExpressionFunctionNotAllowed {
+        context: String,
+        function: String,
+        use_: ExpressionUse,
+    },
+
+    // `to_date`, `to_timestamp`, `to_char`, `date_trunc` and `datediff` /
+    // `date_diff` are on the allowlist, but only one argument shape each is
+    // a function of its arguments alone — the other reads a Snowflake
+    // session parameter (#1942). `function` names which call was refused;
+    // `accepted_shape` is `shape_refusal`'s per-function advice, so the
+    // message can point at the fix rather than at `CHECK_EXPRESSION_FUNCTIONS`,
+    // which is the wrong fix here — the name is already allowed.
+    #[error(
+        "{context}: expression calls `{function}` in a shape whose result can depend on more \
+         than its arguments. {} may call `{function}` only {accepted_shape}",
+        .use_.noun()
+    )]
+    ExpressionFunctionShapeNotAllowed {
+        context: String,
+        function: String,
+        use_: ExpressionUse,
+        accepted_shape: &'static str,
+    },
+
+    // A name refused here may already be on the allowlist — `now()` and
+    // `current_timestamp()` are — but the walker checks
+    // `determinism::VOLATILE_FUNCTIONS` before it ever consults the
+    // allowlist, so `random()` or `uuid()` land here too, and neither is on
+    // it. Either way "add it to CHECK_EXPRESSION_FUNCTIONS" is wrong: the
+    // refusal is for the POSITION (a grouping key), not the name, and the
+    // name's allowlist status does not change that (#1971).
+    #[error(
+        "{context}: expression calls `{function}`. A value that can change between \
+         evaluations cannot be a key"
+    )]
+    ExpressionVolatileInKey { context: String, function: String },
+
+    // `COLLATE` is not a function at all, so "add it to
+    // CHECK_EXPRESSION_FUNCTIONS" is meaningless advice for this refusal
+    // (#1971). See `ExpressionUse::refuses_collate`.
+    #[error(
+        "{context}: expression uses COLLATE. COLLATE changes what equality means, so a key \
+         may not carry one"
+    )]
+    ExpressionCollateInKey { context: String },
 
     #[error(
         "{context}: expression calls the qualified function `{function}`. Qualified names \
-         reach user-defined, remote or plugin functions, which are never allowed in an \
-         expression check"
+         reach user-defined, remote or plugin functions, which are never allowed in {}",
+        .use_.noun_lowercase()
     )]
-    ExpressionQualifiedFunction { context: String, function: String },
+    ExpressionQualifiedFunction {
+        context: String,
+        function: String,
+        use_: ExpressionUse,
+    },
 }
 
 /// Validates a SQL identifier (catalog, schema, table, column names).

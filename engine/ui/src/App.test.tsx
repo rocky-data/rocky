@@ -1,8 +1,11 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { useState } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { MetaOutput } from "@rocky-types/meta";
 import { ApiError } from "./api";
-import { App, EnginePanel } from "./App";
+import { App, EnginePanel, WIDE_ENOUGH_FOR_THE_SIDEBAR } from "./App";
+import { NOT_YET_HEADING } from "./areas";
+import { GovernorScreen } from "./governor/GovernorScreen";
 import { TOKEN_STORAGE_KEY } from "./token";
 
 const META: MetaOutput = {
@@ -82,41 +85,418 @@ describe("EnginePanel", () => {
     render(<EnginePanel token={null} />);
     expect(screen.getByText("No token for this tab")).toBeInTheDocument();
   });
+
+  describe("how often it asks", () => {
+    // These render the PRODUCTION seam: `<EnginePanel />` with no loader, the
+    // way `App` renders it. A test that passes its own loader pins a stable
+    // function and cannot see the defect — an idle tab asked the engine about
+    // 15 times a second, for as long as it was open (#2075).
+    afterEach(() => {
+      vi.unstubAllGlobals();
+      window.sessionStorage.clear();
+    });
+
+    function countingFetch() {
+      const calls: string[] = [];
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async (input: RequestInfo | URL) => {
+          calls.push(String(input));
+          return new Response(JSON.stringify(META), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          });
+        }),
+      );
+      return calls;
+    }
+
+    it("asks once, and does not ask again while the tab sits there", async () => {
+      window.sessionStorage.setItem(TOKEN_STORAGE_KEY, "t");
+      const calls = countingFetch();
+      render(<EnginePanel />);
+
+      await waitFor(() => expect(screen.getByText("rocky 1.74.0")).toBeInTheDocument());
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      expect(calls.filter((url) => url.includes("/api/v1/meta"))).toHaveLength(1);
+    });
+
+    it("does not ask again when the page around it renders", async () => {
+      window.sessionStorage.setItem(TOKEN_STORAGE_KEY, "t");
+      const calls = countingFetch();
+      function Around() {
+        const [tick, setTick] = useState(0);
+        return (
+          <>
+            <button type="button" onClick={() => setTick((t) => t + 1)}>
+              render again ({tick})
+            </button>
+            <EnginePanel />
+          </>
+        );
+      }
+      render(<Around />);
+      await waitFor(() => expect(screen.getByText("rocky 1.74.0")).toBeInTheDocument());
+
+      for (let i = 0; i < 3; i++) fireEvent.click(screen.getByRole("button", { name: /render again/ }));
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      expect(calls.filter((url) => url.includes("/api/v1/meta"))).toHaveLength(1);
+    });
+  });
 });
 
 describe("App", () => {
-  it("renders the three lanes and the engine slot", () => {
-    render(<App token="t" engine={<span>engine slot</span>} estate={<span>estate slot</span>} />);
-    for (const lane of ["Estate", "Review", "Governor"]) {
-      expect(screen.getByRole("link", { name: lane })).toHaveAttribute(
-        "href",
-        `/ui/${lane.toLowerCase()}`,
-      );
+  const slots = {
+    engine: <span>engine slot</span>,
+    estate: <span>estate slot</span>,
+    review: <span>review slot</span>,
+    governor: <span>governor slot</span>,
+  };
+
+  /**
+   * The areas nav a screen reader would read, so a Governor tab of the same
+   * name never matches — and neither does the fixed sidebar while the drawer
+   * is open, since the dialog puts `aria-hidden` on the rest of the page.
+   */
+  function liveAreasNav(): HTMLElement {
+    const navs = [...document.querySelectorAll('nav[aria-label="Areas"]')].filter(
+      (nav) => nav.closest('[aria-hidden="true"]') === null,
+    );
+    expect(navs).toHaveLength(1);
+    return navs[0] as HTMLElement;
+  }
+  const areas = () => within(liveAreasNav());
+
+  it("shows the Rocky mark beside the name, and says nothing twice", () => {
+    window.history.pushState(null, "", "/ui/estate");
+    const { container } = render(<App token="t" {...slots} />);
+    // Two wordmarks with the drawer closed: the sidebar's and the narrow
+    // bar's. CSS shows one at a time; both carry the mark.
+    const marks = container.querySelectorAll("img");
+    expect(marks).toHaveLength(2);
+    for (const mark of marks) {
+      // Decorative: the name beside it is the text a screen reader reads.
+      expect(mark).toHaveAttribute("alt", "");
+      // The build inlines a mark this small as a data URI and emits larger
+      // ones under `assets/`. Either is the page itself; nothing may be
+      // remote, which the page's CSP would refuse anyway. Resolved against
+      // the page, so `//other.example/x.svg` counts as remote too.
+      const src = mark.getAttribute("src") ?? "";
+      if (src.startsWith("data:")) {
+        expect(src).toMatch(/^data:image\/svg\+xml/);
+      } else {
+        expect(new URL(src, window.location.href).origin).toBe(window.location.origin);
+        expect(src).toMatch(/rocky-logo.*\.svg$/);
+      }
+      expect(mark.closest("span")?.textContent).toBe("Rocky");
     }
+  });
+
+  it("renders the eleven areas: five links, six disabled with their reasons", () => {
+    window.history.pushState(null, "", "/ui/estate");
+    render(<App token="t" {...slots} />);
+    const nav = liveAreasNav();
+    // Five that open a screen, then the six that do not, under their heading.
+    // Queried as its own element, not as page text: three of the six reasons
+    // also begin "No page yet", so a `toContain` passes with the heading gone.
+    expect(within(nav).getByText(NOT_YET_HEADING, { selector: "div" })).toBeInTheDocument();
+    expect(within(nav).getAllByRole("link").map((link) => link.textContent)).toEqual([
+      "Needs you",
+      "Estate",
+      "Review",
+      "Products",
+      "Governance",
+    ]);
+    const disabled = nav.querySelectorAll('[aria-disabled="true"]');
+    expect(disabled).toHaveLength(6);
+    // Not a link, so not in the tab order; its reason is on the page.
+    for (const entry of disabled) expect(entry.closest("a")).toBeNull();
+    expect(within(nav).getByText("No page of its own yet. The runs table is on Estate.")).toBeInTheDocument();
     expect(screen.getByText("engine slot")).toBeInTheDocument();
   });
 
-  it("switches lanes on a nav click without a reload, and deep-links by path", async () => {
+  it("switches areas on a click without a reload, and marks exactly one current", async () => {
     window.history.pushState(null, "", "/ui/governor");
-    render(
-      <App
-        token="t"
-        engine={<span>engine slot</span>}
-        estate={<span>estate slot</span>}
-        review={<span>review slot</span>}
-        governor={<span>governor slot</span>}
-      />,
-    );
+    render(<App token="t" {...slots} />);
     expect(screen.getByText("governor slot")).toBeInTheDocument();
-    expect(screen.getByRole("link", { name: "Governor" })).toHaveAttribute("aria-current", "page");
+    // A bare governor path opens the brief, so Needs you is current.
+    expect(areas().getByRole("link", { name: "Needs you" })).toHaveAttribute("aria-current", "page");
 
-    screen.getByRole("link", { name: "Estate" }).click();
+    areas().getByRole("link", { name: "Estate" }).click();
     await waitFor(() => expect(screen.getByText("estate slot")).toBeInTheDocument());
     expect(window.location.pathname).toBe("/ui/estate");
 
-    screen.getByRole("link", { name: "Review" }).click();
+    areas().getByRole("link", { name: "Governance" }).click();
+    await waitFor(() => expect(window.location.pathname).toBe("/ui/governor/scorecard"));
+    expect(screen.getByText("governor slot")).toBeInTheDocument();
+
+    const current = screen
+      .getByRole("navigation", { name: "Areas" })
+      .querySelectorAll("[aria-current]");
+    expect([...current].map((node) => node.textContent)).toEqual(["Governance"]);
+  });
+
+  it.each([
+    // Governance has tabs, so its sidebar entry is the current section ("true").
+    ["/ui/governor/custody/freeze%3Aglobal", "Governance", "true", "governor slot"],
+    ["/ui/governor/audit/revenue%20daily", "Governance", "true", "governor slot"],
+    ["/ui/governor/products/revenue%20daily", "Products", "page", "governor slot"],
+    ["/ui/review/plan-1", "Review", "page", "review slot"],
+    ["/ui/nope", "Estate", "page", "estate slot"],
+  ])("deep-links %s under %s", (path, area, mark, slot) => {
+    window.history.pushState(null, "", path);
+    render(<App token="t" {...slots} />);
+    expect(screen.getByText(slot)).toBeInTheDocument();
+    expect(areas().getByRole("link", { name: area })).toHaveAttribute("aria-current", mark);
+  });
+
+  it.each([
+    ["/ui/governor", "Needs you"],
+    ["/ui/governor/scorecard", "Scorecard"],
+    ["/ui/governor/custody/freeze%3Aglobal", "Custody"],
+    ["/ui/governor/audit", "Audit"],
+    ["/ui/governor/products", "Products"],
+    ["/ui/estate", "Estate"],
+  ])("marks exactly one current page on the whole page at %s", (path, page) => {
+    // The real governor tab bar, not a slot: the defect this pins was a tab
+    // and a sidebar entry both claiming the page, which a slot cannot show.
+    window.history.pushState(null, "", path);
+    const governor = (
+      <GovernorScreen
+        brief={<span>brief slot</span>}
+        scorecard={<span>scorecard slot</span>}
+        custody={() => <span>custody slot</span>}
+        audit={() => <span>audit slot</span>}
+        products={() => <span>products slot</span>}
+      />
+    );
+    render(<App token="t" {...slots} governor={governor} />);
+    const pages = document.querySelectorAll('[aria-current="page"]');
+    expect([...pages].map((node) => node.textContent)).toEqual([page]);
+  });
+
+  it("follows Back and Forward", async () => {
+    window.history.pushState(null, "", "/ui/estate");
+    render(<App token="t" {...slots} />);
+    areas().getByRole("link", { name: "Review" }).click();
     await waitFor(() => expect(screen.getByText("review slot")).toBeInTheDocument());
-    expect(window.location.pathname).toBe("/ui/review");
+
+    act(() => {
+      window.history.back();
+    });
+    await waitFor(() => expect(screen.getByText("estate slot")).toBeInTheDocument());
+    expect(areas().getByRole("link", { name: "Estate" })).toHaveAttribute("aria-current", "page");
+  });
+
+  describe("the drawer below the breakpoint", () => {
+    /**
+     * The button that opens the drawer, captured as a node: once the dialog
+     * is open it sits behind `aria-hidden`, so a role query cannot find it.
+     */
+    const openButton = () => screen.getByRole("button", { name: "Areas" });
+
+    it("names the current area in the bar, and opens the areas in a dialog", async () => {
+      window.history.pushState(null, "", "/ui/review");
+      render(<App token="t" {...slots} />);
+      // The bar names where you are, since the sidebar is folded away.
+      expect(screen.getByText("Review", { selector: "div" })).toBeInTheDocument();
+      const button = openButton();
+      expect(button).toHaveAttribute("aria-expanded", "false");
+      expect(document.querySelectorAll('[role="dialog"]')).toHaveLength(0);
+
+      fireEvent.click(button);
+      const dialog = await screen.findByRole("dialog");
+      expect(button).toHaveAttribute("aria-expanded", "true");
+      expect(within(dialog).getByRole("link", { name: "Estate" })).toBeInTheDocument();
+    });
+
+    it("leaves one set of areas in the reading order while it is open", async () => {
+      window.history.pushState(null, "", "/ui/estate");
+      render(<App token="t" {...slots} />);
+      const button = openButton();
+      fireEvent.click(button);
+      await screen.findByRole("dialog");
+
+      // Two navs exist in the page — the fixed one and the drawer's — but the
+      // dialog hides the rest of the page, so only one is read, and only one
+      // link says it is the current page.
+      expect(document.querySelectorAll('nav[aria-label="Areas"]')).toHaveLength(2);
+      expect(liveAreasNav().closest('[role="dialog"]')).not.toBeNull();
+      const announced = [...document.querySelectorAll('[aria-current="page"]')].filter(
+        (node) => node.closest('[aria-hidden="true"]') === null,
+      );
+      expect(announced.map((node) => node.textContent)).toEqual(["Estate"]);
+      // And the engine line is drawn twice but read once, from one request.
+      expect(screen.getAllByText("engine slot")).toHaveLength(2);
+    });
+
+    it("closes on a navigation from inside it", async () => {
+      window.history.pushState(null, "", "/ui/estate");
+      render(<App token="t" {...slots} />);
+      const button = openButton();
+      fireEvent.click(button);
+      const dialog = await screen.findByRole("dialog");
+      within(dialog).getByRole("link", { name: "Review" }).click();
+      await waitFor(() => expect(button).toHaveAttribute("aria-expanded", "false"));
+      expect(window.location.pathname).toBe("/ui/review");
+    });
+
+    it("closes on Back", async () => {
+      window.history.pushState(null, "", "/ui/estate");
+      window.history.pushState(null, "", "/ui/review");
+      render(<App token="t" {...slots} />);
+      const button = openButton();
+      fireEvent.click(button);
+      await screen.findByRole("dialog");
+      act(() => {
+        window.history.back();
+      });
+      await waitFor(() => expect(screen.getByText("estate slot")).toBeInTheDocument());
+      expect(button).toHaveAttribute("aria-expanded", "false");
+    });
+
+    it("closes on Escape and gives focus back to the button", async () => {
+      window.history.pushState(null, "", "/ui/estate");
+      render(<App token="t" {...slots} />);
+      const button = openButton();
+      fireEvent.click(button);
+      await screen.findByRole("dialog");
+      fireEvent.keyDown(document, { key: "Escape" });
+      await waitFor(() => expect(button).toHaveAttribute("aria-expanded", "false"));
+      // The dialog restores focus itself, after it has closed.
+      await waitFor(() => expect(document.activeElement).toBe(button));
+    });
+
+    it("closes when the window grows past the breakpoint", async () => {
+      // Left open there, the dialog would keep its focus trap and its hold on
+      // the page over a sidebar the viewer can now see anyway.
+      const listeners: ((event: MediaQueryListEvent) => void)[] = [];
+      const removed: ((event: MediaQueryListEvent) => void)[] = [];
+      vi.stubGlobal(
+        "matchMedia",
+        vi.fn((query: string) => ({
+          matches: false,
+          media: query,
+          addEventListener: (_: string, fn: (event: MediaQueryListEvent) => void) =>
+            listeners.push(fn),
+          removeEventListener: (_: string, fn: (event: MediaQueryListEvent) => void) =>
+            removed.push(fn),
+        })),
+      );
+      window.history.pushState(null, "", "/ui/estate");
+      render(<App token="t" {...slots} />);
+      expect(window.matchMedia).toHaveBeenCalledWith(WIDE_ENOUGH_FOR_THE_SIDEBAR);
+      const button = openButton();
+      fireEvent.click(button);
+      await screen.findByRole("dialog");
+
+      act(() => {
+        for (const fn of listeners) fn({ matches: true } as MediaQueryListEvent);
+      });
+      await waitFor(() => expect(button).toHaveAttribute("aria-expanded", "false"));
+      vi.unstubAllGlobals();
+    });
+
+    it("takes its breakpoint listener back off on unmount", () => {
+      // Without this the subscription outlives the component: a later match
+      // calls `setMenuOpen` on a tree that is gone.
+      const added: ((event: MediaQueryListEvent) => void)[] = [];
+      const removed: ((event: MediaQueryListEvent) => void)[] = [];
+      vi.stubGlobal(
+        "matchMedia",
+        vi.fn((query: string) => ({
+          matches: false,
+          media: query,
+          addEventListener: (_: string, fn: (event: MediaQueryListEvent) => void) =>
+            added.push(fn),
+          removeEventListener: (_: string, fn: (event: MediaQueryListEvent) => void) =>
+            removed.push(fn),
+        })),
+      );
+      window.history.pushState(null, "", "/ui/estate");
+      const view = render(<App token="t" {...slots} />);
+      expect(added.length).toBeGreaterThan(0);
+
+      view.unmount();
+      // The same functions come back off, not merely the same count.
+      expect(removed).toEqual(added);
+      vi.unstubAllGlobals();
+    });
+
+    it("folds when you tap the area you are already on", async () => {
+      // That click navigates nowhere: `navigateTo` pushes the same path, so
+      // the pathname never changes and the effect keyed on it never runs.
+      // Left to that effect, the drawer stayed open with its focus trap and
+      // scroll lock over an inert page.
+      window.history.pushState(null, "", "/ui/estate");
+      render(<App token="t" {...slots} />);
+      const button = openButton();
+      fireEvent.click(button);
+      const dialog = await screen.findByRole("dialog");
+
+      fireEvent.click(within(dialog).getByRole("link", { name: "Estate" }));
+
+      await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+      expect(window.location.pathname).toBe("/ui/estate");
+    });
+
+    it("gives each drawn engine line its own description id", async () => {
+      // Both copies carry the capability list as a hidden description. One id
+      // for both would point every `aria-describedby` at the first element.
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(
+          async () =>
+            new Response(JSON.stringify(META), {
+              status: 200,
+              headers: { "content-type": "application/json" },
+            }),
+        ),
+      );
+      window.history.pushState(null, "", "/ui/estate");
+      render(<App token="t" estate={<span>estate slot</span>} />);
+      await waitFor(() => expect(screen.getAllByText("2 capabilities").length).toBe(1));
+      const button = openButton();
+      fireEvent.click(button);
+      await screen.findByRole("dialog");
+
+      const described = [...document.querySelectorAll("[aria-describedby]")].map((node) =>
+        node.getAttribute("aria-describedby"),
+      );
+      expect(described).toHaveLength(2);
+      expect(new Set(described).size).toBe(2);
+      // Each one points at an element that exists, and at its own.
+      for (const id of described) expect(document.getElementById(id ?? "")).not.toBeNull();
+      vi.unstubAllGlobals();
+    });
+
+    it("reads the engine once, however often the drawer opens", async () => {
+      // The sidebar is drawn twice; two reads of `/api/v1/meta` would be the
+      // shape of #2075 again, one level up.
+      const calls: string[] = [];
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async (input: RequestInfo | URL) => {
+          calls.push(String(input));
+          return new Response(JSON.stringify(META), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          });
+        }),
+      );
+      window.history.pushState(null, "", "/ui/estate");
+      render(<App token="t" estate={<span>estate slot</span>} />);
+      await waitFor(() => expect(calls.some((url) => url.includes("/api/v1/meta"))).toBe(true));
+
+      const button = openButton();
+      fireEvent.click(button);
+      await screen.findByRole("dialog");
+      fireEvent.keyDown(document, { key: "Escape" });
+      await waitFor(() => expect(button).toHaveAttribute("aria-expanded", "false"));
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      expect(calls.filter((url) => url.includes("/api/v1/meta"))).toHaveLength(1);
+      vi.unstubAllGlobals();
+    });
   });
 });
 
@@ -137,6 +517,17 @@ describe("the no-token page", () => {
   afterEach(() => {
     vi.unstubAllGlobals();
     window.sessionStorage.clear();
+  });
+
+  it("keeps the engine line inside the token boundary, though it sits in the sidebar", () => {
+    // The sidebar renders at every width and for every path, including with no
+    // token. The engine line reads the API, so it must not render there.
+    render(<App token={null} engine={<span>engine slot</span>} />);
+    expect(screen.getByText("No token for this tab")).toBeInTheDocument();
+    expect(screen.queryByText("engine slot")).toBeNull();
+    expect(screen.queryByRole("region", { name: "Engine" })).toBeNull();
+    // The areas still show: they read nothing.
+    expect(screen.getByRole("navigation", { name: "Areas" })).toBeInTheDocument();
   });
 
   it.each(["estate", "review", "governor"])(

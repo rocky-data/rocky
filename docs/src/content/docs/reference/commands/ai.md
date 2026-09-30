@@ -29,8 +29,7 @@ rocky ai <intent> [flags]
 |------|------|---------|-------------|
 | `--format <FORMAT>` | `string` | `rocky` | Output format: `rocky` (`.rocky` body + `.toml` sidecar) or `sql` (`.sql` body + `.toml` sidecar). |
 | `--models <PATH>` | `string` | `models` | Models directory. Used both to ground the prompt in real schemas and as the destination directory for the emitted body + sidecar. |
-| `--materialization <STRATEGY>` | `string` | `full_refresh` | Materialization strategy written into the sidecar `[strategy]` block. One of `full_refresh`, `incremental`, `merge`, `ephemeral`. |
-| `--watermark <COLUMN>` | `string` | | Watermark column for `--materialization=incremental`. Maps to `[strategy].timestamp_column` in the sidecar. Required when materialization is `incremental`; ignored otherwise. |
+| `--materialization <STRATEGY>` | `string` | `full_refresh` | Materialization strategy written into the sidecar `[strategy]` block. One of `full_refresh` or `merge`. Two values fail before any LLM call: `incremental`, because on a transformation model it re-inserts every row on each run (`E037`), and `ephemeral`, because it is never inlined into its consumers (`E038`). |
 | `--unique-key <COLUMNS>` | `string` | | Upsert key for `--materialization=merge`. Maps to `[strategy].unique_key` (an array) in the sidecar. Accepts a comma-separated list (`--unique-key id,created_at`) or repeated flags. Required when materialization is `merge`; the emitted sidecar is incomplete without it. |
 | `--target <FQN>` | `string` | `generated.ai.<name>` | Target table coordinates as `catalog.schema.table`. Written into the sidecar `[target]` block. |
 | `--overwrite` | `bool` | `false` | Overwrite an existing body or sidecar file at the destination. Without this flag, the command fails loudly rather than silently clobber user-authored models. |
@@ -61,28 +60,38 @@ rocky ai "monthly revenue by customer, joining orders and refunds"
 }
 ```
 
-Generate an incremental model with a watermark, into a non-default target:
+Generate a merge model keyed on `order_date`, into a non-default target:
 
 ```bash
 rocky ai "daily order facts from stg_orders" \
-  --materialization incremental --watermark order_date \
+  --materialization merge --unique-key order_date \
   --target analytics.marts.fct_orders_daily
 ```
 
-The emitted sidecar (`models/fct_orders_daily.toml`) carries the parsed materialization + watermark + target:
+The emitted sidecar (`models/fct_orders_daily.toml`) carries the parsed materialization, key and target:
 
 ```toml
 name = "fct_orders_daily"
 
 [strategy]
-type = "incremental"
-timestamp_column = "order_date"
+type = "merge"
+unique_key = ["order_date"]
 
 [target]
 catalog = "analytics"
-schema  = "marts"
-table   = "fct_orders_daily"
+schema = "marts"
+table = "fct_orders_daily"
 ```
+
+`--materialization incremental` fails before any LLM call, with:
+
+> --materialization incremental is not supported: on a transformation model it re-inserts every row on each run (E037). Use `merge` with --unique-key, or `full_refresh`
+
+`--materialization ephemeral` fails the same way, with:
+
+> --materialization ephemeral is not supported: an ephemeral model is not materialized and is not inlined into its consumers, so a consumer reads whatever table already carries the name (E038). Use `view`, or `full_refresh`
+
+`--watermark` no longer exists. Passing it is an argument error.
 
 Generate raw SQL instead (still emits both `.sql` body and `.toml` sidecar):
 

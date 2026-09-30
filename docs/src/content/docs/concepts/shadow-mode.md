@@ -95,7 +95,9 @@ and the incremental family (`incremental`, `merge`, `delete_insert`,
   isolate those yet.
 - An `ephemeral` model is neither materialized nor inlined into its consumers.
   The consumer would read the production table, and no rewrite could redirect
-  that read. Give the model a materialized strategy to shadow it.
+  that read. Compile already refuses the strategy on any run (`E038`), and the
+  shadow path refuses it again by name. Use `view` for an intermediate other
+  models read.
 - An **incremental** model appends to whatever its target already holds. A
   shadow target starts empty while production holds full history, so the first
   run compares a partial table against a complete one, and every later run

@@ -316,7 +316,7 @@ describe("ProductsScreen", () => {
   it("renders a hostile event and product name as text, never as markup", async () => {
     const hostile = '<img src=x onerror="alert(1)">';
     const { container } = render(
-      // The name reaches the heading and the custody link. An earlier
+      // The name reaches the heading and the ledger link. An earlier
       // version of this test passed a benign name and only put the hostile
       // value in the event, so the heading was never exercised (#1815).
       <ProductsScreen
@@ -333,7 +333,14 @@ describe("ProductsScreen", () => {
 
     expect(await screen.findByText(hostile)).toBeTruthy();
     expect(screen.getByRole("heading", { name: hostile })).toBeTruthy();
-    expect(screen.getByRole("link", { name: `product:${hostile}` })).toBeTruthy();
+    // The name now rides in the ledger link's href rather than its text
+    // (#2003), so encodeURIComponent is what has to hold — assert the escaped
+    // form is there and the raw one is not.
+    const ledger = screen.getByRole("link", { name: /the ledger, scoped to this product/ });
+    expect(ledger.getAttribute("href")).toBe(
+      `/ui/governor/audit/${encodeURIComponent(hostile)}`,
+    );
+    expect(ledger.getAttribute("href")).not.toContain("<img");
     expect(container.querySelector("img")).toBeNull();
   });
 

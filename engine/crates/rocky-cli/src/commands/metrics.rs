@@ -158,10 +158,10 @@ pub fn run_metrics(
 
     if trend {
         println!(
-            "{:<24} {:<12} {:<10} {:<14}",
+            "{:<24} {:<12} {:<24} {:<14}",
             "TIMESTAMP", "ROW COUNT", "RUN ID", "FRESHNESS"
         );
-        println!("{}", "-".repeat(62));
+        println!("{}", "-".repeat(76));
 
         for snapshot in snapshots {
             let freshness = snapshot
@@ -169,10 +169,10 @@ pub fn run_metrics(
                 .map(|s| format!("{s}s"))
                 .unwrap_or_else(|| "-".to_string());
             println!(
-                "{:<24} {:<12} {:<10} {:<14}",
+                "{:<24} {:<12} {:<24} {:<14}",
                 snapshot.timestamp.format("%Y-%m-%d %H:%M:%S"),
                 snapshot.row_count,
-                &snapshot.run_id[..snapshot.run_id.len().min(9)],
+                snapshot.run_id,
                 freshness,
             );
         }

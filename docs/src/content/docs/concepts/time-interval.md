@@ -16,8 +16,9 @@ Reach for this strategy when:
 - Your model aggregates by date and you need per-day rebuilds
 - You want cost and row counts reported per partition
 
-For a pure append-only pattern, where a row never arrives late, `incremental`
-stays the simpler choice.
+A transformation model cannot use `incremental`. Rocky refuses it with `E037`,
+because it would append every row again on each run. If each row has a key you
+can match on, `merge` is the simpler choice.
 
 ## TOML reference
 
@@ -159,6 +160,12 @@ returns a `Vec<String>`, so the runtime can issue more than one statement.
 Atomicity holds per partition. If a statement fails mid-batch, the runtime
 issues `ROLLBACK` and marks the partition `Failed` in the state store.
 
+Before it runs any partition, Rocky checks that the target table exists. If
+not, it creates it by running the model SQL over an empty window. The empty
+window means the model reads no upstream rows. A model with an ungrouped
+aggregate still writes one row; every other shape writes none. The table's
+columns come from that query. The partitions then run as below.
+
 ### Databricks (Delta Lake)
 
 Single statement using Delta's atomic `REPLACE WHERE`:
@@ -206,6 +213,24 @@ WHERE order_date >= '2026-04-07 00:00:00' AND order_date < '2026-04-08 00:00:00'
 INSERT INTO "marts"."fct_daily_orders"
 SELECT ... ;
 COMMIT;
+```
+
+### BigQuery
+
+One statement: a `BEGIN TRANSACTION` / `COMMIT TRANSACTION` script joining
+the delete and the insert into a single job. BigQuery's REST API is
+stateless. Each `jobs.query` call is its own session. Separate `BEGIN` and
+`COMMIT` statements fail with "Transaction control statements are supported
+only in scripts or sessions." One script keeps the delete and the insert
+atomic:
+
+```sql
+BEGIN TRANSACTION;
+DELETE FROM `warehouse`.`marts`.`fct_daily_orders`
+WHERE order_date >= '2026-04-07 00:00:00' AND order_date < '2026-04-08 00:00:00';
+INSERT INTO `warehouse`.`marts`.`fct_daily_orders`
+SELECT ... ;
+COMMIT TRANSACTION
 ```
 
 ## State store
@@ -279,14 +304,9 @@ discriminator into a Dagster `DailyPartitionsDefinition`, or `Hourly`,
 
 ## Comparison with `incremental`
 
-| Aspect | `[strategy] type = "incremental"` | `[strategy] type = "time_interval"` |
-|---|---|---|
-| State | Single watermark per table | Per-partition `PARTITIONS` records |
-| Filter | `WHERE ts > MAX(ts_in_target)` | `WHERE ts >= @start_date AND ts < @end_date` |
-| Late data | Missed (watermark already past) | Picked up on partition re-run |
-| Idempotent re-run | No (depends on watermark state) | Yes (DELETE+INSERT) |
-| Backfill | `full_refresh` only | `--from / --to` walks the range |
-| Per-partition observability | No | Yes (`PartitionInfo` in JSON) |
+There is no choice to make on a transformation model. `rocky compile` refuses `type = "incremental"` there with `E037`. Rocky has no watermark to apply to the model's SQL, so the strategy would append every row again on each run. `time_interval` is the strategy for time-windowed reprocessing of a model.
+
+`incremental` remains a [replication](/concepts/incremental/) strategy, where Rocky filters each copy of a source table on a stored watermark.
 
 ## Limitations (v1)
 
@@ -295,14 +315,8 @@ The following are deferred:
 - **Rocky DSL placeholder syntax** — `@start_date` / `@end_date` are
   recognized in `.sql` files only. The `.rocky` parser will gain `@var`
   syntax in v1.1.
-- **Bootstrap on first run** — the target table must exist before the
-  first partition runs. The runtime currently emits `DELETE` against the
-  target, which fails if the table is missing. Either pre-create the
-  table once (recommended for now) or `full_refresh` an empty version
-  via a one-time migration. Bootstrap-on-first-run is a planned follow-up.
-- **BigQuery and Postgres adapters** — these adapters don't exist yet.
-  When they ship, BigQuery will use `MERGE ... WHEN NOT MATCHED BY SOURCE`
-  and Postgres will route via parent table + child partition truncate.
+- **Postgres adapter** — it doesn't exist yet. When it ships, `time_interval`
+  will route via a parent table plus a child-partition truncate.
 - **Sub-day granularities** below `hour` — belongs in streaming systems.
 - **Multi-column partitions** — single time column only in v1.
 - **Partition column transformations** — `time_column` must be a real

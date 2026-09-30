@@ -16,7 +16,7 @@ Two commands for migrating off dbt:
    on a warehouse, reports which dbt models map cleanly and which need
    manual attention.
 
-## Why it's distinctive vs `rocky/examples/dbt-migration`
+## Why it's distinctive vs `engine/examples/dbt-migration`
 
 That example shows hand-written before/after equivalents. This POC
 demonstrates the **automated** import path on a real (small) dbt project.

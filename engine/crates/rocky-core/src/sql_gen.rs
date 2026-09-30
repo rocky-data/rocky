@@ -372,7 +372,14 @@ pub fn generate_transformation_sql_with_warehouse(
             Ok(stmts)
         }
         MaterializationStrategy::Incremental { .. } => {
-            Ok(vec![dialect.insert_into(&target, &model_ir.sql)])
+            // Refused (#1990). On a transformation model this strategy has
+            // no watermark to apply, so the only SQL it could emit is an
+            // unfiltered `INSERT INTO <target> <model SQL>` that appends the
+            // whole result again on every run. `rocky compile` reports E037;
+            // this arm keeps callers that skip the compile gate (`rocky plan`,
+            // `rocky estimate`) from printing or running that INSERT.
+            // Replication `incremental` goes through `generate_insert_sql`.
+            Err(incremental_transformation_refused(model_ir))
         }
         MaterializationStrategy::Merge {
             unique_key,
@@ -440,12 +447,7 @@ pub fn generate_transformation_sql_with_warehouse(
 
             Ok(dialect.insert_overwrite_partition(&target, &filter, &substituted)?)
         }
-        MaterializationStrategy::Ephemeral => {
-            // Ephemeral models are not materialized — the compiler inlines
-            // them as CTEs in downstream queries. If we reach SQL gen for an
-            // ephemeral model, it's a no-op.
-            Ok(vec![])
-        }
+        MaterializationStrategy::Ephemeral => Err(ephemeral_refused(model_ir)),
         MaterializationStrategy::DeleteInsert { partition_by } => {
             // Validate partition columns
             for col in partition_by {
@@ -466,9 +468,10 @@ pub fn generate_transformation_sql_with_warehouse(
         MaterializationStrategy::Microbatch {
             timestamp_column, ..
         } => {
-            // Microbatch is functionally an incremental append keyed by
-            // the timestamp column. The runtime handles batch windowing;
-            // SQL gen emits a simple INSERT with watermark filter.
+            // No windowing and no watermark filter exist for a transformation
+            // model: this is an unfiltered `INSERT INTO <target> <model SQL>`,
+            // so every run after the first appends the whole result again.
+            // Tracked in #2054; left legal pending that ruling.
             validation::validate_identifier(timestamp_column)?;
             Ok(vec![dialect.insert_into(&target, &model_ir.sql)])
         }
@@ -516,6 +519,19 @@ pub fn generate_time_interval_bootstrap_sql(
 ) -> Result<String, SqlGenError> {
     if model_ir.variant() != ModelIrVariant::Transformation {
         return Err(variant_mismatch(model_ir, "Transformation"));
+    }
+    // An `incremental` body has no `@start_date`/`@end_date` for the sentinel
+    // window to empty, so this CTAS would load the whole result (#1990).
+    if matches!(
+        model_ir.materialization,
+        MaterializationStrategy::Incremental { .. }
+    ) {
+        return Err(incremental_transformation_refused(model_ir));
+    }
+    // An `ephemeral` model must never get a table (#1996). Refused here too,
+    // so a caller that skips the compile gate cannot create one.
+    if matches!(model_ir.materialization, MaterializationStrategy::Ephemeral) {
+        return Err(ephemeral_refused(model_ir));
     }
     let target = dialect.format_table_ref(
         &model_ir.target.catalog,
@@ -587,6 +603,20 @@ pub fn generate_transformation_initial_ddl(
     if model_ir.variant() != ModelIrVariant::Transformation {
         return Err(variant_mismatch(model_ir, "Transformation"));
     }
+    // The bootstrap CTAS is the first load of an `incremental` model, so it
+    // is refused here too (#1990). Otherwise a caller that skips the compile
+    // gate could still create and load the table before the exec arm refuses.
+    if matches!(
+        model_ir.materialization,
+        MaterializationStrategy::Incremental { .. }
+    ) {
+        return Err(incremental_transformation_refused(model_ir));
+    }
+    // Same for `ephemeral` (#1996): this DDL would give a model that must
+    // never be materialized a physical table.
+    if matches!(model_ir.materialization, MaterializationStrategy::Ephemeral) {
+        return Err(ephemeral_refused(model_ir));
+    }
     let target = dialect.format_table_ref(
         &model_ir.target.catalog,
         &model_ir.target.schema,
@@ -609,6 +639,35 @@ pub fn generate_transformation_initial_ddl(
     }
 
     Ok(vec![dialect.create_table_as_new(&target, &model_ir.sql)])
+}
+
+/// The refusal every transformation generator returns for `incremental` (#1990):
+/// the exec SQL, the first-run CTAS and the time-interval bootstrap.
+///
+/// A transformation model has no watermark to apply, so every statement this
+/// strategy could produce, the bootstrap CTAS and the INSERT alike, loads the
+/// whole result again. `rocky compile` reports the same thing as E037.
+fn incremental_transformation_refused(model_ir: &ModelIr) -> SqlGenError {
+    SqlGenError::InvalidRequest(format!(
+        "model '{}': `type = \"incremental\"` is not supported on transformation models \
+         (E037); use merge, delete_insert, time_interval or full_refresh",
+        model_ir.name
+    ))
+}
+
+/// The refusal every transformation generator returns for `ephemeral` (#1996):
+///
+/// An ephemeral model is not materialized, and nothing rewrites a consumer's
+/// `FROM <model>` into a CTE. Returning an empty statement list left the
+/// consumer reading whatever physical table carried the name, which is a
+/// catalog error when none exists and a stale table when one does.
+/// `rocky compile` reports the same thing as E038.
+fn ephemeral_refused(model_ir: &ModelIr) -> SqlGenError {
+    SqlGenError::InvalidRequest(format!(
+        "model '{}': `type = \"ephemeral\"` is not supported (E038) — an ephemeral model is \
+         not materialized and is not inlined into its consumers; use `type = \"view\"`",
+        model_ir.name
+    ))
 }
 
 /// Substitute `@start_date` / `@end_date` placeholders in the model SQL with
@@ -1644,8 +1703,56 @@ mod tests {
         assert!(sql.contains("WHERE active = true"));
     }
 
+    /// #1996: an ephemeral model is not materialized and nothing inlines it
+    /// into a consumer, so the generator refuses it rather than returning an
+    /// empty statement list. Callers that skip the compile gate (`rocky
+    /// plan`, `rocky estimate`) then report the refusal instead of silently
+    /// leaving the model out of the preview.
     #[test]
-    fn test_transformation_incremental() {
+    fn test_ephemeral_is_refused() {
+        let ir = ModelIr::transformation(
+            TargetRef {
+                catalog: "cat".into(),
+                schema: "silver".into(),
+                table: "stg_orders".into(),
+            },
+            MaterializationStrategy::Ephemeral,
+            vec![],
+            "SELECT * FROM cat.sch.raw_orders".into(),
+            GovernanceConfig {
+                permissions_file: None,
+                auto_create_catalogs: false,
+                auto_create_schemas: false,
+            },
+            None,
+            None,
+        );
+        // Every public transformation entry refuses it, not just the
+        // dispatcher: a caller that skips the compile gate must not be able
+        // to create the table either.
+        let errors: Vec<SqlGenError> = vec![
+            generate_transformation_sql(&ir, &dialect())
+                .expect_err("an ephemeral model must not produce SQL"),
+            generate_transformation_initial_ddl(&ir, &dialect())
+                .expect_err("an ephemeral model must not get initial DDL"),
+            generate_time_interval_bootstrap_sql(&ir, &dialect())
+                .expect_err("an ephemeral model must not bootstrap a table"),
+        ];
+        for err in errors {
+            let msg = err.to_string();
+            assert!(matches!(err, SqlGenError::InvalidRequest(_)), "{msg}");
+            assert!(msg.contains("stg_orders"), "the model is named: {msg}");
+            assert!(msg.contains("E038") && msg.contains("view"), "{msg}");
+        }
+    }
+
+    /// #1990: a transformation `incremental` model has no watermark to apply,
+    /// so the only SQL it could produce is an unfiltered INSERT that appends
+    /// the whole result on every run. The generator refuses it, so callers
+    /// that skip the compile gate (`rocky plan`, `rocky estimate`) cannot
+    /// print or run that statement either.
+    #[test]
+    fn test_transformation_incremental_is_refused() {
         let ir = ModelIr::transformation(
             TargetRef {
                 catalog: "cat".into(),
@@ -1665,9 +1772,25 @@ mod tests {
             None,
             None,
         );
-        let stmts = generate_transformation_sql(&ir, &dialect()).unwrap();
-        assert_eq!(stmts.len(), 1);
-        assert!(stmts[0].starts_with("INSERT INTO cat.silver.fct_orders"));
+        let err = generate_transformation_sql(&ir, &dialect())
+            .expect_err("an incremental transformation model must not produce SQL");
+        let msg = err.to_string();
+        assert!(matches!(err, SqlGenError::InvalidRequest(_)), "{msg}");
+        assert!(
+            msg.contains("E037"),
+            "the error names the compile diagnostic: {msg}"
+        );
+
+        // The bootstrap CTAS is the first load, so it is refused too.
+        let err = generate_transformation_initial_ddl(&ir, &dialect())
+            .expect_err("an incremental transformation model must not bootstrap either");
+        assert!(err.to_string().contains("E037"), "{err}");
+
+        // Nor through the time-interval bootstrap: with no placeholders for its
+        // sentinel window to empty, that CTAS would load the whole result.
+        let err = generate_time_interval_bootstrap_sql(&ir, &dialect())
+            .expect_err("the time-interval bootstrap must refuse it too");
+        assert!(err.to_string().contains("E037"), "{err}");
     }
 
     #[test]
@@ -2205,22 +2328,25 @@ SELECT id, name, email FROM cat.sch.src WHERE active = true";
     }
 
     #[test]
-    fn test_lakehouse_incremental_ignores_format_on_insert() {
-        // Incremental INSERT should not emit lakehouse DDL — that's for
+    fn test_lakehouse_append_ignores_format_on_insert() {
+        // An append INSERT should not emit lakehouse DDL — that's for
         // initial table creation. The format field is silently ignored for
-        // the INSERT path, since the table already exists.
+        // the INSERT path, since the table already exists. Uses `microbatch`,
+        // the append strategy still legal on transformation models (#2054);
+        // `incremental` is refused before this path (#1990).
         let plan = lakehouse_ir(
             LakehouseFormat::DeltaTable,
             LakehouseOptions::default(),
-            MaterializationStrategy::Incremental {
+            MaterializationStrategy::Microbatch {
                 timestamp_column: "updated_at".into(),
+                granularity: rocky_ir::TimeGrain::Hour,
             },
         );
         let stmts = generate_transformation_sql(&plan, &dialect()).unwrap();
         assert_eq!(stmts.len(), 1);
         assert!(
             stmts[0].starts_with("INSERT INTO"),
-            "incremental should be INSERT INTO: {}",
+            "an append strategy should be INSERT INTO: {}",
             stmts[0]
         );
     }
@@ -2234,8 +2360,11 @@ SELECT id, name, email FROM cat.sch.src WHERE active = true";
                 table_properties: vec![("delta.enableChangeDataFeed".into(), "true".into())],
                 ..LakehouseOptions::default()
             },
-            MaterializationStrategy::Incremental {
+            // An append strategy still legal on transformation models (#2054);
+            // `incremental` is refused before any DDL (#1990).
+            MaterializationStrategy::Microbatch {
                 timestamp_column: "updated_at".into(),
+                granularity: rocky_ir::TimeGrain::Hour,
             },
         );
         let stmts = generate_transformation_initial_ddl(&plan, &dialect()).unwrap();
@@ -2454,8 +2583,11 @@ SELECT id, name, email FROM cat.sch.src WHERE active = true";
                 comment: Some("Incremental orders mart".into()),
                 ..LakehouseOptions::default()
             },
-            MaterializationStrategy::Incremental {
+            // `microbatch`, the append strategy still legal on transformation
+            // models (#2054); `incremental` is refused before any DDL (#1990).
+            MaterializationStrategy::Microbatch {
                 timestamp_column: "updated_at".into(),
+                granularity: rocky_ir::TimeGrain::Hour,
             },
         );
         let stmts = generate_transformation_initial_ddl(&plan, &dialect()).unwrap();

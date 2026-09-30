@@ -347,6 +347,50 @@ pub enum ConfigError {
          duration — use a `<N>d` / `<N>h` span (e.g. \"7d\", \"24h\")"
     )]
     PolicyBudgetInvalidWindow { rule_index: usize, window: String },
+    #[error(
+        "[checks] assertion name {name:?} on table {table:?} is reserved: it \
+         collides with the engine's own {reserved:?} result. Dagster maps \
+         every non-alphanumeric character to `_`, so {name:?} and \
+         {reserved:?} become the same check and one would be lost. Rename \
+         the assertion."
+    )]
+    ReservedAssertionName {
+        table: String,
+        name: String,
+        reserved: String,
+    },
+
+    /// Two DIFFERENT check-name producers (a custom check, a `null_rate`
+    /// column, or an assertion — named or unnamed) resolve to names that
+    /// sanitize onto the same Dagster check name (#1941). Unlike
+    /// [`ConfigError::ReservedAssertionName`], neither side has to be a
+    /// fixed reserved word — the collision is between two pieces of user
+    /// input, and only exists once both are sanitized the same way Dagster
+    /// sanitizes them.
+    #[error(
+        "[checks] {source_a} and {source_b} {scope} both sanitize to the Dagster check name \
+         {sanitized:?}. Dagster keys check results by (asset_key, sanitized_name); the \
+         first spec wins and the second is silently dropped. Rename one of them."
+    )]
+    DuplicateCheckName {
+        /// The pipeline the collision was found in.
+        pipeline: String,
+        /// `"<kind> \"<name>\""`, e.g. `custom "null rate id"` — kind and
+        /// name folded into one field (rather than two) to keep this
+        /// variant's size down; `ConfigError` is returned by value on
+        /// every config-load path (`Result::Err`), and clippy's
+        /// `result_large_err` flags a variant this wide.
+        source_a: String,
+        source_b: String,
+        /// Where the collision applies, already naming `pipeline` in
+        /// prose: `"on table \"orders\" in pipeline \"p\""` for a
+        /// single-table pair (an assertion is involved), or `"on every
+        /// table pipeline \"p\" copies"` for two table-independent
+        /// producers (custom checks and `null_rate` columns run on EVERY
+        /// materialized table).
+        scope: String,
+        sanitized: String,
+    },
 
     #[error(
         "[policy] rules[{rule_index}] autonomy_budget.failures = 0 is invalid — a budget must \
@@ -840,12 +884,17 @@ pub struct StateConfig {
     /// identical to pre-CAS). Set to `"cas"` on live multi-pod deployments with
     /// a durable object tier (`s3`, `gcs`, `tiered`) so a writer that lost a
     /// cross-pod race is reconciled by writer class instead of silently
-    /// overwriting the winner: the end-of-run upload fail-closes, and the
-    /// `rocky policy` freeze/unfreeze ledger write replays onto the winner.
-    /// `rocky gc` and `rocky apply` still write unconditionally (issue #1228),
-    /// so `cas` reduces but does not yet eliminate lost updates. On `tiered` it
-    /// additionally makes the Valkey tier coherent with the durable object.
-    /// Auto-downgrades to `off` (with a warn) on `local` and `valkey`.
+    /// overwriting the winner: the end-of-run upload fail-closes, the
+    /// `rocky policy` freeze/unfreeze ledger write replays onto the winner,
+    /// and `rocky gc` commits through the same seam (since #1372). `rocky
+    /// restore` still uploads unconditionally on every remote backend, `rocky
+    /// apply` of a restore plan routes through that same path and so uploads
+    /// unconditionally too, and `rocky apply` elsewhere does so only for its
+    /// verify-after custody rows (issue #1228), so `cas` reduces but does not
+    /// yet eliminate lost updates. On
+    /// `tiered` it additionally makes the Valkey tier coherent with the
+    /// durable object. Auto-downgrades to `off` (with a warn) on `local` and
+    /// `valkey`.
     #[serde(default)]
     pub concurrency_control: ConcurrencyControl,
 }
@@ -1222,7 +1271,24 @@ pub struct MetadataColumnConfig {
 }
 
 /// Data quality checks configuration (row count, column match, freshness, null rate, custom).
-#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+//
+// `Default` is implemented by hand below, NOT derived, and the distinction is
+// load-bearing. A derived `Default` cannot see `#[serde(default = "...")]`, so
+// it returned the Rust zero value for every field — and because the `checks`
+// field is `#[serde(default)]` on FOUR of the five pipeline variants
+// (replication, transformation, snapshot, load — NOT quality, where the table
+// is required), an ABSENT `[checks]` table went through that derive while an
+// EMPTY one went through the field attributes. The two disagreed: absent gave
+// `fail_on_error = false`, empty gave `true` (#1924).
+//
+// This is a plain comment, not a doc comment, on purpose: `JsonSchema` exports
+// the doc comment into `schemas/rocky_project.schema.json`, and from there into
+// the vscode interface and the SDK docstring. A config author reading a tooltip
+// has no use for a note about Rust derive macros.
+//
+// The parity guard is
+// `manual_default_matches_serde_default_for_every_config_with_field_defaults`.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ChecksConfig {
     #[serde(default)]
@@ -1283,6 +1349,26 @@ fn default_anomaly_threshold_pct() -> f64 {
 
 fn default_fail_on_error() -> bool {
     true
+}
+
+impl Default for ChecksConfig {
+    /// Calls the same `default_*` functions the serde attributes name, so an
+    /// absent `[checks]` table and an empty one agree (#1924).
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            row_count: AggregateCheckToggle::default(),
+            column_match: AggregateCheckToggle::default(),
+            freshness: None,
+            null_rate: None,
+            custom: Vec::new(),
+            cross_source_overlap: None,
+            assertions: Vec::new(),
+            quarantine: None,
+            anomaly_threshold_pct: default_anomaly_threshold_pct(),
+            fail_on_error: default_fail_on_error(),
+        }
+    }
 }
 
 /// Replication `strategy` values the runner recognizes. Anything else parses
@@ -1547,18 +1633,55 @@ impl ProjectFreshnessConfig {
     }
 }
 
-/// Freshness check configuration with optional per-schema overrides.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+/// Freshness check configuration.
+///
+/// A single scalar `threshold_seconds` applies to every checked table.
+/// There used to be an `overrides` key for per-schema thresholds; it parsed
+/// and validated but nothing on the check path ever read it, so it is now
+/// refused with a message naming the remedy (#1620).
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct FreshnessConfig {
     pub threshold_seconds: u64,
-    /// Per-schema freshness overrides. Key is a schema pattern (e.g., "raw__us_west__shopify"),
-    /// value overrides threshold_seconds for matching schemas.
-    #[serde(default)]
-    pub overrides: std::collections::HashMap<String, u64>,
     /// Severity reported when freshness lag exceeds the threshold.
     #[serde(default)]
     pub severity: crate::tests::TestSeverity,
+}
+
+/// Message returned when a config still declares the removed
+/// `[checks.freshness] overrides` key.
+///
+/// Says what was removed, why it never did anything, and what to do about
+/// it. Kept as a constant so the parse test asserts the exact text a user
+/// sees.
+pub const FRESHNESS_OVERRIDES_REMOVED: &str = "the `overrides` key under `[checks.freshness]` was removed because nothing ever read it: \
+     the freshness check only ever applied the single `threshold_seconds` scalar, and no \
+     per-schema lookup existed on the check path. Delete `overrides` from this `[checks.freshness]` \
+     block; removing it changes no behaviour. Whether a per-schema override should key on the \
+     target or the source schema was never decided, so the key stops parsing instead of promising \
+     a contract; re-add it once that question is answered. See \
+     https://github.com/rocky-data/rocky/issues/1620";
+
+impl<'de> Deserialize<'de> for FreshnessConfig {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Raw {
+            threshold_seconds: u64,
+            #[serde(default)]
+            overrides: Option<serde::de::IgnoredAny>,
+            #[serde(default)]
+            severity: crate::tests::TestSeverity,
+        }
+        let raw = Raw::deserialize(deserializer)?;
+        if raw.overrides.is_some() {
+            return Err(serde::de::Error::custom(FRESHNESS_OVERRIDES_REMOVED));
+        }
+        Ok(FreshnessConfig {
+            threshold_seconds: raw.threshold_seconds,
+            severity: raw.severity,
+        })
+    }
 }
 
 /// Null rate check configuration: columns to check, threshold, and sample size.
@@ -1960,8 +2083,9 @@ impl GovernanceOverride {
 pub const SCHEMA_EVOLUTION_REMOVED: &str = "the `[schema_evolution]` section was removed because nothing ever read it: \
      drift detection never reported a column that disappeared from the source, so Rocky never dropped one and \
      `grace_period_days` never took effect. Delete the `[schema_evolution]` section from this config; \
-     removing it changes no behaviour. Grace-period column drops are tracked in \
-     https://github.com/rocky-data/rocky/issues/1616 (see issue #1435)";
+     removing it changes no behaviour. A source-side column removal alone never schedules a DROP COLUMN, \
+     and there is no opt-in for that; a full refresh or a drift-driven table recreation can still discard \
+     a target-only column. See https://github.com/rocky-data/rocky/issues/1616.";
 
 /// The removed `[schema_evolution]` section.
 ///
@@ -3484,13 +3608,272 @@ pub fn validate_freeze_marker_writes(config: &RockyConfig) -> Vec<ConfigError> {
     errors
 }
 
-/// Every pipeline's `checks.anomaly_threshold_pct` must be a finite number
-/// (#1816). TOML parses `nan`, `inf` and `-inf` into an `f64` without
-/// complaint, and `detect_anomaly` cannot compare against any of them: NaN
-/// fails both `> 0` and `<= 0`, so it fell through to "within normal range"
-/// with detection silently off; `inf` is never exceeded. Rejected here, at
-/// load, so the run never starts with detection off by accident. Zero and
-/// negative values are the documented off switch and stay accepted.
+/// Check names that are ALWAYS taken, which a user assertion or custom check
+/// may not use.
+///
+/// Dagster maps every character outside `[A-Za-z0-9_]` to `_`
+/// (`sanitize_check_name`), then keys results by
+/// `(asset_key, sanitized_name)`. On collision the FIRST spec wins and the
+/// later one is dropped with only a log line (`component.py::_add`), so the
+/// user-visible symptom is a check that silently vanishes rather than an
+/// error.
+///
+/// Compared AFTER the same sanitization, so `quarantine:compile`,
+/// `quarantine_compile` and `quarantine.compile` are all refused — checking
+/// the raw string would miss the spellings that collide only once mapped.
+///
+/// **Only unconditional names belong here.** Dagster declares several check
+/// specs conditionally, and reserving one of those refuses a name the user
+/// could legitimately have used:
+///
+/// | name | declared when | so |
+/// |---|---|---|
+/// | `row_count`, `column_match`, `row_count_anomaly` | always | reserved here |
+/// | `freshness` | the pipeline declares `[checks.freshness]` | reserved per-pipeline below, not here |
+/// | `compliance_exception` | the component opts into `surface_compliance` | NOT reserved — the engine cannot see that flag |
+/// | the three `contract_*` names | a matching contract rule kind is declared | NOT reserved — ownership is per-asset, see #1941 |
+///
+/// A first version of this list reserved all nine unconditionally. That was a
+/// FALSE REFUSAL: a project not using contracts or compliance would have been
+/// refused a name nothing else was using. Refusing a legitimate name breaks a
+/// working project, which is worse than the collision it was guarding.
+const RESERVED_CHECK_NAMES: &[&str] = &[
+    // engine
+    "quarantine:compile",
+    "quarantine:execute",
+    // dagster checks declared on every asset, unconditionally
+    // (`component.py::DEFAULT_CHECK_NAMES`, minus the conditional freshness)
+    "row_count",
+    "column_match",
+    "row_count_anomaly",
+];
+
+/// Reserved only for a pipeline that declares `[checks.freshness]`.
+///
+/// Dagster skips the `freshness` spec when the pipeline has no freshness
+/// config (`component.py`, the `declare_freshness` guard), so the name is
+/// free in a project that does not use it.
+const FRESHNESS_CHECK_NAME: &str = "freshness";
+
+/// Every non-alphanumeric character mapped to `_` — the same shape
+/// `dagster_rocky.contracts.sanitize_check_name` produces. Case is
+/// PRESERVED, matching the Python side.
+fn sanitized_check_name(name: &str) -> String {
+    name.chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect()
+}
+
+/// Which check-name producer resolved a [`ResolvedCheckName`]. Mirrors the
+/// `kind` tag `rocky_cli::output::ResolvedCheckNameOutput` puts on the wire
+/// (`"custom" | "null_rate" | "assertion" | "cross_source_overlap"`) — kept
+/// as a typed enum here so the two collision guards below can match on it
+/// without re-parsing a string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckNameKind {
+    Custom,
+    NullRate,
+    Assertion,
+    CrossSourceOverlap,
+}
+
+impl CheckNameKind {
+    /// The wire-format tag. Must byte-match `ResolvedCheckNameOutput.kind`
+    /// in `rocky-cli/src/output.rs` — that projection now builds its list
+    /// by mapping over [`resolved_check_names_for_table`]'s output.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CheckNameKind::Custom => "custom",
+            CheckNameKind::NullRate => "null_rate",
+            CheckNameKind::Assertion => "assertion",
+            CheckNameKind::CrossSourceOverlap => "cross_source_overlap",
+        }
+    }
+}
+
+/// A single check name a pipeline will emit as `CheckResult.name`, plus the
+/// producer that resolved it. The un-sanitized, byte-exact name — sanitizing
+/// is [`resolved_check_name_collisions`]'s job, not this one's, so a caller
+/// that wants the raw resolved set (e.g. `rocky discover`'s projection) gets
+/// it untouched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedCheckName {
+    pub name: String,
+    pub kind: CheckNameKind,
+    /// `true` for a name whose existence depends on runtime-discovered
+    /// siblings (`cross_source_overlap`) and so may not be emitted on every
+    /// run. Mirrors `ResolvedCheckNameOutput.candidate`.
+    pub candidate: bool,
+    /// Disambiguates two entries whose `name` is byte-identical — chiefly
+    /// two UNNAMED assertions on the same table, same test kind, same (or
+    /// absent) column: `resolved_name()` synthesizes the same
+    /// `"{kind}:{column}"` for both (e.g. two unnamed `expression`
+    /// assertions both produce `"expression:-"`), so without this a
+    /// collision message naming both sides would print the identical
+    /// string twice, telling the author nothing about WHICH two assertions
+    /// collide. Populated only for [`CheckNameKind::Assertion`] — its
+    /// 1-based position among the table's own `[[checks.assertions]]`
+    /// entries, e.g. `"assertion #2 for table"`. Internal only; not part
+    /// of any JSON output — `rocky-cli`'s `ResolvedCheckNameOutput`
+    /// projection reads only `name`/`kind`/`candidate` and ignores this
+    /// field, so adding it here does not touch the wire schema.
+    pub detail: Option<String>,
+}
+
+/// Custom-check and `null_rate` names, independent of any specific table.
+///
+/// `[[checks.custom]]` has no `table` field — `run.rs` runs every custom
+/// check against every materialized table — and `NullRateConfig.columns` is
+/// a flat, un-scoped list, not chosen per table. A collision between two
+/// names drawn from these two producers therefore collides on EVERY table
+/// the pipeline touches, which is what lets [`validate_checks`] catch it at
+/// config load, before discovery has run and before anything is
+/// materialized (#1941).
+fn table_independent_check_names(
+    cfg: &ChecksConfig,
+    executed_kinds: &[crate::checks::CheckKind],
+) -> Vec<ResolvedCheckName> {
+    use crate::checks::CheckKind;
+    let runs = |k: CheckKind| executed_kinds.contains(&k);
+    let mut names = Vec::new();
+
+    if runs(CheckKind::Custom) {
+        for custom in &cfg.custom {
+            names.push(ResolvedCheckName {
+                name: custom.name.clone(),
+                kind: CheckNameKind::Custom,
+                candidate: false,
+                detail: None,
+            });
+        }
+    }
+
+    if runs(CheckKind::NullRate)
+        && let Some(nr) = cfg.null_rate.as_ref()
+    {
+        for col in &nr.columns {
+            names.push(ResolvedCheckName {
+                name: crate::checks::null_rate_check_name(col),
+                kind: CheckNameKind::NullRate,
+                candidate: false,
+                detail: None,
+            });
+        }
+    }
+
+    names
+}
+
+/// Every check name a single `table` will emit under `cfg`, given the check
+/// kinds this pipeline type actually executes (see
+/// [`PipelineConfig::executed_check_kinds`]) and the `source_type` this
+/// table was discovered under — one entry per occurrence, so a table
+/// discovered under the same source type twice (a sibling pair) has that
+/// source type twice in `sibling_source_types`.
+///
+/// This is the single derivation `rocky discover`'s `ChecksConfigOutput`
+/// projection (`rocky-cli/src/output.rs`) and the pre-run collision guards
+/// (here and in `rocky-cli/src/commands/run.rs`) all call, so none of them
+/// can enumerate a different set of names for the same config (#1941). It
+/// covers all four producers: every custom check (table-independent),
+/// `null_rate_check_name(col)` per configured `null_rate` column
+/// (table-independent), `assertion.resolved_name()` for every assertion
+/// targeting `table` (covers UNNAMED assertions — their synthesized name is
+/// exactly as collision-prone as an explicit one), and the
+/// `cross_source_overlap` name when `table` has ≥2 siblings under the same
+/// source type.
+///
+/// Returns the RAW resolved names — no sanitizing, no deduplication. A
+/// caller that wants to know whether two of them collide calls
+/// [`resolved_check_name_collisions`] on the result; silently deduplicating
+/// here would hide the exact collision this function exists to make
+/// visible (#1941).
+pub fn resolved_check_names_for_table(
+    cfg: &ChecksConfig,
+    executed_kinds: &[crate::checks::CheckKind],
+    table: &str,
+    sibling_source_types: &[String],
+) -> Vec<ResolvedCheckName> {
+    use crate::checks::CheckKind;
+    let runs = |k: CheckKind| executed_kinds.contains(&k);
+    let mut names = table_independent_check_names(cfg, executed_kinds);
+
+    if runs(CheckKind::Assertions) {
+        for (idx, assertion) in cfg
+            .assertions
+            .iter()
+            .filter(|a| a.table == table)
+            .enumerate()
+        {
+            names.push(ResolvedCheckName {
+                name: assertion.resolved_name(),
+                kind: CheckNameKind::Assertion,
+                candidate: false,
+                // 1-based, and scoped to THIS table's own assertions (not
+                // a global index into `cfg.assertions`) — see the doc
+                // comment on `ResolvedCheckName::detail`.
+                detail: Some(format!("assertion #{} for table {table:?}", idx + 1)),
+            });
+        }
+    }
+
+    if runs(CheckKind::CrossSourceOverlap) && cfg.cross_source_overlap.is_some() {
+        let mut counts: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+        for source_type in sibling_source_types {
+            *counts.entry(source_type.as_str()).or_default() += 1;
+        }
+        for (source_type, n) in counts {
+            if n >= 2 {
+                names.push(ResolvedCheckName {
+                    name: crate::checks::cross_source_overlap_name(source_type, table),
+                    kind: CheckNameKind::CrossSourceOverlap,
+                    candidate: true,
+                    detail: None,
+                });
+            }
+        }
+    }
+
+    names
+}
+
+/// Every pair in `names` whose entries sanitize to the same Dagster check
+/// name, alongside that shared sanitized name — in encounter order, first
+/// occurrence kept as the "earlier" side of each pair. Reports EVERY
+/// collision, including a raw exact-name duplicate: the previous resolver
+/// (`ChecksConfigOutput::from_engine`, before #1941) silently deduplicated
+/// those away, which is the bug this function exists to stop repeating.
+pub fn resolved_check_name_collisions(
+    names: &[ResolvedCheckName],
+) -> Vec<(ResolvedCheckName, ResolvedCheckName, String)> {
+    let mut seen: std::collections::BTreeMap<String, ResolvedCheckName> =
+        std::collections::BTreeMap::new();
+    let mut collisions = Vec::new();
+    for n in names {
+        let sanitized = sanitized_check_name(&n.name);
+        if let Some(existing) = seen.get(&sanitized) {
+            collisions.push((existing.clone(), n.clone(), sanitized));
+        } else {
+            seen.insert(sanitized, n.clone());
+        }
+    }
+    collisions
+}
+
+/// `"<kind> \"<name>\""` — one side of a [`ConfigError::DuplicateCheckName`],
+/// naming both the resolved name and the producer that resolved it. When
+/// `detail` is set (currently only for [`CheckNameKind::Assertion`]) it is
+/// appended in parentheses, so two unnamed assertions that synthesize the
+/// SAME name (e.g. two unnamed `expression` assertions both producing
+/// `"expression:-"`) still read as two distinguishable sides rather than
+/// the identical string twice.
+fn describe_resolved_check_name(n: &ResolvedCheckName) -> String {
+    match &n.detail {
+        Some(detail) => format!("{} {:?} ({detail})", n.kind.as_str(), n.name),
+        None => format!("{} {:?}", n.kind.as_str(), n.name),
+    }
+}
+
 /// Refuse a `metadata_columns[].value` that is not one parseable SQL
 /// expression calling only allowlisted scalar functions.
 ///
@@ -3526,6 +3909,11 @@ pub fn validate_metadata_columns(config: &RockyConfig) -> Vec<ConfigError> {
                 "metadata_columns[].value",
                 &mc.value,
                 dialect.as_ref(),
+                // A value projected into the SELECT list, rendered once per
+                // statement. Volatile is the ordinary case here —
+                // `_loaded_at = current_timestamp()` is the reason metadata
+                // columns exist.
+                rocky_sql::check_expression::ExpressionUse::ScalarProjection,
             ) {
                 errors.push(ConfigError::MetadataColumnValueRefused {
                     pipeline: pipeline_name.clone(),
@@ -3538,6 +3926,13 @@ pub fn validate_metadata_columns(config: &RockyConfig) -> Vec<ConfigError> {
     errors
 }
 
+/// Every pipeline's `checks.anomaly_threshold_pct` must be a finite number
+/// (#1816). TOML parses `nan`, `inf` and `-inf` into an `f64` without
+/// complaint, and `detect_anomaly` cannot compare against any of them: NaN
+/// fails both `> 0` and `<= 0`, so it fell through to "within normal range"
+/// with detection silently off; `inf` is never exceeded. Rejected here, at
+/// load, so the run never starts with detection off by accident. Zero and
+/// negative values are the documented off switch and stay accepted.
 pub fn validate_checks(config: &RockyConfig) -> Vec<ConfigError> {
     let mut errors = Vec::new();
     for (name, pipeline) in &config.pipelines {
@@ -3547,6 +3942,101 @@ pub fn validate_checks(config: &RockyConfig) -> Vec<ConfigError> {
                 pipeline: name.clone(),
                 value: threshold.to_string(),
             });
+        }
+        // EVERY user-nameable check, not just assertions. A custom check
+        // carries an arbitrary name too, and it reaches the same dagster
+        // keying — the first version of this guard walked assertions alone
+        // and left the collision it exists to stop wide open.
+        let named: Vec<(String, String)> = pipeline
+            .checks()
+            .assertions
+            .iter()
+            .filter_map(|a| a.name.as_deref().map(|n| (a.table.clone(), n.to_string())))
+            .chain(
+                pipeline
+                    .checks()
+                    .custom
+                    .iter()
+                    .map(|c| (name.clone(), c.name.clone())),
+            )
+            .collect();
+        for (table, declared) in named {
+            let declared = declared.as_str();
+            let sanitized = sanitized_check_name(declared);
+            let conditional: &[&str] = if pipeline.checks().freshness.is_some() {
+                &[FRESHNESS_CHECK_NAME]
+            } else {
+                &[]
+            };
+            if let Some(reserved) = RESERVED_CHECK_NAMES
+                .iter()
+                .chain(conditional.iter())
+                .find(|r| sanitized_check_name(r) == sanitized)
+            {
+                errors.push(ConfigError::ReservedAssertionName {
+                    table,
+                    name: declared.to_string(),
+                    reserved: (*reserved).to_string(),
+                });
+            }
+        }
+
+        // #1941: two check names that sanitize alike collide in Dagster even
+        // when NEITHER is a reserved word — the loop above only catches a
+        // collision against the fixed list. This is the static half of that
+        // guard; the complete per-table check (every producer, on every
+        // ACTUALLY discovered table) runs at run start once discovery has
+        // run — see `refuse_check_name_collisions` in `rocky-cli`'s
+        // `run.rs`.
+        let checks = pipeline.checks();
+        let executed_kinds = pipeline.executed_check_kinds();
+
+        // Custom checks and `null_rate` columns are table-independent (both
+        // run on EVERY materialized table), so a collision between them is
+        // real regardless of which tables discovery eventually finds. Caught
+        // here, once per pipeline, before discovery has ever run.
+        let table_independent = table_independent_check_names(checks, executed_kinds);
+        for (a, b, sanitized) in resolved_check_name_collisions(&table_independent) {
+            errors.push(ConfigError::DuplicateCheckName {
+                pipeline: name.clone(),
+                source_a: describe_resolved_check_name(&a),
+                source_b: describe_resolved_check_name(&b),
+                // "checks", not "copies": a quality pipeline runs custom
+                // and null_rate checks against tables it never copies —
+                // "copies" was replication-specific wording on a sentence
+                // that applies to every pipeline type.
+                scope: format!("on every table pipeline {name:?} checks"),
+                sanitized,
+            });
+        }
+
+        // Every table an assertion names is known statically. Custom checks
+        // and `null_rate` columns are folded back in here too (via
+        // `resolved_check_names_for_table`) so a collision between an
+        // assertion and either of them is caught on the tables config
+        // already names — only the table-independent pair (both sides
+        // custom/null_rate) is skipped, since that pair was already reported
+        // once, above, without needing a table at all.
+        let mut tables: Vec<&str> = checks.assertions.iter().map(|a| a.table.as_str()).collect();
+        tables.sort_unstable();
+        tables.dedup();
+        for &table in &tables {
+            let names = resolved_check_names_for_table(checks, executed_kinds, table, &[]);
+            for (a, b, sanitized) in resolved_check_name_collisions(&names) {
+                let both_table_independent =
+                    matches!(a.kind, CheckNameKind::Custom | CheckNameKind::NullRate)
+                        && matches!(b.kind, CheckNameKind::Custom | CheckNameKind::NullRate);
+                if both_table_independent {
+                    continue;
+                }
+                errors.push(ConfigError::DuplicateCheckName {
+                    pipeline: name.clone(),
+                    source_a: describe_resolved_check_name(&a),
+                    source_b: describe_resolved_check_name(&b),
+                    scope: format!("on table {table:?} in pipeline {name:?}"),
+                    sanitized,
+                });
+            }
         }
     }
     errors
@@ -5242,6 +5732,12 @@ pub struct ReplicationPipelineConfig {
     /// target's recorded last-copied value (never wall-clock), so a failed
     /// prior run cannot cause a false skip. Pass `--no-prune` to `rocky run`
     /// to force a full pass (e.g. after a manual target-side mutation).
+    ///
+    /// An `incremental` table is never pruned until it has a
+    /// recorded watermark: its first run always copies, even when the marker
+    /// matches, because a table with no watermark has nothing recorded for
+    /// the next incremental run to append from. A `full_refresh` table has no
+    /// such condition.
     #[serde(default)]
     pub prune_unchanged: bool,
 }
@@ -6436,6 +6932,37 @@ pub fn parse_rocky_config(path: &Path) -> Result<RockyConfig, ConfigError> {
     parse_rocky_config_str(&raw)
 }
 
+/// Parses `path` into the same normalized raw TOML document
+/// [`parse_rocky_config`] deserializes from — after env-var substitution,
+/// deprecation remapping, and bare-`[adapter]`/`[pipeline]` shorthand
+/// normalization — but stops short of building a [`RockyConfig`].
+///
+/// `rocky validate`'s L004/L006 lints need this: whether a key like
+/// `[state] backend` or `pipeline.*.target.governance.auto_create_catalogs`
+/// was actually written in the file, not what the defaulted struct resolved
+/// it to. A deserialized `RockyConfig` cannot answer that — `#[serde(default)]`
+/// makes an absent key and an explicitly-written default value
+/// indistinguishable. Because this document ran through the same
+/// normalization `parse_rocky_config` does, a bare `[pipeline]` (single,
+/// unnamed) is already keyed as `pipeline.default` here too, so a caller can
+/// index it by the exact same names `RockyConfig::pipelines` reports.
+///
+/// Presence of a key does not depend on what an env-var placeholder resolves
+/// to — only on the document's structure — so this does not need the
+/// credential-tolerance policy `parse_rocky_config` applies; an unresolved
+/// `${VAR}` left verbatim inside a quoted string parses as an ordinary raw
+/// string either way. It is still an error, not a silent skip, so the caller
+/// gets one clear signal (`Err`) rather than a document that just doesn't
+/// have keys it should.
+pub fn parse_rocky_config_raw(path: &Path) -> Result<toml::Value, ConfigError> {
+    let raw = read_config_file(path)?;
+    let expanded = substitute_env_vars_inner(&raw);
+    let mut value: toml::Value = toml::from_str(&expanded.text)?;
+    apply_deprecations(&mut value);
+    normalize_toml_shorthands(&mut value);
+    Ok(value)
+}
+
 /// Read the raw config file bytes.
 ///
 /// A path with nothing at it maps to [`ConfigError::FileNotFound`] — the one
@@ -6953,9 +7480,10 @@ pub struct LoadedConfig {
 /// Uses [`std::hash::DefaultHasher`] (SipHash with fixed keys), so the value
 /// is deterministic across processes for the same bytes — intra-release
 /// stable, not cross-release stable. Deliberately hashes the RAW bytes, never
-/// a serde serialization of the parsed config: `FreshnessConfig::overrides`
-/// is a `std::collections::HashMap` reachable from [`RockyConfig`], so a
-/// serialized form would have nondeterministic ordering across processes.
+/// a serde serialization of the parsed config: nothing in [`RockyConfig`]
+/// promises every field will avoid an unordered collection like
+/// `std::collections::HashMap`, whose iteration order a serialized form
+/// would expose as nondeterministic ordering across processes.
 ///
 /// This is the single hashing implementation behind both the CLI's
 /// path-based `config_fingerprint` (rocky-cli `output.rs`) and
@@ -7855,11 +8383,11 @@ mod tests {
     }
 
     /// WP-01 PR-B: `load_rocky_config_fingerprinted` is deterministic across
-    /// repeated loads — including for a config whose `FreshnessConfig::
-    /// overrides` `HashMap` carries multiple keys. The fingerprint hashes the
-    /// RAW file bytes (never a serde serialization), so `HashMap` iteration
-    /// order cannot leak into the value. A serialization-based fingerprint
-    /// would flake this test across processes/seeds.
+    /// repeated loads. The fingerprint hashes the RAW file bytes, never a
+    /// serde serialization of the parsed config, so it is independent of any
+    /// collection field's iteration order — a serialization-based
+    /// fingerprint would flake across processes/seeds the moment such a
+    /// field existed.
     #[test]
     fn fingerprinted_load_is_deterministic_across_repeated_loads() {
         let dir = tempfile::tempdir().unwrap();
@@ -7883,11 +8411,6 @@ enabled = true
 
 [pipeline.silver.checks.freshness]
 threshold_seconds = 3600
-
-[pipeline.silver.checks.freshness.overrides]
-"raw__us_west__shopify" = 7200
-"raw__eu__stripe" = 1800
-"raw__apac__ads" = 900
 "#,
         )
         .unwrap();
@@ -7901,10 +8424,8 @@ threshold_seconds = 3600
                 .freshness
                 .as_ref()
                 .unwrap()
-                .overrides
-                .len(),
-            3,
-            "the overrides HashMap must actually carry multiple keys"
+                .threshold_seconds,
+            3600
         );
         assert_eq!(
             first.fingerprint,
@@ -8446,7 +8967,7 @@ effect = "deny"
     }
 
     /// A config that still declares `[schema_evolution]` is refused, and
-    /// the message says what to delete and where the feature is tracked.
+    /// the message says what to delete and what Rocky actually does.
     ///
     /// The section parsed and validated before this change while nothing
     /// read it (#1435). Swapping one silence for another (an anonymous
@@ -8502,6 +9023,172 @@ database = ":memory:"
         )
         .expect("a config without [schema_evolution] must still parse");
         assert!(cfg.schema_evolution.is_none());
+    }
+
+    /// A config that still declares `[checks.freshness] overrides` is
+    /// refused, and the message says what to delete and where the
+    /// unresolved question is tracked (N2 of #1620).
+    ///
+    /// The key parsed and validated before this change while nothing on the
+    /// check path ever read it. Swapping one silence for another (an
+    /// anonymous `unknown field` error) would repeat the defect, so the
+    /// removal carries its own remedy.
+    #[test]
+    fn removed_freshness_overrides_key_is_refused_with_the_remedy() {
+        let err = toml::from_str::<RockyConfig>(
+            r#"
+[adapter.wh]
+type = "duckdb"
+database = ":memory:"
+
+[pipeline.silver]
+type = "transformation"
+models = "models/**"
+
+[pipeline.silver.target]
+adapter = "wh"
+
+[pipeline.silver.checks]
+enabled = true
+
+[pipeline.silver.checks.freshness]
+threshold_seconds = 3600
+
+[pipeline.silver.checks.freshness.overrides]
+"raw__us_west__shopify" = 7200
+"#,
+        )
+        .expect_err("[checks.freshness] overrides must be refused, not ignored");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("`overrides` key under `[checks.freshness]` was removed"),
+            "message must name the removed key, got: {msg}"
+        );
+        assert!(
+            msg.contains("Delete `overrides`"),
+            "message must name the remedy, got: {msg}"
+        );
+        assert!(
+            msg.contains("issues/1620"),
+            "message must point at the tracking issue, got: {msg}"
+        );
+    }
+
+    /// The remedy text survives the loader every executing path actually
+    /// calls — `load_rocky_config`, not `toml::from_str` directly. That
+    /// loader wraps a parse failure in `ConfigError::ParseToml`, whose
+    /// `Display` renders the inner `toml::de::Error`; this pins that the
+    /// wrap does not truncate or reformat away the remedy.
+    #[test]
+    fn removed_freshness_overrides_key_is_refused_with_the_remedy_through_the_real_loader() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rocky.toml");
+        std::fs::write(
+            &path,
+            r#"
+[adapter.wh]
+type = "duckdb"
+database = ":memory:"
+
+[pipeline.silver]
+type = "transformation"
+models = "models/**"
+
+[pipeline.silver.target]
+adapter = "wh"
+
+[pipeline.silver.checks]
+enabled = true
+
+[pipeline.silver.checks.freshness]
+threshold_seconds = 3600
+
+[pipeline.silver.checks.freshness.overrides]
+"raw__us_west__shopify" = 7200
+"#,
+        )
+        .unwrap();
+
+        let err = load_rocky_config(&path)
+            .expect_err("[checks.freshness] overrides must be refused, not ignored");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("`overrides` key under `[checks.freshness]` was removed"),
+            "message must name the removed key, got: {msg}"
+        );
+        assert!(
+            msg.contains("Delete `overrides`"),
+            "message must name the remedy, got: {msg}"
+        );
+        assert!(
+            msg.contains("issues/1620"),
+            "message must point at the tracking issue, got: {msg}"
+        );
+    }
+
+    /// An empty `overrides` table is refused too — the refusal is on the
+    /// key, not on any entry inside it.
+    #[test]
+    fn removed_freshness_overrides_key_is_refused_even_when_empty() {
+        let err = toml::from_str::<RockyConfig>(
+            r#"
+[adapter.wh]
+type = "duckdb"
+database = ":memory:"
+
+[pipeline.silver]
+type = "transformation"
+models = "models/**"
+
+[pipeline.silver.target]
+adapter = "wh"
+
+[pipeline.silver.checks]
+enabled = true
+
+[pipeline.silver.checks.freshness]
+threshold_seconds = 3600
+
+[pipeline.silver.checks.freshness.overrides]
+"#,
+        )
+        .expect_err("an empty overrides table must be refused");
+        assert!(err.to_string().contains("was removed"), "got: {err}");
+    }
+
+    /// A config that declares `[checks.freshness]` with only
+    /// `threshold_seconds` (no `overrides`) still loads.
+    #[test]
+    fn freshness_without_overrides_still_parses() {
+        let cfg = toml::from_str::<RockyConfig>(
+            r#"
+[adapter.wh]
+type = "duckdb"
+database = ":memory:"
+
+[pipeline.silver]
+type = "transformation"
+models = "models/**"
+
+[pipeline.silver.target]
+adapter = "wh"
+
+[pipeline.silver.checks]
+enabled = true
+
+[pipeline.silver.checks.freshness]
+threshold_seconds = 3600
+"#,
+        )
+        .expect("a config without overrides must still parse");
+        let freshness = cfg.pipelines["silver"]
+            .as_transformation()
+            .expect("transformation pipeline")
+            .checks
+            .freshness
+            .as_ref()
+            .expect("freshness block");
+        assert_eq!(freshness.threshold_seconds, 3600);
     }
 
     #[test]
@@ -8647,6 +9334,596 @@ autonomy_budget = { failures = 0, window = "7d" }
             ),
             "got {errors:?}"
         );
+    }
+
+    /// The engine emits `quarantine:compile` and `quarantine:execute` checks
+    /// of its own. A user assertion may not take either name, in ANY spelling
+    /// that sanitizes to the same thing.
+    ///
+    /// Dagster maps every non-alphanumeric character to `_` and then keys by
+    /// `(asset_key, sanitized_name)` with no dedup, so `quarantine:compile`
+    /// and `quarantine_compile` are one check and one result is lost.
+    /// Comparing the raw strings would catch only the first spelling.
+    #[test]
+    fn a_reserved_assertion_name_is_refused_in_every_spelling() {
+        for spelling in [
+            "quarantine:compile",
+            "quarantine_compile",
+            "quarantine.compile",
+            "quarantine:execute",
+            "quarantine_execute",
+            "quarantine.execute",
+        ] {
+            let cfg = parse(&format!(
+                r#"
+[adapter]
+type = "duckdb"
+path = "x.duckdb"
+
+[pipeline.dq]
+type = "quality"
+
+[pipeline.dq.target]
+adapter = "default"
+
+[[pipeline.dq.checks.assertions]]
+table = "orders"
+name = "{spelling}"
+type = "not_null"
+column = "id"
+"#
+            ));
+            let errors = validate_checks(&cfg);
+            assert!(
+                errors.iter().any(|e| matches!(
+                    e,
+                    ConfigError::ReservedAssertionName { name, .. } if name == spelling
+                )),
+                "{spelling} must be refused: {errors:?}"
+            );
+        }
+    }
+
+    /// A name Dagster ALWAYS declares is refused.
+    ///
+    /// The first version reserved `quarantine:compile` alone, which was too
+    /// narrow. The second reserved all nine names Dagster can declare, which
+    /// was too broad — five of them are conditional, and refusing one in a
+    /// project that does not use that feature is a false refusal.
+    #[test]
+    fn a_name_dagster_always_declares_is_refused() {
+        for spelling in ["row_count", "column-match", "row_count_anomaly"] {
+            let errors = validate_checks(&parse(&named_assertion(spelling, "")));
+            assert!(
+                errors.iter().any(|e| matches!(
+                    e,
+                    ConfigError::ReservedAssertionName { name, .. } if name == spelling
+                )),
+                "{spelling} is declared on every asset and must be refused: {errors:?}"
+            );
+        }
+    }
+
+    /// A CONDITIONAL Dagster name is free until the pipeline turns the
+    /// feature on.
+    ///
+    /// `freshness` is declared only when the pipeline has `[checks.freshness]`
+    /// (`component.py`'s `declare_freshness` guard). `compliance_exception`
+    /// and the three `contract_*` names depend on state the engine cannot
+    /// see, so they are not reserved here at all — see #1941.
+    ///
+    /// This is the test that would have caught the over-broad version: it
+    /// asserts a name is ACCEPTED, which no amount of extra strictness can
+    /// satisfy.
+    #[test]
+    fn a_conditional_dagster_name_is_free_until_the_feature_is_on() {
+        let reserved = |errors: &[ConfigError]| {
+            errors
+                .iter()
+                .any(|e| matches!(e, ConfigError::ReservedAssertionName { .. }))
+        };
+
+        // Nothing declares freshness, so the name is the user's to take.
+        let errors = validate_checks(&parse(&named_assertion("freshness", "")));
+        assert!(
+            !reserved(&errors),
+            "freshness is free when the pipeline declares no freshness config: {errors:?}"
+        );
+
+        // Declared, so dagster will emit that spec and the name now collides.
+        let errors = validate_checks(&parse(&named_assertion("freshness", FRESHNESS_TOML)));
+        assert!(
+            errors.iter().any(|e| matches!(
+                e,
+                ConfigError::ReservedAssertionName { name, .. } if name == "freshness"
+            )),
+            "freshness collides once the pipeline declares it: {errors:?}"
+        );
+
+        // These four depend on state the engine cannot see, so it reserves
+        // none of them. Detecting those collisions is #1941.
+        for spelling in [
+            "compliance_exception",
+            "contract_required_columns",
+            "contract_protected_columns",
+            "contract_column_constraints",
+        ] {
+            let errors = validate_checks(&parse(&named_assertion(spelling, "")));
+            assert!(
+                !reserved(&errors),
+                "{spelling} is conditional in dagster and must not be refused here: {errors:?}"
+            );
+        }
+    }
+
+    const FRESHNESS_TOML: &str = r#"
+[pipeline.dq.checks.freshness]
+threshold_seconds = 86400
+"#;
+
+    /// A quality pipeline with one named assertion, plus any extra TOML.
+    fn named_assertion(name: &str, extra: &str) -> String {
+        format!(
+            r#"
+[adapter]
+type = "duckdb"
+path = "x.duckdb"
+
+[pipeline.dq]
+type = "quality"
+
+[pipeline.dq.target]
+adapter = "default"
+
+[[pipeline.dq.checks.assertions]]
+table = "orders"
+name = "{name}"
+type = "not_null"
+column = "id"
+{extra}
+"#
+        )
+    }
+
+    /// A CUSTOM check carries a user name too, and the first version of the
+    /// guard walked assertions alone — leaving the collision it exists to
+    /// stop reachable through the other door.
+    ///
+    /// Worse than a duplicate: dagster's component path silently SKIPS the
+    /// later duplicate and reports a generic gate failure, so the quarantine
+    /// result disappears behind a passing custom check.
+    #[test]
+    fn a_reserved_name_on_a_custom_check_is_refused_too() {
+        let cfg = parse(
+            r#"
+[adapter]
+type = "duckdb"
+path = "x.duckdb"
+
+[pipeline.dq]
+type = "quality"
+
+[pipeline.dq.target]
+adapter = "default"
+
+[[pipeline.dq.checks.custom]]
+name = "quarantine_compile"
+sql = "SELECT 0"
+threshold = 0
+"#,
+        );
+        let errors = validate_checks(&cfg);
+        assert!(
+            errors.iter().any(
+                |e| matches!(e, ConfigError::ReservedAssertionName { name, .. }
+                    if name == "quarantine_compile")
+            ),
+            "a custom check may not take the reserved name: {errors:?}"
+        );
+    }
+
+    /// The control: an ordinary assertion name is untouched, and an assertion
+    /// with NO explicit name is untouched. Without this, the refusal above
+    /// would also pass on a change that rejected every assertion.
+    #[test]
+    fn an_ordinary_assertion_name_is_not_reserved() {
+        let cfg = parse(
+            r#"
+[adapter]
+type = "duckdb"
+path = "x.duckdb"
+
+[pipeline.dq]
+type = "quality"
+
+[pipeline.dq.target]
+adapter = "default"
+
+[[pipeline.dq.checks.assertions]]
+table = "orders"
+name = "orders_id_present"
+type = "not_null"
+column = "id"
+
+[[pipeline.dq.checks.assertions]]
+table = "orders"
+type = "not_null"
+column = "name"
+"#,
+        );
+        let errors = validate_checks(&cfg);
+        assert!(
+            !errors
+                .iter()
+                .any(|e| matches!(e, ConfigError::ReservedAssertionName { .. })),
+            "an ordinary name must pass: {errors:?}"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // #1941: the shared derivation + collision detection.
+    // -------------------------------------------------------------------
+
+    /// A minimal `ChecksConfig` exercising all four name producers: a custom
+    /// check, `null_rate` on one column, one NAMED assertion, and one
+    /// UNNAMED assertion (gap 1 from the issue's enumeration — the old
+    /// `validate_checks` candidate list dropped these with `filter_map`).
+    fn all_producers_checks_cfg() -> ChecksConfig {
+        toml::from_str(
+            r#"
+null_rate = { columns = ["amount"], threshold = 0.1 }
+cross_source_overlap = { keys = ["id"] }
+
+[[custom]]
+name = "has_rows"
+sql = "SELECT COUNT(*) FROM {table}"
+threshold = 1
+
+[[assertions]]
+table = "orders"
+name = "id_not_null"
+type = "not_null"
+column = "id"
+
+[[assertions]]
+table = "orders"
+type = "not_null"
+column = "email"
+"#,
+        )
+        .unwrap()
+    }
+
+    /// The derivation covers all four producers for one table, including
+    /// the UNNAMED assertion's synthesized name.
+    ///
+    /// Mutation that must turn this red: drop the `null_rate` arm (or any
+    /// other producer arm) from `resolved_check_names_for_table`.
+    #[test]
+    fn resolved_check_names_for_table_covers_all_four_producers() {
+        let cfg = all_producers_checks_cfg();
+        let names = resolved_check_names_for_table(
+            &cfg,
+            ReplicationPipelineConfig::EXECUTED_CHECK_KINDS,
+            "orders",
+            &[],
+        );
+        let by_name: std::collections::HashMap<&str, &ResolvedCheckName> =
+            names.iter().map(|n| (n.name.as_str(), n)).collect();
+
+        assert_eq!(
+            by_name["has_rows"].kind,
+            CheckNameKind::Custom,
+            "custom checks must be included: {names:?}"
+        );
+        assert_eq!(
+            by_name["null_rate:amount"].kind,
+            CheckNameKind::NullRate,
+            "null_rate columns must be included: {names:?}"
+        );
+        assert_eq!(
+            by_name["id_not_null"].kind,
+            CheckNameKind::Assertion,
+            "a NAMED assertion must be included: {names:?}"
+        );
+        // The unnamed assertion's synthesized name is "{kind}:{column}".
+        assert_eq!(
+            by_name.get("not_null:email").map(|n| n.kind),
+            Some(CheckNameKind::Assertion),
+            "an UNNAMED assertion's synthesized name must be included too: {names:?}"
+        );
+    }
+
+    /// A table with no discovered siblings gets no `cross_source_overlap`
+    /// name; a table discovered twice under the SAME source type does.
+    ///
+    /// Mutation that must turn this red: change the `n >= 2` threshold to
+    /// `n >= 1`, or drop the cross-source-overlap arm entirely.
+    #[test]
+    fn cross_source_overlap_name_only_appears_with_two_siblings() {
+        let cfg = all_producers_checks_cfg();
+        let kinds = ReplicationPipelineConfig::EXECUTED_CHECK_KINDS;
+
+        let alone = resolved_check_names_for_table(&cfg, kinds, "orders", &[]);
+        assert!(
+            !alone
+                .iter()
+                .any(|n| n.kind == CheckNameKind::CrossSourceOverlap),
+            "no cross_source_overlap name with zero siblings: {alone:?}"
+        );
+
+        let with_sibling = resolved_check_names_for_table(
+            &cfg,
+            kinds,
+            "orders",
+            &["duckdb".to_string(), "duckdb".to_string()],
+        );
+        let overlap = with_sibling
+            .iter()
+            .find(|n| n.kind == CheckNameKind::CrossSourceOverlap)
+            .expect("two same-source-type siblings must produce a cross_source_overlap name");
+        assert_eq!(overlap.name, "cross_source_overlap:duckdb.orders");
+        assert!(overlap.candidate, "overlap names must be marked candidate");
+    }
+
+    /// A pipeline type that does not execute a kind (e.g. quality never runs
+    /// `null_rate` or `cross_source_overlap`) must not resolve names for it.
+    #[test]
+    fn ungated_kinds_are_not_resolved() {
+        let cfg = all_producers_checks_cfg();
+        let quality_kinds: &[crate::checks::CheckKind] = &[
+            crate::checks::CheckKind::RowCount,
+            crate::checks::CheckKind::Custom,
+            crate::checks::CheckKind::Assertions,
+        ];
+        let names = resolved_check_names_for_table(&cfg, quality_kinds, "orders", &[]);
+        assert!(
+            !names.iter().any(|n| n.kind == CheckNameKind::NullRate),
+            "a kind the pipeline type does not execute must not be resolved: {names:?}"
+        );
+    }
+
+    /// Every ordered pair of producers collides once sanitized alike:
+    /// custom×null_rate, custom×assertion, null_rate×assertion, and
+    /// assertion×assertion (two assertions on the same table).
+    ///
+    /// Mutation that must turn this red: change
+    /// `resolved_check_name_collisions` to `retain`/dedup instead of
+    /// reporting pairs.
+    #[test]
+    fn every_producer_pair_collides_when_sanitized_alike() {
+        let kinds = ReplicationPipelineConfig::EXECUTED_CHECK_KINDS;
+
+        // custom x null_rate: "null rate amount" -> "null_rate_amount",
+        // same as null_rate_check_name("amount") -> "null_rate:amount" ->
+        // "null_rate_amount". This is the issue's own worked example.
+        let cfg: ChecksConfig = toml::from_str(
+            r#"
+null_rate = { columns = ["amount"], threshold = 0.1 }
+[[custom]]
+name = "null rate amount"
+sql = "SELECT 0"
+threshold = 0
+"#,
+        )
+        .unwrap();
+        let names = resolved_check_names_for_table(&cfg, kinds, "orders", &[]);
+        let collisions = resolved_check_name_collisions(&names);
+        assert_eq!(
+            collisions.len(),
+            1,
+            "custom x null_rate must collide: {collisions:?}"
+        );
+        assert_eq!(collisions[0].2, "null_rate_amount");
+
+        // custom x assertion, same table.
+        let cfg: ChecksConfig = toml::from_str(
+            r#"
+[[custom]]
+name = "orders check"
+sql = "SELECT 0"
+threshold = 0
+[[assertions]]
+table = "orders"
+name = "orders_check"
+type = "not_null"
+column = "id"
+"#,
+        )
+        .unwrap();
+        let names = resolved_check_names_for_table(&cfg, kinds, "orders", &[]);
+        let collisions = resolved_check_name_collisions(&names);
+        assert_eq!(
+            collisions.len(),
+            1,
+            "custom x assertion must collide: {collisions:?}"
+        );
+        assert_eq!(collisions[0].2, "orders_check");
+
+        // null_rate x assertion, same table.
+        let cfg: ChecksConfig = toml::from_str(
+            r#"
+null_rate = { columns = ["id"], threshold = 0.1 }
+[[assertions]]
+table = "orders"
+name = "null.rate.id"
+type = "not_null"
+column = "email"
+"#,
+        )
+        .unwrap();
+        let names = resolved_check_names_for_table(&cfg, kinds, "orders", &[]);
+        let collisions = resolved_check_name_collisions(&names);
+        assert_eq!(
+            collisions.len(),
+            1,
+            "null_rate x assertion must collide: {collisions:?}"
+        );
+        assert_eq!(collisions[0].2, "null_rate_id");
+
+        // assertion x assertion, same table, both named the same.
+        let cfg: ChecksConfig = toml::from_str(
+            r#"
+[[assertions]]
+table = "orders"
+name = "dup"
+type = "not_null"
+column = "id"
+[[assertions]]
+table = "orders"
+name = "dup"
+type = "not_null"
+column = "email"
+"#,
+        )
+        .unwrap();
+        let names = resolved_check_names_for_table(&cfg, kinds, "orders", &[]);
+        let collisions = resolved_check_name_collisions(&names);
+        assert_eq!(
+            collisions.len(),
+            1,
+            "assertion x assertion must collide: {collisions:?}"
+        );
+        assert_eq!(collisions[0].2, "dup");
+    }
+
+    /// A collision between two TABLE-INDEPENDENT producers (custom and
+    /// `null_rate`) is refused at `validate_checks` time, naming both
+    /// sources and the shared sanitized name — before discovery has run.
+    ///
+    /// Mutation that must turn this red: drop the `table_independent`
+    /// collision loop from `validate_checks`.
+    #[test]
+    fn validate_checks_refuses_a_table_independent_collision() {
+        let cfg = parse(
+            r#"
+[adapter]
+type = "duckdb"
+path = "x.duckdb"
+
+[pipeline.repl]
+strategy = "full_refresh"
+
+[pipeline.repl.source.schema_pattern]
+prefix = "src__"
+separator = "__"
+components = ["source"]
+
+[pipeline.repl.target]
+catalog_template = "wh"
+schema_template = "raw__{source}"
+
+[pipeline.repl.checks.null_rate]
+columns = ["amount"]
+threshold = 0.1
+
+[[pipeline.repl.checks.custom]]
+name = "null rate amount"
+sql = "SELECT 0"
+threshold = 0
+"#,
+        );
+        let errors = validate_checks(&cfg);
+        let found = errors.iter().find(|e| {
+            matches!(
+                e,
+                ConfigError::DuplicateCheckName { sanitized, .. } if sanitized == "null_rate_amount"
+            )
+        });
+        assert!(
+            found.is_some(),
+            "a table-independent collision must be refused: {errors:?}"
+        );
+        if let Some(ConfigError::DuplicateCheckName {
+            pipeline,
+            source_a,
+            source_b,
+            ..
+        }) = found
+        {
+            assert_eq!(pipeline, "repl", "must name the offending pipeline");
+            let sources = [source_a.as_str(), source_b.as_str()];
+            assert!(
+                sources.iter().any(|s| s.contains("null rate amount")),
+                "must name the custom-check source: {sources:?}"
+            );
+            assert!(
+                sources.iter().any(|s| s.contains("null_rate:amount")),
+                "must name the null_rate source: {sources:?}"
+            );
+        }
+    }
+
+    /// Two UNNAMED `expression` assertions on the same table both
+    /// synthesize the SAME name (`resolved_name()` -> `"expression:-"` for
+    /// both, since neither has a `column`), so the collision message must
+    /// not print the identical string twice — the reader would have no way
+    /// to tell WHICH two assertions collide. `describe_resolved_check_name`
+    /// appends each side's 1-based per-table assertion index to disambiguate
+    /// (#1941 review finding).
+    ///
+    /// Mutation that must turn this red: drop the `detail` field, or stop
+    /// populating it in `resolved_check_names_for_table`'s assertion loop,
+    /// or stop appending it in `describe_resolved_check_name`.
+    #[test]
+    fn validate_checks_disambiguates_two_unnamed_assertions_colliding() {
+        let cfg = parse(
+            r#"
+[adapter]
+type = "duckdb"
+path = "x.duckdb"
+
+[pipeline.repl]
+strategy = "full_refresh"
+
+[pipeline.repl.source.schema_pattern]
+prefix = "src__"
+separator = "__"
+components = ["source"]
+
+[pipeline.repl.target]
+catalog_template = "wh"
+schema_template = "raw__{source}"
+
+[[pipeline.repl.checks.assertions]]
+table = "orders"
+type = "expression"
+expression = "amount > 0"
+
+[[pipeline.repl.checks.assertions]]
+table = "orders"
+type = "expression"
+expression = "quantity > 0"
+"#,
+        );
+        let errors = validate_checks(&cfg);
+        let found = errors.iter().find(|e| {
+            matches!(
+                e,
+                ConfigError::DuplicateCheckName { sanitized, .. } if sanitized == "expression__"
+            )
+        });
+        assert!(
+            found.is_some(),
+            "two unnamed assertions colliding must be refused: {errors:?}"
+        );
+        if let Some(ConfigError::DuplicateCheckName {
+            source_a, source_b, ..
+        }) = found
+        {
+            assert_ne!(
+                source_a, source_b,
+                "the two sides must be distinguishable, not the identical string twice"
+            );
+            assert!(
+                source_a.contains('1') || source_b.contains('1'),
+                "one side must be identified as assertion #1: {source_a} / {source_b}"
+            );
+            assert!(
+                source_a.contains('2') || source_b.contains('2'),
+                "one side must be identified as assertion #2: {source_a} / {source_b}"
+            );
+        }
     }
 
     #[test]
@@ -10320,17 +11597,47 @@ schema_template = "raw__{{source}}"
         };
 
         // Values an operator legitimately writes, including a template whose
-        // placeholder is resolved later from schema identifiers.
+        // placeholder is resolved later from schema identifiers. This list is
+        // also the accepted-examples block on the `[pipeline.NAME]` reference
+        // page, so a change here has to change that page too.
         for ok in [
             "NULL",
             "'rocky'",
+            "1",
             "CURRENT_TIMESTAMP",
             "current_timestamp()",
+            "CAST('x' AS VARCHAR)",
             "'{source}'",
+            "CONCAT('{tenant}', '_', '{source}')",
         ] {
             let errors = validate_metadata_columns(&cfg_with(ok));
             assert!(errors.is_empty(), "{ok} must be accepted: {errors:?}");
         }
+
+        // An UNQUOTED placeholder. The reference page tells operators to quote
+        // them and says the refusal is a PARSE failure, so pin the reason and
+        // not only the refusal.
+        let errors = validate_metadata_columns(&cfg_with("{tenant}"));
+        assert!(
+            matches!(
+                errors.as_slice(),
+                [ConfigError::MetadataColumnValueRefused { reason, .. }]
+                    if reason.contains("does not parse as a single SQL expression")
+            ),
+            "an unquoted placeholder must be refused as unparseable, got {errors:?}"
+        );
+        // The advice beside that refusal describes THIS field (#1959). The
+        // validator is shared with `[checks.assertions]`, whose advice says
+        // "one boolean expression"; a metadata column value is a scalar, and
+        // the accepted list above has no boolean in it.
+        let [ConfigError::MetadataColumnValueRefused { reason, .. }] = errors.as_slice() else {
+            unreachable!("pinned by the assertion above");
+        };
+        assert!(
+            reason.contains("A metadata column value is one scalar expression")
+                && !reason.contains("boolean"),
+            "the refusal must explain a column value, not a check: {reason}"
+        );
 
         // An off-allowlist function. The name is ordinary on purpose: the rule
         // is "not on the allowlist", not "looks dangerous".
@@ -14291,6 +15598,202 @@ x_token = "EXTRA-SECRET"
                     "database": "ANALYTICS",
                 },
             })
+        );
+    }
+}
+
+#[cfg(test)]
+mod default_parity {
+    use super::*;
+
+    /// A config struct carrying `#[serde(default = "..."]` on any field must
+    /// implement `Default` BY HAND, and that impl must agree with the
+    /// attributes.
+    ///
+    /// The failure this catches is silent and asymmetric. A parent field
+    /// declared `#[serde(default)]` takes two different routes:
+    ///
+    /// ```text
+    /// [table] present, empty  ->  serde walks the fields
+    ///                             -> #[serde(default = "f")] applies, f() runs
+    /// [table] absent          ->  serde calls T::default()
+    ///                             -> a DERIVED Default cannot see the
+    ///                                attributes, so every field is its Rust
+    ///                                zero value
+    /// ```
+    ///
+    /// So a derived `Default` makes an absent table mean something different
+    /// from an empty one. `ChecksConfig` had exactly that: absent turned
+    /// `fail_on_error` off (#1924).
+    ///
+    /// **Compared via `Debug`, not JSON, on purpose.** A field with
+    /// `skip_serializing_if` is missing from the serialized form, so a JSON
+    /// comparison cannot see a mismatch in it — `ChecksConfig`'s own
+    /// `cross_source_overlap` is such a field. `Debug` prints every field.
+    ///
+    /// **The list is maintained by hand, and it started incomplete.** The
+    /// first version named the twelve types the report mentioned. A reviewer's
+    /// brace-depth scan of the workspace found six more that both implement
+    /// `Default` and carry a `#[serde(default = "...")]` field. Four joined the
+    /// list — `QuarantineConfig` from this very file, plus
+    /// `ComparisonThresholds`, `StateRetentionConfig` and `ShadowConfig`. All
+    /// were already correct, so there was no second bug, but they were not
+    /// covered.
+    ///
+    /// The other two are outside the class, and the distinction is the point:
+    ///
+    /// ```text
+    /// PreviewConfig   has a REQUIRED field, so it cannot deserialize from
+    ///                 `{}` and therefore cannot be a defaulted table at all.
+    ///                 Asserted separately below.
+    /// LoadOptions     lives in `rocky-adapter-sdk`, which neither depends on
+    ///                 this crate nor is depended on by it, so it cannot be
+    ///                 named here. It has its own copy of this test beside it.
+    /// ```
+    ///
+    /// Note also what `#[serde(default)]` on an `Option<T>` does NOT do: absent
+    /// gives `None`, never `T::default()`. `QuarantineConfig` reaches this list
+    /// on its own merits, not through `checks.quarantine`.
+    ///
+    /// A struct not named here is still not covered. An automatic version
+    /// would have to attribute every `#[serde(default = "...")]` to its
+    /// enclosing struct, which needs brace-depth tracking rather than a grep,
+    /// and a scan that silently matches nothing reads exactly like a scan that
+    /// passes. The real fix is to make the derive unavailable on such a struct;
+    /// until then, adding a name here is cheap and a guard that lies is not.
+    #[test]
+    fn manual_default_matches_serde_default_for_every_config_with_field_defaults() {
+        macro_rules! assert_parity {
+            ($($t:ty),+ $(,)?) => {
+                $(
+                    {
+                        let from_rust = format!("{:?}", <$t>::default());
+                        let from_serde = format!(
+                            "{:?}",
+                            serde_json::from_str::<$t>("{}").unwrap_or_else(|e| panic!(
+                                "{} must deserialize from an empty object, or an \
+                                 absent table could not use its defaults at all: {e}",
+                                stringify!($t)
+                            ))
+                        );
+                        assert_eq!(
+                            from_rust,
+                            from_serde,
+                            "{}: `Default::default()` disagrees with deserializing \
+                             an empty object, so an ABSENT table means something \
+                             different from an EMPTY one. Implement `Default` by \
+                             hand, calling the same `default_*` functions the \
+                             serde attributes name.",
+                            stringify!($t)
+                        );
+                    }
+                )+
+            };
+        }
+
+        assert_parity!(
+            AiSection,
+            BranchApprovalConfig,
+            ChecksConfig,
+            CostSection,
+            ExecutionConfig,
+            IdempotencyConfig,
+            LoadOptionsConfig,
+            ResilienceConfig,
+            RetryConfig,
+            ReuseConfig,
+            ScheduleDefaultsConfig,
+            StateConfig,
+            // Found by a reviewer's workspace scan, not by the report.
+            QuarantineConfig,
+            crate::compare::ComparisonThresholds,
+            crate::retention::StateRetentionConfig,
+            crate::shadow::ShadowConfig,
+        );
+
+        // `crate::preview::PreviewConfig` is deliberately NOT above. It has a
+        // REQUIRED field, `branch`, so it cannot deserialize from `{}` at all —
+        // which means it can never be the target of a `#[serde(default)]` field
+        // without an empty table becoming a parse error. Adding it to the list
+        // fails the precondition rather than the comparison, which is a
+        // different statement than this test makes.
+        //
+        // Pinned here so that making it a defaulted table stops being silent:
+        assert!(
+            serde_json::from_str::<crate::preview::PreviewConfig>("{}").is_err(),
+            "PreviewConfig gained a default for every field. If it is now the \
+             target of a `#[serde(default)]` field, move it into the list above \
+             — an absent table would call `Default::default()` and could \
+             disagree with an empty one."
+        );
+    }
+
+    /// The user-visible symptom, through the real TOML surface rather than
+    /// through `Default` directly.
+    ///
+    /// Omitting `[checks]` used to switch the gate off: `fail_on_error` came
+    /// back `false` and `anomaly_threshold_pct` `0`, while declaring the table
+    /// and leaving it empty gave `true` and `50`.
+    #[test]
+    fn an_absent_checks_table_gives_the_same_defaults_as_an_empty_one() {
+        // Lifted from `duckdb_without_kind_validates_as_both_roles` rather
+        // than hand-built: a fixture invented for this test can be the wrong
+        // shape and still look right.
+        let base = r#"
+[adapter.local]
+type = "duckdb"
+
+[pipeline.poc]
+type = "replication"
+strategy = "full_refresh"
+
+[pipeline.poc.source]
+adapter = "local"
+
+[pipeline.poc.source.schema_pattern]
+prefix = "raw__"
+separator = "__"
+components = ["source"]
+
+[pipeline.poc.source.discovery]
+adapter = "local"
+
+[pipeline.poc.target]
+adapter = "local"
+catalog_template = "poc"
+schema_template = "demo"
+"#;
+        let absent: RockyConfig = toml::from_str(base).expect("parses without [checks]");
+        let declared: RockyConfig = toml::from_str(&format!("{base}\n[pipeline.poc.checks]\n"))
+            .expect("parses with an empty [checks]");
+
+        let absent = absent
+            .pipelines
+            .get("poc")
+            .expect("the pipeline is present")
+            .checks()
+            .clone();
+        let declared = declared
+            .pipelines
+            .get("poc")
+            .expect("the pipeline is present")
+            .checks()
+            .clone();
+
+        assert_eq!(
+            format!("{absent:?}"),
+            format!("{declared:?}"),
+            "omitting [checks] must mean the same as declaring it empty"
+        );
+        assert!(
+            absent.fail_on_error,
+            "omitting [checks] must not switch the failure gate off"
+        );
+        assert_eq!(
+            absent.anomaly_threshold_pct,
+            default_anomaly_threshold_pct(),
+            "omitting [checks] must not zero the anomaly threshold, which \
+             disables detection"
         );
     }
 }

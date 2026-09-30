@@ -38,10 +38,6 @@ class OptimizeOutput(BaseModel):
     """
 
     command: str
-    incrementality_note: str | None = None
-    """
-    Hint pointing users to `rocky compile --output json` for inferred incrementality recommendations on `full_refresh` models. Only populated when the optimize command detects that compile-time analysis could provide additional optimization opportunities.
-    """
     message: str | None = None
     recommendations: list[OptimizeRecommendation]
     total_models_analyzed: conint(ge=0)
