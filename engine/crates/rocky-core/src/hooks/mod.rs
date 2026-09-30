@@ -868,6 +868,7 @@ async fn execute_hook(hook: &HookConfig, json: &str) -> Result<(), HookError> {
     for (k, v) in &hook.env {
         cmd.env(k, v);
     }
+    crate::process::strip_dagster_pipes_env(cmd.as_std_mut());
 
     let mut child = cmd.spawn()?;
 
@@ -1037,6 +1038,24 @@ mod tests {
     }
 
     // -- Fire tests (async) --
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn hook_child_does_not_receive_pipes_environment() {
+        let hook = HookConfig {
+            command: "test -z \"$DAGSTER_PIPES_CONTEXT\" && test -z \"$DAGSTER_PIPES_MESSAGES\" && test -z \"$DAGSTER_PIPES_EXTRA\"".into(),
+            timeout_ms: 5000,
+            on_failure: FailureAction::Abort,
+            env: HashMap::from([
+                ("DAGSTER_PIPES_CONTEXT".into(), "outer".into()),
+                ("DAGSTER_PIPES_MESSAGES".into(), "outer".into()),
+                ("DAGSTER_PIPES_EXTRA".into(), "outer".into()),
+            ]),
+        };
+        execute_hook(&hook, "{}")
+            .await
+            .expect("hook must see no Pipes environment");
+    }
 
     #[tokio::test]
     async fn test_fire_successful_command() {

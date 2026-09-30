@@ -194,6 +194,12 @@ types. In the run viewer they arrive as `MaterializationEvent`s, carrying
 strategy, duration_ms, rows_copied, sql_hash, and partition_key, plus
 `AssetCheckEvaluation`s.
 
+If your own code starts a subprocess inside a Pipes run, that subprocess
+inherits `DAGSTER_PIPES_*` variables by default. Remove all variables with
+that prefix from its environment unless the child is meant to speak on the
+same Pipes channel. Rocky removes them from processes it starts itself,
+including hooks and fulfillment workers.
+
 Returns a `PipesClientCompletedInvocation`. Call `.get_results()` to
 extract the materialization events Dagster built from the Pipes
 messages.
@@ -243,6 +249,12 @@ The current engine emission is **batch at end of run**. Events emit right
 before the JSON output payload, not as each table completes. A future
 engine release can move to per-event streaming without changing the wire
 protocol or any consumer.
+
+If Dagster closes the messages channel after receiving `opened`, Rocky logs
+subsequent write errors but does not cancel the run. Warehouse writes can
+continue while Dagster receives no further events. A run that needs strict
+observation should monitor the Rocky process and reconcile its final result
+and warehouse state after a lost channel.
 
 ## RockyComponent default
 

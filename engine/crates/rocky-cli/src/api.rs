@@ -2965,10 +2965,7 @@ async fn execute_job_subprocess(
         }
     };
 
-    let mut cmd = tokio::process::Command::new(exe);
-    for arg in job_subprocess_args(kind, config_path.as_deref(), &state_path, &request) {
-        cmd.arg(arg);
-    }
+    let mut cmd = job_subprocess_command(exe, kind, config_path.as_deref(), &state_path, &request);
 
     let output = match cmd.output().await {
         Ok(output) => output,
@@ -2999,6 +2996,21 @@ async fn execute_job_subprocess(
         };
         (JobState::Failed, result, Some(msg))
     }
+}
+
+fn job_subprocess_command(
+    exe: std::path::PathBuf,
+    kind: JobKind,
+    config_path: Option<&std::path::Path>,
+    state_path: &std::path::Path,
+    request: &JobRequest,
+) -> tokio::process::Command {
+    let mut cmd = tokio::process::Command::new(exe);
+    rocky_core::process::strip_dagster_pipes_env(cmd.as_std_mut());
+    for arg in job_subprocess_args(kind, config_path, state_path, request) {
+        cmd.arg(arg);
+    }
+    cmd
 }
 
 /// `GET /api/v1/jobs/{id}` — job status, with the embedded canonical result once
@@ -3060,6 +3072,47 @@ mod tests {
     use super::*;
     use std::io::Write;
     use std::path::PathBuf;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn serve_job_child_does_not_inherit_pipes_environment() {
+        use std::os::unix::fs::PermissionsExt;
+        const KEY: &str = "DAGSTER_PIPES_SERVE_PROBE";
+        struct Restore(Option<std::ffi::OsString>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                // SAFETY: restore this test's unique environment variable.
+                unsafe {
+                    match self.0.take() {
+                        Some(value) => std::env::set_var(KEY, value),
+                        None => std::env::remove_var(KEY),
+                    }
+                }
+            }
+        }
+        let _restore = Restore(std::env::var_os(KEY));
+        // SAFETY: no other test reads this probe variable.
+        unsafe { std::env::set_var(KEY, "outer") };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let probe = dir.path().join("probe.sh");
+        std::fs::write(
+            &probe,
+            "#!/bin/sh\nprintf '%s' \"$DAGSTER_PIPES_SERVE_PROBE\"\n",
+        )
+        .expect("write probe");
+        std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o700))
+            .expect("chmod probe");
+        let mut command = job_subprocess_command(
+            probe,
+            JobKind::Run,
+            None,
+            &dir.path().join("state.redb"),
+            &JobRequest::default(),
+        );
+        let output = command.output().await.expect("spawn serve job child");
+        assert!(output.status.success());
+        assert!(output.stdout.is_empty(), "serve child inherited Pipes");
+    }
 
     use rocky_server::auth::{ServeToken, is_safe_method};
 

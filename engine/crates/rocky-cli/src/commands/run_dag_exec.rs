@@ -229,6 +229,9 @@ pub async fn run_with_dag(
     // keeps the historical unbounded fan-out.
     node_concurrency: Option<u32>,
 ) -> Result<()> {
+    // Seed nodes do not pass through run(), so reject broken Pipes before
+    // the DAG can execute any node.
+    crate::pipes::PipesEmitter::validate_requested()?;
     // Under `-o json` the orchestrator contract is that stdout is exactly one
     // JSON document (the `DagRunOutput` below). Sub-runs are dispatched with
     // `json = false` so they don't each emit their own JSON payload, which

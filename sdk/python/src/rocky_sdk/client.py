@@ -383,6 +383,13 @@ class RockyClient:
     # Binary resolution + version gate                                   #
     # ------------------------------------------------------------------ #
 
+    @staticmethod
+    def _rocky_env() -> dict[str, str]:
+        """Keep an outer Dagster Pipes launch out of ordinary Rocky calls."""
+        return {
+            key: value for key, value in os.environ.items() if not key.startswith("DAGSTER_PIPES_")
+        }
+
     def _resolve_binary(self) -> str:
         """Resolve and memoize the path to the rocky binary.
 
@@ -411,6 +418,7 @@ class RockyClient:
         try:
             result = subprocess.run(
                 [binary, "--version"],
+                env=self._rocky_env(),
                 capture_output=True,
                 text=True,
                 check=False,
@@ -727,7 +735,7 @@ class RockyClient:
 
         # Inherit the parent environment and force-suppress engine deprecation
         # notices (operator-overridable via setdefault).
-        rocky_env = os.environ.copy()
+        rocky_env = self._rocky_env()
         rocky_env.setdefault("ROCKY_SUPPRESS_DEPRECATION", "1")
         popen_kwargs: dict[str, object] = {
             "stdout": subprocess.PIPE,

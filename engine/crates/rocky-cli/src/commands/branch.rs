@@ -370,7 +370,9 @@ fn git_identity() -> Result<(String, Option<String>)> {
 }
 
 fn run_git_config(key: &str) -> Result<String> {
-    let output = ProcessCommand::new("git")
+    let mut command = ProcessCommand::new("git");
+    rocky_core::process::strip_dagster_pipes_env(&mut command);
+    let output = command
         .args(["config", "--get", key])
         .output()
         .with_context(|| format!("invoking `git config --get {key}`"))?;

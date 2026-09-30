@@ -395,7 +395,9 @@ fn bench_sql_gen(iterations: usize) -> Result<Vec<BenchResult>> {
 
 fn bench_startup(iterations: usize) -> Vec<BenchResult> {
     let times = measure(iterations.min(5), || {
-        let _ = std::process::Command::new("cargo")
+        let mut command = std::process::Command::new("cargo");
+        rocky_core::process::strip_dagster_pipes_env(&mut command);
+        let _ = command
             .args(["run", "-q", "-p", "rocky", "--", "--version"])
             .output();
     });

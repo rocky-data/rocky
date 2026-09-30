@@ -3160,6 +3160,23 @@ fn main() -> Result<()> {
     reset_sigpipe();
 
     let cli = Cli::parse();
+    // A Pipes writer must receive EPIPE as a Rust error. With SIG_DFL,
+    // Dagster closing its stream would kill this process before the run
+    // releases its idempotency claim. Keep the ordinary CLI pipe behavior
+    // above for help/version and commands that never open a Pipes channel.
+    #[cfg(unix)]
+    if std::env::var_os(rocky_cli::pipes::ENV_PIPES_CONTEXT).is_some()
+        && matches!(
+            &cli.command,
+            Command::Run { .. }
+                | Command::Apply { .. }
+                | Command::Snapshot { .. }
+                | Command::Fulfill { .. }
+        )
+    {
+        // SAFETY: this runs before the Tokio runtime and its threads exist.
+        unsafe { libc::signal(libc::SIGPIPE, libc::SIG_IGN) };
+    }
     // Resolve the effective output format: an explicit `--output` always wins;
     // otherwise TTY-detect (table at a terminal, json when piped). Computed
     // here because `json` feeds both `init_tracing` and the miette hook.
@@ -3352,6 +3369,19 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
     let _remote_parent = rocky_observe::tracing_setup::adopt_remote_parent();
 
     let config_path = cli.config.clone();
+
+    // Apply can write policy state before its run reaches PipesEmitter::detect.
+    // DAG seeds bypass that detector, and watch absorbs iteration errors.
+    // Validate these binary entry points before any of those paths begin.
+    if matches!(
+        &cli.command,
+        Command::Run { .. }
+            | Command::Apply { .. }
+            | Command::Snapshot { .. }
+            | Command::Fulfill { .. }
+    ) {
+        rocky_cli::pipes::PipesEmitter::validate_requested()?;
+    }
 
     // Resolve `--state-path` once so every command below sees the same
     // canonical location. When the caller didn't pass `--state-path`

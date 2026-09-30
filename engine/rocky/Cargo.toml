@@ -44,6 +44,8 @@ libc = "0.2"
 [dev-dependencies]
 duckdb = { workspace = true }
 tempfile = "3"
+base64 = { workspace = true }
+flate2 = { workspace = true }
 # `replay_check` integration test seeds a state store through the production
 # ledger APIs (build_records + record_reuse_spine + record_artifact) before
 # spawning the binary, so the reachability proof exercises the real read path.

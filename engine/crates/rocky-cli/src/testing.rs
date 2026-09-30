@@ -302,19 +302,14 @@ impl SqlDialect for RecordingDialect {
 }
 
 /// Serialises every test in this crate that mutates `DAGSTER_PIPES_CONTEXT`
-/// / `DAGSTER_PIPES_MESSAGES` — `pipes::tests`, `commands::run_local::tests`,
-/// and `commands::run_audit::tests` all read or set one or both, and
+/// / `DAGSTER_PIPES_MESSAGES` and every Pipes-detecting entry point. The
+/// `pipes` and `run_audit` tests set them, and
 /// `cargo test` runs a crate's tests in parallel threads within ONE process
 /// by default, so env vars are shared, process-global state across all of
-/// them. Each of those three modules used to keep its OWN private lock,
-/// which serialised its own tests against each other but not against the
-/// other two files — `commands::run_audit::tests`' own doc comment even
-/// asserted "the remaining engine test suite doesn't read these particular
-/// env vars in parallel", which a real run of `commands::run_local::tests`'
-/// new #2166 tests (long-running: real DuckDB I/O between setting the env
-/// vars and the code under test reading them) promptly falsified —
-/// corrupted, interleaved JSON in a captured messages file, not a
-/// hypothetical.
+/// them. Earlier file-local locks did not protect callers in other test
+/// modules. `PipesEmitter::requested_channel` and audit detection now take
+/// this lock on reads too; a test already holding it can re-enter on the
+/// same thread while setting its fixture.
 ///
 /// A panic in one env-mutating test (deliberate, in a mutation-check)
 /// poisons this lock for every test after it in the same run; the lock
@@ -323,10 +318,29 @@ impl SqlDialect for RecordingDialect {
 /// guard instead of unwrapping it.
 pub(crate) static PIPES_ENV_LOCK: Mutex<()> = Mutex::new(());
 
-pub(crate) fn lock_pipes_env() -> std::sync::MutexGuard<'static, ()> {
-    PIPES_ENV_LOCK
+thread_local! {
+    static HOLDS_PIPES_ENV_LOCK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub(crate) struct PipesEnvGuard(Option<std::sync::MutexGuard<'static, ()>>);
+
+impl Drop for PipesEnvGuard {
+    fn drop(&mut self) {
+        if self.0.is_some() {
+            HOLDS_PIPES_ENV_LOCK.with(|held| held.set(false));
+        }
+    }
+}
+
+pub(crate) fn lock_pipes_env() -> PipesEnvGuard {
+    if HOLDS_PIPES_ENV_LOCK.with(std::cell::Cell::get) {
+        return PipesEnvGuard(None);
+    }
+    let guard = PIPES_ENV_LOCK
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    HOLDS_PIPES_ENV_LOCK.with(|held| held.set(true));
+    PipesEnvGuard(Some(guard))
 }
 
 /// A warehouse adapter that wraps a real in-memory DuckDB adapter but fails

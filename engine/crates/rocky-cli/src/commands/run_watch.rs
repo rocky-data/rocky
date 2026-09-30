@@ -72,6 +72,9 @@ pub async fn run_watch(
     // watch iteration's `run()`. Default OFF ⇒ unchanged watch behavior.
     skip_opts: &super::run::SkipRunOptions,
 ) -> Result<()> {
+    // The watch loop logs iteration errors and keeps running. Refuse an
+    // unusable Pipes channel before entering that loop.
+    crate::pipes::PipesEmitter::validate_requested()?;
     // -------------------------------------------------------------------
     // Resolve watcher scope.
     //

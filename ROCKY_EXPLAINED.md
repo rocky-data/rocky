@@ -1011,7 +1011,8 @@ startup (pipes.rs): it checks that DAGSTER_PIPES_CONTEXT is set,
 and decodes DAGSTER_PIPES_MESSAGES as base64+zlib-encoded JSON
 saying where to write messages, usually {"path": "…"} — the exact
 shape dagster_pipes.decode_param produces. A payload it cannot
-decode is a warning, and Rocky falls back to plain output.
+decode fails the command before pipeline work begins. Rocky also
+refuses a missing or unsupported message channel.
 Rocky emits structured messages (asset materialization events,
 check results, metadata) to that channel as JSON lines.
 Dagster reads them back in real time.

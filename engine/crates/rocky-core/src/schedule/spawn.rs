@@ -215,7 +215,12 @@ impl SubprocessSpawner {
 
     fn build_command(request: &SpawnRequest) -> tokio::process::Command {
         let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("rocky"));
+        Self::build_command_for_exe(request, exe)
+    }
+
+    fn build_command_for_exe(request: &SpawnRequest, exe: PathBuf) -> tokio::process::Command {
         let mut cmd = tokio::process::Command::new(exe);
+        crate::process::strip_dagster_pipes_env(cmd.as_std_mut());
         // Discard the child's stdout: the child runs with `--output json`, so its
         // own `RunOutput` would otherwise be inherited onto the tick's stdout and
         // corrupt the tick's `--output json` document (two JSON payloads on one
@@ -496,6 +501,52 @@ impl Spawner for CapturingSpawner {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn scheduler_child_does_not_inherit_pipes_environment() {
+        use std::os::unix::fs::PermissionsExt;
+        const KEY: &str = "DAGSTER_PIPES_SCHEDULE_PROBE";
+        struct Restore(Option<std::ffi::OsString>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                // SAFETY: restore this test's unique environment variable.
+                unsafe {
+                    match self.0.take() {
+                        Some(value) => std::env::set_var(KEY, value),
+                        None => std::env::remove_var(KEY),
+                    }
+                }
+            }
+        }
+        let _restore = Restore(std::env::var_os(KEY));
+        // SAFETY: no other test reads this probe variable.
+        unsafe { std::env::set_var(KEY, "outer") };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let probe = dir.path().join("probe.sh");
+        std::fs::write(
+            &probe,
+            "#!/bin/sh\nprintf '%s' \"$DAGSTER_PIPES_SCHEDULE_PROBE\"\n",
+        )
+        .expect("write probe");
+        std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o700))
+            .expect("chmod probe");
+        let request = SpawnRequest {
+            pipeline: "raw".into(),
+            config_path: dir.path().join("rocky.toml"),
+            state_path: dir.path().join("state.redb"),
+            submission_id: "probe".into(),
+            trace_context: None,
+            timeout: None,
+            trigger: RunTriggerKind::Schedule,
+        };
+        let mut command = SubprocessSpawner::build_command_for_exe(&request, probe);
+        // Production discards scheduler stdout. Capture the same child for this probe.
+        command.stdout(std::process::Stdio::piped());
+        let output = command.output().await.expect("spawn scheduler child");
+        assert!(output.status.success());
+        assert!(output.stdout.is_empty(), "scheduler child inherited Pipes");
+    }
 
     /// A drain raised BEFORE the spawner runs must not start a child at all.
     /// The reconciler checks the drain before it gets here, so a shutdown landing

@@ -2726,6 +2726,10 @@ pub async fn run_with_explicit_contracts(
     reviewed_source_state: Option<(&str, &[crate::output::ReplicationConnectorSnapshot])>,
     contracts_dir: Option<&Path>,
 ) -> Result<RunTermination> {
+    // Refuse a broken Dagster Pipes launch before an idempotency claim, state
+    // session, hook, or warehouse statement can run.
+    crate::pipes::PipesEmitter::validate_requested()?;
+
     // This first explicit-contract route is deliberately model-only. Validate
     // it before the idempotency claim, state session, adapter, or warehouse
     // work. In particular, an old idempotency key must never skip reading a
@@ -2854,6 +2858,17 @@ pub async fn run_with_explicit_contracts(
         None => None,
     };
 
+    let pipes = match crate::pipes::PipesEmitter::detect() {
+        Ok(pipes) => pipes,
+        Err(error) => {
+            finalize_idempotency_on_error(&mut idempotency_ctx, state_path, &run_id).await;
+            return Err(error);
+        }
+    };
+    if let Some(p) = &pipes {
+        p.log("INFO", "rocky run starting");
+    }
+
     // WP-01 PR-B (stage 2a): the replication path's remote-state lifecycle
     // owner. Declared OUTSIDE the `run_result` body so both terminal consumers
     // can take it: the happy path finalizes inside the block (terminal upload
@@ -2887,16 +2902,6 @@ pub async fn run_with_explicit_contracts(
     // one-shot (takes the ctx out of the `Option`); if that already fired,
     // the wrapper's error-path finalize is a no-op.
     let run_result: Result<()> = async {
-
-    // Detect Dagster Pipes mode. When the parent process is a Dagster
-    // job that launched us via PipesSubprocessClient, both
-    // DAGSTER_PIPES_CONTEXT and DAGSTER_PIPES_MESSAGES are set; we
-    // emit structured events on the messages channel as the run
-    // progresses. Outside Pipes mode, this is a no-op.
-    let pipes = crate::pipes::PipesEmitter::detect();
-    if let Some(p) = &pipes {
-        p.log("INFO", "rocky run starting");
-    }
 
     // The caller's threaded snapshot (formerly a second disk load — #1120).
     // The fingerprint was captured over the exact bytes THIS config parsed
