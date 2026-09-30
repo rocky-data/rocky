@@ -680,6 +680,13 @@
         "metadata": {
           "$ref": "#/definitions/MaterializationMetadata"
         },
+        "notes": {
+          "description": "Operator-visible actions taken while materializing this model.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
         "partition": {
           "anyOf": [
             {

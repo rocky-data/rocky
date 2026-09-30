@@ -491,7 +491,8 @@ fn default_microbatch_granularity() -> TimeGrain {
 #[derive(Debug, Clone, Deserialize)]
 pub struct RawModelConfig {
     pub name: Option<String>,
-    /// Explicit permission to replace a target of this existing kind.
+    /// Standing permission to drop a target of this existing kind during a
+    /// view/full-refresh switch. DROP + CREATE is not atomic on every warehouse.
     #[serde(default)]
     pub drop_existing_kind: Option<DropExistingKind>,
     #[serde(default)]

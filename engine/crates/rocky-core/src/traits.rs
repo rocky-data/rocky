@@ -445,6 +445,23 @@ pub trait WarehouseAdapter: Send + Sync {
             .map(|()| ExecutionStats::default())
     }
 
+    /// Execute a kind switch in one transaction when supported. `None` means
+    /// the caller must issue DROP and CREATE separately. If CREATE fails,
+    /// the adapter rolls back the DROP before returning an error. A failed
+    /// COMMIT can leave target state uncertain and must say so in its error.
+    async fn atomic_drop_and_create(
+        &self,
+        _drop_sql: &str,
+        _create_sql: &str,
+    ) -> AdapterResult<Option<ExecutionStats>> {
+        Ok(None)
+    }
+
+    /// Whether `object_kind` can distinguish table from view on this adapter.
+    fn supports_object_kind_probe(&self) -> bool {
+        false
+    }
+
     /// Classify an error this adapter returned into a run-loop
     /// [`FailureClass`](crate::failure_class::FailureClass).
     ///

@@ -8,6 +8,11 @@
       "type": "string",
       "description": "Model name (defaults to file name stem if omitted)"
     },
+    "drop_existing_kind": {
+      "type": "string",
+      "enum": ["table", "view"],
+      "description": "Standing permission to drop this existing target kind when switching between full_refresh and view. DuckDB only; other warehouses may not support atomic replacement."
+    },
     "depends_on": {
       "type": "array",
       "items": { "type": "string" },

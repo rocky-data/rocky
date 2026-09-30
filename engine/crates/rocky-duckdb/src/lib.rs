@@ -32,6 +32,18 @@ pub enum DuckDbError {
     /// `concat_batches` against a schema mismatch).
     #[error("Arrow error: {0}")]
     Arrow(String),
+
+    #[error("DuckDB rolled back the DROP after the kind switch failed: {0}")]
+    KindSwitchRolledBack(duckdb::Error),
+
+    #[error("DuckDB kind switch failed: {cause}; rollback also failed: {rollback}")]
+    KindSwitchRollbackFailed {
+        cause: Box<duckdb::Error>,
+        rollback: Box<duckdb::Error>,
+    },
+
+    #[error("DuckDB kind switch COMMIT failed; target state is uncertain: {0}")]
+    KindSwitchCommitUncertain(duckdb::Error),
 }
 
 /// Query result matching the structure of rocky-databricks QueryResult.
@@ -186,6 +198,32 @@ impl DuckDbConnector {
         debug!(sql = sql, "executing DuckDB statement");
         self.conn.execute_batch(sql)?;
         Ok(())
+    }
+
+    /// Keep both DDL statements on the same connection and roll back either
+    /// failure before another adapter call can acquire the connection lock.
+    pub fn atomic_drop_and_create(
+        &self,
+        drop_sql: &str,
+        create_sql: &str,
+    ) -> Result<(), DuckDbError> {
+        self.conn.execute_batch("BEGIN TRANSACTION")?;
+        let result = self
+            .conn
+            .execute_batch(drop_sql)
+            .and_then(|()| self.conn.execute_batch(create_sql));
+        if let Err(cause) = result {
+            return match self.conn.execute_batch("ROLLBACK") {
+                Ok(()) => Err(DuckDbError::KindSwitchRolledBack(cause)),
+                Err(rollback) => Err(DuckDbError::KindSwitchRollbackFailed {
+                    cause: Box::new(cause),
+                    rollback: Box::new(rollback),
+                }),
+            };
+        }
+        self.conn
+            .execute_batch("COMMIT")
+            .map_err(DuckDbError::KindSwitchCommitUncertain)
     }
 
     /// Execute `sql` via DuckDB's native `query_arrow` and return a single

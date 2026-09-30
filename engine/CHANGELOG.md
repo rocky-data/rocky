@@ -70,6 +70,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **New branch names now use 1–64 ASCII letters, digits, or underscores at every unquoted SQL-backed entry point.** Invalid names fail before config or state I/O. Git-derived preview names use underscores. `branch compare` reports unreadable counts as null with an error reason instead of inventing zero. The preview action defaults to `pr_<PR number>_<head slug>` within the 64-character limit, so separate PRs cannot replace the same preview schema through slug collisions. Legacy names can still be listed, shown, approved, and promoted; deleting a branch record leaves warehouse tables and does not revoke an already persisted promote plan. (#2137)
 
 - **A model can switch between `view` and `full_refresh` with an explicit per-model drop permission.** Set `drop_existing_kind = "view"` or `"table"` in its sidecar to name the existing kind Rocky may remove. A known mismatch without matching permission still names the needed `DROP`; an unknown kind never triggers a drop. The run reports the removed target and the new kind. (#2037)
+- **A model kind switch now keeps the old DuckDB object if creation fails.** Rocky carries the permission from `.rocky` sidecars, generates SQL before any drop, reports a successful drop in run JSON, and gives DROP advice only for a confirmed mismatch. The permission is refused on adapters without a kind probe. (#2037)
 
 ### Added
 

@@ -348,6 +348,7 @@ mod tests {
     fn sample_mat() -> MaterializationOutput {
         MaterializationOutput {
             asset_key: vec!["main".into(), "orders".into()],
+            notes: vec![],
             rows_copied: None,
             duration_ms: 1,
             started_at: chrono::Utc::now(),

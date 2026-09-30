@@ -53,9 +53,12 @@ The `.toml` file names the model, lists what it depends on, picks a materializat
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `name` | string | Yes | Model identifier. Must be unique across all models. |
+| `drop_existing_kind` | `"table"` or `"view"` | No | Standing permission to drop a target of this existing kind when switching between `full_refresh` and `view`. DuckDB only today. |
 | `depends_on` | list of strings | No | Names of upstream models that must run before this one. Defaults to `[]`. |
 | `group` | string | No | Name of a [config group](#config-groups) (`models/groups/<name>.toml`) this model opts into for shared routing and materialization. |
 | `retention` | string | No | Data retention policy for this model. Grammar `^\d+[dy]$` — e.g. `"90d"` or `"1y"`. See [Retention](#retention). |
+
+`drop_existing_kind` applies only when a `full_refresh` model finds a view, or a `view` model finds a table. Rocky checks the existing kind before using the permission. On DuckDB, the DROP and CREATE run in one transaction. DROP and CREATE are not atomic on every warehouse. The key is a standing permission on the model, not a one-time approval. Rocky keeps no ownership record for the old object; confirm the target belongs to this model before setting the key.
 
 **`[args]`** -- Placeholder values for a config group's `schema_template` (only meaningful when the model declares a `group`):
 

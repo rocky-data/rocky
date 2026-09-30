@@ -143,6 +143,30 @@ impl WarehouseAdapter for DuckDbWarehouseAdapter {
         .map_err(|e| join_error(&e))?
     }
 
+    fn supports_object_kind_probe(&self) -> bool {
+        true
+    }
+
+    async fn atomic_drop_and_create(
+        &self,
+        drop_sql: &str,
+        create_sql: &str,
+    ) -> AdapterResult<Option<rocky_core::traits::ExecutionStats>> {
+        let conn = Arc::clone(&self.connector);
+        let drop_sql = drop_sql.to_string();
+        let create_sql = create_sql.to_string();
+        spawn_blocking(move || {
+            let conn = conn
+                .lock()
+                .map_err(|e| AdapterError::msg(format!("mutex poisoned: {e}")))?;
+            conn.atomic_drop_and_create(&drop_sql, &create_sql)
+                .map_err(AdapterError::new)?;
+            Ok(Some(rocky_core::traits::ExecutionStats::default()))
+        })
+        .await
+        .map_err(|e| join_error(&e))?
+    }
+
     async fn execute_query(&self, sql: &str) -> AdapterResult<QueryResult> {
         let conn = Arc::clone(&self.connector);
         let sql = sql.to_string();

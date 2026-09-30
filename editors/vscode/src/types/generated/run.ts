@@ -469,6 +469,10 @@ export interface MaterializationOutput {
   job_ids?: string[];
   metadata: MaterializationMetadata;
   /**
+   * Operator-visible actions taken while materializing this model.
+   */
+  notes?: string[];
+  /**
    * Partition window this materialization targeted, present only when the model's strategy is `time_interval`. `None` for unpartitioned strategies (full_refresh, incremental, merge).
    */
   partition?: PartitionInfo | null;
