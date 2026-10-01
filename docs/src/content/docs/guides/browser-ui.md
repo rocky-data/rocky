@@ -9,8 +9,6 @@ sidebar:
 
 ![A tour of the Rocky browser UI: the estate with its DAG, the review queue, an agent's breaking change awaiting a human, the governor brief, a model's custody chain, and a data product's journal](/demo-ui-tour.gif)
 
-The screenshots and the tour above come from the current release, which still groups the screens under a header of three lanes. The sidebar described below arrives in the next release. No address changed, so every link on this page works in both.
-
 The UI ships inside the release binaries and the container image. A sidebar lists eleven areas. Five open a screen today:
 
 ```
