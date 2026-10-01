@@ -19,7 +19,7 @@ Three steps from this directory.
 2. Put a project in `./project`: a `rocky.toml` and a `models/` directory. To try the example with the sample DuckDB project instead, let the image scaffold one:
 
    ```bash
-   docker run --rm -v "$PWD:/data" ghcr.io/rocky-data/rocky:1.74.0 playground project
+   docker run --rm -v "$PWD:/data" ghcr.io/rocky-data/rocky:1.75.0 playground project
    ```
 
 3. Start it and read the address the server prints:
@@ -36,7 +36,7 @@ Open that address. The token travels in the URL fragment, which never reaches th
 
 | Line in `compose.yaml` | Why |
 |---|---|
-| `image: ${ROCKY_IMAGE:-ghcr.io/rocky-data/rocky:1.74.0}` | A version tag, pinned. `latest` moves on every release; a version tag never does. `ROCKY_IMAGE` in `.env` overrides it. |
+| `image: ${ROCKY_IMAGE:-ghcr.io/rocky-data/rocky:1.75.0}` | A version tag, pinned. `latest` moves on every release; a version tag never does. `ROCKY_IMAGE` in `.env` overrides it. |
 | `command: serve --host 0.0.0.0 --ui --scheduler` | Inside a container the server must bind every interface to be reachable through the published port. `--ui` serves the browser UI. `--scheduler` runs every pipeline's `[schedule]` in-process. |
 | `ROCKY_SERVE_TOKEN`, `ROCKY_SERVE_TOKEN_SCOPE=read-only` | A non-loopback bind needs a token, and `--ui` needs the read-only scope, so a leaked browser token cannot reach a mutating route. |
 | `ROCKY_WEBHOOK_SECRET` | `--ui --scheduler` refuses to start without it. The scheduler's webhook route authenticates with this secret, not with the bearer token. |

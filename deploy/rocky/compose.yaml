@@ -19,7 +19,7 @@ services:
     # Pin the version tag you run. `latest` moves on every release; a
     # version tag never does. ROCKY_IMAGE overrides it (a locally built
     # image, for one) without editing this file.
-    image: ${ROCKY_IMAGE:-ghcr.io/rocky-data/rocky:1.74.0}
+    image: ${ROCKY_IMAGE:-ghcr.io/rocky-data/rocky:1.75.0}
 
     # `--host 0.0.0.0`: inside a container the server must bind every
     # interface to be reachable through the published port; the port mapping

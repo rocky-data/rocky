@@ -55,7 +55,7 @@ initContainers: []
 # ---------------------------------------------------------------------------
 serve:
   # The browser UI. Needs an engine release carrying `--ui` and `--allowed-host`:
-  # 1.74.0 and later, which is the chart's appVersion. Off means the API alone.
+  # 1.74.0 and later. The chart's appVersion is 1.75.0. Off means the API alone.
   # With scheduling.mode=resident the UI also needs existingSecret.webhookSecretKey.
   ui:
     enabled: true
