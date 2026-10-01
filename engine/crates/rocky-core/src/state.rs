@@ -955,6 +955,9 @@ pub enum StateError {
          drop a replicated table"
     )]
     UnknownSnapshotTable(String),
+
+    #[error("run progress {run_id:?} is missing; refusing to confirm its watermarks")]
+    MissingRunProgress { run_id: String },
 }
 
 impl From<redb::TransactionError> for StateError {
@@ -1128,6 +1131,23 @@ pub fn force_schema_version(path: &Path, version: &str) {
     }
     txn.commit().expect("commit schema-version stamp");
     // `store` drops here, releasing the advisory lock.
+}
+
+/// Seed a legacy or invalid progress header for recovery tests.
+/// Existing per-table entries take precedence over its inline `tables`, so
+/// callers should use a fresh run ID. Production initialization is unchanged.
+#[cfg(any(test, feature = "test-support"))]
+pub fn force_run_progress_header(
+    store: &StateStore,
+    progress: &RunProgress,
+) -> Result<(), StateError> {
+    let bytes = serde_json::to_vec(progress)?;
+    let txn = store.db.begin_write()?;
+    {
+        let mut table = txn.open_table(RUN_PROGRESS)?;
+        table.insert(progress.run_id.as_str(), bytes.as_slice())?;
+    }
+    store.commit_write(txn)
 }
 
 /// Outcome of [`StateStore::init_db`].
@@ -1919,6 +1939,48 @@ impl StateStore {
             for (key, watermark) in entries {
                 let bytes = serde_json::to_vec(*watermark)?;
                 table.insert(*key, bytes.as_slice())?;
+            }
+        }
+        self.commit_write(txn)?;
+        Ok(entries.len())
+    }
+
+    /// Commit watermarks and the runs they fully account for atomically.
+    ///
+    /// The caller must reconcile every recovery table before naming a run:
+    /// a failed target-MAX capture produces no deferred watermark and cannot
+    /// be confirmed merely because the available queue was flushed. Empty
+    /// entries still confirm runs whose recovery found empty targets.
+    pub fn batch_set_watermarks_and_confirm_runs(
+        &self,
+        entries: &[(&str, &WatermarkState)],
+        run_ids: &[&str],
+    ) -> Result<usize, StateError> {
+        if entries.is_empty() && run_ids.is_empty() {
+            return Ok(0);
+        }
+        let txn = self.db.begin_write()?;
+        {
+            let mut table = txn.open_table(WATERMARKS)?;
+            for (key, watermark) in entries {
+                let bytes = serde_json::to_vec(*watermark)?;
+                table.insert(*key, bytes.as_slice())?;
+            }
+        }
+        {
+            let mut table = txn.open_table(RUN_PROGRESS)?;
+            for run_id in run_ids {
+                let mut progress: RunProgress = match table.get(*run_id)? {
+                    Some(value) => serde_json::from_slice(value.value())?,
+                    None => {
+                        return Err(StateError::MissingRunProgress {
+                            run_id: (*run_id).to_string(),
+                        });
+                    }
+                };
+                progress.watermarks_confirmed = true;
+                let bytes = serde_json::to_vec(&progress)?;
+                table.insert(*run_id, bytes.as_slice())?;
             }
         }
         self.commit_write(txn)?;
@@ -3263,6 +3325,20 @@ impl std::fmt::Display for ResumeTarget {
     }
 }
 
+/// The incremental copy decision recorded before warehouse writes begin.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct WatermarkRecoveryTable {
+    pub source: rocky_ir::TableRef,
+    pub target: rocky_ir::TableRef,
+    pub timestamp_column: String,
+    /// `None` preserves the missing-watermark full-refresh decision.
+    pub prior_watermark: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+fn watermarks_unconfirmed(confirmed: &bool) -> bool {
+    !confirmed
+}
+
 /// Progress for an entire run (collection of table progresses).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RunProgress {
@@ -3285,6 +3361,14 @@ pub struct RunProgress {
     /// identical to pre-v30.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub planned_tables: Option<Vec<String>>,
+    /// Set in the same transaction as the watermark flush. Older headers
+    /// default to unconfirmed without changing the state-schema namespace.
+    #[serde(default, skip_serializing_if = "watermarks_unconfirmed")]
+    pub watermarks_confirmed: bool,
+    /// `None` means legacy recovery metadata is unavailable; `Some([])` is
+    /// an explicitly recorded plan with no incremental recovery tables.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub watermark_recovery_tables: Option<Vec<WatermarkRecoveryTable>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -3874,6 +3958,27 @@ impl StateStore {
         planned_tables: &[String],
         scope: Option<&ResumeScope>,
     ) -> Result<(), StateError> {
+        self.init_run_progress_inner(run_id, planned_tables, scope, None)
+    }
+
+    /// Initialize progress with the recovery plan before executing a copy.
+    pub fn init_run_progress_with_recovery(
+        &self,
+        run_id: &str,
+        planned_tables: &[String],
+        scope: Option<&ResumeScope>,
+        recovery_tables: &[WatermarkRecoveryTable],
+    ) -> Result<(), StateError> {
+        self.init_run_progress_inner(run_id, planned_tables, scope, Some(recovery_tables))
+    }
+
+    fn init_run_progress_inner(
+        &self,
+        run_id: &str,
+        planned_tables: &[String],
+        scope: Option<&ResumeScope>,
+        recovery_tables: Option<&[WatermarkRecoveryTable]>,
+    ) -> Result<(), StateError> {
         let progress = RunProgress {
             run_id: run_id.to_string(),
             started_at: chrono::Utc::now(),
@@ -3881,6 +3986,8 @@ impl StateStore {
             tables: Vec::new(),
             scope: scope.cloned(),
             planned_tables: Some(planned_tables.to_vec()),
+            watermarks_confirmed: false,
+            watermark_recovery_tables: recovery_tables.map(<[_]>::to_vec),
         };
         let bytes = serde_json::to_vec(&progress)?;
         let txn = self.db.begin_write()?;
@@ -4044,6 +4151,51 @@ impl StateStore {
             progress.tables = entries;
         }
         Ok(Some(progress))
+    }
+
+    /// Read all unconfirmed runs that may have written this physical target.
+    ///
+    /// Unlike strict resume matching, changing a filter or routing template
+    /// must not hide an older interrupted run. Source differences and legacy
+    /// unknown targets are returned too; the caller must validate their
+    /// concrete recovery targets and refuse incompatible recovery before copy.
+    pub fn list_unconfirmed_run_progress_for_recovery_scope(
+        &self,
+        scope: &ResumeScope,
+    ) -> Result<Vec<RunProgress>, StateError> {
+        let txn = self.db.begin_read()?;
+        let headers = txn.open_table(RUN_PROGRESS)?;
+        let entries = txn.open_table(RUN_PROGRESS_ENTRIES)?;
+        let mut result = Vec::new();
+        for entry in headers.iter()? {
+            let (_, value) = entry?;
+            let mut progress: RunProgress = serde_json::from_slice(value.value())?;
+            if progress.watermarks_confirmed
+                || !progress.scope.as_ref().is_some_and(|recorded| {
+                    recorded.pipeline == scope.pipeline
+                        && match (&recorded.target, &scope.target) {
+                            (Some(recorded), Some(current)) => {
+                                recorded.endpoint == current.endpoint
+                            }
+                            // A legacy target cannot prove it belongs elsewhere.
+                            _ => true,
+                        }
+                })
+            {
+                continue;
+            }
+            let table_entries = Self::read_progress_entries(&entries, &progress.run_id)?;
+            if !table_entries.is_empty() {
+                progress.tables = table_entries;
+            }
+            result.push(progress);
+        }
+        result.sort_by(|a, b| {
+            a.started_at
+                .cmp(&b.started_at)
+                .then(a.run_id.cmp(&b.run_id))
+        });
+        Ok(result)
     }
 }
 
@@ -4234,20 +4386,33 @@ impl StateStore {
     ) -> Result<Vec<String>, StateError> {
         let txn = self.db.begin_read()?;
         let table = txn.open_table(RUN_HISTORY)?;
-        let mut entries: Vec<(String, chrono::DateTime<chrono::Utc>)> = Vec::new();
+        let progress = txn.open_table(RUN_PROGRESS)?;
+        let mut entries = Vec::new();
         for entry in table.iter()? {
             let (key, value) = entry?;
             let run: RunRecord = serde_json::from_slice(value.value())?;
-            entries.push((key.value().to_string(), run.started_at));
+            let pending_recovery = match progress.get(key.value())? {
+                Some(value) => {
+                    let header: RunProgress = serde_json::from_slice(value.value())?;
+                    !header.watermarks_confirmed
+                        && header
+                            .watermark_recovery_tables
+                            .is_some_and(|tables| !tables.is_empty())
+                }
+                None => false,
+            };
+            entries.push((key.value().to_string(), run.started_at, pending_recovery));
         }
         // Newest first; the first `min_keep` are protected unconditionally.
-        entries.sort_by_key(|(_, ts)| std::cmp::Reverse(*ts));
+        entries.sort_by_key(|(_, ts, _)| std::cmp::Reverse(*ts));
 
         let to_delete: Vec<String> = entries
             .into_iter()
             .skip(min_keep)
-            .filter(|(_, ts)| *ts < cutoff)
-            .map(|(key, _)| key)
+            // Recovery intent is correctness state, not disposable history.
+            // Its cursor may still be stale even after the history age limit.
+            .filter(|(_, ts, pending_recovery)| *ts < cutoff && !pending_recovery)
+            .map(|(key, _, _)| key)
             .collect();
         Ok(to_delete)
     }
@@ -10158,6 +10323,315 @@ mod tests {
 
     // --- Checkpoint / resume tests ---
 
+    fn recovery_table(prior_watermark: Option<chrono::DateTime<Utc>>) -> WatermarkRecoveryTable {
+        WatermarkRecoveryTable {
+            source: rocky_ir::TableRef {
+                catalog: "source".into(),
+                schema: "raw".into(),
+                table: "orders".into(),
+            },
+            target: rocky_ir::TableRef {
+                catalog: "wh".into(),
+                schema: "raw".into(),
+                table: "orders".into(),
+            },
+            timestamp_column: "synced_at".into(),
+            prior_watermark,
+        }
+    }
+
+    #[test]
+    fn recovery_fields_are_additive_and_distinguish_legacy_from_empty_plans() {
+        let blob = serde_json::json!({
+            "run_id": "legacy", "started_at": "2026-09-01T00:00:00Z",
+            "total_tables": 0, "tables": []
+        });
+        let legacy: RunProgress = serde_json::from_value(blob.clone()).unwrap();
+        assert!(!legacy.watermarks_confirmed);
+        assert!(legacy.watermark_recovery_tables.is_none());
+        assert_eq!(serde_json::to_value(legacy).unwrap(), blob);
+
+        let (store, _dir) = temp_store();
+        store
+            .init_run_progress_with_recovery("empty", &[], None, &[])
+            .unwrap();
+        let empty = store.get_run_progress("empty").unwrap().unwrap();
+        assert_eq!(empty.watermark_recovery_tables, Some(vec![]));
+        assert!(!empty.watermarks_confirmed);
+
+        let tables = [recovery_table(Some(Utc::now())), recovery_table(None)];
+        store
+            .init_run_progress_with_recovery("planned", &planned_keys(2), None, &tables)
+            .unwrap();
+        assert_eq!(
+            store
+                .get_run_progress("planned")
+                .unwrap()
+                .unwrap()
+                .watermark_recovery_tables,
+            Some(tables.to_vec())
+        );
+    }
+
+    #[test]
+    fn watermark_confirmation_and_cursor_flush_commit_or_rollback_together() {
+        let (store, dir) = temp_store();
+        for run_id in ["first", "second"] {
+            store
+                .init_run_progress_with_recovery(run_id, &planned_keys(1), None, &[])
+                .unwrap();
+        }
+        let watermark = WatermarkState {
+            last_value: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let epoch = store.write_epoch();
+        let err = store
+            .batch_set_watermarks_and_confirm_runs(
+                &[("wh.raw.orders", &watermark)],
+                &["first", "missing"],
+            )
+            .unwrap_err();
+        assert!(matches!(err, StateError::MissingRunProgress { .. }));
+        assert!(store.get_watermark("wh.raw.orders").unwrap().is_none());
+        assert!(
+            !store
+                .get_run_progress("first")
+                .unwrap()
+                .unwrap()
+                .watermarks_confirmed
+        );
+        assert_eq!(
+            store.write_epoch(),
+            epoch,
+            "rolled-back transaction is not dirty"
+        );
+
+        // A corrupt later header must roll back an earlier confirmation too.
+        let txn = store.db.begin_write().unwrap();
+        {
+            let mut headers = txn.open_table(RUN_PROGRESS).unwrap();
+            headers.insert("corrupt", b"not-json".as_slice()).unwrap();
+        }
+        store.commit_write(txn).unwrap();
+        assert!(matches!(
+            store.batch_set_watermarks_and_confirm_runs(
+                &[("wh.raw.orders", &watermark)],
+                &["first", "corrupt"]
+            ),
+            Err(StateError::Serialization(_))
+        ));
+        assert!(store.get_watermark("wh.raw.orders").unwrap().is_none());
+        assert!(
+            !store
+                .get_run_progress("first")
+                .unwrap()
+                .unwrap()
+                .watermarks_confirmed
+        );
+        let epoch = store.write_epoch();
+
+        assert_eq!(
+            store
+                .batch_set_watermarks_and_confirm_runs(
+                    &[("wh.raw.orders", &watermark)],
+                    &["first", "second"],
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(store.write_epoch(), epoch + 1, "one committed transaction");
+        assert_eq!(
+            store
+                .get_watermark("wh.raw.orders")
+                .unwrap()
+                .unwrap()
+                .last_value,
+            watermark.last_value
+        );
+        for run_id in ["first", "second"] {
+            assert!(
+                store
+                    .get_run_progress(run_id)
+                    .unwrap()
+                    .unwrap()
+                    .watermarks_confirmed
+            );
+        }
+        drop(store);
+        let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
+        assert!(
+            store
+                .get_run_progress("first")
+                .unwrap()
+                .unwrap()
+                .watermarks_confirmed
+        );
+        assert_eq!(
+            store
+                .get_watermark("wh.raw.orders")
+                .unwrap()
+                .unwrap()
+                .last_value,
+            watermark.last_value
+        );
+    }
+
+    #[test]
+    fn empty_watermark_flush_confirms_only_explicitly_accounted_runs() {
+        let (store, _dir) = temp_store();
+        for run_id in ["empty", "failed-max"] {
+            store
+                .init_run_progress_with_recovery(run_id, &planned_keys(1), None, &[])
+                .unwrap();
+        }
+        assert_eq!(
+            store
+                .batch_set_watermarks_and_confirm_runs(&[], &["empty"])
+                .unwrap(),
+            0
+        );
+        assert!(
+            store
+                .get_run_progress("empty")
+                .unwrap()
+                .unwrap()
+                .watermarks_confirmed
+        );
+        assert!(
+            !store
+                .get_run_progress("failed-max")
+                .unwrap()
+                .unwrap()
+                .watermarks_confirmed
+        );
+    }
+
+    #[test]
+    fn recovery_lists_all_old_intents_across_filter_source_and_routing_changes() {
+        let (store, _dir) = temp_store();
+        let current = progress_scope("p1");
+        for run_id in ["old", "new", "confirmed"] {
+            store
+                .init_run_progress(run_id, &planned_keys(1), Some(&current))
+                .unwrap();
+        }
+        store
+            .batch_set_watermarks_and_confirm_runs(&[], &["confirmed"])
+            .unwrap();
+        store
+            .record_table_progress(
+                "old",
+                &progress_entry(0, "wh.raw.orders", TableStatus::Success),
+            )
+            .unwrap();
+
+        let mut changed = current.clone();
+        changed.filter = Some("client=other".into());
+        changed.source = Some(ResumeSource {
+            discovery_adapter: Some("new-source".into()),
+            endpoint: None,
+            catalog: Some("new-catalog".into()),
+            pattern_prefix: "src".into(),
+            pattern_separator: "__".into(),
+            pattern_components: vec![],
+        });
+        let target = changed.target.as_mut().unwrap();
+        target.catalog_template = "different_{tenant}".into();
+        target.schema_template = Some("different_{source}".into());
+        target.shadow = Some(ResumeShadow::Schema("different".into()));
+        store
+            .init_run_progress("changed", &planned_keys(1), Some(&changed))
+            .unwrap();
+
+        let mut legacy = current.clone();
+        legacy.target = None;
+        store
+            .init_run_progress("unknown-target", &planned_keys(1), Some(&legacy))
+            .unwrap();
+        let mut elsewhere = current.clone();
+        elsewhere
+            .target
+            .as_mut()
+            .unwrap()
+            .endpoint
+            .locators
+            .insert("path".into(), "/tmp/other.duckdb".into());
+        store
+            .init_run_progress("elsewhere", &planned_keys(1), Some(&elsewhere))
+            .unwrap();
+        let mut other_adapter = current.clone();
+        other_adapter.target.as_mut().unwrap().adapter = "other-adapter".into();
+        store
+            .init_run_progress("other-adapter", &planned_keys(1), Some(&other_adapter))
+            .unwrap();
+        store
+            .init_run_progress(
+                "other-pipeline",
+                &planned_keys(1),
+                Some(&progress_scope("p2")),
+            )
+            .unwrap();
+
+        let recovered = store
+            .list_unconfirmed_run_progress_for_recovery_scope(&current)
+            .unwrap();
+        let ids: std::collections::BTreeSet<_> =
+            recovered.iter().map(|r| r.run_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["old", "new", "changed", "unknown-target", "other-adapter"]
+                .into_iter()
+                .collect()
+        );
+        let old = recovered.iter().find(|r| r.run_id == "old").unwrap();
+        assert_eq!(old.tables[0].table_key, "wh.raw.orders");
+        // Strict resume remains exact: the changed filter/source/routing is excluded.
+        assert_eq!(
+            store
+                .get_latest_run_progress_for_scope(&changed)
+                .unwrap()
+                .unwrap()
+                .run_id,
+            "changed"
+        );
+    }
+
+    #[test]
+    fn recovery_preserves_legacy_inline_header_entries() {
+        let (store, _dir) = temp_store();
+        let scope = progress_scope("p1");
+        let blob = serde_json::json!({
+            "run_id": "old-inline", "started_at": "2026-09-01T00:00:00Z",
+            "total_tables": 1, "scope": scope,
+            "tables": [progress_entry(0, "wh.raw.orders", TableStatus::Success)]
+        });
+        let bytes = serde_json::to_vec(&blob).unwrap();
+        let txn = store.db.begin_write().unwrap();
+        {
+            let mut headers = txn.open_table(RUN_PROGRESS).unwrap();
+            headers.insert("old-inline", bytes.as_slice()).unwrap();
+        }
+        store.commit_write(txn).unwrap();
+        let progress = store
+            .list_unconfirmed_run_progress_for_recovery_scope(&scope)
+            .unwrap();
+        assert_eq!(progress.len(), 1);
+        assert_eq!(progress[0].tables[0].table_key, "wh.raw.orders");
+        store
+            .batch_set_watermarks_and_confirm_runs(&[], &["old-inline"])
+            .unwrap();
+        assert_eq!(
+            store
+                .get_run_progress("old-inline")
+                .unwrap()
+                .unwrap()
+                .tables
+                .len(),
+            1
+        );
+    }
+
     #[test]
     fn test_init_and_get_run_progress() {
         let (store, _dir) = temp_store();
@@ -10953,6 +11427,8 @@ mod tests {
             ],
             scope: None,
             planned_tables: None,
+            watermarks_confirmed: false,
+            watermark_recovery_tables: None,
         };
         let bytes = serde_json::to_vec(&legacy).unwrap();
         {
@@ -12328,6 +12804,52 @@ mod tests {
         for r in &remaining {
             assert!(r.run_id.starts_with("recent-"));
         }
+    }
+
+    #[test]
+    fn sweep_retention_keeps_pending_recovery_until_atomic_confirmation() {
+        let (store, _dir) = temp_store();
+        let old = Utc::now() - chrono::Duration::days(700);
+        for run_id in ["pending", "confirmed", "empty", "legacy"] {
+            store.record_run(&run_at(run_id, old)).unwrap();
+            if run_id == "legacy" {
+                store.init_run_progress(run_id, &[], None).unwrap();
+            } else {
+                let tables = if run_id == "empty" {
+                    Vec::new()
+                } else {
+                    vec![recovery_table(Some(old))]
+                };
+                store
+                    .init_run_progress_with_recovery(run_id, &[], None, &tables)
+                    .unwrap();
+            }
+        }
+        store
+            .batch_set_watermarks_and_confirm_runs(&[], &["confirmed"])
+            .unwrap();
+        let policy = StateRetentionConfig {
+            max_age_days: 30,
+            min_runs_kept: 0,
+            applies_to: vec![StateRetentionDomain::History],
+            ..StateRetentionConfig::default()
+        };
+        let dry = store.sweep_retention_dry_run(&policy).unwrap();
+        assert_eq!((dry.runs_deleted, dry.runs_kept), (3, 1));
+        let report = store.sweep_retention(&policy).unwrap();
+        assert_eq!((report.runs_deleted, report.runs_kept), (3, 1));
+        assert!(store.get_run("pending").unwrap().is_some());
+        assert!(store.get_run_progress("pending").unwrap().is_some());
+        let watermark = WatermarkState {
+            last_value: old,
+            updated_at: Utc::now(),
+        };
+        store
+            .batch_set_watermarks_and_confirm_runs(&[("wh.raw.orders", &watermark)], &["pending"])
+            .unwrap();
+        assert_eq!(store.sweep_retention(&policy).unwrap().runs_deleted, 1);
+        assert!(store.get_run_progress("pending").unwrap().is_none());
+        assert!(store.get_watermark("wh.raw.orders").unwrap().is_some());
     }
 
     /// A swept run record takes its checkpoint with it — the `run_progress`

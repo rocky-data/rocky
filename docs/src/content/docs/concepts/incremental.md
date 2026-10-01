@@ -45,8 +45,8 @@ The strategy needs a timestamp column whose values only ever increase, typically
         ▼                    ▼                    ▼
   watermark = 09:45    watermark = 10:55    watermark = 11:55
 
-  Each watermark is written to the state store only after the copy
-  succeeds. A failed copy leaves the previous watermark in place.
+  Rocky flushes watermarks after copying. A committed copy whose
+  watermark flush fails leaves recovery intent for the next attempt.
 ```
 
 Rocky keys the watermark by the fully qualified table name (`catalog.schema.table`), and stores the maximum timestamp it saw in the batch.
@@ -73,6 +73,78 @@ timestamp_column = "_fivetran_synced"
 ```
 
 The timestamp column must exist in the source table, and its values must only increase. If the source system backfills history with old timestamps, a watermark run misses those rows. Partition checksums, below, catch that case.
+
+### Recovering an interrupted replication
+
+For DuckDB, Databricks, Snowflake, and BigQuery, Rocky records recovery intent
+before copying. It records the source, target, timestamp column, and prior
+watermark. These adapters commit each INSERT atomically.
+Snowflake recovery requires a pinned database or catalog. Fresh runs with an
+unpinned session-default namespace warn and disable recovery.
+
+```text
+record intent -> publish remote intent -> copy -> capture target MAX
+                                                  |
+                               flush watermarks + confirm intent
+
+unconfirmed intent -> read target MAX -> repair watermark -> next copy
+```
+
+An immediate retry reconciles its target before appending again. A fresh run
+reconciles earlier unconfirmed runs before copying or pruning unchanged tables.
+Changing a filter cannot hide an older run. Rocky commits recovered watermarks
+and their confirmation together.
+History cleanup keeps new unresolved recovery records until confirmation, even
+when they exceed the configured history age limit.
+
+A missing watermark still selects full refresh. A missing target clears its
+watermark so Rocky recreates it. A failed recovery query stops the replay.
+Trino and process adapters do not use target-MAX recovery.
+
+Rocky refuses recovery when it cannot verify an older source or timestamp
+contract. Run the affected tables with `strategy = "full_refresh"` without a
+resume flag, then restore their incremental strategy. Keep the state file;
+deleting it also deletes the evidence Rocky needs to explain the interrupted run.
+Legacy checkpoints do not preserve their original source and timestamp contracts.
+An unchanged configuration hash cannot prove discovery still selects the same
+source table. Include every originally planned target in a full-refresh recovery
+run, even when the configuration did not change. Missing cursors can select
+that full-refresh bootstrap automatically. A legacy checkpoint missing its planned
+target set remains unresolved after full refresh. Keep full refresh and seek manual
+recovery support before returning to incremental mode.
+
+Keep `timestamp_column` configured for the source you are restoring. Recovery
+replacements establish its target MAX before confirmation, so returning to
+incremental mode cannot inherit a cursor ahead of the source.
+
+Remote backends publish intent before INSERT using their configured upload
+policy and concurrency checks. With `on_upload_failure = "skip"`, Rocky warns
+and continues after an unavailable upload. Recovery then depends on preserving
+the local ledger. Losing that ledger before a successful upload removes the
+fresh-pod recovery guarantee. Set `on_upload_failure = "fail"` when remote
+durability is required. Governed runs require durable publication too.
+
+Serialize runs that append to the same targets. State compare-and-swap detects
+ledger conflicts; it does not lock warehouse tables against concurrent writers.
+Upgrade every writer before relying on this recovery protocol. Older binaries
+do not reconcile the new recovery descriptors.
+Wait for earlier warehouse statements to finish, or cancel them, before retrying
+after an ambiguous transport failure.
+
+### Resuming after every table copied
+
+Rocky refuses `--resume` and `--resume-latest` when every planned table copied
+but the terminal run record is missing. Skipping those tables would also skip
+their post-copy checks and could report false success.
+
+Follow the recovery route in the refusal. A confirmed checkpoint allows a fresh
+run without a resume flag to execute checks. Supported recovery descriptors also
+allow a fresh run to reconcile watermarks before copying.
+
+Older or unsupported checkpoints require full refresh. Keep that strategy until
+the saved incremental cursor matches the replacement target. Switching back to
+incremental with a wall-clock refresh cursor can skip later source arrivals.
+Incomplete crash checkpoints remain resumable.
 
 ## Merge strategy
 

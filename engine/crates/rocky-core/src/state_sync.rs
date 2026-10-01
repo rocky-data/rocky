@@ -1118,6 +1118,86 @@ impl RemoteStateSession {
         }
     }
 
+    /// Publish the pre-copy recovery plan without consuming this session.
+    ///
+    /// Returns `true` only when the checkpoint is durable (the local backend
+    /// needs no upload). A configured `skip` transport failure returns `false`:
+    /// losing the local ledger then also loses this recovery evidence. Strict
+    /// or governed runs propagate failures before any warehouse write.
+    ///
+    /// Call before starting the periodic uploader. Under CAS, only a committed
+    /// upload advances this session's base; a conflict is never refreshed or
+    /// swallowed. The snapshot uses the same filtering and remote key as the
+    /// terminal upload, while the live store remains open.
+    pub async fn publish_checkpoint(
+        &mut self,
+        store: &StateStore,
+        durability: FinalizeDurability,
+    ) -> Result<bool, StateSyncError> {
+        if !self.acquired || self.periodic.is_some() {
+            return Err(StateSyncError::Io(std::io::Error::other(
+                "publish_checkpoint requires an acquired session before periodic uploads start",
+            )));
+        }
+        let cfg = match (self.durability, durability) {
+            (FinalizeDurability::Durable, _) | (_, FinalizeDurability::Durable) => StateConfig {
+                on_upload_failure: StateUploadFailureMode::Fail,
+                ..self.cfg.clone()
+            },
+            (FinalizeDurability::ConfigDefault, FinalizeDurability::ConfigDefault) => {
+                self.cfg.clone()
+            }
+        };
+        let suppression = self.suppress_reason.or_else(|| {
+            if !self.authority.is_usable() {
+                Some("non-authoritative state download")
+            } else if store.was_recreated_for_forward_incompat() {
+                Some("forward-incompatible state recreation")
+            } else {
+                None
+            }
+        });
+        if let Some(reason) = suppression {
+            let err = StateSyncError::Io(std::io::Error::other(format!(
+                "recovery checkpoint publication suppressed: {reason}"
+            )));
+            apply_upload_failure_policy(&cfg, Err(err))?;
+            return Ok(false);
+        }
+        if matches!(cfg.backend, StateBackend::Local) {
+            return Ok(true);
+        }
+
+        let scratch = ScratchGuard::new();
+        let excluded = crate::state::local_only_table_names(self.replicate_schema_cache);
+        if let Err(err) = store.snapshot_to_excluding(scratch.path(), excluded) {
+            apply_upload_failure_policy(&cfg, Err(err.into()))?;
+            return Ok(false);
+        }
+        let remote_key = remote_state_key(&self.state_path);
+        let result = if self.cas_enabled() {
+            match dispatch_upload_cas(&cfg, scratch.path(), &remote_key, self.base.as_ref()).await {
+                Ok(PutIfMatchOutcome::Committed(generation)) => {
+                    self.base = Some(generation);
+                    Ok(())
+                }
+                Ok(PutIfMatchOutcome::Conflict) => {
+                    Err(StateSyncError::CasConflict { key: remote_key })
+                }
+                Err(err) => Err(err),
+            }
+        } else {
+            dispatch_upload(&cfg, scratch.path(), &remote_key).await
+        };
+        match result {
+            Ok(()) => Ok(true),
+            Err(err) => {
+                apply_upload_failure_policy(&cfg, Err(err))?;
+                Ok(false)
+            }
+        }
+    }
+
     /// Start the owned mid-run periodic uploader over a **`Weak`** handle to the
     /// live [`StateStore`], dirty-gated on its [`write_epoch`][StateStore::write_epoch].
     ///
@@ -5285,6 +5365,331 @@ mod tests {
     fn seed_state_file(path: &Path) {
         let store = StateStore::open(path).expect("seed session state file");
         drop(store);
+    }
+
+    #[tokio::test]
+    async fn session_checkpoint_publishes_live_plan_and_advances_cas_base_before_finalize() {
+        test_support::clear();
+        let provider = ObjectStoreProvider::in_memory();
+        let _guard = test_support::install(provider.clone());
+        let dir = TempDir::new().unwrap();
+        let local = dir
+            .path()
+            .join(crate::state::STATE_NAMESPACE_DIR)
+            .join("recovery.redb");
+        std::fs::create_dir_all(local.parent().unwrap()).unwrap();
+        let mut cfg = s3_session_config(StateUploadFailureMode::Fail);
+        cfg.concurrency_control = ConcurrencyControl::Cas;
+        let mut session =
+            RemoteStateSession::new(&cfg, &local, FinalizeDurability::ConfigDefault, false);
+        assert_eq!(session.acquire().await.unwrap(), StateAuthority::FreshStart);
+        let store = StateStore::open(&local).unwrap();
+        store
+            .write_schema_cache_entry(
+                "local-cache",
+                &crate::schema_cache::SchemaCacheEntry {
+                    columns: vec![],
+                    cached_at: chrono::Utc::now(),
+                },
+            )
+            .unwrap();
+        let recovery = crate::state::WatermarkRecoveryTable {
+            source: rocky_ir::TableRef {
+                catalog: "source".into(),
+                schema: "raw".into(),
+                table: "orders".into(),
+            },
+            target: rocky_ir::TableRef {
+                catalog: "wh".into(),
+                schema: "raw".into(),
+                table: "orders".into(),
+            },
+            timestamp_column: "synced_at".into(),
+            prior_watermark: Some(chrono::Utc::now()),
+        };
+        store
+            .init_run_progress_with_recovery(
+                "planned",
+                &["wh.raw.orders".into()],
+                None,
+                std::slice::from_ref(&recovery),
+            )
+            .unwrap();
+        assert!(
+            session
+                .publish_checkpoint(&store, FinalizeDurability::ConfigDefault)
+                .await
+                .unwrap()
+        );
+        assert!(
+            session.base.is_some(),
+            "a committed bootstrap publication must advance the held base"
+        );
+        assert!(
+            provider
+                .exists(&object_store_state_key("recovery.redb"))
+                .await
+                .unwrap()
+        );
+        assert!(
+            !provider
+                .exists(&object_store_state_key("state.redb"))
+                .await
+                .unwrap()
+        );
+
+        // A fresh pod can recover the plan even if this process dies before
+        // its first periodic tick or final upload, while the live store is open.
+        let other_dir = TempDir::new().unwrap();
+        let restored = other_dir
+            .path()
+            .join(crate::state::STATE_NAMESPACE_DIR)
+            .join("recovery.redb");
+        std::fs::create_dir_all(restored.parent().unwrap()).unwrap();
+        assert_eq!(
+            download_state(&cfg, &restored, false).await.unwrap(),
+            StateAuthority::Authoritative
+        );
+        let restored_store = StateStore::open(&restored).unwrap();
+        assert!(
+            restored_store
+                .read_schema_cache_entry("local-cache")
+                .unwrap()
+                .is_none(),
+            "pre-copy publication must preserve local-only filtering"
+        );
+        let progress = restored_store.get_run_progress("planned").unwrap().unwrap();
+        assert_eq!(progress.watermark_recovery_tables, Some(vec![recovery]));
+        assert!(!progress.watermarks_confirmed);
+        drop(restored_store);
+
+        store
+            .batch_set_watermarks_and_confirm_runs(&[], &["planned"])
+            .unwrap();
+        drop(store);
+        session
+            .finalize()
+            .await
+            .expect("terminal CAS must use the publication's committed base");
+        assert_eq!(
+            download_state(&cfg, &restored, false).await.unwrap(),
+            StateAuthority::Authoritative
+        );
+        assert!(
+            StateStore::open(&restored)
+                .unwrap()
+                .get_run_progress("planned")
+                .unwrap()
+                .unwrap()
+                .watermarks_confirmed
+        );
+        test_support::clear();
+    }
+
+    #[tokio::test]
+    async fn session_checkpoint_cas_conflict_never_advances_or_refreshes_base_under_skip() {
+        test_support::clear();
+        let faults = install_counting_provider();
+        let dir = TempDir::new().unwrap();
+        let local = dir.path().join(".rocky-state.redb");
+        let mut cfg = s3_session_config(StateUploadFailureMode::Skip);
+        cfg.concurrency_control = ConcurrencyControl::Cas;
+        let mut stale =
+            RemoteStateSession::new(&cfg, &local, FinalizeDurability::ConfigDefault, false);
+        assert_eq!(stale.acquire().await.unwrap(), StateAuthority::FreshStart);
+
+        let racer_dir = TempDir::new().unwrap();
+        let racer_path = racer_dir.path().join(".rocky-state.redb");
+        let mut racer =
+            RemoteStateSession::new(&cfg, &racer_path, FinalizeDurability::ConfigDefault, false);
+        assert_eq!(racer.acquire().await.unwrap(), StateAuthority::FreshStart);
+        seed_state_file(&racer_path);
+        racer.finalize().await.unwrap();
+
+        let store = StateStore::open(&local).unwrap();
+        store
+            .init_run_progress_with_recovery("stale-plan", &[], None, &[])
+            .unwrap();
+        let get_count = faults.count(crate::fault_store::FaultOp::Get);
+        let err = stale
+            .publish_checkpoint(&store, FinalizeDurability::ConfigDefault)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StateSyncError::CasConflict { .. }));
+        assert!(
+            stale.base.is_none(),
+            "a conflict cannot advance the acquire base"
+        );
+        assert_eq!(
+            faults.count(crate::fault_store::FaultOp::Get),
+            get_count,
+            "a conflict cannot refresh state"
+        );
+        drop(store);
+        stale.abandon("conflict").await;
+        test_support::clear();
+    }
+
+    #[tokio::test]
+    async fn session_checkpoint_transport_failure_distinguishes_skip_strict_and_governed() {
+        test_support::clear();
+        let faults = install_counting_provider();
+        faults.arm(
+            crate::fault_store::FaultOp::Put,
+            crate::fault_store::FaultMode::FailAll,
+        );
+        for (mode, durability, should_fail) in [
+            (
+                StateUploadFailureMode::Skip,
+                FinalizeDurability::ConfigDefault,
+                false,
+            ),
+            (
+                StateUploadFailureMode::Fail,
+                FinalizeDurability::ConfigDefault,
+                true,
+            ),
+            (
+                StateUploadFailureMode::Skip,
+                FinalizeDurability::Durable,
+                true,
+            ),
+        ] {
+            let dir = TempDir::new().unwrap();
+            let local = dir.path().join(".rocky-state.redb");
+            let mut cfg = s3_session_config(mode);
+            cfg.concurrency_control = ConcurrencyControl::Cas;
+            let mut session = RemoteStateSession::new(&cfg, &local, durability, false);
+            assert_eq!(session.acquire().await.unwrap(), StateAuthority::FreshStart);
+            let store = StateStore::open(&local).unwrap();
+            store
+                .init_run_progress_with_recovery("plan", &[], None, &[])
+                .unwrap();
+            let result = session.publish_checkpoint(&store, durability).await;
+            if should_fail {
+                assert!(result.unwrap_err().to_string().contains("injected fault"));
+            } else {
+                assert!(
+                    !result.unwrap(),
+                    "skipped publication is not durable evidence"
+                );
+            }
+            assert!(
+                session.base.is_none(),
+                "transport failure cannot advance the CAS base"
+            );
+            drop(store);
+            session.abandon("publication failed").await;
+        }
+        test_support::clear();
+    }
+
+    #[tokio::test]
+    async fn session_checkpoint_suppression_does_not_publish_and_governed_refuses_it() {
+        test_support::clear();
+        let faults = install_counting_provider();
+        let dir = TempDir::new().unwrap();
+        let local = dir.path().join(".rocky-state.redb");
+        let mut session = RemoteStateSession::new(
+            &s3_session_config(StateUploadFailureMode::Skip),
+            &local,
+            FinalizeDurability::ConfigDefault,
+            false,
+        );
+        assert_eq!(session.acquire().await.unwrap(), StateAuthority::FreshStart);
+        let store = StateStore::open(&local).unwrap();
+        session.set_suppress_upload("forward-incompatible recreation");
+        assert!(
+            !session
+                .publish_checkpoint(&store, FinalizeDurability::ConfigDefault)
+                .await
+                .unwrap()
+        );
+        assert!(
+            session
+                .publish_checkpoint(&store, FinalizeDurability::Durable)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("publication suppressed")
+        );
+        assert_eq!(faults.count(crate::fault_store::FaultOp::Put), 0);
+        drop(store);
+        session.abandon("suppressed").await;
+        test_support::clear();
+    }
+
+    #[tokio::test]
+    async fn session_checkpoint_non_authoritative_download_never_publishes() {
+        test_support::clear();
+        let faults = install_counting_provider();
+        test_support::arm_object_store_exists_fault();
+        let dir = TempDir::new().unwrap();
+        let local = dir.path().join(".rocky-state.redb");
+        let mut session = RemoteStateSession::new(
+            &s3_session_config(StateUploadFailureMode::Skip),
+            &local,
+            FinalizeDurability::ConfigDefault,
+            false,
+        );
+        assert_eq!(
+            session.acquire().await.unwrap(),
+            StateAuthority::Indeterminate
+        );
+        let store = StateStore::open(&local).unwrap();
+        assert!(
+            !session
+                .publish_checkpoint(&store, FinalizeDurability::ConfigDefault)
+                .await
+                .unwrap()
+        );
+        assert!(
+            session
+                .publish_checkpoint(&store, FinalizeDurability::Durable)
+                .await
+                .is_err()
+        );
+        assert_eq!(faults.count(crate::fault_store::FaultOp::Put), 0);
+        drop(store);
+        session.abandon("non-authoritative state").await;
+        test_support::clear();
+    }
+
+    #[tokio::test]
+    async fn session_checkpoint_local_is_durable_and_publication_precedes_periodic_uploads() {
+        let dir = TempDir::new().unwrap();
+        let local = dir.path().join(".rocky-state.redb");
+        let store = Arc::new(StateStore::open(&local).unwrap());
+        let mut session = RemoteStateSession::new(
+            &StateConfig::default(),
+            &local,
+            FinalizeDurability::Durable,
+            false,
+        );
+        assert!(
+            session
+                .publish_checkpoint(&store, FinalizeDurability::Durable)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            session.acquire().await.unwrap(),
+            StateAuthority::Authoritative
+        );
+        assert!(
+            session
+                .publish_checkpoint(&store, FinalizeDurability::Durable)
+                .await
+                .unwrap()
+        );
+        session.start_periodic_uploader(Arc::downgrade(&store), Duration::from_secs(60));
+        assert!(
+            session
+                .publish_checkpoint(&store, FinalizeDurability::Durable)
+                .await
+                .is_err()
+        );
+        session.abandon("test teardown").await;
     }
 
     fn s3_session_config(on_upload_failure: StateUploadFailureMode) -> StateConfig {

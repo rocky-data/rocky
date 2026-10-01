@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- Incremental replication on DuckDB, Databricks, Snowflake, and BigQuery records recovery intent before copying and reconciles unconfirmed target watermarks before retries or later runs. Watermarks and confirmation commit together, preventing replay after a committed INSERT whose MAX capture or deferred flush failed. Remote intent publication uses the existing authority and CAS policy. Best-effort upload failure still requires a surviving local ledger; strict and governed runs stop before copying. Legacy checkpoints without source descriptors require replacement before appending, even with an unchanged configuration. Complete checkpoints without a terminal run record now refuse resume with recovery guidance, so skipping copied tables cannot skip their checks and report false success. Failed watermark flushes preserve and upload available progress before applying the configured durability exit policy. (#2228)
+
 ## [1.75.0] — 2026-09-30
 
 ### Added

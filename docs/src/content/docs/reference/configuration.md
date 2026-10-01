@@ -635,7 +635,7 @@ Choose where Rocky keeps what it remembers between runs: watermarks, run history
 | `valkey_url` | string | | Valkey/Redis connection URL. Required when `backend` is `"valkey"` or `"tiered"`. |
 | `valkey_prefix` | string | `"rocky:state:"` | Valkey key prefix for state entries. |
 | `transfer_timeout_seconds` | int | `300` | Wall-clock budget for each transfer (upload *or* download). Retries share this budget rather than extending it; raise for large state or slow networks. |
-| `on_upload_failure` | string | `"skip"` | What to do when upload exhausts retries + circuit-breaker. `"skip"` logs a warning and continues (state goes stale, next run re-derives); `"fail"` propagates the error. |
+| `on_upload_failure` | string | `"skip"` | Upload failure policy. `"skip"` warns and continues; recovery requires a surviving local ledger or successfully published recovery intent. `"fail"` propagates the error. Governed runs require durability. |
 | `namespacing` | string | `"none"` | State-file namespacing policy. `"none"` (default) keeps one global state file — byte-identical to a project that omits this key. `"pipeline"` gives each pipeline its own state file (see [State namespacing](#state-namespacing) below). |
 | `concurrency_control` | string | `"off"` | `"off"` (default) uploads unconditionally — last writer wins. `"cas"` makes the end-of-run upload conditional on the remote object still carrying the generation this run downloaded, so a run that lost a cross-pod race fails closed instead of erasing the winner. See [Concurrent writers](#concurrent-writers) below. |
 | `on_schema_mismatch` | string | `"recreate"` | What to do when the binary opens a state store written by a **newer** binary, which happens mid-way through a rolling upgrade. `"recreate"` logs one warning, starts from fresh local state, does one full-refresh run, and never writes the downgraded state back to the shared tier. `"fail"` aborts the open instead. Only the run path honours this; inspection and branch commands always hard-fail on a forward-incompatible store. |
@@ -700,6 +700,15 @@ It needs a backend with a durable object tier: `s3`, `gcs`, or `tiered`. On `loc
 **On `tiered`,** `cas` additionally makes the Valkey tier coherent with the durable object. The compare-and-swap runs against S3 first; only after it commits is the Valkey copy written, stored together with the generation it was committed at. A read may use the cached copy only after confirming that generation is still the durable object's — otherwise it reads S3. So a Valkey write that fails, a process that dies between the two, or a cache entry left over from an earlier run can no longer shadow durable state. Cached copies are held under a separate key from the `off` path's, so a fleet can move pods from `off` to `cas` one at a time.
 
 With `concurrency_control = "off"` the tiered backend keeps its historical behaviour, including the stale-cache window: an `off` write carries no generation, so there is nothing for a read to validate a cached copy against.
+
+Replication publishes recovery intent before copying on supported atomic
+adapters. A failed pre-copy upload with `"fail"` stops before INSERT. With
+`"skip"`, it warns and continues; a fresh pod cannot recover unpublished intent
+after the local ledger disappears. See [Interrupted replication](/concepts/incremental/#recovering-an-interrupted-replication).
+
+A failed watermark flush keeps available progress and attempts its upload.
+Ordinary `"skip"` runs warn and retain their normal exit policy. Explicit
+`"fail"` and governed runs return nonzero after preserving available state.
 
 ### `[state.retry]`
 
