@@ -324,17 +324,6 @@ pub(crate) fn transformation_prod_targets(
         rocky_core::models::StrategyConfig,
     )>,
 > {
-    let parsed_filter = filter.map(parse_filter).transpose()?;
-    if let Some((key, _)) = &parsed_filter
-        && !TRANSFORMATION_FILTER_KEYS.contains(&key.as_str())
-    {
-        anyhow::bail!(
-            "transformation-pipeline `{verb}` does not support `--filter {key}=...`. \
-             Supported keys: {}.",
-            TRANSFORMATION_FILTER_KEYS.join(", ")
-        );
-    }
-
     let models_dir = match crate::models_loader::locate_models_dir(&pipeline.models, config_path)? {
         crate::models_loader::ModelsDir::Present(dir) => dir,
         crate::models_loader::ModelsDir::Absent(dir) => anyhow::bail!(
@@ -354,8 +343,35 @@ pub(crate) fn transformation_prod_targets(
     let all_models =
         crate::models_loader::load_project_models_matching(&models_dir, &models_glob, None)?;
 
+    transformation_prod_targets_from_models(&all_models, filter, verb, include_ephemeral)
+}
+
+/// Select targets from the same loaded model snapshot that promotion compiles.
+pub(crate) fn transformation_prod_targets_from_models(
+    all_models: &[rocky_core::models::Model],
+    filter: Option<&str>,
+    verb: &str,
+    include_ephemeral: bool,
+) -> Result<
+    Vec<(
+        String,
+        rocky_ir::TargetRef,
+        rocky_core::models::StrategyConfig,
+    )>,
+> {
+    let parsed_filter = filter.map(parse_filter).transpose()?;
+    if let Some((key, _)) = &parsed_filter
+        && !TRANSFORMATION_FILTER_KEYS.contains(&key.as_str())
+    {
+        anyhow::bail!(
+            "transformation-pipeline `{verb}` does not support `--filter {key}=...`. \
+             Supported keys: {}.",
+            TRANSFORMATION_FILTER_KEYS.join(", ")
+        );
+    }
+
     let mut targets = Vec::new();
-    for model in &all_models {
+    for model in all_models {
         if !include_ephemeral
             && matches!(
                 model.config.strategy,

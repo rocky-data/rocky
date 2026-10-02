@@ -804,16 +804,33 @@ pub(crate) async fn discover_branch_targets_for_plan(
     let planned =
         discover_branch_targets(config_path, record, filter, Some(&resolved_pipeline_name)).await?;
 
-    let selected: std::collections::HashSet<_> = planned
+    let selected: std::collections::HashMap<_, _> = planned
         .iter()
         .map(|p| {
-            rocky_sql::defer::CollisionIdentity::of(&p.prod.catalog, &p.prod.schema, &p.prod.table)
+            (
+                rocky_sql::defer::CollisionIdentity::of(
+                    &p.prod.catalog,
+                    &p.prod.schema,
+                    &p.prod.table,
+                ),
+                p.prod.full_name(),
+            )
         })
         .collect();
-    let targets = planned
+    let mut nodes = Vec::new();
+    let mut targets = planned
         .into_iter()
         .map(|p| {
             let (statement, production_upstreams) = if let Some(ir) = &p.model_ir {
+                anyhow::ensure!(
+                    ir.target.catalog == p.prod.catalog
+                        && ir.target.schema == p.prod.schema
+                        && ir.target.table == p.prod.table,
+                    "compiled view '{}' targets '{}', but promotion records '{}'",
+                    ir.name,
+                    ir.target.full_name(),
+                    p.prod.full_name()
+                );
                 production_view_sql(dialect, ir, &p.upstreams)?
             } else {
                 (
@@ -821,10 +838,29 @@ pub(crate) async fn discover_branch_targets_for_plan(
                     Vec::new(),
                 )
             };
+            assert_generated_promote_target(dialect, p.kind, &p.prod, &statement)?;
+            nodes.push(rocky_ir::dag::DagNode {
+                name: p.prod.full_name(),
+                depends_on: p
+                    .dependencies
+                    .iter()
+                    .chain(production_upstreams.iter())
+                    .filter_map(|upstream| {
+                        selected.get(&rocky_sql::defer::CollisionIdentity::of(
+                            &upstream.catalog,
+                            &upstream.schema,
+                            &upstream.table,
+                        ))
+                    })
+                    .cloned()
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .into_iter()
+                    .collect(),
+            });
             let production_upstreams = production_upstreams
                 .into_iter()
                 .filter(|upstream| {
-                    !selected.contains(&rocky_sql::defer::CollisionIdentity::of(
+                    !selected.contains_key(&rocky_sql::defer::CollisionIdentity::of(
                         &upstream.catalog,
                         &upstream.schema,
                         &upstream.table,
@@ -849,7 +885,17 @@ pub(crate) async fn discover_branch_targets_for_plan(
         })
         .collect::<Result<Vec<_>>>()?;
 
-    Ok((resolved_pipeline_name, targets))
+    let order = rocky_ir::dag::topological_sort(&nodes)
+        .context("cannot promote views with cyclic production dependencies")?;
+    let mut ordered = Vec::with_capacity(targets.len());
+    for name in order {
+        let index = targets
+            .iter()
+            .position(|target| target.target == name)
+            .with_context(|| format!("promote target '{name}' disappeared while ordering"))?;
+        ordered.push(targets.remove(index));
+    }
+    Ok((resolved_pipeline_name, ordered))
 }
 
 /// Run the approval gate for a branch, updating `audit` and returning
@@ -1352,6 +1398,7 @@ struct PlannedPromote {
     strategy: String,
     model_ir: Option<ModelIr>,
     upstreams: Vec<TargetRef>,
+    dependencies: Vec<TargetRef>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1434,6 +1481,30 @@ fn promote_pre_drop_sql(
     }
 }
 
+fn assert_generated_promote_target(
+    dialect: &dyn rocky_core::traits::SqlDialect,
+    kind: PromoteKind,
+    target: &TargetRef,
+    statement: &str,
+) -> Result<()> {
+    let statement_target = if matches!(kind, PromoteKind::View) {
+        dialect.format_table_ref(&target.catalog, &target.schema, &target.table)?
+    } else {
+        quote_fqn(dialect, target)?
+    };
+    let verb = match kind {
+        PromoteKind::View => "CREATE OR REPLACE VIEW",
+        PromoteKind::Table if dialect.full_refresh_needs_predrop() => "CREATE TABLE",
+        PromoteKind::Table => "CREATE OR REPLACE TABLE",
+    };
+    anyhow::ensure!(
+        statement.starts_with(&format!("{verb} {statement_target} AS")),
+        "generated promote statement does not target '{}'",
+        target.full_name()
+    );
+    Ok(())
+}
+
 /// Generate a production view from its model query. Qualify references to
 /// managed upstream models so a branch rerun or cleanup cannot affect it.
 fn production_view_sql(
@@ -1447,12 +1518,6 @@ fn production_view_sql(
     let mut renames = std::collections::HashMap::new();
     let mut upstream_by_key = std::collections::HashMap::new();
     for target in upstreams {
-        if target.catalog == ir.target.catalog
-            && target.schema == ir.target.schema
-            && target.table == ir.target.table
-        {
-            continue;
-        }
         for part in [&target.catalog, &target.schema, &target.table] {
             quote_part(dialect, part)?;
         }
@@ -1672,6 +1737,7 @@ async fn discover_replication_branch_targets(
                 strategy: pipeline.strategy.clone(),
                 model_ir: None,
                 upstreams: Vec::new(),
+                dependencies: Vec::new(),
             });
         }
     }
@@ -1709,11 +1775,6 @@ fn discover_transformation_branch_targets(
     record: &BranchRecord,
     filter: Option<&str>,
 ) -> Result<Vec<PlannedPromote>> {
-    // One enumeration, shared with `compare` (see the helper's docs): both
-    // must agree about which models a `--filter` selects and which the glob
-    // reaches, and two walks of the same tree is how they stop agreeing.
-    let targets =
-        super::transformation_prod_targets(pipeline, config_path, filter, "branch promote", true)?;
     let models_dir = match crate::models_loader::locate_models_dir(&pipeline.models, config_path)? {
         crate::models_loader::ModelsDir::Present(dir) => dir,
         crate::models_loader::ModelsDir::Absent(dir) => {
@@ -1723,6 +1784,16 @@ fn discover_transformation_branch_targets(
     let models_glob = crate::models_loader::resolved_models_glob(&pipeline.models, config_path);
     let models =
         crate::models_loader::load_project_models_matching(&models_dir, &models_glob, None)?;
+    plan_transformation_from_models(models, record, filter)
+}
+
+fn plan_transformation_from_models(
+    models: Vec<rocky_core::models::Model>,
+    record: &BranchRecord,
+    filter: Option<&str>,
+) -> Result<Vec<PlannedPromote>> {
+    let targets =
+        super::transformation_prod_targets_from_models(&models, filter, "branch promote", true)?;
     // The run compiler resolves @var() before dependency analysis and SQL
     // generation. Promotion must use that same resolved model, not a raw reload.
     let compiled = rocky_compiler::compile::compile_preloaded_models(
@@ -1803,6 +1874,28 @@ fn discover_transformation_branch_targets(
         } else {
             None
         };
+        let dependencies = compiled
+            .project
+            .dag_nodes
+            .iter()
+            .find(|node| node.name == *model_name)
+            .with_context(|| format!("model '{model_name}' has no dependency node"))?
+            .depends_on
+            .iter()
+            .map(|name| {
+                compiled
+                    .project
+                    .models
+                    .iter()
+                    .find(|model| model.config.name == *name)
+                    .map(|model| TargetRef {
+                        catalog: model.config.target.catalog.clone(),
+                        schema: model.config.target.schema.clone(),
+                        table: model.config.target.table.clone(),
+                    })
+                    .with_context(|| format!("dependency '{name}' of '{model_name}' has no model"))
+            })
+            .collect::<Result<Vec<_>>>()?;
         planned.push(PlannedPromote {
             prod,
             branch_source,
@@ -1814,6 +1907,7 @@ fn discover_transformation_branch_targets(
             .to_string(),
             model_ir,
             upstreams: upstreams.clone(),
+            dependencies,
         });
     }
 
@@ -4449,10 +4543,10 @@ adapter = "default"
             "warehouse",
             "reporting",
             "a_view",
-            "SELECT id FROM z_upstream",
+            "SELECT id, added FROM warehouse.raw.z_upstream",
         );
         std::fs::write(models.join("a_view.toml"),
-            "name = \"a_view\"\ndepends_on = [\"z_upstream\"]\n[strategy]\ntype = \"view\"\n[target]\ncatalog = \"warehouse\"\nschema = \"reporting\"\ntable = \"a_view\"\n").unwrap();
+            "name = \"a_view\"\n[strategy]\ntype = \"view\"\n[target]\ncatalog = \"warehouse\"\nschema = \"reporting\"\ntable = \"a_view\"\n").unwrap();
         let record = sample_record("fix_price");
         let (_, all) = discover_branch_targets_for_plan(&config_path, &record, None, None)
             .await
@@ -4463,6 +4557,7 @@ adapter = "default"
                 .collect::<Vec<_>>(),
             vec!["z_upstream", "a_view"]
         );
+        assert!(all[1].statement.contains("raw"));
 
         let (_, filtered) =
             discover_branch_targets_for_plan(&config_path, &record, Some("schema=reporting"), None)
@@ -4523,6 +4618,120 @@ adapter = "default"
                 .await
                 .is_err()
         );
+        for sql in [
+            "CREATE SCHEMA raw",
+            "CREATE TABLE raw.z_upstream AS SELECT 0 AS id",
+            "CREATE TABLE branch__fix_price.z_upstream AS SELECT 2 AS id, 3 AS added",
+        ] {
+            adapter.execute_statement(sql).await.unwrap();
+        }
+        drop(adapter);
+        let steps: Vec<crate::output::PromoteTargetPlan> = all
+            .into_iter()
+            .map(|p| crate::output::PromoteTargetPlan {
+                target: p.target,
+                source: p.source,
+                target_catalog: p.target_catalog,
+                target_schema: p.target_schema,
+                target_table: p.target_table,
+                source_catalog: p.source_catalog,
+                source_schema: p.source_schema,
+                source_table: p.source_table,
+                strategy: p.strategy,
+                statement: p.statement,
+                pre_drop_statement: p.pre_drop_statement,
+                production_upstreams: p
+                    .production_upstreams
+                    .into_iter()
+                    .map(|u| crate::output::PromoteUpstream {
+                        catalog: u.catalog,
+                        schema: u.schema,
+                        table: u.table,
+                    })
+                    .collect(),
+            })
+            .collect();
+        let (_, ok) = run_promote_apply(&loaded, &steps, None).await.unwrap();
+        assert!(ok);
+        let adapter = DuckDbWarehouseAdapter::open(&db).unwrap();
+        let rows = adapter
+            .execute_query("SELECT id, added FROM reporting.a_view")
+            .await
+            .unwrap();
+        assert_eq!(rows.rows[0][0].as_str(), Some("2"));
+        assert_eq!(rows.rows[0][1].as_str(), Some("3"));
+    }
+
+    #[test]
+    fn promote_uses_loaded_sidecar_snapshot_for_view_destination() {
+        let tmp = TempDir::new().unwrap();
+        let models = tmp.path().join("models");
+        std::fs::create_dir(&models).unwrap();
+        write_transformation_model(
+            &models,
+            "view",
+            "warehouse",
+            "marts",
+            "original",
+            "SELECT 1 AS id",
+        );
+        let sidecar = models.join("view.toml");
+        std::fs::write(&sidecar, "name = \"view\"\n[strategy]\ntype = \"view\"\n[target]\ncatalog = \"warehouse\"\nschema = \"marts\"\ntable = \"original\"\n").unwrap();
+        let snapshot = crate::models_loader::load_project_models_matching(
+            &models,
+            &format!("{}/**", models.display()),
+            None,
+        )
+        .unwrap();
+        std::fs::write(&sidecar, "name = \"view\"\n[strategy]\ntype = \"view\"\n[target]\ncatalog = \"warehouse\"\nschema = \"marts\"\ntable = \"swapped\"\n").unwrap();
+        let planned =
+            plan_transformation_from_models(snapshot, &sample_record("fix"), None).unwrap();
+        assert_eq!(planned.len(), 1);
+        assert_eq!(planned[0].prod.table, "original");
+        let ir = planned[0].model_ir.as_ref().unwrap();
+        assert_eq!(ir.target.table, "original");
+        let dialect = rocky_duckdb::dialect::DuckDbSqlDialect;
+        let (sql, _) = production_view_sql(&dialect, ir, &planned[0].upstreams).unwrap();
+        assert_generated_promote_target(&dialect, PromoteKind::View, &planned[0].prod, &sql)
+            .unwrap();
+        let swapped = TargetRef {
+            table: "swapped".to_string(),
+            ..planned[0].prod.clone()
+        };
+        assert!(
+            assert_generated_promote_target(&dialect, PromoteKind::View, &swapped, &sql).is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn promote_rejects_qualified_view_cycle_before_plan() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("rocky.toml");
+        let models = tmp.path().join("models");
+        std::fs::create_dir(&models).unwrap();
+        std::fs::write(
+            &config_path,
+            format!("[adapter]\ntype = \"duckdb\"\npath = \"{}\"\n[pipeline.t]\ntype = \"transformation\"\nmodels = \"models/**\"\n[pipeline.t.target]\nadapter = \"default\"\n", tmp.path().join("warehouse.duckdb").display()),
+        ).unwrap();
+        for (name, upstream) in [("a", "b"), ("b", "a")] {
+            write_transformation_model(
+                &models,
+                name,
+                "warehouse",
+                "marts",
+                name,
+                &format!("SELECT id FROM warehouse.marts.{upstream}"),
+            );
+            std::fs::write(
+                models.join(format!("{name}.toml")),
+                format!("name = \"{name}\"\n[strategy]\ntype = \"view\"\n[target]\ncatalog = \"warehouse\"\nschema = \"marts\"\ntable = \"{name}\"\n"),
+            ).unwrap();
+        }
+        let error =
+            discover_branch_targets_for_plan(&config_path, &sample_record("fix"), None, None)
+                .await
+                .unwrap_err();
+        assert!(format!("{error:#}").contains("cyclic production dependencies"));
     }
 
     /// Issue #2024's DuckDB sequence: production has two orders, the branch
@@ -6118,6 +6327,27 @@ adapter = "default"
             "fct_orders",
             "SELECT 1 AS id",
         );
+        write_transformation_model(
+            &models_dir.join("marts"),
+            "z_upstream",
+            "warehouse",
+            "marts",
+            "z_upstream",
+            "SELECT 2 AS id, 3 AS added",
+        );
+        write_transformation_model(
+            &models_dir.join("marts"),
+            "b_view",
+            "warehouse",
+            "marts",
+            "b_view",
+            "SELECT id, added FROM warehouse.marts.z_upstream",
+        );
+        std::fs::write(
+            models_dir.join("marts/b_view.toml"),
+            "name = \"b_view\"\n[strategy]\ntype = \"view\"\n[target]\ncatalog = \"warehouse\"\nschema = \"marts\"\ntable = \"b_view\"\n",
+        )
+        .unwrap();
 
         // Two transformation pipelines (both on the default duckdb adapter) —
         // enough to make `resolve_pipeline(None)` ambiguous, mirroring the
@@ -6160,6 +6390,9 @@ adapter = "default"
                 "CREATE SCHEMA IF NOT EXISTS marts",
                 "CREATE SCHEMA IF NOT EXISTS \"branch__ci_demo\"",
                 "CREATE TABLE \"branch__ci_demo\".fct_orders AS SELECT 1 AS id UNION ALL SELECT 2",
+                "CREATE TABLE marts.z_upstream AS SELECT 0 AS id",
+                "CREATE TABLE \"branch__ci_demo\".z_upstream AS SELECT 2 AS id, 3 AS added",
+                "CREATE VIEW \"branch__ci_demo\".b_view AS SELECT 2 AS id, 3 AS added",
             ] {
                 adapter.execute_statement(stmt).await.expect("seed");
             }
@@ -6171,7 +6404,7 @@ adapter = "default"
 
         // `rocky plan promote ci_demo --pipeline marts` — disambiguates at
         // plan-build time.
-        let plan_id = crate::commands::plan::build_promote_plan_inner(
+        let result = crate::commands::plan::build_promote_plan_inner(
             dir,
             &config_path,
             &models_dir,
@@ -6185,10 +6418,18 @@ adapter = "default"
             PolicyPrincipal::Human,
         )
         .await
-        .expect("plan build must succeed with --pipeline marts")
-        .plan_output
-        .plan_id
-        .expect("plan_id");
+        .expect("plan build must succeed with --pipeline marts");
+        let names: Vec<_> = result
+            .plan
+            .targets
+            .iter()
+            .map(|p| p.target_table.as_str())
+            .collect();
+        assert!(
+            names.iter().position(|name| *name == "z_upstream")
+                < names.iter().position(|name| *name == "b_view")
+        );
+        let plan_id = result.plan_output.plan_id.expect("plan_id");
 
         // `rocky apply <plan-id>` — `apply` has no `--pipeline` flag at all.
         // Before the fix this re-resolved against the config and failed with
@@ -6226,6 +6467,11 @@ adapter = "default"
             count, 2,
             "`rocky apply` on the promote plan must copy both branch rows"
         );
+        let view = adapter
+            .execute_query("SELECT id, added FROM warehouse.marts.b_view")
+            .await
+            .expect("qualified view must be created after the upstream gains its new column");
+        assert_eq!(view.rows[0][1].as_str(), Some("3"));
     }
 
     /// #2019 (Codex finding, gpt-5.6-terra, high confidence): `rocky branch
