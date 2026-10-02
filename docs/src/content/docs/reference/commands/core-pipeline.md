@@ -934,7 +934,7 @@ rocky branch compare fix_price --pipeline shopify_us   # multi-pipeline project
 
 Internally this is `rocky compare` pointed at the branch's `schema_prefix` via `ShadowConfig.schema_override`, the same mechanism `rocky run --branch` uses for writes, so compare always hits exactly the tables the branch produced. Accepts the shared [`--filter`](/reference/filters/) flag, and `--pipeline <name>` to select the pipeline in a multi-pipeline project.
 
-When Rocky cannot read a table or its schema on either side, that table reports `verdict: "error"` with the reason in `reasons`. Its unreadable row count is `null`, never `0`. An `error` row counts as failed, so the command exits non-zero. See [`rocky compare`](/reference/cli/#rocky-compare).
+When Rocky confirms that production has no target, it reports `verdict: "no_baseline"`. That target does not fail the run. An uncertain metadata read reports `verdict: "error"` and fails the command. Its unreadable row count is `null`, never `0`. See [`rocky compare`](/reference/cli/#rocky-compare).
 
 ### Related Commands
 

@@ -702,6 +702,10 @@ export interface CompareOutput {
   results: TableCompareResult[];
   tables_compared: number;
   tables_failed: number;
+  /**
+   * Targets with no confirmed production object. These do not fail the run.
+   */
+  tables_no_baseline: number;
   tables_passed: number;
   tables_warned: number;
   version: string;

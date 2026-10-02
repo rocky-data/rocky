@@ -263,6 +263,11 @@ production tables rather than sitting beside them.
 The result appears in text output and in JSON under `shadow_comparison`.
 `rocky compare` performs the same comparison on objects you kept with
 `--keep-shadow`. It fails if no tables were selected.
+When production has no target, Rocky reports `no_baseline` for that target.
+It does not fail the run. Rocky drops that shadow after a successful run unless you use `--keep-shadow`.
+If Rocky cannot confirm whether production exists, comparison fails and keeps the shadow.
+Do not combine `--shadow` with `--resume` or `--resume-latest`.
+Remove retained shadow objects, then restart with `--shadow` without a resume flag.
 It finds the targets differently per pipeline type: replication discovers them
 from the source, and transformation reads them off its models. It then compares
 each pair the same way. `rocky branch compare` does the same for a branch's

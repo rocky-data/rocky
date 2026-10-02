@@ -382,6 +382,12 @@
           "minimum": 0.0,
           "type": "integer"
         },
+        "tables_no_baseline": {
+          "description": "Targets with no confirmed production object. These do not fail the run.",
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
         "tables_passed": {
           "format": "uint",
           "minimum": 0.0,
@@ -403,6 +409,7 @@
         "results",
         "tables_compared",
         "tables_failed",
+        "tables_no_baseline",
         "tables_passed",
         "tables_warned",
         "version"

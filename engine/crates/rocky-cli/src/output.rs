@@ -350,6 +350,10 @@ pub struct RunOutput {
     /// Comparison of this run's shadow objects with production, before cleanup.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub shadow_comparison: Option<CompareOutput>,
+    /// Run-local ownership for cleanup after every mixed-run comparison.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub(crate) owned_shadow_objects: Vec<crate::commands::shadow_lifecycle::ShadowObject>,
     pub materializations: Vec<MaterializationOutput>,
     /// Per-model build/skip/reuse decision + reason, surfaced for
     /// transformation runs so orchestrators can explain *why* each model
@@ -3577,6 +3581,8 @@ pub struct CompareOutput {
     pub tables_compared: usize,
     pub tables_passed: usize,
     pub tables_warned: usize,
+    /// Targets with no confirmed production object. These do not fail the run.
+    pub tables_no_baseline: usize,
     pub tables_failed: usize,
     pub results: Vec<TableCompareResult>,
     pub overall_verdict: String,
@@ -5131,6 +5137,7 @@ impl RunOutput {
             resumed_from: None,
             shadow: false,
             shadow_comparison: None,
+            owned_shadow_objects: vec![],
             materializations: vec![],
             model_decisions: vec![],
             contained: vec![],

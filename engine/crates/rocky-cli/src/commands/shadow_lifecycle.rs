@@ -34,7 +34,26 @@
 
 use anyhow::Result;
 use rocky_core::traits::{SqlDialect, WarehouseAdapter};
-use rocky_ir::TargetRef;
+use rocky_ir::{TableRef, TargetRef};
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum ShadowKind {
+    Table,
+    View,
+    MaterializedView,
+    DynamicTable,
+}
+
+impl ShadowKind {
+    fn drop_sql(self, dialect: &dyn SqlDialect, formatted: &str) -> String {
+        match self {
+            Self::Table => dialect.drop_table_sql(formatted),
+            Self::View => format!("DROP VIEW IF EXISTS {formatted}"),
+            Self::MaterializedView => format!("DROP MATERIALIZED VIEW IF EXISTS {formatted}"),
+            Self::DynamicTable => format!("DROP DYNAMIC TABLE IF EXISTS {formatted}"),
+        }
+    }
+}
 
 /// A shadow object this run intends to write, or wrote.
 #[derive(Debug, Clone)]
@@ -45,6 +64,41 @@ pub(crate) struct ShadowObject {
     pub(crate) target: TargetRef,
     /// The production object paired with this shadow target.
     pub(crate) production: TargetRef,
+    pub(crate) kind: ShadowKind,
+}
+
+/// A failed describe is absence only when a successful catalog read confirms it.
+pub(crate) async fn target_is_absent(
+    warehouse: &dyn WarehouseAdapter,
+    target: &TargetRef,
+) -> Result<bool> {
+    let table = TableRef {
+        catalog: target.catalog.clone(),
+        schema: target.schema.clone(),
+        table: target.table.clone(),
+    };
+    match warehouse.describe_table(&table).await {
+        Ok(_) => Ok(false),
+        Err(describe_error) => {
+            let names = warehouse
+                .list_tables(&target.catalog, &target.schema)
+                .await
+                .map_err(|list_error| anyhow::anyhow!(
+                    "cannot determine whether {} exists: describe failed: {describe_error}; catalog read failed: {list_error}",
+                    target.full_name()
+                ))?;
+            if names
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case(&target.table))
+            {
+                anyhow::bail!(
+                    "cannot determine whether {} exists: describe failed: {describe_error}; catalog still lists it",
+                    target.full_name()
+                );
+            }
+            Ok(true)
+        }
+    }
 }
 
 /// Refuse the run if anything already sits at a shadow target.
@@ -53,13 +107,7 @@ pub(crate) struct ShadowObject {
 /// exactly as it was — the same posture as the target-collision preflight
 /// (#1461) and the `metadata_columns` guard (#1594).
 ///
-/// A `describe_table` that fails is treated as "absent". That is deliberate
-/// and is the same reading `execute_one_plain_model` takes: the adapters do
-/// not agree on a typed not-found error, so an existence probe can only
-/// distinguish "returned columns" from "did not". The consequence is a
-/// missed refusal on a transient error, never a spurious one — and the
-/// alternative, refusing every shadow run whose probe hiccuped, would make
-/// the feature unusable on a flaky connection.
+/// A failed describe requires a successful catalog listing that confirms absence.
 ///
 /// # Errors
 ///
@@ -71,16 +119,7 @@ pub(crate) async fn refuse_occupied_shadow_targets(
     objects: &[ShadowObject],
 ) -> Result<()> {
     for object in objects {
-        let table_ref = rocky_ir::TableRef {
-            catalog: object.target.catalog.clone(),
-            schema: object.target.schema.clone(),
-            table: object.target.table.clone(),
-        };
-        let occupied = warehouse
-            .describe_table(&table_ref)
-            .await
-            .map(|columns| !columns.is_empty())
-            .unwrap_or(false);
+        let occupied = !target_is_absent(warehouse, &object.target).await?;
         if occupied {
             let formatted = dialect
                 .format_table_ref(
@@ -96,7 +135,7 @@ pub(crate) async fn refuse_occupied_shadow_targets(
                  name is either not Rocky's or debris from a run that did not finish. \
                  Model '{}' would have written it. Drop it if it is debris:\n    {}",
                 object.model,
-                dialect.drop_table_sql(&formatted)
+                object.kind.drop_sql(dialect, &formatted)
             );
         }
     }
@@ -135,10 +174,8 @@ pub(crate) async fn drop_owned_shadow_objects(
                 continue;
             }
         };
-        if let Err(e) = warehouse
-            .execute_statement(&dialect.drop_table_sql(&formatted))
-            .await
-        {
+        let sql = object.kind.drop_sql(dialect, &formatted);
+        if let Err(e) = warehouse.execute_statement(&sql).await {
             warnings.push(format!(
                 "could not drop shadow object {formatted} for model '{}': {e}. It stays on the \
                  warehouse; the next shadow run will refuse until it is removed",
@@ -152,6 +189,9 @@ pub(crate) async fn drop_owned_shadow_objects(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
+    use rocky_core::traits::{AdapterError, AdapterResult, QueryResult};
+    use rocky_ir::ColumnInfo;
     use rocky_duckdb::DuckDbConnector;
     use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
     use std::sync::{Arc, Mutex};
@@ -169,12 +209,51 @@ mod tests {
                 schema: "main".into(),
                 table: "orders".into(),
             },
+            kind: ShadowKind::Table,
         }
     }
 
     fn duckdb() -> DuckDbWarehouseAdapter {
         let shared = Arc::new(Mutex::new(DuckDbConnector::in_memory().expect("duckdb")));
         DuckDbWarehouseAdapter::from_shared(shared)
+    }
+
+    struct UncertainWarehouse {
+        inner: DuckDbWarehouseAdapter,
+        catalog_error: bool,
+    }
+
+    #[async_trait]
+    impl WarehouseAdapter for UncertainWarehouse {
+        fn dialect(&self) -> &dyn SqlDialect { self.inner.dialect() }
+        async fn execute_statement(&self, _sql: &str) -> AdapterResult<()> {
+            panic!("an uncertain ownership read must never authorize a write")
+        }
+        async fn execute_query(&self, _sql: &str) -> AdapterResult<QueryResult> {
+            panic!("an uncertain ownership read must never authorize a query")
+        }
+        async fn describe_table(&self, _table: &TableRef) -> AdapterResult<Vec<ColumnInfo>> {
+            Err(AdapterError::msg("transient metadata failure"))
+        }
+        async fn list_tables(&self, _catalog: &str, _schema: &str) -> AdapterResult<Vec<String>> {
+            if self.catalog_error {
+                Err(AdapterError::msg("catalog unavailable"))
+            } else {
+                Ok(vec!["orders_rocky_shadow".to_string()])
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn uncertain_metadata_never_grants_shadow_ownership() {
+        for catalog_error in [false, true] {
+            let wh = UncertainWarehouse { inner: duckdb(), catalog_error };
+            let err = refuse_occupied_shadow_targets(
+                &wh, wh.dialect(), &[object("orders_rocky_shadow")]
+            ).await.expect_err("uncertain metadata cannot prove absence");
+            let message = err.to_string();
+            assert!(message.contains("cannot determine whether"), "{message}");
+        }
     }
 
     /// An empty name is this run's to take.

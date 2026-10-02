@@ -2926,6 +2926,13 @@ pub async fn run_with_explicit_contracts(
     // Refuse a broken Dagster Pipes launch before an idempotency claim, state
     // session, hook, or warehouse statement can run.
     crate::pipes::PipesEmitter::validate_requested()?;
+    if shadow_config.is_some_and(|config| config.branch.is_none())
+        && (resume_run_id.is_some() || resume_latest)
+    {
+        anyhow::bail!(
+            "--shadow cannot be combined with --resume or --resume-latest: a checkpoint may skip shadow objects that still need comparison. Remove retained shadow objects, then restart with --shadow without a resume flag"
+        );
+    }
 
     // This first explicit-contract route is deliberately model-only. Validate
     // it before the idempotency claim, state session, adapter, or warehouse
@@ -4734,6 +4741,7 @@ pub async fn run_with_explicit_contracts(
                             model: table.name.clone(),
                             production,
                             target: written,
+                            kind: crate::commands::shadow_lifecycle::ShadowKind::Table,
                         },
                     );
                 }
@@ -5480,6 +5488,7 @@ pub async fn run_with_explicit_contracts(
                         schema: task.target_schema.clone(),
                         table: task.target_table_name.clone(),
                     },
+                    kind: crate::commands::shadow_lifecycle::ShadowKind::Table,
                 })
             })
             .collect::<Result<Vec<_>>>()?
@@ -6930,9 +6939,10 @@ pub async fn run_with_explicit_contracts(
         )
         .await?;
         crate::status_line!(
-            "Shadow comparison: {} passed, {} warned, {} failed ({})",
+            "Shadow comparison: {} passed, {} warned, {} no baseline, {} failed ({})",
             comparison.tables_passed,
             comparison.tables_warned,
+            comparison.tables_no_baseline,
             comparison.tables_failed,
             comparison.overall_verdict
         );
@@ -6940,6 +6950,7 @@ pub async fn run_with_explicit_contracts(
             previous.tables_compared += comparison.tables_compared;
             previous.tables_passed += comparison.tables_passed;
             previous.tables_warned += comparison.tables_warned;
+            previous.tables_no_baseline += comparison.tables_no_baseline;
             previous.tables_failed += comparison.tables_failed;
             previous.results.extend(comparison.results);
             previous.overall_verdict = if previous.tables_failed > 0 {
@@ -6953,13 +6964,19 @@ pub async fn run_with_explicit_contracts(
         } else {
             output.shadow_comparison = Some(comparison);
         }
-        if shadow_config.is_some_and(|config| config.cleanup_after)
-            && output.shadow_comparison.as_ref().is_some_and(|comparison| comparison.tables_failed == 0)
-        {
+        output.status = output.derive_run_status();
+    }
+    if shadow_config.is_some_and(|config| config.cleanup_after)
+        && output.tables_failed == 0
+        && !output.check_gate_failed
+        && output.shadow_comparison.as_ref().is_some_and(|comparison| comparison.tables_failed == 0)
+    {
+        output.owned_shadow_objects.extend(replication_shadow_objects);
+        if !output.owned_shadow_objects.is_empty() {
             for warning in crate::commands::shadow_lifecycle::drop_owned_shadow_objects(
                 warehouse_adapter.as_ref(),
                 warehouse_adapter.dialect(),
-                &replication_shadow_objects,
+                &output.owned_shadow_objects,
             )
             .await
             {
@@ -6967,7 +6984,6 @@ pub async fn run_with_explicit_contracts(
                 output.scheduling_warnings.push(warning);
             }
         }
-        output.status = output.derive_run_status();
     }
 
     // Populate per-model / per-run cost attribution and run the
@@ -11364,6 +11380,18 @@ pub(crate) async fn execute_models_with_explicit_contracts(
                     schema: model.config.target.schema.clone(),
                     table: model.config.target.table.clone(),
                 },
+                kind: match model.config.strategy {
+                    rocky_core::models::StrategyConfig::View => {
+                        crate::commands::shadow_lifecycle::ShadowKind::View
+                    }
+                    rocky_core::models::StrategyConfig::MaterializedView => {
+                        crate::commands::shadow_lifecycle::ShadowKind::MaterializedView
+                    }
+                    rocky_core::models::StrategyConfig::DynamicTable { .. } => {
+                        crate::commands::shadow_lifecycle::ShadowKind::DynamicTable
+                    }
+                    _ => crate::commands::shadow_lifecycle::ShadowKind::Table,
+                },
             });
         }
         // One-off shadow runs always refuse occupied names, including
@@ -12680,9 +12708,10 @@ pub(crate) async fn execute_models_with_explicit_contracts(
         )
         .await?;
         crate::status_line!(
-            "Shadow comparison: {} passed, {} warned, {} failed ({})",
+            "Shadow comparison: {} passed, {} warned, {} no baseline, {} failed ({})",
             comparison.tables_passed,
             comparison.tables_warned,
+            comparison.tables_no_baseline,
             comparison.tables_failed,
             comparison.overall_verdict
         );
@@ -12712,15 +12741,19 @@ pub(crate) async fn execute_models_with_explicit_contracts(
             .as_ref()
             .is_none_or(|comparison| comparison.tables_failed == 0)
     {
-        let warnings = crate::commands::shadow_lifecycle::drop_owned_shadow_objects(
-            warehouse,
-            warehouse.dialect(),
-            &shadow_objects,
-        )
-        .await;
-        for warning in warnings {
-            warn!("{warning}");
-            output.scheduling_warnings.push(warning);
+        if output.pipeline_type.as_deref() == Some("replication") {
+            output.owned_shadow_objects.extend(shadow_objects);
+        } else {
+            let warnings = crate::commands::shadow_lifecycle::drop_owned_shadow_objects(
+                warehouse,
+                warehouse.dialect(),
+                &shadow_objects,
+            )
+            .await;
+            for warning in warnings {
+                warn!("{warning}");
+                output.scheduling_warnings.push(warning);
+            }
         }
     }
 
@@ -21769,6 +21802,7 @@ auto_create_schemas = true
             resumed_from: None,
             shadow: false,
             shadow_comparison: None,
+            owned_shadow_objects: vec![],
             materializations: vec![],
             model_decisions: vec![],
             contained: vec![],

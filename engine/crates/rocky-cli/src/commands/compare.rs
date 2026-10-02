@@ -101,10 +101,11 @@ pub async fn compare(
         println!("  Rocky Compare");
         println!();
         println!(
-            "  Tables: {} compared, {} passed, {} warned, {} failed",
+            "  Tables: {} compared, {} passed, {} warned, {} no baseline, {} failed",
             output.tables_compared,
             output.tables_passed,
             output.tables_warned,
+            output.tables_no_baseline,
             output.tables_failed
         );
         println!("  Overall: {}", output.overall_verdict.to_uppercase());
@@ -115,6 +116,7 @@ pub async fn compare(
                 "warn" => "WARN",
                 "fail" => "FAIL",
                 "error" => " ERR",
+                "no_baseline" => " NEW",
                 _ => "  ??",
             };
             let count = |value: Option<u64>| {
@@ -235,13 +237,22 @@ pub(crate) async fn compare_targets(
         tables_compared: 0,
         tables_passed: 0,
         tables_warned: 0,
+        tables_no_baseline: 0,
         tables_failed: 0,
         results: vec![],
         overall_verdict: "pass".to_string(),
     };
 
     for (prod_target, shadow_target) in targets {
-        let prod_count = get_row_count(adapter, &prod_target).await.map_err(|e| {
+        let baseline_absent =
+            super::shadow_lifecycle::target_is_absent(adapter, &prod_target).await;
+        let no_baseline = matches!(baseline_absent.as_ref(), Ok(true));
+        let prod_count = if no_baseline {
+            Ok(None)
+        } else {
+            get_row_count(adapter, &prod_target).await.map(Some)
+        }
+        .map_err(|e| {
             format!(
                 "failed to read production row count for {}: {e}",
                 prod_target.full_name()
@@ -254,7 +265,7 @@ pub(crate) async fn compare_targets(
             )
         });
         let row_metrics = match (prod_count.as_ref(), shadow_count.as_ref()) {
-            (Ok(prod), Ok(shadow)) => Some(compare::compare_row_counts(*shadow, *prod)),
+            (Ok(Some(prod)), Ok(shadow)) => Some(compare::compare_row_counts(*shadow, *prod)),
             _ => None,
         };
 
@@ -270,7 +281,12 @@ pub(crate) async fn compare_targets(
             table: shadow_target.table.clone(),
         };
 
-        let prod_cols = adapter.describe_table(&prod_table_ref).await.map_err(|e| {
+        let prod_cols = if no_baseline {
+            Ok(None)
+        } else {
+            adapter.describe_table(&prod_table_ref).await.map(Some)
+        }
+        .map_err(|e| {
             format!(
                 "failed to read production schema for {}: {e}",
                 prod_target.full_name()
@@ -286,25 +302,38 @@ pub(crate) async fn compare_targets(
                 )
             });
         let schema_diffs = match (prod_cols.as_ref(), shadow_cols.as_ref()) {
-            (Ok(prod), Ok(shadow)) => compare::compare_schemas(shadow, prod),
+            (Ok(Some(prod)), Ok(shadow)) => compare::compare_schemas(shadow, prod),
             _ => Vec::new(),
         };
-        let schema_match = prod_cols.is_ok() && shadow_cols.is_ok() && schema_diffs.is_empty();
-        let read_failures: Vec<String> = [
-            prod_count.as_ref().err(),
-            shadow_count.as_ref().err(),
-            prod_cols.as_ref().err(),
-            shadow_cols.as_ref().err(),
-        ]
-        .into_iter()
-        .flatten()
-        .cloned()
-        .collect();
+        let schema_match = matches!(prod_cols.as_ref(), Ok(Some(_)))
+            && shadow_cols.is_ok()
+            && schema_diffs.is_empty();
+        let mut read_failures: Vec<String> = baseline_absent
+            .err()
+            .map(|e| e.to_string())
+            .into_iter()
+            .collect();
+        read_failures.extend(
+            [
+                prod_count.as_ref().err(),
+                shadow_count.as_ref().err(),
+                prod_cols.as_ref().err(),
+                shadow_cols.as_ref().err(),
+            ]
+            .into_iter()
+            .flatten()
+            .cloned(),
+        );
 
         let (verdict_str, verdict_reasons) = if !read_failures.is_empty() {
             ("error", read_failures)
+        } else if no_baseline {
+            (
+                "no_baseline",
+                vec!["production target does not exist".to_string()],
+            )
         } else if let (
-            Ok(prod),
+            Ok(Some(prod)),
             Ok(shadow),
             Some((row_count_match, row_count_diff, row_count_diff_pct)),
         ) = (prod_count.as_ref(), shadow_count.as_ref(), row_metrics)
@@ -336,6 +365,7 @@ pub(crate) async fn compare_targets(
         match verdict_str {
             "pass" => output.tables_passed += 1,
             "warn" => output.tables_warned += 1,
+            "no_baseline" => output.tables_no_baseline += 1,
             _ => output.tables_failed += 1,
         }
 
@@ -345,7 +375,7 @@ pub(crate) async fn compare_targets(
             production_table: prod_target.full_name(),
             shadow_table: shadow_target.full_name(),
             row_count_match: row_metrics.is_some_and(|metrics| metrics.0),
-            production_count: prod_count.ok(),
+            production_count: prod_count.ok().flatten(),
             shadow_count: shadow_count.ok(),
             row_count_diff_pct: row_metrics.map(|metrics| metrics.2),
             schema_match,

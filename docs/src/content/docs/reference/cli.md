@@ -543,6 +543,7 @@ rocky compare [--filter <key=value>] [flags]
   "tables_compared": 1,
   "tables_passed": 1,
   "tables_warned": 0,
+  "tables_no_baseline": 0,
   "tables_failed": 0,
   "results": [
     {
@@ -562,7 +563,7 @@ rocky compare [--filter <key=value>] [flags]
 }
 ```
 
-`verdict` is `pass`, `warn`, `fail`, or `error`. `reasons` says why a table is not `pass`. An `error` row means Rocky could not read a table or its schema on one side. The count it could not read is `null`, never `0`. `row_count_diff_pct` is `null` unless Rocky read both counts. Rocky counts an `error` row in `tables_failed`, so `overall_verdict` is `fail` and the command exits non-zero.
+`verdict` is `pass`, `warn`, `fail`, `no_baseline`, or `error`. `no_baseline` means Rocky confirmed that production has no target yet. It increments `tables_no_baseline` and does not fail the run. An `error` means Rocky could not confirm the target or read a count or schema. `reasons` explains each outcome. An unreadable count is `null`, never `0`. `row_count_diff_pct` is `null` unless Rocky read both counts. Rocky counts an `error` row in `tables_failed`, so the command exits non-zero.
 
 ---
 
