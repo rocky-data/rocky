@@ -1,0 +1,30 @@
+{
+  "metadata": {
+    "dbt_schema_version": "https://schemas.getdbt.com/dbt/run-results/v6.json",
+    "dbt_version": "1.12.5",
+    "invocation_id": "be18deaa-e3e3-4d7d-8e0d-5f24f46e1338"
+  },
+  "args": {
+    "which": "compile",
+    "invocation_command": "dbt compile --full-refresh --profiles-dir . -q",
+    "full_refresh": true
+  },
+  "results": [
+    {
+      "unique_id": "model.inc_probe.orders_inc",
+      "status": "success"
+    },
+    {
+      "unique_id": "model.inc_probe.orders_pinned",
+      "status": "success"
+    },
+    {
+      "unique_id": "model.inc_probe.orders_macro",
+      "status": "success"
+    },
+    {
+      "unique_id": "model.inc_probe.orders_nokey",
+      "status": "success"
+    }
+  ]
+}

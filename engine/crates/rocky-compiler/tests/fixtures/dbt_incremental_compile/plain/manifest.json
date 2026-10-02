@@ -1,0 +1,99 @@
+{
+  "metadata": {
+    "dbt_schema_version": "https://schemas.getdbt.com/dbt/manifest/v12.json",
+    "dbt_version": "1.12.5",
+    "project_name": "inc_probe",
+    "invocation_id": "e5956c27-0061-452c-8a73-47361d0ba2b1"
+  },
+  "nodes": {
+    "model.inc_probe.orders_inc": {
+      "unique_id": "model.inc_probe.orders_inc",
+      "name": "orders_inc",
+      "resource_type": "model",
+      "database": "probe",
+      "schema": "main",
+      "relation_name": "\"probe\".\"main\".\"orders_inc\"",
+      "raw_code": "{{ config(materialized='incremental', unique_key='id') }}\nselect 1 as id, timestamp '2026-01-01' as updated_at\n{% if is_incremental() %} where updated_at > (select max(updated_at) from {{ this }}) {% endif %}",
+      "compiled_code": "\nselect 1 as id, timestamp '2026-01-01' as updated_at\n where updated_at > (select max(updated_at) from \"probe\".\"main\".\"orders_inc\") ",
+      "depends_on": {
+        "macros": [
+          "macro.dbt.is_incremental"
+        ],
+        "nodes": []
+      },
+      "config": {
+        "materialized": "incremental",
+        "unique_key": "id",
+        "incremental_strategy": null,
+        "full_refresh": null
+      }
+    },
+    "model.inc_probe.orders_pinned": {
+      "unique_id": "model.inc_probe.orders_pinned",
+      "name": "orders_pinned",
+      "resource_type": "model",
+      "database": "probe",
+      "schema": "main",
+      "relation_name": "\"probe\".\"main\".\"orders_pinned\"",
+      "raw_code": "{{ config(materialized='incremental', unique_key='id', full_refresh=false) }}\nselect 1 as id, timestamp '2026-01-01' as updated_at\n{% if is_incremental() %} where updated_at > (select max(updated_at) from {{ this }}) {% endif %}",
+      "compiled_code": "\nselect 1 as id, timestamp '2026-01-01' as updated_at\n where updated_at > (select max(updated_at) from \"probe\".\"main\".\"orders_pinned\") ",
+      "depends_on": {
+        "macros": [
+          "macro.dbt.is_incremental"
+        ],
+        "nodes": []
+      },
+      "config": {
+        "materialized": "incremental",
+        "unique_key": "id",
+        "incremental_strategy": null,
+        "full_refresh": false
+      }
+    },
+    "model.inc_probe.orders_macro": {
+      "unique_id": "model.inc_probe.orders_macro",
+      "name": "orders_macro",
+      "resource_type": "model",
+      "database": "probe",
+      "schema": "main",
+      "relation_name": "\"probe\".\"main\".\"orders_macro\"",
+      "raw_code": "{{ config(materialized='incremental', unique_key='id') }}\nselect 1 as id, timestamp '2026-01-01' as updated_at\n{{ incremental_where() }}",
+      "compiled_code": "\nselect 1 as id, timestamp '2026-01-01' as updated_at\n where updated_at > (select max(updated_at) from \"probe\".\"main\".\"orders_macro\")",
+      "depends_on": {
+        "macros": [
+          "macro.inc_probe.incremental_where"
+        ],
+        "nodes": []
+      },
+      "config": {
+        "materialized": "incremental",
+        "unique_key": "id",
+        "incremental_strategy": null,
+        "full_refresh": null
+      }
+    },
+    "model.inc_probe.orders_nokey": {
+      "unique_id": "model.inc_probe.orders_nokey",
+      "name": "orders_nokey",
+      "resource_type": "model",
+      "database": "probe",
+      "schema": "main",
+      "relation_name": "\"probe\".\"main\".\"orders_nokey\"",
+      "raw_code": "{{ config(materialized='incremental', incremental_strategy='delete+insert') }}\nselect 1 as id, timestamp '2026-01-01' as updated_at\n{% if is_incremental() %} where updated_at > (select max(updated_at) from {{ this }}) {% endif %}",
+      "compiled_code": "\nselect 1 as id, timestamp '2026-01-01' as updated_at\n where updated_at > (select max(updated_at) from \"probe\".\"main\".\"orders_nokey\") ",
+      "depends_on": {
+        "macros": [
+          "macro.dbt.is_incremental"
+        ],
+        "nodes": []
+      },
+      "config": {
+        "materialized": "incremental",
+        "unique_key": null,
+        "incremental_strategy": "delete+insert",
+        "full_refresh": null
+      }
+    }
+  },
+  "sources": {}
+}

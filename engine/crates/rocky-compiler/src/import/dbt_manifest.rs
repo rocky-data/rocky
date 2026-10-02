@@ -6,7 +6,7 @@
 //! Jinja macros, variables, and conditionals already expanded, no regex-based
 //! Jinja parsing is needed.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::BufReader;
 use std::path::Path;
 
@@ -16,6 +16,11 @@ use serde::Deserialize;
 #[derive(Debug, Clone)]
 pub struct DbtManifest {
     pub metadata: DbtManifestMetadata,
+    /// True only when the sibling run_results.json proves this manifest came
+    /// from the same dbt compile invocation with --full-refresh.
+    pub full_refresh_compiled: bool,
+    /// Model IDs with a successful result in the matching full-refresh compile.
+    pub successfully_compiled_nodes: HashSet<String>,
     pub nodes: HashMap<String, DbtManifestNode>,
     pub sources: HashMap<String, DbtManifestSource>,
     /// Unit-test definitions keyed by `unit_test.<project>.<model>.<name>`.
@@ -79,6 +84,8 @@ pub struct DbtDependsOn {
 #[derive(Debug, Clone)]
 pub struct DbtNodeConfig {
     pub materialized: String,
+    /// Effective dbt model config. `false` overrides even --full-refresh.
+    pub full_refresh: Option<bool>,
     pub schema: Option<String>,
     pub unique_key: Option<UniqueKeyValue>,
     pub incremental_strategy: Option<String>,
@@ -265,6 +272,58 @@ struct RawMetadata {
     generated_at: Option<String>,
     #[serde(default)]
     project_name: Option<String>,
+    #[serde(default)]
+    invocation_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct RawRunResults {
+    metadata: RawRunMetadata,
+    args: RawRunArgs,
+    #[serde(default)]
+    results: Vec<RawRunResult>,
+}
+
+#[derive(Deserialize)]
+struct RawRunResult {
+    unique_id: String,
+    status: String,
+}
+
+#[derive(Deserialize)]
+struct RawRunMetadata {
+    invocation_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct RawRunArgs {
+    full_refresh: Option<bool>,
+}
+
+fn full_refresh_compile_evidence(
+    manifest_path: &Path,
+    invocation_id: Option<&str>,
+) -> Option<HashSet<String>> {
+    let invocation_id = invocation_id.filter(|id| !id.is_empty())?;
+    let Ok(file) = std::fs::File::open(manifest_path.with_file_name("run_results.json")) else {
+        return None;
+    };
+    let Ok(results) = serde_json::from_reader::<_, RawRunResults>(BufReader::new(file)) else {
+        return None;
+    };
+    if results.metadata.invocation_id.as_deref() != Some(invocation_id)
+        || results.args.full_refresh != Some(true)
+    {
+        return None;
+    }
+    Some(
+        results
+            .results
+            .into_iter()
+            .filter(|result| result.status == "success")
+            .map(|result| result.unique_id)
+            .collect(),
+    )
 }
 
 #[derive(Deserialize)]
@@ -309,6 +368,8 @@ struct RawDependsOn {
 struct RawNodeConfig {
     #[serde(default)]
     materialized: Option<String>,
+    #[serde(default)]
+    full_refresh: Option<bool>,
     #[serde(default)]
     schema: Option<String>,
     #[serde(default)]
@@ -406,6 +467,10 @@ pub fn parse_manifest(path: &Path) -> Result<DbtManifest, String> {
     let raw: RawManifest = serde_json::from_reader(reader)
         .map_err(|e| format!("failed to parse {}: {e}", path.display()))?;
 
+    let evidence = full_refresh_compile_evidence(path, raw.metadata.invocation_id.as_deref());
+    let full_refresh_compiled = evidence.is_some();
+    let successfully_compiled_nodes = evidence.unwrap_or_default();
+
     let metadata = DbtManifestMetadata {
         dbt_schema_version: raw.metadata.dbt_schema_version.unwrap_or_default(),
         dbt_version: raw.metadata.dbt_version.unwrap_or_default(),
@@ -457,6 +522,8 @@ pub fn parse_manifest(path: &Path) -> Result<DbtManifest, String> {
 
     Ok(DbtManifest {
         metadata,
+        full_refresh_compiled,
+        successfully_compiled_nodes,
         nodes,
         sources,
         unit_tests,
@@ -578,6 +645,7 @@ fn convert_node(raw: RawNode) -> DbtManifestNode {
         },
         config: DbtNodeConfig {
             materialized: config.materialized.unwrap_or_else(|| "view".to_string()),
+            full_refresh: config.full_refresh,
             schema: config.schema,
             unique_key,
             incremental_strategy: config.incremental_strategy,

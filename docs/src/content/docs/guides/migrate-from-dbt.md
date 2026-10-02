@@ -308,13 +308,13 @@ It translates the rest of the project like this:
 - `<dbt_project>/seeds/` → copied verbatim into `<out>/seeds/`
 - `profiles.yml` adapter type → a Rocky `[adapter]` block (DuckDB, Databricks, Snowflake, or BigQuery), or a DuckDB stub when the type is absent or unrecognised. In the `type` field, the parser resolves YAML anchors and aliases (`&anchor` / `*alias`) and `{{ env_var('VAR', 'default') }}`. A profile that templates its adapter type therefore detects the right warehouse instead of falling back to the DuckDB stub.
 
-The importer does not translate the items below, by design. Rocky has no Jinja runtime, so each one needs a manual pass. The importer detects every one, lists it under "Known limitations" in `MIGRATION-NOTES.md`, and writes a `# TODO: dbt-jinja-not-translated` comment above any Jinja left in the emitted SQL:
+The importer does not translate the items below, by design. Rocky has no Jinja runtime, so each one needs a manual pass. Some models are refused. Other unsupported expressions are reported in `MIGRATION-NOTES.md` and marked in the emitted SQL:
 
 - **dbt tests with no native Rocky equivalent.** Beyond the canonical four, the importer converts several `dbt_utils` and `dbt_expectations` tests to native Rocky assertions: `unique_combination_of_columns`, `accepted_range` / `expect_column_values_to_be_between` (→ `in_range`), `expect_column_values_to_match_regex` (→ `regex_match`), `expect_column_values_to_be_in_set` (→ `accepted_values`), and `dbt_utils.expression_is_true` (→ `expression`). See [Generic test mapping](#generic-test-mapping). Anything outside that set — other `dbt_utils.*` and `dbt_expectations.*` tests, project-defined generics, other model-level tests — becomes a structured `UnsupportedTest` warning per occurrence. The emitted TOML carries no stub for it. Rewrite those as a Rocky `expression` test or a quality-pipeline check.
 - **Singular tests** in `tests/` (custom SQL): copy and rewrite them yourself.
 - **dbt macros and `dbt_packages/`.** Rocky has no Jinja runtime, so no macro body expands.
-- **Raw Jinja that calls `is_incremental()`**, on the no-manifest or raw-manifest path: **refused**. Stripping the branch can delete bounded logic. Keeping it can reference a target that does not exist during bootstrap. The refusal covers compound `if` and `elif` conditions and indirect `{% set %}` forms. It applies even when a `unique_key` would map the model to `merge`. A full-source merge is idempotent by key, but it is not the same query as dbt's bounded one. The refusal message also suggests compiling dbt in an incremental context and importing that manifest. That does not help today. A manifest import refuses an unkeyed model too, and imports a keyed one as `merge` with the filter still in its SQL ([#2059](https://github.com/rocky-data/rocky/issues/2059)). Rewrite the model by hand: remove the `is_incremental()` filter, then use `merge` with a `unique_key` or a `time_interval` model.
-- **`{% for %}` and `{% set %}`** on the no-manifest path: **refused**. The importer lists the model as a failure rather than half-rendering it into broken SQL, because the loop or assignment body would survive exactly once. Re-run after `dbt compile`, which the manifest path resolves, or rewrite the model. A `{% if %}` is different: the importer emits it verbatim with a TODO marker, and its body then applies *unconditionally*, so review it. `{{ var() }}` is not in this list. It converts to an `@var()` run-variable marker, as described above.
+- **Incremental models on the raw path:** **refused**, including models configured in `dbt_project.yml` or a model properties YAML file. Rocky cannot prove the first-run SQL from raw code. Run `dbt compile --full-refresh` and import the artifact pair. A non-incremental raw model that calls `is_incremental()` is also refused. Versioned models are refused because raw import cannot resolve their per-version settings.
+- **Jinja control flow** (`{% if %}`, `{% for %}`, `{% macro %}`, `{% call %}`, and whitespace-control forms) on the no-manifest path: **refused**. Raw conversion cannot evaluate these statements and would keep a conditional body without its guard. Run `dbt compile --full-refresh` and import with the manifest, or rewrite the model. `{{ var() }}` still converts to an `@var()` run-variable marker when used outside a config expression.
 - **Unmapped `materialized` values** (`dynamic_table`, `seed`): flattened to `full_refresh` and listed in `MIGRATION-NOTES.md`. `materialized_view` is not in this group; it maps to Rocky's own `materialized_view` strategy.
 - **Adapters Rocky does not support natively** (Postgres, Redshift, and others): the generated repo stubs DuckDB so the project still loads. Replace the `[adapter]` block once Rocky has an adapter for that warehouse, or pass `--target-adapter <kind>` to skip detection.
 - **Custom Jinja macros that emit SQL** (`{{ generate_schema_name() }}`, a dynamic `UNION ALL` macro): reported as failed models, with the macro name in the reason.
@@ -322,8 +322,10 @@ The importer does not translate the items below, by design. Rocky has no Jinja r
 - **Snapshots, MetricFlow metrics and semantic models, and exposures**: not translated, but **detected and counted**. Each one raises a `DroppedConstruct` warning and increments `constructs_dropped` in the JSON output, so an import is never silently lossy.
 - **dbt model contracts** (`contract: {enforced: true}`, column `data_type` declarations, and `constraints`): not carried over to Rocky's contract model. The importer detects and reports them instead of dropping them. Each one emits a warning and increments a `contracts_dropped` counter in the JSON output and in `MIGRATION-NOTES.md`. You then know which models had a contract to re-author. See [Column-level contracts](#column-level-contracts-manual) for the Rocky equivalent.
 
-:::caution[Run `dbt compile` first]
-The importer prefers `manifest.json`, because its Jinja is already resolved. A manifest that was only *parsed*, and not *compiled*, carries no compiled SQL. Every model then falls back to the lower-fidelity regex render, which can render Jinja wrongly. The importer warns loudly when it finds a manifest with no compiled SQL. Regenerate it with `dbt compile`, including any `--vars` the project needs, before you import.
+:::caution[Run `dbt compile --full-refresh` first]
+Run `dbt compile --full-refresh` before import, including any required `--vars`. Keep `manifest.json` and `run_results.json` in the same target directory. Every dbt incremental model needs matching invocation IDs and `args.full_refresh = true`. It also needs a successful result for its `unique_id` and `compiled_code`.
+
+A selective compile leaves unselected models without that evidence. Compile without `--select` or include each model you want to import. This rule applies without a key or a direct `is_incremental()` call. Remove any effective `full_refresh=false` config and compile again. That config overrides the command flag.
 :::
 
 ## 1. Import the dbt Project
@@ -458,7 +460,7 @@ Two things moved. The `{{ config() }}` block became `[strategy]`, and `{{ source
 
 ## 3. Handle Unsupported Jinja
 
-The importer converts most Jinja, not all of it. It raises a warning or a failure for each pattern it cannot handle.
+The manifest path uses SQL compiled by dbt. The raw path converts a limited set of Jinja expressions and refuses statement tags.
 
 :::tip[`{{ var() }}` and per-model routing]
 `{{ var('name') }}` in a model body converts to an `@var(name)` run-variable marker on its own. Supply the value at run time with `rocky run --var name=value`. That covers any value you splice into the SQL itself.
@@ -471,14 +473,13 @@ Per-model `catalog`, `schema`, and `table` routing driven by an orchestrator is 
 | Pattern | Importer Behavior | Manual Fix |
 |---|---|---|
 | `{{ var('some_var') }}` | Converted to an `@var(some_var)` run-variable marker in the emitted SQL (not a warning) | Pass the value at run time with `rocky run --var some_var=value`, or give the marker an inline default: `@var(some_var, fallback)`. A marker with neither a `--var` binding nor a default fails to compile. |
-| `{% if target.name == 'prod' %}` | Emitted verbatim with a `# TODO` marker — the body applies *unconditionally*, so review it | Remove environment branching or use separate `rocky.toml` files per environment |
-| `{% set ... %}` variable assignments | Refused — the model is listed as a failure rather than half-rendered | Inline the value or refactor the query |
 
 ### Common failures
 
 | Pattern | Reason | Manual Fix |
 |---|---|---|
 | Custom Jinja macros (`{{ generate_schema_name() }}`) | Rocky cannot interpret custom macros | Rewrite the SQL without the macro |
+| `{% if ... %}` and `{% set ... %}` | Raw import cannot evaluate the statement and refuses the model | Compile with `dbt compile --full-refresh` and import the manifest, or rewrite the SQL |
 | `{% for ... %}` loops generating SQL | Dynamic SQL generation not supported | Write out the SQL explicitly or use a CTE |
 | `{% macro ... %}` definitions | Rocky uses pure SQL, not macros | Convert shared logic to CTEs or separate models |
 | Python dbt models (`.py` files) | Not SQL | Rewrite in SQL |
@@ -979,13 +980,16 @@ Rocky has no append strategy for transformation models. It refuses `type = "incr
 
 Each one appears as a warning. To keep incremental behaviour, give the model a `unique_key` and set `incremental_strategy` to `'merge'` or leave it unset. It then maps to `merge`. Otherwise, rewrite it as a [`time_interval`](/concepts/time-interval/) model with `@start_date` and `@end_date`.
 
-Any of these is refused rather than imported when its dbt SQL uses `is_incremental()`. dbt compiles that branch as true against an existing table. The compiled SQL can then keep a filter such as `WHERE updated_at > '2026-09-01'`. As `full_refresh`, every run would replace the table with only those recent rows. So the importer lists that model as a failed import instead. Rewrite it by hand: remove the `is_incremental()` filter, then use `merge` with a `unique_key` or a `time_interval` model.
+Any of these is refused when its dbt SQL uses `is_incremental()`. The compiled SQL can keep a delta filter. As `full_refresh`, every run would replace the table with only recent rows. Rewrite it by hand: remove the filter, then use `merge` with a `unique_key` or a `time_interval` model.
 
-:::caution[Remove the filter before you rely on merge]
-A keyed model is imported as `merge` from the same compiled SQL, and the importer does not refuse it. `merge` creates its table from that SQL on the first run, and so does `delete_insert`. If the SQL kept an `is_incremental()` filter, that first run goes wrong ([#2059](https://github.com/rocky-data/rocky/issues/2059)). The common filter, `MAX(...)` over the model's own table, fails because that table does not exist yet. A literal cutoff loads only the recent rows. Check every imported model whose dbt SQL used `is_incremental()`, and remove the filter first.
+:::caution[Incremental models need a full-refresh compile]
+Every manifest incremental model needs successful per-model evidence in a matching full-refresh artifact pair and `compiled_code`. Plain or selective compiles can leave unsafe or missing SQL. A custom macro can hide the `is_incremental()` call. Rocky's first run then fails or omits old rows.
+
+Run `dbt compile --full-refresh` without `--select`, or include the model. Keep `manifest.json` and `run_results.json` side by side. Remove any effective `full_refresh=false` model config and compile again. That config overrides the command flag.
 :::
 
-The raw and no-manifest importer still refuses unresolved Jinja that calls `is_incremental()`, rather than deleting bounded logic silently.
+The raw and no-manifest importer refuses every effectively incremental model it resolves from inline, project, or model properties config. It has no compiled SQL or per-model run result.
+It also refuses Jinja control flow, versioned models, and config expressions it cannot resolve.
 
 ### Environment-specific logic
 

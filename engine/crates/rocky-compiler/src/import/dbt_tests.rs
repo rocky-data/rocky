@@ -18,6 +18,10 @@ use rocky_core::tests::{CompositeKind, TestDecl, TestSeverity, TestType};
 #[derive(Debug, Clone)]
 pub struct DbtModelYaml {
     pub name: String,
+    pub materialized: Option<String>,
+    /// SQL stems belonging to a versioned model. Raw import cannot resolve
+    /// per-version configuration without dbt's compiled manifest.
+    pub versioned_names: Vec<String>,
     pub description: Option<String>,
     pub columns: Vec<DbtColumnYaml>,
     /// Model-level (non-column) tests, e.g. `dbt_utils.unique_combination_of_columns`.
@@ -67,6 +71,10 @@ struct RawModelFile {
 #[derive(Deserialize)]
 struct RawModel {
     name: String,
+    #[serde(default)]
+    versions: Vec<serde_yaml::Value>,
+    #[serde(default)]
+    config: Option<serde_yaml::Value>,
     #[serde(default)]
     description: Option<String>,
     #[serde(default)]
@@ -178,6 +186,31 @@ pub fn parse_model_yaml_content(content: &str) -> Result<Vec<DbtModelYaml>, Stri
 
     let mut models = Vec::new();
     for raw_model in raw_models {
+        let mut versioned_names = Vec::new();
+        if !raw_model.versions.is_empty() {
+            versioned_names.push(raw_model.name.clone());
+            for version in &raw_model.versions {
+                let Some(version) = version.as_mapping() else {
+                    continue;
+                };
+                if let Some(defined_in) = version
+                    .get(serde_yaml::Value::String("defined_in".to_string()))
+                    .and_then(serde_yaml::Value::as_str)
+                    && let Some(stem) = Path::new(defined_in).file_stem().and_then(|s| s.to_str())
+                {
+                    versioned_names.push(stem.to_string());
+                }
+                if let Some(number) = version.get(serde_yaml::Value::String("v".to_string())) {
+                    let number = number.as_str().map(str::to_string).unwrap_or_else(|| {
+                        serde_yaml::to_string(number)
+                            .unwrap_or_default()
+                            .trim()
+                            .to_string()
+                    });
+                    versioned_names.push(format!("{}_v{number}", raw_model.name));
+                }
+            }
+        }
         let model_tests = parse_column_tests(&raw_model.tests);
         let columns = raw_model
             .columns
@@ -194,6 +227,14 @@ pub fn parse_model_yaml_content(content: &str) -> Result<Vec<DbtModelYaml>, Stri
 
         models.push(DbtModelYaml {
             name: raw_model.name,
+            versioned_names,
+            materialized: raw_model.config.as_ref().and_then(|config| {
+                config
+                    .as_mapping()?
+                    .get(serde_yaml::Value::String("materialized".to_string()))?
+                    .as_str()
+                    .map(str::to_string)
+            }),
             description: raw_model.description,
             columns,
             tests: model_tests,
@@ -1526,6 +1567,8 @@ models:
     fn test_not_null_to_contract() {
         let model = DbtModelYaml {
             name: "fct_orders".to_string(),
+            materialized: None,
+            versioned_names: Vec::new(),
             description: None,
             columns: vec![
                 DbtColumnYaml {
@@ -1553,6 +1596,8 @@ models:
     fn test_unique_to_contract() {
         let model = DbtModelYaml {
             name: "fct_orders".to_string(),
+            materialized: None,
+            versioned_names: Vec::new(),
             description: None,
             columns: vec![DbtColumnYaml {
                 name: "order_id".to_string(),
@@ -1581,6 +1626,8 @@ models:
 
         let model = DbtModelYaml {
             name: "fct_orders".to_string(),
+            materialized: None,
+            versioned_names: Vec::new(),
             description: None,
             columns: vec![DbtColumnYaml {
                 name: "status".to_string(),
@@ -1622,6 +1669,8 @@ models:
 
         let model = DbtModelYaml {
             name: "fct_orders".to_string(),
+            materialized: None,
+            versioned_names: Vec::new(),
             description: None,
             columns: vec![DbtColumnYaml {
                 name: "customer_id".to_string(),
@@ -1657,6 +1706,8 @@ models:
 
         let model = DbtModelYaml {
             name: "fct_orders".to_string(),
+            materialized: None,
+            versioned_names: Vec::new(),
             description: None,
             columns: vec![DbtColumnYaml {
                 name: "amount".to_string(),
@@ -1683,6 +1734,8 @@ models:
     fn test_unknown_test_skipped() {
         let model = DbtModelYaml {
             name: "model".to_string(),
+            materialized: None,
+            versioned_names: Vec::new(),
             description: None,
             columns: vec![DbtColumnYaml {
                 name: "col".to_string(),
@@ -1707,6 +1760,8 @@ models:
 
         let model = DbtModelYaml {
             name: "users".to_string(),
+            materialized: None,
+            versioned_names: Vec::new(),
             description: None,
             columns: vec![
                 DbtColumnYaml {
@@ -1847,6 +1902,8 @@ models:
     fn test_decl_simple_unique_and_not_null() {
         let model = DbtModelYaml {
             name: "fct_orders".to_string(),
+            materialized: None,
+            versioned_names: Vec::new(),
             description: None,
             columns: vec![DbtColumnYaml {
                 name: "order_id".to_string(),
@@ -1887,6 +1944,8 @@ models:
         );
         let model = DbtModelYaml {
             name: "users".to_string(),
+            materialized: None,
+            versioned_names: Vec::new(),
             description: None,
             columns: vec![DbtColumnYaml {
                 name: "status".to_string(),
@@ -1923,6 +1982,8 @@ models:
         );
         let model = DbtModelYaml {
             name: "fct_orders".to_string(),
+            materialized: None,
+            versioned_names: Vec::new(),
             description: None,
             columns: vec![DbtColumnYaml {
                 name: "customer_id".to_string(),
@@ -1975,6 +2036,8 @@ models:
         );
         let model = DbtModelYaml {
             name: "fct".to_string(),
+            materialized: None,
+            versioned_names: Vec::new(),
             description: None,
             columns: vec![DbtColumnYaml {
                 name: "external_id".to_string(),
@@ -2003,6 +2066,8 @@ models:
         // mapping (configured). Both must surface as UnsupportedTest.
         let model = DbtModelYaml {
             name: "model".to_string(),
+            materialized: None,
+            versioned_names: Vec::new(),
             description: None,
             columns: vec![DbtColumnYaml {
                 name: "amount".to_string(),
@@ -2044,6 +2109,8 @@ models:
         config.insert("values".to_string(), serde_yaml::Value::Sequence(vec![]));
         let model = DbtModelYaml {
             name: "m".to_string(),
+            materialized: None,
+            versioned_names: Vec::new(),
             description: None,
             columns: vec![DbtColumnYaml {
                 name: "c".to_string(),
@@ -2071,6 +2138,8 @@ models:
         );
         let model = DbtModelYaml {
             name: "users".to_string(),
+            materialized: None,
+            versioned_names: Vec::new(),
             description: None,
             columns: vec![
                 DbtColumnYaml {
