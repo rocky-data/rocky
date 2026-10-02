@@ -63,7 +63,7 @@ export function openReviewPanel(planId: string, review: ReviewOutput): void {
 
   let current = review;
   const rerender = (): void => {
-    panel.webview.html = render(panel.webview, planId, current);
+    panel.webview.html = renderReviewHtml(panel.webview, planId, current);
   };
   rerender();
 
@@ -106,7 +106,7 @@ export function openReviewPanel(planId: string, review: ReviewOutput): void {
   });
 }
 
-function render(
+export function renderReviewHtml(
   webview: vscode.Webview,
   planId: string,
   r: ReviewOutput,
@@ -124,6 +124,14 @@ function render(
       </tr>`,
     )
     .join("");
+  const drops = r.conditional_drops;
+  const dropRows = drops.map((drop) => `
+      <tr>
+        <td>${escapeHtml(drop.model)}</td>
+        <td><code>${escapeHtml(drop.target)}</code></td>
+        <td>${escapeHtml(drop.existing_kind)}</td>
+        <td><code>${escapeHtml(drop.drop_sql)}</code></td>
+      </tr>`).join("");
 
   const applyAttrs = canApply(r) ? "" : "disabled";
   const approveHidden = r.approved ? "hidden" : "";
@@ -135,12 +143,6 @@ ${buildHead(webview, nonce, "Rocky review")}
   <h1>Plan review <span class="badge ${verdict === "approved" ? "ok" : verdict === "blocked" ? "warn" : "ok"}">${verdict}</span></h1>
   <p class="muted">Plan <code>${escapeHtml(planId)}</code> · diffed vs <code>${escapeHtml(r.base_ref)}</code></p>
 
-  <div id="toolbar" style="margin: 12px 0; display:flex; gap:8px;">
-    <button id="approve" ${approveHidden}>Approve</button>
-    <button id="apply" ${applyAttrs}>Apply</button>
-  </div>
-  <p class="muted">${r.approved ? "Approved — Apply will execute the plan." : "Approve records your sign-off (writes the review marker) and unblocks Apply."}</p>
-
   ${
     findings.length > 0
       ? `<h2>Breaking changes (${findings.length})</h2>
@@ -150,6 +152,16 @@ ${buildHead(webview, nonce, "Rocky review")}
     </table>`
       : `<p class="badge ok">No breaking changes detected vs ${escapeHtml(r.base_ref)}.</p>`
   }
+  ${drops.length > 0 ? `<h2>Conditional DROPs (${drops.length})</h2>
+    <p>The DROP runs only if the warehouse finds the listed existing kind.</p>
+    <table><thead><tr><th>Model</th><th>Target</th><th>Existing kind</th><th>DROP SQL</th></tr></thead>
+    <tbody>${dropRows}</tbody></table>` : ""}
+
+  <div id="toolbar" style="margin: 12px 0; display:flex; gap:8px;">
+    <button id="approve" ${approveHidden}>Approve</button>
+    <button id="apply" ${applyAttrs}>Apply</button>
+  </div>
+  <p class="muted">${r.approved ? "Approved — Apply will execute the plan." : "Approve records your sign-off (writes the review marker) and unblocks Apply."}</p>
 
   <script nonce="${nonce}">
     const vscode = acquireVsCodeApi();

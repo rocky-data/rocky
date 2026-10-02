@@ -8119,6 +8119,15 @@ pub struct FulfillOutput {
     pub plan_id: Option<String>,
 }
 
+/// A DROP permitted when a model switches between a table and a view.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct ConditionalDrop {
+    pub model: String,
+    pub target: String,
+    pub existing_kind: String,
+    pub drop_sql: String,
+}
+
 /// JSON output for `rocky review <plan-id>`.
 ///
 /// `rocky review` is the human sign-off gate for an AI-authored plan. It
@@ -8152,6 +8161,8 @@ pub struct ReviewOutput {
     /// the models directory was unavailable).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub breaking_changes: Option<Vec<rocky_core::breaking_change::BreakingFinding>>,
+    /// Conditional kind-switch DROPs at their effective execution targets.
+    pub conditional_drops: Vec<ConditionalDrop>,
     /// Human-readable summary of the review outcome.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,

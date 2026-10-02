@@ -139,13 +139,23 @@ pub(crate) fn review_marker_state(root: &Path, plan_id: &str) -> ReviewMarkerSta
 /// [`crate::commands::run_apply`]) and delegates to [`run_review_in`].
 pub async fn run_review(
     config_path: &Path,
+    state_path: &Path,
     plan_id: &str,
     base_ref: &str,
     approve: bool,
     output_json: bool,
 ) -> Result<()> {
     let cwd = std::env::current_dir().context("failed to get current working directory")?;
-    run_review_in(&cwd, config_path, plan_id, base_ref, approve, output_json).await
+    run_review_in(
+        &cwd,
+        config_path,
+        state_path,
+        plan_id,
+        base_ref,
+        approve,
+        output_json,
+    )
+    .await
 }
 
 /// Inner implementation — takes an explicit `root` for the plans / marker
@@ -154,12 +164,21 @@ pub async fn run_review(
 pub(crate) async fn run_review_in(
     root: &Path,
     config_path: &Path,
+    state_path: &Path,
     plan_id: &str,
     base_ref: &str,
     approve: bool,
     output_json: bool,
 ) -> Result<()> {
-    let output = compute_review(root, config_path, plan_id, base_ref, approve).await?;
+    let output = compute_review_with_state_path(
+        root,
+        config_path,
+        Some(state_path),
+        plan_id,
+        base_ref,
+        approve,
+    )
+    .await?;
 
     if output_json {
         print_json(&output)?;
@@ -221,6 +240,19 @@ pub async fn compute_review(
     base_ref: &str,
     approve: bool,
 ) -> Result<ReviewOutput> {
+    compute_review_with_state_path(root, config_path, None, plan_id, base_ref, approve).await
+}
+
+/// Review with the state path already resolved by the caller. This keeps
+/// branch routing in the same state namespace as plan and apply.
+pub async fn compute_review_with_state_path(
+    root: &Path,
+    config_path: &Path,
+    state_path: Option<&Path>,
+    plan_id: &str,
+    base_ref: &str,
+    approve: bool,
+) -> Result<ReviewOutput> {
     let plan = read_plan(root, plan_id)
         .with_context(|| format!("failed to read plan '{plan_id}' for review"))?;
 
@@ -264,18 +296,23 @@ pub async fn compute_review(
     // the process cwd — the governor's MCP server reviews from a cwd that is
     // not the project, and a cwd-relative path would silently skip the
     // breaking-change gate there.
-    let (models_dir, state_path) = review_gate_paths(root, run_plan.models_dir.as_deref());
+    let (models_dir, default_state_path) = review_gate_paths(root, run_plan.models_dir.as_deref());
+    let state_path = state_path.unwrap_or(&default_state_path);
 
     // `?` here is the whole point of the change: a present-but-unloadable
     // `rocky.toml` propagates BEFORE the `--approve` branch below, so no marker
     // is written and no zero count is recorded.
-    let findings = compute_review_findings(config_path, &models_dir, &state_path, base_ref)?;
+    let findings = compute_review_findings(config_path, &models_dir, state_path, base_ref)?;
     let breaking_count = findings
         .as_ref()
         .map(|f| f.iter().filter(|x| x.is_breaking()).count())
         .unwrap_or(0);
-    let conditional_drops =
-        conditional_drop_review_lines(config_path, &models_dir, run_plan.model.as_deref())?;
+    let conditional_drops = super::plan::conditional_drops_for_run_plan(
+        config_path,
+        &models_dir,
+        state_path,
+        &run_plan,
+    )?;
 
     let mut marker_written = false;
     if approve {
@@ -313,9 +350,12 @@ pub async fn compute_review(
     }
 
     let mut message = build_message(approve, breaking_count, &findings, plan_id);
-    for line in conditional_drops {
+    for drop in &conditional_drops {
         message.push('\n');
-        message.push_str(&line);
+        message.push_str(&format!(
+            "{}: -- {} (only if the existing object is a {})",
+            drop.model, drop.drop_sql, drop.existing_kind
+        ));
     }
 
     Ok(ReviewOutput {
@@ -326,22 +366,9 @@ pub async fn compute_review(
         approved: approve,
         marker_written,
         breaking_changes: findings,
+        conditional_drops,
         message: Some(message),
     })
-}
-
-fn conditional_drop_review_lines(
-    config_path: &Path,
-    models_dir: &Path,
-    model: Option<&str>,
-) -> Result<Vec<String>> {
-    let preview = super::plan::plan_preview_output(Some(config_path), models_dir, model, None)?;
-    Ok(preview
-        .statements
-        .into_iter()
-        .filter(|statement| statement.purpose == "conditional_drop")
-        .map(|statement| format!("{}: {}", statement.target, statement.sql))
-        .collect())
 }
 
 /// Review (and optionally approve) a `PlanKind::Gc` reclamation plan or a
@@ -436,6 +463,7 @@ async fn compute_review_marker_only(
         approved: approve,
         marker_written,
         breaking_changes: None,
+        conditional_drops: Vec::new(),
         message: Some(message),
     })
 }
@@ -1204,8 +1232,8 @@ mod tests {
     use super::*;
     use crate::output::ApproverSource;
 
-    #[test]
-    fn review_lists_conditional_drop_per_model() -> anyhow::Result<()> {
+    #[tokio::test]
+    async fn review_branch_drop_matches_executed_target_before_approval() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let models = dir.path().join("models");
         std::fs::create_dir(&models)?;
@@ -1219,10 +1247,56 @@ mod tests {
             &config,
             "[adapter.default]\ntype = \"duckdb\"\ndatabase = \":memory:\"\n",
         )?;
-        let lines = conditional_drop_review_lines(&config, &models, None)?;
-        assert_eq!(lines.len(), 1);
-        assert!(lines[0].contains("DROP TABLE"));
-        assert!(lines[0].contains("only if the existing object is a table"));
+        let state_path = dir.path().join("isolated_state.redb");
+        let store = StateStore::open(&state_path)?;
+        store.put_branch(&rocky_core::state::BranchRecord {
+            name: "review_branch".to_string(),
+            schema_prefix: "branch_schema".to_string(),
+            created_by: "test".to_string(),
+            created_at: Utc::now(),
+            description: None,
+        })?;
+        drop(store);
+        let payload = serde_json::json!({
+            "parallel": 1, "models_dir": "models", "model": "switch",
+            "branch": "review_branch"
+        });
+        let plan_id = crate::plan_store::write_plan(dir.path(), PlanKind::AiAuthored, &payload)?;
+        let review = compute_review_with_state_path(
+            dir.path(),
+            &config,
+            Some(&state_path),
+            &plan_id,
+            "HEAD",
+            false,
+        )
+        .await?;
+        assert!(!review.marker_written);
+        assert_eq!(review.conditional_drops.len(), 1);
+        let drop = &review.conditional_drops[0];
+        let model = rocky_core::models::load_models_from_dir(&models, None)?.remove(0);
+        let shadow = crate::commands::branch::resolve_branch_shadow_config(
+            &state_path,
+            "review_branch",
+            "_rocky_shadow".to_string(),
+        )?;
+        let target = rocky_core::shadow::shadow_target(&model.to_model_ir().target, &shadow);
+        let dialect = rocky_duckdb::dialect::DuckDbSqlDialect;
+        let executed_target = rocky_core::traits::SqlDialect::format_table_ref(
+            &dialect,
+            &target.catalog,
+            &target.schema,
+            &target.table,
+        )?;
+        let executed_drop = crate::commands::run::strategy_switch_drop_sql(
+            &dialect,
+            &executed_target,
+            rocky_core::traits::ObjectKind::Table,
+        )
+        .unwrap();
+        assert_eq!(drop.target, executed_target);
+        assert_eq!(drop.drop_sql, executed_drop);
+        assert!(drop.target.contains("branch_schema"));
         Ok(())
     }
 

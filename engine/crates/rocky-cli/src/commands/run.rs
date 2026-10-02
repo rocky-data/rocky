@@ -13421,7 +13421,7 @@ fn strategy_implies_object_kind(
     }
 }
 
-fn strategy_switch_drop_sql(
+pub(crate) fn strategy_switch_drop_sql(
     dialect: &dyn rocky_core::traits::SqlDialect,
     target: &str,
     existing: rocky_core::traits::ObjectKind,

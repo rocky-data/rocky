@@ -190,8 +190,8 @@ pub use replay::{
 pub use restore::run_restore_plan;
 pub use retention_status::run_retention_status;
 pub use review::{
-    compute_review, compute_review_queue, compute_review_status, plan_is_reviewable, run_review,
-    run_review_queue, run_review_status,
+    compute_review, compute_review_queue, compute_review_status, compute_review_with_state_path,
+    plan_is_reviewable, run_review, run_review_queue, run_review_status,
 };
 pub use schedule_spool::{ScheduleSpoolError, compute_schedule_spool, state_schedule_spool};
 pub use schedule_status::{ScheduleStatusError, schedule_status_output};

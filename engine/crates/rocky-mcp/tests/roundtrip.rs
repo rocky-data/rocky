@@ -1055,8 +1055,8 @@ effect = "require_review"
 /// server: an agent `propose` under a `require_review` policy plants one
 /// escalation in the ledger, then every governor projection surfaces it with
 /// citations, the scorecard matches hand-computed truth, and the `review_queue`
-/// approve action is gated on an explicit confirmation before it writes the
-/// sign-off marker that unblocks `rocky apply`.
+/// approve action previews a conditional DROP before confirmation, then
+/// writes the sign-off marker that unblocks `rocky apply`.
 ///
 /// Runs on the APPROVER profile (#1517) — the only profile that serves the
 /// approve action at all. The confirm gate tested here is the SECOND gate: it
@@ -1080,6 +1080,16 @@ scope = { any = true }
 effect = "require_review"
 "#,
     );
+    let sidecar = dir.path().join("models/orders.toml");
+    let source = std::fs::read_to_string(&sidecar).unwrap();
+    std::fs::write(
+        &sidecar,
+        source.replace(
+            "name = \"orders\"\n",
+            "name = \"orders\"\ndrop_existing_kind = \"view\"\n",
+        ),
+    )
+    .unwrap();
     let server = RockyMcpServer::new_with_profile(
         dir.path().join("rocky.toml"),
         rocky_mcp::McpProfile::Approver,
@@ -1206,24 +1216,25 @@ effect = "require_review"
         "escalation rate is 1.0: {agent:?}"
     );
 
-    // review_queue approve WITHOUT confirm → the gate refuses.
+    // review_queue without confirmation returns the dry-run review.
     let approve_no_confirm = serde_json::json!({ "approve_plan_id": plan_id })
         .as_object()
         .unwrap()
         .clone();
-    let refused = client
+    let preview = client
         .call_tool(CallToolRequestParams::new("review_queue").with_arguments(approve_no_confirm))
         .await
         .expect("review_queue approve (no confirm) returns a result");
-    assert_eq!(
-        refused.is_error,
-        Some(true),
-        "an unconfirmed approve is refused"
-    );
-    let err = refused
-        .structured_content
-        .expect("structured error envelope");
-    assert_eq!(err["code"], serde_json::json!("policy_review_required"));
+    assert_ne!(preview.is_error, Some(true));
+    let review = preview.structured_content.expect("dry-run review");
+    assert_eq!(review["review"]["approved"], serde_json::json!(false));
+    assert_eq!(review["review"]["marker_written"], serde_json::json!(false));
+    let drops = review["review"]["conditional_drops"].as_array().unwrap();
+    assert_eq!(drops.len(), 1);
+    assert_eq!(drops[0]["model"], "orders");
+    assert_eq!(drops[0]["existing_kind"], "view");
+    assert!(drops[0]["drop_sql"].as_str().unwrap().contains("DROP VIEW"));
+    assert!(review.get("approval").is_none());
 
     // No sign-off marker before confirmation — the gate held.
     let marker = dir

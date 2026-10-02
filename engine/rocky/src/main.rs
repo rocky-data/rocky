@@ -3464,7 +3464,15 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                          pending-review queue"
                     );
                 };
-                rocky_cli::commands::run_review(&cli.config, &plan_id, &base, approve, json).await
+                rocky_cli::commands::run_review(
+                    &cli.config,
+                    &state_path,
+                    &plan_id,
+                    &base,
+                    approve,
+                    json,
+                )
+                .await
             }
         }
         Command::Backfill {

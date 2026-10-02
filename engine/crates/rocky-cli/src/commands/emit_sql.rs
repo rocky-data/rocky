@@ -20,12 +20,10 @@
 //! is refused on transformation models, E037, and `ephemeral` is refused
 //! outright, E038; neither reaches this file.)
 //!
-//! The dialect is the project's configured target adapter type (resolved from
-//! `rocky.toml` without credentials); with no project file at all it defaults
-//! to DuckDB. A `rocky.toml` that exists but does not load is an error, not a
-//! fallback. All models render in this one resolved dialect, so for a project
-//! whose models target more than one adapter, the emitted SQL matches
-//! `rocky run` only for the models whose target uses that dialect. Output is
+//! The dialect is the adapter `rocky run --model` selects from `rocky.toml`
+//! without credentials. With no project file it defaults to DuckDB. A
+//! `rocky.toml` that exists but does not load is an error. All models render
+//! in this one resolved dialect. Output is
 //! one `<model>.sql` file per model when `--out-dir` is given,
 //! otherwise the concatenated SQL is printed to stdout, both in dependency
 //! order. Models whose SQL cannot be rendered offline (e.g. Snowflake
@@ -43,12 +41,20 @@ use tracing::{debug, info};
 use super::plan::dialect_for_adapter_type;
 use crate::registry;
 
-/// Resolve the project's target dialect from the loaded config, falling back
-/// to DuckDB when there is none. Mirrors the resolution in
-/// [`super::plan::plan_preview_output`] so emitted SQL matches the plan preview.
+/// Resolve the model target dialect from the loaded config. Models use the
+/// adapter chosen by `run --model`; a project without pipelines keeps the
+/// standalone preview default.
 fn resolve_dialect(
     config: Option<&rocky_core::config::RockyConfig>,
-) -> Box<dyn rocky_core::traits::SqlDialect> {
+) -> Result<Box<dyn rocky_core::traits::SqlDialect>> {
+    if let Some(cfg) = config.filter(|cfg| !cfg.pipelines.is_empty()) {
+        let adapter_name = super::run::resolve_model_run_target(cfg, None)?.0;
+        let adapter = cfg
+            .adapters
+            .get(&adapter_name)
+            .ok_or_else(|| anyhow::anyhow!("target adapter '{adapter_name}' is not configured"))?;
+        return Ok(dialect_for_adapter_type(&adapter.adapter_type));
+    }
     let adapter_type = config
         .and_then(|cfg| {
             let target_adapter_name = registry::resolve_replication_pipeline(cfg, None)
@@ -59,7 +65,7 @@ fn resolve_dialect(
                 .or_else(|| cfg.adapters.values().next().map(|a| a.adapter_type.clone()))
         })
         .unwrap_or_else(|| "duckdb".to_string());
-    dialect_for_adapter_type(&adapter_type)
+    Ok(dialect_for_adapter_type(&adapter_type))
 }
 
 /// One model's emitted SQL: its name and the joined runnable statement(s).
@@ -114,7 +120,7 @@ fn emit_models(
                     .unwrap_or_default()
             )
         })?;
-    let dialect = resolve_dialect(project_config.as_ref());
+    let dialect = resolve_dialect(project_config.as_ref())?;
 
     let config = CompilerConfig {
         models_dir: models_dir.to_path_buf(),
@@ -664,6 +670,44 @@ mod tests {
         assert!(body.lines().next().unwrap().starts_with("-- DROP VIEW"));
         assert!(body.contains("only if the existing object is a view"));
         assert!(body.contains("CREATE OR REPLACE TABLE"));
+    }
+
+    #[test]
+    fn selected_model_emit_uses_transformation_adapter_dialect() {
+        let dir = tempfile::tempdir().unwrap();
+        let models = dir.path().join("models");
+        std::fs::create_dir(&models).unwrap();
+        std::fs::write(models.join("switch.sql"), "SELECT 1 AS id\n").unwrap();
+        std::fs::write(models.join("switch.toml"),
+            "name = \"switch\"\ndrop_existing_kind = \"view\"\n[strategy]\ntype = \"full_refresh\"\n[target]\ncatalog = \"warehouse\"\nschema = \"prod\"\n").unwrap();
+        let config = dir.path().join("rocky.toml");
+        std::fs::write(&config,
+            "[adapter.duck]\ntype = \"duckdb\"\n[adapter.snow]\ntype = \"snowflake\"\naccount = \"example\"\n[pipeline.trans]\ntype = \"transformation\"\nmodels = \"models/**\"\n[pipeline.trans.target]\nadapter = \"snow\"\n").unwrap();
+        let emitted = emit_models(
+            Some(&config),
+            &models,
+            Some("switch"),
+            &rocky_core::run_vars::RunVars::new(),
+        )
+        .unwrap();
+        assert_eq!(emitted.models.len(), 1);
+        assert!(
+            emitted.models[0]
+                .sql
+                .contains("DROP VIEW \"warehouse\".\"prod\".\"switch\"")
+        );
+        let all = emit_models(
+            Some(&config),
+            &models,
+            None,
+            &rocky_core::run_vars::RunVars::new(),
+        )
+        .unwrap();
+        assert!(
+            all.models[0]
+                .sql
+                .contains("DROP VIEW \"warehouse\".\"prod\".\"switch\"")
+        );
     }
 
     #[test]

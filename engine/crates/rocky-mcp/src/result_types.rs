@@ -1003,6 +1003,9 @@ pub struct ReviewQueueResult {
     /// be read integrity-checked appears as a `{plan_id, warning}` entry
     /// instead of being silently dropped.
     pub pending: serde_json::Value,
+    /// Dry-run review returned before confirmation for an exact pending plan.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub review: Option<serde_json::Value>,
     /// Present only when this call approved a plan.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub approval: Option<ReviewApprovalOutcome>,

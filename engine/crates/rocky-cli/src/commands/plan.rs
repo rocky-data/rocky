@@ -487,8 +487,14 @@ pub async fn plan(
         // preview could not render is named in `skipped`, and dropping it
         // here left `rocky plan --model <refused>` reporting an empty plan
         // with nothing to say why (#1996).
-        let preview =
-            plan_preview_output(Some(config_path), &blueprint_models_dir, Some(model), env)?;
+        let preview = plan_preview_output_for_pipeline(
+            Some(config_path),
+            &blueprint_models_dir,
+            Some(model),
+            env,
+            pipeline_name,
+            None,
+        )?;
         output.statements = preview.statements;
         output.skipped = preview.skipped;
     }
@@ -507,15 +513,36 @@ pub async fn plan(
             state_path,
         ) {
             Ok(Some(RunPlanBuild::Persisted(run_plan, plan_id, persisted_at))) => {
-                if run_options.model.is_none() {
-                    let preview =
-                        plan_preview_output(Some(config_path), &blueprint_models_dir, None, env)?;
-                    output.statements.extend(
-                        preview
-                            .statements
-                            .into_iter()
-                            .filter(|stmt| stmt.purpose == "conditional_drop"),
-                    );
+                if let Some(model) = run_plan.model.as_deref()
+                    && let Some(shadow) = shadow_config_for_run_plan(state_path, &run_plan)?
+                {
+                    let preview = plan_preview_output_for_pipeline(
+                        Some(config_path),
+                        &blueprint_models_dir,
+                        Some(model),
+                        env,
+                        run_plan.pipeline.as_deref(),
+                        Some(&shadow),
+                    )?;
+                    output.statements = preview.statements;
+                }
+                output
+                    .statements
+                    .retain(|stmt| stmt.purpose != "conditional_drop");
+                for drop in conditional_drops_for_run_plan(
+                    config_path,
+                    &blueprint_models_dir,
+                    state_path,
+                    &run_plan,
+                )? {
+                    output.statements.push(PlannedStatement {
+                        purpose: "conditional_drop".to_string(),
+                        target: drop.target.clone(),
+                        sql: format!(
+                            "-- {} (only if the existing object is a {})",
+                            drop.drop_sql, drop.existing_kind,
+                        ),
+                    });
                 }
                 output.models = run_plan.models.clone();
                 output.execution_layers = run_plan.execution_layers.clone();
@@ -988,25 +1015,151 @@ pub(crate) fn conditional_kind_drop_preview(
     ir: &rocky_ir::ModelIr,
     dialect: &dyn rocky_core::traits::SqlDialect,
 ) -> Result<Option<String>> {
+    Ok(
+        conditional_kind_drop_detail(model, ir, dialect)?.map(|drop| {
+            let replacement = if drop.existing_kind == "view" {
+                "table"
+            } else {
+                "view"
+            };
+            format!(
+                "-- {} (only if the existing object is a {} and the model creates a {replacement})",
+                drop.drop_sql, drop.existing_kind,
+            )
+        }),
+    )
+}
+
+/// Use the execution DROP builder, so quoting and adapter SQL match apply.
+pub(crate) fn conditional_kind_drop_detail(
+    model: &rocky_core::models::Model,
+    ir: &rocky_ir::ModelIr,
+    dialect: &dyn rocky_core::traits::SqlDialect,
+) -> Result<Option<ConditionalDrop>> {
     use rocky_core::models::DropExistingKind;
+    use rocky_core::traits::ObjectKind;
     use rocky_ir::MaterializationStrategy;
 
-    let (kind, replacement) = match (&ir.materialization, model.drop_existing_kind) {
-        (MaterializationStrategy::FullRefresh, Some(DropExistingKind::View)) => ("VIEW", "table"),
-        (MaterializationStrategy::View, Some(DropExistingKind::Table)) => ("TABLE", "view"),
+    let (kind, label) = match (&ir.materialization, model.drop_existing_kind) {
+        (MaterializationStrategy::FullRefresh, Some(DropExistingKind::View)) => {
+            (ObjectKind::View, "view")
+        }
+        (MaterializationStrategy::View, Some(DropExistingKind::Table)) => {
+            (ObjectKind::Table, "table")
+        }
         _ => return Ok(None),
     };
     let target =
         dialect.format_table_ref(&ir.target.catalog, &ir.target.schema, &ir.target.table)?;
-    let drop = if kind == "TABLE" {
-        dialect.drop_table_sql(&target)
-    } else {
-        format!("DROP VIEW {target}")
+    let drop_sql = super::run::strategy_switch_drop_sql(dialect, &target, kind)
+        .ok_or_else(|| anyhow::anyhow!("no DROP SQL for permitted kind switch"))?;
+    Ok(Some(ConditionalDrop {
+        model: model.config.name.clone(),
+        target,
+        existing_kind: label.to_string(),
+        drop_sql,
+    }))
+}
+
+/// Build kind-switch warnings from the persisted execution selection.
+/// The run path uses the same branch resolver and `shadow_target` function.
+pub(crate) fn conditional_drops_for_run_plan(
+    config_path: &Path,
+    models_dir: &Path,
+    state_path: &Path,
+    run_plan: &RunPlan,
+) -> Result<Vec<ConditionalDrop>> {
+    use rocky_compiler::compile::{self, CompilerConfig};
+
+    let config = CompilerConfig {
+        models_dir: models_dir.to_path_buf(),
+        contracts_dir: None,
+        required_explicit_contract_model: None,
+        source_schemas: std::collections::HashMap::new(),
+        mask: std::collections::BTreeMap::new(),
+        allow_unmasked: vec![],
+        project_freshness: Default::default(),
+        run_vars: rocky_core::run_vars::RunVars::new(),
     };
-    Ok(Some(format!(
-        "-- {drop} (only if the existing object is a {} and the model creates a {replacement})",
-        kind.to_lowercase()
-    )))
+    let models = match compile::compile(&config) {
+        Ok(result) => result.project.models,
+        // Legacy reviewable plans may omit the informational model list and
+        // point at an uncompiled project. Apply cannot execute a model when
+        // this same compile fails, so there is no conditional DROP to show.
+        Err(_) if run_plan.models.is_empty() && run_plan.model.is_none() => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(anyhow::Error::from(error)
+                .context("failed to compile models for conditional DROP review"));
+        }
+    };
+    if models.is_empty() {
+        return Ok(Vec::new());
+    }
+    let dialect = match rocky_core::config::load_optional_project_config(Some(config_path))? {
+        Some(cfg) => {
+            let adapter_name = if run_plan.model.is_some() {
+                super::run::resolve_model_run_target(&cfg, run_plan.pipeline.as_deref())?.0
+            } else if cfg.pipelines.is_empty() {
+                "default".to_string()
+            } else {
+                registry::resolve_pipeline(&cfg, run_plan.pipeline.as_deref())?
+                    .1
+                    .target_adapter()
+                    .to_string()
+            };
+            let adapter_type = cfg
+                .adapters
+                .get(&adapter_name)
+                .with_context(|| format!("target adapter '{adapter_name}' is not configured"))?
+                .adapter_type
+                .as_str();
+            dialect_for_adapter_type(adapter_type)
+        }
+        None => preview_dialect(Some(config_path))?,
+    };
+    let shadow = shadow_config_for_run_plan(state_path, run_plan)?;
+    let mut drops = Vec::new();
+    for model in models {
+        if run_plan
+            .model
+            .as_deref()
+            .is_some_and(|name| name != model.config.name)
+        {
+            continue;
+        }
+        let mut ir = model.to_model_ir();
+        if let Some(shadow) = &shadow {
+            ir.target = rocky_core::shadow::shadow_target(&ir.target, shadow);
+        }
+        if let Some(drop) = conditional_kind_drop_detail(&model, &ir, dialect.as_ref())? {
+            drops.push(drop);
+        }
+    }
+    Ok(drops)
+}
+
+fn shadow_config_for_run_plan(
+    state_path: &Path,
+    run_plan: &RunPlan,
+) -> Result<Option<rocky_core::shadow::ShadowConfig>> {
+    let suffix = run_plan
+        .shadow_suffix
+        .clone()
+        .unwrap_or_else(|| "_rocky_shadow".to_string());
+    if let Some(branch) = &run_plan.branch {
+        Ok(Some(super::branch::resolve_branch_shadow_config(
+            state_path, branch, suffix,
+        )?))
+    } else if run_plan.shadow {
+        Ok(Some(rocky_core::shadow::ShadowConfig {
+            suffix,
+            schema_override: run_plan.shadow_schema.clone(),
+            cleanup_after: true,
+            branch: None,
+        }))
+    } else {
+        Ok(None)
+    }
 }
 
 /// Side-effect-free SQL preview core: compile the project in-process and render
@@ -1054,6 +1207,17 @@ pub fn plan_preview_output(
     filter: Option<&str>,
     env: Option<&str>,
 ) -> Result<PlanOutput> {
+    plan_preview_output_for_pipeline(config_path, models_dir, filter, env, None, None)
+}
+
+fn plan_preview_output_for_pipeline(
+    config_path: Option<&Path>,
+    models_dir: &Path,
+    filter: Option<&str>,
+    env: Option<&str>,
+    pipeline_name: Option<&str>,
+    shadow: Option<&rocky_core::shadow::ShadowConfig>,
+) -> Result<PlanOutput> {
     use rocky_compiler::compile::{self, CompilerConfig};
 
     let mut output = PlanOutput::new(filter.unwrap_or("").to_string());
@@ -1063,7 +1227,26 @@ pub fn plan_preview_output(
     // No config file / unresolvable target → DuckDB (or the Databricks
     // fallback when the `duckdb` feature is off). A config that EXISTS but
     // does not load refuses — see [`preview_dialect`].
-    let dialect = preview_dialect(config_path)?;
+    let loaded =
+        rocky_core::config::load_optional_project_config(config_path).with_context(|| {
+            format!(
+                "failed to load config from {} for the offline SQL preview",
+                config_path
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_default(),
+            )
+        })?;
+    let dialect = match loaded {
+        Some(cfg) if !cfg.pipelines.is_empty() => {
+            let adapter_name = super::run::resolve_model_run_target(&cfg, pipeline_name)?.0;
+            let adapter = cfg
+                .adapters
+                .get(&adapter_name)
+                .with_context(|| format!("target adapter '{adapter_name}' is not configured"))?;
+            dialect_for_adapter_type(&adapter.adapter_type)
+        }
+        _ => preview_dialect(config_path)?,
+    };
 
     // Compile the project in-process (offline — no source schemas, no cache).
     let config = CompilerConfig {
@@ -1199,7 +1382,17 @@ pub fn plan_preview_output(
             }
             None => std::borrow::Cow::Borrowed(model_ir),
         };
-        let model_ir = model_ir.as_ref();
+        let routed;
+        let model_ir = if let Some(shadow) = shadow {
+            routed = {
+                let mut ir = model_ir.as_ref().clone();
+                ir.target = rocky_core::shadow::shadow_target(&ir.target, shadow);
+                ir
+            };
+            &routed
+        } else {
+            model_ir.as_ref()
+        };
 
         let target_label = if model_ir.target.catalog.is_empty() {
             format!("{}.{}", model_ir.target.schema, model_ir.target.table)
@@ -4031,6 +4224,79 @@ table = "users"
                 .iter()
                 .any(|s| s.sql.contains("CREATE OR REPLACE TABLE"))
         );
+    }
+
+    #[test]
+    fn selected_model_preview_uses_its_transformation_adapter() {
+        let tmp = TempDir::new().unwrap();
+        let (cfg, models) = write_project(
+            &tmp,
+            "[adapter.duck]\ntype = \"duckdb\"\n[adapter.snow]\ntype = \"snowflake\"\naccount = \"example\"\n[pipeline.snow]\ntype = \"transformation\"\nmodels = \"models/**\"\n[pipeline.snow.target]\nadapter = \"snow\"\n",
+            &[(
+                "switch",
+                "name = \"switch\"\ndrop_existing_kind = \"view\"\n[strategy]\ntype = \"full_refresh\"\n[target]\ncatalog = \"warehouse\"\nschema = \"prod\"\n",
+            )],
+        );
+        let out = plan_preview_output_for_pipeline(
+            Some(&cfg),
+            &models,
+            Some("switch"),
+            None,
+            Some("snow"),
+            None,
+        )
+        .unwrap();
+        let drop = out
+            .statements
+            .iter()
+            .find(|stmt| stmt.purpose == "conditional_drop")
+            .unwrap();
+        assert!(
+            drop.sql
+                .contains("DROP VIEW \"warehouse\".\"prod\".\"switch\""),
+            "{}",
+            drop.sql
+        );
+        let unfiltered = plan_preview_output(Some(&cfg), &models, None, None).unwrap();
+        assert!(unfiltered.statements.iter().any(|stmt| {
+            stmt.sql
+                .contains("DROP VIEW \"warehouse\".\"prod\".\"switch\"")
+        }));
+        let routed = plan_preview_output_for_pipeline(
+            Some(&cfg),
+            &models,
+            Some("switch"),
+            None,
+            Some("snow"),
+            Some(&rocky_core::shadow::ShadowConfig {
+                suffix: "_rocky_shadow".to_string(),
+                schema_override: Some("branch_schema".to_string()),
+                cleanup_after: false,
+                branch: Some("review_branch".to_string()),
+            }),
+        )
+        .unwrap();
+        assert!(
+            routed
+                .statements
+                .iter()
+                .all(|stmt| stmt.sql.contains("\"branch_schema\""))
+        );
+        assert!(
+            routed
+                .statements
+                .iter()
+                .all(|stmt| !stmt.sql.contains("\"prod\""))
+        );
+        let plan: RunPlan = serde_json::from_value(serde_json::json!({
+            "parallel": 1, "pipeline": "snow"
+        }))
+        .unwrap();
+        let drops =
+            conditional_drops_for_run_plan(&cfg, &models, &tmp.path().join("state.redb"), &plan)
+                .unwrap();
+        assert_eq!(drops.len(), 1, "model metadata is only informational");
+        assert_eq!(drops[0].model, "switch");
     }
 
     /// #1996: an ephemeral model renders no statement, and the preview used

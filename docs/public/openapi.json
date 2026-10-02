@@ -5461,6 +5461,30 @@
         ],
         "description": "Concurrency strategy: the literal `\"adaptive\"` for AIMD-based throttling, or a positive integer for fixed concurrency."
       },
+      "ConditionalDrop": {
+        "description": "A DROP permitted when a model switches between a table and a view.",
+        "properties": {
+          "drop_sql": {
+            "type": "string"
+          },
+          "existing_kind": {
+            "type": "string"
+          },
+          "model": {
+            "type": "string"
+          },
+          "target": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "drop_sql",
+          "existing_kind",
+          "model",
+          "target"
+        ],
+        "type": "object"
+      },
       "ConfigStatus": {
         "description": "What happened when `rocky.toml` was read at server start.",
         "oneOf": [
@@ -17499,6 +17523,13 @@
           "command": {
             "type": "string"
           },
+          "conditional_drops": {
+            "description": "Conditional kind-switch DROPs at their effective execution targets.",
+            "items": {
+              "$ref": "#/components/schemas/ConditionalDrop"
+            },
+            "type": "array"
+          },
           "marker_written": {
             "description": "True when the approval marker is now present on disk as a result of this invocation. Mirrors `approved` today; kept distinct so callers reading the JSON do not have to infer marker state from the flag.",
             "type": "boolean"
@@ -17522,6 +17553,7 @@
           "approved",
           "base_ref",
           "command",
+          "conditional_drops",
           "marker_written",
           "plan_id",
           "version"
