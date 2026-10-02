@@ -2714,6 +2714,13 @@ pub(crate) async fn build_promote_plan_inner(
         .map(|pt| PromoteTargetPlan {
             target: pt.target.clone(),
             source: pt.source.clone(),
+            target_catalog: pt.target_catalog.clone(),
+            target_schema: pt.target_schema.clone(),
+            target_table: pt.target_table.clone(),
+            source_catalog: pt.source_catalog.clone(),
+            source_schema: pt.source_schema.clone(),
+            source_table: pt.source_table.clone(),
+            strategy: pt.strategy.clone(),
             statement: pt.statement.clone(),
         })
         .collect();
@@ -4694,6 +4701,13 @@ token = "${ROCKY_T_1625_PREVIEW_UNSET_2}"
             targets: vec![PromoteTargetPlan {
                 target: "cat.prod_schema.orders".to_string(),
                 source: "cat.branch__fix.orders".to_string(),
+                target_catalog: "cat".to_string(),
+                target_schema: "prod_schema".to_string(),
+                target_table: "orders".to_string(),
+                source_catalog: "cat".to_string(),
+                source_schema: "branch__fix".to_string(),
+                source_table: "orders".to_string(),
+                strategy: "full_refresh".to_string(),
                 statement: "CREATE OR REPLACE TABLE \"cat\".\"prod_schema\".\"orders\" \
                      AS SELECT * FROM \"cat\".\"branch__fix\".\"orders\""
                     .to_string(),

@@ -9176,7 +9176,9 @@ fn apply_defer_rewrite(
 /// `bigquery` because Snowflake also folds UNQUOTED identifiers, while this
 /// function groups `snowflake` with `trino` because both render double quotes.
 /// Those two groupings answer different questions and are meant to disagree.
-fn rewrite_quote_style(dialect: &dyn rocky_core::traits::SqlDialect) -> Result<Option<char>> {
+pub(crate) fn rewrite_quote_style(
+    dialect: &dyn rocky_core::traits::SqlDialect,
+) -> Result<Option<char>> {
     match dialect.name() {
         // `format_table_ref` renders bare identifiers.
         "duckdb" | "databricks" => Ok(None),

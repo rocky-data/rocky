@@ -7942,7 +7942,7 @@ pub struct RejectedApproval {
 /// Per-model promote step captured in a [`PromotePlan`].
 ///
 /// Mirrors the shape of [`PromoteTarget`] but contains only plan-time fields
-/// (`target`, `source`, `statement`). Execution outcome (`succeeded`, `error`)
+/// (`target`, `source`, structured coordinates, `strategy`, `statement`). Execution outcome (`succeeded`, `error`)
 /// is added at apply time and lives on [`PromoteTarget`].
 ///
 /// `statement` is persisted verbatim so `rocky apply` executes the **exact**
@@ -7955,8 +7955,16 @@ pub struct PromoteTargetPlan {
     /// Fully-qualified branch source the promote will read from
     /// (catalog.branch_schema.table).
     pub source: String,
-    /// `CREATE OR REPLACE TABLE <target> AS SELECT * FROM <source>` SQL,
-    /// dialect-quoted at plan time.
+    /// Structured destination coordinates. Display names may contain dots.
+    pub target_catalog: String,
+    pub target_schema: String,
+    pub target_table: String,
+    pub source_catalog: String,
+    pub source_schema: String,
+    pub source_table: String,
+    /// The strategy approved at plan time. Only full_refresh and view apply.
+    pub strategy: String,
+    /// Dialect-quoted replacement SQL, generated at plan time.
     pub statement: String,
 }
 

@@ -312,7 +312,7 @@ export interface AuditEvent {
 /**
  * Per-model promote step captured in a [`PromotePlan`].
  *
- * Mirrors the shape of [`PromoteTarget`] but contains only plan-time fields (`target`, `source`, `statement`). Execution outcome (`succeeded`, `error`) is added at apply time and lives on [`PromoteTarget`].
+ * Mirrors the shape of [`PromoteTarget`] but contains only plan-time fields (`target`, `source`, structured coordinates, `strategy`, `statement`). Execution outcome (`succeeded`, `error`) is added at apply time and lives on [`PromoteTarget`].
  *
  * `statement` is persisted verbatim so `rocky apply` executes the **exact** SQL generated at plan time — skipping re-discovery and ensuring the `plan_id` digest is invalidated if the SQL would differ.
  */
@@ -321,13 +321,26 @@ export interface PromoteTargetPlan {
    * Fully-qualified branch source the promote will read from (catalog.branch_schema.table).
    */
   source: string;
+  source_catalog: string;
+  source_schema: string;
+  source_table: string;
   /**
-   * `CREATE OR REPLACE TABLE <target> AS SELECT * FROM <source>` SQL, dialect-quoted at plan time.
+   * Dialect-quoted replacement SQL, generated at plan time.
    */
   statement: string;
+  /**
+   * The strategy approved at plan time. Only full_refresh and view apply.
+   */
+  strategy: string;
   /**
    * Fully-qualified production target (catalog.schema.table).
    */
   target: string;
+  /**
+   * Structured destination coordinates. Display names may contain dots.
+   */
+  target_catalog: string;
+  target_schema: string;
+  target_table: string;
   [k: string]: unknown;
 }
