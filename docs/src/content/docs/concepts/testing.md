@@ -104,7 +104,9 @@ A column can end up with type `Unknown`, which means the compiler could not infe
 `rocky test` compiles your models and executes them on a local DuckDB. It needs no warehouse connection, so you get fast feedback while you write.
 
 :::note[Time-interval models under `rocky test`]
-A `time_interval` model's SQL uses the `@start_date` and `@end_date` bounds. `rocky test` and `rocky ci` replace them with the widest window the local engine holds: `'0001-01-01 00:00:00'` to `'9999-12-31 23:59:59'`. The end is exclusive, as in `rocky run`. So the window drops no fixture row, and a test sees every row you give it. This applies to the model-execution check and to `[[test]]` unit tests.
+A `time_interval` model's SQL uses the `@start_date` and `@end_date` bounds. `rocky test` replaces them with the widest window the local engine holds: `'0001-01-01 00:00:00'` to `'9999-12-31 23:59:59'`. This applies to the model-execution check and to `[[test]]` unit tests. `rocky ci` runs the model-execution check only.
+
+The end is exclusive, as in `rocky run`. A model that filters `< @end_date` keeps every fixture row before `9999-12-31 23:59:59` and drops a row at that second or later.
 :::
 
 ### What each step does
