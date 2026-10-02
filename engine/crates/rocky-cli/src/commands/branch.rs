@@ -5275,7 +5275,14 @@ adapter = "default"
             )
             .await
             .expect_err("undefined strategy must refuse before planning SQL");
-            assert!(format!("{err:#}").contains(kind), "{kind}: {err:#}");
+            // `microbatch` loads as an alias of `time_interval` (#2054), so
+            // the refusal names the strategy it normalized to.
+            let named = if kind == "microbatch" {
+                "time_interval"
+            } else {
+                kind
+            };
+            assert!(format!("{err:#}").contains(named), "{kind}: {err:#}");
         }
     }
 
