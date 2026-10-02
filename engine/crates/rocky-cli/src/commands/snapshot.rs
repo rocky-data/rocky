@@ -49,6 +49,21 @@ pub async fn run_snapshot(
 
     // Build the snapshot config from pipeline config.
     let config = SnapshotConfig::from_pipeline_config(snapshot_cfg);
+    // The insert must enumerate the source columns. Use the warehouse's
+    // existing schema description API before creating the target or writing rows.
+    let source_columns = adapter
+        .describe_table(&rocky_ir::TableRef {
+            catalog: config.source.catalog.clone(),
+            schema: config.source.schema.clone(),
+            table: config.source.table.clone(),
+        })
+        .await
+        .context("failed to describe snapshot source")?
+        .into_iter()
+        .map(|column| column.name)
+        .collect::<Vec<_>>();
+    let merge_stmts = generate_snapshot_sql(&config, dialect, &source_columns)
+        .context("failed to generate snapshot SQL")?;
 
     info!(
         pipeline = name,
@@ -130,9 +145,6 @@ pub async fn run_snapshot(
     }
 
     // Step 2: Generate and execute the SCD2 MERGE statements.
-    let merge_stmts =
-        generate_snapshot_sql(&config, dialect).context("failed to generate snapshot SQL")?;
-
     for (i, stmt) in merge_stmts.iter().enumerate() {
         let step_name = format!("merge_{}", i + 1);
 

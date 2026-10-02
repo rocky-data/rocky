@@ -1066,9 +1066,11 @@ use std::fmt::Write;
 ///
 /// Returns [`SqlGenError::InvalidRequest`] when `model_ir` was not
 /// a snapshot-variant [`ModelIr`] (see [`rocky_ir::ModelIrVariant`]).
+/// `source_columns` is the projected source column list in warehouse spelling.
 pub fn generate_snapshot_sql(
     model_ir: &ModelIr,
     dialect: &dyn SqlDialect,
+    source_columns: &[String],
 ) -> Result<Vec<String>, SqlGenError> {
     if model_ir.variant() != ModelIrVariant::Snapshot {
         return Err(variant_mismatch(model_ir, "Snapshot"));
@@ -1094,14 +1096,14 @@ pub fn generate_snapshot_sql(
         return Err(SqlGenError::MergeNoKey);
     }
 
-    // Validate identifiers
-    for k in &model_ir.unique_key {
-        validation::validate_identifier(k)?;
-    }
-    validation::validate_identifier(updated_at)?;
-
-    let join_cond = model_ir
+    let keys = model_ir
         .unique_key
+        .iter()
+        .map(|key| dialect.snapshot_source_reference(key, source_columns))
+        .collect::<Result<Vec<_>, _>>()?;
+    let updated_at = dialect.snapshot_source_reference(updated_at, source_columns)?;
+
+    let join_cond = keys
         .iter()
         .map(|k| format!("target.{k} = source.{k}"))
         .collect::<Vec<_>>()
@@ -1128,6 +1130,20 @@ pub fn generate_snapshot_sql(
         &format!("source.{updated_at}"),
         &format!("target.{updated_at}"),
     );
+    let insert_clause = dialect.snapshot_merge_insert(
+        source_columns,
+        &[
+            ("valid_from", "CURRENT_TIMESTAMP"),
+            ("valid_to", "CAST(NULL AS TIMESTAMP)"),
+        ],
+    )?;
+    let (insert_names, insert_values) = dialect.snapshot_insert_columns(
+        source_columns,
+        &[
+            ("valid_from", "CURRENT_TIMESTAMP"),
+            ("valid_to", "CAST(NULL AS TIMESTAMP)"),
+        ],
+    )?;
     let merge = format!(
         "MERGE INTO {target} AS target \
          USING {source} AS source \
@@ -1135,16 +1151,15 @@ pub fn generate_snapshot_sql(
          WHEN MATCHED AND {change_predicate} THEN \
            UPDATE SET valid_to = CURRENT_TIMESTAMP \
          WHEN NOT MATCHED THEN \
-           INSERT (*) VALUES (source.*, CURRENT_TIMESTAMP, NULL)",
+           {insert_clause}",
     );
     stmts.push(merge);
 
     // Statement 3: Insert new versions for rows that were updated
     // (the MERGE above closed them, now insert the fresh version)
     let insert_new = format!(
-        "INSERT INTO {target} \
-         SELECT source.*, CURRENT_TIMESTAMP AS valid_from, \
-         CAST(NULL AS TIMESTAMP) AS valid_to \
+        "INSERT INTO {target} ({columns}) \
+         SELECT {values} \
          FROM {source} AS source \
          INNER JOIN {target} AS target \
          ON {join_cond} \
@@ -1156,14 +1171,14 @@ pub fn generate_snapshot_sql(
            SELECT 1 FROM {target} AS existing \
            WHERE {existing_join_cond} AND existing.valid_to IS NULL\
          )",
-        self_join_cond = model_ir
-            .unique_key
+        columns = insert_names.join(", "),
+        values = insert_values.join(", "),
+        self_join_cond = keys
             .iter()
             .map(|k| format!("t2.{k} = source.{k}"))
             .collect::<Vec<_>>()
             .join(" AND "),
-        existing_join_cond = model_ir
-            .unique_key
+        existing_join_cond = keys
             .iter()
             .map(|k| format!("existing.{k} = source.{k}"))
             .collect::<Vec<_>>()
@@ -1173,12 +1188,18 @@ pub fn generate_snapshot_sql(
 
     // Statement 4 (optional): Invalidate hard-deleted rows
     if model_ir.invalidate_hard_deletes {
+        let (update_target, update_qualifier) = dialect.snapshot_update_target(&target);
+        let update_join_cond = keys
+            .iter()
+            .map(|key| format!("{update_qualifier}.{key} = source.{key}"))
+            .collect::<Vec<_>>()
+            .join(" AND ");
         let invalidate = format!(
-            "UPDATE {target} SET valid_to = CURRENT_TIMESTAMP \
+            "UPDATE {update_target} SET valid_to = CURRENT_TIMESTAMP \
              WHERE valid_to IS NULL \
              AND NOT EXISTS (\
                SELECT 1 FROM {source} AS source \
-               WHERE {join_cond}\
+               WHERE {update_join_cond}\
              )",
         );
         stmts.push(invalidate);
@@ -2729,7 +2750,8 @@ SELECT id, name, email FROM cat.sch.src WHERE active = true";
     #[test]
     fn variant_mismatch_snapshot_helper_names_transformation_input() {
         let ir = sample_transformation_ir();
-        let err = generate_snapshot_sql(&ir, &dialect()).expect_err("expected variant mismatch");
+        let err = generate_snapshot_sql(&ir, &dialect(), &["user_id".into(), "updated_at".into()])
+            .expect_err("expected variant mismatch");
         let msg = err.to_string();
         assert!(
             msg.contains("expected Snapshot ModelIr"),
@@ -2787,18 +2809,21 @@ SELECT id, name, email FROM cat.sch.src WHERE active = true";
     #[test]
     fn snapshot_merge_uses_null_safe_neq_on_updated_at() {
         let ir = sample_snapshot_ir();
-        let stmts = generate_snapshot_sql(&ir, &dialect()).expect("snapshot SQL gen");
+        let stmts =
+            generate_snapshot_sql(&ir, &dialect(), &["user_id".into(), "updated_at".into()])
+                .expect("snapshot SQL gen");
 
         // The MERGE is the second statement (after the bootstrap CREATE).
         let merge = &stmts[1];
         assert!(
-            merge.contains("source.updated_at IS DISTINCT FROM target.updated_at"),
+            merge.contains("source.\"updated_at\" IS DISTINCT FROM target.\"updated_at\""),
             "MERGE must use IS DISTINCT FROM for NULL-safe change detection, got: {merge}"
         );
         assert!(
             !merge.contains("source.updated_at != target.updated_at"),
             "bare SQL `!=` is NULL-unsafe and must not appear in MERGE, got: {merge}"
         );
+        assert!(merge.contains("INSERT (\"user_id\", \"updated_at\", \"valid_from\", \"valid_to\") VALUES (source.\"user_id\", source.\"updated_at\", CURRENT_TIMESTAMP, CAST(NULL AS TIMESTAMP))"), "snapshot MERGE must enumerate its insert columns: {merge}");
     }
 
     // -----------------------------------------------------------------------

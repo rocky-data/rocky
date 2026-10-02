@@ -1017,6 +1017,123 @@ pub trait SqlDialect: Send + Sync {
     /// INSERT INTO ... SELECT (incremental append).
     fn insert_into(&self, target: &str, select_sql: &str) -> String;
 
+    /// UPDATE target and qualifier for a snapshot hard-delete correlation.
+    /// Databricks accepts the alias live. BigQuery and Snowflake document
+    /// UPDATE aliases, but this statement has not been run live on either.
+    fn snapshot_update_target(&self, target: &str) -> (String, String) {
+        (format!("{target} AS target"), "target".to_string())
+    }
+
+    /// Quote a column returned by snapshot source schema discovery exactly.
+    fn snapshot_column_identifier(&self, name: &str) -> String {
+        match self.name() {
+            "databricks" => format!("`{}`", name.replace('`', "``")),
+            "bigquery" => format!("`{}`", name.replace('\\', "\\\\").replace('`', "\\`")),
+            _ => format!("\"{}\"", name.replace('"', "\"\"")),
+        }
+    }
+
+    /// Rocky's unquoted bootstrap metadata folds to upper case on Snowflake.
+    fn snapshot_metadata_identifier(&self, name: &str) -> String {
+        self.snapshot_column_identifier(name)
+    }
+
+    /// Resolve a configured key or change column to the discovered spelling.
+    fn snapshot_source_reference(
+        &self,
+        configured: &str,
+        source_columns: &[String],
+    ) -> AdapterResult<String> {
+        let exact = source_columns
+            .iter()
+            .find(|name| name.as_str() == configured);
+        let column = if let Some(name) = exact {
+            name
+        } else {
+            let mut matches = source_columns
+                .iter()
+                .filter(|name| name.eq_ignore_ascii_case(configured));
+            let first = matches.next().ok_or_else(|| {
+                AdapterError::msg(format!("snapshot source column '{configured}' not found"))
+            })?;
+            if matches.next().is_some() {
+                return Err(AdapterError::msg(format!(
+                    "snapshot source column '{configured}' is ambiguous"
+                )));
+            }
+            first
+        };
+        Ok(self.snapshot_column_identifier(column))
+    }
+
+    /// The `WHEN NOT MATCHED` insert for a snapshot MERGE.
+    ///
+    /// Vendor forms: Databricks `INSERT (columns) VALUES (expressions)`
+    /// https://docs.databricks.com/aws/en/sql/language-manual/delta-merge-into;
+    /// Snowflake https://docs.snowflake.com/en/sql-reference/sql/merge;
+    /// BigQuery https://cloud.google.com/bigquery/docs/reference/standard-sql/dml-syntax;
+    /// Trino https://trino.io/docs/current/sql/merge.html;
+    /// DuckDB https://duckdb.org/docs/stable/sql/statements/merge_into.html.
+    fn snapshot_merge_insert(
+        &self,
+        source_columns: &[String],
+        metadata: &[(&str, &str)],
+    ) -> AdapterResult<String> {
+        let (names, values) = self.snapshot_insert_columns(source_columns, metadata)?;
+        Ok(format!(
+            "INSERT ({}) VALUES ({})",
+            names.join(", "),
+            values.join(", ")
+        ))
+    }
+
+    /// Column and expression lists shared by the MERGE and changed-version insert.
+    fn snapshot_insert_columns(
+        &self,
+        source_columns: &[String],
+        metadata: &[(&str, &str)],
+    ) -> AdapterResult<(Vec<String>, Vec<String>)> {
+        if source_columns.is_empty() {
+            return Err(AdapterError::msg("snapshot source has no columns"));
+        }
+        let mut names = Vec::new();
+        let mut values = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for name in source_columns {
+            if name.is_empty() || name.chars().any(char::is_control) {
+                return Err(AdapterError::msg(
+                    "snapshot source contains an invalid column name",
+                ));
+            }
+            let identity = if self.name() == "snowflake" {
+                name.clone()
+            } else {
+                name.to_ascii_lowercase()
+            };
+            if !seen.insert(identity) {
+                return Err(AdapterError::msg(format!(
+                    "snapshot source contains duplicate column '{name}'"
+                )));
+            }
+            if metadata
+                .iter()
+                .any(|(reserved, _)| name.eq_ignore_ascii_case(reserved))
+            {
+                return Err(AdapterError::msg(format!(
+                    "snapshot source column '{name}' conflicts with a snapshot metadata column"
+                )));
+            }
+            let quoted = self.snapshot_column_identifier(name);
+            names.push(quoted.clone());
+            values.push(format!("source.{quoted}"));
+        }
+        for (name, value) in metadata {
+            names.push(self.snapshot_metadata_identifier(name));
+            values.push((*value).to_owned());
+        }
+        Ok((names, values))
+    }
+
     /// MERGE INTO (upsert by key).
     ///
     /// Keys are `&[Arc<str>]` so the ir-level `Vec<Arc<str>>` on

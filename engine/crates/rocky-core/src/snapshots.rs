@@ -173,10 +173,12 @@ pub fn generate_initial_load_sql(
 ///    that no longer exist in the source.
 ///
 /// The `snapshot_id` is a deterministic UUID generated once per call and
-/// shared across all statements in the batch.
+/// shared across all statements in the batch. `source_columns` is the
+/// projected source column list in warehouse spelling.
 pub fn generate_snapshot_sql(
     config: &SnapshotConfig,
     dialect: &dyn SqlDialect,
+    source_columns: &[String],
 ) -> Result<Vec<String>, SqlGenError> {
     if config.unique_key.is_empty() {
         return Err(SqlGenError::MergeNoKey);
@@ -185,15 +187,15 @@ pub fn generate_snapshot_sql(
     let source = format_source(config, dialect)?;
     let target = format_target(config, dialect)?;
 
-    // Validate unique_key identifiers.
-    for k in &config.unique_key {
-        validation::validate_identifier(k)?;
-    }
+    let keys = config
+        .unique_key
+        .iter()
+        .map(|key| dialect.snapshot_source_reference(key, source_columns))
+        .collect::<Result<Vec<_>, _>>()?;
 
-    // Validate strategy-specific identifiers.
-    match &config.strategy {
+    let tracked_columns = match &config.strategy {
         SnapshotStrategy::Timestamp { updated_at } => {
-            validation::validate_identifier(updated_at)?;
+            vec![dialect.snapshot_source_reference(updated_at, source_columns)?]
         }
         SnapshotStrategy::Check { check_columns } => {
             if check_columns.is_empty() {
@@ -201,15 +203,16 @@ pub fn generate_snapshot_sql(
                     "check strategy requires at least one check_column".to_string(),
                 ));
             }
-            for col in check_columns {
-                validation::validate_identifier(col)?;
-            }
+            check_columns
+                .iter()
+                .map(|column| dialect.snapshot_source_reference(column, source_columns))
+                .collect::<Result<Vec<_>, _>>()?
         }
-    }
+    };
 
     let snapshot_id = generate_snapshot_id(&config.target);
 
-    let join_cond = build_join_condition(&config.unique_key, "target", "source");
+    let join_cond = build_join_condition(&keys, "target", "source");
 
     // Build the change-detection predicate for WHEN MATCHED.
     //
@@ -221,11 +224,11 @@ pub fn generate_snapshot_sql(
     // through the dialect's `null_safe_neq` keeps the two branches
     // consistent and lets non-ANSI dialects (e.g. MySQL) override.
     let change_predicate = match &config.strategy {
-        SnapshotStrategy::Timestamp { updated_at } => dialect.null_safe_neq(
-            &format!("source.{updated_at}"),
-            &format!("target.{updated_at}"),
+        SnapshotStrategy::Timestamp { .. } => dialect.null_safe_neq(
+            &format!("source.{}", tracked_columns[0]),
+            &format!("target.{}", tracked_columns[0]),
         ),
-        SnapshotStrategy::Check { check_columns } => check_columns
+        SnapshotStrategy::Check { .. } => tracked_columns
             .iter()
             .map(|c| dialect.null_safe_neq(&format!("source.{c}"), &format!("target.{c}")))
             .collect::<Vec<_>>()
@@ -235,29 +238,28 @@ pub fn generate_snapshot_sql(
     let mut stmts = Vec::new();
 
     // Statement 1: MERGE — close changed rows and insert new keys.
-    let merge_source = if dialect.name() == "duckdb" {
-        format!(
-            "(SELECT *, CURRENT_TIMESTAMP AS {vf}, CAST(NULL AS TIMESTAMP) AS {vt}, \
-             TRUE AS {ic}, '{sid}' AS {snapshot_id_col} FROM {source})",
-            vf = COL_VALID_FROM,
-            vt = COL_VALID_TO,
-            ic = COL_IS_CURRENT,
-            sid = snapshot_id,
-            snapshot_id_col = COL_SNAPSHOT_ID,
-        )
-    } else {
-        source.clone()
-    };
-    let insert_clause = if dialect.name() == "duckdb" {
-        "INSERT BY NAME".to_string()
-    } else {
-        format!(
-            "INSERT (*) VALUES (source.*, CURRENT_TIMESTAMP, CAST(NULL AS TIMESTAMP), TRUE, '{snapshot_id}')"
-        )
-    };
+    let snapshot_id_value = format!("'{snapshot_id}'");
+    let insert_clause = dialect.snapshot_merge_insert(
+        source_columns,
+        &[
+            (COL_VALID_FROM, "CURRENT_TIMESTAMP"),
+            (COL_VALID_TO, "CAST(NULL AS TIMESTAMP)"),
+            (COL_IS_CURRENT, "TRUE"),
+            (COL_SNAPSHOT_ID, &snapshot_id_value),
+        ],
+    )?;
+    let (insert_names, insert_values) = dialect.snapshot_insert_columns(
+        source_columns,
+        &[
+            (COL_VALID_FROM, "CURRENT_TIMESTAMP"),
+            (COL_VALID_TO, "CAST(NULL AS TIMESTAMP)"),
+            (COL_IS_CURRENT, "TRUE"),
+            (COL_SNAPSHOT_ID, &snapshot_id_value),
+        ],
+    )?;
     let merge = format!(
         "MERGE INTO {target} AS target \
-         USING {merge_source} AS source \
+         USING {source} AS source \
          ON {join_cond} AND target.{ic} = TRUE \
          WHEN MATCHED AND ({change_predicate}) THEN \
            UPDATE SET {vt} = CURRENT_TIMESTAMP, {ic} = FALSE \
@@ -271,16 +273,12 @@ pub fn generate_snapshot_sql(
     // Statement 2: Insert fresh versions for rows that were just closed.
     // These are rows where the MERGE set valid_to (changed rows) but we
     // still need the new version with is_current = TRUE.
-    let self_join_cond = build_join_condition(&config.unique_key, "t2", "source");
-    let existing_join_cond = build_join_condition(&config.unique_key, "existing", "source");
+    let self_join_cond = build_join_condition(&keys, "t2", "source");
+    let existing_join_cond = build_join_condition(&keys, "existing", "source");
 
     let insert_updated = format!(
-        "INSERT INTO {target} \
-         SELECT source.*, \
-         CURRENT_TIMESTAMP AS {vf}, \
-         CAST(NULL AS TIMESTAMP) AS {vt}, \
-         TRUE AS {ic}, \
-         '{sid}' AS {snapshot_id_col} \
+        "INSERT INTO {target} ({columns}) \
+         SELECT {values} \
          FROM {source} AS source \
          INNER JOIN {target} AS target \
          ON {join_cond} \
@@ -293,21 +291,17 @@ pub fn generate_snapshot_sql(
            SELECT 1 FROM {target} AS existing \
            WHERE {existing_join_cond} AND existing.{ic} = TRUE\
          )",
-        vf = COL_VALID_FROM,
+        columns = insert_names.join(", "),
+        values = insert_values.join(", "),
         vt = COL_VALID_TO,
         ic = COL_IS_CURRENT,
-        sid = snapshot_id,
-        snapshot_id_col = COL_SNAPSHOT_ID,
     );
     stmts.push(insert_updated);
 
     // Statement 3 (optional): Invalidate hard-deleted rows.
     if config.invalidate_hard_deletes {
-        let update_target = if dialect.name() == "duckdb" {
-            format!("{target} AS target")
-        } else {
-            target.clone()
-        };
+        let (update_target, update_qualifier) = dialect.snapshot_update_target(&target);
+        let update_join_cond = build_join_condition(&keys, &update_qualifier, "source");
         let invalidate = format!(
             "UPDATE {update_target} SET \
              {vt} = CURRENT_TIMESTAMP, \
@@ -315,7 +309,7 @@ pub fn generate_snapshot_sql(
              WHERE {ic} = TRUE \
              AND NOT EXISTS (\
                SELECT 1 FROM {source} AS source \
-               WHERE {join_cond}\
+               WHERE {update_join_cond}\
              )",
             vt = COL_VALID_TO,
             ic = COL_IS_CURRENT,
@@ -539,6 +533,10 @@ mod tests {
         TestDialect { name: "test" }
     }
 
+    fn source_columns() -> Vec<String> {
+        vec!["customer_id".into(), "name".into(), "updated_at".into()]
+    }
+
     fn timestamp_config() -> SnapshotConfig {
         SnapshotConfig {
             source: SourceRef {
@@ -627,7 +625,7 @@ mod tests {
     #[test]
     fn test_timestamp_strategy_merge_statement() {
         let config = timestamp_config();
-        let stmts = generate_snapshot_sql(&config, &dialect()).unwrap();
+        let stmts = generate_snapshot_sql(&config, &dialect(), &source_columns()).unwrap();
 
         // Without hard deletes: MERGE + INSERT = 2 statements.
         assert_eq!(stmts.len(), 2, "expected 2 statements, got: {stmts:?}");
@@ -642,7 +640,7 @@ mod tests {
             "MERGE should use source table: {merge}"
         );
         assert!(
-            merge.contains("target.customer_id = source.customer_id"),
+            merge.contains("target.\"customer_id\" = source.\"customer_id\""),
             "join should use unique_key: {merge}"
         );
         assert!(
@@ -650,7 +648,7 @@ mod tests {
             "should only match current rows: {merge}"
         );
         assert!(
-            merge.contains("source.updated_at IS DISTINCT FROM target.updated_at"),
+            merge.contains("source.\"updated_at\" IS DISTINCT FROM target.\"updated_at\""),
             "timestamp strategy should compare updated_at via NULL-safe \
              IS DISTINCT FROM (bare `!=` silently drops NULL↔value \
              transitions): {merge}"
@@ -670,26 +668,39 @@ mod tests {
     }
 
     #[test]
-    fn test_duckdb_snapshot_merge_uses_supported_insert_form() {
+    fn test_snapshot_merge_uses_explicit_columns() {
         let config = timestamp_config();
         let duckdb = TestDialect { name: "duckdb" };
-        let stmts = generate_snapshot_sql(&config, &duckdb).unwrap();
-        assert!(stmts[0].contains("USING (SELECT *, CURRENT_TIMESTAMP AS valid_from"));
-        assert!(stmts[0].contains("TRUE AS is_current"));
-        assert!(
-            stmts[0].contains("AS snapshot_id FROM raw_catalog.raw__us_west__shopify.customers")
-        );
-        assert!(stmts[0].contains("WHEN NOT MATCHED THEN INSERT BY NAME"));
-        assert!(!stmts[0].contains("INSERT (*)"));
-        let other = generate_snapshot_sql(&config, &dialect()).unwrap();
+        let stmts = generate_snapshot_sql(&config, &duckdb, &source_columns()).unwrap();
+        assert!(stmts[0].contains("USING raw_catalog.raw__us_west__shopify.customers AS source"));
+        assert!(stmts[0].contains("INSERT (\"customer_id\", \"name\", \"updated_at\", \"valid_from\", \"valid_to\", \"is_current\", \"snapshot_id\") VALUES (source.\"customer_id\", source.\"name\", source.\"updated_at\", CURRENT_TIMESTAMP, CAST(NULL AS TIMESTAMP), TRUE, '"));
+        let other = generate_snapshot_sql(&config, &dialect(), &source_columns()).unwrap();
         assert!(other[0].contains("USING raw_catalog.raw__us_west__shopify.customers AS source"));
-        assert!(other[0].contains("WHEN NOT MATCHED THEN INSERT (*) VALUES"));
+        assert!(!other[0].contains("INSERT (*)"));
+    }
+
+    #[test]
+    fn test_snapshot_merge_rejects_missing_or_reserved_source_columns() {
+        let config = timestamp_config();
+        let empty = generate_snapshot_sql(&config, &dialect(), &[]).unwrap_err();
+        assert!(empty.to_string().contains("not found"), "{empty}");
+        let reserved = generate_snapshot_sql(
+            &config,
+            &dialect(),
+            &[
+                "customer_id".into(),
+                "updated_at".into(),
+                "valid_from".into(),
+            ],
+        )
+        .unwrap_err();
+        assert!(reserved.to_string().contains("conflicts"), "{reserved}");
     }
 
     #[test]
     fn test_timestamp_strategy_insert_new_versions() {
         let config = timestamp_config();
-        let stmts = generate_snapshot_sql(&config, &dialect()).unwrap();
+        let stmts = generate_snapshot_sql(&config, &dialect(), &source_columns()).unwrap();
         let insert = &stmts[1];
 
         assert!(
@@ -697,19 +708,20 @@ mod tests {
             "second statement should INSERT: {insert}"
         );
         assert!(
-            insert.contains("CURRENT_TIMESTAMP AS valid_from"),
+            insert.contains("\"valid_from\", \"valid_to\", \"is_current\", \"snapshot_id\")")
+                && insert.contains("CURRENT_TIMESTAMP, CAST(NULL AS TIMESTAMP), TRUE, '"),
             "new version should have valid_from: {insert}"
         );
         assert!(
-            insert.contains("CAST(NULL AS TIMESTAMP) AS valid_to"),
+            insert.contains("CAST(NULL AS TIMESTAMP)"),
             "new version should have NULL valid_to: {insert}"
         );
         assert!(
-            insert.contains("TRUE AS is_current"),
+            insert.contains(", TRUE, '"),
             "new version should be current: {insert}"
         );
         assert!(
-            insert.contains("AS snapshot_id"),
+            insert.contains("\"snapshot_id\") SELECT"),
             "new version should carry snapshot_id: {insert}"
         );
     }
@@ -717,18 +729,17 @@ mod tests {
     #[test]
     fn test_snapshot_id_is_hex() {
         let config = timestamp_config();
-        let stmts = generate_snapshot_sql(&config, &dialect()).unwrap();
+        let stmts = generate_snapshot_sql(&config, &dialect(), &source_columns()).unwrap();
 
         // The snapshot_id appears in the MERGE NOT MATCHED clause and in the
         // INSERT statement. Extract one instance and verify it's valid hex.
         let insert = &stmts[1];
-        let marker = "' AS snapshot_id";
+        let marker = "CURRENT_TIMESTAMP, CAST(NULL AS TIMESTAMP), TRUE, '";
         let end_pos = insert
             .find(marker)
-            .expect("should contain snapshot_id marker");
-        let before = &insert[..end_pos];
-        let start_pos = before.rfind('\'').expect("opening quote") + 1;
-        let sid = &insert[start_pos..end_pos];
+            .expect("should contain snapshot_id marker")
+            + marker.len();
+        let sid = insert[end_pos..].split('\'').next().unwrap();
         assert_eq!(
             sid.len(),
             16,
@@ -743,17 +754,15 @@ mod tests {
     #[test]
     fn test_consistent_snapshot_id_across_statements() {
         let config = timestamp_config();
-        let stmts = generate_snapshot_sql(&config, &dialect()).unwrap();
+        let stmts = generate_snapshot_sql(&config, &dialect(), &source_columns()).unwrap();
 
         // Extract snapshot_id from each statement that contains one.
-        let marker = "' AS snapshot_id";
+        let marker = "CURRENT_TIMESTAMP, CAST(NULL AS TIMESTAMP), TRUE, '";
         let ids: Vec<&str> = stmts
             .iter()
             .filter_map(|s| {
-                let end_pos = s.find(marker)?;
-                let before = &s[..end_pos];
-                let start_pos = before.rfind('\'')? + 1;
-                Some(&s[start_pos..end_pos])
+                let start_pos = s.find(marker)? + marker.len();
+                s[start_pos..].split('\'').next()
             })
             .collect();
 
@@ -777,19 +786,25 @@ mod tests {
     #[test]
     fn test_check_strategy_change_detection() {
         let config = check_config();
-        let stmts = generate_snapshot_sql(&config, &dialect()).unwrap();
+        let columns = vec![
+            "customer_id".into(),
+            "name".into(),
+            "email".into(),
+            "status".into(),
+        ];
+        let stmts = generate_snapshot_sql(&config, &dialect(), &columns).unwrap();
 
         let merge = &stmts[0];
         assert!(
-            merge.contains("source.name IS DISTINCT FROM target.name"),
+            merge.contains("source.\"name\" IS DISTINCT FROM target.\"name\""),
             "check strategy should use IS DISTINCT FROM for name: {merge}"
         );
         assert!(
-            merge.contains("source.email IS DISTINCT FROM target.email"),
+            merge.contains("source.\"email\" IS DISTINCT FROM target.\"email\""),
             "check strategy should use IS DISTINCT FROM for email: {merge}"
         );
         assert!(
-            merge.contains("source.status IS DISTINCT FROM target.status"),
+            merge.contains("source.\"status\" IS DISTINCT FROM target.\"status\""),
             "check strategy should use IS DISTINCT FROM for status: {merge}"
         );
         // Columns joined by OR.
@@ -802,7 +817,13 @@ mod tests {
     #[test]
     fn test_check_strategy_no_updated_at_reference() {
         let config = check_config();
-        let stmts = generate_snapshot_sql(&config, &dialect()).unwrap();
+        let columns = vec![
+            "customer_id".into(),
+            "name".into(),
+            "email".into(),
+            "status".into(),
+        ];
+        let stmts = generate_snapshot_sql(&config, &dialect(), &columns).unwrap();
 
         let merge = &stmts[0];
         assert!(
@@ -819,7 +840,7 @@ mod tests {
             },
             ..timestamp_config()
         };
-        let result = generate_snapshot_sql(&config, &dialect());
+        let result = generate_snapshot_sql(&config, &dialect(), &source_columns());
         assert!(result.is_err(), "empty check_columns should error");
     }
 
@@ -833,12 +854,13 @@ mod tests {
             unique_key: vec!["customer_id".into(), "region".into()],
             ..timestamp_config()
         };
-        let stmts = generate_snapshot_sql(&config, &dialect()).unwrap();
+        let columns = vec!["customer_id".into(), "region".into(), "updated_at".into()];
+        let stmts = generate_snapshot_sql(&config, &dialect(), &columns).unwrap();
         let merge = &stmts[0];
 
         assert!(
             merge.contains(
-                "target.customer_id = source.customer_id AND target.region = source.region"
+                "target.\"customer_id\" = source.\"customer_id\" AND target.\"region\" = source.\"region\""
             ),
             "composite key should produce AND-joined condition: {merge}"
         );
@@ -850,15 +872,16 @@ mod tests {
             unique_key: vec!["customer_id".into(), "region".into()],
             ..timestamp_config()
         };
-        let stmts = generate_snapshot_sql(&config, &dialect()).unwrap();
+        let columns = vec!["customer_id".into(), "region".into(), "updated_at".into()];
+        let stmts = generate_snapshot_sql(&config, &dialect(), &columns).unwrap();
         let insert = &stmts[1];
 
         assert!(
-            insert.contains("target.customer_id = source.customer_id"),
+            insert.contains("target.\"customer_id\" = source.\"customer_id\""),
             "INSERT join should use all key columns: {insert}"
         );
         assert!(
-            insert.contains("target.region = source.region"),
+            insert.contains("target.\"region\" = source.\"region\""),
             "INSERT join should use all key columns: {insert}"
         );
     }
@@ -873,7 +896,7 @@ mod tests {
             invalidate_hard_deletes: true,
             ..timestamp_config()
         };
-        let stmts = generate_snapshot_sql(&config, &dialect()).unwrap();
+        let stmts = generate_snapshot_sql(&config, &dialect(), &source_columns()).unwrap();
 
         // With hard deletes: MERGE + INSERT + UPDATE = 3 statements.
         assert_eq!(stmts.len(), 3, "expected 3 statements with hard deletes");
@@ -903,7 +926,7 @@ mod tests {
             invalidate_hard_deletes: false,
             ..timestamp_config()
         };
-        let stmts = generate_snapshot_sql(&config, &dialect()).unwrap();
+        let stmts = generate_snapshot_sql(&config, &dialect(), &source_columns()).unwrap();
 
         // Without hard deletes: MERGE + INSERT = 2 statements.
         assert_eq!(stmts.len(), 2, "expected 2 statements without hard deletes");
@@ -919,7 +942,7 @@ mod tests {
             unique_key: vec![],
             ..timestamp_config()
         };
-        let result = generate_snapshot_sql(&config, &dialect());
+        let result = generate_snapshot_sql(&config, &dialect(), &source_columns());
         assert!(
             matches!(result, Err(SqlGenError::MergeNoKey)),
             "empty unique_key should error"
@@ -927,37 +950,37 @@ mod tests {
     }
 
     #[test]
-    fn test_unsafe_unique_key_rejected() {
+    fn test_unresolved_unique_key_rejected() {
         let config = SnapshotConfig {
             unique_key: vec!["id; DROP TABLE".into()],
             ..timestamp_config()
         };
-        let result = generate_snapshot_sql(&config, &dialect());
-        assert!(result.is_err(), "unsafe identifier should be rejected");
+        let result = generate_snapshot_sql(&config, &dialect(), &source_columns());
+        assert!(result.unwrap_err().to_string().contains("not found"));
     }
 
     #[test]
-    fn test_unsafe_updated_at_rejected() {
+    fn test_unresolved_updated_at_rejected() {
         let config = SnapshotConfig {
             strategy: SnapshotStrategy::Timestamp {
                 updated_at: "col; DROP TABLE".into(),
             },
             ..timestamp_config()
         };
-        let result = generate_snapshot_sql(&config, &dialect());
-        assert!(result.is_err(), "unsafe updated_at should be rejected");
+        let result = generate_snapshot_sql(&config, &dialect(), &source_columns());
+        assert!(result.unwrap_err().to_string().contains("not found"));
     }
 
     #[test]
-    fn test_unsafe_check_column_rejected() {
+    fn test_unresolved_check_column_rejected() {
         let config = SnapshotConfig {
             strategy: SnapshotStrategy::Check {
                 check_columns: vec!["ok_col".into(), "bad col".into()],
             },
             ..timestamp_config()
         };
-        let result = generate_snapshot_sql(&config, &dialect());
-        assert!(result.is_err(), "unsafe check column should be rejected");
+        let result = generate_snapshot_sql(&config, &dialect(), &source_columns());
+        assert!(result.unwrap_err().to_string().contains("not found"));
     }
 
     #[test]
@@ -970,7 +993,7 @@ mod tests {
             },
             ..timestamp_config()
         };
-        let result = generate_snapshot_sql(&config, &dialect());
+        let result = generate_snapshot_sql(&config, &dialect(), &source_columns());
         assert!(result.is_err(), "unsafe source catalog should be rejected");
     }
 
