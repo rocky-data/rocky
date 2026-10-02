@@ -4161,9 +4161,12 @@ impl StateStore {
     /// refuse incompatible recovery before copy.
     ///
     /// A run recorded under another pipeline name is returned when it used
-    /// the same target endpoint and its recovery targets overlap `targets`
-    /// (full `catalog.schema.table` names), so renaming a pipeline cannot hide
-    /// a committed INSERT.
+    /// the same target endpoint and every one of its recovery targets is in
+    /// `targets` (full `catalog.schema.table` names), so renaming a pipeline
+    /// cannot hide a committed INSERT. Requiring every target means the
+    /// caller checks each recorded contract against the current plan; a
+    /// partial overlap would reconcile unplanned tables under a contract
+    /// nothing validates.
     ///
     /// Headers without recovery descriptors (written before descriptors
     /// existed) are never returned: they carry no source or timestamp
@@ -4195,9 +4198,10 @@ impl StateStore {
                 same_endpoint != Some(false)
             } else {
                 same_endpoint == Some(true)
+                    && !tables.is_empty()
                     && tables
                         .iter()
-                        .any(|table| targets.contains(&table.target.full_name()))
+                        .all(|table| targets.contains(&table.target.full_name()))
             };
             if progress.watermarks_confirmed || !relevant {
                 continue;
@@ -10588,6 +10592,26 @@ mod tests {
         let mut renamed_unknown = unknown_target.clone();
         renamed_unknown.pipeline = "p2".into();
         init("renamed-unknown-target", &renamed_unknown);
+        // Another pipeline's run counts only when this run plans every target
+        // it recorded, so each recorded contract meets a current one.
+        let mut other_table = recovery_table(Some(Utc::now()));
+        other_table.target.table = "other".into();
+        store
+            .init_run_progress_with_recovery(
+                "renamed-partial",
+                &planned_keys(2),
+                Some(&progress_scope("p2")),
+                &[recovery_table(Some(Utc::now())), other_table],
+            )
+            .unwrap();
+        store
+            .init_run_progress_with_recovery(
+                "renamed-empty",
+                &planned_keys(1),
+                Some(&progress_scope("p2")),
+                &[],
+            )
+            .unwrap();
 
         // A header without descriptors is never a recovery candidate.
         store
@@ -10595,7 +10619,7 @@ mod tests {
             .unwrap();
 
         let list = |targets: &[&str]| -> std::collections::BTreeSet<String> {
-            let targets = targets.iter().map(|t| t.to_string()).collect();
+            let targets = targets.iter().map(ToString::to_string).collect();
             store
                 .list_unconfirmed_run_progress_for_recovery_scope(&current, &targets)
                 .unwrap()
@@ -10609,13 +10633,21 @@ mod tests {
             same_pipeline
                 .iter()
                 .chain(&["renamed"])
-                .map(|id| id.to_string())
+                .map(ToString::to_string)
+                .collect()
+        );
+        assert_eq!(
+            list(&["wh.raw.orders", "wh.raw.other"]),
+            same_pipeline
+                .iter()
+                .chain(&["renamed", "renamed-partial"])
+                .map(ToString::to_string)
                 .collect()
         );
         assert_eq!(
             list(&["wh.raw.other"]),
-            same_pipeline.iter().map(|id| id.to_string()).collect(),
-            "another pipeline's intent is read only when it names a planned target"
+            same_pipeline.iter().map(ToString::to_string).collect(),
+            "another pipeline's intent is read only when every recorded target is planned"
         );
 
         let recovered = store

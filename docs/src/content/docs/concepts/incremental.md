@@ -93,9 +93,9 @@ unconfirmed intent -> read target MAX -> repair watermark -> next copy
 An immediate retry reconciles its target before appending again. A fresh run
 reconciles earlier unconfirmed runs before copying or pruning unchanged tables.
 Changing a filter cannot hide an older run. Renaming a pipeline cannot hide one
-either: Rocky also reconciles unconfirmed runs of another pipeline on the same
-target endpoint when they wrote a target this run plans. Rocky commits recovered
-watermarks and their confirmation together.
+either: Rocky also reconciles an unconfirmed run of another pipeline on the same
+target endpoint when this run plans every target it wrote. Rocky commits
+recovered watermarks and their confirmation together.
 History cleanup keeps new unresolved recovery records until confirmation, even
 when they exceed the configured history age limit.
 
@@ -111,8 +111,7 @@ deleting it also deletes the evidence Rocky needs to explain the interrupted run
 Checkpoints written by Rocky 1.75.0 and earlier carry no recovery records.
 Recovery ignores them, so an upgrade does not change how those runs behave. If
 one of them crashed after its INSERT committed, the next incremental append can
-copy those rows again, as in earlier releases. Run the affected tables once with
-`strategy = "full_refresh"` if you suspect that.
+copy those rows again, as in earlier releases.
 
 Keep `timestamp_column` configured for the source you are restoring. Recovery
 replacements establish its target MAX before confirmation, so returning to
@@ -144,7 +143,7 @@ allow a fresh run to reconcile watermarks before copying.
 
 A checkpoint from Rocky 1.75.0 or earlier cannot show that its watermarks were
 saved. A fresh run without a resume flag executes its checks. If its watermarks
-may be lost, run its incremental tables once with full refresh first.
+were lost, that run can copy rows again, as in earlier releases.
 
 Other unsupported checkpoints require full refresh. Keep that strategy until
 the saved incremental cursor matches the replacement target. Switching back to

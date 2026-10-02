@@ -2312,9 +2312,8 @@ fn ensure_run_is_resumable(state_store: &StateStore, progress: &RunProgress) -> 
                 // Written before recovery descriptors existed; recovery ignores it.
                 "It predates recovery records, so Rocky cannot tell whether its \
                  watermarks were saved. Run the pipeline without a resume flag to re-run \
-                 the post-copy checks. If the watermarks were lost, incremental tables \
-                 append those rows again; run them once with the full_refresh strategy \
-                 to prevent that."
+                 the post-copy checks. If the watermarks were lost, the next incremental \
+                 append can copy those rows again, as in earlier releases."
             } else if progress
                 .watermark_recovery_tables
                 .as_ref()
@@ -14752,7 +14751,7 @@ async fn recovered_target_watermark(
 
 /// Full `catalog.schema.table` names of every target this run plans to write
 /// or prune. Recovery reads another pipeline's unconfirmed intent only when
-/// it names one of these targets.
+/// every target it names is one of these.
 fn recovery_target_names(tasks: &[TableTask]) -> std::collections::HashSet<String> {
     tasks
         .iter()
