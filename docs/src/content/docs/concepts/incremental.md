@@ -137,16 +137,50 @@ Rocky refuses `--resume` and `--resume-latest` when every planned table copied
 but the terminal run record is missing. Skipping those tables would also skip
 their post-copy checks and could report false success.
 
-Follow the recovery route in the refusal. A confirmed checkpoint allows a fresh
-run without a resume flag to execute checks. Supported recovery descriptors also
-allow a fresh run to reconcile watermarks before copying.
+Follow the recovery route in the refusal. A matching fresh run does not prune targets
+from a complete checkpoint without a run record. It copies those targets and
+runs their checks, even when the source marker is unchanged. A later matching
+run can use another pipeline name. Its target endpoint must match, and its plan
+must contain every target in the checkpoint.
+
+After that run finishes checks and writes its run record, Rocky marks the old
+checkpoint superseded. The next run can prune unchanged targets. A recorded
+check failure still completes this step.
+
+With supported recovery records, the fresh run also re-derives watermarks from
+the target before copying. An old checkpoint alone never fails a fresh run.
 
 A checkpoint from Rocky 1.75.0 or earlier cannot show that its watermarks were
-saved. A fresh run without a resume flag executes its checks. If its watermarks
-were lost, that run can copy rows again, as in earlier releases.
+saved. Switch the affected tables to `strategy = "full_refresh"`, then run
+`rocky run --pipeline <name> --no-prune` without a resume flag. That replaces
+their data and runs the checks without appending the same rows twice. Keep the
+full-refresh strategy until you repair the incremental cursor from the
+replacement target:
+
+```sh
+rocky state reconcile-watermark --pipeline <name> --dry-run
+rocky state reconcile-watermark --pipeline <name>
+```
+
+Repeat `--table catalog.schema.table` to select affected targets. The command
+reads `MAX(timestamp_column)` from each target and saves it through the
+configured state backend. For DuckDB, use `--table .schema.table`.
+An empty target has its cursor cleared. The next incremental run replaces it.
+Confirm that each target's effective `timestamp_column` still identifies the copied rows. Run the command only
+after the replacement and any earlier warehouse writes have finished.
+The command applies table-specific timestamp overrides.
+It refuses a connector-specific override if the source connector cannot be identified.
+Then restore `strategy = "incremental"`.
+
+Rocky 1.75.0 and earlier did not record recovery descriptors. A crash after
+an INSERT but before its watermark flush can leave a stale cursor. The first
+run after upgrading can append those rows again. Repair the cursor from the
+target before that run if the old flush is uncertain. #2235 stays open for
+recovery gaps that this checkpoint rule does not address.
 
 Other unsupported checkpoints require full refresh. Keep that strategy until
-the saved incremental cursor matches the replacement target. Switching back to
+`rocky state reconcile-watermark --pipeline <name>` sets the replacement
+target's cursor. Switching back to
 incremental with a wall-clock refresh cursor can skip later source arrivals.
 Incomplete crash checkpoints remain resumable.
 

@@ -30,12 +30,12 @@ use crate::output::{
     MetaOutput, MetricsOutput, ModelDetailOutput, ModelHistoryOutput, ModelListOutput,
     OptimizeOutput, PlanOutput, PolicyCheckOutput, PolicyFreezeOutput, PolicyRulesOutput,
     PolicyTestOutput, PreviewCostOutput, PreviewCreateOutput, PreviewDiffOutput, PreviewRowsOutput,
-    ProfileOutput, ProfileStorageOutput, PromotePlan, RecipeHistoryOutput, ReplayCheckOutput,
-    ReplayExecuteOutput, ReplayOutput, RestoreApplyOutput, RestorePlanOutput,
-    RetentionStatusOutput, RetentionSweepOutput, ReviewOutput, ReviewQueueOutput,
-    ReviewStatusOutput, RunOutput, ScheduleHoldOutput, ScheduleSpoolOutput, ScheduleStatusOutput,
-    SeedOutput, StateOutput, TestAdapterOutput, TestOutput, TickOutput, TraceOutput,
-    ValidateMigrationOutput, ValidateOutput,
+    ProfileOutput, ProfileStorageOutput, PromotePlan, RecipeHistoryOutput,
+    ReconcileWatermarkOutput, ReplayCheckOutput, ReplayExecuteOutput, ReplayOutput,
+    RestoreApplyOutput, RestorePlanOutput, RetentionStatusOutput, RetentionSweepOutput,
+    ReviewOutput, ReviewQueueOutput, ReviewStatusOutput, RunOutput, ScheduleHoldOutput,
+    ScheduleSpoolOutput, ScheduleStatusOutput, SeedOutput, StateOutput, TestAdapterOutput,
+    TestOutput, TickOutput, TraceOutput, ValidateMigrationOutput, ValidateOutput,
 };
 
 /// Top-level command output types currently covered by schemars.
@@ -65,6 +65,7 @@ pub(crate) fn schemas() -> Vec<(&'static str, serde_json::Value)> {
         entry::<PlanOutput>("plan"),
         entry::<StateOutput>("state"),
         entry::<ClearSchemaCacheOutput>("state_clear_schema_cache"),
+        entry::<ReconcileWatermarkOutput>("state_reconcile_watermark"),
         entry::<DoctorOutput>("doctor"),
         entry::<CompileOutput>("compile"),
         // `rocky serve` HTTP API surface (not CLI `--output json` commands,

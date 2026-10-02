@@ -1029,6 +1029,7 @@ Inspect or manage the embedded state store. `rocky state` is a subcommand group.
 ```bash
 rocky state                                # show watermarks (default)
 rocky state show                           # same as bare `rocky state`
+rocky state reconcile-watermark --pipeline <name> [--table <target>]... [--dry-run]
 rocky state clear-schema-cache [--dry-run] # flush the DESCRIBE cache
 rocky state retention sweep [--dry-run]    # trim the history tables
 rocky state schedule pause <pipeline>      # hold a pipeline's schedule
@@ -1041,6 +1042,7 @@ rocky state schedule spool                 # list queued webhook demands
 | Subcommand | Description |
 |------------|-------------|
 | `show` (default) | Display stored watermarks. Same output as bare `rocky state`; the named form is provided so scripts can be explicit. |
+| `reconcile-watermark` | Set incremental cursors from physical target tables. See [`rocky state reconcile-watermark`](#rocky-state-reconcile-watermark). |
 | `clear-schema-cache` | Flush the `DESCRIBE TABLE` schema cache. See [`rocky state clear-schema-cache`](#rocky-state-clear-schema-cache). |
 | `retention sweep` | Delete history rows that fall outside `[state.retention]`. See [`rocky state retention sweep`](#rocky-state-retention-sweep). |
 | `schedule pause` / `schedule resume` | Hold or release one pipeline's schedule at runtime. See [`rocky state schedule`](#rocky-state-schedule). |
@@ -1064,8 +1066,42 @@ If you have an existing CWD `.rocky-state.redb`, move it into `models/` to silen
 ### Related Commands
 
 - [`rocky state clear-schema-cache`](#rocky-state-clear-schema-cache) -- flush the DESCRIBE cache
+- [`rocky state reconcile-watermark`](#rocky-state-reconcile-watermark) -- repair incremental cursors
 - [`rocky history`](#rocky-history) -- read persisted run records
 - [`rocky replay`](#rocky-replay) / [`rocky trace`](#rocky-trace) / [`rocky cost`](#rocky-cost) -- read the same `RunRecord` the state store persists
+
+---
+
+## `rocky state reconcile-watermark`
+
+Repair a replication pipeline's incremental cursors from its target tables.
+Rocky reads each target's effective timestamp column from the pipeline and its table overrides.
+It then reads the target's maximum timestamp.
+An empty target has no cursor, so the next incremental run replaces it.
+Rocky updates all selected cursors in one state transaction.
+The remote state upload uses the same authority and CAS rules as a run.
+
+```bash
+rocky state reconcile-watermark --pipeline bronze --dry-run
+rocky state reconcile-watermark --pipeline bronze --table wh.raw.orders
+```
+
+### Flags
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--pipeline <NAME>` | `string` | required | Name the replication pipeline. |
+| `--table <TARGET>` | `string` (repeatable) | all recorded targets | Select physical `catalog.schema.table` targets. Repeat the flag for more targets. |
+| `--dry-run` | `bool` | `false` | Show the values without saving new watermarks. |
+
+Stop earlier warehouse writes before repair. Use `--dry-run` to inspect the values.
+If a recorded plan includes a removed target, select the current targets with `--table`.
+The command refuses an unpinned remote catalog.
+It also refuses a connector-specific override when it cannot identify the target's source connector.
+
+### Related Commands
+
+- [Interrupted replication](/concepts/incremental/#recovering-an-interrupted-replication) -- choose the recovery route
 
 ---
 

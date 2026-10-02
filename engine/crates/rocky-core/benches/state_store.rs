@@ -65,6 +65,7 @@ fn naive_record_table_progress(db: &Database, run_id: &str, progress: &TableProg
                 planned_tables: None,
                 watermarks_confirmed: false,
                 watermark_recovery_tables: None,
+                superseded: false,
             },
         }
     };

@@ -3403,6 +3403,25 @@ pub struct WatermarkEntry {
     pub updated_at: DateTime<Utc>,
 }
 
+/// Result of repairing incremental cursors from physical target tables.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct ReconcileWatermarkOutput {
+    pub version: String,
+    pub command: String,
+    pub pipeline: String,
+    pub dry_run: bool,
+    pub watermarks: Vec<ReconciledWatermark>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct ReconciledWatermark {
+    pub table: String,
+    pub previous: Option<DateTime<Utc>>,
+    pub target_max: Option<DateTime<Utc>>,
+    /// `null` means the empty target's cursor was cleared.
+    pub watermark: Option<DateTime<Utc>>,
+}
+
 /// JSON output for `rocky state clear-schema-cache`.
 ///
 /// `dry_run = true` reports what *would* be deleted without touching

@@ -1315,6 +1315,7 @@ from .types_generated import (  # noqa: E402, F401
     CiDiffOutput,
     CiOutput,
     ClearSchemaCacheOutput,
+    ReconcileWatermarkOutput,
     ColumnClassificationStatus,
     ColumnLineageOutput,
     ColumnTrendPoint,
@@ -1511,6 +1512,7 @@ RockyOutput = (
     | PlanResult
     | StateResult
     | ClearSchemaCacheOutput
+    | ReconcileWatermarkOutput
     | ScheduleSpoolOutput
     | CompileResult
     | ModelLineageResult
@@ -1564,6 +1566,7 @@ _SIMPLE_DISPATCH: dict[str, type[BaseModel]] = {
     "plan": PlanResult,
     "state": StateResult,
     "state-clear-schema-cache": ClearSchemaCacheOutput,
+    "state-reconcile-watermark": ReconcileWatermarkOutput,
     "state-schedule-spool": ScheduleSpoolOutput,
     "compile": CompileResult,
     "test": TestResult,
