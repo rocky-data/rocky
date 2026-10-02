@@ -177,6 +177,29 @@ impl WarehouseAdapter for DatabricksWarehouseAdapter {
         &self.dialect
     }
 
+    fn is_missing_object_error(&self, error: &AdapterError) -> bool {
+        if let Some(CatalogError::TableNotFound(_) | CatalogError::NamespaceNotFound(_)) =
+            error.inner().downcast_ref::<CatalogError>()
+        {
+            return true;
+        }
+        let Some(crate::catalog::CatalogManagerError::Connector(
+            crate::connector::ConnectorError::StatementFailed { message, .. },
+        )) = error
+            .inner()
+            .downcast_ref::<crate::catalog::CatalogManagerError>()
+        else {
+            return false;
+        };
+        [
+            "TABLE_OR_VIEW_NOT_FOUND",
+            "SCHEMA_NOT_FOUND",
+            "DELTA_TABLE_NOT_FOUND",
+        ]
+        .iter()
+        .any(|code| message.contains(code))
+    }
+
     /// Databricks folds identifier case, so this is a dialect constant and needs
     /// no round trip (#1281).
     ///
@@ -710,6 +733,49 @@ mod tests {
                 .to_string()
                 .contains("FUTURE_KIND")
         );
+    }
+
+    #[test]
+    fn missing_sql_and_unity_errors_confirm_absence() {
+        let auth = crate::auth::Auth::from_config(crate::auth::AuthConfig {
+            host: "offline.databricks.test".into(),
+            token: Some("test".into()),
+            client_id: None,
+            client_secret: None,
+        })
+        .unwrap();
+        let connector = DatabricksConnector::new(
+            crate::connector::ConnectorConfig {
+                host: "offline.databricks.test".into(),
+                warehouse_id: "noop".into(),
+                timeout: std::time::Duration::from_secs(1),
+                retry: Default::default(),
+            },
+            auth,
+        );
+        let adapter = DatabricksWarehouseAdapter::new(connector);
+        for code in [
+            "TABLE_OR_VIEW_NOT_FOUND",
+            "SCHEMA_NOT_FOUND",
+            "DELTA_TABLE_NOT_FOUND",
+        ] {
+            let error = AdapterError::new(crate::catalog::CatalogManagerError::Connector(
+                crate::connector::ConnectorError::StatementFailed {
+                    id: "stmt".into(),
+                    message: format!("[{}] missing", code),
+                },
+            ));
+            assert!(adapter.is_missing_object_error(&error), "{code}");
+        }
+        for error in [
+            CatalogError::TableNotFound("missing".into()),
+            CatalogError::NamespaceNotFound("missing".into()),
+        ] {
+            assert!(adapter.is_missing_object_error(&AdapterError::new(error)));
+        }
+        assert!(!adapter.is_missing_object_error(&AdapterError::new(
+            CatalogError::PermissionDenied("missing".into())
+        )));
     }
 
     #[test]

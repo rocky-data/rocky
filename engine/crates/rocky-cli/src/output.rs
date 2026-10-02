@@ -347,6 +347,13 @@ pub struct RunOutput {
     /// True when running in shadow mode (targets rewritten).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub shadow: bool,
+    /// Comparison of this run's shadow objects with production, before cleanup.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shadow_comparison: Option<CompareOutput>,
+    /// Run-local ownership for cleanup after every mixed-run comparison.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub(crate) owned_shadow_objects: Vec<crate::commands::shadow_lifecycle::ShadowObject>,
     pub materializations: Vec<MaterializationOutput>,
     /// Per-model build/skip/reuse decision + reason, surfaced for
     /// transformation runs so orchestrators can explain *why* each model
@@ -791,6 +798,7 @@ impl From<&rocky_bigquery::connector::BigQueryError> for FailureKind {
                 Some(_) => Self::QueryRejected,
                 None => Self::Unknown,
             },
+            E::TableNotFound { .. } => Self::NotFound,
             E::JobError { .. } | E::LoadJobError { .. } => Self::QueryRejected,
             E::Timeout { .. } => Self::Transient,
             E::RetryBudgetExhausted { .. } => Self::QuotaExceeded,
@@ -3574,6 +3582,8 @@ pub struct CompareOutput {
     pub tables_compared: usize,
     pub tables_passed: usize,
     pub tables_warned: usize,
+    /// Targets with no confirmed production object. These do not fail the run.
+    pub tables_no_baseline: usize,
     pub tables_failed: usize,
     pub results: Vec<TableCompareResult>,
     pub overall_verdict: String,
@@ -5127,6 +5137,8 @@ impl RunOutput {
             excluded_tables: vec![],
             resumed_from: None,
             shadow: false,
+            shadow_comparison: None,
+            owned_shadow_objects: vec![],
             materializations: vec![],
             model_decisions: vec![],
             contained: vec![],
@@ -5609,6 +5621,11 @@ impl RunOutput {
             || self.tables_failed > 0
             || self.check_gate_failed
             || self.verify_after_failed;
+        let has_problem = has_problem
+            || self
+                .shadow_comparison
+                .as_ref()
+                .is_some_and(|comparison| comparison.tables_failed > 0);
         match (has_progress, has_problem) {
             (_, false) => rocky_core::state::RunStatus::Success,
             (true, true) => rocky_core::state::RunStatus::PartialFailure,

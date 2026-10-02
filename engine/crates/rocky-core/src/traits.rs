@@ -378,6 +378,14 @@ pub trait WarehouseAdapter: Send + Sync {
     /// Returns the SQL dialect for this warehouse.
     fn dialect(&self) -> &dyn SqlDialect;
 
+    /// Whether a failed table description proves that its object is absent.
+    /// Unknown and transport errors must return false. Permission errors must
+    /// return false unless the warehouse combines denial with missing-object
+    /// in one error code, as Snowflake does for 002003.
+    fn is_missing_object_error(&self, _error: &AdapterError) -> bool {
+        false
+    }
+
     /// Does the warehouse treat a QUOTED identifier's case as part of object
     /// identity, as observed right now?
     ///

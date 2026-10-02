@@ -77,7 +77,7 @@ pub mod schedule_status;
 pub mod scheduler;
 mod seed;
 pub(crate) mod serve;
-mod shadow_lifecycle;
+pub(crate) mod shadow_lifecycle;
 mod shell;
 mod skip_gate;
 mod snapshot;
@@ -200,7 +200,7 @@ pub use schedule_status::{ScheduleStatusError, schedule_status_output};
 pub use rocky_sql::transpile::Dialect;
 pub use run::{
     CheckGateFailure, DeferOptions, Interrupted, PartialFailure, PartitionRunOptions,
-    SkipRunOptions, require_shadow_support_for_config, run,
+    ShadowComparisonFailure, SkipRunOptions, require_shadow_support_for_config, run,
 };
 pub use run_dag_exec::run_with_dag;
 pub use run_watch::run_watch as run_with_watch;

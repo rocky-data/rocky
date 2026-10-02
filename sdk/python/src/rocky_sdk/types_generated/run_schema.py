@@ -520,6 +520,31 @@ class RunStatus3(StrEnum):
     SkippedInFlight = "SkippedInFlight"
 
 
+class TableCompareResult(BaseModel):
+    production_count: conint(ge=0) | None = None
+    """
+    Null when the warehouse count could not be read.
+    """
+    production_table: str
+    reasons: list[str]
+    """
+    Read errors for an `error` row, or threshold reasons for `warn`/`fail`. Empty for `pass`.
+    """
+    row_count_diff_pct: float | None = None
+    """
+    Null unless both counts were read.
+    """
+    row_count_match: bool
+    schema_diffs: list[str]
+    schema_match: bool
+    shadow_count: conint(ge=0) | None = None
+    """
+    Null when the warehouse count could not be read.
+    """
+    shadow_table: str
+    verdict: str
+
+
 class TableErrorOutput(BaseModel):
     """
     Error from a table that failed during parallel processing.
@@ -748,6 +773,26 @@ class CheckResult7(BaseModel):
     """
 
 
+class CompareOutput(BaseModel):
+    """
+    JSON output for `rocky compare`.
+    """
+
+    command: str
+    filter: str
+    overall_verdict: str
+    results: list[TableCompareResult]
+    tables_compared: conint(ge=0)
+    tables_failed: conint(ge=0)
+    tables_no_baseline: conint(ge=0)
+    """
+    Targets with no confirmed production object. These do not fail the run.
+    """
+    tables_passed: conint(ge=0)
+    tables_warned: conint(ge=0)
+    version: str
+
+
 class MaterializationOutput(BaseModel):
     asset_key: list[str]
     attempts: list[AttemptRecord] | None = None
@@ -896,6 +941,10 @@ class RunOutput(BaseModel):
     shadow: bool | None = None
     """
     True when running in shadow mode (targets rewritten).
+    """
+    shadow_comparison: CompareOutput | None = None
+    """
+    Comparison of this run's shadow objects with production, before cleanup.
     """
     skipped_by_run_id: str | None = None
     """

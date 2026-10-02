@@ -33,6 +33,13 @@ pub enum BigQueryError {
     #[error("BigQuery API error: {message} (status: {status})")]
     ApiError { status: String, message: String },
 
+    #[error("table `{catalog}`.`{schema}`.`{table}` not found")]
+    TableNotFound {
+        catalog: String,
+        schema: String,
+        table: String,
+    },
+
     /// A query job that BigQuery accepted (HTTP 200, `jobComplete=true`)
     /// but which then *failed at the job level* — the response carries a
     /// top-level `errors[]` array (an `ErrorProto`) and no result rows.
@@ -1028,6 +1035,32 @@ impl WarehouseAdapter for BigQueryAdapter {
         &self.dialect
     }
 
+    fn is_missing_object_error(&self, error: &AdapterError) -> bool {
+        fn names_missing_object(message: &str) -> bool {
+            message.starts_with("Not found: Table ") || message.starts_with("Not found: Dataset ")
+        }
+        match error.inner().downcast_ref::<BigQueryError>() {
+            Some(BigQueryError::TableNotFound { .. }) => true,
+            Some(BigQueryError::JobError { reason, message }) => {
+                reason == "notFound" && names_missing_object(message)
+            }
+            Some(BigQueryError::ApiError { status, message }) if status.starts_with("404") => {
+                serde_json::from_str::<serde_json::Value>(message)
+                    .ok()
+                    .is_some_and(|body| {
+                        body.pointer("/error/errors/0/reason")
+                            .and_then(serde_json::Value::as_str)
+                            == Some("notFound")
+                            && body
+                                .pointer("/error/errors/0/message")
+                                .and_then(serde_json::Value::as_str)
+                                .is_some_and(names_missing_object)
+                    })
+            }
+            _ => false,
+        }
+    }
+
     async fn execute_statement(&self, sql: &str) -> AdapterResult<()> {
         self.run_query(sql)
             .await
@@ -1175,10 +1208,11 @@ impl WarehouseAdapter for BigQueryAdapter {
         // `describe_table().is_ok()` to probe existence (e.g. the
         // time-interval bootstrap path) get the right answer.
         if columns.is_empty() {
-            return Err(AdapterError::msg(format!(
-                "table `{}`.`{}`.`{}` not found",
-                table.catalog, table.schema, table.table
-            )));
+            return Err(AdapterError::new(BigQueryError::TableNotFound {
+                catalog: table.catalog.clone(),
+                schema: table.schema.clone(),
+                table: table.table.clone(),
+            }));
         }
 
         Ok(columns)
@@ -1994,7 +2028,8 @@ pub(crate) fn is_transient(err: &BigQueryError) -> bool {
             matches!(code, Some(429 | 502 | 503 | 504))
         }
         BigQueryError::Http(e) => e.is_connect() || e.is_timeout(),
-        BigQueryError::JobError { .. }
+        BigQueryError::TableNotFound { .. }
+        | BigQueryError::JobError { .. }
         | BigQueryError::LoadJobError { .. }
         | BigQueryError::Auth(_)
         | BigQueryError::Timeout { .. }
@@ -2255,6 +2290,41 @@ mod tests {
                 message: "Dataset test-project:orders_ds".into()
             }
         )));
+    }
+
+    #[test]
+    fn missing_table_and_dataset_errors_confirm_absence() {
+        let adapter = BigQueryAdapter::new(
+            "project",
+            "US",
+            BigQueryAuth::Bearer(rocky_core::redacted::RedactedString::new("test".into())),
+        );
+        let missing_table = AdapterError::new(BigQueryError::TableNotFound {
+            catalog: "project".into(),
+            schema: "dataset".into(),
+            table: "table".into(),
+        });
+        assert!(adapter.is_missing_object_error(&missing_table));
+        let missing_dataset = AdapterError::new(BigQueryError::ApiError {
+            status: "404 Not Found".into(),
+            message: r#"{"error":{"errors":[{"reason":"notFound","message":"Not found: Dataset project:dataset"}]}}"#.into(),
+        });
+        assert!(adapter.is_missing_object_error(&missing_dataset));
+        let response: BigQueryResponse = serde_json::from_str(
+            r#"{"jobComplete":true,"errors":[{"reason":"notFound","message":"Not found: Dataset project:dataset"}]}"#,
+        ).unwrap();
+        let job = AdapterError::new(response.check_job_error().unwrap_err());
+        assert!(adapter.is_missing_object_error(&job));
+        let denied = AdapterError::new(BigQueryError::ApiError {
+            status: "403 Forbidden".into(),
+            message: "notFound".into(),
+        });
+        assert!(!adapter.is_missing_object_error(&denied));
+        let missing_job = AdapterError::new(BigQueryError::JobError {
+            reason: "notFound".into(),
+            message: "Not found: Job project:job_id".into(),
+        });
+        assert!(!adapter.is_missing_object_error(&missing_job));
     }
 
     #[test]

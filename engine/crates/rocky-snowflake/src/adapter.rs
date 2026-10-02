@@ -105,6 +105,35 @@ impl WarehouseAdapter for SnowflakeWarehouseAdapter {
         &self.dialect
     }
 
+    /// Snowflake code 002003 says "does not exist or not authorized" for
+    /// objects and schemas. It does not distinguish absence from denial;
+    /// shadow preflight treats both as missing, matching earlier behavior.
+    fn is_missing_object_error(&self, error: &AdapterError) -> bool {
+        match error
+            .inner()
+            .downcast_ref::<crate::connector::ConnectorError>()
+        {
+            Some(crate::connector::ConnectorError::StatementFailed { message, .. }) => {
+                message.starts_with("002003: SQL compilation error:")
+                    && message.contains("does not exist or not authorized")
+            }
+            Some(crate::connector::ConnectorError::ApiError {
+                status: 400 | 422,
+                body,
+            }) => {
+                let Ok(json) = serde_json::from_str::<serde_json::Value>(body) else {
+                    return false;
+                };
+                json.get("code").and_then(serde_json::Value::as_str) == Some("002003")
+                    && json
+                        .get("message")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|m| m.contains("does not exist or not authorized"))
+            }
+            _ => false,
+        }
+    }
+
     fn warehouse_name(&self) -> Option<&str> {
         Some(self.connector.warehouse())
     }
@@ -594,6 +623,51 @@ mod tests {
                 .to_string()
                 .contains("FUTURE KIND")
         );
+    }
+
+    #[test]
+    fn compilation_code_002003_confirms_missing_object_or_schema() {
+        let auth = Auth::from_config(AuthConfig {
+            account: "test_account".into(),
+            username: None,
+            password: None,
+            oauth_token: Some("test_token".into()),
+            private_key_path: None,
+            pat: None,
+        })
+        .unwrap();
+        let connector = SnowflakeConnector::new(
+            ConnectorConfig {
+                account: "test_account".into(),
+                warehouse: "COMPUTE_WH".into(),
+                database: None,
+                schema: None,
+                role: None,
+                timeout: Duration::from_secs(1),
+                retry: RetryConfig::default(),
+            },
+            auth,
+        );
+        let adapter = SnowflakeWarehouseAdapter::new(connector);
+        for object in ["Object 'DB.SCH.T'", "Schema 'DB.SCH'"] {
+            let error = AdapterError::new(crate::connector::ConnectorError::StatementFailed {
+                handle: "stmt".into(),
+                message: format!(
+                    "002003: SQL compilation error: {object} does not exist or not authorized."
+                ),
+            });
+            assert!(adapter.is_missing_object_error(&error), "{object}");
+        }
+        let denied = AdapterError::new(crate::connector::ConnectorError::StatementFailed {
+            handle: "stmt".into(),
+            message: "003001: permission denied".into(),
+        });
+        assert!(!adapter.is_missing_object_error(&denied));
+        let api_error = AdapterError::new(crate::connector::ConnectorError::ApiError {
+            status: 422,
+            body: r#"{"code":"002003","message":"SQL compilation error: Schema 'DB.SCH' does not exist or not authorized."}"#.into(),
+        });
+        assert!(adapter.is_missing_object_error(&api_error));
     }
 
     /// Verifies that the adapter can be constructed and used as a trait object.

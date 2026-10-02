@@ -398,6 +398,17 @@ pub struct RunFailed {
     pub custody: RecordCustody,
 }
 
+/// A completed shadow run whose comparison failed after its writes landed.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "{count} shadow table(s) failed comparison (run_id: {run_id}; see `shadow_comparison` in the JSON output)"
+)]
+pub struct ShadowComparisonFailure {
+    pub count: usize,
+    pub run_id: String,
+    pub custody: RecordCustody,
+}
+
 /// Sentinel error signalling that a quality run completed its terminal state
 /// writes and then failed its check gate: at least one error-severity check
 /// failed, or could not be evaluated, while `[pipeline.<name>.checks]
@@ -508,7 +519,12 @@ pub(crate) fn session_disposition(error: &anyhow::Error) -> SessionDisposition {
     let custody = error
         .downcast_ref::<RunFailed>()
         .map(|e| e.custody)
-        .or_else(|| error.downcast_ref::<PartialFailure>().map(|e| e.custody));
+        .or_else(|| error.downcast_ref::<PartialFailure>().map(|e| e.custody))
+        .or_else(|| {
+            error
+                .downcast_ref::<ShadowComparisonFailure>()
+                .map(|e| e.custody)
+        });
     match custody {
         Some(RecordCustody::Persisted) => SessionDisposition::Finalize,
         Some(RecordCustody::Lost) | None => SessionDisposition::Abandon,
@@ -537,6 +553,19 @@ pub(crate) fn run_status_exit_result(
     // than on the error type, which says nothing about the write.
     custody: RecordCustody,
 ) -> Result<()> {
+    if output.tables_failed == 0
+        && !output.check_gate_failed
+        && !output.verify_after_failed
+        && let Some(comparison) = output.shadow_comparison.as_ref()
+        && comparison.tables_failed > 0
+    {
+        return Err(ShadowComparisonFailure {
+            count: comparison.tables_failed,
+            run_id: run_id.to_string(),
+            custody,
+        }
+        .into());
+    }
     match output.derive_run_status() {
         rocky_core::state::RunStatus::PartialFailure => Err(PartialFailure {
             count: output.tables_failed,
@@ -2897,6 +2926,13 @@ pub async fn run_with_explicit_contracts(
     // Refuse a broken Dagster Pipes launch before an idempotency claim, state
     // session, hook, or warehouse statement can run.
     crate::pipes::PipesEmitter::validate_requested()?;
+    if shadow_config.is_some_and(|config| config.branch.is_none())
+        && (resume_run_id.is_some() || resume_latest)
+    {
+        anyhow::bail!(
+            "--shadow cannot be combined with --resume or --resume-latest: a checkpoint may skip shadow objects that still need comparison. Remove retained shadow objects, then restart with --shadow without a resume flag"
+        );
+    }
 
     // This first explicit-contract route is deliberately model-only. Validate
     // it before the idempotency claim, state session, adapter, or warehouse
@@ -4608,10 +4644,27 @@ pub async fn run_with_explicit_contracts(
             (String, String),
         > = HashMap::new();
         let mut collision_check_pairs: Vec<(String, String)> = Vec::new();
+        let mut shadow_preflight_objects = Vec::new();
+        let mut all_production_targets = Vec::new();
+        let default_catalog = warehouse_adapter.default_catalog().unwrap_or_default();
         for conn in &connectors {
             let Ok(parsed) = pattern.parse(&conn.schema) else {
                 continue;
             };
+            let target_catalog = parsed.resolve_template(target_catalog_template, target_sep);
+            let target_catalog = if target_catalog.is_empty() {
+                default_catalog.clone()
+            } else {
+                target_catalog
+            };
+            let target_schema = parsed.resolve_template(target_schema_template, target_sep);
+            if shadow_config.is_some() {
+                all_production_targets.extend(conn.tables.iter().map(|table| rocky_ir::TargetRef {
+                    catalog: target_catalog.clone(),
+                    schema: target_schema.clone(),
+                    table: table.name.clone(),
+                }));
+            }
             if !parsed_filter
                 .as_ref()
                 .is_none_or(|(k, v)| matches_filter(conn, &parsed, k, v))
@@ -4629,15 +4682,6 @@ pub async fn run_with_explicit_contracts(
             // so a connector whose tables are all filtered, missing or
             // disabled is not refused for a value `run` never renders.
             let mut metadata_preflighted = false;
-            let target_catalog = parsed.resolve_template(target_catalog_template, target_sep);
-            let target_schema = if let Some(cfg) = shadow_config {
-                cfg.schema_override
-                    .clone()
-                    .unwrap_or_else(|| parsed.resolve_template(target_schema_template, target_sep))
-            } else {
-                parsed.resolve_template(target_schema_template, target_sep)
-            };
-
             for table in &conn.tables {
                 if !filter_table_matches(parsed_filter.as_ref(), &table.name) {
                     continue;
@@ -4665,18 +4709,19 @@ pub async fn run_with_explicit_contracts(
                     .with_context(|| format!("source schema '{}'", conn.schema))?;
                     metadata_preflighted = true;
                 }
-                let target_table_name = if let Some(cfg) = shadow_config {
-                    if cfg.schema_override.is_none() {
-                        format!("{}{}", table.name, cfg.suffix)
-                    } else {
-                        table.name.clone()
-                    }
-                } else {
-                    table.name.clone()
+                let production = rocky_ir::TargetRef {
+                    catalog: target_catalog.clone(),
+                    schema: target_schema.clone(),
+                    table: table.name.clone(),
                 };
+                let written = shadow_config.map_or_else(
+                    || production.clone(),
+                    |config| rocky_core::shadow::shadow_target(&production, config),
+                );
+                let target_table_name = written.table.clone();
                 let id = rocky_sql::defer::CollisionIdentity::of(
                     &target_catalog,
-                    &target_schema,
+                    &written.schema,
                     &target_table_name,
                 );
                 let this = (conn.schema.clone(), table.name.clone());
@@ -4685,7 +4730,7 @@ pub async fn run_with_explicit_contracts(
                 {
                     anyhow::bail!(
                         "two sources resolve to the same target table \
-                         '{target_catalog}.{target_schema}.{target_table_name}': \
+                         '{target_catalog}.{}.{target_table_name}': \
                          '{}.{}' and '{}.{}'. Writing both would leave whichever \
                          ran last, and the run would still report copying two \
                          tables. This happens when `--shadow-schema` replaces a \
@@ -4694,6 +4739,7 @@ pub async fn run_with_explicit_contracts(
                          `--shadow-suffix` instead, which keeps the template and \
                          renames the table, or give the sources distinct target \
                          tables.",
+                        written.schema,
                         prior.0,
                         prior.1,
                         this.0,
@@ -4702,6 +4748,66 @@ pub async fn run_with_explicit_contracts(
                 }
                 preflight_claims.insert(id, this);
                 collision_check_pairs.push((target_table_name, conn.source_type.clone()));
+                if shadow_config.is_some() {
+                    shadow_preflight_objects.push(
+                        crate::commands::shadow_lifecycle::ShadowObject {
+                            model: table.name.clone(),
+                            production,
+                            target: written,
+                            kind: crate::commands::shadow_lifecycle::ShadowKind::Table,
+                        },
+                    );
+                }
+            }
+        }
+
+        // In a mixed `--all` run, replication writes before model compilation.
+        // Include model production names now, or a replication shadow could
+        // occupy a model's as-yet-absent production target and later drop it.
+        if let Some(config) = shadow_config
+            && (run_all || models_dir.is_some())
+        {
+            let mdir = models_dir.unwrap_or_else(|| std::path::Path::new("models"));
+            if mdir.exists() {
+                let compiled = rocky_compiler::compile::compile(
+                    &rocky_compiler::compile::CompilerConfig {
+                        models_dir: mdir.to_path_buf(),
+                        source_schemas: if rocky_cfg.cache.schemas.enabled {
+                            rocky_compiler::schema_cache::load_source_schemas_from_cache(
+                                &state_store,
+                                chrono::Utc::now(),
+                                rocky_cfg.cache.schemas.ttl(),
+                            )
+                            .unwrap_or_default()
+                        } else {
+                            HashMap::new()
+                        },
+                        run_vars: run_vars.clone(),
+                        ..Default::default()
+                    },
+                )
+                .context("cannot preflight mixed shadow model targets")?;
+                let resolved = |target: &rocky_core::models::TargetConfig| rocky_ir::TargetRef {
+                    catalog: if target.catalog.is_empty() {
+                        default_catalog.clone()
+                    } else {
+                        target.catalog.clone()
+                    },
+                    schema: target.schema.clone(),
+                    table: target.table.clone(),
+                };
+                for model in &compiled.project.models {
+                    let production = resolved(&model.config.target);
+                    all_production_targets.push(production.clone());
+                    shadow_preflight_objects.push(
+                        crate::commands::shadow_lifecycle::ShadowObject {
+                            model: model.config.name.clone(),
+                            target: rocky_core::shadow::shadow_target(&production, config),
+                            production,
+                            kind: crate::commands::shadow_lifecycle::ShadowKind::Table,
+                        },
+                    );
+                }
             }
         }
 
@@ -4715,6 +4821,20 @@ pub async fn run_with_explicit_contracts(
                 .iter()
                 .map(|(t, s)| (t.as_str(), s.as_str())),
         )?;
+        crate::commands::shadow_lifecycle::refuse_production_shadow_collisions(
+            &shadow_preflight_objects,
+            &all_production_targets,
+        )?;
+        if shadow_config.is_some_and(|config| config.branch.is_none())
+            && !shadow_preflight_objects.is_empty()
+        {
+            crate::commands::shadow_lifecycle::refuse_occupied_shadow_targets(
+                warehouse_adapter.as_ref(),
+                warehouse_adapter.dialect(),
+                &shadow_preflight_objects,
+            )
+            .await?;
+        }
     }
 
     // --- Sequential: catalog/schema setup + table collection ---
@@ -5143,16 +5263,16 @@ pub async fn run_with_explicit_contracts(
                     continue;
                 }
 
-                // In shadow suffix mode, append suffix to table name
-                let target_table_name = if let Some(shadow_cfg) = shadow_config {
-                    if shadow_cfg.schema_override.is_none() {
-                        format!("{}{}", table.name, shadow_cfg.suffix)
-                    } else {
-                        table.name.clone()
-                    }
-                } else {
-                    table.name.clone()
+                let production = rocky_ir::TargetRef {
+                    catalog: target_catalog.clone(),
+                    schema: parsed.resolve_template(target_schema_template, target_sep),
+                    table: table.name.clone(),
                 };
+                let written = shadow_config.map_or_else(
+                    || production.clone(),
+                    |config| rocky_core::shadow::shadow_target(&production, config),
+                );
+                let target_table_name = written.table;
 
                 // Fail closed on two sources resolving to one target object.
                 // Refuses only on a real clash, so a multi-connector project
@@ -5419,6 +5539,31 @@ pub async fn run_with_explicit_contracts(
         );
     }
 
+    let replication_shadow_objects = if shadow_config.is_some_and(|config| config.branch.is_none()) {
+        tables_to_process
+            .iter()
+            .map(|task| {
+                let parsed = pattern.parse(&task.source_schema)?;
+                let production = rocky_ir::TargetRef {
+                    catalog: task.target_catalog.clone(),
+                    schema: parsed.resolve_template(target_schema_template, target_sep),
+                    table: task.source_table_name.clone(),
+                };
+                Ok(crate::commands::shadow_lifecycle::ShadowObject {
+                    model: task.source_table_name.clone(),
+                    production,
+                    target: rocky_ir::TargetRef {
+                        catalog: task.target_catalog.clone(),
+                        schema: task.target_schema.clone(),
+                        table: task.target_table_name.clone(),
+                    },
+                    kind: crate::commands::shadow_lifecycle::ShadowKind::Table,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?
+    } else {
+        Vec::new()
+    };
     // Initialize run progress tracking, stamped with this invocation's
     // pipeline scope so a later resume can prove the checkpoint is its own
     // (#1549), and with the table keys it plans to copy so a later resume can
@@ -6847,6 +6992,69 @@ pub async fn run_with_explicit_contracts(
     // to status=Success / exit 0.
     merge_replication_compile_and_copy_errors(&mut output, &table_errors);
 
+    if shadow_config.is_some()
+        && !replication_shadow_objects.is_empty()
+        && output.tables_failed == 0
+        && !output.check_gate_failed
+    {
+        let comparison = crate::commands::compare::compare_targets(
+            warehouse_adapter.as_ref(),
+            replication_shadow_objects
+                .iter()
+                .map(|object| (object.production.clone(), object.target.clone()))
+                .collect(),
+            filter,
+            &rocky_core::compare::ComparisonThresholds::default(),
+        )
+        .await?;
+        crate::status_line!(
+            "Shadow comparison: {} passed, {} warned, {} no baseline, {} failed ({})",
+            comparison.tables_passed,
+            comparison.tables_warned,
+            comparison.tables_no_baseline,
+            comparison.tables_failed,
+            comparison.overall_verdict
+        );
+        if let Some(previous) = output.shadow_comparison.as_mut() {
+            previous.tables_compared += comparison.tables_compared;
+            previous.tables_passed += comparison.tables_passed;
+            previous.tables_warned += comparison.tables_warned;
+            previous.tables_no_baseline += comparison.tables_no_baseline;
+            previous.tables_failed += comparison.tables_failed;
+            previous.results.extend(comparison.results);
+            previous.overall_verdict = if previous.tables_failed > 0 {
+                "fail"
+            } else if previous.tables_warned > 0 {
+                "warn"
+            } else {
+                "pass"
+            }
+            .to_string();
+        } else {
+            output.shadow_comparison = Some(comparison);
+        }
+        output.status = output.derive_run_status();
+    }
+    if shadow_config.is_some_and(|config| config.cleanup_after)
+        && output.tables_failed == 0
+        && !output.check_gate_failed
+        && output.shadow_comparison.as_ref().is_some_and(|comparison| comparison.tables_failed == 0)
+    {
+        output.owned_shadow_objects.extend(replication_shadow_objects);
+        if !output.owned_shadow_objects.is_empty() {
+            for warning in crate::commands::shadow_lifecycle::drop_owned_shadow_objects(
+                warehouse_adapter.as_ref(),
+                warehouse_adapter.dialect(),
+                &output.owned_shadow_objects,
+            )
+            .await
+            {
+                warn!("{warning}");
+                output.scheduling_warnings.push(warning);
+            }
+        }
+    }
+
     // Populate per-model / per-run cost attribution and run the
     // configured `[budget]` check. Populate always; propagate the
     // budget error (if any) after the output has been printed so
@@ -7212,6 +7420,22 @@ pub async fn run_with_explicit_contracts(
         anyhow::bail!(
             "{count} error-severity check(s) failed (run_id: {run_id}, see `check_results` in the JSON output)"
         );
+    }
+
+    if let Some(comparison) = output.shadow_comparison.as_ref()
+        && comparison.tables_failed > 0
+    {
+        let msg = format!("{} shadow table(s) failed comparison", comparison.tables_failed);
+        let _ = hook_registry
+            .fire(&HookContext::pipeline_error(&run_id, pipeline_name, &msg))
+            .await;
+        let _ = hook_registry.wait_async_webhooks().await;
+        return Err(ShadowComparisonFailure {
+            count: comparison.tables_failed,
+            run_id: run_id.clone(),
+            custody: record_custody,
+        }
+        .into());
     }
 
     // §P2.6 emit: pipeline_complete on happy-path exit. Drain async
@@ -11186,6 +11410,21 @@ pub(crate) async fn execute_models_with_explicit_contracts(
     // both no-ops there (#1273).
     let mut shadow_objects: Vec<crate::commands::shadow_lifecycle::ShadowObject> = Vec::new();
     if let Some(config) = shadow_config {
+        let production_targets: std::collections::HashMap<_, _> = compile_result
+            .project
+            .models
+            .iter()
+            .map(|model| {
+                (
+                    model.config.name.clone(),
+                    rocky_ir::TargetRef {
+                        catalog: model.config.target.catalog.clone(),
+                        schema: model.config.target.schema.clone(),
+                        table: model.config.target.table.clone(),
+                    },
+                )
+            })
+            .collect();
         apply_shadow_rewrite(
             &mut compile_result,
             model_name_filter,
@@ -11206,29 +11445,35 @@ pub(crate) async fn execute_models_with_explicit_contracts(
             }
             shadow_objects.push(crate::commands::shadow_lifecycle::ShadowObject {
                 model: model.config.name.clone(),
+                production: production_targets[&model.config.name].clone(),
                 target: rocky_ir::TargetRef {
                     catalog: model.config.target.catalog.clone(),
                     schema: model.config.target.schema.clone(),
                     table: model.config.target.table.clone(),
                 },
+                kind: match model.config.strategy {
+                    rocky_core::models::StrategyConfig::View => {
+                        crate::commands::shadow_lifecycle::ShadowKind::View
+                    }
+                    rocky_core::models::StrategyConfig::MaterializedView => {
+                        crate::commands::shadow_lifecycle::ShadowKind::MaterializedView
+                    }
+                    rocky_core::models::StrategyConfig::DynamicTable { .. } => {
+                        crate::commands::shadow_lifecycle::ShadowKind::DynamicTable
+                    }
+                    _ => crate::commands::shadow_lifecycle::ShadowKind::Table,
+                },
             });
         }
-        // Refuse before any write — but ONLY in the disposable mode.
-        //
-        // `cleanup_after` is exactly the axis this turns on, because it is
-        // what makes "the name should be free" a true invariant: a run that
-        // drops what it made leaves nothing, so an object sitting there is
-        // either not Rocky's or debris from a run that did not finish, and
-        // replacing it silently is the defect #1273 reported.
-        //
-        // With `cleanup_after` off — a named `--branch`, or any caller that
-        // asks for objects outliving the run — the previous run's objects
-        // are SUPPOSED to still be there, and the next run is supposed to
-        // replace them. Refusing would break the feature outright. Rocky
-        // cannot tell its own leftover from a stranger's without a
-        // persisted owner record, so it does not guess: the persistent mode
-        // keeps no per-object ownership check, and #1273 stays open for it.
-        if config.cleanup_after {
+        // One-off shadow runs always refuse occupied names, including
+        // `--keep-shadow`. A kept object must be removed before another run
+        // can claim that name. Named branches intentionally replace objects
+        // in their own namespace and retain their existing exception (#1273).
+        crate::commands::shadow_lifecycle::refuse_production_shadow_collisions(
+            &shadow_objects,
+            &production_targets.into_values().collect::<Vec<_>>(),
+        )?;
+        if config.branch.is_none() {
             crate::commands::shadow_lifecycle::refuse_occupied_shadow_targets(
                 warehouse,
                 warehouse.dialect(),
@@ -12522,6 +12767,32 @@ pub(crate) async fn execute_models_with_explicit_contracts(
         }
     }
 
+    if let Some(config) = shadow_config
+        && config.branch.is_none()
+        && !shadow_objects.is_empty()
+        && output.tables_failed == 0
+    {
+        let comparison = crate::commands::compare::compare_targets(
+            warehouse,
+            shadow_objects
+                .iter()
+                .map(|object| (object.production.clone(), object.target.clone()))
+                .collect(),
+            None,
+            &rocky_core::compare::ComparisonThresholds::default(),
+        )
+        .await?;
+        crate::status_line!(
+            "Shadow comparison: {} passed, {} warned, {} no baseline, {} failed ({})",
+            comparison.tables_passed,
+            comparison.tables_warned,
+            comparison.tables_no_baseline,
+            comparison.tables_failed,
+            comparison.overall_verdict
+        );
+        output.shadow_comparison = Some(comparison);
+    }
+
     // `cleanup_after` finally has a consumer (#1273). It has always been
     // documented as "whether to drop shadow tables after comparison
     // completes" and defaulted to `true`, while nothing read it and every
@@ -12539,16 +12810,25 @@ pub(crate) async fn execute_models_with_explicit_contracts(
     if let Some(config) = shadow_config
         && config.cleanup_after
         && !shadow_objects.is_empty()
+        && output.tables_failed == 0
+        && output
+            .shadow_comparison
+            .as_ref()
+            .is_none_or(|comparison| comparison.tables_failed == 0)
     {
-        let warnings = crate::commands::shadow_lifecycle::drop_owned_shadow_objects(
-            warehouse,
-            warehouse.dialect(),
-            &shadow_objects,
-        )
-        .await;
-        for warning in warnings {
-            warn!("{warning}");
-            output.scheduling_warnings.push(warning);
+        if output.pipeline_type.as_deref() == Some("replication") {
+            output.owned_shadow_objects.extend(shadow_objects);
+        } else {
+            let warnings = crate::commands::shadow_lifecycle::drop_owned_shadow_objects(
+                warehouse,
+                warehouse.dialect(),
+                &shadow_objects,
+            )
+            .await;
+            for warning in warnings {
+                warn!("{warning}");
+                output.scheduling_warnings.push(warning);
+            }
         }
     }
 
@@ -19974,6 +20254,315 @@ auto_create_schemas = true
         (config_path, state_path, db_path)
     }
 
+    /// The production target starts absent. An ownership probe alone would
+    /// therefore allow both aliases and cleanup could drop the new table.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn replication_shadow_aliases_refuse_before_any_warehouse_write() {
+        use rocky_core::shadow::ShadowConfig;
+
+        for (label, shadow, add_other_source, filter) in [
+            (
+                "empty suffix",
+                ShadowConfig {
+                    suffix: String::new(),
+                    ..Default::default()
+                },
+                false,
+                None,
+            ),
+            (
+                "equal schema",
+                ShadowConfig {
+                    schema_override: Some("staging__acme".to_string()),
+                    ..Default::default()
+                },
+                false,
+                None,
+            ),
+            (
+                "case-folded schema",
+                ShadowConfig {
+                    schema_override: Some("STAGING__ACME".to_string()),
+                    ..Default::default()
+                },
+                false,
+                None,
+            ),
+            (
+                "unselected production target",
+                ShadowConfig::default(),
+                true,
+                Some("table=orders"),
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let (config_path, state_path, db_path) =
+                write_two_pipeline_project(dir.path(), "staging__{source}", "other__{source}")
+                    .await;
+            if add_other_source {
+                let warehouse =
+                    rocky_duckdb::adapter::DuckDbWarehouseAdapter::open(&db_path).unwrap();
+                warehouse
+                    .execute_statement(
+                        "CREATE TABLE raw__acme.orders_rocky_shadow AS SELECT 2 AS id",
+                    )
+                    .await
+                    .unwrap();
+            }
+            assert!(!target_table_exists(&db_path, "staging__acme", "orders").await);
+
+            let error = super::run(
+                &config_path,
+                Arc::new(
+                    rocky_core::config::load_rocky_config_fingerprinted(&config_path).unwrap(),
+                ),
+                filter,
+                Some("p1"),
+                &state_path,
+                None,
+                true,
+                None,
+                false,
+                None,
+                false,
+                Some(&shadow),
+                &PartitionRunOptions::default(),
+                None,
+                None,
+                None,
+                None,
+                &DeferOptions::default(),
+                &SkipRunOptions::default(),
+                &rocky_core::run_vars::RunVars::new(),
+                None,
+                None,
+                false,
+                None,
+            )
+            .await
+            .expect_err(label);
+            assert!(
+                format!("{error:#}").contains("collides with the production target"),
+                "{label}: {error:#}"
+            );
+            let warehouse = rocky_duckdb::adapter::DuckDbWarehouseAdapter::open(&db_path).unwrap();
+            let schemas = warehouse
+                .execute_query(
+                    "SELECT schema_name FROM information_schema.schemata \
+                     WHERE lower(schema_name) = 'staging__acme'",
+                )
+                .await
+                .unwrap();
+            assert!(
+                schemas.rows.is_empty(),
+                "{label}: target schema was written"
+            );
+            assert!(!target_table_exists(&db_path, "staging__acme", "orders").await);
+            assert!(target_table_exists(&db_path, "raw__acme", "orders").await);
+        }
+    }
+
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn model_shadow_aliases_refuse_with_production_absent() {
+        use rocky_core::shadow::ShadowConfig;
+
+        for (label, shadow) in [
+            (
+                "empty suffix",
+                ShadowConfig {
+                    suffix: String::new(),
+                    ..Default::default()
+                },
+            ),
+            (
+                "equal schema",
+                ShadowConfig {
+                    schema_override: Some("main".into()),
+                    ..Default::default()
+                },
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let models_dir = dir.path().join("models");
+            std::fs::create_dir(&models_dir).unwrap();
+            write_model_with_target(&models_dir, "orders", "SELECT 1 AS id", "main", "orders");
+            let db_path = dir.path().join("warehouse.duckdb");
+            let config_path = dir.path().join("rocky.toml");
+            let state_path = dir.path().join("state.redb");
+            std::fs::write(
+                &config_path,
+                format!(
+                    "[adapter]\ntype = \"duckdb\"\npath = \"{}\"\n\
+                     [state]\nbackend = \"local\"\n\
+                     [pipeline.transform]\ntype = \"transformation\"\nmodels = \"models/**\"\n\
+                     [pipeline.transform.target]\nadapter = \"default\"\n",
+                    db_path.display()
+                ),
+            )
+            .unwrap();
+            let error = super::run(
+                &config_path,
+                Arc::new(
+                    rocky_core::config::load_rocky_config_fingerprinted(&config_path).unwrap(),
+                ),
+                None,
+                Some("transform"),
+                &state_path,
+                None,
+                true,
+                None,
+                false,
+                None,
+                false,
+                Some(&shadow),
+                &PartitionRunOptions::default(),
+                None,
+                None,
+                None,
+                None,
+                &DeferOptions::default(),
+                &SkipRunOptions::default(),
+                &rocky_core::run_vars::RunVars::new(),
+                None,
+                None,
+                false,
+                None,
+            )
+            .await
+            .expect_err(label);
+            assert!(
+                format!("{error:#}").contains("model(s) failed"),
+                "{label}: {error:#}"
+            );
+            assert!(!target_table_exists(&db_path, "main", "orders").await);
+        }
+    }
+
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn mixed_shadow_refuses_model_production_alias_before_replication_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let (config_path, state_path, db_path) =
+            write_two_pipeline_project(dir.path(), "staging__{source}", "other__{source}").await;
+        let models_dir = dir.path().join("models");
+        std::fs::create_dir(&models_dir).unwrap();
+        write_model_with_target(
+            &models_dir,
+            "model_target",
+            "SELECT 1 AS id",
+            "staging__acme",
+            "orders_rocky_shadow",
+        );
+        let error = super::run(
+            &config_path,
+            Arc::new(rocky_core::config::load_rocky_config_fingerprinted(&config_path).unwrap()),
+            None,
+            Some("p1"),
+            &state_path,
+            None,
+            true,
+            Some(&models_dir),
+            true,
+            None,
+            false,
+            Some(&rocky_core::shadow::ShadowConfig::default()),
+            &PartitionRunOptions::default(),
+            None,
+            None,
+            None,
+            None,
+            &DeferOptions::default(),
+            &SkipRunOptions::default(),
+            &rocky_core::run_vars::RunVars::new(),
+            None,
+            None,
+            false,
+            None,
+        )
+        .await
+        .expect_err("replication shadow must not claim a model production target");
+        assert!(
+            format!("{error:#}").contains("collides with the production target"),
+            "{error:#}"
+        );
+        assert!(!target_table_exists(&db_path, "staging__acme", "orders_rocky_shadow").await);
+        assert!(!target_table_exists(&db_path, "staging__acme", "orders").await);
+    }
+
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn mixed_shadow_resolves_empty_replication_catalog_before_any_ddl() {
+        let dir = tempfile::tempdir().unwrap();
+        let (config_path, state_path, db_path) =
+            write_two_pipeline_project(dir.path(), "staging__{source}", "other__{source}").await;
+        let config = std::fs::read_to_string(&config_path).unwrap();
+        std::fs::write(
+            &config_path,
+            config.replace(
+                "catalog_template = \"warehouse\"",
+                "catalog_template = \"\"",
+            ),
+        )
+        .unwrap();
+        let models_dir = dir.path().join("models");
+        std::fs::create_dir(&models_dir).unwrap();
+        write_model_with_target(
+            &models_dir,
+            "model_target",
+            "SELECT 1 AS id",
+            "staging__acme",
+            "orders_rocky_shadow",
+        );
+        let error = super::run(
+            &config_path,
+            Arc::new(rocky_core::config::load_rocky_config_fingerprinted(&config_path).unwrap()),
+            None,
+            Some("p1"),
+            &state_path,
+            None,
+            true,
+            Some(&models_dir),
+            true,
+            None,
+            false,
+            Some(&rocky_core::shadow::ShadowConfig::default()),
+            &PartitionRunOptions::default(),
+            None,
+            None,
+            None,
+            None,
+            &DeferOptions::default(),
+            &SkipRunOptions::default(),
+            &rocky_core::run_vars::RunVars::new(),
+            None,
+            None,
+            false,
+            None,
+        )
+        .await
+        .expect_err("catalogless replication shadow aliases the model's production target");
+        assert!(
+            format!("{error:#}").contains("collides with the production target"),
+            "{error:#}"
+        );
+        assert!(!target_table_exists(&db_path, "staging__acme", "orders_rocky_shadow").await);
+        assert!(!target_table_exists(&db_path, "staging__acme", "orders").await);
+        let warehouse = rocky_duckdb::adapter::DuckDbWarehouseAdapter::open(&db_path).unwrap();
+        use rocky_core::traits::WarehouseAdapter;
+        let schemas = warehouse
+            .execute_query(
+                "SELECT schema_name FROM information_schema.schemata WHERE schema_name = 'staging__acme'",
+            )
+            .await
+            .unwrap();
+        assert!(
+            schemas.rows.is_empty(),
+            "preflight must refuse before CREATE SCHEMA"
+        );
+    }
+
     /// Creates the DuckDB file at `db_path` holding the one source table
     /// (`raw__acme.orders`) the two-pipeline project replicates.
     #[cfg(feature = "duckdb")]
@@ -21596,6 +22185,8 @@ auto_create_schemas = true
             excluded_tables: vec![],
             resumed_from: None,
             shadow: false,
+            shadow_comparison: None,
+            owned_shadow_objects: vec![],
             materializations: vec![],
             model_decisions: vec![],
             contained: vec![],
@@ -27479,6 +28070,8 @@ backend = "local"
     ///   RunFailed      { Lost }       ->  Abandon
     ///   PartialFailure { Persisted }  ->  Finalize
     ///   PartialFailure { Lost }       ->  Abandon
+    ///   ShadowComparisonFailure { Persisted } -> Finalize
+    ///   ShadowComparisonFailure { Lost }      -> Abandon
     ///   anything else                 ->  Abandon   (pre-terminal hard exit)
     /// ```
     ///
@@ -27488,7 +28081,9 @@ backend = "local"
     /// a bookkeeping problem would be a worse lie than the one being fixed.
     #[test]
     fn session_disposition_reads_the_record_custody_not_the_error_type() {
-        use super::{PartialFailure, RecordCustody, RunFailed, SessionDisposition};
+        use super::{
+            PartialFailure, RecordCustody, RunFailed, SessionDisposition, ShadowComparisonFailure,
+        };
 
         let run_failed = |custody| {
             anyhow::Error::from(RunFailed {
@@ -27523,6 +28118,17 @@ backend = "local"
             super::session_disposition(&partial(RecordCustody::Lost)),
             SessionDisposition::Abandon
         );
+        for (custody, expected) in [
+            (RecordCustody::Persisted, SessionDisposition::Finalize),
+            (RecordCustody::Lost, SessionDisposition::Abandon),
+        ] {
+            let error = anyhow::Error::from(ShadowComparisonFailure {
+                count: 1,
+                run_id: "r".to_string(),
+                custody,
+            });
+            assert_eq!(super::session_disposition(&error), expected);
+        }
         assert_eq!(
             super::session_disposition(&anyhow::anyhow!("adapter auth failed")),
             SessionDisposition::Abandon,

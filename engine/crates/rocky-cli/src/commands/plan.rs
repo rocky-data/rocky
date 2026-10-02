@@ -148,6 +148,16 @@ pub async fn plan(
     // and we strip catalogs from table refs so we emit two-part `schema.table`
     // names rather than three-part names that would fail at execution time.
     let supports_catalogs = dialect.create_catalog_sql("__probe").is_some();
+    let shadow_config = run_options
+        .shadow
+        .then(|| rocky_core::shadow::ShadowConfig {
+            suffix: run_options
+                .shadow_suffix
+                .clone()
+                .unwrap_or_else(|| "_rocky_shadow".to_string()),
+            schema_override: run_options.shadow_schema.clone(),
+            ..Default::default()
+        });
 
     for conn in &connectors {
         let parsed = match pattern.parse(&conn.schema) {
@@ -168,6 +178,10 @@ pub async fn plan(
             .unwrap_or(&pattern.separator);
         let target_catalog = parsed.resolve_template(&pipeline.target.catalog_template, target_sep);
         let target_schema = parsed.resolve_template(&pipeline.target.schema_template, target_sep);
+        let written_schema = shadow_config
+            .as_ref()
+            .and_then(|config| config.schema_override.as_deref())
+            .unwrap_or(&target_schema);
 
         // Effective catalog used in table refs and statements. Empty for
         // catalog-less dialects so the dialect emits two-part names.
@@ -192,13 +206,13 @@ pub async fn plan(
         // Schema creation — only when governance enables it.
         if pipeline.target.governance.auto_create_schemas
             && let Some(create_sch) =
-                dialect.create_schema_sql(&effective_target_catalog, &target_schema)
+                dialect.create_schema_sql(&effective_target_catalog, written_schema)
         {
             let sql = create_sch.map_err(|e| anyhow::anyhow!("create_schema: {e}"))?;
             let target_label = if effective_target_catalog.is_empty() {
-                target_schema.clone()
+                written_schema.to_string()
             } else {
-                format!("{effective_target_catalog}.{target_schema}")
+                format!("{effective_target_catalog}.{written_schema}")
             };
             output.statements.push(PlannedStatement {
                 purpose: "create_schema".into(),
@@ -219,10 +233,19 @@ pub async fn plan(
             if !filter_table_matches(parsed_filter.as_ref(), &table.name) {
                 continue;
             }
-            let target_label = if effective_target_catalog.is_empty() {
-                format!("{target_schema}.{}", table.name)
+            let production_target = TargetRef {
+                catalog: effective_target_catalog.clone(),
+                schema: target_schema.clone(),
+                table: table.name.clone(),
+            };
+            let target = shadow_config.as_ref().map_or_else(
+                || production_target.clone(),
+                |config| rocky_core::shadow::shadow_target(&production_target, config),
+            );
+            let target_label = if target.catalog.is_empty() {
+                format!("{}.{}", target.schema, target.table)
             } else {
-                format!("{effective_target_catalog}.{target_schema}.{}", table.name)
+                target.full_name()
             };
 
             // Resolve the per-table override and the effective strategy the
@@ -252,23 +275,7 @@ pub async fn plan(
                 });
                 continue;
             }
-            let check_table_name = if run_options.shadow
-                && run_options.branch.is_none()
-                && run_options.shadow_schema.is_none()
-            {
-                format!(
-                    "{}{}",
-                    table.name,
-                    run_options
-                        .shadow_suffix
-                        .as_deref()
-                        .unwrap_or("_rocky_shadow")
-                )
-            } else {
-                // A branch or shadow schema override leaves the table name intact.
-                table.name.clone()
-            };
-            collision_check_pairs.push((check_table_name, conn.source_type.clone()));
+            collision_check_pairs.push((target.table.clone(), conn.source_type.clone()));
 
             // Resolved AFTER the filter and disabled-override exclusions.
             // Unlike `run`, plan does not query the warehouse to exclude
@@ -312,11 +319,7 @@ pub async fn plan(
 
             // sql_gen consumes the typed IR directly.
             let model_ir = ModelIr::replication(
-                TargetRef {
-                    catalog: effective_target_catalog.clone(),
-                    schema: target_schema.clone(),
-                    table: table.name.clone(),
-                },
+                target,
                 strategy,
                 SourceRef {
                     catalog: effective_source_catalog.clone(),
