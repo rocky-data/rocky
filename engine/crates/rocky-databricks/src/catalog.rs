@@ -298,13 +298,16 @@ impl<'a> CatalogManager<'a> {
 }
 
 /// `DESCRIBE TABLE` repeats partition columns after `# Partition Information`.
+///
+/// A metadata section starts at a row whose name begins with `#` and whose
+/// type is empty. A real column may also start with `#` (a delimited name such
+/// as `` `#tag` ``), but it always carries a type, so it stays in the list.
 fn primary_describe_columns(rows: &[Vec<serde_json::Value>]) -> Vec<rocky_ir::ColumnInfo> {
     rows.iter()
         .take_while(|row| {
-            !row.first()
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .starts_with('#')
+            let name = row.first().and_then(|v| v.as_str()).unwrap_or("");
+            let data_type = row.get(1).and_then(|v| v.as_str()).unwrap_or("");
+            !(name.starts_with('#') && data_type.trim().is_empty())
         })
         .filter_map(|row| {
             let name = row.first().and_then(|v| v.as_str())?.to_string();
@@ -437,6 +440,26 @@ mod tests {
             .map(|c| c.name)
             .collect();
         assert_eq!(names, ["id", "day"]);
+    }
+
+    /// A delimited column named `#tag` is a real column, not a metadata
+    /// header: it has a type, so the columns after it are kept too.
+    #[test]
+    fn describe_keeps_a_real_hash_prefixed_column() {
+        let rows = vec![
+            vec![json!("id"), json!("bigint")],
+            vec![json!("#tag"), json!("string")],
+            vec![json!("payload"), json!("string")],
+            vec![json!(""), json!("")],
+            vec![json!("# Partition Information"), json!("")],
+            vec![json!("# col_name"), json!("data_type")],
+            vec![json!("id"), json!("bigint")],
+        ];
+        let names: Vec<_> = primary_describe_columns(&rows)
+            .into_iter()
+            .map(|c| c.name)
+            .collect();
+        assert_eq!(names, ["id", "#tag", "payload"]);
     }
 
     #[test]
