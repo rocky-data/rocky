@@ -16,9 +16,9 @@
 //! - **Regex (fallback):** regex-based Jinja extraction from raw `.sql` files
 //!
 //! **Not supported (produces diagnostics):**
-//! - Custom Jinja macros, `{% for %}`, `{{ var() }}`, Python models
+//! - Raw Jinja control flow, custom Jinja macros, Python models
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
 use regex::Regex;
@@ -43,6 +43,13 @@ const RAW_INCREMENTAL_EVIDENCE_REFUSED: &str = "is an effectively incremental db
 The raw importer has no compiled SQL or per-model run_results.json evidence and cannot prove \
 the first run contains all rows. Run `dbt compile --full-refresh`, then import manifest.json \
 with its matching run_results.json";
+
+const RAW_JINJA_CONTROL_REFUSED: &str = "raw import cannot evaluate Jinja control flow; \
+run `dbt compile --full-refresh` and import with the manifest";
+const RAW_CONFIG_UNRESOLVED: &str = "raw import cannot resolve a dbt config expression; \
+run `dbt compile --full-refresh` and import with the manifest";
+const RAW_VERSIONED_REFUSED: &str = "raw import cannot resolve versioned model properties; \
+run `dbt compile --full-refresh` and import with the manifest";
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -1957,12 +1964,20 @@ pub fn import_dbt_project(
     }
 
     let mut model_yamls = HashMap::new();
+    let mut versioned_names = HashSet::new();
     for dir in &model_dirs {
-        model_yamls.extend(super::dbt_tests::parse_model_yamls(dir)?);
+        let parsed = super::dbt_tests::parse_model_yamls(dir)?;
+        versioned_names.extend(
+            parsed
+                .values()
+                .flat_map(|model| model.versioned_names.iter().cloned()),
+        );
+        model_yamls.extend(parsed);
     }
     let settings = RawModelSettings {
         project: &project_config,
         model_yamls: &model_yamls,
+        versioned_names: &versioned_names,
     };
 
     for dir in &model_dirs {
@@ -2004,6 +2019,7 @@ pub fn import_dbt_project(
 struct RawModelSettings<'a> {
     project: &'a Option<DbtProjectConfig>,
     model_yamls: &'a HashMap<String, super::dbt_tests::DbtModelYaml>,
+    versioned_names: &'a HashSet<String>,
 }
 
 fn visit_dbt_models(
@@ -2050,18 +2066,8 @@ fn visit_dbt_models(
 
             let rel_path = path.strip_prefix(models_root).unwrap_or(path.as_path());
 
-            match import_single_model(
-                &path,
-                &name,
-                rel_path,
-                default_target,
-                settings.project,
-                settings
-                    .model_yamls
-                    .get(&name)
-                    .and_then(|model| model.materialized.as_deref()),
-                source_map,
-            ) {
+            match import_single_model(&path, &name, rel_path, default_target, settings, source_map)
+            {
                 Ok((model, warnings)) => {
                     result.warnings.extend(warnings);
                     result.imported.push(model);
@@ -2081,15 +2087,32 @@ fn import_single_model(
     name: &str,
     rel_path: &Path,
     default_target: &TargetConfig,
-    project_config: &Option<DbtProjectConfig>,
-    yaml_materialization: Option<&str>,
+    settings: &RawModelSettings<'_>,
     source_map: &HashMap<(String, String), dbt_sources::RockySourceMapping>,
 ) -> Result<(ImportedModel, Vec<ImportWarning>), String> {
     let content = std::fs::read_to_string(path).map_err(|e| format!("failed to read: {e}"))?;
 
-    let resolved_project_config = project_config
+    if settings.versioned_names.contains(name) {
+        return Err(RAW_VERSIONED_REFUSED.to_string());
+    }
+    let config_calls = dbt_config_calls(&content);
+    let config_starts = Regex::new(r"\{\{\s*-?\s*config\b").unwrap();
+    if config_starts.find_iter(&content).count() != config_calls.len()
+        || config_calls
+            .iter()
+            .any(|call| !raw_config_is_resolvable(call))
+    {
+        return Err(RAW_CONFIG_UNRESOLVED.to_string());
+    }
+
+    let resolved_project_config = settings
+        .project
         .as_ref()
         .map(|project| dbt_project::resolve_model_config(project, rel_path));
+    let yaml_materialization = settings
+        .model_yamls
+        .get(name)
+        .and_then(|model| model.materialized.as_deref());
     let effective_materialization = inline_dbt_materialization(&content)
         .or_else(|| yaml_materialization.map(str::to_string))
         .or_else(|| {
@@ -2097,11 +2120,22 @@ fn import_single_model(
                 .as_ref()
                 .map(|config| config.materialized.clone())
         });
+    if effective_materialization
+        .as_deref()
+        .is_some_and(|value| !value.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
+    {
+        return Err(RAW_CONFIG_UNRESOLVED.to_string());
+    }
     if effective_materialization.as_deref() == Some("incremental") {
         return Err(RAW_INCREMENTAL_EVIDENCE_REFUSED.to_string());
     }
 
     let mut warnings = Vec::new();
+
+    // Raw conversion strips statement tags and keeps their bodies.
+    if content.contains("{%") {
+        return Err(RAW_JINJA_CONTROL_REFUSED.to_string());
+    }
 
     // Refuse is_incremental() before general Jinja handling. This must catch
     // compound conditions too: otherwise the generic fallback removes the
@@ -2111,36 +2145,6 @@ fn import_single_model(
     }
     let content_processed = content;
 
-    // Check for remaining unsupported Jinja patterns
-    if content_processed.contains("{%") {
-        // `{% for %}` / `{% set %}` REFUSE: the regex conversion strips only
-        // the `{% %}` delimiters, so a loop/assignment body survives exactly
-        // once — a loop meant to emit N columns emits one broken fragment that
-        // loads but is wrong. A loud failure beats a silent mis-render.
-        let for_set_re = Regex::new(r"\{%-?\s*(for|set)\b").unwrap();
-        if for_set_re.is_match(&content_processed) {
-            return Err(
-                "contains unsupported Jinja control flow ({% for %} or {% set %}) that the \
-                 no-manifest importer cannot faithfully render — re-run after `dbt compile` (the \
-                 manifest path resolves Jinja) or rewrite the model without loops/assignments"
-                    .to_string(),
-            );
-        }
-        // Other control flow ({% if %}) is still emitted with TODO markers and
-        // a warning — it degrades (the body is applied unconditionally) but
-        // stays inspectable for review, matching the long-standing behaviour.
-        let block_re = Regex::new(r"\{%[^%]*%\}").unwrap();
-        if block_re.is_match(&content_processed) {
-            warnings.push(ImportWarning {
-                model: name.to_string(),
-                category: WarningCategory::JinjaControlFlow,
-                message: "contains Jinja control flow ({% if %}) — emitted with TODO markers; the conditional body is applied unconditionally, so review the result".to_string(),
-                suggestion: Some(
-                    "use the manifest import path (`dbt compile`) for faithful Jinja resolution".to_string(),
-                ),
-            });
-        }
-    }
     // `{{ var('x') }}` is now mapped to Rocky's native per-run variable marker
     // `@var(x)` (with `{{ var('x', 'd') }}` -> `@var(x, d)`) during
     // `convert_jinja_to_sql`, so it is no longer an unsupported macro. Emit an
@@ -2492,34 +2496,133 @@ fn dbt_tags_to_map(tags: &[String]) -> std::collections::BTreeMap<String, String
 /// name; dropping it would silently route the model's data to a table named
 /// after the file.
 fn extract_dbt_alias(content: &str) -> Option<String> {
-    let config_re = Regex::new(r"\{\{\s*config\s*\(([^)]*)\)\s*\}\}").ok()?;
-    let caps = config_re.captures(content)?;
-    single_string_value(&caps[1], "alias")
+    dbt_config_calls(content)
+        .into_iter()
+        .filter_map(|call| single_string_value(call, "alias"))
+        .next_back()
 }
 
 fn inline_dbt_materialization(content: &str) -> Option<String> {
-    let config_re = Regex::new(r"(?s)\{\{\s*config\s*\((.*?)\)\s*\}\}").ok()?;
-    config_re
-        .captures_iter(content)
-        .find_map(|captures| single_string_value(&captures[1], "materialized"))
+    dbt_config_calls(content)
+        .into_iter()
+        .filter_map(|call| single_string_value(call, "materialized"))
+        .next_back()
+}
+
+fn dbt_config_calls(content: &str) -> Vec<&str> {
+    let mut calls = Vec::new();
+    let mut rest = content;
+    while let Some(start) = rest.find("{{") {
+        rest = &rest[start + 2..];
+        let Some(end) = find_jinja_tag_end(rest, "}}") else {
+            break;
+        };
+        let body = rest[..end].trim().trim_start_matches('-').trim();
+        let body = body.trim_end_matches('-').trim();
+        if let Some(args) = body.strip_prefix("config") {
+            let args = args.trim();
+            if let Some(args) = args.strip_prefix('(').and_then(|s| s.strip_suffix(')')) {
+                calls.push(args);
+            }
+        }
+        rest = &rest[end + 2..];
+    }
+    calls
+}
+
+fn raw_config_is_resolvable(call: &str) -> bool {
+    // These arguments are only a best-effort literal subset. Any expression
+    // requiring Jinja evaluation must use the manifest path.
+    let mut quote = None;
+    let mut depth = 0;
+    let mut start = 0;
+    let mut materialized_seen = false;
+    for (index, ch) in call
+        .char_indices()
+        .chain(std::iter::once((call.len(), ',')))
+    {
+        if let Some(delimiter) = quote {
+            if ch == delimiter {
+                quote = None;
+            }
+            continue;
+        }
+        match ch {
+            '\'' | '"' => quote = Some(ch),
+            '[' | '{' => depth += 1,
+            ']' | '}' if depth > 0 => depth -= 1,
+            '(' | ')' => return false,
+            ',' if depth == 0 => {
+                let arg = call[start..index].trim();
+                if !arg.is_empty() {
+                    let Some((key, value)) = arg.split_once('=') else {
+                        return false;
+                    };
+                    let key = key.trim();
+                    let value = value.trim();
+                    if !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                        || key.is_empty()
+                        || value.is_empty()
+                    {
+                        return false;
+                    }
+                    if key == "materialized" {
+                        if materialized_seen || !is_literal_materialization(value) {
+                            return false;
+                        }
+                        materialized_seen = true;
+                    } else if !is_literal_config_value(value) {
+                        return false;
+                    }
+                }
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    quote.is_none() && depth == 0
+}
+
+fn is_literal_materialization(value: &str) -> bool {
+    let value = value
+        .strip_prefix('\'')
+        .and_then(|value| value.strip_suffix('\''))
+        .or_else(|| {
+            value
+                .strip_prefix('"')
+                .and_then(|value| value.strip_suffix('"'))
+        });
+    value.is_some_and(|value| {
+        !value.is_empty() && value.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    })
+}
+
+fn is_literal_config_value(value: &str) -> bool {
+    let quoted = value
+        .strip_prefix('\'')
+        .and_then(|value| value.strip_suffix('\''))
+        .or_else(|| {
+            value
+                .strip_prefix('"')
+                .and_then(|value| value.strip_suffix('"'))
+        });
+    quoted.is_some()
+        || (value.starts_with('[') && value.ends_with(']'))
+        || (value.starts_with('{') && value.ends_with('}'))
+        || matches!(value, "true" | "false" | "True" | "False" | "none" | "None")
+        || value.parse::<f64>().is_ok()
 }
 
 fn extract_dbt_config(content: &str) -> (StrategyConfig, Vec<String>) {
     let mut messages = Vec::new();
 
-    let config_re = Regex::new(r"\{\{\s*config\s*\(([^)]*)\)\s*\}\}").unwrap();
-    let Some(captures) = config_re.captures(content) else {
+    let calls = dbt_config_calls(content);
+    let Some(config_str) = calls.last().copied() else {
         return (StrategyConfig::FullRefresh, messages);
     };
 
-    let config_str = &captures[1];
-
     // Parse materialized
-    let mat_re = Regex::new(r#"materialized\s*=\s*['"](\w+)['"]"#).unwrap();
-    let materialized = mat_re
-        .captures(config_str)
-        .map(|c| c[1].to_string())
-        .unwrap_or_else(|| "table".to_string());
+    let materialized = inline_dbt_materialization(content).unwrap_or_else(|| "table".to_string());
 
     // Parse unique_key — accepts string-form (`unique_key='id'`) or
     // single-line list (`unique_key=['user_id', 'date']`).
@@ -2632,7 +2735,7 @@ fn convert_jinja_to_sql(content: &str, this_ref: &str) -> String {
     let mut sql = content.to_string();
 
     // Remove {{ config(...) }} blocks
-    let config_re = Regex::new(r"\{\{\s*config\s*\([^)]*\)\s*\}\}\s*\n?").unwrap();
+    let config_re = Regex::new(r"\{\{\s*-?\s*config\s*\([^)]*\)\s*-?\s*\}\}\s*\n?").unwrap();
     sql = config_re.replace_all(&sql, "").to_string();
 
     // {{ ref('model_name') }} -> model_name
@@ -4399,6 +4502,199 @@ FROM {{ ref('stg_events') }}
         let result = import_dbt_project(dir.path(), &target).unwrap();
         assert_eq!(result.imported.len(), 1);
         assert!(result.failed.is_empty());
+    }
+
+    #[test]
+    fn raw_import_refuses_jinja_control_flow_before_emitting_sql() {
+        let target = TargetConfig {
+            catalog: "w".into(),
+            schema: "s".into(),
+            table: String::new(),
+        };
+        for (label, tag) in [
+            ("if", "{% if delta_mode() %}where id > 10{% endif %}"),
+            (
+                "if_trim",
+                "{%- if delta_mode() -%}where id > 10{%- endif -%}",
+            ),
+            ("for", "{% for c in columns %}{{ c }}{% endfor %}"),
+            ("macro", "{% macro delta() %}where id > 10{% endmacro %}"),
+            ("call", "{% call delta() %}where id > 10{% endcall %}"),
+            (
+                "wrapped_incremental",
+                "{% macro delta() %}{{ is_incremental() }}{% endmacro %}{% if delta() %}where id > 10{% endif %}",
+            ),
+        ] {
+            let dir = tempfile::TempDir::new().unwrap();
+            std::fs::create_dir(dir.path().join("models")).unwrap();
+            std::fs::write(
+                dir.path().join("models/orders.sql"),
+                format!("select * from source {tag}"),
+            )
+            .unwrap();
+            let result = import_dbt_project(dir.path(), &target).unwrap();
+            assert!(result.imported.is_empty(), "{label}");
+            assert_eq!(result.failed.len(), 1, "{label}");
+            assert!(
+                result.failed[0]
+                    .reason
+                    .contains("raw import cannot evaluate Jinja control flow"),
+                "{label}"
+            );
+            assert!(
+                result.failed[0]
+                    .reason
+                    .contains("dbt compile --full-refresh"),
+                "{label}"
+            );
+        }
+    }
+
+    #[test]
+    fn raw_import_resolves_whitespace_and_last_inline_config() {
+        let target = TargetConfig {
+            catalog: "w".into(),
+            schema: "s".into(),
+            table: String::new(),
+        };
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir(dir.path().join("models")).unwrap();
+        let sql = dir.path().join("models/orders.sql");
+        std::fs::write(
+            &sql,
+            "{{- config(materialized='incremental') -}}\nselect 1 as id",
+        )
+        .unwrap();
+        let refused = import_dbt_project(dir.path(), &target).unwrap();
+        assert!(refused.imported.is_empty());
+        assert!(refused.failed[0].reason.contains("effectively incremental"));
+
+        std::fs::write(&sql, "{{ config(materialized='incremental') }}\n{{- config(materialized='table') -}}\nselect 1 as id").unwrap();
+        let accepted = import_dbt_project(dir.path(), &target).unwrap();
+        assert_eq!(accepted.imported.len(), 1, "{:?}", accepted.failed);
+        assert!(accepted.failed.is_empty());
+        assert!(matches!(
+            accepted.imported[0].config.strategy,
+            StrategyConfig::FullRefresh
+        ));
+        assert_eq!(accepted.imported[0].sql.trim(), "select 1 as id");
+
+        std::fs::write(&sql, "{{ config(materialized='table') }}\n{{ config(materialized='incremental') }}\nselect 1 as id").unwrap();
+        let refused = import_dbt_project(dir.path(), &target).unwrap();
+        assert!(refused.imported.is_empty());
+        assert!(refused.failed[0].reason.contains("effectively incremental"));
+    }
+
+    #[test]
+    fn raw_import_refuses_unresolved_config_expression() {
+        let target = TargetConfig {
+            catalog: "w".into(),
+            schema: "s".into(),
+            table: String::new(),
+        };
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir(dir.path().join("models")).unwrap();
+        for expression in [
+            "materialized=var('mode')",
+            "**model_config",
+            "schema=target.schema",
+        ] {
+            std::fs::write(
+                dir.path().join("models/orders.sql"),
+                format!("{{{{ config({expression}) }}}}\nselect 1 as id"),
+            )
+            .unwrap();
+            let result = import_dbt_project(dir.path(), &target).unwrap();
+            assert!(result.imported.is_empty(), "{expression}");
+            assert!(
+                result.failed[0]
+                    .reason
+                    .contains("cannot resolve a dbt config expression"),
+                "{expression}"
+            );
+        }
+
+        std::fs::write(
+            dir.path().join("models/orders.sql"),
+            "{{ config(materialized='incremental' }}\nselect 1 as id",
+        )
+        .unwrap();
+        let result = import_dbt_project(dir.path(), &target).unwrap();
+        assert!(result.imported.is_empty());
+        assert!(
+            result.failed[0]
+                .reason
+                .contains("cannot resolve a dbt config expression")
+        );
+    }
+
+    #[test]
+    fn raw_import_applies_root_model_default() {
+        let target = TargetConfig {
+            catalog: "w".into(),
+            schema: "s".into(),
+            table: String::new(),
+        };
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir(dir.path().join("models")).unwrap();
+        std::fs::write(
+            dir.path().join("dbt_project.yml"),
+            "name: p\nmodels:\n  +materialized: incremental\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("models/orders.sql"), "select 1 as id").unwrap();
+        let refused = import_dbt_project(dir.path(), &target).unwrap();
+        assert!(refused.imported.is_empty());
+        assert!(refused.failed[0].reason.contains("effectively incremental"));
+
+        std::fs::write(
+            dir.path().join("dbt_project.yml"),
+            "name: p\nmodels:\n  +materialized: incremental\n  p:\n    +materialized: table\n",
+        )
+        .unwrap();
+        let accepted = import_dbt_project(dir.path(), &target).unwrap();
+        assert_eq!(accepted.imported.len(), 1, "{:?}", accepted.failed);
+
+        std::fs::write(
+            dir.path().join("dbt_project.yml"),
+            "name: p\nmodels:\n  +materialized: \"{{ var('mode') }}\"\n",
+        )
+        .unwrap();
+        let refused = import_dbt_project(dir.path(), &target).unwrap();
+        assert!(refused.imported.is_empty());
+        assert!(
+            refused.failed[0]
+                .reason
+                .contains("cannot resolve a dbt config expression")
+        );
+    }
+
+    #[test]
+    fn raw_import_refuses_versioned_properties() {
+        let target = TargetConfig {
+            catalog: "w".into(),
+            schema: "s".into(),
+            table: String::new(),
+        };
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir(dir.path().join("models")).unwrap();
+        std::fs::write(dir.path().join("models/properties.yml"), "models:\n  - name: orders\n    versions:\n      - v: 1\n        config:\n          materialized: incremental\n      - v: 2\n        defined_in: orders_archive\n").unwrap();
+        for name in ["orders_v1", "orders_archive"] {
+            std::fs::write(
+                dir.path().join(format!("models/{name}.sql")),
+                "select 1 as id",
+            )
+            .unwrap();
+        }
+        let result = import_dbt_project(dir.path(), &target).unwrap();
+        assert!(result.imported.is_empty());
+        assert_eq!(result.failed.len(), 2);
+        assert!(
+            result
+                .failed
+                .iter()
+                .all(|failure| failure.reason.contains("versioned model properties"))
+        );
     }
 
     #[test]

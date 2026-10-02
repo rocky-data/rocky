@@ -155,13 +155,19 @@ fn parse_models_section(value: &Option<serde_yaml::Value>, project_name: &str) -
         return DbtModelDefaults::default();
     };
 
-    // Look for the project name key
+    let mut defaults = DbtModelDefaults::default();
+    if let Some(materialized) = top
+        .get(serde_yaml::Value::String("+materialized".to_string()))
+        .and_then(serde_yaml::Value::as_str)
+    {
+        defaults.materialized = Some(materialized.to_string());
+    }
+
+    // Project-specific settings override root-level defaults.
     let project_key = serde_yaml::Value::String(project_name.to_string());
     let Some(serde_yaml::Value::Mapping(project_map)) = top.get(&project_key) else {
-        return DbtModelDefaults::default();
+        return defaults;
     };
-
-    let mut defaults = DbtModelDefaults::default();
 
     for (key, val) in project_map {
         let Some(key_str) = key.as_str() else {
