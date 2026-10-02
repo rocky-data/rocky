@@ -507,6 +507,16 @@ pub async fn plan(
             state_path,
         ) {
             Ok(Some(RunPlanBuild::Persisted(run_plan, plan_id, persisted_at))) => {
+                if run_options.model.is_none() {
+                    let preview =
+                        plan_preview_output(Some(config_path), &blueprint_models_dir, None, env)?;
+                    output.statements.extend(
+                        preview
+                            .statements
+                            .into_iter()
+                            .filter(|stmt| stmt.purpose == "conditional_drop"),
+                    );
+                }
                 output.models = run_plan.models.clone();
                 output.execution_layers = run_plan.execution_layers.clone();
                 output.plan_id = Some(plan_id);
@@ -617,6 +627,10 @@ pub async fn plan(
         print_json(&output)?;
     } else {
         for stmt in &output.statements {
+            if stmt.purpose == "conditional_drop" {
+                println!("{}", stmt.sql);
+                continue;
+            }
             println!("-- {} ({})", stmt.purpose, stmt.target);
             println!("{};", stmt.sql);
             println!();
@@ -967,6 +981,34 @@ fn preview_merge_shape(model_ir: &ModelIr, dialect: &dyn SqlDialect) -> Result<S
     ))
 }
 
+/// A single review line for the destructive action permitted by a model.
+/// Offline previews cannot know the current warehouse object kind.
+pub(crate) fn conditional_kind_drop_preview(
+    model: &rocky_core::models::Model,
+    ir: &rocky_ir::ModelIr,
+    dialect: &dyn rocky_core::traits::SqlDialect,
+) -> Result<Option<String>> {
+    use rocky_core::models::DropExistingKind;
+    use rocky_ir::MaterializationStrategy;
+
+    let (kind, replacement) = match (&ir.materialization, model.drop_existing_kind) {
+        (MaterializationStrategy::FullRefresh, Some(DropExistingKind::View)) => ("VIEW", "table"),
+        (MaterializationStrategy::View, Some(DropExistingKind::Table)) => ("TABLE", "view"),
+        _ => return Ok(None),
+    };
+    let target =
+        dialect.format_table_ref(&ir.target.catalog, &ir.target.schema, &ir.target.table)?;
+    let drop = if kind == "TABLE" {
+        dialect.drop_table_sql(&target)
+    } else {
+        format!("DROP VIEW {target}")
+    };
+    Ok(Some(format!(
+        "-- {drop} (only if the existing object is a {} and the model creates a {replacement})",
+        kind.to_lowercase()
+    )))
+}
+
 /// Side-effect-free SQL preview core: compile the project in-process and render
 /// the SQL each compiled transformation model **would** emit, returning a
 /// [`PlanOutput`] whose only populated field is `statements`.
@@ -1177,6 +1219,20 @@ pub fn plan_preview_output(
         match sql_gen::generate_transformation_sql_with_warehouse(model_ir, dialect.as_ref(), None)
         {
             Ok(stmts) => {
+                if let Some(model) = result
+                    .project
+                    .models
+                    .iter()
+                    .find(|m| m.config.name == model_name)
+                    && let Some(drop) =
+                        conditional_kind_drop_preview(model, model_ir, dialect.as_ref())?
+                {
+                    output.statements.push(PlannedStatement {
+                        purpose: "conditional_drop".to_string(),
+                        target: target_label.clone(),
+                        sql: drop,
+                    });
+                }
                 // Multi-statement strategies (DeleteInsert, lakehouse DDL)
                 // emit one row each.
                 for sql in stmts {
@@ -3938,6 +3994,43 @@ table = "users"
         assert!(out.retention_actions.is_empty());
         assert!(out.plan_id.is_none());
         assert!(out.execution_layers.is_empty());
+    }
+
+    #[test]
+    fn plan_preview_shows_only_permitted_conditional_kind_drop() {
+        let tmp = TempDir::new().unwrap();
+        let (cfg, models) = write_project(
+            &tmp,
+            "[adapter.default]\ntype = \"duckdb\"\ndatabase = \":memory:\"\n",
+            &[
+                (
+                    "switch",
+                    "name = \"switch\"\ndrop_existing_kind = \"view\"\n[strategy]\ntype = \"full_refresh\"\n[target]\ncatalog = \"\"\nschema = \"main\"\n",
+                ),
+                (
+                    "plain",
+                    "name = \"plain\"\n[strategy]\ntype = \"full_refresh\"\n[target]\ncatalog = \"\"\nschema = \"main\"\n",
+                ),
+            ],
+        );
+        let out = plan_preview_output(Some(&cfg), &models, None, None).unwrap();
+        let drops: Vec<_> = out
+            .statements
+            .iter()
+            .filter(|s| s.purpose == "conditional_drop")
+            .collect();
+        assert_eq!(drops.len(), 1);
+        assert!(drops[0].sql.contains("DROP VIEW"));
+        assert!(
+            drops[0]
+                .sql
+                .contains("only if the existing object is a view")
+        );
+        assert!(
+            out.statements
+                .iter()
+                .any(|s| s.sql.contains("CREATE OR REPLACE TABLE"))
+        );
     }
 
     /// #1996: an ephemeral model renders no statement, and the preview used

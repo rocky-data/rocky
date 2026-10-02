@@ -243,6 +243,16 @@ fn emit_models(
         match sql_gen::generate_transformation_sql_with_warehouse(&model_ir, dialect.as_ref(), None)
         {
             Ok(stmts) => {
+                let drop_note = result
+                    .project
+                    .models
+                    .iter()
+                    .find(|m| m.config.name == model_name)
+                    .map(|m| {
+                        super::plan::conditional_kind_drop_preview(m, &model_ir, dialect.as_ref())
+                    })
+                    .transpose()?
+                    .flatten();
                 // Join multi-statement strategies (e.g. predrop + CTAS) into one
                 // runnable script, each statement terminated with `;`.
                 let sql = stmts
@@ -250,6 +260,10 @@ fn emit_models(
                     .map(|s| format!("{};", s.trim_end_matches(';')))
                     .collect::<Vec<_>>()
                     .join("\n\n");
+                let sql = match drop_note {
+                    Some(note) => format!("{note}\n{sql}"),
+                    None => sql,
+                };
                 emitted.push(EmittedModel {
                     name: model_name.to_string(),
                     sql,
@@ -628,6 +642,28 @@ mod tests {
             "the preview must carry the declared surrogate key:\n{}",
             preview.statements[0].sql
         );
+    }
+
+    #[test]
+    fn emit_sql_labels_conditional_drop_without_running_it_unconditionally() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("switch.sql"), "SELECT 1 AS id\n").unwrap();
+        std::fs::write(dir.path().join("switch.toml"),
+            "name = \"switch\"\ndrop_existing_kind = \"view\"\n[strategy]\ntype = \"full_refresh\"\n[target]\ncatalog = \"\"\nschema = \"main\"\n").unwrap();
+        let models = emit_models(
+            None,
+            dir.path(),
+            None,
+            &rocky_core::run_vars::RunVars::new(),
+        )
+        .unwrap()
+        .models;
+        assert_eq!(models.len(), 1);
+        let body = file_body(&models[0]);
+        assert_eq!(body.matches("DROP VIEW").count(), 1);
+        assert!(body.lines().next().unwrap().starts_with("-- DROP VIEW"));
+        assert!(body.contains("only if the existing object is a view"));
+        assert!(body.contains("CREATE OR REPLACE TABLE"));
     }
 
     #[test]

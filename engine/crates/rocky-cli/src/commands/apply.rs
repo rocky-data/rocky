@@ -2436,10 +2436,14 @@ pub(crate) fn execution_ir_fingerprint(
     for m in models {
         // `to_value` normalises any nested HashMap to sorted-key order.
         let config = serde_json::to_value(&m.config).ok()?;
-        projection.insert(
-            m.config.name.clone(),
-            serde_json::json!({ "config": config, "sql": m.sql }),
-        );
+        let mut entry = serde_json::json!({ "config": config, "sql": m.sql });
+        if let Some(kind) = m.drop_existing_kind {
+            entry["drop_existing_kind"] = serde_json::json!(match kind {
+                rocky_core::models::DropExistingKind::Table => "table",
+                rocky_core::models::DropExistingKind::View => "view",
+            });
+        }
+        projection.insert(m.config.name.clone(), entry);
     }
     // Re-through `to_value` so the whole tree is canonical (sorted keys).
     let root = serde_json::to_value(&projection).ok()?;
@@ -5077,6 +5081,36 @@ pub async fn run_apply_inline_for_run(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn execution_fingerprint_tracks_drop_existing_kind() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("switch.sql"), "SELECT 1 AS id\n").unwrap();
+        let sidecar = dir.path().join("switch.toml");
+        let write = |permission: &str| {
+            std::fs::write(&sidecar, format!(
+            "name = \"switch\"\n{permission}[strategy]\ntype = \"full_refresh\"\n[target]\ncatalog = \"\"\nschema = \"main\"\n"
+        )).unwrap()
+        };
+        let fingerprint = || {
+            let models = rocky_core::models::load_models_from_dir(dir.path(), None).unwrap();
+            super::execution_ir_fingerprint(
+                &models,
+                "config",
+                "governance",
+                "execution",
+                &super::ExecutionExtras::default(),
+            )
+            .unwrap()
+        };
+        write("");
+        let absent = fingerprint();
+        write("drop_existing_kind = \"view\"\n");
+        let view = fingerprint();
+        write("drop_existing_kind = \"table\"\n");
+        let table = fingerprint();
+        assert_ne!(absent, view);
+        assert_ne!(view, table);
+    }
     /// #1730. Both sides of the execution fingerprint must build the
     /// surrogate-key map with the SAME function over the SAME set.
     ///

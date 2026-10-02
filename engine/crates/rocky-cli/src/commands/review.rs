@@ -274,6 +274,8 @@ pub async fn compute_review(
         .as_ref()
         .map(|f| f.iter().filter(|x| x.is_breaking()).count())
         .unwrap_or(0);
+    let conditional_drops =
+        conditional_drop_review_lines(config_path, &models_dir, run_plan.model.as_deref())?;
 
     let mut marker_written = false;
     if approve {
@@ -310,7 +312,11 @@ pub async fn compute_review(
         );
     }
 
-    let message = build_message(approve, breaking_count, &findings, plan_id);
+    let mut message = build_message(approve, breaking_count, &findings, plan_id);
+    for line in conditional_drops {
+        message.push('\n');
+        message.push_str(&line);
+    }
 
     Ok(ReviewOutput {
         version: VERSION.to_string(),
@@ -322,6 +328,20 @@ pub async fn compute_review(
         breaking_changes: findings,
         message: Some(message),
     })
+}
+
+fn conditional_drop_review_lines(
+    config_path: &Path,
+    models_dir: &Path,
+    model: Option<&str>,
+) -> Result<Vec<String>> {
+    let preview = super::plan::plan_preview_output(Some(config_path), models_dir, model, None)?;
+    Ok(preview
+        .statements
+        .into_iter()
+        .filter(|statement| statement.purpose == "conditional_drop")
+        .map(|statement| format!("{}: {}", statement.target, statement.sql))
+        .collect())
 }
 
 /// Review (and optionally approve) a `PlanKind::Gc` reclamation plan or a
@@ -1183,6 +1203,28 @@ fn render_excluded_note(excluded: u64) {
 mod tests {
     use super::*;
     use crate::output::ApproverSource;
+
+    #[test]
+    fn review_lists_conditional_drop_per_model() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let models = dir.path().join("models");
+        std::fs::create_dir(&models)?;
+        std::fs::write(models.join("switch.sql"), "SELECT 1 AS id\n")?;
+        std::fs::write(
+            models.join("switch.toml"),
+            "name = \"switch\"\ndrop_existing_kind = \"table\"\n[strategy]\ntype = \"view\"\n[target]\ncatalog = \"\"\nschema = \"main\"\n",
+        )?;
+        let config = dir.path().join("rocky.toml");
+        std::fs::write(
+            &config,
+            "[adapter.default]\ntype = \"duckdb\"\ndatabase = \":memory:\"\n",
+        )?;
+        let lines = conditional_drop_review_lines(&config, &models, None)?;
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("DROP TABLE"));
+        assert!(lines[0].contains("only if the existing object is a table"));
+        Ok(())
+    }
 
     fn dummy_marker(plan_id: &str) -> ReviewMarker {
         ReviewMarker {
