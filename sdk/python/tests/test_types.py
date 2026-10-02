@@ -30,12 +30,14 @@ def test_parse_reconciled_watermark_output():
         "command": "state-reconcile-watermark",
         "pipeline": "bronze",
         "dry_run": True,
-        "watermarks": [{
-            "table": "wh.raw.orders",
-            "previous": "2026-09-01T00:00:00Z",
-            "target_max": "2026-09-02T00:00:00Z",
-            "watermark": "2026-09-02T00:00:00Z",
-        }],
+        "watermarks": [
+            {
+                "table": "wh.raw.orders",
+                "previous": "2026-09-01T00:00:00Z",
+                "target_max": "2026-09-02T00:00:00Z",
+                "watermark": "2026-09-02T00:00:00Z",
+            }
+        ],
     }
     result = parse_rocky_output(json.dumps(payload))
     assert isinstance(result, ReconcileWatermarkOutput)

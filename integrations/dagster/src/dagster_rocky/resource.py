@@ -1257,9 +1257,7 @@ class RockyResource(dg.ConfigurableResource):
     ) -> ReconcileWatermarkOutput:
         """Repair incremental cursors from the recorded target tables."""
         with _translating():
-            return self._get_client().reconcile_watermark(
-                pipeline, tables=tables, dry_run=dry_run
-            )
+            return self._get_client().reconcile_watermark(pipeline, tables=tables, dry_run=dry_run)
 
     # ------------------------------------------------------------------ #
     # Branch approval / promote                                          #

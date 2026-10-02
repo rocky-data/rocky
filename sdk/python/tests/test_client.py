@@ -106,17 +106,29 @@ def test_build_cmd_uses_state_namespace_when_set():
 
 def test_reconcile_watermark_builds_selected_dry_run_command():
     client = _client()
-    payload = json.dumps({
-        "version": "1.75.0", "command": "state-reconcile-watermark",
-        "pipeline": "bronze", "dry_run": True, "watermarks": [],
-    })
+    payload = json.dumps(
+        {
+            "version": "1.75.0",
+            "command": "state-reconcile-watermark",
+            "pipeline": "bronze",
+            "dry_run": True,
+            "watermarks": [],
+        }
+    )
     with patch.object(client, "run_cli", return_value=payload) as run_cli:
         result = client.reconcile_watermark("bronze", tables=["wh.raw.orders"], dry_run=True)
     assert result.dry_run
-    run_cli.assert_called_once_with([
-        "state", "reconcile-watermark", "--pipeline", "bronze",
-        "--table", "wh.raw.orders", "--dry-run",
-    ])
+    run_cli.assert_called_once_with(
+        [
+            "state",
+            "reconcile-watermark",
+            "--pipeline",
+            "bronze",
+            "--table",
+            "wh.raw.orders",
+            "--dry-run",
+        ]
+    )
 
 
 def test_build_run_args_threads_every_flag():
