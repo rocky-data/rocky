@@ -460,7 +460,7 @@ Two things moved. The `{{ config() }}` block became `[strategy]`, and `{{ source
 
 ## 3. Handle Unsupported Jinja
 
-The importer converts most Jinja, not all of it. It raises a warning or a failure for each pattern it cannot handle.
+The manifest path uses SQL compiled by dbt. The raw path converts a limited set of Jinja expressions and refuses statement tags.
 
 :::tip[`{{ var() }}` and per-model routing]
 `{{ var('name') }}` in a model body converts to an `@var(name)` run-variable marker on its own. Supply the value at run time with `rocky run --var name=value`. That covers any value you splice into the SQL itself.
@@ -473,14 +473,13 @@ Per-model `catalog`, `schema`, and `table` routing driven by an orchestrator is 
 | Pattern | Importer Behavior | Manual Fix |
 |---|---|---|
 | `{{ var('some_var') }}` | Converted to an `@var(some_var)` run-variable marker in the emitted SQL (not a warning) | Pass the value at run time with `rocky run --var some_var=value`, or give the marker an inline default: `@var(some_var, fallback)`. A marker with neither a `--var` binding nor a default fails to compile. |
-| `{% if target.name == 'prod' %}` | Emitted verbatim with a `# TODO` marker — the body applies *unconditionally*, so review it | Remove environment branching or use separate `rocky.toml` files per environment |
-| `{% set ... %}` variable assignments | Refused — the model is listed as a failure rather than half-rendered | Inline the value or refactor the query |
 
 ### Common failures
 
 | Pattern | Reason | Manual Fix |
 |---|---|---|
 | Custom Jinja macros (`{{ generate_schema_name() }}`) | Rocky cannot interpret custom macros | Rewrite the SQL without the macro |
+| `{% if ... %}` and `{% set ... %}` | Raw import cannot evaluate the statement and refuses the model | Compile with `dbt compile --full-refresh` and import the manifest, or rewrite the SQL |
 | `{% for ... %}` loops generating SQL | Dynamic SQL generation not supported | Write out the SQL explicitly or use a CTE |
 | `{% macro ... %}` definitions | Rocky uses pure SQL, not macros | Convert shared logic to CTEs or separate models |
 | Python dbt models (`.py` files) | Not SQL | Rewrite in SQL |
@@ -990,6 +989,7 @@ Run `dbt compile --full-refresh` without `--select`, or include the model. Keep 
 :::
 
 The raw and no-manifest importer refuses every effectively incremental model it resolves from inline, project, or model properties config. It has no compiled SQL or per-model run result.
+It also refuses Jinja control flow, versioned models, and config expressions it cannot resolve.
 
 ### Environment-specific logic
 

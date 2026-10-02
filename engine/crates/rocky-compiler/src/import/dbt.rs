@@ -2092,6 +2092,11 @@ fn import_single_model(
 ) -> Result<(ImportedModel, Vec<ImportWarning>), String> {
     let content = std::fs::read_to_string(path).map_err(|e| format!("failed to read: {e}"))?;
 
+    // The raw converter keeps the body of statement tags. Even a condition
+    // unrelated to is_incremental() can leave a bounded query as full SQL.
+    if content.contains("{%") {
+        return Err(RAW_JINJA_CONTROL_REFUSED.to_string());
+    }
     if settings.versioned_names.contains(name) {
         return Err(RAW_VERSIONED_REFUSED.to_string());
     }
@@ -2131,11 +2136,6 @@ fn import_single_model(
     }
 
     let mut warnings = Vec::new();
-
-    // Raw conversion strips statement tags and keeps their bodies.
-    if content.contains("{%") {
-        return Err(RAW_JINJA_CONTROL_REFUSED.to_string());
-    }
 
     // Refuse is_incremental() before general Jinja handling. This must catch
     // compound conditions too: otherwise the generic fallback removes the
@@ -2533,84 +2533,125 @@ fn dbt_config_calls(content: &str) -> Vec<&str> {
 fn raw_config_is_resolvable(call: &str) -> bool {
     // These arguments are only a best-effort literal subset. Any expression
     // requiring Jinja evaluation must use the manifest path.
-    let mut quote = None;
-    let mut depth = 0;
-    let mut start = 0;
-    let mut materialized_seen = false;
-    for (index, ch) in call
-        .char_indices()
-        .chain(std::iter::once((call.len(), ',')))
-    {
-        if let Some(delimiter) = quote {
-            if ch == delimiter {
-                quote = None;
+    let Some(args) = split_literal_items(call) else {
+        return false;
+    };
+    let mut seen = HashSet::new();
+    args.into_iter().all(|arg| {
+        let Some((key, value)) = arg.split_once('=') else {
+            return false;
+        };
+        let key = key.trim();
+        let value = value.trim();
+        !key.is_empty()
+            && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            && seen.insert(key)
+            && if key == "materialized" {
+                is_literal_materialization(value)
+            } else {
+                is_literal_config_value(value)
             }
-            continue;
-        }
-        match ch {
-            '\'' | '"' => quote = Some(ch),
-            '[' | '{' => depth += 1,
-            ']' | '}' if depth > 0 => depth -= 1,
-            '(' | ')' => return false,
-            ',' if depth == 0 => {
-                let arg = call[start..index].trim();
-                if !arg.is_empty() {
-                    let Some((key, value)) = arg.split_once('=') else {
-                        return false;
-                    };
-                    let key = key.trim();
-                    let value = value.trim();
-                    if !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-                        || key.is_empty()
-                        || value.is_empty()
-                    {
-                        return false;
-                    }
-                    if key == "materialized" {
-                        if materialized_seen || !is_literal_materialization(value) {
-                            return false;
-                        }
-                        materialized_seen = true;
-                    } else if !is_literal_config_value(value) {
-                        return false;
-                    }
-                }
-                start = index + 1;
-            }
-            _ => {}
-        }
-    }
-    quote.is_none() && depth == 0
+    })
 }
 
 fn is_literal_materialization(value: &str) -> bool {
-    let value = value
-        .strip_prefix('\'')
-        .and_then(|value| value.strip_suffix('\''))
-        .or_else(|| {
-            value
-                .strip_prefix('"')
-                .and_then(|value| value.strip_suffix('"'))
-        });
+    let value = quoted_literal_contents(value);
     value.is_some_and(|value| {
         !value.is_empty() && value.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
     })
 }
 
 fn is_literal_config_value(value: &str) -> bool {
-    let quoted = value
-        .strip_prefix('\'')
-        .and_then(|value| value.strip_suffix('\''))
-        .or_else(|| {
-            value
-                .strip_prefix('"')
-                .and_then(|value| value.strip_suffix('"'))
-        });
-    quoted.is_some()
-        || (value.starts_with('[') && value.ends_with(']'))
-        || (value.starts_with('{') && value.ends_with('}'))
+    if quoted_literal_contents(value).is_some()
         || matches!(value, "true" | "false" | "True" | "False" | "none" | "None")
         || value.parse::<f64>().is_ok()
+    {
+        return true;
+    }
+    if let Some(inner) = value.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+        return split_literal_items(inner).is_some_and(|items| {
+            items
+                .iter()
+                .all(|item| is_literal_config_value(item.trim()))
+        });
+    }
+    if let Some(inner) = value.strip_prefix('{').and_then(|s| s.strip_suffix('}')) {
+        return split_literal_items(inner).is_some_and(|items| {
+            items.iter().all(|item| {
+                item.split_once(':').is_some_and(|(key, value)| {
+                    quoted_literal_contents(key.trim()).is_some()
+                        && is_literal_config_value(value.trim())
+                })
+            })
+        });
+    }
+    false
+}
+
+fn quoted_literal_contents(value: &str) -> Option<&str> {
+    let quote = value.chars().next()?;
+    if quote != '\'' && quote != '"' || !value.ends_with(quote) || value.len() < 2 {
+        return None;
+    }
+    let inner = &value[1..value.len() - 1];
+    let mut escaped = false;
+    for ch in inner.chars() {
+        if escaped {
+            escaped = false;
+        } else if ch == '\\' {
+            escaped = true;
+        } else if ch == quote {
+            return None;
+        }
+    }
+    (!escaped).then_some(inner)
+}
+
+fn split_literal_items(value: &str) -> Option<Vec<&str>> {
+    if value.trim().is_empty() {
+        return Some(Vec::new());
+    }
+    let mut items = Vec::new();
+    let mut start = 0;
+    let mut quote = None;
+    let mut escaped = false;
+    let mut stack = Vec::new();
+    for (index, ch) in value.char_indices() {
+        if let Some(delimiter) = quote {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == delimiter {
+                quote = None;
+            }
+            continue;
+        }
+        match ch {
+            '\'' | '"' => quote = Some(ch),
+            '[' | '{' => stack.push(ch),
+            ']' if stack.pop() != Some('[') => return None,
+            '}' if stack.pop() != Some('{') => return None,
+            '(' | ')' => return None,
+            ',' if stack.is_empty() => {
+                let item = value[start..index].trim();
+                if item.is_empty() {
+                    return None;
+                }
+                items.push(item);
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    if quote.is_some() || !stack.is_empty() {
+        return None;
+    }
+    let last = value[start..].trim();
+    if !last.is_empty() {
+        items.push(last);
+    }
+    Some(items)
 }
 
 fn extract_dbt_config(content: &str) -> (StrategyConfig, Vec<String>) {
@@ -2732,11 +2773,7 @@ fn strip_surrounding_quotes(s: &str) -> &str {
 }
 
 fn convert_jinja_to_sql(content: &str, this_ref: &str) -> String {
-    let mut sql = content.to_string();
-
-    // Remove {{ config(...) }} blocks
-    let config_re = Regex::new(r"\{\{\s*-?\s*config\s*\([^)]*\)\s*-?\s*\}\}\s*\n?").unwrap();
-    sql = config_re.replace_all(&sql, "").to_string();
+    let mut sql = strip_dbt_config_tags(content);
 
     // {{ ref('model_name') }} -> model_name
     let ref_re = Regex::new(r#"\{\{\s*ref\s*\(\s*['"](\w+)['"]\s*\)\s*\}\}"#).unwrap();
@@ -2791,6 +2828,31 @@ fn convert_jinja_to_sql(content: &str, this_ref: &str) -> String {
         .to_string();
 
     sql.trim().to_string()
+}
+
+fn strip_dbt_config_tags(content: &str) -> String {
+    let mut output = String::with_capacity(content.len());
+    let mut rest = content;
+    while let Some(start) = rest.find("{{") {
+        output.push_str(&rest[..start]);
+        let tag = &rest[start + 2..];
+        let Some(end) = find_jinja_tag_end(tag, "}}") else {
+            output.push_str(&rest[start..]);
+            return output;
+        };
+        let body = tag[..end].trim().trim_start_matches('-').trim();
+        let body = body.trim_end_matches('-').trim();
+        if !body
+            .strip_prefix("config")
+            .and_then(|s| s.trim().strip_prefix('('))
+            .is_some_and(|s| s.ends_with(')'))
+        {
+            output.push_str(&rest[start..start + 2 + end + 2]);
+        }
+        rest = &tag[end + 2..];
+    }
+    output.push_str(rest);
+    output
 }
 
 // ---------------------------------------------------------------------------
@@ -3449,7 +3511,11 @@ FROM {{ ref('stg_events') }}
         assert!(result.imported.is_empty());
         assert_eq!(result.failed.len(), 1);
         assert_eq!(result.failed[0].name, "fct_events");
-        assert!(result.failed[0].reason.contains("effectively incremental"));
+        assert!(
+            result.failed[0]
+                .reason
+                .contains("raw import cannot evaluate Jinja control flow")
+        );
         assert!(
             result.failed[0]
                 .reason
@@ -4449,7 +4515,11 @@ FROM {{ ref('stg_events') }}
             assert!(result.imported.is_empty());
             assert_eq!(result.failed.len(), 1, "{:?}", result.failed);
             assert_eq!(result.failed[0].name, "orders");
-            assert!(result.failed[0].reason.contains("manifest.json"));
+            assert!(
+                result.failed[0]
+                    .reason
+                    .contains("raw import cannot evaluate Jinja control flow")
+            );
             assert!(
                 result.failed[0]
                     .reason
@@ -4598,6 +4668,10 @@ FROM {{ ref('stg_events') }}
             "materialized=var('mode')",
             "**model_config",
             "schema=target.schema",
+            "tags=['daily', var('tag')]",
+            "meta={'owner': target.name}",
+            "schema='safe' + var('suffix')",
+            "schema='safe' + 'suffix'",
         ] {
             std::fs::write(
                 dir.path().join("models/orders.sql"),
@@ -4626,6 +4700,16 @@ FROM {{ ref('stg_events') }}
                 .reason
                 .contains("cannot resolve a dbt config expression")
         );
+
+        std::fs::write(
+            dir.path().join("models/orders.sql"),
+            "{{ config(alias='orders', tags=['daily)'], meta={'owner': 'team'}) }}\nselect 1 as id",
+        )
+        .unwrap();
+        let accepted = import_dbt_project(dir.path(), &target).unwrap();
+        assert_eq!(accepted.imported.len(), 1, "{:?}", accepted.failed);
+        assert_eq!(accepted.imported[0].sql, "select 1 as id");
+        assert_eq!(accepted.imported[0].config.target.table, "orders");
     }
 
     #[test]
@@ -4679,7 +4763,7 @@ FROM {{ ref('stg_events') }}
         let dir = tempfile::TempDir::new().unwrap();
         std::fs::create_dir(dir.path().join("models")).unwrap();
         std::fs::write(dir.path().join("models/properties.yml"), "models:\n  - name: orders\n    versions:\n      - v: 1\n        config:\n          materialized: incremental\n      - v: 2\n        defined_in: orders_archive\n").unwrap();
-        for name in ["orders_v1", "orders_archive"] {
+        for name in ["orders", "orders_v1", "orders_archive"] {
             std::fs::write(
                 dir.path().join(format!("models/{name}.sql")),
                 "select 1 as id",
@@ -4688,7 +4772,7 @@ FROM {{ ref('stg_events') }}
         }
         let result = import_dbt_project(dir.path(), &target).unwrap();
         assert!(result.imported.is_empty());
-        assert_eq!(result.failed.len(), 2);
+        assert_eq!(result.failed.len(), 3);
         assert!(
             result
                 .failed
