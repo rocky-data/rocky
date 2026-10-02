@@ -208,7 +208,10 @@ pub use seed::run_seed;
 pub use serve::{resolve_serve_config_path, run_serve};
 pub use shell::run_shell;
 pub use snapshot::run_snapshot;
-pub use state::{state_clear_schema_cache, state_retention_sweep, state_schedule_hold, state_show};
+pub use state::{
+    state_clear_schema_cache, state_reconcile_watermark, state_retention_sweep,
+    state_schedule_hold, state_show,
+};
 pub use test::declarative_test_output;
 #[cfg(feature = "duckdb")]
 pub use test::run_declarative_tests;

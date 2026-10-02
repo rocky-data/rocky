@@ -598,7 +598,12 @@ re-derives target watermarks before copying.
 For checkpoints from Rocky 1.75.0 or earlier, set `strategy = "full_refresh"`
 for affected tables. Run `rocky run --pipeline <name> --no-prune` without a
 resume flag. That replaces their data without duplicate appends. Keep full
-refresh until the saved incremental cursor matches the replacement target. See
+refresh until `rocky state reconcile-watermark --pipeline <name>` sets the
+cursor from the replacement target's maximum timestamp. Use `--dry-run` to
+preview it and repeat `--table catalog.schema.table` to select targets. A crash
+under Rocky 1.75.0 or earlier may leave a stale cursor after an INSERT. The
+first run after upgrading may append those rows again. Repair the cursor before
+that run if the old flush is uncertain. See
 [Interrupted replication](/concepts/incremental/#recovering-an-interrupted-replication)
 for recovery routes, supported adapters and remote durability limits.
 

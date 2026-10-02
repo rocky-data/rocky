@@ -2,9 +2,168 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 
+use rocky_core::config::PipelineConfig;
 use rocky_core::config::load_rocky_config;
 use rocky_core::retention::StateRetentionConfig;
 use rocky_core::state::StateStore;
+use rocky_core::state_sync::{FinalizeDurability, RemoteStateSession, StateAuthority};
+use rocky_ir::{TableRef, WatermarkState};
+
+use crate::registry::AdapterRegistry;
+
+/// Rebuild incremental cursors from the physical targets recorded in the
+/// pipeline's checkpoints. The warehouse queries finish before any
+/// state write; a failed query leaves every cursor unchanged.
+pub async fn state_reconcile_watermark(
+    config_path: &Path,
+    state_path: &Path,
+    pipeline_name: &str,
+    selected: &[String],
+    dry_run: bool,
+    output_json: bool,
+) -> Result<()> {
+    let config = load_rocky_config(config_path)?;
+    let pipeline = match config.pipelines.get(pipeline_name) {
+        Some(PipelineConfig::Replication(pipeline)) => pipeline,
+        _ => anyhow::bail!("'{pipeline_name}' is not a replication pipeline"),
+    };
+    anyhow::ensure!(
+        pipeline
+            .table_overrides
+            .iter()
+            .all(|rule| rule.timestamp_column.is_none()),
+        "watermark repair needs one pipeline timestamp_column; table timestamp overrides cannot be inferred from physical target names"
+    );
+    let mut session = RemoteStateSession::new(
+        &config.state,
+        state_path,
+        FinalizeDurability::Durable,
+        config.cache.schemas.replicate,
+    );
+    let authority = session.acquire().await?;
+    let result: Result<ReconcileWatermarkOutput> = async {
+        anyhow::ensure!(
+            authority == StateAuthority::Authoritative,
+            "watermark repair requires authoritative existing state"
+        );
+        let store = StateStore::open(state_path)?;
+        let adapter = config
+            .adapters
+            .get(&pipeline.target.adapter)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "target adapter '{}' is not configured",
+                    pipeline.target.adapter
+                )
+            })?;
+        let planned =
+            store.recorded_pipeline_targets(pipeline_name, &adapter.endpoint_identity())?;
+        anyhow::ensure!(
+            !planned.is_empty(),
+            "no recorded physical targets for pipeline '{pipeline_name}'"
+        );
+        let targets: Vec<String> = if selected.is_empty() {
+            planned
+        } else {
+            for key in selected {
+                anyhow::ensure!(
+                    planned.contains(key),
+                    "target '{key}' is not in the pipeline's recorded plans"
+                );
+            }
+            selected.to_vec()
+        };
+        let registry = AdapterRegistry::from_config(&config)?;
+        let warehouse = registry.warehouse_adapter(&pipeline.target.adapter)?;
+        let mut watermarks = Vec::new();
+        for key in targets {
+            let components: Vec<&str> = key.split('.').collect();
+            anyhow::ensure!(
+                components.len() == 3 && components[1..].iter().all(|s| !s.is_empty()),
+                "target '{key}' is not a catalog.schema.table name"
+            );
+            anyhow::ensure!(
+                !components[0].is_empty()
+                    || config
+                        .adapters
+                        .get(&pipeline.target.adapter)
+                        .is_some_and(|adapter| adapter.adapter_type == "duckdb"),
+                "target '{key}' has no pinned catalog; repair requires a physical catalog"
+            );
+            let target = TableRef {
+                catalog: components[0].to_string(),
+                schema: components[1].to_string(),
+                table: components[2].to_string(),
+            };
+            let target_max = super::run::query_target_max_timestamp(
+                warehouse.as_ref(),
+                warehouse.dialect(),
+                &target,
+                &pipeline.timestamp_column,
+            )
+            .await?;
+            let previous = store.get_watermark(&key)?.map(|wm| wm.last_value);
+            watermarks.push(ReconciledWatermark {
+                table: key,
+                previous,
+                target_max,
+                watermark: target_max.unwrap_or_else(super::run::epoch_watermark_sentinel),
+            });
+        }
+        if !dry_run {
+            let values: Vec<WatermarkState> = watermarks
+                .iter()
+                .map(|item| WatermarkState {
+                    last_value: item.watermark,
+                    updated_at: chrono::Utc::now(),
+                })
+                .collect();
+            let entries: Vec<(&str, &WatermarkState)> = watermarks
+                .iter()
+                .zip(&values)
+                .map(|(item, value)| (item.table.as_str(), value))
+                .collect();
+            store.batch_set_watermarks(&entries)?;
+        }
+        Ok(ReconcileWatermarkOutput {
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            command: "state-reconcile-watermark".to_string(),
+            pipeline: pipeline_name.to_string(),
+            dry_run,
+            watermarks,
+        })
+    }
+    .await;
+    let output = match result {
+        Ok(output) => output,
+        Err(error) => {
+            session
+                .abandon("watermark repair failed before finalize")
+                .await;
+            return Err(error);
+        }
+    };
+    if dry_run {
+        session.abandon("dry-run").await;
+    } else {
+        session.finalize().await?;
+    }
+    if output_json {
+        print_json(&output)?;
+    } else {
+        for item in &output.watermarks {
+            let prefix = if dry_run { "would set" } else { "set" };
+            println!(
+                "{prefix} {} = {} (target MAX: {})",
+                item.table,
+                item.watermark,
+                item.target_max
+                    .map_or_else(|| "NULL".to_string(), |value| value.to_string())
+            );
+        }
+    }
+    Ok(())
+}
 
 use crate::output::*;
 
@@ -301,6 +460,130 @@ mod tests {
     use chrono::Utc;
     use rocky_core::schema_cache::{SchemaCacheEntry, StoredColumn, schema_cache_key};
     use tempfile::TempDir;
+
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn reconcile_watermark_repairs_stale_cursor_and_dry_run_does_not_write() {
+        use chrono::TimeZone;
+        use rocky_core::state::{ResumeScope, ResumeTarget, TableProgress, TableStatus};
+        use rocky_core::traits::WarehouseAdapter;
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("warehouse.duckdb");
+        let warehouse = rocky_duckdb::adapter::DuckDbWarehouseAdapter::open(&db_path).unwrap();
+        warehouse
+            .execute_statement("CREATE SCHEMA tgt")
+            .await
+            .unwrap();
+        warehouse
+            .execute_statement("CREATE TABLE tgt.events (id BIGINT, ts TIMESTAMP)")
+            .await
+            .unwrap();
+        warehouse.execute_statement("INSERT INTO tgt.events VALUES (1, '2026-09-01 00:00:00'), (2, '2026-09-02 00:00:00')").await.unwrap();
+        drop(warehouse);
+        let config_path = tmp.path().join("rocky.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                r#"
+[adapter]
+type = "duckdb"
+path = "{}"
+[state]
+backend = "local"
+[pipeline.p]
+type = "replication"
+strategy = "incremental"
+timestamp_column = "ts"
+[pipeline.p.source.discovery]
+adapter = "default"
+[pipeline.p.source.schema_pattern]
+prefix = "src__"
+separator = "__"
+components = ["source"]
+[pipeline.p.target]
+adapter = "default"
+catalog_template = ""
+schema_template = "tgt"
+"#,
+                db_path.display()
+            ),
+        )
+        .unwrap();
+        let state_path = tmp.path().join("state.redb");
+        let stale = Utc.with_ymd_and_hms(2026, 9, 1, 0, 0, 0).unwrap();
+        let config = load_rocky_config(&config_path).unwrap();
+        let store = StateStore::open(&state_path).unwrap();
+        store
+            .init_run_progress(
+                "old",
+                &[".tgt.events".into()],
+                Some(&ResumeScope {
+                    pipeline: "p".into(),
+                    filter: None,
+                    target: Some(ResumeTarget {
+                        adapter: "default".into(),
+                        catalog_template: String::new(),
+                        schema_template: Some("tgt".into()),
+                        separator_role: None,
+                        endpoint: config.adapters["default"].endpoint_identity(),
+                        shadow: None,
+                    }),
+                    source: None,
+                }),
+            )
+            .unwrap();
+        store
+            .record_table_progress(
+                "old",
+                &TableProgress {
+                    index: 0,
+                    table_key: ".tgt.events".into(),
+                    asset_key: vec!["events".into()],
+                    status: TableStatus::Success,
+                    error: None,
+                    duration_ms: 1,
+                    completed_at: Utc::now(),
+                    checks_owed: None,
+                    check_results: Vec::new(),
+                },
+            )
+            .unwrap();
+        store
+            .set_watermark(
+                ".tgt.events",
+                &WatermarkState {
+                    last_value: stale,
+                    updated_at: stale,
+                },
+            )
+            .unwrap();
+        drop(store);
+        state_reconcile_watermark(&config_path, &state_path, "p", &[], true, false)
+            .await
+            .unwrap();
+        let store = StateStore::open(&state_path).unwrap();
+        assert_eq!(
+            store
+                .get_watermark(".tgt.events")
+                .unwrap()
+                .unwrap()
+                .last_value,
+            stale
+        );
+        drop(store);
+        state_reconcile_watermark(&config_path, &state_path, "p", &[], false, false)
+            .await
+            .unwrap();
+        let store = StateStore::open(&state_path).unwrap();
+        assert_eq!(
+            store
+                .get_watermark(".tgt.events")
+                .unwrap()
+                .unwrap()
+                .last_value,
+            Utc.with_ymd_and_hms(2026, 9, 2, 0, 0, 0).unwrap()
+        );
+    }
 
     fn seed_cache(store: &StateStore, catalog: &str, schema: &str, table: &str) {
         let entry = SchemaCacheEntry {

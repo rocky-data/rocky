@@ -140,18 +140,37 @@ their post-copy checks and could report false success.
 Follow the recovery route in the refusal. For a confirmed checkpoint, run
 `rocky run --pipeline <name> --no-prune` to execute the owed checks. With
 supported recovery records, a fresh run re-derives watermarks from the target.
-It then copies rows and runs checks. Rocky disables pruning for targets whose
-copy completed without a terminal run record.
+It then copies rows and runs checks. Rocky records check obligations per
+physical target. A fresh run cannot prune a target while its checks remain
+owed. A resume reruns checks for copied tables it skips. Once checks finish,
+later unchanged runs can prune normally.
 
 A checkpoint from Rocky 1.75.0 or earlier cannot show that its watermarks were
 saved. Switch the affected tables to `strategy = "full_refresh"`, then run
 `rocky run --pipeline <name> --no-prune` without a resume flag. That replaces
 their data and runs the checks without appending the same rows twice. Keep the
-full-refresh strategy until the saved incremental cursor matches the
-replacement target.
+full-refresh strategy until you repair the incremental cursor from the
+replacement target:
+
+```sh
+rocky state reconcile-watermark --pipeline <name> --dry-run
+rocky state reconcile-watermark --pipeline <name>
+```
+
+Repeat `--table catalog.schema.table` to select affected targets. The command
+reads `MAX(timestamp_column)` from each target and saves it through the
+configured state backend. An empty target gets the epoch cursor. Run it only
+after the replacement and any earlier warehouse writes have finished. Then
+restore `strategy = "incremental"`.
+
+Rocky 1.75.0 and earlier did not record recovery descriptors. A crash after
+an INSERT but before its watermark flush can leave a stale cursor. The first
+run after upgrading can append those rows again. Repair the cursor from the
+target before that run if the old flush is uncertain.
 
 Other unsupported checkpoints require full refresh. Keep that strategy until
-the saved incremental cursor matches the replacement target. Switching back to
+`rocky state reconcile-watermark --pipeline <name>` sets the replacement
+target's cursor. Switching back to
 incremental with a wall-clock refresh cursor can skip later source arrivals.
 Incomplete crash checkpoints remain resumable.
 

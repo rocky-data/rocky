@@ -44,6 +44,8 @@ fn sample_progress(index: usize) -> TableProgress {
         error: None,
         duration_ms: 120,
         completed_at: Utc::now(),
+        checks_owed: None,
+        check_results: Vec::new(),
     }
 }
 

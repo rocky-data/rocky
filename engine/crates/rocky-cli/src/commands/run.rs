@@ -2314,8 +2314,8 @@ fn ensure_run_is_resumable(state_store: &StateStore, progress: &RunProgress) -> 
                 "It predates recovery records, so Rocky cannot tell whether its \
                  watermarks were saved. Run the affected tables with the full_refresh \
                  strategy and --no-prune, without a resume flag, to replace their \
-                 data and re-run checks. Reconcile the saved incremental cursor to \
-                 the replacement target before returning to incremental."
+                 data and re-run checks. Then run rocky state reconcile-watermark \
+                 --pipeline <name> before returning to incremental."
             } else if progress
                 .watermark_recovery_tables
                 .as_ref()
@@ -2339,7 +2339,8 @@ fn ensure_run_is_resumable(state_store: &StateStore, progress: &RunProgress) -> 
                 "Run these tables with the full_refresh strategy and --no-prune, \
                  without a resume flag, to replace their data and re-run checks. \
                  Keep full_refresh until the \
-                 saved incremental cursor is reconciled to the replacement target; \
+                 saved incremental cursor is reconciled with rocky state \
+                 reconcile-watermark --pipeline <name>; \
                  do not return to incremental with a wall-clock refresh cursor."
             };
             anyhow::bail!(
@@ -5412,6 +5413,13 @@ pub async fn run_with_explicit_contracts(
         std::collections::HashSet::new()
     };
 
+    let planned_target_names = recovery_target_names(&tables_to_process);
+    let owed_check_targets = state_store.owed_check_targets(&resume_scope, &planned_target_names)?;
+    let skipped_owed_tasks: Vec<TableTask> = tables_to_process
+        .iter()
+        .filter(|task| completed_keys.contains(&table_key(task)) && owed_check_targets.contains(&table_key(task)))
+        .cloned()
+        .collect();
     let original_count = tables_to_process.len();
     if !completed_keys.is_empty() {
         tables_to_process.retain(|task| !completed_keys.contains(&table_key(task)));
@@ -5423,14 +5431,6 @@ pub async fn run_with_explicit_contracts(
             "filtered resumed tables"
         );
     }
-
-    // A completed copy without a RunRecord still owes its post-copy checks.
-    // The fresh run must materialize those targets even when their source
-    // change marker is unchanged.
-    let owed_check_targets = state_store.complete_recordless_check_targets(
-        &resume_scope,
-        &recovery_target_names(&tables_to_process),
-    )?;
 
     // Initialize run progress tracking, stamped with this invocation's
     // pipeline scope so a later resume can prove the checkpoint is its own
@@ -6001,6 +6001,8 @@ pub async fn run_with_explicit_contracts(
                             error: Some(msg.clone()),
                             duration_ms: 0,
                             completed_at: Utc::now(),
+                            checks_owed: None,
+                            check_results: Vec::new(),
                         },
                     )
                     .await;
@@ -6034,6 +6036,8 @@ pub async fn run_with_explicit_contracts(
                         error: Some(msg.clone()),
                         duration_ms: 0,
                         completed_at: Utc::now(),
+                        checks_owed: None,
+                        check_results: Vec::new(),
                     },
                 )
                 .await;
@@ -6152,6 +6156,8 @@ pub async fn run_with_explicit_contracts(
                             error: None,
                             duration_ms: 0,
                             completed_at: Utc::now(),
+                            checks_owed: None,
+                            check_results: Vec::new(),
                         },
                     ) {
                         tracing::warn!(error = %e, "failed to record table progress for run ");
@@ -6448,12 +6454,47 @@ pub async fn run_with_explicit_contracts(
     // happy-path watermark flush's blocking closure has dropped its clone, so
     // the refcount is back to 1 and `try_unwrap` recovers the owned store for
     // the serial tail below.
-    let state_store = Arc::try_unwrap(shared_state).ok();
+    let state_store = Some(Arc::try_unwrap(shared_state).map_err(|_| {
+        anyhow::anyhow!("cannot persist post-copy check completion: state store is still shared")
+    })?);
 
     // --- Batched checks ---
     // See the `_governance_span` note above — same reason.
     let _checks_span = info_span!("batched_checks");
     let checks_start = Instant::now();
+
+    // Resume skips the copy of a completed table. Its check debt survives that
+    // skip, so rebuild the same check inputs from the current physical plan.
+    for task in &skipped_owed_tasks {
+        let (source, target) = copy_endpoints(task);
+        let key = target.full_name();
+        let mut asset_key = task.asset_key_prefix.clone();
+        asset_key.push(task.target_table_name.clone());
+        if task.check_row_count {
+            source_batch_refs.push(source.clone());
+            target_batch_refs.push(target.clone());
+        }
+        if task.check_freshness {
+            freshness_batch_refs.push(target.clone());
+        }
+        if let Some(severity) = task.column_match {
+            let (source_probe, target_probe) = tokio::join!(
+                probe_columns_after_copy(shared_warehouse.as_ref(), &source),
+                probe_columns_after_copy(shared_warehouse.as_ref(), &target),
+            );
+            let (mut check, _) = post_copy_column_match(
+                &source, &target, source_probe, target_probe, &task.column_match_exclude,
+            );
+            if check.not_evaluated.is_none() {
+                check.severity = severity;
+            }
+            pending_checks.entry(key.clone()).or_insert_with(|| PendingCheck {
+                asset_key: asset_key.clone(), checks: Vec::new(),
+            }).checks.push(check);
+        }
+        batch_asset_keys.push((key, asset_key.clone()));
+        assertion_targets.push((target, asset_key));
+    }
 
     run_batched_checks(
         shared_warehouse.as_ref(),
@@ -6473,6 +6514,23 @@ pub async fn run_with_explicit_contracts(
         &mut output.anomaly_evaluated,
     )
     .await?;
+
+    if let Some(store) = state_store.as_ref() {
+        let checked: HashMap<String, Vec<rocky_core::checks::CheckResult>> = assertion_targets
+            .iter()
+            .map(|(target, _)| {
+                let key = target.full_name();
+                let results = pending_checks
+                    .get(&key)
+                    .map_or_else(Vec::new, |pending| pending.checks.clone());
+                (key, results)
+            })
+            .collect();
+        store.discharge_check_targets(&resume_scope, &checked)
+            .context("failed to persist post-copy check completion")?;
+        let remaining = store.owed_check_targets(&resume_scope, &planned_target_names)?;
+        anyhow::ensure!(remaining.is_empty(), "post-copy checks remain owed for: {}", remaining.into_iter().collect::<Vec<_>>().join(", "));
+    }
 
     // Assemble check results
     for (_table_key, pending) in pending_checks {
@@ -14543,7 +14601,7 @@ fn resolve_merge_update_columns(
 /// NULL (an empty target). Query, shape, and parse failures propagate so they
 /// cannot be mistaken for "no progress" and persisted as a valid epoch
 /// watermark.
-async fn query_target_max_timestamp(
+pub(crate) async fn query_target_max_timestamp(
     warehouse: &dyn WarehouseAdapter,
     dialect: &dyn rocky_core::traits::SqlDialect,
     target: &TableRef,
@@ -14664,7 +14722,7 @@ async fn resolve_new_watermark(
 /// The "no progress" watermark sentinel (`1970-01-01T00:00:00Z`). Recorded when
 /// an incremental run loaded nothing and has no prior watermark, so the next
 /// run re-scans the whole source rather than advancing past unloaded rows.
-fn epoch_watermark_sentinel() -> chrono::DateTime<Utc> {
+pub(crate) fn epoch_watermark_sentinel() -> chrono::DateTime<Utc> {
     chrono::DateTime::<Utc>::from_timestamp(0, 0).unwrap_or_else(Utc::now)
 }
 
@@ -14765,8 +14823,8 @@ async fn recovered_target_watermark(
 }
 
 /// Full `catalog.schema.table` names of every target this run plans to write
-/// or prune. Recovery reads another pipeline's unconfirmed intent only when
-/// every target it names is one of these.
+/// or prune. Recovery uses these to detect even partial overlap with older
+/// unconfirmed intent.
 fn recovery_target_names(tasks: &[TableTask]) -> std::collections::HashSet<String> {
     tasks
         .iter()
@@ -15024,6 +15082,8 @@ async fn checkpoint_planned_table(
             error: None,
             duration_ms: 0,
             completed_at: Utc::now(),
+            checks_owed: Some(false),
+            check_results: Vec::new(),
         },
     )
     .await;
@@ -16020,6 +16080,8 @@ async fn collect_materialized_table(
             error: None,
             duration_ms,
             completed_at: Utc::now(),
+            checks_owed: Some(true),
+            check_results: Vec::new(),
         },
     )
     .await;
@@ -16220,6 +16282,8 @@ async fn process_completed_result(
                         error: Some(msg.clone()),
                         duration_ms: 0,
                         completed_at: Utc::now(),
+                        checks_owed: None,
+                        check_results: Vec::new(),
                     },
                 )
                 .await;
@@ -16250,6 +16314,8 @@ async fn process_completed_result(
                     error: Some(msg.clone()),
                     duration_ms: 0,
                     completed_at: Utc::now(),
+                    checks_owed: None,
+                    check_results: Vec::new(),
                 },
             )
             .await;
@@ -17513,6 +17579,8 @@ schema_template = "staging"
             error: None,
             duration_ms: 1,
             completed_at: Utc::now(),
+            checks_owed: None,
+            check_results: Vec::new(),
         }
     }
 
@@ -20218,6 +20286,27 @@ auto_create_schemas = true
                 "staging_p2__{source}",
             )
             .await;
+            if run_record_status.is_none() {
+                use rocky_core::traits::WarehouseAdapter;
+                let warehouse =
+                    rocky_duckdb::adapter::DuckDbWarehouseAdapter::open(&db_path).unwrap();
+                warehouse
+                    .execute_statement("CREATE SCHEMA staging_p2__acme")
+                    .await
+                    .unwrap();
+                warehouse
+                    .execute_statement(
+                        "CREATE TABLE staging_p2__acme.orders AS SELECT * FROM raw__acme.orders",
+                    )
+                    .await
+                    .unwrap();
+                use std::io::Write;
+                let mut config = std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&config_path)
+                    .unwrap();
+                writeln!(config, "\n[pipeline.p2.checks]\nrow_count = true").unwrap();
+            }
 
             // Seed the checkpoint the way an interrupted p2 run leaves it:
             // scope stamped by the same helper the run path uses, the only
@@ -20274,11 +20363,34 @@ auto_create_schemas = true
                 .unwrap_or_else(|err| {
                     panic!("a {run_record_status:?} run stays resumable: {err:#}")
                 });
-            assert!(
-                !target_table_exists(&db_path, "staging_p2__acme", "orders").await,
-                "the resumed run must skip the table the checkpoint completed \
-                 (seeded record: {run_record_status:?})"
-            );
+            if run_record_status.is_none() {
+                assert!(target_table_exists(&db_path, "staging_p2__acme", "orders").await);
+                let store = StateStore::open(&state_path).unwrap();
+                let resumed = store.list_runs(1).unwrap().pop().unwrap();
+                assert_eq!(resumed.status, rocky_core::state::RunStatus::Success);
+                let captured = super::CAPTURED_RUN_OUTPUT_FOR_TEST
+                    .lock()
+                    .unwrap()
+                    .remove(&resumed.run_id)
+                    .expect("resume emitted JSON");
+                assert!(
+                    captured["check_results"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|table| {
+                            table["checks"].as_array().unwrap().iter().any(|check| {
+                                check["name"] == "row_count" && check["passed"] == true
+                            })
+                        }),
+                    "the copied table skipped by resume must still run its row-count check: {captured}"
+                );
+            } else {
+                assert!(
+                    !target_table_exists(&db_path, "staging_p2__acme", "orders").await,
+                    "the resumed run must skip the table the checkpoint completed"
+                );
+            }
         }
     }
 
@@ -28044,6 +28156,8 @@ backend = "local"
                     error: None,
                     duration_ms: 1,
                     completed_at: now,
+                    checks_owed: None,
+                    check_results: Vec::new(),
                 },
             )
             .unwrap();
@@ -44018,10 +44132,7 @@ timestamp_column = "ts"
             true,
             false,
             state
-                .complete_recordless_check_targets(
-                    &scope,
-                    &[table_key(&task)].into_iter().collect(),
-                )
+                .owed_check_targets(&scope, &[table_key(&task)].into_iter().collect())
                 .unwrap()
                 .contains(&table_key(&task)),
         )
@@ -44031,6 +44142,34 @@ timestamp_column = "ts"
         };
         assert!(result.source_batch_ref.is_some());
         assert!(result.target_batch_ref.is_some());
+        let target = table_key(&task);
+        let checked = [(
+            target.clone(),
+            vec![rocky_core::checks::check_row_count(2, 2)],
+        )]
+        .into_iter()
+        .collect();
+        state.discharge_check_targets(&scope, &checked).unwrap();
+        assert!(
+            state
+                .owed_check_targets(&scope, &[target].into_iter().collect())
+                .unwrap()
+                .is_empty()
+        );
+        assert!(matches!(
+            process_table_with_replacement_recovery(
+                &StableMarker(&warehouse),
+                &state,
+                &pipeline,
+                &task,
+                true,
+                false,
+                false,
+            )
+            .await
+            .unwrap(),
+            TableOutcome::Pruned(_)
+        ));
         assert_eq!(scope.pipeline, "p1");
     }
 
@@ -44059,6 +44198,69 @@ timestamp_column = "ts"
                 .last_value,
             Utc.with_ymd_and_hms(2026, 3, 2, 12, 0, 0).unwrap()
         );
+    }
+
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn renamed_partial_overlap_recovers_all_old_watermark_intents() {
+        use chrono::TimeZone;
+        use rocky_core::traits::WarehouseAdapter;
+        let (_dir, warehouse, state, pipeline, task, scope, descriptor) =
+            checkpoint_recovery_boundary_fixture().await;
+        let mut old_scope = scope.clone();
+        old_scope.pipeline = "old-name".into();
+        let mut other = descriptor.clone();
+        other.target.table = "other".into();
+        warehouse
+            .execute_statement("CREATE TABLE tgt.other AS SELECT * FROM tgt.events")
+            .await
+            .unwrap();
+        state
+            .set_watermark(
+                &other.target.state_key(),
+                &WatermarkState {
+                    last_value: descriptor.prior_watermark.unwrap(),
+                    updated_at: Utc::now(),
+                },
+            )
+            .unwrap();
+        state
+            .init_run_progress_with_recovery(
+                "partly",
+                &[descriptor.target.full_name(), other.target.full_name()],
+                Some(&old_scope),
+                &[descriptor.clone(), other.clone()],
+            )
+            .unwrap();
+        let before = warehouse
+            .execute_query("SELECT COUNT(*) FROM tgt.events")
+            .await
+            .unwrap();
+        reconcile_prior_watermarks(&warehouse, &state, &pipeline, &[task], &scope)
+            .await
+            .unwrap();
+        assert!(
+            state
+                .get_run_progress("partly")
+                .unwrap()
+                .unwrap()
+                .watermarks_confirmed
+        );
+        for target in [descriptor.target, other.target] {
+            assert_eq!(
+                state
+                    .get_watermark(&target.state_key())
+                    .unwrap()
+                    .unwrap()
+                    .last_value,
+                Utc.with_ymd_and_hms(2026, 3, 2, 12, 0, 0).unwrap()
+            );
+        }
+        let after = warehouse
+            .execute_query("SELECT COUNT(*) FROM tgt.events")
+            .await
+            .unwrap();
+        assert_eq!(before.rows, after.rows, "recovery must not reappend");
     }
 
     #[cfg(feature = "duckdb")]
@@ -44415,6 +44617,20 @@ timestamp_column = "ts"
                 );
             }
             let local = harness.open_store(&harness.pod_a);
+            if interrupted {
+                let copied = local.get_run_progress(&run_id).unwrap().unwrap();
+                assert!(
+                    copied
+                        .tables
+                        .iter()
+                        .any(|table| table.checks_owed == Some(true)),
+                    "SIGINT after the last copy must leave durable check debt"
+                );
+                assert_eq!(
+                    local.get_run(&run_id).unwrap().unwrap().status,
+                    rocky_core::state::RunStatus::PartialFailure
+                );
+            }
             assert!(
                 !local
                     .get_run_progress(&run_id)

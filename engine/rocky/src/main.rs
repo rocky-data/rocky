@@ -2916,6 +2916,18 @@ enum ImportsAction {
 enum StateAction {
     /// Show stored watermarks (same as bare `rocky state`).
     Show,
+    /// Set incremental cursors to MAX(timestamp_column) in recorded targets.
+    ReconcileWatermark {
+        /// Replication pipeline whose recorded plans own the targets.
+        #[arg(long)]
+        pipeline: String,
+        /// Physical catalog.schema.table target. Repeat to select targets.
+        #[arg(long = "table")]
+        tables: Vec<String>,
+        /// Show the target values without writing state.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Flush the cached `DESCRIBE TABLE` results.
     ///
     /// Removes every `SCHEMA_CACHE` entry from `state.redb`. The next
@@ -4188,6 +4200,21 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
         }
         Command::State { action } => match action {
             None | Some(StateAction::Show) => rocky_cli::commands::state_show(&state_path, json),
+            Some(StateAction::ReconcileWatermark {
+                pipeline,
+                tables,
+                dry_run,
+            }) => {
+                rocky_cli::commands::state_reconcile_watermark(
+                    &cli.config,
+                    &state_path,
+                    &pipeline,
+                    &tables,
+                    dry_run,
+                    json,
+                )
+                .await
+            }
             Some(StateAction::ClearSchemaCache { dry_run }) => {
                 rocky_cli::commands::state_clear_schema_cache(&state_path, dry_run, json)
             }

@@ -70,6 +70,7 @@ from .types import (
     ProductListOutput,
     ProductStatusOutput,
     ProductVerifyOutput,
+    ReconcileWatermarkOutput,
     PromotePlan,
     RetentionStatusOutput,
     ReviewStatusOutput,
@@ -1250,6 +1251,15 @@ class RockyResource(dg.ConfigurableResource):
         """Run ``rocky state`` and return the parsed result."""
         with _translating():
             return self._get_client().state()
+
+    def reconcile_watermark(
+        self, pipeline: str, *, tables: list[str] | None = None, dry_run: bool = False
+    ) -> ReconcileWatermarkOutput:
+        """Repair incremental cursors from the recorded target tables."""
+        with _translating():
+            return self._get_client().reconcile_watermark(
+                pipeline, tables=tables, dry_run=dry_run
+            )
 
     # ------------------------------------------------------------------ #
     # Branch approval / promote                                          #

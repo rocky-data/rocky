@@ -92,6 +92,19 @@ def _patched_run(**kwargs: Any):
     return patch("rocky_sdk.client.subprocess.run", **kwargs)
 
 
+def test_reconcile_watermark_delegates_selected_targets():
+    client = MagicMock()
+    client.reconcile_watermark.return_value = "repaired"
+    with patch.object(RockyResource, "_get_client", return_value=client):
+        result = RockyResource().reconcile_watermark(
+            "bronze", tables=["wh.raw.orders"], dry_run=True
+        )
+    assert result == "repaired"
+    client.reconcile_watermark.assert_called_once_with(
+        "bronze", tables=["wh.raw.orders"], dry_run=True
+    )
+
+
 # ---------------------------------------------------------------------------
 # _build_cmd
 # ---------------------------------------------------------------------------

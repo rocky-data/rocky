@@ -81,6 +81,7 @@ from rocky_sdk.types import (
     ProductStatusOutput,
     ProductVerifyOutput,
     PromotePlan,
+    ReconcileWatermarkOutput,
     RestoreApplyOutput,
     RetentionStatusOutput,
     ReviewStatusOutput,
@@ -1462,6 +1463,19 @@ class RockyClient:
     def state(self) -> StateResult:
         """Run ``rocky state`` and return the parsed watermarks/checkpoints."""
         return _parse_rocky_json(self.run_cli(["state"]), StateResult, command="state")
+
+    def reconcile_watermark(
+        self, pipeline: str, *, tables: list[str] | None = None, dry_run: bool = False
+    ) -> ReconcileWatermarkOutput:
+        """Set incremental cursors from the recorded physical targets."""
+        args = ["state", "reconcile-watermark", "--pipeline", pipeline]
+        for table in tables or []:
+            args.extend(["--table", table])
+        if dry_run:
+            args.append("--dry-run")
+        return _parse_rocky_json(
+            self.run_cli(args), ReconcileWatermarkOutput, command="state-reconcile-watermark"
+        )
 
     def schedule_spool(self) -> ScheduleSpoolOutput:
         """Run ``rocky state schedule spool``: webhook demands not yet consumed.

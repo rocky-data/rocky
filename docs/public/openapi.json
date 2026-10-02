@@ -16327,6 +16327,67 @@
         },
         "type": "object"
       },
+      "ReconcileWatermarkOutput": {
+        "description": "Result of repairing incremental cursors from physical target tables.",
+        "properties": {
+          "command": {
+            "type": "string"
+          },
+          "dry_run": {
+            "type": "boolean"
+          },
+          "pipeline": {
+            "type": "string"
+          },
+          "version": {
+            "type": "string"
+          },
+          "watermarks": {
+            "items": {
+              "$ref": "#/components/schemas/ReconciledWatermark"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "command",
+          "dry_run",
+          "pipeline",
+          "version",
+          "watermarks"
+        ],
+        "type": "object"
+      },
+      "ReconciledWatermark": {
+        "properties": {
+          "previous": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "table": {
+            "type": "string"
+          },
+          "target_max": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "watermark": {
+            "format": "date-time",
+            "type": "string"
+          }
+        },
+        "required": [
+          "table",
+          "watermark"
+        ],
+        "type": "object"
+      },
       "RedactedString": {
         "type": "string"
       },
