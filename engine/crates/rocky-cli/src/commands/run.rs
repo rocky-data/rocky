@@ -4645,10 +4645,20 @@ pub async fn run_with_explicit_contracts(
         > = HashMap::new();
         let mut collision_check_pairs: Vec<(String, String)> = Vec::new();
         let mut shadow_preflight_objects = Vec::new();
+        let mut all_production_targets = Vec::new();
         for conn in &connectors {
             let Ok(parsed) = pattern.parse(&conn.schema) else {
                 continue;
             };
+            let target_catalog = parsed.resolve_template(target_catalog_template, target_sep);
+            let target_schema = parsed.resolve_template(target_schema_template, target_sep);
+            if shadow_config.is_some() {
+                all_production_targets.extend(conn.tables.iter().map(|table| rocky_ir::TargetRef {
+                    catalog: target_catalog.clone(),
+                    schema: target_schema.clone(),
+                    table: table.name.clone(),
+                }));
+            }
             if !parsed_filter
                 .as_ref()
                 .is_none_or(|(k, v)| matches_filter(conn, &parsed, k, v))
@@ -4666,9 +4676,6 @@ pub async fn run_with_explicit_contracts(
             // so a connector whose tables are all filtered, missing or
             // disabled is not refused for a value `run` never renders.
             let mut metadata_preflighted = false;
-            let target_catalog = parsed.resolve_template(target_catalog_template, target_sep);
-            let target_schema = parsed.resolve_template(target_schema_template, target_sep);
-
             for table in &conn.tables {
                 if !filter_table_matches(parsed_filter.as_ref(), &table.name) {
                     continue;
@@ -4735,12 +4742,63 @@ pub async fn run_with_explicit_contracts(
                 }
                 preflight_claims.insert(id, this);
                 collision_check_pairs.push((target_table_name, conn.source_type.clone()));
-                if shadow_config.is_some_and(|config| config.branch.is_none()) {
+                if shadow_config.is_some() {
                     shadow_preflight_objects.push(
                         crate::commands::shadow_lifecycle::ShadowObject {
                             model: table.name.clone(),
                             production,
                             target: written,
+                            kind: crate::commands::shadow_lifecycle::ShadowKind::Table,
+                        },
+                    );
+                }
+            }
+        }
+
+        // In a mixed `--all` run, replication writes before model compilation.
+        // Include model production names now, or a replication shadow could
+        // occupy a model's as-yet-absent production target and later drop it.
+        if let Some(config) = shadow_config
+            && (run_all || models_dir.is_some())
+        {
+            let mdir = models_dir.unwrap_or_else(|| std::path::Path::new("models"));
+            if mdir.exists() {
+                let compiled = rocky_compiler::compile::compile(
+                    &rocky_compiler::compile::CompilerConfig {
+                        models_dir: mdir.to_path_buf(),
+                        source_schemas: if rocky_cfg.cache.schemas.enabled {
+                            rocky_compiler::schema_cache::load_source_schemas_from_cache(
+                                &state_store,
+                                chrono::Utc::now(),
+                                rocky_cfg.cache.schemas.ttl(),
+                            )
+                            .unwrap_or_default()
+                        } else {
+                            HashMap::new()
+                        },
+                        run_vars: run_vars.clone(),
+                        ..Default::default()
+                    },
+                )
+                .context("cannot preflight mixed shadow model targets")?;
+                let default_catalog = warehouse_adapter.default_catalog().unwrap_or_default();
+                let resolved = |target: &rocky_core::models::TargetConfig| rocky_ir::TargetRef {
+                    catalog: if target.catalog.is_empty() {
+                        default_catalog.clone()
+                    } else {
+                        target.catalog.clone()
+                    },
+                    schema: target.schema.clone(),
+                    table: target.table.clone(),
+                };
+                for model in &compiled.project.models {
+                    let production = resolved(&model.config.target);
+                    all_production_targets.push(production.clone());
+                    shadow_preflight_objects.push(
+                        crate::commands::shadow_lifecycle::ShadowObject {
+                            model: model.config.name.clone(),
+                            target: rocky_core::shadow::shadow_target(&production, config),
+                            production,
                             kind: crate::commands::shadow_lifecycle::ShadowKind::Table,
                         },
                     );
@@ -4758,7 +4816,13 @@ pub async fn run_with_explicit_contracts(
                 .iter()
                 .map(|(t, s)| (t.as_str(), s.as_str())),
         )?;
-        if !shadow_preflight_objects.is_empty() {
+        crate::commands::shadow_lifecycle::refuse_production_shadow_collisions(
+            &shadow_preflight_objects,
+            &all_production_targets,
+        )?;
+        if shadow_config.is_some_and(|config| config.branch.is_none())
+            && !shadow_preflight_objects.is_empty()
+        {
             crate::commands::shadow_lifecycle::refuse_occupied_shadow_targets(
                 warehouse_adapter.as_ref(),
                 warehouse_adapter.dialect(),
@@ -11398,6 +11462,10 @@ pub(crate) async fn execute_models_with_explicit_contracts(
         // `--keep-shadow`. A kept object must be removed before another run
         // can claim that name. Named branches intentionally replace objects
         // in their own namespace and retain their existing exception (#1273).
+        crate::commands::shadow_lifecycle::refuse_production_shadow_collisions(
+            &shadow_objects,
+            &production_targets.into_values().collect::<Vec<_>>(),
+        )?;
         if config.branch.is_none() {
             crate::commands::shadow_lifecycle::refuse_occupied_shadow_targets(
                 warehouse,
@@ -20177,6 +20245,243 @@ auto_create_schemas = true
         let (config_path, state_path) =
             write_two_pipeline_config(dir, &db_path, p1_schema_template, p2_schema_template);
         (config_path, state_path, db_path)
+    }
+
+    /// The production target starts absent. An ownership probe alone would
+    /// therefore allow both aliases and cleanup could drop the new table.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn replication_shadow_aliases_refuse_before_any_warehouse_write() {
+        use rocky_core::shadow::ShadowConfig;
+
+        for (label, shadow, add_other_source, filter) in [
+            (
+                "empty suffix",
+                ShadowConfig {
+                    suffix: String::new(),
+                    ..Default::default()
+                },
+                false,
+                None,
+            ),
+            (
+                "equal schema",
+                ShadowConfig {
+                    schema_override: Some("staging__acme".to_string()),
+                    ..Default::default()
+                },
+                false,
+                None,
+            ),
+            (
+                "case-folded schema",
+                ShadowConfig {
+                    schema_override: Some("STAGING__ACME".to_string()),
+                    ..Default::default()
+                },
+                false,
+                None,
+            ),
+            (
+                "unselected production target",
+                ShadowConfig::default(),
+                true,
+                Some("table=orders"),
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let (config_path, state_path, db_path) =
+                write_two_pipeline_project(dir.path(), "staging__{source}", "other__{source}")
+                    .await;
+            if add_other_source {
+                let warehouse =
+                    rocky_duckdb::adapter::DuckDbWarehouseAdapter::open(&db_path).unwrap();
+                warehouse
+                    .execute_statement(
+                        "CREATE TABLE raw__acme.orders_rocky_shadow AS SELECT 2 AS id",
+                    )
+                    .await
+                    .unwrap();
+            }
+            assert!(!target_table_exists(&db_path, "staging__acme", "orders").await);
+
+            let error = super::run(
+                &config_path,
+                Arc::new(
+                    rocky_core::config::load_rocky_config_fingerprinted(&config_path).unwrap(),
+                ),
+                filter,
+                Some("p1"),
+                &state_path,
+                None,
+                true,
+                None,
+                false,
+                None,
+                false,
+                Some(&shadow),
+                &PartitionRunOptions::default(),
+                None,
+                None,
+                None,
+                None,
+                &DeferOptions::default(),
+                &SkipRunOptions::default(),
+                &rocky_core::run_vars::RunVars::new(),
+                None,
+                None,
+                false,
+                None,
+            )
+            .await
+            .expect_err(label);
+            assert!(
+                format!("{error:#}").contains("collides with the production target"),
+                "{label}: {error:#}"
+            );
+            let warehouse = rocky_duckdb::adapter::DuckDbWarehouseAdapter::open(&db_path).unwrap();
+            let schemas = warehouse
+                .execute_query(
+                    "SELECT schema_name FROM information_schema.schemata \
+                     WHERE lower(schema_name) = 'staging__acme'",
+                )
+                .await
+                .unwrap();
+            assert!(
+                schemas.rows.is_empty(),
+                "{label}: target schema was written"
+            );
+            assert!(!target_table_exists(&db_path, "staging__acme", "orders").await);
+            assert!(target_table_exists(&db_path, "raw__acme", "orders").await);
+        }
+    }
+
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn model_shadow_aliases_refuse_with_production_absent() {
+        use rocky_core::shadow::ShadowConfig;
+
+        for (label, shadow) in [
+            (
+                "empty suffix",
+                ShadowConfig {
+                    suffix: String::new(),
+                    ..Default::default()
+                },
+            ),
+            (
+                "equal schema",
+                ShadowConfig {
+                    schema_override: Some("main".into()),
+                    ..Default::default()
+                },
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let models_dir = dir.path().join("models");
+            std::fs::create_dir(&models_dir).unwrap();
+            write_model_with_target(&models_dir, "orders", "SELECT 1 AS id", "main", "orders");
+            let db_path = dir.path().join("warehouse.duckdb");
+            let config_path = dir.path().join("rocky.toml");
+            let state_path = dir.path().join("state.redb");
+            std::fs::write(
+                &config_path,
+                format!(
+                    "[adapter]\ntype = \"duckdb\"\npath = \"{}\"\n\
+                     [state]\nbackend = \"local\"\n\
+                     [pipeline.transform]\ntype = \"transformation\"\nmodels = \"models/**\"\n\
+                     [pipeline.transform.target]\nadapter = \"default\"\n",
+                    db_path.display()
+                ),
+            )
+            .unwrap();
+            let error = super::run(
+                &config_path,
+                Arc::new(
+                    rocky_core::config::load_rocky_config_fingerprinted(&config_path).unwrap(),
+                ),
+                None,
+                Some("transform"),
+                &state_path,
+                None,
+                true,
+                None,
+                false,
+                None,
+                false,
+                Some(&shadow),
+                &PartitionRunOptions::default(),
+                None,
+                None,
+                None,
+                None,
+                &DeferOptions::default(),
+                &SkipRunOptions::default(),
+                &rocky_core::run_vars::RunVars::new(),
+                None,
+                None,
+                false,
+                None,
+            )
+            .await
+            .expect_err(label);
+            assert!(
+                format!("{error:#}").contains("model(s) failed"),
+                "{label}: {error:#}"
+            );
+            assert!(!target_table_exists(&db_path, "main", "orders").await);
+        }
+    }
+
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn mixed_shadow_refuses_model_production_alias_before_replication_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let (config_path, state_path, db_path) =
+            write_two_pipeline_project(dir.path(), "staging__{source}", "other__{source}").await;
+        let models_dir = dir.path().join("models");
+        std::fs::create_dir(&models_dir).unwrap();
+        write_model_with_target(
+            &models_dir,
+            "model_target",
+            "SELECT 1 AS id",
+            "staging__acme",
+            "orders_rocky_shadow",
+        );
+        let error = super::run(
+            &config_path,
+            Arc::new(rocky_core::config::load_rocky_config_fingerprinted(&config_path).unwrap()),
+            None,
+            Some("p1"),
+            &state_path,
+            None,
+            true,
+            Some(&models_dir),
+            true,
+            None,
+            false,
+            Some(&rocky_core::shadow::ShadowConfig::default()),
+            &PartitionRunOptions::default(),
+            None,
+            None,
+            None,
+            None,
+            &DeferOptions::default(),
+            &SkipRunOptions::default(),
+            &rocky_core::run_vars::RunVars::new(),
+            None,
+            None,
+            false,
+            None,
+        )
+        .await
+        .expect_err("replication shadow must not claim a model production target");
+        assert!(
+            format!("{error:#}").contains("collides with the production target"),
+            "{error:#}"
+        );
+        assert!(!target_table_exists(&db_path, "staging__acme", "orders_rocky_shadow").await);
+        assert!(!target_table_exists(&db_path, "staging__acme", "orders").await);
     }
 
     /// Creates the DuckDB file at `db_path` holding the one source table

@@ -35,6 +35,7 @@
 use anyhow::Result;
 use rocky_core::traits::{SqlDialect, WarehouseAdapter};
 use rocky_ir::{TableRef, TargetRef};
+use rocky_sql::defer::CollisionIdentity;
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum ShadowKind {
@@ -65,6 +66,41 @@ pub(crate) struct ShadowObject {
     /// The production object paired with this shadow target.
     pub(crate) production: TargetRef,
     pub(crate) kind: ShadowKind,
+}
+
+/// Check names without consulting the warehouse: an absent production table
+/// must never let a shadow run claim its name for a later drop.
+pub(crate) fn refuse_production_shadow_collisions(
+    objects: &[ShadowObject],
+    other_production: &[TargetRef],
+) -> Result<()> {
+    let production: Vec<_> = objects
+        .iter()
+        .map(|object| &object.production)
+        .chain(other_production.iter())
+        .map(|target| {
+            (
+                CollisionIdentity::of(&target.catalog, &target.schema, &target.table),
+                target,
+            )
+        })
+        .collect();
+    for object in objects {
+        let shadow = CollisionIdentity::of(
+            &object.target.catalog,
+            &object.target.schema,
+            &object.target.table,
+        );
+        if let Some((_, target)) = production.iter().find(|(id, _)| *id == shadow) {
+            anyhow::bail!(
+                "shadow target {} for '{}' collides with the production target {}",
+                object.target.full_name(),
+                object.model,
+                target.full_name()
+            );
+        }
+    }
+    Ok(())
 }
 
 /// A failed describe is absence only when a successful catalog read confirms it.
@@ -118,6 +154,7 @@ pub(crate) async fn refuse_occupied_shadow_targets(
     dialect: &dyn SqlDialect,
     objects: &[ShadowObject],
 ) -> Result<()> {
+    refuse_production_shadow_collisions(objects, &[])?;
     for object in objects {
         let occupied = !target_is_absent(warehouse, &object.target).await?;
         if occupied {
@@ -218,6 +255,26 @@ mod tests {
         DuckDbWarehouseAdapter::from_shared(shared)
     }
 
+    #[test]
+    fn shadow_name_cannot_alias_another_production_target_by_case() {
+        let first = object("OTHER");
+        let mut second = object("second_shadow");
+        second.model = "other".into();
+        second.production.table = "other".into();
+        let error = refuse_production_shadow_collisions(&[first, second], &[]).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("collides with the production target")
+        );
+        let unselected = TargetRef {
+            catalog: String::new(),
+            schema: "main".into(),
+            table: "OTHER".into(),
+        };
+        assert!(refuse_production_shadow_collisions(&[object("other")], &[unselected]).is_err());
+    }
+
     struct UncertainWarehouse {
         inner: DuckDbWarehouseAdapter,
         catalog_error: bool,
@@ -270,6 +327,54 @@ mod tests {
         refuse_occupied_shadow_targets(&wh, dialect, &[object("orders_rocky_shadow")])
             .await
             .expect("nothing is there, so the run owns the name");
+    }
+
+    #[tokio::test]
+    async fn fresh_trino_shadow_target_passes_ownership_preflight() {
+        use rocky_trino::adapter::TrinoAdapter;
+        use rocky_trino::auth::TrinoAuth;
+        use rocky_trino::connector::TrinoClientConfig;
+        use wiremock::matchers::{body_string, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/statement"))
+            .and(body_string("DESCRIBE \"iceberg\".\"raw\".\"orders_rocky_shadow\""))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "missing",
+                "stats": {"state": "FAILED"},
+                "error": {"message": "table not found", "errorCode": 1, "errorName": "TABLE_NOT_FOUND"}
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/statement"))
+            .and(body_string(
+                "SELECT table_name FROM \"iceberg\".information_schema.tables WHERE table_schema = 'raw'",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "listing",
+                "columns": [{"name": "table_name", "type": "varchar"}],
+                "data": [["other_table"]],
+                "stats": {"state": "FINISHED"}
+            })))
+            .mount(&server)
+            .await;
+        let warehouse = TrinoAdapter::new(
+            TrinoClientConfig::new(server.uri()),
+            TrinoAuth::basic("test", "test").unwrap(),
+        );
+        let mut shadow = object("orders_rocky_shadow");
+        shadow.target.catalog = "iceberg".into();
+        shadow.target.schema = "raw".into();
+        shadow.production.catalog = "iceberg".into();
+        shadow.production.schema = "raw".into();
+        refuse_production_shadow_collisions(&[shadow.clone()], &[]).unwrap();
+        refuse_occupied_shadow_targets(&warehouse, warehouse.dialect(), &[shadow])
+            .await
+            .expect("a fresh Trino shadow target must pass preflight");
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
     }
 
     /// The #1273 case: somebody else's table at the derived name. The
