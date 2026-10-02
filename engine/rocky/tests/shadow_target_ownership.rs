@@ -462,14 +462,20 @@ auto_create_schemas = true
             "mixed={mixed}: {message}"
         );
         let conn = duckdb::Connection::open(root.join("probe.duckdb")).expect("reopen duckdb");
-        let count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM information_schema.tables \
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM information_schema.tables \
              WHERE table_schema = 'staging__orders' AND table_name = 'one_rocky_shadow'",
-            [], |row| row.get(0),
-        ).expect("inspect replication shadow");
+                [],
+                |row| row.get(0),
+            )
+            .expect("inspect replication shadow");
         assert_eq!(count, 1, "mixed={mixed}: {message}");
         if mixed {
-            assert!(!columns_of(root, "model_rocky_shadow").is_empty(), "{message}");
+            assert!(
+                !columns_of(root, "model_rocky_shadow").is_empty(),
+                "{message}"
+            );
         }
     }
 }
