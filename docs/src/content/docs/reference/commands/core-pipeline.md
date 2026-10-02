@@ -875,7 +875,7 @@ Writes a content-addressed approval artifact that binds the approver's git ident
 
 Rocky promotes `full_refresh` tables by copying their branch results. It creates production views from the model SQL with production upstreams. It refuses all other strategies because their promotion is undefined. Replication promotion supports `full_refresh` only. Quality and snapshot pipelines are unsupported.
 
-Before the first replacement, Rocky checks every branch source and production destination. It verifies that each destination schema exists and that each existing object has a known kind. DuckDB supports this check. Other adapters refuse promotion until they support it. If a later write fails, Rocky does not roll back earlier replacements. Text and JSON output identify replaced, failed, and unattempted targets. The command exits non-zero.
+Before the first replacement, Rocky checks every branch source and production destination. It verifies that each destination schema exists. It also checks the kind of each existing destination object. These checks work on DuckDB, Databricks, Snowflake, BigQuery, and Trino. If a later write fails, Rocky does not roll back earlier replacements. Text and JSON output identify replaced, failed, and unattempted targets. The command exits non-zero.
 
 The breaking-change gate vetoes the promote and exits non-zero when any finding has `severity == "breaking"`, unless you pass `--allow-breaking`. Rocky records every gate decision in the audit trail: a block, an allow via override, and a fail-open when the gate could not run. To surface the same findings on every pull request without blocking, use [`rocky ci-diff --semantic`](/reference/commands/modeling/#rocky-ci-diff).
 

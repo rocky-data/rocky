@@ -23,7 +23,8 @@
 use async_trait::async_trait;
 
 use rocky_core::traits::{
-    AdapterError, AdapterResult, ChunkChecksum, PkRange, QueryResult, SqlDialect, WarehouseAdapter,
+    AdapterError, AdapterResult, CaseSignificance, ChunkChecksum, ObjectKind, PkRange, QueryResult,
+    SqlDialect, WarehouseAdapter,
 };
 use rocky_ir::{ColumnInfo, TableRef};
 use rocky_sql::validation;
@@ -49,6 +50,52 @@ impl SnowflakeWarehouseAdapter {
     /// Access the underlying connector (for adapter-specific operations).
     pub fn connector(&self) -> &SnowflakeConnector {
         &self.connector
+    }
+}
+
+fn promotion_queries(
+    dialect: &dyn SqlDialect,
+    table: &TableRef,
+    case: CaseSignificance,
+) -> AdapterResult<(String, String)> {
+    let database = dialect.quote_identifier(&table.catalog.replace('"', "\"\""));
+    let schema = rocky_core::sql_gen::string_literal(dialect, &table.schema);
+    let name = rocky_core::sql_gen::string_literal(dialect, &table.table);
+    let predicate = |column: &str, value: &str| match case {
+        CaseSignificance::Significant => format!("{column} = {value}"),
+        CaseSignificance::Insignificant => format!("UPPER({column}) = UPPER({value})"),
+    };
+    Ok((
+        format!(
+            "SELECT schema_name FROM {database}.INFORMATION_SCHEMA.SCHEMATA WHERE {}",
+            predicate("schema_name", &schema)
+        ),
+        format!(
+            "SELECT table_type FROM {database}.INFORMATION_SCHEMA.TABLES WHERE {} AND {}",
+            predicate("table_schema", &schema),
+            predicate("table_name", &name)
+        ),
+    ))
+}
+
+fn promotion_kind(result: &QueryResult) -> AdapterResult<Option<ObjectKind>> {
+    match result.rows.as_slice() {
+        [] => Ok(None),
+        [row] => match row.first().and_then(|v| v.as_str()) {
+            Some("BASE TABLE" | "TEMPORARY TABLE" | "EXTERNAL TABLE" | "EVENT TABLE") => {
+                Ok(Some(ObjectKind::Table))
+            }
+            Some("VIEW" | "MATERIALIZED VIEW") => Ok(Some(ObjectKind::View)),
+            Some(other) => Err(AdapterError::msg(format!(
+                "unknown promotion destination kind: {other}"
+            ))),
+            None => Err(AdapterError::msg(
+                "promotion destination kind is missing or malformed",
+            )),
+        },
+        _ => Err(AdapterError::msg(
+            "promotion destination kind returned multiple rows",
+        )),
     }
 }
 
@@ -128,6 +175,27 @@ impl WarehouseAdapter for SnowflakeWarehouseAdapter {
             columns: result.columns.iter().map(|c| c.name.clone()).collect(),
             rows: result.rows,
         })
+    }
+
+    async fn promotion_destination_kind(
+        &self,
+        table: &TableRef,
+    ) -> AdapterResult<Option<ObjectKind>> {
+        let case = self.identifier_case_significance().await?;
+        let (namespace_sql, kind_sql) = promotion_queries(&self.dialect, table, case)?;
+        let namespace = self.execute_query(&namespace_sql).await?;
+        if namespace.rows.is_empty() {
+            return Err(AdapterError::msg(
+                "promotion destination namespace does not exist",
+            ));
+        }
+        if namespace.rows.len() != 1 || namespace.rows[0].first().and_then(|v| v.as_str()).is_none()
+        {
+            return Err(AdapterError::msg(
+                "promotion destination namespace response is ambiguous",
+            ));
+        }
+        promotion_kind(&self.execute_query(&kind_sql).await?)
     }
 
     async fn describe_table(&self, table: &TableRef) -> AdapterResult<Vec<ColumnInfo>> {
@@ -421,6 +489,82 @@ mod tests {
     use crate::connector::ConnectorConfig;
     use rocky_core::config::RetryConfig;
     use std::time::Duration;
+
+    #[test]
+    fn promotion_probe_sql_and_kinds() {
+        let table = TableRef {
+            catalog: "db".into(),
+            schema: "Mixed'Case".into(),
+            table: "Orders\\'24".into(),
+        };
+        let (namespace, kind) =
+            promotion_queries(&SnowflakeSqlDialect, &table, CaseSignificance::Significant).unwrap();
+        assert_eq!(
+            namespace,
+            r#"SELECT schema_name FROM "db".INFORMATION_SCHEMA.SCHEMATA WHERE schema_name = 'Mixed\'Case'"#
+        );
+        assert_eq!(
+            kind,
+            r#"SELECT table_type FROM "db".INFORMATION_SCHEMA.TABLES WHERE table_schema = 'Mixed\'Case' AND table_name = 'Orders\\\'24'"#
+        );
+        let (namespace_folded, kind_folded) = promotion_queries(
+            &SnowflakeSqlDialect,
+            &table,
+            CaseSignificance::Insignificant,
+        )
+        .unwrap();
+        assert!(namespace_folded.contains("UPPER(schema_name) = UPPER("));
+        assert!(kind_folded.contains("UPPER(table_name) = UPPER("));
+        let quoted_database = TableRef {
+            catalog: "db\"archive".into(),
+            ..table.clone()
+        };
+        assert!(
+            promotion_queries(
+                &SnowflakeSqlDialect,
+                &quoted_database,
+                CaseSignificance::Significant
+            )
+            .unwrap()
+            .0
+            .contains("\"db\"\"archive\".INFORMATION_SCHEMA.SCHEMATA")
+        );
+        let result = |value: &str| QueryResult {
+            columns: vec!["table_type".into()],
+            rows: vec![vec![serde_json::json!(value)]],
+        };
+        for value in [
+            "BASE TABLE",
+            "TEMPORARY TABLE",
+            "EXTERNAL TABLE",
+            "EVENT TABLE",
+        ] {
+            assert_eq!(
+                promotion_kind(&result(value)).unwrap(),
+                Some(ObjectKind::Table)
+            );
+        }
+        for value in ["VIEW", "MATERIALIZED VIEW"] {
+            assert_eq!(
+                promotion_kind(&result(value)).unwrap(),
+                Some(ObjectKind::View)
+            );
+        }
+        assert_eq!(
+            promotion_kind(&QueryResult {
+                columns: vec![],
+                rows: vec![]
+            })
+            .unwrap(),
+            None
+        );
+        assert!(
+            promotion_kind(&result("FUTURE KIND"))
+                .unwrap_err()
+                .to_string()
+                .contains("FUTURE KIND")
+        );
+    }
 
     /// Verifies that the adapter can be constructed and used as a trait object.
     fn _assert_warehouse_adapter_trait_object(_: &dyn WarehouseAdapter) {}

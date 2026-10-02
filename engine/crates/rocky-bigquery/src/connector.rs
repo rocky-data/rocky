@@ -14,8 +14,8 @@ use rocky_core::failure_class::{FailureClass, TransientKind};
 use rocky_core::retry::compute_backoff;
 use rocky_core::retry_budget::RetryBudget;
 use rocky_core::traits::{
-    AdapterError, AdapterResult, ChunkChecksum, ExecutionStats, PkRange, QueryResult, SqlDialect,
-    WarehouseAdapter,
+    AdapterError, AdapterResult, ChunkChecksum, ExecutionStats, ObjectKind, PkRange, QueryResult,
+    SqlDialect, WarehouseAdapter,
 };
 use rocky_ir::{ColumnInfo, TableRef};
 use rocky_observe::span_attrs;
@@ -1111,6 +1111,23 @@ impl WarehouseAdapter for BigQueryAdapter {
         Ok(QueryResult { columns, rows })
     }
 
+    async fn promotion_destination_kind(
+        &self,
+        table: &TableRef,
+    ) -> AdapterResult<Option<ObjectKind>> {
+        let sql = promotion_sql(&self.dialect, table)?;
+        let result = match self.execute_query(&sql).await {
+            Ok(result) => result,
+            Err(err) if bigquery_dataset_not_found(&err) => {
+                return Err(AdapterError::msg(
+                    "promotion destination namespace does not exist",
+                ));
+            }
+            Err(err) => return Err(err),
+        };
+        promotion_kind(&result)
+    }
+
     /// Arrow path via the BigQuery Storage Read API (gRPC). Overrides
     /// the default `Err(...)` impl on `WarehouseAdapter`. See
     /// [`BigQueryAdapter::fetch_arrow_via_storage_read`] for the
@@ -1490,6 +1507,49 @@ fn parse_bq_i128(v: &serde_json::Value) -> AdapterResult<i128> {
 ///
 /// `bytes_written` is always `None` — BigQuery query jobs don't expose
 /// a bytes-written figure naturally.
+fn promotion_sql(dialect: &dyn SqlDialect, table: &TableRef) -> AdapterResult<String> {
+    validate_gcp_project_id(&table.catalog).map_err(AdapterError::new)?;
+    validate_identifier(&table.schema).map_err(AdapterError::new)?;
+    let name = rocky_core::sql_gen::string_literal(dialect, &table.table);
+    Ok(format!(
+        "SELECT table_type FROM `{}`.`{}`.INFORMATION_SCHEMA.TABLES WHERE table_name = {name}",
+        table.catalog, table.schema
+    ))
+}
+
+fn bigquery_dataset_not_found(err: &AdapterError) -> bool {
+    match err.inner().downcast_ref::<BigQueryError>() {
+        Some(BigQueryError::ApiError { status, message }) => {
+            status.starts_with("404")
+                && message.contains("Dataset ")
+                && message.to_ascii_lowercase().contains("not found")
+        }
+        Some(BigQueryError::JobError { reason, message }) => {
+            reason == "notFound" && message.contains("Dataset ")
+        }
+        _ => false,
+    }
+}
+
+fn promotion_kind(result: &QueryResult) -> AdapterResult<Option<ObjectKind>> {
+    match result.rows.as_slice() {
+        [] => Ok(None),
+        [row] => match row.first().and_then(|v| v.as_str()) {
+            Some("BASE TABLE" | "CLONE" | "SNAPSHOT" | "EXTERNAL") => Ok(Some(ObjectKind::Table)),
+            Some("VIEW" | "MATERIALIZED VIEW") => Ok(Some(ObjectKind::View)),
+            Some(other) => Err(AdapterError::msg(format!(
+                "unknown promotion destination kind: {other}"
+            ))),
+            None => Err(AdapterError::msg(
+                "promotion destination kind is missing or malformed",
+            )),
+        },
+        _ => Err(AdapterError::msg(
+            "promotion destination kind returned multiple rows",
+        )),
+    }
+}
+
 fn stats_from_response(response: &BigQueryResponse) -> ExecutionStats {
     let bytes_scanned = response
         .statistics
@@ -2114,6 +2174,73 @@ struct TableCell {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn promotion_probe_sql_kinds_and_missing_dataset() {
+        let table = TableRef {
+            catalog: "test-project".into(),
+            schema: "orders_ds".into(),
+            table: "Orders\\'24".into(),
+        };
+        assert_eq!(
+            promotion_sql(&BigQueryDialect, &table).unwrap(),
+            r"SELECT table_type FROM `test-project`.`orders_ds`.INFORMATION_SCHEMA.TABLES WHERE table_name = 'Orders\\\'24'"
+        );
+        let result = |value: &str| QueryResult {
+            columns: vec!["table_type".into()],
+            rows: vec![vec![serde_json::json!(value)]],
+        };
+        for value in ["BASE TABLE", "CLONE", "SNAPSHOT", "EXTERNAL"] {
+            assert_eq!(
+                promotion_kind(&result(value)).unwrap(),
+                Some(ObjectKind::Table)
+            );
+        }
+        for value in ["VIEW", "MATERIALIZED VIEW"] {
+            assert_eq!(
+                promotion_kind(&result(value)).unwrap(),
+                Some(ObjectKind::View)
+            );
+        }
+        assert_eq!(
+            promotion_kind(&QueryResult {
+                columns: vec![],
+                rows: vec![]
+            })
+            .unwrap(),
+            None
+        );
+        assert!(
+            promotion_kind(&result("NEW TYPE"))
+                .unwrap_err()
+                .to_string()
+                .contains("NEW TYPE")
+        );
+        assert!(bigquery_dataset_not_found(&AdapterError::new(
+            BigQueryError::JobError {
+                reason: "notFound".into(),
+                message: "Not found: Dataset test-project:orders_ds".into()
+            }
+        )));
+        assert!(bigquery_dataset_not_found(&AdapterError::new(
+            BigQueryError::ApiError {
+                status: "404 Not Found".into(),
+                message: "Not found: Dataset test-project:orders_ds".into()
+            }
+        )));
+        assert!(!bigquery_dataset_not_found(&AdapterError::new(
+            BigQueryError::ApiError {
+                status: "404 Not Found".into(),
+                message: "Not found: Table test-project:orders_ds.orders".into()
+            }
+        )));
+        assert!(!bigquery_dataset_not_found(&AdapterError::new(
+            BigQueryError::JobError {
+                reason: "accessDenied".into(),
+                message: "Dataset test-project:orders_ds".into()
+            }
+        )));
+    }
 
     #[test]
     fn test_query_request_serialization() {

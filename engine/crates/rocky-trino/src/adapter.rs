@@ -8,7 +8,9 @@
 
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
-use rocky_core::traits::{AdapterError, AdapterResult, QueryResult, SqlDialect, WarehouseAdapter};
+use rocky_core::traits::{
+    AdapterError, AdapterResult, ObjectKind, QueryResult, SqlDialect, WarehouseAdapter,
+};
 use rocky_ir::{ColumnInfo, TableRef};
 
 use crate::auth::TrinoAuth;
@@ -42,6 +44,42 @@ impl TrinoAdapter {
     /// out-of-tree extensions for raw `/v1/statement` access).
     pub fn client(&self) -> &TrinoClient {
         &self.client
+    }
+}
+
+fn promotion_queries(
+    dialect: &dyn SqlDialect,
+    table: &TableRef,
+) -> AdapterResult<(String, String)> {
+    let catalog = dialect.quote_identifier(&table.catalog.replace('"', "\"\""));
+    let schema = rocky_core::sql_gen::string_literal(dialect, &table.schema);
+    let name = rocky_core::sql_gen::string_literal(dialect, &table.table);
+    Ok((
+        format!(
+            "SELECT schema_name FROM {catalog}.information_schema.schemata WHERE lower(schema_name) = lower({schema})"
+        ),
+        format!(
+            "SELECT table_type FROM {catalog}.information_schema.tables WHERE lower(table_schema) = lower({schema}) AND lower(table_name) = lower({name})"
+        ),
+    ))
+}
+
+fn promotion_kind(result: &QueryResult) -> AdapterResult<Option<ObjectKind>> {
+    match result.rows.as_slice() {
+        [] => Ok(None),
+        [row] => match row.first().and_then(|v| v.as_str()) {
+            Some("BASE TABLE") => Ok(Some(ObjectKind::Table)),
+            Some("VIEW") => Ok(Some(ObjectKind::View)),
+            Some(other) => Err(AdapterError::msg(format!(
+                "unknown promotion destination kind: {other}"
+            ))),
+            None => Err(AdapterError::msg(
+                "promotion destination kind is missing or malformed",
+            )),
+        },
+        _ => Err(AdapterError::msg(
+            "promotion destination kind returned multiple rows",
+        )),
     }
 }
 
@@ -81,6 +119,26 @@ impl WarehouseAdapter for TrinoAdapter {
             columns,
             rows: out.rows,
         })
+    }
+
+    async fn promotion_destination_kind(
+        &self,
+        table: &TableRef,
+    ) -> AdapterResult<Option<ObjectKind>> {
+        let (namespace_sql, kind_sql) = promotion_queries(&self.dialect, table)?;
+        let namespace = self.execute_query(&namespace_sql).await?;
+        if namespace.rows.is_empty() {
+            return Err(AdapterError::msg(
+                "promotion destination namespace does not exist",
+            ));
+        }
+        if namespace.rows.len() != 1 || namespace.rows[0].first().and_then(|v| v.as_str()).is_none()
+        {
+            return Err(AdapterError::msg(
+                "promotion destination namespace response is ambiguous",
+            ));
+        }
+        promotion_kind(&self.execute_query(&kind_sql).await?)
     }
 
     /// Fetch `sql` results as a single Arrow `RecordBatch` via Trino's
@@ -153,6 +211,60 @@ impl WarehouseAdapter for TrinoAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn promotion_probe_sql_and_kinds() {
+        let table = TableRef {
+            catalog: "iceberg".into(),
+            schema: "Mixed'Case".into(),
+            table: "Orders'24".into(),
+        };
+        let (namespace, kind) = promotion_queries(&TrinoDialect::new(), &table).unwrap();
+        assert_eq!(
+            namespace,
+            "SELECT schema_name FROM \"iceberg\".information_schema.schemata WHERE lower(schema_name) = lower('Mixed''Case')"
+        );
+        assert_eq!(
+            kind,
+            "SELECT table_type FROM \"iceberg\".information_schema.tables WHERE lower(table_schema) = lower('Mixed''Case') AND lower(table_name) = lower('Orders''24')"
+        );
+        let quoted_catalog = TableRef {
+            catalog: "iceberg\"archive".into(),
+            ..table.clone()
+        };
+        assert!(
+            promotion_queries(&TrinoDialect::new(), &quoted_catalog)
+                .unwrap()
+                .0
+                .contains("\"iceberg\"\"archive\".information_schema.schemata")
+        );
+        let result = |value: &str| QueryResult {
+            columns: vec!["table_type".into()],
+            rows: vec![vec![serde_json::json!(value)]],
+        };
+        assert_eq!(
+            promotion_kind(&result("BASE TABLE")).unwrap(),
+            Some(ObjectKind::Table)
+        );
+        assert_eq!(
+            promotion_kind(&result("VIEW")).unwrap(),
+            Some(ObjectKind::View)
+        );
+        assert_eq!(
+            promotion_kind(&QueryResult {
+                columns: vec![],
+                rows: vec![]
+            })
+            .unwrap(),
+            None
+        );
+        assert!(
+            promotion_kind(&result("OTHER"))
+                .unwrap_err()
+                .to_string()
+                .contains("OTHER")
+        );
+    }
 
     #[test]
     fn is_not_experimental() {
