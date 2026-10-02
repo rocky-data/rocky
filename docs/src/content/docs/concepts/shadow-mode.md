@@ -79,9 +79,14 @@ Pass `--keep-shadow` when you need a separate `rocky compare`. This keeps the
 objects after the run. The next one-off shadow run still refuses those occupied
 names. Remove the kept objects before you run it again.
 
-Rocky keeps the tables when model execution or comparison fails. The tables
-remain available for inspection. The next run refuses rather than overwriting
-them, and prints the `DROP` that clears them.
+Rocky drops its shadow objects after a completed comparison, whether the verdict
+is `pass`, `warn`, `fail`, or `no_baseline`. A failed verdict makes the run exit
+non-zero. The run output keeps the comparison result. Use `--keep-shadow` if
+you need to inspect the objects after a failed comparison.
+
+A model write error or a comparison query error can leave the target's state
+uncertain. Rocky may keep those objects. The next shadow run refuses an occupied
+name and prints the `DROP` that clears it.
 
 Because it drops what it made, it must be sure it made them. So before writing,
 it checks every derived shadow target in the warehouse. If one already exists,
@@ -264,10 +269,12 @@ The result appears in text output and in JSON under `shadow_comparison`.
 `rocky compare` performs the same comparison on objects you kept with
 `--keep-shadow`. It fails if no tables were selected.
 When production has no target, Rocky reports `no_baseline` for that target.
-It does not fail the run. Rocky drops that shadow after a successful run unless you use `--keep-shadow`.
-If Rocky cannot confirm whether production exists, comparison fails and keeps the shadow.
+It does not fail the run. Rocky drops that shadow unless you use `--keep-shadow`.
+A failed threshold does fail the run, after Rocky drops the shadow objects it created.
+If Rocky cannot confirm whether production exists, the comparison errors before a verdict and may leave the shadow.
 Do not combine `--shadow` with `--resume` or `--resume-latest`.
-Remove retained shadow objects, then restart with `--shadow` without a resume flag.
+Remove any retained shadow objects, then restart with `--shadow` without a resume flag.
+
 It finds the targets differently per pipeline type: replication discovers them
 from the source, and transformation reads them off its models. It then compares
 each pair the same way. `rocky branch compare` does the same for a branch's

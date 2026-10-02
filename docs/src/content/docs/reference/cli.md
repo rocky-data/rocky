@@ -297,14 +297,16 @@ rocky run [--filter <key=value>] [flags]
 | `--governance-override <JSON>` | | Additional governance config as inline JSON or `@file.json`, merged with defaults. |
 | `--models <PATH>` | | Models directory for transformation execution. |
 | `--all` | | Execute both replication and compiled models. |
-| `--resume <RUN_ID>` | | Resume a specific previous replication run from its last checkpoint; mints a new `run_id` and records the prior one as `resumed_from`. Rejected with `--dag`, which does not replay the resume into its sub-runs (rejected at parse time). |
-| `--resume-latest` | | Resume the most recent failed replication run from its last checkpoint; mints a new `run_id` and records the prior one as `resumed_from`. Rejected with `--dag`, which does not replay the resume into its sub-runs (rejected at parse time). |
-| `--shadow` | | Run in shadow mode: write to shadow targets instead of production. |
+| `--resume <RUN_ID>` | | Resume a specific previous replication run from its last checkpoint; mints a new `run_id` and records the prior one as `resumed_from`. Rejected with `--dag` or `--shadow`. |
+| `--resume-latest` | | Resume the most recent failed replication run from its last checkpoint; mints a new `run_id` and records the prior one as `resumed_from`. Rejected with `--dag` or `--shadow`. |
+| `--shadow` | | Write to shadow targets, compare them with production, then drop them after any completed verdict. A failed threshold exits non-zero. |
 | `--keep-shadow` | Requires `--shadow`; conflicts with `--watch` | Keep shadow objects for a separate `rocky compare`. |
 | `--shadow-suffix <SUFFIX>` | Requires `--shadow` | Suffix appended to table names. Conflicts with `--branch`. `--shadow` alone uses `_rocky_shadow`. |
 | `--shadow-schema <NAME>` | Requires `--shadow` | Override schema for shadow tables. Conflicts with `--branch`. |
 | `--branch <NAME>` | | Execute against a named branch created with `rocky branch create`. Conflicts with `--shadow`, `--shadow-schema`, and `--shadow-suffix`. See [`rocky branch`](/reference/commands/core-pipeline/#rocky-branch). |
 | `--idempotency-key <KEY>` | | Caller-supplied opaque key used to dedup this run against prior runs with the same key. Three outcomes: a prior run succeeded (or reached a terminal state under `dedup_on = "any"`) → exit 0 with `status = "skipped_idempotent"` and the prior `skipped_by_run_id`; another caller currently holds the claim within `in_flight_ttl_hours` → exit 0 with `status = "skipped_in_flight"`; otherwise proceed normally. Rejected when combined with `--resume` / `--resume-latest` (resume is an explicit override). Stamps are stored verbatim; do not put secrets in the key. See [`[state.idempotency]`](/reference/configuration/) for tuning. |
+
+`--keep-shadow` retains objects after a failed verdict too. A write or comparison query error may leave a shadow object whose state Rocky cannot confirm.
 
 **Pipeline stages (in order):**
 

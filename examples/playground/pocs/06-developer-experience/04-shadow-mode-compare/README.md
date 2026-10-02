@@ -8,8 +8,8 @@
 ## What it shows
 
 `rocky run --shadow` writes to `<table>_rocky_shadow` and compares it with
-production before cleanup. This POC uses `--keep-shadow` so a separate
-`rocky compare` can inspect the same tables.
+production before cleanup. The first run drops its table. The next run reuses
+the name with `--keep-shadow` so `rocky compare` can inspect the table.
 
 ## Why it's distinctive
 
@@ -30,8 +30,9 @@ The POC runs end to end on the local DuckDB path, and `run.sh` exits 0:
   real target `poc.staging__orders.orders` (100 rows).
 - **The `--shadow` run works.** It reads the unsuffixed source
   `raw__orders.orders` and writes `poc.staging__orders.orders_rocky_shadow`.
-  The real target is not touched. The result is in
-  `expected/run_shadow.json`.
+  The real target is not touched. `expected/run_shadow_once.json` records the
+  first verdict. The second run succeeds without manual cleanup and keeps its
+  table. Its verdict is in `expected/run_shadow.json`.
 - **Both comparisons pass.** `expected/run_shadow.json` contains the in-run
   verdict. `expected/compare.json` reports 100 rows in
   both tables, `schema_match: true` and `overall_verdict: "pass"`.

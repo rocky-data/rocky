@@ -74,7 +74,7 @@ fn run(dir: &std::path::Path, extra: &[&str]) -> std::process::Output {
 }
 
 #[test]
-fn mixed_shadow_failure_keeps_passing_model_evidence() {
+fn mixed_shadow_failure_cleans_models_and_replication_after_comparison() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let dir = tmp.path();
     seed(dir);
@@ -123,13 +123,18 @@ fn mixed_shadow_failure_keeps_passing_model_evidence() {
     );
     let conn = duckdb::Connection::open(dir.join("fixture.duckdb")).expect("open DuckDB");
     let count: i64 = conn.query_row(
-        "SELECT count(*) FROM information_schema.tables WHERE table_schema = 'main' AND table_name = 'derived_rocky_shadow'",
+        "SELECT count(*) FROM information_schema.tables WHERE table_name IN ('derived_rocky_shadow', 'orders_rocky_shadow')",
         [], |row| row.get(0),
-    ).expect("inspect model shadow");
-    assert_eq!(
-        count, 1,
-        "failed mixed comparison must retain passing model evidence"
+    ).expect("inspect shadow objects");
+    assert_eq!(count, 0, "failed mixed comparison cleans both groups");
+    drop(conn);
+    let second = run(dir, &["--all", "--shadow"]);
+    assert!(
+        !second.status.success(),
+        "comparison still detects divergence"
     );
+    let second_json: serde_json::Value = serde_json::from_slice(&second.stdout).expect("run JSON");
+    assert_eq!(second_json["shadow_comparison"]["tables_failed"], 1);
 }
 
 #[test]
@@ -414,7 +419,7 @@ fn replication_shadow_compares_before_default_cleanup() {
 }
 
 #[test]
-fn replication_shadow_mismatch_fails_and_retains_its_target() {
+fn replication_shadow_mismatch_fails_and_cleans_its_target() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let dir = tmp.path();
     seed(dir);
@@ -455,7 +460,51 @@ fn replication_shadow_mismatch_fails_and_retains_its_target() {
             |row| row.get(0),
         )
         .expect("inspect shadow target");
-    assert_eq!(left, 1, "failed comparison keeps the shadow for inspection");
+    assert_eq!(left, 0, "failed comparison drops its shadow target");
+    drop(conn);
+    let second = run(dir, &["--shadow", "--filter", "source=shopify"]);
+    assert_eq!(second.status.code(), Some(2));
+    let second_json: serde_json::Value = serde_json::from_slice(&second.stdout).expect("run JSON");
+    assert_eq!(second_json["shadow_comparison"]["tables_failed"], 1);
+}
+
+#[test]
+fn a_check_gate_still_compares_and_cleans_a_completed_shadow_copy() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dir = tmp.path();
+    seed(dir);
+    fs::write(dir.join("rocky.toml"), ROCKY_TOML).expect("write config");
+    assert!(run(dir, &[]).status.success(), "create production targets");
+    let conn = duckdb::Connection::open(dir.join("fixture.duckdb")).expect("open duckdb");
+    conn.execute_batch("INSERT INTO raw__shopify.orders VALUES (NULL)")
+        .expect("add a row that fails the check and diverges from production");
+    drop(conn);
+    fs::write(
+        dir.join("rocky.toml"),
+        format!(
+            "{ROCKY_TOML}\n[[pipeline.ingest.checks.assertions]]\n\
+             table = \"orders_rocky_shadow\"\ntype = \"not_null\"\ncolumn = \"id\"\n"
+        ),
+    )
+    .expect("enable a failing check");
+
+    let out = run(dir, &["--shadow", "--filter", "source=shopify"]);
+    assert_eq!(out.status.code(), Some(2));
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).expect("run JSON");
+    assert_eq!(json["check_gate_failed"], true, "{json}");
+    assert_eq!(json["shadow_comparison"]["tables_failed"], 1);
+    let conn = duckdb::Connection::open(dir.join("fixture.duckdb")).expect("open duckdb");
+    let count: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM information_schema.tables WHERE table_schema = 'staging__shopify' AND table_name = 'orders_rocky_shadow'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("inspect shadow target");
+    assert_eq!(
+        count, 0,
+        "a completed comparison must clean after a check gate"
+    );
 }
 
 /// #1461 follow-up: the collision key must fold case.

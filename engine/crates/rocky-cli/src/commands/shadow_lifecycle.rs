@@ -12,7 +12,7 @@
 //!   before a shadow run writes   is anything already at this name?
 //!                                  yes ─▶ REFUSE, naming the object
 //!                                  no  ─▶ this run owns it
-//!   after a passing comparison   drop what this run created (unless kept)
+//!   after a completed comparison drop what this run created (unless kept)
 //! ```
 //!
 //! Why "already there" is a sound refusal, which it would NOT have been
@@ -20,17 +20,18 @@
 //! every strategy that reaches a shadow write REPLACES its target rather
 //! than adding to it — and `cleanup_after` now actually drops. Together
 //! those mean a clean default run leaves the name empty. An object sitting
-//! there is either somebody else's, a retained object, or failed-run debris. In
-//! both cases writing over it is the thing #1273 reported.
+//! there is either somebody else's, a retained object, or debris from an
+//! interrupted run or failed DROP. In every case writing over it is the thing
+//! #1273 reported.
 //!
 //! **What "Rocky-owned" means here, exactly.** It means *this run created
 //! it*. That is the strictest reading, and it is the only one available
 //! without persisting ownership: a state record would have to survive a
 //! deleted state file and a different machine to be trusted, and a
 //! warehouse tag is not portable across the adapters Rocky targets. The
-//! cost of the strict reading is that a shadow run which failed part-way
-//! leaves objects that the next run refuses — so the refusal names the
-//! object and prints the statement that clears it.
+//! cost of the strict reading is that a shadow run whose write or comparison
+//! errors before a verdict may leave objects that the next run refuses — so
+//! the refusal names the object and prints the statement that clears it.
 
 use anyhow::Result;
 use rocky_core::traits::{SqlDialect, WarehouseAdapter};
@@ -191,9 +192,9 @@ pub(crate) async fn refuse_occupied_shadow_targets(
 
 /// Drop the shadow objects this run created.
 ///
-/// Called only on a successful run, and only when `cleanup_after` is set —
-/// which is the default for a one-off `--shadow`, and deliberately off for
-/// a named `--branch`, whose objects are the point of the branch.
+/// Called after a completed comparison, regardless of verdict, when
+/// `cleanup_after` is set. That is the default for a one-off `--shadow` and
+/// is deliberately off for `--keep-shadow` and named branches.
 ///
 /// Best-effort by design: a failed drop is reported to the caller as a
 /// warning rather than failing a run whose real work already succeeded.

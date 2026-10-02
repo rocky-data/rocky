@@ -7016,7 +7016,6 @@ pub async fn run_with_explicit_contracts(
     if shadow_config.is_some()
         && !replication_shadow_objects.is_empty()
         && output.tables_failed == 0
-        && !output.check_gate_failed
     {
         let comparison = crate::commands::compare::compare_targets(
             warehouse_adapter.as_ref(),
@@ -7056,10 +7055,14 @@ pub async fn run_with_explicit_contracts(
         }
         output.status = output.derive_run_status();
     }
+    // All model and replication comparisons have completed here. A failed
+    // verdict is still a completed comparison, so it must not retain either
+    // group's objects. A table/model write error or a comparison query error
+    // can leave ownership or completeness uncertain; those paths do not reach
+    // this cleanup. `--keep-shadow` explicitly disables it.
     if shadow_config.is_some_and(|config| config.cleanup_after)
         && output.tables_failed == 0
-        && !output.check_gate_failed
-        && output.shadow_comparison.as_ref().is_some_and(|comparison| comparison.tables_failed == 0)
+        && output.shadow_comparison.is_some()
     {
         output.owned_shadow_objects.extend(replication_shadow_objects);
         if !output.owned_shadow_objects.is_empty() {
@@ -12824,28 +12827,17 @@ pub(crate) async fn execute_models_with_explicit_contracts(
         output.shadow_comparison = Some(comparison);
     }
 
-    // `cleanup_after` finally has a consumer (#1273). It has always been
-    // documented as "whether to drop shadow tables after comparison
-    // completes" and defaulted to `true`, while nothing read it and every
-    // construction hard-coded `false` — so shadow objects accumulated, and
-    // the next run wrote over its own leftover.
-    //
-    // Dropped only on the success path, on purpose: a run that failed is
-    // evidence, and destroying it to save the operator one statement is the
-    // wrong trade. The next run refuses on those leftovers rather than
-    // replacing them, and prints the drop — so the failure mode is a
-    // refusal with a remedy, never a silent overwrite.
-    //
-    // A named `--branch` sets `cleanup_after = false`: its objects are the
-    // point of the branch, not debris.
+    // A comparison verdict, including fail or no_baseline, establishes that
+    // comparison completed. Cleanup follows regardless of that verdict.
+    // A model write error may leave a target only partly created, and a
+    // comparison query error has no completed verdict; those paths retain
+    // objects because their state is uncertain. `--keep-shadow` and named
+    // branches also disable cleanup explicitly.
     if let Some(config) = shadow_config
         && config.cleanup_after
         && !shadow_objects.is_empty()
         && output.tables_failed == 0
-        && output
-            .shadow_comparison
-            .as_ref()
-            .is_none_or(|comparison| comparison.tables_failed == 0)
+        && output.shadow_comparison.is_some()
     {
         if output.pipeline_type.as_deref() == Some("replication") {
             output.owned_shadow_objects.extend(shadow_objects);

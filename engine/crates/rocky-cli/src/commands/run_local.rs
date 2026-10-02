@@ -1653,6 +1653,18 @@ mod tests {
         count_rows_in_schema(db, "main", table).await
     }
 
+    async fn table_exists(db: &Path, schema: &str, table: &str) -> bool {
+        let a = DuckDbWarehouseAdapter::open(db).expect("catalog open");
+        let r = a
+            .execute_query(&format!(
+                "SELECT COUNT(*) FROM information_schema.tables \
+                 WHERE table_schema = '{schema}' AND table_name = '{table}'"
+            ))
+            .await
+            .unwrap();
+        r.rows[0][0].as_i64() == Some(1)
+    }
+
     /// Write a `full_refresh` SQL model (`name.sql` + `name.toml`) into the
     /// project's `main` schema, with an optional `depends_on` sidecar key.
     fn write_model(dir: &Path, name: &str, sql: &str, depends_on: &[&str]) {
@@ -2470,17 +2482,8 @@ auto_create_schemas = true
             1,
             "shadow must not overwrite production"
         );
-        assert_eq!(
-            count_rows(&db, "orders_rocky_shadow").await,
-            2,
-            "producer must materialize its shadow target"
-        );
-        assert_eq!(
-            count_rows(&db, "mart_rocky_shadow").await,
-            2,
-            "consumer must read the producer's shadow target, which requires the producer to \
-             have run first"
-        );
+        assert!(!table_exists(&db, "main", "orders_rocky_shadow").await);
+        assert!(!table_exists(&db, "main", "mart_rocky_shadow").await);
     }
 
     /// A transformation shadow run must materialize the rewritten physical
@@ -2537,29 +2540,16 @@ auto_create_schemas = true
             1,
             "suffix shadow must not overwrite the production target"
         );
-        assert_eq!(
-            count_rows(&db, "orders_rocky_shadow").await,
-            2,
-            "suffix shadow must materialize the rewritten table"
-        );
+        assert!(!table_exists(&db, "main", "orders_rocky_shadow").await);
 
-        // A failed comparison retains its shadow for inspection. The next
-        // one-off run refuses to reuse that name, so clear the inspected table.
-        let adapter = DuckDbWarehouseAdapter::open(&db).unwrap();
-        adapter
-            .execute_statement("DROP TABLE main.orders_rocky_shadow")
-            .await
-            .unwrap();
-        drop(adapter);
+        // A failed verdict still drops the owned target. Reuse needs no
+        // manual cleanup.
         assert_shadow_comparison_failed(
             run_full_dag_result(&config_path, &state_path, false, Some(&suffix_shadow), None).await,
             2,
         );
-        assert_eq!(
-            count_rows(&db, "mart_rocky_shadow").await,
-            2,
-            "downstream suffix shadow must read the shadow upstream"
-        );
+        assert!(!table_exists(&db, "main", "orders_rocky_shadow").await);
+        assert!(!table_exists(&db, "main", "mart_rocky_shadow").await);
 
         write_model(
             &models_dir,

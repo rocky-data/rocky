@@ -329,7 +329,7 @@ fn keep_shadow_allows_separate_compare_and_refuses_the_next_run() {
 }
 
 #[test]
-fn a_failed_shadow_comparison_is_reported_and_keeps_the_evidence() {
+fn a_failed_shadow_comparison_exits_nonzero_and_cleans_for_the_next_run() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let root = tmp.path();
     project(root);
@@ -341,19 +341,39 @@ fn a_failed_shadow_comparison_is_reported_and_keeps_the_evidence() {
         .expect("seed production with two rows");
     }
 
-    let out = run_shadow(root);
-    assert!(
-        !out.status.success(),
-        "a row-count mismatch must fail the run"
-    );
+    for attempt in 1..=2 {
+        let out = run_shadow(root);
+        assert_eq!(out.status.code(), Some(2), "attempt {attempt}");
+        let json: serde_json::Value = serde_json::from_slice(&out.stdout).expect("run JSON");
+        assert_eq!(json["status"], "PartialFailure");
+        assert_eq!(json["shadow_comparison"]["tables_compared"], 1);
+        assert_eq!(json["shadow_comparison"]["tables_failed"], 1);
+        assert_eq!(
+            json["shadow_comparison"]["results"][0]["production_count"],
+            2
+        );
+        assert_eq!(json["shadow_comparison"]["results"][0]["shadow_count"], 1);
+        assert!(
+            columns_of(root, "orders_rocky_shadow").is_empty(),
+            "attempt {attempt} must leave the name free for the next run"
+        );
+    }
+}
+
+#[test]
+fn keep_shadow_retains_a_failed_comparison() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+    project(root);
+    {
+        let conn = duckdb::Connection::open(root.join("probe.duckdb")).expect("open duckdb");
+        conn.execute_batch("CREATE TABLE main.orders AS SELECT 1 AS id, 'prod' AS origin UNION ALL SELECT 2, 'prod';")
+            .expect("seed divergent production");
+    }
+    let out = run_shadow_with(root, &["--keep-shadow"]);
+    assert_eq!(out.status.code(), Some(2));
     let json: serde_json::Value = serde_json::from_slice(&out.stdout).expect("run JSON");
-    assert_eq!(json["shadow_comparison"]["tables_compared"], 1);
     assert_eq!(json["shadow_comparison"]["tables_failed"], 1);
-    assert_eq!(
-        json["shadow_comparison"]["results"][0]["production_count"],
-        2
-    );
-    assert_eq!(json["shadow_comparison"]["results"][0]["shadow_count"], 1);
     assert!(!columns_of(root, "orders_rocky_shadow").is_empty());
 }
 
