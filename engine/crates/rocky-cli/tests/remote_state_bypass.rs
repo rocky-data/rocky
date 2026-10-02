@@ -932,11 +932,11 @@ async fn load_partial_failure_still_finalizes() {
 /// Build a backfill project (transformation model + optional `[policy]`
 /// plane + remote state), persist a Backfill plan + review marker, and
 /// return `(project, plan_id)`.
-fn backfill_fixture(model_sql: &str) -> (ModelProject, String) {
-    backfill_fixture_with(model_sql, true)
+async fn backfill_fixture(model_sql: &str) -> (ModelProject, String) {
+    backfill_fixture_with(model_sql, true).await
 }
 
-fn backfill_fixture_with(model_sql: &str, with_policy: bool) -> (ModelProject, String) {
+async fn backfill_fixture_with(model_sql: &str, with_policy: bool) -> (ModelProject, String) {
     let project = ModelProject::new(model_sql);
     let root = project.config_path.parent().unwrap().to_path_buf();
     if with_policy {
@@ -948,44 +948,50 @@ fn backfill_fixture_with(model_sql: &str, with_policy: bool) -> (ModelProject, S
         std::fs::write(&project.config_path, cfg).expect("append policy block");
     }
 
-    // The raw plan writers are `pub(crate)` (the route-inventory
-    // invariant: no public API can mint a plan without crossing the
-    // governed propose helper), so this fixture fabricates the plan FILE
-    // per the documented on-disk contract instead — `.rocky/plans/
-    // <plan_id>.json`, where `plan_id` is blake3 over the canonical
-    // `{"kind", "payload"}` envelope. `read_plan`'s integrity re-hash
-    // verifies the fabrication is faithful.
-    let payload = serde_json::json!({
-        "models": ["m1"],
-        "models_dir": "models",
-    });
-    let envelope = serde_json::json!({ "kind": "backfill", "payload": payload });
-    let plan_id = blake3::hash(&serde_json::to_vec(&envelope).expect("envelope"))
-        .to_hex()
-        .to_string();
-    let plans_dir = root.join(".rocky").join("plans");
-    std::fs::create_dir_all(&plans_dir).expect("plans dir");
-    let record = serde_json::json!({
-        "plan_id": plan_id,
-        "kind": "backfill",
-        "created_at": "2026-08-18T00:00:00Z",
-        "format_version": 1,
-        "principal": "agent",
-        "payload": payload,
-    });
-    std::fs::write(
-        plans_dir.join(format!("{plan_id}.json")),
-        serde_json::to_vec_pretty(&record).expect("record"),
+    // Compose through the same public path as `rocky backfill`, so the plan
+    // carries the execution fingerprint that apply checks before running.
+    let prev_cwd = std::env::current_dir().expect("read cwd");
+    std::env::set_current_dir(&root).expect("enter project root");
+    let result = rocky_cli::commands::run_backfill(
+        &project.config_path,
+        &project.state_path,
+        &project.models_dir,
+        &["m1".to_string()],
+        false,
+        None,
+        None,
+        true,
+        false,
     )
-    .expect("persist backfill plan");
-    // The fabricated bytes must still pass the loader's integrity check.
-    rocky_cli::plan_store::read_plan(&root, &plan_id).expect("fabricated plan reads back");
-    let marker = root.join(".rocky").join("plans");
-    std::fs::create_dir_all(&marker).expect("plans dir");
+    .await;
+    std::env::set_current_dir(prev_cwd).expect("restore cwd");
+    result.expect("compose backfill plan");
+
+    let plans_dir = root.join(".rocky").join("plans");
+    let plan_files: Vec<_> = std::fs::read_dir(&plans_dir)
+        .expect("read plans dir")
+        .map(|entry| entry.expect("plan entry").path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+        .collect();
+    assert_eq!(plan_files.len(), 1, "backfill must persist one plan");
+    let plan_id = plan_files[0]
+        .file_stem()
+        .expect("plan file stem")
+        .to_str()
+        .expect("UTF-8 plan ID")
+        .to_string();
+    let plan = rocky_cli::plan_store::read_plan(&root, &plan_id).expect("composed plan reads back");
+    assert_eq!(plan.kind, rocky_cli::plan_store::PlanKind::Backfill);
+    assert!(
+        plan.payload["policy_capabilities"]["models_fingerprint"]
+            .as_str()
+            .is_some(),
+        "backfill plan must bind the compiled execution fingerprint"
+    );
     // A WELL-FORMED marker naming the plan: the apply gate parses and
     // matches the marker (FF-WP1), so a bare `{}` no longer approves.
     std::fs::write(
-        marker.join(format!("{plan_id}.reviewed.json")),
+        plans_dir.join(format!("{plan_id}.reviewed.json")),
         format!(
             r#"{{
   "plan_id": "{plan_id}",
@@ -1030,7 +1036,7 @@ async fn drive_backfill_apply(project: &ModelProject, plan_id: &str) -> anyhow::
 async fn backfill_gate_decision_survives_to_remote() {
     let _serial = remote_testing::serial_guard();
     let harness = CrossPodHarness::new_s3_like();
-    let (project, plan_id) = backfill_fixture("SELECT 1 AS id\n");
+    let (project, plan_id) = backfill_fixture("SELECT 1 AS id\n").await;
 
     drive_backfill_apply(&project, &plan_id)
         .await
@@ -1043,7 +1049,9 @@ async fn backfill_gate_decision_survives_to_remote() {
     let store = harness.open_store(&harness.pod_b);
     let decisions = store.list_policy_decisions().expect("list decisions");
     assert!(
-        decisions.iter().any(|d| d.plan_id == plan_id),
+        decisions
+            .iter()
+            .any(|d| d.plan_id == plan_id && d.model == "m1"),
         "the gate's decision row must survive to the remote ledger (one session: no \
          second download between gate and upload); got {} decision(s)",
         decisions.len()
@@ -1061,8 +1069,8 @@ async fn backfill_gate_decision_survives_to_remote() {
 async fn backfill_finalizes_even_on_execution_failure() {
     let _serial = remote_testing::serial_guard();
     let harness = CrossPodHarness::new_s3_like();
-    // A model that cannot compile/execute: unknown upstream reference.
-    let (project, plan_id) = backfill_fixture("SELECT * FROM no_such_upstream\n");
+    // This compiles, then fails when DuckDB evaluates the cast at execution.
+    let (project, plan_id) = backfill_fixture("SELECT CAST('bad' AS INTEGER) AS id\n").await;
 
     let err = drive_backfill_apply(&project, &plan_id)
         .await
@@ -1078,6 +1086,16 @@ async fn backfill_finalizes_even_on_execution_failure() {
          partial ledger mutations reach the remote (the old upload-even-on-failure \
          contract)"
     );
+    let _authority = harness
+        .download(&harness.pod_b)
+        .await
+        .expect("pod B start-download");
+    let runs = harness
+        .open_store(&harness.pod_b)
+        .list_runs(1)
+        .expect("read remote runs");
+    assert_eq!(runs.len(), 1, "execution must record a failed run");
+    assert_eq!(runs[0].status, rocky_core::state::RunStatus::Failure);
 }
 
 /// Red-team FIX 2: a backfill whose canonical store was RECREATED because the
@@ -1106,7 +1124,7 @@ async fn backfill_finalizes_even_on_execution_failure() {
 async fn backfill_forward_incompat_recreate_suppresses_upload() {
     let _serial = remote_testing::serial_guard();
     let harness = CrossPodHarness::new_s3_like();
-    let (project, plan_id) = backfill_fixture_with("SELECT 1 AS id\n", false);
+    let (project, plan_id) = backfill_fixture_with("SELECT 1 AS id\n", false).await;
     let future_version = rocky_core::state::current_schema_version() + 1;
 
     // Pod A is the "newer binary": its uploaded ledger carries schema v+1.
