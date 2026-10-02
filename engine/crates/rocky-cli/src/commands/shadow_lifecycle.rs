@@ -33,7 +33,7 @@
 //! object and prints the statement that clears it.
 
 use anyhow::Result;
-use rocky_core::traits::{AdapterError, SqlDialect, WarehouseAdapter};
+use rocky_core::traits::{SqlDialect, WarehouseAdapter};
 use rocky_ir::{TableRef, TargetRef};
 use rocky_sql::defer::CollisionIdentity;
 
@@ -103,52 +103,6 @@ pub(crate) fn refuse_production_shadow_collisions(
     Ok(())
 }
 
-/// Only a missing-object DESCRIBE error can establish absence. A listing can
-/// contradict that result, but cannot establish absence on its own.
-fn describe_reports_missing_object(error: &AdapterError) -> bool {
-    use rocky_trino::connector::TrinoError;
-
-    if let Some(TrinoError::QueryFailed { error_name, .. }) =
-        error.inner().downcast_ref::<TrinoError>()
-    {
-        return matches!(error_name.as_str(), "TABLE_NOT_FOUND" | "SCHEMA_NOT_FOUND");
-    }
-    if let Some(rocky_catalog_core::CatalogError::TableNotFound(_)) =
-        error
-            .inner()
-            .downcast_ref::<rocky_catalog_core::CatalogError>()
-    {
-        return true;
-    }
-    if let Some(rocky_databricks::catalog::CatalogManagerError::Connector(
-        rocky_databricks::connector::ConnectorError::StatementFailed { message, .. },
-    )) = error
-        .inner()
-        .downcast_ref::<rocky_databricks::catalog::CatalogManagerError>()
-    {
-        return message.contains("TABLE_OR_VIEW_NOT_FOUND")
-            || message.contains("DELTA_TABLE_NOT_FOUND");
-    }
-    // DuckDB exposes its CatalogException as an opaque driver error. Match
-    // only its missing table/schema diagnostic, never a generic "not found".
-    #[cfg(feature = "duckdb")]
-    {
-        let message = error.to_string();
-        let message = message.strip_prefix("DuckDB error: ").unwrap_or(&message);
-        if message.starts_with("Catalog Error: Table with name ")
-            && message.contains(" does not exist!")
-        {
-            return true;
-        }
-        if message.starts_with("Catalog Error: Schema with name ")
-            && message.contains(" does not exist!")
-        {
-            return true;
-        }
-    }
-    false
-}
-
 pub(crate) async fn target_is_absent(
     warehouse: &dyn WarehouseAdapter,
     target: &TargetRef,
@@ -161,19 +115,22 @@ pub(crate) async fn target_is_absent(
     match warehouse.describe_table(&table).await {
         Ok(_) => Ok(false),
         Err(describe_error) => {
-            if !describe_reports_missing_object(&describe_error) {
+            if !warehouse.is_missing_object_error(&describe_error) {
                 anyhow::bail!(
                     "cannot determine whether {} exists: DESCRIBE did not report a missing object: {describe_error}",
                     target.full_name()
                 );
             }
-            let names = warehouse
-                .list_tables(&target.catalog, &target.schema)
-                .await
-                .map_err(|list_error| anyhow::anyhow!(
+            let names = match warehouse.list_tables(&target.catalog, &target.schema).await {
+                Ok(names) => names,
+                Err(list_error) if warehouse.is_missing_object_error(&list_error) => {
+                    return Ok(true);
+                }
+                Err(list_error) => anyhow::bail!(
                     "cannot determine whether {} exists: describe failed: {describe_error}; catalog read failed: {list_error}",
                     target.full_name()
-                ))?;
+                ),
+            };
             if names
                 .iter()
                 .any(|name| name.eq_ignore_ascii_case(&target.table))
@@ -194,7 +151,9 @@ pub(crate) async fn target_is_absent(
 /// exactly as it was — the same posture as the target-collision preflight
 /// (#1461) and the `metadata_columns` guard (#1594).
 ///
-/// A missing-object DESCRIBE error requires a listing that does not contradict it.
+/// A missing-object DESCRIBE error requires a listing that does not contradict
+/// it. A missing namespace can make the listing fail with another missing-object
+/// error; that also confirms absence.
 ///
 /// # Errors
 ///
@@ -307,28 +266,6 @@ mod tests {
     }
 
     #[test]
-    fn trino_only_accepts_missing_object_error_names() {
-        use rocky_trino::connector::TrinoError;
-
-        for name in ["TABLE_NOT_FOUND", "SCHEMA_NOT_FOUND"] {
-            let error = AdapterError::new(TrinoError::QueryFailed {
-                state: "FAILED".into(),
-                error_code: 1,
-                error_name: name.into(),
-                message: name.into(),
-            });
-            assert!(describe_reports_missing_object(&error), "{name}");
-        }
-        let denied = AdapterError::new(TrinoError::QueryFailed {
-            state: "FAILED".into(),
-            error_code: 1,
-            error_name: "PERMISSION_DENIED".into(),
-            message: "Access denied".into(),
-        });
-        assert!(!describe_reports_missing_object(&denied));
-    }
-
-    #[test]
     fn shadow_name_cannot_alias_another_production_target_by_case() {
         let first = object("OTHER");
         let mut second = object("second_shadow");
@@ -359,6 +296,9 @@ mod tests {
         fn dialect(&self) -> &dyn SqlDialect {
             self.inner.dialect()
         }
+        fn is_missing_object_error(&self, error: &AdapterError) -> bool {
+            self.inner.is_missing_object_error(error)
+        }
         async fn execute_statement(&self, _sql: &str) -> AdapterResult<()> {
             panic!("an uncertain ownership read must never authorize a write")
         }
@@ -377,6 +317,41 @@ mod tests {
                 Ok(vec!["orders_rocky_shadow".to_string()])
             }
         }
+    }
+
+    struct MissingNamespaceWarehouse;
+
+    #[async_trait]
+    impl WarehouseAdapter for MissingNamespaceWarehouse {
+        fn dialect(&self) -> &dyn SqlDialect {
+            static DIALECT: rocky_duckdb::dialect::DuckDbSqlDialect =
+                rocky_duckdb::dialect::DuckDbSqlDialect;
+            &DIALECT
+        }
+        fn is_missing_object_error(&self, error: &AdapterError) -> bool {
+            error.to_string() == "missing dataset"
+        }
+        async fn execute_statement(&self, _sql: &str) -> AdapterResult<()> {
+            panic!("preflight must not write")
+        }
+        async fn execute_query(&self, _sql: &str) -> AdapterResult<QueryResult> {
+            panic!("preflight must not query")
+        }
+        async fn describe_table(&self, _table: &TableRef) -> AdapterResult<Vec<ColumnInfo>> {
+            Err(AdapterError::msg("missing dataset"))
+        }
+        async fn list_tables(&self, _catalog: &str, _schema: &str) -> AdapterResult<Vec<String>> {
+            Err(AdapterError::msg("missing dataset"))
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_namespace_listing_confirms_missing_describe() {
+        assert!(
+            target_is_absent(&MissingNamespaceWarehouse, &object("shadow").target)
+                .await
+                .unwrap()
+        );
     }
 
     #[tokio::test]

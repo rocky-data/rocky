@@ -798,6 +798,7 @@ impl From<&rocky_bigquery::connector::BigQueryError> for FailureKind {
                 Some(_) => Self::QueryRejected,
                 None => Self::Unknown,
             },
+            E::TableNotFound { .. } => Self::NotFound,
             E::JobError { .. } | E::LoadJobError { .. } => Self::QueryRejected,
             E::Timeout { .. } => Self::Transient,
             E::RetryBudgetExhausted { .. } => Self::QuotaExceeded,

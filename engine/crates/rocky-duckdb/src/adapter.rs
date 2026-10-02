@@ -128,6 +128,18 @@ impl WarehouseAdapter for DuckDbWarehouseAdapter {
         &self.dialect
     }
 
+    fn is_missing_object_error(&self, error: &AdapterError) -> bool {
+        let Some(crate::DuckDbError::Database(driver_error)) =
+            error.inner().downcast_ref::<crate::DuckDbError>()
+        else {
+            return false;
+        };
+        let message = driver_error.to_string();
+        (message.starts_with("Catalog Error: Table with name ")
+            || message.starts_with("Catalog Error: Schema with name "))
+            && message.contains(" does not exist!")
+    }
+
     /// DuckDB folds identifier case, so this is a dialect constant and needs
     /// no round trip (#1281).
     ///
@@ -440,6 +452,23 @@ pub fn classify_duckdb_failure(err: &AdapterError) -> FailureClass {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn real_describe_missing_error_confirms_absence() {
+        let adapter = DuckDbWarehouseAdapter::in_memory().unwrap();
+        let missing = adapter
+            .describe_table(&TableRef {
+                catalog: "memory".into(),
+                schema: "main".into(),
+                table: "missing".into(),
+            })
+            .await
+            .unwrap_err();
+        assert!(adapter.is_missing_object_error(&missing), "{missing}");
+        assert!(!adapter.is_missing_object_error(&AdapterError::msg(
+            "Catalog Error: Table with name missing does not exist!"
+        )));
+    }
 
     #[test]
     fn classify_lock_contention_is_transient() {

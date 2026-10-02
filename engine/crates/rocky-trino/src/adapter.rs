@@ -76,6 +76,14 @@ impl WarehouseAdapter for TrinoAdapter {
         &self.dialect
     }
 
+    fn is_missing_object_error(&self, error: &AdapterError) -> bool {
+        matches!(
+            error.inner().downcast_ref::<crate::connector::TrinoError>(),
+            Some(crate::connector::TrinoError::QueryFailed { error_name, .. })
+                if matches!(error_name.as_str(), "TABLE_NOT_FOUND" | "SCHEMA_NOT_FOUND")
+        )
+    }
+
     /// Trino folds identifier case, so this is a dialect constant and needs
     /// no round trip (#1281).
     ///
@@ -184,6 +192,30 @@ impl WarehouseAdapter for TrinoAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_structured_missing_errors_confirm_absence() {
+        let adapter = TrinoAdapter::new(
+            TrinoClientConfig::new("http://localhost:8080"),
+            crate::test_helpers::test_basic_auth(),
+        );
+        for name in ["TABLE_NOT_FOUND", "SCHEMA_NOT_FOUND"] {
+            let error = AdapterError::new(crate::connector::TrinoError::QueryFailed {
+                state: "FAILED".into(),
+                error_code: 1,
+                error_name: name.into(),
+                message: name.into(),
+            });
+            assert!(adapter.is_missing_object_error(&error));
+        }
+        let denied = AdapterError::new(crate::connector::TrinoError::QueryFailed {
+            state: "FAILED".into(),
+            error_code: 1,
+            error_name: "PERMISSION_DENIED".into(),
+            message: "not found".into(),
+        });
+        assert!(!adapter.is_missing_object_error(&denied));
+    }
 
     #[test]
     fn list_tables_sql_and_parsing_without_network() {

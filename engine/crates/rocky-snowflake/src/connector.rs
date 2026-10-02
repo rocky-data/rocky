@@ -787,7 +787,7 @@ fn check_terminal(response: StatementResponse) -> Result<StatementResponse, Conn
     } else {
         Err(ConnectorError::StatementFailed {
             handle: response.statement_handle,
-            message: response.message,
+            message: format!("{}: {}", response.code, response.message),
         })
     }
 }
@@ -1263,7 +1263,10 @@ mod tests {
             data: None,
         };
         let err = check_terminal(resp).unwrap_err();
-        assert!(matches!(err, ConnectorError::StatementFailed { .. }));
+        assert!(
+            matches!(err, ConnectorError::StatementFailed { message, .. }
+            if message == "002140: SQL compilation error")
+        );
     }
 
     #[test]
