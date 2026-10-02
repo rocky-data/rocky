@@ -188,7 +188,10 @@ fn real_runs_keep_shadow_and_branch_out_of_diff_and_cost_bases() {
     let production_id = StateStore::open(&state).unwrap().list_runs(1).unwrap()[0]
         .run_id
         .clone();
-    std::fs::write(&model, "SELECT unnest([1, 2]) AS id").unwrap();
+    // The shadow runs build the same rows as production, so their
+    // comparison passes (a diverging shadow comparison fails the run, #2198).
+    // This test checks only that shadow runs stay out of the diff and cost
+    // bases.
     rocky(
         root,
         &state,
