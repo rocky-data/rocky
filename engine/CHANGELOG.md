@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A filtered run now copies and checks each selected target that overlaps a complete record-less checkpoint from the same pipeline. Only a later full-plan run with completed checks supersedes that checkpoint. (#1814, #2230, #2232)
 - Complete record-less checkpoints refuse resume with guidance for `rocky state reconcile-watermark` or `full_refresh`. A matching fresh run copies their targets and runs checks before a later run can prune them. A recorded check failure also allows pruning after the new RunRecord is written. An old checkpoint alone never fails a fresh run. (#1814, #2230)
 - Recovery matches physical targets on the same endpoint when the new plan contains every recorded target. Fully qualified Snowflake targets remain matched after a default database change. (#2232)
 - `rocky state reconcile-watermark --pipeline <name>` repairs incremental cursors from target maxima. It clears stale cursors for empty targets and uses each target's effective timestamp column. `--dry-run` previews the values. State writes use the existing authority and CAS path. (#1814)

@@ -4336,18 +4336,20 @@ impl StateStore {
         Ok(result)
     }
 
-    /// Complete checkpoints without a terminal record whose targets all occur
-    /// in this physical plan. Their targets must bypass unchanged-source pruning
-    /// until a later matching run finishes its checks and records a result.
+    /// Selected targets of complete checkpoints without a terminal record.
+    /// Same-pipeline overlap must bypass unchanged-source pruning even when
+    /// this run selects only part of the old plan. Other pipelines require
+    /// the full physical plan to match.
     pub fn complete_recordless_check_targets(
         &self,
         scope: &ResumeScope,
         targets: &std::collections::HashSet<String>,
     ) -> Result<std::collections::HashSet<String>, StateError> {
         Ok(self
-            .matching_complete_recordless_checkpoints(scope, targets)?
+            .matching_complete_recordless_checkpoints(scope, targets, false)?
             .into_iter()
             .flat_map(|(_, planned)| planned)
+            .filter(|target| targets.contains(target))
             .collect())
     }
 
@@ -4360,7 +4362,8 @@ impl StateStore {
         scope: &ResumeScope,
         checked_targets: &std::collections::HashSet<String>,
     ) -> Result<(), StateError> {
-        let matches = self.matching_complete_recordless_checkpoints(scope, checked_targets)?;
+        let matches =
+            self.matching_complete_recordless_checkpoints(scope, checked_targets, true)?;
         if matches.is_empty() {
             return Ok(());
         }
@@ -4396,6 +4399,7 @@ impl StateStore {
         &self,
         scope: &ResumeScope,
         targets: &std::collections::HashSet<String>,
+        require_full_plan: bool,
     ) -> Result<Vec<(String, Vec<String>)>, StateError> {
         let txn = self.db.begin_read()?;
         let headers = txn.open_table(RUN_PROGRESS)?;
@@ -4444,7 +4448,12 @@ impl StateStore {
             } else {
                 successful.len() >= progress.total_tables
             };
-            if !complete || !planned.iter().all(|key| targets.contains(*key)) {
+            let covered = if require_full_plan || recorded_scope.pipeline != scope.pipeline {
+                planned.iter().all(|key| targets.contains(*key))
+            } else {
+                planned.iter().any(|key| targets.contains(*key))
+            };
+            if !complete || !covered {
                 continue;
             }
             let explicit = progress

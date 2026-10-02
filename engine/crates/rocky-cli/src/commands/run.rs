@@ -44030,24 +44030,49 @@ timestamp_column = "ts"
         let (_dir, warehouse, state, pipeline, mut task, scope, descriptor) =
             checkpoint_recovery_boundary_fixture().await;
         task.check_row_count = true;
+        // The old run copied both tables, then lost its terminal RunRecord.
+        // Select only events in the next run, as with --filter table=events.
+        seed_run_record(&state, "old", "Success");
+        warehouse
+            .execute_statement("CREATE TABLE src.items (id INTEGER, ts TIMESTAMP)")
+            .await
+            .unwrap();
+        warehouse
+            .execute_statement("INSERT INTO src.items VALUES (1, TIMESTAMP '2026-03-01 10:00:00')")
+            .await
+            .unwrap();
+        warehouse
+            .execute_statement("CREATE TABLE tgt.items AS SELECT * FROM src.items")
+            .await
+            .unwrap();
+        let mut other = task.clone();
+        other.source_table_name = "items".into();
+        other.target_table_name = "items".into();
+        let selected = table_key(&task);
+        let other_key = table_key(&other);
+        state
+            .init_run_progress(
+                "crash",
+                &[selected.clone(), other_key.clone()],
+                Some(&scope),
+            )
+            .unwrap();
+        for (index, key) in [&selected, &other_key].into_iter().enumerate() {
+            state
+                .record_table_progress(
+                    "crash",
+                    &table_entry(index, key, rocky_core::state::TableStatus::Success),
+                )
+                .unwrap();
+        }
         state
             .set_source_marker(&descriptor.target.state_key(), "unchanged")
             .unwrap();
         state
-            .record_table_progress(
-                "old",
-                &table_entry(
-                    0,
-                    &table_key(&task),
-                    rocky_core::state::TableStatus::Success,
-                ),
-            )
+            .batch_set_watermarks_and_confirm_runs(&[], &["crash"])
             .unwrap();
-        state
-            .batch_set_watermarks_and_confirm_runs(&[], &["old"])
-            .unwrap();
-        let progress = state.get_run_progress("old").unwrap().unwrap();
-        assert!(state.get_run("old").unwrap().is_none());
+        let progress = state.get_run_progress("crash").unwrap().unwrap();
+        assert!(state.get_run("crash").unwrap().is_none());
         assert!(ensure_run_is_resumable(&state, &progress).is_err());
         assert!(matches!(
             process_table(&StableMarker(&warehouse), &state, &pipeline, &task, true)
@@ -44055,7 +44080,7 @@ timestamp_column = "ts"
                 .unwrap(),
             TableOutcome::Pruned(_)
         ));
-        let target = table_key(&task);
+        let target = selected;
         let planned = [target.clone()].into_iter().collect();
         assert_eq!(
             state
@@ -44118,7 +44143,51 @@ timestamp_column = "ts"
         state
             .supersede_complete_recordless_checkpoints("fresh", &scope, &planned)
             .unwrap();
-        assert!(state.get_run_progress("old").unwrap().unwrap().superseded);
+        assert!(!state.get_run_progress("crash").unwrap().unwrap().superseded);
+        assert_eq!(
+            state
+                .complete_recordless_check_targets(&scope, &planned)
+                .unwrap(),
+            planned
+        );
+        for next in [&task, &other] {
+            let TableOutcome::Materialized(_) = process_table_with_replacement_recovery(
+                &StableMarker(&warehouse),
+                &state,
+                &pipeline,
+                next,
+                true,
+                false,
+                true,
+            )
+            .await
+            .unwrap() else {
+                panic!("the full run must copy every target before checking it");
+            };
+            let source = warehouse
+                .execute_query(&format!(
+                    "SELECT COUNT(*) FROM src.{}",
+                    next.source_table_name
+                ))
+                .await
+                .unwrap();
+            let target = warehouse
+                .execute_query(&format!(
+                    "SELECT COUNT(*) FROM tgt.{}",
+                    next.target_table_name
+                ))
+                .await
+                .unwrap();
+            let source_count = source.rows[0][0].as_str().unwrap().parse().unwrap();
+            let target_count = target.rows[0][0].as_str().unwrap().parse().unwrap();
+            let _completed_check = rocky_core::checks::check_row_count(source_count, target_count);
+        }
+        seed_run_record(&state, "full", "PartialFailure");
+        let full_plan = [target.clone(), other_key].into_iter().collect();
+        state
+            .supersede_complete_recordless_checkpoints("full", &scope, &full_plan)
+            .unwrap();
+        assert!(state.get_run_progress("crash").unwrap().unwrap().superseded);
         assert!(
             state
                 .complete_recordless_check_targets(&scope, &planned)
