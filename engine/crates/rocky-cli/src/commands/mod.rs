@@ -306,8 +306,8 @@ pub(crate) const TRANSFORMATION_FILTER_KEYS: &[&str] = &["table", "model", "cata
 /// walking the same tree separately is how they stop agreeing — silently, and
 /// only for the projects where it matters.
 ///
-/// `ephemeral` models are excluded: they materialize nothing, so there is no
-/// physical table to promote or to compare.
+/// `compare` excludes ephemeral models because they have no physical target.
+/// Promote includes them so its strategy gate can refuse them explicitly.
 ///
 /// `verb` names the caller in the two error messages, so a user sees the
 /// command they ran rather than this helper.
@@ -316,7 +316,14 @@ pub(crate) fn transformation_prod_targets(
     config_path: &std::path::Path,
     filter: Option<&str>,
     verb: &str,
-) -> Result<Vec<(String, rocky_ir::TargetRef)>> {
+    include_ephemeral: bool,
+) -> Result<
+    Vec<(
+        String,
+        rocky_ir::TargetRef,
+        rocky_core::models::StrategyConfig,
+    )>,
+> {
     let parsed_filter = filter.map(parse_filter).transpose()?;
     if let Some((key, _)) = &parsed_filter
         && !TRANSFORMATION_FILTER_KEYS.contains(&key.as_str())
@@ -349,10 +356,12 @@ pub(crate) fn transformation_prod_targets(
 
     let mut targets = Vec::new();
     for model in &all_models {
-        if matches!(
-            model.config.strategy,
-            rocky_core::models::StrategyConfig::Ephemeral
-        ) {
+        if !include_ephemeral
+            && matches!(
+                model.config.strategy,
+                rocky_core::models::StrategyConfig::Ephemeral
+            )
+        {
             continue;
         }
         if let Some((key, value)) = &parsed_filter {
@@ -374,6 +383,7 @@ pub(crate) fn transformation_prod_targets(
                 schema: model.config.target.schema.clone(),
                 table: model.config.target.table.clone(),
             },
+            model.config.strategy.clone(),
         ));
     }
     Ok(targets)

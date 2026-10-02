@@ -823,7 +823,7 @@ rocky branch promote <name> --plan <plan-id> [--pipeline <name>]   # canonical: 
 
 Branch names accept 1–64 `[A-Za-z0-9_]` characters. Rocky refuses other characters at the command entry point and suggests underscores. The default schema prefix is `branch__<name>`. Deleting a branch removes its state-store entry but leaves its warehouse tables.
 
-**Target names have their own limit.** `branch promote` writes each name into a `CREATE OR REPLACE TABLE` statement, quoted the way the warehouse quotes identifiers. Quoting is not escaping, so one character cannot survive it: the warehouse's own identifier quote. Promote refuses a catalog, schema or table name containing it, and names the character.
+**Target names have their own limit.** `branch promote` quotes each name in the strategy's `CREATE OR REPLACE TABLE` or `VIEW` statement. Quoting is not escaping. Promote refuses a name that contains the warehouse's identifier quote and names the character.
 
 | Warehouse | Identifier quote | Also refused |
 |---|---|---|
@@ -871,7 +871,11 @@ Writes a content-addressed approval artifact that binds the approver's git ident
 | `--pipeline <name>` | `string` | (none) | Which pipeline to promote, in a multi-pipeline project. Optional when the project defines a single pipeline, or when `--plan` names a promote plan that already recorded one — omit it to use the plan's pipeline. A value that disagrees with the plan's recorded pipeline is refused. |
 | `--filter <key=value>` | `string` | (none) | Filter the promote targets. Replication pipelines filter sources by schema-pattern component (e.g. `--filter client=acme`); transformation pipelines filter models by `table`, `model`, `catalog`, or `schema`. |
 
-`rocky branch promote` enumerates the pipeline's production targets and promotes each one. A replication pipeline finds the source connector's tables through the schema-pattern templates. A transformation pipeline walks the configured `models` glob and promotes one target per model, skipping ephemeral models. Rocky then runs the optional `[branch.approval]` gate, followed by the semantic breaking-change gate against `--base-ref`. For each target it dispatches `CREATE OR REPLACE TABLE prod.<x> AS SELECT * FROM branch__<name>.<x>`. Quality and snapshot pipelines are not supported and return a clear error.
+`rocky branch promote` enumerates the pipeline's production targets. A replication pipeline finds the source connector's tables through the schema-pattern templates. A transformation pipeline walks the configured `models` glob. Rocky runs the optional `[branch.approval]` gate and the semantic breaking-change gate against `--base-ref`.
+
+Rocky promotes table strategies with `CREATE OR REPLACE TABLE`. It promotes `view` with `CREATE OR REPLACE VIEW`. It refuses `materialized_view`, `dynamic_table`, `content_addressed`, and `ephemeral` models because their promotion is undefined. Quality and snapshot pipelines are also unsupported.
+
+Before the first replacement, Rocky builds every statement, checks the names, and verifies that every branch source can be read. A predictable failure stops the whole promote without replacing a target. If a later write fails, Rocky does not roll back earlier replacements. Text output names each replaced, failed, and unattempted target. JSON includes every planned target in `targets`; `succeeded` is `false` for the failed and unattempted targets, and `error` explains why. The command exits non-zero.
 
 The breaking-change gate vetoes the promote and exits non-zero when any finding has `severity == "breaking"`, unless you pass `--allow-breaking`. Rocky records every gate decision in the audit trail: a block, an allow via override, and a fail-open when the gate could not run. To surface the same findings on every pull request without blocking, use [`rocky ci-diff --semantic`](/reference/commands/modeling/#rocky-ci-diff).
 
