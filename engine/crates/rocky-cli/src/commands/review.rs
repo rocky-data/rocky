@@ -280,7 +280,9 @@ pub async fn compute_review_with_state_path(
     .await
 }
 
-async fn compute_review_with_disclosure(
+/// Run an approval guard after the review is computed and before its marker
+/// is written. MCP uses this to bind confirmation to disclosed findings.
+pub async fn compute_review_with_disclosure(
     root: &Path,
     config_path: &Path,
     state_path: Option<&Path>,
@@ -325,17 +327,24 @@ async fn compute_review_with_disclosure(
         plan.kind,
         PlanKind::Gc | PlanKind::Restore | PlanKind::Compact | PlanKind::Archive
     ) {
-        return compute_review_marker_only(root, plan_id, approve, &plan.kind).await;
+        return compute_review_marker_only(root, plan_id, approve, &plan.kind, disclose).await;
     }
 
     let run_plan: RunPlan = serde_json::from_value(plan.payload.clone())
         .context("failed to deserialize plan payload")?;
     let resolved_config_path = root.join(config_path);
 
-    // Use apply's execution selection, including the pipeline's configured
-    // file glob. A relative explicit directory belongs to this project root,
-    // not the review server's process directory.
-    let (selected_dir, models_glob) =
+    // Run plans use apply's execution selection, including the pipeline glob.
+    // Backfills below use their persisted directory and rebuild set instead.
+    // A relative directory belongs to this project root.
+    let (selected_dir, models_glob) = if plan.kind == PlanKind::Backfill {
+        // Backfill executes its persisted directory and model set, without the
+        // transformation pipeline's glob.
+        (
+            PathBuf::from(run_plan.models_dir.as_deref().unwrap_or("models")),
+            None,
+        )
+    } else {
         match rocky_core::config::load_optional_project_config(Some(&resolved_config_path))
             .with_context(|| {
                 format!(
@@ -348,31 +357,30 @@ async fn compute_review_with_disclosure(
                 PathBuf::from(run_plan.models_dir.as_deref().unwrap_or("models")),
                 None,
             ),
-        };
+        }
+    };
     let (models_dir, default_state_path) = review_gate_paths(root, &selected_dir);
     let state_path = state_path.unwrap_or(&default_state_path);
 
     // `?` here is the whole point of the change: a present-but-unloadable
     // `rocky.toml` propagates BEFORE the `--approve` branch below, so no marker
     // is written and no zero count is recorded.
-    let findings = compute_review_findings(
-        &resolved_config_path,
-        &models_dir,
-        models_glob.as_deref(),
-        state_path,
-        base_ref,
-    )?;
+    let findings =
+        compute_review_findings(&resolved_config_path, &models_dir, state_path, base_ref)?;
     let breaking_count = findings
         .as_ref()
         .map(|f| f.iter().filter(|x| x.is_breaking()).count())
         .unwrap_or(0);
-    let conditional_drops = super::plan::conditional_drops_for_run_plan(
+    let mut conditional_drops = super::plan::conditional_drops_for_run_plan(
         &resolved_config_path,
         &models_dir,
         models_glob.as_deref(),
         state_path,
         &run_plan,
     )?;
+    if plan.kind == PlanKind::Backfill {
+        conditional_drops.retain(|drop| run_plan.models.iter().any(|model| model == &drop.model));
+    }
 
     disclose(&conditional_drops, &findings)?;
 
@@ -450,7 +458,12 @@ async fn compute_review_marker_only(
     plan_id: &str,
     approve: bool,
     kind: &PlanKind,
+    disclose: impl FnOnce(
+        &[crate::output::ConditionalDrop],
+        &Option<Vec<BreakingFinding>>,
+    ) -> Result<()>,
 ) -> Result<ReviewOutput> {
+    disclose(&[], &None)?;
     let mut marker_written = false;
     if approve {
         let approver =
@@ -605,7 +618,6 @@ fn review_gate_paths(root: &Path, selected_dir: &Path) -> (PathBuf, PathBuf) {
 fn compute_review_findings(
     config_path: &Path,
     models_dir: &Path,
-    models_glob: Option<&str>,
     state_path: &Path,
     base_ref: &str,
 ) -> Result<Option<Vec<BreakingFinding>>> {
@@ -652,8 +664,7 @@ fn compute_review_findings(
             source_schemas: source_schemas.clone(),
             ..Default::default()
         };
-        let result = compile_review_models(&config, models_glob);
-        match result {
+        match rocky_compiler::compile::compile(&config) {
             Ok(r) => r,
             Err(e) => {
                 tracing::warn!(
@@ -666,37 +677,22 @@ fn compute_review_findings(
         }
     };
 
-    let base_compile = match super::ci_diff::extract_base_compile_matching(
-        base_ref,
-        models_dir,
-        source_schemas,
-        models_glob,
-    ) {
-        Ok(r) => r,
-        Err(reason) => {
-            tracing::warn!(
-                target: "rocky::review",
-                reason = %reason,
-                "base compile failed — breaking-change gate skipped"
-            );
-            return Ok(None);
-        }
-    };
+    let base_compile =
+        match super::ci_diff::extract_base_compile(base_ref, models_dir, source_schemas) {
+            Ok(r) => r,
+            Err(reason) => {
+                tracing::warn!(
+                    target: "rocky::review",
+                    reason = %reason,
+                    "base compile failed — breaking-change gate skipped"
+                );
+                return Ok(None);
+            }
+        };
 
     let base_ir = super::ci_diff::project_ir_from_compile(&base_compile);
     let head_ir = super::ci_diff::project_ir_from_compile(&head_compile);
     Ok(Some(breaking_change::diff_project_ir(&base_ir, &head_ir)))
-}
-
-fn compile_review_models(
-    config: &rocky_compiler::compile::CompilerConfig,
-    models_glob: Option<&str>,
-) -> Result<rocky_compiler::compile::CompileResult> {
-    let compiled = match models_glob {
-        Some(glob) => rocky_compiler::compile::compile_matching(config, glob)?,
-        None => rocky_compiler::compile::compile(config)?,
-    };
-    Ok(compiled)
 }
 
 /// Write the review marker to `<root>/.rocky/plans/<plan_id>.reviewed.json`.
@@ -1303,30 +1299,6 @@ mod tests {
     use super::*;
     use crate::output::ApproverSource;
 
-    #[test]
-    fn breaking_review_head_ignores_invalid_model_outside_execution_glob() -> anyhow::Result<()> {
-        let dir = tempfile::tempdir()?;
-        std::fs::write(dir.path().join("switch.sql"), "SELECT 1 AS id\n")?;
-        std::fs::write(
-            dir.path().join("switch.toml"),
-            "name = \"switch\"\n[strategy]\ntype = \"full_refresh\"\n[target]\ncatalog = \"\"\nschema = \"main\"\n",
-        )?;
-        std::fs::write(dir.path().join("excluded.sql"), "SELECT 2 AS id\n")?;
-        std::fs::write(dir.path().join("excluded.toml"), "invalid = [")?;
-        let config = rocky_compiler::compile::CompilerConfig {
-            models_dir: dir.path().to_path_buf(),
-            ..Default::default()
-        };
-        assert!(compile_review_models(&config, None).is_err());
-        let selected = compile_review_models(
-            &config,
-            Some(&dir.path().join("switch.sql").to_string_lossy()),
-        )?;
-        assert_eq!(selected.project.models.len(), 1);
-        assert_eq!(selected.project.models[0].config.name, "switch");
-        Ok(())
-    }
-
     #[tokio::test]
     async fn approval_discloses_drops_before_marker_and_refuses_failed_review() -> anyhow::Result<()>
     {
@@ -1504,6 +1476,66 @@ mod tests {
             "DROP TABLE IF EXISTS main.switch"
         );
         assert!(!review.marker_written);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn backfill_drop_review_uses_persisted_directory_without_pipeline_glob()
+    -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let models = dir.path().join("models");
+        std::fs::create_dir(&models)?;
+        std::fs::write(models.join("visible.sql"), "SELECT 1 AS id\n")?;
+        std::fs::write(
+            models.join("visible.toml"),
+            "name = \"visible\"\ndrop_existing_kind = \"table\"\n[strategy]\ntype = \"view\"\n[target]\ncatalog = \"\"\nschema = \"main\"\n",
+        )?;
+        std::fs::write(models.join("recovery.sql"), "SELECT 2 AS id\n")?;
+        std::fs::write(
+            models.join("recovery.toml"),
+            "name = \"recovery\"\ndrop_existing_kind = \"table\"\n[strategy]\ntype = \"view\"\n[target]\ncatalog = \"\"\nschema = \"main\"\n",
+        )?;
+        std::fs::write(
+            dir.path().join("rocky.toml"),
+            "[adapter.default]\ntype = \"duckdb\"\ndatabase = \":memory:\"\n\n[pipeline.p]\ntype = \"transformation\"\nmodels = \"models/visible.sql\"\n\n[pipeline.p.target]\nadapter = \"default\"\n",
+        )?;
+        let payload = serde_json::json!({"parallel": 1, "pipeline": "p", "models_dir": "models", "models": ["recovery"]});
+        let plan_id = crate::plan_store::write_plan(dir.path(), PlanKind::Backfill, &payload)?;
+        let review = compute_review_with_state_path(
+            dir.path(),
+            Path::new("rocky.toml"),
+            Some(&dir.path().join("state.redb")),
+            &plan_id,
+            "HEAD",
+            false,
+        )
+        .await?;
+        assert_eq!(review.conditional_drops.len(), 1);
+        assert_eq!(review.conditional_drops[0].model, "recovery");
+        assert_eq!(
+            review.conditional_drops[0].drop_sql,
+            "DROP TABLE IF EXISTS main.recovery"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn marker_only_review_guard_refuses_before_marker_write() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let plan_id =
+            crate::plan_store::write_plan(dir.path(), PlanKind::Gc, &serde_json::json!({}))?;
+        let result = compute_review_with_disclosure(
+            dir.path(),
+            Path::new("rocky.toml"),
+            None,
+            &plan_id,
+            "HEAD",
+            true,
+            |_, _| anyhow::bail!("review token missing"),
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(!review_marker_path(dir.path(), &plan_id).exists());
         Ok(())
     }
 
@@ -2218,13 +2250,13 @@ mod tests {
         // the base compile has no git repo to read.
         let (models_dir, state_path) = review_gate_paths(root, Path::new("models"));
         assert!(
-            compute_review_findings(&config_path, &models_dir, None, &state_path, "HEAD").is_ok(),
+            compute_review_findings(&config_path, &models_dir, &state_path, "HEAD").is_ok(),
             "an absent rocky.toml must skip the gate, never refuse it"
         );
         let broken = root.join("broken.toml");
         std::fs::write(&broken, BROKEN_CONFIG_1680)?;
         assert!(
-            compute_review_findings(&broken, &models_dir, None, &state_path, "HEAD").is_err(),
+            compute_review_findings(&broken, &models_dir, &state_path, "HEAD").is_err(),
             "a present-but-broken rocky.toml must refuse the gate"
         );
 

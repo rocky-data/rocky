@@ -1106,6 +1106,26 @@ effect = "require_review"
     assert_eq!(plans.len(), 1, "the propose persisted one plan for review");
     let plan_id = plans[0].file_stem().unwrap().to_str().unwrap().to_string();
 
+    let without_token = serde_json::json!({"approve_plan_id": plan_id, "confirm": true})
+        .as_object()
+        .unwrap()
+        .clone();
+    let refused = client
+        .call_tool(CallToolRequestParams::new("review_queue").with_arguments(without_token))
+        .await
+        .expect("confirm without token returns a refusal");
+    assert_eq!(refused.is_error, Some(true));
+    assert_eq!(
+        refused.structured_content.unwrap()["code"],
+        "invalid_argument"
+    );
+    assert!(
+        !dir.path()
+            .join(".rocky/plans")
+            .join(format!("{plan_id}.reviewed.json"))
+            .exists()
+    );
+
     // review_queue (read) lists the escalation, cited.
     let queue = client
         .call_tool(CallToolRequestParams::new("review_queue"))
@@ -1235,6 +1255,10 @@ effect = "require_review"
     assert_eq!(drops[0]["existing_kind"], "view");
     assert!(drops[0]["drop_sql"].as_str().unwrap().contains("DROP VIEW"));
     assert!(review.get("approval").is_none());
+    let token = review["review_token"]
+        .as_str()
+        .expect("dry-run review token")
+        .to_string();
 
     // No sign-off marker before confirmation — the gate held.
     let marker = dir
@@ -1244,11 +1268,38 @@ effect = "require_review"
         .join(format!("{plan_id}.reviewed.json"));
     assert!(!marker.exists(), "no sign-off marker before confirmation");
 
+    let original_sidecar = std::fs::read_to_string(&sidecar).unwrap();
+    std::fs::write(
+        &sidecar,
+        original_sidecar.replace(
+            "drop_existing_kind = \"view\"",
+            "drop_existing_kind = \"table\"",
+        ),
+    )
+    .unwrap();
+    let stale =
+        serde_json::json!({"approve_plan_id": plan_id, "confirm": true, "review_token": token})
+            .as_object()
+            .unwrap()
+            .clone();
+    let refused = client
+        .call_tool(CallToolRequestParams::new("review_queue").with_arguments(stale))
+        .await
+        .expect("stale token returns a refusal");
+    assert_eq!(refused.is_error, Some(true));
+    assert_eq!(
+        refused.structured_content.unwrap()["code"],
+        "invalid_argument"
+    );
+    assert!(!marker.exists(), "stale token cannot write a marker");
+    std::fs::write(&sidecar, original_sidecar).unwrap();
+
     // review_queue approve WITH confirm=true → writes the marker, attributed.
-    let approve = serde_json::json!({ "approve_plan_id": plan_id, "confirm": true })
-        .as_object()
-        .unwrap()
-        .clone();
+    let approve =
+        serde_json::json!({ "approve_plan_id": plan_id, "confirm": true, "review_token": token })
+            .as_object()
+            .unwrap()
+            .clone();
     let approved = client
         .call_tool(CallToolRequestParams::new("review_queue").with_arguments(approve))
         .await
