@@ -135,9 +135,12 @@ impl WarehouseAdapter for DuckDbWarehouseAdapter {
             return false;
         };
         let message = driver_error.to_string();
-        (message.starts_with("Catalog Error: Table with name ")
+        ((message.starts_with("Catalog Error: Table with name ")
             || message.starts_with("Catalog Error: Schema with name "))
-            && message.contains(" does not exist!")
+            && message.contains(" does not exist!"))
+            || (message.starts_with("Catalog Error: Table with name ")
+                && message.contains(" does not exist because schema ")
+                && message.contains(" does not exist."))
     }
 
     /// DuckDB folds identifier case, so this is a dialect constant and needs
@@ -522,6 +525,20 @@ mod tests {
         assert!(!adapter.is_missing_object_error(&AdapterError::msg(
             "Catalog Error: Table with name missing does not exist!"
         )));
+    }
+
+    #[tokio::test]
+    async fn real_describe_missing_schema_error_confirms_absence() {
+        let adapter = DuckDbWarehouseAdapter::in_memory().unwrap();
+        let missing = adapter
+            .describe_table(&TableRef {
+                catalog: "memory".into(),
+                schema: "missing_schema".into(),
+                table: "missing".into(),
+            })
+            .await
+            .unwrap_err();
+        assert!(adapter.is_missing_object_error(&missing), "{missing}");
     }
 
     #[test]

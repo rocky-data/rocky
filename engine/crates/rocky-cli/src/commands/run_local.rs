@@ -1687,6 +1687,24 @@ mod tests {
         shadow_config: Option<&rocky_core::shadow::ShadowConfig>,
         model_name_filter: Option<&str>,
     ) {
+        run_full_dag_result(
+            config_path,
+            state_path,
+            skip_unchanged,
+            shadow_config,
+            model_name_filter,
+        )
+        .await
+        .expect("full-DAG transformation run should succeed");
+    }
+
+    async fn run_full_dag_result(
+        config_path: &Path,
+        state_path: &Path,
+        skip_unchanged: bool,
+        shadow_config: Option<&rocky_core::shadow::ShadowConfig>,
+        model_name_filter: Option<&str>,
+    ) -> anyhow::Result<()> {
         let opts = PartitionRunOptions::default();
         let models_dir = config_path.parent().unwrap().join("models");
         let skip_opts = SkipRunOptions {
@@ -1724,7 +1742,16 @@ mod tests {
             None,  // #1460
         )
         .await
-        .expect("full-DAG transformation run should succeed");
+        .map(|_| ())
+    }
+
+    fn assert_shadow_comparison_failed(result: anyhow::Result<()>, expected_count: usize) {
+        let error = result.expect_err("divergent shadow comparison must fail the run");
+        let failure = error
+            .downcast_ref::<super::super::run::ShadowComparisonFailure>()
+            .unwrap_or_else(|| panic!("failure must report the shadow comparison: {error:#}"));
+        assert_eq!(failure.count, expected_count);
+        assert!(!failure.run_id.is_empty());
     }
 
     /// Write the project `rocky.toml`. `skip_block` controls whether the
@@ -2432,11 +2459,11 @@ auto_create_schemas = true
             "SELECT * FROM (VALUES (1), (2)) AS t(id)",
             &[],
         );
-        let shadow = rocky_core::shadow::ShadowConfig {
-            cleanup_after: false,
-            ..Default::default()
-        };
-        run_full_dag(&config_path, &state_path, false, Some(&shadow), None).await;
+        let shadow = rocky_core::shadow::ShadowConfig::default();
+        assert_shadow_comparison_failed(
+            run_full_dag_result(&config_path, &state_path, false, Some(&shadow), None).await,
+            2,
+        );
 
         assert_eq!(
             count_rows(&db, "orders").await,
@@ -2493,18 +2520,18 @@ auto_create_schemas = true
             "SELECT * FROM (VALUES (1), (2)) AS t(id)",
             &[],
         );
-        let suffix_shadow = rocky_core::shadow::ShadowConfig {
-            cleanup_after: false,
-            ..Default::default()
-        };
-        run_full_dag(
-            &config_path,
-            &state_path,
-            false,
-            Some(&suffix_shadow),
-            Some("orders"),
-        )
-        .await;
+        let suffix_shadow = rocky_core::shadow::ShadowConfig::default();
+        assert_shadow_comparison_failed(
+            run_full_dag_result(
+                &config_path,
+                &state_path,
+                false,
+                Some(&suffix_shadow),
+                Some("orders"),
+            )
+            .await,
+            1,
+        );
         assert_eq!(
             count_rows(&db, "orders").await,
             1,
@@ -2516,7 +2543,18 @@ auto_create_schemas = true
             "suffix shadow must materialize the rewritten table"
         );
 
-        run_full_dag(&config_path, &state_path, false, Some(&suffix_shadow), None).await;
+        // A failed comparison retains its shadow for inspection. The next
+        // one-off run refuses to reuse that name, so clear the inspected table.
+        let adapter = DuckDbWarehouseAdapter::open(&db).unwrap();
+        adapter
+            .execute_statement("DROP TABLE main.orders_rocky_shadow")
+            .await
+            .unwrap();
+        drop(adapter);
+        assert_shadow_comparison_failed(
+            run_full_dag_result(&config_path, &state_path, false, Some(&suffix_shadow), None).await,
+            2,
+        );
         assert_eq!(
             count_rows(&db, "mart_rocky_shadow").await,
             2,
@@ -2534,7 +2572,10 @@ auto_create_schemas = true
             cleanup_after: false,
             ..Default::default()
         };
-        run_full_dag(&config_path, &state_path, false, Some(&branch_shadow), None).await;
+        assert_shadow_comparison_failed(
+            run_full_dag_result(&config_path, &state_path, false, Some(&branch_shadow), None).await,
+            2,
+        );
         assert_eq!(
             count_rows(&db, "orders").await,
             1,
