@@ -987,9 +987,9 @@ pub struct DriftPreviewResult {
 /// Result of the `review_queue` tool.
 ///
 /// In the read mode (`approve_plan_id` unset) `approval` is `None` and `pending`
-/// carries the full ranked queue. In the approve mode it carries the
-/// [`ReviewApprovalOutcome`] and `pending` is re-listed *after* the sign-off, so
-/// the caller sees the just-approved escalation cleared.
+/// carries the full ranked queue. In the approve mode it carries the computed
+/// review and [`ReviewApprovalOutcome`]. `pending` is re-listed *after* the
+/// sign-off, so the caller sees the just-approved escalation cleared.
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct ReviewQueueResult {
     /// Number of escalations still awaiting review after this call.
@@ -1003,7 +1003,7 @@ pub struct ReviewQueueResult {
     /// be read integrity-checked appears as a `{plan_id, warning}` entry
     /// instead of being silently dropped.
     pub pending: serde_json::Value,
-    /// Dry-run review returned before confirmation for an exact pending plan.
+    /// Review for the exact pending plan, also returned with confirmation.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub review: Option<serde_json::Value>,
     /// Present only when this call approved a plan.

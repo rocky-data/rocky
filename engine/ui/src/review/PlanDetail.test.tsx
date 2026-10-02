@@ -110,6 +110,29 @@ function loaders(overrides: Partial<PlanLoaders> = {}): PlanLoaders {
 }
 
 describe("PlanDetail", () => {
+  it("withholds the approval command until the DROP review succeeds", async () => {
+    let resolveDiff!: (value: ReviewOutput) => void;
+    const pending = new Promise<ReviewOutput>((resolve) => { resolveDiff = resolve; });
+    const view = render(
+      <PlanDetail planId={PLAN} loaders={loaders({ diff: vi.fn(() => pending) })} />,
+    );
+    await screen.findByText("awaiting a human");
+    expect(screen.queryByText(`rocky review ${PLAN} --approve`)).toBeNull();
+
+    resolveDiff(DIFF);
+    await screen.findByText('DROP TABLE IF EXISTS "main"."orders"');
+    expect(screen.getByText(`rocky review ${PLAN} --approve`)).toBeTruthy();
+    view.unmount();
+
+    render(
+      <PlanDetail planId={PLAN} loaders={loaders({
+        diff: vi.fn(async () => { throw new Error("review unavailable"); }),
+      })} />,
+    );
+    await screen.findByText(/review unavailable/);
+    expect(screen.queryByText(`rocky review ${PLAN} --approve`)).toBeNull();
+  });
+
   /// The queue is not a durable source for the model name: an approval marker
   /// resolves the escalation, so the entry disappears exactly when the table
   /// it built starts existing. Reading the queue alone meant the panel could

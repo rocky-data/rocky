@@ -549,7 +549,9 @@ export function PlanDetail({
         <SampleFallback lookup={lookup} productId={productId} product={product} />
       )}
 
-      <HowToApprove status={status.value} entries={entries} />
+      {(status.value.reviewed || diff.kind === "ready") && (
+        <HowToApprove status={status.value} entries={entries} />
+      )}
     </div>
   );
 }

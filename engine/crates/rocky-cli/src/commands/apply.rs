@@ -455,6 +455,10 @@ async fn run_apply_run_plan(
     let run_plan: RunPlan = serde_json::from_value(plan.payload.clone())
         .context("failed to deserialize run plan payload")?;
 
+    if super::review::plan_is_reviewable(&plan) {
+        require_reviewable_plan_fingerprint(&plan, plan_id)?;
+    }
+
     validate_run_plan_execution_shape(plan_id, &run_plan)?;
 
     // policy seam 2: an agent running `rocky apply` (`ROCKY_PRINCIPAL=agent`) is
@@ -3794,7 +3798,7 @@ async fn run_apply_ai_authored_plan(
     let run_plan: RunPlan = serde_json::from_value(plan.payload.clone())
         .context("failed to deserialize ai_authored plan payload")?;
 
-    require_ai_plan_fingerprint(&plan, plan_id)?;
+    require_reviewable_plan_fingerprint(&plan, plan_id)?;
 
     validate_run_plan_execution_shape(plan_id, &run_plan)?;
 
@@ -3946,11 +3950,11 @@ async fn run_apply_ai_authored_plan(
     Ok(apply_outcome_for(termination, &apply_run_id))
 }
 
-fn require_ai_plan_fingerprint(plan: &PersistedPlan, plan_id: &str) -> Result<()> {
+fn require_reviewable_plan_fingerprint(plan: &PersistedPlan, plan_id: &str) -> Result<()> {
     let capabilities = plan.embedded_capabilities();
     if capabilities.fingerprint_version == 0 || capabilities.models_fingerprint.is_none() {
         bail!(
-            "refusing to apply AI-authored plan '{plan_id}' without an execution fingerprint. \
+            "refusing to apply review-gated plan '{plan_id}' without an execution fingerprint. \
              Re-run `rocky plan` and review the new plan before applying."
         );
     }
@@ -4023,6 +4027,8 @@ async fn run_apply_backfill_plan(
 
     let run_plan: RunPlan = serde_json::from_value(plan.payload.clone())
         .context("failed to deserialize backfill plan payload")?;
+
+    require_reviewable_plan_fingerprint(&plan, plan_id)?;
 
     // HARD RULE: a backfill is always review-gated, regardless of policy.
     match super::review::review_marker_state(root, plan_id) {
@@ -6116,6 +6122,87 @@ mod tests {
                 ..Default::default()
             },
         )
+    }
+
+    #[tokio::test]
+    async fn reviewed_legacy_agent_run_refuses_later_drop_permission() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path();
+        let models = root.join("models");
+        std::fs::create_dir(&models)?;
+        std::fs::write(models.join("switch.sql"), "SELECT 1 AS id\n")?;
+        let sidecar = models.join("switch.toml");
+        std::fs::write(
+            &sidecar,
+            "name = \"switch\"\n[strategy]\ntype = \"full_refresh\"\n[target]\ncatalog = \"\"\nschema = \"main\"\n",
+        )?;
+        let config = write_config(root, "")?;
+        let state = root.join("state.redb");
+        let plan = RunPlan {
+            pipeline: Some("p".to_string()),
+            models_dir: Some("models".to_string()),
+            models: vec!["switch".to_string()],
+            ..minimal_run_plan()
+        };
+        let id = crate::plan_store::write_plan_governed(
+            root,
+            PlanKind::Run,
+            &plan,
+            PolicyPrincipal::Agent,
+            crate::plan_store::EmbeddedCapabilities::default(),
+        )?;
+        let review = crate::commands::review::compute_review_with_state_path(
+            root,
+            &config,
+            Some(&state),
+            &id,
+            "HEAD",
+            true,
+        )
+        .await?;
+        assert!(review.marker_written);
+        assert!(review.conditional_drops.is_empty());
+
+        std::fs::write(
+            &sidecar,
+            "name = \"switch\"\ndrop_existing_kind = \"view\"\n[strategy]\ntype = \"full_refresh\"\n[target]\ncatalog = \"\"\nschema = \"main\"\n",
+        )?;
+        let error = run_apply_in(
+            root,
+            &config,
+            &id,
+            &state,
+            PolicyPrincipal::Agent,
+            None,
+            false,
+        )
+        .await
+        .expect_err("a reviewed fingerprintless run must refuse the new DROP");
+        assert!(format!("{error:#}").contains("Re-run `rocky plan`"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reviewed_fingerprintless_backfill_refuses_before_execution() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path();
+        let id = write_plan(root, PlanKind::Backfill, &minimal_run_plan())?;
+        let marker = super::review_marker_path(root, &id);
+        std::fs::create_dir_all(marker.parent().expect("marker has parent"))?;
+        std::fs::write(&marker, well_formed_marker_json(&id))?;
+        let error = run_apply_in(
+            root,
+            &root.join("rocky.toml"),
+            &id,
+            &root.join("state.redb"),
+            PolicyPrincipal::Human,
+            None,
+            false,
+        )
+        .await
+        .expect_err("a reviewed backfill without a fingerprint must refuse");
+        assert!(format!("{error:#}").contains("Re-run `rocky plan`"));
+        Ok(())
     }
 
     #[tokio::test]

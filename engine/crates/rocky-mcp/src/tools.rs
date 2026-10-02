@@ -5658,8 +5658,9 @@ impl RockyMcpServer {
          is refused with `approve_not_enabled` unless the operator started this server as `rocky \
          mcp --profile approver`. Where it is served, `approve_plan_id` without confirmation \
          returns the dry-run review, including conditional DROPs, before any marker is written. \
-         `confirm=true` writes the marker only for a pending plan (the confirmation stands in \
-         for explicit human intent). Policy applies to \
+         `confirm=true` computes the review, returns its conditional DROPs and breaking findings, \
+         and writes the marker only when that succeeds for a pending plan. The confirmation stands in \
+         for explicit human intent. Policy applies to \
          the governor's agent too: the approval is attributed to the operator's git identity, not \
          a cryptographically bound principal (a signed human confirmation is a later step). Never \
          approve on the user's behalf; the normal path is the human running `rocky review \
@@ -5806,7 +5807,7 @@ impl RockyMcpServer {
             plan_id: plan_id.to_string(),
             marker_written: review.marker_written,
             breaking_change_count,
-            message: review.message.unwrap_or_default(),
+            message: review.message.clone().unwrap_or_default(),
             attribution: "Recorded via the governor MCP surface and attributed to the operator's \
                  git identity (name/email/host), not a cryptographically bound principal. A signed \
                  human confirmation is a later step; the confirm flag stands in for explicit human \
@@ -5829,19 +5830,7 @@ impl RockyMcpServer {
                  review_queue to see the current state.",
             )
         })?;
-        let pending = serde_json::to_value(&queue_after.pending).map_err(|e| {
-            ToolError::internal(
-                format!("failed to serialize the review queue: {e}"),
-                "Retry; if it persists this is an internal serialization bug.",
-            )
-        })?;
-        Ok(Json(ReviewQueueResult {
-            total: queue_after.total,
-            ranking: queue_after.ranking,
-            pending,
-            review: None,
-            approval: Some(approval),
-        }))
+        confirmed_review_result(queue_after, review, approval)
     }
 
     /// Resolve the project's target warehouse adapter from `rocky.toml`.
@@ -7483,6 +7472,32 @@ fn preconfirmation_review_result(
         pending,
         review: Some(review),
         approval: None,
+    }))
+}
+
+fn confirmed_review_result(
+    queue: rocky_cli::output::ReviewQueueOutput,
+    review: rocky_cli::output::ReviewOutput,
+    approval: ReviewApprovalOutcome,
+) -> ToolResult<ReviewQueueResult> {
+    let review = serde_json::to_value(review).map_err(|e| {
+        ToolError::internal(
+            format!("failed to serialize the approved review: {e}"),
+            "Retry the review.",
+        )
+    })?;
+    let pending = serde_json::to_value(&queue.pending).map_err(|e| {
+        ToolError::internal(
+            format!("failed to serialize the review queue: {e}"),
+            "Retry the review.",
+        )
+    })?;
+    Ok(Json(ReviewQueueResult {
+        total: queue.total,
+        ranking: queue.ranking,
+        pending,
+        review: Some(review),
+        approval: Some(approval),
     }))
 }
 
@@ -10792,6 +10807,49 @@ database = ":memory:"
         );
         assert_eq!(json["review"]["marker_written"], false);
         assert!(json.get("approval").is_none());
+    }
+
+    #[test]
+    fn confirmed_review_queue_response_contains_the_approved_drop() {
+        let queue = rocky_cli::output::ReviewQueueOutput {
+            version: "test".to_string(),
+            command: "review".to_string(),
+            ranking: "test".to_string(),
+            total: 0,
+            excluded_non_plan_rows: 0,
+            pending: Vec::new(),
+        };
+        let review = rocky_cli::output::ReviewOutput {
+            version: "test".to_string(),
+            command: "review".to_string(),
+            plan_id: "plan".to_string(),
+            base_ref: "HEAD".to_string(),
+            approved: true,
+            marker_written: true,
+            breaking_changes: None,
+            conditional_drops: vec![rocky_cli::output::ConditionalDrop {
+                model: "orders".to_string(),
+                target: "main.orders".to_string(),
+                existing_kind: "view".to_string(),
+                drop_sql: "DROP VIEW IF EXISTS main.orders".to_string(),
+            }],
+            message: None,
+        };
+        let approval = ReviewApprovalOutcome {
+            plan_id: "plan".to_string(),
+            marker_written: true,
+            breaking_change_count: 0,
+            message: String::new(),
+            attribution: String::new(),
+        };
+        let response = super::confirmed_review_result(queue, review, approval)
+            .unwrap_or_else(|_| panic!("confirmed review should serialize"));
+        let json = serde_json::to_value(response.0).unwrap();
+        assert_eq!(
+            json["review"]["conditional_drops"][0]["drop_sql"],
+            "DROP VIEW IF EXISTS main.orders"
+        );
+        assert_eq!(json["approval"]["marker_written"], true);
     }
 
     /// #1517 — the opt-in enables an ACTION, it does not add a TOOL.

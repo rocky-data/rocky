@@ -1087,17 +1087,10 @@ pub(crate) fn conditional_drops_for_run_plan(
         Some(glob) => compile::compile_matching(&config, glob),
         None => compile::compile(&config),
     };
-    let models = match compiled {
-        Ok(result) => result.project.models,
-        // A reviewable plan may omit the informational model list and point at
-        // an uncompiled project. Apply cannot execute a model when this same
-        // compile fails, so there is no conditional DROP to show.
-        Err(_) if run_plan.models.is_empty() && run_plan.model.is_none() => return Ok(Vec::new()),
-        Err(error) => {
-            return Err(anyhow::Error::from(error)
-                .context("failed to compile models for conditional DROP review"));
-        }
-    };
+    let models = compiled
+        .context("failed to compile models for conditional DROP review")?
+        .project
+        .models;
     if models.is_empty() {
         return Ok(Vec::new());
     }

@@ -20,13 +20,11 @@
 //! The marker is written even when breaking changes exist: approving over a
 //! reported break is allowed.
 //!
-//! The marker is ALSO written when the classifier could not run for a
-//! RECOVERABLE reason: a missing models directory, or either tree failing to
-//! compile. `compute_review_findings` returns `Ok(None)` there,
-//! `breaking_change_count` falls back to 0 and `--approve` still writes the
-//! marker. So the count on a marker is not evidence that a delta was computed,
-//! and the emitted output does not always carry one. The approver identity
-//! falls back to `unknown` when the git identity cannot be read.
+//! The classifier may skip for a missing models directory or a failed base
+//! compile. The marker can still be written when the selected models compile
+//! for conditional DROP review. A failed DROP compile refuses approval. A
+//! marker count of zero does not prove that a base delta was computed. The
+//! approver identity falls back to `unknown` when git identity cannot be read.
 //!
 //! One case is NOT recoverable and refuses instead (#1680): a `rocky.toml`
 //! that is PRESENT and does not load. The schema cache the classifier types
@@ -170,13 +168,30 @@ pub(crate) async fn run_review_in(
     approve: bool,
     output_json: bool,
 ) -> Result<()> {
-    let output = compute_review_with_state_path(
+    let output = compute_review_with_disclosure(
         root,
         config_path,
         Some(state_path),
         plan_id,
         base_ref,
         approve,
+        |drops, findings| {
+            if approve {
+                eprintln!("Review findings before approval:");
+                for drop in drops {
+                    eprintln!(
+                        "  {}: -- {} (only if the existing object is a {})",
+                        drop.model, drop.drop_sql, drop.existing_kind
+                    );
+                }
+                if let Some(findings) = findings {
+                    for finding in findings.iter().filter(|f| f.is_breaking()) {
+                        eprintln!("  breaking: {:?}", finding.change);
+                    }
+                }
+            }
+            Ok(())
+        },
     )
     .await?;
 
@@ -253,6 +268,30 @@ pub async fn compute_review_with_state_path(
     base_ref: &str,
     approve: bool,
 ) -> Result<ReviewOutput> {
+    compute_review_with_disclosure(
+        root,
+        config_path,
+        state_path,
+        plan_id,
+        base_ref,
+        approve,
+        |_, _| Ok(()),
+    )
+    .await
+}
+
+async fn compute_review_with_disclosure(
+    root: &Path,
+    config_path: &Path,
+    state_path: Option<&Path>,
+    plan_id: &str,
+    base_ref: &str,
+    approve: bool,
+    disclose: impl FnOnce(
+        &[crate::output::ConditionalDrop],
+        &Option<Vec<BreakingFinding>>,
+    ) -> Result<()>,
+) -> Result<ReviewOutput> {
     let plan = read_plan(root, plan_id)
         .with_context(|| format!("failed to read plan '{plan_id}' for review"))?;
 
@@ -316,8 +355,13 @@ pub async fn compute_review_with_state_path(
     // `?` here is the whole point of the change: a present-but-unloadable
     // `rocky.toml` propagates BEFORE the `--approve` branch below, so no marker
     // is written and no zero count is recorded.
-    let findings =
-        compute_review_findings(&resolved_config_path, &models_dir, state_path, base_ref)?;
+    let findings = compute_review_findings(
+        &resolved_config_path,
+        &models_dir,
+        models_glob.as_deref(),
+        state_path,
+        base_ref,
+    )?;
     let breaking_count = findings
         .as_ref()
         .map(|f| f.iter().filter(|x| x.is_breaking()).count())
@@ -329,6 +373,8 @@ pub async fn compute_review_with_state_path(
         state_path,
         &run_plan,
     )?;
+
+    disclose(&conditional_drops, &findings)?;
 
     let mut marker_written = false;
     if approve {
@@ -548,8 +594,8 @@ fn review_gate_paths(root: &Path, selected_dir: &Path) -> (PathBuf, PathBuf) {
 ///   ran. `findings` is the full classified list including `Info`-severity
 ///   entries; callers filter on [`BreakingFinding::is_breaking`].
 /// - `Ok(None)` when the gate was skipped because the models directory was
-///   unavailable or either side failed to compile. Those are recoverable
-///   conditions the approver can see; the marker is still written.
+///   unavailable or either side failed to compile. Approval still requires
+///   a successful conditional DROP calculation.
 /// - `Err` when a `rocky.toml` is PRESENT and does not load (#1680). That is
 ///   not a skip: the schema cache the classifier types against is gated on the
 ///   config, so an unloadable config silently downgrades a type change to "no
@@ -559,10 +605,11 @@ fn review_gate_paths(root: &Path, selected_dir: &Path) -> (PathBuf, PathBuf) {
 fn compute_review_findings(
     config_path: &Path,
     models_dir: &Path,
+    models_glob: Option<&str>,
     state_path: &Path,
     base_ref: &str,
 ) -> Result<Option<Vec<BreakingFinding>>> {
-    use rocky_compiler::compile::{self, CompilerConfig};
+    use rocky_compiler::compile::CompilerConfig;
 
     // The config is read BEFORE the models-dir check so a broken `rocky.toml`
     // refuses whether or not the project also has a models directory — the
@@ -605,7 +652,8 @@ fn compute_review_findings(
             source_schemas: source_schemas.clone(),
             ..Default::default()
         };
-        match compile::compile(&config) {
+        let result = compile_review_models(&config, models_glob);
+        match result {
             Ok(r) => r,
             Err(e) => {
                 tracing::warn!(
@@ -618,22 +666,37 @@ fn compute_review_findings(
         }
     };
 
-    let base_compile =
-        match super::ci_diff::extract_base_compile(base_ref, models_dir, source_schemas) {
-            Ok(r) => r,
-            Err(reason) => {
-                tracing::warn!(
-                    target: "rocky::review",
-                    reason = %reason,
-                    "base compile failed — breaking-change gate skipped"
-                );
-                return Ok(None);
-            }
-        };
+    let base_compile = match super::ci_diff::extract_base_compile_matching(
+        base_ref,
+        models_dir,
+        source_schemas,
+        models_glob,
+    ) {
+        Ok(r) => r,
+        Err(reason) => {
+            tracing::warn!(
+                target: "rocky::review",
+                reason = %reason,
+                "base compile failed — breaking-change gate skipped"
+            );
+            return Ok(None);
+        }
+    };
 
     let base_ir = super::ci_diff::project_ir_from_compile(&base_compile);
     let head_ir = super::ci_diff::project_ir_from_compile(&head_compile);
     Ok(Some(breaking_change::diff_project_ir(&base_ir, &head_ir)))
+}
+
+fn compile_review_models(
+    config: &rocky_compiler::compile::CompilerConfig,
+    models_glob: Option<&str>,
+) -> Result<rocky_compiler::compile::CompileResult> {
+    let compiled = match models_glob {
+        Some(glob) => rocky_compiler::compile::compile_matching(config, glob)?,
+        None => rocky_compiler::compile::compile(config)?,
+    };
+    Ok(compiled)
 }
 
 /// Write the review marker to `<root>/.rocky/plans/<plan_id>.reviewed.json`.
@@ -1239,6 +1302,78 @@ fn render_excluded_note(excluded: u64) {
 mod tests {
     use super::*;
     use crate::output::ApproverSource;
+
+    #[test]
+    fn breaking_review_head_ignores_invalid_model_outside_execution_glob() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        std::fs::write(dir.path().join("switch.sql"), "SELECT 1 AS id\n")?;
+        std::fs::write(
+            dir.path().join("switch.toml"),
+            "name = \"switch\"\n[strategy]\ntype = \"full_refresh\"\n[target]\ncatalog = \"\"\nschema = \"main\"\n",
+        )?;
+        std::fs::write(dir.path().join("excluded.sql"), "SELECT 2 AS id\n")?;
+        std::fs::write(dir.path().join("excluded.toml"), "invalid = [")?;
+        let config = rocky_compiler::compile::CompilerConfig {
+            models_dir: dir.path().to_path_buf(),
+            ..Default::default()
+        };
+        assert!(compile_review_models(&config, None).is_err());
+        let selected = compile_review_models(
+            &config,
+            Some(&dir.path().join("switch.sql").to_string_lossy()),
+        )?;
+        assert_eq!(selected.project.models.len(), 1);
+        assert_eq!(selected.project.models[0].config.name, "switch");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn approval_discloses_drops_before_marker_and_refuses_failed_review() -> anyhow::Result<()>
+    {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path();
+        let models = root.join("models");
+        std::fs::create_dir(&models)?;
+        std::fs::write(models.join("switch.sql"), "SELECT 1 AS id\n")?;
+        let sidecar = models.join("switch.toml");
+        std::fs::write(
+            &sidecar,
+            "name = \"switch\"\ndrop_existing_kind = \"table\"\n[strategy]\ntype = \"view\"\n[target]\ncatalog = \"\"\nschema = \"main\"\n",
+        )?;
+        let config = root.join("rocky.toml");
+        std::fs::write(
+            &config,
+            "[adapter.default]\ntype = \"duckdb\"\ndatabase = \":memory:\"\n",
+        )?;
+        let payload = serde_json::json!({"parallel": 1, "models_dir": "models", "model": "switch"});
+        let id = crate::plan_store::write_plan(root, PlanKind::AiAuthored, &payload)?;
+        let marker = review_marker_path(root, &id);
+        let state = root.join("state.redb");
+        let output = compute_review_with_disclosure(
+            root,
+            &config,
+            Some(&state),
+            &id,
+            "HEAD",
+            true,
+            |drops, _| {
+                assert!(!marker.exists(), "the marker must follow disclosure");
+                assert_eq!(drops.len(), 1);
+                assert_eq!(drops[0].drop_sql, "DROP TABLE IF EXISTS main.switch");
+                Ok(())
+            },
+        )
+        .await?;
+        assert!(output.marker_written);
+        std::fs::remove_file(&marker)?;
+        std::fs::write(&sidecar, "invalid = [")?;
+        let error = compute_review_with_state_path(root, &config, Some(&state), &id, "HEAD", true)
+            .await
+            .expect_err("failed DROP review must refuse approval");
+        assert!(format!("{error:#}").contains("failed to compile models"));
+        assert!(!marker.exists());
+        Ok(())
+    }
 
     #[tokio::test]
     async fn review_branch_drop_matches_executed_target_before_approval() -> anyhow::Result<()> {
@@ -1994,7 +2129,7 @@ mod tests {
 
     /// Loads under the credential-TOLERANT loader (#1536), refuses under the
     /// strict one this site used before.
-    const UNSET_CREDENTIAL_CONFIG_1680: &str = "[adapters.wh]\ntype = \"databricks\"\n\
+    const UNSET_CREDENTIAL_CONFIG_1680: &str = "[adapters.default]\ntype = \"databricks\"\n\
          host = \"${ROCKY_T_1680_REVIEW_UNSET}\"\n";
 
     /// Build a reviewable AI-authored plan in `root`, with a real models tree
@@ -2003,6 +2138,10 @@ mod tests {
         let models_dir = root.join("models");
         std::fs::create_dir_all(&models_dir)?;
         std::fs::write(models_dir.join("m.sql"), "SELECT id FROM src.raw.t")?;
+        std::fs::write(
+            models_dir.join("m.toml"),
+            "name = \"m\"\n[strategy]\ntype = \"full_refresh\"\n[target]\ncatalog = \"\"\nschema = \"main\"\n",
+        )?;
         let payload = serde_json::json!({ "parallel": 1, "models_dir": "models" });
         crate::plan_store::write_plan(root, PlanKind::AiAuthored, &payload)
     }
@@ -2079,13 +2218,13 @@ mod tests {
         // the base compile has no git repo to read.
         let (models_dir, state_path) = review_gate_paths(root, Path::new("models"));
         assert!(
-            compute_review_findings(&config_path, &models_dir, &state_path, "HEAD").is_ok(),
+            compute_review_findings(&config_path, &models_dir, None, &state_path, "HEAD").is_ok(),
             "an absent rocky.toml must skip the gate, never refuse it"
         );
         let broken = root.join("broken.toml");
         std::fs::write(&broken, BROKEN_CONFIG_1680)?;
         assert!(
-            compute_review_findings(&broken, &models_dir, &state_path, "HEAD").is_err(),
+            compute_review_findings(&broken, &models_dir, None, &state_path, "HEAD").is_err(),
             "a present-but-broken rocky.toml must refuse the gate"
         );
 
