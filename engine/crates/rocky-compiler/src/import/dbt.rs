@@ -1040,6 +1040,13 @@ fn import_manifest_node(
     let mut sql = match &node.compiled_code {
         Some(code) => rewrite_upstream_refs_to_bare(code, node, model_relations),
         None => {
+            if node.raw_code.contains("{%") {
+                result.failed.push(ImportFailure {
+                    name: node.name.clone(),
+                    reason: RAW_JINJA_CONTROL_REFUSED.to_string(),
+                });
+                return;
+            }
             if contains_unresolved_is_incremental(&node.raw_code) {
                 result.failed.push(ImportFailure {
                     name: node.name.clone(),
@@ -2118,7 +2125,9 @@ fn import_single_model(
         .model_yamls
         .get(name)
         .and_then(|model| model.materialized.as_deref());
-    let effective_materialization = inline_dbt_materialization(&content)
+    let inline_materialization = inline_dbt_materialization(&content);
+    let effective_materialization = inline_materialization
+        .clone()
         .or_else(|| yaml_materialization.map(str::to_string))
         .or_else(|| {
             resolved_project_config
@@ -2165,7 +2174,8 @@ fn import_single_model(
     }
 
     // Extract config block
-    let (mut strategy, config_warnings) = extract_dbt_config(&content_processed);
+    let (mut strategy, config_warnings) =
+        extract_dbt_config(&content_processed, inline_materialization.as_deref());
     warnings.extend(config_warnings.into_iter().map(|msg| ImportWarning {
         model: name.to_string(),
         category: WarningCategory::UnsupportedMaterialization,
@@ -2178,9 +2188,7 @@ fn import_single_model(
     // Apply project config inheritance
     let (resolved_schema, resolved_tags) = if let Some(resolved) = resolved_project_config {
         // Apply inherited materialization only when inline config does not set it.
-        if inline_dbt_materialization(&content_processed).is_none()
-            && matches!(strategy, StrategyConfig::FullRefresh)
-        {
+        if inline_materialization.is_none() && matches!(strategy, StrategyConfig::FullRefresh) {
             match resolved.materialized.as_str() {
                 "view" => {
                     strategy = StrategyConfig::View;
@@ -2505,7 +2513,14 @@ fn extract_dbt_alias(content: &str) -> Option<String> {
 fn inline_dbt_materialization(content: &str) -> Option<String> {
     dbt_config_calls(content)
         .into_iter()
-        .filter_map(|call| single_string_value(call, "materialized"))
+        .filter_map(|call| {
+            split_literal_items(call)?.into_iter().find_map(|arg| {
+                let (key, value) = arg.split_once('=')?;
+                (key.trim() == "materialized")
+                    .then(|| quoted_literal_contents(value.trim()).map(str::to_string))
+                    .flatten()
+            })
+        })
         .next_back()
 }
 
@@ -2654,7 +2669,10 @@ fn split_literal_items(value: &str) -> Option<Vec<&str>> {
     Some(items)
 }
 
-fn extract_dbt_config(content: &str) -> (StrategyConfig, Vec<String>) {
+fn extract_dbt_config(
+    content: &str,
+    inline_materialization: Option<&str>,
+) -> (StrategyConfig, Vec<String>) {
     let mut messages = Vec::new();
 
     let calls = dbt_config_calls(content);
@@ -2663,7 +2681,7 @@ fn extract_dbt_config(content: &str) -> (StrategyConfig, Vec<String>) {
     };
 
     // Parse materialized
-    let materialized = inline_dbt_materialization(content).unwrap_or_else(|| "table".to_string());
+    let materialized = inline_materialization.unwrap_or("table").to_string();
 
     // Parse unique_key — accepts string-form (`unique_key='id'`) or
     // single-line list (`unique_key=['user_id', 'date']`).
@@ -2993,14 +3011,44 @@ mod tests {
     #[test]
     fn test_extract_config_incremental() {
         let input = "{{ config(materialized='incremental', unique_key='id') }}";
-        let (strategy, _) = extract_dbt_config(input);
+        let (strategy, _) = extract_dbt_config(input, inline_dbt_materialization(input).as_deref());
         assert!(matches!(strategy, StrategyConfig::Merge { .. }));
+    }
+
+    #[test]
+    fn test_extract_config_materialized_ignores_nested_metadata_string() {
+        let input = "{{ config(meta={'note': \"materialized='table'\"}, materialized='incremental', unique_key='id') }}";
+        let inline_materialization = inline_dbt_materialization(input);
+        assert_eq!(inline_materialization.as_deref(), Some("incremental"));
+        let (strategy, _) = extract_dbt_config(input, inline_materialization.as_deref());
+        assert!(matches!(strategy, StrategyConfig::Merge { .. }));
+    }
+
+    #[test]
+    fn raw_import_refuses_top_level_incremental_after_nested_metadata_text() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir(dir.path().join("models")).unwrap();
+        std::fs::write(
+            dir.path().join("models/orders.sql"),
+            "{{ config(meta={'note': \"materialized='table'\"}, materialized='incremental') }}\nSELECT * FROM source_orders WHERE id > 100",
+        )
+        .unwrap();
+        let target = TargetConfig {
+            catalog: "w".into(),
+            schema: "s".into(),
+            table: String::new(),
+        };
+        let result = import_dbt_project(dir.path(), &target).unwrap();
+        assert!(result.imported.is_empty());
+        assert_eq!(result.failed.len(), 1);
+        assert_eq!(result.failed[0].name, "orders");
+        assert!(result.failed[0].reason.contains("effectively incremental"));
     }
 
     #[test]
     fn test_extract_config_table() {
         let input = "{{ config(materialized='table') }}";
-        let (strategy, _) = extract_dbt_config(input);
+        let (strategy, _) = extract_dbt_config(input, inline_dbt_materialization(input).as_deref());
         assert!(matches!(strategy, StrategyConfig::FullRefresh));
     }
 
@@ -3009,7 +3057,8 @@ mod tests {
         // Wave 2: `materialized='view'` now maps to StrategyConfig::View
         // (no warning) instead of FullRefresh + warning.
         let input = "{{ config(materialized='view') }}";
-        let (strategy, warnings) = extract_dbt_config(input);
+        let (strategy, warnings) =
+            extract_dbt_config(input, inline_dbt_materialization(input).as_deref());
         assert!(matches!(strategy, StrategyConfig::View));
         assert!(warnings.is_empty());
     }
@@ -3019,14 +3068,15 @@ mod tests {
         // Wave 2: `materialized='materialized_view'` now maps to
         // StrategyConfig::MaterializedView (previously: dropped silently).
         let input = "{{ config(materialized='materialized_view') }}";
-        let (strategy, _) = extract_dbt_config(input);
+        let (strategy, _) = extract_dbt_config(input, inline_dbt_materialization(input).as_deref());
         assert!(matches!(strategy, StrategyConfig::MaterializedView));
     }
 
     #[test]
     fn test_extract_config_ephemeral_warns() {
         let input = "{{ config(materialized='ephemeral') }}";
-        let (strategy, warnings) = extract_dbt_config(input);
+        let (strategy, warnings) =
+            extract_dbt_config(input, inline_dbt_materialization(input).as_deref());
         assert!(matches!(strategy, StrategyConfig::FullRefresh));
         assert!(!warnings.is_empty());
     }
@@ -3037,7 +3087,7 @@ mod tests {
         // must map to StrategyConfig::Merge, NOT to
         // `Incremental { timestamp_column: "merge" }`.
         let input = "{{ config(materialized='incremental', incremental_strategy='merge', unique_key=['user_id']) }}";
-        let (strategy, _) = extract_dbt_config(input);
+        let (strategy, _) = extract_dbt_config(input, inline_dbt_materialization(input).as_deref());
         match strategy {
             StrategyConfig::Merge {
                 unique_key,
@@ -3053,7 +3103,7 @@ mod tests {
         // captured 'merge' as a timestamp column. Assert that does NOT
         // happen anymore.
         let input = "{{ config(materialized='incremental', incremental_strategy='merge') }}";
-        let (strategy, _) = extract_dbt_config(input);
+        let (strategy, _) = extract_dbt_config(input, inline_dbt_materialization(input).as_deref());
         // Without unique_key, merge cannot apply, and the append fallback is
         // `full_refresh` (#1990: `incremental` is refused on transformation
         // models). The old failure mode was 'merge' landing in a timestamp
@@ -3067,7 +3117,7 @@ mod tests {
     #[test]
     fn test_extract_no_config() {
         let input = "SELECT 1";
-        let (strategy, _) = extract_dbt_config(input);
+        let (strategy, _) = extract_dbt_config(input, inline_dbt_materialization(input).as_deref());
         assert!(matches!(strategy, StrategyConfig::FullRefresh));
     }
 
@@ -4001,6 +4051,26 @@ FROM {{ ref('stg_events') }}
                 .any(|w| matches!(w.category, WarningCategory::StaleManifest)),
             "a manifest with no compiled SQL must warn loudly"
         );
+    }
+
+    #[test]
+    fn manifest_raw_table_refuses_jinja_control_flow() {
+        let manifest = serde_json::json!({
+            "metadata": { "project_name": "p" },
+            "nodes": { "model.p.orders": {
+                "unique_id": "model.p.orders", "name": "orders", "resource_type": "model",
+                "raw_code": "SELECT * FROM source_orders {% if false %} WHERE id > 100 {% endif %}",
+                "depends_on": { "nodes": [], "macros": [] },
+                "config": { "materialized": "table" },
+                "columns": {}, "tags": [], "schema": "s", "database": "d"
+            }},
+            "sources": {}
+        });
+        let result = import_from_manifest_json(&manifest);
+        assert!(result.imported.is_empty());
+        assert_eq!(result.failed.len(), 1);
+        assert_eq!(result.failed[0].name, "orders");
+        assert!(result.failed[0].reason.contains(RAW_JINJA_CONTROL_REFUSED));
     }
 
     #[test]
