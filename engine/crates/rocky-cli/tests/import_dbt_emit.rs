@@ -63,12 +63,18 @@ fn emit_runnable_repo_from_rich_fixture() {
     // A dbt incremental model has no full-refresh compile evidence in raw
     // mode, so the raw importer refuses it (#2059).
     assert!(
-        !result.imported.iter().any(|m| m.name == "orders_incremental"),
+        !result
+            .imported
+            .iter()
+            .any(|m| m.name == "orders_incremental"),
         "orders_incremental is incremental and must be refused by the raw importer"
     );
     assert!(
-        result.failed.iter().any(|f| f.name == "orders_incremental"
-            && f.reason.contains("dbt compile --full-refresh")),
+        result
+            .failed
+            .iter()
+            .any(|f| f.name == "orders_incremental"
+                && f.reason.contains("dbt compile --full-refresh")),
         "orders_incremental should be refused with the full-refresh remedy"
     );
     assert!(

@@ -4984,10 +4984,10 @@ async fn run_apply_promote_plan(
         );
     } else {
         println!(
-            "promote failed for branch '{}' after {} target(s) — see JSON output for details",
-            output.branch,
-            output.targets.len()
+            "promote failed for branch '{}' — target outcomes:",
+            output.branch
         );
+        crate::commands::branch::print_promote_failure_targets(&output.targets);
     }
 
     if !overall_success {
@@ -7113,6 +7113,7 @@ effect = "deny"
     /// non-vacuous because each plan's `resolved_principal()` is checked first.
     #[tokio::test]
     async fn promote_gate_enforces_runtime_principal_not_stored_stamp() -> anyhow::Result<()> {
+        use rocky_core::traits::WarehouseAdapter;
         let dir = tempfile::tempdir()?;
         let root = dir.path();
         let warehouse = root.join("warehouse.duckdb");
@@ -7147,9 +7148,17 @@ effect = "deny"
             ),
         )?;
 
-        // A self-contained, idempotent target so the human-runtime ALLOW path
-        // executes cleanly (no branch source table needed) and re-running it
-        // once per entrypoint is a no-op.
+        let source_adapter = rocky_duckdb::adapter::DuckDbWarehouseAdapter::open(&warehouse)?;
+        source_adapter
+            .execute_statement("CREATE SCHEMA branch_src")
+            .await?;
+        source_adapter
+            .execute_statement("CREATE TABLE branch_src.source AS SELECT 42 AS answer")
+            .await?;
+        drop(source_adapter);
+
+        // The human-runtime ALLOW path copies a real branch source and can be
+        // run once per entrypoint.
         let make_plan = |table: &str| crate::output::PromotePlan {
             branch_name: "fix".to_string(),
             pipeline: None,
@@ -7161,9 +7170,20 @@ effect = "deny"
             breaking_changes: None,
             allow_breaking: false,
             targets: vec![crate::output::PromoteTargetPlan {
-                target: "main.promoted".to_string(),
-                source: "main.branch_src".to_string(),
-                statement: format!("CREATE OR REPLACE TABLE {table} AS SELECT 42 AS answer"),
+                target: format!("warehouse.main.{table}"),
+                source: "warehouse.branch_src.source".to_string(),
+                target_catalog: "warehouse".to_string(),
+                target_schema: "main".to_string(),
+                target_table: table.to_string(),
+                source_catalog: "warehouse".to_string(),
+                source_schema: "branch_src".to_string(),
+                source_table: "source".to_string(),
+                strategy: "full_refresh".to_string(),
+                statement: format!(
+                    "CREATE OR REPLACE TABLE \"warehouse\".\"main\".\"{table}\" AS SELECT * FROM \"warehouse\".\"branch_src\".\"source\""
+                ),
+                pre_drop_statement: None,
+                production_upstreams: Vec::new(),
             }],
             plan_audit: Vec::new(),
             created_at: chrono::Utc::now(),
@@ -7889,7 +7909,16 @@ effect = "allow"
             targets: vec![crate::output::PromoteTargetPlan {
                 target: "cat.prod.orders".to_string(),
                 source: "cat.branch.orders".to_string(),
+                target_catalog: "cat".to_string(),
+                target_schema: "prod".to_string(),
+                target_table: "orders".to_string(),
+                source_catalog: "cat".to_string(),
+                source_schema: "branch".to_string(),
+                source_table: "orders".to_string(),
+                strategy: "full_refresh".to_string(),
                 statement: "CREATE OR REPLACE TABLE ...".to_string(),
+                pre_drop_statement: None,
+                production_upstreams: Vec::new(),
             }],
             plan_audit: vec![],
             created_at: chrono::Utc::now(),
@@ -8002,12 +8031,30 @@ effect = "allow"
                 crate::output::PromoteTargetPlan {
                     target: "c.s.orders".to_string(),
                     source: "c.b.orders".to_string(),
+                    target_catalog: "c".to_string(),
+                    target_schema: "s".to_string(),
+                    target_table: "orders".to_string(),
+                    source_catalog: "c".to_string(),
+                    source_schema: "b".to_string(),
+                    source_table: "orders".to_string(),
+                    strategy: "full_refresh".to_string(),
                     statement: "CREATE OR REPLACE ...".to_string(),
+                    pre_drop_statement: None,
+                    production_upstreams: Vec::new(),
                 },
                 crate::output::PromoteTargetPlan {
                     target: "c.s.customers".to_string(),
                     source: "c.b.customers".to_string(),
+                    target_catalog: "c".to_string(),
+                    target_schema: "s".to_string(),
+                    target_table: "customers".to_string(),
+                    source_catalog: "c".to_string(),
+                    source_schema: "b".to_string(),
+                    source_table: "customers".to_string(),
+                    strategy: "full_refresh".to_string(),
                     statement: "CREATE OR REPLACE ...".to_string(),
+                    pre_drop_statement: None,
+                    production_upstreams: Vec::new(),
                 },
             ],
             plan_audit: vec![],
@@ -8047,7 +8094,16 @@ effect = "allow"
             targets: vec![crate::output::PromoteTargetPlan {
                 target: "c.s.orders".to_string(),
                 source: "c.b.orders".to_string(),
+                target_catalog: "c".to_string(),
+                target_schema: "s".to_string(),
+                target_table: "orders".to_string(),
+                source_catalog: "c".to_string(),
+                source_schema: "b".to_string(),
+                source_table: "orders".to_string(),
+                strategy: "full_refresh".to_string(),
                 statement: "CREATE OR REPLACE ...".to_string(),
+                pre_drop_statement: None,
+                production_upstreams: Vec::new(),
             }],
             plan_audit: vec![],
             created_at: chrono::Utc::now(),
@@ -8101,14 +8157,32 @@ effect = "allow"
                 crate::output::PromoteTargetPlan {
                     target: "c.s.orders".to_string(),
                     source: "c.b.orders".to_string(),
+                    target_catalog: "c".to_string(),
+                    target_schema: "s".to_string(),
+                    target_table: "orders".to_string(),
+                    source_catalog: "c".to_string(),
+                    source_schema: "b".to_string(),
+                    source_table: "orders".to_string(),
+                    strategy: "full_refresh".to_string(),
                     statement: "CREATE OR REPLACE ...".to_string(),
+                    pre_drop_statement: None,
+                    production_upstreams: Vec::new(),
                 },
                 // Unmappable: no model targets this FQN any more, but a model
                 // is NAMED this.
                 crate::output::PromoteTargetPlan {
                     target: "corp.prod.orders".to_string(),
                     source: "corp.branch.orders".to_string(),
+                    target_catalog: "corp".to_string(),
+                    target_schema: "prod".to_string(),
+                    target_table: "orders".to_string(),
+                    source_catalog: "corp".to_string(),
+                    source_schema: "branch".to_string(),
+                    source_table: "orders".to_string(),
+                    strategy: "full_refresh".to_string(),
                     statement: "CREATE OR REPLACE ...".to_string(),
+                    pre_drop_statement: None,
+                    production_upstreams: Vec::new(),
                 },
             ],
             plan_audit: vec![],

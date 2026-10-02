@@ -345,23 +345,54 @@ class PromoteTargetPlan(BaseModel):
     """
     Per-model promote step captured in a [`PromotePlan`].
 
-    Mirrors the shape of [`PromoteTarget`] but contains only plan-time fields (`target`, `source`, `statement`). Execution outcome (`succeeded`, `error`) is added at apply time and lives on [`PromoteTarget`].
+    Mirrors the shape of [`PromoteTarget`] but contains only plan-time fields (`target`, `source`, structured coordinates, `strategy`, `statement`). Execution outcome (`succeeded`, `error`) is added at apply time and lives on [`PromoteTarget`].
 
     `statement` is persisted verbatim so `rocky apply` executes the **exact** SQL generated at plan time — skipping re-discovery and ensuring the `plan_id` digest is invalidated if the SQL would differ.
     """
 
+    pre_drop_statement: str | None = None
+    """
+    Optional dialect-required DROP issued before `statement`.
+    """
+    production_upstreams: list[PromoteUpstream]
+    """
+    Production objects read by this view that this plan does not replace.
+    """
     source: str
     """
     Fully-qualified branch source the promote will read from (catalog.branch_schema.table).
     """
+    source_catalog: str
+    source_schema: str
+    source_table: str
     statement: str
     """
-    `CREATE OR REPLACE TABLE <target> AS SELECT * FROM <source>` SQL, dialect-quoted at plan time.
+    Dialect-quoted replacement SQL, generated at plan time.
+    """
+    strategy: str
+    """
+    The strategy approved at plan time. Only full_refresh and view apply.
     """
     target: str
     """
     Fully-qualified production target (catalog.schema.table).
     """
+    target_catalog: str
+    """
+    Structured destination coordinates. Display names may contain dots.
+    """
+    target_schema: str
+    target_table: str
+
+
+class PromoteUpstream(BaseModel):
+    """
+    Production object read by a promoted view.
+    """
+
+    catalog: str
+    schema: str
+    table: str
 
 
 class RejectedApproval(BaseModel):

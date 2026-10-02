@@ -555,6 +555,18 @@ pub trait WarehouseAdapter: Send + Sync {
         Ok(ObjectKind::Unknown)
     }
 
+    /// Preflight a promotion destination. Return `None` only when its namespace
+    /// exists and the object is absent. Unknown kinds and unsupported probes
+    /// must fail; promotion uses this before its first write.
+    async fn promotion_destination_kind(
+        &self,
+        _table: &TableRef,
+    ) -> AdapterResult<Option<ObjectKind>> {
+        Err(AdapterError::msg(
+            "this adapter cannot preflight promotion destinations",
+        ))
+    }
+
     /// A cheap, opaque change-marker for a source table, used by the
     /// replication runner's skip-unchanged pruning (`prune_unchanged`) to
     /// decide whether a source has been written since the last successful

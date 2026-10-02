@@ -10,7 +10,7 @@ use rocky_catalog_core::{
 };
 use rocky_core::traits::{
     AdapterError, AdapterResult, BatchCheckAdapter, ChunkChecksum, ExecutionStats, FreshnessResult,
-    PkRange, QueryResult, RowCountResult, SqlDialect, WarehouseAdapter,
+    ObjectKind, PkRange, QueryResult, RowCountResult, SqlDialect, WarehouseAdapter,
 };
 use rocky_ir::{ColumnInfo, TableRef};
 use tracing::debug;
@@ -128,6 +128,49 @@ fn catalog_error_is_fallback(err: &CatalogError) -> bool {
     )
 }
 
+fn promotion_queries(
+    dialect: &dyn SqlDialect,
+    table: &TableRef,
+) -> AdapterResult<(String, String)> {
+    let catalog = dialect.quote_identifier(&table.catalog.replace('`', "``"));
+    let schema = rocky_core::sql_gen::string_literal(dialect, &table.schema);
+    let name = rocky_core::sql_gen::string_literal(dialect, &table.table);
+    Ok((
+        format!(
+            "SELECT schema_name FROM {catalog}.information_schema.schemata WHERE lower(schema_name) = lower({schema})"
+        ),
+        format!(
+            "SELECT table_type FROM {catalog}.information_schema.tables WHERE lower(table_schema) = lower({schema}) AND lower(table_name) = lower({name})"
+        ),
+    ))
+}
+
+fn promotion_kind(result: &QueryResult) -> AdapterResult<Option<ObjectKind>> {
+    match result.rows.as_slice() {
+        [] => Ok(None),
+        [row] => match row.first().and_then(|v| v.as_str()) {
+            Some(
+                "MANAGED"
+                | "EXTERNAL"
+                | "STREAMING_TABLE"
+                | "FOREIGN"
+                | "MANAGED_SHALLOW_CLONE"
+                | "EXTERNAL_SHALLOW_CLONE",
+            ) => Ok(Some(ObjectKind::Table)),
+            Some("VIEW" | "MATERIALIZED_VIEW") => Ok(Some(ObjectKind::View)),
+            Some(other) => Err(AdapterError::msg(format!(
+                "unknown promotion destination kind: {other}"
+            ))),
+            None => Err(AdapterError::msg(
+                "promotion destination kind is missing or malformed",
+            )),
+        },
+        _ => Err(AdapterError::msg(
+            "promotion destination kind returned multiple rows",
+        )),
+    }
+}
+
 #[async_trait]
 impl WarehouseAdapter for DatabricksWarehouseAdapter {
     fn dialect(&self) -> &dyn SqlDialect {
@@ -182,6 +225,26 @@ impl WarehouseAdapter for DatabricksWarehouseAdapter {
             columns: result.columns.iter().map(|c| c.name.clone()).collect(),
             rows: result.rows,
         })
+    }
+
+    async fn promotion_destination_kind(
+        &self,
+        table: &TableRef,
+    ) -> AdapterResult<Option<ObjectKind>> {
+        let (namespace_sql, kind_sql) = promotion_queries(&self.dialect, table)?;
+        let namespace = self.execute_query(&namespace_sql).await?;
+        if namespace.rows.is_empty() {
+            return Err(AdapterError::msg(
+                "promotion destination namespace does not exist",
+            ));
+        }
+        if namespace.rows.len() != 1 || namespace.rows[0].first().and_then(|v| v.as_str()).is_none()
+        {
+            return Err(AdapterError::msg(
+                "promotion destination namespace response is ambiguous",
+            ));
+        }
+        promotion_kind(&self.execute_query(&kind_sql).await?)
     }
 
     /// Override the default `Err(...)` impl from
@@ -583,6 +646,71 @@ fn parse_databricks_i128(v: &serde_json::Value) -> AdapterResult<i128> {
 mod tests {
     use super::*;
     use rocky_catalog_core::{ColumnSchema as CatalogColumnSchema, TableSchema as CatalogSchema};
+
+    #[test]
+    fn promotion_probe_sql_and_kinds() {
+        let table = TableRef {
+            catalog: "main".into(),
+            schema: "Mixed'Case".into(),
+            table: "Orders\\'24".into(),
+        };
+        let (namespace, kind) = promotion_queries(&DatabricksSqlDialect, &table).unwrap();
+        assert_eq!(
+            namespace,
+            r"SELECT schema_name FROM `main`.information_schema.schemata WHERE lower(schema_name) = lower('Mixed\'Case')"
+        );
+        assert_eq!(
+            kind,
+            r"SELECT table_type FROM `main`.information_schema.tables WHERE lower(table_schema) = lower('Mixed\'Case') AND lower(table_name) = lower('Orders\\\'24')"
+        );
+        let quoted_catalog = TableRef {
+            catalog: "main`archive".into(),
+            ..table.clone()
+        };
+        assert!(
+            promotion_queries(&DatabricksSqlDialect, &quoted_catalog)
+                .unwrap()
+                .0
+                .contains("`main``archive`.information_schema.schemata")
+        );
+        let result = |value: &str| QueryResult {
+            columns: vec!["table_type".into()],
+            rows: vec![vec![serde_json::json!(value)]],
+        };
+        for value in [
+            "MANAGED",
+            "EXTERNAL",
+            "STREAMING_TABLE",
+            "FOREIGN",
+            "MANAGED_SHALLOW_CLONE",
+            "EXTERNAL_SHALLOW_CLONE",
+        ] {
+            assert_eq!(
+                promotion_kind(&result(value)).unwrap(),
+                Some(ObjectKind::Table)
+            );
+        }
+        for value in ["VIEW", "MATERIALIZED_VIEW"] {
+            assert_eq!(
+                promotion_kind(&result(value)).unwrap(),
+                Some(ObjectKind::View)
+            );
+        }
+        assert_eq!(
+            promotion_kind(&QueryResult {
+                columns: vec![],
+                rows: vec![]
+            })
+            .unwrap(),
+            None
+        );
+        assert!(
+            promotion_kind(&result("FUTURE_KIND"))
+                .unwrap_err()
+                .to_string()
+                .contains("FUTURE_KIND")
+        );
+    }
 
     #[test]
     fn ir_to_catalog_ref_projects_three_part_name() {
