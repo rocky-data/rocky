@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Shadow routing tests now expect a failed run when changed model rows differ from production. DuckDB now recognizes a missing schema during shadow target checks. (#2198, #2207)
 - `rocky run --shadow` compares its tables before cleanup and reports the result. `--keep-shadow` retains them for a separate comparison. `rocky plan --shadow` previews the written targets. (#2198, #2207)
 - Shadow runs refuse resume, require confirmed target absence, and keep all mixed-run objects until every comparison passes. Missing production targets report `no_baseline`. Cleanup drops each created object by its kind. (#2198, #2207)
 - Shadow runs refuse targets that share a production name, even when production is absent. Each warehouse adapter identifies its missing-object errors before a fresh shadow target is accepted. A filtered listing cannot prove absence. A missing dataset can make both metadata reads report absence. Snowflake code 002003 also covers unauthorized objects. Mixed runs compare catalogless replication and model targets using the same default catalog. (#2198, #2207)
