@@ -294,6 +294,33 @@ pub async fn compute_review_with_disclosure(
         &Option<Vec<BreakingFinding>>,
     ) -> Result<()>,
 ) -> Result<ReviewOutput> {
+    compute_review_with_disclosure_and_seam(
+        root,
+        config_path,
+        state_path,
+        plan_id,
+        base_ref,
+        approve,
+        disclose,
+        || Ok(()),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn compute_review_with_disclosure_and_seam(
+    root: &Path,
+    config_path: &Path,
+    state_path: Option<&Path>,
+    plan_id: &str,
+    base_ref: &str,
+    approve: bool,
+    disclose: impl FnOnce(
+        &[crate::output::ConditionalDrop],
+        &Option<Vec<BreakingFinding>>,
+    ) -> Result<()>,
+    after_drop_snapshot: impl FnOnce() -> Result<()>,
+) -> Result<ReviewOutput> {
     let plan = read_plan(root, plan_id)
         .with_context(|| format!("failed to read plan '{plan_id}' for review"))?;
 
@@ -371,19 +398,49 @@ pub async fn compute_review_with_disclosure(
         .as_ref()
         .map(|f| f.iter().filter(|x| x.is_breaking()).count())
         .unwrap_or(0);
-    let mut conditional_drops = super::plan::conditional_drops_for_run_plan(
-        &resolved_config_path,
-        &models_dir,
-        models_glob.as_deref(),
-        state_path,
-        &run_plan,
-    )?;
+    let loaded_config =
+        rocky_core::config::load_optional_project_config(Some(&resolved_config_path))?;
+    let replication_only = plan.kind != PlanKind::Backfill
+        && loaded_config
+            .as_ref()
+            .is_some_and(|cfg| super::apply::is_replication_only(cfg, &run_plan));
+    let approval_models = if approve && !replication_only {
+        Some(compile_approval_models(&plan, &models_dir)?)
+    } else {
+        None
+    };
+    let mut conditional_drops = if replication_only {
+        Vec::new()
+    } else if let Some(models) = &approval_models {
+        super::plan::conditional_drops_from_models(
+            &resolved_config_path,
+            models,
+            models_glob.as_deref(),
+            state_path,
+            &run_plan,
+        )?
+    } else {
+        super::plan::conditional_drops_for_run_plan(
+            &resolved_config_path,
+            &models_dir,
+            models_glob.as_deref(),
+            state_path,
+            &run_plan,
+        )?
+    };
     if plan.kind == PlanKind::Backfill {
         conditional_drops.retain(|drop| run_plan.models.iter().any(|model| model == &drop.model));
     }
 
-    if approve {
-        verify_current_models_for_approval(&plan, &run_plan, &resolved_config_path, &models_dir)?;
+    after_drop_snapshot()?;
+    if let Some(models) = &approval_models {
+        verify_current_models_for_approval(
+            &plan,
+            &run_plan,
+            &resolved_config_path,
+            &models_dir,
+            models,
+        )?;
     }
 
     disclose(&conditional_drops, &findings)?;
@@ -445,7 +502,36 @@ pub async fn compute_review_with_disclosure(
     })
 }
 
-/// Recompute the plan-time execution fingerprint over the current model tree.
+/// Compile the approval snapshot once, including the plan's reviewed schemas.
+fn compile_approval_models(
+    plan: &PersistedPlan,
+    models_dir: &Path,
+) -> Result<Vec<rocky_core::models::Model>> {
+    use rocky_compiler::compile::{self, CompilerConfig};
+
+    let stale =
+        || anyhow::anyhow!("the models changed since this plan was written; re-run `rocky plan`");
+    let capabilities = plan.embedded_capabilities();
+    if capabilities.fingerprint_version == 0 || capabilities.models_fingerprint.is_none() {
+        return Err(stale());
+    }
+    let source_schemas = capabilities.reviewed_source_schemas.ok_or_else(stale)?;
+    let config = CompilerConfig {
+        models_dir: models_dir.to_path_buf(),
+        source_schemas: source_schemas.into_iter().collect(),
+        ..Default::default()
+    };
+    let compiled = compile::compile(&config);
+    match compiled {
+        Ok(result) => Ok(result.project.models),
+        Err(compile::CompileError::Project(rocky_compiler::project::ProjectError::NoModels {
+            ..
+        })) => Ok(Vec::new()),
+        Err(error) => Err(error).context("failed to compile models for conditional DROP review"),
+    }
+}
+
+/// Recompute the plan-time execution fingerprint from the disclosed snapshot.
 /// This also makes a `NoModels` DROP preview safe: a removed model cannot turn
 /// a previously disclosed DROP into an empty approval.
 fn verify_current_models_for_approval(
@@ -453,9 +539,8 @@ fn verify_current_models_for_approval(
     run_plan: &RunPlan,
     config_path: &Path,
     models_dir: &Path,
+    models: &[rocky_core::models::Model],
 ) -> Result<()> {
-    use rocky_compiler::compile::{self, CompilerConfig};
-
     let stale =
         || anyhow::anyhow!("the models changed since this plan was written; re-run `rocky plan`");
     let capabilities = plan.embedded_capabilities();
@@ -466,17 +551,6 @@ fn verify_current_models_for_approval(
     if capabilities.fingerprint_version == 0 {
         return Err(stale());
     }
-    let source_schemas = capabilities
-        .reviewed_source_schemas
-        .ok_or_else(stale)?
-        .into_iter()
-        .collect();
-    let compiled = compile::compile(&CompilerConfig {
-        models_dir: models_dir.to_path_buf(),
-        source_schemas,
-        ..Default::default()
-    })
-    .map_err(|_| stale())?;
     let config = rocky_core::config::load_optional_project_config(Some(config_path))?;
     let config_identity = config
         .as_ref()
@@ -501,15 +575,10 @@ fn verify_current_models_for_approval(
         .map(|cfg| cfg.resolve_mask_for_env(run_plan.env.as_deref()))
         .unwrap_or_default();
     let surrogate_keys =
-        super::apply::resolved_surrogate_keys(models_dir, &compiled.project.models)
-            .map_err(|_| stale())?;
-    let extras = super::apply::ExecutionExtras::build(
-        &surrogate_keys,
-        &compiled.project.models,
-        &resolved_mask,
-    );
+        super::apply::resolved_surrogate_keys(models_dir, models).map_err(|_| stale())?;
+    let extras = super::apply::ExecutionExtras::build(&surrogate_keys, models, &resolved_mask);
     let actual = super::apply::execution_ir_fingerprint(
-        &compiled.project.models,
+        models,
         &config_identity,
         &governance_identity,
         &exec_control_identity,
@@ -1513,6 +1582,117 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn model_restored_after_drop_snapshot_cannot_gain_approval() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path();
+        let models = root.join("models");
+        std::fs::create_dir(&models)?;
+        let sql = models.join("switch.sql");
+        let sidecar = models.join("switch.toml");
+        std::fs::write(&sql, "SELECT 1 AS id\n")?;
+        std::fs::write(
+            &sidecar,
+            "name = \"switch\"\ndrop_existing_kind = \"table\"\n[strategy]\ntype = \"view\"\n[target]\ncatalog = \"\"\nschema = \"main\"\n",
+        )?;
+        let config = root.join("rocky.toml");
+        std::fs::write(
+            &config,
+            "[adapter.default]\ntype = \"duckdb\"\ndatabase = \":memory:\"\n",
+        )?;
+        let state = root.join("state.redb");
+        let capabilities = super::super::plan::compute_embedded_capabilities(
+            &config,
+            &models,
+            "HEAD",
+            Some(&state),
+            None,
+            false,
+        )?;
+        let run_plan: RunPlan = serde_json::from_value(
+            serde_json::json!({"parallel": 1, "models_dir": "models", "model": "switch"}),
+        )?;
+        let id = crate::plan_store::write_plan_governed(
+            root,
+            PlanKind::AiAuthored,
+            &run_plan,
+            PolicyPrincipal::Agent,
+            capabilities,
+        )?;
+        let saved_sql = std::fs::read(&sql)?;
+        let saved_sidecar = std::fs::read(&sidecar)?;
+        std::fs::remove_file(&sql)?;
+        std::fs::remove_file(&sidecar)?;
+
+        let error = compute_review_with_disclosure_and_seam(
+            root,
+            &config,
+            Some(&state),
+            &id,
+            "HEAD",
+            true,
+            |_, _| anyhow::bail!("disclosure must not run after a stale snapshot"),
+            || {
+                std::fs::write(&sql, &saved_sql)?;
+                std::fs::write(&sidecar, &saved_sidecar)?;
+                Ok(())
+            },
+        )
+        .await
+        .expect_err("restoring the model after DROP capture must not approve it");
+        assert!(
+            error
+                .to_string()
+                .contains("the models changed since this plan was written")
+        );
+        assert!(!review_marker_path(root, &id).exists());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn v1_replication_only_plan_can_be_approved() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path();
+        let models = root.join("models");
+        std::fs::create_dir(&models)?;
+        std::fs::write(models.join("m.sql"), "SELECT 1 AS id\n")?;
+        std::fs::write(
+            models.join("m.toml"),
+            "name = \"m\"\n[strategy]\ntype = \"full_refresh\"\n[target]\ncatalog = \"\"\nschema = \"main\"\n",
+        )?;
+        let config = root.join("rocky.toml");
+        std::fs::write(
+            &config,
+            "[adapter]\ntype = \"duckdb\"\npath = \"a.duckdb\"\n\n[pipeline.p]\ntype = \"replication\"\nstrategy = \"full_refresh\"\n\n[pipeline.p.source.schema_pattern]\nprefix = \"raw__\"\nseparator = \"__\"\ncomponents = [\"source\"]\n\n[pipeline.p.target]\nadapter = \"default\"\ncatalog_template = \"c\"\nschema_template = \"s__{source}\"\n",
+        )?;
+        let state = root.join("state.redb");
+        let mut capabilities = super::super::plan::compute_embedded_capabilities(
+            &config,
+            &models,
+            "HEAD",
+            Some(&state),
+            None,
+            false,
+        )?;
+        assert!(capabilities.models_fingerprint.is_some());
+        capabilities.fingerprint_version = 1;
+        capabilities.reviewed_source_schemas = None;
+        let run_plan: RunPlan =
+            serde_json::from_value(serde_json::json!({"parallel": 1, "pipeline": "p"}))?;
+        let id = crate::plan_store::write_plan_governed(
+            root,
+            PlanKind::AiAuthored,
+            &run_plan,
+            PolicyPrincipal::Agent,
+            capabilities,
+        )?;
+        let output =
+            compute_review_with_state_path(root, &config, Some(&state), &id, "HEAD", true).await?;
+        assert!(output.marker_written);
+        assert!(output.conditional_drops.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn review_branch_drop_matches_executed_target_before_approval() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let models = dir.path().join("models");
@@ -1641,6 +1821,37 @@ mod tests {
             "DROP TABLE IF EXISTS main.switch"
         );
         assert!(!review.marker_written);
+
+        let capabilities = super::super::plan::compute_embedded_capabilities(
+            &config,
+            &selected_models,
+            "HEAD",
+            Some(&state),
+            None,
+            false,
+        )?;
+        let governed_id = crate::plan_store::write_plan_governed(
+            dir.path(),
+            PlanKind::AiAuthored,
+            &plan,
+            PolicyPrincipal::Agent,
+            capabilities,
+        )?;
+        let approved = compute_review_with_state_path(
+            dir.path(),
+            Path::new("rocky.toml"),
+            Some(&state),
+            &governed_id,
+            "HEAD",
+            true,
+        )
+        .await?;
+        assert!(approved.marker_written);
+        assert_eq!(approved.conditional_drops.len(), 1);
+        assert_eq!(
+            approved.conditional_drops[0].drop_sql,
+            review.conditional_drops[0].drop_sql
+        );
         Ok(())
     }
 

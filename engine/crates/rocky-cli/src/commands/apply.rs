@@ -762,7 +762,10 @@ pub(crate) fn pipeline_is_replication(
 /// identity. The only inert case is a genuinely-legacy v0 plan (no identity,
 /// `!require_fingerprint`) — the pre-existing legacy exemption this carve-out does
 /// not widen.
-fn is_replication_only(cfg: &rocky_core::config::RockyConfig, run_plan: &RunPlan) -> bool {
+pub(crate) fn is_replication_only(
+    cfg: &rocky_core::config::RockyConfig,
+    run_plan: &RunPlan,
+) -> bool {
     pipeline_is_replication(cfg, run_plan.pipeline.as_deref())
         && !run_plan.run_all
         && run_plan.models_dir.is_none()

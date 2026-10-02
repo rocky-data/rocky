@@ -1099,6 +1099,17 @@ pub(crate) fn conditional_drops_for_run_plan(
             return Err(error).context("failed to compile models for conditional DROP review");
         }
     };
+    conditional_drops_from_models(config_path, &models, models_glob, state_path, run_plan)
+}
+
+/// Render DROP disclosures from the same compiled models used by approval.
+pub(crate) fn conditional_drops_from_models(
+    config_path: &Path,
+    models: &[rocky_core::models::Model],
+    models_glob: Option<&str>,
+    state_path: &Path,
+    run_plan: &RunPlan,
+) -> Result<Vec<ConditionalDrop>> {
     if models.is_empty() {
         return Ok(Vec::new());
     }
@@ -1125,8 +1136,21 @@ pub(crate) fn conditional_drops_for_run_plan(
         None => preview_dialect(Some(config_path))?,
     };
     let shadow = shadow_config_for_run_plan(state_path, run_plan)?;
+    let pattern = models_glob.map(glob::Pattern::new).transpose()?;
     let mut drops = Vec::new();
     for model in models {
+        if pattern.as_ref().is_some_and(|pattern| {
+            !pattern.matches_path_with(
+                &model.file_path,
+                glob::MatchOptions {
+                    case_sensitive: true,
+                    require_literal_separator: true,
+                    require_literal_leading_dot: false,
+                },
+            )
+        }) {
+            continue;
+        }
         if run_plan
             .model
             .as_deref()
@@ -1138,7 +1162,7 @@ pub(crate) fn conditional_drops_for_run_plan(
         if let Some(shadow) = &shadow {
             ir.target = rocky_core::shadow::shadow_target(&ir.target, shadow);
         }
-        if let Some(drop) = conditional_kind_drop_detail(&model, &ir, dialect.as_ref())? {
+        if let Some(drop) = conditional_kind_drop_detail(model, &ir, dialect.as_ref())? {
             drops.push(drop);
         }
     }
