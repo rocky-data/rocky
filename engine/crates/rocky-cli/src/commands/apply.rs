@@ -6151,17 +6151,7 @@ mod tests {
             PolicyPrincipal::Agent,
             crate::plan_store::EmbeddedCapabilities::default(),
         )?;
-        let review = crate::commands::review::compute_review_with_state_path(
-            root,
-            &config,
-            Some(&state),
-            &id,
-            "HEAD",
-            true,
-        )
-        .await?;
-        assert!(review.marker_written);
-        assert!(review.conditional_drops.is_empty());
+        crate::commands::review::write_test_review_marker(root, &id);
 
         std::fs::write(
             &sidecar,

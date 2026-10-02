@@ -588,6 +588,13 @@ pub(crate) fn run_status_exit_result(
     }
 }
 
+fn shadow_comparison_has_read_error(output: &RunOutput) -> bool {
+    output
+        .shadow_comparison
+        .as_ref()
+        .is_some_and(|comparison| comparison.results.iter().any(|row| row.verdict == "error"))
+}
+
 /// Merge `execute_models`' compile-error bookkeeping into the replication
 /// path's parallel-copy tallies, then stamp the terminal `status`.
 ///
@@ -7057,12 +7064,13 @@ pub async fn run_with_explicit_contracts(
     }
     // All model and replication comparisons have completed here. A failed
     // verdict is still a completed comparison, so it must not retain either
-    // group's objects. A table/model write error or a comparison query error
-    // can leave ownership or completeness uncertain; those paths do not reach
-    // this cleanup. `--keep-shadow` explicitly disables it.
+    // group's objects. A write error or an `error` comparison row leaves
+    // completeness uncertain, so those objects remain for inspection.
+    // `--keep-shadow` explicitly disables cleanup.
     if shadow_config.is_some_and(|config| config.cleanup_after)
         && output.tables_failed == 0
         && output.shadow_comparison.is_some()
+        && !shadow_comparison_has_read_error(&output)
     {
         output.owned_shadow_objects.extend(replication_shadow_objects);
         if !output.owned_shadow_objects.is_empty() {
@@ -12827,17 +12835,15 @@ pub(crate) async fn execute_models_with_explicit_contracts(
         output.shadow_comparison = Some(comparison);
     }
 
-    // A comparison verdict, including fail or no_baseline, establishes that
-    // comparison completed. Cleanup follows regardless of that verdict.
-    // A model write error may leave a target only partly created, and a
-    // comparison query error has no completed verdict; those paths retain
-    // objects because their state is uncertain. `--keep-shadow` and named
-    // branches also disable cleanup explicitly.
+    // Fail and no_baseline are completed comparisons. An `error` row means a
+    // read failed, so keep the objects for inspection. Model write errors,
+    // `--keep-shadow`, and named branches also prevent cleanup.
     if let Some(config) = shadow_config
         && config.cleanup_after
         && !shadow_objects.is_empty()
         && output.tables_failed == 0
         && output.shadow_comparison.is_some()
+        && !shadow_comparison_has_read_error(output)
     {
         if output.pipeline_type.as_deref() == Some("replication") {
             output.owned_shadow_objects.extend(shadow_objects);

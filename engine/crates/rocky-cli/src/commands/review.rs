@@ -57,7 +57,7 @@ use crate::commands::audit::{blast_radius_union, compile_project_with_schemas, p
 use crate::output::{
     ApproverIdentity, ReviewOutput, ReviewQueueEntry, ReviewQueueOutput, RunPlan, print_json,
 };
-use crate::plan_store::{PlanKind, read_plan};
+use crate::plan_store::{PersistedPlan, PlanKind, read_plan};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -382,6 +382,10 @@ pub async fn compute_review_with_disclosure(
         conditional_drops.retain(|drop| run_plan.models.iter().any(|model| model == &drop.model));
     }
 
+    if approve {
+        verify_current_models_for_approval(&plan, &run_plan, &resolved_config_path, &models_dir)?;
+    }
+
     disclose(&conditional_drops, &findings)?;
 
     let mut marker_written = false;
@@ -439,6 +443,82 @@ pub async fn compute_review_with_disclosure(
         conditional_drops,
         message: Some(message),
     })
+}
+
+/// Recompute the plan-time execution fingerprint over the current model tree.
+/// This also makes a `NoModels` DROP preview safe: a removed model cannot turn
+/// a previously disclosed DROP into an empty approval.
+fn verify_current_models_for_approval(
+    plan: &PersistedPlan,
+    run_plan: &RunPlan,
+    config_path: &Path,
+    models_dir: &Path,
+) -> Result<()> {
+    use rocky_compiler::compile::{self, CompilerConfig};
+
+    let stale =
+        || anyhow::anyhow!("the models changed since this plan was written; re-run `rocky plan`");
+    let capabilities = plan.embedded_capabilities();
+    let expected = capabilities
+        .models_fingerprint
+        .as_deref()
+        .ok_or_else(stale)?;
+    if capabilities.fingerprint_version == 0 {
+        return Err(stale());
+    }
+    let source_schemas = capabilities
+        .reviewed_source_schemas
+        .ok_or_else(stale)?
+        .into_iter()
+        .collect();
+    let compiled = compile::compile(&CompilerConfig {
+        models_dir: models_dir.to_path_buf(),
+        source_schemas,
+        ..Default::default()
+    })
+    .map_err(|_| stale())?;
+    let config = rocky_core::config::load_optional_project_config(Some(config_path))?;
+    let config_identity = config
+        .as_ref()
+        .map(super::apply::config_policy_identity)
+        .unwrap_or_default();
+    let governance_identity = config
+        .as_ref()
+        .map(super::apply::governance_policy_identity)
+        .unwrap_or_default();
+    let exec_control_identity = config
+        .as_ref()
+        .map(super::apply::execution_control_identity)
+        .unwrap_or_default();
+    let resolved_mask = config
+        .as_ref()
+        .filter(|cfg| {
+            plan.kind != PlanKind::Backfill
+                && super::apply::pipeline_is_replication(cfg, run_plan.pipeline.as_deref())
+                && (run_plan.run_all || run_plan.models_dir.is_some())
+                && run_plan.model.is_none()
+        })
+        .map(|cfg| cfg.resolve_mask_for_env(run_plan.env.as_deref()))
+        .unwrap_or_default();
+    let surrogate_keys =
+        super::apply::resolved_surrogate_keys(models_dir, &compiled.project.models)
+            .map_err(|_| stale())?;
+    let extras = super::apply::ExecutionExtras::build(
+        &surrogate_keys,
+        &compiled.project.models,
+        &resolved_mask,
+    );
+    let actual = super::apply::execution_ir_fingerprint(
+        &compiled.project.models,
+        &config_identity,
+        &governance_identity,
+        &exec_control_identity,
+        &extras,
+    );
+    if actual.as_deref() != Some(expected) {
+        return Err(stale());
+    }
+    Ok(())
 }
 
 /// Review (and optionally approve) a `PlanKind::Gc` reclamation plan or a
@@ -1317,8 +1397,24 @@ mod tests {
             &config,
             "[adapter.default]\ntype = \"duckdb\"\ndatabase = \":memory:\"\n",
         )?;
-        let payload = serde_json::json!({"parallel": 1, "models_dir": "models", "model": "switch"});
-        let id = crate::plan_store::write_plan(root, PlanKind::AiAuthored, &payload)?;
+        let run_plan: RunPlan = serde_json::from_value(
+            serde_json::json!({"parallel": 1, "models_dir": "models", "model": "switch"}),
+        )?;
+        let capabilities = super::super::plan::compute_embedded_capabilities(
+            &config,
+            &models,
+            "HEAD",
+            Some(&root.join("state.redb")),
+            None,
+            false,
+        )?;
+        let id = crate::plan_store::write_plan_governed(
+            root,
+            PlanKind::AiAuthored,
+            &run_plan,
+            PolicyPrincipal::Agent,
+            capabilities,
+        )?;
         let marker = review_marker_path(root, &id);
         let state = root.join("state.redb");
         let output = compute_review_with_disclosure(
@@ -1344,6 +1440,75 @@ mod tests {
             .expect_err("failed DROP review must refuse approval");
         assert!(format!("{error:#}").contains("failed to compile models"));
         assert!(!marker.exists());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn removed_model_refuses_approval_until_restored_with_drop_disclosed()
+    -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path();
+        let models = root.join("models");
+        std::fs::create_dir(&models)?;
+        let sql = models.join("switch.sql");
+        let sidecar = models.join("switch.toml");
+        std::fs::write(&sql, "SELECT 1 AS id\n")?;
+        std::fs::write(
+            &sidecar,
+            "name = \"switch\"\ndrop_existing_kind = \"table\"\n[strategy]\ntype = \"view\"\n[target]\ncatalog = \"\"\nschema = \"main\"\n",
+        )?;
+        let config = root.join("rocky.toml");
+        std::fs::write(
+            &config,
+            "[adapter.default]\ntype = \"duckdb\"\ndatabase = \":memory:\"\n",
+        )?;
+        let state = root.join("state.redb");
+        let run_plan = RunPlan {
+            models_dir: Some("models".to_string()),
+            model: Some("switch".to_string()),
+            ..serde_json::from_value(serde_json::json!({"parallel": 1}))?
+        };
+        let capabilities = super::super::plan::compute_embedded_capabilities(
+            &config,
+            &models,
+            "HEAD",
+            Some(&state),
+            None,
+            false,
+        )?;
+        assert!(capabilities.models_fingerprint.is_some());
+        let id = crate::plan_store::write_plan_governed(
+            root,
+            PlanKind::AiAuthored,
+            &run_plan,
+            PolicyPrincipal::Agent,
+            capabilities,
+        )?;
+        let marker = review_marker_path(root, &id);
+        let saved_sql = std::fs::read(&sql)?;
+        let saved_sidecar = std::fs::read(&sidecar)?;
+        std::fs::remove_file(&sql)?;
+        std::fs::remove_file(&sidecar)?;
+        let error = compute_review_with_state_path(root, &config, Some(&state), &id, "HEAD", true)
+            .await
+            .expect_err("a removed model must not be approved");
+        assert!(
+            error
+                .to_string()
+                .contains("the models changed since this plan was written; re-run `rocky plan`")
+        );
+        assert!(!marker.exists());
+
+        std::fs::write(&sql, saved_sql)?;
+        std::fs::write(&sidecar, saved_sidecar)?;
+        let review =
+            compute_review_with_state_path(root, &config, Some(&state), &id, "HEAD", true).await?;
+        assert!(review.marker_written);
+        assert_eq!(review.conditional_drops.len(), 1);
+        assert_eq!(
+            review.conditional_drops[0].drop_sql,
+            "DROP TABLE IF EXISTS main.switch"
+        );
         Ok(())
     }
 
@@ -2178,6 +2343,27 @@ mod tests {
         crate::plan_store::write_plan(root, PlanKind::AiAuthored, &payload)
     }
 
+    fn seed_fingerprinted_reviewable_plan(root: &Path) -> anyhow::Result<String> {
+        let legacy = seed_reviewable_plan(root)?;
+        let plan = read_plan(root, &legacy)?;
+        let run_plan: RunPlan = serde_json::from_value(plan.payload)?;
+        let capabilities = super::super::plan::compute_embedded_capabilities(
+            &root.join("rocky.toml"),
+            &root.join("models"),
+            "HEAD",
+            Some(&root.join("state.redb")),
+            None,
+            false,
+        )?;
+        crate::plan_store::write_plan_governed(
+            root,
+            PlanKind::AiAuthored,
+            &run_plan,
+            PolicyPrincipal::Agent,
+            capabilities,
+        )
+    }
+
     /// FAIL-BEFORE: with a broken config, `--approve` must refuse and write NO
     /// marker. On unmodified production code this returns `Ok`, reports
     /// "no breaking changes", and leaves a marker on disk.
@@ -2240,7 +2426,7 @@ mod tests {
     async fn review_approve_still_works_without_any_config() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let root = dir.path();
-        let plan_id = seed_reviewable_plan(root)?;
+        let plan_id = seed_fingerprinted_reviewable_plan(root)?;
         let config_path = root.join("rocky.toml");
         assert!(!config_path.exists());
 
@@ -2277,9 +2463,9 @@ mod tests {
     async fn review_approve_tolerates_an_unset_credential_var() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let root = dir.path();
-        let plan_id = seed_reviewable_plan(root)?;
         let config_path = root.join("rocky.toml");
         std::fs::write(&config_path, UNSET_CREDENTIAL_CONFIG_1680)?;
+        let plan_id = seed_fingerprinted_reviewable_plan(root)?;
 
         // Pin that the loader swap is what decides this, in both directions.
         assert!(
