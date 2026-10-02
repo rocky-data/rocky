@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Review of an agent proposal now shows conditional DROPs for its recorded models, even when the project defaults to replication. Confirmation still checks the model fingerprint. (#2217)
 - Review approval uses one compiled model snapshot for conditional DROPs and the execution fingerprint. Replication-only run plans with a valid v1 fingerprint can be approved without a source-schema snapshot. (#2217)
 - **Breaking:** Transformation `microbatch` now uses the `time_interval` partition path, including models that inherit the strategy from `_defaults.toml`. `timestamp_column` becomes the partition column, and `granularity` still defaults to `hour`. `E024` refuses a model missing either `@start_date` or `@end_date`. Old `microbatch` models without a bounded SQL window must add both placeholders before they run. Replication microbatch copy is unchanged. (#2054)
 - Snapshot MERGE and changed-version inserts now map payload columns by name. Quoted source names keep their exact spelling. Databricks partition headings and BigQuery hidden columns no longer enter the insert list. Hard deletes now correlate to the UPDATE target on each dialect. A missing source produces a failed run record and closes Pipes. Both snapshot runners describe the source before generating SQL, including dry runs. (#2212)

@@ -400,7 +400,11 @@ async fn compute_review_with_disclosure_and_seam(
         .unwrap_or(0);
     let loaded_config =
         rocky_core::config::load_optional_project_config(Some(&resolved_config_path))?;
+    // A proposed plan can name compiled models even when its implicit pipeline
+    // is replication. Those declarations still need DROP disclosure and a
+    // fingerprinted approval; only a plan with no models can skip both.
     let replication_only = plan.kind != PlanKind::Backfill
+        && run_plan.models.is_empty()
         && loaded_config
             .as_ref()
             .is_some_and(|cfg| super::apply::is_replication_only(cfg, &run_plan));

@@ -1294,6 +1294,50 @@ effect = "require_review"
     assert!(!marker.exists(), "stale token cannot write a marker");
     std::fs::write(&sidecar, original_sidecar).unwrap();
 
+    // SQL changes do not alter the DROP warning or its token. The plan's
+    // fingerprint must still prevent approval of a different model snapshot.
+    let sql = dir.path().join("models/orders.sql");
+    let original_sql = std::fs::read_to_string(&sql).unwrap();
+    std::fs::write(&sql, "SELECT 2 AS id, 'COMPLETE' AS status\n").unwrap();
+    let unchanged_warning = client
+        .call_tool(
+            CallToolRequestParams::new("review_queue").with_arguments(
+                serde_json::json!({ "approve_plan_id": plan_id })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        )
+        .await
+        .expect("changed model still has a dry-run review");
+    assert_eq!(
+        unchanged_warning.structured_content.unwrap()["review_token"],
+        token,
+        "the DROP warning alone cannot detect a SQL-only change"
+    );
+    let changed_model = client
+        .call_tool(
+            CallToolRequestParams::new("review_queue").with_arguments(
+                serde_json::json!({ "approve_plan_id": plan_id, "confirm": true, "review_token": token })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        )
+        .await
+        .expect("changed model returns a refusal");
+    assert_eq!(changed_model.is_error, Some(true));
+    let reason = changed_model.structured_content.unwrap();
+    assert_eq!(reason["code"], "internal");
+    assert!(
+        reason["message"]
+            .as_str()
+            .unwrap()
+            .contains("the models changed since this plan was written")
+    );
+    assert!(!marker.exists(), "changed model cannot write a marker");
+    std::fs::write(&sql, original_sql).unwrap();
+
     // review_queue approve WITH confirm=true → writes the marker, attributed.
     let approve =
         serde_json::json!({ "approve_plan_id": plan_id, "confirm": true, "review_token": token })
