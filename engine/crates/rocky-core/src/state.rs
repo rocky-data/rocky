@@ -3101,13 +3101,6 @@ pub struct TableProgress {
     pub duration_ms: u64,
     /// When this table completed.
     pub completed_at: chrono::DateTime<chrono::Utc>,
-    /// `Some(true)` is a durable post-copy check obligation. `Some(false)`
-    /// records its discharge. Older checkpoints have no field.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub checks_owed: Option<bool>,
-    /// Durable results from the check phase, including recorded failures.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub check_results: Vec<crate::checks::CheckResult>,
 }
 
 /// The replication execution identity a checkpoint belongs to (#1549).
@@ -3421,18 +3414,14 @@ pub struct RunProgress {
     /// an explicitly recorded plan with no incremental recovery tables.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub watermark_recovery_tables: Option<Vec<WatermarkRecoveryTable>>,
-    /// Check definitions and names owed by each copied target. The scope
-    /// identifies the pipeline that declared them.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub check_obligations: Option<CheckObligations>,
+    /// A later matching run completed checks and wrote its terminal record.
+    /// Older checkpoints default to needing one fresh checked run.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub superseded: bool,
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct CheckObligations {
-    /// Digest of the validated check configuration. A changed definition
-    /// with the same display name cannot discharge an older obligation.
-    pub config_identity: String,
-    pub by_target: std::collections::HashMap<String, Vec<String>>,
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 // ---------------------------------------------------------------------------
@@ -4052,38 +4041,13 @@ impl StateStore {
             planned_tables: Some(planned_tables.to_vec()),
             watermarks_confirmed: false,
             watermark_recovery_tables: recovery_tables.map(<[_]>::to_vec),
-            check_obligations: None,
+            superseded: false,
         };
         let bytes = serde_json::to_vec(&progress)?;
         let txn = self.db.begin_write()?;
         {
             let mut table = txn.open_table(RUN_PROGRESS)?;
             table.insert(run_id, bytes.as_slice())?;
-        }
-        self.commit_write(txn)?;
-        Ok(())
-    }
-
-    /// Record the check plan before any copy can create a debt.
-    pub fn set_run_check_obligations(
-        &self,
-        run_id: &str,
-        obligations: CheckObligations,
-    ) -> Result<(), StateError> {
-        let txn = self.db.begin_write()?;
-        {
-            let mut headers = txn.open_table(RUN_PROGRESS)?;
-            let mut progress: RunProgress = {
-                let Some(row) = headers.get(run_id)? else {
-                    return Err(StateError::MissingRunProgress {
-                        run_id: run_id.to_string(),
-                    });
-                };
-                serde_json::from_slice(row.value())?
-            };
-            progress.check_obligations = Some(obligations);
-            let bytes = serde_json::to_vec(&progress)?;
-            headers.insert(run_id, bytes.as_slice())?;
         }
         self.commit_write(txn)?;
         Ok(())
@@ -4311,9 +4275,9 @@ impl StateStore {
     /// refuse incompatible recovery before copy.
     ///
     /// A run recorded under another pipeline name is returned when it used
-    /// the same target endpoint and any recovery target overlaps this plan.
-    /// The caller uses the saved descriptors to reconcile all of that run's
-    /// targets before another copy.
+    /// the same target endpoint and every recovery target occurs in this plan.
+    /// The caller uses the saved descriptors to reconcile those targets before
+    /// another copy.
     ///
     /// Headers without recovery descriptors (written before descriptors
     /// existed) are never returned: they carry no source or timestamp
@@ -4353,7 +4317,7 @@ impl StateStore {
                     && !tables.is_empty()
                     && tables
                         .iter()
-                        .any(|table| targets.contains(&table.target.full_name()))
+                        .all(|table| targets.contains(&table.target.full_name()))
             };
             if progress.watermarks_confirmed || !relevant {
                 continue;
@@ -4372,23 +4336,79 @@ impl StateStore {
         Ok(result)
     }
 
-    /// Physical targets with copied rows whose post-copy checks are still owed.
-    /// Older checkpoints without an explicit obligation are owed unless a
-    /// successful terminal record proves their checks completed.
-    pub fn owed_check_targets(
+    /// Complete checkpoints without a terminal record whose targets all occur
+    /// in this physical plan. Their targets must bypass unchanged-source pruning
+    /// until a later matching run finishes its checks and records a result.
+    pub fn complete_recordless_check_targets(
         &self,
         scope: &ResumeScope,
         targets: &std::collections::HashSet<String>,
     ) -> Result<std::collections::HashSet<String>, StateError> {
+        Ok(self
+            .matching_complete_recordless_checkpoints(scope, targets)?
+            .into_iter()
+            .flat_map(|(_, planned)| planned)
+            .collect())
+    }
+
+    /// Retire only the complete record-less checkpoints covered by targets
+    /// whose check phase finished in a later recorded run. A missing RunRecord
+    /// leaves the checkpoint active, including after a failed record write.
+    pub fn supersede_complete_recordless_checkpoints(
+        &self,
+        run_id: &str,
+        scope: &ResumeScope,
+        checked_targets: &std::collections::HashSet<String>,
+    ) -> Result<(), StateError> {
+        let matches = self.matching_complete_recordless_checkpoints(scope, checked_targets)?;
+        if matches.is_empty() {
+            return Ok(());
+        }
+        let txn = self.db.begin_write()?;
+        {
+            let runs = txn.open_table(RUN_HISTORY)?;
+            if runs.get(run_id)?.is_none() {
+                return Err(StateError::MissingRunProgress {
+                    run_id: run_id.to_string(),
+                });
+            }
+            let mut headers = txn.open_table(RUN_PROGRESS)?;
+            for (orphan_id, _) in matches {
+                let mut progress: RunProgress = {
+                    let Some(value) = headers.get(orphan_id.as_str())? else {
+                        continue;
+                    };
+                    serde_json::from_slice(value.value())?
+                };
+                if progress.superseded || runs.get(orphan_id.as_str())?.is_some() {
+                    continue;
+                }
+                progress.superseded = true;
+                let bytes = serde_json::to_vec(&progress)?;
+                headers.insert(orphan_id.as_str(), bytes.as_slice())?;
+            }
+        }
+        self.commit_write(txn)?;
+        Ok(())
+    }
+
+    fn matching_complete_recordless_checkpoints(
+        &self,
+        scope: &ResumeScope,
+        targets: &std::collections::HashSet<String>,
+    ) -> Result<Vec<(String, Vec<String>)>, StateError> {
         let txn = self.db.begin_read()?;
         let headers = txn.open_table(RUN_PROGRESS)?;
         let entries = txn.open_table(RUN_PROGRESS_ENTRIES)?;
         let runs = txn.open_table(RUN_HISTORY)?;
-        let mut owed = std::collections::HashSet::new();
-        for entry in headers.iter()? {
-            let (_, value) = entry?;
+        let mut matches = Vec::new();
+        for row in headers.iter()? {
+            let (_, value) = row?;
             let progress: RunProgress = serde_json::from_slice(value.value())?;
-            if progress.total_tables == 0 {
+            if progress.total_tables == 0
+                || progress.superseded
+                || runs.get(progress.run_id.as_str())?.is_some()
+            {
                 continue;
             }
             let Some(recorded_scope) = progress.scope.as_ref() else {
@@ -4405,6 +4425,28 @@ impl StateStore {
             } else {
                 &table_entries
             };
+            let successful: std::collections::HashSet<&str> = completed
+                .iter()
+                .filter(|entry| entry.status == TableStatus::Success)
+                .map(|entry| entry.table_key.as_str())
+                .collect();
+            let planned: Vec<&str> = progress.planned_tables.as_ref().map_or_else(
+                || {
+                    completed
+                        .iter()
+                        .map(|entry| entry.table_key.as_str())
+                        .collect()
+                },
+                |keys| keys.iter().map(String::as_str).collect(),
+            );
+            let complete = if progress.planned_tables.is_some() {
+                planned.iter().all(|key| successful.contains(key))
+            } else {
+                successful.len() >= progress.total_tables
+            };
+            if !complete || !planned.iter().all(|key| targets.contains(*key)) {
+                continue;
+            }
             let explicit = progress
                 .watermark_recovery_tables
                 .as_ref()
@@ -4421,156 +4463,12 @@ impl StateStore {
             ) {
                 continue;
             }
-            let terminal_success = runs
-                .get(progress.run_id.as_str())?
-                .map(|value| serde_json::from_slice::<RunRecord>(value.value()))
-                .transpose()?
-                .is_some_and(|record| record.status == RunStatus::Success);
-            owed.extend(
-                completed
-                    .iter()
-                    .filter(|entry| {
-                        entry.status == TableStatus::Success
-                            && targets.contains(&entry.table_key)
-                            && match entry.checks_owed {
-                                Some(owed) => owed,
-                                None => !terminal_success,
-                            }
-                    })
-                    .map(|entry| entry.table_key.clone()),
-            );
+            matches.push((
+                progress.run_id,
+                planned.into_iter().map(str::to_string).collect(),
+            ));
         }
-        Ok(owed)
-    }
-
-    /// Discharge every outstanding obligation for checked physical targets.
-    /// The update is one redb transaction, before a successful run is recorded.
-    pub fn discharge_check_targets(
-        &self,
-        scope: &ResumeScope,
-        config_identity: &str,
-        results: &std::collections::HashMap<String, Vec<crate::checks::CheckResult>>,
-    ) -> Result<(), StateError> {
-        if results.is_empty() {
-            return Ok(());
-        }
-        let txn = self.db.begin_write()?;
-        let mut updates = Vec::new();
-        {
-            let headers = txn.open_table(RUN_PROGRESS)?;
-            let entries = txn.open_table(RUN_PROGRESS_ENTRIES)?;
-            let runs = txn.open_table(RUN_HISTORY)?;
-            for row in headers.iter()? {
-                let (_, value) = row?;
-                let progress: RunProgress = serde_json::from_slice(value.value())?;
-                let Some(owing_scope) = progress.scope.as_ref() else {
-                    continue;
-                };
-                if owing_scope.pipeline != scope.pipeline || owing_scope.source != scope.source {
-                    continue;
-                }
-                let check_plan = progress.check_obligations.as_ref();
-                if check_plan.is_some_and(|plan| plan.config_identity != config_identity) {
-                    continue;
-                }
-                let Some(recorded) = progress.scope.as_ref().and_then(|s| s.target.as_ref()) else {
-                    continue;
-                };
-                let Some(current) = scope.target.as_ref() else {
-                    continue;
-                };
-                let explicit = progress
-                    .watermark_recovery_tables
-                    .as_ref()
-                    .is_some_and(|tables| {
-                        !tables.is_empty()
-                            && tables.iter().all(|table| !table.target.catalog.is_empty())
-                    });
-                if !recovery_endpoint_matches(&recorded.endpoint, &current.endpoint, explicit) {
-                    continue;
-                }
-                let terminal_success = runs
-                    .get(progress.run_id.as_str())?
-                    .map(|value| serde_json::from_slice::<RunRecord>(value.value()))
-                    .transpose()?
-                    .is_some_and(|record| record.status == RunStatus::Success);
-                let table_entries = Self::read_progress_entries(&entries, &progress.run_id)?;
-                if table_entries.is_empty() {
-                    // Pre-v8 checkpoints kept their table rows in the header.
-                    let mut old = progress.clone();
-                    let mut changed = false;
-                    for entry in &mut old.tables {
-                        if entry.status == TableStatus::Success
-                            && check_results_cover_obligation(check_plan, entry, results)
-                            && (entry.checks_owed == Some(true)
-                                || (entry.checks_owed.is_none() && !terminal_success))
-                        {
-                            entry.checks_owed = Some(false);
-                            entry.check_results = results[&entry.table_key].clone();
-                            changed = true;
-                        }
-                    }
-                    if changed {
-                        updates.push((old.run_id.clone(), None, serde_json::to_vec(&old)?));
-                    }
-                } else {
-                    for mut entry in table_entries {
-                        if entry.status == TableStatus::Success
-                            && check_results_cover_obligation(check_plan, &entry, results)
-                            && (entry.checks_owed == Some(true)
-                                || (entry.checks_owed.is_none() && !terminal_success))
-                        {
-                            entry.checks_owed = Some(false);
-                            entry.check_results = results[&entry.table_key].clone();
-                            updates.push((
-                                progress.run_id.clone(),
-                                Some(entry.table_key.clone()),
-                                serde_json::to_vec(&entry)?,
-                            ));
-                        }
-                    }
-                }
-            }
-        }
-        {
-            let mut headers = txn.open_table(RUN_PROGRESS)?;
-            let mut entries = txn.open_table(RUN_PROGRESS_ENTRIES)?;
-            for (run_id, table_key, bytes) in updates {
-                if let Some(table_key) = table_key {
-                    let key = run_progress_entry_key(&run_id, &table_key);
-                    entries.insert(key.as_str(), bytes.as_slice())?;
-                } else {
-                    headers.insert(run_id.as_str(), bytes.as_slice())?;
-                }
-            }
-        }
-        self.commit_write(txn)?;
-        Ok(())
-    }
-}
-
-/// A target result is evidence only for the check names the owning run
-/// recorded before copying. Legacy checkpoints require a measured result
-/// from the same pipeline because their check definitions were not saved.
-fn check_results_cover_obligation(
-    plan: Option<&CheckObligations>,
-    entry: &TableProgress,
-    results: &std::collections::HashMap<String, Vec<crate::checks::CheckResult>>,
-) -> bool {
-    let Some(observed) = results.get(&entry.table_key) else {
-        return false;
-    };
-    let measured = |name: &str| {
-        observed
-            .iter()
-            .any(|result| result.name == name && result.not_evaluated.is_none())
-    };
-    match plan {
-        Some(plan) => plan
-            .by_target
-            .get(&entry.table_key)
-            .is_some_and(|names| names.iter().all(|name| measured(name))),
-        None => observed.iter().any(|result| result.not_evaluated.is_none()),
+        Ok(matches)
     }
 }
 
@@ -4589,7 +4487,7 @@ impl StateStore {
     /// are never touched: they hold live state, not history.
     ///
     /// A swept run record takes its checkpoint with it unless that checkpoint
-    /// still owes post-copy checks or watermark recovery. The `run_progress`
+    /// still needs watermark recovery. The `run_progress`
     /// header and the `run_progress_entries` rows keyed by that run id are
     /// removed in the same write transaction as the record, so a resume can
     /// never find a checkpoint whose record retention already dropped. A
@@ -4763,7 +4661,6 @@ impl StateStore {
         let txn = self.db.begin_read()?;
         let table = txn.open_table(RUN_HISTORY)?;
         let progress = txn.open_table(RUN_PROGRESS)?;
-        let progress_entries = txn.open_table(RUN_PROGRESS_ENTRIES)?;
         let mut entries = Vec::new();
         for entry in table.iter()? {
             let (key, value) = entry?;
@@ -4771,25 +4668,10 @@ impl StateStore {
             let pending_recovery = match progress.get(key.value())? {
                 Some(value) => {
                     let header: RunProgress = serde_json::from_slice(value.value())?;
-                    let pending_watermark = !header.watermarks_confirmed
+                    !header.watermarks_confirmed
                         && header
                             .watermark_recovery_tables
-                            .is_some_and(|tables| !tables.is_empty());
-                    let table_entries =
-                        Self::read_progress_entries(&progress_entries, key.value())?;
-                    let copied = if table_entries.is_empty() {
-                        &header.tables
-                    } else {
-                        &table_entries
-                    };
-                    let pending_checks = copied.iter().any(|entry| {
-                        entry.status == TableStatus::Success
-                            && match entry.checks_owed {
-                                Some(owed) => owed,
-                                None => run.status != RunStatus::Success,
-                            }
-                    });
-                    pending_watermark || pending_checks
+                            .is_some_and(|tables| !tables.is_empty())
                 }
                 None => false,
             };
@@ -10962,7 +10844,7 @@ mod tests {
         let mut renamed_unknown = unknown_target.clone();
         renamed_unknown.pipeline = "p2".into();
         init("renamed-unknown-target", &renamed_unknown);
-        // Any overlapping target from a renamed pipeline exposes its intent.
+        // A renamed pipeline needs every recorded target in the current plan.
         let mut other_table = recovery_table(Some(Utc::now()));
         other_table.target.table = "other".into();
         store
@@ -11001,7 +10883,7 @@ mod tests {
             list(&["wh.raw.orders"]),
             same_pipeline
                 .iter()
-                .chain(&["renamed", "renamed-partial"])
+                .chain(&["renamed"])
                 .map(ToString::to_string)
                 .collect()
         );
@@ -11015,12 +10897,8 @@ mod tests {
         );
         assert_eq!(
             list(&["wh.raw.other"]),
-            same_pipeline
-                .iter()
-                .chain(&["renamed-partial"])
-                .map(ToString::to_string)
-                .collect(),
-            "another pipeline's intent is present for a physical target overlap"
+            same_pipeline.iter().map(ToString::to_string).collect(),
+            "a partial target overlap cannot reconcile another pipeline's intent"
         );
 
         let recovered = store
@@ -11101,184 +10979,6 @@ mod tests {
     }
 
     #[test]
-    fn check_obligations_follow_physical_target_overlap_and_discharge() {
-        let (store, _dir) = temp_store();
-        let old = progress_scope("old");
-        let current = progress_scope("new");
-        let names = ["wh.raw.orders".to_string(), "wh.raw.other".to_string()];
-        store
-            .init_run_progress("crashed", &names, Some(&old))
-            .unwrap();
-        for (index, name) in names.iter().enumerate() {
-            store
-                .record_table_progress(
-                    "crashed",
-                    &progress_entry(index, name, TableStatus::Success),
-                )
-                .unwrap();
-        }
-        let only_one = [names[0].clone()].into_iter().collect();
-        assert_eq!(
-            store.owed_check_targets(&current, &only_one).unwrap(),
-            only_one
-        );
-        let both = names.iter().cloned().collect();
-        assert_eq!(store.owed_check_targets(&current, &both).unwrap(), both);
-        let checked = [(names[0].clone(), vec![crate::checks::check_row_count(2, 3)])]
-            .into_iter()
-            .collect();
-        store.discharge_check_targets(&old, "", &checked).unwrap();
-        let discharged = store.get_run_progress("crashed").unwrap().unwrap();
-        assert_eq!(discharged.tables[0].checks_owed, Some(false));
-        assert!(
-            !discharged.tables[0].check_results[0].passed,
-            "the failed check must survive a crash before RunRecord persistence"
-        );
-        assert!(
-            store
-                .owed_check_targets(&current, &only_one)
-                .unwrap()
-                .is_empty(),
-            "a third unchanged run may prune after check completion"
-        );
-        assert_eq!(
-            store.owed_check_targets(&current, &both).unwrap(),
-            [names[1].clone()].into_iter().collect()
-        );
-        let mut elsewhere = current;
-        elsewhere
-            .target
-            .as_mut()
-            .unwrap()
-            .endpoint
-            .locators
-            .insert("path".into(), "other-endpoint".into());
-        assert!(
-            store
-                .owed_check_targets(&elsewhere, &both)
-                .unwrap()
-                .is_empty()
-        );
-    }
-
-    #[test]
-    fn another_pipeline_or_different_check_cannot_clear_target_debt() {
-        let (store, _dir) = temp_store();
-        let p = progress_scope("p");
-        let q = progress_scope("q");
-        let key = "wh.raw.orders".to_string();
-        let targets = [key.clone()].into_iter().collect();
-        store
-            .init_run_progress("p-copy", std::slice::from_ref(&key), Some(&p))
-            .unwrap();
-        store
-            .set_run_check_obligations(
-                "p-copy",
-                CheckObligations {
-                    config_identity: "p:unique-sql".into(),
-                    by_target: [(key.clone(), vec!["unique".into()])].into_iter().collect(),
-                },
-            )
-            .unwrap();
-        let mut copied = progress_entry(0, &key, TableStatus::Success);
-        copied.checks_owed = Some(true);
-        store.record_table_progress("p-copy", &copied).unwrap();
-        let empty = [(key.clone(), Vec::new())].into_iter().collect();
-        store
-            .discharge_check_targets(&q, "q:no-checks", &empty)
-            .unwrap();
-        assert_eq!(store.owed_check_targets(&q, &targets).unwrap(), targets);
-        let different = [(key.clone(), vec![crate::checks::check_row_count(1, 1)])]
-            .into_iter()
-            .collect();
-        store
-            .discharge_check_targets(&q, "q:row-count", &different)
-            .unwrap();
-        store
-            .discharge_check_targets(&p, "p:unique-sql", &different)
-            .unwrap();
-        assert_eq!(store.owed_check_targets(&p, &targets).unwrap(), targets);
-        let mut unique = crate::checks::check_row_count(1, 1);
-        unique.name = "unique".into();
-        let measured = [(key.clone(), vec![unique])].into_iter().collect();
-        store
-            .discharge_check_targets(&p, "p:changed-sql", &measured)
-            .unwrap();
-        assert_eq!(store.owed_check_targets(&p, &targets).unwrap(), targets);
-        store
-            .discharge_check_targets(&p, "p:unique-sql", &measured)
-            .unwrap();
-        assert!(store.owed_check_targets(&p, &targets).unwrap().is_empty());
-    }
-
-    #[test]
-    fn interrupted_record_and_incomplete_resume_leave_per_target_checks_owed() {
-        let (store, _dir) = temp_store();
-        let scope = progress_scope("p");
-        let names = ["wh.raw.orders".to_string(), "wh.raw.other".to_string()];
-        store
-            .init_run_progress("interrupted", &names, Some(&scope))
-            .unwrap();
-        let mut copied = progress_entry(0, &names[0], TableStatus::Success);
-        copied.checks_owed = Some(true);
-        store.record_table_progress("interrupted", &copied).unwrap();
-        let mut record = run_at("interrupted", Utc::now());
-        record.status = RunStatus::PartialFailure;
-        store.record_run(&record).unwrap();
-        let planned = names.iter().cloned().collect();
-        assert_eq!(
-            store.owed_check_targets(&scope, &planned).unwrap(),
-            [names[0].clone()].into_iter().collect()
-        );
-        store
-            .init_run_progress("resume", &names, Some(&scope))
-            .unwrap();
-        store
-            .record_table_progress(
-                "resume",
-                &progress_entry(1, &names[1], TableStatus::Success),
-            )
-            .unwrap();
-        assert_eq!(
-            store.owed_check_targets(&scope, &planned).unwrap(),
-            planned,
-            "an incomplete resume cannot erase the first table's check debt"
-        );
-    }
-
-    #[test]
-    fn retention_preserves_check_obligation_until_discharge() {
-        let (store, _dir) = temp_store();
-        let scope = progress_scope("p");
-        let key = "wh.raw.orders".to_string();
-        store
-            .init_run_progress("old", std::slice::from_ref(&key), Some(&scope))
-            .unwrap();
-        let mut copied = progress_entry(0, &key, TableStatus::Success);
-        copied.checks_owed = Some(true);
-        store.record_table_progress("old", &copied).unwrap();
-        let mut record = run_at("old", Utc::now() - chrono::Duration::days(100));
-        record.status = RunStatus::PartialFailure;
-        store.record_run(&record).unwrap();
-        let policy = StateRetentionConfig {
-            max_age_days: 1,
-            min_runs_kept: 0,
-            applies_to: vec![StateRetentionDomain::History],
-            ..StateRetentionConfig::default()
-        };
-        assert_eq!(
-            store.sweep_retention_dry_run(&policy).unwrap().runs_deleted,
-            0
-        );
-        assert_eq!(store.sweep_retention(&policy).unwrap().runs_deleted, 0);
-        let checked = [(key, vec![crate::checks::check_row_count(1, 1)])]
-            .into_iter()
-            .collect();
-        store.discharge_check_targets(&scope, "", &checked).unwrap();
-        assert_eq!(store.sweep_retention(&policy).unwrap().runs_deleted, 1);
-    }
-
-    #[test]
     fn recovery_ignores_headers_without_descriptors() {
         let (store, _dir) = temp_store();
         let scope = progress_scope("p1");
@@ -11325,7 +11025,7 @@ mod tests {
     }
 
     #[test]
-    fn version_175_checkpoint_with_stale_watermark_keeps_check_debt() {
+    fn version_175_checkpoint_remains_visible_until_superseded() {
         let (store, _dir) = temp_store();
         let scope = progress_scope("p");
         let key = "wh.raw.orders";
@@ -11336,9 +11036,7 @@ mod tests {
             "total_tables": 1, "tables": [], "scope": scope,
             "planned_tables": [key]
         });
-        let mut entry = serde_json::to_value(progress_entry(0, key, TableStatus::Success)).unwrap();
-        entry.as_object_mut().unwrap().remove("checks_owed");
-        entry.as_object_mut().unwrap().remove("check_results");
+        let entry = serde_json::to_value(progress_entry(0, key, TableStatus::Success)).unwrap();
         let header_bytes = serde_json::to_vec(&header).unwrap();
         let entry_bytes = serde_json::to_vec(&entry).unwrap();
         let txn = store.db.begin_write().unwrap();
@@ -11362,12 +11060,90 @@ mod tests {
                 .is_empty(),
             "descriptor-less release checkpoints must not force upgraded runs to refuse"
         );
-        assert_eq!(store.owed_check_targets(&scope, &targets).unwrap(), targets);
+        assert_eq!(
+            store
+                .complete_recordless_check_targets(&scope, &targets)
+                .unwrap(),
+            targets
+        );
+        assert!(!store.get_run_progress("v175").unwrap().unwrap().superseded);
+        assert!(
+            store
+                .supersede_complete_recordless_checkpoints("later", &scope, &targets)
+                .is_err(),
+            "a missing later record cannot supersede the checkpoint"
+        );
+        let mut later = run_at("later", Utc::now());
+        later.status = RunStatus::Failure;
+        store.record_run(&later).unwrap();
+        store
+            .supersede_complete_recordless_checkpoints("later", &scope, &targets)
+            .unwrap();
+        assert!(store.get_run_progress("v175").unwrap().unwrap().superseded);
+        assert!(
+            store
+                .complete_recordless_check_targets(&scope, &targets)
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(
             store.get_watermark(key).unwrap().unwrap().last_value,
             stale.last_value,
             "the old flush gap remains until the operator repairs the cursor"
         );
+    }
+
+    #[test]
+    fn orphan_checkpoint_requires_full_physical_plan_and_matching_endpoint() {
+        let (store, _dir) = temp_store();
+        let old = progress_scope("old-name");
+        let mut renamed = old.clone();
+        renamed.pipeline = "new-name".into();
+        let keys = ["wh.raw.orders".to_string(), "wh.raw.items".to_string()];
+        store.init_run_progress("crash", &keys, Some(&old)).unwrap();
+        for (index, key) in keys.iter().enumerate() {
+            store
+                .record_table_progress("crash", &progress_entry(index, key, TableStatus::Success))
+                .unwrap();
+        }
+        let partial = [keys[0].clone()].into_iter().collect();
+        assert!(
+            store
+                .complete_recordless_check_targets(&renamed, &partial)
+                .unwrap()
+                .is_empty()
+        );
+        let full = keys.iter().cloned().collect();
+        assert_eq!(
+            store
+                .complete_recordless_check_targets(&renamed, &full)
+                .unwrap(),
+            full
+        );
+        let mut elsewhere = renamed.clone();
+        elsewhere
+            .target
+            .as_mut()
+            .unwrap()
+            .endpoint
+            .locators
+            .insert("path".into(), "elsewhere".into());
+        assert!(
+            store
+                .complete_recordless_check_targets(&elsewhere, &full)
+                .unwrap()
+                .is_empty()
+        );
+        let later = run_at("later", Utc::now());
+        store.record_run(&later).unwrap();
+        store
+            .supersede_complete_recordless_checkpoints("later", &renamed, &partial)
+            .unwrap();
+        assert!(!store.get_run_progress("crash").unwrap().unwrap().superseded);
+        store
+            .supersede_complete_recordless_checkpoints("later", &renamed, &full)
+            .unwrap();
+        assert!(store.get_run_progress("crash").unwrap().unwrap().superseded);
     }
 
     #[test]
@@ -11405,8 +11181,6 @@ mod tests {
             error: None,
             duration_ms: 120,
             completed_at: Utc::now(),
-            checks_owed: None,
-            check_results: Vec::new(),
         };
         let p2 = TableProgress {
             index: 1,
@@ -11416,8 +11190,6 @@ mod tests {
             error: Some("connection timeout".to_string()),
             duration_ms: 5000,
             completed_at: Utc::now(),
-            checks_owed: None,
-            check_results: Vec::new(),
         };
         let p3 = TableProgress {
             index: 2,
@@ -11427,8 +11199,6 @@ mod tests {
             error: None,
             duration_ms: 85,
             completed_at: Utc::now(),
-            checks_owed: None,
-            check_results: Vec::new(),
         };
 
         store.record_table_progress("run-001", &p1).unwrap();
@@ -11534,8 +11304,6 @@ mod tests {
                     error: None,
                     duration_ms: 1,
                     completed_at: chrono::Utc::now(),
-                    checks_owed: None,
-                    check_results: Vec::new(),
                 },
             )
             .unwrap();
@@ -11942,8 +11710,6 @@ mod tests {
                         },
                         duration_ms: 100,
                         completed_at: Utc::now(),
-                        checks_owed: None,
-                        check_results: Vec::new(),
                     },
                 )
                 .unwrap();
@@ -11978,8 +11744,6 @@ mod tests {
             error: None,
             duration_ms: 100,
             completed_at: Utc::now(),
-            checks_owed: None,
-            check_results: Vec::new(),
         }
     }
 
@@ -12179,7 +11943,7 @@ mod tests {
             planned_tables: None,
             watermarks_confirmed: false,
             watermark_recovery_tables: None,
-            check_obligations: None,
+            superseded: false,
         };
         let bytes = serde_json::to_vec(&legacy).unwrap();
         {

@@ -137,13 +137,18 @@ Rocky refuses `--resume` and `--resume-latest` when every planned table copied
 but the terminal run record is missing. Skipping those tables would also skip
 their post-copy checks and could report false success.
 
-Follow the recovery route in the refusal. For a confirmed checkpoint, run
-`rocky run --pipeline <name> --no-prune` to execute the owed checks. With
-supported recovery records, a fresh run re-derives watermarks from the target.
-It then copies rows and runs checks. Rocky records check obligations per
-physical target. A fresh run cannot prune a target while its checks remain
-owed. A resume reruns checks for copied tables it skips. Once checks finish,
-later unchanged runs can prune normally.
+Follow the recovery route in the refusal. A matching fresh run does not prune targets
+from a complete checkpoint without a run record. It copies those targets and
+runs their checks, even when the source marker is unchanged. A later matching
+run can use another pipeline name. Its target endpoint must match, and its plan
+must contain every target in the checkpoint.
+
+After that run finishes checks and writes its run record, Rocky marks the old
+checkpoint superseded. The next run can prune unchanged targets. A recorded
+check failure still completes this step.
+
+With supported recovery records, the fresh run also re-derives watermarks from
+the target before copying. An old checkpoint alone never fails a fresh run.
 
 A checkpoint from Rocky 1.75.0 or earlier cannot show that its watermarks were
 saved. Switch the affected tables to `strategy = "full_refresh"`, then run
@@ -170,7 +175,8 @@ Then restore `strategy = "incremental"`.
 Rocky 1.75.0 and earlier did not record recovery descriptors. A crash after
 an INSERT but before its watermark flush can leave a stale cursor. The first
 run after upgrading can append those rows again. Repair the cursor from the
-target before that run if the old flush is uncertain.
+target before that run if the old flush is uncertain. #2235 stays open for
+recovery gaps that this checkpoint rule does not address.
 
 Other unsupported checkpoints require full refresh. Keep that strategy until
 `rocky state reconcile-watermark --pipeline <name>` sets the replacement

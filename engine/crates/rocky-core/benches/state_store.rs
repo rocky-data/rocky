@@ -44,8 +44,6 @@ fn sample_progress(index: usize) -> TableProgress {
         error: None,
         duration_ms: 120,
         completed_at: Utc::now(),
-        checks_owed: None,
-        check_results: Vec::new(),
     }
 }
 
@@ -67,7 +65,7 @@ fn naive_record_table_progress(db: &Database, run_id: &str, progress: &TableProg
                 planned_tables: None,
                 watermarks_confirmed: false,
                 watermark_recovery_tables: None,
-                check_obligations: None,
+                superseded: false,
             },
         }
     };

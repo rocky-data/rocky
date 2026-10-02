@@ -640,8 +640,6 @@ table = "other"
                     error: None,
                     duration_ms: 1,
                     completed_at: Utc::now(),
-                    checks_owed: None,
-                    check_results: Vec::new(),
                 },
             )
             .unwrap();

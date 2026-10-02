@@ -591,9 +591,16 @@ rocky run [flags]
 copied but whose terminal run record is missing. Resuming that checkpoint would
 skip its post-copy checks. Incomplete crash checkpoints remain resumable.
 
-Follow the refusal's recovery route. For confirmed checkpoints, run fresh with
-`--no-prune` to execute checks. With supported recovery records, a fresh run
-re-derives target watermarks before copying.
+Follow the refusal's recovery route. A matching fresh run copies targets from
+a complete checkpoint without a run record, even with unchanged source markers.
+It runs checks and writes a new run record. Rocky then marks the old checkpoint
+superseded, so the next run can prune unchanged targets. A recorded check
+failure also supersedes it.
+
+Matching requires the same target endpoint and a plan containing every target
+in the checkpoint. An old checkpoint alone never fails a fresh run. With
+supported recovery records, Rocky re-derives target watermarks before copying.
+#2235 stays open for remaining recovery gaps.
 
 For checkpoints from Rocky 1.75.0 or earlier, set `strategy = "full_refresh"`
 for affected tables. Run `rocky run --pipeline <name> --no-prune` without a
