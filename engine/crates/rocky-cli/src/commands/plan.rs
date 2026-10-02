@@ -1089,9 +1089,9 @@ pub(crate) fn conditional_drops_for_run_plan(
     };
     let models = match compiled {
         Ok(result) => result.project.models,
-        // Legacy reviewable plans may omit the informational model list and
-        // point at an uncompiled project. Apply cannot execute a model when
-        // this same compile fails, so there is no conditional DROP to show.
+        // A reviewable plan may omit the informational model list and point at
+        // an uncompiled project. Apply cannot execute a model when this same
+        // compile fails, so there is no conditional DROP to show.
         Err(_) if run_plan.models.is_empty() && run_plan.model.is_none() => return Ok(Vec::new()),
         Err(error) => {
             return Err(anyhow::Error::from(error)

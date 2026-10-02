@@ -6102,6 +6102,22 @@ mod tests {
         }
     }
 
+    fn write_fingerprinted_ai_plan(root: &Path, plan: &RunPlan) -> anyhow::Result<String> {
+        crate::plan_store::write_plan_governed(
+            root,
+            PlanKind::AiAuthored,
+            plan,
+            PolicyPrincipal::Agent,
+            crate::plan_store::EmbeddedCapabilities {
+                models_fingerprint: Some("reviewed-fingerprint".to_string()),
+                config_identity: Some("reviewed-config".to_string()),
+                fingerprint_version: crate::plan_store::CURRENT_FINGERPRINT_VERSION,
+                reviewed_source_schemas: Some(BTreeMap::new()),
+                ..Default::default()
+            },
+        )
+    }
+
     #[tokio::test]
     async fn transformation_shadow_and_branch_plans_pass_apply_preflight() -> anyhow::Result<()> {
         for branch in [None, Some("fix_price")] {
@@ -6167,7 +6183,7 @@ mod tests {
         plan.pipeline = Some("dq".to_string());
         plan.shadow = true;
         plan.models_dir = Some(models_dir.to_string_lossy().into_owned());
-        let plan_id = write_plan(dir.path(), PlanKind::AiAuthored, &plan)?;
+        let plan_id = write_fingerprinted_ai_plan(dir.path(), &plan)?;
         let state_path = dir.path().join("state.redb");
 
         let error = super::run_apply_core_in(
@@ -6331,7 +6347,7 @@ mod tests {
     async fn ai_authored_apply_with_invalid_marker_is_refused_distinctly() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let rp = minimal_run_plan();
-        let plan_id = write_plan(dir.path(), PlanKind::AiAuthored, &rp)?;
+        let plan_id = write_fingerprinted_ai_plan(dir.path(), &rp)?;
         let config_path = dir.path().join("rocky.toml");
         std::fs::write(
             &config_path,
@@ -6387,7 +6403,7 @@ mod tests {
     async fn ai_authored_apply_without_marker_is_refused() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let rp = minimal_run_plan();
-        let plan_id = write_plan(dir.path(), PlanKind::AiAuthored, &rp)?;
+        let plan_id = write_fingerprinted_ai_plan(dir.path(), &rp)?;
 
         // A loadable (policy-free) config: since PR-B the gate HARD-loads the
         // single config snapshot up front (#1120 behavior delta), so the
@@ -6531,7 +6547,7 @@ auto_create_schemas = true
         let mut rp = minimal_run_plan();
         rp.models_dir = Some(models_dir.to_string_lossy().into_owned());
         rp.models = vec!["orders".to_string()];
-        let plan_id = write_plan(dir.path(), PlanKind::AiAuthored, &rp)?;
+        let plan_id = write_fingerprinted_ai_plan(dir.path(), &rp)?;
         strip_principal_from_plan(dir.path(), &plan_id)?;
 
         let state = dir.path().join("state.redb");
@@ -6578,7 +6594,7 @@ auto_create_schemas = true
         let mut rp = minimal_run_plan();
         rp.models_dir = Some(models_dir.to_string_lossy().into_owned());
         rp.models = vec!["orders".to_string()];
-        let plan_id = write_plan(dir.path(), PlanKind::AiAuthored, &rp)?;
+        let plan_id = write_fingerprinted_ai_plan(dir.path(), &rp)?;
 
         let state = dir.path().join("state.redb");
         let err = super::run_apply_ai_authored_plan(
@@ -6606,7 +6622,7 @@ auto_create_schemas = true
     async fn no_policy_block_ai_authored_requires_marker() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         std::fs::write(dir.path().join("rocky.toml"), NO_POLICY_TOML)?;
-        let plan_id = write_plan(dir.path(), PlanKind::AiAuthored, &minimal_run_plan())?;
+        let plan_id = write_fingerprinted_ai_plan(dir.path(), &minimal_run_plan())?;
 
         let state = dir.path().join("state.redb");
         let err = super::run_apply_ai_authored_plan(

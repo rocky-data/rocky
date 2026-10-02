@@ -291,36 +291,39 @@ pub async fn compute_review_with_state_path(
 
     let run_plan: RunPlan = serde_json::from_value(plan.payload.clone())
         .context("failed to deserialize plan payload")?;
+    let resolved_config_path = root.join(config_path);
 
     // Use apply's execution selection, including the pipeline's configured
     // file glob. A relative explicit directory belongs to this project root,
     // not the review server's process directory.
     let (selected_dir, models_glob) =
-        match rocky_core::config::load_optional_project_config(Some(config_path))? {
-            Some(cfg) => super::apply::run_model_selection(&cfg, config_path, &run_plan)?,
+        match rocky_core::config::load_optional_project_config(Some(&resolved_config_path))
+            .with_context(|| {
+                format!(
+                    "failed to load config from {}",
+                    resolved_config_path.display()
+                )
+            })? {
+            Some(cfg) => super::apply::run_model_selection(&cfg, &resolved_config_path, &run_plan)?,
             None => (
                 PathBuf::from(run_plan.models_dir.as_deref().unwrap_or("models")),
                 None,
             ),
         };
-    let models_dir = if selected_dir.is_absolute() {
-        selected_dir
-    } else {
-        root.join(selected_dir)
-    };
-    let default_state_path = rocky_core::state::resolve_state_path(None, &models_dir).path;
+    let (models_dir, default_state_path) = review_gate_paths(root, &selected_dir);
     let state_path = state_path.unwrap_or(&default_state_path);
 
     // `?` here is the whole point of the change: a present-but-unloadable
     // `rocky.toml` propagates BEFORE the `--approve` branch below, so no marker
     // is written and no zero count is recorded.
-    let findings = compute_review_findings(config_path, &models_dir, state_path, base_ref)?;
+    let findings =
+        compute_review_findings(&resolved_config_path, &models_dir, state_path, base_ref)?;
     let breaking_count = findings
         .as_ref()
         .map(|f| f.iter().filter(|x| x.is_breaking()).count())
         .unwrap_or(0);
     let conditional_drops = super::plan::conditional_drops_for_run_plan(
-        config_path,
+        &resolved_config_path,
         &models_dir,
         models_glob.as_deref(),
         state_path,
@@ -528,18 +531,10 @@ fn build_message(
     }
 }
 
-/// Resolve the paths the review's breaking-change gate reads, anchored at the
-/// project `root` rather than the process cwd.
-///
-/// - `models_dir`: the plan's recorded models directory (default `models`),
-///   joined onto `root` (an already-absolute recorded path is used verbatim —
-///   `Path::join` replaces on absolute).
-/// - `state_path`: the schema-cache state store, resolved with the same
-///   [`rocky_core::state::resolve_state_path`] defaulting the CLI and the MCP
-///   server use (`<models_dir>/.rocky-state.redb` et al.) — not a hardcoded
-///   cwd-relative file.
-fn review_gate_paths(root: &Path, plan_models_dir: Option<&str>) -> (PathBuf, PathBuf) {
-    let models_dir = root.join(plan_models_dir.unwrap_or("models"));
+/// Anchor apply's selected model directory at the review project root, then
+/// resolve the schema-cache state path from that directory.
+fn review_gate_paths(root: &Path, selected_dir: &Path) -> (PathBuf, PathBuf) {
+    let models_dir = root.join(selected_dir);
     let state_path = rocky_core::state::resolve_state_path(None, &models_dir).path;
     (models_dir, state_path)
 }
@@ -1336,7 +1331,7 @@ mod tests {
         let state = dir.path().join("state.redb");
         let review = compute_review_with_state_path(
             dir.path(),
-            &config,
+            Path::new("rocky.toml"),
             Some(&state),
             &plan_id,
             "HEAD",
@@ -1369,6 +1364,10 @@ mod tests {
         assert_eq!(review.conditional_drops[0].model, expected.model);
         assert_eq!(review.conditional_drops[0].target, expected.target);
         assert_eq!(review.conditional_drops[0].drop_sql, expected.drop_sql);
+        assert_eq!(
+            review.conditional_drops[0].drop_sql,
+            "DROP TABLE IF EXISTS main.switch"
+        );
         assert!(!review.marker_written);
         Ok(())
     }
@@ -1927,7 +1926,7 @@ mod tests {
         let root = dir.path();
         std::fs::create_dir_all(root.join("models")).unwrap();
 
-        let (models_dir, state_path) = review_gate_paths(root, Some("models"));
+        let (models_dir, state_path) = review_gate_paths(root, Path::new("models"));
         assert_eq!(models_dir, root.join("models"));
         assert!(
             models_dir.is_dir(),
@@ -1938,16 +1937,9 @@ mod tests {
         // cwd-relative `.rocky/state.redb`.
         assert_eq!(state_path, root.join("models").join(".rocky-state.redb"));
 
-        // An absolute recorded models_dir is used verbatim.
-        let (abs_dir, _) = review_gate_paths(
-            Path::new("/somewhere/else"),
-            Some(root.join("models").to_str().unwrap()),
-        );
+        // An absolute selected directory is used verbatim.
+        let (abs_dir, _) = review_gate_paths(Path::new("/somewhere/else"), &root.join("models"));
         assert_eq!(abs_dir, root.join("models"));
-
-        // Default when the plan recorded none.
-        let (default_dir, _) = review_gate_paths(root, None);
-        assert_eq!(default_dir, root.join("models"));
     }
 
     /// FIX: an approved plan's later apply-time re-evaluation rows (same
@@ -2085,7 +2077,7 @@ mod tests {
         // REFUSE on a broken one. Without this the assertion below would pass
         // for the wrong reason — the marker is written here anyway, because
         // the base compile has no git repo to read.
-        let (models_dir, state_path) = review_gate_paths(root, Some("models"));
+        let (models_dir, state_path) = review_gate_paths(root, Path::new("models"));
         assert!(
             compute_review_findings(&config_path, &models_dir, &state_path, "HEAD").is_ok(),
             "an absent rocky.toml must skip the gate, never refuse it"
