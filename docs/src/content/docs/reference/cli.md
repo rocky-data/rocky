@@ -300,6 +300,7 @@ rocky run [--filter <key=value>] [flags]
 | `--resume <RUN_ID>` | | Resume a specific previous replication run from its last checkpoint; mints a new `run_id` and records the prior one as `resumed_from`. Rejected with `--dag`, which does not replay the resume into its sub-runs (rejected at parse time). |
 | `--resume-latest` | | Resume the most recent failed replication run from its last checkpoint; mints a new `run_id` and records the prior one as `resumed_from`. Rejected with `--dag`, which does not replay the resume into its sub-runs (rejected at parse time). |
 | `--shadow` | | Run in shadow mode: write to shadow targets instead of production. |
+| `--keep-shadow` | Requires `--shadow`; conflicts with `--watch` | Keep shadow objects for a separate `rocky compare`. |
 | `--shadow-suffix <SUFFIX>` | Requires `--shadow` | Suffix appended to table names. Conflicts with `--branch`. `--shadow` alone uses `_rocky_shadow`. |
 | `--shadow-schema <NAME>` | Requires `--shadow` | Override schema for shadow tables. Conflicts with `--branch`. |
 | `--branch <NAME>` | | Execute against a named branch created with `rocky branch create`. Conflicts with `--shadow`, `--shadow-schema`, and `--shadow-suffix`. See [`rocky branch`](/reference/commands/core-pipeline/#rocky-branch). |
@@ -517,7 +518,7 @@ date_key = "DATE"
 
 ### `rocky compare`
 
-Compare shadow tables against production tables. Used after `rocky plan --shadow` + `rocky apply <plan-id>` (or the single-step `rocky run --shadow` alias) to validate results before promoting shadow data to production.
+Compare kept shadow tables against production tables. A plain `rocky run --shadow` already compares before cleanup. Pass `--keep-shadow` to retain its objects for this command.
 
 ```bash
 rocky compare [--filter <key=value>] [flags]

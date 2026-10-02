@@ -398,6 +398,17 @@ pub struct RunFailed {
     pub custody: RecordCustody,
 }
 
+/// A completed shadow run whose comparison failed after its writes landed.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "{count} shadow table(s) failed comparison (run_id: {run_id}; see `shadow_comparison` in the JSON output)"
+)]
+pub struct ShadowComparisonFailure {
+    pub count: usize,
+    pub run_id: String,
+    pub custody: RecordCustody,
+}
+
 /// Sentinel error signalling that a quality run completed its terminal state
 /// writes and then failed its check gate: at least one error-severity check
 /// failed, or could not be evaluated, while `[pipeline.<name>.checks]
@@ -508,7 +519,12 @@ pub(crate) fn session_disposition(error: &anyhow::Error) -> SessionDisposition {
     let custody = error
         .downcast_ref::<RunFailed>()
         .map(|e| e.custody)
-        .or_else(|| error.downcast_ref::<PartialFailure>().map(|e| e.custody));
+        .or_else(|| error.downcast_ref::<PartialFailure>().map(|e| e.custody))
+        .or_else(|| {
+            error
+                .downcast_ref::<ShadowComparisonFailure>()
+                .map(|e| e.custody)
+        });
     match custody {
         Some(RecordCustody::Persisted) => SessionDisposition::Finalize,
         Some(RecordCustody::Lost) | None => SessionDisposition::Abandon,
@@ -537,6 +553,19 @@ pub(crate) fn run_status_exit_result(
     // than on the error type, which says nothing about the write.
     custody: RecordCustody,
 ) -> Result<()> {
+    if output.tables_failed == 0
+        && !output.check_gate_failed
+        && !output.verify_after_failed
+        && let Some(comparison) = output.shadow_comparison.as_ref()
+        && comparison.tables_failed > 0
+    {
+        return Err(ShadowComparisonFailure {
+            count: comparison.tables_failed,
+            run_id: run_id.to_string(),
+            custody,
+        }
+        .into());
+    }
     match output.derive_run_status() {
         rocky_core::state::RunStatus::PartialFailure => Err(PartialFailure {
             count: output.tables_failed,
@@ -4608,6 +4637,7 @@ pub async fn run_with_explicit_contracts(
             (String, String),
         > = HashMap::new();
         let mut collision_check_pairs: Vec<(String, String)> = Vec::new();
+        let mut shadow_preflight_objects = Vec::new();
         for conn in &connectors {
             let Ok(parsed) = pattern.parse(&conn.schema) else {
                 continue;
@@ -4630,13 +4660,7 @@ pub async fn run_with_explicit_contracts(
             // disabled is not refused for a value `run` never renders.
             let mut metadata_preflighted = false;
             let target_catalog = parsed.resolve_template(target_catalog_template, target_sep);
-            let target_schema = if let Some(cfg) = shadow_config {
-                cfg.schema_override
-                    .clone()
-                    .unwrap_or_else(|| parsed.resolve_template(target_schema_template, target_sep))
-            } else {
-                parsed.resolve_template(target_schema_template, target_sep)
-            };
+            let target_schema = parsed.resolve_template(target_schema_template, target_sep);
 
             for table in &conn.tables {
                 if !filter_table_matches(parsed_filter.as_ref(), &table.name) {
@@ -4665,18 +4689,19 @@ pub async fn run_with_explicit_contracts(
                     .with_context(|| format!("source schema '{}'", conn.schema))?;
                     metadata_preflighted = true;
                 }
-                let target_table_name = if let Some(cfg) = shadow_config {
-                    if cfg.schema_override.is_none() {
-                        format!("{}{}", table.name, cfg.suffix)
-                    } else {
-                        table.name.clone()
-                    }
-                } else {
-                    table.name.clone()
+                let production = rocky_ir::TargetRef {
+                    catalog: target_catalog.clone(),
+                    schema: target_schema.clone(),
+                    table: table.name.clone(),
                 };
+                let written = shadow_config.map_or_else(
+                    || production.clone(),
+                    |config| rocky_core::shadow::shadow_target(&production, config),
+                );
+                let target_table_name = written.table.clone();
                 let id = rocky_sql::defer::CollisionIdentity::of(
                     &target_catalog,
-                    &target_schema,
+                    &written.schema,
                     &target_table_name,
                 );
                 let this = (conn.schema.clone(), table.name.clone());
@@ -4685,7 +4710,7 @@ pub async fn run_with_explicit_contracts(
                 {
                     anyhow::bail!(
                         "two sources resolve to the same target table \
-                         '{target_catalog}.{target_schema}.{target_table_name}': \
+                         '{target_catalog}.{}.{target_table_name}': \
                          '{}.{}' and '{}.{}'. Writing both would leave whichever \
                          ran last, and the run would still report copying two \
                          tables. This happens when `--shadow-schema` replaces a \
@@ -4694,6 +4719,7 @@ pub async fn run_with_explicit_contracts(
                          `--shadow-suffix` instead, which keeps the template and \
                          renames the table, or give the sources distinct target \
                          tables.",
+                        written.schema,
                         prior.0,
                         prior.1,
                         this.0,
@@ -4702,6 +4728,15 @@ pub async fn run_with_explicit_contracts(
                 }
                 preflight_claims.insert(id, this);
                 collision_check_pairs.push((target_table_name, conn.source_type.clone()));
+                if shadow_config.is_some_and(|config| config.branch.is_none()) {
+                    shadow_preflight_objects.push(
+                        crate::commands::shadow_lifecycle::ShadowObject {
+                            model: table.name.clone(),
+                            production,
+                            target: written,
+                        },
+                    );
+                }
             }
         }
 
@@ -4715,6 +4750,14 @@ pub async fn run_with_explicit_contracts(
                 .iter()
                 .map(|(t, s)| (t.as_str(), s.as_str())),
         )?;
+        if !shadow_preflight_objects.is_empty() {
+            crate::commands::shadow_lifecycle::refuse_occupied_shadow_targets(
+                warehouse_adapter.as_ref(),
+                warehouse_adapter.dialect(),
+                &shadow_preflight_objects,
+            )
+            .await?;
+        }
     }
 
     // --- Sequential: catalog/schema setup + table collection ---
@@ -5143,16 +5186,16 @@ pub async fn run_with_explicit_contracts(
                     continue;
                 }
 
-                // In shadow suffix mode, append suffix to table name
-                let target_table_name = if let Some(shadow_cfg) = shadow_config {
-                    if shadow_cfg.schema_override.is_none() {
-                        format!("{}{}", table.name, shadow_cfg.suffix)
-                    } else {
-                        table.name.clone()
-                    }
-                } else {
-                    table.name.clone()
+                let production = rocky_ir::TargetRef {
+                    catalog: target_catalog.clone(),
+                    schema: parsed.resolve_template(target_schema_template, target_sep),
+                    table: table.name.clone(),
                 };
+                let written = shadow_config.map_or_else(
+                    || production.clone(),
+                    |config| rocky_core::shadow::shadow_target(&production, config),
+                );
+                let target_table_name = written.table;
 
                 // Fail closed on two sources resolving to one target object.
                 // Refuses only on a real clash, so a multi-connector project
@@ -5419,6 +5462,30 @@ pub async fn run_with_explicit_contracts(
         );
     }
 
+    let replication_shadow_objects = if shadow_config.is_some_and(|config| config.branch.is_none()) {
+        tables_to_process
+            .iter()
+            .map(|task| {
+                let parsed = pattern.parse(&task.source_schema)?;
+                let production = rocky_ir::TargetRef {
+                    catalog: task.target_catalog.clone(),
+                    schema: parsed.resolve_template(target_schema_template, target_sep),
+                    table: task.source_table_name.clone(),
+                };
+                Ok(crate::commands::shadow_lifecycle::ShadowObject {
+                    model: task.source_table_name.clone(),
+                    production,
+                    target: rocky_ir::TargetRef {
+                        catalog: task.target_catalog.clone(),
+                        schema: task.target_schema.clone(),
+                        table: task.target_table_name.clone(),
+                    },
+                })
+            })
+            .collect::<Result<Vec<_>>>()?
+    } else {
+        Vec::new()
+    };
     // Initialize run progress tracking, stamped with this invocation's
     // pipeline scope so a later resume can prove the checkpoint is its own
     // (#1549), and with the table keys it plans to copy so a later resume can
@@ -6847,6 +6914,62 @@ pub async fn run_with_explicit_contracts(
     // to status=Success / exit 0.
     merge_replication_compile_and_copy_errors(&mut output, &table_errors);
 
+    if shadow_config.is_some()
+        && !replication_shadow_objects.is_empty()
+        && output.tables_failed == 0
+        && !output.check_gate_failed
+    {
+        let comparison = crate::commands::compare::compare_targets(
+            warehouse_adapter.as_ref(),
+            replication_shadow_objects
+                .iter()
+                .map(|object| (object.production.clone(), object.target.clone()))
+                .collect(),
+            filter,
+            &rocky_core::compare::ComparisonThresholds::default(),
+        )
+        .await?;
+        crate::status_line!(
+            "Shadow comparison: {} passed, {} warned, {} failed ({})",
+            comparison.tables_passed,
+            comparison.tables_warned,
+            comparison.tables_failed,
+            comparison.overall_verdict
+        );
+        if let Some(previous) = output.shadow_comparison.as_mut() {
+            previous.tables_compared += comparison.tables_compared;
+            previous.tables_passed += comparison.tables_passed;
+            previous.tables_warned += comparison.tables_warned;
+            previous.tables_failed += comparison.tables_failed;
+            previous.results.extend(comparison.results);
+            previous.overall_verdict = if previous.tables_failed > 0 {
+                "fail"
+            } else if previous.tables_warned > 0 {
+                "warn"
+            } else {
+                "pass"
+            }
+            .to_string();
+        } else {
+            output.shadow_comparison = Some(comparison);
+        }
+        if shadow_config.is_some_and(|config| config.cleanup_after)
+            && output.shadow_comparison.as_ref().is_some_and(|comparison| comparison.tables_failed == 0)
+        {
+            for warning in crate::commands::shadow_lifecycle::drop_owned_shadow_objects(
+                warehouse_adapter.as_ref(),
+                warehouse_adapter.dialect(),
+                &replication_shadow_objects,
+            )
+            .await
+            {
+                warn!("{warning}");
+                output.scheduling_warnings.push(warning);
+            }
+        }
+        output.status = output.derive_run_status();
+    }
+
     // Populate per-model / per-run cost attribution and run the
     // configured `[budget]` check. Populate always; propagate the
     // budget error (if any) after the output has been printed so
@@ -7212,6 +7335,22 @@ pub async fn run_with_explicit_contracts(
         anyhow::bail!(
             "{count} error-severity check(s) failed (run_id: {run_id}, see `check_results` in the JSON output)"
         );
+    }
+
+    if let Some(comparison) = output.shadow_comparison.as_ref()
+        && comparison.tables_failed > 0
+    {
+        let msg = format!("{} shadow table(s) failed comparison", comparison.tables_failed);
+        let _ = hook_registry
+            .fire(&HookContext::pipeline_error(&run_id, pipeline_name, &msg))
+            .await;
+        let _ = hook_registry.wait_async_webhooks().await;
+        return Err(ShadowComparisonFailure {
+            count: comparison.tables_failed,
+            run_id: run_id.clone(),
+            custody: record_custody,
+        }
+        .into());
     }
 
     // §P2.6 emit: pipeline_complete on happy-path exit. Drain async
@@ -11184,6 +11323,21 @@ pub(crate) async fn execute_models_with_explicit_contracts(
     // both no-ops there (#1273).
     let mut shadow_objects: Vec<crate::commands::shadow_lifecycle::ShadowObject> = Vec::new();
     if let Some(config) = shadow_config {
+        let production_targets: std::collections::HashMap<_, _> = compile_result
+            .project
+            .models
+            .iter()
+            .map(|model| {
+                (
+                    model.config.name.clone(),
+                    rocky_ir::TargetRef {
+                        catalog: model.config.target.catalog.clone(),
+                        schema: model.config.target.schema.clone(),
+                        table: model.config.target.table.clone(),
+                    },
+                )
+            })
+            .collect();
         apply_shadow_rewrite(
             &mut compile_result,
             model_name_filter,
@@ -11204,6 +11358,7 @@ pub(crate) async fn execute_models_with_explicit_contracts(
             }
             shadow_objects.push(crate::commands::shadow_lifecycle::ShadowObject {
                 model: model.config.name.clone(),
+                production: production_targets[&model.config.name].clone(),
                 target: rocky_ir::TargetRef {
                     catalog: model.config.target.catalog.clone(),
                     schema: model.config.target.schema.clone(),
@@ -11211,22 +11366,11 @@ pub(crate) async fn execute_models_with_explicit_contracts(
                 },
             });
         }
-        // Refuse before any write — but ONLY in the disposable mode.
-        //
-        // `cleanup_after` is exactly the axis this turns on, because it is
-        // what makes "the name should be free" a true invariant: a run that
-        // drops what it made leaves nothing, so an object sitting there is
-        // either not Rocky's or debris from a run that did not finish, and
-        // replacing it silently is the defect #1273 reported.
-        //
-        // With `cleanup_after` off — a named `--branch`, or any caller that
-        // asks for objects outliving the run — the previous run's objects
-        // are SUPPOSED to still be there, and the next run is supposed to
-        // replace them. Refusing would break the feature outright. Rocky
-        // cannot tell its own leftover from a stranger's without a
-        // persisted owner record, so it does not guess: the persistent mode
-        // keeps no per-object ownership check, and #1273 stays open for it.
-        if config.cleanup_after {
+        // One-off shadow runs always refuse occupied names, including
+        // `--keep-shadow`. A kept object must be removed before another run
+        // can claim that name. Named branches intentionally replace objects
+        // in their own namespace and retain their existing exception (#1273).
+        if config.branch.is_none() {
             crate::commands::shadow_lifecycle::refuse_occupied_shadow_targets(
                 warehouse,
                 warehouse.dialect(),
@@ -12520,6 +12664,31 @@ pub(crate) async fn execute_models_with_explicit_contracts(
         }
     }
 
+    if let Some(config) = shadow_config
+        && config.branch.is_none()
+        && !shadow_objects.is_empty()
+        && output.tables_failed == 0
+    {
+        let comparison = crate::commands::compare::compare_targets(
+            warehouse,
+            shadow_objects
+                .iter()
+                .map(|object| (object.production.clone(), object.target.clone()))
+                .collect(),
+            None,
+            &rocky_core::compare::ComparisonThresholds::default(),
+        )
+        .await?;
+        crate::status_line!(
+            "Shadow comparison: {} passed, {} warned, {} failed ({})",
+            comparison.tables_passed,
+            comparison.tables_warned,
+            comparison.tables_failed,
+            comparison.overall_verdict
+        );
+        output.shadow_comparison = Some(comparison);
+    }
+
     // `cleanup_after` finally has a consumer (#1273). It has always been
     // documented as "whether to drop shadow tables after comparison
     // completes" and defaulted to `true`, while nothing read it and every
@@ -12537,6 +12706,11 @@ pub(crate) async fn execute_models_with_explicit_contracts(
     if let Some(config) = shadow_config
         && config.cleanup_after
         && !shadow_objects.is_empty()
+        && output.tables_failed == 0
+        && output
+            .shadow_comparison
+            .as_ref()
+            .is_none_or(|comparison| comparison.tables_failed == 0)
     {
         let warnings = crate::commands::shadow_lifecycle::drop_owned_shadow_objects(
             warehouse,
@@ -21594,6 +21768,7 @@ auto_create_schemas = true
             excluded_tables: vec![],
             resumed_from: None,
             shadow: false,
+            shadow_comparison: None,
             materializations: vec![],
             model_decisions: vec![],
             contained: vec![],
@@ -27481,6 +27656,8 @@ backend = "local"
     ///   RunFailed      { Lost }       ->  Abandon
     ///   PartialFailure { Persisted }  ->  Finalize
     ///   PartialFailure { Lost }       ->  Abandon
+    ///   ShadowComparisonFailure { Persisted } -> Finalize
+    ///   ShadowComparisonFailure { Lost }      -> Abandon
     ///   anything else                 ->  Abandon   (pre-terminal hard exit)
     /// ```
     ///
@@ -27490,7 +27667,9 @@ backend = "local"
     /// a bookkeeping problem would be a worse lie than the one being fixed.
     #[test]
     fn session_disposition_reads_the_record_custody_not_the_error_type() {
-        use super::{PartialFailure, RecordCustody, RunFailed, SessionDisposition};
+        use super::{
+            PartialFailure, RecordCustody, RunFailed, SessionDisposition, ShadowComparisonFailure,
+        };
 
         let run_failed = |custody| {
             anyhow::Error::from(RunFailed {
@@ -27525,6 +27704,17 @@ backend = "local"
             super::session_disposition(&partial(RecordCustody::Lost)),
             SessionDisposition::Abandon
         );
+        for (custody, expected) in [
+            (RecordCustody::Persisted, SessionDisposition::Finalize),
+            (RecordCustody::Lost, SessionDisposition::Abandon),
+        ] {
+            let error = anyhow::Error::from(ShadowComparisonFailure {
+                count: 1,
+                run_id: "r".to_string(),
+                custody,
+            });
+            assert_eq!(super::session_disposition(&error), expected);
+        }
         assert_eq!(
             super::session_disposition(&anyhow::anyhow!("adapter auth failed")),
             SessionDisposition::Abandon,

@@ -12,15 +12,15 @@
 //!   before a shadow run writes   is anything already at this name?
 //!                                  yes ─▶ REFUSE, naming the object
 //!                                  no  ─▶ this run owns it
-//!   after the run succeeds       drop what this run created (cleanup_after)
+//!   after a passing comparison   drop what this run created (unless kept)
 //! ```
 //!
 //! Why "already there" is a sound refusal, which it would NOT have been
 //! before: `apply_shadow_rewrite` now refuses the incremental family, so
 //! every strategy that reaches a shadow write REPLACES its target rather
 //! than adding to it — and `cleanup_after` now actually drops. Together
-//! those mean a clean run leaves the name empty, so an object sitting
-//! there is either somebody else's or the debris of a run that failed. In
+//! those mean a clean default run leaves the name empty. An object sitting
+//! there is either somebody else's, a retained object, or failed-run debris. In
 //! both cases writing over it is the thing #1273 reported.
 //!
 //! **What "Rocky-owned" means here, exactly.** It means *this run created
@@ -43,6 +43,8 @@ pub(crate) struct ShadowObject {
     pub(crate) model: String,
     /// The derived shadow target.
     pub(crate) target: TargetRef,
+    /// The production object paired with this shadow target.
+    pub(crate) production: TargetRef,
 }
 
 /// Refuse the run if anything already sits at a shadow target.
@@ -162,6 +164,11 @@ mod tests {
                 schema: "main".into(),
                 table: table.into(),
             },
+            production: TargetRef {
+                catalog: String::new(),
+                schema: "main".into(),
+                table: "orders".into(),
+            },
         }
     }
 
@@ -217,17 +224,13 @@ mod tests {
         );
     }
 
-    /// The refusal is scoped to the DISPOSABLE mode, and the caller is what
-    /// scopes it (`run.rs` calls this only when `cleanup_after` is set).
+    /// The caller scopes this refusal to one-off shadow runs.
     ///
     /// This test pins the reason, because the scoping is a decision and not
-    /// an oversight: with `cleanup_after` off, the previous run's objects
-    /// are supposed to still be there and the next run is supposed to
-    /// replace them, so an unconditional refusal would make a named
-    /// `--branch` refuse its own workspace on every re-run. Rocky cannot
-    /// tell its own leftover from a stranger's without a persisted owner
-    /// record, so the persistent mode keeps no per-object check and #1273
-    /// stays open for it.
+    /// an oversight: a named `--branch` replaces its objects on every
+    /// re-run. A one-off `--keep-shadow` run still refuses leftovers. Rocky
+    /// cannot tell its own branch object from a stranger's without a
+    /// persisted owner record, so #1273 stays open for branch objects.
     ///
     /// What this function must NOT do is decide that for itself — a future
     /// caller that forgets the gate should get a refusal, not a silent pass.

@@ -91,6 +91,10 @@ pub async fn compare(
     )
     .await?;
 
+    if output.tables_compared == 0 {
+        anyhow::bail!("no shadow tables were selected for comparison");
+    }
+
     if output_json {
         print_json(&output)?;
     } else {
@@ -210,6 +214,20 @@ async fn compute_compare(
         ),
     };
 
+    let targets = prod_targets.into_iter().map(|production| {
+        let shadow = rocky_core::shadow::shadow_target(&production, shadow_config);
+        (production, shadow)
+    });
+    compare_targets(&*adapter, targets.collect(), filter, thresholds).await
+}
+
+/// Compare exact target pairs, including the objects still owned by a shadow run.
+pub(crate) async fn compare_targets(
+    adapter: &dyn WarehouseAdapter,
+    targets: Vec<(TargetRef, TargetRef)>,
+    filter: Option<&str>,
+    thresholds: &ComparisonThresholds,
+) -> Result<CompareOutput> {
     let mut output = CompareOutput {
         version: VERSION.to_string(),
         command: "compare".to_string(),
@@ -222,16 +240,14 @@ async fn compute_compare(
         overall_verdict: "pass".to_string(),
     };
 
-    for prod_target in prod_targets {
-        let shadow_target = rocky_core::shadow::shadow_target(&prod_target, shadow_config);
-
-        let prod_count = get_row_count(&*adapter, &prod_target).await.map_err(|e| {
+    for (prod_target, shadow_target) in targets {
+        let prod_count = get_row_count(adapter, &prod_target).await.map_err(|e| {
             format!(
                 "failed to read production row count for {}: {e}",
                 prod_target.full_name()
             )
         });
-        let shadow_count = get_row_count(&*adapter, &shadow_target).await.map_err(|e| {
+        let shadow_count = get_row_count(adapter, &shadow_target).await.map_err(|e| {
             format!(
                 "failed to read shadow row count for {}: {e}",
                 shadow_target.full_name()

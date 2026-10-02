@@ -200,7 +200,7 @@ pub use schedule_status::{ScheduleStatusError, schedule_status_output};
 pub use rocky_sql::transpile::Dialect;
 pub use run::{
     CheckGateFailure, DeferOptions, Interrupted, PartialFailure, PartitionRunOptions,
-    SkipRunOptions, require_shadow_support_for_config, run,
+    ShadowComparisonFailure, SkipRunOptions, require_shadow_support_for_config, run,
 };
 pub use run_dag_exec::run_with_dag;
 pub use run_watch::run_watch as run_with_watch;

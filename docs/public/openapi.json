@@ -18702,6 +18702,17 @@
             "description": "True when running in shadow mode (targets rewritten).",
             "type": "boolean"
           },
+          "shadow_comparison": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/CompareOutput"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Comparison of this run's shadow objects with production, before cleanup."
+          },
           "skipped_by_run_id": {
             "description": "Prior run whose idempotency key deflected this call, or the run currently holding the in-flight claim. Populated only when `status` is `skipped_idempotent` or `skipped_in_flight`.",
             "type": [

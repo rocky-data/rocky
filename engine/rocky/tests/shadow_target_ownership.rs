@@ -61,8 +61,13 @@ fn project(root: &std::path::Path) {
 }
 
 fn run_shadow(root: &std::path::Path) -> std::process::Output {
+    run_shadow_with(root, &[])
+}
+
+fn run_shadow_with(root: &std::path::Path, extra: &[&str]) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_rocky"))
         .args(["-c", "rocky.toml", "run", "--shadow", "--output", "json"])
+        .args(extra)
         .current_dir(root)
         .env("RUST_LOG", "error")
         .output()
@@ -149,13 +154,38 @@ fn a_shadow_run_cleans_up_after_itself_so_the_next_one_can_run() {
     }
 
     for attempt in 1..=2 {
-        let out = run_shadow(root);
+        let out = if attempt == 1 {
+            run_shadow(root)
+        } else {
+            Command::new(env!("CARGO_BIN_EXE_rocky"))
+                .args(["-c", "rocky.toml", "run", "--shadow", "--output", "table"])
+                .current_dir(root)
+                .env("RUST_LOG", "error")
+                .output()
+                .expect("rocky must launch")
+        };
         assert!(
             out.status.success(),
             "shadow run {attempt} must succeed\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&out.stderr),
         );
+        if attempt == 1 {
+            let json: serde_json::Value =
+                serde_json::from_slice(&out.stdout).expect("run emits JSON");
+            assert_eq!(json["shadow_comparison"]["tables_compared"], 1);
+            assert_eq!(json["shadow_comparison"]["overall_verdict"], "pass");
+        } else {
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert!(
+                text.contains("Shadow comparison: 1 passed, 0 warned, 0 failed (pass)"),
+                "text output must report the comparison: {text}"
+            );
+        }
         assert!(
             columns_of(root, "orders_rocky_shadow").is_empty(),
             "run {attempt} must leave no shadow object behind — cleanup_after \
@@ -169,6 +199,81 @@ fn a_shadow_run_cleans_up_after_itself_so_the_next_one_can_run() {
         vec!["id".to_string(), "origin".to_string()],
         "production must be untouched"
     );
+}
+
+#[test]
+fn keep_shadow_allows_separate_compare_and_refuses_the_next_run() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+    project(root);
+    {
+        let conn = duckdb::Connection::open(root.join("probe.duckdb")).expect("open duckdb");
+        conn.execute_batch("CREATE TABLE main.orders AS SELECT 1 AS id, 'prod' AS origin;")
+            .expect("seed production");
+    }
+
+    let kept = run_shadow_with(root, &["--keep-shadow"]);
+    assert!(
+        kept.status.success(),
+        "{}",
+        String::from_utf8_lossy(&kept.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&kept.stdout).expect("run JSON");
+    assert_eq!(json["shadow_comparison"]["overall_verdict"], "pass");
+    assert!(!columns_of(root, "orders_rocky_shadow").is_empty());
+
+    let compared = Command::new(env!("CARGO_BIN_EXE_rocky"))
+        .args(["-c", "rocky.toml", "compare", "--output", "json"])
+        .current_dir(root)
+        .env("RUST_LOG", "error")
+        .output()
+        .expect("compare launches");
+    assert!(
+        compared.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compared.stderr)
+    );
+    let comparison: serde_json::Value =
+        serde_json::from_slice(&compared.stdout).expect("compare JSON");
+    assert_eq!(comparison["tables_compared"], 1);
+
+    let refused = run_shadow(root);
+    assert!(!refused.status.success(), "a leftover must still refuse");
+    let reported = format!(
+        "{}{}",
+        String::from_utf8_lossy(&refused.stdout),
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    assert!(reported.contains("does not own"), "{reported}");
+}
+
+#[test]
+fn a_failed_shadow_comparison_is_reported_and_keeps_the_evidence() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+    project(root);
+    {
+        let conn = duckdb::Connection::open(root.join("probe.duckdb")).expect("open duckdb");
+        conn.execute_batch(
+            "CREATE TABLE main.orders AS SELECT 1 AS id, 'prod' AS origin UNION ALL SELECT 2, 'prod';",
+        )
+        .expect("seed production with two rows");
+    }
+
+    let out = run_shadow(root);
+    assert!(
+        !out.status.success(),
+        "a row-count mismatch must fail the run"
+    );
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).expect("run JSON");
+    assert_eq!(json["shadow_comparison"]["tables_compared"], 1);
+    assert_eq!(json["shadow_comparison"]["tables_failed"], 1);
+    assert_eq!(
+        json["shadow_comparison"]["results"][0]["production_count"],
+        2
+    );
+    assert_eq!(json["shadow_comparison"]["results"][0]["shadow_count"], 1);
+    assert!(!columns_of(root, "orders_rocky_shadow").is_empty());
 }
 
 /// Column names of `main.<table>`, in ordinal order. Empty when absent.

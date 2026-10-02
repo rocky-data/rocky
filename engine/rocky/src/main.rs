@@ -993,6 +993,9 @@ enum Command {
         /// Run in shadow mode: write to shadow targets instead of production
         #[arg(long)]
         shadow: bool,
+        /// Keep shadow objects after the run so a separate `rocky compare` can read them.
+        #[arg(long, requires = "shadow", conflicts_with = "watch")]
+        keep_shadow: bool,
         /// Suffix appended to table names. Requires --shadow; conflicts with --branch.
         /// --shadow alone uses _rocky_shadow.
         #[arg(long, default_value = "_rocky_shadow", requires = "shadow")]
@@ -3795,6 +3798,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             resume,
             resume_latest,
             shadow,
+            keep_shadow,
             shadow_suffix,
             shadow_schema,
             branch,
@@ -3960,7 +3964,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                     // over its own leftover. The `--branch` arm above keeps
                     // `false` deliberately: a named branch's objects are the
                     // point of the branch.
-                    cleanup_after: true,
+                    cleanup_after: !keep_shadow,
                     branch: None,
                 })
             } else {
@@ -5221,6 +5225,14 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
     if let Err(ref err) = result
         && err
             .downcast_ref::<rocky_cli::commands::CheckGateFailure>()
+            .is_some()
+    {
+        std::process::exit(2);
+    }
+
+    if let Err(ref err) = result
+        && err
+            .downcast_ref::<rocky_cli::commands::ShadowComparisonFailure>()
             .is_some()
     {
         std::process::exit(2);

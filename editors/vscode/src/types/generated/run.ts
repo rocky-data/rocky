@@ -203,6 +203,10 @@ export interface RunOutput {
    */
   shadow?: boolean;
   /**
+   * Comparison of this run's shadow objects with production, before cleanup.
+   */
+  shadow_comparison?: CompareOutput | null;
+  /**
    * Prior run whose idempotency key deflected this call, or the run currently holding the in-flight claim. Populated only when `status` is `skipped_idempotent` or `skipped_in_flight`.
    */
   skipped_by_run_id?: string | null;
@@ -686,5 +690,45 @@ export interface QuarantineOutput {
    * Fully-qualified `catalog.schema.table` name of the `__valid` output table. Empty for `mode = "tag"` (source is rewritten in place).
    */
   valid_table?: string;
+  [k: string]: unknown;
+}
+/**
+ * JSON output for `rocky compare`.
+ */
+export interface CompareOutput {
+  command: string;
+  filter: string;
+  overall_verdict: string;
+  results: TableCompareResult[];
+  tables_compared: number;
+  tables_failed: number;
+  tables_passed: number;
+  tables_warned: number;
+  version: string;
+  [k: string]: unknown;
+}
+export interface TableCompareResult {
+  /**
+   * Null when the warehouse count could not be read.
+   */
+  production_count?: number | null;
+  production_table: string;
+  /**
+   * Read errors for an `error` row, or threshold reasons for `warn`/`fail`. Empty for `pass`.
+   */
+  reasons: string[];
+  /**
+   * Null unless both counts were read.
+   */
+  row_count_diff_pct?: number | null;
+  row_count_match: boolean;
+  schema_diffs: string[];
+  schema_match: boolean;
+  /**
+   * Null when the warehouse count could not be read.
+   */
+  shadow_count?: number | null;
+  shadow_table: string;
+  verdict: string;
   [k: string]: unknown;
 }

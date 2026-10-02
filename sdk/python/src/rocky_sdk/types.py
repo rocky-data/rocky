@@ -517,6 +517,8 @@ class RunResult(BaseModel):
     interrupted: bool = False
     #: ``True`` when the run executed in shadow mode (targets rewritten).
     shadow: bool = False
+    #: Comparison result captured before shadow cleanup. Absent on ordinary runs.
+    shadow_comparison: dict[str, Any] | None = None
     #: Per-model build/skip/reuse decision + reason. Empty (and omitted on the
     #: wire) for a default run; populated under ``--skip-unchanged`` / ``[reuse]``.
     model_decisions: list[ModelDecisionOutput] = Field(default_factory=list)

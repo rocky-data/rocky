@@ -347,6 +347,9 @@ pub struct RunOutput {
     /// True when running in shadow mode (targets rewritten).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub shadow: bool,
+    /// Comparison of this run's shadow objects with production, before cleanup.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shadow_comparison: Option<CompareOutput>,
     pub materializations: Vec<MaterializationOutput>,
     /// Per-model build/skip/reuse decision + reason, surfaced for
     /// transformation runs so orchestrators can explain *why* each model
@@ -5127,6 +5130,7 @@ impl RunOutput {
             excluded_tables: vec![],
             resumed_from: None,
             shadow: false,
+            shadow_comparison: None,
             materializations: vec![],
             model_decisions: vec![],
             contained: vec![],
@@ -5609,6 +5613,11 @@ impl RunOutput {
             || self.tables_failed > 0
             || self.check_gate_failed
             || self.verify_after_failed;
+        let has_problem = has_problem
+            || self
+                .shadow_comparison
+                .as_ref()
+                .is_some_and(|comparison| comparison.tables_failed > 0);
         match (has_progress, has_problem) {
             (_, false) => rocky_core::state::RunStatus::Success,
             (true, true) => rocky_core::state::RunStatus::PartialFailure,

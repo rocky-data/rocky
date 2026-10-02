@@ -570,6 +570,7 @@ rocky run [flags]
 | `--resume <RUN_ID>` | `string` | | Resume a specific previous replication run from its last checkpoint; mints a new `run_id` and records the prior one as `resumed_from`. Rejected with `--dag`, which does not replay the resume into its sub-runs (rejected at parse time). |
 | `--resume-latest` | `bool` | `false` | Resume the most recent failed replication run from its last checkpoint; mints a new `run_id` and records the prior one as `resumed_from`. Rejected with `--dag`, which does not replay the resume into its sub-runs (rejected at parse time). |
 | `--shadow` | `bool` | `false` | Run in shadow mode: write to shadow targets instead of production. |
+| `--keep-shadow` | `bool` | `false` | Requires `--shadow` and conflicts with `--watch`. Keep shadow objects for a separate `rocky compare`. |
 | `--shadow-suffix <SUFFIX>` | `string` | `_rocky_shadow` | Requires `--shadow`. Appends a suffix to table names. Conflicts with `--branch`. `--shadow` alone uses `_rocky_shadow`. |
 | `--shadow-schema <NAME>` | `string` | | Requires `--shadow`. Overrides the schema for shadow tables. Conflicts with `--branch`. |
 | `--branch <NAME>` | `string` | | Execute against a named branch previously registered with `rocky branch create`. Applies the branch's `schema_prefix` to every target (internally equivalent to `--shadow --shadow-schema <branch.schema_prefix>`). Conflicts with `--shadow`, `--shadow-schema`, and `--shadow-suffix`. The run records `<NAME>` as `rocky_branch` in [run history](/reference/commands/administration/#rocky-history). |
@@ -693,10 +694,16 @@ Resume the most recent failed replication run from its last checkpoint:
 rocky run --filter client=acme --resume-latest
 ```
 
-Run in [shadow mode](/reference/glossary/), which writes to `*_rocky_shadow` tables instead of production, so you can compare the results before you promote:
+Run in [shadow mode](/reference/glossary/). Rocky compares each shadow target with production before it drops the shadow object:
 
 ```bash
 rocky run --filter client=acme --shadow
+```
+
+Keep the shadow objects when you need a separate comparison:
+
+```bash
+rocky run --filter client=acme --shadow --keep-shadow
 rocky compare --filter client=acme
 ```
 

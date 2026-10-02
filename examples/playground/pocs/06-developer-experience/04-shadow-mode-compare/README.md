@@ -3,14 +3,13 @@
 > **Category:** 06-developer-experience
 > **Credentials:** none (DuckDB)
 > **Runtime:** < 5s
-> **Rocky features:** `--shadow`, `--shadow-suffix`, `rocky compare`
+> **Rocky features:** `--shadow`, `--keep-shadow`, `rocky compare`
 
 ## What it shows
 
-Shadow mode lets you safely test pipeline changes against production:
-`rocky run --shadow` writes to `<table>_rocky_shadow` instead of the real
-target. Then `rocky compare` diffs row counts and schemas between shadow
-and prod.
+`rocky run --shadow` writes to `<table>_rocky_shadow` and compares it with
+production before cleanup. This POC uses `--keep-shadow` so a separate
+`rocky compare` can inspect the same tables.
 
 ## Why it's distinctive
 
@@ -33,8 +32,6 @@ The POC runs end to end on the local DuckDB path, and `run.sh` exits 0:
   `raw__orders.orders` and writes `poc.staging__orders.orders_rocky_shadow`.
   The real target is not touched. The result is in
   `expected/run_shadow.json`.
-- **`rocky compare` passes.** `expected/compare.json` reports 100 rows in
+- **Both comparisons pass.** `expected/run_shadow.json` contains the in-run
+  verdict. `expected/compare.json` reports 100 rows in
   both tables, `schema_match: true` and `overall_verdict: "pass"`.
-
-`run.sh` still ends the shadow and compare steps with `|| true`, so it does
-not fail if either step fails. Read the two JSON files to see the result.

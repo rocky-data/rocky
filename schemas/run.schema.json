@@ -354,6 +354,61 @@
       ],
       "type": "object"
     },
+    "CompareOutput": {
+      "description": "JSON output for `rocky compare`.",
+      "properties": {
+        "command": {
+          "type": "string"
+        },
+        "filter": {
+          "type": "string"
+        },
+        "overall_verdict": {
+          "type": "string"
+        },
+        "results": {
+          "items": {
+            "$ref": "#/definitions/TableCompareResult"
+          },
+          "type": "array"
+        },
+        "tables_compared": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "tables_failed": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "tables_passed": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "tables_warned": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "version": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "command",
+        "filter",
+        "overall_verdict",
+        "results",
+        "tables_compared",
+        "tables_failed",
+        "tables_passed",
+        "tables_warned",
+        "version"
+      ],
+      "type": "object"
+    },
     "ContainedModelOutput": {
       "description": "One model withheld from a run because an upstream failed (or was itself withheld) and failure-containment continued the disjoint subgraphs.\n\nThis is the blast radius of a failure — the run's `errors[]` name the root cause(s). A withheld model was **not built** this run: its target was left untouched (never rebuilt on a failed upstream's stale/missing output). This is model-graph containment, distinct from the quality pipeline's row-level `quarantine` surface.",
       "properties": {
@@ -1181,6 +1236,74 @@
       ],
       "type": "object"
     },
+    "TableCompareResult": {
+      "properties": {
+        "production_count": {
+          "description": "Null when the warehouse count could not be read.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "production_table": {
+          "type": "string"
+        },
+        "reasons": {
+          "description": "Read errors for an `error` row, or threshold reasons for `warn`/`fail`. Empty for `pass`.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "row_count_diff_pct": {
+          "description": "Null unless both counts were read.",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "row_count_match": {
+          "type": "boolean"
+        },
+        "schema_diffs": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "schema_match": {
+          "type": "boolean"
+        },
+        "shadow_count": {
+          "description": "Null when the warehouse count could not be read.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "shadow_table": {
+          "type": "string"
+        },
+        "verdict": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "production_table",
+        "reasons",
+        "row_count_match",
+        "schema_diffs",
+        "schema_match",
+        "shadow_table",
+        "verdict"
+      ],
+      "type": "object"
+    },
     "TableErrorOutput": {
       "description": "Error from a table that failed during parallel processing.",
       "properties": {
@@ -1399,6 +1522,17 @@
     "shadow": {
       "description": "True when running in shadow mode (targets rewritten).",
       "type": "boolean"
+    },
+    "shadow_comparison": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/CompareOutput"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Comparison of this run's shadow objects with production, before cleanup."
     },
     "skipped_by_run_id": {
       "description": "Prior run whose idempotency key deflected this call, or the run currently holding the in-flight claim. Populated only when `status` is `skipped_idempotent` or `skipped_in_flight`.",
