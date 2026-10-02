@@ -18,8 +18,8 @@
 //!    identity of every existing model.
 //!
 //! 3. **Per-dialect SQL pin** — running the appropriate `sql_gen` entry
-//!    against each of the four dialects (DuckDB, Databricks, BigQuery,
-//!    Snowflake) yields SQL identical to the snapshot under
+//!    against DuckDB, Databricks, BigQuery, and Snowflake (plus Trino for
+//!    snapshots) yields SQL identical to the snapshot under
 //!    `tests/ir-golden/<fixture>/<dialect>.sql`. Catches dialect-specific
 //!    regressions that the in-process `TestDialect` in `sql_gen.rs` tests
 //!    cannot see.
@@ -58,6 +58,118 @@ use rocky_bigquery::dialect::BigQueryDialect;
 use rocky_databricks::dialect::DatabricksSqlDialect;
 use rocky_duckdb::dialect::DuckDbSqlDialect;
 use rocky_snowflake::dialect::SnowflakeSqlDialect;
+use rocky_trino::dialect::TrinoDialect;
+
+#[test]
+fn snapshot_sql_uses_named_inserts_and_correlated_hard_deletes_for_every_dialect() {
+    let ir = build_12_snapshot_scd2();
+    let dialects: [&dyn SqlDialect; 5] = [
+        &DatabricksSqlDialect,
+        &SnowflakeSqlDialect,
+        &BigQueryDialect,
+        &TrinoDialect,
+        &DuckDbSqlDialect,
+    ];
+    for dialect in dialects {
+        let columns = if dialect.name() == "snowflake" {
+            vec![
+                "CUSTOMER_ID".into(),
+                "UPDATED_AT".into(),
+                "DisplayName".into(),
+                "Order Total".into(),
+            ]
+        } else {
+            vec![
+                "customer_id".into(),
+                "updated_at".into(),
+                "DisplayName".into(),
+                "Order Total".into(),
+            ]
+        };
+        let config = rocky_core::snapshots::SnapshotConfig {
+            source: ir.source.clone().unwrap(),
+            target: ir.target.clone(),
+            unique_key: vec!["customer_id".into()],
+            strategy: rocky_core::snapshots::SnapshotStrategy::Timestamp {
+                updated_at: "updated_at".into(),
+            },
+            invalidate_hard_deletes: true,
+        };
+        let current =
+            rocky_core::snapshots::generate_snapshot_sql(&config, dialect, &columns).unwrap();
+        let legacy = sql_gen::generate_snapshot_sql(&ir, dialect, &columns).unwrap();
+        let target = dialect
+            .format_table_ref(&ir.target.catalog, &ir.target.schema, &ir.target.table)
+            .unwrap();
+        let (update_target, update_qualifier) = if dialect.name() == "trino" {
+            (target.clone(), target.as_str())
+        } else {
+            (format!("{target} AS target"), "target")
+        };
+        for update in [&current[2], &legacy[3]] {
+            assert!(
+                update.starts_with(&format!("UPDATE {update_target} SET ")),
+                "{}: {update}",
+                dialect.name()
+            );
+            let key = dialect
+                .snapshot_source_reference("customer_id", &columns)
+                .unwrap();
+            assert!(
+                update.contains(&format!("{update_qualifier}.{key} = source.{key}")),
+                "{}: {update}",
+                dialect.name()
+            );
+        }
+        let quote = match dialect.name() {
+            "databricks" | "bigquery" => "`",
+            _ => "\"",
+        };
+        let ident = |name: &str| {
+            let spelling = if dialect.name() == "snowflake" {
+                name.to_ascii_uppercase()
+            } else {
+                name.to_owned()
+            };
+            format!("{quote}{spelling}{quote}")
+        };
+        for (merge, changed, metadata) in [
+            (
+                &current[0],
+                &current[1],
+                "valid_from, valid_to, is_current, snapshot_id",
+            ),
+            (&legacy[1], &legacy[2], "valid_from, valid_to"),
+        ] {
+            let metadata = metadata
+                .split(", ")
+                .map(&ident)
+                .collect::<Vec<_>>()
+                .join(", ");
+            let expected = format!(
+                "INSERT ({}, {}, {quote}DisplayName{quote}, {quote}Order Total{quote}, {metadata}) VALUES (source.{}, source.{}, source.{quote}DisplayName{quote}, source.{quote}Order Total{quote}, CURRENT_TIMESTAMP, CAST(NULL AS TIMESTAMP)",
+                ident("customer_id"),
+                ident("updated_at"),
+                ident("customer_id"),
+                ident("updated_at")
+            );
+            assert!(merge.contains(&expected), "{}: {merge}", dialect.name());
+            assert!(!merge.contains("INSERT (*)"), "{}: {merge}", dialect.name());
+            assert!(
+                changed.contains(&format!(
+                    "source.{quote}DisplayName{quote}, source.{quote}Order Total{quote}"
+                )),
+                "{}: {changed}",
+                dialect.name()
+            );
+            assert!(
+                !changed.contains("source.*"),
+                "{}: {changed}",
+                dialect.name()
+            );
+        }
+    }
+}
 
 const REGEN_ENV: &str = "REGEN_IR_GOLDENS";
 const FIXTURES_SUBDIR: &str = "tests/ir-golden";
@@ -80,6 +192,7 @@ enum DialectKind {
     Databricks,
     BigQuery,
     Snowflake,
+    Trino,
 }
 
 impl DialectKind {
@@ -88,6 +201,13 @@ impl DialectKind {
         DialectKind::Databricks,
         DialectKind::BigQuery,
         DialectKind::Snowflake,
+    ];
+    const SNAPSHOT: &'static [DialectKind] = &[
+        DialectKind::DuckDb,
+        DialectKind::Databricks,
+        DialectKind::BigQuery,
+        DialectKind::Snowflake,
+        DialectKind::Trino,
     ];
 
     /// Warehouses that natively support `MATERIALIZED VIEW`. DuckDB has
@@ -117,6 +237,7 @@ impl DialectKind {
             DialectKind::Databricks => "databricks",
             DialectKind::BigQuery => "bigquery",
             DialectKind::Snowflake => "snowflake",
+            DialectKind::Trino => "trino",
         }
     }
 
@@ -126,6 +247,7 @@ impl DialectKind {
             DialectKind::Databricks => Box::new(DatabricksSqlDialect),
             DialectKind::BigQuery => Box::new(BigQueryDialect),
             DialectKind::Snowflake => Box::new(SnowflakeSqlDialect),
+            DialectKind::Trino => Box::new(TrinoDialect),
         }
     }
 }
@@ -189,7 +311,11 @@ fn run_entry(
         Entry::TimeIntervalBootstrap => {
             sql_gen::generate_time_interval_bootstrap_sql(ir, dialect).map(|s| vec![s])
         }
-        Entry::Snapshot => sql_gen::generate_snapshot_sql(ir, dialect),
+        Entry::Snapshot => sql_gen::generate_snapshot_sql(
+            ir,
+            dialect,
+            &["customer_id".into(), "updated_at".into()],
+        ),
     }
 }
 
@@ -321,7 +447,7 @@ const FIXTURES: &[Fixture] = &[
         name: "12-snapshot-scd2",
         builder: build_12_snapshot_scd2,
         entry: Entry::Snapshot,
-        dialects: DialectKind::ALL,
+        dialects: DialectKind::SNAPSHOT,
         recipe_hash: "e3cdac244a2517c494a6e9306bcb0eea3b6b18202f69de500f6d0034ac045cd8",
     },
 ];

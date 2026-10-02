@@ -42,6 +42,10 @@ class CompareOutput(BaseModel):
     results: list[TableCompareResult]
     tables_compared: conint(ge=0)
     tables_failed: conint(ge=0)
+    tables_no_baseline: conint(ge=0)
+    """
+    Targets with no confirmed production object. These do not fail the run.
+    """
     tables_passed: conint(ge=0)
     tables_warned: conint(ge=0)
     version: str

@@ -136,6 +136,8 @@ _LAZY: dict[str, tuple[str, str]] = {
     "CiDiffOutput": ("ci_diff_schema", "CiDiffOutput"),
     "CiOutput": ("ci_schema", "CiOutput"),
     "ClearSchemaCacheOutput": ("state_clear_schema_cache_schema", "ClearSchemaCacheOutput"),
+    "ReconcileWatermarkOutput": ("state_reconcile_watermark_schema", "ReconcileWatermarkOutput"),
+    "ReconciledWatermark": ("state_reconcile_watermark_schema", "ReconciledWatermark"),
     "CollisionCandidateOutput": ("discover_schema", "CollisionCandidateOutput"),
     "ColumnClassificationStatus": ("compliance_schema", "ColumnClassificationStatus"),
     "ColumnLineageOutput": ("column_lineage_schema", "ColumnLineageOutput"),
@@ -549,6 +551,7 @@ if TYPE_CHECKING:
         WatermarkEntry,
     )
     from .state_clear_schema_cache_schema import ClearSchemaCacheOutput
+    from .state_reconcile_watermark_schema import ReconcileWatermarkOutput, ReconciledWatermark
     from .test_schema import (
         DeclarativeTestResult,
         ModelTestResult,
@@ -950,6 +953,8 @@ __all__ = [
     "StateOutput",
     "WatermarkEntry",
     "ClearSchemaCacheOutput",
+    "ReconcileWatermarkOutput",
+    "ReconciledWatermark",
     "TestOutput",
     "TestFailure",
     "CompareOutput",

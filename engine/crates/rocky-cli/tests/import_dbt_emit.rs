@@ -60,6 +60,23 @@ fn emit_runnable_repo_from_rich_fixture() {
         result.imported.iter().any(|m| m.name == "stg_orders"),
         "stg_orders should be in imported models"
     );
+    // A dbt incremental model has no full-refresh compile evidence in raw
+    // mode, so the raw importer refuses it (#2059).
+    assert!(
+        !result
+            .imported
+            .iter()
+            .any(|m| m.name == "orders_incremental"),
+        "orders_incremental is incremental and must be refused by the raw importer"
+    );
+    assert!(
+        result
+            .failed
+            .iter()
+            .any(|f| f.name == "orders_incremental"
+                && f.reason.contains("dbt compile --full-refresh")),
+        "orders_incremental should be refused with the full-refresh remedy"
+    );
     assert!(
         result.imported.iter().any(|m| m.name == "fct_orders"),
         "fct_orders should be in imported models"
@@ -100,7 +117,7 @@ fn emit_runnable_repo_from_rich_fixture() {
         "seeds copied verbatim"
     );
     assert_eq!(emission.seeds_copied, 1);
-    assert!(emission.models_translated >= 4);
+    assert!(emission.models_translated >= 3);
 
     // GA regression: `dbt_packages/` and `snapshots/` trees sit outside the
     // walked `models/` directory; the importer must leave them alone — no
@@ -122,26 +139,24 @@ fn emit_runnable_repo_from_rich_fixture() {
         "snapshots/orders_snapshot.sql must not surface as a failure"
     );
 
-    // GA regression: a model with `{% if target.name == 'prod' %}` must
-    // import cleanly, surface a JinjaControlFlow warning, and carry the
-    // documented TODO marker in the emitted SQL.
+    // A model with `{% if target.name == 'prod' %}` is refused in raw mode:
+    // the raw importer cannot evaluate Jinja control flow, and keeping the
+    // branch body unconditionally would change which rows load (#2059).
     assert!(
-        result.imported.iter().any(|m| m.name == "env_branched"),
-        "env_branched.sql must be in imported models"
+        !result.imported.iter().any(|m| m.name == "env_branched"),
+        "env_branched.sql must be refused, not imported"
     );
     assert!(
-        result.warnings.iter().any(|w| w.model == "env_branched"
-            && matches!(w.category, dbt::WarningCategory::JinjaControlFlow)),
-        "env_branched must surface a JinjaControlFlow warning for `{{% if target.name %}}`"
+        result
+            .failed
+            .iter()
+            .any(|f| f.name == "env_branched" && f.reason.contains("Jinja control flow")),
+        "env_branched must be refused for Jinja control flow"
     );
-    let env_branched_sql = std::fs::read_to_string(models_dir.join("env_branched.sql")).unwrap();
-    assert!(
-        env_branched_sql.contains("TODO: dbt-jinja-not-translated"),
-        "env_branched.sql must carry the dbt-jinja-not-translated marker"
-    );
+    assert!(!models_dir.join("env_branched.sql").exists());
 
     // Each model has a sidecar pair.
-    for name in ["stg_customers", "stg_orders", "fct_orders", "env_branched"] {
+    for name in ["stg_customers", "stg_orders", "fct_orders"] {
         let sql = models_dir.join(format!("{name}.sql"));
         let toml = models_dir.join(format!("{name}.toml"));
         assert!(sql.exists(), "{name}.sql exists");
@@ -156,12 +171,9 @@ fn emit_runnable_repo_from_rich_fixture() {
         "view → view mapping must apply, got: {stg_customers_toml}"
     );
     let stg_orders_toml = std::fs::read_to_string(models_dir.join("stg_orders.toml")).unwrap();
-    // incremental + unique_key → merge. The importer never emits
-    // `incremental`: it is a compile error on a transformation model (E037).
     assert!(
-        stg_orders_toml.contains("type = \"merge\"")
-            && !stg_orders_toml.contains("type = \"incremental\""),
-        "incremental + unique_key → merge mapping must apply, got: {stg_orders_toml}"
+        stg_orders_toml.contains("type = \"full_refresh\""),
+        "table → full_refresh mapping must apply, got: {stg_orders_toml}"
     );
     let fct_orders_toml = std::fs::read_to_string(models_dir.join("fct_orders.toml")).unwrap();
     assert!(

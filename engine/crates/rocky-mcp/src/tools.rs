@@ -769,7 +769,7 @@ const WORKER_PROMPT_DESCRIPTIONS: &[(&str, &str)] = &[
     ),
 ];
 
-/// Stateless Rocky MCP server. Holds only the project locators; every tool
+/// Rocky MCP server. Holds project locators and a per-instance review key; every tool
 /// call recompiles from the current on-disk files (correctness over a warm
 /// cache — caching is a deferred optimization).
 #[derive(Clone)]
@@ -781,6 +781,7 @@ pub struct RockyMcpServer {
     /// prompts: the worker profile serves variants that end at the handoff to
     /// the trusted runner instead of instructing tools the profile excludes.
     profile: McpProfile,
+    review_key: [u8; 32],
     /// The `instructions` this profile serves, resolved at construction.
     ///
     /// Built here rather than in [`RockyMcpServer::get_info`] because the
@@ -2032,7 +2033,8 @@ pub struct ScorecardArgs {
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct ReviewQueueArgs {
-    /// When set, APPROVE this pending plan_id instead of listing the queue.
+    /// When set without `confirm`, preview this pending plan before approval.
+    /// With `confirm=true`, approve it instead of listing the queue.
     /// Served only when the operator started the server as `rocky mcp
     /// --profile approver`; on any other profile this field is refused with
     /// `approve_not_enabled` and nothing is written. The plan must also be one
@@ -2041,13 +2043,18 @@ pub struct ReviewQueueArgs {
     #[serde(default)]
     pub approve_plan_id: Option<String>,
     /// Explicit confirmation for the approve action. Approving writes a human
-    /// sign-off marker that unblocks `rocky apply`, so it is refused unless this
-    /// is `true`. Set it ONLY when the human has explicitly authorized approving
+    /// sign-off marker that unblocks `rocky apply`. Without confirmation the
+    /// tool returns a dry-run review and writes no marker. Set this to `true`
+    /// ONLY when the human has explicitly authorized approving
     /// this exact plan — it stands in for that human intent. It cannot unlock
     /// the approve action itself: a server without `--profile approver` refuses
     /// regardless of this flag.
     #[serde(default)]
     pub confirm: bool,
+    /// Token returned by a prior dry-run review of this plan. Required with
+    /// `confirm=true`; a changed review requires another dry run.
+    #[serde(default)]
+    pub review_token: Option<String>,
     /// List mode only: keep only pending plans whose payload carries this
     /// `product_id` (each candidate plan is read integrity-checked). A pending
     /// plan whose file cannot be read or fails its integrity check surfaces as
@@ -2246,6 +2253,12 @@ impl RockyMcpServer {
             models_dir,
             root,
             profile,
+            review_key: {
+                let mut key = [0; 32];
+                key[..16].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+                key[16..].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+                key
+            },
             instructions,
             tool_router,
             prompt_router,
@@ -5654,9 +5667,11 @@ impl RockyMcpServer {
          `approve_command`. Listing works on every profile. APPROVING is different: it writes the \
          human sign-off marker that unblocks `rocky apply`, and MOST SERVERS DO NOT SERVE IT — it \
          is refused with `approve_not_enabled` unless the operator started this server as `rocky \
-         mcp --profile approver`. Where it is served, `approve_plan_id` + `confirm=true` is still \
-         refused unless the plan is actually in the pending queue AND `confirm` is set (the \
-         require-review-grade confirmation stands in for explicit human intent). Policy applies to \
+         mcp --profile approver`. Where it is served, `approve_plan_id` without confirmation \
+         returns the dry-run review, including conditional DROPs, before any marker is written. \
+         `confirm=true` requires the `review_token` returned by that dry run, recomputes the \
+         review, and writes the marker only when the token still matches. The confirmation stands in \
+         for explicit human intent. Policy applies to \
          the governor's agent too: the approval is attributed to the operator's git identity, not \
          a cryptographically bound principal (a signed human confirmation is a later step). Never \
          approve on the user's behalf; the normal path is the human running `rocky review \
@@ -5726,7 +5741,10 @@ impl RockyMcpServer {
                 total,
                 ranking: queue.ranking,
                 pending,
+                review: None,
+                review_token: None,
                 approval: None,
+                queue_refresh_error: None,
             }));
         };
 
@@ -5749,18 +5767,48 @@ impl RockyMcpServer {
             ));
         }
 
-        // The gate: approving writes a human sign-off marker, so it requires an
-        // explicit, require-review-grade confirmation.
+        // A non-confirm call previews the exact plan before any marker exists.
         if !args.confirm {
-            return Err(ToolError::policy_review_required(
-                format!(
-                    "approving '{plan_id}' writes a human sign-off marker that unblocks \
-                     `rocky apply`; it requires explicit confirmation."
-                ),
-                "Re-call review_queue with confirm=true ONLY when the human has explicitly \
-                 authorized approving this exact plan. The approval is attributed to the \
-                 operator's git identity — never approve on the user's behalf.",
-                None,
+            let review = commands::compute_review_with_state_path(
+                &self.root,
+                &self.config_path,
+                Some(&state_path),
+                plan_id,
+                "HEAD",
+                false,
+            )
+            .await
+            .map_err(|e| {
+                ToolError::internal(
+                    format!("{e:#}"),
+                    "Fix the review error before confirming this plan.",
+                )
+            })?;
+            let token = review_token(&self.review_key, &review)?;
+            return preconfirmation_review_result(queue, review, token);
+        }
+
+        let supplied_token = args.review_token.as_deref().ok_or_else(|| {
+            ToolError::invalid_argument(
+                "confirmation requires the review_token from a prior dry-run review",
+                "Call review_queue with approve_plan_id and confirm omitted, read the review, then pass its review_token with confirm=true.",
+            )
+        })?;
+        let current_review = commands::compute_review_with_state_path(
+            &self.root,
+            &self.config_path,
+            Some(&state_path),
+            plan_id,
+            "HEAD",
+            false,
+        )
+        .await
+        .map_err(|e| ToolError::internal(format!("{e:#}"), "Retry the dry-run review."))?;
+        let current_token = review_token(&self.review_key, &current_review)?;
+        if supplied_token != current_token {
+            return Err(ToolError::invalid_argument(
+                "review_token does not match the current review",
+                "Call review_queue without confirm again, inspect the changed review, then confirm with its new token.",
             ));
         }
 
@@ -5771,15 +5819,38 @@ impl RockyMcpServer {
         // the marker still writes — EXCEPT on a present-but-unloadable
         // `rocky.toml`, which `compute_review` refuses before writing anything
         // (#1680). That refusal surfaces here as the `ToolError` below.
-        let review = commands::compute_review(&self.root, &self.config_path, plan_id, "HEAD", true)
-            .await
-            .map_err(|e| {
-                ToolError::internal(
-                    format!("{e:#}"),
-                    "Confirm the plan is an AI-authored or agent-authored plan and the project \
+        let expected_base_ref = current_review.base_ref.clone();
+        let review_key = self.review_key;
+        let review = commands::compute_review_with_disclosure(
+            &self.root,
+            &self.config_path,
+            Some(&state_path),
+            plan_id,
+            "HEAD",
+            true,
+            |drops, findings| {
+                let token = review_token_parts(
+                    &review_key,
+                    plan_id,
+                    &expected_base_ref,
+                    drops,
+                    findings,
+                )?;
+                anyhow::ensure!(
+                    token == supplied_token,
+                    "review changed before the sign-off marker could be written; run the dry-run review again"
+                );
+                Ok(())
+            },
+        )
+        .await
+        .map_err(|e| {
+            ToolError::internal(
+                format!("{e:#}"),
+                "Confirm the plan is an AI-authored or agent-authored plan and the project \
                      directory is writable so the sign-off marker can be persisted.",
-                )
-            })?;
+            )
+        })?;
 
         let breaking_change_count = review
             .breaking_changes
@@ -5790,7 +5861,7 @@ impl RockyMcpServer {
             plan_id: plan_id.to_string(),
             marker_written: review.marker_written,
             breaking_change_count,
-            message: review.message.unwrap_or_default(),
+            message: review.message.clone().unwrap_or_default(),
             attribution: "Recorded via the governor MCP surface and attributed to the operator's \
                  git identity (name/email/host), not a cryptographically bound principal. A signed \
                  human confirmation is a later step; the confirm flag stands in for explicit human \
@@ -5805,26 +5876,8 @@ impl RockyMcpServer {
             &self.config_path,
             &state_path,
             &self.models_dir,
-        )
-        .map_err(|e| {
-            ToolError::internal(
-                format!("{e:#}"),
-                "The sign-off marker was written, but re-listing the queue failed; re-call \
-                 review_queue to see the current state.",
-            )
-        })?;
-        let pending = serde_json::to_value(&queue_after.pending).map_err(|e| {
-            ToolError::internal(
-                format!("failed to serialize the review queue: {e}"),
-                "Retry; if it persists this is an internal serialization bug.",
-            )
-        })?;
-        Ok(Json(ReviewQueueResult {
-            total: queue_after.total,
-            ranking: queue_after.ranking,
-            pending,
-            approval: Some(approval),
-        }))
+        );
+        confirmed_review_after_refresh(queue, queue_after, review, approval)
     }
 
     /// Resolve the project's target warehouse adapter from `rocky.toml`.
@@ -7441,6 +7494,117 @@ fn rollback_disposition(
         .collect::<Vec<_>>()
         .join("; ");
     (format!("{failed_lead} — {listed}; {outcome}."), Some(paths))
+}
+
+/// Serialize the dry-run review before the caller may confirm an approval.
+fn review_token(
+    key: &[u8; 32],
+    review: &rocky_cli::output::ReviewOutput,
+) -> Result<String, Json<ToolError>> {
+    review_token_parts(
+        key,
+        &review.plan_id,
+        &review.base_ref,
+        &review.conditional_drops,
+        &review.breaking_changes,
+    )
+    .map_err(|e| ToolError::internal(format!("{e:#}"), "Retry the review."))
+}
+
+fn review_token_parts(
+    key: &[u8; 32],
+    plan_id: &str,
+    base_ref: &str,
+    drops: &[rocky_cli::output::ConditionalDrop],
+    findings: &Option<Vec<rocky_core::breaking_change::BreakingFinding>>,
+) -> anyhow::Result<String> {
+    let mut drops = drops.to_vec();
+    drops.sort_by(|a, b| {
+        (&a.model, &a.target, &a.existing_kind, &a.drop_sql).cmp(&(
+            &b.model,
+            &b.target,
+            &b.existing_kind,
+            &b.drop_sql,
+        ))
+    });
+    let bytes = serde_json::to_vec(&(plan_id, base_ref, drops, findings))?;
+    Ok(blake3::keyed_hash(key, &bytes).to_hex().to_string())
+}
+
+fn preconfirmation_review_result(
+    queue: rocky_cli::output::ReviewQueueOutput,
+    review: rocky_cli::output::ReviewOutput,
+    token: String,
+) -> ToolResult<ReviewQueueResult> {
+    let review = serde_json::to_value(review).map_err(|e| {
+        ToolError::internal(
+            format!("failed to serialize the review: {e}"),
+            "Retry the review.",
+        )
+    })?;
+    let pending = serde_json::to_value(&queue.pending).map_err(|e| {
+        ToolError::internal(
+            format!("failed to serialize the review queue: {e}"),
+            "Retry the review.",
+        )
+    })?;
+    Ok(Json(ReviewQueueResult {
+        total: queue.total,
+        ranking: queue.ranking,
+        pending,
+        review: Some(review),
+        review_token: Some(token),
+        approval: None,
+        queue_refresh_error: None,
+    }))
+}
+
+fn confirmed_review_result(
+    queue: rocky_cli::output::ReviewQueueOutput,
+    review: rocky_cli::output::ReviewOutput,
+    approval: ReviewApprovalOutcome,
+    queue_refresh_error: Option<String>,
+) -> ToolResult<ReviewQueueResult> {
+    let review = serde_json::to_value(review).map_err(|e| {
+        ToolError::internal(
+            format!("failed to serialize the approved review: {e}"),
+            "Retry the review.",
+        )
+    })?;
+    let pending = serde_json::to_value(&queue.pending).map_err(|e| {
+        ToolError::internal(
+            format!("failed to serialize the review queue: {e}"),
+            "Retry the review.",
+        )
+    })?;
+    Ok(Json(ReviewQueueResult {
+        total: queue.total,
+        ranking: queue.ranking,
+        pending,
+        review: Some(review),
+        review_token: None,
+        approval: Some(approval),
+        queue_refresh_error,
+    }))
+}
+
+fn confirmed_review_after_refresh(
+    queue_before: rocky_cli::output::ReviewQueueOutput,
+    queue_after: anyhow::Result<rocky_cli::output::ReviewQueueOutput>,
+    review: rocky_cli::output::ReviewOutput,
+    approval: ReviewApprovalOutcome,
+) -> ToolResult<ReviewQueueResult> {
+    match queue_after {
+        Ok(queue_after) => confirmed_review_result(queue_after, review, approval, None),
+        Err(error) => confirmed_review_result(
+            queue_before,
+            review,
+            approval,
+            Some(format!(
+                "The sign-off marker was written, but queue refresh failed: {error:#}. Re-list to see current pending plans."
+            )),
+        ),
+    }
 }
 
 /// Filter the pending review queue to plans whose payload carries
@@ -10711,6 +10875,98 @@ database = ":memory:"
         assert!(
             server_with(McpProfile::Approver).approve_action_served(),
             "approver profile: approving is served — the opt-in does something"
+        );
+    }
+
+    #[test]
+    fn non_confirm_review_queue_response_contains_drop_before_approval() {
+        let queue = rocky_cli::output::ReviewQueueOutput {
+            version: "test".to_string(),
+            command: "review".to_string(),
+            ranking: "test".to_string(),
+            total: 1,
+            excluded_non_plan_rows: 0,
+            pending: Vec::new(),
+        };
+        let review = rocky_cli::output::ReviewOutput {
+            version: "test".to_string(),
+            command: "review".to_string(),
+            plan_id: "plan".to_string(),
+            base_ref: "HEAD".to_string(),
+            approved: false,
+            marker_written: false,
+            breaking_changes: None,
+            conditional_drops: vec![rocky_cli::output::ConditionalDrop {
+                model: "orders".to_string(),
+                target: "branch_schema.orders".to_string(),
+                existing_kind: "view".to_string(),
+                drop_sql: "DROP VIEW branch_schema.orders".to_string(),
+            }],
+            message: None,
+        };
+        let response = super::preconfirmation_review_result(queue, review, "token".to_string())
+            .unwrap_or_else(|_| panic!("dry-run response should serialize"));
+        let json = serde_json::to_value(response.0).unwrap();
+        assert_eq!(
+            json["review"]["conditional_drops"][0]["drop_sql"],
+            "DROP VIEW branch_schema.orders"
+        );
+        assert_eq!(json["review"]["marker_written"], false);
+        assert_eq!(json["review_token"], "token");
+        assert!(json.get("approval").is_none());
+    }
+
+    #[test]
+    fn confirmed_review_queue_response_contains_the_approved_drop() {
+        let queue = rocky_cli::output::ReviewQueueOutput {
+            version: "test".to_string(),
+            command: "review".to_string(),
+            ranking: "test".to_string(),
+            total: 0,
+            excluded_non_plan_rows: 0,
+            pending: Vec::new(),
+        };
+        let review = rocky_cli::output::ReviewOutput {
+            version: "test".to_string(),
+            command: "review".to_string(),
+            plan_id: "plan".to_string(),
+            base_ref: "HEAD".to_string(),
+            approved: true,
+            marker_written: true,
+            breaking_changes: None,
+            conditional_drops: vec![rocky_cli::output::ConditionalDrop {
+                model: "orders".to_string(),
+                target: "main.orders".to_string(),
+                existing_kind: "view".to_string(),
+                drop_sql: "DROP VIEW IF EXISTS main.orders".to_string(),
+            }],
+            message: None,
+        };
+        let approval = ReviewApprovalOutcome {
+            plan_id: "plan".to_string(),
+            marker_written: true,
+            breaking_change_count: 0,
+            message: String::new(),
+            attribution: String::new(),
+        };
+        let response = super::confirmed_review_after_refresh(
+            queue,
+            Err(anyhow::anyhow!("store unavailable")),
+            review,
+            approval,
+        )
+        .unwrap_or_else(|_| panic!("confirmed review should serialize"));
+        let json = serde_json::to_value(response.0).unwrap();
+        assert_eq!(
+            json["review"]["conditional_drops"][0]["drop_sql"],
+            "DROP VIEW IF EXISTS main.orders"
+        );
+        assert_eq!(json["approval"]["marker_written"], true);
+        assert!(
+            json["queue_refresh_error"]
+                .as_str()
+                .unwrap()
+                .contains("store unavailable")
         );
     }
 

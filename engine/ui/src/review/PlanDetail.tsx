@@ -176,6 +176,28 @@ function BreakingChanges({ diff }: { diff: ReviewOutput }) {
   );
 }
 
+function ConditionalDrops({ diff }: { diff: ReviewOutput }) {
+  if (diff.conditional_drops.length === 0) return null;
+  return (
+    <section aria-label="Conditional DROPs" className="space-y-2">
+      <h3 className="text-sm font-semibold text-red-800 dark:text-red-200">
+        Conditional DROPs
+      </h3>
+      <p className="text-xs text-zinc-600 dark:text-zinc-300">
+        These run only when the existing object has the named kind.
+      </p>
+      <ul className="space-y-2">
+        {diff.conditional_drops.map((drop, index) => (
+          <li key={index} className="rounded border border-red-200 p-2 text-sm dark:border-red-900">
+            <span className="font-semibold">{drop.model}</span>: existing {drop.existing_kind} at {drop.target}
+            <code className="block break-all font-mono text-xs">{drop.drop_sql}</code>
+          </li>
+        ))}
+      </ul>
+    </section>
+  );
+}
+
 function SpecDrift({
   status,
   product,
@@ -494,7 +516,10 @@ export function PlanDetail({
       </section>
 
       {diff.kind === "ready" ? (
-        <BreakingChanges diff={diff.value} />
+        <>
+          <BreakingChanges diff={diff.value} />
+          <ConditionalDrops diff={diff.value} />
+        </>
       ) : (
         <section aria-label="What it would break" className="space-y-2">
           <h3 className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">
@@ -524,7 +549,9 @@ export function PlanDetail({
         <SampleFallback lookup={lookup} productId={productId} product={product} />
       )}
 
-      <HowToApprove status={status.value} entries={entries} />
+      {(status.value.reviewed || diff.kind === "ready") && (
+        <HowToApprove status={status.value} entries={entries} />
+      )}
     </div>
   );
 }

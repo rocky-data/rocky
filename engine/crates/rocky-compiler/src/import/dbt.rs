@@ -8,17 +8,17 @@
 //! - `{{ source('source_name', 'table_name') }}` -> fully qualified ref
 //! - `{{ config(materialized='incremental', unique_key='id') }}` -> ModelConfig
 //! - `{{ this }}` -> target table ref
-//! - Raw Jinja that invokes `is_incremental()` -> refused because dbt's
-//!   first-run/subsequent-run distinction cannot be preserved
+//! - Manifest incremental models require a matching full-refresh compile
+//!   artifact pair and must not set `full_refresh=false`
 //!
 //! **Import paths:**
 //! - **Manifest (preferred):** uses `compiled_code` from `target/manifest.json`
 //! - **Regex (fallback):** regex-based Jinja extraction from raw `.sql` files
 //!
 //! **Not supported (produces diagnostics):**
-//! - Custom Jinja macros, `{% for %}`, `{{ var() }}`, Python models
+//! - Raw Jinja control flow, custom Jinja macros, Python models
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
 use regex::Regex;
@@ -36,9 +36,20 @@ use super::dbt_sources;
 const RAW_INCREMENTAL_ERROR: &str = "contains an unresolved reference to dbt's `is_incremental()` macro; \
 the raw SQL importer cannot preserve dbt's false-on-bootstrap, true-on-existing-target semantics \
 without either referencing a missing target during bootstrap or deleting bounded incremental \
-logic. Compile dbt in an incremental context, verify the compiled SQL retains its intended \
-predicate and is valid for Rocky's initial target state, and import that manifest; otherwise, \
-rewrite the model with a Rocky-supported strategy";
+logic. Run `dbt compile --full-refresh` and import its compiled SQL from manifest.json with \
+the matching run_results.json, or rewrite the model with a Rocky-supported strategy";
+
+const RAW_INCREMENTAL_EVIDENCE_REFUSED: &str = "is an effectively incremental dbt model. \
+The raw importer has no compiled SQL or per-model run_results.json evidence and cannot prove \
+the first run contains all rows. Run `dbt compile --full-refresh`, then import manifest.json \
+with its matching run_results.json";
+
+const RAW_JINJA_CONTROL_REFUSED: &str = "raw import cannot evaluate Jinja control flow; \
+run `dbt compile --full-refresh` and import with the manifest";
+const RAW_CONFIG_UNRESOLVED: &str = "raw import cannot resolve a dbt config expression; \
+run `dbt compile --full-refresh` and import with the manifest";
+const RAW_VERSIONED_REFUSED: &str = "raw import cannot resolve versioned model properties; \
+run `dbt compile --full-refresh` and import with the manifest";
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -390,6 +401,8 @@ pub fn import_from_manifest(
             node,
             default_target,
             microbatch_mode,
+            manifest.full_refresh_compiled,
+            &manifest.successfully_compiled_nodes,
             &model_relations,
             &mut result,
         );
@@ -405,7 +418,7 @@ pub fn import_from_manifest(
                  import likely looks complete but is not faithful."
             ),
             suggestion: Some(
-                "regenerate the manifest with `dbt compile` (including any required --vars) and re-import".to_string(),
+                "regenerate the manifest with `dbt compile --full-refresh` (including any required --vars) and re-import".to_string(),
             ),
         });
     }
@@ -987,9 +1000,31 @@ fn import_manifest_node(
     node: &DbtManifestNode,
     default_target: &TargetConfig,
     microbatch_mode: MicrobatchMode,
+    manifest_full_refresh_compiled: bool,
+    successfully_compiled_nodes: &std::collections::HashSet<String>,
     model_relations: &HashMap<String, UpstreamModel>,
     result: &mut ImportResult,
 ) {
+    if node.config.materialized == "incremental" {
+        if node.config.full_refresh == Some(false) {
+            result.failed.push(ImportFailure {
+                name: node.name.clone(),
+                reason: INCREMENTAL_FULL_REFRESH_DISABLED.to_string(),
+            });
+            return;
+        }
+        if !manifest_full_refresh_compiled
+            || !successfully_compiled_nodes.contains(&node.unique_id)
+            || node.compiled_code.is_none()
+        {
+            result.failed.push(ImportFailure {
+                name: node.name.clone(),
+                reason: INCREMENTAL_COMPILE_EVIDENCE_REFUSED.to_string(),
+            });
+            return;
+        }
+    }
+
     // Resolve the model's output coordinates up front so the raw-code fallback
     // (for {{ this }}) and the emitted target use the same values. dbt `alias`
     // overrides the relation name; dropping it silently lands the data in a
@@ -1005,6 +1040,13 @@ fn import_manifest_node(
     let mut sql = match &node.compiled_code {
         Some(code) => rewrite_upstream_refs_to_bare(code, node, model_relations),
         None => {
+            if node.raw_code.contains("{%") {
+                result.failed.push(ImportFailure {
+                    name: node.name.clone(),
+                    reason: RAW_JINJA_CONTROL_REFUSED.to_string(),
+                });
+                return;
+            }
             if contains_unresolved_is_incremental(&node.raw_code) {
                 result.failed.push(ImportFailure {
                     name: node.name.clone(),
@@ -1017,7 +1059,9 @@ fn import_manifest_node(
                 category: WarningCategory::JinjaControlFlow,
                 message: "no compiled_code in manifest; using raw_code (may contain Jinja)"
                     .to_string(),
-                suggestion: Some("run `dbt compile` to generate compiled SQL".to_string()),
+                suggestion: Some(
+                    "run `dbt compile --full-refresh` to generate compiled SQL".to_string(),
+                ),
             });
             convert_jinja_to_sql(&node.raw_code, &this_ref)
         }
@@ -1398,6 +1442,18 @@ const INCREMENTAL_FALLBACK_REFUSED: &str = "is an incremental dbt model with no 
      it by hand: remove the `is_incremental()` filter, then use merge with a unique_key or a \
      time_interval model with @start_date/@end_date";
 
+const INCREMENTAL_COMPILE_EVIDENCE_REFUSED: &str = "is a dbt incremental model without successful \
+     per-model evidence in a matching full-refresh `run_results.json` and `compiled_code` in \
+     `manifest.json`. Its SQL may keep a delta filter and omit older rows on Rocky's first run. \
+     Run `dbt compile --full-refresh` without `--select` (or include this model), then import \
+     the resulting manifest.json and run_results.json together";
+
+const INCREMENTAL_FULL_REFRESH_DISABLED: &str = "is a dbt incremental model with effective \
+     `full_refresh=false` config. That config overrides `dbt compile --full-refresh`, so \
+     compiled SQL may still keep a delta filter. Remove the model's `full_refresh=false` \
+     config, then run `dbt compile --full-refresh` without `--select` (or include this model) \
+     and import the matching artifact pair";
+
 /// An explicit `incremental_strategy` wins over `unique_key` in
 /// `map_incremental_strategy`, so adding a key alone does not change an
 /// explicit `'append'`: the strategy must be `'merge'` or unset as well.
@@ -1482,11 +1538,10 @@ fn map_microbatch_strategy(
         // Fall through to the merge mapping below.
     }
 
-    // dbt microbatch idempotently REPLACES each batch partition. Rocky's
-    // Microbatch strategy emits an append-only INSERT (sql_gen.rs), so importing
-    // it as-is silently re-inserts the lookback window every run. dbt microbatch
-    // requires a `unique_key`, so map it to an idempotent Rocky merge instead;
-    // only fall back to append-only (loudly) if a key is somehow absent.
+    // The default import mode maps keyed dbt microbatch models to merge.
+    // The time_interval import mode above wraps the body with bounded windows.
+    // Without a key in the default mode, use full_refresh rather than emit an
+    // unbounded append.
     let unique_keys: Option<Vec<String>> = config.unique_key.as_ref().map(|uk| match uk {
         UniqueKeyValue::Single(s) => vec![s.clone()],
         UniqueKeyValue::Multiple(v) => v.clone(),
@@ -1526,10 +1581,8 @@ fn map_microbatch_strategy(
                 model: model_name.to_string(),
                 mapped_to: "full_refresh".to_string(),
             });
-            // Neither `incremental` (refused, #1990) nor `microbatch` (the
-            // same unfiltered append, #2054): both would re-insert every row
-            // on each run. A full rebuild is the one mapping that cannot
-            // duplicate.
+            // No keyed merge is possible in the default mode. A full rebuild
+            // is safe; callers can select time_interval mode for windows.
             StrategyConfig::FullRefresh
         }
     }
@@ -1914,13 +1967,30 @@ pub fn import_dbt_project(
         ));
     }
 
+    let mut model_yamls = HashMap::new();
+    let mut versioned_names = HashSet::new();
+    for dir in &model_dirs {
+        let parsed = super::dbt_tests::parse_model_yamls(dir)?;
+        versioned_names.extend(
+            parsed
+                .values()
+                .flat_map(|model| model.versioned_names.iter().cloned()),
+        );
+        model_yamls.extend(parsed);
+    }
+    let settings = RawModelSettings {
+        project: &project_config,
+        model_yamls: &model_yamls,
+        versioned_names: &versioned_names,
+    };
+
     for dir in &model_dirs {
         if dir.exists() {
             visit_dbt_models(
                 dir,
                 dir,
                 default_target,
-                &project_config,
+                &settings,
                 &source_map,
                 &mut result,
                 0,
@@ -1950,11 +2020,17 @@ pub fn import_dbt_project(
     Ok(result)
 }
 
+struct RawModelSettings<'a> {
+    project: &'a Option<DbtProjectConfig>,
+    model_yamls: &'a HashMap<String, super::dbt_tests::DbtModelYaml>,
+    versioned_names: &'a HashSet<String>,
+}
+
 fn visit_dbt_models(
     dir: &Path,
     models_root: &Path,
     default_target: &TargetConfig,
-    project_config: &Option<DbtProjectConfig>,
+    settings: &RawModelSettings<'_>,
     source_map: &HashMap<(String, String), dbt_sources::RockySourceMapping>,
     result: &mut ImportResult,
     depth: usize,
@@ -1980,7 +2056,7 @@ fn visit_dbt_models(
                 &path,
                 models_root,
                 default_target,
-                project_config,
+                settings,
                 source_map,
                 result,
                 depth + 1,
@@ -1994,14 +2070,8 @@ fn visit_dbt_models(
 
             let rel_path = path.strip_prefix(models_root).unwrap_or(path.as_path());
 
-            match import_single_model(
-                &path,
-                &name,
-                rel_path,
-                default_target,
-                project_config,
-                source_map,
-            ) {
+            match import_single_model(&path, &name, rel_path, default_target, settings, source_map)
+            {
                 Ok((model, warnings)) => {
                     result.warnings.extend(warnings);
                     result.imported.push(model);
@@ -2021,10 +2091,55 @@ fn import_single_model(
     name: &str,
     rel_path: &Path,
     default_target: &TargetConfig,
-    project_config: &Option<DbtProjectConfig>,
+    settings: &RawModelSettings<'_>,
     source_map: &HashMap<(String, String), dbt_sources::RockySourceMapping>,
 ) -> Result<(ImportedModel, Vec<ImportWarning>), String> {
     let content = std::fs::read_to_string(path).map_err(|e| format!("failed to read: {e}"))?;
+
+    // The raw converter keeps the body of statement tags. Even a condition
+    // unrelated to is_incremental() can leave a bounded query as full SQL.
+    if content.contains("{%") {
+        return Err(RAW_JINJA_CONTROL_REFUSED.to_string());
+    }
+    if settings.versioned_names.contains(name) {
+        return Err(RAW_VERSIONED_REFUSED.to_string());
+    }
+    let config_calls = dbt_config_calls(&content);
+    let config_starts = Regex::new(r"\{\{\s*-?\s*config\b").unwrap();
+    if config_starts.find_iter(&content).count() != config_calls.len()
+        || config_calls
+            .iter()
+            .any(|call| !raw_config_is_resolvable(call))
+    {
+        return Err(RAW_CONFIG_UNRESOLVED.to_string());
+    }
+
+    let resolved_project_config = settings
+        .project
+        .as_ref()
+        .map(|project| dbt_project::resolve_model_config(project, rel_path));
+    let yaml_materialization = settings
+        .model_yamls
+        .get(name)
+        .and_then(|model| model.materialized.as_deref());
+    let inline_materialization = inline_dbt_materialization(&content);
+    let effective_materialization = inline_materialization
+        .clone()
+        .or_else(|| yaml_materialization.map(str::to_string))
+        .or_else(|| {
+            resolved_project_config
+                .as_ref()
+                .map(|config| config.materialized.clone())
+        });
+    if effective_materialization
+        .as_deref()
+        .is_some_and(|value| !value.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
+    {
+        return Err(RAW_CONFIG_UNRESOLVED.to_string());
+    }
+    if effective_materialization.as_deref() == Some("incremental") {
+        return Err(RAW_INCREMENTAL_EVIDENCE_REFUSED.to_string());
+    }
 
     let mut warnings = Vec::new();
 
@@ -2036,36 +2151,6 @@ fn import_single_model(
     }
     let content_processed = content;
 
-    // Check for remaining unsupported Jinja patterns
-    if content_processed.contains("{%") {
-        // `{% for %}` / `{% set %}` REFUSE: the regex conversion strips only
-        // the `{% %}` delimiters, so a loop/assignment body survives exactly
-        // once — a loop meant to emit N columns emits one broken fragment that
-        // loads but is wrong. A loud failure beats a silent mis-render.
-        let for_set_re = Regex::new(r"\{%-?\s*(for|set)\b").unwrap();
-        if for_set_re.is_match(&content_processed) {
-            return Err(
-                "contains unsupported Jinja control flow ({% for %} or {% set %}) that the \
-                 no-manifest importer cannot faithfully render — re-run after `dbt compile` (the \
-                 manifest path resolves Jinja) or rewrite the model without loops/assignments"
-                    .to_string(),
-            );
-        }
-        // Other control flow ({% if %}) is still emitted with TODO markers and
-        // a warning — it degrades (the body is applied unconditionally) but
-        // stays inspectable for review, matching the long-standing behaviour.
-        let block_re = Regex::new(r"\{%[^%]*%\}").unwrap();
-        if block_re.is_match(&content_processed) {
-            warnings.push(ImportWarning {
-                model: name.to_string(),
-                category: WarningCategory::JinjaControlFlow,
-                message: "contains Jinja control flow ({% if %}) — emitted with TODO markers; the conditional body is applied unconditionally, so review the result".to_string(),
-                suggestion: Some(
-                    "use the manifest import path (`dbt compile`) for faithful Jinja resolution".to_string(),
-                ),
-            });
-        }
-    }
     // `{{ var('x') }}` is now mapped to Rocky's native per-run variable marker
     // `@var(x)` (with `{{ var('x', 'd') }}` -> `@var(x, d)`) during
     // `convert_jinja_to_sql`, so it is no longer an unsupported macro. Emit an
@@ -2086,7 +2171,8 @@ fn import_single_model(
     }
 
     // Extract config block
-    let (mut strategy, config_warnings) = extract_dbt_config(&content_processed);
+    let (mut strategy, config_warnings) =
+        extract_dbt_config(&content_processed, inline_materialization.as_deref());
     warnings.extend(config_warnings.into_iter().map(|msg| ImportWarning {
         model: name.to_string(),
         category: WarningCategory::UnsupportedMaterialization,
@@ -2097,23 +2183,10 @@ fn import_single_model(
     }));
 
     // Apply project config inheritance
-    let (resolved_schema, resolved_tags) = if let Some(proj) = project_config {
-        let resolved = dbt_project::resolve_model_config(proj, rel_path);
-        // Project-level materialization: only override if no model-level config
-        if !content_processed.contains("config(") && matches!(strategy, StrategyConfig::FullRefresh)
-        {
+    let (resolved_schema, resolved_tags) = if let Some(resolved) = resolved_project_config {
+        // Apply inherited materialization only when inline config does not set it.
+        if inline_materialization.is_none() && matches!(strategy, StrategyConfig::FullRefresh) {
             match resolved.materialized.as_str() {
-                "incremental" => {
-                    // Stays `full_refresh` (#1990): see `NO_APPEND_EQUIVALENT`.
-                    warnings.push(ImportWarning {
-                        model: name.to_string(),
-                        category: WarningCategory::UnsupportedMaterialization,
-                        message: format!(
-                            "project config materialized='incremental' mapped to full_refresh. {NO_APPEND_EQUIVALENT}"
-                        ),
-                        suggestion: Some(APPEND_SUGGESTION.to_string()),
-                    });
-                }
                 "view" => {
                     strategy = StrategyConfig::View;
                 }
@@ -2428,27 +2501,184 @@ fn dbt_tags_to_map(tags: &[String]) -> std::collections::BTreeMap<String, String
 /// name; dropping it would silently route the model's data to a table named
 /// after the file.
 fn extract_dbt_alias(content: &str) -> Option<String> {
-    let config_re = Regex::new(r"\{\{\s*config\s*\(([^)]*)\)\s*\}\}").ok()?;
-    let caps = config_re.captures(content)?;
-    single_string_value(&caps[1], "alias")
+    dbt_config_calls(content)
+        .into_iter()
+        .filter_map(|call| single_string_value(call, "alias"))
+        .next_back()
 }
 
-fn extract_dbt_config(content: &str) -> (StrategyConfig, Vec<String>) {
+fn inline_dbt_materialization(content: &str) -> Option<String> {
+    dbt_config_calls(content)
+        .into_iter()
+        .filter_map(|call| {
+            split_literal_items(call)?.into_iter().find_map(|arg| {
+                let (key, value) = arg.split_once('=')?;
+                (key.trim() == "materialized")
+                    .then(|| quoted_literal_contents(value.trim()).map(str::to_string))
+                    .flatten()
+            })
+        })
+        .next_back()
+}
+
+fn dbt_config_calls(content: &str) -> Vec<&str> {
+    let mut calls = Vec::new();
+    let mut rest = content;
+    while let Some(start) = rest.find("{{") {
+        rest = &rest[start + 2..];
+        let Some(end) = find_jinja_tag_end(rest, "}}") else {
+            break;
+        };
+        let body = rest[..end].trim().trim_start_matches('-').trim();
+        let body = body.trim_end_matches('-').trim();
+        if let Some(args) = body.strip_prefix("config") {
+            let args = args.trim();
+            if let Some(args) = args.strip_prefix('(').and_then(|s| s.strip_suffix(')')) {
+                calls.push(args);
+            }
+        }
+        rest = &rest[end + 2..];
+    }
+    calls
+}
+
+fn raw_config_is_resolvable(call: &str) -> bool {
+    // These arguments are only a best-effort literal subset. Any expression
+    // requiring Jinja evaluation must use the manifest path.
+    let Some(args) = split_literal_items(call) else {
+        return false;
+    };
+    let mut seen = HashSet::new();
+    args.into_iter().all(|arg| {
+        let Some((key, value)) = arg.split_once('=') else {
+            return false;
+        };
+        let key = key.trim();
+        let value = value.trim();
+        !key.is_empty()
+            && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            && seen.insert(key)
+            && if key == "materialized" {
+                is_literal_materialization(value)
+            } else {
+                is_literal_config_value(value)
+            }
+    })
+}
+
+fn is_literal_materialization(value: &str) -> bool {
+    let value = quoted_literal_contents(value);
+    value.is_some_and(|value| {
+        !value.is_empty() && value.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    })
+}
+
+fn is_literal_config_value(value: &str) -> bool {
+    if quoted_literal_contents(value).is_some()
+        || matches!(value, "true" | "false" | "True" | "False" | "none" | "None")
+        || value.parse::<f64>().is_ok()
+    {
+        return true;
+    }
+    if let Some(inner) = value.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+        return split_literal_items(inner).is_some_and(|items| {
+            items
+                .iter()
+                .all(|item| is_literal_config_value(item.trim()))
+        });
+    }
+    if let Some(inner) = value.strip_prefix('{').and_then(|s| s.strip_suffix('}')) {
+        return split_literal_items(inner).is_some_and(|items| {
+            items.iter().all(|item| {
+                item.split_once(':').is_some_and(|(key, value)| {
+                    quoted_literal_contents(key.trim()).is_some()
+                        && is_literal_config_value(value.trim())
+                })
+            })
+        });
+    }
+    false
+}
+
+fn quoted_literal_contents(value: &str) -> Option<&str> {
+    let quote = value.chars().next()?;
+    if quote != '\'' && quote != '"' || !value.ends_with(quote) || value.len() < 2 {
+        return None;
+    }
+    let inner = &value[1..value.len() - 1];
+    let mut escaped = false;
+    for ch in inner.chars() {
+        if escaped {
+            escaped = false;
+        } else if ch == '\\' {
+            escaped = true;
+        } else if ch == quote {
+            return None;
+        }
+    }
+    (!escaped).then_some(inner)
+}
+
+fn split_literal_items(value: &str) -> Option<Vec<&str>> {
+    if value.trim().is_empty() {
+        return Some(Vec::new());
+    }
+    let mut items = Vec::new();
+    let mut start = 0;
+    let mut quote = None;
+    let mut escaped = false;
+    let mut stack = Vec::new();
+    for (index, ch) in value.char_indices() {
+        if let Some(delimiter) = quote {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == delimiter {
+                quote = None;
+            }
+            continue;
+        }
+        match ch {
+            '\'' | '"' => quote = Some(ch),
+            '[' | '{' => stack.push(ch),
+            ']' if stack.pop() != Some('[') => return None,
+            '}' if stack.pop() != Some('{') => return None,
+            '(' | ')' => return None,
+            ',' if stack.is_empty() => {
+                let item = value[start..index].trim();
+                if item.is_empty() {
+                    return None;
+                }
+                items.push(item);
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    if quote.is_some() || !stack.is_empty() {
+        return None;
+    }
+    let last = value[start..].trim();
+    if !last.is_empty() {
+        items.push(last);
+    }
+    Some(items)
+}
+
+fn extract_dbt_config(
+    content: &str,
+    inline_materialization: Option<&str>,
+) -> (StrategyConfig, Vec<String>) {
     let mut messages = Vec::new();
 
-    let config_re = Regex::new(r"\{\{\s*config\s*\(([^)]*)\)\s*\}\}").unwrap();
-    let Some(captures) = config_re.captures(content) else {
+    let calls = dbt_config_calls(content);
+    let Some(config_str) = calls.last().copied() else {
         return (StrategyConfig::FullRefresh, messages);
     };
 
-    let config_str = &captures[1];
-
     // Parse materialized
-    let mat_re = Regex::new(r#"materialized\s*=\s*['"](\w+)['"]"#).unwrap();
-    let materialized = mat_re
-        .captures(config_str)
-        .map(|c| c[1].to_string())
-        .unwrap_or_else(|| "table".to_string());
+    let materialized = inline_materialization.unwrap_or("table").to_string();
 
     // Parse unique_key — accepts string-form (`unique_key='id'`) or
     // single-line list (`unique_key=['user_id', 'date']`).
@@ -2470,6 +2700,7 @@ fn extract_dbt_config(content: &str) -> (StrategyConfig, Vec<String>) {
     // practice), so they're left empty.
     let synthetic = DbtNodeConfig {
         materialized: materialized.clone(),
+        full_refresh: None,
         schema: None,
         unique_key,
         incremental_strategy,
@@ -2557,11 +2788,7 @@ fn strip_surrounding_quotes(s: &str) -> &str {
 }
 
 fn convert_jinja_to_sql(content: &str, this_ref: &str) -> String {
-    let mut sql = content.to_string();
-
-    // Remove {{ config(...) }} blocks
-    let config_re = Regex::new(r"\{\{\s*config\s*\([^)]*\)\s*\}\}\s*\n?").unwrap();
-    sql = config_re.replace_all(&sql, "").to_string();
+    let mut sql = strip_dbt_config_tags(content);
 
     // {{ ref('model_name') }} -> model_name
     let ref_re = Regex::new(r#"\{\{\s*ref\s*\(\s*['"](\w+)['"]\s*\)\s*\}\}"#).unwrap();
@@ -2616,6 +2843,31 @@ fn convert_jinja_to_sql(content: &str, this_ref: &str) -> String {
         .to_string();
 
     sql.trim().to_string()
+}
+
+fn strip_dbt_config_tags(content: &str) -> String {
+    let mut output = String::with_capacity(content.len());
+    let mut rest = content;
+    while let Some(start) = rest.find("{{") {
+        output.push_str(&rest[..start]);
+        let tag = &rest[start + 2..];
+        let Some(end) = find_jinja_tag_end(tag, "}}") else {
+            output.push_str(&rest[start..]);
+            return output;
+        };
+        let body = tag[..end].trim().trim_start_matches('-').trim();
+        let body = body.trim_end_matches('-').trim();
+        if !body
+            .strip_prefix("config")
+            .and_then(|s| s.trim().strip_prefix('('))
+            .is_some_and(|s| s.ends_with(')'))
+        {
+            output.push_str(&rest[start..start + 2 + end + 2]);
+        }
+        rest = &tag[end + 2..];
+    }
+    output.push_str(rest);
+    output
 }
 
 // ---------------------------------------------------------------------------
@@ -2756,14 +3008,44 @@ mod tests {
     #[test]
     fn test_extract_config_incremental() {
         let input = "{{ config(materialized='incremental', unique_key='id') }}";
-        let (strategy, _) = extract_dbt_config(input);
+        let (strategy, _) = extract_dbt_config(input, inline_dbt_materialization(input).as_deref());
         assert!(matches!(strategy, StrategyConfig::Merge { .. }));
+    }
+
+    #[test]
+    fn test_extract_config_materialized_ignores_nested_metadata_string() {
+        let input = "{{ config(meta={'note': \"materialized='table'\"}, materialized='incremental', unique_key='id') }}";
+        let inline_materialization = inline_dbt_materialization(input);
+        assert_eq!(inline_materialization.as_deref(), Some("incremental"));
+        let (strategy, _) = extract_dbt_config(input, inline_materialization.as_deref());
+        assert!(matches!(strategy, StrategyConfig::Merge { .. }));
+    }
+
+    #[test]
+    fn raw_import_refuses_top_level_incremental_after_nested_metadata_text() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir(dir.path().join("models")).unwrap();
+        std::fs::write(
+            dir.path().join("models/orders.sql"),
+            "{{ config(meta={'note': \"materialized='table'\"}, materialized='incremental') }}\nSELECT * FROM source_orders WHERE id > 100",
+        )
+        .unwrap();
+        let target = TargetConfig {
+            catalog: "w".into(),
+            schema: "s".into(),
+            table: String::new(),
+        };
+        let result = import_dbt_project(dir.path(), &target).unwrap();
+        assert!(result.imported.is_empty());
+        assert_eq!(result.failed.len(), 1);
+        assert_eq!(result.failed[0].name, "orders");
+        assert!(result.failed[0].reason.contains("effectively incremental"));
     }
 
     #[test]
     fn test_extract_config_table() {
         let input = "{{ config(materialized='table') }}";
-        let (strategy, _) = extract_dbt_config(input);
+        let (strategy, _) = extract_dbt_config(input, inline_dbt_materialization(input).as_deref());
         assert!(matches!(strategy, StrategyConfig::FullRefresh));
     }
 
@@ -2772,7 +3054,8 @@ mod tests {
         // Wave 2: `materialized='view'` now maps to StrategyConfig::View
         // (no warning) instead of FullRefresh + warning.
         let input = "{{ config(materialized='view') }}";
-        let (strategy, warnings) = extract_dbt_config(input);
+        let (strategy, warnings) =
+            extract_dbt_config(input, inline_dbt_materialization(input).as_deref());
         assert!(matches!(strategy, StrategyConfig::View));
         assert!(warnings.is_empty());
     }
@@ -2782,14 +3065,15 @@ mod tests {
         // Wave 2: `materialized='materialized_view'` now maps to
         // StrategyConfig::MaterializedView (previously: dropped silently).
         let input = "{{ config(materialized='materialized_view') }}";
-        let (strategy, _) = extract_dbt_config(input);
+        let (strategy, _) = extract_dbt_config(input, inline_dbt_materialization(input).as_deref());
         assert!(matches!(strategy, StrategyConfig::MaterializedView));
     }
 
     #[test]
     fn test_extract_config_ephemeral_warns() {
         let input = "{{ config(materialized='ephemeral') }}";
-        let (strategy, warnings) = extract_dbt_config(input);
+        let (strategy, warnings) =
+            extract_dbt_config(input, inline_dbt_materialization(input).as_deref());
         assert!(matches!(strategy, StrategyConfig::FullRefresh));
         assert!(!warnings.is_empty());
     }
@@ -2800,7 +3084,7 @@ mod tests {
         // must map to StrategyConfig::Merge, NOT to
         // `Incremental { timestamp_column: "merge" }`.
         let input = "{{ config(materialized='incremental', incremental_strategy='merge', unique_key=['user_id']) }}";
-        let (strategy, _) = extract_dbt_config(input);
+        let (strategy, _) = extract_dbt_config(input, inline_dbt_materialization(input).as_deref());
         match strategy {
             StrategyConfig::Merge {
                 unique_key,
@@ -2816,7 +3100,7 @@ mod tests {
         // captured 'merge' as a timestamp column. Assert that does NOT
         // happen anymore.
         let input = "{{ config(materialized='incremental', incremental_strategy='merge') }}";
-        let (strategy, _) = extract_dbt_config(input);
+        let (strategy, _) = extract_dbt_config(input, inline_dbt_materialization(input).as_deref());
         // Without unique_key, merge cannot apply, and the append fallback is
         // `full_refresh` (#1990: `incremental` is refused on transformation
         // models). The old failure mode was 'merge' landing in a timestamp
@@ -2830,7 +3114,7 @@ mod tests {
     #[test]
     fn test_extract_no_config() {
         let input = "SELECT 1";
-        let (strategy, _) = extract_dbt_config(input);
+        let (strategy, _) = extract_dbt_config(input, inline_dbt_materialization(input).as_deref());
         assert!(matches!(strategy, StrategyConfig::FullRefresh));
     }
 
@@ -3096,17 +3380,7 @@ models:
             "sources": {}
         });
 
-        let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("manifest.json");
-        std::fs::write(&path, manifest_json.to_string()).unwrap();
-
-        let manifest = dbt_manifest::parse_manifest(&path).unwrap();
-        let target = TargetConfig {
-            catalog: "w".to_string(),
-            schema: "s".to_string(),
-            table: String::new(),
-        };
-        let result = import_from_manifest(&manifest, &target, false, MicrobatchMode::Merge);
+        let result = import_from_manifest_json_with_evidence(&manifest_json, MicrobatchMode::Merge);
 
         assert_eq!(result.imported.len(), 1);
         assert!(matches!(
@@ -3284,9 +3558,16 @@ FROM {{ ref('stg_events') }}
         assert!(result.imported.is_empty());
         assert_eq!(result.failed.len(), 1);
         assert_eq!(result.failed[0].name, "fct_events");
-        assert!(result.failed[0].reason.contains("is_incremental()"));
-        assert!(result.failed[0].reason.contains("unresolved"));
-        assert!(result.failed[0].reason.contains("compiled SQL"));
+        assert!(
+            result.failed[0]
+                .reason
+                .contains("raw import cannot evaluate Jinja control flow")
+        );
+        assert!(
+            result.failed[0]
+                .reason
+                .contains("dbt compile --full-refresh")
+        );
     }
 
     #[test]
@@ -3317,7 +3598,11 @@ FROM {{ ref('stg_events') }}
         assert!(result.imported.is_empty());
         assert_eq!(result.failed.len(), 1);
         assert_eq!(result.failed[0].name, "fct_events");
-        assert!(result.failed[0].reason.contains("is_incremental()"));
+        assert!(
+            result.failed[0]
+                .reason
+                .contains("dbt compile --full-refresh")
+        );
     }
 
     #[test]
@@ -3378,6 +3663,37 @@ FROM {{ ref('stg_events') }}
         import_from_manifest(&manifest, &target, false, mode)
     }
 
+    /// Supply a matching compile pair for tests of downstream strategy and warnings.
+    fn import_from_manifest_json_with_evidence(
+        manifest_json: &serde_json::Value,
+        mode: MicrobatchMode,
+    ) -> ImportResult {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("manifest.json");
+        let mut manifest_json = manifest_json.clone();
+        manifest_json["metadata"]["invocation_id"] = serde_json::json!("strategy-test");
+        std::fs::write(&path, manifest_json.to_string()).unwrap();
+        let results: Vec<_> = manifest_json["nodes"]
+            .as_object()
+            .unwrap()
+            .values()
+            .filter_map(|node| node["unique_id"].as_str())
+            .map(|id| serde_json::json!({"unique_id": id, "status": "success"}))
+            .collect();
+        std::fs::write(
+            dir.path().join("run_results.json"),
+            serde_json::json!({"metadata":{"invocation_id":"strategy-test"},"args":{"full_refresh":true},"results":results}).to_string(),
+        )
+        .unwrap();
+        let manifest = dbt_manifest::parse_manifest(&path).unwrap();
+        let target = TargetConfig {
+            catalog: "w".to_string(),
+            schema: "s".to_string(),
+            table: String::new(),
+        };
+        import_from_manifest(&manifest, &target, false, mode)
+    }
+
     #[test]
     fn test_microbatch_as_time_interval_emits_time_interval_strategy() {
         let manifest = serde_json::json!({
@@ -3400,7 +3716,8 @@ FROM {{ ref('stg_events') }}
             }},
             "sources": {}
         });
-        let result = import_from_manifest_json_with_mode(&manifest, MicrobatchMode::TimeInterval);
+        let result =
+            import_from_manifest_json_with_evidence(&manifest, MicrobatchMode::TimeInterval);
         let model = &result.imported[0];
         match &model.config.strategy {
             StrategyConfig::TimeInterval {
@@ -3584,7 +3901,7 @@ FROM {{ ref('stg_events') }}
                 serde_json::json!([])) },
             "sources": {}
         });
-        let result = import_from_manifest_json(&manifest);
+        let result = import_from_manifest_json_with_evidence(&manifest, MicrobatchMode::Merge);
         assert!(
             matches!(
                 result.imported[0].config.strategy,
@@ -3734,6 +4051,26 @@ FROM {{ ref('stg_events') }}
     }
 
     #[test]
+    fn manifest_raw_table_refuses_jinja_control_flow() {
+        let manifest = serde_json::json!({
+            "metadata": { "project_name": "p" },
+            "nodes": { "model.p.orders": {
+                "unique_id": "model.p.orders", "name": "orders", "resource_type": "model",
+                "raw_code": "SELECT * FROM source_orders {% if false %} WHERE id > 100 {% endif %}",
+                "depends_on": { "nodes": [], "macros": [] },
+                "config": { "materialized": "table" },
+                "columns": {}, "tags": [], "schema": "s", "database": "d"
+            }},
+            "sources": {}
+        });
+        let result = import_from_manifest_json(&manifest);
+        assert!(result.imported.is_empty());
+        assert_eq!(result.failed.len(), 1);
+        assert_eq!(result.failed[0].name, "orders");
+        assert!(result.failed[0].reason.contains(RAW_JINJA_CONTROL_REFUSED));
+    }
+
+    #[test]
     fn manifest_raw_fallback_refuses_append_incremental_guard() {
         let manifest = serde_json::json!({
             "metadata": { "project_name": "p" },
@@ -3751,8 +4088,12 @@ FROM {{ ref('stg_events') }}
         assert!(result.imported.is_empty());
         assert_eq!(result.failed.len(), 1);
         assert_eq!(result.failed[0].name, "events");
-        assert!(result.failed[0].reason.contains("is_incremental()"));
-        assert!(result.failed[0].reason.contains("unresolved"));
+        assert!(result.failed[0].reason.contains("compiled_code"));
+        assert!(
+            result.failed[0]
+                .reason
+                .contains("dbt compile --full-refresh")
+        );
     }
 
     #[test]
@@ -3773,7 +4114,7 @@ FROM {{ ref('stg_events') }}
         assert!(result.imported.is_empty());
         assert_eq!(result.failed.len(), 1);
         assert_eq!(result.failed[0].name, "events");
-        assert!(result.failed[0].reason.contains("is_incremental()"));
+        assert!(result.failed[0].reason.contains("compiled_code"));
     }
 
     #[test]
@@ -3826,9 +4167,8 @@ FROM {{ ref('stg_events') }}
         });
         let result = import_from_manifest_json(&manifest);
         assert_eq!(result.imported.len(), 1);
-        // A microbatch without a unique_key has no append mapping: `incremental`
-        // is refused on transformation models (#1990) and `microbatch` is the
-        // same unfiltered INSERT (#2054). It rebuilds in full, loudly.
+        // The default import mode has no keyed merge without a unique_key.
+        // It rebuilds in full and warns. Time-interval mode remains available.
         assert!(
             matches!(
                 result.imported[0].config.strategy,
@@ -3938,7 +4278,7 @@ FROM {{ ref('stg_events') }}
             },
             "sources": {}
         });
-        let result = import_from_manifest_json(&manifest);
+        let result = import_from_manifest_json_with_evidence(&manifest, MicrobatchMode::Merge);
         match &result.imported[0].config.strategy {
             StrategyConfig::Merge {
                 unique_key,
@@ -3973,7 +4313,7 @@ FROM {{ ref('stg_events') }}
             },
             "sources": {}
         });
-        let result = import_from_manifest_json(&manifest);
+        let result = import_from_manifest_json_with_evidence(&manifest, MicrobatchMode::Merge);
         // #1990: an emitted `incremental` sidecar would fail `rocky compile`
         // with E037, so an append model rebuilds in full and says why.
         assert!(
@@ -4025,7 +4365,7 @@ FROM {{ ref('stg_events') }}
             },
             "sources": {}
         });
-        let result = import_from_manifest_json(&manifest);
+        let result = import_from_manifest_json_with_evidence(&manifest, MicrobatchMode::Merge);
         assert!(
             result.imported.iter().all(|m| m.name != "events_append"),
             "a delta-filtered model must not be imported as full_refresh: {:?}",
@@ -4063,12 +4403,9 @@ FROM {{ ref('stg_events') }}
         );
     }
 
-    /// The boundary of #2058's refusal: the same model WITH a unique_key is
-    /// still imported as merge. This PINS CURRENT BEHAVIOUR, NOT A CONTRACT:
-    /// merge's first run builds the table from the compiled delta SQL, so it
-    /// loads only recent rows (#2059). When #2059 is ruled, this test changes.
+    /// A key does not make a delta-filtered compiled body safe on first run.
     #[test]
-    fn test_append_model_using_is_incremental_with_unique_key_still_maps_to_merge() {
+    fn test_keyed_incremental_without_compile_evidence_is_refused() {
         let manifest = serde_json::json!({
             "metadata": { "project_name": "p" },
             "nodes": {
@@ -4086,16 +4423,526 @@ FROM {{ ref('stg_events') }}
             "sources": {}
         });
         let result = import_from_manifest_json(&manifest);
-        let model = result
-            .imported
+        assert!(result.imported.iter().all(|m| m.name != "events_keyed"));
+        let failure = result
+            .failed
             .iter()
-            .find(|m| m.name == "events_keyed")
-            .expect("a keyed incremental model is imported");
+            .find(|f| f.name == "events_keyed")
+            .expect("a keyed model without matching evidence is refused");
         assert!(
-            matches!(model.config.strategy, StrategyConfig::Merge { .. }),
-            "expected Merge, got {:?}",
-            model.config.strategy
+            failure.reason.contains("dbt compile --full-refresh"),
+            "refusal names the remedy: {}",
+            failure.reason
         );
+    }
+
+    #[test]
+    fn real_dbt_compile_pair_guards_every_incremental_strategy() {
+        let fixtures =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/dbt_incremental_compile");
+        let target = TargetConfig {
+            catalog: "w".to_string(),
+            schema: "s".to_string(),
+            table: String::new(),
+        };
+
+        let full = dbt_manifest::parse_manifest(&fixtures.join("full_refresh/manifest.json"))
+            .expect("real full-refresh manifest parses");
+        let accepted = import_from_manifest(&full, &target, false, MicrobatchMode::Merge);
+        assert_eq!(accepted.failed.len(), 1, "{:?}", accepted.failed);
+        assert_eq!(accepted.failed[0].name, "orders_pinned");
+        assert!(accepted.failed[0].reason.contains("full_refresh=false"));
+        assert!(
+            accepted.failed[0]
+                .reason
+                .contains("dbt compile --full-refresh")
+        );
+        for name in ["orders_inc", "orders_macro", "orders_nokey"] {
+            let model = accepted.imported.iter().find(|m| m.name == name).unwrap();
+            assert!(
+                !model.sql.contains("where updated_at >"),
+                "{}: {}",
+                name,
+                model.sql
+            );
+            if name == "orders_nokey" {
+                assert!(matches!(
+                    model.config.strategy,
+                    StrategyConfig::DeleteInsert { .. }
+                ));
+            } else {
+                assert!(matches!(
+                    model.config.strategy,
+                    StrategyConfig::Merge { .. }
+                ));
+            }
+        }
+        assert_eq!(accepted.imported.len(), 3);
+
+        let plain = dbt_manifest::parse_manifest(&fixtures.join("plain/manifest.json"))
+            .expect("real plain manifest parses");
+        let refused = import_from_manifest(&plain, &target, false, MicrobatchMode::Merge);
+        assert!(refused.imported.is_empty());
+        assert_eq!(refused.failed.len(), 4, "{:?}", refused.failed);
+        for name in [
+            "orders_inc",
+            "orders_pinned",
+            "orders_macro",
+            "orders_nokey",
+        ] {
+            let failure = refused.failed.iter().find(|f| f.name == name).unwrap();
+            assert!(failure.reason.contains("dbt compile --full-refresh"));
+            if name == "orders_pinned" {
+                assert!(failure.reason.contains("full_refresh=false"));
+            }
+        }
+    }
+
+    #[test]
+    fn selective_full_refresh_compile_imports_only_successful_compiled_node() {
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/dbt_incremental_compile/select_orders_inc");
+        let target = TargetConfig {
+            catalog: "w".to_string(),
+            schema: "s".to_string(),
+            table: String::new(),
+        };
+        let manifest = dbt_manifest::parse_manifest(&fixtures.join("manifest.json")).unwrap();
+        let result = import_from_manifest(&manifest, &target, false, MicrobatchMode::Merge);
+        assert_eq!(
+            result
+                .imported
+                .iter()
+                .map(|model| model.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["orders_inc"]
+        );
+        assert!(!result.imported[0].sql.contains("where updated_at >"));
+        assert_eq!(result.failed.len(), 3, "{:?}", result.failed);
+        for name in ["orders_macro", "orders_nokey", "orders_pinned"] {
+            let failure = result
+                .failed
+                .iter()
+                .find(|failure| failure.name == name)
+                .unwrap();
+            if name == "orders_pinned" {
+                assert!(failure.reason.contains("full_refresh=false"));
+            } else {
+                assert!(failure.reason.contains("dbt compile --full-refresh"));
+                assert!(failure.reason.contains("--select"));
+            }
+        }
+    }
+
+    #[test]
+    fn raw_import_refuses_inline_and_inherited_incremental_models() {
+        let target = TargetConfig {
+            catalog: "w".to_string(),
+            schema: "s".to_string(),
+            table: String::new(),
+        };
+        for (project_config, model_path, model_config) in [
+            (
+                "    +materialized: view\n",
+                "models/orders.sql",
+                "{{ config(materialized='incremental') }}",
+            ),
+            (
+                "    +materialized: incremental\n",
+                "models/orders.sql",
+                "{{ config(tags=['daily']) }}",
+            ),
+            (
+                "    +materialized: view\n    marts:\n      +materialized: incremental\n",
+                "models/marts/orders.sql",
+                "",
+            ),
+            (
+                "    +materialized: view\n    marts:\n      +materialized: view\n      orders:\n        +materialized: incremental\n",
+                "models/marts/orders.sql",
+                "",
+            ),
+        ] {
+            let dir = tempfile::TempDir::new().unwrap();
+            std::fs::create_dir_all(dir.path().join(model_path).parent().unwrap()).unwrap();
+            std::fs::write(
+                dir.path().join("dbt_project.yml"),
+                format!("name: p\nmodels:\n  p:\n{project_config}"),
+            )
+            .unwrap();
+            std::fs::write(
+                dir.path().join(model_path),
+                format!(
+                    "{model_config}\nselect * from orders_source\n{{% if delta_mode() %}}\nwhere updated_at > '2026-01-01'\n{{% endif %}}"
+                ),
+            )
+            .unwrap();
+            let result = import_dbt_project(dir.path(), &target).unwrap();
+            assert!(result.imported.is_empty());
+            assert_eq!(result.failed.len(), 1, "{:?}", result.failed);
+            assert_eq!(result.failed[0].name, "orders");
+            assert!(
+                result.failed[0]
+                    .reason
+                    .contains("raw import cannot evaluate Jinja control flow")
+            );
+            assert!(
+                result.failed[0]
+                    .reason
+                    .contains("dbt compile --full-refresh")
+            );
+        }
+
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir(dir.path().join("models")).unwrap();
+        std::fs::write(
+            dir.path().join("dbt_project.yml"),
+            "name: p\nmodels:\n  p:\n    +materialized: incremental\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("models/orders.sql"),
+            "{{ config(materialized='table') }}\nselect 1 as id",
+        )
+        .unwrap();
+        let result = import_dbt_project(dir.path(), &target).unwrap();
+        assert_eq!(result.imported.len(), 1);
+        assert!(result.failed.is_empty());
+
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir(dir.path().join("models")).unwrap();
+        std::fs::write(
+            dir.path().join("models/properties.yml"),
+            "models:\n  - name: orders\n    config:\n      materialized: incremental\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("models/orders.sql"),
+            "select * from orders_source\n{% if delta_mode() %}\nwhere updated_at > '2026-01-01'\n{% endif %}",
+        )
+        .unwrap();
+        let result = import_dbt_project(dir.path(), &target).unwrap();
+        assert!(result.imported.is_empty());
+        assert_eq!(result.failed.len(), 1);
+        assert!(
+            result.failed[0]
+                .reason
+                .contains("dbt compile --full-refresh")
+        );
+
+        std::fs::write(
+            dir.path().join("models/orders.sql"),
+            "{{ config(materialized='table') }}\nselect 1 as id",
+        )
+        .unwrap();
+        let result = import_dbt_project(dir.path(), &target).unwrap();
+        assert_eq!(result.imported.len(), 1);
+        assert!(result.failed.is_empty());
+    }
+
+    #[test]
+    fn raw_import_refuses_jinja_control_flow_before_emitting_sql() {
+        let target = TargetConfig {
+            catalog: "w".into(),
+            schema: "s".into(),
+            table: String::new(),
+        };
+        for (label, tag) in [
+            ("if", "{% if delta_mode() %}where id > 10{% endif %}"),
+            (
+                "if_trim",
+                "{%- if delta_mode() -%}where id > 10{%- endif -%}",
+            ),
+            ("for", "{% for c in columns %}{{ c }}{% endfor %}"),
+            ("macro", "{% macro delta() %}where id > 10{% endmacro %}"),
+            ("call", "{% call delta() %}where id > 10{% endcall %}"),
+            (
+                "wrapped_incremental",
+                "{% macro delta() %}{{ is_incremental() }}{% endmacro %}{% if delta() %}where id > 10{% endif %}",
+            ),
+        ] {
+            let dir = tempfile::TempDir::new().unwrap();
+            std::fs::create_dir(dir.path().join("models")).unwrap();
+            std::fs::write(
+                dir.path().join("models/orders.sql"),
+                format!("select * from source {tag}"),
+            )
+            .unwrap();
+            let result = import_dbt_project(dir.path(), &target).unwrap();
+            assert!(result.imported.is_empty(), "{label}");
+            assert_eq!(result.failed.len(), 1, "{label}");
+            assert!(
+                result.failed[0]
+                    .reason
+                    .contains("raw import cannot evaluate Jinja control flow"),
+                "{label}"
+            );
+            assert!(
+                result.failed[0]
+                    .reason
+                    .contains("dbt compile --full-refresh"),
+                "{label}"
+            );
+        }
+    }
+
+    #[test]
+    fn raw_import_resolves_whitespace_and_last_inline_config() {
+        let target = TargetConfig {
+            catalog: "w".into(),
+            schema: "s".into(),
+            table: String::new(),
+        };
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir(dir.path().join("models")).unwrap();
+        let sql = dir.path().join("models/orders.sql");
+        std::fs::write(
+            &sql,
+            "{{- config(materialized='incremental') -}}\nselect 1 as id",
+        )
+        .unwrap();
+        let refused = import_dbt_project(dir.path(), &target).unwrap();
+        assert!(refused.imported.is_empty());
+        assert!(refused.failed[0].reason.contains("effectively incremental"));
+
+        std::fs::write(&sql, "{{ config(materialized='incremental') }}\n{{- config(materialized='table') -}}\nselect 1 as id").unwrap();
+        let accepted = import_dbt_project(dir.path(), &target).unwrap();
+        assert_eq!(accepted.imported.len(), 1, "{:?}", accepted.failed);
+        assert!(accepted.failed.is_empty());
+        assert!(matches!(
+            accepted.imported[0].config.strategy,
+            StrategyConfig::FullRefresh
+        ));
+        assert_eq!(accepted.imported[0].sql.trim(), "select 1 as id");
+
+        std::fs::write(&sql, "{{ config(materialized='table') }}\n{{ config(materialized='incremental') }}\nselect 1 as id").unwrap();
+        let refused = import_dbt_project(dir.path(), &target).unwrap();
+        assert!(refused.imported.is_empty());
+        assert!(refused.failed[0].reason.contains("effectively incremental"));
+    }
+
+    #[test]
+    fn raw_import_refuses_unresolved_config_expression() {
+        let target = TargetConfig {
+            catalog: "w".into(),
+            schema: "s".into(),
+            table: String::new(),
+        };
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir(dir.path().join("models")).unwrap();
+        for expression in [
+            "materialized=var('mode')",
+            "**model_config",
+            "schema=target.schema",
+            "tags=['daily', var('tag')]",
+            "meta={'owner': target.name}",
+            "schema='safe' + var('suffix')",
+            "schema='safe' + 'suffix'",
+        ] {
+            std::fs::write(
+                dir.path().join("models/orders.sql"),
+                format!("{{{{ config({expression}) }}}}\nselect 1 as id"),
+            )
+            .unwrap();
+            let result = import_dbt_project(dir.path(), &target).unwrap();
+            assert!(result.imported.is_empty(), "{expression}");
+            assert!(
+                result.failed[0]
+                    .reason
+                    .contains("cannot resolve a dbt config expression"),
+                "{expression}"
+            );
+        }
+
+        std::fs::write(
+            dir.path().join("models/orders.sql"),
+            "{{ config(materialized='incremental' }}\nselect 1 as id",
+        )
+        .unwrap();
+        let result = import_dbt_project(dir.path(), &target).unwrap();
+        assert!(result.imported.is_empty());
+        assert!(
+            result.failed[0]
+                .reason
+                .contains("cannot resolve a dbt config expression")
+        );
+
+        std::fs::write(
+            dir.path().join("models/orders.sql"),
+            "{{ config(alias='orders', tags=['daily)'], meta={'owner': 'team'}) }}\nselect 1 as id",
+        )
+        .unwrap();
+        let accepted = import_dbt_project(dir.path(), &target).unwrap();
+        assert_eq!(accepted.imported.len(), 1, "{:?}", accepted.failed);
+        assert_eq!(accepted.imported[0].sql, "select 1 as id");
+        assert_eq!(accepted.imported[0].config.target.table, "orders");
+    }
+
+    #[test]
+    fn raw_import_applies_root_model_default() {
+        let target = TargetConfig {
+            catalog: "w".into(),
+            schema: "s".into(),
+            table: String::new(),
+        };
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir(dir.path().join("models")).unwrap();
+        std::fs::write(
+            dir.path().join("dbt_project.yml"),
+            "name: p\nmodels:\n  +materialized: incremental\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("models/orders.sql"), "select 1 as id").unwrap();
+        let refused = import_dbt_project(dir.path(), &target).unwrap();
+        assert!(refused.imported.is_empty());
+        assert!(refused.failed[0].reason.contains("effectively incremental"));
+
+        std::fs::write(
+            dir.path().join("dbt_project.yml"),
+            "name: p\nmodels:\n  +materialized: incremental\n  p:\n    +materialized: table\n",
+        )
+        .unwrap();
+        let accepted = import_dbt_project(dir.path(), &target).unwrap();
+        assert_eq!(accepted.imported.len(), 1, "{:?}", accepted.failed);
+
+        std::fs::write(
+            dir.path().join("dbt_project.yml"),
+            "name: p\nmodels:\n  +materialized: \"{{ var('mode') }}\"\n",
+        )
+        .unwrap();
+        let refused = import_dbt_project(dir.path(), &target).unwrap();
+        assert!(refused.imported.is_empty());
+        assert!(
+            refused.failed[0]
+                .reason
+                .contains("cannot resolve a dbt config expression")
+        );
+    }
+
+    #[test]
+    fn raw_import_refuses_versioned_properties() {
+        let target = TargetConfig {
+            catalog: "w".into(),
+            schema: "s".into(),
+            table: String::new(),
+        };
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir(dir.path().join("models")).unwrap();
+        std::fs::write(dir.path().join("models/properties.yml"), "models:\n  - name: orders\n    versions:\n      - v: 1\n        config:\n          materialized: incremental\n      - v: 2\n        defined_in: orders_archive\n").unwrap();
+        for name in ["orders", "orders_v1", "orders_archive"] {
+            std::fs::write(
+                dir.path().join(format!("models/{name}.sql")),
+                "select 1 as id",
+            )
+            .unwrap();
+        }
+        let result = import_dbt_project(dir.path(), &target).unwrap();
+        assert!(result.imported.is_empty());
+        assert_eq!(result.failed.len(), 3);
+        assert!(
+            result
+                .failed
+                .iter()
+                .all(|failure| failure.reason.contains("versioned model properties"))
+        );
+    }
+
+    #[test]
+    fn incremental_requires_both_success_result_and_compiled_code() {
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/dbt_incremental_compile/select_orders_inc");
+        let dir = tempfile::TempDir::new().unwrap();
+        let manifest_path = dir.path().join("manifest.json");
+        let results_path = dir.path().join("run_results.json");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(fixtures.join("manifest.json")).unwrap())
+                .unwrap();
+        let results: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(fixtures.join("run_results.json")).unwrap())
+                .unwrap();
+        let target = TargetConfig {
+            catalog: "w".to_string(),
+            schema: "s".to_string(),
+            table: String::new(),
+        };
+        for (manifest_value, results_value) in [
+            (manifest.clone(), {
+                let mut value = results.clone();
+                value["results"][0]["status"] = serde_json::json!("error");
+                value
+            }),
+            (
+                {
+                    let mut value = manifest.clone();
+                    value["nodes"]["model.inc_probe.orders_inc"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("compiled_code");
+                    value
+                },
+                results.clone(),
+            ),
+        ] {
+            std::fs::write(&manifest_path, manifest_value.to_string()).unwrap();
+            std::fs::write(&results_path, results_value.to_string()).unwrap();
+            let parsed = dbt_manifest::parse_manifest(&manifest_path).unwrap();
+            let imported = import_from_manifest(&parsed, &target, false, MicrobatchMode::Merge);
+            assert!(imported.imported.is_empty());
+            let failure = imported
+                .failed
+                .iter()
+                .find(|f| f.name == "orders_inc")
+                .unwrap();
+            assert!(failure.reason.contains("dbt compile --full-refresh"));
+        }
+    }
+
+    #[test]
+    fn incremental_rejects_missing_mismatched_and_false_evidence() {
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/dbt_incremental_compile/full_refresh");
+        let dir = tempfile::TempDir::new().unwrap();
+        let manifest_path = dir.path().join("manifest.json");
+        let results_path = dir.path().join("run_results.json");
+        std::fs::copy(fixtures.join("manifest.json"), &manifest_path).unwrap();
+        let valid: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(fixtures.join("run_results.json")).unwrap())
+                .unwrap();
+        let target = TargetConfig {
+            catalog: "w".to_string(),
+            schema: "s".to_string(),
+            table: String::new(),
+        };
+
+        for evidence in [
+            None,
+            Some(
+                serde_json::json!({"metadata": {"invocation_id": "other"}, "args": {"full_refresh": true}}),
+            ),
+            Some(
+                serde_json::json!({"metadata": {"invocation_id": valid["metadata"]["invocation_id"]}, "args": {"full_refresh": false}}),
+            ),
+            Some(
+                serde_json::json!({"metadata": {"invocation_id": valid["metadata"]["invocation_id"]}, "args": {}}),
+            ),
+            Some(serde_json::json!({"broken": true})),
+        ] {
+            if let Some(evidence) = evidence {
+                std::fs::write(&results_path, evidence.to_string()).unwrap();
+            } else if results_path.exists() {
+                std::fs::remove_file(&results_path).unwrap();
+            }
+            let manifest = dbt_manifest::parse_manifest(&manifest_path).unwrap();
+            let result = import_from_manifest(&manifest, &target, false, MicrobatchMode::Merge);
+            assert!(result.imported.is_empty());
+            assert_eq!(result.failed.len(), 4, "{:?}", result.failed);
+            assert!(
+                result
+                    .failed
+                    .iter()
+                    .all(|f| f.reason.contains("dbt compile --full-refresh"))
+            );
+        }
     }
 
     #[test]
@@ -4121,7 +4968,7 @@ FROM {{ ref('stg_events') }}
             },
             "sources": {}
         });
-        let result = import_from_manifest_json(&manifest);
+        let result = import_from_manifest_json_with_evidence(&manifest, MicrobatchMode::Merge);
         match &result.imported[0].config.strategy {
             StrategyConfig::DeleteInsert { partition_by } => {
                 assert_eq!(partition_by, &vec!["dt".to_string()]);
@@ -4235,7 +5082,7 @@ FROM {{ ref('stg_events') }}
             },
             "sources": {}
         });
-        let result = import_from_manifest_json(&manifest);
+        let result = import_from_manifest_json_with_evidence(&manifest, MicrobatchMode::Merge);
         let found = result.structured_warnings.iter().find_map(|w| match w {
             ImportDbtStructuredWarning::DroppedOnSchemaChange {
                 dbt_value,
@@ -4849,6 +5696,7 @@ FROM {{ ref('stg_events') }}
             },
             config: DbtNodeConfig {
                 materialized: "table".to_string(),
+                full_refresh: None,
                 schema: None,
                 unique_key: None,
                 incremental_strategy: None,
@@ -5060,6 +5908,14 @@ FROM {{ ref('stg_events') }}
         assert!(
             !typed.diagnostics.iter().any(|d| &*d.code == "E020"),
             "E020 must not fire once the upstream ref is bare: {:?}",
+            typed.diagnostics
+        );
+        assert!(
+            !typed
+                .diagnostics
+                .iter()
+                .any(crate::diagnostic::Diagnostic::is_error),
+            "imported time_interval microbatch must compile: {:?}",
             typed.diagnostics
         );
     }

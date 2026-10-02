@@ -19,7 +19,7 @@ use sqlparser::parser::Parser;
 use crate::compile::default_type_mapper;
 use crate::diagnostic::{
     Diagnostic, E001, E020, E021, E022, E023, E024, E025, E026, E035, E037, E038, E039, I001, I002,
-    SourceSpan, W001, W002, W003, W004, W005, W006,
+    SourceSpan, W001, W002, W004, W005, W006,
 };
 use crate::semantic::{ModelSchema, SemanticGraph};
 use crate::types::{RockyType, TypedColumn};
@@ -598,7 +598,7 @@ fn compute_model_typecheck(
     // Step 5: strategy validation against the typed output schema. For models
     // declaring `[strategy] type = "time_interval"` we confirm the partition
     // column is real, has the right type, isn't nullable, etc. — see
-    // `check_time_interval_strategy` for the full list of E020-E026 + W003.
+    // `check_time_interval_strategy` for the full list of E020-E026.
     // For `type = "merge"` we confirm every `unique_key` column is real — see
     // `check_merge_strategy` (W006).
     //
@@ -893,8 +893,7 @@ fn has_provably_fixed_output_names(sql: &str) -> bool {
 /// | E021  | Error    | `time_column` is not a date/timestamp type |
 /// | E022  | Error    | `time_column` is nullable |
 /// | E023  | Error    | `time_column` failed SQL identifier validation |
-/// | E024  | Error    | Neither `@start_date` nor `@end_date` referenced in SQL |
-/// | W003  | Warning  | Only one of `@start_date` / `@end_date` referenced |
+/// | E024  | Error    | Either `@start_date` or `@end_date` absent from SQL |
 /// | E025  | Error    | `granularity = "hour"` requires TIMESTAMP, not DATE |
 /// | E026  | Error    | `first_partition` is not a valid canonical key for grain |
 fn check_time_interval_strategy(
@@ -1023,7 +1022,7 @@ fn check_time_interval_strategy(
         );
     }
 
-    // E024 + W003: validate placeholder usage in the SQL body.
+    // E024: validate placeholder usage in the SQL body.
     diagnostics.extend(check_time_interval_placeholders(model_name, &model.sql));
 
     // E026: first_partition format must match the granularity.
@@ -1167,9 +1166,8 @@ fn check_merge_strategy(
 /// transformation model (replication tables have no sidecar and never reach
 /// this pass), so no variant check is needed here.
 ///
-/// `microbatch` takes the same unfiltered path and is deliberately NOT refused
-/// here: it is tracked separately in #2054, and the suggestion below does not
-/// offer it.
+/// Loaded `microbatch` models are normalized to `time_interval` before this
+/// check, so they receive the partition-window validation instead.
 fn check_incremental_strategy(model: &rocky_core::models::Model) -> Vec<Diagnostic> {
     use rocky_core::models::StrategyConfig;
 
@@ -1232,8 +1230,7 @@ fn check_ephemeral_strategy(model: &rocky_core::models::Model) -> Vec<Diagnostic
     ]
 }
 
-/// E024 / W003 — both `@start_date` and `@end_date` placeholders should appear
-/// in the model's SQL body. Neither = error; only one = warning.
+/// E024 — both `@start_date` and `@end_date` must appear in the model SQL.
 fn check_time_interval_placeholders(model_name: &str, sql: &str) -> Vec<Diagnostic> {
     let mut diags = Vec::new();
     let has_start = contains_placeholder(sql, "@start_date");
@@ -1254,8 +1251,8 @@ fn check_time_interval_placeholders(model_name: &str, sql: &str) -> Vec<Diagnost
         }
         (true, false) => {
             diags.push(
-                Diagnostic::warning(
-                    W003,
+                Diagnostic::error(
+                    E024,
                     model_name,
                     "time_interval model references `@start_date` but not `@end_date` — partition window is unbounded above",
                 )
@@ -1264,8 +1261,8 @@ fn check_time_interval_placeholders(model_name: &str, sql: &str) -> Vec<Diagnost
         }
         (false, true) => {
             diags.push(
-                Diagnostic::warning(
-                    W003,
+                Diagnostic::error(
+                    E024,
                     model_name,
                     "time_interval model references `@end_date` but not `@start_date` — partition window is unbounded below",
                 )
@@ -4758,7 +4755,7 @@ mod tests {
     /// Build a `Model` whose strategy is `time_interval` with the given fields,
     /// and whose SQL contains both `@start_date` and `@end_date` (so the
     /// placeholder check passes by default — individual tests override `sql`
-    /// when they want to exercise E024/W003).
+    /// when they want to exercise E024).
     fn make_time_interval_model(
         name: &str,
         time_column: &str,
@@ -4903,22 +4900,23 @@ mod tests {
     }
 
     #[test]
-    fn test_w003_only_start_date() {
+    fn test_e024_only_start_date() {
         let mut model = make_time_interval_model("m", "order_date", TimeGrain::Day, None);
         model.sql = "SELECT order_date FROM upstream WHERE order_date >= @start_date".into();
         let cols = vec![typed_col("order_date", RockyType::Date, false)];
         let diags = check_time_interval_strategy(&model, &cols);
-        let w003: Vec<_> = diags.iter().filter(|d| &*d.code == "W003").collect();
-        assert_eq!(w003.len(), 1, "expected one W003, got: {diags:?}");
+        let e024: Vec<_> = diags.iter().filter(|d| &*d.code == "E024").collect();
+        assert_eq!(e024.len(), 1, "expected one E024, got: {diags:?}");
+        assert!(e024[0].is_error());
     }
 
     #[test]
-    fn test_w003_only_end_date() {
+    fn test_e024_only_end_date() {
         let mut model = make_time_interval_model("m", "order_date", TimeGrain::Day, None);
         model.sql = "SELECT order_date FROM upstream WHERE order_date < @end_date".into();
         let cols = vec![typed_col("order_date", RockyType::Date, false)];
         let diags = check_time_interval_strategy(&model, &cols);
-        assert!(diags.iter().any(|d| &*d.code == "W003"));
+        assert!(diags.iter().any(|d| &*d.code == "E024" && d.is_error()));
     }
 
     #[test]
@@ -4975,7 +4973,7 @@ mod tests {
         let cols = vec![typed_col("order_date", RockyType::Date, false)];
         let diags = check_time_interval_strategy(&model, &cols);
         // Should fire E024 (neither placeholder present, since @start_date_extra
-        // doesn't count) — not W003.
+        // doesn't count).
         assert!(diags.iter().any(|d| &*d.code == "E024"));
     }
 

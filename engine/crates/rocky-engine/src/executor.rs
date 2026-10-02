@@ -51,7 +51,10 @@ pub fn execute_locally(compile_result: &CompileResult, db: &DuckDbConnector) -> 
                 }
                 // Wrap model SQL in CREATE TABLE AS for local execution.
                 // `model_name` was validated above; `model.sql` is compiler-emitted SQL.
-                let exec_sql = format!("CREATE OR REPLACE TABLE {model_name} AS\n{}", model.sql);
+                let exec_sql = format!(
+                    "CREATE OR REPLACE TABLE {model_name} AS\n{}",
+                    rocky_core::sql_gen::local_test_sql(model)
+                );
 
                 match db.execute_statement(&exec_sql) {
                     Ok(()) => {

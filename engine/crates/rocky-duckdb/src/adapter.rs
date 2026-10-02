@@ -128,6 +128,21 @@ impl WarehouseAdapter for DuckDbWarehouseAdapter {
         &self.dialect
     }
 
+    fn is_missing_object_error(&self, error: &AdapterError) -> bool {
+        let Some(crate::DuckDbError::Database(driver_error)) =
+            error.inner().downcast_ref::<crate::DuckDbError>()
+        else {
+            return false;
+        };
+        let message = driver_error.to_string();
+        ((message.starts_with("Catalog Error: Table with name ")
+            || message.starts_with("Catalog Error: Schema with name "))
+            && message.contains(" does not exist!"))
+            || (message.starts_with("Catalog Error: Table with name ")
+                && message.contains(" does not exist because schema ")
+                && message.contains(" does not exist."))
+    }
+
     /// DuckDB folds identifier case, so this is a dialect constant and needs
     /// no round trip (#1281).
     ///
@@ -338,6 +353,60 @@ impl WarehouseAdapter for DuckDbWarehouseAdapter {
         .map_err(|e| join_error(&e))?
     }
 
+    async fn promotion_destination_kind(
+        &self,
+        table: &TableRef,
+    ) -> AdapterResult<Option<ObjectKind>> {
+        // These values are SQL string literals, not identifier fragments.
+        // Doubling quotes preserves names that are valid only when quoted.
+        let literal = |name: &str| format!("'{}'", name.replace('\'', "''"));
+        let catalog = if table.catalog.is_empty() {
+            "current_catalog()".to_string()
+        } else {
+            literal(&table.catalog)
+        };
+        let schema = literal(&table.schema);
+        let name = literal(&table.table);
+        let namespace_sql = format!(
+            "SELECT schema_name FROM information_schema.schemata WHERE lower(catalog_name) = lower({catalog}) AND lower(schema_name) = lower({schema})"
+        );
+        let kind_sql = format!(
+            "SELECT table_type FROM information_schema.tables WHERE lower(table_catalog) = lower({catalog}) AND lower(table_schema) = lower({schema}) AND lower(table_name) = lower({name})"
+        );
+        let conn = Arc::clone(&self.connector);
+        spawn_blocking(move || {
+            let conn = conn
+                .lock()
+                .map_err(|e| AdapterError::msg(format!("mutex poisoned: {e}")))?;
+            if conn
+                .execute_sql(&namespace_sql)
+                .map_err(AdapterError::new)?
+                .rows
+                .is_empty()
+            {
+                return Err(AdapterError::msg(
+                    "promotion destination namespace does not exist",
+                ));
+            }
+            let result = conn.execute_sql(&kind_sql).map_err(AdapterError::new)?;
+            match result
+                .rows
+                .first()
+                .and_then(|row| row.first())
+                .and_then(|v| v.as_str())
+            {
+                None => Ok(None),
+                Some("BASE TABLE") => Ok(Some(ObjectKind::Table)),
+                Some("VIEW") => Ok(Some(ObjectKind::View)),
+                Some(other) => Err(AdapterError::msg(format!(
+                    "unknown promotion destination kind: {other}"
+                ))),
+            }
+        })
+        .await
+        .map_err(|e| join_error(&e))?
+    }
+
     async fn explain(&self, sql: &str) -> AdapterResult<ExplainResult> {
         let explain_sql = format!("EXPLAIN {sql}");
         let conn = Arc::clone(&self.connector);
@@ -440,6 +509,37 @@ pub fn classify_duckdb_failure(err: &AdapterError) -> FailureClass {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn real_describe_missing_error_confirms_absence() {
+        let adapter = DuckDbWarehouseAdapter::in_memory().unwrap();
+        let missing = adapter
+            .describe_table(&TableRef {
+                catalog: "memory".into(),
+                schema: "main".into(),
+                table: "missing".into(),
+            })
+            .await
+            .unwrap_err();
+        assert!(adapter.is_missing_object_error(&missing), "{missing}");
+        assert!(!adapter.is_missing_object_error(&AdapterError::msg(
+            "Catalog Error: Table with name missing does not exist!"
+        )));
+    }
+
+    #[tokio::test]
+    async fn real_describe_missing_schema_error_confirms_absence() {
+        let adapter = DuckDbWarehouseAdapter::in_memory().unwrap();
+        let missing = adapter
+            .describe_table(&TableRef {
+                catalog: "memory".into(),
+                schema: "missing_schema".into(),
+                table: "missing".into(),
+            })
+            .await
+            .unwrap_err();
+        assert!(adapter.is_missing_object_error(&missing), "{missing}");
+    }
 
     #[test]
     fn classify_lock_contention_is_transient() {

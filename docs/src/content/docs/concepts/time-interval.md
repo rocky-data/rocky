@@ -99,9 +99,8 @@ The same rule applies at every grain. For `granularity = "hour"`, partition key
 - `@start_date` → `'2026-04-07 13:00:00'`
 - `@end_date` → `'2026-04-07 14:00:00'`
 
-The compiler emits `E024` if neither placeholder is present, and `W003`
-if only one of the two is referenced (the partition window would be
-unbounded on one side).
+The compiler emits `E024` if either placeholder is missing. A partition
+window must have both bounds.
 
 ## Partition key format
 

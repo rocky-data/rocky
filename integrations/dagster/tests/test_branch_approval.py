@@ -78,6 +78,14 @@ _PROMOTE_JSON = json.dumps(
             {
                 "target": "warehouse.public.orders",
                 "source": "warehouse.branch__fix-price.orders",
+                "target_catalog": "warehouse",
+                "target_schema": "public",
+                "target_table": "orders",
+                "source_catalog": "warehouse",
+                "source_schema": "branch__fix-price",
+                "source_table": "orders",
+                "strategy": "full_refresh",
+                "production_upstreams": [],
                 "statement": (
                     "CREATE OR REPLACE TABLE warehouse.public.orders AS "
                     "SELECT * FROM warehouse.branch__fix-price.orders"
@@ -207,6 +215,14 @@ _PLAN_PROMOTE_JSON = json.dumps(
             {
                 "target": "warehouse.public.orders",
                 "source": "warehouse.branch__fix-price.orders",
+                "target_catalog": "warehouse",
+                "target_schema": "public",
+                "target_table": "orders",
+                "source_catalog": "warehouse",
+                "source_schema": "branch__fix-price",
+                "source_table": "orders",
+                "strategy": "full_refresh",
+                "production_upstreams": [],
                 "statement": (
                     "CREATE OR REPLACE TABLE warehouse.public.orders AS "
                     "SELECT * FROM warehouse.branch__fix-price.orders"

@@ -279,6 +279,17 @@ class BreakingSeverity15(StrEnum):
     info = "info"
 
 
+class ConditionalDrop(BaseModel):
+    """
+    A DROP permitted when a model switches between a table and a view.
+    """
+
+    drop_sql: str
+    existing_kind: str
+    model: str
+    target: str
+
+
 class BreakingFinding(BaseModel):
     """
     A classified finding produced by [`diff_project_ir`].
@@ -335,6 +346,10 @@ class ReviewOutput(BaseModel):
     Semantic breaking-change findings between `base_ref` and the working tree. Empty when the classifier ran and found no breaking changes; absent when the gate was skipped (compile failure on either side, or the models directory was unavailable).
     """
     command: str
+    conditional_drops: list[ConditionalDrop]
+    """
+    Conditional kind-switch DROPs at their effective execution targets.
+    """
     marker_written: bool
     """
     True when the approval marker is now present on disk as a result of this invocation. Mirrors `approved` today; kept distinct so callers reading the JSON do not have to infer marker state from the flag.

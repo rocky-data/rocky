@@ -91,16 +91,21 @@ pub async fn compare(
     )
     .await?;
 
+    if output.tables_compared == 0 {
+        anyhow::bail!("no shadow tables were selected for comparison");
+    }
+
     if output_json {
         print_json(&output)?;
     } else {
         println!("  Rocky Compare");
         println!();
         println!(
-            "  Tables: {} compared, {} passed, {} warned, {} failed",
+            "  Tables: {} compared, {} passed, {} warned, {} no baseline, {} failed",
             output.tables_compared,
             output.tables_passed,
             output.tables_warned,
+            output.tables_no_baseline,
             output.tables_failed
         );
         println!("  Overall: {}", output.overall_verdict.to_uppercase());
@@ -111,6 +116,7 @@ pub async fn compare(
                 "warn" => "WARN",
                 "fail" => "FAIL",
                 "error" => " ERR",
+                "no_baseline" => " NEW",
                 _ => "  ??",
             };
             let count = |value: Option<u64>| {
@@ -195,9 +201,9 @@ async fn compute_compare(
             replication_prod_targets(&registry, pipeline, filter).await?
         }
         rocky_core::config::PipelineConfig::Transformation(pipeline) => {
-            super::transformation_prod_targets(pipeline, config_path, filter, "compare")?
+            super::transformation_prod_targets(pipeline, config_path, filter, "compare", false)?
                 .into_iter()
-                .map(|(_model, target)| target)
+                .map(|(_model, target, _strategy)| target)
                 .collect()
         }
         // Unreachable: the guard above rejects every other kind before any
@@ -210,6 +216,20 @@ async fn compute_compare(
         ),
     };
 
+    let targets = prod_targets.into_iter().map(|production| {
+        let shadow = rocky_core::shadow::shadow_target(&production, shadow_config);
+        (production, shadow)
+    });
+    compare_targets(&*adapter, targets.collect(), filter, thresholds).await
+}
+
+/// Compare exact target pairs, including the objects still owned by a shadow run.
+pub(crate) async fn compare_targets(
+    adapter: &dyn WarehouseAdapter,
+    targets: Vec<(TargetRef, TargetRef)>,
+    filter: Option<&str>,
+    thresholds: &ComparisonThresholds,
+) -> Result<CompareOutput> {
     let mut output = CompareOutput {
         version: VERSION.to_string(),
         command: "compare".to_string(),
@@ -217,28 +237,35 @@ async fn compute_compare(
         tables_compared: 0,
         tables_passed: 0,
         tables_warned: 0,
+        tables_no_baseline: 0,
         tables_failed: 0,
         results: vec![],
         overall_verdict: "pass".to_string(),
     };
 
-    for prod_target in prod_targets {
-        let shadow_target = rocky_core::shadow::shadow_target(&prod_target, shadow_config);
-
-        let prod_count = get_row_count(&*adapter, &prod_target).await.map_err(|e| {
+    for (prod_target, shadow_target) in targets {
+        let baseline_absent =
+            super::shadow_lifecycle::target_is_absent(adapter, &prod_target).await;
+        let no_baseline = matches!(baseline_absent.as_ref(), Ok(true));
+        let prod_count = if no_baseline {
+            Ok(None)
+        } else {
+            get_row_count(adapter, &prod_target).await.map(Some)
+        }
+        .map_err(|e| {
             format!(
                 "failed to read production row count for {}: {e}",
                 prod_target.full_name()
             )
         });
-        let shadow_count = get_row_count(&*adapter, &shadow_target).await.map_err(|e| {
+        let shadow_count = get_row_count(adapter, &shadow_target).await.map_err(|e| {
             format!(
                 "failed to read shadow row count for {}: {e}",
                 shadow_target.full_name()
             )
         });
         let row_metrics = match (prod_count.as_ref(), shadow_count.as_ref()) {
-            (Ok(prod), Ok(shadow)) => Some(compare::compare_row_counts(*shadow, *prod)),
+            (Ok(Some(prod)), Ok(shadow)) => Some(compare::compare_row_counts(*shadow, *prod)),
             _ => None,
         };
 
@@ -254,7 +281,12 @@ async fn compute_compare(
             table: shadow_target.table.clone(),
         };
 
-        let prod_cols = adapter.describe_table(&prod_table_ref).await.map_err(|e| {
+        let prod_cols = if no_baseline {
+            Ok(None)
+        } else {
+            adapter.describe_table(&prod_table_ref).await.map(Some)
+        }
+        .map_err(|e| {
             format!(
                 "failed to read production schema for {}: {e}",
                 prod_target.full_name()
@@ -270,25 +302,38 @@ async fn compute_compare(
                 )
             });
         let schema_diffs = match (prod_cols.as_ref(), shadow_cols.as_ref()) {
-            (Ok(prod), Ok(shadow)) => compare::compare_schemas(shadow, prod),
+            (Ok(Some(prod)), Ok(shadow)) => compare::compare_schemas(shadow, prod),
             _ => Vec::new(),
         };
-        let schema_match = prod_cols.is_ok() && shadow_cols.is_ok() && schema_diffs.is_empty();
-        let read_failures: Vec<String> = [
-            prod_count.as_ref().err(),
-            shadow_count.as_ref().err(),
-            prod_cols.as_ref().err(),
-            shadow_cols.as_ref().err(),
-        ]
-        .into_iter()
-        .flatten()
-        .cloned()
-        .collect();
+        let schema_match = matches!(prod_cols.as_ref(), Ok(Some(_)))
+            && shadow_cols.is_ok()
+            && schema_diffs.is_empty();
+        let mut read_failures: Vec<String> = baseline_absent
+            .err()
+            .map(|e| e.to_string())
+            .into_iter()
+            .collect();
+        read_failures.extend(
+            [
+                prod_count.as_ref().err(),
+                shadow_count.as_ref().err(),
+                prod_cols.as_ref().err(),
+                shadow_cols.as_ref().err(),
+            ]
+            .into_iter()
+            .flatten()
+            .cloned(),
+        );
 
         let (verdict_str, verdict_reasons) = if !read_failures.is_empty() {
             ("error", read_failures)
+        } else if no_baseline {
+            (
+                "no_baseline",
+                vec!["production target does not exist".to_string()],
+            )
         } else if let (
-            Ok(prod),
+            Ok(Some(prod)),
             Ok(shadow),
             Some((row_count_match, row_count_diff, row_count_diff_pct)),
         ) = (prod_count.as_ref(), shadow_count.as_ref(), row_metrics)
@@ -320,6 +365,7 @@ async fn compute_compare(
         match verdict_str {
             "pass" => output.tables_passed += 1,
             "warn" => output.tables_warned += 1,
+            "no_baseline" => output.tables_no_baseline += 1,
             _ => output.tables_failed += 1,
         }
 
@@ -329,7 +375,7 @@ async fn compute_compare(
             production_table: prod_target.full_name(),
             shadow_table: shadow_target.full_name(),
             row_count_match: row_metrics.is_some_and(|metrics| metrics.0),
-            production_count: prod_count.ok(),
+            production_count: prod_count.ok().flatten(),
             shadow_count: shadow_count.ok(),
             row_count_diff_pct: row_metrics.map(|metrics| metrics.2),
             schema_match,
@@ -393,7 +439,87 @@ async fn get_row_count(adapter: &dyn WarehouseAdapter, target: &TargetRef) -> Re
 #[cfg(all(test, feature = "duckdb"))]
 mod tests {
     use super::*;
+    use rocky_core::traits::{AdapterError, AdapterResult, QueryResult, SqlDialect};
     use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+    struct UnreadableProduction {
+        inner: DuckDbWarehouseAdapter,
+    }
+
+    #[async_trait::async_trait]
+    impl WarehouseAdapter for UnreadableProduction {
+        fn dialect(&self) -> &dyn SqlDialect {
+            self.inner.dialect()
+        }
+
+        async fn execute_statement(&self, sql: &str) -> AdapterResult<()> {
+            self.inner.execute_statement(sql).await
+        }
+
+        async fn execute_query(&self, sql: &str) -> AdapterResult<QueryResult> {
+            self.inner.execute_query(sql).await
+        }
+
+        async fn describe_table(
+            &self,
+            table: &rocky_ir::TableRef,
+        ) -> AdapterResult<Vec<rocky_ir::ColumnInfo>> {
+            if table.table == "orders" {
+                Err(AdapterError::msg("production metadata unavailable"))
+            } else {
+                self.inner.describe_table(table).await
+            }
+        }
+
+        async fn list_tables(&self, _catalog: &str, _schema: &str) -> AdapterResult<Vec<String>> {
+            Ok(vec![
+                "orders".to_string(),
+                "orders_rocky_shadow".to_string(),
+            ])
+        }
+    }
+
+    #[tokio::test]
+    async fn production_metadata_error_is_not_no_baseline() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let inner =
+            DuckDbWarehouseAdapter::open(&temp.path().join("compare.duckdb")).expect("open DuckDB");
+        inner
+            .execute_statement("CREATE TABLE main.orders AS SELECT 1 AS id")
+            .await
+            .expect("production table");
+        inner
+            .execute_statement("CREATE TABLE main.orders_rocky_shadow AS SELECT 1 AS id")
+            .await
+            .expect("shadow table");
+        let adapter = UnreadableProduction { inner };
+        let production = TargetRef {
+            catalog: String::new(),
+            schema: "main".to_string(),
+            table: "orders".to_string(),
+        };
+        let shadow = TargetRef {
+            table: "orders_rocky_shadow".to_string(),
+            ..production.clone()
+        };
+        let output = compare_targets(
+            &adapter,
+            vec![(production, shadow)],
+            None,
+            &ComparisonThresholds::default(),
+        )
+        .await
+        .expect("comparison returns a structured error row");
+        assert_eq!(output.tables_failed, 1);
+        assert_eq!(output.tables_no_baseline, 0);
+        assert_eq!(output.results[0].verdict, "error");
+        assert!(
+            output.results[0]
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("cannot determine whether"))
+        );
+    }
 
     /// The headline of #1274: `compare` reaches a transformation pipeline's
     /// models and pairs each production target with its shadow.
@@ -575,13 +701,15 @@ auto_create_schemas = true
         .await
         .expect("build comparison rows");
         let row = &output.results[0];
-        assert_eq!(row.verdict, "error");
+        assert_eq!(row.verdict, "no_baseline");
+        assert_eq!(output.tables_no_baseline, 1);
+        assert_eq!(output.tables_failed, 0);
         assert_eq!(row.production_count, None);
         assert_eq!(row.shadow_count, Some(2));
         assert!(
             row.reasons
                 .iter()
-                .any(|r| r.contains("failed to read production row count"))
+                .any(|r| r.contains("production target does not exist"))
         );
     }
 

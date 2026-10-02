@@ -517,6 +517,8 @@ class RunResult(BaseModel):
     interrupted: bool = False
     #: ``True`` when the run executed in shadow mode (targets rewritten).
     shadow: bool = False
+    #: Comparison result captured before shadow cleanup. Absent on ordinary runs.
+    shadow_comparison: dict[str, Any] | None = None
     #: Per-model build/skip/reuse decision + reason. Empty (and omitted on the
     #: wire) for a default run; populated under ``--skip-unchanged`` / ``[reuse]``.
     model_decisions: list[ModelDecisionOutput] = Field(default_factory=list)
@@ -1395,6 +1397,7 @@ from .types_generated import (  # noqa: E402, F401
     PromoteTargetPlan,
     RecipeExecutionRecord,
     RecipeHistoryOutput,
+    ReconcileWatermarkOutput,
     RejectedApproval,
     ReplayModelOutput,
     ReplayOutput,
@@ -1509,6 +1512,7 @@ RockyOutput = (
     | PlanResult
     | StateResult
     | ClearSchemaCacheOutput
+    | ReconcileWatermarkOutput
     | ScheduleSpoolOutput
     | CompileResult
     | ModelLineageResult
@@ -1562,6 +1566,7 @@ _SIMPLE_DISPATCH: dict[str, type[BaseModel]] = {
     "plan": PlanResult,
     "state": StateResult,
     "state-clear-schema-cache": ClearSchemaCacheOutput,
+    "state-reconcile-watermark": ReconcileWatermarkOutput,
     "state-schedule-spool": ScheduleSpoolOutput,
     "compile": CompileResult,
     "test": TestResult,

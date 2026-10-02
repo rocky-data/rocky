@@ -1429,13 +1429,48 @@ pub async fn run_snapshot(
     );
 
     let dialect = warehouse_adapter.dialect();
-    let stmts = sql_gen::generate_snapshot_sql(&model_ir, dialect)?;
+    let source_columns = warehouse_adapter
+        .describe_table(&rocky_ir::TableRef {
+            catalog: pipeline.source.catalog.clone(),
+            schema: pipeline.source.schema.clone(),
+            table: pipeline.source.table.clone(),
+        })
+        .await;
+    let stmts = source_columns
+        .context("failed to describe snapshot source")
+        .and_then(|columns| {
+            let names = columns
+                .into_iter()
+                .map(|column| column.name)
+                .collect::<Vec<_>>();
+            sql_gen::generate_snapshot_sql(&model_ir, dialect, &names).map_err(Into::into)
+        });
 
     let mut tables_failed = 0usize;
-    for stmt in &stmts {
-        if let Err(e) = warehouse_adapter.execute_query(stmt).await {
-            warn!(error = %e, "snapshot statement failed");
-            tables_failed += 1;
+    match stmts {
+        Ok(stmts) => {
+            for stmt in &stmts {
+                if let Err(e) = warehouse_adapter.execute_query(stmt).await {
+                    warn!(error = %e, "snapshot statement failed");
+                    tables_failed += 1;
+                }
+            }
+        }
+        Err(e) => {
+            warn!(error = %e, "snapshot preflight failed");
+            tables_failed = 1;
+            let (failure_kind, cooldown_seconds) =
+                crate::output::classify_anyhow_error_with_cooldown(&e);
+            output.errors.push(TableErrorOutput {
+                asset_key: vec![
+                    pipeline.target.catalog.clone(),
+                    pipeline.target.schema.clone(),
+                    pipeline.target.table.clone(),
+                ],
+                error: format!("{e:#}"),
+                failure_kind,
+                cooldown_seconds,
+            });
         }
     }
 
@@ -1511,7 +1546,12 @@ pub async fn run_snapshot(
         crate::output::print_json(&output)?;
     } else {
         crate::status_line!(
-            "snapshot pipeline complete: {}.{}.{} -> {}.{}.{} in {}ms",
+            "snapshot pipeline {}: {}.{}.{} -> {}.{}.{} in {}ms",
+            if tables_failed == 0 {
+                "complete"
+            } else {
+                "failed"
+            },
             pipeline.source.catalog,
             pipeline.source.schema,
             pipeline.source.table,
@@ -1520,6 +1560,9 @@ pub async fn run_snapshot(
             pipeline.target.table,
             output.duration_ms
         );
+        for error in &output.errors {
+            crate::status_line!("  error: {}", error.error);
+        }
     }
 
     // Persist the canonical `RunRecord` (before the failure bail, so a failed
@@ -1610,6 +1653,18 @@ mod tests {
         count_rows_in_schema(db, "main", table).await
     }
 
+    async fn table_exists(db: &Path, schema: &str, table: &str) -> bool {
+        let a = DuckDbWarehouseAdapter::open(db).expect("catalog open");
+        let r = a
+            .execute_query(&format!(
+                "SELECT COUNT(*) FROM information_schema.tables \
+                 WHERE table_schema = '{schema}' AND table_name = '{table}'"
+            ))
+            .await
+            .unwrap();
+        r.rows[0][0].as_i64() == Some(1)
+    }
+
     /// Write a `full_refresh` SQL model (`name.sql` + `name.toml`) into the
     /// project's `main` schema, with an optional `depends_on` sidecar key.
     fn write_model(dir: &Path, name: &str, sql: &str, depends_on: &[&str]) {
@@ -1644,6 +1699,24 @@ mod tests {
         shadow_config: Option<&rocky_core::shadow::ShadowConfig>,
         model_name_filter: Option<&str>,
     ) {
+        run_full_dag_result(
+            config_path,
+            state_path,
+            skip_unchanged,
+            shadow_config,
+            model_name_filter,
+        )
+        .await
+        .expect("full-DAG transformation run should succeed");
+    }
+
+    async fn run_full_dag_result(
+        config_path: &Path,
+        state_path: &Path,
+        skip_unchanged: bool,
+        shadow_config: Option<&rocky_core::shadow::ShadowConfig>,
+        model_name_filter: Option<&str>,
+    ) -> anyhow::Result<()> {
         let opts = PartitionRunOptions::default();
         let models_dir = config_path.parent().unwrap().join("models");
         let skip_opts = SkipRunOptions {
@@ -1681,7 +1754,16 @@ mod tests {
             None,  // #1460
         )
         .await
-        .expect("full-DAG transformation run should succeed");
+        .map(|_| ())
+    }
+
+    fn assert_shadow_comparison_failed(result: anyhow::Result<()>, expected_count: usize) {
+        let error = result.expect_err("divergent shadow comparison must fail the run");
+        let failure = error
+            .downcast_ref::<super::super::run::ShadowComparisonFailure>()
+            .unwrap_or_else(|| panic!("failure must report the shadow comparison: {error:#}"));
+        assert_eq!(failure.count, expected_count);
+        assert!(!failure.run_id.is_empty());
     }
 
     /// Write the project `rocky.toml`. `skip_block` controls whether the
@@ -2389,28 +2471,19 @@ auto_create_schemas = true
             "SELECT * FROM (VALUES (1), (2)) AS t(id)",
             &[],
         );
-        let shadow = rocky_core::shadow::ShadowConfig {
-            cleanup_after: false,
-            ..Default::default()
-        };
-        run_full_dag(&config_path, &state_path, false, Some(&shadow), None).await;
+        let shadow = rocky_core::shadow::ShadowConfig::default();
+        assert_shadow_comparison_failed(
+            run_full_dag_result(&config_path, &state_path, false, Some(&shadow), None).await,
+            2,
+        );
 
         assert_eq!(
             count_rows(&db, "orders").await,
             1,
             "shadow must not overwrite production"
         );
-        assert_eq!(
-            count_rows(&db, "orders_rocky_shadow").await,
-            2,
-            "producer must materialize its shadow target"
-        );
-        assert_eq!(
-            count_rows(&db, "mart_rocky_shadow").await,
-            2,
-            "consumer must read the producer's shadow target, which requires the producer to \
-             have run first"
-        );
+        assert!(!table_exists(&db, "main", "orders_rocky_shadow").await);
+        assert!(!table_exists(&db, "main", "mart_rocky_shadow").await);
     }
 
     /// A transformation shadow run must materialize the rewritten physical
@@ -2450,35 +2523,33 @@ auto_create_schemas = true
             "SELECT * FROM (VALUES (1), (2)) AS t(id)",
             &[],
         );
-        let suffix_shadow = rocky_core::shadow::ShadowConfig {
-            cleanup_after: false,
-            ..Default::default()
-        };
-        run_full_dag(
-            &config_path,
-            &state_path,
-            false,
-            Some(&suffix_shadow),
-            Some("orders"),
-        )
-        .await;
+        let suffix_shadow = rocky_core::shadow::ShadowConfig::default();
+        assert_shadow_comparison_failed(
+            run_full_dag_result(
+                &config_path,
+                &state_path,
+                false,
+                Some(&suffix_shadow),
+                Some("orders"),
+            )
+            .await,
+            1,
+        );
         assert_eq!(
             count_rows(&db, "orders").await,
             1,
             "suffix shadow must not overwrite the production target"
         );
-        assert_eq!(
-            count_rows(&db, "orders_rocky_shadow").await,
-            2,
-            "suffix shadow must materialize the rewritten table"
-        );
+        assert!(!table_exists(&db, "main", "orders_rocky_shadow").await);
 
-        run_full_dag(&config_path, &state_path, false, Some(&suffix_shadow), None).await;
-        assert_eq!(
-            count_rows(&db, "mart_rocky_shadow").await,
+        // A failed verdict still drops the owned target. Reuse needs no
+        // manual cleanup.
+        assert_shadow_comparison_failed(
+            run_full_dag_result(&config_path, &state_path, false, Some(&suffix_shadow), None).await,
             2,
-            "downstream suffix shadow must read the shadow upstream"
         );
+        assert!(!table_exists(&db, "main", "orders_rocky_shadow").await);
+        assert!(!table_exists(&db, "main", "mart_rocky_shadow").await);
 
         write_model(
             &models_dir,
@@ -2491,7 +2562,10 @@ auto_create_schemas = true
             cleanup_after: false,
             ..Default::default()
         };
-        run_full_dag(&config_path, &state_path, false, Some(&branch_shadow), None).await;
+        assert_shadow_comparison_failed(
+            run_full_dag_result(&config_path, &state_path, false, Some(&branch_shadow), None).await,
+            2,
+        );
         assert_eq!(
             count_rows(&db, "orders").await,
             1,

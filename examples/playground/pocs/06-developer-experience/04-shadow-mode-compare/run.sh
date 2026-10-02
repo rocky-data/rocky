@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -uo pipefail
+set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$HERE"
 mkdir -p expected
@@ -13,12 +13,16 @@ rocky validate
 rocky -c rocky.toml -o json run --filter source=orders > expected/run_prod.json
 echo "Prod run: ok"
 
-# Run in shadow mode (writes to <table>_rocky_shadow)
-rocky -c rocky.toml -o json run --shadow --filter source=orders > expected/run_shadow.json 2>&1 || true
-echo "Shadow run: attempted (see expected/run_shadow.json)"
+# The first shadow run compares and drops its table.
+rocky -c rocky.toml -o json run --shadow --filter source=orders > expected/run_shadow_once.json
+echo "One-off shadow run and cleanup: ok"
+
+# Reuse the name, then keep the table for a separate comparison.
+rocky -c rocky.toml -o json run --shadow --keep-shadow --filter source=orders > expected/run_shadow.json
+echo "Shadow run and in-run comparison: ok"
 
 # Compare shadow against prod
-rocky -c rocky.toml -o json compare --filter source=orders > expected/compare.json 2>&1 || true
+rocky -c rocky.toml -o json compare --filter source=orders > expected/compare.json
 
 echo
-echo "POC complete (spec): shadow + compare flags exercised."
+echo "POC complete: both comparisons passed."

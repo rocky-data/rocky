@@ -17,6 +17,7 @@ import {
   canApply,
   formatBreakingChange,
   reviewVerdict,
+  renderReviewHtml,
 } from "../webviews/reviewPanel";
 import type { ReviewOutput } from "../types/generated/review";
 
@@ -28,7 +29,27 @@ const base = (over: Partial<ReviewOutput>): ReviewOutput => ({
   plan_id: "abc123",
   version: "1.43.0",
   breaking_changes: [],
+  conditional_drops: [],
   ...over,
+});
+
+describe("review panel", () => {
+  it("shows the effective conditional DROP before approval controls and escapes SQL", () => {
+    const html = renderReviewHtml(
+      { cspSource: "vscode-resource:" } as never,
+      "abc123",
+      base({ conditional_drops: [{
+        model: "orders",
+        target: "branch_schema.orders",
+        existing_kind: "view",
+        drop_sql: "DROP VIEW branch_schema.orders <unsafe>",
+      }] }),
+    );
+    expect(html).toContain("DROP VIEW branch_schema.orders &lt;unsafe&gt;");
+    expect(html).toContain("branch_schema.orders");
+    expect(html.indexOf("Conditional DROPs")).toBeLessThan(html.indexOf('id="approve"'));
+    expect(html).not.toContain("DROP VIEW branch_schema.orders <unsafe>");
+  });
 });
 
 describe("planIdsFromFilenames", () => {

@@ -72,6 +72,11 @@ impl SqlDialect for TrinoDialect {
         format!("INSERT INTO {target}\n{select_sql}")
     }
 
+    fn snapshot_update_target(&self, target: &str) -> (String, String) {
+        // Trino UPDATE has no target alias. Correlate through its full name.
+        (target.to_string(), target.to_string())
+    }
+
     fn merge_into(
         &self,
         _target: &str,

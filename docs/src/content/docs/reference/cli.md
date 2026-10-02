@@ -297,13 +297,16 @@ rocky run [--filter <key=value>] [flags]
 | `--governance-override <JSON>` | | Additional governance config as inline JSON or `@file.json`, merged with defaults. |
 | `--models <PATH>` | | Models directory for transformation execution. |
 | `--all` | | Execute both replication and compiled models. |
-| `--resume <RUN_ID>` | | Resume a specific previous replication run from its last checkpoint; mints a new `run_id` and records the prior one as `resumed_from`. Rejected with `--dag`, which does not replay the resume into its sub-runs (rejected at parse time). |
-| `--resume-latest` | | Resume the most recent failed replication run from its last checkpoint; mints a new `run_id` and records the prior one as `resumed_from`. Rejected with `--dag`, which does not replay the resume into its sub-runs (rejected at parse time). |
-| `--shadow` | | Run in shadow mode: write to shadow targets instead of production. |
+| `--resume <RUN_ID>` | | Resume a specific previous replication run from its last checkpoint; mints a new `run_id` and records the prior one as `resumed_from`. Rejected with `--dag` or `--shadow`. |
+| `--resume-latest` | | Resume the most recent failed replication run from its last checkpoint; mints a new `run_id` and records the prior one as `resumed_from`. Rejected with `--dag` or `--shadow`. |
+| `--shadow` | | Write to shadow targets, compare them with production, then drop them after any completed verdict. A failed threshold exits non-zero. |
+| `--keep-shadow` | Requires `--shadow`; conflicts with `--watch` | Keep shadow objects for a separate `rocky compare`. |
 | `--shadow-suffix <SUFFIX>` | Requires `--shadow` | Suffix appended to table names. Conflicts with `--branch`. `--shadow` alone uses `_rocky_shadow`. |
 | `--shadow-schema <NAME>` | Requires `--shadow` | Override schema for shadow tables. Conflicts with `--branch`. |
 | `--branch <NAME>` | | Execute against a named branch created with `rocky branch create`. Conflicts with `--shadow`, `--shadow-schema`, and `--shadow-suffix`. See [`rocky branch`](/reference/commands/core-pipeline/#rocky-branch). |
 | `--idempotency-key <KEY>` | | Caller-supplied opaque key used to dedup this run against prior runs with the same key. Three outcomes: a prior run succeeded (or reached a terminal state under `dedup_on = "any"`) → exit 0 with `status = "skipped_idempotent"` and the prior `skipped_by_run_id`; another caller currently holds the claim within `in_flight_ttl_hours` → exit 0 with `status = "skipped_in_flight"`; otherwise proceed normally. Rejected when combined with `--resume` / `--resume-latest` (resume is an explicit override). Stamps are stored verbatim; do not put secrets in the key. See [`[state.idempotency]`](/reference/configuration/) for tuning. |
+
+`--keep-shadow` retains objects after a failed verdict too. A write or comparison query error may leave a shadow object whose state Rocky cannot confirm.
 
 **Pipeline stages (in order):**
 
@@ -517,7 +520,7 @@ date_key = "DATE"
 
 ### `rocky compare`
 
-Compare shadow tables against production tables. Used after `rocky plan --shadow` + `rocky apply <plan-id>` (or the single-step `rocky run --shadow` alias) to validate results before promoting shadow data to production.
+Compare kept shadow tables against production tables. A plain `rocky run --shadow` already compares before cleanup. Pass `--keep-shadow` to retain its objects for this command.
 
 ```bash
 rocky compare [--filter <key=value>] [flags]
@@ -542,6 +545,7 @@ rocky compare [--filter <key=value>] [flags]
   "tables_compared": 1,
   "tables_passed": 1,
   "tables_warned": 0,
+  "tables_no_baseline": 0,
   "tables_failed": 0,
   "results": [
     {
@@ -561,7 +565,7 @@ rocky compare [--filter <key=value>] [flags]
 }
 ```
 
-`verdict` is `pass`, `warn`, `fail`, or `error`. `reasons` says why a table is not `pass`. An `error` row means Rocky could not read a table or its schema on one side. The count it could not read is `null`, never `0`. `row_count_diff_pct` is `null` unless Rocky read both counts. Rocky counts an `error` row in `tables_failed`, so `overall_verdict` is `fail` and the command exits non-zero.
+`verdict` is `pass`, `warn`, `fail`, `no_baseline`, or `error`. `no_baseline` means Rocky confirmed that production has no target yet. It increments `tables_no_baseline` and does not fail the run. An `error` means Rocky could not confirm the target or read a count or schema. `reasons` explains each outcome. An unreadable count is `null`, never `0`. `row_count_diff_pct` is `null` unless Rocky read both counts. Rocky counts an `error` row in `tables_failed`, so the command exits non-zero.
 
 ---
 

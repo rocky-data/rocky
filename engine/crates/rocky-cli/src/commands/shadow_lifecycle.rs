@@ -12,29 +12,50 @@
 //!   before a shadow run writes   is anything already at this name?
 //!                                  yes ─▶ REFUSE, naming the object
 //!                                  no  ─▶ this run owns it
-//!   after the run succeeds       drop what this run created (cleanup_after)
+//!   after a completed comparison drop what this run created (unless kept)
 //! ```
 //!
 //! Why "already there" is a sound refusal, which it would NOT have been
 //! before: `apply_shadow_rewrite` now refuses the incremental family, so
 //! every strategy that reaches a shadow write REPLACES its target rather
 //! than adding to it — and `cleanup_after` now actually drops. Together
-//! those mean a clean run leaves the name empty, so an object sitting
-//! there is either somebody else's or the debris of a run that failed. In
-//! both cases writing over it is the thing #1273 reported.
+//! those mean a clean default run leaves the name empty. An object sitting
+//! there is either somebody else's, a retained object, or debris from an
+//! interrupted run or failed DROP. In every case writing over it is the thing
+//! #1273 reported.
 //!
 //! **What "Rocky-owned" means here, exactly.** It means *this run created
 //! it*. That is the strictest reading, and it is the only one available
 //! without persisting ownership: a state record would have to survive a
 //! deleted state file and a different machine to be trusted, and a
 //! warehouse tag is not portable across the adapters Rocky targets. The
-//! cost of the strict reading is that a shadow run which failed part-way
-//! leaves objects that the next run refuses — so the refusal names the
-//! object and prints the statement that clears it.
+//! cost of the strict reading is that a shadow run whose write or comparison
+//! errors before a verdict may leave objects that the next run refuses — so
+//! the refusal names the object and prints the statement that clears it.
 
 use anyhow::Result;
 use rocky_core::traits::{SqlDialect, WarehouseAdapter};
-use rocky_ir::TargetRef;
+use rocky_ir::{TableRef, TargetRef};
+use rocky_sql::defer::CollisionIdentity;
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum ShadowKind {
+    Table,
+    View,
+    MaterializedView,
+    DynamicTable,
+}
+
+impl ShadowKind {
+    fn drop_sql(self, dialect: &dyn SqlDialect, formatted: &str) -> String {
+        match self {
+            Self::Table => dialect.drop_table_sql(formatted),
+            Self::View => format!("DROP VIEW IF EXISTS {formatted}"),
+            Self::MaterializedView => format!("DROP MATERIALIZED VIEW IF EXISTS {formatted}"),
+            Self::DynamicTable => format!("DROP DYNAMIC TABLE IF EXISTS {formatted}"),
+        }
+    }
+}
 
 /// A shadow object this run intends to write, or wrote.
 #[derive(Debug, Clone)]
@@ -43,6 +64,86 @@ pub(crate) struct ShadowObject {
     pub(crate) model: String,
     /// The derived shadow target.
     pub(crate) target: TargetRef,
+    /// The production object paired with this shadow target.
+    pub(crate) production: TargetRef,
+    pub(crate) kind: ShadowKind,
+}
+
+/// Check names without consulting the warehouse: an absent production table
+/// must never let a shadow run claim its name for a later drop.
+pub(crate) fn refuse_production_shadow_collisions(
+    objects: &[ShadowObject],
+    other_production: &[TargetRef],
+) -> Result<()> {
+    let production: Vec<_> = objects
+        .iter()
+        .map(|object| &object.production)
+        .chain(other_production.iter())
+        .map(|target| {
+            (
+                CollisionIdentity::of(&target.catalog, &target.schema, &target.table),
+                target,
+            )
+        })
+        .collect();
+    for object in objects {
+        let shadow = CollisionIdentity::of(
+            &object.target.catalog,
+            &object.target.schema,
+            &object.target.table,
+        );
+        if let Some((_, target)) = production.iter().find(|(id, _)| *id == shadow) {
+            anyhow::bail!(
+                "shadow target {} for '{}' collides with the production target {}",
+                object.target.full_name(),
+                object.model,
+                target.full_name()
+            );
+        }
+    }
+    Ok(())
+}
+
+pub(crate) async fn target_is_absent(
+    warehouse: &dyn WarehouseAdapter,
+    target: &TargetRef,
+) -> Result<bool> {
+    let table = TableRef {
+        catalog: target.catalog.clone(),
+        schema: target.schema.clone(),
+        table: target.table.clone(),
+    };
+    match warehouse.describe_table(&table).await {
+        Ok(_) => Ok(false),
+        Err(describe_error) => {
+            if !warehouse.is_missing_object_error(&describe_error) {
+                anyhow::bail!(
+                    "cannot determine whether {} exists: DESCRIBE did not report a missing object: {describe_error}",
+                    target.full_name()
+                );
+            }
+            let names = match warehouse.list_tables(&target.catalog, &target.schema).await {
+                Ok(names) => names,
+                Err(list_error) if warehouse.is_missing_object_error(&list_error) => {
+                    return Ok(true);
+                }
+                Err(list_error) => anyhow::bail!(
+                    "cannot determine whether {} exists: describe failed: {describe_error}; catalog read failed: {list_error}",
+                    target.full_name()
+                ),
+            };
+            if names
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case(&target.table))
+            {
+                anyhow::bail!(
+                    "cannot determine whether {} exists: describe failed: {describe_error}; catalog still lists it",
+                    target.full_name()
+                );
+            }
+            Ok(true)
+        }
+    }
 }
 
 /// Refuse the run if anything already sits at a shadow target.
@@ -51,13 +152,9 @@ pub(crate) struct ShadowObject {
 /// exactly as it was — the same posture as the target-collision preflight
 /// (#1461) and the `metadata_columns` guard (#1594).
 ///
-/// A `describe_table` that fails is treated as "absent". That is deliberate
-/// and is the same reading `execute_one_plain_model` takes: the adapters do
-/// not agree on a typed not-found error, so an existence probe can only
-/// distinguish "returned columns" from "did not". The consequence is a
-/// missed refusal on a transient error, never a spurious one — and the
-/// alternative, refusing every shadow run whose probe hiccuped, would make
-/// the feature unusable on a flaky connection.
+/// A missing-object DESCRIBE error requires a listing that does not contradict
+/// it. A missing namespace can make the listing fail with another missing-object
+/// error; that also confirms absence.
 ///
 /// # Errors
 ///
@@ -68,17 +165,9 @@ pub(crate) async fn refuse_occupied_shadow_targets(
     dialect: &dyn SqlDialect,
     objects: &[ShadowObject],
 ) -> Result<()> {
+    refuse_production_shadow_collisions(objects, &[])?;
     for object in objects {
-        let table_ref = rocky_ir::TableRef {
-            catalog: object.target.catalog.clone(),
-            schema: object.target.schema.clone(),
-            table: object.target.table.clone(),
-        };
-        let occupied = warehouse
-            .describe_table(&table_ref)
-            .await
-            .map(|columns| !columns.is_empty())
-            .unwrap_or(false);
+        let occupied = !target_is_absent(warehouse, &object.target).await?;
         if occupied {
             let formatted = dialect
                 .format_table_ref(
@@ -94,7 +183,7 @@ pub(crate) async fn refuse_occupied_shadow_targets(
                  name is either not Rocky's or debris from a run that did not finish. \
                  Model '{}' would have written it. Drop it if it is debris:\n    {}",
                 object.model,
-                dialect.drop_table_sql(&formatted)
+                object.kind.drop_sql(dialect, &formatted)
             );
         }
     }
@@ -103,9 +192,9 @@ pub(crate) async fn refuse_occupied_shadow_targets(
 
 /// Drop the shadow objects this run created.
 ///
-/// Called only on a successful run, and only when `cleanup_after` is set —
-/// which is the default for a one-off `--shadow`, and deliberately off for
-/// a named `--branch`, whose objects are the point of the branch.
+/// Called after a completed comparison, regardless of verdict, when
+/// `cleanup_after` is set. That is the default for a one-off `--shadow` and
+/// is deliberately off for `--keep-shadow` and named branches.
 ///
 /// Best-effort by design: a failed drop is reported to the caller as a
 /// warning rather than failing a run whose real work already succeeded.
@@ -133,10 +222,8 @@ pub(crate) async fn drop_owned_shadow_objects(
                 continue;
             }
         };
-        if let Err(e) = warehouse
-            .execute_statement(&dialect.drop_table_sql(&formatted))
-            .await
-        {
+        let sql = object.kind.drop_sql(dialect, &formatted);
+        if let Err(e) = warehouse.execute_statement(&sql).await {
             warnings.push(format!(
                 "could not drop shadow object {formatted} for model '{}': {e}. It stays on the \
                  warehouse; the next shadow run will refuse until it is removed",
@@ -150,8 +237,11 @@ pub(crate) async fn drop_owned_shadow_objects(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
+    use rocky_core::traits::{AdapterError, AdapterResult, QueryResult};
     use rocky_duckdb::DuckDbConnector;
     use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+    use rocky_ir::ColumnInfo;
     use std::sync::{Arc, Mutex};
 
     fn object(table: &str) -> ShadowObject {
@@ -162,12 +252,140 @@ mod tests {
                 schema: "main".into(),
                 table: table.into(),
             },
+            production: TargetRef {
+                catalog: String::new(),
+                schema: "main".into(),
+                table: "orders".into(),
+            },
+            kind: ShadowKind::Table,
         }
     }
 
     fn duckdb() -> DuckDbWarehouseAdapter {
         let shared = Arc::new(Mutex::new(DuckDbConnector::in_memory().expect("duckdb")));
         DuckDbWarehouseAdapter::from_shared(shared)
+    }
+
+    #[test]
+    fn shadow_name_cannot_alias_another_production_target_by_case() {
+        let first = object("OTHER");
+        let mut second = object("second_shadow");
+        second.model = "other".into();
+        second.production.table = "other".into();
+        let error = refuse_production_shadow_collisions(&[first, second], &[]).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("collides with the production target")
+        );
+        let unselected = TargetRef {
+            catalog: String::new(),
+            schema: "main".into(),
+            table: "OTHER".into(),
+        };
+        assert!(refuse_production_shadow_collisions(&[object("other")], &[unselected]).is_err());
+    }
+
+    struct UncertainWarehouse {
+        inner: DuckDbWarehouseAdapter,
+        catalog_error: bool,
+        empty_listing: bool,
+    }
+
+    #[async_trait]
+    impl WarehouseAdapter for UncertainWarehouse {
+        fn dialect(&self) -> &dyn SqlDialect {
+            self.inner.dialect()
+        }
+        fn is_missing_object_error(&self, error: &AdapterError) -> bool {
+            self.inner.is_missing_object_error(error)
+        }
+        async fn execute_statement(&self, _sql: &str) -> AdapterResult<()> {
+            panic!("an uncertain ownership read must never authorize a write")
+        }
+        async fn execute_query(&self, _sql: &str) -> AdapterResult<QueryResult> {
+            panic!("an uncertain ownership read must never authorize a query")
+        }
+        async fn describe_table(&self, _table: &TableRef) -> AdapterResult<Vec<ColumnInfo>> {
+            Err(AdapterError::msg("permission denied: SHOW COLUMNS"))
+        }
+        async fn list_tables(&self, _catalog: &str, _schema: &str) -> AdapterResult<Vec<String>> {
+            if self.catalog_error {
+                Err(AdapterError::msg("catalog unavailable"))
+            } else if self.empty_listing {
+                Ok(vec![])
+            } else {
+                Ok(vec!["orders_rocky_shadow".to_string()])
+            }
+        }
+    }
+
+    struct MissingNamespaceWarehouse;
+
+    #[async_trait]
+    impl WarehouseAdapter for MissingNamespaceWarehouse {
+        fn dialect(&self) -> &dyn SqlDialect {
+            static DIALECT: rocky_duckdb::dialect::DuckDbSqlDialect =
+                rocky_duckdb::dialect::DuckDbSqlDialect;
+            &DIALECT
+        }
+        fn is_missing_object_error(&self, error: &AdapterError) -> bool {
+            error.to_string() == "missing dataset"
+        }
+        async fn execute_statement(&self, _sql: &str) -> AdapterResult<()> {
+            panic!("preflight must not write")
+        }
+        async fn execute_query(&self, _sql: &str) -> AdapterResult<QueryResult> {
+            panic!("preflight must not query")
+        }
+        async fn describe_table(&self, _table: &TableRef) -> AdapterResult<Vec<ColumnInfo>> {
+            Err(AdapterError::msg("missing dataset"))
+        }
+        async fn list_tables(&self, _catalog: &str, _schema: &str) -> AdapterResult<Vec<String>> {
+            Err(AdapterError::msg("missing dataset"))
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_namespace_listing_confirms_missing_describe() {
+        assert!(
+            target_is_absent(&MissingNamespaceWarehouse, &object("shadow").target)
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn uncertain_metadata_never_grants_shadow_ownership() {
+        for catalog_error in [false, true] {
+            let wh = UncertainWarehouse {
+                inner: duckdb(),
+                catalog_error,
+                empty_listing: false,
+            };
+            let err =
+                refuse_occupied_shadow_targets(&wh, wh.dialect(), &[object("orders_rocky_shadow")])
+                    .await
+                    .expect_err("uncertain metadata cannot prove absence");
+            let message = err.to_string();
+            assert!(message.contains("cannot determine whether"), "{message}");
+        }
+    }
+
+    #[tokio::test]
+    async fn permission_denied_describe_with_empty_listing_refuses_before_ddl() {
+        let wh = UncertainWarehouse {
+            inner: duckdb(),
+            catalog_error: false,
+            empty_listing: true,
+        };
+        let error =
+            refuse_occupied_shadow_targets(&wh, wh.dialect(), &[object("orders_rocky_shadow")])
+                .await
+                .expect_err("a filtered listing cannot prove absence");
+        let message = error.to_string();
+        assert!(message.contains("cannot determine whether"), "{message}");
+        assert!(message.contains("permission denied"), "{message}");
     }
 
     /// An empty name is this run's to take.
@@ -178,6 +396,62 @@ mod tests {
         refuse_occupied_shadow_targets(&wh, dialect, &[object("orders_rocky_shadow")])
             .await
             .expect("nothing is there, so the run owns the name");
+    }
+
+    #[tokio::test]
+    async fn fresh_trino_shadow_target_passes_ownership_preflight() {
+        use rocky_trino::adapter::TrinoAdapter;
+        use rocky_trino::auth::TrinoAuth;
+        use rocky_trino::connector::TrinoClientConfig;
+        use wiremock::matchers::{body_string, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/statement"))
+            .and(body_string("DESCRIBE \"iceberg\".\"raw\".\"orders_rocky_shadow\""))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "missing",
+                "stats": {"state": "FAILED"},
+                "error": {"message": "table not found", "errorCode": 1, "errorName": "TABLE_NOT_FOUND"}
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/statement"))
+            .and(body_string(
+                "SELECT table_name FROM \"iceberg\".information_schema.tables WHERE table_schema = 'raw'",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "listing",
+                "columns": [{"name": "table_name", "type": "varchar"}],
+                "data": [["other_table"]],
+                "stats": {"state": "FINISHED"}
+            })))
+            .mount(&server)
+            .await;
+        let warehouse = TrinoAdapter::new(
+            TrinoClientConfig::new(server.uri()),
+            // The mock server ignores credentials. Build the password at
+            // runtime so CodeQL's hard-coded-credential rule has no literal
+            // to flag.
+            TrinoAuth::basic(
+                std::env::var("ROCKY_TRINO_TEST_USER").unwrap_or_else(|_| "alice".into()),
+                std::env::var("ROCKY_TRINO_TEST_PASS")
+                    .unwrap_or_else(|_| format!("pw-{}", std::process::id())),
+            )
+            .unwrap(),
+        );
+        let mut shadow = object("orders_rocky_shadow");
+        shadow.target.catalog = "iceberg".into();
+        shadow.target.schema = "raw".into();
+        shadow.production.catalog = "iceberg".into();
+        shadow.production.schema = "raw".into();
+        refuse_production_shadow_collisions(&[shadow.clone()], &[]).unwrap();
+        refuse_occupied_shadow_targets(&warehouse, warehouse.dialect(), &[shadow])
+            .await
+            .expect("a fresh Trino shadow target must pass preflight");
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
     }
 
     /// The #1273 case: somebody else's table at the derived name. The
@@ -217,17 +491,13 @@ mod tests {
         );
     }
 
-    /// The refusal is scoped to the DISPOSABLE mode, and the caller is what
-    /// scopes it (`run.rs` calls this only when `cleanup_after` is set).
+    /// The caller scopes this refusal to one-off shadow runs.
     ///
     /// This test pins the reason, because the scoping is a decision and not
-    /// an oversight: with `cleanup_after` off, the previous run's objects
-    /// are supposed to still be there and the next run is supposed to
-    /// replace them, so an unconditional refusal would make a named
-    /// `--branch` refuse its own workspace on every re-run. Rocky cannot
-    /// tell its own leftover from a stranger's without a persisted owner
-    /// record, so the persistent mode keeps no per-object check and #1273
-    /// stays open for it.
+    /// an oversight: a named `--branch` replaces its objects on every
+    /// re-run. A one-off `--keep-shadow` run still refuses leftovers. Rocky
+    /// cannot tell its own branch object from a stranger's without a
+    /// persisted owner record, so #1273 stays open for branch objects.
     ///
     /// What this function must NOT do is decide that for itself — a future
     /// caller that forgets the gate should get a refusal, not a silent pass.

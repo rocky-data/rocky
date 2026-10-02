@@ -37,6 +37,7 @@ pub struct DbtDirectoryConfig {
     pub materialized: Option<String>,
     pub schema: Option<String>,
     pub tags: Vec<String>,
+    pub children: HashMap<String, DbtDirectoryConfig>,
 }
 
 /// Resolved configuration for a specific model after walking the hierarchy.
@@ -154,13 +155,19 @@ fn parse_models_section(value: &Option<serde_yaml::Value>, project_name: &str) -
         return DbtModelDefaults::default();
     };
 
-    // Look for the project name key
+    let mut defaults = DbtModelDefaults::default();
+    if let Some(materialized) = top
+        .get(serde_yaml::Value::String("+materialized".to_string()))
+        .and_then(serde_yaml::Value::as_str)
+    {
+        defaults.materialized = Some(materialized.to_string());
+    }
+
+    // Project-specific settings override root-level defaults.
     let project_key = serde_yaml::Value::String(project_name.to_string());
     let Some(serde_yaml::Value::Mapping(project_map)) = top.get(&project_key) else {
-        return DbtModelDefaults::default();
+        return defaults;
     };
-
-    let mut defaults = DbtModelDefaults::default();
 
     for (key, val) in project_map {
         let Some(key_str) = key.as_str() else {
@@ -218,7 +225,13 @@ fn parse_directory_config(value: &serde_yaml::Value) -> DbtDirectoryConfig {
                         .collect();
                 }
             }
-            _ => {}
+            _ => {
+                if val.is_mapping() {
+                    config
+                        .children
+                        .insert(clean_key.to_string(), parse_directory_config(val));
+                }
+            }
         }
     }
 
@@ -230,7 +243,7 @@ fn parse_directory_config(value: &serde_yaml::Value) -> DbtDirectoryConfig {
 /// Resolution order (later overrides earlier):
 /// 1. dbt defaults (materialized: "view")
 /// 2. Project-level `models:` config
-/// 3. Directory-level config (walking from root to model's directory)
+/// 3. Directory and model-name config (walking from root to file stem)
 ///
 /// Note: model-level `config()` blocks override everything but are
 /// handled separately in the import pipeline.
@@ -245,26 +258,26 @@ pub fn resolve_model_config(project: &DbtProjectConfig, model_path: &Path) -> Re
         materialized = mat.clone();
     }
 
-    // Walk directory components and apply matching overrides
-    let components: Vec<&str> = model_path
-        .parent()
-        .unwrap_or(Path::new(""))
-        .components()
-        .filter_map(|c| c.as_os_str().to_str())
-        .collect();
-
-    for component in &components {
-        if let Some(dir_config) = project.models.directories.get(*component) {
-            if let Some(ref mat) = dir_config.materialized {
-                materialized = mat.clone();
-            }
-            if let Some(ref s) = dir_config.schema {
-                schema = Some(s.clone());
-            }
-            if !dir_config.tags.is_empty() {
-                tags.extend(dir_config.tags.clone());
-            }
+    // dbt_project.yml can configure both directories and a model by name.
+    // Follow the path hierarchy through the final file stem so an inherited
+    // materialization cannot be lost before the raw importer checks it.
+    let mut children = &project.models.directories;
+    for component in model_path.components() {
+        let Some(name) = component.as_os_str().to_str() else {
+            break;
+        };
+        let name = name.strip_suffix(".sql").unwrap_or(name);
+        let Some(config) = children.get(name) else {
+            break;
+        };
+        if let Some(ref mat) = config.materialized {
+            materialized = mat.clone();
         }
+        if let Some(ref value) = config.schema {
+            schema = Some(value.clone());
+        }
+        tags.extend(config.tags.iter().cloned());
+        children = &config.children;
     }
 
     ResolvedModelConfig {
@@ -417,6 +430,33 @@ models:
         let resolved = resolve_model_config(&config, Path::new("staging/stripe/stg_payments.sql"));
         assert_eq!(resolved.materialized, "view");
         assert_eq!(resolved.schema.as_deref(), Some("staging"));
+    }
+
+    #[test]
+    fn test_resolve_nested_model_materialization() {
+        let yaml = r#"
+name: proj
+models:
+  proj:
+    +materialized: table
+    marts:
+      +materialized: view
+      orders:
+        +materialized: incremental
+"#;
+        let config = parse_yaml_content(yaml, Path::new("dbt_project.yml")).unwrap();
+        assert_eq!(
+            resolve_model_config(&config, Path::new("marts/orders.sql")).materialized,
+            "incremental"
+        );
+        assert_eq!(
+            resolve_model_config(&config, Path::new("marts/customers.sql")).materialized,
+            "view"
+        );
+        assert_eq!(
+            resolve_model_config(&config, Path::new("orders.sql")).materialized,
+            "table"
+        );
     }
 
     #[test]

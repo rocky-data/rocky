@@ -60,7 +60,7 @@ WHERE event_time > (SELECT MAX(event_time) FROM {{ this }})
     assert!(
         result["failed_details"][0]["reason"]
             .as_str()
-            .is_some_and(|reason| reason.contains("is_incremental()"))
+            .is_some_and(|reason| reason.contains("dbt compile --full-refresh"))
     );
     assert_eq!(result["emission"]["models_translated_count"], 0);
     assert!(!out_dir.join("models/events.sql").exists());
@@ -131,7 +131,7 @@ WHERE event_time > (SELECT MAX(event_time) FROM {{ this }})
     assert!(
         result["failed_details"][0]["reason"]
             .as_str()
-            .is_some_and(|reason| reason.contains("is_incremental()"))
+            .is_some_and(|reason| reason.contains("dbt compile --full-refresh"))
     );
     assert_eq!(result["emission"]["models_translated_count"], 0);
     assert!(!out_dir.join("models/events.sql").exists());

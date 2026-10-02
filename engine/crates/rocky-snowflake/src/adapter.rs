@@ -23,7 +23,8 @@
 use async_trait::async_trait;
 
 use rocky_core::traits::{
-    AdapterError, AdapterResult, ChunkChecksum, PkRange, QueryResult, SqlDialect, WarehouseAdapter,
+    AdapterError, AdapterResult, CaseSignificance, ChunkChecksum, ObjectKind, PkRange, QueryResult,
+    SqlDialect, WarehouseAdapter,
 };
 use rocky_ir::{ColumnInfo, TableRef};
 use rocky_sql::validation;
@@ -52,10 +53,85 @@ impl SnowflakeWarehouseAdapter {
     }
 }
 
+fn promotion_queries(
+    dialect: &dyn SqlDialect,
+    table: &TableRef,
+    case: CaseSignificance,
+) -> AdapterResult<(String, String)> {
+    let database = dialect.quote_identifier(&table.catalog.replace('"', "\"\""));
+    let schema = rocky_core::sql_gen::string_literal(dialect, &table.schema);
+    let name = rocky_core::sql_gen::string_literal(dialect, &table.table);
+    let predicate = |column: &str, value: &str| match case {
+        CaseSignificance::Significant => format!("{column} = {value}"),
+        CaseSignificance::Insignificant => format!("UPPER({column}) = UPPER({value})"),
+    };
+    Ok((
+        format!(
+            "SELECT schema_name FROM {database}.INFORMATION_SCHEMA.SCHEMATA WHERE {}",
+            predicate("schema_name", &schema)
+        ),
+        format!(
+            "SELECT table_type FROM {database}.INFORMATION_SCHEMA.TABLES WHERE {} AND {}",
+            predicate("table_schema", &schema),
+            predicate("table_name", &name)
+        ),
+    ))
+}
+
+fn promotion_kind(result: &QueryResult) -> AdapterResult<Option<ObjectKind>> {
+    match result.rows.as_slice() {
+        [] => Ok(None),
+        [row] => match row.first().and_then(|v| v.as_str()) {
+            Some("BASE TABLE" | "TEMPORARY TABLE" | "EXTERNAL TABLE" | "EVENT TABLE") => {
+                Ok(Some(ObjectKind::Table))
+            }
+            Some("VIEW" | "MATERIALIZED VIEW") => Ok(Some(ObjectKind::View)),
+            Some(other) => Err(AdapterError::msg(format!(
+                "unknown promotion destination kind: {other}"
+            ))),
+            None => Err(AdapterError::msg(
+                "promotion destination kind is missing or malformed",
+            )),
+        },
+        _ => Err(AdapterError::msg(
+            "promotion destination kind returned multiple rows",
+        )),
+    }
+}
+
 #[async_trait]
 impl WarehouseAdapter for SnowflakeWarehouseAdapter {
     fn dialect(&self) -> &dyn SqlDialect {
         &self.dialect
+    }
+
+    /// Snowflake code 002003 says "does not exist or not authorized" for
+    /// objects and schemas. It does not distinguish absence from denial;
+    /// shadow preflight treats both as missing, matching earlier behavior.
+    fn is_missing_object_error(&self, error: &AdapterError) -> bool {
+        match error
+            .inner()
+            .downcast_ref::<crate::connector::ConnectorError>()
+        {
+            Some(crate::connector::ConnectorError::StatementFailed { message, .. }) => {
+                message.starts_with("002003: SQL compilation error:")
+                    && message.contains("does not exist or not authorized")
+            }
+            Some(crate::connector::ConnectorError::ApiError {
+                status: 400 | 422,
+                body,
+            }) => {
+                let Ok(json) = serde_json::from_str::<serde_json::Value>(body) else {
+                    return false;
+                };
+                json.get("code").and_then(serde_json::Value::as_str) == Some("002003")
+                    && json
+                        .get("message")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|m| m.contains("does not exist or not authorized"))
+            }
+            _ => false,
+        }
     }
 
     fn warehouse_name(&self) -> Option<&str> {
@@ -130,6 +206,27 @@ impl WarehouseAdapter for SnowflakeWarehouseAdapter {
         })
     }
 
+    async fn promotion_destination_kind(
+        &self,
+        table: &TableRef,
+    ) -> AdapterResult<Option<ObjectKind>> {
+        let case = self.identifier_case_significance().await?;
+        let (namespace_sql, kind_sql) = promotion_queries(&self.dialect, table, case)?;
+        let namespace = self.execute_query(&namespace_sql).await?;
+        if namespace.rows.is_empty() {
+            return Err(AdapterError::msg(
+                "promotion destination namespace does not exist",
+            ));
+        }
+        if namespace.rows.len() != 1 || namespace.rows[0].first().and_then(|v| v.as_str()).is_none()
+        {
+            return Err(AdapterError::msg(
+                "promotion destination namespace response is ambiguous",
+            ));
+        }
+        promotion_kind(&self.execute_query(&kind_sql).await?)
+    }
+
     async fn describe_table(&self, table: &TableRef) -> AdapterResult<Vec<ColumnInfo>> {
         let table_ref =
             self.dialect
@@ -141,45 +238,7 @@ impl WarehouseAdapter for SnowflakeWarehouseAdapter {
             .await
             .map_err(AdapterError::new)?;
 
-        // Snowflake DESCRIBE TABLE returns rows with columns:
-        // name, type, kind, null?, default, primary_key, unique_key, ...
-        // Look up column positions by name so we're resilient to column
-        // order changes across Snowflake versions.
-        let col_headers: Vec<String> = result
-            .columns
-            .iter()
-            .map(|c| c.name.to_lowercase())
-            .collect();
-        let name_idx = col_headers.iter().position(|c| c == "name").unwrap_or(0);
-        let type_idx = col_headers.iter().position(|c| c == "type").unwrap_or(1);
-        let null_idx = col_headers.iter().position(|c| c == "null?").unwrap_or(3);
-
-        let mut columns = Vec::new();
-        for row in &result.rows {
-            let name = row
-                .get(name_idx)
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_lowercase();
-            let data_type = row
-                .get(type_idx)
-                .and_then(|v| v.as_str())
-                .unwrap_or("VARCHAR")
-                .to_string();
-            let nullable = row
-                .get(null_idx)
-                .and_then(|v| v.as_str())
-                .map(|s| s == "Y")
-                .unwrap_or(true);
-
-            columns.push(ColumnInfo {
-                name,
-                data_type,
-                nullable,
-            });
-        }
-
-        Ok(columns)
+        Ok(parse_describe_columns(&result))
     }
 
     async fn ping(&self) -> AdapterResult<()> {
@@ -395,6 +454,39 @@ fn parse_snowflake_chunk_checksums(
     Ok(out)
 }
 
+fn parse_describe_columns(result: &crate::connector::QueryResult) -> Vec<ColumnInfo> {
+    // Snowflake DESCRIBE TABLE returns name, type, kind, null?, and other fields.
+    let headers: Vec<_> = result
+        .columns
+        .iter()
+        .map(|c| c.name.to_lowercase())
+        .collect();
+    let name_idx = headers.iter().position(|c| c == "name").unwrap_or(0);
+    let type_idx = headers.iter().position(|c| c == "type").unwrap_or(1);
+    let null_idx = headers.iter().position(|c| c == "null?").unwrap_or(3);
+    result
+        .rows
+        .iter()
+        .map(|row| ColumnInfo {
+            name: row
+                .get(name_idx)
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            data_type: row
+                .get(type_idx)
+                .and_then(|v| v.as_str())
+                .unwrap_or("VARCHAR")
+                .to_string(),
+            nullable: row
+                .get(null_idx)
+                .and_then(|v| v.as_str())
+                .map(|s| s == "Y")
+                .unwrap_or(true),
+        })
+        .collect()
+}
+
 fn parse_snowflake_i128(v: &serde_json::Value) -> AdapterResult<i128> {
     if let Some(s) = v.as_str() {
         return s.parse::<i128>().map_err(|e| {
@@ -421,6 +513,162 @@ mod tests {
     use crate::connector::ConnectorConfig;
     use rocky_core::config::RetryConfig;
     use std::time::Duration;
+
+    #[test]
+    fn describe_keeps_exact_quoted_column_spelling() {
+        let result = crate::connector::QueryResult {
+            statement_handle: String::new(),
+            columns: ["name", "type", "kind", "null?"]
+                .into_iter()
+                .map(|name| crate::connector::ColumnMetaData {
+                    name: name.into(),
+                    type_name: None,
+                    nullable: None,
+                })
+                .collect(),
+            rows: vec![
+                vec![
+                    serde_json::json!("DisplayName"),
+                    serde_json::json!("VARCHAR"),
+                    serde_json::json!("COLUMN"),
+                    serde_json::json!("Y"),
+                ],
+                vec![
+                    serde_json::json!("Order Total"),
+                    serde_json::json!("NUMBER"),
+                    serde_json::json!("COLUMN"),
+                    serde_json::json!("N"),
+                ],
+            ],
+            total_row_count: None,
+        };
+        let names: Vec<_> = parse_describe_columns(&result)
+            .into_iter()
+            .map(|c| c.name)
+            .collect();
+        assert_eq!(names, ["DisplayName", "Order Total"]);
+    }
+
+    #[test]
+    fn promotion_probe_sql_and_kinds() {
+        let table = TableRef {
+            catalog: "db".into(),
+            schema: "Mixed'Case".into(),
+            table: "Orders\\'24".into(),
+        };
+        let (namespace, kind) =
+            promotion_queries(&SnowflakeSqlDialect, &table, CaseSignificance::Significant).unwrap();
+        assert_eq!(
+            namespace,
+            r#"SELECT schema_name FROM "db".INFORMATION_SCHEMA.SCHEMATA WHERE schema_name = 'Mixed\'Case'"#
+        );
+        assert_eq!(
+            kind,
+            r#"SELECT table_type FROM "db".INFORMATION_SCHEMA.TABLES WHERE table_schema = 'Mixed\'Case' AND table_name = 'Orders\\\'24'"#
+        );
+        let (namespace_folded, kind_folded) = promotion_queries(
+            &SnowflakeSqlDialect,
+            &table,
+            CaseSignificance::Insignificant,
+        )
+        .unwrap();
+        assert!(namespace_folded.contains("UPPER(schema_name) = UPPER("));
+        assert!(kind_folded.contains("UPPER(table_name) = UPPER("));
+        let quoted_database = TableRef {
+            catalog: "db\"archive".into(),
+            ..table.clone()
+        };
+        assert!(
+            promotion_queries(
+                &SnowflakeSqlDialect,
+                &quoted_database,
+                CaseSignificance::Significant
+            )
+            .unwrap()
+            .0
+            .contains("\"db\"\"archive\".INFORMATION_SCHEMA.SCHEMATA")
+        );
+        let result = |value: &str| QueryResult {
+            columns: vec!["table_type".into()],
+            rows: vec![vec![serde_json::json!(value)]],
+        };
+        for value in [
+            "BASE TABLE",
+            "TEMPORARY TABLE",
+            "EXTERNAL TABLE",
+            "EVENT TABLE",
+        ] {
+            assert_eq!(
+                promotion_kind(&result(value)).unwrap(),
+                Some(ObjectKind::Table)
+            );
+        }
+        for value in ["VIEW", "MATERIALIZED VIEW"] {
+            assert_eq!(
+                promotion_kind(&result(value)).unwrap(),
+                Some(ObjectKind::View)
+            );
+        }
+        assert_eq!(
+            promotion_kind(&QueryResult {
+                columns: vec![],
+                rows: vec![]
+            })
+            .unwrap(),
+            None
+        );
+        assert!(
+            promotion_kind(&result("FUTURE KIND"))
+                .unwrap_err()
+                .to_string()
+                .contains("FUTURE KIND")
+        );
+    }
+
+    #[test]
+    fn compilation_code_002003_confirms_missing_object_or_schema() {
+        let auth = Auth::from_config(AuthConfig {
+            account: "test_account".into(),
+            username: None,
+            password: None,
+            oauth_token: Some("test_token".into()),
+            private_key_path: None,
+            pat: None,
+        })
+        .unwrap();
+        let connector = SnowflakeConnector::new(
+            ConnectorConfig {
+                account: "test_account".into(),
+                warehouse: "COMPUTE_WH".into(),
+                database: None,
+                schema: None,
+                role: None,
+                timeout: Duration::from_secs(1),
+                retry: RetryConfig::default(),
+            },
+            auth,
+        );
+        let adapter = SnowflakeWarehouseAdapter::new(connector);
+        for object in ["Object 'DB.SCH.T'", "Schema 'DB.SCH'"] {
+            let error = AdapterError::new(crate::connector::ConnectorError::StatementFailed {
+                handle: "stmt".into(),
+                message: format!(
+                    "002003: SQL compilation error: {object} does not exist or not authorized."
+                ),
+            });
+            assert!(adapter.is_missing_object_error(&error), "{object}");
+        }
+        let denied = AdapterError::new(crate::connector::ConnectorError::StatementFailed {
+            handle: "stmt".into(),
+            message: "003001: permission denied".into(),
+        });
+        assert!(!adapter.is_missing_object_error(&denied));
+        let api_error = AdapterError::new(crate::connector::ConnectorError::ApiError {
+            status: 422,
+            body: r#"{"code":"002003","message":"SQL compilation error: Schema 'DB.SCH' does not exist or not authorized."}"#.into(),
+        });
+        assert!(adapter.is_missing_object_error(&api_error));
+    }
 
     /// Verifies that the adapter can be constructed and used as a trait object.
     fn _assert_warehouse_adapter_trait_object(_: &dyn WarehouseAdapter) {}

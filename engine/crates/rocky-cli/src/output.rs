@@ -347,6 +347,13 @@ pub struct RunOutput {
     /// True when running in shadow mode (targets rewritten).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub shadow: bool,
+    /// Comparison of this run's shadow objects with production, before cleanup.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shadow_comparison: Option<CompareOutput>,
+    /// Run-local ownership for cleanup after every mixed-run comparison.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub(crate) owned_shadow_objects: Vec<crate::commands::shadow_lifecycle::ShadowObject>,
     pub materializations: Vec<MaterializationOutput>,
     /// Per-model build/skip/reuse decision + reason, surfaced for
     /// transformation runs so orchestrators can explain *why* each model
@@ -791,6 +798,7 @@ impl From<&rocky_bigquery::connector::BigQueryError> for FailureKind {
                 Some(_) => Self::QueryRejected,
                 None => Self::Unknown,
             },
+            E::TableNotFound { .. } => Self::NotFound,
             E::JobError { .. } | E::LoadJobError { .. } => Self::QueryRejected,
             E::Timeout { .. } => Self::Transient,
             E::RetryBudgetExhausted { .. } => Self::QuotaExceeded,
@@ -3395,6 +3403,25 @@ pub struct WatermarkEntry {
     pub updated_at: DateTime<Utc>,
 }
 
+/// Result of repairing incremental cursors from physical target tables.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct ReconcileWatermarkOutput {
+    pub version: String,
+    pub command: String,
+    pub pipeline: String,
+    pub dry_run: bool,
+    pub watermarks: Vec<ReconciledWatermark>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct ReconciledWatermark {
+    pub table: String,
+    pub previous: Option<DateTime<Utc>>,
+    pub target_max: Option<DateTime<Utc>>,
+    /// `null` means the empty target's cursor was cleared.
+    pub watermark: Option<DateTime<Utc>>,
+}
+
 /// JSON output for `rocky state clear-schema-cache`.
 ///
 /// `dry_run = true` reports what *would* be deleted without touching
@@ -3574,6 +3601,8 @@ pub struct CompareOutput {
     pub tables_compared: usize,
     pub tables_passed: usize,
     pub tables_warned: usize,
+    /// Targets with no confirmed production object. These do not fail the run.
+    pub tables_no_baseline: usize,
     pub tables_failed: usize,
     pub results: Vec<TableCompareResult>,
     pub overall_verdict: String,
@@ -5127,6 +5156,8 @@ impl RunOutput {
             excluded_tables: vec![],
             resumed_from: None,
             shadow: false,
+            shadow_comparison: None,
+            owned_shadow_objects: vec![],
             materializations: vec![],
             model_decisions: vec![],
             contained: vec![],
@@ -5609,6 +5640,11 @@ impl RunOutput {
             || self.tables_failed > 0
             || self.check_gate_failed
             || self.verify_after_failed;
+        let has_problem = has_problem
+            || self
+                .shadow_comparison
+                .as_ref()
+                .is_some_and(|comparison| comparison.tables_failed > 0);
         match (has_progress, has_problem) {
             (_, false) => rocky_core::state::RunStatus::Success,
             (true, true) => rocky_core::state::RunStatus::PartialFailure,
@@ -7939,10 +7975,18 @@ pub struct RejectedApproval {
     pub detail: String,
 }
 
+/// Production object read by a promoted view.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct PromoteUpstream {
+    pub catalog: String,
+    pub schema: String,
+    pub table: String,
+}
+
 /// Per-model promote step captured in a [`PromotePlan`].
 ///
 /// Mirrors the shape of [`PromoteTarget`] but contains only plan-time fields
-/// (`target`, `source`, `statement`). Execution outcome (`succeeded`, `error`)
+/// (`target`, `source`, structured coordinates, `strategy`, `statement`). Execution outcome (`succeeded`, `error`)
 /// is added at apply time and lives on [`PromoteTarget`].
 ///
 /// `statement` is persisted verbatim so `rocky apply` executes the **exact**
@@ -7955,9 +7999,21 @@ pub struct PromoteTargetPlan {
     /// Fully-qualified branch source the promote will read from
     /// (catalog.branch_schema.table).
     pub source: String,
-    /// `CREATE OR REPLACE TABLE <target> AS SELECT * FROM <source>` SQL,
-    /// dialect-quoted at plan time.
+    /// Structured destination coordinates. Display names may contain dots.
+    pub target_catalog: String,
+    pub target_schema: String,
+    pub target_table: String,
+    pub source_catalog: String,
+    pub source_schema: String,
+    pub source_table: String,
+    /// The strategy approved at plan time. Only full_refresh and view apply.
+    pub strategy: String,
+    /// Dialect-quoted replacement SQL, generated at plan time.
     pub statement: String,
+    /// Optional dialect-required DROP issued before `statement`.
+    pub pre_drop_statement: Option<String>,
+    /// Production objects read by this view that this plan does not replace.
+    pub production_upstreams: Vec<PromoteUpstream>,
 }
 
 /// Persisted payload for a `rocky plan promote` run plan.
@@ -8119,6 +8175,15 @@ pub struct FulfillOutput {
     pub plan_id: Option<String>,
 }
 
+/// A DROP permitted when a model switches between a table and a view.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct ConditionalDrop {
+    pub model: String,
+    pub target: String,
+    pub existing_kind: String,
+    pub drop_sql: String,
+}
+
 /// JSON output for `rocky review <plan-id>`.
 ///
 /// `rocky review` is the human sign-off gate for an AI-authored plan. It
@@ -8152,6 +8217,8 @@ pub struct ReviewOutput {
     /// the models directory was unavailable).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub breaking_changes: Option<Vec<rocky_core::breaking_change::BreakingFinding>>,
+    /// Conditional kind-switch DROPs at their effective execution targets.
+    pub conditional_drops: Vec<ConditionalDrop>,
     /// Human-readable summary of the review outcome.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,

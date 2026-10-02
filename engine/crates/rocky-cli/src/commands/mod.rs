@@ -77,7 +77,7 @@ pub mod schedule_status;
 pub mod scheduler;
 mod seed;
 pub(crate) mod serve;
-mod shadow_lifecycle;
+pub(crate) mod shadow_lifecycle;
 mod shell;
 mod skip_gate;
 mod snapshot;
@@ -190,8 +190,9 @@ pub use replay::{
 pub use restore::run_restore_plan;
 pub use retention_status::run_retention_status;
 pub use review::{
-    compute_review, compute_review_queue, compute_review_status, plan_is_reviewable, run_review,
-    run_review_queue, run_review_status,
+    compute_review, compute_review_queue, compute_review_status, compute_review_with_disclosure,
+    compute_review_with_state_path, plan_is_reviewable, run_review, run_review_queue,
+    run_review_status,
 };
 pub use schedule_spool::{ScheduleSpoolError, compute_schedule_spool, state_schedule_spool};
 pub use schedule_status::{ScheduleStatusError, schedule_status_output};
@@ -200,7 +201,7 @@ pub use schedule_status::{ScheduleStatusError, schedule_status_output};
 pub use rocky_sql::transpile::Dialect;
 pub use run::{
     CheckGateFailure, DeferOptions, Interrupted, PartialFailure, PartitionRunOptions,
-    SkipRunOptions, require_shadow_support_for_config, run,
+    ShadowComparisonFailure, SkipRunOptions, require_shadow_support_for_config, run,
 };
 pub use run_dag_exec::run_with_dag;
 pub use run_watch::run_watch as run_with_watch;
@@ -208,7 +209,10 @@ pub use seed::run_seed;
 pub use serve::{resolve_serve_config_path, run_serve};
 pub use shell::run_shell;
 pub use snapshot::run_snapshot;
-pub use state::{state_clear_schema_cache, state_retention_sweep, state_schedule_hold, state_show};
+pub use state::{
+    state_clear_schema_cache, state_reconcile_watermark, state_retention_sweep,
+    state_schedule_hold, state_show,
+};
 pub use test::declarative_test_output;
 #[cfg(feature = "duckdb")]
 pub use test::run_declarative_tests;
@@ -306,8 +310,8 @@ pub(crate) const TRANSFORMATION_FILTER_KEYS: &[&str] = &["table", "model", "cata
 /// walking the same tree separately is how they stop agreeing — silently, and
 /// only for the projects where it matters.
 ///
-/// `ephemeral` models are excluded: they materialize nothing, so there is no
-/// physical table to promote or to compare.
+/// `compare` excludes ephemeral models because they have no physical target.
+/// Promote includes them so its strategy gate can refuse them explicitly.
 ///
 /// `verb` names the caller in the two error messages, so a user sees the
 /// command they ran rather than this helper.
@@ -316,18 +320,14 @@ pub(crate) fn transformation_prod_targets(
     config_path: &std::path::Path,
     filter: Option<&str>,
     verb: &str,
-) -> Result<Vec<(String, rocky_ir::TargetRef)>> {
-    let parsed_filter = filter.map(parse_filter).transpose()?;
-    if let Some((key, _)) = &parsed_filter
-        && !TRANSFORMATION_FILTER_KEYS.contains(&key.as_str())
-    {
-        anyhow::bail!(
-            "transformation-pipeline `{verb}` does not support `--filter {key}=...`. \
-             Supported keys: {}.",
-            TRANSFORMATION_FILTER_KEYS.join(", ")
-        );
-    }
-
+    include_ephemeral: bool,
+) -> Result<
+    Vec<(
+        String,
+        rocky_ir::TargetRef,
+        rocky_core::models::StrategyConfig,
+    )>,
+> {
     let models_dir = match crate::models_loader::locate_models_dir(&pipeline.models, config_path)? {
         crate::models_loader::ModelsDir::Present(dir) => dir,
         crate::models_loader::ModelsDir::Absent(dir) => anyhow::bail!(
@@ -347,12 +347,41 @@ pub(crate) fn transformation_prod_targets(
     let all_models =
         crate::models_loader::load_project_models_matching(&models_dir, &models_glob, None)?;
 
+    transformation_prod_targets_from_models(&all_models, filter, verb, include_ephemeral)
+}
+
+/// Select targets from the same loaded model snapshot that promotion compiles.
+pub(crate) fn transformation_prod_targets_from_models(
+    all_models: &[rocky_core::models::Model],
+    filter: Option<&str>,
+    verb: &str,
+    include_ephemeral: bool,
+) -> Result<
+    Vec<(
+        String,
+        rocky_ir::TargetRef,
+        rocky_core::models::StrategyConfig,
+    )>,
+> {
+    let parsed_filter = filter.map(parse_filter).transpose()?;
+    if let Some((key, _)) = &parsed_filter
+        && !TRANSFORMATION_FILTER_KEYS.contains(&key.as_str())
+    {
+        anyhow::bail!(
+            "transformation-pipeline `{verb}` does not support `--filter {key}=...`. \
+             Supported keys: {}.",
+            TRANSFORMATION_FILTER_KEYS.join(", ")
+        );
+    }
+
     let mut targets = Vec::new();
-    for model in &all_models {
-        if matches!(
-            model.config.strategy,
-            rocky_core::models::StrategyConfig::Ephemeral
-        ) {
+    for model in all_models {
+        if !include_ephemeral
+            && matches!(
+                model.config.strategy,
+                rocky_core::models::StrategyConfig::Ephemeral
+            )
+        {
             continue;
         }
         if let Some((key, value)) = &parsed_filter {
@@ -374,6 +403,7 @@ pub(crate) fn transformation_prod_targets(
                 schema: model.config.target.schema.clone(),
                 table: model.config.target.table.clone(),
             },
+            model.config.strategy.clone(),
         ));
     }
     Ok(targets)

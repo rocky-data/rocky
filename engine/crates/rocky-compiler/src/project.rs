@@ -346,7 +346,13 @@ impl Project {
     ///
     /// Useful when models come from sources other than a directory
     /// (e.g., DSL lowering, dbt import).
-    pub fn from_models(models: Vec<Model>) -> Result<Self, ProjectError> {
+    pub fn from_models(mut models: Vec<Model>) -> Result<Self, ProjectError> {
+        // Programmatic callers must see the same canonical strategy as file loaders.
+        for model in &mut models {
+            model.config.strategy = models::normalize_transformation_strategy(std::mem::take(
+                &mut model.config.strategy,
+            ));
+        }
         // Reject duplicate model names up front. `model()` is first-wins and
         // `resolve` collapses names into a HashSet, so a second model with the
         // same name would silently shadow the first — a real source of "my edit
@@ -740,6 +746,7 @@ fn load_single_rocky_model_with_db(
             .as_ref()
             .and_then(|d| d.strategy.clone())
             .unwrap_or_default();
+        let strategy = models::normalize_transformation_strategy(strategy);
 
         (
             ModelConfig {
@@ -837,6 +844,25 @@ mod tests {
             file_path: format!("models/{name}.sql").into(),
             contract_path: None,
         }
+    }
+
+    #[test]
+    fn in_memory_model_normalizes_microbatch_before_compilation() {
+        let mut model = make_model(
+            "events",
+            "SELECT updated_at FROM source WHERE updated_at >= @start_date AND updated_at < @end_date",
+        );
+        model.config.strategy = StrategyConfig::Microbatch {
+            timestamp_column: "updated_at".to_string(),
+            granularity: rocky_ir::TimeGrain::Day,
+        };
+
+        let project = Project::from_models(vec![model]).unwrap();
+        assert!(matches!(
+            &project.model("events").unwrap().config.strategy,
+            StrategyConfig::TimeInterval { time_column, granularity: rocky_ir::TimeGrain::Day, .. }
+                if time_column == "updated_at"
+        ));
     }
 
     #[test]

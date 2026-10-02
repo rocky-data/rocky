@@ -1766,7 +1766,17 @@ async fn review_diff(
     // `compute_review` is `async` for its marker-writing path, which
     // `approve = false` never enters; its compiles are synchronous work on this
     // thread, which the permit above bounds to one worker at a time.
-    match crate::commands::compute_review(&root, &config, &plan_id, "HEAD", false).await {
+    let state_path = state_path_for(&state);
+    match crate::commands::compute_review_with_state_path(
+        &root,
+        &config,
+        Some(&state_path),
+        &plan_id,
+        "HEAD",
+        false,
+    )
+    .await
+    {
         Ok(output) => Ok(PrettyJson(output)),
         // The reviewability refusal is already handled above, so anything left
         // here is a genuine failure of this server.
@@ -4845,6 +4855,29 @@ mod tests {
         assert_eq!(resp.status(), 409);
         let err: ErrorEnvelope = resp.json().await.unwrap();
         assert_eq!(err.code, "plan_not_reviewable");
+    }
+
+    /// The route's core must review an AI plan even when the fixture has no
+    /// model sources, and report the conditional DROP set explicitly.
+    #[tokio::test]
+    async fn review_diff_core_accepts_an_empty_model_tree() -> anyhow::Result<()> {
+        use crate::plan_store::{PlanKind, write_plan};
+
+        let dir = tempfile::tempdir()?;
+        let (root, config, _, _) = review_fixture(dir.path());
+        let plan_id = write_plan(
+            &root,
+            PlanKind::AiAuthored,
+            &serde_json::json!({ "models": ["orders"] }),
+        )?;
+        let review =
+            crate::commands::compute_review(&root, &config, &plan_id, "HEAD", false).await?;
+        assert!(!review.approved);
+        assert_eq!(
+            serde_json::to_value(&review)?["conditional_drops"],
+            serde_json::json!([])
+        );
+        Ok(())
     }
 
     /// The review diff refuses the same two shapes the status route does, and

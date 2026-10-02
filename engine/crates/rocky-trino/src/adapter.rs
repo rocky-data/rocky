@@ -1,15 +1,18 @@
 //! Trino warehouse adapter — implements `rocky_core::traits::WarehouseAdapter`.
 //!
 //! Surface: `dialect`, `execute_statement`, `execute_query`,
-//! `describe_table`. Everything else falls back to the trait defaults:
+//! `describe_table`, `list_tables`. Everything else falls back to the trait defaults:
 //! `merge_into` errors via the dialect ("v0 doesn't support MERGE"),
 //! `checksum_chunks` errors via the `row_hash_expr` default, governance /
 //! batch / loader are absent.
 
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
-use rocky_core::traits::{AdapterError, AdapterResult, QueryResult, SqlDialect, WarehouseAdapter};
+use rocky_core::traits::{
+    AdapterError, AdapterResult, ObjectKind, QueryResult, SqlDialect, WarehouseAdapter,
+};
 use rocky_ir::{ColumnInfo, TableRef};
+use rocky_sql::validation;
 
 use crate::auth::TrinoAuth;
 use crate::connector::{TrinoClient, TrinoClientConfig};
@@ -45,10 +48,78 @@ impl TrinoAdapter {
     }
 }
 
+fn promotion_queries(
+    dialect: &dyn SqlDialect,
+    table: &TableRef,
+) -> AdapterResult<(String, String)> {
+    let catalog = dialect.quote_identifier(&table.catalog.replace('"', "\"\""));
+    let schema = rocky_core::sql_gen::string_literal(dialect, &table.schema);
+    let name = rocky_core::sql_gen::string_literal(dialect, &table.table);
+    Ok((
+        format!(
+            "SELECT schema_name FROM {catalog}.information_schema.schemata WHERE lower(schema_name) = lower({schema})"
+        ),
+        format!(
+            "SELECT table_type FROM {catalog}.information_schema.tables WHERE lower(table_schema) = lower({schema}) AND lower(table_name) = lower({name})"
+        ),
+    ))
+}
+
+fn promotion_kind(result: &QueryResult) -> AdapterResult<Option<ObjectKind>> {
+    match result.rows.as_slice() {
+        [] => Ok(None),
+        [row] => match row.first().and_then(|v| v.as_str()) {
+            Some("BASE TABLE") => Ok(Some(ObjectKind::Table)),
+            Some("VIEW") => Ok(Some(ObjectKind::View)),
+            Some(other) => Err(AdapterError::msg(format!(
+                "unknown promotion destination kind: {other}"
+            ))),
+            None => Err(AdapterError::msg(
+                "promotion destination kind is missing or malformed",
+            )),
+        },
+        _ => Err(AdapterError::msg(
+            "promotion destination kind returned multiple rows",
+        )),
+    }
+}
+
+fn list_tables_sql(catalog: &str, schema: &str) -> AdapterResult<String> {
+    validation::validate_identifier(catalog).map_err(AdapterError::new)?;
+    let schema_literal = schema.replace('\'', "''");
+    Ok(format!(
+        "SELECT table_name FROM \"{catalog}\".information_schema.tables \
+         WHERE table_schema = '{schema_literal}'"
+    ))
+}
+
+fn parse_table_names(result: &QueryResult) -> AdapterResult<Vec<String>> {
+    result
+        .rows
+        .iter()
+        .map(|row| {
+            row.first()
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+                .ok_or_else(|| {
+                    AdapterError::msg("Trino table listing returned a non-text table_name")
+                })
+        })
+        .collect()
+}
+
 #[async_trait]
 impl WarehouseAdapter for TrinoAdapter {
     fn dialect(&self) -> &dyn SqlDialect {
         &self.dialect
+    }
+
+    fn is_missing_object_error(&self, error: &AdapterError) -> bool {
+        matches!(
+            error.inner().downcast_ref::<crate::connector::TrinoError>(),
+            Some(crate::connector::TrinoError::QueryFailed { error_name, .. })
+                if matches!(error_name.as_str(), "TABLE_NOT_FOUND" | "SCHEMA_NOT_FOUND")
+        )
     }
 
     /// Trino folds identifier case, so this is a dialect constant and needs
@@ -81,6 +152,26 @@ impl WarehouseAdapter for TrinoAdapter {
             columns,
             rows: out.rows,
         })
+    }
+
+    async fn promotion_destination_kind(
+        &self,
+        table: &TableRef,
+    ) -> AdapterResult<Option<ObjectKind>> {
+        let (namespace_sql, kind_sql) = promotion_queries(&self.dialect, table)?;
+        let namespace = self.execute_query(&namespace_sql).await?;
+        if namespace.rows.is_empty() {
+            return Err(AdapterError::msg(
+                "promotion destination namespace does not exist",
+            ));
+        }
+        if namespace.rows.len() != 1 || namespace.rows[0].first().and_then(|v| v.as_str()).is_none()
+        {
+            return Err(AdapterError::msg(
+                "promotion destination namespace response is ambiguous",
+            ));
+        }
+        promotion_kind(&self.execute_query(&kind_sql).await?)
     }
 
     /// Fetch `sql` results as a single Arrow `RecordBatch` via Trino's
@@ -148,11 +239,119 @@ impl WarehouseAdapter for TrinoAdapter {
             .collect();
         Ok(columns)
     }
+
+    async fn list_tables(&self, catalog: &str, schema: &str) -> AdapterResult<Vec<String>> {
+        let sql = list_tables_sql(catalog, schema)?;
+        let result = self.execute_query(&sql).await?;
+        parse_table_names(&result)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn promotion_probe_sql_and_kinds() {
+        let table = TableRef {
+            catalog: "iceberg".into(),
+            schema: "Mixed'Case".into(),
+            table: "Orders'24".into(),
+        };
+        let (namespace, kind) = promotion_queries(&TrinoDialect::new(), &table).unwrap();
+        assert_eq!(
+            namespace,
+            "SELECT schema_name FROM \"iceberg\".information_schema.schemata WHERE lower(schema_name) = lower('Mixed''Case')"
+        );
+        assert_eq!(
+            kind,
+            "SELECT table_type FROM \"iceberg\".information_schema.tables WHERE lower(table_schema) = lower('Mixed''Case') AND lower(table_name) = lower('Orders''24')"
+        );
+        let quoted_catalog = TableRef {
+            catalog: "iceberg\"archive".into(),
+            ..table.clone()
+        };
+        assert!(
+            promotion_queries(&TrinoDialect::new(), &quoted_catalog)
+                .unwrap()
+                .0
+                .contains("\"iceberg\"\"archive\".information_schema.schemata")
+        );
+        let result = |value: &str| QueryResult {
+            columns: vec!["table_type".into()],
+            rows: vec![vec![serde_json::json!(value)]],
+        };
+        assert_eq!(
+            promotion_kind(&result("BASE TABLE")).unwrap(),
+            Some(ObjectKind::Table)
+        );
+        assert_eq!(
+            promotion_kind(&result("VIEW")).unwrap(),
+            Some(ObjectKind::View)
+        );
+        assert_eq!(
+            promotion_kind(&QueryResult {
+                columns: vec![],
+                rows: vec![]
+            })
+            .unwrap(),
+            None
+        );
+        assert!(
+            promotion_kind(&result("OTHER"))
+                .unwrap_err()
+                .to_string()
+                .contains("OTHER")
+        );
+    }
+
+    #[test]
+    fn only_structured_missing_errors_confirm_absence() {
+        let adapter = TrinoAdapter::new(
+            TrinoClientConfig::new("http://localhost:8080"),
+            crate::test_helpers::test_basic_auth(),
+        );
+        for name in ["TABLE_NOT_FOUND", "SCHEMA_NOT_FOUND"] {
+            let error = AdapterError::new(crate::connector::TrinoError::QueryFailed {
+                state: "FAILED".into(),
+                error_code: 1,
+                error_name: name.into(),
+                message: name.into(),
+            });
+            assert!(adapter.is_missing_object_error(&error));
+        }
+        let denied = AdapterError::new(crate::connector::TrinoError::QueryFailed {
+            state: "FAILED".into(),
+            error_code: 1,
+            error_name: "PERMISSION_DENIED".into(),
+            message: "not found".into(),
+        });
+        assert!(!adapter.is_missing_object_error(&denied));
+    }
+
+    #[test]
+    fn list_tables_sql_and_parsing_without_network() {
+        assert_eq!(
+            list_tables_sql("iceberg", "raw'o").unwrap(),
+            "SELECT table_name FROM \"iceberg\".information_schema.tables WHERE table_schema = 'raw''o'"
+        );
+        assert!(list_tables_sql("iceberg;DROP", "raw").is_err());
+        let result = QueryResult {
+            columns: vec!["table_name".into()],
+            rows: vec![
+                vec![serde_json::json!("Orders")],
+                vec![serde_json::json!("items")],
+            ],
+        };
+        assert_eq!(parse_table_names(&result).unwrap(), vec!["Orders", "items"]);
+        assert!(
+            parse_table_names(&QueryResult {
+                columns: vec!["table_name".into()],
+                rows: vec![vec![serde_json::Value::Null]],
+            })
+            .is_err()
+        );
+    }
 
     #[test]
     fn is_not_experimental() {
@@ -248,5 +447,58 @@ mod tests {
         assert_eq!(cols[0].data_type, "bigint");
         assert_eq!(cols[1].name, "name");
         assert_eq!(cols[1].data_type, "varchar");
+    }
+
+    #[tokio::test]
+    async fn list_tables_escapes_schema_literal_and_parses_names() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/statement"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "tables",
+                "columns": [{"name": "table_name", "type": "varchar"}],
+                "data": [["orders"], ["Items"]],
+                "stats": {"state": "FINISHED"}
+            })))
+            .mount(&server)
+            .await;
+        let adapter = TrinoAdapter::new(
+            TrinoClientConfig::new(server.uri()),
+            crate::test_helpers::test_basic_auth(),
+        );
+        let names = adapter.list_tables("iceberg", "raw'o").await.unwrap();
+        assert_eq!(names, vec!["orders", "Items"]);
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            String::from_utf8(requests[0].body.clone()).unwrap(),
+            "SELECT table_name FROM \"iceberg\".information_schema.tables WHERE table_schema = 'raw''o'"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_tables_refuses_malformed_rows() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/statement"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "tables",
+                "columns": [{"name": "table_name", "type": "varchar"}],
+                "data": [[null]],
+                "stats": {"state": "FINISHED"}
+            })))
+            .mount(&server)
+            .await;
+        let adapter = TrinoAdapter::new(
+            TrinoClientConfig::new(server.uri()),
+            crate::test_helpers::test_basic_auth(),
+        );
+        assert!(adapter.list_tables("iceberg", "raw").await.is_err());
     }
 }

@@ -567,12 +567,14 @@ rocky run [flags]
 | `--governance-override <JSON>` | `string` | | Additional governance config as inline JSON or `@file.json`, merged with defaults. |
 | `--models <PATH>` | `PathBuf` | | Models directory for transformation execution. |
 | `--all` | `bool` | `false` | Execute both replication and compiled models. |
-| `--resume <RUN_ID>` | `string` | | Resume a specific previous replication run from its last checkpoint; mints a new `run_id` and records the prior one as `resumed_from`. Rejected with `--dag`, which does not replay the resume into its sub-runs (rejected at parse time). |
-| `--resume-latest` | `bool` | `false` | Resume the most recent failed replication run from its last checkpoint; mints a new `run_id` and records the prior one as `resumed_from`. Rejected with `--dag`, which does not replay the resume into its sub-runs (rejected at parse time). |
-| `--shadow` | `bool` | `false` | Run in shadow mode: write to shadow targets instead of production. |
+| `--resume <RUN_ID>` | `string` | | Resume a specific previous replication run from its last checkpoint; mints a new `run_id` and records the prior one as `resumed_from`. Rejected with `--dag` or `--shadow`. |
+| `--resume-latest` | `bool` | `false` | Resume the most recent failed replication run from its last checkpoint; mints a new `run_id` and records the prior one as `resumed_from`. Rejected with `--dag` or `--shadow`. |
+| `--shadow` | `bool` | `false` | Write to shadow targets, compare them with production, then drop them after any completed verdict. A failed threshold exits non-zero. |
+| `--keep-shadow` | `bool` | `false` | Requires `--shadow` and conflicts with `--watch`. Keep shadow objects for a separate `rocky compare`. |
 | `--shadow-suffix <SUFFIX>` | `string` | `_rocky_shadow` | Requires `--shadow`. Appends a suffix to table names. Conflicts with `--branch`. `--shadow` alone uses `_rocky_shadow`. |
 | `--shadow-schema <NAME>` | `string` | | Requires `--shadow`. Overrides the schema for shadow tables. Conflicts with `--branch`. |
 | `--branch <NAME>` | `string` | | Execute against a named branch previously registered with `rocky branch create`. Applies the branch's `schema_prefix` to every target (internally equivalent to `--shadow --shadow-schema <branch.schema_prefix>`). Conflicts with `--shadow`, `--shadow-schema`, and `--shadow-suffix`. The run records `<NAME>` as `rocky_branch` in [run history](/reference/commands/administration/#rocky-history). |
+
 | `--watch` | `bool` | `false` | Wrap the run in a filesystem watcher: re-execute the pipeline on every change to `rocky.toml` or any file under `models/`, debounced to 200 ms so editor save bursts coalesce into a single re-run. Failed runs do not exit the loop; Ctrl-C exits cleanly between runs. **v0 limitations:** mutually exclusive with `--dag`, `--resume`, `--resume-latest`, `--idempotency-key`, and `--model` (rejected at parse time). |
 | `--defer` | `bool` | `false` | Build only the `--model`-selected models locally, resolving unbuilt upstream models to an existing (production) schema — the dbt-Core-style defer convenience. Takes effect **only together with `--model`**: a full run builds everything, so the flag is inert. Applies to transformation models; mutually exclusive with `--dag`. See the limitation note below. |
 | `--defer-to <SCHEMA>` | `string` | | Schema the deferred upstream models resolve to. Requires `--defer`. Defaults to each unbuilt upstream's own configured target schema (its production home); pass this to point every deferred reference at a single schema instead (catalog + table are preserved). |
@@ -591,12 +593,27 @@ rocky run [flags]
 copied but whose terminal run record is missing. Resuming that checkpoint would
 skip its post-copy checks. Incomplete crash checkpoints remain resumable.
 
-Follow the refusal's recovery route. Confirmed checkpoints and supported recovery
-descriptors allow a fresh run without a resume flag. So do checkpoints from Rocky
-1.75.0 or earlier; if their watermarks were lost, that run can copy rows again,
-as in earlier releases. Other unsupported checkpoints require
-`strategy = "full_refresh"`. Keep that strategy until the saved incremental
-cursor matches the replacement target. See [Interrupted replication](/concepts/incremental/#recovering-an-interrupted-replication)
+Follow the refusal's recovery route. A matching fresh run copies targets from
+a complete checkpoint without a run record, even with unchanged source markers.
+It runs checks and writes a new run record. Rocky then marks the old checkpoint
+superseded, so the next run can prune unchanged targets. A recorded check
+failure also supersedes it.
+
+Matching requires the same target endpoint and a plan containing every target
+in the checkpoint. An old checkpoint alone never fails a fresh run. With
+supported recovery records, Rocky re-derives target watermarks before copying.
+#2235 stays open for remaining recovery gaps.
+
+For checkpoints from Rocky 1.75.0 or earlier, set `strategy = "full_refresh"`
+for affected tables. Run `rocky run --pipeline <name> --no-prune` without a
+resume flag. That replaces their data without duplicate appends. Keep full
+refresh until `rocky state reconcile-watermark --pipeline <name>` sets the
+cursor from the replacement target's maximum timestamp. Use `--dry-run` to
+preview it and repeat `--table catalog.schema.table` to select targets. A crash
+under Rocky 1.75.0 or earlier may leave a stale cursor after an INSERT. The
+first run after upgrading may append those rows again. Repair the cursor before
+that run if the old flush is uncertain. See
+[Interrupted replication](/concepts/incremental/#recovering-an-interrupted-replication)
 for recovery routes, supported adapters and remote durability limits.
 
 ### Guard one model with a contract
@@ -693,12 +710,20 @@ Resume the most recent failed replication run from its last checkpoint:
 rocky run --filter client=acme --resume-latest
 ```
 
-Run in [shadow mode](/reference/glossary/), which writes to `*_rocky_shadow` tables instead of production, so you can compare the results before you promote:
+Run in [shadow mode](/reference/glossary/). Rocky compares each shadow target with production before it drops the shadow object:
 
 ```bash
 rocky run --filter client=acme --shadow
+```
+
+Keep the shadow objects when you need a separate comparison:
+
+```bash
+rocky run --filter client=acme --shadow --keep-shadow
 rocky compare --filter client=acme
 ```
+
+`--keep-shadow` retains objects after a failed verdict too. A write or comparison query error may leave an object whose state Rocky cannot confirm.
 
 ### When a shadow or branch run is refused
 
@@ -823,7 +848,7 @@ rocky branch promote <name> --plan <plan-id> [--pipeline <name>]   # canonical: 
 
 Branch names accept 1–64 `[A-Za-z0-9_]` characters. Rocky refuses other characters at the command entry point and suggests underscores. The default schema prefix is `branch__<name>`. Deleting a branch removes its state-store entry but leaves its warehouse tables.
 
-**Target names have their own limit.** `branch promote` writes each name into a `CREATE OR REPLACE TABLE` statement, quoted the way the warehouse quotes identifiers. Quoting is not escaping, so one character cannot survive it: the warehouse's own identifier quote. Promote refuses a catalog, schema or table name containing it, and names the character.
+**Target names have their own limit.** `branch promote` quotes each name in the strategy's `CREATE OR REPLACE TABLE` or `VIEW` statement. Quoting is not escaping. Promote refuses a name that contains the warehouse's identifier quote and names the character.
 
 | Warehouse | Identifier quote | Also refused |
 |---|---|---|
@@ -871,7 +896,11 @@ Writes a content-addressed approval artifact that binds the approver's git ident
 | `--pipeline <name>` | `string` | (none) | Which pipeline to promote, in a multi-pipeline project. Optional when the project defines a single pipeline, or when `--plan` names a promote plan that already recorded one — omit it to use the plan's pipeline. A value that disagrees with the plan's recorded pipeline is refused. |
 | `--filter <key=value>` | `string` | (none) | Filter the promote targets. Replication pipelines filter sources by schema-pattern component (e.g. `--filter client=acme`); transformation pipelines filter models by `table`, `model`, `catalog`, or `schema`. |
 
-`rocky branch promote` enumerates the pipeline's production targets and promotes each one. A replication pipeline finds the source connector's tables through the schema-pattern templates. A transformation pipeline walks the configured `models` glob and promotes one target per model, skipping ephemeral models. Rocky then runs the optional `[branch.approval]` gate, followed by the semantic breaking-change gate against `--base-ref`. For each target it dispatches `CREATE OR REPLACE TABLE prod.<x> AS SELECT * FROM branch__<name>.<x>`. Quality and snapshot pipelines are not supported and return a clear error.
+`rocky branch promote` enumerates the pipeline's production targets. A replication pipeline finds the source connector's tables through the schema-pattern templates. A transformation pipeline walks the configured `models` glob. Rocky runs the optional `[branch.approval]` gate and the semantic breaking-change gate against `--base-ref`.
+
+Rocky promotes `full_refresh` tables by copying their branch results. It creates production views from the model SQL with production upstreams. It refuses all other strategies because their promotion is undefined. Replication promotion supports `full_refresh` only. Quality and snapshot pipelines are unsupported.
+
+Before the first replacement, Rocky checks every branch source and production destination. It verifies that each destination schema exists. It also checks the kind of each existing destination object. These checks work on DuckDB, Databricks, Snowflake, BigQuery, and Trino. If a later write fails, Rocky does not roll back earlier replacements. Text and JSON output identify replaced, failed, and unattempted targets. The command exits non-zero.
 
 The breaking-change gate vetoes the promote and exits non-zero when any finding has `severity == "breaking"`, unless you pass `--allow-breaking`. Rocky records every gate decision in the audit trail: a block, an allow via override, and a fail-open when the gate could not run. To surface the same findings on every pull request without blocking, use [`rocky ci-diff --semantic`](/reference/commands/modeling/#rocky-ci-diff).
 
@@ -927,7 +956,7 @@ rocky branch compare fix_price --pipeline shopify_us   # multi-pipeline project
 
 Internally this is `rocky compare` pointed at the branch's `schema_prefix` via `ShadowConfig.schema_override`, the same mechanism `rocky run --branch` uses for writes, so compare always hits exactly the tables the branch produced. Accepts the shared [`--filter`](/reference/filters/) flag, and `--pipeline <name>` to select the pipeline in a multi-pipeline project.
 
-When Rocky cannot read a table or its schema on either side, that table reports `verdict: "error"` with the reason in `reasons`. Its unreadable row count is `null`, never `0`. An `error` row counts as failed, so the command exits non-zero. See [`rocky compare`](/reference/cli/#rocky-compare).
+When Rocky confirms that production has no target, it reports `verdict: "no_baseline"`. That target does not fail the run. An uncertain metadata read reports `verdict: "error"` and fails the command. Its unreadable row count is `null`, never `0`. See [`rocky compare`](/reference/cli/#rocky-compare).
 
 ### Related Commands
 

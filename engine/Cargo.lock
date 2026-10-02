@@ -4048,6 +4048,7 @@ dependencies = [
  "flate2",
  "fs4",
  "futures",
+ "glob",
  "hostname",
  "include_dir",
  "indexmap",
@@ -4384,6 +4385,7 @@ dependencies = [
  "tokio",
  "toml",
  "tracing",
+ "uuid",
 ]
 
 [[package]]

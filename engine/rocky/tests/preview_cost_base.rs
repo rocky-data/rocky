@@ -125,6 +125,19 @@ fn rocky(root: &Path, state: &Path, args: &[&str]) -> serde_json::Value {
     serde_json::from_slice(&output.stdout).expect("JSON output")
 }
 
+fn rocky_failed(root: &Path, state: &Path, args: &[&str]) -> serde_json::Value {
+    let output = Command::new(env!("CARGO_BIN_EXE_rocky"))
+        .current_dir(root)
+        .args(["--state-path", state.to_str().unwrap()])
+        .args(args)
+        .output()
+        .expect("spawn rocky");
+    assert_eq!(output.status.code(), Some(2), "{args:?}");
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("run JSON");
+    assert_eq!(json["shadow_comparison"]["tables_failed"], 1);
+    json
+}
+
 #[test]
 fn real_runs_keep_shadow_and_branch_out_of_diff_and_cost_bases() {
     let dir = tempfile::tempdir().unwrap();
@@ -188,13 +201,15 @@ fn real_runs_keep_shadow_and_branch_out_of_diff_and_cost_bases() {
     let production_id = StateStore::open(&state).unwrap().list_runs(1).unwrap()[0]
         .run_id
         .clone();
-    std::fs::write(&model, "SELECT unnest([1, 2]) AS id").unwrap();
-    rocky(
+    // These shadow runs diverge and exit non-zero. Their recorded scope must
+    // still keep them out of preview base selection.
+    std::fs::write(&model, "SELECT unnest([1, 2, 3]) AS id").unwrap();
+    rocky_failed(
         root,
         &state,
         &["run", "--pipeline", "probe", "--shadow", "--output", "json"],
     );
-    rocky(
+    rocky_failed(
         root,
         &state,
         &[
@@ -213,7 +228,6 @@ fn real_runs_keep_shadow_and_branch_out_of_diff_and_cost_bases() {
         &state,
         &["branch", "create", "preview", "--output", "json"],
     );
-    std::fs::write(&model, "SELECT unnest([1, 2, 3]) AS id").unwrap();
     rocky(
         root,
         &state,

@@ -705,25 +705,90 @@
       ]
     },
     "PromoteTargetPlan": {
-      "description": "Per-model promote step captured in a [`PromotePlan`].\n\nMirrors the shape of [`PromoteTarget`] but contains only plan-time fields (`target`, `source`, `statement`). Execution outcome (`succeeded`, `error`) is added at apply time and lives on [`PromoteTarget`].\n\n`statement` is persisted verbatim so `rocky apply` executes the **exact** SQL generated at plan time — skipping re-discovery and ensuring the `plan_id` digest is invalidated if the SQL would differ.",
+      "description": "Per-model promote step captured in a [`PromotePlan`].\n\nMirrors the shape of [`PromoteTarget`] but contains only plan-time fields (`target`, `source`, structured coordinates, `strategy`, `statement`). Execution outcome (`succeeded`, `error`) is added at apply time and lives on [`PromoteTarget`].\n\n`statement` is persisted verbatim so `rocky apply` executes the **exact** SQL generated at plan time — skipping re-discovery and ensuring the `plan_id` digest is invalidated if the SQL would differ.",
       "properties": {
+        "pre_drop_statement": {
+          "description": "Optional dialect-required DROP issued before `statement`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "production_upstreams": {
+          "description": "Production objects read by this view that this plan does not replace.",
+          "items": {
+            "$ref": "#/definitions/PromoteUpstream"
+          },
+          "type": "array"
+        },
         "source": {
           "description": "Fully-qualified branch source the promote will read from (catalog.branch_schema.table).",
           "type": "string"
         },
+        "source_catalog": {
+          "type": "string"
+        },
+        "source_schema": {
+          "type": "string"
+        },
+        "source_table": {
+          "type": "string"
+        },
         "statement": {
-          "description": "`CREATE OR REPLACE TABLE <target> AS SELECT * FROM <source>` SQL, dialect-quoted at plan time.",
+          "description": "Dialect-quoted replacement SQL, generated at plan time.",
+          "type": "string"
+        },
+        "strategy": {
+          "description": "The strategy approved at plan time. Only full_refresh and view apply.",
           "type": "string"
         },
         "target": {
           "description": "Fully-qualified production target (catalog.schema.table).",
           "type": "string"
+        },
+        "target_catalog": {
+          "description": "Structured destination coordinates. Display names may contain dots.",
+          "type": "string"
+        },
+        "target_schema": {
+          "type": "string"
+        },
+        "target_table": {
+          "type": "string"
         }
       },
       "required": [
+        "production_upstreams",
         "source",
+        "source_catalog",
+        "source_schema",
+        "source_table",
         "statement",
-        "target"
+        "strategy",
+        "target",
+        "target_catalog",
+        "target_schema",
+        "target_table"
+      ],
+      "type": "object"
+    },
+    "PromoteUpstream": {
+      "description": "Production object read by a promoted view.",
+      "properties": {
+        "catalog": {
+          "type": "string"
+        },
+        "schema": {
+          "type": "string"
+        },
+        "table": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "catalog",
+        "schema",
+        "table"
       ],
       "type": "object"
     },

@@ -71,7 +71,7 @@ The `.toml` file names the model, lists what it depends on, picks a materializat
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `type` | string | `"full_refresh"` | Materialization type. One of `"full_refresh"`, `"merge"`, `"time_interval"`, `"view"`, `"materialized_view"`, `"dynamic_table"`, `"delete_insert"`, `"microbatch"`, `"content_addressed"`. Two are refused: `"incremental"` on a transformation model (`E037`, see [Incremental](#incremental)), and `"ephemeral"` outright (`E038`, see [Ephemeral](#ephemeral)). |
-| `timestamp_column` | string | | Column used as the incremental watermark. Required when `type = "microbatch"`. |
+| `timestamp_column` | string | | Replication watermark column. Required for transformation `microbatch`; it names the output partition column. |
 | `unique_key` | list of strings | | Key columns for merge matching. Required when `type = "merge"`. |
 | `update_columns` | list of strings | | Columns to update on merge match. Defaults to all non-key columns if omitted. |
 | `partition_by` | list of strings | | Column(s) identifying the partition to delete. Required when `type = "delete_insert"`. |
@@ -753,6 +753,17 @@ table = "fct_daily_activity"
 ### Microbatch
 
 An alias for `time_interval` that defaults to `hour` granularity. The name matches dbt's for partition-based incremental processing.
+
+The model SQL must use both `@start_date` and `@end_date` to bound each partition. Missing either is a compile error (`E024`). Each run replaces its selected partitions instead of appending the full result again.
+
+**SQL** (`models/fct_hourly_events.sql`):
+
+```sql
+SELECT event_at, event_type
+FROM raw_catalog.events.page_views
+WHERE event_at >= @start_date
+  AND event_at < @end_date
+```
 
 **Config** (`models/fct_hourly_events.toml`):
 

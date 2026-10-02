@@ -5230,6 +5230,12 @@
             "minimum": 0.0,
             "type": "integer"
           },
+          "tables_no_baseline": {
+            "description": "Targets with no confirmed production object. These do not fail the run.",
+            "format": "uint",
+            "minimum": 0.0,
+            "type": "integer"
+          },
           "tables_passed": {
             "format": "uint",
             "minimum": 0.0,
@@ -5251,6 +5257,7 @@
           "results",
           "tables_compared",
           "tables_failed",
+          "tables_no_baseline",
           "tables_passed",
           "tables_warned",
           "version"
@@ -5460,6 +5467,30 @@
           }
         ],
         "description": "Concurrency strategy: the literal `\"adaptive\"` for AIMD-based throttling, or a positive integer for fixed concurrency."
+      },
+      "ConditionalDrop": {
+        "description": "A DROP permitted when a model switches between a table and a view.",
+        "properties": {
+          "drop_sql": {
+            "type": "string"
+          },
+          "existing_kind": {
+            "type": "string"
+          },
+          "model": {
+            "type": "string"
+          },
+          "target": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "drop_sql",
+          "existing_kind",
+          "model",
+          "target"
+        ],
+        "type": "object"
       },
       "ConfigStatus": {
         "description": "What happened when `rocky.toml` was read at server start.",
@@ -15620,25 +15651,90 @@
         "type": "object"
       },
       "PromoteTargetPlan": {
-        "description": "Per-model promote step captured in a [`PromotePlan`].\n\nMirrors the shape of [`PromoteTarget`] but contains only plan-time fields (`target`, `source`, `statement`). Execution outcome (`succeeded`, `error`) is added at apply time and lives on [`PromoteTarget`].\n\n`statement` is persisted verbatim so `rocky apply` executes the **exact** SQL generated at plan time — skipping re-discovery and ensuring the `plan_id` digest is invalidated if the SQL would differ.",
+        "description": "Per-model promote step captured in a [`PromotePlan`].\n\nMirrors the shape of [`PromoteTarget`] but contains only plan-time fields (`target`, `source`, structured coordinates, `strategy`, `statement`). Execution outcome (`succeeded`, `error`) is added at apply time and lives on [`PromoteTarget`].\n\n`statement` is persisted verbatim so `rocky apply` executes the **exact** SQL generated at plan time — skipping re-discovery and ensuring the `plan_id` digest is invalidated if the SQL would differ.",
         "properties": {
+          "pre_drop_statement": {
+            "description": "Optional dialect-required DROP issued before `statement`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "production_upstreams": {
+            "description": "Production objects read by this view that this plan does not replace.",
+            "items": {
+              "$ref": "#/components/schemas/PromoteUpstream"
+            },
+            "type": "array"
+          },
           "source": {
             "description": "Fully-qualified branch source the promote will read from (catalog.branch_schema.table).",
             "type": "string"
           },
+          "source_catalog": {
+            "type": "string"
+          },
+          "source_schema": {
+            "type": "string"
+          },
+          "source_table": {
+            "type": "string"
+          },
           "statement": {
-            "description": "`CREATE OR REPLACE TABLE <target> AS SELECT * FROM <source>` SQL, dialect-quoted at plan time.",
+            "description": "Dialect-quoted replacement SQL, generated at plan time.",
+            "type": "string"
+          },
+          "strategy": {
+            "description": "The strategy approved at plan time. Only full_refresh and view apply.",
             "type": "string"
           },
           "target": {
             "description": "Fully-qualified production target (catalog.schema.table).",
             "type": "string"
+          },
+          "target_catalog": {
+            "description": "Structured destination coordinates. Display names may contain dots.",
+            "type": "string"
+          },
+          "target_schema": {
+            "type": "string"
+          },
+          "target_table": {
+            "type": "string"
           }
         },
         "required": [
+          "production_upstreams",
           "source",
+          "source_catalog",
+          "source_schema",
+          "source_table",
           "statement",
-          "target"
+          "strategy",
+          "target",
+          "target_catalog",
+          "target_schema",
+          "target_table"
+        ],
+        "type": "object"
+      },
+      "PromoteUpstream": {
+        "description": "Production object read by a promoted view.",
+        "properties": {
+          "catalog": {
+            "type": "string"
+          },
+          "schema": {
+            "type": "string"
+          },
+          "table": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "catalog",
+          "schema",
+          "table"
         ],
         "type": "object"
       },
@@ -16325,6 +16421,70 @@
             ]
           }
         },
+        "type": "object"
+      },
+      "ReconcileWatermarkOutput": {
+        "description": "Result of repairing incremental cursors from physical target tables.",
+        "properties": {
+          "command": {
+            "type": "string"
+          },
+          "dry_run": {
+            "type": "boolean"
+          },
+          "pipeline": {
+            "type": "string"
+          },
+          "version": {
+            "type": "string"
+          },
+          "watermarks": {
+            "items": {
+              "$ref": "#/components/schemas/ReconciledWatermark"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "command",
+          "dry_run",
+          "pipeline",
+          "version",
+          "watermarks"
+        ],
+        "type": "object"
+      },
+      "ReconciledWatermark": {
+        "properties": {
+          "previous": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "table": {
+            "type": "string"
+          },
+          "target_max": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "watermark": {
+            "description": "`null` means the empty target's cursor was cleared.",
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "table"
+        ],
         "type": "object"
       },
       "RedactedString": {
@@ -17499,6 +17659,13 @@
           "command": {
             "type": "string"
           },
+          "conditional_drops": {
+            "description": "Conditional kind-switch DROPs at their effective execution targets.",
+            "items": {
+              "$ref": "#/components/schemas/ConditionalDrop"
+            },
+            "type": "array"
+          },
           "marker_written": {
             "description": "True when the approval marker is now present on disk as a result of this invocation. Mirrors `approved` today; kept distinct so callers reading the JSON do not have to infer marker state from the flag.",
             "type": "boolean"
@@ -17522,6 +17689,7 @@
           "approved",
           "base_ref",
           "command",
+          "conditional_drops",
           "marker_written",
           "plan_id",
           "version"
@@ -18701,6 +18869,17 @@
           "shadow": {
             "description": "True when running in shadow mode (targets rewritten).",
             "type": "boolean"
+          },
+          "shadow_comparison": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/CompareOutput"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Comparison of this run's shadow objects with production, before cleanup."
           },
           "skipped_by_run_id": {
             "description": "Prior run whose idempotency key deflected this call, or the run currently holding the in-flight claim. Populated only when `status` is `skipped_idempotent` or `skipped_in_flight`.",

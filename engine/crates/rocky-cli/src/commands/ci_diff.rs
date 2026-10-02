@@ -781,7 +781,16 @@ pub fn extract_base_compile(
     models_dir: &Path,
     source_schemas: HashMap<String, Vec<rocky_compiler::types::TypedColumn>>,
 ) -> Result<rocky_compiler::compile::CompileResult, String> {
-    extract_base_compile_in(base_ref, models_dir, source_schemas, None)
+    extract_base_compile_matching(base_ref, models_dir, source_schemas, None)
+}
+
+pub fn extract_base_compile_matching(
+    base_ref: &str,
+    models_dir: &Path,
+    source_schemas: HashMap<String, Vec<rocky_compiler::types::TypedColumn>>,
+    models_glob: Option<&str>,
+) -> Result<rocky_compiler::compile::CompileResult, String> {
+    extract_base_compile_in(base_ref, models_dir, source_schemas, models_glob, None)
 }
 
 /// [`extract_base_compile`], with the git invocations optionally rooted at an
@@ -790,6 +799,7 @@ fn extract_base_compile_in(
     base_ref: &str,
     models_dir: &Path,
     source_schemas: HashMap<String, Vec<rocky_compiler::types::TypedColumn>>,
+    models_glob: Option<&str>,
     repo_dir: Option<&Path>,
 ) -> Result<rocky_compiler::compile::CompileResult, String> {
     let models_rel = match find_models_relative_path(models_dir, repo_dir) {
@@ -856,7 +866,19 @@ fn extract_base_compile_in(
         ..Default::default()
     };
 
-    compile::compile(&config).map_err(|e| format!("base ref '{base_ref}' did not compile: {e}"))
+    let base_glob = models_glob
+        .map(|glob| {
+            let relative = Path::new(glob)
+                .strip_prefix(models_dir)
+                .map_err(|_| format!("models glob '{glob}' is outside {}", models_dir.display()))?;
+            Ok::<_, String>(tmp.path().join(relative).to_string_lossy().into_owned())
+        })
+        .transpose()?;
+    match base_glob.as_deref() {
+        Some(glob) => compile::compile_matching(&config, glob),
+        None => compile::compile(&config),
+    }
+    .map_err(|e| format!("base ref '{base_ref}' did not compile: {e}"))
 }
 
 /// Find the models directory path relative to the git repo root.
@@ -1176,7 +1198,7 @@ fn compute_ci_diff_in(
         .unwrap_or_default();
 
     let base_compile = if models_dir.is_dir() {
-        extract_base_compile_in(base_ref, models_dir, source_schemas, repo_dir).ok()
+        extract_base_compile_in(base_ref, models_dir, source_schemas, None, repo_dir).ok()
     } else {
         None
     };
@@ -1391,6 +1413,25 @@ fn print_semantic_findings(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn base_review_compile_uses_execution_glob() -> anyhow::Result<()> {
+        let models =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/window-functions/models");
+        let glob = models.join("running_totals_sql.sql");
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let base = extract_base_compile_in(
+            "HEAD",
+            &models,
+            HashMap::new(),
+            Some(&glob.to_string_lossy()),
+            Some(&repo_root),
+        )
+        .map_err(anyhow::Error::msg)?;
+        assert_eq!(base.project.models.len(), 1);
+        assert_eq!(base.project.models[0].config.name, "running_totals_sql");
+        Ok(())
+    }
 
     fn changed(path: &str, status: char) -> ChangedFile {
         ChangedFile {

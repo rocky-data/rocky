@@ -1945,6 +1945,28 @@ impl StateStore {
         Ok(entries.len())
     }
 
+    /// Reconcile a set of target maxima atomically. `None` removes a stale
+    /// cursor so the next incremental run replaces the empty target.
+    pub fn batch_reconcile_watermarks(
+        &self,
+        updates: &[(String, Option<WatermarkState>)],
+    ) -> Result<(), StateError> {
+        let txn = self.db.begin_write()?;
+        {
+            let mut table = txn.open_table(WATERMARKS)?;
+            for (key, watermark) in updates {
+                if let Some(watermark) = watermark {
+                    let bytes = serde_json::to_vec(watermark)?;
+                    table.insert(key.as_str(), bytes.as_slice())?;
+                } else {
+                    table.remove(key.as_str())?;
+                }
+            }
+        }
+        self.commit_write(txn)?;
+        Ok(())
+    }
+
     /// Commit watermarks and the runs they fully account for atomically.
     ///
     /// The caller must reconcile every recovery table before naming a run:
@@ -3335,6 +3357,29 @@ pub struct WatermarkRecoveryTable {
     pub prior_watermark: Option<chrono::DateTime<chrono::Utc>>,
 }
 
+/// A Snowflake session default cannot move a fully qualified recovery target.
+/// Keep the default in strict resume identity and for targets without a catalog.
+fn recovery_endpoint_matches(
+    recorded: &crate::config::EndpointIdentity,
+    current: &crate::config::EndpointIdentity,
+    explicit_catalogs: bool,
+) -> bool {
+    if recorded == current {
+        return true;
+    }
+    if !explicit_catalogs
+        || recorded.adapter_type != "snowflake"
+        || current.adapter_type != "snowflake"
+    {
+        return false;
+    }
+    let mut old = recorded.locators.clone();
+    let mut new = current.locators.clone();
+    old.remove("database");
+    new.remove("database");
+    old == new
+}
+
 fn watermarks_unconfirmed(confirmed: &bool) -> bool {
     !confirmed
 }
@@ -3369,6 +3414,14 @@ pub struct RunProgress {
     /// an explicitly recorded plan with no incremental recovery tables.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub watermark_recovery_tables: Option<Vec<WatermarkRecoveryTable>>,
+    /// A later matching run completed checks and wrote its terminal record.
+    /// Older checkpoints default to needing one fresh checked run.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub superseded: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 // ---------------------------------------------------------------------------
@@ -3988,6 +4041,7 @@ impl StateStore {
             planned_tables: Some(planned_tables.to_vec()),
             watermarks_confirmed: false,
             watermark_recovery_tables: recovery_tables.map(<[_]>::to_vec),
+            superseded: false,
         };
         let bytes = serde_json::to_vec(&progress)?;
         let txn = self.db.begin_write()?;
@@ -4072,6 +4126,66 @@ impl StateStore {
             progress.tables = entries;
         }
         Ok(Some(progress))
+    }
+
+    /// Physical targets recorded for a named pipeline. A resumed run records
+    /// only the tables it still has to copy, so collect all its checkpoints.
+    pub fn recorded_pipeline_targets(
+        &self,
+        pipeline: &str,
+        endpoint: &crate::config::EndpointIdentity,
+    ) -> Result<Vec<String>, StateError> {
+        let txn = self.db.begin_read()?;
+        let headers = txn.open_table(RUN_PROGRESS)?;
+        let entries = txn.open_table(RUN_PROGRESS_ENTRIES)?;
+        let mut targets = std::collections::BTreeSet::new();
+        for row in headers.iter()? {
+            let (_, value) = row?;
+            let progress: RunProgress = serde_json::from_slice(value.value())?;
+            if progress
+                .scope
+                .as_ref()
+                .is_none_or(|scope| scope.pipeline != pipeline)
+            {
+                continue;
+            }
+            let Some(recorded_target) = progress.scope.as_ref().and_then(|s| s.target.as_ref())
+            else {
+                continue;
+            };
+            if recorded_target.shadow.is_some() {
+                continue;
+            }
+            if let Some(plan) = progress.planned_tables {
+                targets.extend(plan.into_iter().filter(|key| {
+                    recovery_endpoint_matches(
+                        &recorded_target.endpoint,
+                        endpoint,
+                        !key.starts_with('.'),
+                    )
+                }));
+            } else {
+                let recorded_entries = Self::read_progress_entries(&entries, &progress.run_id)?;
+                let recorded_entries = if recorded_entries.is_empty() {
+                    progress.tables
+                } else {
+                    recorded_entries
+                };
+                targets.extend(
+                    recorded_entries
+                        .into_iter()
+                        .map(|entry| entry.table_key)
+                        .filter(|key| {
+                            recovery_endpoint_matches(
+                                &recorded_target.endpoint,
+                                endpoint,
+                                !key.starts_with('.'),
+                            )
+                        }),
+                );
+            }
+        }
+        Ok(targets.into_iter().collect())
     }
 
     /// Get the most recent run progress (for `--resume-latest`).
@@ -4161,12 +4275,9 @@ impl StateStore {
     /// refuse incompatible recovery before copy.
     ///
     /// A run recorded under another pipeline name is returned when it used
-    /// the same target endpoint and every one of its recovery targets is in
-    /// `targets` (full `catalog.schema.table` names), so renaming a pipeline
-    /// cannot hide a committed INSERT. Requiring every target keeps the
-    /// caller from reconciling tables this run does not plan; the caller
-    /// checks a recorded contract when its target is incremental or a
-    /// replacement now.
+    /// the same target endpoint and every recovery target occurs in this plan.
+    /// The caller uses the saved descriptors to reconcile those targets before
+    /// another copy.
     ///
     /// Headers without recovery descriptors (written before descriptors
     /// existed) are never returned: they carry no source or timestamp
@@ -4190,7 +4301,12 @@ impl StateStore {
                 continue;
             };
             let same_endpoint = match (&recorded.target, &scope.target) {
-                (Some(recorded), Some(current)) => Some(recorded.endpoint == current.endpoint),
+                (Some(recorded), Some(current)) => Some(recovery_endpoint_matches(
+                    &recorded.endpoint,
+                    &current.endpoint,
+                    !tables.is_empty()
+                        && tables.iter().all(|table| !table.target.catalog.is_empty()),
+                )),
                 _ => None,
             };
             let relevant = if recorded.pipeline == scope.pipeline {
@@ -4219,6 +4335,150 @@ impl StateStore {
         });
         Ok(result)
     }
+
+    /// Selected targets of complete checkpoints without a terminal record.
+    /// Same-pipeline overlap must bypass unchanged-source pruning even when
+    /// this run selects only part of the old plan. Other pipelines require
+    /// the full physical plan to match.
+    pub fn complete_recordless_check_targets(
+        &self,
+        scope: &ResumeScope,
+        targets: &std::collections::HashSet<String>,
+    ) -> Result<std::collections::HashSet<String>, StateError> {
+        Ok(self
+            .matching_complete_recordless_checkpoints(scope, targets, false)?
+            .into_iter()
+            .flat_map(|(_, planned)| planned)
+            .filter(|target| targets.contains(target))
+            .collect())
+    }
+
+    /// Retire only the complete record-less checkpoints covered by targets
+    /// whose check phase finished in a later recorded run. A missing RunRecord
+    /// leaves the checkpoint active, including after a failed record write.
+    pub fn supersede_complete_recordless_checkpoints(
+        &self,
+        run_id: &str,
+        scope: &ResumeScope,
+        checked_targets: &std::collections::HashSet<String>,
+    ) -> Result<(), StateError> {
+        let matches =
+            self.matching_complete_recordless_checkpoints(scope, checked_targets, true)?;
+        if matches.is_empty() {
+            return Ok(());
+        }
+        let txn = self.db.begin_write()?;
+        {
+            let runs = txn.open_table(RUN_HISTORY)?;
+            if runs.get(run_id)?.is_none() {
+                return Err(StateError::MissingRunProgress {
+                    run_id: run_id.to_string(),
+                });
+            }
+            let mut headers = txn.open_table(RUN_PROGRESS)?;
+            for (orphan_id, _) in matches {
+                let mut progress: RunProgress = {
+                    let Some(value) = headers.get(orphan_id.as_str())? else {
+                        continue;
+                    };
+                    serde_json::from_slice(value.value())?
+                };
+                if progress.superseded || runs.get(orphan_id.as_str())?.is_some() {
+                    continue;
+                }
+                progress.superseded = true;
+                let bytes = serde_json::to_vec(&progress)?;
+                headers.insert(orphan_id.as_str(), bytes.as_slice())?;
+            }
+        }
+        self.commit_write(txn)?;
+        Ok(())
+    }
+
+    fn matching_complete_recordless_checkpoints(
+        &self,
+        scope: &ResumeScope,
+        targets: &std::collections::HashSet<String>,
+        require_full_plan: bool,
+    ) -> Result<Vec<(String, Vec<String>)>, StateError> {
+        let txn = self.db.begin_read()?;
+        let headers = txn.open_table(RUN_PROGRESS)?;
+        let entries = txn.open_table(RUN_PROGRESS_ENTRIES)?;
+        let runs = txn.open_table(RUN_HISTORY)?;
+        let mut matches = Vec::new();
+        for row in headers.iter()? {
+            let (_, value) = row?;
+            let progress: RunProgress = serde_json::from_slice(value.value())?;
+            if progress.total_tables == 0
+                || progress.superseded
+                || runs.get(progress.run_id.as_str())?.is_some()
+            {
+                continue;
+            }
+            let Some(recorded_scope) = progress.scope.as_ref() else {
+                continue;
+            };
+            let (Some(recorded_target), Some(current_target)) =
+                (&recorded_scope.target, &scope.target)
+            else {
+                continue;
+            };
+            let table_entries = Self::read_progress_entries(&entries, &progress.run_id)?;
+            let completed = if table_entries.is_empty() {
+                &progress.tables
+            } else {
+                &table_entries
+            };
+            let successful: std::collections::HashSet<&str> = completed
+                .iter()
+                .filter(|entry| entry.status == TableStatus::Success)
+                .map(|entry| entry.table_key.as_str())
+                .collect();
+            let planned: Vec<&str> = progress.planned_tables.as_ref().map_or_else(
+                || {
+                    completed
+                        .iter()
+                        .map(|entry| entry.table_key.as_str())
+                        .collect()
+                },
+                |keys| keys.iter().map(String::as_str).collect(),
+            );
+            let complete = if progress.planned_tables.is_some() {
+                planned.iter().all(|key| successful.contains(key))
+            } else {
+                successful.len() >= progress.total_tables
+            };
+            let covered = if require_full_plan || recorded_scope.pipeline != scope.pipeline {
+                planned.iter().all(|key| targets.contains(*key))
+            } else {
+                planned.iter().any(|key| targets.contains(*key))
+            };
+            if !complete || !covered {
+                continue;
+            }
+            let explicit = progress
+                .watermark_recovery_tables
+                .as_ref()
+                .filter(|descriptors| !descriptors.is_empty())
+                .is_some_and(|descriptors| {
+                    descriptors
+                        .iter()
+                        .all(|table| !table.target.catalog.is_empty())
+                });
+            if !recovery_endpoint_matches(
+                &recorded_target.endpoint,
+                &current_target.endpoint,
+                explicit,
+            ) {
+                continue;
+            }
+            matches.push((
+                progress.run_id,
+                planned.into_iter().map(str::to_string).collect(),
+            ));
+        }
+        Ok(matches)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -4235,7 +4495,8 @@ impl StateStore {
     /// `branches`, `idempotency_keys`, `grace_periods`, `check_history`)
     /// are never touched: they hold live state, not history.
     ///
-    /// A swept run record takes its checkpoint with it: the `run_progress`
+    /// A swept run record takes its checkpoint with it unless that checkpoint
+    /// still needs watermark recovery. The `run_progress`
     /// header and the `run_progress_entries` rows keyed by that run id are
     /// removed in the same write transaction as the record, so a resume can
     /// never find a checkpoint whose record retention already dropped. A
@@ -10592,8 +10853,7 @@ mod tests {
         let mut renamed_unknown = unknown_target.clone();
         renamed_unknown.pipeline = "p2".into();
         init("renamed-unknown-target", &renamed_unknown);
-        // Another pipeline's run counts only when this run plans every target
-        // it recorded, so each recorded contract meets a current one.
+        // A renamed pipeline needs every recorded target in the current plan.
         let mut other_table = recovery_table(Some(Utc::now()));
         other_table.target.table = "other".into();
         store
@@ -10647,7 +10907,7 @@ mod tests {
         assert_eq!(
             list(&["wh.raw.other"]),
             same_pipeline.iter().map(ToString::to_string).collect(),
-            "another pipeline's intent is read only when every recorded target is planned"
+            "a partial target overlap cannot reconcile another pipeline's intent"
         );
 
         let recovered = store
@@ -10663,6 +10923,67 @@ mod tests {
                 .unwrap()
                 .run_id,
             "changed"
+        );
+    }
+
+    #[test]
+    fn recovery_finds_explicit_snowflake_target_after_default_database_changes() {
+        let (store, _dir) = temp_store();
+        let mut old = progress_scope("old_pipeline");
+        let endpoint = &mut old.target.as_mut().unwrap().endpoint;
+        endpoint.adapter_type = "snowflake".into();
+        endpoint.locators = [
+            ("account".into(), "acct".into()),
+            ("database".into(), "OLD_DEFAULT".into()),
+        ]
+        .into_iter()
+        .collect();
+        let mut current = old.clone();
+        current.pipeline = "new_pipeline".into();
+        current
+            .target
+            .as_mut()
+            .unwrap()
+            .endpoint
+            .locators
+            .insert("database".into(), "NEW_DEFAULT".into());
+        let mut descriptor = recovery_table(Some(Utc::now()));
+        descriptor.target.catalog = "EXPLICIT_DB".into();
+        store
+            .init_run_progress_with_recovery(
+                "unconfirmed",
+                &[descriptor.target.full_name()],
+                Some(&old),
+                std::slice::from_ref(&descriptor),
+            )
+            .unwrap();
+        let targets = [descriptor.target.full_name()].into_iter().collect();
+        let found = store
+            .list_unconfirmed_run_progress_for_recovery_scope(&current, &targets)
+            .unwrap();
+        assert_eq!(found.len(), 1, "the explicit target is on the same account");
+        assert_eq!(found[0].run_id, "unconfirmed");
+
+        let mut implicit = descriptor;
+        implicit.target.catalog.clear();
+        let implicit_name = implicit.target.full_name();
+        store
+            .init_run_progress_with_recovery(
+                "implicit",
+                std::slice::from_ref(&implicit_name),
+                Some(&old),
+                &[implicit],
+            )
+            .unwrap();
+        let mut all_targets = targets;
+        all_targets.insert(implicit_name);
+        let found = store
+            .list_unconfirmed_run_progress_for_recovery_scope(&current, &all_targets)
+            .unwrap();
+        assert_eq!(
+            found.len(),
+            1,
+            "a session-default target must stay excluded"
         );
     }
 
@@ -10683,6 +11004,13 @@ mod tests {
         }
         store.commit_write(txn).unwrap();
         let targets = ["wh.raw.orders".to_string()].into_iter().collect();
+        assert_eq!(
+            store
+                .recorded_pipeline_targets("p1", &scope.target.as_ref().unwrap().endpoint)
+                .unwrap(),
+            vec!["wh.raw.orders"],
+            "cursor repair must find a legacy inline target"
+        );
         assert!(
             store
                 .list_unconfirmed_run_progress_for_recovery_scope(&scope, &targets)
@@ -10703,6 +11031,128 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn version_175_checkpoint_remains_visible_until_superseded() {
+        let (store, _dir) = temp_store();
+        let scope = progress_scope("p");
+        let key = "wh.raw.orders";
+        let stale = wm_at(1_700_000_000);
+        store.set_watermark(key, &stale).unwrap();
+        let header = serde_json::json!({
+            "run_id": "v175", "started_at": "2026-09-30T00:00:00Z",
+            "total_tables": 1, "tables": [], "scope": scope,
+            "planned_tables": [key]
+        });
+        let entry = serde_json::to_value(progress_entry(0, key, TableStatus::Success)).unwrap();
+        let header_bytes = serde_json::to_vec(&header).unwrap();
+        let entry_bytes = serde_json::to_vec(&entry).unwrap();
+        let txn = store.db.begin_write().unwrap();
+        {
+            let mut headers = txn.open_table(RUN_PROGRESS).unwrap();
+            headers.insert("v175", header_bytes.as_slice()).unwrap();
+            let mut entries = txn.open_table(RUN_PROGRESS_ENTRIES).unwrap();
+            entries
+                .insert(
+                    run_progress_entry_key("v175", key).as_str(),
+                    entry_bytes.as_slice(),
+                )
+                .unwrap();
+        }
+        store.commit_write(txn).unwrap();
+        let targets = [key.to_string()].into_iter().collect();
+        assert!(
+            store
+                .list_unconfirmed_run_progress_for_recovery_scope(&scope, &targets)
+                .unwrap()
+                .is_empty(),
+            "descriptor-less release checkpoints must not force upgraded runs to refuse"
+        );
+        assert_eq!(
+            store
+                .complete_recordless_check_targets(&scope, &targets)
+                .unwrap(),
+            targets
+        );
+        assert!(!store.get_run_progress("v175").unwrap().unwrap().superseded);
+        assert!(
+            store
+                .supersede_complete_recordless_checkpoints("later", &scope, &targets)
+                .is_err(),
+            "a missing later record cannot supersede the checkpoint"
+        );
+        let mut later = run_at("later", Utc::now());
+        later.status = RunStatus::Failure;
+        store.record_run(&later).unwrap();
+        store
+            .supersede_complete_recordless_checkpoints("later", &scope, &targets)
+            .unwrap();
+        assert!(store.get_run_progress("v175").unwrap().unwrap().superseded);
+        assert!(
+            store
+                .complete_recordless_check_targets(&scope, &targets)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            store.get_watermark(key).unwrap().unwrap().last_value,
+            stale.last_value,
+            "the old flush gap remains until the operator repairs the cursor"
+        );
+    }
+
+    #[test]
+    fn orphan_checkpoint_requires_full_physical_plan_and_matching_endpoint() {
+        let (store, _dir) = temp_store();
+        let old = progress_scope("old-name");
+        let mut renamed = old.clone();
+        renamed.pipeline = "new-name".into();
+        let keys = ["wh.raw.orders".to_string(), "wh.raw.items".to_string()];
+        store.init_run_progress("crash", &keys, Some(&old)).unwrap();
+        for (index, key) in keys.iter().enumerate() {
+            store
+                .record_table_progress("crash", &progress_entry(index, key, TableStatus::Success))
+                .unwrap();
+        }
+        let partial = [keys[0].clone()].into_iter().collect();
+        assert!(
+            store
+                .complete_recordless_check_targets(&renamed, &partial)
+                .unwrap()
+                .is_empty()
+        );
+        let full = keys.iter().cloned().collect();
+        assert_eq!(
+            store
+                .complete_recordless_check_targets(&renamed, &full)
+                .unwrap(),
+            full
+        );
+        let mut elsewhere = renamed.clone();
+        elsewhere
+            .target
+            .as_mut()
+            .unwrap()
+            .endpoint
+            .locators
+            .insert("path".into(), "elsewhere".into());
+        assert!(
+            store
+                .complete_recordless_check_targets(&elsewhere, &full)
+                .unwrap()
+                .is_empty()
+        );
+        let later = run_at("later", Utc::now());
+        store.record_run(&later).unwrap();
+        store
+            .supersede_complete_recordless_checkpoints("later", &renamed, &partial)
+            .unwrap();
+        assert!(!store.get_run_progress("crash").unwrap().unwrap().superseded);
+        store
+            .supersede_complete_recordless_checkpoints("later", &renamed, &full)
+            .unwrap();
+        assert!(store.get_run_progress("crash").unwrap().unwrap().superseded);
     }
 
     #[test]
@@ -11502,6 +11952,7 @@ mod tests {
             planned_tables: None,
             watermarks_confirmed: false,
             watermark_recovery_tables: None,
+            superseded: false,
         };
         let bytes = serde_json::to_vec(&legacy).unwrap();
         {

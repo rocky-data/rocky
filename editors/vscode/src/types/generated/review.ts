@@ -157,6 +157,10 @@ export interface ReviewOutput {
   breaking_changes?: BreakingFinding[] | null;
   command: string;
   /**
+   * Conditional kind-switch DROPs at their effective execution targets.
+   */
+  conditional_drops: ConditionalDrop[];
+  /**
    * True when the approval marker is now present on disk as a result of this invocation. Mirrors `approved` today; kept distinct so callers reading the JSON do not have to infer marker state from the flag.
    */
   marker_written: boolean;
@@ -177,5 +181,15 @@ export interface ReviewOutput {
 export interface BreakingFinding {
   change: BreakingChange;
   severity: BreakingSeverity;
+  [k: string]: unknown;
+}
+/**
+ * A DROP permitted when a model switches between a table and a view.
+ */
+export interface ConditionalDrop {
+  drop_sql: string;
+  existing_kind: string;
+  model: string;
+  target: string;
   [k: string]: unknown;
 }

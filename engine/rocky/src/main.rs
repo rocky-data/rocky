@@ -993,6 +993,9 @@ enum Command {
         /// Run in shadow mode: write to shadow targets instead of production
         #[arg(long)]
         shadow: bool,
+        /// Keep shadow objects after the run so a separate `rocky compare` can read them.
+        #[arg(long, requires = "shadow", conflicts_with = "watch")]
+        keep_shadow: bool,
         /// Suffix appended to table names. Requires --shadow; conflicts with --branch.
         /// --shadow alone uses _rocky_shadow.
         #[arg(long, default_value = "_rocky_shadow", requires = "shadow")]
@@ -2916,6 +2919,18 @@ enum ImportsAction {
 enum StateAction {
     /// Show stored watermarks (same as bare `rocky state`).
     Show,
+    /// Set incremental cursors to MAX(timestamp_column) in recorded targets.
+    ReconcileWatermark {
+        /// Replication pipeline whose recorded plans own the targets.
+        #[arg(long)]
+        pipeline: String,
+        /// Physical catalog.schema.table target. Repeat to select targets.
+        #[arg(long = "table")]
+        tables: Vec<String>,
+        /// Show the target values without writing state.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Flush the cached `DESCRIBE TABLE` results.
     ///
     /// Removes every `SCHEMA_CACHE` entry from `state.redb`. The next
@@ -3464,7 +3479,15 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                          pending-review queue"
                     );
                 };
-                rocky_cli::commands::run_review(&cli.config, &plan_id, &base, approve, json).await
+                rocky_cli::commands::run_review(
+                    &cli.config,
+                    &state_path,
+                    &plan_id,
+                    &base,
+                    approve,
+                    json,
+                )
+                .await
             }
         }
         Command::Backfill {
@@ -3795,6 +3818,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             resume,
             resume_latest,
             shadow,
+            keep_shadow,
             shadow_suffix,
             shadow_schema,
             branch,
@@ -3960,7 +3984,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                     // over its own leftover. The `--branch` arm above keeps
                     // `false` deliberately: a named branch's objects are the
                     // point of the branch.
-                    cleanup_after: true,
+                    cleanup_after: !keep_shadow,
                     branch: None,
                 })
             } else {
@@ -4188,6 +4212,21 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
         }
         Command::State { action } => match action {
             None | Some(StateAction::Show) => rocky_cli::commands::state_show(&state_path, json),
+            Some(StateAction::ReconcileWatermark {
+                pipeline,
+                tables,
+                dry_run,
+            }) => {
+                rocky_cli::commands::state_reconcile_watermark(
+                    &cli.config,
+                    &state_path,
+                    &pipeline,
+                    &tables,
+                    dry_run,
+                    json,
+                )
+                .await
+            }
             Some(StateAction::ClearSchemaCache { dry_run }) => {
                 rocky_cli::commands::state_clear_schema_cache(&state_path, dry_run, json)
             }
@@ -5221,6 +5260,14 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
     if let Err(ref err) = result
         && err
             .downcast_ref::<rocky_cli::commands::CheckGateFailure>()
+            .is_some()
+    {
+        std::process::exit(2);
+    }
+
+    if let Err(ref err) = result
+        && err
+            .downcast_ref::<rocky_cli::commands::ShadowComparisonFailure>()
             .is_some()
     {
         std::process::exit(2);

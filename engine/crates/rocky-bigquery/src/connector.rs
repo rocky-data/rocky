@@ -14,8 +14,8 @@ use rocky_core::failure_class::{FailureClass, TransientKind};
 use rocky_core::retry::compute_backoff;
 use rocky_core::retry_budget::RetryBudget;
 use rocky_core::traits::{
-    AdapterError, AdapterResult, ChunkChecksum, ExecutionStats, PkRange, QueryResult, SqlDialect,
-    WarehouseAdapter,
+    AdapterError, AdapterResult, ChunkChecksum, ExecutionStats, ObjectKind, PkRange, QueryResult,
+    SqlDialect, WarehouseAdapter,
 };
 use rocky_ir::{ColumnInfo, TableRef};
 use rocky_observe::span_attrs;
@@ -32,6 +32,13 @@ pub enum BigQueryError {
 
     #[error("BigQuery API error: {message} (status: {status})")]
     ApiError { status: String, message: String },
+
+    #[error("table `{catalog}`.`{schema}`.`{table}` not found")]
+    TableNotFound {
+        catalog: String,
+        schema: String,
+        table: String,
+    },
 
     /// A query job that BigQuery accepted (HTTP 200, `jobComplete=true`)
     /// but which then *failed at the job level* — the response carries a
@@ -1028,6 +1035,32 @@ impl WarehouseAdapter for BigQueryAdapter {
         &self.dialect
     }
 
+    fn is_missing_object_error(&self, error: &AdapterError) -> bool {
+        fn names_missing_object(message: &str) -> bool {
+            message.starts_with("Not found: Table ") || message.starts_with("Not found: Dataset ")
+        }
+        match error.inner().downcast_ref::<BigQueryError>() {
+            Some(BigQueryError::TableNotFound { .. }) => true,
+            Some(BigQueryError::JobError { reason, message }) => {
+                reason == "notFound" && names_missing_object(message)
+            }
+            Some(BigQueryError::ApiError { status, message }) if status.starts_with("404") => {
+                serde_json::from_str::<serde_json::Value>(message)
+                    .ok()
+                    .is_some_and(|body| {
+                        body.pointer("/error/errors/0/reason")
+                            .and_then(serde_json::Value::as_str)
+                            == Some("notFound")
+                            && body
+                                .pointer("/error/errors/0/message")
+                                .and_then(serde_json::Value::as_str)
+                                .is_some_and(names_missing_object)
+                    })
+            }
+            _ => false,
+        }
+    }
+
     async fn execute_statement(&self, sql: &str) -> AdapterResult<()> {
         self.run_query(sql)
             .await
@@ -1111,6 +1144,23 @@ impl WarehouseAdapter for BigQueryAdapter {
         Ok(QueryResult { columns, rows })
     }
 
+    async fn promotion_destination_kind(
+        &self,
+        table: &TableRef,
+    ) -> AdapterResult<Option<ObjectKind>> {
+        let sql = promotion_sql(&self.dialect, table)?;
+        let result = match self.execute_query(&sql).await {
+            Ok(result) => result,
+            Err(err) if bigquery_dataset_not_found(&err) => {
+                return Err(AdapterError::msg(
+                    "promotion destination namespace does not exist",
+                ));
+            }
+            Err(err) => return Err(err),
+        };
+        promotion_kind(&result)
+    }
+
     /// Arrow path via the BigQuery Storage Read API (gRPC). Overrides
     /// the default `Err(...)` impl on `WarehouseAdapter`. See
     /// [`BigQueryAdapter::fetch_arrow_via_storage_read`] for the
@@ -1133,12 +1183,7 @@ impl WarehouseAdapter for BigQueryAdapter {
         validate_gcp_project_id(&table.catalog).map_err(AdapterError::new)?;
         validate_identifier(&table.schema).map_err(AdapterError::new)?;
         validate_identifier(&table.table).map_err(AdapterError::new)?;
-        let sql = format!(
-            "SELECT column_name, data_type, is_nullable \
-             FROM `{}`.`{}`.INFORMATION_SCHEMA.COLUMNS \
-             WHERE table_name = '{}'",
-            table.catalog, table.schema, table.table
-        );
+        let sql = describe_columns_sql(table);
 
         let result = self.execute_query(&sql).await?;
         let columns: Vec<ColumnInfo> = result
@@ -1163,10 +1208,11 @@ impl WarehouseAdapter for BigQueryAdapter {
         // `describe_table().is_ok()` to probe existence (e.g. the
         // time-interval bootstrap path) get the right answer.
         if columns.is_empty() {
-            return Err(AdapterError::msg(format!(
-                "table `{}`.`{}`.`{}` not found",
-                table.catalog, table.schema, table.table
-            )));
+            return Err(AdapterError::new(BigQueryError::TableNotFound {
+                catalog: table.catalog.clone(),
+                schema: table.schema.clone(),
+                table: table.table.clone(),
+            }));
         }
 
         Ok(columns)
@@ -1291,6 +1337,15 @@ impl WarehouseAdapter for BigQueryAdapter {
         );
         self.execute_statement(&sql).await
     }
+}
+
+fn describe_columns_sql(table: &TableRef) -> String {
+    format!(
+        "SELECT column_name, data_type, is_nullable \
+         FROM `{}`.`{}`.INFORMATION_SCHEMA.COLUMNS \
+         WHERE table_name = '{}' AND is_hidden = 'NO' ORDER BY ordinal_position",
+        table.catalog, table.schema, table.table
+    )
 }
 
 /// Walk the BigQuery `v` representation using its field schema. REPEATED
@@ -1490,6 +1545,49 @@ fn parse_bq_i128(v: &serde_json::Value) -> AdapterResult<i128> {
 ///
 /// `bytes_written` is always `None` — BigQuery query jobs don't expose
 /// a bytes-written figure naturally.
+fn promotion_sql(dialect: &dyn SqlDialect, table: &TableRef) -> AdapterResult<String> {
+    validate_gcp_project_id(&table.catalog).map_err(AdapterError::new)?;
+    validate_identifier(&table.schema).map_err(AdapterError::new)?;
+    let name = rocky_core::sql_gen::string_literal(dialect, &table.table);
+    Ok(format!(
+        "SELECT table_type FROM `{}`.`{}`.INFORMATION_SCHEMA.TABLES WHERE table_name = {name}",
+        table.catalog, table.schema
+    ))
+}
+
+fn bigquery_dataset_not_found(err: &AdapterError) -> bool {
+    match err.inner().downcast_ref::<BigQueryError>() {
+        Some(BigQueryError::ApiError { status, message }) => {
+            status.starts_with("404")
+                && message.contains("Dataset ")
+                && message.to_ascii_lowercase().contains("not found")
+        }
+        Some(BigQueryError::JobError { reason, message }) => {
+            reason == "notFound" && message.contains("Dataset ")
+        }
+        _ => false,
+    }
+}
+
+fn promotion_kind(result: &QueryResult) -> AdapterResult<Option<ObjectKind>> {
+    match result.rows.as_slice() {
+        [] => Ok(None),
+        [row] => match row.first().and_then(|v| v.as_str()) {
+            Some("BASE TABLE" | "CLONE" | "SNAPSHOT" | "EXTERNAL") => Ok(Some(ObjectKind::Table)),
+            Some("VIEW" | "MATERIALIZED VIEW") => Ok(Some(ObjectKind::View)),
+            Some(other) => Err(AdapterError::msg(format!(
+                "unknown promotion destination kind: {other}"
+            ))),
+            None => Err(AdapterError::msg(
+                "promotion destination kind is missing or malformed",
+            )),
+        },
+        _ => Err(AdapterError::msg(
+            "promotion destination kind returned multiple rows",
+        )),
+    }
+}
+
 fn stats_from_response(response: &BigQueryResponse) -> ExecutionStats {
     let bytes_scanned = response
         .statistics
@@ -1930,7 +2028,8 @@ pub(crate) fn is_transient(err: &BigQueryError) -> bool {
             matches!(code, Some(429 | 502 | 503 | 504))
         }
         BigQueryError::Http(e) => e.is_connect() || e.is_timeout(),
-        BigQueryError::JobError { .. }
+        BigQueryError::TableNotFound { .. }
+        | BigQueryError::JobError { .. }
         | BigQueryError::LoadJobError { .. }
         | BigQueryError::Auth(_)
         | BigQueryError::Timeout { .. }
@@ -2114,6 +2213,119 @@ struct TableCell {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn describe_excludes_hidden_partition_columns() {
+        let sql = describe_columns_sql(&TableRef {
+            catalog: "project".into(),
+            schema: "dataset".into(),
+            table: "events".into(),
+        });
+        assert!(sql.contains("is_hidden = 'NO'"), "{sql}");
+        assert!(sql.contains("ORDER BY ordinal_position"), "{sql}");
+    }
+
+    #[test]
+    fn promotion_probe_sql_kinds_and_missing_dataset() {
+        let table = TableRef {
+            catalog: "test-project".into(),
+            schema: "orders_ds".into(),
+            table: "Orders\\'24".into(),
+        };
+        assert_eq!(
+            promotion_sql(&BigQueryDialect, &table).unwrap(),
+            r"SELECT table_type FROM `test-project`.`orders_ds`.INFORMATION_SCHEMA.TABLES WHERE table_name = 'Orders\\\'24'"
+        );
+        let result = |value: &str| QueryResult {
+            columns: vec!["table_type".into()],
+            rows: vec![vec![serde_json::json!(value)]],
+        };
+        for value in ["BASE TABLE", "CLONE", "SNAPSHOT", "EXTERNAL"] {
+            assert_eq!(
+                promotion_kind(&result(value)).unwrap(),
+                Some(ObjectKind::Table)
+            );
+        }
+        for value in ["VIEW", "MATERIALIZED VIEW"] {
+            assert_eq!(
+                promotion_kind(&result(value)).unwrap(),
+                Some(ObjectKind::View)
+            );
+        }
+        assert_eq!(
+            promotion_kind(&QueryResult {
+                columns: vec![],
+                rows: vec![]
+            })
+            .unwrap(),
+            None
+        );
+        assert!(
+            promotion_kind(&result("NEW TYPE"))
+                .unwrap_err()
+                .to_string()
+                .contains("NEW TYPE")
+        );
+        assert!(bigquery_dataset_not_found(&AdapterError::new(
+            BigQueryError::JobError {
+                reason: "notFound".into(),
+                message: "Not found: Dataset test-project:orders_ds".into()
+            }
+        )));
+        assert!(bigquery_dataset_not_found(&AdapterError::new(
+            BigQueryError::ApiError {
+                status: "404 Not Found".into(),
+                message: "Not found: Dataset test-project:orders_ds".into()
+            }
+        )));
+        assert!(!bigquery_dataset_not_found(&AdapterError::new(
+            BigQueryError::ApiError {
+                status: "404 Not Found".into(),
+                message: "Not found: Table test-project:orders_ds.orders".into()
+            }
+        )));
+        assert!(!bigquery_dataset_not_found(&AdapterError::new(
+            BigQueryError::JobError {
+                reason: "accessDenied".into(),
+                message: "Dataset test-project:orders_ds".into()
+            }
+        )));
+    }
+
+    #[test]
+    fn missing_table_and_dataset_errors_confirm_absence() {
+        let adapter = BigQueryAdapter::new(
+            "project",
+            "US",
+            BigQueryAuth::Bearer(rocky_core::redacted::RedactedString::new("test".into())),
+        );
+        let missing_table = AdapterError::new(BigQueryError::TableNotFound {
+            catalog: "project".into(),
+            schema: "dataset".into(),
+            table: "table".into(),
+        });
+        assert!(adapter.is_missing_object_error(&missing_table));
+        let missing_dataset = AdapterError::new(BigQueryError::ApiError {
+            status: "404 Not Found".into(),
+            message: r#"{"error":{"errors":[{"reason":"notFound","message":"Not found: Dataset project:dataset"}]}}"#.into(),
+        });
+        assert!(adapter.is_missing_object_error(&missing_dataset));
+        let response: BigQueryResponse = serde_json::from_str(
+            r#"{"jobComplete":true,"errors":[{"reason":"notFound","message":"Not found: Dataset project:dataset"}]}"#,
+        ).unwrap();
+        let job = AdapterError::new(response.check_job_error().unwrap_err());
+        assert!(adapter.is_missing_object_error(&job));
+        let denied = AdapterError::new(BigQueryError::ApiError {
+            status: "403 Forbidden".into(),
+            message: "notFound".into(),
+        });
+        assert!(!adapter.is_missing_object_error(&denied));
+        let missing_job = AdapterError::new(BigQueryError::JobError {
+            reason: "notFound".into(),
+            message: "Not found: Job project:job_id".into(),
+        });
+        assert!(!adapter.is_missing_object_error(&missing_job));
+    }
 
     #[test]
     fn test_query_request_serialization() {

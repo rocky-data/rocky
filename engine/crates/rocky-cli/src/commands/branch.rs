@@ -12,8 +12,7 @@
 //!   state.
 //! * `promote` enumerates the branch's production targets, verifies that the
 //!   on-disk approvals satisfy `[branch.approval]`, and dispatches a
-//!   `CREATE OR REPLACE TABLE prod.<x> AS SELECT * FROM branch__<name>.<x>`
-//!   per target.
+//!   a strategy-specific `CREATE OR REPLACE TABLE` or `VIEW` per target.
 //!
 //! Warehouse-native clones (Delta `SHALLOW CLONE`, Snowflake zero-copy
 //! `CLONE`) are a follow-up; schema-prefix branches work uniformly across
@@ -32,7 +31,7 @@ use rocky_core::compare::ComparisonThresholds;
 use rocky_core::config::BranchApprovalConfig;
 use rocky_core::shadow::{self, ShadowConfig};
 use rocky_core::state::{BranchRecord, StateStore};
-use rocky_ir::{ModelIr, ProjectIr, TargetRef};
+use rocky_ir::{ModelIr, ProjectIr, TableRef, TargetRef};
 
 use crate::output::{
     ApprovalArtifact, ApprovalSignature, ApproveOutput, ApproverIdentity, ApproverSource,
@@ -747,10 +746,20 @@ pub(crate) fn approver_identity_pub() -> Result<ApproverIdentity> {
 ///
 /// Contains both the target/source FQNs and the dialect-quoted SQL so the
 /// plan persists deterministic SQL without re-running discovery at apply time.
+#[derive(Debug)]
 pub(crate) struct PlannedPromoteWithSql {
     pub target: String,
     pub source: String,
+    pub target_catalog: String,
+    pub target_schema: String,
+    pub target_table: String,
+    pub source_catalog: String,
+    pub source_schema: String,
+    pub source_table: String,
+    pub strategy: String,
     pub statement: String,
+    pub pre_drop_statement: Option<String>,
+    pub production_upstreams: Vec<TargetRef>,
 }
 
 /// Discover branch targets and build dialect-quoted promote SQL at plan time.
@@ -795,18 +804,98 @@ pub(crate) async fn discover_branch_targets_for_plan(
     let planned =
         discover_branch_targets(config_path, record, filter, Some(&resolved_pipeline_name)).await?;
 
-    let targets = planned
+    let selected: std::collections::HashMap<_, _> = planned
+        .iter()
+        .map(|p| {
+            (
+                rocky_sql::defer::CollisionIdentity::of(
+                    &p.prod.catalog,
+                    &p.prod.schema,
+                    &p.prod.table,
+                ),
+                p.prod.full_name(),
+            )
+        })
+        .collect();
+    let mut nodes = Vec::new();
+    let mut targets = planned
         .into_iter()
         .map(|p| {
+            let (statement, production_upstreams) = if let Some(ir) = &p.model_ir {
+                anyhow::ensure!(
+                    ir.target.catalog == p.prod.catalog
+                        && ir.target.schema == p.prod.schema
+                        && ir.target.table == p.prod.table,
+                    "compiled view '{}' targets '{}', but promotion records '{}'",
+                    ir.name,
+                    ir.target.full_name(),
+                    p.prod.full_name()
+                );
+                production_view_sql(dialect, ir, &p.upstreams)?
+            } else {
+                (
+                    build_promote_sql(dialect, &p.prod, &p.branch_source, p.kind)?,
+                    Vec::new(),
+                )
+            };
+            assert_generated_promote_target(dialect, p.kind, &p.prod, &statement)?;
+            nodes.push(rocky_ir::dag::DagNode {
+                name: p.prod.full_name(),
+                depends_on: p
+                    .dependencies
+                    .iter()
+                    .chain(production_upstreams.iter())
+                    .filter_map(|upstream| {
+                        selected.get(&rocky_sql::defer::CollisionIdentity::of(
+                            &upstream.catalog,
+                            &upstream.schema,
+                            &upstream.table,
+                        ))
+                    })
+                    .cloned()
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .into_iter()
+                    .collect(),
+            });
+            let production_upstreams = production_upstreams
+                .into_iter()
+                .filter(|upstream| {
+                    !selected.contains_key(&rocky_sql::defer::CollisionIdentity::of(
+                        &upstream.catalog,
+                        &upstream.schema,
+                        &upstream.table,
+                    ))
+                })
+                .collect();
+            let pre_drop_statement = promote_pre_drop_sql(dialect, &p.prod, p.kind)?;
             Ok(PlannedPromoteWithSql {
                 target: p.prod.full_name(),
                 source: p.branch_source.full_name(),
-                statement: build_promote_sql(dialect, &p.prod, &p.branch_source)?,
+                target_catalog: p.prod.catalog.clone(),
+                target_schema: p.prod.schema.clone(),
+                target_table: p.prod.table.clone(),
+                source_catalog: p.branch_source.catalog.clone(),
+                source_schema: p.branch_source.schema.clone(),
+                source_table: p.branch_source.table.clone(),
+                strategy: p.strategy,
+                statement,
+                pre_drop_statement,
+                production_upstreams,
             })
         })
         .collect::<Result<Vec<_>>>()?;
 
-    Ok((resolved_pipeline_name, targets))
+    let order = rocky_ir::dag::topological_sort(&nodes)
+        .context("cannot promote views with cyclic production dependencies")?;
+    let mut ordered = Vec::with_capacity(targets.len());
+    for name in order {
+        let index = targets
+            .iter()
+            .position(|target| target.target == name)
+            .with_context(|| format!("promote target '{name}' disappeared while ordering"))?;
+        ordered.push(targets.remove(index));
+    }
+    Ok((resolved_pipeline_name, ordered))
 }
 
 /// Run the approval gate for a branch, updating `audit` and returning
@@ -940,7 +1029,14 @@ fn reject_unquotable_promote_names(
     targets: &[crate::output::PromoteTargetPlan],
 ) -> Result<()> {
     for step in targets {
-        for (role, name) in [("target", &step.target), ("source", &step.source)] {
+        for (role, name) in [
+            ("target catalog", &step.target_catalog),
+            ("target schema", &step.target_schema),
+            ("target table", &step.target_table),
+            ("source catalog", &step.source_catalog),
+            ("source schema", &step.source_schema),
+            ("source table", &step.source_table),
+        ] {
             if let Some(bad) = unquotable_char(dialect, name) {
                 anyhow::bail!(
                     "refusing to apply this promote plan: its {role} '{name}' contains {bad:?}, \
@@ -958,7 +1054,11 @@ fn reject_duplicate_promote_targets(targets: &[crate::output::PromoteTargetPlan]
     let mut claimed: std::collections::HashMap<rocky_sql::defer::CollisionIdentity, &str> =
         std::collections::HashMap::new();
     for step in targets {
-        let key = rocky_sql::defer::CollisionIdentity::of_qualified(&step.target);
+        let key = rocky_sql::defer::CollisionIdentity::of(
+            &step.target_catalog,
+            &step.target_schema,
+            &step.target_table,
+        );
         if let Some(prior) = claimed.insert(key, step.source.as_str()) {
             anyhow::bail!(
                 "refusing to apply this promote plan: two steps both replace the production \
@@ -980,7 +1080,8 @@ fn reject_duplicate_promote_targets(targets: &[crate::output::PromoteTargetPlan]
 /// from a `PromotePlan` and dispatches them via `execute_statement`, returning
 /// one `PromoteTarget` per step (with `succeeded` / `error` filled in).
 ///
-/// Stops on the first failure (same policy as the bare-verb path).
+/// Checks every branch source before replacing any target. Stops on the first
+/// write failure and reports every later target as unattempted.
 pub(crate) async fn run_promote_apply(
     // The gate-verified config snapshot threaded from `gate_promote_plan`
     // (#1120): the adapter/destination the promote SQL executes against is
@@ -1004,6 +1105,12 @@ pub(crate) async fn run_promote_apply(
     // Before the adapter is even opened: a plan that would replace one table
     // twice is refused without touching the warehouse.
     reject_duplicate_promote_targets(targets)?;
+    for step in targets {
+        match step.strategy.as_str() {
+            "full_refresh" | "view" => {}
+            other => anyhow::bail!("branch promotion is undefined for {other}"),
+        }
+    }
 
     let rocky_cfg = &loaded.config;
     let registry = AdapterRegistry::from_config(rocky_cfg)?;
@@ -1022,10 +1129,103 @@ pub(crate) async fn run_promote_apply(
     // place.
     reject_unquotable_promote_names(adapter.dialect(), targets)?;
 
+    // Validate every destination and branch source before the first write.
+    // The SELECT checks source readability without copying rows.
+    for step in targets {
+        let expected_kind = match step.strategy.as_str() {
+            "full_refresh"
+                if step.statement.starts_with("CREATE OR REPLACE TABLE ")
+                    || (step.pre_drop_statement.is_some()
+                        && step.statement.starts_with("CREATE TABLE ")) =>
+            {
+                rocky_core::traits::ObjectKind::Table
+            }
+            "view" if step.statement.starts_with("CREATE OR REPLACE VIEW ") => {
+                rocky_core::traits::ObjectKind::View
+            }
+            _ => anyhow::bail!(
+                "invalid promote SQL for target '{}' and strategy '{}'",
+                step.target,
+                step.strategy
+            ),
+        };
+        let target_ref = TableRef {
+            catalog: step.target_catalog.clone(),
+            schema: step.target_schema.clone(),
+            table: step.target_table.clone(),
+        };
+        let actual_kind = adapter
+            .promotion_destination_kind(&target_ref)
+            .await
+            .with_context(|| format!("cannot preflight destination '{}'", step.target))?;
+        if let Some(actual_kind) = actual_kind {
+            anyhow::ensure!(
+                actual_kind == expected_kind,
+                "target '{}' is a {actual_kind:?}, but promote would replace it with a {expected_kind:?}",
+                step.target
+            );
+        }
+        let source_ref = TargetRef {
+            catalog: step.source_catalog.clone(),
+            schema: step.source_schema.clone(),
+            table: step.source_table.clone(),
+        };
+        let quoted_source = quote_fqn(adapter.dialect(), &source_ref)?;
+        adapter
+            .execute_query(&format!("SELECT * FROM {quoted_source} LIMIT 0"))
+            .await
+            .with_context(|| {
+                format!(
+                    "branch source '{}' for target '{}' is not readable",
+                    step.source, step.target
+                )
+            })?;
+        for upstream in &step.production_upstreams {
+            let upstream_ref = TargetRef {
+                catalog: upstream.catalog.clone(),
+                schema: upstream.schema.clone(),
+                table: upstream.table.clone(),
+            };
+            let quoted = quote_fqn(adapter.dialect(), &upstream_ref)?;
+            adapter
+                .execute_query(&format!("SELECT * FROM {quoted} LIMIT 0"))
+                .await
+                .with_context(|| {
+                    format!(
+                        "production upstream '{}' for view '{}' is not readable",
+                        upstream_ref.full_name(),
+                        step.target
+                    )
+                })?;
+        }
+    }
+
     let mut targets_out: Vec<crate::output::PromoteTarget> = Vec::new();
     let mut overall_success = true;
 
-    for step in targets {
+    for (index, step) in targets.iter().enumerate() {
+        if let Some(drop_sql) = &step.pre_drop_statement
+            && let Err(e) = adapter.execute_statement(drop_sql).await
+        {
+            targets_out.push(crate::output::PromoteTarget {
+                target: step.target.clone(),
+                source: step.source.clone(),
+                statement: step.statement.clone(),
+                succeeded: false,
+                error: Some(format!("pre-drop failed: {e}")),
+            });
+            overall_success = false;
+            targets_out.extend(targets.iter().skip(index + 1).map(|remaining| {
+                crate::output::PromoteTarget {
+                    target: remaining.target.clone(),
+                    source: remaining.source.clone(),
+                    statement: remaining.statement.clone(),
+                    succeeded: false,
+                    error: Some("not attempted after an earlier write failed".to_string()),
+                }
+            }));
+            break;
+        }
         match adapter.execute_statement(&step.statement).await {
             Ok(()) => targets_out.push(crate::output::PromoteTarget {
                 target: step.target.clone(),
@@ -1040,15 +1240,64 @@ pub(crate) async fn run_promote_apply(
                     source: step.source.clone(),
                     statement: step.statement.clone(),
                     succeeded: false,
-                    error: Some(format!("{e}")),
+                    error: Some(if step.pre_drop_statement.is_some() {
+                        format!("dropped but not replaced: {e}")
+                    } else {
+                        format!("{e}")
+                    }),
                 });
                 overall_success = false;
+                targets_out.extend(targets.iter().skip(index + 1).map(|remaining| {
+                    crate::output::PromoteTarget {
+                        target: remaining.target.clone(),
+                        source: remaining.source.clone(),
+                        statement: remaining.statement.clone(),
+                        succeeded: false,
+                        error: Some("not attempted after an earlier write failed".to_string()),
+                    }
+                }));
                 break;
             }
         }
     }
 
     Ok((targets_out, overall_success))
+}
+
+fn promote_failure_target_lines(targets: &[crate::output::PromoteTarget]) -> Vec<String> {
+    targets
+        .iter()
+        .map(|target| {
+            if target.succeeded {
+                format!("replaced: {}", target.target)
+            } else if target.error.as_deref() == Some("not attempted after an earlier write failed")
+            {
+                format!("not replaced: {} (not attempted)", target.target)
+            } else if target
+                .error
+                .as_deref()
+                .is_some_and(|e| e.starts_with("dropped but not replaced:"))
+            {
+                format!(
+                    "dropped, not replaced: {} ({})",
+                    target.target,
+                    target.error.as_deref().unwrap_or("unknown error")
+                )
+            } else {
+                format!(
+                    "not confirmed replaced: {} (write failed: {})",
+                    target.target,
+                    target.error.as_deref().unwrap_or("unknown error")
+                )
+            }
+        })
+        .collect()
+}
+
+pub(crate) fn print_promote_failure_targets(targets: &[crate::output::PromoteTarget]) {
+    for line in promote_failure_target_lines(targets) {
+        println!("{line}");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1145,9 +1394,62 @@ pub fn run_branch_approve(
 struct PlannedPromote {
     prod: TargetRef,
     branch_source: TargetRef,
+    kind: PromoteKind,
+    strategy: String,
+    model_ir: Option<ModelIr>,
+    upstreams: Vec<TargetRef>,
+    dependencies: Vec<TargetRef>,
 }
 
-/// Build the v1 promote SQL for a single target.
+#[derive(Debug, Clone, Copy)]
+enum PromoteKind {
+    Table,
+    View,
+}
+
+fn transformation_promote_kind(
+    strategy: &rocky_core::models::StrategyConfig,
+) -> Result<PromoteKind> {
+    use rocky_core::models::StrategyConfig;
+    match strategy {
+        StrategyConfig::FullRefresh => Ok(PromoteKind::Table),
+        StrategyConfig::View => Ok(PromoteKind::View),
+        StrategyConfig::Incremental { .. } => {
+            anyhow::bail!("branch promotion is undefined for incremental")
+        }
+        StrategyConfig::Merge { .. } => anyhow::bail!("branch promotion is undefined for merge"),
+        StrategyConfig::TimeInterval { .. } => {
+            anyhow::bail!("branch promotion is undefined for time_interval")
+        }
+        StrategyConfig::DeleteInsert { .. } => {
+            anyhow::bail!("branch promotion is undefined for delete_insert")
+        }
+        StrategyConfig::Microbatch { .. } => {
+            anyhow::bail!("branch promotion is undefined for microbatch")
+        }
+        StrategyConfig::MaterializedView => {
+            anyhow::bail!("branch promotion is undefined for materialized_view models")
+        }
+        StrategyConfig::DynamicTable { .. } => {
+            anyhow::bail!("branch promotion is undefined for dynamic_table models")
+        }
+        StrategyConfig::ContentAddressed { .. } => {
+            anyhow::bail!("branch promotion is undefined for content_addressed models")
+        }
+        StrategyConfig::Ephemeral => {
+            anyhow::bail!("branch promotion is undefined for ephemeral models")
+        }
+    }
+}
+
+fn replication_promote_kind(strategy: &str) -> Result<PromoteKind> {
+    match strategy {
+        "full_refresh" => Ok(PromoteKind::Table),
+        other => anyhow::bail!("branch promotion is undefined for {other} replication"),
+    }
+}
+
+/// Build promote SQL for a single target.
 ///
 /// Uses dialect-specific identifier quoting so branches whose names contain
 /// hyphens, dots, or any other character that would otherwise need escaping
@@ -1157,12 +1459,104 @@ fn build_promote_sql(
     dialect: &dyn rocky_core::traits::SqlDialect,
     prod: &TargetRef,
     branch_source: &TargetRef,
+    kind: PromoteKind,
 ) -> Result<String> {
-    Ok(format!(
-        "CREATE OR REPLACE TABLE {} AS SELECT * FROM {}",
-        quote_fqn(dialect, prod)?,
-        quote_fqn(dialect, branch_source)?,
-    ))
+    let target = quote_fqn(dialect, prod)?;
+    let source = quote_fqn(dialect, branch_source)?;
+    Ok(match kind {
+        PromoteKind::Table => dialect.create_table_as(&target, &format!("SELECT * FROM {source}")),
+        PromoteKind::View => dialect.view_ddl(&target, &format!("SELECT * FROM {source}"))?,
+    })
+}
+
+fn promote_pre_drop_sql(
+    dialect: &dyn rocky_core::traits::SqlDialect,
+    prod: &TargetRef,
+    kind: PromoteKind,
+) -> Result<Option<String>> {
+    if matches!(kind, PromoteKind::Table) && dialect.full_refresh_needs_predrop() {
+        Ok(Some(dialect.drop_table_sql(&quote_fqn(dialect, prod)?)))
+    } else {
+        Ok(None)
+    }
+}
+
+fn assert_generated_promote_target(
+    dialect: &dyn rocky_core::traits::SqlDialect,
+    kind: PromoteKind,
+    target: &TargetRef,
+    statement: &str,
+) -> Result<()> {
+    let statement_target = if matches!(kind, PromoteKind::View) {
+        dialect.format_table_ref(&target.catalog, &target.schema, &target.table)?
+    } else {
+        quote_fqn(dialect, target)?
+    };
+    let verb = match kind {
+        PromoteKind::View => "CREATE OR REPLACE VIEW",
+        PromoteKind::Table if dialect.full_refresh_needs_predrop() => "CREATE TABLE",
+        PromoteKind::Table => "CREATE OR REPLACE TABLE",
+    };
+    anyhow::ensure!(
+        statement.starts_with(&format!("{verb} {statement_target} AS")),
+        "generated promote statement does not target '{}'",
+        target.full_name()
+    );
+    Ok(())
+}
+
+/// Generate a production view from its model query. Qualify references to
+/// managed upstream models so a branch rerun or cleanup cannot affect it.
+fn production_view_sql(
+    dialect: &dyn rocky_core::traits::SqlDialect,
+    ir: &ModelIr,
+    upstreams: &[TargetRef],
+) -> Result<(String, Vec<TargetRef>)> {
+    use rocky_sql::defer::{DeferTarget, TargetIdentity};
+    let rules = super::run::dialect_case_rules(dialect)?;
+    let quote_style = super::run::rewrite_quote_style(dialect)?;
+    let mut renames = std::collections::HashMap::new();
+    let mut upstream_by_key = std::collections::HashMap::new();
+    for target in upstreams {
+        for part in [&target.catalog, &target.schema, &target.table] {
+            quote_part(dialect, part)?;
+        }
+        let key = TargetIdentity::of(&target.catalog, &target.schema, &target.table, rules);
+        upstream_by_key.insert(key.clone(), target.clone());
+        renames.insert(
+            key,
+            DeferTarget {
+                catalog: target.catalog.clone(),
+                schema: target.schema.clone(),
+                table: target.table.clone(),
+                quote_style,
+            },
+        );
+    }
+    let rewritten = rocky_sql::defer::rewrite_upstream_refs(
+        &ir.sql,
+        &renames,
+        rules,
+        super::run::dialect_recursive_cte_visibility(dialect),
+    )?;
+    anyhow::ensure!(
+        rewritten.ambiguous_refs.is_empty() && rewritten.case_fold_only_refs.is_empty(),
+        "cannot bind production upstreams for view '{}': ambiguous references {:?}, case-dependent references {:?}",
+        ir.name,
+        rewritten.ambiguous_refs,
+        rewritten.case_fold_only_refs
+    );
+    let mut production_ir = ir.clone();
+    production_ir.sql = rewritten.sql;
+    // The same SQL generator that `rocky run` uses for a production view.
+    let sql = rocky_core::sql_gen::generate_view_sql(&production_ir, dialect)?;
+    let mut used_upstreams: Vec<TargetRef> = rewritten
+        .rewritten_keys
+        .iter()
+        .filter_map(|key| upstream_by_key.get(key).cloned())
+        .collect();
+    used_upstreams.sort_by_key(TargetRef::full_name);
+    Ok((sql, used_upstreams))
 }
 
 fn quote_fqn(dialect: &dyn rocky_core::traits::SqlDialect, target: &TargetRef) -> Result<String> {
@@ -1278,6 +1672,7 @@ async fn discover_replication_branch_targets(
     use crate::registry::AdapterRegistry;
 
     let registry = AdapterRegistry::from_config(rocky_cfg)?;
+    let kind = replication_promote_kind(&pipeline.strategy)?;
 
     let pattern = pipeline.schema_pattern()?;
     let parsed_filter = filter.map(parse_filter).transpose()?;
@@ -1338,6 +1733,11 @@ async fn discover_replication_branch_targets(
             planned.push(PlannedPromote {
                 prod,
                 branch_source,
+                kind,
+                strategy: pipeline.strategy.clone(),
+                model_ir: None,
+                upstreams: Vec::new(),
+                dependencies: Vec::new(),
             });
         }
     }
@@ -1375,11 +1775,41 @@ fn discover_transformation_branch_targets(
     record: &BranchRecord,
     filter: Option<&str>,
 ) -> Result<Vec<PlannedPromote>> {
-    // One enumeration, shared with `compare` (see the helper's docs): both
-    // must agree about which models a `--filter` selects and which the glob
-    // reaches, and two walks of the same tree is how they stop agreeing.
+    let models_dir = match crate::models_loader::locate_models_dir(&pipeline.models, config_path)? {
+        crate::models_loader::ModelsDir::Present(dir) => dir,
+        crate::models_loader::ModelsDir::Absent(dir) => {
+            anyhow::bail!("models directory '{}' does not exist", dir.display())
+        }
+    };
+    let models_glob = crate::models_loader::resolved_models_glob(&pipeline.models, config_path);
+    let models =
+        crate::models_loader::load_project_models_matching(&models_dir, &models_glob, None)?;
+    plan_transformation_from_models(models, record, filter)
+}
+
+fn plan_transformation_from_models(
+    models: Vec<rocky_core::models::Model>,
+    record: &BranchRecord,
+    filter: Option<&str>,
+) -> Result<Vec<PlannedPromote>> {
     let targets =
-        super::transformation_prod_targets(pipeline, config_path, filter, "branch promote")?;
+        super::transformation_prod_targets_from_models(&models, filter, "branch promote", true)?;
+    // The run compiler resolves @var() before dependency analysis and SQL
+    // generation. Promotion must use that same resolved model, not a raw reload.
+    let compiled = rocky_compiler::compile::compile_preloaded_models(
+        models,
+        &rocky_compiler::compile::CompilerConfig::default(),
+    )?;
+    let upstreams: Vec<TargetRef> = compiled
+        .project
+        .models
+        .iter()
+        .map(|model| TargetRef {
+            catalog: model.config.target.catalog.clone(),
+            schema: model.config.target.schema.clone(),
+            table: model.config.target.table.clone(),
+        })
+        .collect();
 
     let shadow_cfg = ShadowConfig {
         suffix: "_rocky_shadow".to_string(),
@@ -1392,9 +1822,9 @@ fn discover_transformation_branch_targets(
     // Two models resolving to one physical target would both plan a
     // replacement against it, and execution runs the steps back to back —
     // the later source silently overwriting the earlier, exit 0 (#1310).
-    // Promote never compiles, so the compiler's duplicate-target diagnostic
-    // (E036, #1303) cannot fire on this path; refuse here, at discovery,
-    // before anything is planned. Checked on the POST-filter set — the set
+    // The compiler sees the full model set, while promotion selects a subset.
+    // Refuse collisions on that selected set before anything is planned. The
+    // check is on the POST-filter set — the set
     // that will actually execute — so `--filter` can still promote one model
     // out of a project that has a collision elsewhere.
     //
@@ -1406,26 +1836,101 @@ fn discover_transformation_branch_targets(
     // reach it.
     let mut claimed: std::collections::HashMap<rocky_sql::defer::CollisionIdentity, String> =
         std::collections::HashMap::new();
-    for (model_name, prod) in targets {
+    for model_name in &compiled.project.execution_order {
+        let Some((_, prod, strategy)) = targets
+            .iter()
+            .find(|(name, _, _)| name == model_name)
+            .cloned()
+        else {
+            continue;
+        };
+        let kind = transformation_promote_kind(&strategy)
+            .with_context(|| format!("cannot promote model '{model_name}'"))?;
         let key = rocky_sql::defer::CollisionIdentity::of(&prod.catalog, &prod.schema, &prod.table);
         if let Some(prior) = claimed.insert(key, model_name.clone()) {
             anyhow::bail!(
                 "duplicate promote target {}.{}.{}: models '{prior}' and '{model_name}' both \
                  resolve to it, and promoting both would execute two replacements with the later \
                  silently overwriting the earlier. Point one model's [target] elsewhere (the \
-                 compiler reports this as E036; `branch promote` does not compile, so it refuses \
-                 here).",
+                 compiler reports this as E036 for an unfiltered run).",
                 prod.catalog,
                 prod.schema,
                 prod.table,
             );
         }
         let branch_source = shadow::shadow_target(&prod, &shadow_cfg);
+        let model_ir = if matches!(kind, PromoteKind::View) {
+            Some(
+                compiled
+                    .project
+                    .models
+                    .iter()
+                    .find(|model| model.config.name == *model_name)
+                    .with_context(|| {
+                        format!("model '{model_name}' disappeared during promotion planning")
+                    })?
+                    .to_model_ir(),
+            )
+        } else {
+            None
+        };
+        let dependencies = compiled
+            .project
+            .dag_nodes
+            .iter()
+            .find(|node| node.name == *model_name)
+            .with_context(|| format!("model '{model_name}' has no dependency node"))?
+            .depends_on
+            .iter()
+            .map(|name| {
+                compiled
+                    .project
+                    .models
+                    .iter()
+                    .find(|model| model.config.name == *name)
+                    .map(|model| TargetRef {
+                        catalog: model.config.target.catalog.clone(),
+                        schema: model.config.target.schema.clone(),
+                        table: model.config.target.table.clone(),
+                    })
+                    .with_context(|| format!("dependency '{name}' of '{model_name}' has no model"))
+            })
+            .collect::<Result<Vec<_>>>()?;
         planned.push(PlannedPromote {
             prod,
             branch_source,
+            kind,
+            strategy: match kind {
+                PromoteKind::Table => "full_refresh",
+                PromoteKind::View => "view",
+            }
+            .to_string(),
+            model_ir,
+            upstreams: upstreams.clone(),
+            dependencies,
         });
     }
+
+    let selected_names: std::collections::HashSet<_> =
+        targets.iter().map(|(name, _, _)| name.as_str()).collect();
+    let selected_errors: Vec<_> = compiled
+        .diagnostics
+        .iter()
+        .filter(|d| {
+            d.severity == rocky_compiler::diagnostic::Severity::Error
+                && selected_names.contains(d.model.as_str())
+                && d.code.as_ref() != "E036"
+        })
+        .collect();
+    anyhow::ensure!(
+        selected_errors.is_empty(),
+        "cannot promote transformation models: compilation reported errors: {}",
+        selected_errors
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("; ")
+    );
 
     Ok(planned)
 }
@@ -1611,10 +2116,10 @@ pub async fn run_branch_promote(
         );
     } else {
         println!(
-            "promote failed for branch '{}' after {} target(s) — see audit/JSON for details",
-            output.branch,
-            output.targets.len()
+            "promote failed for branch '{}' — target outcomes:",
+            output.branch
         );
+        print_promote_failure_targets(&output.targets);
     }
 
     if !overall_success {
@@ -2015,9 +2520,10 @@ pub async fn run_branch_promote_from_plan(
         );
     } else {
         println!(
-            "promote failed for branch '{}' — see JSON output for details",
+            "promote failed for branch '{}' — target outcomes:",
             output.branch
         );
+        print_promote_failure_targets(&output.targets);
     }
 
     if !overall_success {
@@ -2640,11 +3146,58 @@ mod tests {
             schema: "branch__live-test".to_string(),
             table: "orders".to_string(),
         };
-        let sql = build_promote_sql(&dialect, &prod, &branch_source).unwrap();
+        let sql = build_promote_sql(&dialect, &prod, &branch_source, PromoteKind::Table).unwrap();
         assert_eq!(
             sql,
-            r#"CREATE OR REPLACE TABLE "playground"."staging__orders"."orders" AS SELECT * FROM "playground"."branch__live-test"."orders""#,
+            "CREATE OR REPLACE TABLE \"playground\".\"staging__orders\".\"orders\" AS\nSELECT * FROM \"playground\".\"branch__live-test\".\"orders\"",
         );
+    }
+
+    #[test]
+    fn trino_promote_uses_full_refresh_predrop_and_portable_ctas() {
+        let dialect = rocky_trino::dialect::TrinoDialect::new();
+        let prod = TargetRef {
+            catalog: "lake".into(),
+            schema: "marts".into(),
+            table: "orders".into(),
+        };
+        let source = TargetRef {
+            catalog: "lake".into(),
+            schema: "branch".into(),
+            table: "orders".into(),
+        };
+        assert_eq!(
+            promote_pre_drop_sql(&dialect, &prod, PromoteKind::Table)
+                .unwrap()
+                .as_deref(),
+            Some("DROP TABLE IF EXISTS \"lake\".\"marts\".\"orders\"")
+        );
+        let create = build_promote_sql(&dialect, &prod, &source, PromoteKind::Table).unwrap();
+        assert!(
+            create.starts_with("CREATE TABLE \"lake\".\"marts\".\"orders\" AS"),
+            "{create}"
+        );
+        assert!(!create.contains("OR REPLACE"));
+    }
+
+    #[test]
+    fn promote_replication_classifies_every_configured_strategy() {
+        assert!(matches!(
+            replication_promote_kind("full_refresh").unwrap(),
+            PromoteKind::Table
+        ));
+        for strategy in [
+            "incremental",
+            "merge",
+            "view",
+            "materialized_view",
+            "dynamic_table",
+            "unknown",
+        ] {
+            assert!(
+                format!("{:#}", replication_promote_kind(strategy).unwrap_err()).contains(strategy)
+            );
+        }
     }
 
     /// `quote_identifier` wraps a name in the dialect's delimiter and does
@@ -2682,29 +3235,46 @@ mod tests {
             &duckdb,
             &plain("staging__orders"),
             &plain("branch__live-test"),
+            PromoteKind::Table,
         )
         .expect("a hyphenated schema name must still quote safely");
         assert_eq!(
             sql,
-            r#"CREATE OR REPLACE TABLE "playground"."staging__orders"."orders" AS SELECT * FROM "playground"."branch__live-test"."orders""#,
+            "CREATE OR REPLACE TABLE \"playground\".\"staging__orders\".\"orders\" AS\nSELECT * FROM \"playground\".\"branch__live-test\".\"orders\"",
         );
 
         // The production target is refused.
-        build_promote_sql(&duckdb, &plain("north\"america"), &plain("branch__live"))
-            .expect_err("a double quote must be refused on the DuckDB dialect");
+        build_promote_sql(
+            &duckdb,
+            &plain("north\"america"),
+            &plain("branch__live"),
+            PromoteKind::Table,
+        )
+        .expect_err("a double quote must be refused on the DuckDB dialect");
 
         // So is the branch source: both names reach the statement.
-        build_promote_sql(&duckdb, &plain("staging"), &plain("north\"america"))
-            .expect_err("the branch source is checked too");
+        build_promote_sql(
+            &duckdb,
+            &plain("staging"),
+            &plain("north\"america"),
+            PromoteKind::Table,
+        )
+        .expect_err("the branch source is checked too");
 
         // The delimiter is per dialect. Databricks quotes with backticks, so
         // a backtick is the hazard there and a double quote is not.
-        build_promote_sql(&databricks, &plain("north`america"), &plain("branch__live"))
-            .expect_err("a backtick must be refused on the Databricks dialect");
+        build_promote_sql(
+            &databricks,
+            &plain("north`america"),
+            &plain("branch__live"),
+            PromoteKind::Table,
+        )
+        .expect_err("a backtick must be refused on the Databricks dialect");
         build_promote_sql(
             &databricks,
             &plain("north\"america"),
             &plain("branch__live"),
+            PromoteKind::Table,
         )
         .expect("a double quote is contained by backtick quoting");
     }
@@ -2784,20 +3354,36 @@ mod tests {
         let duckdb = rocky_duckdb::dialect::DuckDbSqlDialect;
         let snowflake = rocky_snowflake::dialect::SnowflakeSqlDialect;
 
-        build_promote_sql(&bigquery, &plain(r"reporting\"), &plain("branch__live"))
-            .expect_err("a trailing backslash must be refused on BigQuery");
+        build_promote_sql(
+            &bigquery,
+            &plain(r"reporting\"),
+            &plain("branch__live"),
+            PromoteKind::Table,
+        )
+        .expect_err("a trailing backslash must be refused on BigQuery");
 
         // The controls: the same name promotes everywhere else.
-        let sql = build_promote_sql(&duckdb, &plain(r"raw\"), &plain("branch__live"))
-            .expect("a backslash is an ordinary DuckDB schema character");
+        let sql = build_promote_sql(
+            &duckdb,
+            &plain(r"raw\"),
+            &plain("branch__live"),
+            PromoteKind::Table,
+        )
+        .expect("a backslash is an ordinary DuckDB schema character");
         assert!(sql.contains(r#""raw\""#), "got {sql}");
-        build_promote_sql(&snowflake, &plain(r"raw\"), &plain("branch__live"))
-            .expect("and an ordinary Snowflake one");
+        build_promote_sql(
+            &snowflake,
+            &plain(r"raw\"),
+            &plain("branch__live"),
+            PromoteKind::Table,
+        )
+        .expect("and an ordinary Snowflake one");
 
         build_promote_sql(
             &bigquery,
             &plain("branch__live-test"),
             &plain("branch__live"),
+            PromoteKind::Table,
         )
         .expect("a hyphen is still fine on BigQuery");
     }
@@ -2830,9 +3416,18 @@ mod tests {
         let step = crate::output::PromoteTargetPlan {
             target: "wh.north\"america.orders".to_string(),
             source: "wh.br.orders".to_string(),
+            target_catalog: "wh".to_string(),
+            target_schema: "north\"america".to_string(),
+            target_table: "orders".to_string(),
+            source_catalog: "wh".to_string(),
+            source_schema: "br".to_string(),
+            source_table: "orders".to_string(),
+            strategy: "full_refresh".to_string(),
             statement: "CREATE OR REPLACE TABLE \"wh\".\"north\"america\".\"orders\" \
                         AS SELECT * FROM \"wh\".\"br\".\"orders\""
                 .to_string(),
+            pre_drop_statement: None,
+            production_upstreams: Vec::new(),
         };
         let err = run_promote_apply(&loaded, &[step], Some("one"))
             .await
@@ -3687,6 +4282,7 @@ adapter = "default"
     /// adapter was resolved and the statement executed against `b.duckdb`.
     #[tokio::test]
     async fn promote_swap_cannot_redirect_adapter() {
+        use rocky_core::traits::WarehouseAdapter;
         use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
 
         let tmp = TempDir::new().unwrap();
@@ -3706,6 +4302,17 @@ adapter = "default"
         };
         std::fs::write(&config_path, config_for(&a_db)).unwrap();
 
+        let source_adapter = DuckDbWarehouseAdapter::open(&a_db).unwrap();
+        source_adapter
+            .execute_statement("CREATE SCHEMA branch_src")
+            .await
+            .unwrap();
+        source_adapter
+            .execute_statement("CREATE TABLE branch_src.promoted AS SELECT 42 AS answer")
+            .await
+            .unwrap();
+        drop(source_adapter);
+
         let promote_plan = crate::output::PromotePlan {
             branch_name: "fix_price".to_string(),
             pipeline: None,
@@ -3717,9 +4324,18 @@ adapter = "default"
             breaking_changes: None,
             allow_breaking: false,
             targets: vec![crate::output::PromoteTargetPlan {
-                target: "main.promoted".to_string(),
-                source: "main.branch_src".to_string(),
-                statement: "CREATE TABLE promoted AS SELECT 42 AS answer".to_string(),
+                target: "a.main.promoted".to_string(),
+                source: "a.branch_src.promoted".to_string(),
+                target_catalog: "a".to_string(),
+                target_schema: "main".to_string(),
+                target_table: "promoted".to_string(),
+                source_catalog: "a".to_string(),
+                source_schema: "branch_src".to_string(),
+                source_table: "promoted".to_string(),
+                strategy: "full_refresh".to_string(),
+                statement: "CREATE OR REPLACE TABLE \"a\".\"main\".\"promoted\" AS SELECT * FROM \"a\".\"branch_src\".\"promoted\"".to_string(),
+                pre_drop_statement: None,
+                production_upstreams: Vec::new(),
             }],
             plan_audit: Vec::new(),
             created_at: Utc::now(),
@@ -3761,6 +4377,954 @@ adapter = "default"
             !b_db.exists(),
             "the swap must not redirect the promote: b.duckdb must never be created"
         );
+    }
+
+    /// A branch view must stay a view after promotion. The same plan also
+    /// contains a table model, so this exercises per-model strategy selection.
+    #[tokio::test]
+    async fn promote_duckdb_view_keeps_its_strategy() {
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        let tmp = TempDir::new().unwrap();
+        let db = tmp.path().join("warehouse.duckdb");
+        let config_path = tmp.path().join("rocky.toml");
+        let models = tmp.path().join("models");
+        std::fs::create_dir(&models).unwrap();
+        std::fs::write(
+            &config_path,
+            format!(
+                "[adapter]\ntype = \"duckdb\"\npath = \"{}\"\n\n[pipeline.t]\ntype = \"transformation\"\nmodels = \"models/**\"\n\n[pipeline.t.target]\nadapter = \"default\"\n[pipeline.t.target.governance]\nauto_create_schemas = true\n",
+                db.display()
+            ),
+        )
+        .unwrap();
+        write_transformation_model(
+            &models,
+            "a_table",
+            "warehouse",
+            "marts",
+            "a_table",
+            "SELECT @var(id, 1) AS id",
+        );
+        write_transformation_model(
+            &models,
+            "b_view",
+            "warehouse",
+            "marts",
+            "b_view",
+            "SELECT id, '@var(region, us)' AS region FROM a_table",
+        );
+        std::fs::write(
+            models.join("b_view.toml"),
+            "name = \"b_view\"\n[strategy]\ntype = \"view\"\n[target]\ncatalog = \"warehouse\"\nschema = \"marts\"\ntable = \"b_view\"\n",
+        )
+        .unwrap();
+        let adapter = DuckDbWarehouseAdapter::open(&db).unwrap();
+        adapter
+            .execute_statement("CREATE SCHEMA marts")
+            .await
+            .unwrap();
+        drop(adapter);
+        let state_path = tmp.path().join("state.redb");
+        let shadow = ShadowConfig {
+            suffix: "_rocky_shadow".to_string(),
+            schema_override: Some("branch__fix_price".to_string()),
+            cleanup_after: false,
+            branch: Some("fix_price".to_string()),
+        };
+        let mut first_vars = rocky_core::run_vars::RunVars::new();
+        first_vars.insert("id", "1");
+        run_issue_2024_demo(&config_path, &state_path, "t", Some(&shadow), &first_vars)
+            .await
+            .unwrap();
+
+        let (_, planned) =
+            discover_branch_targets_for_plan(&config_path, &sample_record("fix_price"), None, None)
+                .await
+                .unwrap();
+        let view_plan = planned.iter().find(|p| p.target_table == "b_view").unwrap();
+        assert!(view_plan.statement.contains("'us'"));
+        assert!(!view_plan.statement.contains("@var("));
+        let steps: Vec<crate::output::PromoteTargetPlan> = planned
+            .into_iter()
+            .map(|p| crate::output::PromoteTargetPlan {
+                target: p.target,
+                source: p.source,
+                target_catalog: p.target_catalog,
+                target_schema: p.target_schema,
+                target_table: p.target_table,
+                source_catalog: p.source_catalog,
+                source_schema: p.source_schema,
+                source_table: p.source_table,
+                strategy: p.strategy,
+                statement: p.statement,
+                pre_drop_statement: p.pre_drop_statement,
+                production_upstreams: p
+                    .production_upstreams
+                    .into_iter()
+                    .map(|upstream| crate::output::PromoteUpstream {
+                        catalog: upstream.catalog,
+                        schema: upstream.schema,
+                        table: upstream.table,
+                    })
+                    .collect(),
+            })
+            .collect();
+        let loaded = rocky_core::config::LoadedConfig {
+            config: rocky_core::config::load_rocky_config(&config_path).unwrap(),
+            fingerprint: "fixture".to_string(),
+        };
+        let (_, ok) = run_promote_apply(&loaded, &steps, None).await.unwrap();
+        assert!(ok);
+        let adapter = DuckDbWarehouseAdapter::open(&db).unwrap();
+        let view_rows = adapter
+            .execute_query("SELECT region FROM marts.b_view")
+            .await
+            .unwrap();
+        assert_eq!(view_rows.rows[0][0].as_str(), Some("us"));
+        let rows = adapter.execute_query("SELECT table_name, table_type FROM information_schema.tables WHERE table_schema = 'marts' ORDER BY table_name").await.unwrap();
+        assert_eq!(rows.rows.len(), 2);
+        assert_eq!(rows.rows[0][1].as_str(), Some("BASE TABLE"));
+        assert_eq!(rows.rows[1][1].as_str(), Some("VIEW"));
+        let before = adapter
+            .execute_query("SELECT id FROM marts.b_view")
+            .await
+            .unwrap();
+        assert_eq!(before.rows[0][0].as_str(), Some("1"));
+        drop(adapter);
+        let mut second_vars = rocky_core::run_vars::RunVars::new();
+        second_vars.insert("id", "2");
+        run_issue_2024_demo(&config_path, &state_path, "t", Some(&shadow), &second_vars)
+            .await
+            .unwrap();
+        let adapter = DuckDbWarehouseAdapter::open(&db).unwrap();
+        let after = adapter
+            .execute_query("SELECT id FROM marts.b_view")
+            .await
+            .unwrap();
+        assert_eq!(after.rows[0][0].as_str(), Some("1"));
+        adapter
+            .execute_statement("DROP SCHEMA branch__fix_price CASCADE")
+            .await
+            .unwrap();
+        let after_cleanup = adapter
+            .execute_query("SELECT id FROM marts.b_view")
+            .await
+            .unwrap();
+        assert_eq!(after_cleanup.rows[0][0].as_str(), Some("1"));
+    }
+
+    #[tokio::test]
+    async fn promote_orders_dependencies_and_preflights_filtered_view_upstream() {
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        let tmp = TempDir::new().unwrap();
+        let db = tmp.path().join("warehouse.duckdb");
+        let config_path = tmp.path().join("rocky.toml");
+        let models = tmp.path().join("models");
+        std::fs::create_dir(&models).unwrap();
+        std::fs::write(&config_path, format!(
+            "[adapter]\ntype = \"duckdb\"\npath = \"{}\"\n[pipeline.t]\ntype = \"transformation\"\nmodels = \"models/**\"\n[pipeline.t.target]\nadapter = \"default\"\n",
+            db.display()
+        )).unwrap();
+        write_transformation_model(
+            &models,
+            "z_upstream",
+            "warehouse",
+            "raw",
+            "z_upstream",
+            "SELECT 1 AS id",
+        );
+        write_transformation_model(
+            &models,
+            "a_view",
+            "warehouse",
+            "reporting",
+            "a_view",
+            "SELECT id, added FROM warehouse.raw.z_upstream",
+        );
+        std::fs::write(models.join("a_view.toml"),
+            "name = \"a_view\"\n[strategy]\ntype = \"view\"\n[target]\ncatalog = \"warehouse\"\nschema = \"reporting\"\ntable = \"a_view\"\n").unwrap();
+        let record = sample_record("fix_price");
+        let (_, all) = discover_branch_targets_for_plan(&config_path, &record, None, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            all.iter()
+                .map(|p| p.target_table.as_str())
+                .collect::<Vec<_>>(),
+            vec!["z_upstream", "a_view"]
+        );
+        assert!(all[1].statement.contains("raw"));
+
+        let (_, filtered) =
+            discover_branch_targets_for_plan(&config_path, &record, Some("schema=reporting"), None)
+                .await
+                .unwrap();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(
+            filtered[0].production_upstreams[0].full_name(),
+            "warehouse.raw.z_upstream"
+        );
+        let adapter = DuckDbWarehouseAdapter::open(&db).unwrap();
+        adapter
+            .execute_statement("CREATE SCHEMA reporting")
+            .await
+            .unwrap();
+        adapter
+            .execute_statement("CREATE SCHEMA branch__fix_price")
+            .await
+            .unwrap();
+        adapter
+            .execute_statement("CREATE VIEW branch__fix_price.a_view AS SELECT 1 AS id")
+            .await
+            .unwrap();
+        drop(adapter);
+        let p = &filtered[0];
+        let step = crate::output::PromoteTargetPlan {
+            target: p.target.clone(),
+            source: p.source.clone(),
+            target_catalog: p.target_catalog.clone(),
+            target_schema: p.target_schema.clone(),
+            target_table: p.target_table.clone(),
+            source_catalog: p.source_catalog.clone(),
+            source_schema: p.source_schema.clone(),
+            source_table: p.source_table.clone(),
+            strategy: p.strategy.clone(),
+            statement: p.statement.clone(),
+            pre_drop_statement: p.pre_drop_statement.clone(),
+            production_upstreams: p
+                .production_upstreams
+                .iter()
+                .map(|u| crate::output::PromoteUpstream {
+                    catalog: u.catalog.clone(),
+                    schema: u.schema.clone(),
+                    table: u.table.clone(),
+                })
+                .collect(),
+        };
+        let loaded = rocky_core::config::LoadedConfig {
+            config: rocky_core::config::load_rocky_config(&config_path).unwrap(),
+            fingerprint: "fixture".into(),
+        };
+        let error = run_promote_apply(&loaded, &[step], None).await.unwrap_err();
+        assert!(format!("{error:#}").contains("production upstream 'warehouse.raw.z_upstream'"));
+        let adapter = DuckDbWarehouseAdapter::open(&db).unwrap();
+        assert!(
+            adapter
+                .execute_query("SELECT * FROM reporting.a_view")
+                .await
+                .is_err()
+        );
+        for sql in [
+            "CREATE SCHEMA raw",
+            "CREATE TABLE raw.z_upstream AS SELECT 0 AS id",
+            "CREATE TABLE branch__fix_price.z_upstream AS SELECT 2 AS id, 3 AS added",
+        ] {
+            adapter.execute_statement(sql).await.unwrap();
+        }
+        drop(adapter);
+        let steps: Vec<crate::output::PromoteTargetPlan> = all
+            .into_iter()
+            .map(|p| crate::output::PromoteTargetPlan {
+                target: p.target,
+                source: p.source,
+                target_catalog: p.target_catalog,
+                target_schema: p.target_schema,
+                target_table: p.target_table,
+                source_catalog: p.source_catalog,
+                source_schema: p.source_schema,
+                source_table: p.source_table,
+                strategy: p.strategy,
+                statement: p.statement,
+                pre_drop_statement: p.pre_drop_statement,
+                production_upstreams: p
+                    .production_upstreams
+                    .into_iter()
+                    .map(|u| crate::output::PromoteUpstream {
+                        catalog: u.catalog,
+                        schema: u.schema,
+                        table: u.table,
+                    })
+                    .collect(),
+            })
+            .collect();
+        let (_, ok) = run_promote_apply(&loaded, &steps, None).await.unwrap();
+        assert!(ok);
+        let adapter = DuckDbWarehouseAdapter::open(&db).unwrap();
+        let rows = adapter
+            .execute_query("SELECT id, added FROM reporting.a_view")
+            .await
+            .unwrap();
+        assert_eq!(rows.rows[0][0].as_str(), Some("2"));
+        assert_eq!(rows.rows[0][1].as_str(), Some("3"));
+    }
+
+    #[test]
+    fn promote_uses_loaded_sidecar_snapshot_for_view_destination() {
+        let tmp = TempDir::new().unwrap();
+        let models = tmp.path().join("models");
+        std::fs::create_dir(&models).unwrap();
+        write_transformation_model(
+            &models,
+            "view",
+            "warehouse",
+            "marts",
+            "original",
+            "SELECT 1 AS id",
+        );
+        let sidecar = models.join("view.toml");
+        std::fs::write(&sidecar, "name = \"view\"\n[strategy]\ntype = \"view\"\n[target]\ncatalog = \"warehouse\"\nschema = \"marts\"\ntable = \"original\"\n").unwrap();
+        let snapshot = crate::models_loader::load_project_models_matching(
+            &models,
+            &format!("{}/**", models.display()),
+            None,
+        )
+        .unwrap();
+        std::fs::write(&sidecar, "name = \"view\"\n[strategy]\ntype = \"view\"\n[target]\ncatalog = \"warehouse\"\nschema = \"marts\"\ntable = \"swapped\"\n").unwrap();
+        let planned =
+            plan_transformation_from_models(snapshot, &sample_record("fix"), None).unwrap();
+        assert_eq!(planned.len(), 1);
+        assert_eq!(planned[0].prod.table, "original");
+        let ir = planned[0].model_ir.as_ref().unwrap();
+        assert_eq!(ir.target.table, "original");
+        let dialect = rocky_duckdb::dialect::DuckDbSqlDialect;
+        let (sql, _) = production_view_sql(&dialect, ir, &planned[0].upstreams).unwrap();
+        assert_generated_promote_target(&dialect, PromoteKind::View, &planned[0].prod, &sql)
+            .unwrap();
+        let swapped = TargetRef {
+            table: "swapped".to_string(),
+            ..planned[0].prod.clone()
+        };
+        assert!(
+            assert_generated_promote_target(&dialect, PromoteKind::View, &swapped, &sql).is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn promote_rejects_qualified_view_cycle_before_plan() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("rocky.toml");
+        let models = tmp.path().join("models");
+        std::fs::create_dir(&models).unwrap();
+        std::fs::write(
+            &config_path,
+            format!("[adapter]\ntype = \"duckdb\"\npath = \"{}\"\n[pipeline.t]\ntype = \"transformation\"\nmodels = \"models/**\"\n[pipeline.t.target]\nadapter = \"default\"\n", tmp.path().join("warehouse.duckdb").display()),
+        ).unwrap();
+        for (name, upstream) in [("a", "b"), ("b", "a")] {
+            write_transformation_model(
+                &models,
+                name,
+                "warehouse",
+                "marts",
+                name,
+                &format!("SELECT id FROM warehouse.marts.{upstream}"),
+            );
+            std::fs::write(
+                models.join(format!("{name}.toml")),
+                format!("name = \"{name}\"\n[strategy]\ntype = \"view\"\n[target]\ncatalog = \"warehouse\"\nschema = \"marts\"\ntable = \"{name}\"\n"),
+            ).unwrap();
+        }
+        let error =
+            discover_branch_targets_for_plan(&config_path, &sample_record("fix"), None, None)
+                .await
+                .unwrap_err();
+        assert!(format!("{error:#}").contains("cyclic production dependencies"));
+    }
+
+    /// Issue #2024's DuckDB sequence: production has two orders, the branch
+    /// filters to one, and promotion must update both tables and keep the view.
+    async fn run_issue_2024_demo(
+        config_path: &Path,
+        state_path: &Path,
+        pipeline: &str,
+        shadow: Option<&ShadowConfig>,
+        vars: &rocky_core::run_vars::RunVars,
+    ) -> Result<()> {
+        let loaded = std::sync::Arc::new(rocky_core::config::load_rocky_config_fingerprinted(
+            config_path,
+        )?);
+        crate::commands::run(
+            config_path,
+            loaded,
+            None,
+            Some(pipeline),
+            state_path,
+            None,
+            false,
+            None,
+            false,
+            None,
+            false,
+            shadow,
+            &crate::commands::PartitionRunOptions::default(),
+            None,
+            None,
+            None,
+            None,
+            &crate::commands::DeferOptions::default(),
+            &crate::commands::SkipRunOptions::default(),
+            vars,
+            None,
+            None,
+            false,
+            None,
+        )
+        .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn promote_issue_2024_three_model_duckdb_recipe() {
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let db = dir.join("promote.duckdb");
+        let config_path = dir.join("rocky.toml");
+        let state_path = dir.join("state.redb");
+        let models = dir.join("models");
+        std::fs::create_dir(&models).unwrap();
+        std::fs::write(&config_path, format!("[adapter]\ntype = \"duckdb\"\npath = \"{}\"\n[pipeline.demo]\ntype = \"transformation\"\nmodels = \"models/**\"\n[pipeline.demo.target]\nadapter = \"default\"\n[pipeline.demo.target.governance]\nauto_create_schemas = true\n", db.display())).unwrap();
+        std::fs::write(models.join("orders.sql"), "SELECT id, amount FROM (VALUES (1, 10.0), (2, 100.0)) AS source(id, amount) WHERE amount >= @var(min_amount, 0)").unwrap();
+        std::fs::write(models.join("orders.toml"), "name = \"orders\"\n[strategy]\ntype = \"full_refresh\"\n[target]\ncatalog = \"promote\"\nschema = \"main\"\ntable = \"orders\"\n").unwrap();
+        std::fs::write(
+            models.join("orders_view.sql"),
+            "SELECT id, amount FROM orders",
+        )
+        .unwrap();
+        std::fs::write(models.join("orders_view.toml"), "name = \"orders_view\"\ndepends_on = [\"orders\"]\n[strategy]\ntype = \"view\"\n[target]\ncatalog = \"promote\"\nschema = \"main\"\ntable = \"orders_view\"\n").unwrap();
+        std::fs::write(
+            models.join("orders_summary.sql"),
+            "SELECT COUNT(*) AS row_count, SUM(amount) AS total FROM orders",
+        )
+        .unwrap();
+        std::fs::write(models.join("orders_summary.toml"), "name = \"orders_summary\"\ndepends_on = [\"orders\"]\n[strategy]\ntype = \"full_refresh\"\n[target]\ncatalog = \"promote\"\nschema = \"main\"\ntable = \"orders_summary\"\n").unwrap();
+
+        let git = |args: &[&str]| {
+            let status = ProcessCommand::new("git")
+                .args(args)
+                .current_dir(dir)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.email", "test@rocky.invalid"]);
+        git(&["config", "user.name", "Rocky Test"]);
+        git(&["config", "commit.gpgsign", "false"]);
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "base"]);
+
+        let _cwd_guard = cwd_lock();
+        let saved_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir).unwrap();
+        run_issue_2024_demo(
+            &config_path,
+            &state_path,
+            "demo",
+            None,
+            &rocky_core::run_vars::RunVars::new(),
+        )
+        .await
+        .expect("production run");
+        let adapter = DuckDbWarehouseAdapter::open(&db).unwrap();
+        let prod = adapter
+            .execute_query("SELECT row_count, total FROM promote.main.orders_summary")
+            .await
+            .unwrap();
+        assert_eq!(prod.rows[0][0].as_str(), Some("2"));
+        assert_eq!(prod.rows[0][1].as_str(), Some("110.0"));
+        drop(adapter);
+
+        run_branch_create(&state_path, "b1", Some("only orders of 50 or more"), false).unwrap();
+        let shadow =
+            resolve_branch_shadow_config(&state_path, "b1", "_rocky_shadow".to_string()).unwrap();
+        let mut vars = rocky_core::run_vars::RunVars::new();
+        vars.insert("min_amount", "50");
+        run_issue_2024_demo(&config_path, &state_path, "demo", Some(&shadow), &vars)
+            .await
+            .expect("branch run");
+        let adapter = DuckDbWarehouseAdapter::open(&db).unwrap();
+        let branch = adapter
+            .execute_query("SELECT row_count, total FROM promote.branch__b1.orders_summary")
+            .await
+            .unwrap();
+        assert_eq!(branch.rows[0][0].as_str(), Some("1"));
+        assert_eq!(branch.rows[0][1].as_str(), Some("100.0"));
+        drop(adapter);
+
+        let result = run_branch_promote(
+            dir,
+            &state_path,
+            &config_path,
+            &models,
+            "main",
+            "b1",
+            None,
+            Some("demo"),
+            false,
+            false,
+            rocky_core::config::PolicyPrincipal::Human,
+            false,
+        )
+        .await;
+        std::env::set_current_dir(saved_cwd).unwrap();
+        result.expect("all three targets promote");
+        let adapter = DuckDbWarehouseAdapter::open(&db).unwrap();
+        let prod = adapter
+            .execute_query("SELECT row_count, total FROM promote.main.orders_summary")
+            .await
+            .unwrap();
+        assert_eq!(prod.rows[0][0].as_str(), Some("1"));
+        assert_eq!(prod.rows[0][1].as_str(), Some("100.0"));
+        let kinds = adapter.execute_query("SELECT table_type FROM information_schema.tables WHERE table_schema = 'main' AND table_name = 'orders_view'").await.unwrap();
+        assert_eq!(kinds.rows[0][0].as_str(), Some("VIEW"));
+    }
+
+    /// A missing later branch object is predictable before the first write.
+    #[tokio::test]
+    async fn promote_preflights_all_sources_before_replacing_any_target() {
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        let tmp = TempDir::new().unwrap();
+        let db = tmp.path().join("warehouse.duckdb");
+        let config_path = tmp.path().join("rocky.toml");
+        std::fs::write(&config_path, format!("[adapter]\ntype = \"duckdb\"\npath = \"{}\"\n[pipeline.t]\ntype = \"transformation\"\nmodels = \"models/**\"\n[pipeline.t.target]\nadapter = \"default\"\n", db.display())).unwrap();
+        let adapter = DuckDbWarehouseAdapter::open(&db).unwrap();
+        for sql in [
+            "CREATE SCHEMA marts",
+            "CREATE SCHEMA branch__fix_price",
+            "CREATE TABLE marts.first AS SELECT 0 AS id",
+            "CREATE TABLE branch__fix_price.first AS SELECT 1 AS id",
+        ] {
+            adapter.execute_statement(sql).await.unwrap();
+        }
+        drop(adapter);
+        let step = |name: &str| crate::output::PromoteTargetPlan {
+            target: format!("warehouse.marts.{name}"),
+            source: format!("warehouse.branch__fix_price.{name}"),
+            target_catalog: "warehouse".to_string(),
+            target_schema: "marts".to_string(),
+            target_table: name.to_string(),
+            source_catalog: "warehouse".to_string(),
+            source_schema: "branch__fix_price".to_string(),
+            source_table: name.to_string(),
+            strategy: "full_refresh".to_string(),
+            statement: format!(
+                "CREATE OR REPLACE TABLE \"warehouse\".\"marts\".\"{name}\" AS SELECT * FROM \"warehouse\".\"branch__fix_price\".\"{name}\""
+            ),
+            pre_drop_statement: None,
+            production_upstreams: Vec::new(),
+        };
+        let loaded = rocky_core::config::LoadedConfig {
+            config: rocky_core::config::load_rocky_config(&config_path).unwrap(),
+            fingerprint: "fixture".to_string(),
+        };
+        let err = run_promote_apply(&loaded, &[step("first"), step("missing")], None)
+            .await
+            .expect_err("missing second source must refuse before the first replacement");
+        assert!(format!("{err:#}").contains("missing"));
+        let adapter = DuckDbWarehouseAdapter::open(&db).unwrap();
+        let rows = adapter
+            .execute_query("SELECT id FROM marts.first")
+            .await
+            .unwrap();
+        assert_eq!(rows.rows[0][0].as_str(), Some("0"));
+    }
+
+    #[tokio::test]
+    async fn promote_preflights_every_destination_schema_before_writing() {
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        let tmp = TempDir::new().unwrap();
+        let db = tmp.path().join("warehouse.duckdb");
+        let config_path = tmp.path().join("rocky.toml");
+        std::fs::write(&config_path, format!("[adapter]\ntype = \"duckdb\"\npath = \"{}\"\n[pipeline.t]\ntype = \"transformation\"\nmodels = \"models/**\"\n[pipeline.t.target]\nadapter = \"default\"\n", db.display())).unwrap();
+        let adapter = DuckDbWarehouseAdapter::open(&db).unwrap();
+        for sql in [
+            "CREATE SCHEMA marts",
+            "CREATE SCHEMA branch__fix_price",
+            "CREATE TABLE marts.first AS SELECT 0 AS id",
+            "CREATE TABLE branch__fix_price.first AS SELECT 1 AS id",
+            "CREATE TABLE branch__fix_price.second AS SELECT 2 AS id",
+        ] {
+            adapter.execute_statement(sql).await.unwrap();
+        }
+        drop(adapter);
+        let step = |schema: &str, table: &str| crate::output::PromoteTargetPlan {
+            target: format!("warehouse.{schema}.{table}"),
+            source: format!("warehouse.branch__fix_price.{table}"),
+            target_catalog: "warehouse".to_string(),
+            target_schema: schema.to_string(),
+            target_table: table.to_string(),
+            source_catalog: "warehouse".to_string(),
+            source_schema: "branch__fix_price".to_string(),
+            source_table: table.to_string(),
+            strategy: "full_refresh".to_string(),
+            statement: format!(
+                "CREATE OR REPLACE TABLE \"warehouse\".\"{schema}\".\"{table}\" AS SELECT * FROM \"warehouse\".\"branch__fix_price\".\"{table}\""
+            ),
+            pre_drop_statement: None,
+            production_upstreams: Vec::new(),
+        };
+        let loaded = rocky_core::config::LoadedConfig {
+            config: rocky_core::config::load_rocky_config(&config_path).unwrap(),
+            fingerprint: "fixture".to_string(),
+        };
+        let err = run_promote_apply(
+            &loaded,
+            &[step("marts", "first"), step("missing", "second")],
+            None,
+        )
+        .await
+        .expect_err("a missing later namespace must refuse before the first write");
+        assert!(
+            format!("{err:#}").contains("namespace does not exist"),
+            "{err:#}"
+        );
+        let adapter = DuckDbWarehouseAdapter::open(&db).unwrap();
+        let rows = adapter
+            .execute_query("SELECT id FROM marts.first")
+            .await
+            .unwrap();
+        assert_eq!(rows.rows[0][0].as_str(), Some("0"));
+    }
+
+    #[tokio::test]
+    async fn promote_preflights_quoted_destination_coordinates() {
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+        let tmp = TempDir::new().unwrap();
+        let db = tmp.path().join("warehouse.duckdb");
+        let config_path = tmp.path().join("rocky.toml");
+        std::fs::write(&config_path, format!("[adapter]\ntype = \"duckdb\"\npath = \"{}\"\n[pipeline.t]\ntype = \"transformation\"\nmodels = \"models/**\"\n[pipeline.t.target]\nadapter = \"default\"\n", db.display())).unwrap();
+        let adapter = DuckDbWarehouseAdapter::open(&db).unwrap();
+        for sql in [
+            "CREATE SCHEMA \"marts.part\"",
+            "CREATE SCHEMA branch__fix_price",
+            "CREATE TABLE \"marts.part\".\"orders.part\" AS SELECT 0 AS id",
+            "CREATE TABLE branch__fix_price.\"orders.part\" AS SELECT 1 AS id",
+        ] {
+            adapter.execute_statement(sql).await.unwrap();
+        }
+        drop(adapter);
+        let step = crate::output::PromoteTargetPlan {
+            target: "warehouse.marts.part.orders.part".to_string(),
+            source: "warehouse.branch__fix_price.orders.part".to_string(),
+            target_catalog: "warehouse".to_string(), target_schema: "marts.part".to_string(), target_table: "orders.part".to_string(),
+            source_catalog: "warehouse".to_string(), source_schema: "branch__fix_price".to_string(), source_table: "orders.part".to_string(),
+            strategy: "full_refresh".to_string(),
+            statement: "CREATE OR REPLACE TABLE \"warehouse\".\"marts.part\".\"orders.part\" AS SELECT * FROM \"warehouse\".\"branch__fix_price\".\"orders.part\"".to_string(),
+            pre_drop_statement: None,
+            production_upstreams: Vec::new(),
+        };
+        let loaded = rocky_core::config::LoadedConfig {
+            config: rocky_core::config::load_rocky_config(&config_path).unwrap(),
+            fingerprint: "fixture".to_string(),
+        };
+        let (_, ok) = run_promote_apply(&loaded, &[step], None).await.unwrap();
+        assert!(ok);
+        let adapter = DuckDbWarehouseAdapter::open(&db).unwrap();
+        let rows = adapter
+            .execute_query("SELECT id FROM \"marts.part\".\"orders.part\"")
+            .await
+            .unwrap();
+        assert_eq!(rows.rows[0][0].as_str(), Some("1"));
+    }
+
+    #[tokio::test]
+    async fn promote_preflights_a_known_view_table_conflict() {
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        let tmp = TempDir::new().unwrap();
+        let db = tmp.path().join("warehouse.duckdb");
+        let config_path = tmp.path().join("rocky.toml");
+        std::fs::write(&config_path, format!("[adapter]\ntype = \"duckdb\"\npath = \"{}\"\n[pipeline.t]\ntype = \"transformation\"\nmodels = \"models/**\"\n[pipeline.t.target]\nadapter = \"default\"\n", db.display())).unwrap();
+        let adapter = DuckDbWarehouseAdapter::open(&db).unwrap();
+        for sql in [
+            "CREATE SCHEMA marts",
+            "CREATE SCHEMA branch__fix_price",
+            "CREATE TABLE marts.first AS SELECT 0 AS id",
+            "CREATE TABLE marts.second AS SELECT 0 AS id",
+            "CREATE TABLE branch__fix_price.first AS SELECT 1 AS id",
+            "CREATE VIEW branch__fix_price.second AS SELECT 2 AS id",
+        ] {
+            adapter.execute_statement(sql).await.unwrap();
+        }
+        drop(adapter);
+        let step = |name: &str, kind: &str| crate::output::PromoteTargetPlan {
+            target: format!("warehouse.marts.{name}"),
+            source: format!("warehouse.branch__fix_price.{name}"),
+            target_catalog: "warehouse".to_string(),
+            target_schema: "marts".to_string(),
+            target_table: name.to_string(),
+            source_catalog: "warehouse".to_string(),
+            source_schema: "branch__fix_price".to_string(),
+            source_table: name.to_string(),
+            strategy: if kind == "VIEW" {
+                "view"
+            } else {
+                "full_refresh"
+            }
+            .to_string(),
+            statement: format!(
+                "CREATE OR REPLACE {kind} \"warehouse\".\"marts\".\"{name}\" AS SELECT * FROM \"warehouse\".\"branch__fix_price\".\"{name}\""
+            ),
+            pre_drop_statement: None,
+            production_upstreams: Vec::new(),
+        };
+        let loaded = rocky_core::config::LoadedConfig {
+            config: rocky_core::config::load_rocky_config(&config_path).unwrap(),
+            fingerprint: "fixture".to_string(),
+        };
+        let err = run_promote_apply(
+            &loaded,
+            &[step("first", "TABLE"), step("second", "VIEW")],
+            None,
+        )
+        .await
+        .expect_err("existing table cannot be replaced by a view after an earlier write");
+        assert!(format!("{err:#}").contains("warehouse.marts.second"));
+        let adapter = DuckDbWarehouseAdapter::open(&db).unwrap();
+        let rows = adapter
+            .execute_query("SELECT id FROM marts.first")
+            .await
+            .unwrap();
+        assert_eq!(rows.rows[0][0].as_str(), Some("0"));
+    }
+
+    /// An evaluation error can still happen after LIMIT 0 preflight. Every
+    /// target must then appear in JSON and text with its actual disposition.
+    #[tokio::test]
+    async fn promote_reports_all_targets_after_a_partial_write() {
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        let tmp = TempDir::new().unwrap();
+        let db = tmp.path().join("warehouse.duckdb");
+        let config_path = tmp.path().join("rocky.toml");
+        std::fs::write(&config_path, format!("[adapter]\ntype = \"duckdb\"\npath = \"{}\"\n[pipeline.t]\ntype = \"transformation\"\nmodels = \"models/**\"\n[pipeline.t.target]\nadapter = \"default\"\n", db.display())).unwrap();
+        let adapter = DuckDbWarehouseAdapter::open(&db).unwrap();
+        for sql in [
+            "CREATE SCHEMA marts",
+            "CREATE SCHEMA branch__fix_price",
+            "CREATE TABLE branch__fix_price.first AS SELECT 1 AS id",
+            "CREATE VIEW branch__fix_price.second AS SELECT CAST('bad' AS INTEGER) AS id",
+            "CREATE TABLE branch__fix_price.third AS SELECT 3 AS id",
+        ] {
+            adapter.execute_statement(sql).await.unwrap();
+        }
+        drop(adapter);
+        let step = |name: &str| crate::output::PromoteTargetPlan {
+            target: format!("warehouse.marts.{name}"),
+            source: format!("warehouse.branch__fix_price.{name}"),
+            target_catalog: "warehouse".to_string(),
+            target_schema: "marts".to_string(),
+            target_table: name.to_string(),
+            source_catalog: "warehouse".to_string(),
+            source_schema: "branch__fix_price".to_string(),
+            source_table: name.to_string(),
+            strategy: "full_refresh".to_string(),
+            statement: format!(
+                "CREATE OR REPLACE TABLE \"warehouse\".\"marts\".\"{name}\" AS SELECT * FROM \"warehouse\".\"branch__fix_price\".\"{name}\""
+            ),
+            pre_drop_statement: None,
+            production_upstreams: Vec::new(),
+        };
+        let loaded = rocky_core::config::LoadedConfig {
+            config: rocky_core::config::load_rocky_config(&config_path).unwrap(),
+            fingerprint: "fixture".to_string(),
+        };
+        let (targets, ok) = run_promote_apply(
+            &loaded,
+            &[step("first"), step("second"), step("third")],
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(!ok);
+        let json = serde_json::to_value(&targets).unwrap();
+        assert_eq!(json.as_array().unwrap().len(), 3);
+        assert_eq!(json[0]["succeeded"], true);
+        assert_eq!(json[1]["succeeded"], false);
+        assert_eq!(json[2]["succeeded"], false);
+        assert!(json[2]["error"].as_str().unwrap().contains("not attempted"));
+        let lines = promote_failure_target_lines(&targets);
+        assert!(lines[0].contains("replaced: warehouse.marts.first"));
+        assert!(lines[1].contains("not confirmed replaced: warehouse.marts.second"));
+        assert!(lines[2].contains("not replaced: warehouse.marts.third"));
+        let adapter = DuckDbWarehouseAdapter::open(&db).unwrap();
+        let rows = adapter
+            .execute_query("SELECT id FROM marts.first")
+            .await
+            .unwrap();
+        assert_eq!(rows.rows[0][0].as_str(), Some("1"));
+        assert!(
+            adapter
+                .execute_query("SELECT * FROM marts.third")
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn promote_reports_target_dropped_when_create_fails() {
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        let tmp = TempDir::new().unwrap();
+        let db = tmp.path().join("warehouse.duckdb");
+        let config_path = tmp.path().join("rocky.toml");
+        std::fs::write(&config_path, format!(
+            "[adapter]\ntype = \"duckdb\"\npath = \"{}\"\n[pipeline.t]\ntype = \"transformation\"\nmodels = \"models/**\"\n[pipeline.t.target]\nadapter = \"default\"\n",
+            db.display()
+        )).unwrap();
+        let adapter = DuckDbWarehouseAdapter::open(&db).unwrap();
+        for sql in [
+            "CREATE SCHEMA marts",
+            "CREATE SCHEMA branch__fix_price",
+            "CREATE TABLE marts.orders AS SELECT 0 AS id",
+            "CREATE TABLE branch__fix_price.orders AS SELECT 1 AS id",
+        ] {
+            adapter.execute_statement(sql).await.unwrap();
+        }
+        drop(adapter);
+        let step = crate::output::PromoteTargetPlan {
+            target: "warehouse.marts.orders".into(),
+            source: "warehouse.branch__fix_price.orders".into(),
+            target_catalog: "warehouse".into(),
+            target_schema: "marts".into(),
+            target_table: "orders".into(),
+            source_catalog: "warehouse".into(),
+            source_schema: "branch__fix_price".into(),
+            source_table: "orders".into(),
+            strategy: "full_refresh".into(),
+            statement:
+                "CREATE TABLE \"warehouse\".\"marts\".\"orders\" AS SELECT * FROM nonexistent"
+                    .into(),
+            pre_drop_statement: Some(
+                "DROP TABLE IF EXISTS \"warehouse\".\"marts\".\"orders\"".into(),
+            ),
+            production_upstreams: Vec::new(),
+        };
+        let loaded = rocky_core::config::LoadedConfig {
+            config: rocky_core::config::load_rocky_config(&config_path).unwrap(),
+            fingerprint: "fixture".into(),
+        };
+        let (targets, success) = run_promote_apply(&loaded, &[step], None).await.unwrap();
+        assert!(!success);
+        assert!(
+            targets[0]
+                .error
+                .as_deref()
+                .unwrap()
+                .starts_with("dropped but not replaced:")
+        );
+        assert!(promote_failure_target_lines(&targets)[0].starts_with("dropped, not replaced:"));
+        let adapter = DuckDbWarehouseAdapter::open(&db).unwrap();
+        assert!(
+            adapter
+                .execute_query("SELECT * FROM marts.orders")
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn promote_refuses_undefined_model_strategies_during_plan_build() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("rocky.toml");
+        let models = tmp.path().join("models");
+        std::fs::create_dir(&models).unwrap();
+        std::fs::write(&config_path, "[adapter]\ntype = \"duckdb\"\npath = \":memory:\"\n[pipeline.t]\ntype = \"transformation\"\nmodels = \"models/**\"\n[pipeline.t.target]\nadapter = \"default\"\n").unwrap();
+        std::fs::write(models.join("unsupported.sql"), "SELECT 1 AS id").unwrap();
+        for (kind, extra) in [
+            ("incremental", "timestamp_column = \"id\"\n"),
+            ("merge", "unique_key = [\"id\"]\n"),
+            (
+                "time_interval",
+                "time_column = \"id\"\ngranularity = \"day\"\n",
+            ),
+            ("delete_insert", "partition_by = [\"id\"]\n"),
+            (
+                "microbatch",
+                "timestamp_column = \"id\"\ngranularity = \"day\"\n",
+            ),
+            ("materialized_view", ""),
+            ("dynamic_table", "target_lag = \"1 minute\"\n"),
+            (
+                "content_addressed",
+                "storage_prefix = \"s3://bucket/model\"\n",
+            ),
+            ("ephemeral", ""),
+        ] {
+            std::fs::write(models.join("unsupported.toml"), format!("name = \"unsupported\"\n[strategy]\ntype = \"{kind}\"\n{extra}[target]\ncatalog = \"memory\"\nschema = \"main\"\ntable = \"unsupported\"\n")).unwrap();
+            let err = discover_branch_targets_for_plan(
+                &config_path,
+                &sample_record("fix_price"),
+                None,
+                None,
+            )
+            .await
+            .expect_err("undefined strategy must refuse before planning SQL");
+            // `microbatch` loads as an alias of `time_interval` (#2054), so
+            // the refusal names the strategy it normalized to.
+            let named = if kind == "microbatch" {
+                "time_interval"
+            } else {
+                kind
+            };
+            assert!(format!("{err:#}").contains(named), "{kind}: {err:#}");
+        }
+    }
+
+    #[tokio::test]
+    async fn promote_apply_refuses_persisted_undefined_strategies() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("rocky.toml");
+        std::fs::write(&config_path, "[adapter]\ntype = \"duckdb\"\npath = \":memory:\"\n[pipeline.t]\ntype = \"transformation\"\nmodels = \"models/**\"\n[pipeline.t.target]\nadapter = \"default\"\n").unwrap();
+        let loaded = rocky_core::config::LoadedConfig {
+            config: rocky_core::config::load_rocky_config(&config_path).unwrap(),
+            fingerprint: "fixture".to_string(),
+        };
+        for strategy in [
+            "incremental",
+            "merge",
+            "time_interval",
+            "delete_insert",
+            "microbatch",
+            "ephemeral",
+            "snapshot",
+            "materialized_view",
+            "dynamic_table",
+            "content_addressed",
+        ] {
+            let step = crate::output::PromoteTargetPlan {
+                target: "memory.main.orders".to_string(), source: "memory.branch__fix.orders".to_string(),
+                target_catalog: "memory".to_string(), target_schema: "main".to_string(), target_table: "orders".to_string(),
+                source_catalog: "memory".to_string(), source_schema: "branch__fix".to_string(), source_table: "orders".to_string(),
+                strategy: strategy.to_string(),
+                statement: "CREATE OR REPLACE TABLE memory.main.orders AS SELECT * FROM memory.branch__fix.orders".to_string(),
+                pre_drop_statement: None,
+                production_upstreams: Vec::new(),
+            };
+            let err = run_promote_apply(&loaded, &[step], Some("t"))
+                .await
+                .expect_err("unsupported persisted strategy must refuse before adapter execution");
+            let message = format!("{err:#}");
+            assert!(
+                message.contains(strategy) && message.contains("undefined"),
+                "{message}"
+            );
+        }
     }
 
     /// `branch promote` end-to-end on a transformation-only pipeline against
@@ -4770,6 +6334,27 @@ adapter = "default"
             "fct_orders",
             "SELECT 1 AS id",
         );
+        write_transformation_model(
+            &models_dir.join("marts"),
+            "z_upstream",
+            "warehouse",
+            "marts",
+            "z_upstream",
+            "SELECT 2 AS id, 3 AS added",
+        );
+        write_transformation_model(
+            &models_dir.join("marts"),
+            "b_view",
+            "warehouse",
+            "marts",
+            "b_view",
+            "SELECT id, added FROM warehouse.marts.z_upstream",
+        );
+        std::fs::write(
+            models_dir.join("marts/b_view.toml"),
+            "name = \"b_view\"\n[strategy]\ntype = \"view\"\n[target]\ncatalog = \"warehouse\"\nschema = \"marts\"\ntable = \"b_view\"\n",
+        )
+        .unwrap();
 
         // Two transformation pipelines (both on the default duckdb adapter) —
         // enough to make `resolve_pipeline(None)` ambiguous, mirroring the
@@ -4812,6 +6397,9 @@ adapter = "default"
                 "CREATE SCHEMA IF NOT EXISTS marts",
                 "CREATE SCHEMA IF NOT EXISTS \"branch__ci_demo\"",
                 "CREATE TABLE \"branch__ci_demo\".fct_orders AS SELECT 1 AS id UNION ALL SELECT 2",
+                "CREATE TABLE marts.z_upstream AS SELECT 0 AS id",
+                "CREATE TABLE \"branch__ci_demo\".z_upstream AS SELECT 2 AS id, 3 AS added",
+                "CREATE VIEW \"branch__ci_demo\".b_view AS SELECT 2 AS id, 3 AS added",
             ] {
                 adapter.execute_statement(stmt).await.expect("seed");
             }
@@ -4823,7 +6411,7 @@ adapter = "default"
 
         // `rocky plan promote ci_demo --pipeline marts` — disambiguates at
         // plan-build time.
-        let plan_id = crate::commands::plan::build_promote_plan_inner(
+        let result = crate::commands::plan::build_promote_plan_inner(
             dir,
             &config_path,
             &models_dir,
@@ -4837,10 +6425,18 @@ adapter = "default"
             PolicyPrincipal::Human,
         )
         .await
-        .expect("plan build must succeed with --pipeline marts")
-        .plan_output
-        .plan_id
-        .expect("plan_id");
+        .expect("plan build must succeed with --pipeline marts");
+        let names: Vec<_> = result
+            .plan
+            .targets
+            .iter()
+            .map(|p| p.target_table.as_str())
+            .collect();
+        assert!(
+            names.iter().position(|name| *name == "z_upstream")
+                < names.iter().position(|name| *name == "b_view")
+        );
+        let plan_id = result.plan_output.plan_id.expect("plan_id");
 
         // `rocky apply <plan-id>` — `apply` has no `--pipeline` flag at all.
         // Before the fix this re-resolved against the config and failed with
@@ -4878,6 +6474,11 @@ adapter = "default"
             count, 2,
             "`rocky apply` on the promote plan must copy both branch rows"
         );
+        let view = adapter
+            .execute_query("SELECT id, added FROM warehouse.marts.b_view")
+            .await
+            .expect("qualified view must be created after the upstream gains its new column");
+        assert_eq!(view.rows[0][1].as_str(), Some("3"));
     }
 
     /// #2019 (Codex finding, gpt-5.6-terra, high confidence): `rocky branch
@@ -5141,6 +6742,7 @@ adapter = "default"
             ["init", "-q", "."].as_slice(),
             ["config", "user.email", "test@rocky.invalid"].as_slice(),
             ["config", "user.name", "Rocky Test"].as_slice(),
+            ["config", "commit.gpgsign", "false"].as_slice(),
         ] {
             let status = std::process::Command::new("git")
                 .args(git_args)
@@ -5317,6 +6919,7 @@ path = "{}"
 # panicking.
 [pipeline.raw]
 type = "replication"
+strategy = "full_refresh"
 
 [pipeline.raw.source.schema_pattern]
 prefix = "src__"
@@ -5609,7 +7212,16 @@ mod duplicate_target_refusal_tests {
         let step = |source: &str| crate::output::PromoteTargetPlan {
             target: "wh.main.orders".to_string(),
             source: source.to_string(),
+            target_catalog: "wh".to_string(),
+            target_schema: "main".to_string(),
+            target_table: "orders".to_string(),
+            source_catalog: "wh".to_string(),
+            source_schema: "br".to_string(),
+            source_table: "orders".to_string(),
+            strategy: "full_refresh".to_string(),
             statement: format!("CREATE OR REPLACE TABLE wh.main.orders AS SELECT * FROM {source}"),
+            pre_drop_statement: None,
+            production_upstreams: Vec::new(),
         };
         let err = reject_duplicate_promote_targets(&[step("wh.br.alpha"), step("wh.br.beta")])
             .expect_err("a plan replacing one table twice must refuse");
@@ -5627,7 +7239,16 @@ mod duplicate_target_refusal_tests {
         let step = |target: &str| crate::output::PromoteTargetPlan {
             target: target.to_string(),
             source: format!("wh.br.{}", target.rsplit('.').next().unwrap()),
+            target_catalog: "wh".to_string(),
+            target_schema: "main".to_string(),
+            target_table: target.rsplit(".").next().unwrap().to_string(),
+            source_catalog: "wh".to_string(),
+            source_schema: "br".to_string(),
+            source_table: "orders".to_string(),
+            strategy: "full_refresh".to_string(),
             statement: String::new(),
+            pre_drop_statement: None,
+            production_upstreams: Vec::new(),
         };
         assert!(
             reject_duplicate_promote_targets(&[step("wh.main.orders"), step("wh.main.ORDERS")])
@@ -5666,7 +7287,16 @@ mod duplicate_target_refusal_tests {
         let step = |source: &str| crate::output::PromoteTargetPlan {
             target: "wh.main.orders".to_string(),
             source: source.to_string(),
+            target_catalog: "wh".to_string(),
+            target_schema: "main".to_string(),
+            target_table: "orders".to_string(),
+            source_catalog: "wh".to_string(),
+            source_schema: "br".to_string(),
+            source_table: "orders".to_string(),
+            strategy: "full_refresh".to_string(),
             statement: String::new(),
+            pre_drop_statement: None,
+            production_upstreams: Vec::new(),
         };
 
         let err = run_promote_apply(&loaded, &[step("wh.br.alpha"), step("wh.br.beta")], None)
@@ -5685,7 +7315,16 @@ mod duplicate_target_refusal_tests {
         let step = |target: &str| crate::output::PromoteTargetPlan {
             target: target.to_string(),
             source: "wh.br.src".to_string(),
+            target_catalog: "wh".to_string(),
+            target_schema: "main".to_string(),
+            target_table: target.rsplit(".").next().unwrap().to_string(),
+            source_catalog: "wh".to_string(),
+            source_schema: "br".to_string(),
+            source_table: "src".to_string(),
+            strategy: "full_refresh".to_string(),
             statement: String::new(),
+            pre_drop_statement: None,
+            production_upstreams: Vec::new(),
         };
         reject_duplicate_promote_targets(&[step("wh.main.orders"), step("wh.main.customers")])
             .expect("distinct targets must apply");
