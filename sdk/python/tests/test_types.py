@@ -15,8 +15,8 @@ from rocky_sdk.types import (
     CheckResult,
     GcApplyOutput,
     MaterializationInfo,
-    RestoreApplyOutput,
     ReconcileWatermarkOutput,
+    RestoreApplyOutput,
     RunResult,
     ScheduleSpoolOutput,
 )
