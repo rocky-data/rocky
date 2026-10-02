@@ -10,7 +10,10 @@ class ReconciledWatermark(BaseModel):
     previous: AwareDatetime | None = None
     table: str
     target_max: AwareDatetime | None = None
-    watermark: AwareDatetime
+    watermark: AwareDatetime | None = None
+    """
+    `null` means the empty target's cursor was cleared.
+    """
 
 
 class ReconcileWatermarkOutput(BaseModel):

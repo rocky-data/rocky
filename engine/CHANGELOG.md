@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Check debt now records the owning pipeline and its check definitions for each target. Another pipeline cannot clear it without running the owed checks. (#1814, #2230, #2232)
+- Watermark repair clears a stale cursor for an empty target. It resolves table timestamp overrides for selected targets. (#1814)
 - Replication checkpoints now keep a durable check obligation for each copied physical target. Fresh runs and resumes execute owed checks. Later unchanged runs can prune after those checks finish. (#1814, #2230, #2232)
 - `rocky state reconcile-watermark --pipeline <name>` repairs incremental cursors from target maximum timestamps. `--dry-run` previews the values. (#1814)
 - Rocky 1.75.0 and earlier did not save recovery descriptors. A crash before their watermark flush can cause duplicate appends on the first upgraded run. Repair the cursor first. (#1814)

@@ -1945,6 +1945,28 @@ impl StateStore {
         Ok(entries.len())
     }
 
+    /// Reconcile a set of target maxima atomically. `None` removes a stale
+    /// cursor so the next incremental run replaces the empty target.
+    pub fn batch_reconcile_watermarks(
+        &self,
+        updates: &[(String, Option<WatermarkState>)],
+    ) -> Result<(), StateError> {
+        let txn = self.db.begin_write()?;
+        {
+            let mut table = txn.open_table(WATERMARKS)?;
+            for (key, watermark) in updates {
+                if let Some(watermark) = watermark {
+                    let bytes = serde_json::to_vec(watermark)?;
+                    table.insert(key.as_str(), bytes.as_slice())?;
+                } else {
+                    table.remove(key.as_str())?;
+                }
+            }
+        }
+        self.commit_write(txn)?;
+        Ok(())
+    }
+
     /// Commit watermarks and the runs they fully account for atomically.
     ///
     /// The caller must reconcile every recovery table before naming a run:
@@ -3399,6 +3421,18 @@ pub struct RunProgress {
     /// an explicitly recorded plan with no incremental recovery tables.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub watermark_recovery_tables: Option<Vec<WatermarkRecoveryTable>>,
+    /// Check definitions and names owed by each copied target. The scope
+    /// identifies the pipeline that declared them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub check_obligations: Option<CheckObligations>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CheckObligations {
+    /// Digest of the validated check configuration. A changed definition
+    /// with the same display name cannot discharge an older obligation.
+    pub config_identity: String,
+    pub by_target: std::collections::HashMap<String, Vec<String>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -4018,12 +4052,38 @@ impl StateStore {
             planned_tables: Some(planned_tables.to_vec()),
             watermarks_confirmed: false,
             watermark_recovery_tables: recovery_tables.map(<[_]>::to_vec),
+            check_obligations: None,
         };
         let bytes = serde_json::to_vec(&progress)?;
         let txn = self.db.begin_write()?;
         {
             let mut table = txn.open_table(RUN_PROGRESS)?;
             table.insert(run_id, bytes.as_slice())?;
+        }
+        self.commit_write(txn)?;
+        Ok(())
+    }
+
+    /// Record the check plan before any copy can create a debt.
+    pub fn set_run_check_obligations(
+        &self,
+        run_id: &str,
+        obligations: CheckObligations,
+    ) -> Result<(), StateError> {
+        let txn = self.db.begin_write()?;
+        {
+            let mut headers = txn.open_table(RUN_PROGRESS)?;
+            let mut progress: RunProgress = {
+                let Some(row) = headers.get(run_id)? else {
+                    return Err(StateError::MissingRunProgress {
+                        run_id: run_id.to_string(),
+                    });
+                };
+                serde_json::from_slice(row.value())?
+            };
+            progress.check_obligations = Some(obligations);
+            let bytes = serde_json::to_vec(&progress)?;
+            headers.insert(run_id, bytes.as_slice())?;
         }
         self.commit_write(txn)?;
         Ok(())
@@ -4388,6 +4448,7 @@ impl StateStore {
     pub fn discharge_check_targets(
         &self,
         scope: &ResumeScope,
+        config_identity: &str,
         results: &std::collections::HashMap<String, Vec<crate::checks::CheckResult>>,
     ) -> Result<(), StateError> {
         if results.is_empty() {
@@ -4402,6 +4463,16 @@ impl StateStore {
             for row in headers.iter()? {
                 let (_, value) = row?;
                 let progress: RunProgress = serde_json::from_slice(value.value())?;
+                let Some(owing_scope) = progress.scope.as_ref() else {
+                    continue;
+                };
+                if owing_scope.pipeline != scope.pipeline || owing_scope.source != scope.source {
+                    continue;
+                }
+                let check_plan = progress.check_obligations.as_ref();
+                if check_plan.is_some_and(|plan| plan.config_identity != config_identity) {
+                    continue;
+                }
                 let Some(recorded) = progress.scope.as_ref().and_then(|s| s.target.as_ref()) else {
                     continue;
                 };
@@ -4426,11 +4497,11 @@ impl StateStore {
                 let table_entries = Self::read_progress_entries(&entries, &progress.run_id)?;
                 if table_entries.is_empty() {
                     // Pre-v8 checkpoints kept their table rows in the header.
-                    let mut old = progress;
+                    let mut old = progress.clone();
                     let mut changed = false;
                     for entry in &mut old.tables {
                         if entry.status == TableStatus::Success
-                            && results.contains_key(&entry.table_key)
+                            && check_results_cover_obligation(check_plan, entry, results)
                             && (entry.checks_owed == Some(true)
                                 || (entry.checks_owed.is_none() && !terminal_success))
                         {
@@ -4445,7 +4516,7 @@ impl StateStore {
                 } else {
                     for mut entry in table_entries {
                         if entry.status == TableStatus::Success
-                            && results.contains_key(&entry.table_key)
+                            && check_results_cover_obligation(check_plan, &entry, results)
                             && (entry.checks_owed == Some(true)
                                 || (entry.checks_owed.is_none() && !terminal_success))
                         {
@@ -4475,6 +4546,31 @@ impl StateStore {
         }
         self.commit_write(txn)?;
         Ok(())
+    }
+}
+
+/// A target result is evidence only for the check names the owning run
+/// recorded before copying. Legacy checkpoints require a measured result
+/// from the same pipeline because their check definitions were not saved.
+fn check_results_cover_obligation(
+    plan: Option<&CheckObligations>,
+    entry: &TableProgress,
+    results: &std::collections::HashMap<String, Vec<crate::checks::CheckResult>>,
+) -> bool {
+    let Some(observed) = results.get(&entry.table_key) else {
+        return false;
+    };
+    let measured = |name: &str| {
+        observed
+            .iter()
+            .any(|result| result.name == name && result.not_evaluated.is_none())
+    };
+    match plan {
+        Some(plan) => plan
+            .by_target
+            .get(&entry.table_key)
+            .is_some_and(|names| names.iter().all(|name| measured(name))),
+        None => observed.iter().any(|result| result.not_evaluated.is_none()),
     }
 }
 
@@ -11031,7 +11127,7 @@ mod tests {
         let checked = [(names[0].clone(), vec![crate::checks::check_row_count(2, 3)])]
             .into_iter()
             .collect();
-        store.discharge_check_targets(&current, &checked).unwrap();
+        store.discharge_check_targets(&old, "", &checked).unwrap();
         let discharged = store.get_run_progress("crashed").unwrap().unwrap();
         assert_eq!(discharged.tables[0].checks_owed, Some(false));
         assert!(
@@ -11063,6 +11159,56 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn another_pipeline_or_different_check_cannot_clear_target_debt() {
+        let (store, _dir) = temp_store();
+        let p = progress_scope("p");
+        let q = progress_scope("q");
+        let key = "wh.raw.orders".to_string();
+        let targets = [key.clone()].into_iter().collect();
+        store
+            .init_run_progress("p-copy", std::slice::from_ref(&key), Some(&p))
+            .unwrap();
+        store
+            .set_run_check_obligations(
+                "p-copy",
+                CheckObligations {
+                    config_identity: "p:unique-sql".into(),
+                    by_target: [(key.clone(), vec!["unique".into()])].into_iter().collect(),
+                },
+            )
+            .unwrap();
+        let mut copied = progress_entry(0, &key, TableStatus::Success);
+        copied.checks_owed = Some(true);
+        store.record_table_progress("p-copy", &copied).unwrap();
+        let empty = [(key.clone(), Vec::new())].into_iter().collect();
+        store
+            .discharge_check_targets(&q, "q:no-checks", &empty)
+            .unwrap();
+        assert_eq!(store.owed_check_targets(&q, &targets).unwrap(), targets);
+        let different = [(key.clone(), vec![crate::checks::check_row_count(1, 1)])]
+            .into_iter()
+            .collect();
+        store
+            .discharge_check_targets(&q, "q:row-count", &different)
+            .unwrap();
+        store
+            .discharge_check_targets(&p, "p:unique-sql", &different)
+            .unwrap();
+        assert_eq!(store.owed_check_targets(&p, &targets).unwrap(), targets);
+        let mut unique = crate::checks::check_row_count(1, 1);
+        unique.name = "unique".into();
+        let measured = [(key.clone(), vec![unique])].into_iter().collect();
+        store
+            .discharge_check_targets(&p, "p:changed-sql", &measured)
+            .unwrap();
+        assert_eq!(store.owed_check_targets(&p, &targets).unwrap(), targets);
+        store
+            .discharge_check_targets(&p, "p:unique-sql", &measured)
+            .unwrap();
+        assert!(store.owed_check_targets(&p, &targets).unwrap().is_empty());
     }
 
     #[test]
@@ -11128,7 +11274,7 @@ mod tests {
         let checked = [(key, vec![crate::checks::check_row_count(1, 1)])]
             .into_iter()
             .collect();
-        store.discharge_check_targets(&scope, &checked).unwrap();
+        store.discharge_check_targets(&scope, "", &checked).unwrap();
         assert_eq!(store.sweep_retention(&policy).unwrap().runs_deleted, 1);
     }
 
@@ -12033,6 +12179,7 @@ mod tests {
             planned_tables: None,
             watermarks_confirmed: false,
             watermark_recovery_tables: None,
+            check_obligations: None,
         };
         let bytes = serde_json::to_vec(&legacy).unwrap();
         {

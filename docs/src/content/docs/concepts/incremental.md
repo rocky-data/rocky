@@ -160,10 +160,11 @@ rocky state reconcile-watermark --pipeline <name>
 Repeat `--table catalog.schema.table` to select affected targets. The command
 reads `MAX(timestamp_column)` from each target and saves it through the
 configured state backend. For DuckDB, use `--table .schema.table`.
-An empty target gets the epoch cursor. Confirm that the configured
-`timestamp_column` still identifies the copied rows. Run the command only
+An empty target has its cursor cleared. The next incremental run replaces it.
+Confirm that each target's effective `timestamp_column` still identifies the copied rows. Run the command only
 after the replacement and any earlier warehouse writes have finished.
-The command refuses pipelines with table-specific timestamp overrides.
+The command applies table-specific timestamp overrides.
+It refuses a connector-specific override if the source connector cannot be identified.
 Then restore `strategy = "incremental"`.
 
 Rocky 1.75.0 and earlier did not record recovery descriptors. A crash after

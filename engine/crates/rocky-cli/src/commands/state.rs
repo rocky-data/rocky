@@ -2,8 +2,8 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 
-use rocky_core::config::PipelineConfig;
 use rocky_core::config::load_rocky_config;
+use rocky_core::config::{PipelineConfig, ReplicationPipelineConfig, resolve_table_override};
 use rocky_core::retention::StateRetentionConfig;
 use rocky_core::state::StateStore;
 use rocky_core::state_sync::{FinalizeDurability, RemoteStateSession, StateAuthority};
@@ -27,13 +27,6 @@ pub async fn state_reconcile_watermark(
         Some(PipelineConfig::Replication(pipeline)) => pipeline,
         _ => anyhow::bail!("'{pipeline_name}' is not a replication pipeline"),
     };
-    anyhow::ensure!(
-        pipeline
-            .table_overrides
-            .iter()
-            .all(|rule| rule.timestamp_column.is_none()),
-        "watermark repair needs one pipeline timestamp_column; table timestamp overrides cannot be inferred from physical target names"
-    );
     let mut session = RemoteStateSession::new(
         &config.state,
         state_path,
@@ -74,6 +67,7 @@ pub async fn state_reconcile_watermark(
             selected.to_vec()
         };
         let registry = AdapterRegistry::from_config(&config)?;
+        let columns = repair_timestamp_columns(pipeline, &registry, &targets).await?;
         let warehouse = registry.warehouse_adapter(&pipeline.target.adapter)?;
         let mut watermarks = Vec::new();
         for key in targets {
@@ -95,11 +89,14 @@ pub async fn state_reconcile_watermark(
                 schema: components[1].to_string(),
                 table: components[2].to_string(),
             };
+            let column = columns.get(&key).ok_or_else(|| {
+                anyhow::anyhow!("target '{key}' has no resolved timestamp column")
+            })?;
             let target_max = super::run::query_target_max_timestamp(
                 warehouse.as_ref(),
                 warehouse.dialect(),
                 &target,
-                &pipeline.timestamp_column,
+                column,
             )
             .await?;
             let previous = store.get_watermark(&key)?.map(|wm| wm.last_value);
@@ -107,23 +104,23 @@ pub async fn state_reconcile_watermark(
                 table: key,
                 previous,
                 target_max,
-                watermark: target_max.unwrap_or_else(super::run::epoch_watermark_sentinel),
+                watermark: target_max,
             });
         }
         if !dry_run {
-            let values: Vec<WatermarkState> = watermarks
+            let updates: Vec<(String, Option<WatermarkState>)> = watermarks
                 .iter()
-                .map(|item| WatermarkState {
-                    last_value: item.watermark,
-                    updated_at: chrono::Utc::now(),
+                .map(|item| {
+                    (
+                        item.table.clone(),
+                        item.watermark.map(|last_value| WatermarkState {
+                            last_value,
+                            updated_at: chrono::Utc::now(),
+                        }),
+                    )
                 })
                 .collect();
-            let entries: Vec<(&str, &WatermarkState)> = watermarks
-                .iter()
-                .zip(&values)
-                .map(|(item, value)| (item.table.as_str(), value))
-                .collect();
-            store.batch_set_watermarks(&entries)?;
+            store.batch_reconcile_watermarks(&updates)?;
         }
         Ok(ReconcileWatermarkOutput {
             version: env!("CARGO_PKG_VERSION").to_string(),
@@ -152,17 +149,113 @@ pub async fn state_reconcile_watermark(
         print_json(&output)?;
     } else {
         for item in &output.watermarks {
-            let prefix = if dry_run { "would set" } else { "set" };
+            let prefix = if item.watermark.is_none() {
+                if dry_run { "would clear" } else { "cleared" }
+            } else if dry_run {
+                "would set"
+            } else {
+                "set"
+            };
             println!(
                 "{prefix} {} = {} (target MAX: {})",
                 item.table,
-                item.watermark,
+                item.watermark
+                    .map_or_else(|| "NULL".to_string(), |value| value.to_string()),
                 item.target_max
                     .map_or_else(|| "NULL".to_string(), |value| value.to_string())
             );
         }
     }
     Ok(())
+}
+
+/// Resolve against the same discovered connector and rendered target names
+/// used by replication. A historical target without a current source can be
+/// repaired only when its table-level override is unambiguous.
+async fn repair_timestamp_columns(
+    pipeline: &ReplicationPipelineConfig,
+    registry: &AdapterRegistry,
+    targets: &[String],
+) -> Result<std::collections::HashMap<String, String>> {
+    let pattern = pipeline.schema_pattern()?;
+    let mut columns = std::collections::HashMap::new();
+    let needs_connector = targets.iter().any(|key| {
+        let table = key.rsplit('.').next().unwrap_or("");
+        pipeline.table_overrides.iter().any(|rule| {
+            rule.timestamp_column.is_some()
+                && rule.match_.connector.is_some()
+                && rule.match_.matches_table(table)
+        })
+    });
+    if needs_connector {
+        let discovery = pipeline.source.discovery.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("connector-specific timestamp overrides require a discovery adapter")
+        })?;
+        let discovered = registry
+            .discovery_adapter(&discovery.adapter)?
+            .discover(&pattern.prefix)
+            .await?;
+        anyhow::ensure!(
+            discovered.failed.is_empty(),
+            "source discovery was incomplete; cannot resolve timestamp overrides safely"
+        );
+        let separator = pipeline
+            .target
+            .separator
+            .as_deref()
+            .unwrap_or(&pattern.separator);
+        for connector in discovered.connectors {
+            let Ok(parsed) = pattern.parse(&connector.schema) else {
+                continue;
+            };
+            let catalog = parsed.resolve_template(&pipeline.target.catalog_template, separator);
+            let schema = parsed.resolve_template(&pipeline.target.schema_template, separator);
+            for table in connector.tables {
+                let key = format!("{catalog}.{schema}.{}", table.name);
+                if !targets.contains(&key) {
+                    continue;
+                }
+                let resolved = resolve_table_override(
+                    &pipeline.table_overrides,
+                    &connector.id,
+                    &connector.schema,
+                    &table.name,
+                );
+                let column = resolved
+                    .timestamp_column
+                    .unwrap_or_else(|| pipeline.timestamp_column.clone());
+                if let Some(previous) = columns.insert(key.clone(), column.clone()) {
+                    anyhow::ensure!(
+                        previous == column,
+                        "target '{key}' has conflicting timestamp overrides"
+                    );
+                }
+            }
+        }
+    }
+    for key in targets {
+        if columns.contains_key(key) {
+            continue;
+        }
+        let table = key.rsplit('.').next().unwrap_or("");
+        anyhow::ensure!(
+            !pipeline
+                .table_overrides
+                .iter()
+                .any(|rule| rule.timestamp_column.is_some()
+                    && rule.match_.connector.is_some()
+                    && rule.match_.matches_table(table)),
+            "target '{key}' has a connector-specific timestamp override but its source was not discovered"
+        );
+        let resolved = resolve_table_override(&pipeline.table_overrides, "", "", table);
+        columns.insert(
+            key.clone(),
+            resolved
+                .timestamp_column
+                .unwrap_or_else(|| pipeline.timestamp_column.clone()),
+        );
+    }
+    Ok(columns)
 }
 
 use crate::output::*;
@@ -504,6 +597,10 @@ components = ["source"]
 adapter = "default"
 catalog_template = ""
 schema_template = "tgt"
+[[pipeline.p.table_overrides]]
+timestamp_column = "other_ts"
+[pipeline.p.table_overrides.match]
+table = "other"
 "#,
                 db_path.display()
             ),
@@ -582,6 +679,158 @@ schema_template = "tgt"
                 .unwrap()
                 .last_value,
             Utc.with_ymd_and_hms(2026, 9, 2, 0, 0, 0).unwrap()
+        );
+    }
+
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn reconcile_watermark_clears_empty_target_and_resolves_selected_overrides() {
+        use chrono::TimeZone;
+        use rocky_core::state::{ResumeScope, ResumeTarget};
+        use rocky_core::traits::WarehouseAdapter;
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("warehouse.duckdb");
+        let warehouse = rocky_duckdb::adapter::DuckDbWarehouseAdapter::open(&db_path).unwrap();
+        warehouse
+            .execute_statement("CREATE SCHEMA tgt")
+            .await
+            .unwrap();
+        warehouse
+            .execute_statement("CREATE TABLE tgt.events (ts TIMESTAMP)")
+            .await
+            .unwrap();
+        warehouse
+            .execute_statement("CREATE SCHEMA src__x")
+            .await
+            .unwrap();
+        for table in ["events", "special", "empty"] {
+            warehouse
+                .execute_statement(&format!("CREATE TABLE src__x.{table} (ts TIMESTAMP) "))
+                .await
+                .unwrap();
+        }
+        warehouse
+            .execute_statement("INSERT INTO tgt.events VALUES (TIMESTAMP '2026-09-01 00:00:00')")
+            .await
+            .unwrap();
+        warehouse
+            .execute_statement("CREATE TABLE tgt.special (ts TIMESTAMP, override_ts TIMESTAMP)")
+            .await
+            .unwrap();
+        warehouse.execute_statement("INSERT INTO tgt.special VALUES (TIMESTAMP '2026-01-01 00:00:00', TIMESTAMP '2026-09-05 00:00:00')").await.unwrap();
+        warehouse
+            .execute_statement("CREATE TABLE tgt.empty (ts TIMESTAMP)")
+            .await
+            .unwrap();
+        drop(warehouse);
+        let config_path = tmp.path().join("rocky.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                r#"
+[adapter]
+type = "duckdb"
+path = "{}"
+[state]
+backend = "local"
+[pipeline.p]
+type = "replication"
+strategy = "incremental"
+timestamp_column = "ts"
+[pipeline.p.source.discovery]
+adapter = "default"
+[pipeline.p.source.schema_pattern]
+prefix = "src__"
+separator = "__"
+components = ["source"]
+[pipeline.p.target]
+adapter = "default"
+catalog_template = ""
+schema_template = "tgt"
+[[pipeline.p.table_overrides]]
+timestamp_column = "override_ts"
+[pipeline.p.table_overrides.match]
+connector = "src__x"
+table = "special"
+"#,
+                db_path.display()
+            ),
+        )
+        .unwrap();
+        let config = load_rocky_config(&config_path).unwrap();
+        let state_path = tmp.path().join("state.redb");
+        let store = StateStore::open(&state_path).unwrap();
+        let keys = [
+            ".tgt.events".to_string(),
+            ".tgt.special".to_string(),
+            ".tgt.empty".to_string(),
+        ];
+        store
+            .init_run_progress(
+                "old",
+                &keys,
+                Some(&ResumeScope {
+                    pipeline: "p".into(),
+                    filter: None,
+                    target: Some(ResumeTarget {
+                        adapter: "default".into(),
+                        catalog_template: String::new(),
+                        schema_template: Some("tgt".into()),
+                        separator_role: None,
+                        endpoint: config.adapters["default"].endpoint_identity(),
+                        shadow: None,
+                    }),
+                    source: None,
+                }),
+            )
+            .unwrap();
+        let stale = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        for key in &keys {
+            store
+                .set_watermark(
+                    key,
+                    &WatermarkState {
+                        last_value: stale,
+                        updated_at: stale,
+                    },
+                )
+                .unwrap();
+        }
+        drop(store);
+        state_reconcile_watermark(
+            &config_path,
+            &state_path,
+            "p",
+            &[keys[0].clone()],
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+        let store = StateStore::open(&state_path).unwrap();
+        assert_eq!(
+            store.get_watermark(&keys[0]).unwrap().unwrap().last_value,
+            Utc.with_ymd_and_hms(2026, 9, 1, 0, 0, 0).unwrap()
+        );
+        drop(store);
+        state_reconcile_watermark(
+            &config_path,
+            &state_path,
+            "p",
+            &[keys[1].clone(), keys[2].clone()],
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+        let store = StateStore::open(&state_path).unwrap();
+        assert_eq!(
+            store.get_watermark(&keys[1]).unwrap().unwrap().last_value,
+            Utc.with_ymd_and_hms(2026, 9, 5, 0, 0, 0).unwrap()
+        );
+        assert!(
+            store.get_watermark(&keys[2]).unwrap().is_none(),
+            "NULL MAX must clear a stale cursor"
         );
     }
 

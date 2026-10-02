@@ -20,6 +20,9 @@ export interface ReconciledWatermark {
   previous?: string | null;
   table: string;
   target_max?: string | null;
-  watermark: string;
+  /**
+   * `null` means the empty target's cursor was cleared.
+   */
+  watermark?: string | null;
   [k: string]: unknown;
 }

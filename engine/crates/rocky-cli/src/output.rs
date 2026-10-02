@@ -3410,7 +3410,8 @@ pub struct ReconciledWatermark {
     pub table: String,
     pub previous: Option<DateTime<Utc>>,
     pub target_max: Option<DateTime<Utc>>,
-    pub watermark: DateTime<Utc>,
+    /// `null` means the empty target's cursor was cleared.
+    pub watermark: Option<DateTime<Utc>>,
 }
 
 /// JSON output for `rocky state clear-schema-cache`.

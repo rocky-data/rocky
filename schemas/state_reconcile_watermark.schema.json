@@ -21,13 +21,16 @@
           ]
         },
         "watermark": {
+          "description": "`null` means the empty target's cursor was cleared.",
           "format": "date-time",
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "required": [
-        "table",
-        "watermark"
+        "table"
       ],
       "type": "object"
     }

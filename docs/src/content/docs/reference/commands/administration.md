@@ -1075,8 +1075,10 @@ If you have an existing CWD `.rocky-state.redb`, move it into `models/` to silen
 ## `rocky state reconcile-watermark`
 
 Repair a replication pipeline's incremental cursors from its target tables.
-Rocky reads `MAX(timestamp_column)` from each target in that pipeline's recorded plans.
-An empty target gets the epoch cursor. Rocky writes all cursors in one state transaction.
+Rocky reads each target's effective timestamp column from the pipeline and its table overrides.
+It then reads the target's maximum timestamp.
+An empty target has no cursor, so the next incremental run replaces it.
+Rocky updates all selected cursors in one state transaction.
 The remote state upload uses the same authority and CAS rules as a run.
 
 ```bash
@@ -1094,7 +1096,8 @@ rocky state reconcile-watermark --pipeline bronze --table wh.raw.orders
 
 Stop earlier warehouse writes before repair. Use `--dry-run` to inspect the values.
 If a recorded plan includes a removed target, select the current targets with `--table`.
-The command refuses per-table timestamp column overrides and unpinned remote catalogs.
+The command refuses an unpinned remote catalog.
+It also refuses a connector-specific override when it cannot identify the target's source connector.
 
 ### Related Commands
 

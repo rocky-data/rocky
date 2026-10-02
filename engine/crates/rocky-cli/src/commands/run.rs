@@ -5437,6 +5437,14 @@ pub async fn run_with_explicit_contracts(
     // (#1549), and with the table keys it plans to copy so a later resume can
     // prove completeness as a set rather than a count (#1674).
     let planned_table_keys: Vec<String> = tables_to_process.iter().map(table_key).collect();
+    let check_identity = blake3::hash(&serde_json::to_vec(&pipeline.checks)?).to_hex().to_string();
+    let check_obligations = rocky_core::state::CheckObligations {
+        config_identity: check_identity.clone(),
+        by_target: tables_to_process
+            .iter()
+            .map(|task| (table_key(task), owed_check_names(pipeline, task)))
+            .collect(),
+    };
     let recovery_tables = if recovery_enabled {
         tables_to_process
             .iter()
@@ -5456,6 +5464,7 @@ pub async fn run_with_explicit_contracts(
             &recovery_tables,
         )
         .context("failed to initialize run progress")?;
+    state_store.set_run_check_obligations(&run_id, check_obligations)?;
     // Publish intent before an INSERT can commit. This closes the first-upload
     // crash window on authoritative remote state. Default skip remains best
     // effort and cannot promise cross-pod recovery after an unavailable upload.
@@ -6526,7 +6535,7 @@ pub async fn run_with_explicit_contracts(
                 (key, results)
             })
             .collect();
-        store.discharge_check_targets(&resume_scope, &checked)
+        store.discharge_check_targets(&resume_scope, &check_identity, &checked)
             .context("failed to persist post-copy check completion")?;
         let remaining = store.owed_check_targets(&resume_scope, &planned_target_names)?;
         anyhow::ensure!(remaining.is_empty(), "post-copy checks remain owed for: {}", remaining.into_iter().collect::<Vec<_>>().join(", "));
@@ -14764,6 +14773,32 @@ fn watermark_recovery_table(
     }))
 }
 
+/// Names the checks that this pipeline must measure after copying a target.
+/// The check configuration is also stored with the plan, so a changed SQL
+/// assertion under the same name cannot satisfy an earlier copy.
+fn owed_check_names(pipeline: &ReplicationPipelineConfig, task: &TableTask) -> Vec<String> {
+    let mut names: Vec<String> = rocky_core::config::resolved_check_names_for_table(
+        &pipeline.checks,
+        ReplicationPipelineConfig::EXECUTED_CHECK_KINDS,
+        &task.target_table_name,
+        &[],
+    )
+    .into_iter()
+    .filter(|name| !name.candidate)
+    .map(|name| name.name)
+    .collect();
+    if task.check_row_count {
+        names.push("row_count".into());
+    }
+    if task.column_match.is_some() {
+        names.push("column_match".into());
+    }
+    if task.check_freshness {
+        names.push("freshness".into());
+    }
+    names
+}
+
 fn replaces_target(pipeline: &ReplicationPipelineConfig, task: &TableTask) -> Result<bool> {
     Ok(matches!(
         build_replication_strategy_with_override(pipeline, &task.effective_override)?,
@@ -18421,6 +18456,7 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
                 planned_tables: planned.map(|keys| keys.into_iter().map(str::to_string).collect()),
                 watermarks_confirmed: false,
                 watermark_recovery_tables: None,
+                check_obligations: None,
             }
         };
 
@@ -20343,6 +20379,28 @@ auto_create_schemas = true
                 store
                     .init_run_progress("run-seeded", &planned_tables, Some(&scope))
                     .unwrap();
+                let check_identity =
+                    blake3::hash(&serde_json::to_vec(&replication.checks).unwrap())
+                        .to_hex()
+                        .to_string();
+                store
+                    .set_run_check_obligations(
+                        "run-seeded",
+                        rocky_core::state::CheckObligations {
+                            config_identity: check_identity,
+                            by_target: [(
+                                planned_tables[0].clone(),
+                                if run_record_status.is_none() {
+                                    vec!["row_count".into()]
+                                } else {
+                                    Vec::new()
+                                },
+                            )]
+                            .into_iter()
+                            .collect(),
+                        },
+                    )
+                    .unwrap();
                 store
                     .record_table_progress(
                         "run-seeded",
@@ -20489,6 +20547,21 @@ auto_create_schemas = true
                     ],
                     Some(&scope),
                     &[],
+                )
+                .unwrap();
+            store
+                .set_run_check_obligations(
+                    "run-branch",
+                    rocky_core::state::CheckObligations {
+                        config_identity: blake3::hash(
+                            &serde_json::to_vec(&replication.checks).unwrap(),
+                        )
+                        .to_hex()
+                        .to_string(),
+                        by_target: [("warehouse.branch__feature.orders".to_string(), Vec::new())]
+                            .into_iter()
+                            .collect(),
+                    },
                 )
                 .unwrap();
             store
@@ -43615,6 +43688,7 @@ timestamp_column = "ts"
                         planned_tables: None,
                         watermarks_confirmed: false,
                         watermark_recovery_tables: None,
+                        check_obligations: None,
                     },
                 )
                 .unwrap();
@@ -44124,6 +44198,43 @@ timestamp_column = "ts"
                 .unwrap(),
             TableOutcome::Pruned(_)
         ));
+        let mut q_scope = scope.clone();
+        q_scope.pipeline = "p2".into();
+        let mut q_task = task.clone();
+        q_task.check_row_count = false;
+        let target = table_key(&task);
+        let planned = [target.clone()].into_iter().collect();
+        assert!(
+            matches!(
+                process_table_with_replacement_recovery(
+                    &StableMarker(&warehouse),
+                    &state,
+                    &pipeline,
+                    &q_task,
+                    true,
+                    false,
+                    state
+                        .owed_check_targets(&q_scope, &planned)
+                        .unwrap()
+                        .contains(&target),
+                )
+                .await
+                .unwrap(),
+                TableOutcome::Materialized(_)
+            ),
+            "the second pipeline must not prune an owed target"
+        );
+        state
+            .discharge_check_targets(
+                &q_scope,
+                "p2:no-checks",
+                &[(target.clone(), Vec::new())].into_iter().collect(),
+            )
+            .unwrap();
+        assert_eq!(
+            state.owed_check_targets(&q_scope, &planned).unwrap(),
+            planned
+        );
         let TableOutcome::Materialized(result) = process_table_with_replacement_recovery(
             &StableMarker(&warehouse),
             &state,
@@ -44142,14 +44253,13 @@ timestamp_column = "ts"
         };
         assert!(result.source_batch_ref.is_some());
         assert!(result.target_batch_ref.is_some());
-        let target = table_key(&task);
         let checked = [(
             target.clone(),
             vec![rocky_core::checks::check_row_count(2, 2)],
         )]
         .into_iter()
         .collect();
-        state.discharge_check_targets(&scope, &checked).unwrap();
+        state.discharge_check_targets(&scope, "", &checked).unwrap();
         assert!(
             state
                 .owed_check_targets(&scope, &[target].into_iter().collect())
