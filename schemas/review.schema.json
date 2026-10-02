@@ -517,6 +517,30 @@
           "type": "string"
         }
       ]
+    },
+    "ConditionalDrop": {
+      "description": "A DROP permitted when a model switches between a table and a view.",
+      "properties": {
+        "drop_sql": {
+          "type": "string"
+        },
+        "existing_kind": {
+          "type": "string"
+        },
+        "model": {
+          "type": "string"
+        },
+        "target": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "drop_sql",
+        "existing_kind",
+        "model",
+        "target"
+      ],
+      "type": "object"
     }
   },
   "description": "JSON output for `rocky review <plan-id>`.\n\n`rocky review` is the human sign-off gate for an AI-authored plan. It compares the working-tree models against `base_ref`, classifies the semantic delta, and either reports the findings (dry run) or — with `--approve` — writes a review marker that unblocks `rocky apply`.\n\nThe marker is written even when breaking changes exist, on the premise that the human approving has seen this report and is signing off on them explicitly. `breaking_changes` therefore always lists the full classified delta so the approval is informed.",
@@ -542,6 +566,13 @@
     "command": {
       "type": "string"
     },
+    "conditional_drops": {
+      "description": "Conditional kind-switch DROPs at their effective execution targets.",
+      "items": {
+        "$ref": "#/definitions/ConditionalDrop"
+      },
+      "type": "array"
+    },
     "marker_written": {
       "description": "True when the approval marker is now present on disk as a result of this invocation. Mirrors `approved` today; kept distinct so callers reading the JSON do not have to infer marker state from the flag.",
       "type": "boolean"
@@ -565,6 +596,7 @@
     "approved",
     "base_ref",
     "command",
+    "conditional_drops",
     "marker_written",
     "plan_id",
     "version"

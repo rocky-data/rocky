@@ -987,12 +987,13 @@ pub struct DriftPreviewResult {
 /// Result of the `review_queue` tool.
 ///
 /// In the read mode (`approve_plan_id` unset) `approval` is `None` and `pending`
-/// carries the full ranked queue. In the approve mode it carries the
-/// [`ReviewApprovalOutcome`] and `pending` is re-listed *after* the sign-off, so
-/// the caller sees the just-approved escalation cleared.
+/// carries the full ranked queue. In the approve mode it carries the computed
+/// review and [`ReviewApprovalOutcome`]. The queue is refreshed after the
+/// sign-off. If refresh fails, `queue_refresh_error` is set and the queue
+/// fields contain the pre-approval snapshot.
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct ReviewQueueResult {
-    /// Number of escalations still awaiting review after this call.
+    /// Number of escalations in the returned queue snapshot.
     pub total: u64,
     /// Human-readable description of the queue ordering.
     pub ranking: String,
@@ -1003,9 +1004,20 @@ pub struct ReviewQueueResult {
     /// be read integrity-checked appears as a `{plan_id, warning}` entry
     /// instead of being silently dropped.
     pub pending: serde_json::Value,
+    /// Review for the exact pending plan, also returned with confirmation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub review: Option<serde_json::Value>,
+    /// Opaque token returned with a dry-run review. Pass it back to confirm
+    /// the same plan, conditional DROPs, and breaking findings.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub review_token: Option<String>,
     /// Present only when this call approved a plan.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub approval: Option<ReviewApprovalOutcome>,
+    /// A post-approval queue refresh failed. The queue fields then describe
+    /// the pre-approval snapshot; the approved review remains available.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub queue_refresh_error: Option<String>,
 }
 
 /// Outcome of the gated `review_queue` approve action.

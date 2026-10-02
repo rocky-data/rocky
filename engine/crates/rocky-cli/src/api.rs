@@ -1766,7 +1766,17 @@ async fn review_diff(
     // `compute_review` is `async` for its marker-writing path, which
     // `approve = false` never enters; its compiles are synchronous work on this
     // thread, which the permit above bounds to one worker at a time.
-    match crate::commands::compute_review(&root, &config, &plan_id, "HEAD", false).await {
+    let state_path = state_path_for(&state);
+    match crate::commands::compute_review_with_state_path(
+        &root,
+        &config,
+        Some(&state_path),
+        &plan_id,
+        "HEAD",
+        false,
+    )
+    .await
+    {
         Ok(output) => Ok(PrettyJson(output)),
         // The reviewability refusal is already handled above, so anything left
         // here is a genuine failure of this server.

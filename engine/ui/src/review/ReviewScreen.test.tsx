@@ -37,6 +37,7 @@ const PLAN_LOADERS: PlanLoaders = {
       base_ref: "HEAD",
       approved: false,
       marker_written: false,
+      conditional_drops: [],
       breaking_changes: [],
     }),
   ),
@@ -120,6 +121,7 @@ describe("ReviewScreen", () => {
           base_ref: "HEAD",
           approved: false,
           marker_written: false,
+          conditional_drops: [],
           breaking_changes: [],
         };
       }),

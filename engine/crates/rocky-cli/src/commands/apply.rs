@@ -455,6 +455,10 @@ async fn run_apply_run_plan(
     let run_plan: RunPlan = serde_json::from_value(plan.payload.clone())
         .context("failed to deserialize run plan payload")?;
 
+    if super::review::plan_is_reviewable(&plan) {
+        require_reviewable_plan_fingerprint(&plan, plan_id)?;
+    }
+
     validate_run_plan_execution_shape(plan_id, &run_plan)?;
 
     // policy seam 2: an agent running `rocky apply` (`ROCKY_PRINCIPAL=agent`) is
@@ -2262,7 +2266,7 @@ fn touched_models_for_run(
 }
 
 /// Resolve the model directory and file glob the run executor will use.
-fn run_model_selection(
+pub(crate) fn run_model_selection(
     config: &rocky_core::config::RockyConfig,
     config_path: &Path,
     run_plan: &RunPlan,
@@ -2436,10 +2440,14 @@ pub(crate) fn execution_ir_fingerprint(
     for m in models {
         // `to_value` normalises any nested HashMap to sorted-key order.
         let config = serde_json::to_value(&m.config).ok()?;
-        projection.insert(
-            m.config.name.clone(),
-            serde_json::json!({ "config": config, "sql": m.sql }),
-        );
+        let mut entry = serde_json::json!({ "config": config, "sql": m.sql });
+        if let Some(kind) = m.drop_existing_kind {
+            entry["drop_existing_kind"] = serde_json::json!(match kind {
+                rocky_core::models::DropExistingKind::Table => "table",
+                rocky_core::models::DropExistingKind::View => "view",
+            });
+        }
+        projection.insert(m.config.name.clone(), entry);
     }
     // Re-through `to_value` so the whole tree is canonical (sorted keys).
     let root = serde_json::to_value(&projection).ok()?;
@@ -3790,6 +3798,8 @@ async fn run_apply_ai_authored_plan(
     let run_plan: RunPlan = serde_json::from_value(plan.payload.clone())
         .context("failed to deserialize ai_authored plan payload")?;
 
+    require_reviewable_plan_fingerprint(&plan, plan_id)?;
+
     validate_run_plan_execution_shape(plan_id, &run_plan)?;
 
     // policy seam 2: rule-driven refusal. When a `[policy]` block is configured,
@@ -3940,6 +3950,17 @@ async fn run_apply_ai_authored_plan(
     Ok(apply_outcome_for(termination, &apply_run_id))
 }
 
+fn require_reviewable_plan_fingerprint(plan: &PersistedPlan, plan_id: &str) -> Result<()> {
+    let capabilities = plan.embedded_capabilities();
+    if capabilities.fingerprint_version == 0 || capabilities.models_fingerprint.is_none() {
+        bail!(
+            "refusing to apply review-gated plan '{plan_id}' without an execution fingerprint. \
+             Re-run `rocky plan` and review the new plan before applying."
+        );
+    }
+    Ok(())
+}
+
 /// Apply a `PlanKind::Backfill` plan — a scoped, review-gated recovery run.
 ///
 /// A backfill plan is composed by the engine (`rocky backfill`) in response to
@@ -4006,6 +4027,8 @@ async fn run_apply_backfill_plan(
 
     let run_plan: RunPlan = serde_json::from_value(plan.payload.clone())
         .context("failed to deserialize backfill plan payload")?;
+
+    require_reviewable_plan_fingerprint(&plan, plan_id)?;
 
     // HARD RULE: a backfill is always review-gated, regardless of policy.
     match super::review::review_marker_state(root, plan_id) {
@@ -5077,6 +5100,64 @@ pub async fn run_apply_inline_for_run(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn ai_apply_refuses_legacy_plan_before_execution() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let payload = serde_json::json!({"parallel": 1, "pipeline": "p", "models": []});
+        let plan_id = crate::plan_store::write_plan(
+            dir.path(),
+            crate::plan_store::PlanKind::AiAuthored,
+            &payload,
+        )?;
+        let err = super::run_apply_ai_authored_plan(
+            dir.path(),
+            &dir.path().join("rocky.toml"),
+            &plan_id,
+            &dir.path().join("state.redb"),
+            super::PolicyPrincipal::Agent,
+            true,
+        )
+        .await
+        .expect_err("a fingerprintless AI plan must refuse before config or warehouse work");
+        let message = err.to_string();
+        assert!(
+            message.contains("without an execution fingerprint"),
+            "{message}"
+        );
+        assert!(message.contains("Re-run `rocky plan`"), "{message}");
+        Ok(())
+    }
+
+    #[test]
+    fn execution_fingerprint_tracks_drop_existing_kind() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("switch.sql"), "SELECT 1 AS id\n").unwrap();
+        let sidecar = dir.path().join("switch.toml");
+        let write = |permission: &str| {
+            std::fs::write(&sidecar, format!(
+            "name = \"switch\"\n{permission}[strategy]\ntype = \"full_refresh\"\n[target]\ncatalog = \"\"\nschema = \"main\"\n"
+        )).unwrap()
+        };
+        let fingerprint = || {
+            let models = rocky_core::models::load_models_from_dir(dir.path(), None).unwrap();
+            super::execution_ir_fingerprint(
+                &models,
+                "config",
+                "governance",
+                "execution",
+                &super::ExecutionExtras::default(),
+            )
+            .unwrap()
+        };
+        write("");
+        let absent = fingerprint();
+        write("drop_existing_kind = \"view\"\n");
+        let view = fingerprint();
+        write("drop_existing_kind = \"table\"\n");
+        let table = fingerprint();
+        assert_ne!(absent, view);
+        assert_ne!(view, table);
+    }
     /// #1730. Both sides of the execution fingerprint must build the
     /// surrogate-key map with the SAME function over the SAME set.
     ///
@@ -6027,6 +6108,103 @@ mod tests {
         }
     }
 
+    fn write_fingerprinted_ai_plan(root: &Path, plan: &RunPlan) -> anyhow::Result<String> {
+        crate::plan_store::write_plan_governed(
+            root,
+            PlanKind::AiAuthored,
+            plan,
+            PolicyPrincipal::Agent,
+            crate::plan_store::EmbeddedCapabilities {
+                models_fingerprint: Some("reviewed-fingerprint".to_string()),
+                config_identity: Some("reviewed-config".to_string()),
+                fingerprint_version: crate::plan_store::CURRENT_FINGERPRINT_VERSION,
+                reviewed_source_schemas: Some(BTreeMap::new()),
+                ..Default::default()
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn reviewed_legacy_agent_run_refuses_later_drop_permission() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path();
+        let models = root.join("models");
+        std::fs::create_dir(&models)?;
+        std::fs::write(models.join("switch.sql"), "SELECT 1 AS id\n")?;
+        let sidecar = models.join("switch.toml");
+        std::fs::write(
+            &sidecar,
+            "name = \"switch\"\n[strategy]\ntype = \"full_refresh\"\n[target]\ncatalog = \"\"\nschema = \"main\"\n",
+        )?;
+        let config = write_config(root, "")?;
+        let state = root.join("state.redb");
+        let plan = RunPlan {
+            pipeline: Some("p".to_string()),
+            models_dir: Some("models".to_string()),
+            models: vec!["switch".to_string()],
+            ..minimal_run_plan()
+        };
+        let id = crate::plan_store::write_plan_governed(
+            root,
+            PlanKind::Run,
+            &plan,
+            PolicyPrincipal::Agent,
+            crate::plan_store::EmbeddedCapabilities::default(),
+        )?;
+        let review = crate::commands::review::compute_review_with_state_path(
+            root,
+            &config,
+            Some(&state),
+            &id,
+            "HEAD",
+            true,
+        )
+        .await?;
+        assert!(review.marker_written);
+        assert!(review.conditional_drops.is_empty());
+
+        std::fs::write(
+            &sidecar,
+            "name = \"switch\"\ndrop_existing_kind = \"view\"\n[strategy]\ntype = \"full_refresh\"\n[target]\ncatalog = \"\"\nschema = \"main\"\n",
+        )?;
+        let error = run_apply_in(
+            root,
+            &config,
+            &id,
+            &state,
+            PolicyPrincipal::Agent,
+            None,
+            false,
+        )
+        .await
+        .expect_err("a reviewed fingerprintless run must refuse the new DROP");
+        assert!(format!("{error:#}").contains("Re-run `rocky plan`"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reviewed_fingerprintless_backfill_refuses_before_execution() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path();
+        let id = write_plan(root, PlanKind::Backfill, &minimal_run_plan())?;
+        let marker = super::review_marker_path(root, &id);
+        std::fs::create_dir_all(marker.parent().expect("marker has parent"))?;
+        std::fs::write(&marker, well_formed_marker_json(&id))?;
+        let error = run_apply_in(
+            root,
+            &root.join("rocky.toml"),
+            &id,
+            &root.join("state.redb"),
+            PolicyPrincipal::Human,
+            None,
+            false,
+        )
+        .await
+        .expect_err("a reviewed backfill without a fingerprint must refuse");
+        assert!(format!("{error:#}").contains("Re-run `rocky plan`"));
+        Ok(())
+    }
+
     #[tokio::test]
     async fn transformation_shadow_and_branch_plans_pass_apply_preflight() -> anyhow::Result<()> {
         for branch in [None, Some("fix_price")] {
@@ -6092,7 +6270,7 @@ mod tests {
         plan.pipeline = Some("dq".to_string());
         plan.shadow = true;
         plan.models_dir = Some(models_dir.to_string_lossy().into_owned());
-        let plan_id = write_plan(dir.path(), PlanKind::AiAuthored, &plan)?;
+        let plan_id = write_fingerprinted_ai_plan(dir.path(), &plan)?;
         let state_path = dir.path().join("state.redb");
 
         let error = super::run_apply_core_in(
@@ -6256,7 +6434,7 @@ mod tests {
     async fn ai_authored_apply_with_invalid_marker_is_refused_distinctly() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let rp = minimal_run_plan();
-        let plan_id = write_plan(dir.path(), PlanKind::AiAuthored, &rp)?;
+        let plan_id = write_fingerprinted_ai_plan(dir.path(), &rp)?;
         let config_path = dir.path().join("rocky.toml");
         std::fs::write(
             &config_path,
@@ -6312,7 +6490,7 @@ mod tests {
     async fn ai_authored_apply_without_marker_is_refused() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let rp = minimal_run_plan();
-        let plan_id = write_plan(dir.path(), PlanKind::AiAuthored, &rp)?;
+        let plan_id = write_fingerprinted_ai_plan(dir.path(), &rp)?;
 
         // A loadable (policy-free) config: since PR-B the gate HARD-loads the
         // single config snapshot up front (#1120 behavior delta), so the
@@ -6456,7 +6634,7 @@ auto_create_schemas = true
         let mut rp = minimal_run_plan();
         rp.models_dir = Some(models_dir.to_string_lossy().into_owned());
         rp.models = vec!["orders".to_string()];
-        let plan_id = write_plan(dir.path(), PlanKind::AiAuthored, &rp)?;
+        let plan_id = write_fingerprinted_ai_plan(dir.path(), &rp)?;
         strip_principal_from_plan(dir.path(), &plan_id)?;
 
         let state = dir.path().join("state.redb");
@@ -6503,7 +6681,7 @@ auto_create_schemas = true
         let mut rp = minimal_run_plan();
         rp.models_dir = Some(models_dir.to_string_lossy().into_owned());
         rp.models = vec!["orders".to_string()];
-        let plan_id = write_plan(dir.path(), PlanKind::AiAuthored, &rp)?;
+        let plan_id = write_fingerprinted_ai_plan(dir.path(), &rp)?;
 
         let state = dir.path().join("state.redb");
         let err = super::run_apply_ai_authored_plan(
@@ -6531,7 +6709,7 @@ auto_create_schemas = true
     async fn no_policy_block_ai_authored_requires_marker() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         std::fs::write(dir.path().join("rocky.toml"), NO_POLICY_TOML)?;
-        let plan_id = write_plan(dir.path(), PlanKind::AiAuthored, &minimal_run_plan())?;
+        let plan_id = write_fingerprinted_ai_plan(dir.path(), &minimal_run_plan())?;
 
         let state = dir.path().join("state.redb");
         let err = super::run_apply_ai_authored_plan(
