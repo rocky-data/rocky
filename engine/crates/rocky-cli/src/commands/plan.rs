@@ -1087,10 +1087,15 @@ pub(crate) fn conditional_drops_for_run_plan(
         Some(glob) => compile::compile_matching(&config, glob),
         None => compile::compile(&config),
     };
-    let models = compiled
-        .context("failed to compile models for conditional DROP review")?
-        .project
-        .models;
+    let models = match compiled {
+        Ok(result) => result.project.models,
+        Err(compile::CompileError::Project(rocky_compiler::project::ProjectError::NoModels {
+            ..
+        })) => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(error).context("failed to compile models for conditional DROP review");
+        }
+    };
     if models.is_empty() {
         return Ok(Vec::new());
     }
