@@ -532,6 +532,7 @@ pub async fn plan(
                 for drop in conditional_drops_for_run_plan(
                     config_path,
                     &blueprint_models_dir,
+                    None,
                     state_path,
                     &run_plan,
                 )? {
@@ -1066,6 +1067,7 @@ pub(crate) fn conditional_kind_drop_detail(
 pub(crate) fn conditional_drops_for_run_plan(
     config_path: &Path,
     models_dir: &Path,
+    models_glob: Option<&str>,
     state_path: &Path,
     run_plan: &RunPlan,
 ) -> Result<Vec<ConditionalDrop>> {
@@ -1081,7 +1083,11 @@ pub(crate) fn conditional_drops_for_run_plan(
         project_freshness: Default::default(),
         run_vars: rocky_core::run_vars::RunVars::new(),
     };
-    let models = match compile::compile(&config) {
+    let compiled = match models_glob {
+        Some(glob) => compile::compile_matching(&config, glob),
+        None => compile::compile(&config),
+    };
+    let models = match compiled {
         Ok(result) => result.project.models,
         // Legacy reviewable plans may omit the informational model list and
         // point at an uncompiled project. Apply cannot execute a model when
@@ -4292,9 +4298,14 @@ table = "users"
             "parallel": 1, "pipeline": "snow"
         }))
         .unwrap();
-        let drops =
-            conditional_drops_for_run_plan(&cfg, &models, &tmp.path().join("state.redb"), &plan)
-                .unwrap();
+        let drops = conditional_drops_for_run_plan(
+            &cfg,
+            &models,
+            None,
+            &tmp.path().join("state.redb"),
+            &plan,
+        )
+        .unwrap();
         assert_eq!(drops.len(), 1, "model metadata is only informational");
         assert_eq!(drops[0].model, "switch");
     }

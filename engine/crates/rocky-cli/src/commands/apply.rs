@@ -2262,7 +2262,7 @@ fn touched_models_for_run(
 }
 
 /// Resolve the model directory and file glob the run executor will use.
-fn run_model_selection(
+pub(crate) fn run_model_selection(
     config: &rocky_core::config::RockyConfig,
     config_path: &Path,
     run_plan: &RunPlan,
@@ -3794,6 +3794,8 @@ async fn run_apply_ai_authored_plan(
     let run_plan: RunPlan = serde_json::from_value(plan.payload.clone())
         .context("failed to deserialize ai_authored plan payload")?;
 
+    require_ai_plan_fingerprint(&plan, plan_id)?;
+
     validate_run_plan_execution_shape(plan_id, &run_plan)?;
 
     // policy seam 2: rule-driven refusal. When a `[policy]` block is configured,
@@ -3942,6 +3944,17 @@ async fn run_apply_ai_authored_plan(
     )
     .await?;
     Ok(apply_outcome_for(termination, &apply_run_id))
+}
+
+fn require_ai_plan_fingerprint(plan: &PersistedPlan, plan_id: &str) -> Result<()> {
+    let capabilities = plan.embedded_capabilities();
+    if capabilities.fingerprint_version == 0 || capabilities.models_fingerprint.is_none() {
+        bail!(
+            "refusing to apply AI-authored plan '{plan_id}' without an execution fingerprint. \
+             Re-run `rocky plan` and review the new plan before applying."
+        );
+    }
+    Ok(())
 }
 
 /// Apply a `PlanKind::Backfill` plan — a scoped, review-gated recovery run.
@@ -5081,6 +5094,34 @@ pub async fn run_apply_inline_for_run(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn ai_apply_refuses_legacy_plan_before_execution() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let payload = serde_json::json!({"parallel": 1, "pipeline": "p", "models": []});
+        let plan_id = crate::plan_store::write_plan(
+            dir.path(),
+            crate::plan_store::PlanKind::AiAuthored,
+            &payload,
+        )?;
+        let err = super::run_apply_ai_authored_plan(
+            dir.path(),
+            &dir.path().join("rocky.toml"),
+            &plan_id,
+            &dir.path().join("state.redb"),
+            super::PolicyPrincipal::Agent,
+            true,
+        )
+        .await
+        .expect_err("a fingerprintless AI plan must refuse before config or warehouse work");
+        let message = err.to_string();
+        assert!(
+            message.contains("without an execution fingerprint"),
+            "{message}"
+        );
+        assert!(message.contains("Re-run `rocky plan`"), "{message}");
+        Ok(())
+    }
+
     #[test]
     fn execution_fingerprint_tracks_drop_existing_kind() {
         let dir = tempfile::tempdir().unwrap();

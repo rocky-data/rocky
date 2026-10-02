@@ -23,6 +23,12 @@ const DIFF: ReviewOutput = {
   base_ref: "HEAD",
   approved: false,
   marker_written: false,
+  conditional_drops: [{
+    model: "orders",
+    target: '"main"."orders"',
+    existing_kind: "table",
+    drop_sql: 'DROP TABLE IF EXISTS "main"."orders"',
+  }],
   breaking_changes: [
     {
       change: {
@@ -366,6 +372,8 @@ describe("PlanDetail", () => {
     await screen.findByText("orders carries a classified column");
     expect(screen.getByText("customers is a governed product input")).toBeTruthy();
     expect(screen.getByText("#2")).toBeTruthy();
+    expect(screen.getByRole("region", { name: "Conditional DROPs" })).toBeTruthy();
+    expect(screen.getByText('DROP TABLE IF EXISTS "main"."orders"')).toBeTruthy();
     expect(screen.getByText("#5")).toBeTruthy();
     expect(screen.getByText(/2 escalations name this plan/)).toBeTruthy();
     // Two models is not one to sample; both are named.

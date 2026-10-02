@@ -292,11 +292,23 @@ pub async fn compute_review_with_state_path(
     let run_plan: RunPlan = serde_json::from_value(plan.payload.clone())
         .context("failed to deserialize plan payload")?;
 
-    // Resolve the plan's models directory against the project `root`, never
-    // the process cwd — the governor's MCP server reviews from a cwd that is
-    // not the project, and a cwd-relative path would silently skip the
-    // breaking-change gate there.
-    let (models_dir, default_state_path) = review_gate_paths(root, run_plan.models_dir.as_deref());
+    // Use apply's execution selection, including the pipeline's configured
+    // file glob. A relative explicit directory belongs to this project root,
+    // not the review server's process directory.
+    let (selected_dir, models_glob) =
+        match rocky_core::config::load_optional_project_config(Some(config_path))? {
+            Some(cfg) => super::apply::run_model_selection(&cfg, config_path, &run_plan)?,
+            None => (
+                PathBuf::from(run_plan.models_dir.as_deref().unwrap_or("models")),
+                None,
+            ),
+        };
+    let models_dir = if selected_dir.is_absolute() {
+        selected_dir
+    } else {
+        root.join(selected_dir)
+    };
+    let default_state_path = rocky_core::state::resolve_state_path(None, &models_dir).path;
     let state_path = state_path.unwrap_or(&default_state_path);
 
     // `?` here is the whole point of the change: a present-but-unloadable
@@ -310,6 +322,7 @@ pub async fn compute_review_with_state_path(
     let conditional_drops = super::plan::conditional_drops_for_run_plan(
         config_path,
         &models_dir,
+        models_glob.as_deref(),
         state_path,
         &run_plan,
     )?;
@@ -1297,6 +1310,66 @@ mod tests {
         assert_eq!(drop.target, executed_target);
         assert_eq!(drop.drop_sql, executed_drop);
         assert!(drop.target.contains("branch_schema"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn review_uses_apply_pipeline_glob_when_plan_omits_models_dir() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let default_models = dir.path().join("models");
+        let selected_models = dir.path().join("selected");
+        std::fs::create_dir(&default_models)?;
+        std::fs::create_dir(&selected_models)?;
+        std::fs::write(default_models.join("benign.sql"), "SELECT 1 AS id\n")?;
+        std::fs::write(selected_models.join("switch.sql"), "SELECT 1 AS id\n")?;
+        std::fs::write(
+            selected_models.join("switch.toml"),
+            "name = \"switch\"\ndrop_existing_kind = \"table\"\n[strategy]\ntype = \"view\"\n[target]\ncatalog = \"\"\nschema = \"main\"\n",
+        )?;
+        let config = dir.path().join("rocky.toml");
+        std::fs::write(
+            &config,
+            "[adapter.default]\ntype = \"duckdb\"\ndatabase = \":memory:\"\n\n[pipeline.p]\ntype = \"transformation\"\nmodels = \"selected/switch.sql\"\n\n[pipeline.p.target]\nadapter = \"default\"\n",
+        )?;
+        let payload = serde_json::json!({"parallel": 1, "pipeline": "p", "models": []});
+        let plan_id = crate::plan_store::write_plan(dir.path(), PlanKind::AiAuthored, &payload)?;
+        let state = dir.path().join("state.redb");
+        let review = compute_review_with_state_path(
+            dir.path(),
+            &config,
+            Some(&state),
+            &plan_id,
+            "HEAD",
+            false,
+        )
+        .await?;
+
+        let plan: RunPlan = serde_json::from_value(payload)?;
+        let cfg = rocky_core::config::load_optional_project_config(Some(&config))?.unwrap();
+        let (apply_dir, apply_glob) =
+            super::super::apply::run_model_selection(&cfg, &config, &plan)?;
+        assert_eq!(apply_dir, selected_models);
+        let compiled = rocky_compiler::compile::compile_matching(
+            &rocky_compiler::compile::CompilerConfig {
+                models_dir: apply_dir,
+                ..Default::default()
+            },
+            apply_glob.as_deref().unwrap(),
+        )?;
+        assert_eq!(compiled.project.models.len(), 1);
+        let model = &compiled.project.models[0];
+        let dialect = rocky_duckdb::dialect::DuckDbSqlDialect;
+        let expected = super::super::plan::conditional_kind_drop_detail(
+            model,
+            &model.to_model_ir(),
+            &dialect,
+        )?
+        .unwrap();
+        assert_eq!(review.conditional_drops.len(), 1);
+        assert_eq!(review.conditional_drops[0].model, expected.model);
+        assert_eq!(review.conditional_drops[0].target, expected.target);
+        assert_eq!(review.conditional_drops[0].drop_sql, expected.drop_sql);
+        assert!(!review.marker_written);
         Ok(())
     }
 
