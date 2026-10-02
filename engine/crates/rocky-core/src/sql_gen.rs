@@ -685,6 +685,35 @@ fn substitute_partition_placeholders(sql: &str, window: &PartitionWindow) -> Str
         .replace("@end_date", &end)
 }
 
+/// The SQL `rocky test` runs for a model on the local engine (#2020).
+///
+/// A `time_interval` model's body carries `@start_date` / `@end_date`, which
+/// only `rocky run` used to substitute. Local tests substitute the widest
+/// window the local engine can hold, `0001-01-01 00:00:00` to
+/// `9999-12-31 23:59:59`, so no fixture row is dropped by the window. Every
+/// other strategy runs its compiled SQL unchanged.
+pub fn local_test_sql(model: &crate::models::Model) -> std::borrow::Cow<'_, str> {
+    if !matches!(
+        model.config.strategy,
+        crate::models::StrategyConfig::TimeInterval { .. }
+    ) {
+        return std::borrow::Cow::Borrowed(&model.sql);
+    }
+    let bound = |s: &str| {
+        chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(
+            chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S")
+                .expect("hardcoded local test bound parses"),
+            chrono::Utc,
+        )
+    };
+    let window = PartitionWindow {
+        key: "local_test".to_string(),
+        start: bound("0001-01-01 00:00:00"),
+        end: bound("9999-12-31 23:59:59"),
+    };
+    std::borrow::Cow::Owned(substitute_partition_placeholders(&model.sql, &window))
+}
+
 /// Generates CREATE OR REPLACE VIEW SQL for a transformation model.
 ///
 /// Delegates to the dialect's [`SqlDialect::view_ddl`] so per-warehouse

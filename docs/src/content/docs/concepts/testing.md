@@ -103,8 +103,8 @@ A column can end up with type `Unknown`, which means the compiler could not infe
 
 `rocky test` compiles your models and executes them on a local DuckDB. It needs no warehouse connection, so you get fast feedback while you write.
 
-:::caution[A time-interval model cannot run under `rocky test`]
-`rocky test` does not substitute the `@start_date` and `@end_date` bounds, so a `time_interval` model reaches DuckDB with the placeholders still in the SQL. DuckDB then reports `Binder Error: Referenced column "start_date" not found in FROM clause!`, and `rocky test` and `rocky ci` fail. `rocky run` substitutes the bounds correctly. Track it in [#2020](https://github.com/rocky-data/rocky/issues/2020).
+:::note[Time-interval models under `rocky test`]
+A `time_interval` model's SQL uses the `@start_date` and `@end_date` bounds. `rocky test` and `rocky ci` replace them with the widest window the local engine holds: `'0001-01-01 00:00:00'` to `'9999-12-31 23:59:59'`. The end is exclusive, as in `rocky run`. So the window drops no fixture row, and a test sees every row you give it. This applies to the model-execution check and to `[[test]]` unit tests.
 :::
 
 ### What each step does

@@ -257,7 +257,10 @@ pub fn run_unit_tests(
         if !include_model(model_filter, name) {
             continue;
         }
-        let compiled_sql = compile_result.project.model(name).map(|m| m.sql.clone());
+        let compiled_sql = compile_result
+            .project
+            .model(name)
+            .map(|m| rocky_core::sql_gen::local_test_sql(m).into_owned());
         for test in &unit_tests[name] {
             match &compiled_sql {
                 Some(sql) => results.push(run_one_unit_test(name, sql, test)),
@@ -666,6 +669,75 @@ mod tests {
         )
         .unwrap();
         (dir, models)
+    }
+
+    /// Scaffold a `time_interval` model whose body filters on `@start_date` /
+    /// `@end_date`, with a `[[test]]` whose fixture rows sit near both ends
+    /// of the calendar (#2020).
+    fn scaffold_time_interval_project() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let models = dir.path().join("models");
+        std::fs::create_dir_all(&models).unwrap();
+        std::fs::write(
+            models.join("orders.sql"),
+            "SELECT 1 AS id, TIMESTAMP '2026-01-01 00:00:00' AS order_at",
+        )
+        .unwrap();
+        std::fs::write(
+            models.join("orders.toml"),
+            "[strategy]\ntype = \"full_refresh\"\n[target]\ncatalog=\"wh\"\nschema=\"main\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            models.join("daily.sql"),
+            "SELECT id, order_at FROM orders \
+             WHERE order_at >= @start_date AND order_at < @end_date",
+        )
+        .unwrap();
+        std::fs::write(
+            models.join("daily.toml"),
+            "[strategy]\ntype = \"time_interval\"\ntime_column = \"order_at\"\n\
+             granularity = \"day\"\n\
+             [target]\ncatalog = \"wh\"\nschema = \"main\"\n\n\
+             [[test]]\nname = \"keeps_every_row\"\n\n\
+             [[test.given]]\nref = \"orders\"\n\
+             rows = [ { id = 1, order_at = \"0001-01-02 00:00:00\" }, \
+             { id = 2, order_at = \"9999-12-30 00:00:00\" } ]\n\n\
+             [test.expect]\n\
+             rows = [ { id = 1 }, { id = 2 } ]\n",
+        )
+        .unwrap();
+        (dir, models)
+    }
+
+    /// `rocky test` runs a `time_interval` model with the placeholders
+    /// substituted, instead of failing on the bare `@start_date` (#2020).
+    #[test]
+    fn time_interval_model_executes_locally() {
+        let (_tmp, models) = scaffold_time_interval_project();
+        let result = run_tests(
+            &models,
+            None,
+            Some("daily"),
+            &rocky_core::run_vars::RunVars::new(),
+        )
+        .unwrap();
+        assert_eq!(result.total, 1);
+        assert_eq!(result.passed, 1, "failures: {:?}", result.failures);
+    }
+
+    /// A `[[test]]` on a `time_interval` model keeps fixture rows at both
+    /// ends of the calendar: the local window drops none of them (#2020).
+    #[test]
+    fn time_interval_unit_test_keeps_rows_at_calendar_edges() {
+        let (_tmp, models) = scaffold_time_interval_project();
+        let run = run_unit_tests(&models, None).unwrap();
+        assert_eq!(run.total(), 1);
+        assert!(
+            run.results[0].passed,
+            "error: {:?}, mismatches: {:?}",
+            run.results[0].error, run.results[0].mismatches
+        );
     }
 
     /// A unit test passes when the model's output against the mocked inputs
