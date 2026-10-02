@@ -2307,13 +2307,15 @@ fn ensure_run_is_resumable(state_store: &StateStore, progress: &RunProgress) -> 
                 .join(", ");
             let guidance = if progress.watermarks_confirmed {
                 "Its target watermarks are confirmed. Run the pipeline without a resume \
-                 flag to re-run the post-copy checks."
+                 flag to re-run the post-copy checks. Use --no-prune if the \
+                 source has an unchanged marker."
             } else if progress.watermark_recovery_tables.is_none() {
                 // Written before recovery descriptors existed; recovery ignores it.
                 "It predates recovery records, so Rocky cannot tell whether its \
-                 watermarks were saved. Run the pipeline without a resume flag to re-run \
-                 the post-copy checks. If the watermarks were lost, the next incremental \
-                 append can copy those rows again, as in earlier releases."
+                 watermarks were saved. Run the affected tables with the full_refresh \
+                 strategy and --no-prune, without a resume flag, to replace their \
+                 data and re-run checks. Reconcile the saved incremental cursor to \
+                 the replacement target before returning to incremental."
             } else if progress
                 .watermark_recovery_tables
                 .as_ref()
@@ -2329,11 +2331,14 @@ fn ensure_run_is_resumable(state_store: &StateStore, progress: &RunProgress) -> 
                         )
                     })
             {
-                "Run the pipeline without a resume flag to reconcile its persisted \
-                 target watermark contracts and re-run the post-copy checks."
+                "Run the pipeline without a resume flag. Rocky re-derives the \
+                 persisted watermarks from these targets before the next copy \
+                 and runs their post-copy checks. Use --no-prune if the source \
+                 has an unchanged marker."
             } else {
-                "Run these tables with the full_refresh strategy without a resume flag \
-                 to replace their data and re-run checks. Keep full_refresh until the \
+                "Run these tables with the full_refresh strategy and --no-prune, \
+                 without a resume flag, to replace their data and re-run checks. \
+                 Keep full_refresh until the \
                  saved incremental cursor is reconciled to the replacement target; \
                  do not return to incremental with a wall-clock refresh cursor."
             };
@@ -5419,6 +5424,14 @@ pub async fn run_with_explicit_contracts(
         );
     }
 
+    // A completed copy without a RunRecord still owes its post-copy checks.
+    // The fresh run must materialize those targets even when their source
+    // change marker is unchanged.
+    let owed_check_targets = state_store.complete_recordless_check_targets(
+        &resume_scope,
+        &recovery_target_names(&tables_to_process),
+    )?;
+
     // Initialize run progress tracking, stamped with this invocation's
     // pipeline scope so a later resume can prove the checkpoint is its own
     // (#1549), and with the table keys it plans to copy so a later resume can
@@ -5800,6 +5813,7 @@ pub async fn run_with_explicit_contracts(
         let pipeline_ref = shared_pipeline.clone();
         let task = task.clone();
         let required_replacement = replacement_targets.contains(&copy_endpoints(&task).1.state_key());
+        let checks_owed = owed_check_targets.contains(&table_key(&task));
 
         // §P2.6 per-table emit: before_materialize fires on the main
         // task just before we spawn — the registry is shared via Arc
@@ -5819,7 +5833,7 @@ pub async fn run_with_explicit_contracts(
         join_set.spawn(async move {
             let _permit = permit;
             let result =
-                process_table_with_replacement_recovery(warehouse.as_ref(), &state, &pipeline_ref, &task, prune_enabled, required_replacement).await;
+                process_table_with_replacement_recovery(warehouse.as_ref(), &state, &pipeline_ref, &task, prune_enabled, required_replacement, checks_owed).await;
             (idx, result)
         });
     }
@@ -6260,6 +6274,7 @@ pub async fn run_with_explicit_contracts(
                     // re-copy every run thereafter.
                     prune_enabled,
                     replacement_targets.contains(&copy_endpoints(task).1.state_key()),
+                    owed_check_targets.contains(&table_key(task)),
                 )
                 .await
                 {
@@ -14863,6 +14878,7 @@ async fn reconcile_prior_watermarks(
 
 /// The ordinary retry path repairs only this table. Its run remains
 /// unconfirmed until the final batch accounts for every eligible target.
+#[allow(clippy::too_many_arguments)]
 async fn retry_table_after_recovery(
     warehouse: &dyn WarehouseAdapter,
     state: &Arc<StateStore>,
@@ -14871,6 +14887,7 @@ async fn retry_table_after_recovery(
     recovery: Option<&WatermarkRecoveryTable>,
     prune_enabled: bool,
     required_replacement: bool,
+    checks_owed: bool,
 ) -> Result<TableOutcome> {
     if let Some(table) = recovery
         && let Some(watermark) = recovered_target_watermark(warehouse, state, table).await?
@@ -14887,6 +14904,7 @@ async fn retry_table_after_recovery(
         task,
         prune_enabled,
         required_replacement,
+        checks_owed,
     )
     .await
 }
@@ -14901,13 +14919,14 @@ async fn process_table_with_replacement_recovery(
     task: &TableTask,
     prune_enabled: bool,
     required_replacement: bool,
+    checks_owed: bool,
 ) -> Result<TableOutcome> {
     let outcome = process_table(
         warehouse,
         state,
         pipeline,
         task,
-        prune_enabled && !required_replacement,
+        prune_enabled && !required_replacement && !checks_owed,
     )
     .await?;
     if !required_replacement {
@@ -19605,6 +19624,7 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
                     );
                     assert!(message.contains("wh.staging_p1__acme.t0"), "{message}");
                     assert!(message.contains("without a resume flag"), "{message}");
+                    assert!(message.contains("full_refresh"), "{message}");
                 } else {
                     assert_eq!(result.unwrap().unwrap().run_id, "run-1");
                 }
@@ -20178,7 +20198,7 @@ auto_create_schemas = true
         // The crash case plans two tables and completed one — an incomplete
         // checkpoint with no record. (The complete-checkpoint crash, a kill
         // after the last table, is
-        // `resume_latest_resumes_a_run_that_crashed_after_its_last_table`.)
+        // `resume_latest_refuses_a_run_that_crashed_after_its_last_table`.)
         //
         // The `Failure` case plans two as well, because #1598 refuses a
         // *complete* checkpoint whose run failed with no failed model: a
@@ -20562,6 +20582,7 @@ auto_create_schemas = true
                 message.contains("warehouse.staging_p2__acme.orders"),
                 "{message}"
             );
+            assert!(message.contains("full_refresh"), "{message}");
         }
         assert!(!target_table_exists(&db_path, "staging_p2__acme", "orders").await);
         let store = StateStore::open(&state_path).unwrap();
@@ -42940,6 +42961,7 @@ timestamp_column = "ts"
             Some(&recovery),
             false,
             false,
+            false,
         )
         .await
         .unwrap();
@@ -43296,7 +43318,7 @@ timestamp_column = "ts"
             .init_run_progress_with_recovery("replacement", &[table_key(&task)], Some(&scope), &[])
             .unwrap();
         let TableOutcome::Materialized(result) = process_table_with_replacement_recovery(
-            &warehouse, &state, &pipeline, &task, true, true,
+            &warehouse, &state, &pipeline, &task, true, true, false,
         )
         .await
         .unwrap() else {
@@ -43345,7 +43367,7 @@ timestamp_column = "ts"
             .unwrap();
         pipeline.strategy = "incremental".into();
         let TableOutcome::Materialized(result) = process_table_with_replacement_recovery(
-            &warehouse, &state, &pipeline, &task, false, false,
+            &warehouse, &state, &pipeline, &task, false, false, false,
         )
         .await
         .unwrap() else {
@@ -43638,6 +43660,7 @@ timestamp_column = "ts"
             Some(&descriptor),
             true,
             false,
+            false,
         )
         .await
         .err()
@@ -43678,11 +43701,12 @@ timestamp_column = "ts"
             )
             .await
             .unwrap();
-        let error =
-            process_table_with_replacement_recovery(&failure, &state, &pipeline, &task, true, true)
-                .await
-                .err()
-                .unwrap();
+        let error = process_table_with_replacement_recovery(
+            &failure, &state, &pipeline, &task, true, true, false,
+        )
+        .await
+        .err()
+        .unwrap();
         assert!(format!("{error:#}").contains("recovery read unavailable"));
         assert!(failure.writes.load(std::sync::atomic::Ordering::SeqCst) > 0);
         assert!(
@@ -43700,11 +43724,11 @@ timestamp_column = "ts"
                 .rows[0][0],
             "2"
         );
-        let TableOutcome::Materialized(result) =
-            retry_table_after_recovery(&warehouse, &state, &pipeline, &task, None, true, true)
-                .await
-                .unwrap()
-        else {
+        let TableOutcome::Materialized(result) = retry_table_after_recovery(
+            &warehouse, &state, &pipeline, &task, None, true, true, false,
+        )
+        .await
+        .unwrap() else {
             panic!("full-refresh retry must copy");
         };
         let wm = result.deferred_watermark.unwrap();
@@ -43851,6 +43875,7 @@ timestamp_column = "ts"
             &task,
             true,
             required_replacement,
+            false,
         )
         .await
         .unwrap() else {
@@ -43931,6 +43956,82 @@ timestamp_column = "ts"
         );
         let runs = watermark_confirmation_runs("pruned", &[current], &[], &queue);
         assert_eq!(runs, vec!["pruned"]);
+    }
+
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn recordless_complete_checkpoint_prevents_pruning_owed_checks() {
+        use async_trait::async_trait;
+        use rocky_core::traits::{QueryResult, SqlDialect};
+        struct StableMarker<'a>(&'a rocky_duckdb::adapter::DuckDbWarehouseAdapter);
+        #[async_trait]
+        impl WarehouseAdapter for StableMarker<'_> {
+            fn dialect(&self) -> &dyn SqlDialect {
+                self.0.dialect()
+            }
+            async fn execute_statement(&self, sql: &str) -> AdapterResult<()> {
+                self.0.execute_statement(sql).await
+            }
+            async fn execute_query(&self, sql: &str) -> AdapterResult<QueryResult> {
+                self.0.execute_query(sql).await
+            }
+            async fn describe_table(&self, table: &TableRef) -> AdapterResult<Vec<ColumnInfo>> {
+                self.0.describe_table(table).await
+            }
+            async fn source_change_marker(&self, _: &TableRef) -> AdapterResult<Option<String>> {
+                Ok(Some("unchanged".into()))
+            }
+        }
+        let (_dir, warehouse, state, pipeline, mut task, scope, descriptor) =
+            checkpoint_recovery_boundary_fixture().await;
+        task.check_row_count = true;
+        state
+            .set_source_marker(&descriptor.target.state_key(), "unchanged")
+            .unwrap();
+        state
+            .record_table_progress(
+                "old",
+                &table_entry(
+                    0,
+                    &table_key(&task),
+                    rocky_core::state::TableStatus::Success,
+                ),
+            )
+            .unwrap();
+        state
+            .batch_set_watermarks_and_confirm_runs(&[], &["old"])
+            .unwrap();
+        let progress = state.get_run_progress("old").unwrap().unwrap();
+        assert!(state.get_run("old").unwrap().is_none());
+        assert!(ensure_run_is_resumable(&state, &progress).is_err());
+        assert!(matches!(
+            process_table(&StableMarker(&warehouse), &state, &pipeline, &task, true)
+                .await
+                .unwrap(),
+            TableOutcome::Pruned(_)
+        ));
+        let TableOutcome::Materialized(result) = process_table_with_replacement_recovery(
+            &StableMarker(&warehouse),
+            &state,
+            &pipeline,
+            &task,
+            true,
+            false,
+            state
+                .complete_recordless_check_targets(
+                    &scope,
+                    &[table_key(&task)].into_iter().collect(),
+                )
+                .unwrap()
+                .contains(&table_key(&task)),
+        )
+        .await
+        .unwrap() else {
+            panic!("a fresh run must materialize this target so post-copy checks execute");
+        };
+        assert!(result.source_batch_ref.is_some());
+        assert!(result.target_batch_ref.is_some());
+        assert_eq!(scope.pipeline, "p1");
     }
 
     #[cfg(feature = "duckdb")]
@@ -44112,7 +44213,7 @@ timestamp_column = "ts"
                 ensure_run_is_resumable(&state, &unconfirmed).unwrap_err()
             );
             assert!(
-                message.contains("reconcile its persisted target watermark contracts"),
+                message.contains("re-derives the persisted watermarks from these targets"),
                 "{message}"
             );
             unconfirmed
@@ -44141,7 +44242,8 @@ timestamp_column = "ts"
                 ensure_run_is_resumable(&state, &unconfirmed).unwrap_err()
             );
             assert!(message.contains("predates recovery records"), "{message}");
-            assert!(!message.contains("Keep full_refresh until"), "{message}");
+            assert!(message.contains("full_refresh"), "{message}");
+            assert!(message.contains("--no-prune"), "{message}");
         }
         let error = rt
             .block_on(drive_resume_test_run(

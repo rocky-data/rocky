@@ -137,13 +137,18 @@ Rocky refuses `--resume` and `--resume-latest` when every planned table copied
 but the terminal run record is missing. Skipping those tables would also skip
 their post-copy checks and could report false success.
 
-Follow the recovery route in the refusal. A confirmed checkpoint allows a fresh
-run without a resume flag to execute checks. Supported recovery descriptors also
-allow a fresh run to reconcile watermarks before copying.
+Follow the recovery route in the refusal. For a confirmed checkpoint, run
+`rocky run --pipeline <name> --no-prune` to execute the owed checks. With
+supported recovery records, a fresh run re-derives watermarks from the target.
+It then copies rows and runs checks. Rocky disables pruning for targets whose
+copy completed without a terminal run record.
 
 A checkpoint from Rocky 1.75.0 or earlier cannot show that its watermarks were
-saved. A fresh run without a resume flag executes its checks. If its watermarks
-were lost, that run can copy rows again, as in earlier releases.
+saved. Switch the affected tables to `strategy = "full_refresh"`, then run
+`rocky run --pipeline <name> --no-prune` without a resume flag. That replaces
+their data and runs the checks without appending the same rows twice. Keep the
+full-refresh strategy until the saved incremental cursor matches the
+replacement target.
 
 Other unsupported checkpoints require full refresh. Keep that strategy until
 the saved incremental cursor matches the replacement target. Switching back to

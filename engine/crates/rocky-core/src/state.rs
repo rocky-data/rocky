@@ -3335,6 +3335,29 @@ pub struct WatermarkRecoveryTable {
     pub prior_watermark: Option<chrono::DateTime<chrono::Utc>>,
 }
 
+/// A Snowflake session default cannot move a fully qualified recovery target.
+/// Keep the default in strict resume identity and for targets without a catalog.
+fn recovery_endpoint_matches(
+    recorded: &crate::config::EndpointIdentity,
+    current: &crate::config::EndpointIdentity,
+    explicit_catalogs: bool,
+) -> bool {
+    if recorded == current {
+        return true;
+    }
+    if !explicit_catalogs
+        || recorded.adapter_type != "snowflake"
+        || current.adapter_type != "snowflake"
+    {
+        return false;
+    }
+    let mut old = recorded.locators.clone();
+    let mut new = current.locators.clone();
+    old.remove("database");
+    new.remove("database");
+    old == new
+}
+
 fn watermarks_unconfirmed(confirmed: &bool) -> bool {
     !confirmed
 }
@@ -4190,7 +4213,12 @@ impl StateStore {
                 continue;
             };
             let same_endpoint = match (&recorded.target, &scope.target) {
-                (Some(recorded), Some(current)) => Some(recorded.endpoint == current.endpoint),
+                (Some(recorded), Some(current)) => Some(recovery_endpoint_matches(
+                    &recorded.endpoint,
+                    &current.endpoint,
+                    !tables.is_empty()
+                        && tables.iter().all(|table| !table.target.catalog.is_empty()),
+                )),
                 _ => None,
             };
             let relevant = if recorded.pipeline == scope.pipeline {
@@ -4218,6 +4246,95 @@ impl StateStore {
                 .then(a.run_id.cmp(&b.run_id))
         });
         Ok(result)
+    }
+
+    /// Targets whose copy finished but whose terminal record never proved
+    /// that the post-copy checks ran. A fresh run must not prune these targets.
+    pub fn complete_recordless_check_targets(
+        &self,
+        scope: &ResumeScope,
+        targets: &std::collections::HashSet<String>,
+    ) -> Result<std::collections::HashSet<String>, StateError> {
+        let txn = self.db.begin_read()?;
+        let headers = txn.open_table(RUN_PROGRESS)?;
+        let entries = txn.open_table(RUN_PROGRESS_ENTRIES)?;
+        let runs = txn.open_table(RUN_HISTORY)?;
+        let mut owed = std::collections::HashSet::new();
+        for entry in headers.iter()? {
+            let (_, value) = entry?;
+            let progress: RunProgress = serde_json::from_slice(value.value())?;
+            if progress.total_tables == 0 || runs.get(progress.run_id.as_str())?.is_some() {
+                continue;
+            }
+            let Some(recorded_scope) = progress.scope.as_ref() else {
+                continue;
+            };
+            let (Some(recorded_target), Some(current_target)) =
+                (&recorded_scope.target, &scope.target)
+            else {
+                continue;
+            };
+            let table_entries = Self::read_progress_entries(&entries, &progress.run_id)?;
+            let completed = if table_entries.is_empty() {
+                &progress.tables
+            } else {
+                &table_entries
+            };
+            let successful: std::collections::HashSet<&str> = completed
+                .iter()
+                .filter(|entry| entry.status == TableStatus::Success)
+                .map(|entry| entry.table_key.as_str())
+                .collect();
+            let planned: Vec<&str> = progress.planned_tables.as_ref().map_or_else(
+                || {
+                    completed
+                        .iter()
+                        .map(|entry| entry.table_key.as_str())
+                        .collect()
+                },
+                |keys| keys.iter().map(String::as_str).collect(),
+            );
+            let complete = if progress.planned_tables.is_some() {
+                planned.iter().all(|key| successful.contains(key))
+            } else {
+                completed
+                    .iter()
+                    .filter(|entry| entry.status == TableStatus::Success)
+                    .count()
+                    >= progress.total_tables
+            };
+            if !complete {
+                continue;
+            }
+            let explicit = progress
+                .watermark_recovery_tables
+                .as_ref()
+                .filter(|descriptors| !descriptors.is_empty())
+                .is_some_and(|descriptors| {
+                    descriptors
+                        .iter()
+                        .all(|table| !table.target.catalog.is_empty())
+                });
+            if !recovery_endpoint_matches(
+                &recorded_target.endpoint,
+                &current_target.endpoint,
+                explicit,
+            ) {
+                continue;
+            }
+            if recorded_scope.pipeline != scope.pipeline
+                && !planned.iter().all(|key| targets.contains(*key))
+            {
+                continue;
+            }
+            owed.extend(
+                planned
+                    .into_iter()
+                    .filter(|key| targets.contains(*key))
+                    .map(str::to_string),
+            );
+        }
+        Ok(owed)
     }
 }
 
@@ -10663,6 +10780,114 @@ mod tests {
                 .unwrap()
                 .run_id,
             "changed"
+        );
+    }
+
+    #[test]
+    fn recovery_finds_explicit_snowflake_target_after_default_database_changes() {
+        let (store, _dir) = temp_store();
+        let mut old = progress_scope("old_pipeline");
+        let endpoint = &mut old.target.as_mut().unwrap().endpoint;
+        endpoint.adapter_type = "snowflake".into();
+        endpoint.locators = [
+            ("account".into(), "acct".into()),
+            ("database".into(), "OLD_DEFAULT".into()),
+        ]
+        .into_iter()
+        .collect();
+        let mut current = old.clone();
+        current.pipeline = "new_pipeline".into();
+        current
+            .target
+            .as_mut()
+            .unwrap()
+            .endpoint
+            .locators
+            .insert("database".into(), "NEW_DEFAULT".into());
+        let mut descriptor = recovery_table(Some(Utc::now()));
+        descriptor.target.catalog = "EXPLICIT_DB".into();
+        store
+            .init_run_progress_with_recovery(
+                "unconfirmed",
+                &[descriptor.target.full_name()],
+                Some(&old),
+                std::slice::from_ref(&descriptor),
+            )
+            .unwrap();
+        let targets = [descriptor.target.full_name()].into_iter().collect();
+        let found = store
+            .list_unconfirmed_run_progress_for_recovery_scope(&current, &targets)
+            .unwrap();
+        assert_eq!(found.len(), 1, "the explicit target is on the same account");
+        assert_eq!(found[0].run_id, "unconfirmed");
+
+        let mut implicit = descriptor;
+        implicit.target.catalog.clear();
+        let implicit_name = implicit.target.full_name();
+        store
+            .init_run_progress_with_recovery(
+                "implicit",
+                std::slice::from_ref(&implicit_name),
+                Some(&old),
+                &[implicit],
+            )
+            .unwrap();
+        let mut all_targets = targets;
+        all_targets.insert(implicit_name);
+        let found = store
+            .list_unconfirmed_run_progress_for_recovery_scope(&current, &all_targets)
+            .unwrap();
+        assert_eq!(
+            found.len(),
+            1,
+            "a session-default target must stay excluded"
+        );
+    }
+
+    #[test]
+    fn recordless_checks_require_complete_cross_pipeline_target_overlap() {
+        let (store, _dir) = temp_store();
+        let old = progress_scope("old");
+        let current = progress_scope("new");
+        let names = ["wh.raw.orders".to_string(), "wh.raw.other".to_string()];
+        store
+            .init_run_progress("crashed", &names, Some(&old))
+            .unwrap();
+        for (index, name) in names.iter().enumerate() {
+            store
+                .record_table_progress(
+                    "crashed",
+                    &progress_entry(index, name, TableStatus::Success),
+                )
+                .unwrap();
+        }
+        let only_one = [names[0].clone()].into_iter().collect();
+        assert!(
+            store
+                .complete_recordless_check_targets(&current, &only_one)
+                .unwrap()
+                .is_empty()
+        );
+        let both = names.iter().cloned().collect();
+        assert_eq!(
+            store
+                .complete_recordless_check_targets(&current, &both)
+                .unwrap(),
+            both
+        );
+        let mut elsewhere = current;
+        elsewhere
+            .target
+            .as_mut()
+            .unwrap()
+            .endpoint
+            .locators
+            .insert("path".into(), "other-endpoint".into());
+        assert!(
+            store
+                .complete_recordless_check_targets(&elsewhere, &both)
+                .unwrap()
+                .is_empty()
         );
     }
 

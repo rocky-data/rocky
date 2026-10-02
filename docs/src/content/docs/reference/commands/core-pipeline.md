@@ -591,12 +591,15 @@ rocky run [flags]
 copied but whose terminal run record is missing. Resuming that checkpoint would
 skip its post-copy checks. Incomplete crash checkpoints remain resumable.
 
-Follow the refusal's recovery route. Confirmed checkpoints and supported recovery
-descriptors allow a fresh run without a resume flag. So do checkpoints from Rocky
-1.75.0 or earlier; if their watermarks were lost, that run can copy rows again,
-as in earlier releases. Other unsupported checkpoints require
-`strategy = "full_refresh"`. Keep that strategy until the saved incremental
-cursor matches the replacement target. See [Interrupted replication](/concepts/incremental/#recovering-an-interrupted-replication)
+Follow the refusal's recovery route. For confirmed checkpoints, run fresh with
+`--no-prune` to execute checks. With supported recovery records, a fresh run
+re-derives target watermarks before copying.
+
+For checkpoints from Rocky 1.75.0 or earlier, set `strategy = "full_refresh"`
+for affected tables. Run `rocky run --pipeline <name> --no-prune` without a
+resume flag. That replaces their data without duplicate appends. Keep full
+refresh until the saved incremental cursor matches the replacement target. See
+[Interrupted replication](/concepts/incremental/#recovering-an-interrupted-replication)
 for recovery routes, supported adapters and remote durability limits.
 
 ### Guard one model with a contract
