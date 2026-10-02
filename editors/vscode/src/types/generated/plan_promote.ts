@@ -318,6 +318,14 @@ export interface AuditEvent {
  */
 export interface PromoteTargetPlan {
   /**
+   * Optional dialect-required DROP issued before `statement`.
+   */
+  pre_drop_statement?: string | null;
+  /**
+   * Production objects read by this view that this plan does not replace.
+   */
+  production_upstreams: PromoteUpstream[];
+  /**
    * Fully-qualified branch source the promote will read from (catalog.branch_schema.table).
    */
   source: string;
@@ -342,5 +350,14 @@ export interface PromoteTargetPlan {
   target_catalog: string;
   target_schema: string;
   target_table: string;
+  [k: string]: unknown;
+}
+/**
+ * Production object read by a promoted view.
+ */
+export interface PromoteUpstream {
+  catalog: string;
+  schema: string;
+  table: string;
   [k: string]: unknown;
 }

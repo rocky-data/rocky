@@ -350,6 +350,14 @@ class PromoteTargetPlan(BaseModel):
     `statement` is persisted verbatim so `rocky apply` executes the **exact** SQL generated at plan time — skipping re-discovery and ensuring the `plan_id` digest is invalidated if the SQL would differ.
     """
 
+    pre_drop_statement: str | None = None
+    """
+    Optional dialect-required DROP issued before `statement`.
+    """
+    production_upstreams: list[PromoteUpstream]
+    """
+    Production objects read by this view that this plan does not replace.
+    """
     source: str
     """
     Fully-qualified branch source the promote will read from (catalog.branch_schema.table).
@@ -375,6 +383,16 @@ class PromoteTargetPlan(BaseModel):
     """
     target_schema: str
     target_table: str
+
+
+class PromoteUpstream(BaseModel):
+    """
+    Production object read by a promoted view.
+    """
+
+    catalog: str
+    schema: str
+    table: str
 
 
 class RejectedApproval(BaseModel):

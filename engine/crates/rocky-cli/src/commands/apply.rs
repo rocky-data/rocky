@@ -7182,6 +7182,8 @@ effect = "deny"
                 statement: format!(
                     "CREATE OR REPLACE TABLE \"warehouse\".\"main\".\"{table}\" AS SELECT * FROM \"warehouse\".\"branch_src\".\"source\""
                 ),
+                pre_drop_statement: None,
+                production_upstreams: Vec::new(),
             }],
             plan_audit: Vec::new(),
             created_at: chrono::Utc::now(),
@@ -7915,6 +7917,8 @@ effect = "allow"
                 source_table: "orders".to_string(),
                 strategy: "full_refresh".to_string(),
                 statement: "CREATE OR REPLACE TABLE ...".to_string(),
+                pre_drop_statement: None,
+                production_upstreams: Vec::new(),
             }],
             plan_audit: vec![],
             created_at: chrono::Utc::now(),
@@ -8035,6 +8039,8 @@ effect = "allow"
                     source_table: "orders".to_string(),
                     strategy: "full_refresh".to_string(),
                     statement: "CREATE OR REPLACE ...".to_string(),
+                    pre_drop_statement: None,
+                    production_upstreams: Vec::new(),
                 },
                 crate::output::PromoteTargetPlan {
                     target: "c.s.customers".to_string(),
@@ -8047,6 +8053,8 @@ effect = "allow"
                     source_table: "customers".to_string(),
                     strategy: "full_refresh".to_string(),
                     statement: "CREATE OR REPLACE ...".to_string(),
+                    pre_drop_statement: None,
+                    production_upstreams: Vec::new(),
                 },
             ],
             plan_audit: vec![],
@@ -8094,6 +8102,8 @@ effect = "allow"
                 source_table: "orders".to_string(),
                 strategy: "full_refresh".to_string(),
                 statement: "CREATE OR REPLACE ...".to_string(),
+                pre_drop_statement: None,
+                production_upstreams: Vec::new(),
             }],
             plan_audit: vec![],
             created_at: chrono::Utc::now(),
@@ -8155,6 +8165,8 @@ effect = "allow"
                     source_table: "orders".to_string(),
                     strategy: "full_refresh".to_string(),
                     statement: "CREATE OR REPLACE ...".to_string(),
+                    pre_drop_statement: None,
+                    production_upstreams: Vec::new(),
                 },
                 // Unmappable: no model targets this FQN any more, but a model
                 // is NAMED this.
@@ -8169,6 +8181,8 @@ effect = "allow"
                     source_table: "orders".to_string(),
                     strategy: "full_refresh".to_string(),
                     statement: "CREATE OR REPLACE ...".to_string(),
+                    pre_drop_statement: None,
+                    production_upstreams: Vec::new(),
                 },
             ],
             plan_audit: vec![],

@@ -2722,6 +2722,16 @@ pub(crate) async fn build_promote_plan_inner(
             source_table: pt.source_table.clone(),
             strategy: pt.strategy.clone(),
             statement: pt.statement.clone(),
+            pre_drop_statement: pt.pre_drop_statement.clone(),
+            production_upstreams: pt
+                .production_upstreams
+                .iter()
+                .map(|upstream| crate::output::PromoteUpstream {
+                    catalog: upstream.catalog.clone(),
+                    schema: upstream.schema.clone(),
+                    table: upstream.table.clone(),
+                })
+                .collect(),
         })
         .collect();
 
@@ -4711,6 +4721,8 @@ token = "${ROCKY_T_1625_PREVIEW_UNSET_2}"
                 statement: "CREATE OR REPLACE TABLE \"cat\".\"prod_schema\".\"orders\" \
                      AS SELECT * FROM \"cat\".\"branch__fix\".\"orders\""
                     .to_string(),
+                pre_drop_statement: None,
+                production_upstreams: Vec::new(),
             }],
             plan_audit: vec![],
             created_at: chrono::DateTime::parse_from_rfc3339("2026-05-14T10:00:00Z")

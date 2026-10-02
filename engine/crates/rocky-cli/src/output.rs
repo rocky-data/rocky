@@ -7939,6 +7939,14 @@ pub struct RejectedApproval {
     pub detail: String,
 }
 
+/// Production object read by a promoted view.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct PromoteUpstream {
+    pub catalog: String,
+    pub schema: String,
+    pub table: String,
+}
+
 /// Per-model promote step captured in a [`PromotePlan`].
 ///
 /// Mirrors the shape of [`PromoteTarget`] but contains only plan-time fields
@@ -7966,6 +7974,10 @@ pub struct PromoteTargetPlan {
     pub strategy: String,
     /// Dialect-quoted replacement SQL, generated at plan time.
     pub statement: String,
+    /// Optional dialect-required DROP issued before `statement`.
+    pub pre_drop_statement: Option<String>,
+    /// Production objects read by this view that this plan does not replace.
+    pub production_upstreams: Vec<PromoteUpstream>,
 }
 
 /// Persisted payload for a `rocky plan promote` run plan.
