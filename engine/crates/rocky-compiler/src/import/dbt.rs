@@ -1482,11 +1482,10 @@ fn map_microbatch_strategy(
         // Fall through to the merge mapping below.
     }
 
-    // dbt microbatch idempotently REPLACES each batch partition. Rocky's
-    // Microbatch strategy emits an append-only INSERT (sql_gen.rs), so importing
-    // it as-is silently re-inserts the lookback window every run. dbt microbatch
-    // requires a `unique_key`, so map it to an idempotent Rocky merge instead;
-    // only fall back to append-only (loudly) if a key is somehow absent.
+    // The default import mode maps keyed dbt microbatch models to merge.
+    // The time_interval import mode above wraps the body with bounded windows.
+    // Without a key in the default mode, use full_refresh rather than emit an
+    // unbounded append.
     let unique_keys: Option<Vec<String>> = config.unique_key.as_ref().map(|uk| match uk {
         UniqueKeyValue::Single(s) => vec![s.clone()],
         UniqueKeyValue::Multiple(v) => v.clone(),
@@ -1526,10 +1525,8 @@ fn map_microbatch_strategy(
                 model: model_name.to_string(),
                 mapped_to: "full_refresh".to_string(),
             });
-            // Neither `incremental` (refused, #1990) nor `microbatch` (the
-            // same unfiltered append, #2054): both would re-insert every row
-            // on each run. A full rebuild is the one mapping that cannot
-            // duplicate.
+            // No keyed merge is possible in the default mode. A full rebuild
+            // is safe; callers can select time_interval mode for windows.
             StrategyConfig::FullRefresh
         }
     }
@@ -3826,9 +3823,8 @@ FROM {{ ref('stg_events') }}
         });
         let result = import_from_manifest_json(&manifest);
         assert_eq!(result.imported.len(), 1);
-        // A microbatch without a unique_key has no append mapping: `incremental`
-        // is refused on transformation models (#1990) and `microbatch` is the
-        // same unfiltered INSERT (#2054). It rebuilds in full, loudly.
+        // The default import mode has no keyed merge without a unique_key.
+        // It rebuilds in full and warns. Time-interval mode remains available.
         assert!(
             matches!(
                 result.imported[0].config.strategy,
@@ -5060,6 +5056,14 @@ FROM {{ ref('stg_events') }}
         assert!(
             !typed.diagnostics.iter().any(|d| &*d.code == "E020"),
             "E020 must not fire once the upstream ref is bare: {:?}",
+            typed.diagnostics
+        );
+        assert!(
+            !typed
+                .diagnostics
+                .iter()
+                .any(crate::diagnostic::Diagnostic::is_error),
+            "imported time_interval microbatch must compile: {:?}",
             typed.diagnostics
         );
     }

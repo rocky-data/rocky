@@ -3086,7 +3086,7 @@ mod tests {
 
         std::fs::write(
             models.join("a.sql"),
-            "SELECT 1 AS id, TIMESTAMP '2026-01-01 00:00:00' AS ts\n",
+            "SELECT id, ts FROM (SELECT 1 AS id, TIMESTAMP '2026-01-01 00:00:00' AS ts) AS source WHERE ts >= @start_date AND ts < @end_date\n",
         )
         .unwrap();
         std::fs::write(
@@ -3103,7 +3103,11 @@ mod tests {
         )
         .unwrap();
 
-        std::fs::write(models.join("b.sql"), "SELECT id, ts FROM proj.silver.a\n").unwrap();
+        std::fs::write(
+            models.join("b.sql"),
+            "SELECT id, ts FROM proj.silver.a WHERE ts >= @start_date AND ts < @end_date\n",
+        )
+        .unwrap();
         std::fs::write(
             models.join("b.toml"),
             "name = \"b\"\n\
@@ -3124,7 +3128,10 @@ mod tests {
             dag_snapshot(&root.join("rocky.toml")),
             &root.join(".rocky-state.redb"),
             false,
-            &PartitionRunOptions::default(),
+            &PartitionRunOptions {
+                partition: Some("2026-01-01T00".into()),
+                ..Default::default()
+            },
             &crate::commands::run::SkipRunOptions::default(),
             None,
             // Unbounded node fan-out: these tests predate `--parallel`

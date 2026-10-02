@@ -986,7 +986,7 @@ fn an_incremental_transformation_model_is_refused_with_e037() {
     }
     assert!(
         !suggestion.contains("microbatch"),
-        "microbatch duplicates rows the same way (#2054) and must not be offered"
+        "the suggestion uses the canonical time_interval spelling"
     );
     assert!(result.has_errors, "an E037 must make the compile fail");
 }
@@ -1046,9 +1046,8 @@ fn e038_does_not_fire_for_other_strategies() {
     }
 }
 
-/// Boundary: the refusal is scoped to `incremental`. A `full_refresh` leaf
-/// compiles clean of E037, and `microbatch` is not refused by this check:
-/// its ruling is pending in #2054, so a change here must be deliberate.
+/// E037 is scoped to `incremental`. A `microbatch` model is checked as
+/// `time_interval` and gets E024 if it omits its window placeholders.
 #[test]
 fn e037_does_not_fire_for_other_strategies() {
     for strategy in [
@@ -1062,4 +1061,55 @@ fn e037_does_not_fire_for_other_strategies() {
             result.diagnostics
         );
     }
+}
+
+#[test]
+fn microbatch_without_window_is_refused_with_e024() {
+    let result = compile_strategy_project(
+        "type = \"microbatch\"\ntimestamp_column = \"updated_at\"\ngranularity = \"day\"",
+    );
+    let e024: Vec<_> = result
+        .diagnostics
+        .iter()
+        .filter(|d| &*d.code == "E024" && d.model == "leaf")
+        .collect();
+    assert_eq!(e024.len(), 1, "expected E024: {:?}", result.diagnostics);
+    assert!(e024[0].is_error());
+    assert!(result.has_errors);
+}
+
+#[test]
+fn microbatch_with_window_compiles_as_time_interval() {
+    use rocky_core::models::StrategyConfig;
+    use rocky_ir::{MaterializationStrategy, TimeGrain};
+
+    let dir = tempfile::tempdir().unwrap();
+    write_strategy_project(
+        dir.path(),
+        "type = \"microbatch\"\ntimestamp_column = \"updated_at\"\ngranularity = \"day\"",
+    );
+    std::fs::write(
+        dir.path().join("models/leaf.sql"),
+        "SELECT id, updated_at FROM src WHERE updated_at >= @start_date AND updated_at < @end_date",
+    )
+    .unwrap();
+    let result = compile(&CompilerConfig {
+        models_dir: dir.path().join("models"),
+        contracts_dir: None,
+        source_schemas: HashMap::new(),
+        ..Default::default()
+    })
+    .unwrap();
+    assert!(!result.has_errors, "{:?}", result.diagnostics);
+    let model = result.project.model("leaf").unwrap();
+    assert!(matches!(
+        &model.config.strategy,
+        StrategyConfig::TimeInterval { time_column, granularity: TimeGrain::Day, .. }
+            if time_column == "updated_at"
+    ));
+    assert!(matches!(
+        model.to_model_ir().materialization,
+        MaterializationStrategy::TimeInterval { time_column, granularity: TimeGrain::Day, window: None }
+            if time_column == "updated_at"
+    ));
 }

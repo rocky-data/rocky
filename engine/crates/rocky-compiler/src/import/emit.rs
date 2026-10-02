@@ -846,9 +846,13 @@ fn write_structured_warnings(
                         out.push_str(
                             "- **dbt microbatch → idempotent `merge`** — partition-replace became key-upsert; rows removed from the source window are not deleted. Review the `[strategy]` block.\n",
                         );
+                    } else if mapped_to == "time_interval" {
+                        out.push_str(
+                            "- **dbt microbatch → `time_interval`** — the emitted SQL bounds each partition with `@start_date` and `@end_date`.\n",
+                        );
                     } else {
                         out.push_str(
-                            "- **dbt microbatch imported append-only** — re-inserts the lookback window every run. Add a `unique_key` (maps to an idempotent merge) or convert to a time-interval strategy.\n",
+                            "- **dbt microbatch → `full_refresh`** — the model rebuilds in full. Add a `unique_key` for the default merge mapping, or select the time-interval import mode.\n",
                         );
                     }
                 }
@@ -1017,6 +1021,28 @@ fn write_migration_notes(path: &Path, ctx: &MigrationContext<'_>) -> Result<(), 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn microbatch_import_notes_name_the_actual_mapping() {
+        use super::super::dbt::ImportDbtStructuredWarning;
+
+        for (mapped_to, expected) in [
+            ("time_interval", "bounds each partition"),
+            ("merge", "key-upsert"),
+            ("full_refresh", "rebuilds in full"),
+        ] {
+            let mut notes = String::new();
+            write_structured_warnings(
+                &mut notes,
+                &[ImportDbtStructuredWarning::MicrobatchMapped {
+                    model: "events".into(),
+                    mapped_to: mapped_to.into(),
+                }],
+            );
+            assert!(notes.contains(expected), "{mapped_to}: {notes}");
+            assert!(!notes.contains("append-only"), "{mapped_to}: {notes}");
+        }
+    }
 
     #[test]
     fn is_safe_model_file_stem_rejects_traversal() {

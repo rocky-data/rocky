@@ -24433,7 +24433,7 @@ timestamp_column = "ts"
     ///
     /// Sibling of the replication regression above, for the second of the three
     /// executor bootstrap paths. A strategy that mutates an existing target
-    /// (here `microbatch`) probes the target with `describe_table` and, if it
+    /// (here `delete_insert`) probes the target with `describe_table` and, if it
     /// reads as absent, bootstraps via the non-replacing
     /// `generate_transformation_initial_ddl` CTAS. When that probe *misfires*
     /// against a live target, the bootstrap must fail closed ("already exists")
@@ -24468,9 +24468,8 @@ timestamp_column = "ts"
 name = "fct_events"
 
 [strategy]
-type = "microbatch"
-timestamp_column = "id"
-granularity = "hour"
+type = "delete_insert"
+partition_by = ["id"]
 
 [target]
 catalog = ""
@@ -25282,9 +25281,8 @@ table = "fct_daily"
 name = "fct_events"
 
 [strategy]
-type = "microbatch"
-timestamp_column = "id"
-granularity = "hour"
+type = "delete_insert"
+partition_by = ["id"]
 
 [target]
 catalog = ""
@@ -25404,9 +25402,8 @@ table = "fct_events"
 name = "fct_events"
 
 [strategy]
-type = "microbatch"
-timestamp_column = "id"
-granularity = "hour"
+type = "delete_insert"
+partition_by = ["id"]
 
 [target]
 catalog = ""
@@ -25503,9 +25500,8 @@ table = "fct_events"
 name = "fct_events"
 
 [strategy]
-type = "microbatch"
-timestamp_column = "id"
-granularity = "hour"
+type = "delete_insert"
+partition_by = ["id"]
 
 [target]
 catalog = ""
@@ -34101,79 +34097,6 @@ auto_create_schemas = true
         );
     }
 
-    /// Upstream `MAX(ts)` advanced ⇒ BUILD (watermark signal, via an
-    /// incremental-strategy timestamp column on a ts-bearing source).
-    #[cfg(feature = "duckdb")]
-    #[tokio::test]
-    async fn gate_upstream_watermark_advanced_builds() {
-        use rocky_core::traits::WarehouseAdapter;
-        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
-
-        let tmp = tempfile::TempDir::new().unwrap();
-        let models_dir = tmp.path().join("models");
-        std::fs::create_dir(&models_dir).unwrap();
-        let db = tmp.path().join("g.duckdb");
-        let state = StateStore::open(&tmp.path().join("state")).unwrap();
-
-        // Source with a timestamp column, plus a pre-created incremental
-        // target (the incremental strategy appends; it does not CTAS).
-        {
-            let s = DuckDbWarehouseAdapter::open(&db).unwrap();
-            s.execute_statement("CREATE SCHEMA IF NOT EXISTS main")
-                .await
-                .unwrap();
-            s.execute_statement(
-                "CREATE TABLE main.ev AS SELECT * FROM (VALUES \
-                 (1, TIMESTAMP '2024-01-01 00:00:00')) AS t(id, ts)",
-            )
-            .await
-            .unwrap();
-            s.execute_statement("CREATE TABLE main.agg AS SELECT * FROM main.ev WHERE 1=0")
-                .await
-                .unwrap();
-        }
-        // A timestamp-tracking strategy so the gate tracks `ts` for the
-        // MAX(ts) probe. `microbatch`, because `incremental` is refused on
-        // transformation models (#1990).
-        std::fs::write(models_dir.join("agg.sql"), "SELECT id, ts FROM main.ev\n").unwrap();
-        std::fs::write(
-            models_dir.join("agg.toml"),
-            "[strategy]\ntype = \"microbatch\"\ntimestamp_column = \"ts\"\ngranularity = \"hour\"\n\n[target]\ncatalog = \"\"\nschema = \"main\"\ntable = \"agg\"\n",
-        )
-        .unwrap();
-
-        run_with_gate(
-            &models_dir,
-            &db,
-            &state,
-            active_gate(false, 0),
-            "run-1",
-            rocky_core::state::RunStatus::Success,
-        )
-        .await;
-
-        // Advance MAX(ts) by inserting a later-timestamped row.
-        {
-            let s = DuckDbWarehouseAdapter::open(&db).unwrap();
-            s.execute_statement("INSERT INTO main.ev VALUES (2, TIMESTAMP '2024-06-01 00:00:00')")
-                .await
-                .unwrap();
-        }
-        let out2 = run_with_gate(
-            &models_dir,
-            &db,
-            &state,
-            active_gate(false, 0),
-            "run-2",
-            rocky_core::state::RunStatus::Success,
-        )
-        .await;
-        assert!(
-            built(&out2, "agg"),
-            "an advanced upstream MAX(ts) must rebuild"
-        );
-    }
-
     /// A model whose `FROM` is a subquery hides its real upstreams from the
     /// lineage extractor (it records the opaque `(subquery)` marker). The gate
     /// cannot enumerate the true sources, so it must BUILD even when the
@@ -35587,120 +35510,6 @@ auto_create_schemas = true
             down_exists, 0,
             "no `down` table is written from the unrelated `main.up`"
         );
-    }
-
-    /// `lag_tolerance_seconds`: a sub-tolerance MAX(ts) movement is treated as
-    /// unchanged (SKIP) only when a tolerance is configured; an above-tolerance
-    /// movement always builds; the default tolerance 0 builds on any movement.
-    #[cfg(feature = "duckdb")]
-    #[tokio::test]
-    async fn gate_lag_tolerance_absorbs_small_movement() {
-        use rocky_core::traits::WarehouseAdapter;
-        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
-
-        async fn setup(db: &std::path::Path) {
-            let s = DuckDbWarehouseAdapter::open(db).unwrap();
-            s.execute_statement("CREATE SCHEMA IF NOT EXISTS main")
-                .await
-                .unwrap();
-            s.execute_statement("DROP TABLE IF EXISTS main.ev")
-                .await
-                .unwrap();
-            s.execute_statement(
-                "CREATE TABLE main.ev AS SELECT * FROM (VALUES \
-                 (1, TIMESTAMP '2024-01-01 00:00:00')) AS t(id, ts)",
-            )
-            .await
-            .unwrap();
-            // Pre-create the incremental target (append strategy, no CTAS).
-            s.execute_statement("DROP TABLE IF EXISTS main.agg")
-                .await
-                .unwrap();
-            s.execute_statement("CREATE TABLE main.agg AS SELECT * FROM main.ev WHERE 1=0")
-                .await
-                .unwrap();
-        }
-        fn write_inc(models_dir: &std::path::Path) {
-            std::fs::write(models_dir.join("agg.sql"), "SELECT id, ts FROM main.ev\n").unwrap();
-            std::fs::write(
-                models_dir.join("agg.toml"),
-                "[strategy]\ntype = \"microbatch\"\ntimestamp_column = \"ts\"\ngranularity = \"hour\"\n\n[target]\ncatalog = \"\"\nschema = \"main\"\ntable = \"agg\"\n",
-            )
-            .unwrap();
-        }
-
-        // Movement of 30s, tolerance 60s ⇒ within tolerance ⇒ SKIP.
-        {
-            let tmp = tempfile::TempDir::new().unwrap();
-            let models_dir = tmp.path().join("models");
-            std::fs::create_dir(&models_dir).unwrap();
-            let db = tmp.path().join("g.duckdb");
-            let state = StateStore::open(&tmp.path().join("state")).unwrap();
-            setup(&db).await;
-            write_inc(&models_dir);
-            run_with_gate(
-                &models_dir,
-                &db,
-                &state,
-                active_gate(false, 60),
-                "run-1",
-                rocky_core::state::RunStatus::Success,
-            )
-            .await;
-            let s = DuckDbWarehouseAdapter::open(&db).unwrap();
-            s.execute_statement("INSERT INTO main.ev VALUES (2, TIMESTAMP '2024-01-01 00:00:30')")
-                .await
-                .unwrap();
-            let out2 = run_with_gate(
-                &models_dir,
-                &db,
-                &state,
-                active_gate(false, 60),
-                "run-2",
-                rocky_core::state::RunStatus::Success,
-            )
-            .await;
-            assert!(
-                !built(&out2, "agg"),
-                "a 30s move under a 60s tolerance must skip"
-            );
-        }
-        // Movement of 30s, default tolerance 0 ⇒ any movement ⇒ BUILD.
-        {
-            let tmp = tempfile::TempDir::new().unwrap();
-            let models_dir = tmp.path().join("models");
-            std::fs::create_dir(&models_dir).unwrap();
-            let db = tmp.path().join("g.duckdb");
-            let state = StateStore::open(&tmp.path().join("state")).unwrap();
-            setup(&db).await;
-            write_inc(&models_dir);
-            run_with_gate(
-                &models_dir,
-                &db,
-                &state,
-                active_gate(false, 0),
-                "run-1",
-                rocky_core::state::RunStatus::Success,
-            )
-            .await;
-            let s = DuckDbWarehouseAdapter::open(&db).unwrap();
-            s.execute_statement("INSERT INTO main.ev VALUES (2, TIMESTAMP '2024-01-01 00:00:30')")
-                .await
-                .unwrap();
-            let out2 = run_with_gate(
-                &models_dir,
-                &db,
-                &state,
-                active_gate(false, 0),
-                "run-2",
-                rocky_core::state::RunStatus::Success,
-            )
-            .await;
-            assert!(
-                built(&out2, "agg"),
-                "default tolerance 0 must build on any movement"
-            );
-        }
     }
 
     /// Parallel parity: the same both-unchanged scenario yields an identical
@@ -38415,77 +38224,82 @@ auto_create_schemas = true
         }
     }
 
-    /// Runtime regression: a first run of an append-strategy transformation
-    /// model against a missing target must bootstrap the table (via
-    /// `generate_transformation_initial_ddl`) and load the source **exactly
-    /// once** — the populated CTAS is the load, so the subsequent `INSERT INTO`
-    /// is skipped. Before this wiring the first run hit `INSERT INTO` against a
-    /// nonexistent table and errored; a naive fix that ran the INSERT after the
-    /// CTAS would double-load. This drives the real `execute_one_plain_model`
-    /// runtime path on in-memory DuckDB (format = None, so dialect-independent
-    /// of the lakehouse DDL — what's proven here is the skip, not the format).
-    ///
-    /// The second-run assertion PINS A DEFECT, not a contract. The model SQL
-    /// carries no watermark filter and nothing adds one, so a second run
-    /// re-selects the full source and appends it again. `incremental` used to
-    /// take this path and is now refused (#1990, E037); `microbatch` still
-    /// takes it and is pending its own ruling (#2054). When #2054 is decided,
-    /// this assertion changes with it.
-    #[cfg(feature = "duckdb")]
-    #[tokio::test]
-    async fn append_transformation_first_run_loads_source_once_then_appends() {
-        use std::time::Instant;
+    /// #2058 pinned the old append behavior. A microbatch without a bounded
+    /// window now fails compilation, before any transformation can run.
+    #[test]
+    fn microbatch_without_window_fails_compile_before_append() {
+        use rocky_compiler::compile::{CompilerConfig, compile};
 
-        use rocky_core::models::load_model_pair;
-        use rocky_core::traits::WarehouseAdapter;
-        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
-        use rocky_duckdb::dialect::DuckDbSqlDialect;
-
-        let adapter = DuckDbWarehouseAdapter::in_memory().unwrap();
-        for ddl in [
-            "CREATE SCHEMA src",
-            "CREATE SCHEMA tgt",
-            "CREATE TABLE src.events (id INTEGER, region VARCHAR)",
-            "INSERT INTO src.events VALUES (1, 'a'), (2, 'b'), (3, 'c')",
-        ] {
-            adapter.execute_statement(ddl).await.unwrap();
-        }
-        let source_rows: i64 = 3;
-
-        // Build a real `Model` from a sidecar + SQL pair so the runtime path
-        // (`Model::to_model_ir` → `execute_one_plain_model`) is exercised
-        // end-to-end rather than hand-assembling the IR.
         let dir = tempfile::TempDir::new().unwrap();
         std::fs::write(
             dir.path().join("fct_events.toml"),
-            r#"
-name = "fct_events"
-
-[strategy]
-type = "microbatch"
-timestamp_column = "id"
-granularity = "hour"
-
-[target]
-catalog = ""
-schema = "tgt"
-table = "fct_events"
-"#,
+            "[strategy]\ntype = \"microbatch\"\ntimestamp_column = \"event_at\"\n\n[target]\ncatalog = \"\"\nschema = \"main\"\n",
         )
         .unwrap();
         std::fs::write(
             dir.path().join("fct_events.sql"),
-            "SELECT id, region FROM src.events",
+            "SELECT TIMESTAMP '2026-04-07 13:00:00' AS event_at",
         )
         .unwrap();
+
+        let result = compile(&CompilerConfig {
+            models_dir: dir.path().to_path_buf(),
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(result.has_errors);
+        assert!(
+            result
+                .diagnostics
+                .iter()
+                .any(|d| &*d.code == "E024" && d.model == "fct_events" && d.is_error()),
+            "unbounded microbatch must fail with E024: {:?}",
+            result.diagnostics
+        );
+    }
+
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn microbatch_replaces_the_same_partition_on_rerun() {
+        use rocky_core::models::load_model_pair;
+        use rocky_core::state::StateStore;
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+        use rocky_duckdb::dialect::DuckDbSqlDialect;
+
+        let warehouse = DuckDbWarehouseAdapter::in_memory().unwrap();
+        warehouse
+            .execute_statement("CREATE SCHEMA raw")
+            .await
+            .unwrap();
+        warehouse.execute_statement(
+            "CREATE TABLE raw.events AS SELECT 1 AS id, TIMESTAMP '2026-04-07 13:15:00' AS event_at",
+        ).await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("events.sql"),
+            "SELECT id, event_at FROM raw.events WHERE event_at >= @start_date AND event_at < @end_date",
+        ).unwrap();
+        std::fs::write(
+            dir.path().join("events.toml"),
+            "[strategy]\ntype = \"microbatch\"\ntimestamp_column = \"event_at\"\n\n[target]\ncatalog = \"\"\nschema = \"main\"\n",
+        ).unwrap();
         let model = load_model_pair(
-            &dir.path().join("fct_events.sql"),
-            &dir.path().join("fct_events.toml"),
+            &dir.path().join("events.sql"),
+            &dir.path().join("events.toml"),
             None,
         )
-        .expect("load incremental model");
-
-        let dialect = DuckDbSqlDialect;
+        .unwrap();
+        assert!(!super::is_plain_strategy(&model));
+        assert!(crate::commands::resilience::rerun_is_idempotent(
+            &model.config.strategy
+        ));
+        let state = StateStore::open(&dir.path().join("state.redb")).unwrap();
+        let opts = PartitionRunOptions {
+            partition: Some("2026-04-07T13".into()),
+            parallel: 1,
+            ..Default::default()
+        };
         let typed_models = indexmap::IndexMap::new();
         let model_timings = std::collections::HashMap::new();
         let surrogate_keys = std::collections::HashMap::new();
@@ -38495,50 +38309,33 @@ table = "fct_events"
             surrogate_keys: &surrogate_keys,
         };
 
-        async fn count_target(adapter: &DuckDbWarehouseAdapter) -> i64 {
-            let r = adapter
-                .execute_query("SELECT COUNT(*) FROM tgt.fct_events")
+        for run_id in ["first", "second"] {
+            let mut output = RunOutput::new(String::new(), 0, 1);
+            super::execute_time_interval_model(
+                &model,
+                &warehouse,
+                &DuckDbSqlDialect,
+                Some(&state),
+                &opts,
+                run_id,
+                &mut output,
+                &exec_ctx,
+            )
+            .await
+            .unwrap();
+            let rows = warehouse
+                .execute_query("SELECT COUNT(*) FROM main.events")
                 .await
-                .expect("count query");
-            let cell = &r.rows[0][0];
-            cell.as_i64()
-                .or_else(|| cell.as_str().and_then(|s| s.parse::<i64>().ok()))
-                .expect("count parses as i64")
+                .unwrap();
+            let count = rows.rows[0][0]
+                .as_i64()
+                .or_else(|| rows.rows[0][0].as_str().and_then(|s| s.parse::<i64>().ok()));
+            assert_eq!(
+                count,
+                Some(1),
+                "rerunning one partition must not append rows"
+            );
         }
-
-        // --- First run: target missing → bootstrap CTAS, INSERT skipped. ---
-        super::execute_one_plain_model(
-            &model,
-            &adapter as &dyn WarehouseAdapter,
-            &dialect as &dyn rocky_core::traits::SqlDialect,
-            "fct_events",
-            Instant::now(),
-            exec_ctx,
-        )
-        .await
-        .expect("first run bootstraps without error");
-        assert_eq!(
-            count_target(&adapter).await,
-            source_rows,
-            "first run must load the source exactly once (no double-load)"
-        );
-
-        // --- Second run: target exists → normal incremental append. ---
-        super::execute_one_plain_model(
-            &model,
-            &adapter as &dyn WarehouseAdapter,
-            &dialect as &dyn rocky_core::traits::SqlDialect,
-            "fct_events",
-            Instant::now(),
-            exec_ctx,
-        )
-        .await
-        .expect("second run appends without error");
-        assert_eq!(
-            count_target(&adapter).await,
-            source_rows * 2,
-            "second run reuses the existing table and appends through the INSERT path"
-        );
     }
 
     /// End-to-end reachability + the load-bearing identity invariant for

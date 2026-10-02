@@ -1122,6 +1122,22 @@ fn resolve_model_config(
         .or_else(|| group.and_then(|g| g.strategy.clone()))
         .or_else(|| defaults.and_then(|d| d.strategy.clone()))
         .unwrap_or_default();
+    // `microbatch` is a spelling of `time_interval` for transformation
+    // models. Resolve it here so compiler checks and every execution entry
+    // point see the same partitioned strategy, including group/default values.
+    let strategy = match strategy {
+        StrategyConfig::Microbatch {
+            timestamp_column,
+            granularity,
+        } => StrategyConfig::TimeInterval {
+            time_column: timestamp_column,
+            granularity,
+            lookback: 0,
+            batch_size: default_batch_size(),
+            first_partition: None,
+        },
+        other => other,
+    };
 
     let intent = raw
         .intent
@@ -1357,9 +1373,10 @@ impl Model {
             StrategyConfig::Microbatch {
                 timestamp_column,
                 granularity,
-            } => MaterializationStrategy::Microbatch {
-                timestamp_column: timestamp_column.clone(),
+            } => MaterializationStrategy::TimeInterval {
+                time_column: timestamp_column.clone(),
                 granularity: *granularity,
+                window: None,
             },
             StrategyConfig::ContentAddressed {
                 storage_prefix,
@@ -3029,6 +3046,67 @@ granularity = "day"
             }
             _ => panic!("expected TimeInterval IR variant"),
         }
+    }
+
+    #[test]
+    fn microbatch_loads_as_time_interval_with_hour_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let sql_path = dir.path().join("events.sql");
+        let toml_path = dir.path().join("events.toml");
+        std::fs::write(
+            &sql_path,
+            "SELECT event_at FROM source WHERE event_at >= @start_date AND event_at < @end_date",
+        )
+        .unwrap();
+        std::fs::write(
+            &toml_path,
+            "[strategy]\ntype = \"microbatch\"\ntimestamp_column = \"event_at\"\n\n[target]\ncatalog = \"warehouse\"\nschema = \"s\"\n",
+        )
+        .unwrap();
+
+        let model = load_model_pair(&sql_path, &toml_path, None).unwrap();
+        assert!(matches!(
+            &model.config.strategy,
+            StrategyConfig::TimeInterval { time_column, granularity: TimeGrain::Hour, lookback: 0, first_partition: None, .. }
+                if time_column == "event_at"
+        ));
+        assert!(matches!(
+            model.to_model_ir().materialization,
+            MaterializationStrategy::TimeInterval { time_column, granularity: TimeGrain::Hour, window: None }
+                if time_column == "event_at"
+        ));
+        let state = crate::state::StateStore::open(&dir.path().join("state.redb")).unwrap();
+        let plans = crate::plan_partition::plan_partitions(
+            &model,
+            &crate::plan_partition::PartitionSelection::Single("2026-04-07T13".into()),
+            None,
+            &state,
+        )
+        .unwrap();
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].partition_key, "2026-04-07T13");
+    }
+
+    #[test]
+    fn manually_constructed_microbatch_model_ir_is_partitioned() {
+        let config: ModelConfig = toml::from_str(
+            "name = \"events\"\n[strategy]\ntype = \"microbatch\"\ntimestamp_column = \"event_at\"\ngranularity = \"day\"\n[target]\ncatalog = \"warehouse\"\nschema = \"s\"\ntable = \"events\"\n",
+        )
+        .unwrap();
+        let model = Model {
+            config,
+            drop_existing_kind: None,
+            sql:
+                "SELECT event_at FROM source WHERE event_at >= @start_date AND event_at < @end_date"
+                    .into(),
+            file_path: "events.sql".into(),
+            contract_path: None,
+        };
+        assert!(matches!(
+            model.to_model_ir().materialization,
+            MaterializationStrategy::TimeInterval { time_column, granularity: TimeGrain::Day, window: None }
+                if time_column == "event_at"
+        ));
     }
 
     // ----- Inference + defaults tests -----

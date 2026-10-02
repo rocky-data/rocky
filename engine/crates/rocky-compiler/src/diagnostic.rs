@@ -177,8 +177,6 @@ pub const E040: &str = "E040";
 pub const W001: &str = "W001";
 /// Duplicate column in model output.
 pub const W002: &str = "W002";
-/// `time_column` type is not DATE for day/month/year granularity (TIMESTAMP works but DATE preferred).
-pub const W003: &str = "W003";
 /// Classification tag on a model column doesn't resolve to any `[mask]` /
 /// `[mask.<env>]` strategy and isn't listed in `[classifications.allow_unmasked]`.
 /// One diagnostic per unresolved `(model, column, tag)` triple.

@@ -328,8 +328,8 @@ pub fn generate_transformation_sql_with_warehouse(
 
     // `FullRefresh` rebuilds the whole table every run, so it always emits a
     // format-aware CTAS here when a lakehouse `format` is set. The other
-    // strategies that create a table on first run (Merge, Incremental,
-    // DeleteInsert, Microbatch) instead create it through
+    // strategies that create a table on first run (Merge and DeleteInsert)
+    // instead create it through
     // `generate_transformation_initial_ddl`: the runtime probes target
     // existence via `describe_table` and calls that helper when the target is
     // missing, so the declared `format` + `format_options` are honored from
@@ -465,15 +465,8 @@ pub fn generate_transformation_sql_with_warehouse(
             let insert_sql = dialect.insert_into(&target, &model_ir.sql);
             Ok(vec![delete_sql, insert_sql])
         }
-        MaterializationStrategy::Microbatch {
-            timestamp_column, ..
-        } => {
-            // No windowing and no watermark filter exist for a transformation
-            // model: this is an unfiltered `INSERT INTO <target> <model SQL>`,
-            // so every run after the first appends the whole result again.
-            // Tracked in #2054; left legal pending that ruling.
-            validation::validate_identifier(timestamp_column)?;
-            Ok(vec![dialect.insert_into(&target, &model_ir.sql)])
+        MaterializationStrategy::Microbatch { .. } => {
+            Err(microbatch_transformation_refused(model_ir))
         }
         MaterializationStrategy::ContentAddressed { .. } => {
             // Content-addressed materializations go through the
@@ -532,6 +525,12 @@ pub fn generate_time_interval_bootstrap_sql(
     // so a caller that skips the compile gate cannot create one.
     if matches!(model_ir.materialization, MaterializationStrategy::Ephemeral) {
         return Err(ephemeral_refused(model_ir));
+    }
+    if matches!(
+        model_ir.materialization,
+        MaterializationStrategy::Microbatch { .. }
+    ) {
+        return Err(microbatch_transformation_refused(model_ir));
     }
     let target = dialect.format_table_ref(
         &model_ir.target.catalog,
@@ -617,6 +616,12 @@ pub fn generate_transformation_initial_ddl(
     if matches!(model_ir.materialization, MaterializationStrategy::Ephemeral) {
         return Err(ephemeral_refused(model_ir));
     }
+    if matches!(
+        model_ir.materialization,
+        MaterializationStrategy::Microbatch { .. }
+    ) {
+        return Err(microbatch_transformation_refused(model_ir));
+    }
     let target = dialect.format_table_ref(
         &model_ir.target.catalog,
         &model_ir.target.schema,
@@ -651,6 +656,16 @@ fn incremental_transformation_refused(model_ir: &ModelIr) -> SqlGenError {
     SqlGenError::InvalidRequest(format!(
         "model '{}': `type = \"incremental\"` is not supported on transformation models \
          (E037); use merge, delete_insert, time_interval or full_refresh",
+        model_ir.name
+    ))
+}
+
+/// Loaded transformation microbatch models become time_interval before IR
+/// construction. Refuse a hand-built legacy IR before it can append data.
+fn microbatch_transformation_refused(model_ir: &ModelIr) -> SqlGenError {
+    SqlGenError::InvalidRequest(format!(
+        "model '{}': transformation `microbatch` must use the `time_interval` partition path \
+         with `@start_date` and `@end_date` (E024)",
         model_ir.name
     ))
 }
@@ -2357,12 +2372,7 @@ SELECT id, name, email FROM cat.sch.src WHERE active = true";
     }
 
     #[test]
-    fn test_lakehouse_append_ignores_format_on_insert() {
-        // An append INSERT should not emit lakehouse DDL — that's for
-        // initial table creation. The format field is silently ignored for
-        // the INSERT path, since the table already exists. Uses `microbatch`,
-        // the append strategy still legal on transformation models (#2054);
-        // `incremental` is refused before this path (#1990).
+    fn test_raw_microbatch_transformation_ir_is_refused() {
         let plan = lakehouse_ir(
             LakehouseFormat::DeltaTable,
             LakehouseOptions::default(),
@@ -2371,13 +2381,15 @@ SELECT id, name, email FROM cat.sch.src WHERE active = true";
                 granularity: rocky_ir::TimeGrain::Hour,
             },
         );
-        let stmts = generate_transformation_sql(&plan, &dialect()).unwrap();
-        assert_eq!(stmts.len(), 1);
+        let err = generate_transformation_sql(&plan, &dialect()).unwrap_err();
         assert!(
-            stmts[0].starts_with("INSERT INTO"),
-            "an append strategy should be INSERT INTO: {}",
-            stmts[0]
+            err.to_string().contains("time_interval"),
+            "raw microbatch IR must never emit an unfiltered INSERT: {err}"
         );
+        let err = generate_transformation_initial_ddl(&plan, &dialect()).unwrap_err();
+        assert!(err.to_string().contains("time_interval"));
+        let err = generate_time_interval_bootstrap_sql(&plan, &dialect()).unwrap_err();
+        assert!(err.to_string().contains("time_interval"));
     }
 
     #[test]
@@ -2389,11 +2401,8 @@ SELECT id, name, email FROM cat.sch.src WHERE active = true";
                 table_properties: vec![("delta.enableChangeDataFeed".into(), "true".into())],
                 ..LakehouseOptions::default()
             },
-            // An append strategy still legal on transformation models (#2054);
-            // `incremental` is refused before any DDL (#1990).
-            MaterializationStrategy::Microbatch {
-                timestamp_column: "updated_at".into(),
-                granularity: rocky_ir::TimeGrain::Hour,
+            MaterializationStrategy::DeleteInsert {
+                partition_by: vec!["region".into()],
             },
         );
         let stmts = generate_transformation_initial_ddl(&plan, &dialect()).unwrap();
@@ -2560,11 +2569,8 @@ SELECT id, name, email FROM cat.sch.src WHERE active = true";
     }
 
     #[test]
-    fn test_lakehouse_initial_ddl_with_microbatch_strategy() {
-        // Microbatch strategy should also get format-aware DDL on initial
-        // creation: an incremental/microbatch Iceberg mart must get
-        // USING ICEBERG + format_options on its first run, not the warehouse
-        // default.
+    fn test_lakehouse_initial_ddl_with_merge_strategy() {
+        // Merge gets format-aware DDL on initial creation.
         let plan = lakehouse_ir(
             LakehouseFormat::IcebergTable,
             LakehouseOptions {
@@ -2574,9 +2580,9 @@ SELECT id, name, email FROM cat.sch.src WHERE active = true";
                 table_properties: vec![("team".into(), "growth".into())],
                 ..LakehouseOptions::default()
             },
-            MaterializationStrategy::Microbatch {
-                timestamp_column: "event_ts".into(),
-                granularity: rocky_ir::TimeGrain::Day,
+            MaterializationStrategy::Merge {
+                unique_key: vec!["event_ts".into()],
+                update_columns: rocky_ir::ColumnSelection::All,
             },
         );
         let stmts = generate_transformation_initial_ddl(&plan, &dialect()).unwrap();
@@ -2612,11 +2618,8 @@ SELECT id, name, email FROM cat.sch.src WHERE active = true";
                 comment: Some("Incremental orders mart".into()),
                 ..LakehouseOptions::default()
             },
-            // `microbatch`, the append strategy still legal on transformation
-            // models (#2054); `incremental` is refused before any DDL (#1990).
-            MaterializationStrategy::Microbatch {
-                timestamp_column: "updated_at".into(),
-                granularity: rocky_ir::TimeGrain::Hour,
+            MaterializationStrategy::DeleteInsert {
+                partition_by: vec!["region".into()],
             },
         );
         let stmts = generate_transformation_initial_ddl(&plan, &dialect()).unwrap();

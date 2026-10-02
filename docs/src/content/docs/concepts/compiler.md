@@ -288,7 +288,6 @@ span, and sometimes a suggested fix.
 | `E040` | A `.rocky` string literal contains a backslash; use a `.sql` model with the target's own escaping |
 | `W001` | Unused model (no downstream consumers) |
 | `W002` | Duplicate column in model output |
-| `W003` | `time_column` is TIMESTAMP where DATE is preferred for the granularity |
 | `W004` | Classification tag with no matching `[mask]` strategy |
 | `W005` | Temporal column present but no `freshness` declaration in scope |
 | `W006` | `merge` strategy declares a `unique_key` column the model does not output |
