@@ -1435,18 +1435,42 @@ pub async fn run_snapshot(
             schema: pipeline.source.schema.clone(),
             table: pipeline.source.table.clone(),
         })
-        .await
-        .context("failed to describe snapshot source")?
-        .into_iter()
-        .map(|column| column.name)
-        .collect::<Vec<_>>();
-    let stmts = sql_gen::generate_snapshot_sql(&model_ir, dialect, &source_columns)?;
+        .await;
+    let stmts = source_columns
+        .context("failed to describe snapshot source")
+        .and_then(|columns| {
+            let names = columns
+                .into_iter()
+                .map(|column| column.name)
+                .collect::<Vec<_>>();
+            sql_gen::generate_snapshot_sql(&model_ir, dialect, &names).map_err(Into::into)
+        });
 
     let mut tables_failed = 0usize;
-    for stmt in &stmts {
-        if let Err(e) = warehouse_adapter.execute_query(stmt).await {
-            warn!(error = %e, "snapshot statement failed");
-            tables_failed += 1;
+    match stmts {
+        Ok(stmts) => {
+            for stmt in &stmts {
+                if let Err(e) = warehouse_adapter.execute_query(stmt).await {
+                    warn!(error = %e, "snapshot statement failed");
+                    tables_failed += 1;
+                }
+            }
+        }
+        Err(e) => {
+            warn!(error = %e, "snapshot preflight failed");
+            tables_failed = 1;
+            let (failure_kind, cooldown_seconds) =
+                crate::output::classify_anyhow_error_with_cooldown(&e);
+            output.errors.push(TableErrorOutput {
+                asset_key: vec![
+                    pipeline.target.catalog.clone(),
+                    pipeline.target.schema.clone(),
+                    pipeline.target.table.clone(),
+                ],
+                error: format!("{e:#}"),
+                failure_kind,
+                cooldown_seconds,
+            });
         }
     }
 
@@ -1522,7 +1546,12 @@ pub async fn run_snapshot(
         crate::output::print_json(&output)?;
     } else {
         crate::status_line!(
-            "snapshot pipeline complete: {}.{}.{} -> {}.{}.{} in {}ms",
+            "snapshot pipeline {}: {}.{}.{} -> {}.{}.{} in {}ms",
+            if tables_failed == 0 {
+                "complete"
+            } else {
+                "failed"
+            },
             pipeline.source.catalog,
             pipeline.source.schema,
             pipeline.source.table,
@@ -1531,6 +1560,9 @@ pub async fn run_snapshot(
             pipeline.target.table,
             output.duration_ms
         );
+        for error in &output.errors {
+            crate::status_line!("  error: {}", error.error);
+        }
     }
 
     // Persist the canonical `RunRecord` (before the failure bail, so a failed

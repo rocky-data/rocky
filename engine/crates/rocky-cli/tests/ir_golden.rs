@@ -63,7 +63,6 @@ use rocky_trino::dialect::TrinoDialect;
 #[test]
 fn snapshot_merge_insert_is_explicit_for_every_dialect() {
     let ir = build_12_snapshot_scd2();
-    let columns = vec!["customer_id".into(), "updated_at".into()];
     let dialects: [&dyn SqlDialect; 5] = [
         &DatabricksSqlDialect,
         &SnowflakeSqlDialect,
@@ -72,6 +71,21 @@ fn snapshot_merge_insert_is_explicit_for_every_dialect() {
         &DuckDbSqlDialect,
     ];
     for dialect in dialects {
+        let columns = if dialect.name() == "snowflake" {
+            vec![
+                "CUSTOMER_ID".into(),
+                "UPDATED_AT".into(),
+                "DisplayName".into(),
+                "Order Total".into(),
+            ]
+        } else {
+            vec![
+                "customer_id".into(),
+                "updated_at".into(),
+                "DisplayName".into(),
+                "Order Total".into(),
+            ]
+        };
         let config = rocky_core::snapshots::SnapshotConfig {
             source: ir.source.clone().unwrap(),
             target: ir.target.clone(),
@@ -96,9 +110,13 @@ fn snapshot_merge_insert_is_explicit_for_every_dialect() {
             };
             format!("{quote}{spelling}{quote}")
         };
-        for (merge, metadata) in [
-            (&current[0], "valid_from, valid_to, is_current, snapshot_id"),
-            (&legacy[1], "valid_from, valid_to"),
+        for (merge, changed, metadata) in [
+            (
+                &current[0],
+                &current[1],
+                "valid_from, valid_to, is_current, snapshot_id",
+            ),
+            (&legacy[1], &legacy[2], "valid_from, valid_to"),
         ] {
             let metadata = metadata
                 .split(", ")
@@ -106,7 +124,7 @@ fn snapshot_merge_insert_is_explicit_for_every_dialect() {
                 .collect::<Vec<_>>()
                 .join(", ");
             let expected = format!(
-                "INSERT ({}, {}, {metadata}) VALUES (source.{}, source.{}, CURRENT_TIMESTAMP, CAST(NULL AS TIMESTAMP)",
+                "INSERT ({}, {}, {quote}DisplayName{quote}, {quote}Order Total{quote}, {metadata}) VALUES (source.{}, source.{}, source.{quote}DisplayName{quote}, source.{quote}Order Total{quote}, CURRENT_TIMESTAMP, CAST(NULL AS TIMESTAMP)",
                 ident("customer_id"),
                 ident("updated_at"),
                 ident("customer_id"),
@@ -114,6 +132,18 @@ fn snapshot_merge_insert_is_explicit_for_every_dialect() {
             );
             assert!(merge.contains(&expected), "{}: {merge}", dialect.name());
             assert!(!merge.contains("INSERT (*)"), "{}: {merge}", dialect.name());
+            assert!(
+                changed.contains(&format!(
+                    "source.{quote}DisplayName{quote}, source.{quote}Order Total{quote}"
+                )),
+                "{}: {changed}",
+                dialect.name()
+            );
+            assert!(
+                !changed.contains("source.*"),
+                "{}: {changed}",
+                dialect.name()
+            );
         }
     }
 }

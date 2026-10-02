@@ -23,11 +23,8 @@ impl SqlDialect for SnowflakeSqlDialect {
         "snowflake"
     }
 
-    fn snapshot_column_identifier(&self, name: &str) -> String {
-        // DESCRIBE TABLE lowercases names in the adapter, while unquoted
-        // Snowflake columns (including Rocky's SCD2 bootstrap columns) fold
-        // to uppercase. Quote that warehouse spelling for the MERGE.
-        self.quote_identifier(&name.to_ascii_uppercase())
+    fn snapshot_metadata_identifier(&self, name: &str) -> String {
+        self.snapshot_column_identifier(&name.to_ascii_uppercase())
     }
 
     /// Snowflake's `'…'` literal processes backslash escapes; a quote is
@@ -749,10 +746,18 @@ mod tests {
     fn snapshot_identifiers_match_unquoted_snowflake_columns() {
         let d = SnowflakeSqlDialect;
         assert_eq!(
-            d.snapshot_column_identifier("customer_id"),
-            "\"CUSTOMER_ID\""
+            d.snapshot_column_identifier("DisplayName"),
+            "\"DisplayName\""
         );
-        assert_eq!(d.snapshot_column_identifier("valid_from"), "\"VALID_FROM\"");
+        assert_eq!(
+            d.snapshot_column_identifier("Order Total"),
+            "\"Order Total\""
+        );
+        assert_eq!(d.snapshot_column_identifier("a\"b"), "\"a\"\"b\"");
+        assert_eq!(
+            d.snapshot_metadata_identifier("valid_from"),
+            "\"VALID_FROM\""
+        );
     }
 
     #[test]

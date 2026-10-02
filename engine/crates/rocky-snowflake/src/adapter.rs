@@ -141,45 +141,7 @@ impl WarehouseAdapter for SnowflakeWarehouseAdapter {
             .await
             .map_err(AdapterError::new)?;
 
-        // Snowflake DESCRIBE TABLE returns rows with columns:
-        // name, type, kind, null?, default, primary_key, unique_key, ...
-        // Look up column positions by name so we're resilient to column
-        // order changes across Snowflake versions.
-        let col_headers: Vec<String> = result
-            .columns
-            .iter()
-            .map(|c| c.name.to_lowercase())
-            .collect();
-        let name_idx = col_headers.iter().position(|c| c == "name").unwrap_or(0);
-        let type_idx = col_headers.iter().position(|c| c == "type").unwrap_or(1);
-        let null_idx = col_headers.iter().position(|c| c == "null?").unwrap_or(3);
-
-        let mut columns = Vec::new();
-        for row in &result.rows {
-            let name = row
-                .get(name_idx)
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_lowercase();
-            let data_type = row
-                .get(type_idx)
-                .and_then(|v| v.as_str())
-                .unwrap_or("VARCHAR")
-                .to_string();
-            let nullable = row
-                .get(null_idx)
-                .and_then(|v| v.as_str())
-                .map(|s| s == "Y")
-                .unwrap_or(true);
-
-            columns.push(ColumnInfo {
-                name,
-                data_type,
-                nullable,
-            });
-        }
-
-        Ok(columns)
+        Ok(parse_describe_columns(&result))
     }
 
     async fn ping(&self) -> AdapterResult<()> {
@@ -395,6 +357,39 @@ fn parse_snowflake_chunk_checksums(
     Ok(out)
 }
 
+fn parse_describe_columns(result: &crate::connector::QueryResult) -> Vec<ColumnInfo> {
+    // Snowflake DESCRIBE TABLE returns name, type, kind, null?, and other fields.
+    let headers: Vec<_> = result
+        .columns
+        .iter()
+        .map(|c| c.name.to_lowercase())
+        .collect();
+    let name_idx = headers.iter().position(|c| c == "name").unwrap_or(0);
+    let type_idx = headers.iter().position(|c| c == "type").unwrap_or(1);
+    let null_idx = headers.iter().position(|c| c == "null?").unwrap_or(3);
+    result
+        .rows
+        .iter()
+        .map(|row| ColumnInfo {
+            name: row
+                .get(name_idx)
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            data_type: row
+                .get(type_idx)
+                .and_then(|v| v.as_str())
+                .unwrap_or("VARCHAR")
+                .to_string(),
+            nullable: row
+                .get(null_idx)
+                .and_then(|v| v.as_str())
+                .map(|s| s == "Y")
+                .unwrap_or(true),
+        })
+        .collect()
+}
+
 fn parse_snowflake_i128(v: &serde_json::Value) -> AdapterResult<i128> {
     if let Some(s) = v.as_str() {
         return s.parse::<i128>().map_err(|e| {
@@ -421,6 +416,41 @@ mod tests {
     use crate::connector::ConnectorConfig;
     use rocky_core::config::RetryConfig;
     use std::time::Duration;
+
+    #[test]
+    fn describe_keeps_exact_quoted_column_spelling() {
+        let result = crate::connector::QueryResult {
+            statement_handle: String::new(),
+            columns: ["name", "type", "kind", "null?"]
+                .into_iter()
+                .map(|name| crate::connector::ColumnMetaData {
+                    name: name.into(),
+                    type_name: None,
+                    nullable: None,
+                })
+                .collect(),
+            rows: vec![
+                vec![
+                    serde_json::json!("DisplayName"),
+                    serde_json::json!("VARCHAR"),
+                    serde_json::json!("COLUMN"),
+                    serde_json::json!("Y"),
+                ],
+                vec![
+                    serde_json::json!("Order Total"),
+                    serde_json::json!("NUMBER"),
+                    serde_json::json!("COLUMN"),
+                    serde_json::json!("N"),
+                ],
+            ],
+            total_row_count: None,
+        };
+        let names: Vec<_> = parse_describe_columns(&result)
+            .into_iter()
+            .map(|c| c.name)
+            .collect();
+        assert_eq!(names, ["DisplayName", "Order Total"]);
+    }
 
     /// Verifies that the adapter can be constructed and used as a trait object.
     fn _assert_warehouse_adapter_trait_object(_: &dyn WarehouseAdapter) {}

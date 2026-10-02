@@ -300,7 +300,7 @@ async fn run_snapshot_pipes_path_opens_and_closes() {
             .await
             .unwrap();
         a.execute_statement(
-            "CREATE TABLE main.src AS SELECT 1 AS id, CURRENT_TIMESTAMP AS updated_at",
+            "CREATE TABLE main.src AS SELECT 1 AS \"Order Id\", CURRENT_TIMESTAMP AS \"Changed At\", 'Alice' AS \"DisplayName\"",
         )
         .await
         .unwrap();
@@ -316,8 +316,8 @@ path = "{db}"
 
 [pipeline.dim]
 type = "snapshot"
-unique_key = ["id"]
-updated_at = "updated_at"
+unique_key = ["Order Id"]
+updated_at = "Changed At"
 
 [pipeline.dim.source]
 catalog = "s"
@@ -337,32 +337,45 @@ auto_create_schemas = true
     )
     .unwrap();
 
-    // DuckDB's parser refuses the `MERGE ... WHEN NOT MATCHED THEN INSERT
-    // (*) VALUES (source.*, ...)` SQL `generate_snapshot_sql` emits for this
-    // pipeline type — a pre-existing dialect gap, unrelated to Pipes and out
-    // of scope here. `closed()` must still fire on THIS failure path (it
-    // runs before the `tables_failed > 0` bail in `run_snapshot`), which is
-    // exactly the case worth pinning: a Pipes launch must not lose its
-    // `closed` message just because the pipeline's own work failed.
     let (lines, result) = run_with_pipes_capture(&messages_path, || {
         drive_run(&config_path, &state_path, None)
     })
     .await;
-
-    let err = result.expect_err(
-        "this test's snapshot SQL is expected to fail on DuckDB's MERGE dialect gap; \
-         if it now succeeds, DuckDB gained support and this test should assert Ok instead",
-    );
-    assert!(
-        err.to_string().contains("snapshot pipeline failed"),
-        "expected the known DuckDB-dialect failure, got a different error (a real regression?): {err}"
-    );
+    result.expect("snapshot MERGE should execute on DuckDB");
 
     assert!(lines.len() >= 2, "{lines:?}");
     assert_eq!(lines[0]["method"], "opened", "{lines:?}");
     assert_eq!(
         lines.last().unwrap()["method"],
         "closed",
-        "run_snapshot's Pipes path must call closed() even on its failure path (#2166): {lines:?}"
+        "snapshot success must close Pipes: {lines:?}"
+    );
+
+    // A missing source fails during schema discovery, before any target write.
+    let config = std::fs::read_to_string(&config_path).unwrap();
+    std::fs::write(
+        &config_path,
+        config.replace("table = \"src\"", "table = \"missing_src\""),
+    )
+    .unwrap();
+    let failure_messages = dir.path().join("failure-messages.jsonl");
+    let (lines, result) = run_with_pipes_capture(&failure_messages, || {
+        drive_run(&config_path, &state_path, None)
+    })
+    .await;
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("snapshot pipeline failed")
+    );
+    assert_eq!(lines[0]["method"], "opened", "{lines:?}");
+    assert_eq!(lines.last().unwrap()["method"], "closed", "{lines:?}");
+    let store = rocky_core::state::StateStore::open(&state_path).unwrap();
+    let runs = store.list_runs(10).unwrap();
+    assert!(
+        runs.iter()
+            .any(|run| run.status == rocky_core::state::RunStatus::Failure),
+        "{runs:?}"
     );
 }

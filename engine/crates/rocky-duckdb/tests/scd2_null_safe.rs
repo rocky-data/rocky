@@ -13,7 +13,7 @@ use rocky_core::snapshots::{SnapshotConfig, SnapshotStrategy, generate_snapshot_
 use rocky_core::traits::{SqlDialect, WarehouseAdapter};
 use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
 use rocky_duckdb::dialect::DuckDbSqlDialect;
-use rocky_ir::{SourceRef, TargetRef};
+use rocky_ir::{GovernanceConfig, ModelIr, SourceRef, TargetRef};
 
 /// Dialect contract: `null_safe_neq` must evaluate truthy for the three
 /// NULL ↔ value cases that bare `!=` would silently drop, and falsy for
@@ -80,7 +80,7 @@ async fn duckdb_null_safe_neq_captures_null_value_transitions() {
 async fn snapshot_merge_inserts_explicit_columns_and_closes_changed_rows() {
     let adapter = DuckDbWarehouseAdapter::in_memory().unwrap();
     let dialect = DuckDbSqlDialect;
-    adapter.execute_statement("CREATE TABLE main.source (id INTEGER, name VARCHAR, updated_at TIMESTAMP); INSERT INTO main.source VALUES (1, 'Alice', TIMESTAMP '2026-01-01')").await.unwrap();
+    adapter.execute_statement("CREATE TABLE main.source (id INTEGER, name VARCHAR, \"DisplayName\" VARCHAR, \"Order Total\" VARCHAR, updated_at TIMESTAMP); INSERT INTO main.source VALUES (1, 'Alice', 'Alice A', '100', TIMESTAMP '2026-01-01')").await.unwrap();
     let config = SnapshotConfig {
         source: SourceRef {
             catalog: String::new(),
@@ -100,12 +100,18 @@ async fn snapshot_merge_inserts_explicit_columns_and_closes_changed_rows() {
     };
     let init = rocky_core::snapshots::generate_initial_load_sql(&config, &dialect).unwrap();
     adapter.execute_statement(&init).await.unwrap();
-    let columns = vec!["id".into(), "name".into(), "updated_at".into()];
+    let columns = vec![
+        "id".into(),
+        "name".into(),
+        "DisplayName".into(),
+        "Order Total".into(),
+        "updated_at".into(),
+    ];
     let statements = generate_snapshot_sql(&config, &dialect, &columns).unwrap();
     for sql in &statements {
         adapter.execute_statement(sql).await.unwrap();
     }
-    assert!(statements[0].contains("INSERT (\"id\", \"name\", \"updated_at\", \"valid_from\", \"valid_to\", \"is_current\", \"snapshot_id\") VALUES (source.\"id\", source.\"name\", source.\"updated_at\", CURRENT_TIMESTAMP, CAST(NULL AS TIMESTAMP), TRUE,"));
+    assert!(statements[0].contains("INSERT (\"id\", \"name\", \"DisplayName\", \"Order Total\", \"updated_at\", \"valid_from\", \"valid_to\", \"is_current\", \"snapshot_id\") VALUES (source.\"id\", source.\"name\", source.\"DisplayName\", source.\"Order Total\", source.\"updated_at\", CURRENT_TIMESTAMP, CAST(NULL AS TIMESTAMP), TRUE,"));
     adapter
         .execute_statement(
             "UPDATE main.source SET name = 'Alicia', updated_at = TIMESTAMP '2026-02-01'",
@@ -124,6 +130,127 @@ async fn snapshot_merge_inserts_explicit_columns_and_closes_changed_rows() {
     assert_eq!(rows.rows[0][1], "false");
     assert_eq!(rows.rows[1][0], "Alicia");
     assert_eq!(rows.rows[1][1], "true");
+}
+
+#[tokio::test]
+async fn snapshot_accepts_quoted_key_and_change_column() {
+    let adapter = DuckDbWarehouseAdapter::in_memory().unwrap();
+    let dialect = DuckDbSqlDialect;
+    adapter.execute_statement("CREATE TABLE main.source (\"Order Id\" INTEGER, \"Order Total\" VARCHAR, \"Changed At\" TIMESTAMP); INSERT INTO main.source VALUES (1, '100', TIMESTAMP '2026-01-01')").await.unwrap();
+    let config = SnapshotConfig {
+        source: SourceRef {
+            catalog: String::new(),
+            schema: "main".into(),
+            table: "source".into(),
+        },
+        target: TargetRef {
+            catalog: String::new(),
+            schema: "main".into(),
+            table: "history".into(),
+        },
+        unique_key: vec!["Order Id".into()],
+        strategy: SnapshotStrategy::Timestamp {
+            updated_at: "Changed At".into(),
+        },
+        invalidate_hard_deletes: false,
+    };
+    adapter
+        .execute_statement(
+            &rocky_core::snapshots::generate_initial_load_sql(&config, &dialect).unwrap(),
+        )
+        .await
+        .unwrap();
+    let columns = vec!["Order Id".into(), "Order Total".into(), "Changed At".into()];
+    for sql in generate_snapshot_sql(&config, &dialect, &columns).unwrap() {
+        adapter.execute_statement(&sql).await.unwrap();
+    }
+    adapter.execute_statement("UPDATE main.source SET \"Order Total\" = '200', \"Changed At\" = TIMESTAMP '2026-02-01'").await.unwrap();
+    for sql in generate_snapshot_sql(&config, &dialect, &columns).unwrap() {
+        adapter.execute_statement(&sql).await.unwrap();
+    }
+    let rows = adapter
+        .execute_query("SELECT \"Order Total\" FROM main.history WHERE is_current = TRUE")
+        .await
+        .unwrap();
+    assert_eq!(rows.rows.len(), 1, "{rows:?}");
+    assert_eq!(rows.rows[0][0], "200");
+}
+
+#[tokio::test]
+async fn changed_version_insert_maps_reordered_view_columns_by_name() {
+    let adapter = DuckDbWarehouseAdapter::in_memory().unwrap();
+    let dialect = DuckDbSqlDialect;
+    adapter.execute_statement("CREATE TABLE main.base (id INTEGER, a VARCHAR, b VARCHAR, updated_at TIMESTAMP); INSERT INTO main.base VALUES (1, 'a1', 'b1', TIMESTAMP '2026-01-01'); CREATE VIEW main.source AS SELECT id, a, b, updated_at FROM main.base").await.unwrap();
+    let config = SnapshotConfig {
+        source: SourceRef {
+            catalog: String::new(),
+            schema: "main".into(),
+            table: "source".into(),
+        },
+        target: TargetRef {
+            catalog: String::new(),
+            schema: "main".into(),
+            table: "history".into(),
+        },
+        unique_key: vec!["id".into()],
+        strategy: SnapshotStrategy::Timestamp {
+            updated_at: "updated_at".into(),
+        },
+        invalidate_hard_deletes: false,
+    };
+    adapter
+        .execute_statement(
+            &rocky_core::snapshots::generate_initial_load_sql(&config, &dialect).unwrap(),
+        )
+        .await
+        .unwrap();
+    let columns = vec!["id".into(), "a".into(), "b".into(), "updated_at".into()];
+    let legacy = ModelIr::snapshot(
+        TargetRef {
+            catalog: String::new(),
+            schema: "main".into(),
+            table: "legacy_history".into(),
+        },
+        config.source.clone(),
+        vec![std::sync::Arc::from("id")],
+        "updated_at".into(),
+        false,
+        GovernanceConfig {
+            permissions_file: None,
+            auto_create_catalogs: false,
+            auto_create_schemas: false,
+        },
+    );
+    for sql in rocky_core::sql_gen::generate_snapshot_sql(&legacy, &dialect, &columns).unwrap() {
+        adapter.execute_statement(&sql).await.unwrap();
+    }
+    for sql in generate_snapshot_sql(&config, &dialect, &columns).unwrap() {
+        adapter.execute_statement(&sql).await.unwrap();
+    }
+    adapter.execute_statement("UPDATE main.base SET a = 'a2', b = 'b2', updated_at = TIMESTAMP '2026-02-01'; CREATE OR REPLACE VIEW main.source AS SELECT id, b, a, updated_at FROM main.base").await.unwrap();
+    let reordered_columns = vec!["id".into(), "b".into(), "a".into(), "updated_at".into()];
+    for sql in
+        rocky_core::sql_gen::generate_snapshot_sql(&legacy, &dialect, &reordered_columns).unwrap()
+    {
+        adapter.execute_statement(&sql).await.unwrap();
+    }
+    for sql in generate_snapshot_sql(&config, &dialect, &reordered_columns).unwrap() {
+        adapter.execute_statement(&sql).await.unwrap();
+    }
+    let rows = adapter
+        .execute_query("SELECT a, b FROM main.history WHERE is_current = TRUE")
+        .await
+        .unwrap();
+    assert_eq!(rows.rows.len(), 1, "{rows:?}");
+    assert_eq!(rows.rows[0][0], "a2");
+    assert_eq!(rows.rows[0][1], "b2");
+    let legacy_rows = adapter
+        .execute_query("SELECT a, b FROM main.legacy_history WHERE valid_to IS NULL")
+        .await
+        .unwrap();
+    assert_eq!(legacy_rows.rows.len(), 1, "{legacy_rows:?}");
+    assert_eq!(legacy_rows.rows[0][0], "a2");
+    assert_eq!(legacy_rows.rows[0][1], "b2");
 }
 
 /// End-to-end contract: a row whose tracked column transitions from
@@ -183,7 +310,7 @@ async fn scd2_change_predicate_captures_null_to_value_on_duckdb() {
         .expect("snapshot SQL");
     let merge_sql = &stmts[0];
     assert!(
-        merge_sql.contains("source.updated_at IS DISTINCT FROM target.updated_at"),
+        merge_sql.contains("source.\"updated_at\" IS DISTINCT FROM target.\"updated_at\""),
         "generated MERGE must use IS DISTINCT FROM, got: {merge_sql}"
     );
 

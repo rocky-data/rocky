@@ -1133,12 +1133,7 @@ impl WarehouseAdapter for BigQueryAdapter {
         validate_gcp_project_id(&table.catalog).map_err(AdapterError::new)?;
         validate_identifier(&table.schema).map_err(AdapterError::new)?;
         validate_identifier(&table.table).map_err(AdapterError::new)?;
-        let sql = format!(
-            "SELECT column_name, data_type, is_nullable \
-             FROM `{}`.`{}`.INFORMATION_SCHEMA.COLUMNS \
-             WHERE table_name = '{}'",
-            table.catalog, table.schema, table.table
-        );
+        let sql = describe_columns_sql(table);
 
         let result = self.execute_query(&sql).await?;
         let columns: Vec<ColumnInfo> = result
@@ -1291,6 +1286,15 @@ impl WarehouseAdapter for BigQueryAdapter {
         );
         self.execute_statement(&sql).await
     }
+}
+
+fn describe_columns_sql(table: &TableRef) -> String {
+    format!(
+        "SELECT column_name, data_type, is_nullable \
+         FROM `{}`.`{}`.INFORMATION_SCHEMA.COLUMNS \
+         WHERE table_name = '{}' AND is_hidden = 'NO' ORDER BY ordinal_position",
+        table.catalog, table.schema, table.table
+    )
 }
 
 /// Walk the BigQuery `v` representation using its field schema. REPEATED
@@ -2114,6 +2118,17 @@ struct TableCell {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn describe_excludes_hidden_partition_columns() {
+        let sql = describe_columns_sql(&TableRef {
+            catalog: "project".into(),
+            schema: "dataset".into(),
+            table: "events".into(),
+        });
+        assert!(sql.contains("is_hidden = 'NO'"), "{sql}");
+        assert!(sql.contains("ORDER BY ordinal_position"), "{sql}");
+    }
 
     #[test]
     fn test_query_request_serialization() {

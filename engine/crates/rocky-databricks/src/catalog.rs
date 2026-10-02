@@ -293,25 +293,32 @@ impl<'a> CatalogManager<'a> {
             .map_err(SqlGenError::from)?;
         let result = self.connector.execute_sql(&sql).await?;
 
-        let columns = result
-            .rows
-            .iter()
-            .filter_map(|row| {
-                let name = row.first().and_then(|v| v.as_str())?.to_string();
-                let data_type = row.get(1).and_then(|v| v.as_str())?.to_string();
-                // Skip partition/metadata separator rows (empty name or starts with #)
-                if name.is_empty() || name.starts_with('#') {
-                    return None;
-                }
-                Some(rocky_ir::ColumnInfo {
-                    name,
-                    data_type,
-                    nullable: true, // DESCRIBE TABLE doesn't reliably report nullability
-                })
-            })
-            .collect();
-        Ok(columns)
+        Ok(primary_describe_columns(&result.rows))
     }
+}
+
+/// `DESCRIBE TABLE` repeats partition columns after `# Partition Information`.
+fn primary_describe_columns(rows: &[Vec<serde_json::Value>]) -> Vec<rocky_ir::ColumnInfo> {
+    rows.iter()
+        .take_while(|row| {
+            !row.first()
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .starts_with('#')
+        })
+        .filter_map(|row| {
+            let name = row.first().and_then(|v| v.as_str())?.to_string();
+            let data_type = row.get(1).and_then(|v| v.as_str())?.to_string();
+            if name.is_empty() {
+                return None;
+            }
+            Some(rocky_ir::ColumnInfo {
+                name,
+                data_type,
+                nullable: true, // DESCRIBE TABLE doesn't reliably report nullability
+            })
+        })
+        .collect()
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -415,6 +422,22 @@ fn parse_delta_duration_days(value: &str) -> Option<u32> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn partition_describe_keeps_only_primary_columns() {
+        let rows = vec![
+            vec![json!("id"), json!("bigint")],
+            vec![json!("day"), json!("date")],
+            vec![json!("# Partition Information"), json!("")],
+            vec![json!("# col_name"), json!("data_type")],
+            vec![json!("day"), json!("date")],
+        ];
+        let names: Vec<_> = primary_describe_columns(&rows)
+            .into_iter()
+            .map(|c| c.name)
+            .collect();
+        assert_eq!(names, ["id", "day"]);
+    }
 
     #[test]
     fn parse_duration_accepts_interval_form() {

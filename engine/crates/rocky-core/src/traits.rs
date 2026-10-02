@@ -1017,9 +1017,46 @@ pub trait SqlDialect: Send + Sync {
     /// INSERT INTO ... SELECT (incremental append).
     fn insert_into(&self, target: &str, select_sql: &str) -> String;
 
-    /// Quote a column returned by snapshot source schema discovery.
+    /// Quote a column returned by snapshot source schema discovery exactly.
     fn snapshot_column_identifier(&self, name: &str) -> String {
-        self.quote_identifier(name)
+        match self.name() {
+            "databricks" => format!("`{}`", name.replace('`', "``")),
+            "bigquery" => format!("`{}`", name.replace('\\', "\\\\").replace('`', "\\`")),
+            _ => format!("\"{}\"", name.replace('"', "\"\"")),
+        }
+    }
+
+    /// Rocky's unquoted bootstrap metadata folds to upper case on Snowflake.
+    fn snapshot_metadata_identifier(&self, name: &str) -> String {
+        self.snapshot_column_identifier(name)
+    }
+
+    /// Resolve a configured key or change column to the discovered spelling.
+    fn snapshot_source_reference(
+        &self,
+        configured: &str,
+        source_columns: &[String],
+    ) -> AdapterResult<String> {
+        let exact = source_columns
+            .iter()
+            .find(|name| name.as_str() == configured);
+        let column = if let Some(name) = exact {
+            name
+        } else {
+            let mut matches = source_columns
+                .iter()
+                .filter(|name| name.eq_ignore_ascii_case(configured));
+            let first = matches.next().ok_or_else(|| {
+                AdapterError::msg(format!("snapshot source column '{configured}' not found"))
+            })?;
+            if matches.next().is_some() {
+                return Err(AdapterError::msg(format!(
+                    "snapshot source column '{configured}' is ambiguous"
+                )));
+            }
+            first
+        };
+        Ok(self.snapshot_column_identifier(column))
     }
 
     /// The `WHEN NOT MATCHED` insert for a snapshot MERGE.
@@ -1035,6 +1072,20 @@ pub trait SqlDialect: Send + Sync {
         source_columns: &[String],
         metadata: &[(&str, &str)],
     ) -> AdapterResult<String> {
+        let (names, values) = self.snapshot_insert_columns(source_columns, metadata)?;
+        Ok(format!(
+            "INSERT ({}) VALUES ({})",
+            names.join(", "),
+            values.join(", ")
+        ))
+    }
+
+    /// Column and expression lists shared by the MERGE and changed-version insert.
+    fn snapshot_insert_columns(
+        &self,
+        source_columns: &[String],
+        metadata: &[(&str, &str)],
+    ) -> AdapterResult<(Vec<String>, Vec<String>)> {
         if source_columns.is_empty() {
             return Err(AdapterError::msg("snapshot source has no columns"));
         }
@@ -1042,8 +1093,17 @@ pub trait SqlDialect: Send + Sync {
         let mut values = Vec::new();
         let mut seen = std::collections::HashSet::new();
         for name in source_columns {
-            rocky_sql::validation::validate_identifier(name).map_err(AdapterError::new)?;
-            if !seen.insert(name.to_ascii_lowercase()) {
+            if name.is_empty() || name.chars().any(char::is_control) {
+                return Err(AdapterError::msg(
+                    "snapshot source contains an invalid column name",
+                ));
+            }
+            let identity = if self.name() == "snowflake" {
+                name.clone()
+            } else {
+                name.to_ascii_lowercase()
+            };
+            if !seen.insert(identity) {
                 return Err(AdapterError::msg(format!(
                     "snapshot source contains duplicate column '{name}'"
                 )));
@@ -1061,14 +1121,10 @@ pub trait SqlDialect: Send + Sync {
             values.push(format!("source.{quoted}"));
         }
         for (name, value) in metadata {
-            names.push(self.snapshot_column_identifier(name));
+            names.push(self.snapshot_metadata_identifier(name));
             values.push((*value).to_owned());
         }
-        Ok(format!(
-            "INSERT ({}) VALUES ({})",
-            names.join(", "),
-            values.join(", ")
-        ))
+        Ok((names, values))
     }
 
     /// MERGE INTO (upsert by key).

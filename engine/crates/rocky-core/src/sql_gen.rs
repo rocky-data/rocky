@@ -1022,7 +1022,7 @@ use std::fmt::Write;
 ///
 /// Returns [`SqlGenError::InvalidRequest`] when `model_ir` was not
 /// a snapshot-variant [`ModelIr`] (see [`rocky_ir::ModelIrVariant`]).
-/// `source_columns` comes from `WarehouseAdapter::describe_table`.
+/// `source_columns` is the projected source column list in warehouse spelling.
 pub fn generate_snapshot_sql(
     model_ir: &ModelIr,
     dialect: &dyn SqlDialect,
@@ -1052,14 +1052,14 @@ pub fn generate_snapshot_sql(
         return Err(SqlGenError::MergeNoKey);
     }
 
-    // Validate identifiers
-    for k in &model_ir.unique_key {
-        validation::validate_identifier(k)?;
-    }
-    validation::validate_identifier(updated_at)?;
-
-    let join_cond = model_ir
+    let keys = model_ir
         .unique_key
+        .iter()
+        .map(|key| dialect.snapshot_source_reference(key, source_columns))
+        .collect::<Result<Vec<_>, _>>()?;
+    let updated_at = dialect.snapshot_source_reference(updated_at, source_columns)?;
+
+    let join_cond = keys
         .iter()
         .map(|k| format!("target.{k} = source.{k}"))
         .collect::<Vec<_>>()
@@ -1093,6 +1093,13 @@ pub fn generate_snapshot_sql(
             ("valid_to", "CAST(NULL AS TIMESTAMP)"),
         ],
     )?;
+    let (insert_names, insert_values) = dialect.snapshot_insert_columns(
+        source_columns,
+        &[
+            ("valid_from", "CURRENT_TIMESTAMP"),
+            ("valid_to", "CAST(NULL AS TIMESTAMP)"),
+        ],
+    )?;
     let merge = format!(
         "MERGE INTO {target} AS target \
          USING {source} AS source \
@@ -1107,9 +1114,8 @@ pub fn generate_snapshot_sql(
     // Statement 3: Insert new versions for rows that were updated
     // (the MERGE above closed them, now insert the fresh version)
     let insert_new = format!(
-        "INSERT INTO {target} \
-         SELECT source.*, CURRENT_TIMESTAMP AS valid_from, \
-         CAST(NULL AS TIMESTAMP) AS valid_to \
+        "INSERT INTO {target} ({columns}) \
+         SELECT {values} \
          FROM {source} AS source \
          INNER JOIN {target} AS target \
          ON {join_cond} \
@@ -1121,14 +1127,14 @@ pub fn generate_snapshot_sql(
            SELECT 1 FROM {target} AS existing \
            WHERE {existing_join_cond} AND existing.valid_to IS NULL\
          )",
-        self_join_cond = model_ir
-            .unique_key
+        columns = insert_names.join(", "),
+        values = insert_values.join(", "),
+        self_join_cond = keys
             .iter()
             .map(|k| format!("t2.{k} = source.{k}"))
             .collect::<Vec<_>>()
             .join(" AND "),
-        existing_join_cond = model_ir
-            .unique_key
+        existing_join_cond = keys
             .iter()
             .map(|k| format!("existing.{k} = source.{k}"))
             .collect::<Vec<_>>()
@@ -2772,7 +2778,7 @@ SELECT id, name, email FROM cat.sch.src WHERE active = true";
         // The MERGE is the second statement (after the bootstrap CREATE).
         let merge = &stmts[1];
         assert!(
-            merge.contains("source.updated_at IS DISTINCT FROM target.updated_at"),
+            merge.contains("source.\"updated_at\" IS DISTINCT FROM target.\"updated_at\""),
             "MERGE must use IS DISTINCT FROM for NULL-safe change detection, got: {merge}"
         );
         assert!(
