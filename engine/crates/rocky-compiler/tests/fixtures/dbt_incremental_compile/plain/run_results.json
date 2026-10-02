@@ -7,5 +7,23 @@
   "args": {
     "which": "compile",
     "invocation_command": "dbt compile --profiles-dir . -q"
-  }
+  },
+  "results": [
+    {
+      "unique_id": "model.inc_probe.orders_inc",
+      "status": "success"
+    },
+    {
+      "unique_id": "model.inc_probe.orders_pinned",
+      "status": "success"
+    },
+    {
+      "unique_id": "model.inc_probe.orders_macro",
+      "status": "success"
+    },
+    {
+      "unique_id": "model.inc_probe.orders_nokey",
+      "status": "success"
+    }
+  ]
 }

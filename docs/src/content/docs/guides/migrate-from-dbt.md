@@ -313,7 +313,7 @@ The importer does not translate the items below, by design. Rocky has no Jinja r
 - **dbt tests with no native Rocky equivalent.** Beyond the canonical four, the importer converts several `dbt_utils` and `dbt_expectations` tests to native Rocky assertions: `unique_combination_of_columns`, `accepted_range` / `expect_column_values_to_be_between` (→ `in_range`), `expect_column_values_to_match_regex` (→ `regex_match`), `expect_column_values_to_be_in_set` (→ `accepted_values`), and `dbt_utils.expression_is_true` (→ `expression`). See [Generic test mapping](#generic-test-mapping). Anything outside that set — other `dbt_utils.*` and `dbt_expectations.*` tests, project-defined generics, other model-level tests — becomes a structured `UnsupportedTest` warning per occurrence. The emitted TOML carries no stub for it. Rewrite those as a Rocky `expression` test or a quality-pipeline check.
 - **Singular tests** in `tests/` (custom SQL): copy and rewrite them yourself.
 - **dbt macros and `dbt_packages/`.** Rocky has no Jinja runtime, so no macro body expands.
-- **Raw Jinja that calls `is_incremental()`**, on the no-manifest or raw-manifest path: **refused**. Rocky cannot choose dbt's first-run branch from raw SQL. Run `dbt compile --full-refresh` and import the artifact pair. Every manifest incremental model needs a matching `run_results.json` with `args.full_refresh = true`. Rocky refuses a model with effective `full_refresh=false` even with that pair. An unkeyed `full_refresh` fallback that calls `is_incremental()` still needs a manual rewrite.
+- **Incremental models on the raw path:** **refused**, including models configured in `dbt_project.yml` or a model properties YAML file. Rocky cannot prove the first-run SQL from raw code. Run `dbt compile --full-refresh` and import the artifact pair. A non-incremental raw model that calls `is_incremental()` is also refused.
 - **`{% for %}` and `{% set %}`** on the no-manifest path: **refused**. The importer lists the model as a failure rather than half-rendering it into broken SQL, because the loop or assignment body would survive exactly once. Re-run after `dbt compile --full-refresh`, which the manifest path resolves, or rewrite the model. A `{% if %}` is different: the importer emits it verbatim with a TODO marker, and its body then applies *unconditionally*, so review it. `{{ var() }}` is not in this list. It converts to an `@var()` run-variable marker, as described above.
 - **Unmapped `materialized` values** (`dynamic_table`, `seed`): flattened to `full_refresh` and listed in `MIGRATION-NOTES.md`. `materialized_view` is not in this group; it maps to Rocky's own `materialized_view` strategy.
 - **Adapters Rocky does not support natively** (Postgres, Redshift, and others): the generated repo stubs DuckDB so the project still loads. Replace the `[adapter]` block once Rocky has an adapter for that warehouse, or pass `--target-adapter <kind>` to skip detection.
@@ -323,7 +323,9 @@ The importer does not translate the items below, by design. Rocky has no Jinja r
 - **dbt model contracts** (`contract: {enforced: true}`, column `data_type` declarations, and `constraints`): not carried over to Rocky's contract model. The importer detects and reports them instead of dropping them. Each one emits a warning and increments a `contracts_dropped` counter in the JSON output and in `MIGRATION-NOTES.md`. You then know which models had a contract to re-author. See [Column-level contracts](#column-level-contracts-manual) for the Rocky equivalent.
 
 :::caution[Run `dbt compile --full-refresh` first]
-Run `dbt compile --full-refresh` before import, including any required `--vars`. Keep `manifest.json` and `run_results.json` in the same target directory. Every dbt incremental model needs matching invocation IDs and `args.full_refresh = true`. This includes models without a key or a direct `is_incremental()` call. The effective model config must not set `full_refresh=false`. That setting can retain the delta filter despite the command flag. Remove it and compile again. A parsed-only manifest has no compiled SQL. Rocky refuses incremental models without matching evidence.
+Run `dbt compile --full-refresh` before import, including any required `--vars`. Keep `manifest.json` and `run_results.json` in the same target directory. Every dbt incremental model needs matching invocation IDs and `args.full_refresh = true`. It also needs a successful result for its `unique_id` and `compiled_code`.
+
+A selective compile leaves unselected models without that evidence. Compile without `--select` or include each model you want to import. This rule applies without a key or a direct `is_incremental()` call. Remove any effective `full_refresh=false` config and compile again. That config overrides the command flag.
 :::
 
 ## 1. Import the dbt Project
@@ -982,10 +984,12 @@ Each one appears as a warning. To keep incremental behaviour, give the model a `
 Any of these is refused when its dbt SQL uses `is_incremental()`. The compiled SQL can keep a delta filter. As `full_refresh`, every run would replace the table with only recent rows. Rewrite it by hand: remove the filter, then use `merge` with a `unique_key` or a `time_interval` model.
 
 :::caution[Incremental models need a full-refresh compile]
-Every manifest incremental model needs a matching full-refresh artifact pair. Plain `dbt compile` can keep a filter against the target table. A custom macro can hide the `is_incremental()` call. A model without a key can also contain a filter. Rocky's first run then fails or omits old rows. Run `dbt compile --full-refresh` before import. Keep its `manifest.json` and `run_results.json` side by side. Remove any effective `full_refresh=false` model config and compile again. That config overrides the command flag.
+Every manifest incremental model needs successful per-model evidence in a matching full-refresh artifact pair and `compiled_code`. Plain or selective compiles can leave unsafe or missing SQL. A custom macro can hide the `is_incremental()` call. Rocky's first run then fails or omits old rows.
+
+Run `dbt compile --full-refresh` without `--select`, or include the model. Keep `manifest.json` and `run_results.json` side by side. Remove any effective `full_refresh=false` model config and compile again. That config overrides the command flag.
 :::
 
-The raw and no-manifest importer still refuses unresolved Jinja that calls `is_incremental()`, rather than deleting bounded logic silently.
+The raw and no-manifest importer refuses every effectively incremental model it resolves from inline, project, or model properties config. It has no compiled SQL or per-model run result.
 
 ### Environment-specific logic
 

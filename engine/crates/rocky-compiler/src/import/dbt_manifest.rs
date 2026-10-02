@@ -6,7 +6,7 @@
 //! Jinja macros, variables, and conditionals already expanded, no regex-based
 //! Jinja parsing is needed.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::BufReader;
 use std::path::Path;
 
@@ -19,6 +19,8 @@ pub struct DbtManifest {
     /// True only when the sibling run_results.json proves this manifest came
     /// from the same dbt compile invocation with --full-refresh.
     pub full_refresh_compiled: bool,
+    /// Model IDs with a successful result in the matching full-refresh compile.
+    pub successfully_compiled_nodes: HashSet<String>,
     pub nodes: HashMap<String, DbtManifestNode>,
     pub sources: HashMap<String, DbtManifestSource>,
     /// Unit-test definitions keyed by `unit_test.<project>.<model>.<name>`.
@@ -278,6 +280,14 @@ struct RawMetadata {
 struct RawRunResults {
     metadata: RawRunMetadata,
     args: RawRunArgs,
+    #[serde(default)]
+    results: Vec<RawRunResult>,
+}
+
+#[derive(Deserialize)]
+struct RawRunResult {
+    unique_id: String,
+    status: String,
 }
 
 #[derive(Deserialize)]
@@ -290,18 +300,30 @@ struct RawRunArgs {
     full_refresh: Option<bool>,
 }
 
-fn has_full_refresh_compile_evidence(manifest_path: &Path, invocation_id: Option<&str>) -> bool {
-    let Some(invocation_id) = invocation_id.filter(|id| !id.is_empty()) else {
-        return false;
-    };
+fn full_refresh_compile_evidence(
+    manifest_path: &Path,
+    invocation_id: Option<&str>,
+) -> Option<HashSet<String>> {
+    let invocation_id = invocation_id.filter(|id| !id.is_empty())?;
     let Ok(file) = std::fs::File::open(manifest_path.with_file_name("run_results.json")) else {
-        return false;
+        return None;
     };
     let Ok(results) = serde_json::from_reader::<_, RawRunResults>(BufReader::new(file)) else {
-        return false;
+        return None;
     };
-    results.metadata.invocation_id.as_deref() == Some(invocation_id)
-        && results.args.full_refresh == Some(true)
+    if results.metadata.invocation_id.as_deref() != Some(invocation_id)
+        || results.args.full_refresh != Some(true)
+    {
+        return None;
+    }
+    Some(
+        results
+            .results
+            .into_iter()
+            .filter(|result| result.status == "success")
+            .map(|result| result.unique_id)
+            .collect(),
+    )
 }
 
 #[derive(Deserialize)]
@@ -445,8 +467,9 @@ pub fn parse_manifest(path: &Path) -> Result<DbtManifest, String> {
     let raw: RawManifest = serde_json::from_reader(reader)
         .map_err(|e| format!("failed to parse {}: {e}", path.display()))?;
 
-    let full_refresh_compiled =
-        has_full_refresh_compile_evidence(path, raw.metadata.invocation_id.as_deref());
+    let evidence = full_refresh_compile_evidence(path, raw.metadata.invocation_id.as_deref());
+    let full_refresh_compiled = evidence.is_some();
+    let successfully_compiled_nodes = evidence.unwrap_or_default();
 
     let metadata = DbtManifestMetadata {
         dbt_schema_version: raw.metadata.dbt_schema_version.unwrap_or_default(),
@@ -500,6 +523,7 @@ pub fn parse_manifest(path: &Path) -> Result<DbtManifest, String> {
     Ok(DbtManifest {
         metadata,
         full_refresh_compiled,
+        successfully_compiled_nodes,
         nodes,
         sources,
         unit_tests,

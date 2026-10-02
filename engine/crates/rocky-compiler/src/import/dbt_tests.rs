@@ -18,6 +18,7 @@ use rocky_core::tests::{CompositeKind, TestDecl, TestSeverity, TestType};
 #[derive(Debug, Clone)]
 pub struct DbtModelYaml {
     pub name: String,
+    pub materialized: Option<String>,
     pub description: Option<String>,
     pub columns: Vec<DbtColumnYaml>,
     /// Model-level (non-column) tests, e.g. `dbt_utils.unique_combination_of_columns`.
@@ -67,6 +68,8 @@ struct RawModelFile {
 #[derive(Deserialize)]
 struct RawModel {
     name: String,
+    #[serde(default)]
+    config: Option<serde_yaml::Value>,
     #[serde(default)]
     description: Option<String>,
     #[serde(default)]
@@ -194,6 +197,13 @@ pub fn parse_model_yaml_content(content: &str) -> Result<Vec<DbtModelYaml>, Stri
 
         models.push(DbtModelYaml {
             name: raw_model.name,
+            materialized: raw_model.config.as_ref().and_then(|config| {
+                config
+                    .as_mapping()?
+                    .get(serde_yaml::Value::String("materialized".to_string()))?
+                    .as_str()
+                    .map(str::to_string)
+            }),
             description: raw_model.description,
             columns,
             tests: model_tests,
@@ -1526,6 +1536,7 @@ models:
     fn test_not_null_to_contract() {
         let model = DbtModelYaml {
             name: "fct_orders".to_string(),
+            materialized: None,
             description: None,
             columns: vec![
                 DbtColumnYaml {
@@ -1553,6 +1564,7 @@ models:
     fn test_unique_to_contract() {
         let model = DbtModelYaml {
             name: "fct_orders".to_string(),
+            materialized: None,
             description: None,
             columns: vec![DbtColumnYaml {
                 name: "order_id".to_string(),
@@ -1581,6 +1593,7 @@ models:
 
         let model = DbtModelYaml {
             name: "fct_orders".to_string(),
+            materialized: None,
             description: None,
             columns: vec![DbtColumnYaml {
                 name: "status".to_string(),
@@ -1622,6 +1635,7 @@ models:
 
         let model = DbtModelYaml {
             name: "fct_orders".to_string(),
+            materialized: None,
             description: None,
             columns: vec![DbtColumnYaml {
                 name: "customer_id".to_string(),
@@ -1657,6 +1671,7 @@ models:
 
         let model = DbtModelYaml {
             name: "fct_orders".to_string(),
+            materialized: None,
             description: None,
             columns: vec![DbtColumnYaml {
                 name: "amount".to_string(),
@@ -1683,6 +1698,7 @@ models:
     fn test_unknown_test_skipped() {
         let model = DbtModelYaml {
             name: "model".to_string(),
+            materialized: None,
             description: None,
             columns: vec![DbtColumnYaml {
                 name: "col".to_string(),
@@ -1707,6 +1723,7 @@ models:
 
         let model = DbtModelYaml {
             name: "users".to_string(),
+            materialized: None,
             description: None,
             columns: vec![
                 DbtColumnYaml {
@@ -1847,6 +1864,7 @@ models:
     fn test_decl_simple_unique_and_not_null() {
         let model = DbtModelYaml {
             name: "fct_orders".to_string(),
+            materialized: None,
             description: None,
             columns: vec![DbtColumnYaml {
                 name: "order_id".to_string(),
@@ -1887,6 +1905,7 @@ models:
         );
         let model = DbtModelYaml {
             name: "users".to_string(),
+            materialized: None,
             description: None,
             columns: vec![DbtColumnYaml {
                 name: "status".to_string(),
@@ -1923,6 +1942,7 @@ models:
         );
         let model = DbtModelYaml {
             name: "fct_orders".to_string(),
+            materialized: None,
             description: None,
             columns: vec![DbtColumnYaml {
                 name: "customer_id".to_string(),
@@ -1975,6 +1995,7 @@ models:
         );
         let model = DbtModelYaml {
             name: "fct".to_string(),
+            materialized: None,
             description: None,
             columns: vec![DbtColumnYaml {
                 name: "external_id".to_string(),
@@ -2003,6 +2024,7 @@ models:
         // mapping (configured). Both must surface as UnsupportedTest.
         let model = DbtModelYaml {
             name: "model".to_string(),
+            materialized: None,
             description: None,
             columns: vec![DbtColumnYaml {
                 name: "amount".to_string(),
@@ -2044,6 +2066,7 @@ models:
         config.insert("values".to_string(), serde_yaml::Value::Sequence(vec![]));
         let model = DbtModelYaml {
             name: "m".to_string(),
+            materialized: None,
             description: None,
             columns: vec![DbtColumnYaml {
                 name: "c".to_string(),
@@ -2071,6 +2094,7 @@ models:
         );
         let model = DbtModelYaml {
             name: "users".to_string(),
+            materialized: None,
             description: None,
             columns: vec![
                 DbtColumnYaml {

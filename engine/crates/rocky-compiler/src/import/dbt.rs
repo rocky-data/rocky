@@ -39,6 +39,11 @@ without either referencing a missing target during bootstrap or deleting bounded
 logic. Run `dbt compile --full-refresh` and import its compiled SQL from manifest.json with \
 the matching run_results.json, or rewrite the model with a Rocky-supported strategy";
 
+const RAW_INCREMENTAL_EVIDENCE_REFUSED: &str = "is an effectively incremental dbt model. \
+The raw importer has no compiled SQL or per-model run_results.json evidence and cannot prove \
+the first run contains all rows. Run `dbt compile --full-refresh`, then import manifest.json \
+with its matching run_results.json";
+
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
@@ -390,6 +395,7 @@ pub fn import_from_manifest(
             default_target,
             microbatch_mode,
             manifest.full_refresh_compiled,
+            &manifest.successfully_compiled_nodes,
             &model_relations,
             &mut result,
         );
@@ -988,9 +994,30 @@ fn import_manifest_node(
     default_target: &TargetConfig,
     microbatch_mode: MicrobatchMode,
     manifest_full_refresh_compiled: bool,
+    successfully_compiled_nodes: &std::collections::HashSet<String>,
     model_relations: &HashMap<String, UpstreamModel>,
     result: &mut ImportResult,
 ) {
+    if node.config.materialized == "incremental" {
+        if node.config.full_refresh == Some(false) {
+            result.failed.push(ImportFailure {
+                name: node.name.clone(),
+                reason: INCREMENTAL_FULL_REFRESH_DISABLED.to_string(),
+            });
+            return;
+        }
+        if !manifest_full_refresh_compiled
+            || !successfully_compiled_nodes.contains(&node.unique_id)
+            || node.compiled_code.is_none()
+        {
+            result.failed.push(ImportFailure {
+                name: node.name.clone(),
+                reason: INCREMENTAL_COMPILE_EVIDENCE_REFUSED.to_string(),
+            });
+            return;
+        }
+    }
+
     // Resolve the model's output coordinates up front so the raw-code fallback
     // (for {{ this }}) and the emitted target use the same values. dbt `alias`
     // overrides the relation name; dropping it silently lands the data in a
@@ -1035,14 +1062,6 @@ fn import_manifest_node(
         structured,
     } = map_manifest_strategy(&node.config, &node.name, microbatch_mode);
 
-    if node.config.materialized == "incremental" && node.config.full_refresh == Some(false) {
-        result.failed.push(ImportFailure {
-            name: node.name.clone(),
-            reason: INCREMENTAL_FULL_REFRESH_DISABLED.to_string(),
-        });
-        return;
-    }
-
     // #1990: an incremental dbt model with no Rocky append equivalent falls
     // back to `full_refresh`. That is safe only when the SQL has no dbt
     // incremental branch. dbt compiles `is_incremental()` as true against an
@@ -1060,17 +1079,6 @@ fn import_manifest_node(
         result.failed.push(ImportFailure {
             name: node.name.clone(),
             reason: INCREMENTAL_FALLBACK_REFUSED.to_string(),
-        });
-        return;
-    }
-
-    // Every incremental strategy creates its first Rocky target from this
-    // compiled SQL. A raw-code scan cannot see indirect macro branches, and
-    // neither a unique key nor a strategy makes a delta-only bootstrap safe.
-    if node.config.materialized == "incremental" && !manifest_full_refresh_compiled {
-        result.failed.push(ImportFailure {
-            name: node.name.clone(),
-            reason: INCREMENTAL_COMPILE_EVIDENCE_REFUSED.to_string(),
         });
         return;
     }
@@ -1420,15 +1428,17 @@ const INCREMENTAL_FALLBACK_REFUSED: &str = "is an incremental dbt model with no 
      it by hand: remove the `is_incremental()` filter, then use merge with a unique_key or a \
      time_interval model with @start_date/@end_date";
 
-const INCREMENTAL_COMPILE_EVIDENCE_REFUSED: &str = "is a dbt incremental model without a \
-     matching `run_results.json` with `args.full_refresh = true`. Its compiled SQL may \
-     keep a delta filter and omit older rows on Rocky's first run. Run \
-     `dbt compile --full-refresh` and import the resulting manifest and run_results.json together";
+const INCREMENTAL_COMPILE_EVIDENCE_REFUSED: &str = "is a dbt incremental model without successful \
+     per-model evidence in a matching full-refresh `run_results.json` and `compiled_code` in \
+     `manifest.json`. Its SQL may keep a delta filter and omit older rows on Rocky's first run. \
+     Run `dbt compile --full-refresh` without `--select` (or include this model), then import \
+     the resulting manifest.json and run_results.json together";
 
 const INCREMENTAL_FULL_REFRESH_DISABLED: &str = "is a dbt incremental model with effective \
      `full_refresh=false` config. That config overrides `dbt compile --full-refresh`, so \
      compiled SQL may still keep a delta filter. Remove the model's `full_refresh=false` \
-     config, then run `dbt compile --full-refresh` and import the matching artifact pair";
+     config, then run `dbt compile --full-refresh` without `--select` (or include this model) \
+     and import the matching artifact pair";
 
 /// An explicit `incremental_strategy` wins over `unique_key` in
 /// `map_incremental_strategy`, so adding a key alone does not change an
@@ -1946,13 +1956,22 @@ pub fn import_dbt_project(
         ));
     }
 
+    let mut model_yamls = HashMap::new();
+    for dir in &model_dirs {
+        model_yamls.extend(super::dbt_tests::parse_model_yamls(dir)?);
+    }
+    let settings = RawModelSettings {
+        project: &project_config,
+        model_yamls: &model_yamls,
+    };
+
     for dir in &model_dirs {
         if dir.exists() {
             visit_dbt_models(
                 dir,
                 dir,
                 default_target,
-                &project_config,
+                &settings,
                 &source_map,
                 &mut result,
                 0,
@@ -1982,11 +2001,16 @@ pub fn import_dbt_project(
     Ok(result)
 }
 
+struct RawModelSettings<'a> {
+    project: &'a Option<DbtProjectConfig>,
+    model_yamls: &'a HashMap<String, super::dbt_tests::DbtModelYaml>,
+}
+
 fn visit_dbt_models(
     dir: &Path,
     models_root: &Path,
     default_target: &TargetConfig,
-    project_config: &Option<DbtProjectConfig>,
+    settings: &RawModelSettings<'_>,
     source_map: &HashMap<(String, String), dbt_sources::RockySourceMapping>,
     result: &mut ImportResult,
     depth: usize,
@@ -2012,7 +2036,7 @@ fn visit_dbt_models(
                 &path,
                 models_root,
                 default_target,
-                project_config,
+                settings,
                 source_map,
                 result,
                 depth + 1,
@@ -2031,7 +2055,11 @@ fn visit_dbt_models(
                 &name,
                 rel_path,
                 default_target,
-                project_config,
+                settings.project,
+                settings
+                    .model_yamls
+                    .get(&name)
+                    .and_then(|model| model.materialized.as_deref()),
                 source_map,
             ) {
                 Ok((model, warnings)) => {
@@ -2054,9 +2082,24 @@ fn import_single_model(
     rel_path: &Path,
     default_target: &TargetConfig,
     project_config: &Option<DbtProjectConfig>,
+    yaml_materialization: Option<&str>,
     source_map: &HashMap<(String, String), dbt_sources::RockySourceMapping>,
 ) -> Result<(ImportedModel, Vec<ImportWarning>), String> {
     let content = std::fs::read_to_string(path).map_err(|e| format!("failed to read: {e}"))?;
+
+    let resolved_project_config = project_config
+        .as_ref()
+        .map(|project| dbt_project::resolve_model_config(project, rel_path));
+    let effective_materialization = inline_dbt_materialization(&content)
+        .or_else(|| yaml_materialization.map(str::to_string))
+        .or_else(|| {
+            resolved_project_config
+                .as_ref()
+                .map(|config| config.materialized.clone())
+        });
+    if effective_materialization.as_deref() == Some("incremental") {
+        return Err(RAW_INCREMENTAL_EVIDENCE_REFUSED.to_string());
+    }
 
     let mut warnings = Vec::new();
 
@@ -2129,23 +2172,12 @@ fn import_single_model(
     }));
 
     // Apply project config inheritance
-    let (resolved_schema, resolved_tags) = if let Some(proj) = project_config {
-        let resolved = dbt_project::resolve_model_config(proj, rel_path);
-        // Project-level materialization: only override if no model-level config
-        if !content_processed.contains("config(") && matches!(strategy, StrategyConfig::FullRefresh)
+    let (resolved_schema, resolved_tags) = if let Some(resolved) = resolved_project_config {
+        // Apply inherited materialization only when inline config does not set it.
+        if inline_dbt_materialization(&content_processed).is_none()
+            && matches!(strategy, StrategyConfig::FullRefresh)
         {
             match resolved.materialized.as_str() {
-                "incremental" => {
-                    // Stays `full_refresh` (#1990): see `NO_APPEND_EQUIVALENT`.
-                    warnings.push(ImportWarning {
-                        model: name.to_string(),
-                        category: WarningCategory::UnsupportedMaterialization,
-                        message: format!(
-                            "project config materialized='incremental' mapped to full_refresh. {NO_APPEND_EQUIVALENT}"
-                        ),
-                        suggestion: Some(APPEND_SUGGESTION.to_string()),
-                    });
-                }
                 "view" => {
                     strategy = StrategyConfig::View;
                 }
@@ -2463,6 +2495,13 @@ fn extract_dbt_alias(content: &str) -> Option<String> {
     let config_re = Regex::new(r"\{\{\s*config\s*\(([^)]*)\)\s*\}\}").ok()?;
     let caps = config_re.captures(content)?;
     single_string_value(&caps[1], "alias")
+}
+
+fn inline_dbt_materialization(content: &str) -> Option<String> {
+    let config_re = Regex::new(r"(?s)\{\{\s*config\s*\((.*?)\)\s*\}\}").ok()?;
+    config_re
+        .captures_iter(content)
+        .find_map(|captures| single_string_value(&captures[1], "materialized"))
 }
 
 fn extract_dbt_config(content: &str) -> (StrategyConfig, Vec<String>) {
@@ -3307,9 +3346,12 @@ FROM {{ ref('stg_events') }}
         assert!(result.imported.is_empty());
         assert_eq!(result.failed.len(), 1);
         assert_eq!(result.failed[0].name, "fct_events");
-        assert!(result.failed[0].reason.contains("is_incremental()"));
-        assert!(result.failed[0].reason.contains("unresolved"));
-        assert!(result.failed[0].reason.contains("compiled SQL"));
+        assert!(result.failed[0].reason.contains("effectively incremental"));
+        assert!(
+            result.failed[0]
+                .reason
+                .contains("dbt compile --full-refresh")
+        );
     }
 
     #[test]
@@ -3340,7 +3382,11 @@ FROM {{ ref('stg_events') }}
         assert!(result.imported.is_empty());
         assert_eq!(result.failed.len(), 1);
         assert_eq!(result.failed[0].name, "fct_events");
-        assert!(result.failed[0].reason.contains("is_incremental()"));
+        assert!(
+            result.failed[0]
+                .reason
+                .contains("dbt compile --full-refresh")
+        );
     }
 
     #[test]
@@ -3411,9 +3457,16 @@ FROM {{ ref('stg_events') }}
         let mut manifest_json = manifest_json.clone();
         manifest_json["metadata"]["invocation_id"] = serde_json::json!("strategy-test");
         std::fs::write(&path, manifest_json.to_string()).unwrap();
+        let results: Vec<_> = manifest_json["nodes"]
+            .as_object()
+            .unwrap()
+            .values()
+            .filter_map(|node| node["unique_id"].as_str())
+            .map(|id| serde_json::json!({"unique_id": id, "status": "success"}))
+            .collect();
         std::fs::write(
             dir.path().join("run_results.json"),
-            r#"{"metadata":{"invocation_id":"strategy-test"},"args":{"full_refresh":true}}"#,
+            serde_json::json!({"metadata":{"invocation_id":"strategy-test"},"args":{"full_refresh":true},"results":results}).to_string(),
         )
         .unwrap();
         let manifest = dbt_manifest::parse_manifest(&path).unwrap();
@@ -3799,8 +3852,12 @@ FROM {{ ref('stg_events') }}
         assert!(result.imported.is_empty());
         assert_eq!(result.failed.len(), 1);
         assert_eq!(result.failed[0].name, "events");
-        assert!(result.failed[0].reason.contains("is_incremental()"));
-        assert!(result.failed[0].reason.contains("unresolved"));
+        assert!(result.failed[0].reason.contains("compiled_code"));
+        assert!(
+            result.failed[0]
+                .reason
+                .contains("dbt compile --full-refresh")
+        );
     }
 
     #[test]
@@ -3821,7 +3878,7 @@ FROM {{ ref('stg_events') }}
         assert!(result.imported.is_empty());
         assert_eq!(result.failed.len(), 1);
         assert_eq!(result.failed[0].name, "events");
-        assert!(result.failed[0].reason.contains("is_incremental()"));
+        assert!(result.failed[0].reason.contains("compiled_code"));
     }
 
     #[test]
@@ -4073,7 +4130,7 @@ FROM {{ ref('stg_events') }}
             },
             "sources": {}
         });
-        let result = import_from_manifest_json(&manifest);
+        let result = import_from_manifest_json_with_evidence(&manifest, MicrobatchMode::Merge);
         assert!(
             result.imported.iter().all(|m| m.name != "events_append"),
             "a delta-filtered model must not be imported as full_refresh: {:?}",
@@ -4203,6 +4260,194 @@ FROM {{ ref('stg_events') }}
             if name == "orders_pinned" {
                 assert!(failure.reason.contains("full_refresh=false"));
             }
+        }
+    }
+
+    #[test]
+    fn selective_full_refresh_compile_imports_only_successful_compiled_node() {
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/dbt_incremental_compile/select_orders_inc");
+        let target = TargetConfig {
+            catalog: "w".to_string(),
+            schema: "s".to_string(),
+            table: String::new(),
+        };
+        let manifest = dbt_manifest::parse_manifest(&fixtures.join("manifest.json")).unwrap();
+        let result = import_from_manifest(&manifest, &target, false, MicrobatchMode::Merge);
+        assert_eq!(
+            result
+                .imported
+                .iter()
+                .map(|model| model.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["orders_inc"]
+        );
+        assert!(!result.imported[0].sql.contains("where updated_at >"));
+        assert_eq!(result.failed.len(), 3, "{:?}", result.failed);
+        for name in ["orders_macro", "orders_nokey", "orders_pinned"] {
+            let failure = result
+                .failed
+                .iter()
+                .find(|failure| failure.name == name)
+                .unwrap();
+            if name == "orders_pinned" {
+                assert!(failure.reason.contains("full_refresh=false"));
+            } else {
+                assert!(failure.reason.contains("dbt compile --full-refresh"));
+                assert!(failure.reason.contains("--select"));
+            }
+        }
+    }
+
+    #[test]
+    fn raw_import_refuses_inline_and_inherited_incremental_models() {
+        let target = TargetConfig {
+            catalog: "w".to_string(),
+            schema: "s".to_string(),
+            table: String::new(),
+        };
+        for (project_config, model_path, model_config) in [
+            (
+                "    +materialized: view\n",
+                "models/orders.sql",
+                "{{ config(materialized='incremental') }}",
+            ),
+            (
+                "    +materialized: incremental\n",
+                "models/orders.sql",
+                "{{ config(tags=['daily']) }}",
+            ),
+            (
+                "    +materialized: view\n    marts:\n      +materialized: incremental\n",
+                "models/marts/orders.sql",
+                "",
+            ),
+            (
+                "    +materialized: view\n    marts:\n      +materialized: view\n      orders:\n        +materialized: incremental\n",
+                "models/marts/orders.sql",
+                "",
+            ),
+        ] {
+            let dir = tempfile::TempDir::new().unwrap();
+            std::fs::create_dir_all(dir.path().join(model_path).parent().unwrap()).unwrap();
+            std::fs::write(
+                dir.path().join("dbt_project.yml"),
+                format!("name: p\nmodels:\n  p:\n{project_config}"),
+            )
+            .unwrap();
+            std::fs::write(
+                dir.path().join(model_path),
+                format!(
+                    "{model_config}\nselect * from orders_source\n{{% if delta_mode() %}}\nwhere updated_at > '2026-01-01'\n{{% endif %}}"
+                ),
+            )
+            .unwrap();
+            let result = import_dbt_project(dir.path(), &target).unwrap();
+            assert!(result.imported.is_empty());
+            assert_eq!(result.failed.len(), 1, "{:?}", result.failed);
+            assert_eq!(result.failed[0].name, "orders");
+            assert!(result.failed[0].reason.contains("manifest.json"));
+            assert!(
+                result.failed[0]
+                    .reason
+                    .contains("dbt compile --full-refresh")
+            );
+        }
+
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir(dir.path().join("models")).unwrap();
+        std::fs::write(
+            dir.path().join("dbt_project.yml"),
+            "name: p\nmodels:\n  p:\n    +materialized: incremental\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("models/orders.sql"),
+            "{{ config(materialized='table') }}\nselect 1 as id",
+        )
+        .unwrap();
+        let result = import_dbt_project(dir.path(), &target).unwrap();
+        assert_eq!(result.imported.len(), 1);
+        assert!(result.failed.is_empty());
+
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir(dir.path().join("models")).unwrap();
+        std::fs::write(
+            dir.path().join("models/properties.yml"),
+            "models:\n  - name: orders\n    config:\n      materialized: incremental\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("models/orders.sql"),
+            "select * from orders_source\n{% if delta_mode() %}\nwhere updated_at > '2026-01-01'\n{% endif %}",
+        )
+        .unwrap();
+        let result = import_dbt_project(dir.path(), &target).unwrap();
+        assert!(result.imported.is_empty());
+        assert_eq!(result.failed.len(), 1);
+        assert!(
+            result.failed[0]
+                .reason
+                .contains("dbt compile --full-refresh")
+        );
+
+        std::fs::write(
+            dir.path().join("models/orders.sql"),
+            "{{ config(materialized='table') }}\nselect 1 as id",
+        )
+        .unwrap();
+        let result = import_dbt_project(dir.path(), &target).unwrap();
+        assert_eq!(result.imported.len(), 1);
+        assert!(result.failed.is_empty());
+    }
+
+    #[test]
+    fn incremental_requires_both_success_result_and_compiled_code() {
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/dbt_incremental_compile/select_orders_inc");
+        let dir = tempfile::TempDir::new().unwrap();
+        let manifest_path = dir.path().join("manifest.json");
+        let results_path = dir.path().join("run_results.json");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(fixtures.join("manifest.json")).unwrap())
+                .unwrap();
+        let results: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(fixtures.join("run_results.json")).unwrap())
+                .unwrap();
+        let target = TargetConfig {
+            catalog: "w".to_string(),
+            schema: "s".to_string(),
+            table: String::new(),
+        };
+        for (manifest_value, results_value) in [
+            (manifest.clone(), {
+                let mut value = results.clone();
+                value["results"][0]["status"] = serde_json::json!("error");
+                value
+            }),
+            (
+                {
+                    let mut value = manifest.clone();
+                    value["nodes"]["model.inc_probe.orders_inc"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("compiled_code");
+                    value
+                },
+                results.clone(),
+            ),
+        ] {
+            std::fs::write(&manifest_path, manifest_value.to_string()).unwrap();
+            std::fs::write(&results_path, results_value.to_string()).unwrap();
+            let parsed = dbt_manifest::parse_manifest(&manifest_path).unwrap();
+            let imported = import_from_manifest(&parsed, &target, false, MicrobatchMode::Merge);
+            assert!(imported.imported.is_empty());
+            let failure = imported
+                .failed
+                .iter()
+                .find(|f| f.name == "orders_inc")
+                .unwrap();
+            assert!(failure.reason.contains("dbt compile --full-refresh"));
         }
     }
 

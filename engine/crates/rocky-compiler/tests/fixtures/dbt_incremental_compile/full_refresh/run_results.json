@@ -8,5 +8,23 @@
     "which": "compile",
     "invocation_command": "dbt compile --full-refresh --profiles-dir . -q",
     "full_refresh": true
-  }
+  },
+  "results": [
+    {
+      "unique_id": "model.inc_probe.orders_inc",
+      "status": "success"
+    },
+    {
+      "unique_id": "model.inc_probe.orders_pinned",
+      "status": "success"
+    },
+    {
+      "unique_id": "model.inc_probe.orders_macro",
+      "status": "success"
+    },
+    {
+      "unique_id": "model.inc_probe.orders_nokey",
+      "status": "success"
+    }
+  ]
 }
