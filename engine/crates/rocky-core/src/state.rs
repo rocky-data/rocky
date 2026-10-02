@@ -4163,10 +4163,10 @@ impl StateStore {
     /// A run recorded under another pipeline name is returned when it used
     /// the same target endpoint and every one of its recovery targets is in
     /// `targets` (full `catalog.schema.table` names), so renaming a pipeline
-    /// cannot hide a committed INSERT. Requiring every target means the
-    /// caller checks each recorded contract against the current plan; a
-    /// partial overlap would reconcile unplanned tables under a contract
-    /// nothing validates.
+    /// cannot hide a committed INSERT. Requiring every target keeps the
+    /// caller from reconciling tables this run does not plan; the caller
+    /// checks a recorded contract when its target is incremental or a
+    /// replacement now.
     ///
     /// Headers without recovery descriptors (written before descriptors
     /// existed) are never returned: they carry no source or timestamp
