@@ -4857,6 +4857,29 @@ mod tests {
         assert_eq!(err.code, "plan_not_reviewable");
     }
 
+    /// The route's core must review an AI plan even when the fixture has no
+    /// model sources, and report the conditional DROP set explicitly.
+    #[tokio::test]
+    async fn review_diff_core_accepts_an_empty_model_tree() -> anyhow::Result<()> {
+        use crate::plan_store::{PlanKind, write_plan};
+
+        let dir = tempfile::tempdir()?;
+        let (root, config, _, _) = review_fixture(dir.path());
+        let plan_id = write_plan(
+            &root,
+            PlanKind::AiAuthored,
+            &serde_json::json!({ "models": ["orders"] }),
+        )?;
+        let review =
+            crate::commands::compute_review(&root, &config, &plan_id, "HEAD", false).await?;
+        assert!(!review.approved);
+        assert_eq!(
+            serde_json::to_value(&review)?["conditional_drops"],
+            serde_json::json!([])
+        );
+        Ok(())
+    }
+
     /// The review diff refuses the same two shapes the status route does, and
     /// a 404 must not create the plans directory — `read_plan` would.
     #[tokio::test]
