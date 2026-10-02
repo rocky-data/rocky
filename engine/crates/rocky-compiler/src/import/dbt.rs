@@ -8,8 +8,8 @@
 //! - `{{ source('source_name', 'table_name') }}` -> fully qualified ref
 //! - `{{ config(materialized='incremental', unique_key='id') }}` -> ModelConfig
 //! - `{{ this }}` -> target table ref
-//! - Raw Jinja that invokes `is_incremental()` -> refused because dbt's
-//!   first-run/subsequent-run distinction cannot be preserved
+//! - Raw Jinja that invokes `is_incremental()` -> refused unless a keyed
+//!   manifest model has a matching full-refresh compile artifact pair
 //!
 //! **Import paths:**
 //! - **Manifest (preferred):** uses `compiled_code` from `target/manifest.json`
@@ -36,9 +36,8 @@ use super::dbt_sources;
 const RAW_INCREMENTAL_ERROR: &str = "contains an unresolved reference to dbt's `is_incremental()` macro; \
 the raw SQL importer cannot preserve dbt's false-on-bootstrap, true-on-existing-target semantics \
 without either referencing a missing target during bootstrap or deleting bounded incremental \
-logic. Compile dbt in an incremental context, verify the compiled SQL retains its intended \
-predicate and is valid for Rocky's initial target state, and import that manifest; otherwise, \
-rewrite the model with a Rocky-supported strategy";
+logic. Run `dbt compile --full-refresh` and import its compiled SQL from manifest.json with \
+the matching run_results.json, or rewrite the model with a Rocky-supported strategy";
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -390,6 +389,7 @@ pub fn import_from_manifest(
             node,
             default_target,
             microbatch_mode,
+            manifest.full_refresh_compiled,
             &model_relations,
             &mut result,
         );
@@ -405,7 +405,7 @@ pub fn import_from_manifest(
                  import likely looks complete but is not faithful."
             ),
             suggestion: Some(
-                "regenerate the manifest with `dbt compile` (including any required --vars) and re-import".to_string(),
+                "regenerate the manifest with `dbt compile --full-refresh` (including any required --vars) and re-import".to_string(),
             ),
         });
     }
@@ -987,6 +987,7 @@ fn import_manifest_node(
     node: &DbtManifestNode,
     default_target: &TargetConfig,
     microbatch_mode: MicrobatchMode,
+    manifest_full_refresh_compiled: bool,
     model_relations: &HashMap<String, UpstreamModel>,
     result: &mut ImportResult,
 ) {
@@ -1017,7 +1018,9 @@ fn import_manifest_node(
                 category: WarningCategory::JinjaControlFlow,
                 message: "no compiled_code in manifest; using raw_code (may contain Jinja)"
                     .to_string(),
-                suggestion: Some("run `dbt compile` to generate compiled SQL".to_string()),
+                suggestion: Some(
+                    "run `dbt compile --full-refresh` to generate compiled SQL".to_string(),
+                ),
             });
             convert_jinja_to_sql(&node.raw_code, &this_ref)
         }
@@ -1049,6 +1052,20 @@ fn import_manifest_node(
         result.failed.push(ImportFailure {
             name: node.name.clone(),
             reason: INCREMENTAL_FALLBACK_REFUSED.to_string(),
+        });
+        return;
+    }
+
+    // A keyed model may map to merge or delete_insert, but its first Rocky
+    // run still creates the target from this compiled SQL. Only the matching
+    // full-refresh dbt invocation proves that SQL excludes the delta branch.
+    if node.config.unique_key.is_some()
+        && contains_unresolved_is_incremental(&node.raw_code)
+        && !manifest_full_refresh_compiled
+    {
+        result.failed.push(ImportFailure {
+            name: node.name.clone(),
+            reason: KEYED_INCREMENTAL_REFUSED.to_string(),
         });
         return;
     }
@@ -1397,6 +1414,11 @@ const INCREMENTAL_FALLBACK_REFUSED: &str = "is an incremental dbt model with no 
      `full_refresh`, it would replace the table with only the recent rows on every run. Rewrite \
      it by hand: remove the `is_incremental()` filter, then use merge with a unique_key or a \
      time_interval model with @start_date/@end_date";
+
+const KEYED_INCREMENTAL_REFUSED: &str = "uses `is_incremental()` in raw SQL, but the manifest \
+     has no matching `run_results.json` with `args.full_refresh = true`. Its compiled SQL may \
+     keep a delta filter, which would omit older rows on Rocky's first run. Run \
+     `dbt compile --full-refresh` and import the resulting manifest and run_results.json together";
 
 /// An explicit `incremental_strategy` wins over `unique_key` in
 /// `map_incremental_strategy`, so adding a key alone does not change an
@@ -4063,12 +4085,9 @@ FROM {{ ref('stg_events') }}
         );
     }
 
-    /// The boundary of #2058's refusal: the same model WITH a unique_key is
-    /// still imported as merge. This PINS CURRENT BEHAVIOUR, NOT A CONTRACT:
-    /// merge's first run builds the table from the compiled delta SQL, so it
-    /// loads only recent rows (#2059). When #2059 is ruled, this test changes.
+    /// A key does not make a delta-filtered compiled body safe on first run.
     #[test]
-    fn test_append_model_using_is_incremental_with_unique_key_still_maps_to_merge() {
+    fn test_keyed_incremental_without_compile_evidence_is_refused() {
         let manifest = serde_json::json!({
             "metadata": { "project_name": "p" },
             "nodes": {
@@ -4086,16 +4105,102 @@ FROM {{ ref('stg_events') }}
             "sources": {}
         });
         let result = import_from_manifest_json(&manifest);
-        let model = result
+        assert!(result.imported.iter().all(|m| m.name != "events_keyed"));
+        let failure = result
+            .failed
+            .iter()
+            .find(|f| f.name == "events_keyed")
+            .expect("a keyed model without matching evidence is refused");
+        assert!(
+            failure.reason.contains("dbt compile --full-refresh"),
+            "refusal names the remedy: {}",
+            failure.reason
+        );
+    }
+
+    #[test]
+    fn real_dbt_compile_pair_guards_keyed_incremental_import() {
+        let fixtures =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/dbt_incremental_compile");
+        let target = TargetConfig {
+            catalog: "w".to_string(),
+            schema: "s".to_string(),
+            table: String::new(),
+        };
+
+        let full = dbt_manifest::parse_manifest(&fixtures.join("full_refresh/manifest.json"))
+            .expect("real full-refresh manifest parses");
+        let accepted = import_from_manifest(&full, &target, false, MicrobatchMode::Merge);
+        assert!(accepted.failed.is_empty(), "{:?}", accepted.failed);
+        let model = accepted
             .imported
             .iter()
-            .find(|m| m.name == "events_keyed")
-            .expect("a keyed incremental model is imported");
+            .find(|m| m.name == "orders_inc")
+            .unwrap();
+        assert!(matches!(
+            model.config.strategy,
+            StrategyConfig::Merge { .. }
+        ));
+        assert!(!model.sql.contains("where updated_at >"), "{}", model.sql);
+
+        let plain = dbt_manifest::parse_manifest(&fixtures.join("plain/manifest.json"))
+            .expect("real plain manifest parses");
+        let refused = import_from_manifest(&plain, &target, false, MicrobatchMode::Merge);
+        assert!(refused.imported.is_empty());
+        assert_eq!(refused.failed.len(), 1);
+        assert_eq!(refused.failed[0].name, "orders_inc");
         assert!(
-            matches!(model.config.strategy, StrategyConfig::Merge { .. }),
-            "expected Merge, got {:?}",
-            model.config.strategy
+            refused.failed[0]
+                .reason
+                .contains("dbt compile --full-refresh")
         );
+    }
+
+    #[test]
+    fn keyed_incremental_rejects_missing_mismatched_and_false_evidence() {
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/dbt_incremental_compile/full_refresh");
+        let dir = tempfile::TempDir::new().unwrap();
+        let manifest_path = dir.path().join("manifest.json");
+        let results_path = dir.path().join("run_results.json");
+        std::fs::copy(fixtures.join("manifest.json"), &manifest_path).unwrap();
+        let valid: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(fixtures.join("run_results.json")).unwrap())
+                .unwrap();
+        let target = TargetConfig {
+            catalog: "w".to_string(),
+            schema: "s".to_string(),
+            table: String::new(),
+        };
+
+        for evidence in [
+            None,
+            Some(
+                serde_json::json!({"metadata": {"invocation_id": "other"}, "args": {"full_refresh": true}}),
+            ),
+            Some(
+                serde_json::json!({"metadata": {"invocation_id": valid["metadata"]["invocation_id"]}, "args": {"full_refresh": false}}),
+            ),
+            Some(
+                serde_json::json!({"metadata": {"invocation_id": valid["metadata"]["invocation_id"]}, "args": {}}),
+            ),
+            Some(serde_json::json!({"broken": true})),
+        ] {
+            if let Some(evidence) = evidence {
+                std::fs::write(&results_path, evidence.to_string()).unwrap();
+            } else if results_path.exists() {
+                std::fs::remove_file(&results_path).unwrap();
+            }
+            let manifest = dbt_manifest::parse_manifest(&manifest_path).unwrap();
+            let result = import_from_manifest(&manifest, &target, false, MicrobatchMode::Merge);
+            assert!(result.imported.is_empty());
+            assert_eq!(result.failed.len(), 1);
+            assert!(
+                result.failed[0]
+                    .reason
+                    .contains("dbt compile --full-refresh")
+            );
+        }
     }
 
     #[test]

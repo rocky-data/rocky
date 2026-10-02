@@ -1,0 +1,11 @@
+{
+  "metadata": {
+    "dbt_schema_version": "https://schemas.getdbt.com/dbt/run-results/v6.json",
+    "dbt_version": "1.12.5",
+    "invocation_id": "366dbb03-8077-4305-91fe-e087af5e9547"
+  },
+  "args": {
+    "which": "compile",
+    "invocation_command": "dbt compile --profiles-dir . -q"
+  }
+}
