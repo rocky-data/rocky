@@ -4646,11 +4646,17 @@ pub async fn run_with_explicit_contracts(
         let mut collision_check_pairs: Vec<(String, String)> = Vec::new();
         let mut shadow_preflight_objects = Vec::new();
         let mut all_production_targets = Vec::new();
+        let default_catalog = warehouse_adapter.default_catalog().unwrap_or_default();
         for conn in &connectors {
             let Ok(parsed) = pattern.parse(&conn.schema) else {
                 continue;
             };
             let target_catalog = parsed.resolve_template(target_catalog_template, target_sep);
+            let target_catalog = if target_catalog.is_empty() {
+                default_catalog.clone()
+            } else {
+                target_catalog
+            };
             let target_schema = parsed.resolve_template(target_schema_template, target_sep);
             if shadow_config.is_some() {
                 all_production_targets.extend(conn.tables.iter().map(|table| rocky_ir::TargetRef {
@@ -4781,7 +4787,6 @@ pub async fn run_with_explicit_contracts(
                     },
                 )
                 .context("cannot preflight mixed shadow model targets")?;
-                let default_catalog = warehouse_adapter.default_catalog().unwrap_or_default();
                 let resolved = |target: &rocky_core::models::TargetConfig| rocky_ir::TargetRef {
                     catalog: if target.catalog.is_empty() {
                         default_catalog.clone()
@@ -20482,6 +20487,78 @@ auto_create_schemas = true
         );
         assert!(!target_table_exists(&db_path, "staging__acme", "orders_rocky_shadow").await);
         assert!(!target_table_exists(&db_path, "staging__acme", "orders").await);
+    }
+
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn mixed_shadow_resolves_empty_replication_catalog_before_any_ddl() {
+        let dir = tempfile::tempdir().unwrap();
+        let (config_path, state_path, db_path) =
+            write_two_pipeline_project(dir.path(), "staging__{source}", "other__{source}").await;
+        let config = std::fs::read_to_string(&config_path).unwrap();
+        std::fs::write(
+            &config_path,
+            config.replace(
+                "catalog_template = \"warehouse\"",
+                "catalog_template = \"\"",
+            ),
+        )
+        .unwrap();
+        let models_dir = dir.path().join("models");
+        std::fs::create_dir(&models_dir).unwrap();
+        write_model_with_target(
+            &models_dir,
+            "model_target",
+            "SELECT 1 AS id",
+            "staging__acme",
+            "orders_rocky_shadow",
+        );
+        let error = super::run(
+            &config_path,
+            Arc::new(rocky_core::config::load_rocky_config_fingerprinted(&config_path).unwrap()),
+            None,
+            Some("p1"),
+            &state_path,
+            None,
+            true,
+            Some(&models_dir),
+            true,
+            None,
+            false,
+            Some(&rocky_core::shadow::ShadowConfig::default()),
+            &PartitionRunOptions::default(),
+            None,
+            None,
+            None,
+            None,
+            &DeferOptions::default(),
+            &SkipRunOptions::default(),
+            &rocky_core::run_vars::RunVars::new(),
+            None,
+            None,
+            false,
+            None,
+        )
+        .await
+        .expect_err("catalogless replication shadow aliases the model's production target");
+        assert!(
+            format!("{error:#}").contains("collides with the production target"),
+            "{error:#}"
+        );
+        assert!(!target_table_exists(&db_path, "staging__acme", "orders_rocky_shadow").await);
+        assert!(!target_table_exists(&db_path, "staging__acme", "orders").await);
+        let warehouse = rocky_duckdb::adapter::DuckDbWarehouseAdapter::open(&db_path).unwrap();
+        use rocky_core::traits::WarehouseAdapter;
+        let schemas = warehouse
+            .execute_query(
+                "SELECT schema_name FROM information_schema.schemata WHERE schema_name = 'staging__acme'",
+            )
+            .await
+            .unwrap();
+        assert!(
+            schemas.rows.is_empty(),
+            "preflight must refuse before CREATE SCHEMA"
+        );
     }
 
     /// Creates the DuckDB file at `db_path` holding the one source table
