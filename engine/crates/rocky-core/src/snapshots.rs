@@ -300,11 +300,8 @@ pub fn generate_snapshot_sql(
 
     // Statement 3 (optional): Invalidate hard-deleted rows.
     if config.invalidate_hard_deletes {
-        let update_target = if dialect.name() == "duckdb" {
-            format!("{target} AS target")
-        } else {
-            target.clone()
-        };
+        let (update_target, update_qualifier) = dialect.snapshot_update_target(&target);
+        let update_join_cond = build_join_condition(&keys, &update_qualifier, "source");
         let invalidate = format!(
             "UPDATE {update_target} SET \
              {vt} = CURRENT_TIMESTAMP, \
@@ -312,7 +309,7 @@ pub fn generate_snapshot_sql(
              WHERE {ic} = TRUE \
              AND NOT EXISTS (\
                SELECT 1 FROM {source} AS source \
-               WHERE {join_cond}\
+               WHERE {update_join_cond}\
              )",
             vt = COL_VALID_TO,
             ic = COL_IS_CURRENT,

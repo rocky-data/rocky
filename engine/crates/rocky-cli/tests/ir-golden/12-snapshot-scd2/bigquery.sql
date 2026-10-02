@@ -13,4 +13,4 @@ INSERT INTO `tgtwarehouse`.`snapshots__demo`.`dim_customers_history` (`customer_
 
 -- --- next statement ---
 
-UPDATE `tgtwarehouse`.`snapshots__demo`.`dim_customers_history` SET valid_to = CURRENT_TIMESTAMP WHERE valid_to IS NULL AND NOT EXISTS (SELECT 1 FROM `tgtwarehouse`.`marts__demo`.`dim_customers` AS source WHERE target.`customer_id` = source.`customer_id`)
+UPDATE `tgtwarehouse`.`snapshots__demo`.`dim_customers_history` AS target SET valid_to = CURRENT_TIMESTAMP WHERE valid_to IS NULL AND NOT EXISTS (SELECT 1 FROM `tgtwarehouse`.`marts__demo`.`dim_customers` AS source WHERE target.`customer_id` = source.`customer_id`)

@@ -18,8 +18,8 @@
 //!    identity of every existing model.
 //!
 //! 3. **Per-dialect SQL pin** — running the appropriate `sql_gen` entry
-//!    against each of the four dialects (DuckDB, Databricks, BigQuery,
-//!    Snowflake) yields SQL identical to the snapshot under
+//!    against DuckDB, Databricks, BigQuery, and Snowflake (plus Trino for
+//!    snapshots) yields SQL identical to the snapshot under
 //!    `tests/ir-golden/<fixture>/<dialect>.sql`. Catches dialect-specific
 //!    regressions that the in-process `TestDialect` in `sql_gen.rs` tests
 //!    cannot see.
@@ -61,7 +61,7 @@ use rocky_snowflake::dialect::SnowflakeSqlDialect;
 use rocky_trino::dialect::TrinoDialect;
 
 #[test]
-fn snapshot_merge_insert_is_explicit_for_every_dialect() {
+fn snapshot_sql_uses_named_inserts_and_correlated_hard_deletes_for_every_dialect() {
     let ir = build_12_snapshot_scd2();
     let dialects: [&dyn SqlDialect; 5] = [
         &DatabricksSqlDialect,
@@ -93,11 +93,34 @@ fn snapshot_merge_insert_is_explicit_for_every_dialect() {
             strategy: rocky_core::snapshots::SnapshotStrategy::Timestamp {
                 updated_at: "updated_at".into(),
             },
-            invalidate_hard_deletes: false,
+            invalidate_hard_deletes: true,
         };
         let current =
             rocky_core::snapshots::generate_snapshot_sql(&config, dialect, &columns).unwrap();
         let legacy = sql_gen::generate_snapshot_sql(&ir, dialect, &columns).unwrap();
+        let target = dialect
+            .format_table_ref(&ir.target.catalog, &ir.target.schema, &ir.target.table)
+            .unwrap();
+        let (update_target, update_qualifier) = if dialect.name() == "trino" {
+            (target.clone(), target.as_str())
+        } else {
+            (format!("{target} AS target"), "target")
+        };
+        for update in [&current[2], &legacy[3]] {
+            assert!(
+                update.starts_with(&format!("UPDATE {update_target} SET ")),
+                "{}: {update}",
+                dialect.name()
+            );
+            let key = dialect
+                .snapshot_source_reference("customer_id", &columns)
+                .unwrap();
+            assert!(
+                update.contains(&format!("{update_qualifier}.{key} = source.{key}")),
+                "{}: {update}",
+                dialect.name()
+            );
+        }
         let quote = match dialect.name() {
             "databricks" | "bigquery" => "`",
             _ => "\"",
@@ -169,6 +192,7 @@ enum DialectKind {
     Databricks,
     BigQuery,
     Snowflake,
+    Trino,
 }
 
 impl DialectKind {
@@ -177,6 +201,13 @@ impl DialectKind {
         DialectKind::Databricks,
         DialectKind::BigQuery,
         DialectKind::Snowflake,
+    ];
+    const SNAPSHOT: &'static [DialectKind] = &[
+        DialectKind::DuckDb,
+        DialectKind::Databricks,
+        DialectKind::BigQuery,
+        DialectKind::Snowflake,
+        DialectKind::Trino,
     ];
 
     /// Warehouses that natively support `MATERIALIZED VIEW`. DuckDB has
@@ -206,6 +237,7 @@ impl DialectKind {
             DialectKind::Databricks => "databricks",
             DialectKind::BigQuery => "bigquery",
             DialectKind::Snowflake => "snowflake",
+            DialectKind::Trino => "trino",
         }
     }
 
@@ -215,6 +247,7 @@ impl DialectKind {
             DialectKind::Databricks => Box::new(DatabricksSqlDialect),
             DialectKind::BigQuery => Box::new(BigQueryDialect),
             DialectKind::Snowflake => Box::new(SnowflakeSqlDialect),
+            DialectKind::Trino => Box::new(TrinoDialect),
         }
     }
 }
@@ -414,7 +447,7 @@ const FIXTURES: &[Fixture] = &[
         name: "12-snapshot-scd2",
         builder: build_12_snapshot_scd2,
         entry: Entry::Snapshot,
-        dialects: DialectKind::ALL,
+        dialects: DialectKind::SNAPSHOT,
         recipe_hash: "e3cdac244a2517c494a6e9306bcb0eea3b6b18202f69de500f6d0034ac045cd8",
     },
 ];

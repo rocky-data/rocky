@@ -1017,6 +1017,13 @@ pub trait SqlDialect: Send + Sync {
     /// INSERT INTO ... SELECT (incremental append).
     fn insert_into(&self, target: &str, select_sql: &str) -> String;
 
+    /// UPDATE target and qualifier for a snapshot hard-delete correlation.
+    /// Databricks accepts the alias live. BigQuery and Snowflake document
+    /// UPDATE aliases, but this statement has not been run live on either.
+    fn snapshot_update_target(&self, target: &str) -> (String, String) {
+        (format!("{target} AS target"), "target".to_string())
+    }
+
     /// Quote a column returned by snapshot source schema discovery exactly.
     fn snapshot_column_identifier(&self, name: &str) -> String {
         match self.name() {

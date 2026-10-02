@@ -1144,12 +1144,18 @@ pub fn generate_snapshot_sql(
 
     // Statement 4 (optional): Invalidate hard-deleted rows
     if model_ir.invalidate_hard_deletes {
+        let (update_target, update_qualifier) = dialect.snapshot_update_target(&target);
+        let update_join_cond = keys
+            .iter()
+            .map(|key| format!("{update_qualifier}.{key} = source.{key}"))
+            .collect::<Vec<_>>()
+            .join(" AND ");
         let invalidate = format!(
-            "UPDATE {target} SET valid_to = CURRENT_TIMESTAMP \
+            "UPDATE {update_target} SET valid_to = CURRENT_TIMESTAMP \
              WHERE valid_to IS NULL \
              AND NOT EXISTS (\
                SELECT 1 FROM {source} AS source \
-               WHERE {join_cond}\
+               WHERE {update_join_cond}\
              )",
         );
         stmts.push(invalidate);
