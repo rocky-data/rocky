@@ -191,9 +191,9 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use rocky_core::traits::{AdapterError, AdapterResult, QueryResult};
-    use rocky_ir::ColumnInfo;
     use rocky_duckdb::DuckDbConnector;
     use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+    use rocky_ir::ColumnInfo;
     use std::sync::{Arc, Mutex};
 
     fn object(table: &str) -> ShadowObject {
@@ -225,7 +225,9 @@ mod tests {
 
     #[async_trait]
     impl WarehouseAdapter for UncertainWarehouse {
-        fn dialect(&self) -> &dyn SqlDialect { self.inner.dialect() }
+        fn dialect(&self) -> &dyn SqlDialect {
+            self.inner.dialect()
+        }
         async fn execute_statement(&self, _sql: &str) -> AdapterResult<()> {
             panic!("an uncertain ownership read must never authorize a write")
         }
@@ -247,10 +249,14 @@ mod tests {
     #[tokio::test]
     async fn uncertain_metadata_never_grants_shadow_ownership() {
         for catalog_error in [false, true] {
-            let wh = UncertainWarehouse { inner: duckdb(), catalog_error };
-            let err = refuse_occupied_shadow_targets(
-                &wh, wh.dialect(), &[object("orders_rocky_shadow")]
-            ).await.expect_err("uncertain metadata cannot prove absence");
+            let wh = UncertainWarehouse {
+                inner: duckdb(),
+                catalog_error,
+            };
+            let err =
+                refuse_occupied_shadow_targets(&wh, wh.dialect(), &[object("orders_rocky_shadow")])
+                    .await
+                    .expect_err("uncertain metadata cannot prove absence");
             let message = err.to_string();
             assert!(message.contains("cannot determine whether"), "{message}");
         }

@@ -82,30 +82,100 @@ fn mixed_shadow_failure_keeps_passing_model_evidence() {
     let models = dir.join("models");
     fs::create_dir_all(&models).expect("create models");
     fs::write(models.join("derived.sql"), "SELECT 1 AS id").expect("write SQL");
-    fs::write(models.join("derived.toml"),
+    fs::write(
+        models.join("derived.toml"),
         "[strategy]\ntype = \"full_refresh\"\n[target]\ncatalog = \"fixture\"\nschema = \"main\"\n",
-    ).expect("write sidecar");
+    )
+    .expect("write sidecar");
     let plain = run(dir, &[]);
-    assert!(plain.status.success(), "{}", String::from_utf8_lossy(&plain.stderr));
+    assert!(
+        plain.status.success(),
+        "{}",
+        String::from_utf8_lossy(&plain.stderr)
+    );
     let conn = duckdb::Connection::open(dir.join("fixture.duckdb")).expect("open duckdb");
     conn.execute_batch(
         "CREATE TABLE main.derived AS SELECT 1 AS id;
          CREATE OR REPLACE TABLE staging__shopify.orders AS SELECT 0 AS id;",
-    ).expect("seed model baseline and divergent replication baseline");
+    )
+    .expect("seed model baseline and divergent replication baseline");
     drop(conn);
 
     let out = run(dir, &["--all", "--shadow"]);
-    let message = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    let message = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
     assert!(!out.status.success(), "{message}");
     let json: serde_json::Value = serde_json::from_slice(&out.stdout).expect("run JSON");
-    assert!(json["shadow_comparison"]["results"].as_array().expect("results").iter()
-        .any(|row| row["production_table"].as_str().unwrap_or("").contains("derived") && row["verdict"] == "pass"), "{message}");
+    assert!(
+        json["shadow_comparison"]["results"]
+            .as_array()
+            .expect("results")
+            .iter()
+            .any(|row| row["production_table"]
+                .as_str()
+                .unwrap_or("")
+                .contains("derived")
+                && row["verdict"] == "pass"),
+        "{message}"
+    );
     let conn = duckdb::Connection::open(dir.join("fixture.duckdb")).expect("open DuckDB");
     let count: i64 = conn.query_row(
         "SELECT count(*) FROM information_schema.tables WHERE table_schema = 'main' AND table_name = 'derived_rocky_shadow'",
         [], |row| row.get(0),
     ).expect("inspect model shadow");
-    assert_eq!(count, 1, "failed mixed comparison must retain passing model evidence");
+    assert_eq!(
+        count, 1,
+        "failed mixed comparison must retain passing model evidence"
+    );
+}
+
+#[test]
+fn mixed_shadow_success_cleans_models_and_replication_together() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dir = tmp.path();
+    seed(dir);
+    fs::write(dir.join("rocky.toml"), ROCKY_TOML).expect("write config");
+    let models = dir.join("models");
+    fs::create_dir_all(&models).expect("create models");
+    fs::write(models.join("derived.sql"), "SELECT 1 AS id").expect("write SQL");
+    fs::write(
+        models.join("derived.toml"),
+        "[strategy]\ntype = \"full_refresh\"\n[target]\ncatalog = \"fixture\"\nschema = \"main\"\n",
+    )
+    .expect("write sidecar");
+    let plain = run(dir, &[]);
+    assert!(
+        plain.status.success(),
+        "{}",
+        String::from_utf8_lossy(&plain.stderr)
+    );
+    let conn = duckdb::Connection::open(dir.join("fixture.duckdb")).expect("open duckdb");
+    conn.execute_batch("CREATE TABLE main.derived AS SELECT 1 AS id")
+        .expect("seed model baseline");
+    drop(conn);
+
+    let out = run(dir, &["--all", "--shadow"]);
+    let message = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.status.success(), "{message}");
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).expect("run JSON");
+    assert_eq!(json["shadow_comparison"]["tables_passed"], 3, "{message}");
+    assert_eq!(json["shadow_comparison"]["tables_failed"], 0, "{message}");
+    let conn = duckdb::Connection::open(dir.join("fixture.duckdb")).expect("open DuckDB");
+    let count: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM information_schema.tables WHERE table_name IN ('derived_rocky_shadow', 'orders_rocky_shadow')",
+            [],
+            |row| row.get(0),
+        )
+        .expect("inspect shadow objects");
+    assert_eq!(count, 0, "successful mixed comparison cleans both groups");
 }
 
 #[test]

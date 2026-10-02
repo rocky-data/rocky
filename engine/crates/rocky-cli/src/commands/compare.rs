@@ -439,7 +439,87 @@ async fn get_row_count(adapter: &dyn WarehouseAdapter, target: &TargetRef) -> Re
 #[cfg(all(test, feature = "duckdb"))]
 mod tests {
     use super::*;
+    use rocky_core::traits::{AdapterError, AdapterResult, QueryResult, SqlDialect};
     use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+    struct UnreadableProduction {
+        inner: DuckDbWarehouseAdapter,
+    }
+
+    #[async_trait::async_trait]
+    impl WarehouseAdapter for UnreadableProduction {
+        fn dialect(&self) -> &dyn SqlDialect {
+            self.inner.dialect()
+        }
+
+        async fn execute_statement(&self, sql: &str) -> AdapterResult<()> {
+            self.inner.execute_statement(sql).await
+        }
+
+        async fn execute_query(&self, sql: &str) -> AdapterResult<QueryResult> {
+            self.inner.execute_query(sql).await
+        }
+
+        async fn describe_table(
+            &self,
+            table: &rocky_ir::TableRef,
+        ) -> AdapterResult<Vec<rocky_ir::ColumnInfo>> {
+            if table.table == "orders" {
+                Err(AdapterError::msg("production metadata unavailable"))
+            } else {
+                self.inner.describe_table(table).await
+            }
+        }
+
+        async fn list_tables(&self, _catalog: &str, _schema: &str) -> AdapterResult<Vec<String>> {
+            Ok(vec![
+                "orders".to_string(),
+                "orders_rocky_shadow".to_string(),
+            ])
+        }
+    }
+
+    #[tokio::test]
+    async fn production_metadata_error_is_not_no_baseline() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let inner =
+            DuckDbWarehouseAdapter::open(&temp.path().join("compare.duckdb")).expect("open DuckDB");
+        inner
+            .execute_statement("CREATE TABLE main.orders AS SELECT 1 AS id")
+            .await
+            .expect("production table");
+        inner
+            .execute_statement("CREATE TABLE main.orders_rocky_shadow AS SELECT 1 AS id")
+            .await
+            .expect("shadow table");
+        let adapter = UnreadableProduction { inner };
+        let production = TargetRef {
+            catalog: String::new(),
+            schema: "main".to_string(),
+            table: "orders".to_string(),
+        };
+        let shadow = TargetRef {
+            table: "orders_rocky_shadow".to_string(),
+            ..production.clone()
+        };
+        let output = compare_targets(
+            &adapter,
+            vec![(production, shadow)],
+            None,
+            &ComparisonThresholds::default(),
+        )
+        .await
+        .expect("comparison returns a structured error row");
+        assert_eq!(output.tables_failed, 1);
+        assert_eq!(output.tables_no_baseline, 0);
+        assert_eq!(output.results[0].verdict, "error");
+        assert!(
+            output.results[0]
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("cannot determine whether"))
+        );
+    }
 
     /// The headline of #1274: `compare` reaches a transformation pipeline's
     /// models and pairs each production target with its shadow.
@@ -621,13 +701,15 @@ auto_create_schemas = true
         .await
         .expect("build comparison rows");
         let row = &output.results[0];
-        assert_eq!(row.verdict, "error");
+        assert_eq!(row.verdict, "no_baseline");
+        assert_eq!(output.tables_no_baseline, 1);
+        assert_eq!(output.tables_failed, 0);
         assert_eq!(row.production_count, None);
         assert_eq!(row.shadow_count, Some(2));
         assert!(
             row.reasons
                 .iter()
-                .any(|r| r.contains("failed to read production row count"))
+                .any(|r| r.contains("production target does not exist"))
         );
     }
 
