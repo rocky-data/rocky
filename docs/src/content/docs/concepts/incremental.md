@@ -159,9 +159,12 @@ rocky state reconcile-watermark --pipeline <name>
 
 Repeat `--table catalog.schema.table` to select affected targets. The command
 reads `MAX(timestamp_column)` from each target and saves it through the
-configured state backend. An empty target gets the epoch cursor. Run it only
-after the replacement and any earlier warehouse writes have finished. Then
-restore `strategy = "incremental"`.
+configured state backend. For DuckDB, use `--table .schema.table`.
+An empty target gets the epoch cursor. Confirm that the configured
+`timestamp_column` still identifies the copied rows. Run the command only
+after the replacement and any earlier warehouse writes have finished.
+The command refuses pipelines with table-specific timestamp overrides.
+Then restore `strategy = "incremental"`.
 
 Rocky 1.75.0 and earlier did not record recovery descriptors. A crash after
 an INSERT but before its watermark flush can leave a stale cursor. The first
