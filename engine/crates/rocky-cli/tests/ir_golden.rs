@@ -58,6 +58,65 @@ use rocky_bigquery::dialect::BigQueryDialect;
 use rocky_databricks::dialect::DatabricksSqlDialect;
 use rocky_duckdb::dialect::DuckDbSqlDialect;
 use rocky_snowflake::dialect::SnowflakeSqlDialect;
+use rocky_trino::dialect::TrinoDialect;
+
+#[test]
+fn snapshot_merge_insert_is_explicit_for_every_dialect() {
+    let ir = build_12_snapshot_scd2();
+    let columns = vec!["customer_id".into(), "updated_at".into()];
+    let dialects: [&dyn SqlDialect; 5] = [
+        &DatabricksSqlDialect,
+        &SnowflakeSqlDialect,
+        &BigQueryDialect,
+        &TrinoDialect,
+        &DuckDbSqlDialect,
+    ];
+    for dialect in dialects {
+        let config = rocky_core::snapshots::SnapshotConfig {
+            source: ir.source.clone().unwrap(),
+            target: ir.target.clone(),
+            unique_key: vec!["customer_id".into()],
+            strategy: rocky_core::snapshots::SnapshotStrategy::Timestamp {
+                updated_at: "updated_at".into(),
+            },
+            invalidate_hard_deletes: false,
+        };
+        let current =
+            rocky_core::snapshots::generate_snapshot_sql(&config, dialect, &columns).unwrap();
+        let legacy = sql_gen::generate_snapshot_sql(&ir, dialect, &columns).unwrap();
+        let quote = match dialect.name() {
+            "databricks" | "bigquery" => "`",
+            _ => "\"",
+        };
+        let ident = |name: &str| {
+            let spelling = if dialect.name() == "snowflake" {
+                name.to_ascii_uppercase()
+            } else {
+                name.to_owned()
+            };
+            format!("{quote}{spelling}{quote}")
+        };
+        for (merge, metadata) in [
+            (&current[0], "valid_from, valid_to, is_current, snapshot_id"),
+            (&legacy[1], "valid_from, valid_to"),
+        ] {
+            let metadata = metadata
+                .split(", ")
+                .map(&ident)
+                .collect::<Vec<_>>()
+                .join(", ");
+            let expected = format!(
+                "INSERT ({}, {}, {metadata}) VALUES (source.{}, source.{}, CURRENT_TIMESTAMP, CAST(NULL AS TIMESTAMP)",
+                ident("customer_id"),
+                ident("updated_at"),
+                ident("customer_id"),
+                ident("updated_at")
+            );
+            assert!(merge.contains(&expected), "{}: {merge}", dialect.name());
+            assert!(!merge.contains("INSERT (*)"), "{}: {merge}", dialect.name());
+        }
+    }
+}
 
 const REGEN_ENV: &str = "REGEN_IR_GOLDENS";
 const FIXTURES_SUBDIR: &str = "tests/ir-golden";
@@ -189,7 +248,11 @@ fn run_entry(
         Entry::TimeIntervalBootstrap => {
             sql_gen::generate_time_interval_bootstrap_sql(ir, dialect).map(|s| vec![s])
         }
-        Entry::Snapshot => sql_gen::generate_snapshot_sql(ir, dialect),
+        Entry::Snapshot => sql_gen::generate_snapshot_sql(
+            ir,
+            dialect,
+            &["customer_id".into(), "updated_at".into()],
+        ),
     }
 }
 

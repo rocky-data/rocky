@@ -1017,6 +1017,60 @@ pub trait SqlDialect: Send + Sync {
     /// INSERT INTO ... SELECT (incremental append).
     fn insert_into(&self, target: &str, select_sql: &str) -> String;
 
+    /// Quote a column returned by snapshot source schema discovery.
+    fn snapshot_column_identifier(&self, name: &str) -> String {
+        self.quote_identifier(name)
+    }
+
+    /// The `WHEN NOT MATCHED` insert for a snapshot MERGE.
+    ///
+    /// Vendor forms: Databricks `INSERT (columns) VALUES (expressions)`
+    /// https://docs.databricks.com/aws/en/sql/language-manual/delta-merge-into;
+    /// Snowflake https://docs.snowflake.com/en/sql-reference/sql/merge;
+    /// BigQuery https://cloud.google.com/bigquery/docs/reference/standard-sql/dml-syntax;
+    /// Trino https://trino.io/docs/current/sql/merge.html;
+    /// DuckDB https://duckdb.org/docs/stable/sql/statements/merge_into.html.
+    fn snapshot_merge_insert(
+        &self,
+        source_columns: &[String],
+        metadata: &[(&str, &str)],
+    ) -> AdapterResult<String> {
+        if source_columns.is_empty() {
+            return Err(AdapterError::msg("snapshot source has no columns"));
+        }
+        let mut names = Vec::new();
+        let mut values = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for name in source_columns {
+            rocky_sql::validation::validate_identifier(name).map_err(AdapterError::new)?;
+            if !seen.insert(name.to_ascii_lowercase()) {
+                return Err(AdapterError::msg(format!(
+                    "snapshot source contains duplicate column '{name}'"
+                )));
+            }
+            if metadata
+                .iter()
+                .any(|(reserved, _)| name.eq_ignore_ascii_case(reserved))
+            {
+                return Err(AdapterError::msg(format!(
+                    "snapshot source column '{name}' conflicts with a snapshot metadata column"
+                )));
+            }
+            let quoted = self.snapshot_column_identifier(name);
+            names.push(quoted.clone());
+            values.push(format!("source.{quoted}"));
+        }
+        for (name, value) in metadata {
+            names.push(self.snapshot_column_identifier(name));
+            values.push((*value).to_owned());
+        }
+        Ok(format!(
+            "INSERT ({}) VALUES ({})",
+            names.join(", "),
+            values.join(", ")
+        ))
+    }
+
     /// MERGE INTO (upsert by key).
     ///
     /// Keys are `&[Arc<str>]` so the ir-level `Vec<Arc<str>>` on

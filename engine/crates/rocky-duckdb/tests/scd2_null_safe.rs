@@ -77,7 +77,7 @@ async fn duckdb_null_safe_neq_captures_null_value_transitions() {
 
 /// The snapshot generator must emit a MERGE form DuckDB parses and executes.
 #[tokio::test]
-async fn snapshot_merge_inserts_by_name_and_closes_changed_rows() {
+async fn snapshot_merge_inserts_explicit_columns_and_closes_changed_rows() {
     let adapter = DuckDbWarehouseAdapter::in_memory().unwrap();
     let dialect = DuckDbSqlDialect;
     adapter.execute_statement("CREATE TABLE main.source (id INTEGER, name VARCHAR, updated_at TIMESTAMP); INSERT INTO main.source VALUES (1, 'Alice', TIMESTAMP '2026-01-01')").await.unwrap();
@@ -100,19 +100,19 @@ async fn snapshot_merge_inserts_by_name_and_closes_changed_rows() {
     };
     let init = rocky_core::snapshots::generate_initial_load_sql(&config, &dialect).unwrap();
     adapter.execute_statement(&init).await.unwrap();
-    let statements = generate_snapshot_sql(&config, &dialect).unwrap();
+    let columns = vec!["id".into(), "name".into(), "updated_at".into()];
+    let statements = generate_snapshot_sql(&config, &dialect, &columns).unwrap();
     for sql in &statements {
         adapter.execute_statement(sql).await.unwrap();
     }
-    assert!(statements[0].contains("WHEN NOT MATCHED THEN INSERT BY NAME"));
-    assert!(statements[0].contains("USING (SELECT *"));
+    assert!(statements[0].contains("INSERT (\"id\", \"name\", \"updated_at\", \"valid_from\", \"valid_to\", \"is_current\", \"snapshot_id\") VALUES (source.\"id\", source.\"name\", source.\"updated_at\", CURRENT_TIMESTAMP, CAST(NULL AS TIMESTAMP), TRUE,"));
     adapter
         .execute_statement(
             "UPDATE main.source SET name = 'Alicia', updated_at = TIMESTAMP '2026-02-01'",
         )
         .await
         .unwrap();
-    for sql in generate_snapshot_sql(&config, &dialect).unwrap() {
+    for sql in generate_snapshot_sql(&config, &dialect, &columns).unwrap() {
         adapter.execute_statement(&sql).await.unwrap();
     }
     let rows = adapter
@@ -179,7 +179,8 @@ async fn scd2_change_predicate_captures_null_to_value_on_duckdb() {
         },
         invalidate_hard_deletes: false,
     };
-    let stmts = generate_snapshot_sql(&config, &dialect).expect("snapshot SQL");
+    let stmts = generate_snapshot_sql(&config, &dialect, &["id".into(), "updated_at".into()])
+        .expect("snapshot SQL");
     let merge_sql = &stmts[0];
     assert!(
         merge_sql.contains("source.updated_at IS DISTINCT FROM target.updated_at"),

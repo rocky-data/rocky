@@ -173,10 +173,12 @@ pub fn generate_initial_load_sql(
 ///    that no longer exist in the source.
 ///
 /// The `snapshot_id` is a deterministic UUID generated once per call and
-/// shared across all statements in the batch.
+/// shared across all statements in the batch. `source_columns` comes from
+/// `WarehouseAdapter::describe_table` for the source table.
 pub fn generate_snapshot_sql(
     config: &SnapshotConfig,
     dialect: &dyn SqlDialect,
+    source_columns: &[String],
 ) -> Result<Vec<String>, SqlGenError> {
     if config.unique_key.is_empty() {
         return Err(SqlGenError::MergeNoKey);
@@ -235,29 +237,19 @@ pub fn generate_snapshot_sql(
     let mut stmts = Vec::new();
 
     // Statement 1: MERGE — close changed rows and insert new keys.
-    let merge_source = if dialect.name() == "duckdb" {
-        format!(
-            "(SELECT *, CURRENT_TIMESTAMP AS {vf}, CAST(NULL AS TIMESTAMP) AS {vt}, \
-             TRUE AS {ic}, '{sid}' AS {snapshot_id_col} FROM {source})",
-            vf = COL_VALID_FROM,
-            vt = COL_VALID_TO,
-            ic = COL_IS_CURRENT,
-            sid = snapshot_id,
-            snapshot_id_col = COL_SNAPSHOT_ID,
-        )
-    } else {
-        source.clone()
-    };
-    let insert_clause = if dialect.name() == "duckdb" {
-        "INSERT BY NAME".to_string()
-    } else {
-        format!(
-            "INSERT (*) VALUES (source.*, CURRENT_TIMESTAMP, CAST(NULL AS TIMESTAMP), TRUE, '{snapshot_id}')"
-        )
-    };
+    let snapshot_id_value = format!("'{snapshot_id}'");
+    let insert_clause = dialect.snapshot_merge_insert(
+        source_columns,
+        &[
+            (COL_VALID_FROM, "CURRENT_TIMESTAMP"),
+            (COL_VALID_TO, "CAST(NULL AS TIMESTAMP)"),
+            (COL_IS_CURRENT, "TRUE"),
+            (COL_SNAPSHOT_ID, &snapshot_id_value),
+        ],
+    )?;
     let merge = format!(
         "MERGE INTO {target} AS target \
-         USING {merge_source} AS source \
+         USING {source} AS source \
          ON {join_cond} AND target.{ic} = TRUE \
          WHEN MATCHED AND ({change_predicate}) THEN \
            UPDATE SET {vt} = CURRENT_TIMESTAMP, {ic} = FALSE \
@@ -539,6 +531,10 @@ mod tests {
         TestDialect { name: "test" }
     }
 
+    fn source_columns() -> Vec<String> {
+        vec!["customer_id".into(), "name".into(), "updated_at".into()]
+    }
+
     fn timestamp_config() -> SnapshotConfig {
         SnapshotConfig {
             source: SourceRef {
@@ -627,7 +623,7 @@ mod tests {
     #[test]
     fn test_timestamp_strategy_merge_statement() {
         let config = timestamp_config();
-        let stmts = generate_snapshot_sql(&config, &dialect()).unwrap();
+        let stmts = generate_snapshot_sql(&config, &dialect(), &source_columns()).unwrap();
 
         // Without hard deletes: MERGE + INSERT = 2 statements.
         assert_eq!(stmts.len(), 2, "expected 2 statements, got: {stmts:?}");
@@ -670,26 +666,35 @@ mod tests {
     }
 
     #[test]
-    fn test_duckdb_snapshot_merge_uses_supported_insert_form() {
+    fn test_snapshot_merge_uses_explicit_columns() {
         let config = timestamp_config();
         let duckdb = TestDialect { name: "duckdb" };
-        let stmts = generate_snapshot_sql(&config, &duckdb).unwrap();
-        assert!(stmts[0].contains("USING (SELECT *, CURRENT_TIMESTAMP AS valid_from"));
-        assert!(stmts[0].contains("TRUE AS is_current"));
-        assert!(
-            stmts[0].contains("AS snapshot_id FROM raw_catalog.raw__us_west__shopify.customers")
-        );
-        assert!(stmts[0].contains("WHEN NOT MATCHED THEN INSERT BY NAME"));
-        assert!(!stmts[0].contains("INSERT (*)"));
-        let other = generate_snapshot_sql(&config, &dialect()).unwrap();
+        let stmts = generate_snapshot_sql(&config, &duckdb, &source_columns()).unwrap();
+        assert!(stmts[0].contains("USING raw_catalog.raw__us_west__shopify.customers AS source"));
+        assert!(stmts[0].contains("INSERT (\"customer_id\", \"name\", \"updated_at\", \"valid_from\", \"valid_to\", \"is_current\", \"snapshot_id\") VALUES (source.\"customer_id\", source.\"name\", source.\"updated_at\", CURRENT_TIMESTAMP, CAST(NULL AS TIMESTAMP), TRUE, '"));
+        let other = generate_snapshot_sql(&config, &dialect(), &source_columns()).unwrap();
         assert!(other[0].contains("USING raw_catalog.raw__us_west__shopify.customers AS source"));
-        assert!(other[0].contains("WHEN NOT MATCHED THEN INSERT (*) VALUES"));
+        assert!(!other[0].contains("INSERT (*)"));
+    }
+
+    #[test]
+    fn test_snapshot_merge_rejects_missing_or_reserved_source_columns() {
+        let config = timestamp_config();
+        assert!(generate_snapshot_sql(&config, &dialect(), &[]).is_err());
+        assert!(
+            generate_snapshot_sql(
+                &config,
+                &dialect(),
+                &["customer_id".into(), "valid_from".into()],
+            )
+            .is_err()
+        );
     }
 
     #[test]
     fn test_timestamp_strategy_insert_new_versions() {
         let config = timestamp_config();
-        let stmts = generate_snapshot_sql(&config, &dialect()).unwrap();
+        let stmts = generate_snapshot_sql(&config, &dialect(), &source_columns()).unwrap();
         let insert = &stmts[1];
 
         assert!(
@@ -717,7 +722,7 @@ mod tests {
     #[test]
     fn test_snapshot_id_is_hex() {
         let config = timestamp_config();
-        let stmts = generate_snapshot_sql(&config, &dialect()).unwrap();
+        let stmts = generate_snapshot_sql(&config, &dialect(), &source_columns()).unwrap();
 
         // The snapshot_id appears in the MERGE NOT MATCHED clause and in the
         // INSERT statement. Extract one instance and verify it's valid hex.
@@ -743,7 +748,7 @@ mod tests {
     #[test]
     fn test_consistent_snapshot_id_across_statements() {
         let config = timestamp_config();
-        let stmts = generate_snapshot_sql(&config, &dialect()).unwrap();
+        let stmts = generate_snapshot_sql(&config, &dialect(), &source_columns()).unwrap();
 
         // Extract snapshot_id from each statement that contains one.
         let marker = "' AS snapshot_id";
@@ -777,7 +782,7 @@ mod tests {
     #[test]
     fn test_check_strategy_change_detection() {
         let config = check_config();
-        let stmts = generate_snapshot_sql(&config, &dialect()).unwrap();
+        let stmts = generate_snapshot_sql(&config, &dialect(), &source_columns()).unwrap();
 
         let merge = &stmts[0];
         assert!(
@@ -802,7 +807,13 @@ mod tests {
     #[test]
     fn test_check_strategy_no_updated_at_reference() {
         let config = check_config();
-        let stmts = generate_snapshot_sql(&config, &dialect()).unwrap();
+        let columns = vec![
+            "customer_id".into(),
+            "name".into(),
+            "email".into(),
+            "status".into(),
+        ];
+        let stmts = generate_snapshot_sql(&config, &dialect(), &columns).unwrap();
 
         let merge = &stmts[0];
         assert!(
@@ -819,7 +830,7 @@ mod tests {
             },
             ..timestamp_config()
         };
-        let result = generate_snapshot_sql(&config, &dialect());
+        let result = generate_snapshot_sql(&config, &dialect(), &source_columns());
         assert!(result.is_err(), "empty check_columns should error");
     }
 
@@ -833,7 +844,7 @@ mod tests {
             unique_key: vec!["customer_id".into(), "region".into()],
             ..timestamp_config()
         };
-        let stmts = generate_snapshot_sql(&config, &dialect()).unwrap();
+        let stmts = generate_snapshot_sql(&config, &dialect(), &source_columns()).unwrap();
         let merge = &stmts[0];
 
         assert!(
@@ -850,7 +861,7 @@ mod tests {
             unique_key: vec!["customer_id".into(), "region".into()],
             ..timestamp_config()
         };
-        let stmts = generate_snapshot_sql(&config, &dialect()).unwrap();
+        let stmts = generate_snapshot_sql(&config, &dialect(), &source_columns()).unwrap();
         let insert = &stmts[1];
 
         assert!(
@@ -873,7 +884,7 @@ mod tests {
             invalidate_hard_deletes: true,
             ..timestamp_config()
         };
-        let stmts = generate_snapshot_sql(&config, &dialect()).unwrap();
+        let stmts = generate_snapshot_sql(&config, &dialect(), &source_columns()).unwrap();
 
         // With hard deletes: MERGE + INSERT + UPDATE = 3 statements.
         assert_eq!(stmts.len(), 3, "expected 3 statements with hard deletes");
@@ -903,7 +914,7 @@ mod tests {
             invalidate_hard_deletes: false,
             ..timestamp_config()
         };
-        let stmts = generate_snapshot_sql(&config, &dialect()).unwrap();
+        let stmts = generate_snapshot_sql(&config, &dialect(), &source_columns()).unwrap();
 
         // Without hard deletes: MERGE + INSERT = 2 statements.
         assert_eq!(stmts.len(), 2, "expected 2 statements without hard deletes");
@@ -919,7 +930,7 @@ mod tests {
             unique_key: vec![],
             ..timestamp_config()
         };
-        let result = generate_snapshot_sql(&config, &dialect());
+        let result = generate_snapshot_sql(&config, &dialect(), &source_columns());
         assert!(
             matches!(result, Err(SqlGenError::MergeNoKey)),
             "empty unique_key should error"
@@ -932,7 +943,7 @@ mod tests {
             unique_key: vec!["id; DROP TABLE".into()],
             ..timestamp_config()
         };
-        let result = generate_snapshot_sql(&config, &dialect());
+        let result = generate_snapshot_sql(&config, &dialect(), &source_columns());
         assert!(result.is_err(), "unsafe identifier should be rejected");
     }
 
@@ -944,7 +955,7 @@ mod tests {
             },
             ..timestamp_config()
         };
-        let result = generate_snapshot_sql(&config, &dialect());
+        let result = generate_snapshot_sql(&config, &dialect(), &source_columns());
         assert!(result.is_err(), "unsafe updated_at should be rejected");
     }
 
@@ -956,7 +967,7 @@ mod tests {
             },
             ..timestamp_config()
         };
-        let result = generate_snapshot_sql(&config, &dialect());
+        let result = generate_snapshot_sql(&config, &dialect(), &source_columns());
         assert!(result.is_err(), "unsafe check column should be rejected");
     }
 
@@ -970,7 +981,7 @@ mod tests {
             },
             ..timestamp_config()
         };
-        let result = generate_snapshot_sql(&config, &dialect());
+        let result = generate_snapshot_sql(&config, &dialect(), &source_columns());
         assert!(result.is_err(), "unsafe source catalog should be rejected");
     }
 

@@ -3,7 +3,7 @@ CREATE TABLE IF NOT EXISTS "tgtwarehouse"."snapshots__demo"."dim_customers_histo
 
 -- --- next statement ---
 
-MERGE INTO "tgtwarehouse"."snapshots__demo"."dim_customers_history" AS target USING "tgtwarehouse"."marts__demo"."dim_customers" AS source ON target.customer_id = source.customer_id AND target.valid_to IS NULL WHEN MATCHED AND source.updated_at IS DISTINCT FROM target.updated_at THEN UPDATE SET valid_to = CURRENT_TIMESTAMP WHEN NOT MATCHED THEN INSERT (*) VALUES (source.*, CURRENT_TIMESTAMP, NULL)
+MERGE INTO "tgtwarehouse"."snapshots__demo"."dim_customers_history" AS target USING "tgtwarehouse"."marts__demo"."dim_customers" AS source ON target.customer_id = source.customer_id AND target.valid_to IS NULL WHEN MATCHED AND source.updated_at IS DISTINCT FROM target.updated_at THEN UPDATE SET valid_to = CURRENT_TIMESTAMP WHEN NOT MATCHED THEN INSERT ("CUSTOMER_ID", "UPDATED_AT", "VALID_FROM", "VALID_TO") VALUES (source."CUSTOMER_ID", source."UPDATED_AT", CURRENT_TIMESTAMP, CAST(NULL AS TIMESTAMP))
 ;
 
 -- --- next statement ---

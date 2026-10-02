@@ -1429,7 +1429,18 @@ pub async fn run_snapshot(
     );
 
     let dialect = warehouse_adapter.dialect();
-    let stmts = sql_gen::generate_snapshot_sql(&model_ir, dialect)?;
+    let source_columns = warehouse_adapter
+        .describe_table(&rocky_ir::TableRef {
+            catalog: pipeline.source.catalog.clone(),
+            schema: pipeline.source.schema.clone(),
+            table: pipeline.source.table.clone(),
+        })
+        .await
+        .context("failed to describe snapshot source")?
+        .into_iter()
+        .map(|column| column.name)
+        .collect::<Vec<_>>();
+    let stmts = sql_gen::generate_snapshot_sql(&model_ir, dialect, &source_columns)?;
 
     let mut tables_failed = 0usize;
     for stmt in &stmts {
