@@ -4153,15 +4153,28 @@ impl StateStore {
         Ok(Some(progress))
     }
 
-    /// Read all unconfirmed runs that may have written this physical target.
+    /// Read all unconfirmed runs that may have written these physical targets.
     ///
     /// Unlike strict resume matching, changing a filter or routing template
-    /// must not hide an older interrupted run. Source differences and legacy
-    /// unknown targets are returned too; the caller must validate their
-    /// concrete recovery targets and refuse incompatible recovery before copy.
+    /// must not hide an older interrupted run. Source differences are returned
+    /// too; the caller must validate their concrete recovery targets and
+    /// refuse incompatible recovery before copy.
+    ///
+    /// A run recorded under another pipeline name is returned when it used
+    /// the same target endpoint and every one of its recovery targets is in
+    /// `targets` (full `catalog.schema.table` names), so renaming a pipeline
+    /// cannot hide a committed INSERT. Requiring every target keeps the
+    /// caller from reconciling tables this run does not plan; the caller
+    /// checks a recorded contract when its target is incremental or a
+    /// replacement now.
+    ///
+    /// Headers without recovery descriptors (written before descriptors
+    /// existed) are never returned: they carry no source or timestamp
+    /// contract to reconcile against, so recovery ignores them.
     pub fn list_unconfirmed_run_progress_for_recovery_scope(
         &self,
         scope: &ResumeScope,
+        targets: &std::collections::HashSet<String>,
     ) -> Result<Vec<RunProgress>, StateError> {
         let txn = self.db.begin_read()?;
         let headers = txn.open_table(RUN_PROGRESS)?;
@@ -4170,18 +4183,27 @@ impl StateStore {
         for entry in headers.iter()? {
             let (_, value) = entry?;
             let mut progress: RunProgress = serde_json::from_slice(value.value())?;
-            if progress.watermarks_confirmed
-                || !progress.scope.as_ref().is_some_and(|recorded| {
-                    recorded.pipeline == scope.pipeline
-                        && match (&recorded.target, &scope.target) {
-                            (Some(recorded), Some(current)) => {
-                                recorded.endpoint == current.endpoint
-                            }
-                            // A legacy target cannot prove it belongs elsewhere.
-                            _ => true,
-                        }
-                })
-            {
+            let (Some(recorded), Some(tables)) = (
+                progress.scope.as_ref(),
+                progress.watermark_recovery_tables.as_ref(),
+            ) else {
+                continue;
+            };
+            let same_endpoint = match (&recorded.target, &scope.target) {
+                (Some(recorded), Some(current)) => Some(recorded.endpoint == current.endpoint),
+                _ => None,
+            };
+            let relevant = if recorded.pipeline == scope.pipeline {
+                // An unknown target cannot prove it belongs elsewhere.
+                same_endpoint != Some(false)
+            } else {
+                same_endpoint == Some(true)
+                    && !tables.is_empty()
+                    && tables
+                        .iter()
+                        .all(|table| targets.contains(&table.target.full_name()))
+            };
+            if progress.watermarks_confirmed || !relevant {
                 continue;
             }
             let table_entries = Self::read_progress_entries(&entries, &progress.run_id)?;
@@ -10511,10 +10533,14 @@ mod tests {
     fn recovery_lists_all_old_intents_across_filter_source_and_routing_changes() {
         let (store, _dir) = temp_store();
         let current = progress_scope("p1");
-        for run_id in ["old", "new", "confirmed"] {
+        let intent = [recovery_table(Some(Utc::now()))];
+        let init = |run_id: &str, scope: &ResumeScope| {
             store
-                .init_run_progress(run_id, &planned_keys(1), Some(&current))
+                .init_run_progress_with_recovery(run_id, &planned_keys(1), Some(scope), &intent)
                 .unwrap();
+        };
+        for run_id in ["old", "new", "confirmed"] {
+            init(run_id, &current);
         }
         store
             .batch_set_watermarks_and_confirm_runs(&[], &["confirmed"])
@@ -10540,15 +10566,11 @@ mod tests {
         target.catalog_template = "different_{tenant}".into();
         target.schema_template = Some("different_{source}".into());
         target.shadow = Some(ResumeShadow::Schema("different".into()));
-        store
-            .init_run_progress("changed", &planned_keys(1), Some(&changed))
-            .unwrap();
+        init("changed", &changed);
 
-        let mut legacy = current.clone();
-        legacy.target = None;
-        store
-            .init_run_progress("unknown-target", &planned_keys(1), Some(&legacy))
-            .unwrap();
+        let mut unknown_target = current.clone();
+        unknown_target.target = None;
+        init("unknown-target", &unknown_target);
         let mut elsewhere = current.clone();
         elsewhere
             .target
@@ -10557,33 +10579,80 @@ mod tests {
             .endpoint
             .locators
             .insert("path".into(), "/tmp/other.duckdb".into());
-        store
-            .init_run_progress("elsewhere", &planned_keys(1), Some(&elsewhere))
-            .unwrap();
+        init("elsewhere", &elsewhere);
         let mut other_adapter = current.clone();
         other_adapter.target.as_mut().unwrap().adapter = "other-adapter".into();
+        init("other-adapter", &other_adapter);
+
+        // A renamed pipeline on the same endpoint is found by its targets.
+        init("renamed", &progress_scope("p2"));
+        let mut renamed_elsewhere = elsewhere.clone();
+        renamed_elsewhere.pipeline = "p2".into();
+        init("renamed-elsewhere", &renamed_elsewhere);
+        let mut renamed_unknown = unknown_target.clone();
+        renamed_unknown.pipeline = "p2".into();
+        init("renamed-unknown-target", &renamed_unknown);
+        // Another pipeline's run counts only when this run plans every target
+        // it recorded, so each recorded contract meets a current one.
+        let mut other_table = recovery_table(Some(Utc::now()));
+        other_table.target.table = "other".into();
         store
-            .init_run_progress("other-adapter", &planned_keys(1), Some(&other_adapter))
+            .init_run_progress_with_recovery(
+                "renamed-partial",
+                &planned_keys(2),
+                Some(&progress_scope("p2")),
+                &[recovery_table(Some(Utc::now())), other_table],
+            )
             .unwrap();
         store
-            .init_run_progress(
-                "other-pipeline",
+            .init_run_progress_with_recovery(
+                "renamed-empty",
                 &planned_keys(1),
                 Some(&progress_scope("p2")),
+                &[],
             )
             .unwrap();
 
-        let recovered = store
-            .list_unconfirmed_run_progress_for_recovery_scope(&current)
+        // A header without descriptors is never a recovery candidate.
+        store
+            .init_run_progress("no-descriptors", &planned_keys(1), Some(&current))
             .unwrap();
-        let ids: std::collections::BTreeSet<_> =
-            recovered.iter().map(|r| r.run_id.as_str()).collect();
-        assert_eq!(
-            ids,
-            ["old", "new", "changed", "unknown-target", "other-adapter"]
+
+        let list = |targets: &[&str]| -> std::collections::BTreeSet<String> {
+            let targets = targets.iter().map(ToString::to_string).collect();
+            store
+                .list_unconfirmed_run_progress_for_recovery_scope(&current, &targets)
+                .unwrap()
                 .into_iter()
+                .map(|r| r.run_id)
+                .collect()
+        };
+        let same_pipeline = ["old", "new", "changed", "unknown-target", "other-adapter"];
+        assert_eq!(
+            list(&["wh.raw.orders"]),
+            same_pipeline
+                .iter()
+                .chain(&["renamed"])
+                .map(ToString::to_string)
                 .collect()
         );
+        assert_eq!(
+            list(&["wh.raw.orders", "wh.raw.other"]),
+            same_pipeline
+                .iter()
+                .chain(&["renamed", "renamed-partial"])
+                .map(ToString::to_string)
+                .collect()
+        );
+        assert_eq!(
+            list(&["wh.raw.other"]),
+            same_pipeline.iter().map(ToString::to_string).collect(),
+            "another pipeline's intent is read only when every recorded target is planned"
+        );
+
+        let recovered = store
+            .list_unconfirmed_run_progress_for_recovery_scope(&current, &Default::default())
+            .unwrap();
         let old = recovered.iter().find(|r| r.run_id == "old").unwrap();
         assert_eq!(old.tables[0].table_key, "wh.raw.orders");
         // Strict resume remains exact: the changed filter/source/routing is excluded.
@@ -10598,7 +10667,7 @@ mod tests {
     }
 
     #[test]
-    fn recovery_preserves_legacy_inline_header_entries() {
+    fn recovery_ignores_headers_without_descriptors() {
         let (store, _dir) = temp_store();
         let scope = progress_scope("p1");
         let blob = serde_json::json!({
@@ -10613,11 +10682,15 @@ mod tests {
             headers.insert("old-inline", bytes.as_slice()).unwrap();
         }
         store.commit_write(txn).unwrap();
-        let progress = store
-            .list_unconfirmed_run_progress_for_recovery_scope(&scope)
-            .unwrap();
-        assert_eq!(progress.len(), 1);
-        assert_eq!(progress[0].tables[0].table_key, "wh.raw.orders");
+        let targets = ["wh.raw.orders".to_string()].into_iter().collect();
+        assert!(
+            store
+                .list_unconfirmed_run_progress_for_recovery_scope(&scope, &targets)
+                .unwrap()
+                .is_empty(),
+            "a header written before descriptors existed has no contract to reconcile"
+        );
+        // Confirming such a header still keeps its inline entries.
         store
             .batch_set_watermarks_and_confirm_runs(&[], &["old-inline"])
             .unwrap();

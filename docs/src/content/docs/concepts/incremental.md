@@ -92,8 +92,10 @@ unconfirmed intent -> read target MAX -> repair watermark -> next copy
 
 An immediate retry reconciles its target before appending again. A fresh run
 reconciles earlier unconfirmed runs before copying or pruning unchanged tables.
-Changing a filter cannot hide an older run. Rocky commits recovered watermarks
-and their confirmation together.
+Changing a filter cannot hide an older run. Renaming a pipeline cannot hide one
+either: Rocky also reconciles an unconfirmed run of another pipeline on the same
+target endpoint when this run plans every target it wrote. Rocky commits
+recovered watermarks and their confirmation together.
 History cleanup keeps new unresolved recovery records until confirmation, even
 when they exceed the configured history age limit.
 
@@ -105,13 +107,11 @@ Rocky refuses recovery when it cannot verify an older source or timestamp
 contract. Run the affected tables with `strategy = "full_refresh"` without a
 resume flag, then restore their incremental strategy. Keep the state file;
 deleting it also deletes the evidence Rocky needs to explain the interrupted run.
-Legacy checkpoints do not preserve their original source and timestamp contracts.
-An unchanged configuration hash cannot prove discovery still selects the same
-source table. Include every originally planned target in a full-refresh recovery
-run, even when the configuration did not change. Missing cursors can select
-that full-refresh bootstrap automatically. A legacy checkpoint missing its planned
-target set remains unresolved after full refresh. Keep full refresh and seek manual
-recovery support before returning to incremental mode.
+
+Checkpoints written by Rocky 1.75.0 and earlier carry no recovery records.
+Recovery ignores them, so an upgrade does not change how those runs behave. If
+one of them crashed after its INSERT committed, the next incremental append can
+copy those rows again, as in earlier releases.
 
 Keep `timestamp_column` configured for the source you are restoring. Recovery
 replacements establish its target MAX before confirmation, so returning to
@@ -141,7 +141,11 @@ Follow the recovery route in the refusal. A confirmed checkpoint allows a fresh
 run without a resume flag to execute checks. Supported recovery descriptors also
 allow a fresh run to reconcile watermarks before copying.
 
-Older or unsupported checkpoints require full refresh. Keep that strategy until
+A checkpoint from Rocky 1.75.0 or earlier cannot show that its watermarks were
+saved. A fresh run without a resume flag executes its checks. If its watermarks
+were lost, that run can copy rows again, as in earlier releases.
+
+Other unsupported checkpoints require full refresh. Keep that strategy until
 the saved incremental cursor matches the replacement target. Switching back to
 incremental with a wall-clock refresh cursor can skip later source arrivals.
 Incomplete crash checkpoints remain resumable.
