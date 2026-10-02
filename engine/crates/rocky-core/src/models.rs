@@ -481,6 +481,24 @@ fn default_microbatch_granularity() -> TimeGrain {
     TimeGrain::Hour
 }
 
+/// Canonicalize transformation strategies before compiler or runner dispatch.
+/// All model loaders and in-memory project construction use this conversion.
+pub fn normalize_transformation_strategy(strategy: StrategyConfig) -> StrategyConfig {
+    match strategy {
+        StrategyConfig::Microbatch {
+            timestamp_column,
+            granularity,
+        } => StrategyConfig::TimeInterval {
+            time_column: timestamp_column,
+            granularity,
+            lookback: 0,
+            batch_size: default_batch_size(),
+            first_partition: None,
+        },
+        other => other,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Raw deserialization types (all fields optional for inference)
 // ---------------------------------------------------------------------------
@@ -1122,22 +1140,7 @@ fn resolve_model_config(
         .or_else(|| group.and_then(|g| g.strategy.clone()))
         .or_else(|| defaults.and_then(|d| d.strategy.clone()))
         .unwrap_or_default();
-    // `microbatch` is a spelling of `time_interval` for transformation
-    // models. Resolve it here so compiler checks and every execution entry
-    // point see the same partitioned strategy, including group/default values.
-    let strategy = match strategy {
-        StrategyConfig::Microbatch {
-            timestamp_column,
-            granularity,
-        } => StrategyConfig::TimeInterval {
-            time_column: timestamp_column,
-            granularity,
-            lookback: 0,
-            batch_size: default_batch_size(),
-            first_partition: None,
-        },
-        other => other,
-    };
+    let strategy = normalize_transformation_strategy(strategy);
 
     let intent = raw
         .intent

@@ -12,7 +12,7 @@ use serde::Serialize;
 /// One compiler diagnostic, projected from `rocky_compiler::diagnostic::Diagnostic`.
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct DiagnosticLite {
-    /// Diagnostic code, e.g. `"E001"`, `"W003"`, `"P001"`.
+    /// Diagnostic code, e.g. `"E001"`, `"E024"`, `"P001"`.
     pub code: String,
     /// `"Error"`, `"Warning"`, or `"Info"`.
     pub severity: String,

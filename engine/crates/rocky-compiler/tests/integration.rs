@@ -1113,3 +1113,96 @@ fn microbatch_with_window_compiles_as_time_interval() {
             if time_column == "updated_at"
     ));
 }
+
+#[test]
+fn defaulted_dsl_microbatch_is_refused_and_defaulted_sql_window_compiles() {
+    use rocky_core::models::StrategyConfig;
+    use rocky_ir::{MaterializationStrategy, TimeGrain};
+
+    let dir = tempfile::tempdir().unwrap();
+    let models_dir = dir.path().join("models");
+    std::fs::create_dir(&models_dir).unwrap();
+    std::fs::write(
+        models_dir.join("_defaults.toml"),
+        "[target]\ncatalog = \"warehouse\"\nschema = \"s\"\n\
+         [strategy]\ntype = \"microbatch\"\ntimestamp_column = \"updated_at\"\n\
+         granularity = \"day\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        models_dir.join("unbounded.rocky"),
+        "from src\nselect { id, updated_at }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        models_dir.join("bounded.sql"),
+        "SELECT id, updated_at FROM src WHERE updated_at >= @start_date AND updated_at < @end_date",
+    )
+    .unwrap();
+    std::fs::write(models_dir.join("bounded.toml"), "name = \"bounded\"\n").unwrap();
+
+    let loaded = rocky_compiler::project::load_dir_models(&models_dir, None).unwrap();
+    for name in ["unbounded", "bounded"] {
+        let model = loaded
+            .iter()
+            .find(|model| model.config.name == name)
+            .unwrap();
+        assert!(
+            matches!(
+                &model.config.strategy,
+                StrategyConfig::TimeInterval { time_column, granularity: TimeGrain::Day, .. }
+                    if time_column == "updated_at"
+            ),
+            "{name} must normalize during loading"
+        );
+    }
+
+    let result = compile(&CompilerConfig {
+        models_dir: models_dir.clone(),
+        contracts_dir: None,
+        source_schemas: HashMap::new(),
+        ..Default::default()
+    })
+    .unwrap();
+    let e024: Vec<_> = result
+        .diagnostics
+        .iter()
+        .filter(|d| &*d.code == "E024" && d.model == "unbounded")
+        .collect();
+    assert_eq!(e024.len(), 1, "expected DSL E024: {:?}", result.diagnostics);
+    assert!(e024[0].is_error());
+
+    let bounded = result.project.model("bounded").unwrap();
+    assert!(matches!(
+        &bounded.config.strategy,
+        StrategyConfig::TimeInterval { time_column, granularity: TimeGrain::Day, .. }
+            if time_column == "updated_at"
+    ));
+    assert!(matches!(
+        bounded.to_model_ir().materialization,
+        MaterializationStrategy::TimeInterval { time_column, granularity: TimeGrain::Day, window: None }
+            if time_column == "updated_at"
+    ));
+    assert!(
+        !result
+            .diagnostics
+            .iter()
+            .any(|d| d.model == "bounded" && d.is_error()),
+        "bounded inherited SQL must compile: {:?}",
+        result.diagnostics
+    );
+
+    std::fs::remove_file(models_dir.join("unbounded.rocky")).unwrap();
+    let bounded_only = compile(&CompilerConfig {
+        models_dir,
+        contracts_dir: None,
+        source_schemas: HashMap::new(),
+        ..Default::default()
+    })
+    .unwrap();
+    assert!(
+        !bounded_only.has_errors,
+        "bounded inherited SQL must compile cleanly: {:?}",
+        bounded_only.diagnostics
+    );
+}
