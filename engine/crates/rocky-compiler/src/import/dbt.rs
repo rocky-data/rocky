@@ -8,8 +8,8 @@
 //! - `{{ source('source_name', 'table_name') }}` -> fully qualified ref
 //! - `{{ config(materialized='incremental', unique_key='id') }}` -> ModelConfig
 //! - `{{ this }}` -> target table ref
-//! - Raw Jinja that invokes `is_incremental()` -> refused unless a keyed
-//!   manifest model has a matching full-refresh compile artifact pair
+//! - Manifest incremental models require a matching full-refresh compile
+//!   artifact pair and must not set `full_refresh=false`
 //!
 //! **Import paths:**
 //! - **Manifest (preferred):** uses `compiled_code` from `target/manifest.json`
@@ -1035,6 +1035,14 @@ fn import_manifest_node(
         structured,
     } = map_manifest_strategy(&node.config, &node.name, microbatch_mode);
 
+    if node.config.materialized == "incremental" && node.config.full_refresh == Some(false) {
+        result.failed.push(ImportFailure {
+            name: node.name.clone(),
+            reason: INCREMENTAL_FULL_REFRESH_DISABLED.to_string(),
+        });
+        return;
+    }
+
     // #1990: an incremental dbt model with no Rocky append equivalent falls
     // back to `full_refresh`. That is safe only when the SQL has no dbt
     // incremental branch. dbt compiles `is_incremental()` as true against an
@@ -1056,16 +1064,13 @@ fn import_manifest_node(
         return;
     }
 
-    // A keyed model may map to merge or delete_insert, but its first Rocky
-    // run still creates the target from this compiled SQL. Only the matching
-    // full-refresh dbt invocation proves that SQL excludes the delta branch.
-    if node.config.unique_key.is_some()
-        && contains_unresolved_is_incremental(&node.raw_code)
-        && !manifest_full_refresh_compiled
-    {
+    // Every incremental strategy creates its first Rocky target from this
+    // compiled SQL. A raw-code scan cannot see indirect macro branches, and
+    // neither a unique key nor a strategy makes a delta-only bootstrap safe.
+    if node.config.materialized == "incremental" && !manifest_full_refresh_compiled {
         result.failed.push(ImportFailure {
             name: node.name.clone(),
-            reason: KEYED_INCREMENTAL_REFUSED.to_string(),
+            reason: INCREMENTAL_COMPILE_EVIDENCE_REFUSED.to_string(),
         });
         return;
     }
@@ -1415,10 +1420,15 @@ const INCREMENTAL_FALLBACK_REFUSED: &str = "is an incremental dbt model with no 
      it by hand: remove the `is_incremental()` filter, then use merge with a unique_key or a \
      time_interval model with @start_date/@end_date";
 
-const KEYED_INCREMENTAL_REFUSED: &str = "uses `is_incremental()` in raw SQL, but the manifest \
-     has no matching `run_results.json` with `args.full_refresh = true`. Its compiled SQL may \
-     keep a delta filter, which would omit older rows on Rocky's first run. Run \
+const INCREMENTAL_COMPILE_EVIDENCE_REFUSED: &str = "is a dbt incremental model without a \
+     matching `run_results.json` with `args.full_refresh = true`. Its compiled SQL may \
+     keep a delta filter and omit older rows on Rocky's first run. Run \
      `dbt compile --full-refresh` and import the resulting manifest and run_results.json together";
+
+const INCREMENTAL_FULL_REFRESH_DISABLED: &str = "is a dbt incremental model with effective \
+     `full_refresh=false` config. That config overrides `dbt compile --full-refresh`, so \
+     compiled SQL may still keep a delta filter. Remove the model's `full_refresh=false` \
+     config, then run `dbt compile --full-refresh` and import the matching artifact pair";
 
 /// An explicit `incremental_strategy` wins over `unique_key` in
 /// `map_incremental_strategy`, so adding a key alone does not change an
@@ -2492,6 +2502,7 @@ fn extract_dbt_config(content: &str) -> (StrategyConfig, Vec<String>) {
     // practice), so they're left empty.
     let synthetic = DbtNodeConfig {
         materialized: materialized.clone(),
+        full_refresh: None,
         schema: None,
         unique_key,
         incremental_strategy,
@@ -3118,17 +3129,7 @@ models:
             "sources": {}
         });
 
-        let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("manifest.json");
-        std::fs::write(&path, manifest_json.to_string()).unwrap();
-
-        let manifest = dbt_manifest::parse_manifest(&path).unwrap();
-        let target = TargetConfig {
-            catalog: "w".to_string(),
-            schema: "s".to_string(),
-            table: String::new(),
-        };
-        let result = import_from_manifest(&manifest, &target, false, MicrobatchMode::Merge);
+        let result = import_from_manifest_json_with_evidence(&manifest_json, MicrobatchMode::Merge);
 
         assert_eq!(result.imported.len(), 1);
         assert!(matches!(
@@ -3400,6 +3401,30 @@ FROM {{ ref('stg_events') }}
         import_from_manifest(&manifest, &target, false, mode)
     }
 
+    /// Supply a matching compile pair for tests of downstream strategy and warnings.
+    fn import_from_manifest_json_with_evidence(
+        manifest_json: &serde_json::Value,
+        mode: MicrobatchMode,
+    ) -> ImportResult {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("manifest.json");
+        let mut manifest_json = manifest_json.clone();
+        manifest_json["metadata"]["invocation_id"] = serde_json::json!("strategy-test");
+        std::fs::write(&path, manifest_json.to_string()).unwrap();
+        std::fs::write(
+            dir.path().join("run_results.json"),
+            r#"{"metadata":{"invocation_id":"strategy-test"},"args":{"full_refresh":true}}"#,
+        )
+        .unwrap();
+        let manifest = dbt_manifest::parse_manifest(&path).unwrap();
+        let target = TargetConfig {
+            catalog: "w".to_string(),
+            schema: "s".to_string(),
+            table: String::new(),
+        };
+        import_from_manifest(&manifest, &target, false, mode)
+    }
+
     #[test]
     fn test_microbatch_as_time_interval_emits_time_interval_strategy() {
         let manifest = serde_json::json!({
@@ -3422,7 +3447,8 @@ FROM {{ ref('stg_events') }}
             }},
             "sources": {}
         });
-        let result = import_from_manifest_json_with_mode(&manifest, MicrobatchMode::TimeInterval);
+        let result =
+            import_from_manifest_json_with_evidence(&manifest, MicrobatchMode::TimeInterval);
         let model = &result.imported[0];
         match &model.config.strategy {
             StrategyConfig::TimeInterval {
@@ -3606,7 +3632,7 @@ FROM {{ ref('stg_events') }}
                 serde_json::json!([])) },
             "sources": {}
         });
-        let result = import_from_manifest_json(&manifest);
+        let result = import_from_manifest_json_with_evidence(&manifest, MicrobatchMode::Merge);
         assert!(
             matches!(
                 result.imported[0].config.strategy,
@@ -3960,7 +3986,7 @@ FROM {{ ref('stg_events') }}
             },
             "sources": {}
         });
-        let result = import_from_manifest_json(&manifest);
+        let result = import_from_manifest_json_with_evidence(&manifest, MicrobatchMode::Merge);
         match &result.imported[0].config.strategy {
             StrategyConfig::Merge {
                 unique_key,
@@ -3995,7 +4021,7 @@ FROM {{ ref('stg_events') }}
             },
             "sources": {}
         });
-        let result = import_from_manifest_json(&manifest);
+        let result = import_from_manifest_json_with_evidence(&manifest, MicrobatchMode::Merge);
         // #1990: an emitted `incremental` sidecar would fail `rocky compile`
         // with E037, so an append model rebuilds in full and says why.
         assert!(
@@ -4119,7 +4145,7 @@ FROM {{ ref('stg_events') }}
     }
 
     #[test]
-    fn real_dbt_compile_pair_guards_keyed_incremental_import() {
+    fn real_dbt_compile_pair_guards_every_incremental_strategy() {
         let fixtures =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/dbt_incremental_compile");
         let target = TargetConfig {
@@ -4131,33 +4157,57 @@ FROM {{ ref('stg_events') }}
         let full = dbt_manifest::parse_manifest(&fixtures.join("full_refresh/manifest.json"))
             .expect("real full-refresh manifest parses");
         let accepted = import_from_manifest(&full, &target, false, MicrobatchMode::Merge);
-        assert!(accepted.failed.is_empty(), "{:?}", accepted.failed);
-        let model = accepted
-            .imported
-            .iter()
-            .find(|m| m.name == "orders_inc")
-            .unwrap();
-        assert!(matches!(
-            model.config.strategy,
-            StrategyConfig::Merge { .. }
-        ));
-        assert!(!model.sql.contains("where updated_at >"), "{}", model.sql);
+        assert_eq!(accepted.failed.len(), 1, "{:?}", accepted.failed);
+        assert_eq!(accepted.failed[0].name, "orders_pinned");
+        assert!(accepted.failed[0].reason.contains("full_refresh=false"));
+        assert!(
+            accepted.failed[0]
+                .reason
+                .contains("dbt compile --full-refresh")
+        );
+        for name in ["orders_inc", "orders_macro", "orders_nokey"] {
+            let model = accepted.imported.iter().find(|m| m.name == name).unwrap();
+            assert!(
+                !model.sql.contains("where updated_at >"),
+                "{}: {}",
+                name,
+                model.sql
+            );
+            if name == "orders_nokey" {
+                assert!(matches!(
+                    model.config.strategy,
+                    StrategyConfig::DeleteInsert { .. }
+                ));
+            } else {
+                assert!(matches!(
+                    model.config.strategy,
+                    StrategyConfig::Merge { .. }
+                ));
+            }
+        }
+        assert_eq!(accepted.imported.len(), 3);
 
         let plain = dbt_manifest::parse_manifest(&fixtures.join("plain/manifest.json"))
             .expect("real plain manifest parses");
         let refused = import_from_manifest(&plain, &target, false, MicrobatchMode::Merge);
         assert!(refused.imported.is_empty());
-        assert_eq!(refused.failed.len(), 1);
-        assert_eq!(refused.failed[0].name, "orders_inc");
-        assert!(
-            refused.failed[0]
-                .reason
-                .contains("dbt compile --full-refresh")
-        );
+        assert_eq!(refused.failed.len(), 4, "{:?}", refused.failed);
+        for name in [
+            "orders_inc",
+            "orders_pinned",
+            "orders_macro",
+            "orders_nokey",
+        ] {
+            let failure = refused.failed.iter().find(|f| f.name == name).unwrap();
+            assert!(failure.reason.contains("dbt compile --full-refresh"));
+            if name == "orders_pinned" {
+                assert!(failure.reason.contains("full_refresh=false"));
+            }
+        }
     }
 
     #[test]
-    fn keyed_incremental_rejects_missing_mismatched_and_false_evidence() {
+    fn incremental_rejects_missing_mismatched_and_false_evidence() {
         let fixtures = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/dbt_incremental_compile/full_refresh");
         let dir = tempfile::TempDir::new().unwrap();
@@ -4194,11 +4244,12 @@ FROM {{ ref('stg_events') }}
             let manifest = dbt_manifest::parse_manifest(&manifest_path).unwrap();
             let result = import_from_manifest(&manifest, &target, false, MicrobatchMode::Merge);
             assert!(result.imported.is_empty());
-            assert_eq!(result.failed.len(), 1);
+            assert_eq!(result.failed.len(), 4, "{:?}", result.failed);
             assert!(
-                result.failed[0]
-                    .reason
-                    .contains("dbt compile --full-refresh")
+                result
+                    .failed
+                    .iter()
+                    .all(|f| f.reason.contains("dbt compile --full-refresh"))
             );
         }
     }
@@ -4226,7 +4277,7 @@ FROM {{ ref('stg_events') }}
             },
             "sources": {}
         });
-        let result = import_from_manifest_json(&manifest);
+        let result = import_from_manifest_json_with_evidence(&manifest, MicrobatchMode::Merge);
         match &result.imported[0].config.strategy {
             StrategyConfig::DeleteInsert { partition_by } => {
                 assert_eq!(partition_by, &vec!["dt".to_string()]);
@@ -4340,7 +4391,7 @@ FROM {{ ref('stg_events') }}
             },
             "sources": {}
         });
-        let result = import_from_manifest_json(&manifest);
+        let result = import_from_manifest_json_with_evidence(&manifest, MicrobatchMode::Merge);
         let found = result.structured_warnings.iter().find_map(|w| match w {
             ImportDbtStructuredWarning::DroppedOnSchemaChange {
                 dbt_value,
@@ -4954,6 +5005,7 @@ FROM {{ ref('stg_events') }}
             },
             config: DbtNodeConfig {
                 materialized: "table".to_string(),
+                full_refresh: None,
                 schema: None,
                 unique_key: None,
                 incremental_strategy: None,

@@ -82,6 +82,8 @@ pub struct DbtDependsOn {
 #[derive(Debug, Clone)]
 pub struct DbtNodeConfig {
     pub materialized: String,
+    /// Effective dbt model config. `false` overrides even --full-refresh.
+    pub full_refresh: Option<bool>,
     pub schema: Option<String>,
     pub unique_key: Option<UniqueKeyValue>,
     pub incremental_strategy: Option<String>,
@@ -344,6 +346,8 @@ struct RawDependsOn {
 struct RawNodeConfig {
     #[serde(default)]
     materialized: Option<String>,
+    #[serde(default)]
+    full_refresh: Option<bool>,
     #[serde(default)]
     schema: Option<String>,
     #[serde(default)]
@@ -617,6 +621,7 @@ fn convert_node(raw: RawNode) -> DbtManifestNode {
         },
         config: DbtNodeConfig {
             materialized: config.materialized.unwrap_or_else(|| "view".to_string()),
+            full_refresh: config.full_refresh,
             schema: config.schema,
             unique_key,
             incremental_strategy: config.incremental_strategy,
