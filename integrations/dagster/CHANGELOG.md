@@ -16,6 +16,7 @@ Pairs with engine 1.76.0 and `rocky-sdk` 0.17.0.
 ### Changed
 
 - **The `rocky-sdk` floor rises to `>=0.17.0`**: `resource.py` imports `ReconcileWatermarkOutput`, which 0.16.0 does not have.
+- **Breaking: upgrade the engine to 1.76.0 together with this release.** Through `rocky-sdk` 0.17.0, `plan_promote()` cannot parse a non-empty promote plan from engine 1.75.0 or earlier.
 - Dependencies: urllib3 2.8.0 (security fixes). (#2224)
 
 ## [1.67.0] — 2026-09-30
