@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.68.0] — 2026-10-03
+
+Pairs with engine 1.76.0 and `rocky-sdk` 0.17.0.
+
+### Added
+
+- **`RockyResource.reconcile_watermark(pipeline, *, tables=None, dry_run=False)`** runs `rocky state reconcile-watermark` through `RockyClient`, with the usual `RockyError` to `dagster.Failure` translation. (#1814)
+
+### Changed
+
+- **The `rocky-sdk` floor rises to `>=0.17.0`**: `resource.py` imports `ReconcileWatermarkOutput`, which 0.16.0 does not have.
+- Dependencies: urllib3 2.8.0 (security fixes). (#2224)
+
 ## [1.67.0] — 2026-09-30
 
 Pairs with engine 1.75.0 and `rocky-sdk` 0.16.0.
