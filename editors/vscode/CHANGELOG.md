@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.43.0] — 2026-10-03
+
+Pairs with engine 1.76.0.
+
+### Changed
+
+- **The plan review panel lists conditional DROPs before it offers Approve and Apply.** A model whose `drop_existing_kind` permission can replace a view with a table, or the reverse, shows the DROP and the target it applies to. (#2217)
+- Generated types follow engine 1.76.0, including `ReconcileWatermarkOutput`.
+- Dependencies: brace-expansion 5.0.12 (security fixes). (#2222)
+
 ## [1.42.0] — 2026-09-30
 
 Pairs with engine 1.75.0.

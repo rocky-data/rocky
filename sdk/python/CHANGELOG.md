@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.17.0] — 2026-10-03
+
+Pairs with engine 1.76.0.
+
+### Added
+
+- **`RockyClient.reconcile_watermark(pipeline, *, tables=None, dry_run=False)`** wraps the new `rocky state reconcile-watermark` and returns `ReconcileWatermarkOutput`. It sets each incremental cursor from the target's maximum timestamp. Needs engine 1.76.0. (#1814)
+- **`RunResult.shadow_comparison`**: the comparison a `rocky run --shadow` makes before it drops its shadow objects. Absent on ordinary runs. (#2198)
+- Generated models follow the engine: `ReviewOutput.conditional_drops` (#2217) and `CompareOutput.tables_no_baseline` (#2198).
+
+### Changed
+
+- **Breaking: `plan_promote()` needs engine 1.76.0.** Promote plan targets gain required fields (structured coordinates, `strategy`, `pre_drop_statement`, `production_upstreams`; #2024). Parsing a non-empty promote plan from engine 1.75.0 or earlier fails on the missing fields. Upgrade the engine with the SDK.
+
 ## [0.16.0] — 2026-09-30
 
 Pairs with engine 1.75.0.
