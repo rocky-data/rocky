@@ -236,6 +236,21 @@ depends_on = ["raw"]
 adapter = "warehouse"
 ```
 
+Declare the external tables the models read, with optional dbt-style freshness
+checked by `rocky freshness` (exit 1 on `error` / `runtime_error`):
+
+```toml
+[[pipeline.silver.sources]]
+schema = "raw"                     # catalog optional (two-part names)
+table  = "orders"
+
+[pipeline.silver.sources.freshness]
+loaded_at_field = "_loaded_at"     # DATE / TIMESTAMP column
+warn_after      = "12h"            # <N>s | <N>h | <N>d; at least one of the two
+error_after     = "24h"            # must be >= warn_after (else E050)
+filter          = "status <> 'test'"   # optional WHERE predicate; no `;`
+```
+
 ### Quality pipeline
 
 ```toml

@@ -196,9 +196,11 @@ pub fn validate_contract(
                             // advice (#1721).
                             .with_suggestion(format!(
                                 "give `rocky compile` source schemas so `{0}`'s type resolves — \
-                                 `rocky discover --with-schemas` fills the cache, or use \
-                                 `rocky compile --with-seed`; `rocky test` and `rocky ci` always \
-                                 compile without them. Do not add a CAST to silence this: a cast \
+                                 `rocky compile --with-seed` reads them from `data/seed.sql`; \
+                                 for a replication pipeline, `rocky discover --with-schemas` \
+                                 fills the schema cache (it refuses transformation-only \
+                                 pipelines); `rocky test` and `rocky ci` always compile without \
+                                 them. Do not add a CAST to silence this: a cast \
                                  takes its type from the target, so it would report {1} whatever \
                                  the column actually holds",
                                 contract_col.name, expected_type

@@ -5680,6 +5680,7 @@ mod tests {
             max_lag_seconds: 3600,
             time_column: Some("event_ts".to_string()),
             severity: None,
+            declared_in_sidecar: true,
         });
         let models = vec![model];
         let typed = typed_models_for("events", &[("event_ts", RockyType::Timestamp)]);

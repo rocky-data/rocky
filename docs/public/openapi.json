@@ -7980,6 +7980,89 @@
         },
         "type": "object"
       },
+      "FreshnessCheckResult": {
+        "description": "One freshness check.",
+        "properties": {
+          "age_seconds": {
+            "description": "`checked_at - max_loaded_at`, in seconds. Negative when the newest load time is in the future (clock skew).",
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "error_after_seconds": {
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "loaded_at_field": {
+            "description": "The column read with `MAX(..)`. `None` when the measurement is the model's last successful build from the state store.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "max_loaded_at": {
+            "description": "The newest load time seen. `None` when the table is empty, every value is NULL, the model was never built, or the check could not run.",
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "measured_from": {
+            "description": "Where `max_loaded_at` came from: `warehouse` or `state_store`.",
+            "type": "string"
+          },
+          "message": {
+            "description": "Why the status is what it is, when that is not just the age.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "description": "Source `schema.table` (or `catalog.schema.table`), or the model name.",
+            "type": "string"
+          },
+          "pipeline": {
+            "description": "The pipeline that declares the source or loads the model.",
+            "type": "string"
+          },
+          "status": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/FreshnessStatus"
+              }
+            ],
+            "description": "`pass`, `warn`, `error`, or `runtime_error`."
+          },
+          "table": {
+            "description": "The table the measurement was taken from (`catalog.schema.table`).",
+            "type": "string"
+          },
+          "warn_after_seconds": {
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "measured_from",
+          "name",
+          "pipeline",
+          "status",
+          "table"
+        ],
+        "type": "object"
+      },
       "FreshnessConfig": {
         "additionalProperties": false,
         "description": "Freshness check configuration.\n\nA single scalar `threshold_seconds` applies to every checked table. There used to be an `overrides` key for per-schema thresholds; it parsed and validated but nothing on the check path ever read it, so it is now refused with a message naming the remedy (#1620).",
@@ -8015,6 +8098,48 @@
         },
         "required": [
           "threshold_seconds"
+        ],
+        "type": "object"
+      },
+      "FreshnessOutput": {
+        "description": "JSON output for `rocky freshness`.",
+        "properties": {
+          "checked_at": {
+            "description": "The instant every age was measured against.",
+            "format": "date-time",
+            "type": "string"
+          },
+          "command": {
+            "type": "string"
+          },
+          "models": {
+            "description": "One entry per model `[freshness]` block.",
+            "items": {
+              "$ref": "#/components/schemas/FreshnessCheckResult"
+            },
+            "type": "array"
+          },
+          "sources": {
+            "description": "One entry per declared source freshness block.",
+            "items": {
+              "$ref": "#/components/schemas/FreshnessCheckResult"
+            },
+            "type": "array"
+          },
+          "summary": {
+            "$ref": "#/components/schemas/FreshnessSummary"
+          },
+          "version": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "checked_at",
+          "command",
+          "models",
+          "sources",
+          "summary",
+          "version"
         ],
         "type": "object"
       },
@@ -8064,6 +8189,48 @@
         "required": [
           "max_lag",
           "time_column"
+        ],
+        "type": "object"
+      },
+      "FreshnessStatus": {
+        "description": "Outcome of one freshness check. Serialized `pass` / `warn` / `error` / `runtime_error`, matching dbt's `source freshness` statuses.\n\n- `pass`: within every threshold. - `warn`: older than `warn_after`, not older than `error_after`. - `error`: older than `error_after`. - `runtime_error`: the check could not be evaluated (invalid config, a failed query, or a value that does not read as a timestamp).",
+        "enum": [
+          "pass",
+          "warn",
+          "error",
+          "runtime_error"
+        ],
+        "type": "string"
+      },
+      "FreshnessSummary": {
+        "description": "Counts per status across `sources` and `models`.",
+        "properties": {
+          "error": {
+            "format": "uint",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "pass": {
+            "format": "uint",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "runtime_error": {
+            "format": "uint",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "warn": {
+            "format": "uint",
+            "minimum": 0.0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "error",
+          "pass",
+          "runtime_error",
+          "warn"
         ],
         "type": "object"
       },
@@ -11581,7 +11748,7 @@
         "type": "object"
       },
       "ModelFreshnessConfig": {
-        "description": "Per-model freshness configuration.\n\nDeclares the maximum allowed lag between successive materializations of the model plus the optional timestamp column used by the runtime freshness check.\n\nThe compiler does not enforce the TTL — it's metadata consumed by downstream observability tooling (`dagster-rocky` `FreshnessPolicy`, `rocky doctor --freshness`, etc.). The compiler does however soft-warn (W005) when a model has at least one temporal output column but no `freshness` declaration anywhere in scope (per-model or project-level default).",
+        "description": "Per-model freshness configuration.\n\nDeclares the maximum allowed lag between successive materializations of the model plus the optional timestamp column used by the runtime freshness check.\n\n`rocky freshness` enforces the TTL at run time: it reads `MAX(time_column)` from the model's target table (or, without a `time_column`, the model's last successful build in the state store) and reports `warn`, or `error` when `severity = \"error\"`. `rocky run` does not gate on it. The compiler checks the `time_column` (E050 when absent from a provably complete output, W050 when not temporal), and soft-warns (W005) when a model has at least one temporal output column but no `freshness` declaration anywhere in scope (per-model or project-level default).",
         "properties": {
           "max_lag_seconds": {
             "description": "Maximum lag in seconds before the model is considered stale.\n\nAccepts both `max_lag_seconds` (legacy field name, preserved for existing sidecar fixtures + dagster Pydantic + VS Code bindings) and `expected_lag_seconds` (the documented public-facing name matching dbt freshness + SQLMesh defaults). Both deserialize to the same field; the serialized name stays `max_lag_seconds` so existing JSON/codegen consumers keep working unchanged.",
@@ -12533,6 +12700,41 @@
         },
         "required": [
           "schema_pattern"
+        ],
+        "type": "object"
+      },
+      "PipelineSourceConfig2": {
+        "additionalProperties": false,
+        "description": "One external source a transformation pipeline reads.\n\n`catalog` may be omitted (DuckDB and other two-part warehouses); it then defaults to the empty string, which the dialects render as `schema.table`.",
+        "properties": {
+          "catalog": {
+            "default": "",
+            "description": "Catalog (database) holding the table. Empty for two-part names.",
+            "type": "string"
+          },
+          "freshness": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SourceFreshnessConfig"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Optional freshness expectation. A source without one is declared but never checked."
+          },
+          "schema": {
+            "description": "Schema holding the table.",
+            "type": "string"
+          },
+          "table": {
+            "description": "Table name.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "schema",
+          "table"
         ],
         "type": "object"
       },
@@ -15438,10 +15640,10 @@
                 "type": "null"
               }
             ],
-            "description": "Default severity reported when the freshness check trips. Inherited on the same terms as `time_column`. No runtime check reads it yet."
+            "description": "Default severity reported when the freshness check trips. Inherited on the same terms as `time_column`. Under `error`, a stale model makes `rocky freshness` exit 1."
           },
           "time_column": {
-            "description": "Default timestamp column used to evaluate freshness at runtime. Carried into a model that declares no `[freshness]` block of its own; a model that declares one keeps its own value, or none. Only inherited alongside an `expected_lag_seconds`. No runtime check reads it yet.",
+            "description": "Default timestamp column used to evaluate freshness at runtime. Carried into a model that declares no `[freshness]` block of its own; a model that declares one keeps its own value, or none. Only inherited alongside an `expected_lag_seconds`. `rocky freshness` reads `MAX(time_column)` from each inheriting model's target; when a model does not have the column it measures the last successful build instead.",
             "type": [
               "string",
               "null"
@@ -20380,6 +20582,41 @@
         ],
         "type": "object"
       },
+      "SourceFreshnessConfig": {
+        "additionalProperties": false,
+        "description": "Freshness expectation for one source (dbt `freshness:` parity).",
+        "properties": {
+          "error_after": {
+            "description": "Age above which the source reports `error` and `rocky freshness` exits non-zero. Must not be shorter than `warn_after`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "filter": {
+            "description": "Optional SQL predicate limiting the rows the maximum is taken over, spliced as `WHERE (<filter>)`. A statement terminator is refused.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "loaded_at_field": {
+            "description": "Column holding the load time of each row. Should be a TIMESTAMP or DATE column; `rocky freshness` reads `MAX(loaded_at_field)`.",
+            "type": "string"
+          },
+          "warn_after": {
+            "description": "Age above which the source reports `warn` (`\"12h\"`, `\"3600s\"`, `\"7d\"`).",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "loaded_at_field"
+        ],
+        "type": "object"
+      },
       "SourceOutput": {
         "description": "A discovered source (connector, schema, integration — terminology varies by adapter).",
         "properties": {
@@ -22150,6 +22387,13 @@
               }
             ],
             "description": "Optional native-schedule declaration. See [`ScheduleConfig`]."
+          },
+          "sources": {
+            "description": "External sources the pipeline's models read, with optional freshness expectations checked by `rocky freshness`. Declared as `[[pipeline.<name>.sources]]`. See [`crate::source_freshness::PipelineSourceConfig`].",
+            "items": {
+              "$ref": "#/components/schemas/PipelineSourceConfig2"
+            },
+            "type": "array"
           },
           "target": {
             "allOf": [

@@ -194,6 +194,10 @@ _LAZY: dict[str, tuple[str, str]] = {
     "FivetranStateEnvelopeVersion": ("rocky_fivetran_state_schema", "EnvelopeVersion"),
     "FivetranTableConfig": ("rocky_fivetran_state_schema", "FivetranTableConfig"),
     "FreshnessConfigOutput": ("discover_schema", "FreshnessConfigOutput"),
+    "FreshnessCheckResult": ("freshness_schema", "FreshnessCheckResult"),
+    "FreshnessOutput": ("freshness_schema", "FreshnessOutput"),
+    "FreshnessStatus": ("freshness_schema", "FreshnessStatus"),
+    "FreshnessSummary": ("freshness_schema", "FreshnessSummary"),
     "GcApplyOutput": ("gc_apply_schema", "GcApplyOutput"),
     "GcCandidateOutput": ("gc_schema", "GcCandidateOutput"),
     "GcCheckOutput": ("gc_schema", "GcCheckOutput"),
@@ -719,6 +723,12 @@ if TYPE_CHECKING:
         ModelRetentionStatus,
         RetentionStatusOutput,
     )
+    from .freshness_schema import (
+        FreshnessCheckResult,
+        FreshnessOutput,
+        FreshnessStatus,
+        FreshnessSummary,
+    )
     from .preview_create_schema import (
         PreviewCopiedModel,
         PreviewCreateOutput,
@@ -905,6 +915,10 @@ __all__ = [
     "DiscoverOutput",
     "FailedSourceOutput",
     "FreshnessConfigOutput",
+    "FreshnessCheckResult",
+    "FreshnessOutput",
+    "FreshnessStatus",
+    "FreshnessSummary",
     "SourceOutput",
     "TableOutput",
     "DoctorOutput",

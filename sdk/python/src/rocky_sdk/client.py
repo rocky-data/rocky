@@ -67,6 +67,7 @@ from rocky_sdk.types import (
     DagResult,
     DiscoverResult,
     DoctorResult,
+    FreshnessOutput,
     GcApplyOutput,
     HistoryResult,
     MetricsResult,
@@ -1853,6 +1854,21 @@ class RockyClient:
         if env is not None:
             args.extend(["--env", env])
         return _parse_rocky_json(self.run_cli(args), ComplianceOutput, command="compliance")
+
+    def freshness(self, *, pipeline: str | None = None) -> FreshnessOutput:
+        """Run ``rocky freshness`` and return per-source and per-model freshness.
+
+        Each entry carries ``max_loaded_at``, ``age_seconds`` and a ``status`` of
+        ``pass``, ``warn``, ``error`` or ``runtime_error``. The CLI exits 1 when
+        any check is ``error`` or ``runtime_error``; the JSON report is still
+        returned (``allow_partial=True``), so read ``summary`` to gate on it.
+        """
+        args = ["freshness"]
+        if pipeline is not None:
+            args.extend(["--pipeline", pipeline])
+        return _parse_rocky_json(
+            self.run_cli(args, allow_partial=True), FreshnessOutput, command="freshness"
+        )
 
     def retention_status(self, *, env: str | None = None) -> RetentionStatusOutput:
         """Run ``rocky retention-status`` against ``models_dir`` and return per-model status.

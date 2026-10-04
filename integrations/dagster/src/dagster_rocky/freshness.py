@@ -14,6 +14,7 @@ worlds, so the wiring at every call site (``load_rocky_assets``,
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from datetime import timedelta
 from typing import TYPE_CHECKING
 
@@ -22,7 +23,12 @@ import dagster as dg
 from .types import ChecksConfig
 
 if TYPE_CHECKING:
-    from .types import CompileResult, ModelFreshnessConfig
+    from .types import (
+        CompileResult,
+        FreshnessCheckResult,
+        FreshnessOutput,
+        ModelFreshnessConfig,
+    )
 
 #: Name of the built-in freshness check. The engine emits a ``CheckResult``
 #: under this exact name, and only when the pipeline declares
@@ -78,8 +84,10 @@ def freshness_is_configured(checks: ChecksConfig | None) -> bool:
     :class:`dagster.FreshnessPolicy` on one asset through
     :func:`freshness_policy_from_model` while this predicate is ``False``. That
     policy is Dagster's own staleness evaluation. The engine never emits a
-    ``freshness`` ``CheckResult`` for it — per-model ``max_lag_seconds`` is read
-    by ``rocky tick`` and ``rocky validate``, not by the check runner — so it
+    ``freshness`` ``CheckResult`` for it during ``rocky run`` — per-model
+    ``max_lag_seconds`` is read by ``rocky tick``, ``rocky validate`` and the
+    separate ``rocky freshness`` command (see
+    :func:`freshness_check_results`), not by the run's check runner — so it
     does not change the answer here.
 
     ``checks`` is ``None`` when the pipeline declares no ``[checks]`` block at
@@ -153,3 +161,70 @@ def per_model_freshness_policies(
         if policy is not None:
             out[model.name] = policy
     return out
+
+
+#: Check names for ``rocky freshness`` results. Distinct from
+#: :data:`FRESHNESS_CHECK_NAME`, which the replication run's
+#: ``[checks.freshness]`` emits, so both can sit on one asset.
+SOURCE_FRESHNESS_CHECK_NAME: str = "source_freshness"
+MODEL_FRESHNESS_CHECK_NAME: str = "model_freshness"
+
+
+def _default_freshness_asset_key(entry: FreshnessCheckResult) -> dg.AssetKey:
+    return dg.AssetKey(entry.table.split("."))
+
+
+def freshness_check_results(
+    output: FreshnessOutput,
+    *,
+    asset_key_for: Callable[[FreshnessCheckResult], dg.AssetKey | None] | None = None,
+) -> list[dg.AssetCheckResult]:
+    """Map a ``rocky freshness`` report to Dagster asset check results.
+
+    One :class:`dagster.AssetCheckResult` per source (check name
+    :data:`SOURCE_FRESHNESS_CHECK_NAME`) and per model
+    (:data:`MODEL_FRESHNESS_CHECK_NAME`). ``pass`` passes. ``warn`` fails with
+    ``WARN`` severity. ``error`` and ``runtime_error`` fail with ``ERROR``.
+
+    ``asset_key_for`` maps an entry to its asset key. The default splits the
+    entry's ``table`` (``catalog.schema.table``) on dots. Return ``None`` to
+    skip an entry, e.g. a source with no asset in the code location.
+    """
+    key_for = asset_key_for or _default_freshness_asset_key
+    results: list[dg.AssetCheckResult] = []
+    for check_name, entries in (
+        (SOURCE_FRESHNESS_CHECK_NAME, output.sources),
+        (MODEL_FRESHNESS_CHECK_NAME, output.models),
+    ):
+        for entry in entries:
+            key = key_for(entry)
+            if key is None:
+                continue
+            status = entry.status.value
+            severity = (
+                dg.AssetCheckSeverity.WARN if status == "warn" else dg.AssetCheckSeverity.ERROR
+            )
+            metadata: dict[str, dg.MetadataValue] = {
+                "status": dg.MetadataValue.text(status),
+                "measured_from": dg.MetadataValue.text(entry.measured_from),
+            }
+            if entry.max_loaded_at is not None:
+                metadata["max_loaded_at"] = dg.MetadataValue.text(entry.max_loaded_at.isoformat())
+            if entry.age_seconds is not None:
+                metadata["age_seconds"] = dg.MetadataValue.int(entry.age_seconds)
+            if entry.warn_after_seconds is not None:
+                metadata["warn_after_seconds"] = dg.MetadataValue.int(entry.warn_after_seconds)
+            if entry.error_after_seconds is not None:
+                metadata["error_after_seconds"] = dg.MetadataValue.int(entry.error_after_seconds)
+            if entry.message:
+                metadata["message"] = dg.MetadataValue.text(entry.message)
+            results.append(
+                dg.AssetCheckResult(
+                    asset_key=key,
+                    check_name=check_name,
+                    passed=status == "pass",
+                    severity=severity,
+                    metadata=metadata,
+                )
+            )
+    return results

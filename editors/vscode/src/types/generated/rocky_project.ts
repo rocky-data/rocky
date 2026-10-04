@@ -1007,11 +1007,11 @@ export interface ProjectFreshnessConfig {
    */
   expected_lag_seconds?: number | null;
   /**
-   * Default severity reported when the freshness check trips. Inherited on the same terms as `time_column`. No runtime check reads it yet.
+   * Default severity reported when the freshness check trips. Inherited on the same terms as `time_column`. Under `error`, a stale model makes `rocky freshness` exit 1.
    */
   severity?: TestSeverity | null;
   /**
-   * Default timestamp column used to evaluate freshness at runtime. Carried into a model that declares no `[freshness]` block of its own; a model that declares one keeps its own value, or none. Only inherited alongside an `expected_lag_seconds`. No runtime check reads it yet.
+   * Default timestamp column used to evaluate freshness at runtime. Carried into a model that declares no `[freshness]` block of its own; a model that declares one keeps its own value, or none. Only inherited alongside an `expected_lag_seconds`. `rocky freshness` reads `MAX(time_column)` from each inheriting model's target; when a model does not have the column it measures the last successful build instead.
    */
   time_column?: string | null;
 }
@@ -1645,10 +1645,58 @@ export interface TransformationPipelineConfig {
    */
   schedule?: ScheduleConfig | null;
   /**
+   * External sources the pipeline's models read, with optional freshness expectations checked by `rocky freshness`. Declared as `[[pipeline.<name>.sources]]`. See [`crate::source_freshness::PipelineSourceConfig`].
+   */
+  sources?: PipelineSourceConfig2[];
+  /**
    * Target configuration (adapter + governance).
    */
   target: TransformationTargetConfig;
   [k: string]: unknown;
+}
+/**
+ * One external source a transformation pipeline reads.
+ *
+ * `catalog` may be omitted (DuckDB and other two-part warehouses); it then defaults to the empty string, which the dialects render as `schema.table`.
+ */
+export interface PipelineSourceConfig2 {
+  /**
+   * Catalog (database) holding the table. Empty for two-part names.
+   */
+  catalog?: string;
+  /**
+   * Optional freshness expectation. A source without one is declared but never checked.
+   */
+  freshness?: SourceFreshnessConfig | null;
+  /**
+   * Schema holding the table.
+   */
+  schema: string;
+  /**
+   * Table name.
+   */
+  table: string;
+}
+/**
+ * Freshness expectation for one source (dbt `freshness:` parity).
+ */
+export interface SourceFreshnessConfig {
+  /**
+   * Age above which the source reports `error` and `rocky freshness` exits non-zero. Must not be shorter than `warn_after`.
+   */
+  error_after?: string | null;
+  /**
+   * Optional SQL predicate limiting the rows the maximum is taken over, spliced as `WHERE (<filter>)`. A statement terminator is refused.
+   */
+  filter?: string | null;
+  /**
+   * Column holding the load time of each row. Should be a TIMESTAMP or DATE column; `rocky freshness` reads `MAX(loaded_at_field)`.
+   */
+  loaded_at_field: string;
+  /**
+   * Age above which the source reports `warn` (`"12h"`, `"3600s"`, `"7d"`).
+   */
+  warn_after?: string | null;
 }
 /**
  * Target configuration for transformation pipelines.

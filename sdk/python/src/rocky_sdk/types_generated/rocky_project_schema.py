@@ -1651,6 +1651,32 @@ class SnapshotSourceConfig(BaseModel):
     table: str
 
 
+class SourceFreshnessConfig(BaseModel):
+    """
+    Freshness expectation for one source (dbt `freshness:` parity).
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+    )
+    error_after: str | None = None
+    """
+    Age above which the source reports `error` and `rocky freshness` exits non-zero. Must not be shorter than `warn_after`.
+    """
+    filter: str | None = None
+    """
+    Optional SQL predicate limiting the rows the maximum is taken over, spliced as `WHERE (<filter>)`. A statement terminator is refused.
+    """
+    loaded_at_field: str
+    """
+    Column holding the load time of each row. Should be a TIMESTAMP or DATE column; `rocky freshness` reads `MAX(loaded_at_field)`.
+    """
+    warn_after: str | None = None
+    """
+    Age above which the source reports `warn` (`"12h"`, `"3600s"`, `"7d"`).
+    """
+
+
 class StateBackend1(StrEnum):
     """
     State stored on local disk (default). No sync needed.
@@ -2293,6 +2319,34 @@ class PipelineSourceConfig(BaseModel):
     """
 
 
+class PipelineSourceConfig2(BaseModel):
+    """
+    One external source a transformation pipeline reads.
+
+    `catalog` may be omitted (DuckDB and other two-part warehouses); it then defaults to the empty string, which the dialects render as `schema.table`.
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+    )
+    catalog: str | None = ""
+    """
+    Catalog (database) holding the table. Empty for two-part names.
+    """
+    freshness: SourceFreshnessConfig | None = None
+    """
+    Optional freshness expectation. A source without one is declared but never checked.
+    """
+    schema_: str = Field(..., alias="schema")
+    """
+    Schema holding the table.
+    """
+    table: str
+    """
+    Table name.
+    """
+
+
 class PolicyRule(BaseModel):
     """
     One `[[policy.rules]]` entry: `(principal, capability, scope) → effect`.
@@ -2371,11 +2425,11 @@ class ProjectFreshnessConfig(BaseModel):
     """
     severity: TestSeverity5 | TestSeverity6 | None = None
     """
-    Default severity reported when the freshness check trips. Inherited on the same terms as `time_column`. No runtime check reads it yet.
+    Default severity reported when the freshness check trips. Inherited on the same terms as `time_column`. Under `error`, a stale model makes `rocky freshness` exit 1.
     """
     time_column: str | None = None
     """
-    Default timestamp column used to evaluate freshness at runtime. Carried into a model that declares no `[freshness]` block of its own; a model that declares one keeps its own value, or none. Only inherited alongside an `expected_lag_seconds`. No runtime check reads it yet.
+    Default timestamp column used to evaluate freshness at runtime. Carried into a model that declares no `[freshness]` block of its own; a model that declares one keeps its own value, or none. Only inherited alongside an `expected_lag_seconds`. `rocky freshness` reads `MAX(time_column)` from each inheriting model's target; when a model does not have the column it measures the last successful build instead.
     """
 
 
@@ -3761,6 +3815,10 @@ class TransformationPipelineConfig(BaseModel):
     schedule: ScheduleConfig | None = None
     """
     Optional native-schedule declaration. See [`ScheduleConfig`].
+    """
+    sources: list[PipelineSourceConfig2] | None = None
+    """
+    External sources the pipeline's models read, with optional freshness expectations checked by `rocky freshness`. Declared as `[[pipeline.<name>.sources]]`. See [`crate::source_freshness::PipelineSourceConfig`].
     """
     target: TransformationTargetConfig
     """

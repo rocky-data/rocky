@@ -471,6 +471,13 @@ pub fn compile_project(
         &type_check.typed_models,
         config.project_freshness.has_default(),
     );
+    // E050 / W050: a model `[freshness] time_column` that `rocky freshness`
+    // could not read as a load time.
+    let model_freshness_diagnostics = crate::freshness::check_model_freshness(
+        &project.models,
+        &type_check.typed_models,
+        &semantic_graph,
+    );
 
     // 9. Managed-Iceberg format_options (E035). Reject `format_options` the
     //    Databricks warehouse rejects at execution (partition_by + cluster_by
@@ -485,6 +492,7 @@ pub fn compile_project(
     diagnostics.extend(blast_radius_diagnostics);
     diagnostics.extend(classification_diagnostics);
     diagnostics.extend(freshness_diagnostics);
+    diagnostics.extend(model_freshness_diagnostics);
     diagnostics.extend(lakehouse_diagnostics);
     diagnostics.extend(run_var_diagnostics);
     diagnostics.extend(target_collision_diagnostics(&project));
@@ -733,6 +741,13 @@ pub fn compile_incremental(
         &type_check.typed_models,
         config.project_freshness.has_default(),
     );
+    // E050 / W050: a model `[freshness] time_column` that `rocky freshness`
+    // could not read as a load time.
+    let model_freshness_diagnostics = crate::freshness::check_model_freshness(
+        &project.models,
+        &type_check.typed_models,
+        &semantic_graph,
+    );
 
     // E035: managed-Iceberg format_options, mirroring the full-compile path so
     // the LSP (incremental) surface matches `rocky compile`. (FR-044)
@@ -743,6 +758,7 @@ pub fn compile_incremental(
     diagnostics.extend(blast_radius_diagnostics);
     diagnostics.extend(classification_diagnostics);
     diagnostics.extend(freshness_diagnostics);
+    diagnostics.extend(model_freshness_diagnostics);
     diagnostics.extend(lakehouse_diagnostics);
     diagnostics.extend(run_var_diagnostics);
     diagnostics.extend(target_collision_diagnostics(&project));

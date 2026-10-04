@@ -22,6 +22,7 @@ pub mod contracts;
 pub mod cost_check;
 pub mod diagnostic;
 mod group_by;
+pub mod freshness;
 pub mod import;
 pub mod limits;
 pub mod operand_check;

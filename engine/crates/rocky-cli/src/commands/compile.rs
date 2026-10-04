@@ -380,6 +380,24 @@ fn compile_inner(
         result.diagnostics.extend(import_diags);
     }
 
+    // E050 / W050 for transformation pipelines' declared source freshness
+    // (`[[pipeline.<name>.sources]]`). The source schemas are the same map the
+    // typecheck used (seed or schema cache), so a stale schema only warns.
+    if let Some(config_file) = &project_config {
+        for pipeline in config_file.pipelines.values() {
+            if let Some(tx) = pipeline.as_transformation() {
+                let diags = rocky_compiler::freshness::check_source_freshness(
+                    &tx.sources,
+                    &config.source_schemas,
+                );
+                if diags.iter().any(Diagnostic::is_error) {
+                    result.has_errors = true;
+                }
+                result.diagnostics.extend(diags);
+            }
+        }
+    }
+
     // Re-apply model filter to diagnostics (may now include E027).
     let diagnostics: Vec<_> = result
         .diagnostics

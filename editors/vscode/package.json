@@ -289,6 +289,11 @@
         "category": "Rocky"
       },
       {
+        "command": "rocky.freshness",
+        "title": "Check Source Freshness",
+        "category": "Rocky"
+      },
+      {
         "command": "rocky.optimize",
         "title": "Analyze Cost & Optimization",
         "category": "Rocky"

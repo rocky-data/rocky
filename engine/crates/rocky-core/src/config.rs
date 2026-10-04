@@ -1612,13 +1612,15 @@ pub struct ProjectFreshnessConfig {
     /// Default timestamp column used to evaluate freshness at runtime.
     /// Carried into a model that declares no `[freshness]` block of its
     /// own; a model that declares one keeps its own value, or none. Only
-    /// inherited alongside an `expected_lag_seconds`. No runtime check
-    /// reads it yet.
+    /// inherited alongside an `expected_lag_seconds`. `rocky freshness`
+    /// reads `MAX(time_column)` from each inheriting model's target; when a
+    /// model does not have the column it measures the last successful build
+    /// instead.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub time_column: Option<String>,
     /// Default severity reported when the freshness check trips.
-    /// Inherited on the same terms as `time_column`. No runtime check
-    /// reads it yet.
+    /// Inherited on the same terms as `time_column`. Under `error`, a stale
+    /// model makes `rocky freshness` exit 1.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub severity: Option<crate::tests::TestSeverity>,
 }
@@ -6149,6 +6151,13 @@ pub struct TransformationPipelineConfig {
     /// Optional native-schedule declaration. See [`ScheduleConfig`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schedule: Option<ScheduleConfig>,
+
+    /// External sources the pipeline's models read, with optional freshness
+    /// expectations checked by `rocky freshness`. Declared as
+    /// `[[pipeline.<name>.sources]]`. See
+    /// [`crate::source_freshness::PipelineSourceConfig`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sources: Vec<crate::source_freshness::PipelineSourceConfig>,
 }
 
 fn default_models_glob() -> String {

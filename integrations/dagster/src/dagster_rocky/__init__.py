@@ -47,6 +47,9 @@ from .derived_models import (
     split_model_specs_by_partition_shape,
 )
 from .freshness import (
+    MODEL_FRESHNESS_CHECK_NAME,
+    SOURCE_FRESHNESS_CHECK_NAME,
+    freshness_check_results,
     freshness_policy_from_checks,
     freshness_policy_from_model,
     per_model_freshness_policies,
@@ -117,7 +120,9 @@ from .types import (
     DriftInfo,
     ExecutionSummary,
     FailedSourceOutput,
+    FreshnessCheckResult,
     FreshnessConfig,
+    FreshnessOutput,
     HealthCheck,
     HealthStatus,
     HistoryResult,
@@ -179,6 +184,9 @@ __all__ = [
     "cost_metadata_from_optimize",
     "parse_rocky_output",
     # Freshness + automation (T1.1, T1.2, T5.2)
+    "MODEL_FRESHNESS_CHECK_NAME",
+    "SOURCE_FRESHNESS_CHECK_NAME",
+    "freshness_check_results",
     "freshness_policy_from_checks",
     "freshness_policy_from_model",
     "per_model_freshness_policies",
@@ -328,4 +336,7 @@ __all__ = [
     "ComplianceSummary",
     "RetentionStatusOutput",
     "ModelRetentionStatus",
+    # Freshness (`rocky freshness`)
+    "FreshnessOutput",
+    "FreshnessCheckResult",
 ]

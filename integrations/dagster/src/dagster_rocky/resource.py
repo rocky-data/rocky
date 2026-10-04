@@ -58,6 +58,7 @@ from .types import (
     DagResult,
     DiscoverResult,
     DoctorResult,
+    FreshnessOutput,
     HistoryResult,
     MetricsResult,
     ModelHistoryResult,
@@ -1539,6 +1540,16 @@ class RockyResource(dg.ConfigurableResource):
         """Run ``rocky compliance`` and return the governance rollup."""
         with _translating():
             return self._get_client().compliance(env=env)
+
+    def freshness(self, *, pipeline: str | None = None) -> FreshnessOutput:
+        """Run ``rocky freshness`` and return per-source and per-model freshness.
+
+        The CLI exits 1 on any ``error`` / ``runtime_error`` check but the report
+        is still returned. Map it to asset checks with
+        :func:`dagster_rocky.freshness_check_results`.
+        """
+        with _translating():
+            return self._get_client().freshness(pipeline=pipeline)
 
     def retention_status(self, *, env: str | None = None) -> RetentionStatusOutput:
         """Run ``rocky retention-status`` and return per-model retention status.

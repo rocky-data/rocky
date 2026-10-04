@@ -414,3 +414,120 @@ def test_materialized_table_reports_no_freshness_verdict_without_a_freshness_con
     assert "freshness" not in evaluated
     # The op really ran and the other declared defaults still get a verdict.
     assert evaluated == _OTHER_DEFAULT_CHECKS
+
+
+# ---------------------------------------------------------------------------
+# `rocky freshness` -> asset check results
+# ---------------------------------------------------------------------------
+
+_FRESHNESS_REPORT = {
+    "version": "1.76.0",
+    "command": "freshness",
+    "checked_at": "2026-10-04T12:00:00Z",
+    "sources": [
+        {
+            "name": "raw.fresh",
+            "pipeline": "silver",
+            "table": "raw.fresh",
+            "loaded_at_field": "loaded_at",
+            "measured_from": "warehouse",
+            "max_loaded_at": "2026-10-04T11:00:00Z",
+            "age_seconds": 3600,
+            "warn_after_seconds": 43200,
+            "error_after_seconds": 86400,
+            "status": "pass",
+        },
+        {
+            "name": "raw.stale",
+            "pipeline": "silver",
+            "table": "raw.stale",
+            "loaded_at_field": "loaded_at",
+            "measured_from": "warehouse",
+            "max_loaded_at": "2026-10-03T23:00:00Z",
+            "age_seconds": 46800,
+            "warn_after_seconds": 43200,
+            "error_after_seconds": 86400,
+            "status": "warn",
+        },
+        {
+            "name": "raw.empty",
+            "pipeline": "silver",
+            "table": "raw.empty",
+            "loaded_at_field": "loaded_at",
+            "measured_from": "warehouse",
+            "max_loaded_at": None,
+            "age_seconds": None,
+            "error_after_seconds": 86400,
+            "status": "error",
+            "message": "no rows to measure",
+        },
+    ],
+    "models": [
+        {
+            "name": "fct_orders",
+            "pipeline": "silver",
+            "table": "analytics.marts.fct_orders",
+            "measured_from": "state_store",
+            "max_loaded_at": None,
+            "age_seconds": None,
+            "warn_after_seconds": 3600,
+            "status": "runtime_error",
+            "message": "could not read run history",
+        }
+    ],
+    "summary": {"pass": 1, "warn": 1, "error": 1, "runtime_error": 1},
+}
+
+
+def _freshness_output():
+    from dagster_rocky.types import FreshnessOutput
+
+    return FreshnessOutput.model_validate(_FRESHNESS_REPORT)
+
+
+def test_freshness_check_results_map_status_to_passed_and_severity():
+    from dagster_rocky import (
+        MODEL_FRESHNESS_CHECK_NAME,
+        SOURCE_FRESHNESS_CHECK_NAME,
+        freshness_check_results,
+    )
+
+    results = {(r.asset_key, r.check_name): r for r in freshness_check_results(_freshness_output())}
+    fresh = results[(dg.AssetKey(["raw", "fresh"]), SOURCE_FRESHNESS_CHECK_NAME)]
+    assert fresh.passed
+    stale = results[(dg.AssetKey(["raw", "stale"]), SOURCE_FRESHNESS_CHECK_NAME)]
+    assert not stale.passed
+    assert stale.severity == dg.AssetCheckSeverity.WARN
+    empty = results[(dg.AssetKey(["raw", "empty"]), SOURCE_FRESHNESS_CHECK_NAME)]
+    assert not empty.passed
+    assert empty.severity == dg.AssetCheckSeverity.ERROR
+    model = results[(dg.AssetKey(["analytics", "marts", "fct_orders"]), MODEL_FRESHNESS_CHECK_NAME)]
+    assert not model.passed
+    assert model.severity == dg.AssetCheckSeverity.ERROR
+    assert stale.metadata["age_seconds"].value == 46800
+
+
+def test_freshness_check_results_custom_key_can_skip_entries():
+    from dagster_rocky import freshness_check_results
+
+    results = freshness_check_results(
+        _freshness_output(),
+        asset_key_for=lambda e: dg.AssetKey(["src", e.name]) if e.name == "raw.stale" else None,
+    )
+    assert [r.asset_key for r in results] == [dg.AssetKey(["src", "raw.stale"])]
+
+
+def test_resource_freshness_parses_report_from_failing_exit():
+    from rocky_sdk import RockyClient
+
+    captured: list[tuple[list[str], bool]] = []
+
+    def fake_run(self, args, *, allow_partial=False, log_callback=None):
+        captured.append((args, allow_partial))
+        return json.dumps(_FRESHNESS_REPORT)
+
+    with patch.object(RockyClient, "run_cli", autospec=True, side_effect=fake_run):
+        result = RockyResource().freshness(pipeline="silver")
+
+    assert captured == [(["freshness", "--pipeline", "silver"], True)]
+    assert result.summary.error == 1

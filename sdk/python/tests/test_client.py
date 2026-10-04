@@ -214,6 +214,40 @@ def test_retention_status_threads_models_dir():
     run_cli.assert_called_once_with(["retention-status", "--models", "custom-models"])
 
 
+def test_freshness_returns_report_on_failing_exit():
+    # ``rocky freshness`` exits 1 on an ``error`` source but still prints the
+    # report; the client must parse it (allow_partial) rather than raise.
+    client = _client()
+    output = json.dumps(
+        {
+            "version": "1.76.0",
+            "command": "freshness",
+            "checked_at": "2026-10-04T12:00:00Z",
+            "sources": [
+                {
+                    "name": "raw.orders",
+                    "pipeline": "silver",
+                    "table": "raw.orders",
+                    "loaded_at_field": "loaded_at",
+                    "measured_from": "warehouse",
+                    "max_loaded_at": None,
+                    "age_seconds": None,
+                    "error_after_seconds": 86400,
+                    "status": "error",
+                    "message": "no rows to measure",
+                }
+            ],
+            "models": [],
+            "summary": {"pass": 0, "warn": 0, "error": 1, "runtime_error": 0},
+        }
+    )
+    with patch.object(client, "run_cli", return_value=output) as run_cli:
+        result = client.freshness(pipeline="silver")
+    run_cli.assert_called_once_with(["freshness", "--pipeline", "silver"], allow_partial=True)
+    assert result.sources[0].status.value == "error"
+    assert result.summary.error == 1
+
+
 def test_retention_status_rejects_env():
     # ``rocky retention-status`` has no ``--env`` flag (unlike ``compliance``);
     # passing env must raise before any subprocess spawns, not hard-error at clap.

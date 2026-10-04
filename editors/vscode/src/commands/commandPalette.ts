@@ -60,6 +60,7 @@ function buildItems(): (vscode.QuickPickItem | CommandPickItem)[] {
     // --- Infra ---
     separator("Infra"),
     cmd("$(heart) Doctor", "Run health checks", "rocky.doctor"),
+    cmd("$(clock) Freshness", "Check source and model freshness", "rocky.freshness"),
     cmd("$(archive) Compact", "Generate OPTIMIZE/VACUUM SQL", "rocky.compact"),
 
     // --- AI ---
