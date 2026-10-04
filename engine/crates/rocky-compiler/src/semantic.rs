@@ -113,6 +113,12 @@ pub struct SemanticGraph {
     /// walk in [`SemanticGraph::trace_column_downstream`].
     #[serde(skip, default)]
     edges_by_source_model: HashMap<String, Vec<usize>>,
+    /// The project's user-defined functions (`functions/`). Carried on the
+    /// graph so the type checker, which already receives the graph, can type
+    /// UDF calls. Empty unless set via [`SemanticGraph::set_functions`];
+    /// not serialized.
+    #[serde(skip, default)]
+    functions: Arc<crate::udf::FunctionRegistry>,
 }
 
 impl SemanticGraph {
@@ -124,9 +130,21 @@ impl SemanticGraph {
             edges_by_target_model: HashMap::new(),
             edge_by_target_column: HashMap::new(),
             edges_by_source_model: HashMap::new(),
+            functions: Arc::default(),
         };
         graph.rebuild_indices();
         graph
+    }
+
+    /// The project's user-defined functions.
+    #[must_use]
+    pub fn functions(&self) -> &Arc<crate::udf::FunctionRegistry> {
+        &self.functions
+    }
+
+    /// Attach the project's user-defined functions.
+    pub fn set_functions(&mut self, functions: Arc<crate::udf::FunctionRegistry>) {
+        self.functions = functions;
     }
 
     /// Rebuild the derived edge indices from `self.edges`.

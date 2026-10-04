@@ -24,6 +24,7 @@ pub mod failure_class;
 pub mod fault_store;
 pub mod freeze_marker;
 pub mod fulfill;
+pub mod functions;
 pub mod hooks;
 pub mod idempotency;
 pub mod imports;

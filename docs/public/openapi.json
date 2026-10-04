@@ -5294,6 +5294,13 @@
             "description": "Expanded SQL for each model after macro substitution. Only populated when `--expand-macros` is passed. Keys are model names, values are the SQL after all `@macro()` calls have been replaced.",
             "type": "object"
           },
+          "functions": {
+            "description": "User-defined functions declared under `functions/` that passed validation, with the models that call each one. Under `--model`, only the selected function, or the functions the selected model calls. Empty (and omitted) when the project declares none.",
+            "items": {
+              "$ref": "#/components/schemas/FunctionDetail"
+            },
+            "type": "array"
+          },
           "has_errors": {
             "description": "Whether the diagnostics this result describes include error-severity entries — and, for the CLI, whether the command exits non-zero.\n\nUnder `--model` this is computed from the exact-attribution filter above, so it says nothing about whether the selected model's upstreams compile: an error attributed to another model is filtered out and leaves this `false`, even though `rocky run` would classify that model as a compile error and exclude it from execution. A failure that aborts compilation outright rather than emitting a diagnostic — an unparseable model, a semantic-graph or contract-load failure — fails the command before any scoping applies. To learn whether a model can be built, compile without a selector.",
             "type": "boolean"
@@ -8212,6 +8219,55 @@
           "product_id",
           "state",
           "version"
+        ],
+        "type": "object"
+      },
+      "FunctionDetail": {
+        "description": "A user-defined function in `CompileOutput.functions`.",
+        "properties": {
+          "called_by": {
+            "description": "Models that call this function directly. `rocky run` creates the function before any of them is built.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "calls": {
+            "description": "Other project functions this function's body calls (created first).",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "deterministic": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "name": {
+            "type": "string"
+          },
+          "returns": {
+            "description": "Declared return type, as written.",
+            "type": "string"
+          },
+          "signature": {
+            "description": "`name(arg TYPE, ...) RETURNS TYPE`, as declared.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "called_by",
+          "name",
+          "returns",
+          "signature"
         ],
         "type": "object"
       },

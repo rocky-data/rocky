@@ -33,6 +33,7 @@ mod export_schemas;
 mod fmt;
 mod freeze_fence;
 pub mod fulfill_api;
+mod functions_ddl;
 mod gc;
 pub mod groups;
 mod history;

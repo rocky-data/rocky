@@ -1666,6 +1666,20 @@ impl LanguageServer for RockyLsp {
             }
         }
 
+        // A user-defined function (`functions/`) shows its declared signature.
+        if let Some(ref w) = word
+            && result.project.model(w).is_none()
+            && let Some(udf) = result.semantic_graph.functions().get(w)
+        {
+            return Ok(Some(Hover {
+                contents: HoverContents::Markup(MarkupContent {
+                    kind: MarkupKind::Markdown,
+                    value: udf.hover_markdown(),
+                }),
+                range: None,
+            }));
+        }
+
         // Check if hovering on a model name (could be a referenced model, not the current file's model)
         if let Some(ref w) = word
             && let Some(hover_model) = result.project.model(w)

@@ -1979,6 +1979,32 @@ pub struct CompileOutput {
     /// values are the SQL after all `@macro()` calls have been replaced.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub expanded_sql: HashMap<String, String>,
+    /// User-defined functions declared under `functions/` that passed
+    /// validation, with the models that call each one. Under `--model`,
+    /// only the selected function, or the functions the selected model
+    /// calls. Empty (and omitted) when the project declares none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub functions: Vec<FunctionDetail>,
+}
+
+/// A user-defined function in `CompileOutput.functions`.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct FunctionDetail {
+    pub name: String,
+    /// `name(arg TYPE, ...) RETURNS TYPE`, as declared.
+    pub signature: String,
+    /// Declared return type, as written.
+    pub returns: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deterministic: Option<bool>,
+    /// Models that call this function directly. `rocky run` creates the
+    /// function before any of them is built.
+    pub called_by: Vec<String>,
+    /// Other project functions this function's body calls (created first).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub calls: Vec<String>,
 }
 
 /// Per-model summary projected from `rocky_core::models::ModelConfig`.
@@ -2059,7 +2085,15 @@ impl CompileOutput {
             compile_timings,
             models_detail: vec![],
             expanded_sql: HashMap::new(),
+            functions: vec![],
         }
+    }
+
+    /// Attach the project's user-defined functions.
+    #[must_use]
+    pub fn with_functions(mut self, functions: Vec<FunctionDetail>) -> Self {
+        self.functions = functions;
+        self
     }
 
     /// Attach per-model details and return self.

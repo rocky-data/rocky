@@ -11226,6 +11226,36 @@ pub(crate) async fn execute_models_with_explicit_contracts(
         }
     };
 
+    // `--model <function>` selects a user-defined function (`functions/`):
+    // create it and the functions it calls, and build no model.
+    if let Some(name) = model_name_filter
+        && compile_result.project.model(name).is_none()
+        && compile_result
+            .semantic_graph
+            .functions()
+            .get(name)
+            .is_some()
+    {
+        // Function DDL is not covered by the governed-apply fingerprint or
+        // the freeze fence, so a governed apply may not select a function.
+        anyhow::ensure!(
+            exec_fp_gate.is_none(),
+            "a governed apply cannot select user-defined function '{name}': function DDL is \
+             not covered by the plan fingerprint"
+        );
+        let statements = super::functions_ddl::statements_for(
+            &compile_result,
+            [name],
+            warehouse.dialect().name(),
+        )?;
+        let failed =
+            super::functions_ddl::create_functions(warehouse, &compile_result, &statements).await;
+        if let Some((function, e)) = failed.into_iter().next() {
+            anyhow::bail!("function '{function}': {e}");
+        }
+        return Ok(GovernanceSnapshot::default());
+    }
+
     if let Some(name) = model_name_filter {
         let selected = compile_result.project.model(name).ok_or_else(|| {
             anyhow::anyhow!("model '{name}' not found (no transformation model with that name)")
@@ -11676,6 +11706,67 @@ pub(crate) async fn execute_models_with_explicit_contracts(
         }
     }
 
+    // User-defined functions (`functions/`): create every function a model
+    // this invocation builds calls — callees first — before any model runs.
+    // A function that cannot be created fails only the models that need it
+    // (and their declared descendants); everything else still builds.
+    let in_run = |name: &str| {
+        model_name_filter.is_none_or(|selected| selected == name)
+            && model_set.is_none_or(|set| set.contains(name))
+    };
+    let function_failures = match super::functions_ddl::function_statements(
+        &compile_result,
+        |name| in_run(name) && !compile_excluded_models.contains(name),
+        dialect.name(),
+    ) {
+        Ok(statements) => {
+            super::functions_ddl::create_functions(warehouse, &compile_result, &statements).await
+        }
+        Err(e) => compile_result
+            .semantic_graph
+            .functions()
+            .functions()
+            .map(|f| (f.def.name.clone(), format!("{e:#}")))
+            .collect(),
+    };
+    let function_blocked =
+        super::functions_ddl::callers_of_failed(&compile_result, &function_failures);
+    let mut newly_excluded: BTreeSet<String> = BTreeSet::new();
+    for (model, function) in &function_blocked {
+        if !in_run(model) || compile_excluded_models.contains(model) {
+            continue;
+        }
+        newly_excluded.insert(model.clone());
+        output.tables_failed += 1;
+        output.errors.push(crate::output::TableErrorOutput {
+            asset_key: vec![model.clone()],
+            error: format!(
+                "model '{model}' was not built: function '{function}' {}",
+                function_failures
+                    .get(function)
+                    .map(String::as_str)
+                    .unwrap_or("could not be created")
+            ),
+            failure_kind: crate::output::FailureKind::CompileError,
+            cooldown_seconds: None,
+        });
+    }
+    // Declared descendants keep their existing targets rather than reading a
+    // producer that was not rebuilt.
+    let mut changed = !newly_excluded.is_empty();
+    while changed {
+        changed = false;
+        for node in &compile_result.project.dag_nodes {
+            if !newly_excluded.contains(&node.name)
+                && node.depends_on.iter().any(|d| newly_excluded.contains(d))
+            {
+                newly_excluded.insert(node.name.clone());
+                changed = true;
+            }
+        }
+    }
+    compile_excluded_models.extend(newly_excluded);
+
     let mut models_executed = 0usize;
 
     // Bundle borrowed compile-time facts (typed schemas + per-model timings)
@@ -11705,7 +11796,17 @@ pub(crate) async fn execute_models_with_explicit_contracts(
     // Opt-in model-skip gate. Inert unless `skip_gate.is_active()`; when
     // inactive the gate below short-circuits and `execute_models` builds every
     // model exactly as before (no extra state reads / warehouse queries).
-    let mut gate = super::skip_gate::SkipGate::new(skip_gate, &compile_result.project);
+    // Models that call a project UDF: never skipped or reused, because their
+    // logic hash does not cover the function bodies they call.
+    let function_callers: std::collections::HashSet<String> = rocky_compiler::udf::function_usage(
+        &compile_result.project.models,
+        compile_result.semantic_graph.functions(),
+    )
+    .into_values()
+    .flatten()
+    .collect();
+    let mut gate = super::skip_gate::SkipGate::new(skip_gate, &compile_result.project)
+        .with_function_callers(function_callers.clone());
 
     // Failure-containment ledger (opt-in via `[resilience] contain_failures`).
     // Tracks the downstream closure of every failed / withheld model so a
@@ -12384,11 +12485,15 @@ pub(crate) async fn execute_models_with_explicit_contracts(
                     );
                     match (model_is_unpartitioned, state_store) {
                         (true, Some(store)) => {
-                            let input_hash = compute_decision_input_hash(
-                                &model_ir,
-                                &reuse_target_by_model,
-                                &reuse_outputs,
-                            );
+                            let input_hash = if function_callers.contains(model_ir.name.as_ref()) {
+                                None
+                            } else {
+                                compute_decision_input_hash(
+                                    &model_ir,
+                                    &reuse_target_by_model,
+                                    &reuse_outputs,
+                                )
+                            };
                             Some(super::run_content_addressed::ReuseDecisionCtx {
                                 input_hash,
                                 state_store: store,

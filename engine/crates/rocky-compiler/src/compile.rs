@@ -364,11 +364,14 @@ pub fn compile_project(
 ) -> Result<CompileResult, CompileError> {
     let mut timings = PhaseTimings::default();
 
-    // 2. Build semantic graph
+    // 2. Build semantic graph, carrying the project's user-defined functions
+    //    (`functions/` beside the models dir) so typecheck can type UDF calls.
     let sg_start = Instant::now();
-    let semantic_graph =
+    let mut semantic_graph =
         semantic::build_semantic_graph(&project, &source_column_info(&config.source_schemas))
             .map_err(CompileError::SemanticGraph)?;
+    let (functions, function_diagnostics) = crate::udf::load_for_models_dir(&config.models_dir);
+    semantic_graph.set_functions(Arc::new(functions));
     timings.semantic_graph_ms = sg_start.elapsed().as_millis() as u64;
 
     // 3. Type check (with model SQL/paths for reference tracking)
@@ -492,6 +495,12 @@ pub fn compile_project(
         &config.source_schemas,
         &config.source_provenance,
     ));
+    // User-defined functions: invalid definitions, then invalid calls (E051).
+    diagnostics.extend(function_diagnostics);
+    diagnostics.extend(crate::udf::check_model_calls(
+        &project.models,
+        semantic_graph.functions(),
+    ));
     // Dependency-resolution warnings (D011 depends_on mismatch, D012 an edge
     // derived from a name match a warehouse run does not honour). Produced by
     // `resolve::resolve_dependencies` and parked on the project until now;
@@ -563,9 +572,16 @@ pub fn compile_incremental(
     let project_load_ms = load_start.elapsed().as_millis() as u64;
 
     let sg_start = Instant::now();
-    let semantic_graph =
+    let mut semantic_graph =
         semantic::build_semantic_graph(&project, &source_column_info(&config.source_schemas))
             .map_err(CompileError::SemanticGraph)?;
+    let (functions, function_diagnostics) = crate::udf::load_for_models_dir(&config.models_dir);
+    // A changed function can retype any model that calls it, and the affected
+    // set below only tracks model files — fall through to a full compile.
+    if functions != **previous.semantic_graph.functions() {
+        return compile(config);
+    }
+    semantic_graph.set_functions(Arc::new(functions));
     let semantic_graph_ms = sg_start.elapsed().as_millis() as u64;
 
     // 2. Compute the affected set. The comparison must be with the NEW
@@ -736,6 +752,11 @@ pub fn compile_incremental(
         &project.models,
         &config.source_schemas,
         &config.source_provenance,
+    ));
+    diagnostics.extend(function_diagnostics);
+    diagnostics.extend(crate::udf::check_model_calls(
+        &project.models,
+        semantic_graph.functions(),
     ));
     // Dependency-resolution warnings (D011 depends_on mismatch, D012 an edge
     // derived from a name match a warehouse run does not honour). Produced by

@@ -808,6 +808,11 @@ class CompileResult(BaseModel):
     #: Expanded SQL per model after macro substitution. Populated only when
     #: ``--expand-macros`` is passed; ``{}`` otherwise.
     expanded_sql: dict[str, str] = Field(default_factory=dict)
+    #: User-defined functions declared under ``functions/`` that passed
+    #: validation, each with its ``signature`` and the models that call it
+    #: (``called_by``). Loose ``dict`` — the nested shape lives on the
+    #: generated ``CompileOutput.functions``. ``[]`` when none are declared.
+    functions: list[dict] = Field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------

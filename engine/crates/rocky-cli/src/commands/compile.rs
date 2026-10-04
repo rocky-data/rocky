@@ -16,7 +16,7 @@ use rocky_sql::portability::{self, PortabilityIssue};
 use rocky_sql::pragma;
 use rocky_sql::transpile::Dialect;
 
-use crate::output::{CompileOutput, CostHint, ModelDetail, print_json};
+use crate::output::{CompileOutput, CostHint, FunctionDetail, ModelDetail, print_json};
 
 use super::ModelNotFound;
 
@@ -236,12 +236,23 @@ fn compile_inner(
 
     let mut result = compile::compile(&config)?;
 
+    // `--model` may also name a user-defined function (`functions/`), valid
+    // or not, to see its own diagnostics.
     if let Some(filter) = model_filter
         && result.project.model(filter).is_none()
+        && !result.semantic_graph.functions().declares(filter)
     {
         return Err(anyhow::Error::new(ModelNotFound(filter.to_string())));
     }
     let in_scope = |name: &str| model_filter.is_none_or(|filter| name == filter);
+
+    // A warehouse that cannot create functions refuses them here (E051), at
+    // compile time, rather than mid-run.
+    if let Some(config) = &project_config {
+        result
+            .diagnostics
+            .extend(function_adapter_diagnostics(config, &result));
+    }
 
     // Portability lint. Effective target_dialect = CLI flag > [portability]
     // config > unset. Project-wide allow list and per-model `-- rocky-allow:`
@@ -449,6 +460,9 @@ fn compile_inner(
         result.has_errors
     };
 
+    let has_errors = has_errors || diagnostics.iter().any(|d| d.severity == Severity::Error);
+    let functions = function_details(&result, model_filter);
+
     let output = CompileOutput::new(
         models_detail.len(),
         execution_layers,
@@ -457,7 +471,8 @@ fn compile_inner(
         result.timings.clone(),
     )
     .with_models_detail(models_detail)
-    .with_expanded_sql(expanded_sql);
+    .with_expanded_sql(expanded_sql)
+    .with_functions(functions);
 
     Ok((output, text_data))
 }
@@ -520,6 +535,99 @@ fn deny_warnings(diagnostics: &mut [Diagnostic], codes: &[String]) -> bool {
         }
     }
     escalated
+}
+
+/// `CompileOutput.functions`: every valid user-defined function with the
+/// models that call it. Under `--model`, the selected function, or the
+/// functions the selected model calls (and the functions those call).
+fn function_details(
+    result: &compile::CompileResult,
+    model_filter: Option<&str>,
+) -> Vec<FunctionDetail> {
+    let registry = result.semantic_graph.functions();
+    if registry.is_empty() {
+        return Vec::new();
+    }
+    let usage = rocky_compiler::udf::function_usage(&result.project.models, registry);
+    let wanted: Option<std::collections::HashSet<String>> = model_filter.map(|filter| {
+        let roots: Vec<&str> = if registry.get(filter).is_some() {
+            vec![filter]
+        } else {
+            usage
+                .iter()
+                .filter(|(_, callers)| callers.contains(filter))
+                .map(|(name, _)| name.as_str())
+                .collect()
+        };
+        registry
+            .creation_order(roots)
+            .into_iter()
+            .map(|sig| sig.def.name.to_ascii_lowercase())
+            .collect()
+    });
+    registry
+        .functions()
+        .filter(|sig| {
+            wanted
+                .as_ref()
+                .is_none_or(|w| w.contains(&sig.def.name.to_ascii_lowercase()))
+        })
+        .map(|sig| FunctionDetail {
+            name: sig.def.name.clone(),
+            signature: sig.signature(),
+            returns: sig.def.config.returns.trim().to_string(),
+            description: sig.def.config.description.clone(),
+            deterministic: sig.def.config.deterministic,
+            called_by: usage
+                .get(&sig.def.name)
+                .map(|callers| callers.iter().cloned().collect())
+                .unwrap_or_default(),
+            calls: sig.calls.iter().cloned().collect(),
+        })
+        .collect()
+}
+
+/// E051 for every valid function a model calls when every warehouse adapter
+/// the project configures is one that cannot create functions (Trino). A
+/// project that also configures a capable warehouse is not refused here —
+/// `rocky run` refuses at the boundary if the model runs on Trino.
+fn function_adapter_diagnostics(
+    config: &rocky_config::RockyConfig,
+    result: &compile::CompileResult,
+) -> Vec<Diagnostic> {
+    use rocky_core::functions::FunctionDialect;
+    let registry = result.semantic_graph.functions();
+    let warehouses: Vec<Option<FunctionDialect>> = config
+        .adapters
+        .values()
+        .filter_map(|a| FunctionDialect::from_dialect_name(&a.adapter_type))
+        .map(Some)
+        .collect();
+    if registry.is_empty()
+        || warehouses.is_empty()
+        || !warehouses
+            .iter()
+            .all(|w| *w == Some(FunctionDialect::Trino))
+    {
+        return Vec::new();
+    }
+    let usage = rocky_compiler::udf::function_usage(&result.project.models, registry);
+    usage
+        .keys()
+        .map(|name| {
+            Diagnostic::error(
+                diagnostic::E051,
+                name,
+                format!(
+                    "function `{name}` cannot be created: the Trino adapter does not support \
+                     creating persistent user-defined functions"
+                ),
+            )
+            .with_suggestion(
+                "inline the expression in the calling models, or create the routine outside Rocky",
+            )
+        })
+        .collect()
 }
 
 /// Extra data the `rocky compile` text renderer needs from the raw

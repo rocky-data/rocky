@@ -42,6 +42,12 @@ pub fn execute_locally(compile_result: &CompileResult, db: &DuckDbConnector) -> 
         failed: Vec::new(),
     };
 
+    // User-defined functions first, as `rocky run` does, so models that call
+    // them resolve. A function that fails is reported under its own name.
+    result
+        .failed
+        .extend(create_local_functions(compile_result, db));
+
     for layer in &compile_result.project.layers {
         for model_name in layer {
             if let Some(model) = compile_result.project.model(model_name) {
@@ -70,6 +76,29 @@ pub fn execute_locally(compile_result: &CompileResult, db: &DuckDbConnector) -> 
     }
 
     result
+}
+
+/// Create every valid user-defined function (`functions/`) as a DuckDB macro,
+/// callees first. Returns `(function, error)` for each one that failed.
+pub fn create_local_functions(
+    compile_result: &CompileResult,
+    db: &DuckDbConnector,
+) -> Vec<(String, String)> {
+    let registry = compile_result.semantic_graph.functions();
+    let names: Vec<String> = registry.functions().map(|f| f.def.name.clone()).collect();
+    let mut failed = Vec::new();
+    for sig in registry.creation_order(names.iter().map(String::as_str)) {
+        let created = rocky_core::functions::create_function_sql(
+            &sig.def,
+            rocky_core::functions::FunctionDialect::DuckDb,
+        )
+        .map_err(|e| e.to_string())
+        .and_then(|sql| db.execute_statement(&sql).map_err(|e| e.to_string()));
+        if let Err(e) = created {
+            failed.push((sig.def.name.clone(), e));
+        }
+    }
+    failed
 }
 
 /// Compile and execute a project locally.

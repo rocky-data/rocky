@@ -33,6 +33,32 @@ class CostHint(BaseModel):
     """
 
 
+class FunctionDetail(BaseModel):
+    """
+    A user-defined function in `CompileOutput.functions`.
+    """
+
+    called_by: list[str]
+    """
+    Models that call this function directly. `rocky run` creates the function before any of them is built.
+    """
+    calls: list[str] | None = None
+    """
+    Other project functions this function's body calls (created first).
+    """
+    description: str | None = None
+    deterministic: bool | None = None
+    name: str
+    returns: str
+    """
+    Declared return type, as written.
+    """
+    signature: str
+    """
+    `name(arg TYPE, ...) RETURNS TYPE`, as declared.
+    """
+
+
 class PhaseTimings(BaseModel):
     """
     Wall-clock duration of each compile phase.
@@ -423,6 +449,10 @@ class CompileOutput(BaseModel):
     expanded_sql: dict[str, str] | None = None
     """
     Expanded SQL for each model after macro substitution. Only populated when `--expand-macros` is passed. Keys are model names, values are the SQL after all `@macro()` calls have been replaced.
+    """
+    functions: list[FunctionDetail] | None = None
+    """
+    User-defined functions declared under `functions/` that passed validation, with the models that call each one. Under `--model`, only the selected function, or the functions the selected model calls. Empty (and omitted) when the project declares none.
     """
     has_errors: bool
     """
