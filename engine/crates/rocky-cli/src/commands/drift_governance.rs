@@ -332,6 +332,11 @@ impl DriftGovernor {
             reason.push_str("; ");
             reason.push_str(suffix);
         }
+        // Stored in the `${NAME}` form, as `finalize_drift_verify_after` stores
+        // its row: the reason quotes the rule's `verify_after` check names and
+        // the policy's own reason, and `rocky audit` reads this row without
+        // loading the config, so it cannot render it later (#1919).
+        let reason = rocky_core::secret_registry::render_placeholders(&reason);
 
         let record = PolicyDecisionRecord {
             keys_recorded: false,
@@ -804,6 +809,35 @@ mod tests {
             }],
             tests: Vec::new(),
         }
+    }
+
+    /// #1919 follow-up (P1-4): the plain decision row's `reason` quotes the
+    /// rule's `verify_after` check names. `rocky audit` reads it without the
+    /// config, so it is stored in the `${NAME}` form, as the verification row
+    /// already is.
+    #[tokio::test]
+    async fn the_decision_row_reason_is_stored_rendered() {
+        const CHECK: &str = "rocky_t1919_drift_reason_check_9c1e";
+        rocky_core::secret_registry::register_substitution("ROCKY_T1919_DRIFT_CHECK", CHECK);
+        let cfg = cfg_opt_in_with_policy(granting_policy(&[CHECK], None));
+        let gov = DriftGovernor::build(&cfg, "run-1919", "wh.raw.orders", true, &[])
+            .expect("governor present");
+        let (store, _d) = temp_store();
+        let state = Arc::new(store);
+        let d = gov
+            .govern(&additive_add_drift(), "wh.raw.orders", &state)
+            .await;
+        if let GovernDecision::Refuse(why) = &d {
+            panic!("PRECONDITION: a granted additive drift applies, got a refusal: {why}");
+        }
+        let rows = state.list_policy_decisions().unwrap();
+        assert_eq!(rows.len(), 1, "one plain decision row");
+        let reason = &rows[0].reason;
+        assert!(!reason.contains(CHECK), "stored resolved: {reason}");
+        assert!(
+            reason.contains("verify_after due post-run: [${ROCKY_T1919_DRIFT_CHECK}]"),
+            "{reason}"
+        );
     }
 
     /// A config with the auto-apply opt-in ON and the given `[policy]` block.
