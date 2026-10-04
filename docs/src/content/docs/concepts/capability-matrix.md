@@ -70,9 +70,11 @@ Two limits, stated plainly:
   column as `I003` at info severity, naming the column and the type the
   contract declares. Info changes no exit code: `rocky compile`, `rocky test`
   and `rocky ci` all still pass. To make the check run, give the compiler
-  source schemas: `rocky discover --with-schemas` fills the cache that
-  `rocky compile` reads, or use `rocky compile --with-seed`. Two limits on
-  that. `rocky test` and `rocky ci` always compile with no source schemas, so
+  source schemas. `rocky compile --with-seed` reads them from
+  `data/seed.sql` and works for every pipeline type. For a replication
+  pipeline, `rocky discover --with-schemas` (or `rocky run`) fills the schema
+  cache that `rocky compile` reads. `discover` refuses a transformation-only
+  pipeline, so for those use `--with-seed`. Two limits on that. `rocky test` and `rocky ci` always compile with no source schemas, so
   every column that takes its type from a source table is `Unknown` under
   them. And an expression whose result type depends on the warehouse — `AVG`
   over a `DECIMAL` column — stays `Unknown` either way. Do not add a `CAST`
@@ -127,21 +129,44 @@ section "How apply works", and graded in the
 
 ## Freshness
 
-**Declared metadata, not a gate.** A model's `[freshness]` block
-(`expected_lag_seconds`, `time_column`) declares how stale the model may get.
-Three things consume the declaration:
+**Checked on demand by `rocky freshness`; not a gate on `rocky run`.** Two
+declarations describe how stale data may get:
 
-- The scheduler (`rocky tick`, `rocky serve --scheduler`) turns the declared
+- A model's `[freshness]` block (`expected_lag_seconds`, `time_column`,
+  `severity`).
+- A transformation pipeline's `[[pipeline.<name>.sources]]` entry with a
+  `freshness` block (`loaded_at_field`, `warn_after`, `error_after`,
+  `filter`). A source is a table the models read but do not build.
+
+`rocky freshness` measures both against the warehouse:
+
+```
+  source  MAX(loaded_at_field) [WHERE filter]   ─┐
+  model   MAX(time_column), or last good build  ─┴─► age = now - max
+                                                     age > error_after  error
+                                                     age > warn_after   warn
+                                                     else               pass
+```
+
+The command exits 1 on any `error` or `runtime_error`. A `warn` alone exits 0.
+An empty source counts as never loaded, so the worst threshold applies.
+A model's one TTL is its warn threshold, or its error threshold under
+`severity = "error"`.
+
+Other consumers of the declarations:
+
+- The scheduler (`rocky tick`, `rocky serve --scheduler`) turns a model's
   budget into demand: a pipeline with a freshness schedule runs again once
   too much time passes since its last successful run.
-- `rocky validate` checks the declaration itself is well-formed.
+- `rocky validate` checks the model declaration is well-formed.
 - The compiler warns (`W005`) when a model has a temporal column but no
-  freshness declaration in scope.
+  freshness declaration in scope. It raises `E050` for a declaration that
+  cannot be evaluated, and `W050` for a column that is not a date or time.
 
-What the declaration does **not** do: `rocky test` does not evaluate it, and
-no materialization is blocked by it. Declaring `[freshness]` on a model does
-not create a run-time staleness alarm. Detecting stale data in production is
-an observation job that you own.
+What the declarations do **not** do: `rocky run` does not check them and
+does not skip a model downstream of a stale source. To gate a run, call
+`rocky freshness` first and stop on a non-zero exit. `rocky test` does not
+evaluate them.
 
 One separate, opt-in run-time check exists, for replication pipelines only:
 `[checks] freshness = { threshold_seconds = ... }` measures the real lag with
@@ -155,9 +180,11 @@ The run's status comes from copied and failed tables, never from check results,
 so the exit code does not change. Rocky reports the outcome and leaves the
 decision to your orchestrator.
 
-Declaration: `ModelFreshnessConfig`, `engine/crates/rocky-core/src/models.rs`
-(its own doc comment states the compiler does not enforce it). Scheduler
-demand: `engine/crates/rocky-core/src/schedule/demand.rs`. Run-time check:
+Declarations: `ModelFreshnessConfig`, `engine/crates/rocky-core/src/models.rs`;
+`PipelineSourceConfig`, `engine/crates/rocky-core/src/source_freshness.rs`.
+Command: `engine/crates/rocky-cli/src/commands/freshness.rs`. Compile checks:
+`engine/crates/rocky-compiler/src/freshness.rs`. Scheduler demand:
+`engine/crates/rocky-core/src/schedule/demand.rs`. Replication check:
 `check_freshness`, `engine/crates/rocky-core/src/checks.rs`.
 
 ## Human review of AI-authored plans

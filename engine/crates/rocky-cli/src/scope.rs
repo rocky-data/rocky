@@ -408,6 +408,7 @@ table = "customers"
             execution: Default::default(),
             depends_on: vec![],
             schedule: None,
+            sources: Vec::new(),
         };
 
         let config_path = dir.path().join("rocky.toml");
@@ -457,6 +458,7 @@ table = "secret"
             execution: Default::default(),
             depends_on: vec![],
             schedule: None,
+            sources: Vec::new(),
         };
 
         let config_path = project_dir.join("rocky.toml");

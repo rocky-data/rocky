@@ -286,11 +286,13 @@ span, and sometimes a suggested fix.
 | `E037` | A transformation model declares `type = "incremental"`, which would append every row again on each run. Use `merge`, `delete_insert`, `time_interval` or `full_refresh` |
 | `E039` | A direct projection names a column absent from a complete in-project upstream model |
 | `E040` | A `.rocky` string literal contains a backslash; use a `.sql` model with the target's own escaping |
+| `E050` | A freshness declaration cannot be evaluated: no threshold, a bad duration, `error_after` shorter than `warn_after`, a bad `loaded_at_field` or `filter`, or a model `time_column` absent from a complete output |
 | `W001` | Unused model (no downstream consumers) |
 | `W002` | Duplicate column in model output |
 | `W004` | Classification tag with no matching `[mask]` strategy |
 | `W005` | Temporal column present but no `freshness` declaration in scope |
 | `W006` | `merge` strategy declares a `unique_key` column the model does not output |
+| `W050` | A freshness `loaded_at_field` / `time_column` is not a date or time type, or a source `loaded_at_field` is missing from the known source schema |
 | `W010` | Contract defines a column not in model output (not required) |
 | `W011` | Contract exists for a model not found in the project |
 | `W012` | An `[imports.<name>]` snapshot could not be loaded; `E030`/`E033` checks skipped |

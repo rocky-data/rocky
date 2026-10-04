@@ -146,11 +146,11 @@ pub struct ModelConfig {
     /// Used by `rocky ai-sync` to propose updates when upstream schemas change.
     #[serde(default)]
     pub intent: Option<String>,
-    /// Per-model freshness expectation. Declarative-only — the compiler does
-    /// not enforce anything; downstream consumers (`dagster-rocky` to attach
-    /// `FreshnessPolicy`, `rocky doctor --freshness` to surface stale
-    /// models, the upcoming Dagster UI freshness badge) read this field
-    /// from the compile JSON output.
+    /// Per-model freshness expectation. `rocky freshness` enforces it against
+    /// the warehouse (exit non-zero when a `severity = "error"` model is
+    /// stale); `rocky compile` checks the `time_column` (E050 / W050).
+    /// Downstream consumers (`dagster-rocky` `FreshnessPolicy`) also read
+    /// this field from the compile JSON output.
     #[serde(default)]
     pub freshness: Option<ModelFreshnessConfig>,
     /// Declarative tests for this model. Parsed from `[[tests]]` arrays in
@@ -303,12 +303,14 @@ pub struct ModelConfig {
 /// the model plus the optional timestamp column used by the runtime
 /// freshness check.
 ///
-/// The compiler does not enforce the TTL — it's metadata consumed by
-/// downstream observability tooling (`dagster-rocky` `FreshnessPolicy`,
-/// `rocky doctor --freshness`, etc.). The compiler does however soft-warn
-/// (W005) when a model has at least one temporal output column but no
-/// `freshness` declaration anywhere in scope (per-model or project-level
-/// default).
+/// `rocky freshness` enforces the TTL at run time: it reads
+/// `MAX(time_column)` from the model's target table (or, without a
+/// `time_column`, the model's last successful build in the state store) and
+/// reports `warn`, or `error` when `severity = "error"`. `rocky run` does not
+/// gate on it. The compiler checks the `time_column` (E050 when absent from a
+/// provably complete output, W050 when not temporal), and soft-warns (W005)
+/// when a model has at least one temporal output column but no `freshness`
+/// declaration anywhere in scope (per-model or project-level default).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ModelFreshnessConfig {
     /// Maximum lag in seconds before the model is considered stale.
@@ -332,6 +334,15 @@ pub struct ModelFreshnessConfig {
     /// `error` to fail the pipeline on stale data.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub severity: Option<crate::tests::TestSeverity>,
+    /// True only when the model's own sidecar declares this block. False when
+    /// it was inherited from `_defaults.toml` or the project `[freshness]`,
+    /// or read back from JSON. An inherited `time_column` was not written for
+    /// this model, so the compiler never refuses on it (E050) and
+    /// `rocky freshness` falls back to the state store when it cannot be read.
+    /// Not serialized.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub declared_in_sidecar: bool,
 }
 
 impl ModelFreshnessConfig {
@@ -352,6 +363,7 @@ impl ModelFreshnessConfig {
             max_lag_seconds,
             time_column: default.time_column.clone(),
             severity: default.severity,
+            declared_in_sidecar: false,
         })
     }
 }
@@ -1152,6 +1164,10 @@ fn resolve_model_config(
     // no freshness today, unlike `strategy` above.)
     let freshness = raw
         .freshness
+        .map(|f| ModelFreshnessConfig {
+            declared_in_sidecar: true,
+            ..f
+        })
         .or_else(|| defaults.and_then(|d| d.freshness.clone()))
         .or_else(|| {
             ctx.project_freshness

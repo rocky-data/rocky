@@ -2245,6 +2245,19 @@ enum Command {
         drift: bool,
     },
 
+    /// Check source and model freshness against the warehouse.
+    ///
+    /// Reads `MAX(loaded_at_field)` for every `[[pipeline.<name>.sources]]`
+    /// entry with a `freshness` block, and `MAX(time_column)` (or the last
+    /// successful build) for every model `[freshness]` block. Reports
+    /// `pass` / `warn` / `error` / `runtime_error` per check and exits 1 on
+    /// any `error` or `runtime_error`.
+    Freshness {
+        /// Check only this transformation pipeline (default: all of them)
+        #[arg(long)]
+        pipeline: Option<String>,
+    },
+
     /// List project contents: pipelines, adapters, models, sources
     List {
         #[command(subcommand)]
@@ -5113,6 +5126,10 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                 json,
             )
             .await
+        }
+        Command::Freshness { pipeline } => {
+            rocky_cli::commands::run_freshness(&cli.config, &state_path, pipeline.as_deref(), json)
+                .await
         }
         Command::List { action } => match action {
             ListAction::Pipelines => rocky_cli::commands::list_pipelines(&cli.config, json),

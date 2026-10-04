@@ -574,6 +574,36 @@ table_retries = 1
 
 ---
 
+### `[[pipeline.NAME.sources]]`
+
+Declare the external tables a transformation pipeline reads, and how fresh each must be. A source is a table your models read but do not build, for example a landing table that Fivetran loads. [`rocky freshness`](/reference/commands/core-pipeline/#rocky-freshness) checks each declared freshness block against the warehouse. Transformation pipelines only.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `catalog` | string | `""` | Catalog of the table. Leave it out for two-part names (DuckDB). |
+| `schema` | string | (required) | Schema of the table. |
+| `table` | string | (required) | Table name. |
+| `freshness.loaded_at_field` | string | (required in `freshness`) | Column that holds each row's load time. Use a `DATE` or `TIMESTAMP` column. |
+| `freshness.warn_after` | string | (unset) | Age above which the source reports `warn`. Format: a positive integer and one unit, `s`, `h` or `d` (`"3600s"`, `"12h"`, `"7d"`). |
+| `freshness.error_after` | string | (unset) | Age above which the source reports `error`. Must not be shorter than `warn_after`. |
+| `freshness.filter` | string | (unset) | SQL predicate that limits the rows Rocky takes the maximum over. Rocky adds it as `WHERE (<filter>)`. A `;` is refused. |
+
+Set at least one of `warn_after` and `error_after`.
+
+```toml
+[[pipeline.silver.sources]]
+schema = "raw"
+table  = "orders"
+
+[pipeline.silver.sources.freshness]
+loaded_at_field = "_loaded_at"
+warn_after      = "12h"
+error_after     = "24h"
+filter          = "status <> 'test'"
+```
+
+`rocky compile` checks each block. It raises `E050` for a block it cannot evaluate: no threshold, a duration that does not parse, `error_after` shorter than `warn_after`, a `loaded_at_field` that is not a plain column name, or a `filter` with a `;`. It raises `W050` when the compiler's source schema shows the `loaded_at_field` as missing or not a date or time type. That schema comes from a seed or the schema cache and can be out of date, so this case only warns.
+
 ### `[pipeline.NAME.schedule]`
 
 Declare when this pipeline is due, so [`rocky tick`](/guides/running-without-an-orchestrator/#native-scheduling-with-rocky-tick-experimental) can run it without an external orchestrator. Every field is optional. Omit the block and the pipeline has no standing demand: it runs only when you invoke it. **Experimental** while the reconciler soaks.
@@ -1177,8 +1207,8 @@ Set a project-wide staleness budget, so you do not repeat the same threshold in 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `expected_lag_seconds` | integer | (unset) | Maximum lag before a model counts as stale. This is the field that makes the block active: without it, Rocky treats the project as having no freshness default and inherits nothing. |
-| `time_column` | string | (unset) | Timestamp column to measure lag from. Inherited by a model that declares no `[freshness]` block. No runtime check reads it yet. |
-| `severity` | string | (unset) | `"error"` or `"warning"`. Inherited by a model that declares no `[freshness]` block. No runtime check reads it yet. |
+| `time_column` | string | (unset) | Timestamp column to measure lag from. Inherited by a model that declares no `[freshness]` block. [`rocky freshness`](/reference/commands/core-pipeline/#rocky-freshness) reads `MAX(time_column)` from the model's target table. |
+| `severity` | string | (unset) | `"error"` or `"warning"`. Inherited by a model that declares no `[freshness]` block. Under `"error"`, a stale model makes `rocky freshness` exit 1. |
 
 ```toml
 [freshness]

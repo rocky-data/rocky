@@ -32,6 +32,7 @@ mod export_openapi;
 mod export_schemas;
 mod fmt;
 mod freeze_fence;
+pub mod freshness;
 pub mod fulfill_api;
 mod gc;
 pub mod groups;
@@ -138,6 +139,7 @@ pub use estimate::{EstimateReport, compute_estimate, run_estimate};
 pub use export_openapi::export_openapi;
 pub use export_schemas::{export_schemas, schemas_hash};
 pub use fmt::run_fmt;
+pub use freshness::run_freshness;
 pub use fulfill_api::propose_governed_run_plan;
 pub use gc::{run_gc_derivable, run_gc_plan};
 pub use history::{

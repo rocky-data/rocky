@@ -172,6 +172,20 @@ pub const E039: &str = "E039";
 /// by target dialect. Use a `.sql` model with the target's own escaping.
 pub const E040: &str = "E040";
 
+/// A freshness declaration cannot be checked as written.
+///
+/// Emitted by `rocky compile` for a transformation pipeline's
+/// `[[pipeline.<name>.sources]]` `freshness` block when it declares neither
+/// `warn_after` nor `error_after`, a duration that does not parse (`"12h"`,
+/// `"3600s"`, `"7d"`), an `error_after` shorter than `warn_after`, a
+/// `loaded_at_field` that is not a plain identifier, or a `filter` carrying a
+/// statement terminator. Also emitted for a model's own sidecar `[freshness]`
+/// block (not an inherited one) whose `time_column` is absent from the
+/// model's output when that output is
+/// provably complete (no `SELECT *`, every projection named): the model's own
+/// SQL decides its output, so the absence is a fact, not a stale schema.
+pub const E050: &str = "E050";
+
 // Warnings
 /// Unused model (no downstream consumers).
 pub const W001: &str = "W001";
@@ -223,6 +237,22 @@ pub const W005: &str = "W005";
 /// `rocky_compiler::typecheck::check_merge_strategy` for the per-adapter survey
 /// and the Snowflake limitation it accepts.
 pub const W006: &str = "W006";
+/// A freshness `loaded_at_field` / `time_column` may not be readable as a
+/// load time.
+///
+/// Emitted by `rocky compile` when the column's known type is concrete and
+/// not DATE / TIMESTAMP / TIMESTAMP_NTZ, or when a source's
+/// `loaded_at_field` is absent from the source schema the compiler holds.
+///
+/// # Why a warning and not an error
+///
+/// Source schemas reach the compiler from a seed (`--with-seed`) or the
+/// schema cache, and either can be stale: the warehouse may have gained the
+/// column since. A stale schema must never refuse a build, so an absent
+/// source column only warns. A model column whose output is not provably
+/// complete warns for the same reason. `rocky freshness` reports the real
+/// outcome against the warehouse as `runtime_error`.
+pub const W050: &str = "W050";
 /// Contract defines a column not in model output (but not required).
 pub const W010: &str = "W010";
 /// Contract exists for a model not found in the project.
@@ -311,8 +341,10 @@ pub const I002: &str = "I002";
 /// # How to clear it
 ///
 /// Give the compiler source schemas. Many commands read them from the schema
-/// cache, written by `rocky run` / `rocky discover --with-schemas`;
-/// `rocky compile` also accepts a seed file via `--with-seed`. Several
+/// cache, written by `rocky run` / `rocky discover --with-schemas` — both on
+/// replication pipelines only (`discover` refuses a transformation-only
+/// pipeline). `rocky compile` also accepts a seed file via `--with-seed`,
+/// the route that works for a transformation-only project. Several
 /// commands do not — they build a `CompilerConfig` with an empty map, so
 /// nothing clears this code under them today. `rocky test` and `rocky ci`
 /// are the two that matter here (`rocky_engine::test_runner`,

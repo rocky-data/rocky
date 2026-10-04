@@ -284,7 +284,7 @@ export interface CostHint {
  *
  * Declares the maximum allowed lag between successive materializations of the model plus the optional timestamp column used by the runtime freshness check.
  *
- * The compiler does not enforce the TTL — it's metadata consumed by downstream observability tooling (`dagster-rocky` `FreshnessPolicy`, `rocky doctor --freshness`, etc.). The compiler does however soft-warn (W005) when a model has at least one temporal output column but no `freshness` declaration anywhere in scope (per-model or project-level default).
+ * `rocky freshness` enforces the TTL at run time: it reads `MAX(time_column)` from the model's target table (or, without a `time_column`, the model's last successful build in the state store) and reports `warn`, or `error` when `severity = "error"`. `rocky run` does not gate on it. The compiler checks the `time_column` (E050 when absent from a provably complete output, W050 when not temporal), and soft-warns (W005) when a model has at least one temporal output column but no `freshness` declaration anywhere in scope (per-model or project-level default).
  */
 export interface ModelFreshnessConfig {
   /**

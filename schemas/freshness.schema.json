@@ -1,0 +1,171 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "FreshnessCheckResult": {
+      "description": "One freshness check.",
+      "properties": {
+        "age_seconds": {
+          "description": "`checked_at - max_loaded_at`, in seconds. Negative when the newest load time is in the future (clock skew).",
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "error_after_seconds": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "loaded_at_field": {
+          "description": "The column read with `MAX(..)`. `None` when the measurement is the model's last successful build from the state store.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "max_loaded_at": {
+          "description": "The newest load time seen. `None` when the table is empty, every value is NULL, the model was never built, or the check could not run.",
+          "format": "date-time",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "measured_from": {
+          "description": "Where `max_loaded_at` came from: `warehouse` or `state_store`.",
+          "type": "string"
+        },
+        "message": {
+          "description": "Why the status is what it is, when that is not just the age.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "description": "Source `schema.table` (or `catalog.schema.table`), or the model name.",
+          "type": "string"
+        },
+        "pipeline": {
+          "description": "The pipeline that declares the source or loads the model.",
+          "type": "string"
+        },
+        "status": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/FreshnessStatus"
+            }
+          ],
+          "description": "`pass`, `warn`, `error`, or `runtime_error`."
+        },
+        "table": {
+          "description": "The table the measurement was taken from (`catalog.schema.table`).",
+          "type": "string"
+        },
+        "warn_after_seconds": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "measured_from",
+        "name",
+        "pipeline",
+        "status",
+        "table"
+      ],
+      "type": "object"
+    },
+    "FreshnessStatus": {
+      "description": "Outcome of one freshness check. Serialized `pass` / `warn` / `error` / `runtime_error`, matching dbt's `source freshness` statuses.\n\n- `pass`: within every threshold. - `warn`: older than `warn_after`, not older than `error_after`. - `error`: older than `error_after`. - `runtime_error`: the check could not be evaluated (invalid config, a failed query, or a value that does not read as a timestamp).",
+      "enum": [
+        "pass",
+        "warn",
+        "error",
+        "runtime_error"
+      ],
+      "type": "string"
+    },
+    "FreshnessSummary": {
+      "description": "Counts per status across `sources` and `models`.",
+      "properties": {
+        "error": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "pass": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "runtime_error": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "warn": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "error",
+        "pass",
+        "runtime_error",
+        "warn"
+      ],
+      "type": "object"
+    }
+  },
+  "description": "JSON output for `rocky freshness`.",
+  "properties": {
+    "checked_at": {
+      "description": "The instant every age was measured against.",
+      "format": "date-time",
+      "type": "string"
+    },
+    "command": {
+      "type": "string"
+    },
+    "models": {
+      "description": "One entry per model `[freshness]` block.",
+      "items": {
+        "$ref": "#/definitions/FreshnessCheckResult"
+      },
+      "type": "array"
+    },
+    "sources": {
+      "description": "One entry per declared source freshness block.",
+      "items": {
+        "$ref": "#/definitions/FreshnessCheckResult"
+      },
+      "type": "array"
+    },
+    "summary": {
+      "$ref": "#/definitions/FreshnessSummary"
+    },
+    "version": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "checked_at",
+    "command",
+    "models",
+    "sources",
+    "summary",
+    "version"
+  ],
+  "title": "FreshnessOutput",
+  "type": "object"
+}

@@ -827,6 +827,86 @@ acme_warehouse.staging__eu_central__stripe.charges    | 2026-03-29T22:15:00Z    
 
 ---
 
+## `rocky freshness`
+
+Check how fresh each declared source and model is, against the warehouse. This is Rocky's form of `dbt source freshness`. It reads data only and writes nothing.
+
+```bash
+rocky freshness [flags]
+```
+
+Rocky checks two kinds of declaration:
+
+- **Sources.** Each [`[[pipeline.NAME.sources]]`](/reference/configuration/#pipelinenamesources) entry with a `freshness` block. Rocky runs `SELECT COUNT(*), MAX(loaded_at_field) FROM <table> [WHERE (<filter>)]`.
+- **Models.** Each model with a `[freshness]` block. With a `time_column`, Rocky reads `MAX(time_column)` from the model's target table. Without one, Rocky uses the model's last successful build from the state store.
+
+The age is the check time minus the newest load time. Rocky grades it:
+
+| Status | When |
+|--------|------|
+| `pass` | The age is within every threshold. |
+| `warn` | The age is greater than `warn_after`. |
+| `error` | The age is greater than `error_after`. |
+| `runtime_error` | Rocky could not measure: invalid config, a failed query, or a value that does not read as a timestamp. |
+
+A table with no rows, or with only NULL load times, counts as never loaded. The worst threshold it declares applies. A model's `max_lag_seconds` is its warn threshold. Under `severity = "error"` it is the error threshold instead.
+
+**Exit code.** `1` when any check is `error` or `runtime_error`. `0` otherwise, including when checks only `warn`.
+
+`rocky run` does not call this command. To stop a run on stale sources, run `rocky freshness` first and stop on a non-zero exit.
+
+A model can inherit `time_column` from `_defaults.toml` or the project `[freshness]` block. When Rocky cannot read an inherited column on that model, it measures the last successful build instead and says so in `message`. A `time_column` in the model's own sidecar gets no fallback: a failed read is `runtime_error`.
+
+**Limits.**
+
+- Run history records a model build under its bare target table name. Two models whose targets share a table name in different schemas share that history. For a model without a `time_column`, the newer build of the two can hide a stale one. Set a `time_column` to measure the table itself.
+- With `[state] namespacing = "pipeline"`, the state-store fallback reads the global state file, so it may find no build.
+- Exit `1` covers both a stale check and a command failure (for example a config that does not load). A command failure prints no JSON report.
+- Snowflake temporal cells arrive as epoch numbers and are decoded as such. That decoding follows the documented SQL API format and is not yet verified against a live account.
+
+### Flags
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--pipeline <NAME>` | `string` | | Check one transformation pipeline. By default Rocky checks every transformation pipeline. A replication pipeline is refused: it checks freshness with `[checks.freshness]` during `rocky run`. |
+
+### Examples
+
+```bash
+rocky freshness
+```
+
+```json
+{
+  "version": "1.76.0",
+  "command": "freshness",
+  "checked_at": "2026-10-04T12:00:00Z",
+  "sources": [
+    {
+      "name": "raw.orders",
+      "pipeline": "silver",
+      "table": "raw.orders",
+      "loaded_at_field": "_loaded_at",
+      "measured_from": "warehouse",
+      "max_loaded_at": "2026-10-03T23:00:00Z",
+      "age_seconds": 46800,
+      "warn_after_seconds": 43200,
+      "error_after_seconds": 86400,
+      "status": "warn"
+    }
+  ],
+  "models": [],
+  "summary": { "pass": 0, "warn": 1, "error": 0, "runtime_error": 0 }
+}
+```
+
+### Related Commands
+
+- [`rocky compile`](/reference/commands/modeling/#rocky-compile) -- checks the declarations (`E050`, `W050`)
+- [`rocky run`](#rocky-run) -- builds the models; does not check freshness
+
+---
+
 ## `rocky branch`
 
 Manage named virtual branches. A branch is the persistent, named form of shadow mode. Creating one records a `schema_prefix` in the state store. Every later run that names the branch applies that prefix to each model target. That holds whether you run `rocky plan --branch <name>` plus `rocky apply <plan-id>` or the one-step `rocky run --branch <name>`. Schema-prefix branches behave the same on every adapter today. Warehouse-native clones (Delta `SHALLOW CLONE`, Snowflake zero-copy `CLONE`) are a follow-up.

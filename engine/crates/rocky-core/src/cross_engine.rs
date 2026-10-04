@@ -590,6 +590,7 @@ mod tests {
             execution: ExecutionConfig::default(),
             depends_on,
             schedule: None,
+            sources: Vec::new(),
         }))
     }
 
