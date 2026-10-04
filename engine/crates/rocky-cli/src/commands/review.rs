@@ -2175,13 +2175,13 @@ mod tests {
             None,
             false,
         )?;
-        Ok(crate::plan_store::write_plan_governed(
+        crate::plan_store::write_plan_governed(
             root,
             PlanKind::Run,
             &run_plan,
             PolicyPrincipal::Agent,
             capabilities,
-        )?)
+        )
     }
 
     /// #2239: a `--dag` plan's breaking-change findings cover every pipeline

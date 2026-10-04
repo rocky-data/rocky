@@ -9695,13 +9695,7 @@ autonomy_budget = { failures = 3, window = "7d" }
             false,
         )?;
         assert!(capabilities.models_fingerprint.is_some());
-        Ok(crate::plan_store::write_plan_governed(
-            root,
-            PlanKind::Run,
-            &rp,
-            principal,
-            capabilities,
-        )?)
+        crate::plan_store::write_plan_governed(root, PlanKind::Run, &rp, principal, capabilities)
     }
 
     async fn apply_dag_plan_as_human(
@@ -9728,7 +9722,8 @@ autonomy_budget = { failures = 3, window = "7d" }
     #[tokio::test]
     async fn reviewed_dag_plan_refuses_when_another_pipelines_models_change() -> anyhow::Result<()>
     {
-        let edits: [(&str, fn(&Path) -> std::io::Result<()>); 4] = [
+        type Edit = fn(&Path) -> std::io::Result<()>;
+        let edits: [(&str, Edit); 4] = [
             // A seed is a DAG node too: its CSV, sidecar and hooks run.
             ("seed added", |root| {
                 std::fs::create_dir_all(root.join("seeds"))?;
