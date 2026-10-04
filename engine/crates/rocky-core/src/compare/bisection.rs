@@ -378,6 +378,23 @@ async fn null_key_groups_differ(
     Ok(base_hashes != branch_hashes)
 }
 
+/// The most null-key rows compared on one side. Null-key rows are fetched
+/// into memory, so a larger group fails with an error instead of risking
+/// an out-of-memory crash.
+pub const MAX_NULL_KEY_ROWS: usize = 100_000;
+
+/// Refuse a null-key group larger than [`MAX_NULL_KEY_ROWS`].
+fn check_null_key_cap(rows: usize, table: &TableRef) -> AdapterResult<()> {
+    if rows > MAX_NULL_KEY_ROWS {
+        return Err(AdapterError::msg(format!(
+            "{}.{}.{} has more than {MAX_NULL_KEY_ROWS} rows with a NULL key; \
+             bisection cannot compare them",
+            table.catalog, table.schema, table.table
+        )));
+    }
+    Ok(())
+}
+
 /// One row hash per null-key row on one side, sorted.
 async fn fetch_null_key_hashes(
     adapter: &dyn WarehouseAdapter,
@@ -392,8 +409,10 @@ async fn fetch_null_key_hashes(
         target.pk_column,
         target.value_columns,
     ))?;
-    let sql = format!("SELECT {row_hash} FROM {table_ref} WHERE {pk} IS NULL");
+    let limit = MAX_NULL_KEY_ROWS + 1;
+    let sql = format!("SELECT {row_hash} FROM {table_ref} WHERE {pk} IS NULL LIMIT {limit}");
     let result = adapter.execute_query(&sql).await?;
+    check_null_key_cap(result.rows.len(), table)?;
     let mut hashes = result
         .rows
         .iter()
@@ -410,10 +429,10 @@ async fn fetch_null_key_hashes(
 
 /// Parse an integer cell. Warehouses return wide integers (BIGINT,
 /// HUGEINT, NUMBER) as JSON strings and small ones as JSON numbers. A
-/// JSON `null` (a NULL row hash) reads as 0.
+/// JSON `null` is an error, so a NULL row hash never matches a real 0.
 fn parse_integer_cell(cell: &serde_json::Value, what: &str) -> AdapterResult<i128> {
     match cell {
-        serde_json::Value::Null => Ok(0),
+        serde_json::Value::Null => Err(AdapterError::msg(format!("{what} is NULL"))),
         serde_json::Value::Number(n) => {
             if let Some(v) = n.as_i64() {
                 Ok(v.into())
@@ -504,8 +523,10 @@ async fn fetch_null_key_rows(
         cols_clause.push_str(", ");
         cols_clause.push_str(&dialect.quote_identifier(c));
     }
-    let sql = format!("SELECT {cols_clause} FROM {table_ref} WHERE {pk} IS NULL");
+    let limit = MAX_NULL_KEY_ROWS + 1;
+    let sql = format!("SELECT {cols_clause} FROM {table_ref} WHERE {pk} IS NULL LIMIT {limit}");
     let result = adapter.execute_query(&sql).await?;
+    check_null_key_cap(result.rows.len(), table)?;
     result
         .rows
         .into_iter()
@@ -843,7 +864,7 @@ mod tests {
     #[test]
     fn parse_integer_cell_accepts_warehouse_shapes() {
         use serde_json::json;
-        assert_eq!(parse_integer_cell(&json!(null), "x").unwrap(), 0);
+        assert!(parse_integer_cell(&json!(null), "x").is_err());
         assert_eq!(parse_integer_cell(&json!(-5), "x").unwrap(), -5);
         assert_eq!(
             parse_integer_cell(&json!("18446744073709551615"), "x").unwrap(),

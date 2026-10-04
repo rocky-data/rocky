@@ -149,6 +149,9 @@ Bisection is a checksum, not a proof. It can miss a change in two cases:
 
 - **Hash collision.** The row hashes are 64-bit and non-cryptographic. A change can, rarely, produce the same chunk checksum.
 - **Duplicate keys.** Two rows with the same key and the same values have the same hash, and `BIT_XOR` cancels them in pairs. Bisection runs only on Merge models with a single-column `unique_key`, where keys are expected to be unique.
+- **Linear multi-column hashes.** If a warehouse combines per-column hashes linearly, `BIT_XOR` can cancel a change across rows. DuckDB does this, so Rocky hashes the DuckDB row as one serialized string. That string form does not tell `1` from `'1'`. Snowflake's multi-column `HASH` has not been tested for this property. Treat a Snowflake "no change" result with care until it is.
+
+A table with more than 100,000 NULL-key rows on one side stops the bisection with an error, because those rows are compared in memory.
 
 Each per-model `Bisection` variant carries a `bisection_stats` block:
 
