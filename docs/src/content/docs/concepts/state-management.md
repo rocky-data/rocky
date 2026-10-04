@@ -269,6 +269,13 @@ When the current key is absent, Rocky looks for an older key. It probes older ve
 
 This assumes that every process that shares the backend runs the same engine version, as the [deployment contract](/advanced/deployment-contract/#mixed-versions-during-an-upgrade) requires. An older engine that keeps writing its own key after the upgrade writes state that the new engine never reads again.
 
+Four effects to know before you upgrade or reset:
+
+- **Deleting only the current key does not reset state.** The next download restores the newest older key instead. To reset, delete every version key under the prefix, or point `s3_prefix`, `gcs_prefix` or `valkey_prefix` at a new prefix.
+- **A rollback reads the older key as it was.** If you go back to the older engine, it reads its own frozen key. Nothing written after the upgrade is in it, and nothing is merged back.
+- **A fresh start makes up to 9 existence checks, not 1.** All of them share `transfer_timeout_seconds`. A check that fails stops the download. An IAM policy that allows only the current version's path refuses the older paths, so the first run after an upgrade fails. Grant read access to the whole prefix.
+- **Fields added since the older version read as empty.** For example, a run recorded before v25 does not carry the `check_gate_failed` flag, so it reads as `false`. Treat `--resume` of a run from before the upgrade with care.
+
 ### Retry and Failure Policy
 
 Every remote transfer runs inside a wall-clock budget, for uploads and downloads alike. Retries back off exponentially, and a three-state circuit breaker stops a failing backend from being hammered. This is the same machinery the Databricks and Snowflake adapters use. Configure it under `[state.retry]` in `rocky.toml`. The [configuration reference](/reference/configuration/#stateretry) lists every field.
