@@ -1215,6 +1215,23 @@ pub trait SqlDialect: Send + Sync {
         Ok(format!("CREATE OR REPLACE VIEW {target} AS\n{select_sql}"))
     }
 
+    /// The query that lists the governance attached to an existing view:
+    /// its table tags, column tags, row filters and column masks (#2234).
+    ///
+    /// Rocky runs this query before every `CREATE OR REPLACE VIEW` over a
+    /// view that may exist, and refuses the replace when the view carries
+    /// governance that Rocky does not declare. See
+    /// [`crate::view_governance::check_view_replace`] for the row shape the
+    /// query must return.
+    ///
+    /// Default: `None`. The warehouse does not drop governance on a view
+    /// replace, or Rocky does not check it there yet. Only Databricks
+    /// overrides this today: on Unity Catalog, `CREATE OR REPLACE VIEW`
+    /// drops the view's governed tags and the policies attached to it.
+    fn view_governance_probe_sql(&self, _view: &TableRef) -> Option<AdapterResult<String>> {
+        None
+    }
+
     /// `CREATE OR REPLACE MATERIALIZED VIEW <target> AS <select>`.
     ///
     /// Materialized views are warehouse-managed: the warehouse decides

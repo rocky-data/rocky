@@ -341,6 +341,16 @@ pub async fn plan(
             // time, merge → MERGE INTO, view / materialized_view → their DDL).
             let sql = replication_copy_sql(&model_ir, dialect)?;
 
+            if matches!(model_ir.materialization, MaterializationStrategy::View)
+                && let Some(check) = view_governance_check_preview(dialect, &model_ir.target)
+            {
+                output.statements.push(PlannedStatement {
+                    purpose: "view_governance_check".into(),
+                    target: target_label.clone(),
+                    sql: check,
+                });
+            }
+
             output.statements.push(PlannedStatement {
                 purpose: purpose.into(),
                 target: target_label,
@@ -894,6 +904,33 @@ fn replication_copy_purpose(strategy: &MaterializationStrategy) -> &'static str 
         MaterializationStrategy::MaterializedView => "materialized_view",
         _ => "full_refresh_copy",
     }
+}
+
+/// The `view_governance_check` preview row for a view `rocky run` replaces
+/// (#2234). `None` when the dialect has no governance probe.
+///
+/// The row shows the probe `rocky run` sends before its `CREATE OR REPLACE
+/// VIEW`. The probe reads live catalog state, so the offline plan cannot
+/// show its answer. It shows the check and the rule instead.
+pub(crate) fn view_governance_check_preview(
+    dialect: &dyn SqlDialect,
+    target: &TargetRef,
+) -> Option<String> {
+    let probe = dialect.view_governance_probe_sql(&TableRef {
+        catalog: target.catalog.clone(),
+        schema: target.schema.clone(),
+        table: target.table.clone(),
+    })?;
+    Some(match probe {
+        Ok(sql) => format!(
+            "-- rocky run refuses to replace this view when the probe returns a tag the \
+             model does not declare, or any row filter or column mask (#2234)\n{sql}"
+        ),
+        Err(e) => format!(
+            "-- rocky run refuses to replace this view: cannot build the governance \
+             probe: {e} (#2234)"
+        ),
+    })
 }
 
 /// Render the forward-looking copy SQL for one replication table, matching the
@@ -1455,6 +1492,16 @@ fn plan_preview_output_for_pipeline(
                         purpose: "conditional_drop".to_string(),
                         target: target_label.clone(),
                         sql: drop,
+                    });
+                }
+                if matches!(model_ir.materialization, MaterializationStrategy::View)
+                    && let Some(check) =
+                        view_governance_check_preview(dialect.as_ref(), &model_ir.target)
+                {
+                    output.statements.push(PlannedStatement {
+                        purpose: "view_governance_check".to_string(),
+                        target: target_label.clone(),
+                        sql: check,
                     });
                 }
                 // Multi-statement strategies (DeleteInsert, lakehouse DDL)
@@ -3347,6 +3394,33 @@ mod tests {
             !sql.contains("INSERT INTO"),
             "view must not preview as an INSERT (the pre-fix regression), got:\n{sql}"
         );
+    }
+
+    /// #2234: the plan shows the governance probe `rocky run` sends before
+    /// it replaces a Databricks view, with the same SQL the run uses. A
+    /// dialect without a probe shows no check row.
+    #[test]
+    fn view_preview_shows_the_governance_check_run_performs() {
+        let ir = replication_ir(MaterializationStrategy::View);
+        let databricks = dialect_for_adapter_type("databricks");
+        let check = view_governance_check_preview(databricks.as_ref(), &ir.target)
+            .expect("databricks previews the governance check");
+        let probe = databricks
+            .view_governance_probe_sql(&TableRef {
+                catalog: ir.target.catalog.clone(),
+                schema: ir.target.schema.clone(),
+                table: ir.target.table.clone(),
+            })
+            .unwrap()
+            .unwrap();
+        assert!(
+            check.starts_with("-- rocky run refuses to replace this view"),
+            "{check}"
+        );
+        assert!(check.ends_with(&probe), "{check}");
+
+        let duckdb = dialect_for_adapter_type("duckdb");
+        assert!(view_governance_check_preview(duckdb.as_ref(), &ir.target).is_none());
     }
 
     #[test]

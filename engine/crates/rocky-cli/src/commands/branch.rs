@@ -1165,6 +1165,8 @@ pub(crate) async fn run_promote_apply(
                 step.target
             );
         }
+        check_promote_view_governance(adapter.as_ref(), &target_ref, actual_kind, &step.target)
+            .await?;
         let source_ref = TargetRef {
             catalog: step.source_catalog.clone(),
             schema: step.source_schema.clone(),
@@ -1405,6 +1407,32 @@ struct PlannedPromote {
 enum PromoteKind {
     Table,
     View,
+}
+
+/// Refuse to promote over a production view that carries governance (#2234).
+///
+/// `CREATE OR REPLACE VIEW` drops the view's governed tags and attached
+/// policies on Unity Catalog. Promote re-applies no tags, so every tag on the
+/// production view counts as foreign here. Only an existing view is probed:
+/// an absent destination has nothing to drop.
+async fn check_promote_view_governance(
+    adapter: &dyn rocky_core::traits::WarehouseAdapter,
+    target: &TableRef,
+    actual_kind: Option<rocky_core::traits::ObjectKind>,
+    target_name: &str,
+) -> Result<()> {
+    if actual_kind != Some(rocky_core::traits::ObjectKind::View) {
+        return Ok(());
+    }
+    rocky_core::view_governance::check_view_replace(
+        adapter,
+        target,
+        &rocky_core::view_governance::DeclaredViewGovernance::default(),
+    )
+    .await
+    .with_context(|| {
+        format!("cannot promote view '{target_name}': branch promote does not re-apply tags")
+    })
 }
 
 fn transformation_promote_kind(
@@ -2536,6 +2564,63 @@ pub async fn run_branch_promote_from_plan(
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    /// #2234: promote never replaces a production view that carries a tag,
+    /// a row filter or a column mask. Promote re-applies no tags, so even a
+    /// tag a model declares refuses here. An absent destination or a table is
+    /// not probed.
+    #[tokio::test]
+    async fn promote_refuses_a_governed_production_view() {
+        use crate::testing::GovernedViewWarehouse;
+        use rocky_core::traits::ObjectKind;
+        use serde_json::json;
+
+        let target = TableRef {
+            catalog: "cat".into(),
+            schema: "marts".into(),
+            table: "v".into(),
+        };
+        let tagged = vec![vec![
+            json!("table_tag"),
+            json!(null),
+            json!("domain"),
+            json!("finance"),
+        ]];
+
+        let warehouse = GovernedViewWarehouse::new(Ok(tagged.clone()));
+        let err = check_promote_view_governance(
+            &warehouse,
+            &target,
+            Some(ObjectKind::View),
+            "cat.marts.v",
+        )
+        .await
+        .expect_err("a tagged view must refuse the promote");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("cannot promote view 'cat.marts.v'"), "{msg}");
+        assert!(msg.contains("tag domain=finance"), "{msg}");
+
+        let failing = GovernedViewWarehouse::new(Err("PERMISSION_DENIED".into()));
+        let err =
+            check_promote_view_governance(&failing, &target, Some(ObjectKind::View), "cat.marts.v")
+                .await
+                .expect_err("a failed probe must refuse the promote");
+        assert!(format!("{err:#}").contains("PERMISSION_DENIED"));
+
+        let clean = GovernedViewWarehouse::new(Ok(vec![]));
+        check_promote_view_governance(&clean, &target, Some(ObjectKind::View), "cat.marts.v")
+            .await
+            .expect("an untagged view promotes");
+        assert_eq!(clean.log(), vec!["probe".to_string()]);
+
+        for kind in [None, Some(ObjectKind::Table)] {
+            let warehouse = GovernedViewWarehouse::new(Ok(tagged.clone()));
+            check_promote_view_governance(&warehouse, &target, kind, "cat.marts.v")
+                .await
+                .expect("only an existing view is probed");
+            assert!(warehouse.log().is_empty());
+        }
+    }
 
     #[test]
     fn validate_accepts_common_names() {

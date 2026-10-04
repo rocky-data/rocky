@@ -71,3 +71,4 @@ pub mod tests;
 pub mod traits;
 pub mod unified_dag;
 pub mod unit_test;
+pub mod view_governance;

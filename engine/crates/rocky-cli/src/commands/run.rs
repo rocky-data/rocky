@@ -13932,6 +13932,27 @@ async fn execute_one_plain_model(
                 pending_drop = Some((drop_sql, existing_name, expected_name));
             }
         }
+        // #2234: `CREATE OR REPLACE VIEW` drops the view's governed tags and
+        // attached policies on Unity Catalog. Refuse before any statement when
+        // the view carries governance this model does not declare. An
+        // existing table is out of scope: it either refused above, or the
+        // model named it for an explicit drop. `Unknown` still probes, so a
+        // failed kind probe cannot skip the check.
+        if expected_kind == rocky_core::traits::ObjectKind::View
+            && existing_kind != rocky_core::traits::ObjectKind::Table
+        {
+            let declared = rocky_core::view_governance::DeclaredViewGovernance::for_model(
+                &model.config.governance.tags,
+                &model.config.classification,
+            );
+            rocky_core::view_governance::check_view_replace(
+                warehouse,
+                &target_table_struct,
+                &declared,
+            )
+            .await
+            .map_err(|e| anyhow::Error::from(e).context(format!("model '{model_name}' failed")))?;
+        }
     }
 
     let model_started_at = Utc::now();
@@ -15839,6 +15860,19 @@ async fn process_table(
         );
         warehouse
             .execute_statement(&drop_sql)
+            .await
+            .map_err(anyhow::Error::from)?;
+    }
+
+    // #2234: refuse to replace a view whose governance the replace would
+    // drop. The pipeline's per-table tags are the declared set: the deferred
+    // tagging phase below re-applies them.
+    if strategy_name == "view" {
+        let declared = rocky_core::view_governance::DeclaredViewGovernance {
+            tags: task.governance_tags.clone(),
+            column_tags: BTreeMap::new(),
+        };
+        rocky_core::view_governance::check_view_replace(warehouse, &target_table, &declared)
             .await
             .map_err(anyhow::Error::from)?;
     }
@@ -25186,6 +25220,151 @@ table = "fct_events"
             .await
             .unwrap();
         assert_eq!(rows.rows, vec![vec![serde_json::json!("99")]]);
+    }
+
+    async fn run_governed_view_model(
+        warehouse: &crate::testing::GovernedViewWarehouse,
+    ) -> anyhow::Result<crate::output::MaterializationOutput> {
+        use rocky_core::models::load_model_pair;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("orders_view.toml"),
+            r#"
+name = "orders_view"
+
+[strategy]
+type = "view"
+
+[target]
+catalog = "cat"
+schema = "sch"
+table = "orders_view"
+
+[governance.tags]
+domain = "finance"
+
+[classification]
+email = "pii"
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("orders_view.sql"),
+            "SELECT id, email FROM cat.src.orders",
+        )
+        .unwrap();
+        let model = load_model_pair(
+            &dir.path().join("orders_view.sql"),
+            &dir.path().join("orders_view.toml"),
+            None,
+        )
+        .expect("load view model");
+
+        let typed_models = indexmap::IndexMap::new();
+        let model_timings = std::collections::HashMap::new();
+        let surrogate_keys = std::collections::HashMap::new();
+        let exec_ctx = super::ExecutionContext {
+            typed_models: &typed_models,
+            model_timings: &model_timings,
+            surrogate_keys: &surrogate_keys,
+        };
+        super::execute_one_plain_model(
+            &model,
+            warehouse,
+            rocky_core::traits::WarehouseAdapter::dialect(warehouse),
+            "orders_view",
+            std::time::Instant::now(),
+            exec_ctx,
+        )
+        .await
+    }
+
+    /// #2234: a view carrying a tag the model does not declare, or any row
+    /// filter or column mask, is never replaced. The probe runs and the
+    /// `CREATE OR REPLACE VIEW` is never sent.
+    #[tokio::test]
+    async fn view_replace_refuses_foreign_governance_before_any_statement() {
+        use serde_json::json;
+        for (rows, expect) in [
+            (
+                vec![json!(["table_tag", null, "pii", "true"])],
+                "tag pii=true",
+            ),
+            (
+                vec![json!(["table_tag", null, "domain", "hr"])],
+                "tag domain=hr",
+            ),
+            (
+                vec![json!(["row_filter", null, "cat.sec.region_filter", null])],
+                "row filter cat.sec.region_filter",
+            ),
+            (
+                vec![json!(["column_mask", "email", "cat.sec.mask_email", null])],
+                "column mask cat.sec.mask_email on column email",
+            ),
+        ] {
+            let rows = rows
+                .into_iter()
+                .map(|r| r.as_array().unwrap().clone())
+                .collect();
+            let warehouse = crate::testing::GovernedViewWarehouse::new(Ok(rows));
+            let err = run_governed_view_model(&warehouse)
+                .await
+                .expect_err("foreign governance must refuse the replace");
+            let msg = format!("{err:#}");
+            assert!(msg.contains("model 'orders_view' failed"), "{msg}");
+            assert!(
+                msg.contains("refusing to replace view cat.sch.orders_view"),
+                "{msg}"
+            );
+            assert!(msg.contains(expect), "{msg}");
+            assert_eq!(warehouse.log(), vec!["probe".to_string()]);
+        }
+    }
+
+    /// #2234: the check fails closed. A probe that errors refuses the
+    /// replace, and nothing is sent after it.
+    #[tokio::test]
+    async fn view_replace_refuses_when_the_governance_probe_fails() {
+        let warehouse =
+            crate::testing::GovernedViewWarehouse::new(Err("PERMISSION_DENIED".to_string()));
+        let err = run_governed_view_model(&warehouse)
+            .await
+            .expect_err("a failed probe must refuse the replace");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("cannot read its tags"), "{msg}");
+        assert!(msg.contains("PERMISSION_DENIED"), "{msg}");
+        assert_eq!(warehouse.log(), vec!["probe".to_string()]);
+    }
+
+    /// #2234: tags the model declares (its `[governance.tags]` and its
+    /// `classification` column tags) never refuse. The statement order is
+    /// probe first, then the `CREATE OR REPLACE VIEW`.
+    #[tokio::test]
+    async fn view_replace_proceeds_when_only_declared_tags_exist() {
+        use serde_json::json;
+        let rows = [
+            json!(["table_tag", null, "domain", "finance"]),
+            json!(["column_tag", "EMAIL", "classification", "pii"]),
+        ]
+        .into_iter()
+        .map(|r| r.as_array().unwrap().clone())
+        .collect();
+        for probe in [Ok(rows), Ok(vec![])] {
+            let warehouse = crate::testing::GovernedViewWarehouse::new(probe);
+            run_governed_view_model(&warehouse)
+                .await
+                .expect("declared governance must not refuse");
+            let log = warehouse.log();
+            assert_eq!(log.len(), 2, "{log:?}");
+            assert_eq!(log[0], "probe");
+            assert!(
+                log[1].starts_with("statement: CREATE OR REPLACE VIEW `cat`.`sch`.`orders_view`")
+                    || log[1].starts_with("statement: CREATE OR REPLACE VIEW cat.sch.orders_view"),
+                "{log:?}"
+            );
+        }
     }
 
     /// #2037, part 1 ("say what happened"): a model run as `strategy =
