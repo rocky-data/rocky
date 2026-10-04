@@ -7163,7 +7163,10 @@ mod tests {
     async fn ledger_seam_off_failed_transition_restores_the_remote_copy() {
         let _serial = test_support::serial_guard();
         test_support::clear();
-        let harness = crate::test_harness::CrossPodHarness::new_s3_like();
+        let mut harness = crate::test_harness::CrossPodHarness::new_s3_like();
+        // Explicit `off`: an unset mode defaults to `cas` on s3 (#1228).
+        harness.pod_a.cfg.concurrency_control = Some(ConcurrencyControl::Off);
+        harness.pod_b.cfg.concurrency_control = Some(ConcurrencyControl::Off);
         {
             let store = harness.open_store(&harness.pod_a);
             store
