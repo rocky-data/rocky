@@ -754,7 +754,7 @@ circuit_breaker_threshold = 3
 circuit_breaker_recovery_timeout_secs = 30
 ```
 
-Every transfer ends with a structured `outcome` field on its `state.upload` or `state.download` event: `ok`, `absent`, `timeout`, `error_then_fresh`, `skipped_after_failure`, `transient_exhausted`, `circuit_open`, or `budget_exhausted`. Build alerts on those values, not on the free-form log message.
+Every transfer ends with a structured `outcome` field on its `state.upload` or `state.download` event: `ok`, `absent`, `carried_forward`, `timeout`, `error_then_fresh`, `skipped_after_failure`, `transient_exhausted`, `circuit_open`, or `budget_exhausted`. Build alerts on those values, not on the free-form log message.
 
 ### `[state.idempotency]`
 
