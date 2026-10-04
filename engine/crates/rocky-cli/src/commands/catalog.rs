@@ -216,11 +216,9 @@ pub fn compute_catalog_output(
         let t = &m.config.target;
         target_fqns.insert(
             m.config.name.clone(),
-            // Sidecar values print each resolved `${VAR}` as `${NAME}` (#1919).
-            rocky_core::secret_registry::render_placeholders(&format!(
-                "{}.{}.{}",
-                t.catalog, t.schema, t.table
-            )),
+            // A target prints resolved, as `rocky run`'s `asset_key` does
+            // (#1919).
+            format!("{}.{}.{}", t.catalog, t.schema, t.table),
         );
     }
 

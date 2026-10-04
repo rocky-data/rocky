@@ -63,10 +63,8 @@ fn record_to_history(run: &RunRecord, audit: bool) -> RunHistoryRecord {
             run.git_commit.clone(),
             run.git_branch.clone(),
             run.idempotency_key.clone(),
-            // Stored resolved; printed as `${NAME}` (#1919).
-            run.target_catalog
-                .as_deref()
-                .map(rocky_core::secret_registry::render_placeholders),
+            // A target prints resolved, as `rocky run` does (#1919).
+            run.target_catalog.clone(),
             Some(run.hostname.clone()),
             Some(run.rocky_version.clone()),
         )

@@ -294,14 +294,13 @@ fn build_dag_output(
                 NodeKind::Transformation => {
                     if let Some(model) = model_map.get(node.label.as_str()) {
                         // Sidecar values were `${VAR}`-expanded before parsing.
-                        // Print each resolved value as `${NAME}` (#1919).
+                        // Print each resolved value as `${NAME}` (#1919),
+                        // except the target: it prints resolved, as `rocky
+                        // run`'s `asset_key` does, so asset keys still match.
                         let strategy = render_placeholders_in(&model.config.strategy)
                             .context("failed to render the model strategy for output")?;
                         (
-                            Some(
-                                render_placeholders_in(&model.config.target)
-                                    .context("failed to render the model target for output")?,
-                            ),
+                            Some(model.config.target.clone()),
                             Some(strategy.clone()),
                             render_placeholders_in(&model.config.freshness)
                                 .context("failed to render the model freshness for output")?,
@@ -602,18 +601,21 @@ mod secret_render_tests {
     use super::*;
 
     /// #1919: `rocky dag --output json` prints a resolved sidecar value as
-    /// `${NAME}` in a model node's `target` and `strategy`.
+    /// `${NAME}` in a model node's `strategy`, but prints the `target`
+    /// resolved, as `rocky run`'s `asset_key` does.
     #[test]
     fn dag_output_prints_a_resolved_sidecar_value_as_its_placeholder() {
-        const SECRET: &str = "rocky_1919_dag_catalog_feed";
+        const SECRET: &str = "rocky_1919_dag_column_feed";
+        const CATALOG: &str = "rocky_1919_dag_catalog";
         let dir = tempfile::tempdir().unwrap();
         let models_dir = dir.path().join("models");
         std::fs::create_dir_all(&models_dir).unwrap();
         std::fs::write(models_dir.join("m.sql"), "SELECT 1 AS id").unwrap();
         std::fs::write(
             models_dir.join("m.toml"),
-            "name = \"m\"\n\n[strategy]\ntype = \"full_refresh\"\n\n\
-             [target]\ncatalog = \"${ROCKY_T1919_DAG}\"\nschema = \"s\"\ntable = \"m\"\n",
+            "name = \"m\"\n\n[strategy]\ntype = \"incremental\"\n\
+             timestamp_column = \"${ROCKY_T1919_DAG}\"\n\n\
+             [target]\ncatalog = \"${ROCKY_T1919_DAG_CATALOG}\"\nschema = \"s\"\ntable = \"m\"\n",
         )
         .unwrap();
         let config_path = dir.path().join("rocky.toml");
@@ -625,7 +627,10 @@ mod secret_render_tests {
         )
         .unwrap();
         // SAFETY: test-only; the variable name is unique to this test.
-        unsafe { std::env::set_var("ROCKY_T1919_DAG", SECRET) };
+        unsafe {
+            std::env::set_var("ROCKY_T1919_DAG", SECRET);
+            std::env::set_var("ROCKY_T1919_DAG_CATALOG", CATALOG);
+        }
         let out = dag_output(
             &config_path,
             &dir.path().join("state.redb"),
@@ -636,12 +641,19 @@ mod secret_render_tests {
             None,
         );
         // SAFETY: as above.
-        unsafe { std::env::remove_var("ROCKY_T1919_DAG") };
+        unsafe {
+            std::env::remove_var("ROCKY_T1919_DAG");
+            std::env::remove_var("ROCKY_T1919_DAG_CATALOG");
+        }
         let out = out.expect("dag builds");
         let json = serde_json::to_string(&out).unwrap();
         assert!(!json.contains(SECRET), "leaked: {json}");
         assert!(
-            json.contains("\"catalog\":\"${ROCKY_T1919_DAG}\""),
+            json.contains("\"timestamp_column\":\"${ROCKY_T1919_DAG}\""),
+            "{json}"
+        );
+        assert!(
+            json.contains(&format!("\"catalog\":\"{CATALOG}\"")),
             "{json}"
         );
     }

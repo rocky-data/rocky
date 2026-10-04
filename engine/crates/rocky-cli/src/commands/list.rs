@@ -135,12 +135,12 @@ fn build_model_entries(models_dir: &Path) -> Result<Vec<ListModelEntry>> {
     let entries: Vec<ListModelEntry> = models
         .iter()
         .map(|m| {
-            // Sidecar values were `${VAR}`-expanded before parsing. Print
-            // each resolved value as `${NAME}` (#1919).
-            let target = render_placeholders(&format!(
+            // The target prints resolved, as `rocky run`'s `asset_key` does
+            // (#1919): target coordinates are not rendered as `${NAME}`.
+            let target = format!(
                 "{}.{}.{}",
                 m.config.target.catalog, m.config.target.schema, m.config.target.table
-            ));
+            );
             let strategy = match &m.config.strategy {
                 rocky_core::models::StrategyConfig::FullRefresh => "full_refresh",
                 rocky_core::models::StrategyConfig::Incremental { .. } => "incremental",
@@ -357,10 +357,13 @@ mod tests {
     use super::*;
 
     /// #1919: `rocky list adapters | sources | models --output json` print a
-    /// resolved `${VAR}` value as `${NAME}`, never the value.
+    /// resolved `${VAR}` value as `${NAME}`, never the value. A model's
+    /// `target` is the exception: it prints resolved, as `rocky run`'s
+    /// `asset_key` does.
     #[test]
     fn list_outputs_print_a_resolved_value_as_its_placeholder() {
         const SECRET: &str = "rocky1919listvalue77";
+        const CATALOG: &str = "rocky1919listcatalog";
         let dir = tempfile::TempDir::new().unwrap();
         let cfg_path = dir.path().join("rocky.toml");
         std::fs::write(
@@ -401,22 +404,31 @@ schema_template = "s__{source}"
         std::fs::write(models_dir.join("m1.sql"), "SELECT 1 AS id").unwrap();
         std::fs::write(
             models_dir.join("m1.toml"),
-            "name = \"m1\"\n\n[strategy]\ntype = \"full_refresh\"\n\n\
-             [target]\ncatalog = \"${ROCKY_T1919_LIST}\"\nschema = \"s\"\ntable = \"m1\"\n",
+            "name = \"m1\"\ndepends_on = [\"${ROCKY_T1919_LIST}\"]\n\n\
+             [strategy]\ntype = \"full_refresh\"\n\n\
+             [target]\ncatalog = \"${ROCKY_T1919_LIST_CATALOG}\"\nschema = \"s\"\ntable = \"m1\"\n",
         )
         .unwrap();
 
         // SAFETY: test-only; the variable name is unique to this test.
-        unsafe { std::env::set_var("ROCKY_T1919_LIST", SECRET) };
+        unsafe {
+            std::env::set_var("ROCKY_T1919_LIST", SECRET);
+            std::env::set_var("ROCKY_T1919_LIST_CATALOG", CATALOG);
+        }
         let cfg = rocky_core::config::load_rocky_config(&cfg_path);
         let models = build_model_entries(&models_dir);
         // SAFETY: as above.
-        unsafe { std::env::remove_var("ROCKY_T1919_LIST") };
+        unsafe {
+            std::env::remove_var("ROCKY_T1919_LIST");
+            std::env::remove_var("ROCKY_T1919_LIST_CATALOG");
+        }
         let cfg = cfg.expect("config loads");
 
         let adapters = serde_json::to_string(&build_adapter_entries(&cfg)).unwrap();
         let sources = serde_json::to_string(&build_source_entries(&cfg)).unwrap();
-        let models = serde_json::to_string(&models.expect("models load")).unwrap();
+        let models = models.expect("models load");
+        assert_eq!(models[0].target, format!("{CATALOG}.s.m1"));
+        let models = serde_json::to_string(&models).unwrap();
         for printed in [&adapters, &sources, &models] {
             assert!(!printed.contains(SECRET), "leaked: {printed}");
             assert!(printed.contains("${ROCKY_T1919_LIST}"), "{printed}");

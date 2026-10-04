@@ -94,7 +94,8 @@ fn env_values_scope_active() -> bool {
 ///
 /// let token = EnvString::substituted("DEPLOY_TOKEN", "dapi_abc123_secret");
 /// assert_eq!(token.to_string(), "${DEPLOY_TOKEN}");
-/// assert_eq!(format!("{token:?}"), "${DEPLOY_TOKEN}");
+/// // `Debug` quotes the placeholder, as it quotes any string.
+/// assert_eq!(format!("{token:?}"), "\"${DEPLOY_TOKEN}\"");
 /// assert_eq!(serde_json::to_string(&token).unwrap(), "\"${DEPLOY_TOKEN}\"");
 /// assert_eq!(token.expose(), "dapi_abc123_secret");
 /// ```

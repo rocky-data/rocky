@@ -409,15 +409,17 @@ fn compile_inner(
                 },
             });
             // Sidecar values were `${VAR}`-expanded before parsing. Every
-            // field below is written with each resolved value as `${NAME}`
-            // (#1919). The copies are for printing only.
+            // field below except `target` is written with each resolved value
+            // as `${NAME}` (#1919). The copies are for printing only.
+            // `target` prints resolved on purpose: dagster-rocky matches the
+            // asset key it builds from it against `rocky run`'s `asset_key`,
+            // which carries the resolved coordinates.
             let render = render_placeholders;
             Ok(ModelDetail {
                 name: render(&model.config.name),
                 strategy: render_placeholders_in(&model.config.strategy)
                     .context("failed to render the model strategy for output")?,
-                target: render_placeholders_in(&model.config.target)
-                    .context("failed to render the model target for output")?,
+                target: model.config.target.clone(),
                 freshness: render_placeholders_in(&model.config.freshness)
                     .context("failed to render the model freshness for output")?,
                 contract_source: model.contract_path.as_ref().map(|_| "auto".to_string()),
@@ -826,9 +828,12 @@ schema_template = "s"
 
     /// #1919: a sidecar value expanded from `${VAR}` prints only as `${NAME}`
     /// in `rocky compile --output json` (`models_detail`), never as the value.
+    /// The target is the exception: it prints resolved, as `rocky run`'s
+    /// `asset_key` does.
     #[test]
     fn compile_output_prints_a_resolved_sidecar_value_as_its_placeholder() {
-        const SECRET: &str = "rocky_1919_compile_catalog_d00d";
+        const SECRET: &str = "rocky_1919_compile_secret_d00d";
+        const CATALOG: &str = "rocky_1919_compile_catalog";
         let dir = TempDir::new().unwrap();
         let models_dir = dir.path().join("models");
         fs::create_dir_all(&models_dir).unwrap();
@@ -841,12 +846,15 @@ schema_template = "s"
             models_dir.join("m1.toml"),
             "name = \"m1\"\n\n\
              [strategy]\ntype = \"incremental\"\ntimestamp_column = \"${ROCKY_T1919_COMPILE}\"\n\n\
-             [target]\ncatalog = \"${ROCKY_T1919_COMPILE}\"\nschema = \"s\"\ntable = \"m1\"\n\n\
+             [target]\ncatalog = \"${ROCKY_T1919_COMPILE_CATALOG}\"\nschema = \"s\"\ntable = \"m1\"\n\n\
              [tags]\nowner = \"${ROCKY_T1919_COMPILE}\"\n",
         )
         .unwrap();
         // SAFETY: test-only; the variable name is unique to this test.
-        unsafe { std::env::set_var("ROCKY_T1919_COMPILE", SECRET) };
+        unsafe {
+            std::env::set_var("ROCKY_T1919_COMPILE", SECRET);
+            std::env::set_var("ROCKY_T1919_COMPILE_CATALOG", CATALOG);
+        }
         let out = compile_output(
             None,
             &dir.path().join(".rocky-state.redb"),
@@ -859,13 +867,16 @@ schema_template = "s"
             None,
         );
         // SAFETY: as above.
-        unsafe { std::env::remove_var("ROCKY_T1919_COMPILE") };
+        unsafe {
+            std::env::remove_var("ROCKY_T1919_COMPILE");
+            std::env::remove_var("ROCKY_T1919_COMPILE_CATALOG");
+        }
         let out = out.expect("compiles");
         assert_eq!(out.models_detail.len(), 1, "PRECONDITION: the model loaded");
         let json = serde_json::to_string(&out).unwrap();
         assert!(!json.contains(SECRET), "leaked: {json}");
         let detail = serde_json::to_value(&out.models_detail[0]).unwrap();
-        assert_eq!(detail["target"]["catalog"], "${ROCKY_T1919_COMPILE}");
+        assert_eq!(detail["target"]["catalog"], CATALOG);
         assert_eq!(
             detail["strategy"]["timestamp_column"],
             "${ROCKY_T1919_COMPILE}"
