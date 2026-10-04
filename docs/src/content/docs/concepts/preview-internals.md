@@ -133,7 +133,7 @@ This is fast, deterministic, and bounded. It has one known blind spot: a row tha
 Bisection checks every row, by splitting the primary-key range and comparing checksums. It needs a single-column integer or numeric primary key. [Datafold's data-diff](https://github.com/datafold/data-diff) uses the same technique.
 
 1. Split the primary-key range into `K` chunks (default `K=32`).
-2. On both the branch and base sides, compute a per-chunk checksum: a `BIT_XOR` aggregate over a per-row hash (DuckDB `hash`, BigQuery `FARM_FINGERPRINT`, Databricks Spark `xxhash64`).
+2. On both the branch and base sides, compute a per-chunk checksum: the row count plus a `BIT_XOR` aggregate over a per-row hash (DuckDB `hash`, BigQuery `FARM_FINGERPRINT`, Databricks Spark `xxhash64`, Snowflake `HASH`). The row hash covers the primary key and every value column.
 3. Compare the two sides chunk-by-chunk. Matching chunks (equal row count + equal checksum) are pruned from the search.
 4. Recurse into mismatched chunks until each one falls below a leaf threshold (default `MIN_CHUNK_ROWS=1000`). At the leaf, materialize both sides and walk them in lockstep, classifying each row as added / removed / changed.
 5. Bound recursion at `MAX_DEPTH=8` (covers `K^8 ≈ 10^12` rows). On hit, surface `bisection_stats.depth_capped: true`.
@@ -141,7 +141,14 @@ Bisection checks every row, by splitting the primary-key range and comparing che
 Two properties set this apart from sampling:
 
 - **Bounded scan cost.** A no-op diff bottoms out at `K=32` chunk checksums per side. A single-row change recurses to that row in `O(K · log_K(N))` chunks examined. For a 1B-row table at `K=32`, that is about 128 chunk reads.
-- **Exhaustive coverage.** Every row hashes into exactly one chunk. If any row differs, the chunk it lives in must mismatch, and the recursion must find it. There is no `coverage_warning` hedge.
+- **Whole-table coverage.** Every row with a non-NULL key hashes into exactly one chunk. A changed, added or removed row changes its chunk's count or checksum, so the recursion finds it. There is no `coverage_warning` hedge.
+
+Rows with a NULL key belong to no chunk. Bisection compares them as a separate group: the row count, then the sorted list of row hashes. When the groups differ, it diffs the NULL-key rows by value. It reports each surplus row as added or removed, with the sample key `NULL`. A NULL-key row cannot be "changed", because it has no key to match on.
+
+Bisection is a checksum, not a proof. It can miss a change in two cases:
+
+- **Hash collision.** The row hashes are 64-bit and non-cryptographic. A change can, rarely, produce the same chunk checksum.
+- **Duplicate keys.** Two rows with the same key and the same values have the same hash, and `BIT_XOR` cancels them in pairs. Bisection runs only on Merge models with a single-column `unique_key`, where keys are expected to be unique.
 
 Each per-model `Bisection` variant carries a `bisection_stats` block:
 

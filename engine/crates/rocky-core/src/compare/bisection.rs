@@ -12,10 +12,13 @@
 //!    side. Uniform mismatch bottoms out at `O(K · log_K(N))` chunks
 //!    examined. Compare to `O(N)` for full-table compare and `O(1000)` —
 //!    with an unbounded false-negative tail — for sampling.
-//! 2. **Exhaustive coverage.** Every row hashes into exactly one chunk; if
-//!    any row differs between sides, the chunk it lives in is guaranteed
-//!    to mismatch and the recursion is guaranteed to find it. No coverage
-//!    hedge.
+//! 2. **Whole-table coverage.** Every non-NULL-key row hashes into
+//!    exactly one chunk. The row hash covers the key and the values
+//!    ([`checksum_hash_columns`]), so a changed row changes its chunk's
+//!    checksum and the recursion finds it. NULL-key rows are compared as
+//!    a separate group at the root. Limits: a 64-bit hash collision, and
+//!    duplicate key-and-value rows, which cancel in pairs under
+//!    `BIT_XOR`.
 //!
 //! **Current scope.** This implementation supports a single-column
 //! integer / numeric primary key (`SplitStrategy::IntRange`). Composite
@@ -99,10 +102,15 @@ pub struct BisectionTarget<'a> {
     /// Primary-key column name. Sub-step 1 supports a single integer /
     /// numeric column.
     pub pk_column: &'a str,
-    /// Columns to hash for chunk checksums and to compare row-by-row at
-    /// leaves. Typically every non-PK column the caller cares about; the
-    /// PK column itself is excluded so two rows with the same PK but
+    /// Columns to compare row-by-row at leaves. Typically every non-PK
+    /// column the caller cares about. Leave the PK column out: the leaf
+    /// step aligns rows on the PK, so two rows with the same PK but
     /// different content surface as `Changed`.
+    ///
+    /// The chunk checksum hashes the PK **together with** these columns
+    /// (see [`checksum_hash_columns`]). Without the PK in the hash, two
+    /// rows that swap their values between keys produce the same chunk
+    /// checksum, and the diff misses the change.
     pub value_columns: &'a [String],
     /// `[lo, hi)` bounds of the primary-key range to search. Callers
     /// derive these from `MIN(pk)` / `MAX(pk)` on either side, or from
@@ -176,9 +184,11 @@ pub struct BisectionStats {
     /// reports `IntRange`; `Composite` / `HashBucket` / `FirstColumn`
     /// land in follow-up changes.
     pub split_strategy: SplitStrategy,
-    /// Rows on the base side whose primary-key column is NULL. Excluded
-    /// from chunk membership but counted at the root so a divergence in
-    /// null-PK row counts surfaces instead of silently dropping rows.
+    /// Rows on the base side whose primary-key column is NULL. These
+    /// rows are in no chunk. The runner compares them at the root as a
+    /// separate group (count + multiset of row hashes). When the groups
+    /// differ, it diffs the null-key rows by value and reports the
+    /// surplus rows as `Added` / `Removed` with the sample key `NULL`.
     pub null_pk_rows_base: u64,
     /// Rows on the branch side whose primary-key column is NULL.
     pub null_pk_rows_branch: u64,
@@ -222,11 +232,9 @@ pub async fn bisection_diff(
         std::cmp::max(base.recommended_leaf_size(), branch.recommended_leaf_size())
     });
 
-    // Count null-PK rows once per side at the root. Null-PK rows
-    // never land in any chunk (the chunking SQL filters them out) so a
-    // null-only divergence would otherwise be silent. Surfaced on
-    // BisectionStats; if base and branch counts diverge, the caller
-    // should treat that as a row-count mismatch at the table level.
+    // Null-key rows never land in any chunk (the chunking SQL filters
+    // them out). Compare them once per side at the root as a separate
+    // group: the row count, then the multiset of per-row hashes.
     let null_pk_rows_base = count_null_pk_rows(base, target.base, target.pk_column).await?;
     let null_pk_rows_branch = count_null_pk_rows(branch, target.branch, target.pk_column).await?;
 
@@ -262,6 +270,11 @@ pub async fn bisection_diff(
         },
         config.k,
     )?;
+    if null_key_groups_differ(base, branch, target, null_pk_rows_base, null_pk_rows_branch).await?
+    {
+        diff_null_key_rows(base, branch, target, &mut state).await?;
+    }
+
     let mut stack: Vec<(Vec<PkRange>, u32)> = vec![(root_chunks, 0)];
     while let Some((chunks, depth)) = stack.pop() {
         diff_one_level(base, branch, target, &chunks, depth, &mut state, &mut stack).await?;
@@ -283,6 +296,23 @@ pub async fn bisection_diff(
             null_pk_rows_branch,
         },
     })
+}
+
+/// The columns the chunk checksum hashes for one row: the primary key
+/// first, then every value column that is not the primary key.
+///
+/// The key must be in the hash. A checksum over the value columns alone
+/// cannot see two rows that swap their values between keys, because the
+/// multiset of value tuples does not change.
+///
+/// Every `checksum_chunks` implementation and the null-key checksum call
+/// this, so both sides of a diff hash the same column list.
+#[must_use]
+pub fn checksum_hash_columns(pk_column: &str, value_columns: &[String]) -> Vec<String> {
+    let mut cols = Vec::with_capacity(value_columns.len() + 1);
+    cols.push(pk_column.to_string());
+    cols.extend(value_columns.iter().filter(|c| *c != pk_column).cloned());
+    cols
 }
 
 /// Issue one `COUNT(*) WHERE pk IS NULL` per side at the root. Returns
@@ -316,6 +346,174 @@ async fn count_null_pk_rows(
             "null-pk count returned unexpected JSON shape: {other:?}"
         ))),
     }
+}
+
+/// Do the null-key groups of the two sides differ?
+///
+/// A different row count is a difference. With equal, non-zero counts,
+/// the runner fetches one row hash per null-key row on each side and
+/// compares the two hash multisets (sorted lists). The row hash is the
+/// dialect's [`crate::traits::SqlDialect::row_hash_expr`] over
+/// [`checksum_hash_columns`], the same hash the chunk checksum uses.
+///
+/// A multiset compare, not an XOR: duplicate null-key rows cannot
+/// cancel. The remaining limit is the hash itself: a 64-bit
+/// non-cryptographic hash can collide, so a change that maps a row to a
+/// colliding hash is missed. The rows are fetched only when a side has
+/// null keys, and the per-row result holds one integer per row.
+async fn null_key_groups_differ(
+    base: &dyn WarehouseAdapter,
+    branch: &dyn WarehouseAdapter,
+    target: &BisectionTarget<'_>,
+    base_count: u64,
+    branch_count: u64,
+) -> AdapterResult<bool> {
+    if base_count != branch_count {
+        return Ok(true);
+    }
+    if base_count == 0 {
+        return Ok(false);
+    }
+    let base_hashes = fetch_null_key_hashes(base, target.base, target).await?;
+    let branch_hashes = fetch_null_key_hashes(branch, target.branch, target).await?;
+    Ok(base_hashes != branch_hashes)
+}
+
+/// One row hash per null-key row on one side, sorted.
+async fn fetch_null_key_hashes(
+    adapter: &dyn WarehouseAdapter,
+    table: &TableRef,
+    target: &BisectionTarget<'_>,
+) -> AdapterResult<Vec<i128>> {
+    rocky_sql::validation::validate_identifier(target.pk_column).map_err(AdapterError::new)?;
+    let dialect = adapter.dialect();
+    let table_ref = dialect.format_table_ref(&table.catalog, &table.schema, &table.table)?;
+    let pk = dialect.quote_identifier(target.pk_column);
+    let row_hash =
+        dialect.row_hash_expr(&checksum_hash_columns(target.pk_column, target.value_columns))?;
+    let sql = format!("SELECT {row_hash} FROM {table_ref} WHERE {pk} IS NULL");
+    let result = adapter.execute_query(&sql).await?;
+    let mut hashes = result
+        .rows
+        .iter()
+        .map(|row| {
+            let cell = row
+                .first()
+                .ok_or_else(|| AdapterError::msg("null-pk hash query returned an empty row"))?;
+            parse_integer_cell(cell, "null-pk row hash")
+        })
+        .collect::<AdapterResult<Vec<i128>>>()?;
+    hashes.sort_unstable();
+    Ok(hashes)
+}
+
+/// Parse an integer cell. Warehouses return wide integers (BIGINT,
+/// HUGEINT, NUMBER) as JSON strings and small ones as JSON numbers. A
+/// JSON `null` (a NULL row hash) reads as 0.
+fn parse_integer_cell(cell: &serde_json::Value, what: &str) -> AdapterResult<i128> {
+    match cell {
+        serde_json::Value::Null => Ok(0),
+        serde_json::Value::Number(n) => {
+            if let Some(v) = n.as_i64() {
+                Ok(v.into())
+            } else if let Some(v) = n.as_u64() {
+                Ok(v.into())
+            } else {
+                Err(AdapterError::msg(format!(
+                    "{what} returned a non-integer number: {n}"
+                )))
+            }
+        }
+        serde_json::Value::String(s) => s
+            .parse::<i128>()
+            .map_err(|e| AdapterError::msg(format!("failed to parse {what} {s:?}: {e}"))),
+        other => Err(AdapterError::msg(format!(
+            "{what} returned unexpected JSON shape: {other:?}"
+        ))),
+    }
+}
+
+/// Diff the null-key rows of both sides as multisets of value tuples.
+///
+/// Null-key rows have no key to align on, so no row can be `Changed`.
+/// Each surplus tuple on the branch side counts as `Added`; each surplus
+/// tuple on the base side counts as `Removed`. Samples use the key
+/// string `NULL`.
+///
+/// The runner calls this only when the null-key count or checksum
+/// differs, so a table with no null keys never pays for it.
+async fn diff_null_key_rows(
+    base: &dyn WarehouseAdapter,
+    branch: &dyn WarehouseAdapter,
+    target: &BisectionTarget<'_>,
+    state: &mut TraversalState<'_>,
+) -> AdapterResult<()> {
+    let base_rows = fetch_null_key_rows(base, target.base, target).await?;
+    let branch_rows = fetch_null_key_rows(branch, target.branch, target).await?;
+
+    // Signed multiplicity per serialized tuple: +1 per branch row, -1
+    // per base row. A BTreeMap keeps the sample order deterministic.
+    let mut balance: std::collections::BTreeMap<String, i64> = std::collections::BTreeMap::new();
+    for row in &branch_rows {
+        *balance.entry(row.clone()).or_insert(0) += 1;
+    }
+    for row in &base_rows {
+        *balance.entry(row.clone()).or_insert(0) -= 1;
+    }
+    for delta in balance.values() {
+        let n = delta.unsigned_abs();
+        let kind = if *delta > 0 {
+            state.rows_added = state.rows_added.saturating_add(n);
+            LeafRowKind::Added
+        } else if *delta < 0 {
+            state.rows_removed = state.rows_removed.saturating_add(n);
+            LeafRowKind::Removed
+        } else {
+            continue;
+        };
+        for _ in 0..n {
+            if state.samples.len() >= state.config.max_samples {
+                break;
+            }
+            record_sample(state, kind, "NULL");
+        }
+    }
+    Ok(())
+}
+
+/// Fetch the value tuples of the null-key rows on one side, each one
+/// serialized to a JSON string so it can key a map.
+async fn fetch_null_key_rows(
+    adapter: &dyn WarehouseAdapter,
+    table: &TableRef,
+    target: &BisectionTarget<'_>,
+) -> AdapterResult<Vec<String>> {
+    rocky_sql::validation::validate_identifier(target.pk_column).map_err(AdapterError::new)?;
+    for col in target.value_columns {
+        rocky_sql::validation::validate_identifier(col).map_err(AdapterError::new)?;
+    }
+    let dialect = adapter.dialect();
+    let table_ref = dialect.format_table_ref(&table.catalog, &table.schema, &table.table)?;
+    let pk = dialect.quote_identifier(target.pk_column);
+    // The key is NULL on every row here, so selecting it adds nothing to
+    // the comparison. It keeps the select list non-empty when the caller
+    // passed no value columns.
+    let mut cols_clause = pk.clone();
+    for c in target.value_columns {
+        cols_clause.push_str(", ");
+        cols_clause.push_str(&dialect.quote_identifier(c));
+    }
+    let sql = format!("SELECT {cols_clause} FROM {table_ref} WHERE {pk} IS NULL");
+    let result = adapter.execute_query(&sql).await?;
+    result
+        .rows
+        .into_iter()
+        .map(|row| {
+            serde_json::to_string(&row).map_err(|e| {
+                AdapterError::msg(format!("failed to serialize a null-pk row: {e}"))
+            })
+        })
+        .collect()
 }
 
 struct TraversalState<'a> {
@@ -633,6 +831,26 @@ mod tests {
         let parent = PkRange::IntRange { lo: 5, hi: 7 };
         let chunks = split_int_range(&parent, 32).unwrap();
         assert_eq!(chunks.len(), 1);
+    }
+
+    #[test]
+    fn checksum_hash_columns_puts_key_first_and_drops_duplicate_key() {
+        let cols = checksum_hash_columns("id", &["name".into(), "id".into(), "value".into()]);
+        assert_eq!(cols, vec!["id", "name", "value"]);
+        assert_eq!(checksum_hash_columns("id", &[]), vec!["id"]);
+    }
+
+    #[test]
+    fn parse_integer_cell_accepts_warehouse_shapes() {
+        use serde_json::json;
+        assert_eq!(parse_integer_cell(&json!(null), "x").unwrap(), 0);
+        assert_eq!(parse_integer_cell(&json!(-5), "x").unwrap(), -5);
+        assert_eq!(
+            parse_integer_cell(&json!("18446744073709551615"), "x").unwrap(),
+            i128::from(u64::MAX)
+        );
+        assert!(parse_integer_cell(&json!("42.5"), "x").is_err());
+        assert!(parse_integer_cell(&json!(1.5), "x").is_err());
     }
 
     #[test]
