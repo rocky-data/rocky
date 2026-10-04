@@ -218,10 +218,16 @@ fn cte_and_alias_refactor_matches() {
         )
         .expect("count");
     assert_eq!(leaked, 0);
+    // Release the file lock before the next `rocky plan` opens the database.
+    drop(conn);
 
     // The table renderer carries the verdict and the caveat.
     let text = p.plan("table", &["--intent", "refactor"]);
-    assert!(text.status.success());
+    assert!(
+        text.status.success(),
+        "{}",
+        String::from_utf8_lossy(&text.stderr)
+    );
     let stdout = String::from_utf8_lossy(&text.stdout);
     assert!(stdout.contains("[MATCH] stg_orders"), "{stdout}");
     assert!(stdout.contains("not a proof for other inputs"), "{stdout}");

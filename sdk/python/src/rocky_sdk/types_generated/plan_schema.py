@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from enum import StrEnum
 
-from pydantic import AwareDatetime, BaseModel, conint
+from pydantic import AwareDatetime, BaseModel, RootModel, conint
 
 
 class Kind(StrEnum):
@@ -298,6 +298,121 @@ class ClassificationAction(BaseModel):
     """
 
 
+class IntentCheckReason1(StrEnum):
+    """
+    Mismatch: the column names, types or order differ.
+    """
+
+    schema_differs = "schema_differs"
+
+
+class IntentCheckReason2(StrEnum):
+    """
+    Mismatch: the outputs are different multisets of rows.
+    """
+
+    rows_differ = "rows_differ"
+
+
+class IntentCheckReason3(StrEnum):
+    """
+    Mismatch: the model exists at the base ref and not in the working tree.
+    """
+
+    model_removed = "model_removed"
+
+
+class IntentCheckReason4(StrEnum):
+    """
+    Unverified: the target adapter is not DuckDB.
+    """
+
+    adapter_unsupported = "adapter_unsupported"
+
+
+class IntentCheckReason5(StrEnum):
+    """
+    Unverified: the model does not exist at the base ref.
+    """
+
+    no_base = "no_base"
+
+
+class IntentCheckReason6(StrEnum):
+    """
+    Unverified: the models at the base ref could not be read or compiled.
+    """
+
+    base_unavailable = "base_unavailable"
+
+
+class IntentCheckReason7(StrEnum):
+    """
+    Unverified: the SQL calls a volatile builtin, or two builds of the same SQL disagree.
+    """
+
+    nondeterministic = "nondeterministic"
+
+
+class IntentCheckReason8(StrEnum):
+    """
+    Unverified: the materialization strategy is not supported.
+    """
+
+    unsupported_strategy = "unsupported_strategy"
+
+
+class IntentCheckReason9(StrEnum):
+    """
+    Unverified: a build or a comparison query failed.
+    """
+
+    build_failed = "build_failed"
+
+
+class IntentCheckSummary(BaseModel):
+    """
+    Counts of each verdict in [`IntentCheckOutput::models`].
+    """
+
+    match: conint(ge=0)
+    mismatch: conint(ge=0)
+    unverified: conint(ge=0)
+
+
+class IntentColumn(BaseModel):
+    """
+    One column of a built output: its name and its warehouse type.
+    """
+
+    name: str
+    type: str
+
+
+class IntentVerdict1(StrEnum):
+    """
+    The effect satisfies the intent on the recorded inputs.
+    """
+
+    match = "match"
+
+
+class IntentVerdict2(StrEnum):
+    """
+    The effect breaks the intent. `reason` says how.
+    """
+
+    mismatch = "mismatch"
+
+
+class IntentVerdict3(StrEnum):
+    """
+    The check could not decide. `reason` says why.
+    """
+
+    unverified = "unverified"
+
+
 class MaskAction(BaseModel):
     """
     Masking-policy application row in `PlanOutput.mask_actions`.
@@ -318,6 +433,85 @@ class MaskAction(BaseModel):
     tag: str
     """
     Classification tag the mask is resolved against.
+    """
+
+
+class ModelIntentVerdict(BaseModel):
+    """
+    The intent verdict for one changed model.
+    """
+
+    detail: str | None = None
+    """
+    Plain-text detail, such as the error text of a failed build.
+    """
+    model: str
+    """
+    The model name, as declared in its sidecar.
+    """
+    reason: (
+        IntentCheckReason1
+        | IntentCheckReason2
+        | IntentCheckReason3
+        | IntentCheckReason4
+        | IntentCheckReason5
+        | IntentCheckReason6
+        | IntentCheckReason7
+        | IntentCheckReason8
+        | IntentCheckReason9
+        | None
+    ) = None
+    """
+    Set for every `mismatch` and every `unverified`. Unset for `match`.
+    """
+    rows_base: conint(ge=0) | None = None
+    """
+    Row count of the base build.
+    """
+    rows_head: conint(ge=0) | None = None
+    """
+    Row count of the head build.
+    """
+    rows_only_in_base: conint(ge=0) | None = None
+    """
+    Rows in the base output and not in the head output (multiset).
+    """
+    rows_only_in_head: conint(ge=0) | None = None
+    """
+    Rows in the head output and not in the base output (multiset).
+    """
+    schema_base: list[IntentColumn] | None = None
+    """
+    The base output columns. Set only when `reason` is `schema_differs`.
+    """
+    schema_head: list[IntentColumn] | None = None
+    """
+    The head output columns. Set only when `reason` is `schema_differs`.
+    """
+    upstream_changed: list[str] | None = None
+    """
+    Changed models upstream of this one. Both builds read the materialized upstream tables, so this model's verdict does not cover the upstream change. Empty when no upstream model changed.
+    """
+    verdict: IntentVerdict1 | IntentVerdict2 | IntentVerdict3
+    """
+    The verdict for one changed model.
+    """
+
+
+class PlanIntent1(StrEnum):
+    """
+    Same schema. The base and head outputs are equal multisets of rows.
+    """
+
+    refactor = "refactor"
+
+
+class PlanIntent(RootModel[PlanIntent1]):
+    root: PlanIntent1
+    """
+    The closed list of intents `rocky plan --intent` accepts.
+
+    Version 1 has one intent. Each intent has a written predicate that the check measures on the data. clap rejects any other value.
     """
 
 
@@ -456,6 +650,40 @@ class Diagnostic(BaseModel):
     """
 
 
+class IntentCheckOutput(BaseModel):
+    """
+    Result of `rocky plan --intent <intent>`. **Experimental. Report-only.**
+
+    Rocky builds each changed model twice, once from the SQL at `base_ref` and once from the working tree, in one DuckDB transaction, and compares the two outputs exactly. See [`INTENT_CHECK_CAVEAT`] for what a `match` does and does not mean.
+    """
+
+    adapter: str
+    """
+    The target adapter type (for example `"duckdb"`).
+    """
+    base_ref: str
+    """
+    The git ref the working tree was compared against (`--base`).
+    """
+    caveat: str
+    """
+    What a verdict means and what it does not check. Always set.
+    """
+    intent: PlanIntent
+    """
+    The intent that was checked.
+    """
+    models: list[ModelIntentVerdict]
+    """
+    One verdict per changed model, sorted by model name.
+    """
+    probes: conint(ge=0)
+    """
+    Extra builds of the base SQL used to detect nondeterminism.
+    """
+    summary: IntentCheckSummary
+
+
 class SemanticPlanVerdict(BaseModel):
     """
     Decision-support verdict from the typed-IR breaking-change classifier, attached to `PlanOutput` when `rocky plan --semantic` runs against a usable baseline.
@@ -513,6 +741,10 @@ class PlanOutput(BaseModel):
     has_budget_errors: bool | None = None
     """
     `true` when at least one entry in `budget_diagnostics` has error-level severity (`on_breach = "error"`). Callers can use this flag to fail a pipeline-as-code check without inspecting individual diagnostic severities.
+    """
+    intent_check: IntentCheckOutput | None = None
+    """
+    Result of `rocky plan --intent <intent>`: one verdict per changed model. **Experimental.** Present only when `--intent` is set. REPORT-ONLY: it relaxes no gate and never changes the exit code. It lives on the output, not in the persisted plan, so it does not enter `plan_id`. See [`IntentCheckOutput`] and its `caveat`.
     """
     mask_actions: list[MaskAction] | None = None
     """
