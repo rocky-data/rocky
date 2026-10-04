@@ -614,6 +614,23 @@ pub fn is_safe_package_name(name: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
+/// True when `rel` is a `/`-separated path strictly inside `models/packages/`
+/// with no `..`, `.`, empty or absolute component. Every path `rocky package`
+/// reads, writes or deletes from the lockfile must pass this.
+pub fn is_vendored_path(rel: &str) -> bool {
+    let Some(rest) = rel
+        .strip_prefix(PACKAGES_DIR)
+        .and_then(|r| r.strip_prefix('/'))
+    else {
+        return false;
+    };
+    let parts: Vec<&str> = rest.split('/').collect();
+    parts.len() >= 2
+        && parts.iter().all(|p| {
+            !p.is_empty() && *p != "." && *p != ".." && !p.contains('\\') && !p.contains(':')
+        })
+}
+
 /// Project-relative directory of a vendored package.
 pub fn package_dir(package: &str) -> String {
     format!("{PACKAGES_DIR}/{package}")
@@ -630,6 +647,12 @@ pub fn render_package_files(import: &PackageImport) -> Result<BTreeMap<String, S
         if !is_safe_package_name(name) || name.contains('-') {
             return Err(format!(
                 "model name {name:?} is not a safe file name; refusing to vendor it"
+            ));
+        }
+        if !is_safe_package_name(&vm.owner_package) {
+            return Err(format!(
+                "package name {:?} is not a safe directory name; refusing to vendor it",
+                vm.owner_package
             ));
         }
         let dir = package_dir(&vm.owner_package);
@@ -681,7 +704,44 @@ pub fn find_collisions(
 
 /// Content hash recorded in the lockfile (`blake3:<hex>`).
 pub fn content_hash(content: &str) -> String {
-    format!("blake3:{}", blake3::hash(content.as_bytes()).to_hex())
+    hash_bytes(content.as_bytes())
+}
+
+/// [`content_hash`] of raw file bytes. `\r\n` is folded to `\n` first, so a
+/// checkout with `core.autocrlf` does not make every vendored file look
+/// edited. Bytes need not be UTF-8: a file saved in another encoding still
+/// hashes, and so still reads as edited rather than as absent.
+pub fn hash_bytes(bytes: &[u8]) -> String {
+    let mut normalized = Vec::with_capacity(bytes.len());
+    let mut iter = bytes.iter().peekable();
+    while let Some(&b) = iter.next() {
+        if b == b'\r' && iter.peek() == Some(&&b'\n') {
+            continue;
+        }
+        normalized.push(b);
+    }
+    format!("blake3:{}", blake3::hash(&normalized).to_hex())
+}
+
+/// What is on disk at a vendored path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DiskFile {
+    /// No file.
+    Absent,
+    /// A file with this [`hash_bytes`] hash.
+    Hash(String),
+    /// A file that exists but could not be read. Treated as edited: it is
+    /// never overwritten or deleted.
+    Unreadable,
+}
+
+/// Probe a file for [`plan_update`]. Only `NotFound` counts as absent.
+pub fn read_disk(path: &Path) -> DiskFile {
+    match std::fs::read(path) {
+        Ok(bytes) => DiskFile::Hash(hash_bytes(&bytes)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => DiskFile::Absent,
+        Err(_) => DiskFile::Unreadable,
+    }
 }
 
 /// Hash of the vars a package was compiled with (order-independent).
@@ -744,6 +804,22 @@ impl PackagesLock {
             Ok(text) => {
                 let lock: Self = toml::from_str(&text)
                     .map_err(|e| format!("failed to parse {}: {e}", path.display()))?;
+                for pkg in &lock.packages {
+                    if !is_safe_package_name(&pkg.name) {
+                        return Err(format!(
+                            "{}: package name {:?} is not a safe directory name",
+                            path.display(),
+                            pkg.name
+                        ));
+                    }
+                    if let Some(bad) = pkg.files.keys().find(|f| !is_vendored_path(f)) {
+                        return Err(format!(
+                            "{}: `{bad}` is not a path under {PACKAGES_DIR}/; refusing to \
+                             read or delete it",
+                            path.display()
+                        ));
+                    }
+                }
                 if lock.version > LOCK_VERSION {
                     return Err(format!(
                         "{} has lock version {}; this Rocky reads version {LOCK_VERSION}. Upgrade Rocky",
@@ -772,6 +848,17 @@ impl PackagesLock {
              # and the hash of every file it wrote, so `rocky package update` can tell your\n\
              # edits from upstream changes. Commit this file.\n\n{body}"
         ))
+    }
+
+    /// Render and write the lockfile atomically (temp file + rename), so an
+    /// interrupted write never leaves a half-written lock.
+    pub fn write(&self, path: &Path) -> Result<(), String> {
+        let text = self.render()?;
+        let tmp = path.with_extension("lock.tmp");
+        std::fs::write(&tmp, text)
+            .map_err(|e| format!("failed to write {}: {e}", tmp.display()))?;
+        std::fs::rename(&tmp, path)
+            .map_err(|e| format!("failed to replace {}: {e}", path.display()))
     }
 
     pub fn get(&self, name: &str) -> Option<&LockedPackage> {
@@ -832,32 +919,29 @@ pub struct UpdatePlan {
 pub fn plan_update(
     planned: &BTreeMap<String, String>,
     locked: &BTreeMap<String, String>,
-    disk: &dyn Fn(&str) -> Option<String>,
+    disk: &dyn Fn(&str) -> DiskFile,
 ) -> UpdatePlan {
     let mut plan = UpdatePlan::default();
     for (path, content) in planned {
         let new_hash = content_hash(content);
         plan.lock_files.insert(path.clone(), new_hash.clone());
-        match disk(path) {
-            None => {
+        let current_hash = match disk(path) {
+            DiskFile::Absent => {
                 plan.write.insert(path.clone(), content.clone());
+                continue;
             }
-            Some(current) => {
-                let current_hash = content_hash(&current);
-                if current_hash == new_hash {
-                    plan.unchanged.push(path.clone());
-                    continue;
-                }
-                let clean = locked.get(path) == Some(&current_hash);
-                if clean {
-                    plan.write.insert(path.clone(), content.clone());
-                } else if locked.get(path) == Some(&new_hash) {
-                    // Upstream did not change; the user's edit stands.
-                    plan.kept_edited.push(path.clone());
-                } else {
-                    plan.incoming.insert(path.clone(), content.clone());
-                }
-            }
+            DiskFile::Hash(h) => Some(h),
+            DiskFile::Unreadable => None,
+        };
+        if current_hash.as_ref() == Some(&new_hash) {
+            plan.unchanged.push(path.clone());
+        } else if current_hash.is_some() && locked.get(path) == current_hash.as_ref() {
+            plan.write.insert(path.clone(), content.clone());
+        } else if locked.get(path) == Some(&new_hash) {
+            // Upstream did not change; the user's edit stands.
+            plan.kept_edited.push(path.clone());
+        } else {
+            plan.incoming.insert(path.clone(), content.clone());
         }
     }
     for (path, locked_hash) in locked {
@@ -865,14 +949,32 @@ pub fn plan_update(
             continue;
         }
         match disk(path) {
-            None => {}
-            Some(current) if &content_hash(&current) == locked_hash => {
-                plan.delete.push(path.clone());
-            }
-            Some(_) => {
-                plan.kept_edited.push(path.clone());
-            }
+            DiskFile::Absent => {}
+            DiskFile::Hash(h) if &h == locked_hash => plan.delete.push(path.clone()),
+            DiskFile::Hash(_) | DiskFile::Unreadable => plan.kept_edited.push(path.clone()),
         }
+    }
+    // A model is a `.sql` + `.toml` pair. When upstream removes it and you
+    // edited one half, keep both: a lone `.sql` would load with a default
+    // config (no target, no strategy).
+    let model_key = |p: &str| -> String {
+        p.strip_suffix(".sql")
+            .or_else(|| p.strip_suffix(".toml"))
+            .unwrap_or(p)
+            .to_string()
+    };
+    let kept_models: BTreeSet<String> = plan.kept_edited.iter().map(|p| model_key(p)).collect();
+    let (keep, delete): (Vec<String>, Vec<String>) = std::mem::take(&mut plan.delete)
+        .into_iter()
+        .partition(|p| kept_models.contains(&model_key(p)));
+    plan.delete = delete;
+    for p in keep {
+        // Still Rocky's content: keep recording it so a later update can
+        // delete the pair once the edited half is clean again.
+        if let Some(h) = locked.get(&p) {
+            plan.lock_files.insert(p.clone(), h.clone());
+        }
+        plan.kept_edited.push(p);
     }
     plan.kept_edited.sort();
     plan
@@ -1603,7 +1705,7 @@ mod tests {
         planned.insert("f.sql".to_string(), "select 6".to_string());
         planned.insert("new.sql".to_string(), "select 7".to_string());
 
-        let disk = |p: &str| -> Option<String> {
+        let text = |p: &str| -> Option<String> {
             match p {
                 "a.sql" => Some(old_clean.clone()),
                 "b.sql" => Some("select 2 -- my edit".to_string()),
@@ -1613,6 +1715,10 @@ mod tests {
                 "f.sql" => Some("select 6 -- my edit".to_string()),
                 _ => None,
             }
+        };
+        let disk = |p: &str| match text(p) {
+            Some(t) => DiskFile::Hash(content_hash(&t)),
+            None => DiskFile::Absent,
         };
         let plan = plan_update(&planned, &locked, &disk);
         assert_eq!(
@@ -1635,10 +1741,55 @@ mod tests {
         let mut planned = BTreeMap::new();
         planned.insert("x.sql".to_string(), "select 1".to_string());
         let plan = plan_update(&planned, &BTreeMap::new(), &|_| {
-            Some("select 'mine'".to_string())
+            DiskFile::Hash(content_hash("select 'mine'"))
         });
         assert!(plan.write.is_empty());
         assert_eq!(plan.incoming.keys().collect::<Vec<_>>(), vec!["x.sql"]);
+    }
+
+    #[test]
+    fn unreadable_files_are_treated_as_edited() {
+        let mut planned = BTreeMap::new();
+        planned.insert("a.sql".to_string(), "select 2".to_string());
+        let mut locked = BTreeMap::new();
+        locked.insert("a.sql".to_string(), content_hash("select 1"));
+        locked.insert("gone.sql".to_string(), content_hash("select 9"));
+        let plan = plan_update(&planned, &locked, &|_| DiskFile::Unreadable);
+        assert!(plan.write.is_empty());
+        assert!(plan.delete.is_empty());
+        assert_eq!(plan.incoming.keys().collect::<Vec<_>>(), vec!["a.sql"]);
+        assert_eq!(plan.kept_edited, vec!["gone.sql".to_string()]);
+    }
+
+    #[test]
+    fn a_removed_model_pair_is_kept_whole_when_one_half_is_edited() {
+        let mut locked = BTreeMap::new();
+        locked.insert("m.sql".to_string(), content_hash("select 1"));
+        locked.insert("m.toml".to_string(), content_hash("[strategy]"));
+        let disk = |p: &str| match p {
+            "m.sql" => DiskFile::Hash(content_hash("select 1 -- mine")),
+            _ => DiskFile::Hash(content_hash("[strategy]")),
+        };
+        let plan = plan_update(&BTreeMap::new(), &locked, &disk);
+        assert!(plan.delete.is_empty(), "{plan:?}");
+        assert_eq!(
+            plan.kept_edited,
+            vec!["m.sql".to_string(), "m.toml".to_string()]
+        );
+        assert!(plan.lock_files.contains_key("m.toml"));
+    }
+
+    #[test]
+    fn crlf_checkouts_hash_like_the_written_file() {
+        assert_eq!(
+            hash_bytes(b"select 1\r\nfrom t\r\n"),
+            content_hash("select 1\nfrom t\n")
+        );
+        assert_ne!(
+            hash_bytes(b"select 1\rfrom t"),
+            content_hash("select 1\nfrom t")
+        );
+        assert!(hash_bytes(&[0xff, 0xfe, 0x00]).starts_with("blake3:"));
     }
 
     #[test]
@@ -1718,6 +1869,32 @@ mod tests {
                 .unwrap_err()
                 .contains("upgrade dbt")
         );
+    }
+
+    #[test]
+    fn lock_paths_outside_the_packages_dir_are_refused() {
+        assert!(is_vendored_path("models/packages/stripe/a.sql"));
+        assert!(
+            !is_vendored_path("models/packages/a.sql"),
+            "needs a package dir"
+        );
+        assert!(!is_vendored_path("models/packages/../../etc/passwd"));
+        assert!(!is_vendored_path("models/packages/stripe/../../x.sql"));
+        assert!(!is_vendored_path("/etc/passwd"));
+        assert!(!is_vendored_path("models/x.sql"));
+        assert!(!is_vendored_path("models/packages/stripe//a.sql"));
+        assert!(!is_vendored_path("models/packages/stripe/C:\\x"));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(LOCKFILE_NAME);
+        std::fs::write(
+            &path,
+            "version = 1\n[[package]]\nname = \"stripe\"\nhub = \"fivetran/stripe\"\n\
+             version = \"1\"\ndbt_version = \"1\"\nadapter = \"duckdb\"\ncompiled_at = \"\"\n\
+             vars_hash = \"\"\n[package.files]\n\"models/packages/../../x\" = \"h\"\n",
+        )
+        .unwrap();
+        let err = PackagesLock::read(&path).unwrap_err();
+        assert!(err.contains("refusing"), "{err}");
     }
 
     #[test]

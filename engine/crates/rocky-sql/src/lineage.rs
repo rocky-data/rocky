@@ -421,11 +421,15 @@ fn extract_set_expr_lineage(
         }
         SetExpr::SetOperation { left, right, .. } => {
             let mut result = extract_set_expr_lineage(left, ctes, nested_sources)?;
-            let right = extract_set_expr_lineage(right, ctes, Vec::new())?;
-            collect_nested(&right, &mut result.nested_sources);
+            // A right branch the extractor cannot read (`VALUES`, `TABLE t`)
+            // contributes no reads rather than refusing the whole model: the
+            // output columns come from the left branch either way.
+            if let Ok(right) = extract_set_expr_lineage(right, ctes, Vec::new()) {
+                collect_nested(&right, &mut result.nested_sources);
+                result.row_selection.extend(right.row_selection);
+            }
             result.nested_sources.sort();
             result.nested_sources.dedup();
-            result.row_selection.extend(right.row_selection);
             Ok(result)
         }
         _ => Err("unsupported query type for lineage".to_string()),
@@ -1771,6 +1775,13 @@ mod tests {
             vec!["right_t".to_string(), "third_t".to_string()]
         );
         assert!(!result.has_star);
+    }
+
+    #[test]
+    fn a_union_with_a_values_branch_still_extracts() {
+        let result = extract_lineage("SELECT id, name FROM t UNION ALL VALUES (1, 'x')").unwrap();
+        assert_eq!(result.source_tables[0].name, "t");
+        assert_eq!(result.columns.len(), 2);
     }
 
     #[test]

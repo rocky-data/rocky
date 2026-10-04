@@ -482,9 +482,11 @@ fn vendor(
     let import =
         dbt_package::import_package(&manifest, &info, &pkg_name, &default_target).map_err(e055)?;
 
+    let planned = dbt_package::render_package_files(&import).map_err(e055)?;
+
     // Namespacing: refuse a model name the project or another package owns.
     let lock = PackagesLock::read(lock_path).map_err(e055)?;
-    let existing = existing_models(root, &lock)?;
+    let existing = existing_models(root, &lock, &planned)?;
     let replacing: BTreeSet<String> = std::iter::once(pkg_name.clone()).collect();
     let collisions = dbt_package::find_collisions(&import, &existing, &replacing);
     if !collisions.is_empty() {
@@ -500,9 +502,8 @@ fn vendor(
         )));
     }
 
-    let planned = dbt_package::render_package_files(&import).map_err(e055)?;
     let locked_files = previous.map(|p| p.files.clone()).unwrap_or_default();
-    let disk = |rel: &str| std::fs::read_to_string(root.join(rel)).ok();
+    let disk = |rel: &str| dbt_package::read_disk(&root.join(rel));
     let plan = dbt_package::plan_update(&planned, &locked_files, &disk);
     apply_plan(root, &plan)?;
 
@@ -565,9 +566,7 @@ fn vendor(
         sources: import.sources.clone(),
         files: plan.lock_files.clone(),
     });
-    let text = lock.render().map_err(e055)?;
-    std::fs::write(lock_path, text)
-        .with_context(|| format!("failed to write {}", lock_path.display()))?;
+    lock.write(lock_path).map_err(e055)?;
 
     let report = PackageVendorReport {
         name: pkg_name,
@@ -698,7 +697,15 @@ fn select_adapter<'a>(
 
 /// Every model name already in the project, mapped to its owners: the lock
 /// entry that vendored it, or `project`.
-fn existing_models(root: &Path, lock: &PackagesLock) -> Result<BTreeMap<String, BTreeSet<String>>> {
+///
+/// A file at a path this run is about to write, with exactly the content it
+/// would write, is skipped: it is the leftover of an earlier run that wrote
+/// files but failed before recording them, not a competing model.
+fn existing_models(
+    root: &Path,
+    lock: &PackagesLock,
+    planned: &BTreeMap<String, String>,
+) -> Result<BTreeMap<String, BTreeSet<String>>> {
     let models_dir = root.join("models");
     let mut out = BTreeMap::new();
     let (dirs, errors) = rocky_core::model_walk::walk_model_dirs(&models_dir);
@@ -720,6 +727,14 @@ fn existing_models(root: &Path, lock: &PackagesLock) -> Result<BTreeMap<String, 
             };
             let rel = relative_slash(root, &path);
             let owner = lock.owner_of(&rel).unwrap_or("project").to_string();
+            if owner == "project"
+                && planned.get(&rel).is_some_and(|content| {
+                    dbt_package::read_disk(&path)
+                        == dbt_package::DiskFile::Hash(dbt_package::content_hash(content))
+                })
+            {
+                continue;
+            }
             out.entry(stem.to_string())
                 .or_insert_with(BTreeSet::new)
                 .insert(owner);
@@ -919,10 +934,10 @@ pub fn run_package_list(config_path: &Path, output_json: bool) -> Result<()> {
         let mut missing = Vec::new();
         let mut incoming = Vec::new();
         for (rel, hash) in &p.files {
-            match std::fs::read_to_string(root.join(rel)) {
-                Ok(text) if dbt_package::content_hash(&text) == *hash => {}
-                Ok(_) => modified.push(rel.clone()),
-                Err(_) => missing.push(rel.clone()),
+            match dbt_package::read_disk(&root.join(rel)) {
+                dbt_package::DiskFile::Hash(h) if h == *hash => {}
+                dbt_package::DiskFile::Absent => missing.push(rel.clone()),
+                _ => modified.push(rel.clone()),
             }
             if root.join(format!("{rel}{INCOMING_SUFFIX}")).exists() {
                 incoming.push(format!("{rel}{INCOMING_SUFFIX}"));
@@ -995,10 +1010,13 @@ pub fn run_package_remove(
     let edited: Vec<&String> = pkg
         .files
         .iter()
-        .filter(|(rel, hash)| {
-            std::fs::read_to_string(root.join(rel))
-                .is_ok_and(|text| dbt_package::content_hash(&text) != **hash)
-        })
+        .filter(
+            |(rel, hash)| match dbt_package::read_disk(&root.join(rel)) {
+                dbt_package::DiskFile::Absent => false,
+                dbt_package::DiskFile::Hash(h) => h != **hash,
+                dbt_package::DiskFile::Unreadable => true,
+            },
+        )
         .map(|(rel, _)| rel)
         .collect();
     if !edited.is_empty() && !force {
@@ -1024,8 +1042,7 @@ pub fn run_package_remove(
         prune_empty_dirs(&root, path.parent());
     }
     lock.packages.retain(|p| p.name != name);
-    std::fs::write(&lock_path, lock.render().map_err(e055)?)
-        .with_context(|| format!("failed to write {}", lock_path.display()))?;
+    lock.write(&lock_path).map_err(e055)?;
 
     if output_json {
         print_json(&PackageRemoveOutput {
