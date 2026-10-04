@@ -20,6 +20,12 @@ export interface ColumnLineageOutput {
    */
   downstream_consumers?: LineageQualifiedColumn[];
   model: string;
+  /**
+   * Row-selection edges along the trace: columns that decide which rows or groups exist (join keys, filters, group keys, window keys) rather than feeding a value. `trace` stays value-derivation only.
+   *
+   * Upstream: the row-selection inputs of every model on the value trace, for the traced column. Downstream: the models whose rows the traced column (or a column derived from it) filters, joins, groups or partitions. Omitted when empty.
+   */
+  row_selection?: RowSelectionEdgeRecord[];
   trace: LineageEdgeRecord[];
   version: string;
   [k: string]: unknown;
@@ -27,6 +33,28 @@ export interface ColumnLineageOutput {
 export interface LineageQualifiedColumn {
   column: string;
   model: string;
+  [k: string]: unknown;
+}
+/**
+ * One row-selection lineage edge. See `ColumnLineageOutput::row_selection`.
+ */
+export interface RowSelectionEdgeRecord {
+  /**
+   * `join_key`, `filter`, `group_by`, `having`, `qualify`, `window_partition` or `window_order`.
+   */
+  kind: string;
+  /**
+   * The column that influences row selection.
+   */
+  source: LineageQualifiedColumn;
+  /**
+   * The single output column affected (window keys). Omitted when the edge affects every output column of `target_model`.
+   */
+  target_column?: string | null;
+  /**
+   * The model whose rows it influences.
+   */
+  target_model: string;
   [k: string]: unknown;
 }
 export interface LineageEdgeRecord {

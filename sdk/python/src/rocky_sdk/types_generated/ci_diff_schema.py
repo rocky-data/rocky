@@ -279,6 +279,22 @@ class BreakingSeverity6(StrEnum):
     info = "info"
 
 
+class CiDiffMode1(StrEnum):
+    """
+    Compare the HEAD commit, read from git objects. The default.
+    """
+
+    head = "head"
+
+
+class CiDiffMode2(StrEnum):
+    """
+    Compare the working tree: staged, unstaged, untracked, renamed and deleted files on disk (`--working-tree`).
+    """
+
+    working_tree = "working_tree"
+
+
 class ColumnChangeType1(StrEnum):
     """
     Column was added in the incoming side.
@@ -452,6 +468,10 @@ class CiDiffOutput(BaseModel):
     Reports which models changed between two git refs, with optional column-level structural diffs when compilation succeeds on both sides.
     """
 
+    base_commit: str | None = None
+    """
+    Commit the base side was read from: the merge base of `base_ref` and HEAD. Omitted when git could not compute one and `base_ref` itself was used (e.g. a shallow clone).
+    """
     base_ref: str
     """
     Git ref used as the comparison base (e.g. `main`).
@@ -468,6 +488,10 @@ class CiDiffOutput(BaseModel):
     markdown: str
     """
     Pre-rendered Markdown suitable for posting as a GitHub PR comment.
+    """
+    mode: CiDiffMode1 | CiDiffMode2
+    """
+    Which snapshot was compared against the base: `head` (the HEAD commit; uncommitted edits ignored) or `working_tree` (files on disk, including staged, unstaged and untracked changes).
     """
     models: list[DiffResult]
     """

@@ -327,6 +327,47 @@ rocky lineage stg_orders.customer_id --downstream
 
 Upstream output has `"direction": "upstream"` (the default shape, unchanged). The transitive walker is backed by an `edges_by_source_model` index so cost scales with fan-out rather than total edges.
 
+#### Value derivation and row selection
+
+A column trace reports two kinds of edge, labelled separately:
+
+- **Value derivation** (`trace`): the source column feeds the output value. `SUM(s.amount) AS total` derives `total` from `amount`.
+- **Row selection** (`row_selection`): the source column decides which rows or groups exist. It feeds no output value directly.
+
+```text
+SELECT c.region, SUM(s.amount) AS total
+FROM stg s JOIN cust c ON s.customer_id = c.customer_id   <- join_key: stg.customer_id, cust.customer_id
+WHERE s.status = 'paid'                                   <- filter:   stg.status
+GROUP BY c.region                                         <- group_by: cust.region
+                     SUM(s.amount) ─────────────────────▶ value:    stg.amount -> total
+```
+
+```bash
+rocky lineage fct.total -o json | jq '.row_selection'
+```
+
+```json
+[
+  { "source": { "model": "cust", "column": "customer_id" }, "target_model": "fct", "kind": "join_key" },
+  { "source": { "model": "stg",  "column": "status" },      "target_model": "fct", "kind": "filter" }
+]
+```
+
+Each entry names the `source` column, the `target_model` whose rows it affects, and a `kind`: `join_key`, `filter`, `group_by`, `having`, `qualify`, `window_partition`, or `window_order`. A window key also carries `target_column`, the one output column its window feeds. Without `target_column`, the edge affects every column of `target_model`.
+
+Upstream, `row_selection` lists the row-selection inputs of every model on the value trace. Downstream (`--downstream`), it lists the models whose rows the traced column, or a column derived from it, filters, joins, groups, or partitions. The table output prints the same edges under a `Row selection` heading. `trace` and `edges` stay value-only, so existing consumers see no change. JSON omits `row_selection` when it is empty.
+
+Row selection is read from the model's top-level `SELECT`. These constructs produce no row-selection edge yet:
+
+- predicates inside a `WITH` body, a derived table, or a subquery expression (`IN (SELECT …)`, `EXISTS`)
+- correlated references
+- `GROUP BY ALL`, `NATURAL` joins, `DISTINCT ON`, and `ORDER BY … LIMIT`
+- set operations (`UNION`, `INTERSECT`, `EXCEPT`)
+- a named window that references another named window
+- an unqualified column in a multi-table query, because its table cannot be determined statically
+
+`GROUP BY 1` and `GROUP BY <alias>` resolve to the projected expression's source columns.
+
 ### Related Commands
 
 - [`rocky compile`](#rocky-compile) -- build the semantic graph that lineage reads
@@ -338,7 +379,7 @@ Upstream output has `"direction": "upstream"` (the default shape, unchanged). Th
 
 Report the downstream blast radius of a change between two git refs, for PR review. It combines the structural diff from `rocky ci-diff` with the downstream consumers from `rocky lineage --downstream`. Together they show which downstream columns each changed column reaches.
 
-Git selects the changed paths from committed history between `base_ref` and HEAD. The column schemas and the downstream trace, though, come from the current working tree, not a git checkout of HEAD. For a report that must describe HEAD exactly, commit your changes first, so the working tree matches HEAD.
+By default the report describes the HEAD commit. Uncommitted edits are ignored. Pass `--working-tree` to include them. See [snapshot modes](#snapshot-modes) under `rocky ci-diff`.
 
 ```bash
 rocky lineage-diff [base_ref] [flags]
@@ -355,6 +396,7 @@ rocky lineage-diff [base_ref] [flags]
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
 | `--models <PATH>` | `PathBuf` | `models` | Directory containing model files. |
+| `--working-tree` | flag | off | Compare the working tree instead of the HEAD commit, including staged, unstaged, untracked, renamed, and deleted files. |
 | `-o, --output <FORMAT>` | `json` \| `table` \| `md` | terminal-aware | `json` emits the full payload, including the pre-rendered report in a `markdown` field. `table` and `md` print that same report directly. |
 
 ### Examples
@@ -442,7 +484,39 @@ rocky lineage-diff main -o json
 }
 ```
 
-A removed column has no downstream trace. The column no longer exists on HEAD's compile, so Rocky cannot walk its downstream reach. JSON omits `downstream_consumers` when it is empty, so a consumer should default a missing key to an empty list. The structural diff still reports the removal.
+A removed column has no downstream trace on HEAD, because it no longer exists there. JSON omits `downstream_consumers` when it is empty, so default a missing key to an empty list.
+
+#### Consumers of a removed column
+
+A removed column carries `consumer_impact` instead. Rocky compares the base and HEAD lineage graphs and classifies every model that read the column directly. A renamed column shows up as one removed and one added column, so its consumers are classified the same way.
+
+| `status` | Meaning |
+|----------|---------|
+| `newly_broken` | HEAD still reads the removed column, or a model now reads it. This consumer breaks. |
+| `unknown` | Rocky cannot decide. HEAD did not compile, or the consumer mentions the column where lineage cannot tell which relation it reads. |
+| `deleted` | The consumer model no longer exists on HEAD. |
+| `repaired` | The consumer still exists on HEAD and provably no longer reads the column. |
+
+A read counts through either edge kind: a value read, or a row-selection read such as a join key or filter (see [`rocky lineage`](#value-derivation-and-row-selection)). Each entry carries `model`, `status`, `columns` (the consumer's output columns involved), `via` (`value` or a row-selection kind), and a one-line `reason`:
+
+```json
+{
+  "column_name": "amount",
+  "change_type": "removed",
+  "consumer_impact": [
+    { "model": "fct_broken", "status": "newly_broken", "columns": ["amount"], "via": ["value"],
+      "reason": "HEAD still reads `stg_orders.amount`, which no longer exists" },
+    { "model": "fct_filtered", "status": "newly_broken", "via": ["filter"],
+      "reason": "HEAD still reads `stg_orders.amount`, which no longer exists" },
+    { "model": "fct_deleted", "status": "deleted", "columns": ["deleted_amount"], "via": ["value"],
+      "reason": "consumer model was removed on HEAD" },
+    { "model": "fct_repaired", "status": "repaired", "columns": ["amount"], "via": ["value"],
+      "reason": "HEAD no longer reads `stg_orders.amount`" }
+  ]
+}
+```
+
+The Markdown report adds a **Consumers of removed columns** table to each model with a classified removal. `unknown` is the conservative answer: Rocky never reports `repaired` unless HEAD's lineage proves it. A model that reads the upstream with `SELECT *`, while HEAD cannot list the upstream's columns, is `unknown`. So is an unqualified column name in a join.
 
 `rocky lineage-diff` reports; it does not fail a build. Finding changed columns, however many, does not change the exit code. Only an error makes it exit non-zero: an invalid `base_ref`, a `git diff` that fails, or invalid or unreadable project configuration.
 
@@ -516,7 +590,7 @@ rocky catalog --out build/catalog
 ### Limitations
 
 - Per-asset `last_run_id` and `last_materialized_at` are populated from the state store when a matching successful run exists; they stay `null` for assets that have never been materialized (or built before the run history was captured).
-- Lineage extraction inherits the existing extractor's coverage: window functions, CTEs, set operations, `CASE WHEN` projections, and join keys are not yet surfaced as edges. Asset-level partial lineage is flagged via `stats.assets_with_star`.
+- Lineage extraction inherits the existing extractor's value-lineage coverage: CTEs, set operations, and `CASE WHEN` projections are not yet surfaced as edges. Row-selection edges (join keys, filters, group and window keys) are reported by [`rocky lineage --column`](#value-derivation-and-row-selection) but are not yet written to the catalog. Asset-level partial lineage is flagged via `stats.assets_with_star`.
 
 ### Related Commands
 
@@ -905,6 +979,7 @@ rocky ci-diff [base_ref] [flags]
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
 | `--models <PATH>` | `PathBuf` | `models` | Directory containing model files. |
+| `--working-tree` | flag | off | Compare the working tree instead of the HEAD commit. See [snapshot modes](#snapshot-modes). |
 | `--semantic` | flag | off | Also run the typed-IR semantic breaking-change classifier and surface findings under `breaking_findings` in the JSON output. Informational only — even a `Breaking` finding does not change `ci-diff`'s exit code. The hard gate lives on [`rocky branch promote`](/reference/commands/core-pipeline/#rocky-branch). |
 
 ### Examples
@@ -982,6 +1057,19 @@ rocky ci-diff --semantic
 The `breaking_findings` array is omitted from JSON output when empty or when `--semantic` is not set. Each finding carries a tagged `change` object (`kind` discriminator) and a `severity` (`breaking` / `warning` / `info`). Use `--semantic` in `ci-diff` to surface findings on every PR; rely on [`rocky branch promote`](/reference/commands/core-pipeline/#rocky-branch) to block promotion when `severity == "breaking"`.
 
 The `breaking_findings` field is JSON-only: `--output table` still renders the structural diff but does not print the semantic findings list. Use `--output json` (and pipe through `jq`) to inspect them.
+
+### Snapshot modes
+
+The changed-file list and the compiled files always come from the same snapshot. The JSON output reports which one ran in `mode`, and the commit the base side was read from in `base_commit`.
+
+| `mode` | Changed files | Head side compiled from | Base side compiled from |
+|--------|---------------|-------------------------|-------------------------|
+| `head` (default) | `git diff <base_ref>...HEAD` | the HEAD commit, read from git | the merge base of `base_ref` and HEAD |
+| `working_tree` (`--working-tree`) | `git diff -M <merge base>`, plus untracked files that git does not ignore | the files on disk | the merge base of `base_ref` and HEAD |
+
+In `head` mode, uncommitted edits never reach the report. A CI run and a dirty local checkout of the same commit produce the same diff. `--working-tree` covers staged, unstaged, untracked, renamed, and deleted files, for a local preview before you commit. Its `head_ref` is `WORKTREE`.
+
+The base side is the merge base, the same commit `base_ref...HEAD` selects files against. Later commits on the base branch do not show up as changes in your branch. In a shallow clone without the merge base, both selection and the base compile fall back to `base_ref` itself, and `base_commit` is omitted.
 
 ### Related Commands
 

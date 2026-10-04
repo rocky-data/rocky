@@ -2289,6 +2289,43 @@ pub struct CiDiffOutput {
     /// JSON output when empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub breaking_findings: Vec<rocky_core::breaking_change::BreakingFinding>,
+    /// Which snapshot was compared against the base: `head` (the HEAD
+    /// commit; uncommitted edits ignored) or `working_tree` (files on disk,
+    /// including staged, unstaged and untracked changes).
+    pub mode: CiDiffMode,
+    /// Commit the base side was read from: the merge base of `base_ref` and
+    /// HEAD. Omitted when git could not compute one and `base_ref` itself
+    /// was used (e.g. a shallow clone).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_commit: Option<String>,
+}
+
+/// Which code snapshot `rocky ci-diff` / `rocky lineage-diff` compares
+/// against the base.
+///
+/// Selection (which files changed) and compilation (what those files
+/// contain) always read the same snapshot, so the report never mixes a
+/// committed file list with uncommitted contents.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CiDiffMode {
+    /// Compare the HEAD commit, read from git objects. The default.
+    #[default]
+    Head,
+    /// Compare the working tree: staged, unstaged, untracked, renamed and
+    /// deleted files on disk (`--working-tree`).
+    WorkingTree,
+}
+
+impl CiDiffMode {
+    /// Label for the head side in headers and `head_ref`.
+    #[must_use]
+    pub fn head_label(self) -> &'static str {
+        match self {
+            CiDiffMode::Head => "HEAD",
+            CiDiffMode::WorkingTree => "WORKTREE",
+        }
+    }
 }
 
 impl CiDiffOutput {
@@ -2308,7 +2345,18 @@ impl CiDiffOutput {
             models,
             markdown,
             breaking_findings: Vec::new(),
+            mode: CiDiffMode::Head,
+            base_commit: None,
         }
+    }
+
+    /// Record which snapshot was compared and the base commit it was read
+    /// from.
+    #[must_use]
+    pub fn with_snapshot(mut self, mode: CiDiffMode, base_commit: Option<String>) -> Self {
+        self.mode = mode;
+        self.base_commit = base_commit;
+        self
     }
 
     /// Attach semantic breaking-change findings to this output.
@@ -3076,10 +3124,10 @@ pub struct ProfileColumnStats {
 /// PR comment — answers "what does this PR change downstream?" in one
 /// command.
 ///
-/// Trace direction is fixed to **downstream from HEAD only** in v1.
-/// Removed columns therefore report an empty consumer set (the column
-/// no longer exists on HEAD's compile, so its downstream reach can't be
-/// walked); the structural diff still surfaces the removal.
+/// `downstream_consumers` is traced **downstream from HEAD**, so a removed
+/// column reports an empty set there. Removed columns instead carry
+/// `consumer_impact`: each direct consumer on the base side (or HEAD side),
+/// classified by comparing the base and HEAD lineage graphs.
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct LineageDiffOutput {
     pub version: String,
@@ -3093,6 +3141,12 @@ pub struct LineageDiffOutput {
     pub results: Vec<LineageDiffResult>,
     /// Pre-rendered Markdown suitable for posting as a GitHub PR comment.
     pub markdown: String,
+    /// Which snapshot was compared against the base. See [`CiDiffMode`].
+    pub mode: CiDiffMode,
+    /// Commit the base side was read from (merge base of `base_ref` and
+    /// HEAD). Omitted when it could not be computed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_commit: Option<String>,
 }
 
 /// One model's worth of structural + lineage diff.
@@ -3118,6 +3172,61 @@ pub struct LineageColumnChange {
     /// when the trace finds no consumers.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub downstream_consumers: Vec<LineageQualifiedColumn>,
+    /// For a removed (or renamed-away) column: what happened to each model
+    /// that read it directly, found by comparing the base and HEAD lineage
+    /// graphs. Includes reads through value lineage and through row
+    /// selection (join keys, filters, group keys, window keys). Omitted for
+    /// other change types and when no consumer was found.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub consumer_impact: Vec<LineageConsumerImpact>,
+}
+
+/// One direct consumer of a removed column, classified.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct LineageConsumerImpact {
+    /// The consumer model.
+    pub model: String,
+    pub status: ConsumerImpactStatus,
+    /// Consumer output columns involved: the HEAD-side columns for
+    /// `newly_broken`, the base-side columns otherwise. Empty when the read
+    /// affects every column (a filter or join key).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub columns: Vec<String>,
+    /// How the consumer reads the column: `value`, or a row-selection kind
+    /// (`join_key`, `filter`, `group_by`, `having`, `qualify`,
+    /// `window_partition`, `window_order`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub via: Vec<String>,
+    /// One-line, human-readable explanation of the classification.
+    pub reason: String,
+}
+
+/// What happened to a consumer of a removed column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ConsumerImpactStatus {
+    /// HEAD still reads (or newly reads) the removed column. This consumer
+    /// breaks.
+    NewlyBroken,
+    /// Lineage could not decide: HEAD did not compile, or the consumer
+    /// mentions the column in a place lineage cannot attribute.
+    Unknown,
+    /// The consumer model no longer exists on HEAD.
+    Deleted,
+    /// The consumer still exists on HEAD and provably no longer reads the
+    /// column.
+    Repaired,
+}
+
+impl std::fmt::Display for ConsumerImpactStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            ConsumerImpactStatus::NewlyBroken => "newly broken",
+            ConsumerImpactStatus::Unknown => "unknown",
+            ConsumerImpactStatus::Deleted => "deleted",
+            ConsumerImpactStatus::Repaired => "repaired",
+        })
+    }
 }
 
 /// JSON output for `rocky lineage <model>` (model lineage shape).
@@ -3166,6 +3275,32 @@ pub struct ColumnLineageOutput {
     /// column has no consumers.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub downstream_consumers: Vec<LineageQualifiedColumn>,
+    /// Row-selection edges along the trace: columns that decide which rows
+    /// or groups exist (join keys, filters, group keys, window keys) rather
+    /// than feeding a value. `trace` stays value-derivation only.
+    ///
+    /// Upstream: the row-selection inputs of every model on the value trace,
+    /// for the traced column. Downstream: the models whose rows the traced
+    /// column (or a column derived from it) filters, joins, groups or
+    /// partitions. Omitted when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub row_selection: Vec<RowSelectionEdgeRecord>,
+}
+
+/// One row-selection lineage edge. See `ColumnLineageOutput::row_selection`.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct RowSelectionEdgeRecord {
+    /// The column that influences row selection.
+    pub source: LineageQualifiedColumn,
+    /// The model whose rows it influences.
+    pub target_model: String,
+    /// The single output column affected (window keys). Omitted when the
+    /// edge affects every output column of `target_model`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_column: Option<String>,
+    /// `join_key`, `filter`, `group_by`, `having`, `qualify`,
+    /// `window_partition` or `window_order`.
+    pub kind: String,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]

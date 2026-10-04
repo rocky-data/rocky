@@ -2,9 +2,21 @@
 //!
 //! Shells out to `git diff --name-status` to find `.sql`, `.rocky`, and `.toml`
 //! sidecar files that changed between a base ref (default: `main`) and HEAD.
-//! Compiles the current working tree to extract model schemas, then classifies
-//! each changed model as added, modified, or removed and generates a structured
+//! Compiles both snapshots to extract model schemas, then classifies each
+//! changed model as added, modified, or removed and generates a structured
 //! diff report in JSON and Markdown formats.
+//!
+//! The two snapshots are always taken from the same place the changed-file
+//! list came from ([`CiDiffMode`]):
+//!
+//! ```text
+//! mode          selection                         head compile        base compile
+//! head          git diff <merge-base> HEAD        HEAD commit tree    merge-base tree
+//! working_tree  git diff <merge-base> + untracked files on disk       merge-base tree
+//! ```
+//!
+//! The default `head` mode ignores uncommitted edits entirely, so a CI run and
+//! a dirty local checkout of the same commit report the same diff.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -21,6 +33,7 @@ use rocky_core::ci_diff::{
 use rocky_core::models::Model;
 use rocky_sql::defer::CollisionIdentity;
 
+pub use crate::output::CiDiffMode;
 use crate::output::{CiDiffOutput, print_json};
 
 // ---------------------------------------------------------------------------
@@ -169,6 +182,80 @@ fn git_changed_files(base_ref: &str, repo_dir: Option<&Path>) -> Result<Vec<Chan
     }
 
     parse_name_status(&output.stdout)
+}
+
+/// The [`CiDiffMode`] selected by the `--working-tree` flag.
+#[must_use]
+pub fn ci_diff_mode(working_tree: bool) -> CiDiffMode {
+    if working_tree {
+        CiDiffMode::WorkingTree
+    } else {
+        CiDiffMode::Head
+    }
+}
+
+/// Resolve the commit `base_ref...HEAD` diffs against: the merge base.
+///
+/// Returns `None` when git cannot compute one (a shallow clone without the
+/// base history, an unrelated ref). Callers then fall back to `base_ref`
+/// itself, mirroring the two-dot fallback in [`git_changed_files`].
+fn resolve_merge_base(base_ref: &str, repo_dir: Option<&Path>) -> Option<String> {
+    let output = git_in(repo_dir)
+        .args(["merge-base", base_ref, "HEAD"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let sha = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!sha.is_empty()).then_some(sha)
+}
+
+/// Changed files between `base_commit` and the working tree: staged,
+/// unstaged, deleted and renamed tracked files (`git diff -M <base>`), plus
+/// untracked files that are not ignored (reported as added).
+fn git_changed_files_worktree(
+    base_commit: &str,
+    repo_dir: Option<&Path>,
+) -> Result<Vec<ChangedFile>> {
+    let output = git_in(repo_dir)
+        .args(["diff", "--name-status", "-M", base_commit])
+        .output()
+        .context("failed to run `git diff` — is git installed and is this a git repository?")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("git diff against the working tree failed: {stderr}");
+    }
+    let mut files = parse_name_status(&output.stdout)?;
+
+    // `--full-name` + the `:/` pathspec make paths repo-root-relative, the
+    // same shape `git diff` reports, wherever the process cwd is.
+    let untracked = git_in(repo_dir)
+        .args([
+            "ls-files",
+            "--others",
+            "--exclude-standard",
+            "--full-name",
+            "--",
+            ":/",
+        ])
+        .output()
+        .context("failed to run `git ls-files` for untracked files")?;
+    if !untracked.status.success() {
+        let stderr = String::from_utf8_lossy(&untracked.stderr);
+        anyhow::bail!("git ls-files failed: {stderr}");
+    }
+    for line in String::from_utf8_lossy(&untracked.stdout).lines() {
+        let path = line.trim();
+        if !path.is_empty() && !files.iter().any(|f| f.path == path) {
+            files.push(ChangedFile {
+                path: path.to_string(),
+                old_path: None,
+                status: 'A',
+            });
+        }
+    }
+    Ok(files)
 }
 
 /// Parse the output of `git diff --name-status`.
@@ -802,6 +889,19 @@ fn extract_base_compile_in(
     models_glob: Option<&str>,
     repo_dir: Option<&Path>,
 ) -> Result<rocky_compiler::compile::CompileResult, String> {
+    compile_models_at_ref(base_ref, models_dir, source_schemas, models_glob, repo_dir)
+}
+
+/// Compile the models directory as committed at `base_ref` (any commit-ish,
+/// including `HEAD`), read from git objects into a temp dir. Uncommitted
+/// edits in the working tree never reach this compile.
+fn compile_models_at_ref(
+    base_ref: &str,
+    models_dir: &Path,
+    source_schemas: HashMap<String, Vec<rocky_compiler::types::TypedColumn>>,
+    models_glob: Option<&str>,
+    repo_dir: Option<&Path>,
+) -> Result<rocky_compiler::compile::CompileResult, String> {
     let models_rel = match find_models_relative_path(models_dir, repo_dir) {
         Some(p) => p,
         None => {
@@ -1078,6 +1178,12 @@ pub(crate) struct CiDiffData {
     /// distinguish "PR is empty" from "PR is non-empty but only touches
     /// non-model files".
     pub(crate) changed_file_count: usize,
+    /// Which snapshot was compared against the base.
+    pub(crate) mode: CiDiffMode,
+    /// The commit the base side was read from (the merge base of `base_ref`
+    /// and HEAD). `None` when no merge base could be computed and `base_ref`
+    /// itself was used.
+    pub(crate) base_commit: Option<String>,
 }
 
 /// Compute the CI diff between `base_ref` and HEAD without printing.
@@ -1091,6 +1197,7 @@ pub(crate) fn compute_ci_diff(
     base_ref: &str,
     models_dir: &Path,
     cache_ttl_override: Option<u64>,
+    mode: CiDiffMode,
 ) -> Result<CiDiffData> {
     compute_ci_diff_in(
         config_path,
@@ -1098,18 +1205,20 @@ pub(crate) fn compute_ci_diff(
         base_ref,
         models_dir,
         cache_ttl_override,
+        mode,
         None,
     )
 }
 
 /// [`compute_ci_diff`], with the git invocations optionally rooted at an
 /// explicit repository directory rather than the process cwd. See [`git_in`].
-fn compute_ci_diff_in(
+pub(crate) fn compute_ci_diff_in(
     config_path: &Path,
     state_path: &Path,
     base_ref: &str,
     models_dir: &Path,
     cache_ttl_override: Option<u64>,
+    mode: CiDiffMode,
     repo_dir: Option<&Path>,
 ) -> Result<CiDiffData> {
     validate_base_ref(base_ref)?;
@@ -1128,7 +1237,15 @@ fn compute_ci_diff_in(
         cache_ttl_override,
     )?;
 
-    let changed_files = git_changed_files(base_ref, repo_dir)?;
+    // Both selection and the base compile read the same commit: the merge
+    // base `base...HEAD` diffs against. Without one (shallow clone), both
+    // fall back to `base_ref` itself.
+    let base_commit = resolve_merge_base(base_ref, repo_dir);
+    let base_side = base_commit.as_deref().unwrap_or(base_ref);
+    let changed_files = match mode {
+        CiDiffMode::Head => git_changed_files(base_ref, repo_dir)?,
+        CiDiffMode::WorkingTree => git_changed_files_worktree(base_side, repo_dir)?,
+    };
     let changed_file_count = changed_files.len();
     if changed_files.is_empty() {
         return Ok(CiDiffData {
@@ -1143,6 +1260,8 @@ fn compute_ci_diff_in(
             head_compile: None,
             base_compile: None,
             changed_file_count,
+            mode,
+            base_commit,
         });
     }
 
@@ -1176,16 +1295,28 @@ fn compute_ci_diff_in(
             head_compile: None,
             base_compile: None,
             changed_file_count,
+            mode,
+            base_commit,
         });
     }
 
-    // Compile HEAD: keep the full result so callers can reach into
-    // `semantic_graph`. Schema extraction below is a cheap projection.
+    // Compile the head side: keep the full result so callers can reach into
+    // `semantic_graph`. Schema extraction below is a cheap projection. In
+    // `head` mode it is read from the HEAD commit, so it describes exactly
+    // what the selection above saw; in `working_tree` mode it is the files on
+    // disk, which is what that selection covers.
     let head_compile = if models_dir.is_dir() {
-        match compile_head(models_dir, source_schemas.clone()) {
+        let compiled = match mode {
+            CiDiffMode::Head => {
+                compile_models_at_ref("HEAD", models_dir, source_schemas.clone(), None, repo_dir)
+                    .map_err(anyhow::Error::msg)
+            }
+            CiDiffMode::WorkingTree => compile_head(models_dir, source_schemas.clone()),
+        };
+        match compiled {
             Ok(r) => Some(r),
             Err(e) => {
-                debug!("HEAD compilation failed: {e}");
+                debug!("head-side compilation failed: {e}");
                 None
             }
         }
@@ -1198,7 +1329,7 @@ fn compute_ci_diff_in(
         .unwrap_or_default();
 
     let base_compile = if models_dir.is_dir() {
-        extract_base_compile_in(base_ref, models_dir, source_schemas, None, repo_dir).ok()
+        extract_base_compile_in(base_side, models_dir, source_schemas, None, repo_dir).ok()
     } else {
         None
     };
@@ -1226,6 +1357,8 @@ fn compute_ci_diff_in(
         head_compile,
         base_compile,
         changed_file_count,
+        mode,
+        base_commit,
     })
 }
 
@@ -1298,6 +1431,7 @@ fn semantic_findings(
 /// attached to the JSON output under `breaking_findings`. The flag is
 /// informational only: even a `Breaking` finding does not change the
 /// exit code. The hard gate lives on `rocky branch promote`.
+#[allow(clippy::too_many_arguments)]
 pub fn run_ci_diff(
     config_path: &Path,
     state_path: &Path,
@@ -1306,6 +1440,7 @@ pub fn run_ci_diff(
     output_json: bool,
     semantic: bool,
     cache_ttl_override: Option<u64>,
+    mode: CiDiffMode,
 ) -> Result<()> {
     let data = compute_ci_diff(
         config_path,
@@ -1313,7 +1448,10 @@ pub fn run_ci_diff(
         base_ref,
         models_dir,
         cache_ttl_override,
+        mode,
     )?;
+    let mode = data.mode;
+    let header = format!("Rocky CI Diff ({base_ref}...{})\n", mode.head_label());
 
     // Classify before the empty-structural-diff branch below. A change to
     // shared config — `_defaults.toml`, `groups/*.toml` — retargets models
@@ -1333,17 +1471,18 @@ pub fn run_ci_diff(
         if output_json {
             let output = CiDiffOutput::new(
                 base_ref.to_string(),
-                "HEAD".to_string(),
+                mode.head_label().to_string(),
                 data.summary,
                 vec![],
             )
+            .with_snapshot(mode, data.base_commit.clone())
             .with_breaking_findings(findings);
             print_json(&output)?;
         } else if data.changed_file_count == 0 {
-            println!("Rocky CI Diff ({base_ref}...HEAD)\n");
+            println!("{header}");
             println!("No changed model files detected.");
         } else {
-            println!("Rocky CI Diff ({base_ref}...HEAD)\n");
+            println!("{header}");
             println!(
                 "{} file(s) changed, but no model files (.sql, .rocky) were affected.",
                 data.changed_file_count,
@@ -1356,14 +1495,15 @@ pub fn run_ci_diff(
     if output_json {
         let output = CiDiffOutput::new(
             base_ref.to_string(),
-            "HEAD".to_string(),
+            mode.head_label().to_string(),
             data.summary,
             data.results,
         )
+        .with_snapshot(mode, data.base_commit.clone())
         .with_breaking_findings(findings);
         print_json(&output)?;
     } else {
-        println!("Rocky CI Diff ({base_ref}...HEAD)\n");
+        println!("{header}");
         print!("{}", format_diff_table(&data.results));
         println!();
         println!("--- Markdown (for PR comment) ---\n");
@@ -3004,9 +3144,201 @@ mod tests {
             "HEAD~1",
             models_dir,
             None,
+            CiDiffMode::Head,
             Some(dir),
         )
         .expect("compute_ci_diff must succeed")
+    }
+
+    fn compute_mode(dir: &Path, models_dir: &Path, base: &str, mode: CiDiffMode) -> CiDiffData {
+        compute_ci_diff_in(
+            &dir.join("rocky.toml"),
+            &dir.join("state.redb"),
+            base,
+            models_dir,
+            None,
+            mode,
+            Some(dir),
+        )
+        .expect("compute_ci_diff must succeed")
+    }
+
+    fn column_names(data: &CiDiffData, model: &str) -> Vec<(String, ColumnChangeType)> {
+        let mut cols: Vec<_> = data
+            .results
+            .iter()
+            .filter(|r| r.model_name == model)
+            .flat_map(|r| {
+                r.column_changes
+                    .iter()
+                    .map(|c| (c.column_name.clone(), c.change_type))
+            })
+            .collect();
+        cols.sort_by(|a, b| a.0.cmp(&b.0));
+        cols
+    }
+
+    fn status_of(data: &CiDiffData, model: &str) -> Option<ModelDiffStatus> {
+        data.results
+            .iter()
+            .find(|r| r.model_name == model)
+            .map(|r| r.status)
+    }
+
+    /// G7: the default mode reads the HEAD commit for both selection and
+    /// compilation, so uncommitted edits (modified, untracked, deleted) never
+    /// reach the report. `--working-tree` includes all of them.
+    #[test]
+    fn e2e_default_mode_ignores_dirty_tree_and_working_tree_mode_includes_it() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let models_dir = init_repo(
+            dir,
+            &[
+                ("orders.sql", "SELECT 1 AS id\n"),
+                ("orders.toml", &inferred_sidecar("marts")),
+                ("control.sql", "SELECT 1 AS id\n"),
+                ("control.toml", &inferred_sidecar("marts")),
+                ("moved.sql", "SELECT 1 AS id\n"),
+                ("moved.toml", &inferred_sidecar("marts")),
+            ],
+        );
+        fs::write(
+            models_dir.join("orders.sql"),
+            "SELECT 1 AS id, 2 AS committed\n",
+        )
+        .unwrap();
+        run_git(dir, &["commit", "-q", "-am", "committed change"]);
+
+        // Dirty the tree four ways: an unstaged edit, an untracked model, an
+        // unstaged deletion and a staged rename.
+        fs::write(
+            models_dir.join("orders.sql"),
+            "SELECT 1 AS id, 2 AS committed, 3 AS dirty\n",
+        )
+        .unwrap();
+        fs::write(models_dir.join("fresh.sql"), "SELECT 1 AS id\n").unwrap();
+        fs::write(models_dir.join("fresh.toml"), inferred_sidecar("marts")).unwrap();
+        fs::remove_file(models_dir.join("control.sql")).unwrap();
+        fs::remove_file(models_dir.join("control.toml")).unwrap();
+        run_git(dir, &["mv", "models/moved.sql", "models/renamed.sql"]);
+        run_git(dir, &["mv", "models/moved.toml", "models/renamed.toml"]);
+
+        let head = compute_mode(dir, &models_dir, "HEAD~1", CiDiffMode::Head);
+        assert_eq!(head.mode, CiDiffMode::Head);
+        assert_eq!(
+            column_names(&head, "orders"),
+            vec![("committed".to_string(), ColumnChangeType::Added)],
+            "default mode must not see the uncommitted `dirty` column: {:?}",
+            head.results
+        );
+        for untouched in ["fresh", "control", "moved", "renamed"] {
+            assert_eq!(
+                status_of(&head, untouched),
+                None,
+                "{untouched}: {:?}",
+                head.results
+            );
+        }
+
+        let wt = compute_mode(dir, &models_dir, "HEAD~1", CiDiffMode::WorkingTree);
+        assert_eq!(wt.mode, CiDiffMode::WorkingTree);
+        assert_eq!(
+            column_names(&wt, "orders"),
+            vec![
+                ("committed".to_string(), ColumnChangeType::Added),
+                ("dirty".to_string(), ColumnChangeType::Added),
+            ],
+            "{:?}",
+            wt.results
+        );
+        assert_eq!(status_of(&wt, "fresh"), Some(ModelDiffStatus::Added));
+        assert_eq!(status_of(&wt, "control"), Some(ModelDiffStatus::Removed));
+        assert_eq!(status_of(&wt, "moved"), Some(ModelDiffStatus::Removed));
+        assert_eq!(status_of(&wt, "renamed"), Some(ModelDiffStatus::Added));
+    }
+
+    /// G7: a clean branch whose only edits are uncommitted reports nothing by
+    /// default — the committed diff is empty.
+    #[test]
+    fn e2e_default_mode_reports_nothing_for_uncommitted_only_edits() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let models_dir = init_repo(
+            dir,
+            &[
+                ("orders.sql", "SELECT 1 AS id\n"),
+                ("orders.toml", &inferred_sidecar("marts")),
+            ],
+        );
+        fs::write(
+            models_dir.join("orders.sql"),
+            "SELECT 1 AS id, 3 AS dirty\n",
+        )
+        .unwrap();
+
+        let head = compute_mode(dir, &models_dir, "HEAD", CiDiffMode::Head);
+        assert!(head.results.is_empty(), "{:?}", head.results);
+        assert_eq!(head.changed_file_count, 0);
+
+        let wt = compute_mode(dir, &models_dir, "HEAD", CiDiffMode::WorkingTree);
+        assert_eq!(
+            column_names(&wt, "orders"),
+            vec![("dirty".to_string(), ColumnChangeType::Added)]
+        );
+    }
+
+    /// G7: the base side is the merge base, the same commit `base...HEAD`
+    /// selected files against. Compiling the base branch tip instead would
+    /// attribute the base branch's own later edits to this PR.
+    #[test]
+    fn e2e_base_compile_reads_the_merge_base_not_the_base_tip() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let models_dir = init_repo(
+            dir,
+            &[
+                ("orders.sql", "SELECT 1 AS id\n"),
+                ("orders.toml", &inferred_sidecar("marts")),
+            ],
+        );
+        let fork_point = String::from_utf8(
+            Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(dir)
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+
+        run_git(dir, &["checkout", "-q", "-b", "feature"]);
+        fs::write(
+            models_dir.join("orders.sql"),
+            "SELECT 1 AS id, 2 AS feat_col\n",
+        )
+        .unwrap();
+        run_git(dir, &["commit", "-q", "-am", "feature edit"]);
+
+        run_git(dir, &["checkout", "-q", "main"]);
+        fs::write(
+            models_dir.join("orders.sql"),
+            "SELECT 1 AS id, 9 AS main_col\n",
+        )
+        .unwrap();
+        run_git(dir, &["commit", "-q", "-am", "main moves on"]);
+        run_git(dir, &["checkout", "-q", "feature"]);
+
+        let data = compute_mode(dir, &models_dir, "main", CiDiffMode::Head);
+        assert_eq!(data.base_commit.as_deref(), Some(fork_point.as_str()));
+        assert_eq!(
+            column_names(&data, "orders"),
+            vec![("feat_col".to_string(), ColumnChangeType::Added)],
+            "main's later `main_col` must not appear as removed: {:?}",
+            data.results
+        );
     }
 
     /// The regression #1225 asked for: renaming a model whose `name` and
@@ -3389,6 +3721,7 @@ mod tests {
             "HEAD",
             &models_dir,
             None,
+            CiDiffMode::Head,
         ) else {
             panic!("a present but unloadable rocky.toml must refuse the ci diff");
         };

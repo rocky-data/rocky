@@ -8,7 +8,7 @@ use rocky_compiler::compile::{self, CompilerConfig};
 
 use crate::output::{
     ColumnLineageOutput, LineageColumnDef, LineageEdgeRecord, LineageNodeDef, LineageOutput,
-    LineageQualifiedColumn, print_json,
+    LineageQualifiedColumn, RowSelectionEdgeRecord, print_json,
 };
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -25,6 +25,82 @@ fn to_edge_record(edge: &rocky_compiler::semantic::LineageEdge) -> LineageEdgeRe
             column: edge.target.column.to_string(),
         },
         transform: edge.transform.to_string(),
+    }
+}
+
+/// Row-selection edges relevant to a column trace.
+///
+/// Upstream: for the focal column and every column the value trace passes
+/// through, the edges that select that column's model rows. Downstream: the
+/// edges sourced from the focal column or any column derived from it. Sorted
+/// and deduplicated so the output is deterministic.
+pub(crate) fn row_selection_for_trace(
+    graph: &rocky_compiler::semantic::SemanticGraph,
+    model_name: &str,
+    column: &str,
+    downstream: bool,
+) -> Vec<RowSelectionEdgeRecord> {
+    let mut points: Vec<(String, String)> = vec![(model_name.to_string(), column.to_string())];
+    if downstream {
+        for edge in graph.trace_column_downstream(model_name, column) {
+            points.push((
+                edge.target.model.to_string(),
+                edge.target.column.to_string(),
+            ));
+        }
+    } else {
+        for edge in graph.trace_column(model_name, column) {
+            points.push((
+                edge.source.model.to_string(),
+                edge.source.column.to_string(),
+            ));
+        }
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for (model, col) in &points {
+        let edges = if downstream {
+            graph.row_selection_consumers(model, col)
+        } else {
+            graph.row_selection_into(model, col)
+        };
+        for edge in edges {
+            seen.insert((
+                edge.target_model.to_string(),
+                edge.target_column.as_deref().map(str::to_string),
+                edge.kind.to_string(),
+                edge.source.model.to_string(),
+                edge.source.column.to_string(),
+            ));
+        }
+    }
+    seen.into_iter()
+        .map(
+            |(target_model, target_column, kind, model, column)| RowSelectionEdgeRecord {
+                source: LineageQualifiedColumn { model, column },
+                target_model,
+                target_column,
+                kind,
+            },
+        )
+        .collect()
+}
+
+/// Print the labelled row-selection section of the human column view.
+fn print_row_selection(records: &[RowSelectionEdgeRecord]) {
+    if records.is_empty() {
+        return;
+    }
+    println!();
+    println!("Row selection (decides which rows/groups exist):");
+    for r in records {
+        let scope = r.target_column.as_deref().map_or_else(
+            || r.target_model.clone(),
+            |c| format!("{}.{c}", r.target_model),
+        );
+        println!(
+            "  [{}] {}.{} -> {scope}",
+            r.kind, r.source.model, r.source.column
+        );
     }
 }
 
@@ -140,6 +216,7 @@ pub fn run_lineage(
         if let Some(col) = col_name {
             if downstream {
                 println!("Column consumers: {model_name}.{col}");
+                println!("Value derivation:");
                 let trace = result
                     .semantic_graph
                     .trace_column_downstream(model_name, col);
@@ -152,6 +229,7 @@ pub fn run_lineage(
                 }
             } else {
                 println!("Column trace: {model_name}.{col}");
+                println!("Value derivation:");
                 let trace = result.semantic_graph.trace_column(model_name, col);
                 for (i, edge) in trace.iter().enumerate() {
                     let indent = "  ".repeat(i + 1);
@@ -161,6 +239,12 @@ pub fn run_lineage(
                     );
                 }
             }
+            print_row_selection(&row_selection_for_trace(
+                &result.semantic_graph,
+                model_name,
+                col,
+                downstream,
+            ));
         } else {
             println!("Columns:");
             for col_def in &schema.columns {
@@ -343,6 +427,12 @@ pub fn column_lineage_output(
         direction: direction.to_string(),
         trace,
         downstream_consumers,
+        row_selection: row_selection_for_trace(
+            &result.semantic_graph,
+            model_name,
+            column,
+            downstream,
+        ),
     })
 }
 
@@ -447,6 +537,71 @@ mod tests {
             !json.contains("downstream_consumers"),
             "empty consumer set must be omitted from JSON"
         );
+    }
+
+    /// G6: `--column` labels row-selection edges separately from the value
+    /// trace. `fct.total` derives its value from `stg.amount`, but which rows
+    /// and groups exist is decided by the join key, filter and group key.
+    #[test]
+    fn column_output_labels_row_selection_edges() {
+        let dir = TempDir::new().unwrap();
+        let models_dir = dir.path();
+        write_model(
+            models_dir,
+            "stg",
+            "SELECT order_id, customer_id, amount, status FROM source.raw.orders",
+        );
+        write_model(
+            models_dir,
+            "cust",
+            "SELECT customer_id, region FROM source.raw.customers",
+        );
+        write_model(
+            models_dir,
+            "fct",
+            "SELECT c.region, SUM(s.amount) AS total FROM stg s \
+             JOIN cust c ON s.customer_id = c.customer_id \
+             WHERE s.status = 'paid' GROUP BY c.region",
+        );
+
+        let result = compile_chain(models_dir);
+        let out = column_lineage_output(&result, "fct", "total", false).unwrap();
+
+        // Value trace is unchanged: only `stg.amount` feeds `total`.
+        let value_sources: Vec<(&str, &str)> = out
+            .trace
+            .iter()
+            .filter(|e| e.target.model == "fct")
+            .map(|e| (e.source.model.as_str(), e.source.column.as_str()))
+            .collect();
+        assert_eq!(value_sources, vec![("stg", "amount")]);
+
+        let rs: Vec<(&str, &str, &str)> = out
+            .row_selection
+            .iter()
+            .map(|r| {
+                (
+                    r.kind.as_str(),
+                    r.source.model.as_str(),
+                    r.source.column.as_str(),
+                )
+            })
+            .collect();
+        for expected in [
+            ("join_key", "stg", "customer_id"),
+            ("join_key", "cust", "customer_id"),
+            ("filter", "stg", "status"),
+            ("group_by", "cust", "region"),
+        ] {
+            assert!(rs.contains(&expected), "missing {expected:?} in {rs:?}");
+        }
+
+        // Downstream from `stg.status`: no value consumer, one filter consumer.
+        let down = column_lineage_output(&result, "stg", "status", true).unwrap();
+        assert!(down.trace.is_empty());
+        assert_eq!(down.row_selection.len(), 1, "{:?}", down.row_selection);
+        assert_eq!(down.row_selection[0].target_model, "fct");
+        assert_eq!(down.row_selection[0].kind, "filter");
     }
 
     // ------------------------------------------------------------------

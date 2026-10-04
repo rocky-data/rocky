@@ -1854,6 +1854,12 @@ enum Command {
         /// the exit code. The hard gate lives on `rocky branch promote`.
         #[arg(long)]
         semantic: bool,
+        /// Compare the working tree instead of the HEAD commit. Selection and
+        /// compilation then both include staged, unstaged, untracked, renamed
+        /// and deleted files. By default both read the HEAD commit, so
+        /// uncommitted edits are ignored.
+        #[arg(long)]
+        working_tree: bool,
     },
 
     /// Per-changed-column downstream impact, formatted for PR review
@@ -1871,6 +1877,10 @@ enum Command {
         /// Models directory
         #[arg(long, default_value = "models")]
         models: PathBuf,
+        /// Compare the working tree instead of the HEAD commit (see
+        /// `rocky ci-diff --working-tree`).
+        #[arg(long)]
+        working_tree: bool,
     },
 
     /// Scaffold a new warehouse adapter crate
@@ -4635,6 +4645,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             base_ref,
             models,
             semantic,
+            working_tree,
         } => rocky_cli::commands::run_ci_diff(
             &cli.config,
             &state_path,
@@ -4643,14 +4654,20 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             json,
             semantic,
             cli.cache_ttl,
+            rocky_cli::commands::ci_diff_mode(working_tree),
         ),
-        Command::LineageDiff { base_ref, models } => rocky_cli::commands::run_lineage_diff(
+        Command::LineageDiff {
+            base_ref,
+            models,
+            working_tree,
+        } => rocky_cli::commands::run_lineage_diff(
             &cli.config,
             &state_path,
             &base_ref,
             &models,
             json,
             cli.cache_ttl,
+            rocky_cli::commands::ci_diff_mode(working_tree),
         ),
         Command::InitAdapter { name } => rocky_cli::commands::run_init_adapter(&name),
         Command::TestAdapter {

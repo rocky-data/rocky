@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use indexmap::IndexMap;
 use rocky_ir::ColumnInfo;
-use rocky_sql::lineage::{self, TransformKind};
+use rocky_sql::lineage::{self, RowSelectionKind, TransformKind};
 use serde::{Deserialize, Serialize};
 
 use crate::project::Project;
@@ -20,6 +20,33 @@ use crate::project::Project;
 // already depends on rocky-core, one-way). They are re-exported here so that
 // `rocky_compiler::semantic::{LineageEdge, QualifiedColumn}` keeps resolving.
 pub use rocky_ir::lineage::{LineageEdge, QualifiedColumn};
+
+/// A row-selection lineage edge across model boundaries: `source` decides which
+/// rows or groups `target_model` produces (join key, filter, group key, window
+/// key). The counterpart of a value [`LineageEdge`], kept separate so value
+/// lineage stays exactly as it was. See [`rocky_sql::lineage::RowSelectionLineage`]
+/// for which SQL constructs are covered.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct RowSelectionEdge {
+    /// The column that influences row selection.
+    pub source: QualifiedColumn,
+    /// The model whose rows it influences.
+    pub target_model: Arc<str>,
+    /// The one output column affected, for window keys. `None` means every
+    /// output column of `target_model`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_column: Option<Arc<str>>,
+    /// Which clause the column appears in.
+    pub kind: RowSelectionKind,
+}
+
+impl RowSelectionEdge {
+    /// Whether this edge affects output column `column` of its target model.
+    #[must_use]
+    pub fn affects_column(&self, column: &str) -> bool {
+        self.target_column.as_deref().is_none_or(|c| c == column)
+    }
+}
 
 /// Definition of a column in a model's output schema.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -113,6 +140,11 @@ pub struct SemanticGraph {
     /// walk in [`SemanticGraph::trace_column_downstream`].
     #[serde(skip, default)]
     edges_by_source_model: HashMap<String, Vec<usize>>,
+    /// Row-selection edges (join keys, filters, group keys, window keys).
+    /// Additive: [`Self::edges`] stays value-derivation only, so every
+    /// existing value-lineage consumer is unaffected.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub row_selection_edges: Vec<RowSelectionEdge>,
 }
 
 impl SemanticGraph {
@@ -124,9 +156,34 @@ impl SemanticGraph {
             edges_by_target_model: HashMap::new(),
             edge_by_target_column: HashMap::new(),
             edges_by_source_model: HashMap::new(),
+            row_selection_edges: Vec::new(),
         };
         graph.rebuild_indices();
         graph
+    }
+
+    /// Attach row-selection edges to the graph.
+    #[must_use]
+    pub fn with_row_selection_edges(mut self, edges: Vec<RowSelectionEdge>) -> Self {
+        self.row_selection_edges = edges;
+        self
+    }
+
+    /// Row-selection edges whose source is `(model, column)`: the models whose
+    /// rows this column filters, joins, groups or partitions.
+    pub fn row_selection_consumers(&self, model: &str, column: &str) -> Vec<&RowSelectionEdge> {
+        self.row_selection_edges
+            .iter()
+            .filter(|e| &*e.source.model == model && &*e.source.column == column)
+            .collect()
+    }
+
+    /// Row-selection edges into `model` that affect its output `column`.
+    pub fn row_selection_into(&self, model: &str, column: &str) -> Vec<&RowSelectionEdge> {
+        self.row_selection_edges
+            .iter()
+            .filter(|e| &*e.target_model == model && e.affects_column(column))
+            .collect()
     }
 
     /// Rebuild the derived edge indices from `self.edges`.
@@ -275,6 +332,7 @@ pub fn build_semantic_graph(
 ) -> Result<SemanticGraph, String> {
     let mut models: IndexMap<String, ModelSchema> = IndexMap::new();
     let mut edges: Vec<LineageEdge> = Vec::new();
+    let mut row_selection_edges: Vec<RowSelectionEdge> = Vec::new();
 
     // Build upstream/downstream maps from DAG using references to avoid
     // cloning every model name into both maps.
@@ -325,6 +383,31 @@ pub fn build_semantic_graph(
             .iter()
             .filter_map(|t| t.alias.as_ref().map(|a| (a.clone(), t.name.clone())))
             .collect();
+
+        // Row-selection edges: a reference whose table could not be
+        // determined statically (an unqualified column in a join) is dropped,
+        // as value lineage does. Dedup is per model (alias resolution can fold
+        // two spellings into one edge); edges of different models never collide.
+        let mut seen_row_selection: std::collections::HashSet<RowSelectionEdge> =
+            std::collections::HashSet::new();
+        for rs in &lineage_result.row_selection {
+            let Some(table) = rs.source_table.as_ref() else {
+                continue;
+            };
+            let source_name = alias_to_table.get(table).unwrap_or(table);
+            let edge = RowSelectionEdge {
+                source: QualifiedColumn {
+                    model: Arc::from(source_name.as_str()),
+                    column: Arc::from(rs.source_column.as_str()),
+                },
+                target_model: model_name_arc.clone(),
+                target_column: rs.target_column.as_deref().map(Arc::from),
+                kind: rs.kind,
+            };
+            if seen_row_selection.insert(edge.clone()) {
+                row_selection_edges.push(edge);
+            }
+        }
 
         // Collect output columns. We track names in a parallel HashSet so the
         // SELECT * dedup pass below is O(1) per column instead of O(C²) per
@@ -494,7 +577,7 @@ pub fn build_semantic_graph(
         );
     }
 
-    Ok(SemanticGraph::new(models, edges))
+    Ok(SemanticGraph::new(models, edges).with_row_selection_edges(row_selection_edges))
 }
 
 #[cfg(test)]
@@ -1022,5 +1105,37 @@ mod tests {
         let bv_consumers = graph.column_consumers("b", "b_value");
         assert_eq!(bv_consumers.len(), 1);
         assert_eq!(&*bv_consumers[0].target.model, "d");
+    }
+
+    #[test]
+    fn row_selection_edges_resolve_aliases_and_stay_out_of_value_edges() {
+        let models = vec![
+            make_model("a", "SELECT id, status FROM source.raw.data"),
+            make_model("b", "SELECT id, region FROM source.raw.regions"),
+            make_model(
+                "d",
+                "SELECT x.id, y.region FROM a x JOIN b y ON x.id = y.id WHERE x.status = 'ok'",
+            ),
+        ];
+        let project = Project::from_models(models).unwrap();
+        let graph = build_semantic_graph(&project, &HashMap::new()).unwrap();
+
+        // Value lineage unchanged: `a.status` feeds no output value of d.
+        assert!(graph.column_consumers("a", "status").is_empty());
+
+        let status = graph.row_selection_consumers("a", "status");
+        assert_eq!(status.len(), 1);
+        assert_eq!(&*status[0].target_model, "d");
+        assert_eq!(status[0].kind, RowSelectionKind::Filter);
+        assert!(status[0].affects_column("region"));
+
+        let join_keys: Vec<_> = graph
+            .row_selection_into("d", "region")
+            .into_iter()
+            .filter(|e| e.kind == RowSelectionKind::JoinKey)
+            .map(|e| (e.source.model.to_string(), e.source.column.to_string()))
+            .collect();
+        assert!(join_keys.contains(&("a".to_string(), "id".to_string())));
+        assert!(join_keys.contains(&("b".to_string(), "id".to_string())));
     }
 }

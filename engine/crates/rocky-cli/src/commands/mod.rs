@@ -122,7 +122,9 @@ pub use catalog::{
 };
 #[cfg(feature = "duckdb")]
 pub use ci::run_ci;
-pub use ci_diff::{extract_base_compile, project_ir_from_compile, run_ci_diff};
+pub use ci_diff::{
+    CiDiffMode, ci_diff_mode, extract_base_compile, project_ir_from_compile, run_ci_diff,
+};
 pub use compact::{run_compact, run_compact_apply, run_compact_catalog, run_measure_dedup};
 pub use compare::compare;
 pub use compile::{compile_output, run_compile};
