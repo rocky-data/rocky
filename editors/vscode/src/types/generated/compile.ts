@@ -142,6 +142,10 @@ export interface CompileOutput {
     [k: string]: string;
   };
   /**
+   * User-defined functions declared under `functions/` that passed validation, with the models that call each one. Under `--model`, only the selected function, or the functions the selected model calls. Empty (and omitted) when the project declares none.
+   */
+  functions?: FunctionDetail[];
+  /**
    * Whether the diagnostics this result describes include error-severity entries — and, for the CLI, whether the command exits non-zero.
    *
    * Under `--model` this is computed from the exact-attribution filter above, so it says nothing about whether the selected model's upstreams compile: an error attributed to another model is filtered out and leaves this `false`, even though `rocky run` would classify that model as a compile error and exclude it from execution. A failure that aborts compilation outright rather than emitting a diagnostic — an unparseable model, a semantic-graph or contract-load failure — fails the command before any scoping applies. To learn whether a model can be built, compile without a selector.
@@ -214,6 +218,31 @@ export interface SourceSpan {
   col: number;
   file: string;
   line: number;
+  [k: string]: unknown;
+}
+/**
+ * A user-defined function in `CompileOutput.functions`.
+ */
+export interface FunctionDetail {
+  /**
+   * Models that call this function directly. `rocky run` creates the function before any of them is built.
+   */
+  called_by: string[];
+  /**
+   * Other project functions this function's body calls (created first).
+   */
+  calls?: string[];
+  description?: string | null;
+  deterministic?: boolean | null;
+  name: string;
+  /**
+   * Declared return type, as written.
+   */
+  returns: string;
+  /**
+   * `name(arg TYPE, ...) RETURNS TYPE`, as declared.
+   */
+  signature: string;
   [k: string]: unknown;
 }
 /**
