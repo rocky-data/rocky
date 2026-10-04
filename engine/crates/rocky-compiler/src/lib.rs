@@ -31,6 +31,7 @@ pub mod schema_cache;
 pub mod semantic;
 pub mod typecheck;
 pub mod types;
+pub mod udf;
 
 // Re-export miette for downstream crates that need the rendering types.
 pub use miette;

@@ -11207,6 +11207,25 @@ pub(crate) async fn execute_models_with_explicit_contracts(
         }
     };
 
+    // `--model <function>` selects a user-defined function (`functions/`):
+    // create it and the functions it calls, and build no model.
+    if let Some(name) = model_name_filter
+        && compile_result.project.model(name).is_none()
+        && compile_result
+            .semantic_graph
+            .functions()
+            .get(name)
+            .is_some()
+    {
+        let statements = super::functions_ddl::statements_for(
+            &compile_result,
+            [name],
+            warehouse.dialect().name(),
+        )?;
+        super::functions_ddl::create_functions(warehouse, &statements).await?;
+        return Ok(GovernanceSnapshot::default());
+    }
+
     if let Some(name) = model_name_filter {
         let selected = compile_result.project.model(name).ok_or_else(|| {
             anyhow::anyhow!("model '{name}' not found (no transformation model with that name)")
@@ -11641,6 +11660,19 @@ pub(crate) async fn execute_models_with_explicit_contracts(
             }
         }
     }
+
+    // User-defined functions (`functions/`): create every function a model
+    // this invocation builds calls — callees first — before any model runs.
+    let function_statements = super::functions_ddl::function_statements(
+        &compile_result,
+        |name| {
+            model_name_filter.is_none_or(|selected| selected == name)
+                && model_set.is_none_or(|set| set.contains(name))
+                && !compile_excluded_models.contains(name)
+        },
+        dialect.name(),
+    )?;
+    super::functions_ddl::create_functions(warehouse, &function_statements).await?;
 
     let mut models_executed = 0usize;
 

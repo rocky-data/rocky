@@ -435,6 +435,12 @@ fn compute_model_typecheck(
 ) -> ModelTypecheckOutput {
     let model_start = Instant::now();
     let mut diagnostics: Vec<Diagnostic> = Vec::new();
+    // User-defined functions: installed for this model's inference only.
+    let udf_scope = crate::udf::TypecheckScope::enter(
+        graph.functions(),
+        model_name,
+        model_by_name.get(model_name).map(|m| m.sql.as_str()),
+    );
 
     // Extract references from this model's SQL if available.
     let ref_map = if let Some(model) = model_by_name.get(model_name) {
@@ -495,15 +501,16 @@ fn compute_model_typecheck(
     // Lineage resolves aliases to source models, losing which occurrence an
     // outer join null-extends. Infer in the SQL relation scope before using
     // the resulting nullable bit for contracts and downstream models.
-    let needs_inference = typed_cols.iter().any(|col| {
-        graph
-            .producing_edge(model_name, &col.name)
-            .is_some_and(|edge| {
-                edge.transform.is_cast()
-                    || (!col.nullable
-                        && edge.transform == rocky_sql::lineage::TransformKind::Direct)
-            })
-    });
+    let needs_inference = udf_scope.is_active()
+        || typed_cols.iter().any(|col| {
+            graph
+                .producing_edge(model_name, &col.name)
+                .is_some_and(|edge| {
+                    edge.transform.is_cast()
+                        || (!col.nullable
+                            && edge.transform == rocky_sql::lineage::TransformKind::Direct)
+                })
+        });
     let inferred_cols = model_by_name
         .get(model_name)
         .filter(|_| needs_inference)
@@ -540,6 +547,12 @@ fn compute_model_typecheck(
             }
         }
     }
+    if udf_scope.is_active()
+        && let Some(model) = model_by_name.get(model_name)
+    {
+        crate::udf::apply_direct_call_types(&model.sql, graph.functions(), &mut typed_cols);
+    }
+    diagnostics.extend(udf_scope.finish());
     let enhanced_diags = enhanced_inference(
         model_name,
         graph,
@@ -2107,7 +2120,9 @@ fn infer_function_type(func: &ast::Function, scope: &TypeScope) -> (RockyType, b
         }
 
         "CAST" => (RockyType::Unknown, true), // handled by Expr::Cast above
-        _ => (RockyType::Unknown, true),
+        // A project UDF (`functions/`) types to its declared return type.
+        _ => crate::udf::infer_active_call(func, &|expr| infer_expr_type(expr, scope))
+            .unwrap_or((RockyType::Unknown, true)),
     }
 }
 

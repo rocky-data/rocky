@@ -172,6 +172,20 @@ pub const E039: &str = "E039";
 /// by target dialect. Use a `.sql` model with the target's own escaping.
 pub const E040: &str = "E040";
 
+/// A user-defined function (`functions/`) or a call to one is invalid.
+///
+/// Emitted by `rocky compile` (`rocky_compiler::udf`). Attributed to the
+/// function when its definition cannot be created — `language` other than
+/// `"sql"` (Python UDFs are refused), a bad identifier or type, a missing
+/// body, a duplicate name, a call cycle between functions. Attributed to the
+/// calling model when a call passes the wrong number of arguments, names an
+/// invalid function, or passes an argument whose type no supported warehouse
+/// converts to the declared parameter type (e.g. a `DATE` into a `BIGINT`).
+/// Also the code `rocky run` / `rocky plan` use to refuse function DDL on a
+/// warehouse that cannot create it (Trino). Calls that Rocky cannot verify
+/// are [`W051`], never this.
+pub const E051: &str = "E051";
+
 // Warnings
 /// Unused model (no downstream consumers).
 pub const W001: &str = "W001";
@@ -272,6 +286,16 @@ pub const W030: &str = "W030";
 /// reads keep working — but the consumer's own declared output type may now
 /// be too small, hence a warning rather than silence.
 pub const W031: &str = "W031";
+
+/// A call to a user-defined function could not be fully verified.
+///
+/// Emitted by `rocky compile` (`rocky_compiler::udf`) when an argument's
+/// inferred type (or the declared parameter type) is unknown, when an
+/// argument relies on the warehouse converting it implicitly (e.g. a `VARCHAR`
+/// into a `BIGINT` parameter), or when a function body could not be parsed.
+/// A warning, not an error: the warehouse may well accept the call. Certain
+/// mismatches are [`E051`].
+pub const W051: &str = "W051";
 
 // Info
 /// Model dependency inferred from SQL.

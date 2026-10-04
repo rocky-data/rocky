@@ -1375,6 +1375,21 @@ fn plan_preview_output_for_pipeline(
             selected_model_paths.contains(path)
         })
         .context("invalid surrogate_key configuration")?;
+    // `--model <function>` selects a user-defined function: preview its DDL
+    // (and that of the functions it calls) only.
+    if let Some(name) = filter
+        && result.project.model(name).is_none()
+        && result.semantic_graph.functions().get(name).is_some()
+    {
+        for stmt in super::functions_ddl::statements_for(&result, [name], dialect.name())? {
+            output.statements.push(PlannedStatement {
+                purpose: "create_function".to_string(),
+                target: stmt.target,
+                sql: stmt.sql,
+            });
+        }
+        return Ok(output);
+    }
     if let Some(model) = filter
         && !project_ir
             .models
@@ -1385,6 +1400,29 @@ fn plan_preview_output_for_pipeline(
         // `model_not_found`; `Display` is unchanged from the previous
         // `anyhow::ensure!` string.
         return Err(anyhow::Error::new(ModelNotFound(model.to_string())));
+    }
+
+    // User-defined functions the previewed models call, in the order
+    // `rocky run` creates them: before every model, callees first. A function
+    // this warehouse cannot create is reported, not previewed.
+    match super::functions_ddl::function_statements(
+        &result,
+        |name| filter.is_none_or(|f| f == name),
+        dialect.name(),
+    ) {
+        Ok(statements) => {
+            for stmt in statements {
+                output.statements.push(PlannedStatement {
+                    purpose: "create_function".to_string(),
+                    target: stmt.target,
+                    sql: stmt.sql,
+                });
+            }
+        }
+        Err(e) => output.skipped.push(crate::output::SkippedModel {
+            model: "functions".to_string(),
+            reason: e.to_string(),
+        }),
     }
 
     for model_ir in &project_ir.models {
