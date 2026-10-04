@@ -23,6 +23,9 @@ path = \"warehouse.duckdb\"
 [pipeline.main]
 type = \"transformation\"
 models = \"models/**\"
+
+[pipeline.main.target.governance]
+auto_create_schemas = true
 ";
 
 const NEW_CODES: [&str; 4] = ["E042", "W042", "E043", "W043"];

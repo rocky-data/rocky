@@ -681,19 +681,14 @@ fn string_literal(expr: &Expr) -> Option<&str> {
         Expr::Nested(inner) => string_literal(inner),
         Expr::Cast {
             expr: inner,
-            data_type,
-            kind: ast::CastKind::Cast | ast::CastKind::DoubleColon,
-            ..
-        } if matches!(
-            data_type,
-            ast::DataType::Varchar(_)
+            data_type:
+                ast::DataType::Varchar(_)
                 | ast::DataType::Char(_)
                 | ast::DataType::Text
-                | ast::DataType::String(_)
-        ) =>
-        {
-            string_literal(inner)
-        }
+                | ast::DataType::String(_),
+            kind: ast::CastKind::Cast | ast::CastKind::DoubleColon,
+            ..
+        } => string_literal(inner),
         _ => None,
     }
 }
@@ -767,15 +762,8 @@ fn check_comparison(at: &Expr, left: &Expr, right: &Expr, scope: &TypeScope, ctx
     };
     let suggestion = format!(
         "check the join or filter uses the intended column; if it does, cast explicitly \
-         (e.g. `TRY_CAST({text_side} AS {})`) so the conversion is visible and NULL-safe",
-        if other_ty.is_temporal() {
-            other_ty.to_string()
-        } else {
-            left_ty
-                .is_numeric()
-                .then(|| left_ty.to_string())
-                .unwrap_or_else(|| right_ty.to_string())
-        }
+         (e.g. `TRY_CAST({text_side} AS {other_ty})`) so the conversion is visible and \
+         NULL-safe"
     );
     ctx.emit(refused, W043, E043, at, message, suggestion);
 }
