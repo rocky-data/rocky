@@ -168,7 +168,12 @@ impl DriftGovernor {
         let verify_after = decision
             .matched_rule
             .and_then(|i| policy.rules.get(i))
-            .map(|r| r.verify_after.clone())
+            .map(|r| {
+                r.verify_after
+                    .iter()
+                    .map(|v| v.expose().to_string())
+                    .collect()
+            })
             .unwrap_or_default();
         Some(Self {
             run_id: run_id.to_string(),
@@ -522,7 +527,12 @@ pub(crate) fn finalize_drift_verify_after(
             (Some(idx), Some(policy)) => policy
                 .rules
                 .get(idx)
-                .map(|r| r.verify_after.clone())
+                .map(|r| {
+                    r.verify_after
+                        .iter()
+                        .map(|v| v.expose().to_string())
+                        .collect()
+                })
                 .unwrap_or_default(),
             _ => Vec::new(),
         };
@@ -785,7 +795,7 @@ mod tests {
                     ..Default::default()
                 },
                 effect: PolicyEffect::Allow,
-                verify_after: checks.iter().map(ToString::to_string).collect(),
+                verify_after: checks.iter().map(|c| (*c).into()).collect(),
                 conditions: None,
                 autonomy_budget: budget,
             }],
@@ -1143,7 +1153,7 @@ mod tests {
     async fn exhausted_autonomy_budget_degrades_auto_apply_to_refuse() {
         let budget = rocky_core::config::AutonomyBudget {
             failures: 1,
-            window: "7d".to_string(),
+            window: "7d".to_string().into(),
         };
         let cfg = cfg_opt_in_with_policy(granting_policy(&["row_count"], Some(budget)));
         let gov =

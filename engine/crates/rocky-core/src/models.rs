@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::config::{ModelBudgetConfig, substitute_env_vars};
+use crate::env_string::EnvString;
 use crate::lakehouse::{LakehouseFormat, LakehouseOptions};
 use crate::retention::{RetentionParseError, RetentionPolicy};
 use crate::tests::TestDecl;
@@ -28,67 +29,75 @@ pub enum ModelError {
     /// file IS there, its target is not (#1738).
     #[error("failed to read '{path}': {source}")]
     ReadPath {
-        path: String,
+        path: EnvString,
         source: std::io::Error,
     },
 
     #[error("model file '{path}' has no TOML frontmatter (expected ---toml ... --- block)")]
-    MissingFrontmatter { path: String },
+    MissingFrontmatter { path: EnvString },
 
-    #[error("failed to parse frontmatter in '{path}': {source}")]
+    /// `${VAR}` is expanded before the TOML is parsed, so the parse error
+    /// echoes a source line that holds the resolved value. The message is
+    /// therefore rendered through the substitution registry, and the field is
+    /// deliberately NOT named `source`: a source would put the raw error back
+    /// into every `{e:#}` chain render (#1897, #1919).
+    #[error(
+        "failed to parse frontmatter in '{path}': {}",
+        crate::secret_registry::render_placeholders(&error.to_string())
+    )]
     ParseFrontmatter {
-        path: String,
-        source: toml::de::Error,
+        path: EnvString,
+        error: toml::de::Error,
     },
 
     #[error(
         "model '{model}' is missing target.{field} (set it in the sidecar or in _defaults.toml)"
     )]
-    MissingTarget { model: String, field: String },
+    MissingTarget { model: EnvString, field: EnvString },
 
     #[error("_defaults.toml must not declare per-model field '{field}'")]
-    InvalidDefaultsField { field: String },
+    InvalidDefaultsField { field: EnvString },
 
     #[error("model '{model}' has invalid retention value '{value}': {reason}")]
     InvalidRetention {
-        model: String,
-        value: String,
-        reason: String,
+        model: EnvString,
+        value: EnvString,
+        reason: EnvString,
     },
 
     #[error("model '{model}' has an invalid surrogate_key: {reason}")]
-    InvalidSurrogateKey { model: String, reason: String },
+    InvalidSurrogateKey { model: EnvString, reason: EnvString },
 
     #[error(
         "model '{model}' references unknown config group '{group}' (expected models/groups/{group}.toml)"
     )]
-    UnknownGroup { model: String, group: String },
+    UnknownGroup { model: EnvString, group: EnvString },
 
     #[error("model '{model}' has an invalid config group: {reason}")]
-    InvalidGroup { model: String, reason: String },
+    InvalidGroup { model: EnvString, reason: EnvString },
 
     #[error(
         "model '{model}' overrides '{field}', which its enforced group '{group}' controls; remove the local override or set the group's enforce = false"
     )]
     GroupOverride {
-        model: String,
-        group: String,
-        field: String,
+        model: EnvString,
+        group: EnvString,
+        field: EnvString,
     },
 
     #[error(
         "model '{model}' supplies [args] for config group '{group}'s schema_template but also pins its own target.schema; the pin overrides the template, so the [args] are dead. Remove the pinned schema to route via [args], or remove [args] if the pinned schema is intended."
     )]
-    GroupArgsWithPinnedSchema { model: String, group: String },
+    GroupArgsWithPinnedSchema { model: EnvString, group: EnvString },
 
     #[error(
         "model '{model}' references unknown named test '{name}' (expected a [{name}] entry in test_definitions.toml)"
     )]
-    UnknownTest { model: String, name: String },
+    UnknownTest { model: EnvString, name: EnvString },
 
     #[error("failed to substitute env vars in '{path}': {source}")]
     EnvSubstitution {
-        path: String,
+        path: EnvString,
         #[source]
         source: Box<crate::config::ConfigError>,
     },
@@ -851,7 +860,7 @@ fn read_model_text(path: &Path) -> Result<String, ModelError> {
             source
         };
         ModelError::ReadPath {
-            path: path.display().to_string(),
+            path: path.display().to_string().into(),
             source,
         }
     })
@@ -871,20 +880,20 @@ pub fn load_dir_defaults(path: &Path) -> Result<DirDefaults, ModelError> {
     let raw_content = read_model_text(path)?;
     let content =
         substitute_env_vars(&raw_content).map_err(|source| ModelError::EnvSubstitution {
-            path: path.display().to_string(),
+            path: path.display().to_string().into(),
             source: Box::new(source),
         })?;
 
     // Check for per-model fields that shouldn't be in defaults
     let raw: toml::Value = toml::from_str(&content).map_err(|e| ModelError::ParseFrontmatter {
-        path: path.display().to_string(),
-        source: e,
+        path: path.display().to_string().into(),
+        error: e,
     })?;
     if let Some(table) = raw.as_table() {
         for field in &["name", "depends_on", "sources"] {
             if table.contains_key(*field) {
                 return Err(ModelError::InvalidDefaultsField {
-                    field: field.to_string(),
+                    field: field.to_string().into(),
                 });
             }
         }
@@ -892,8 +901,8 @@ pub fn load_dir_defaults(path: &Path) -> Result<DirDefaults, ModelError> {
 
     let defaults: DirDefaults =
         toml::from_str(&content).map_err(|e| ModelError::ParseFrontmatter {
-            path: path.display().to_string(),
-            source: e,
+            path: path.display().to_string().into(),
+            error: e,
         })?;
     Ok(defaults)
 }
@@ -989,13 +998,13 @@ pub fn load_groups_from_dir(
         };
         let raw = std::fs::read_to_string(&path)?;
         let content = substitute_env_vars(&raw).map_err(|source| ModelError::EnvSubstitution {
-            path: path.display().to_string(),
+            path: path.display().to_string().into(),
             source: Box::new(source),
         })?;
         let group: GroupConfig =
             toml::from_str(&content).map_err(|e| ModelError::ParseFrontmatter {
-                path: path.display().to_string(),
-                source: e,
+                path: path.display().to_string().into(),
+                error: e,
             })?;
         out.insert(stem.to_string(), group);
     }
@@ -1067,13 +1076,13 @@ pub fn load_test_definitions_from_dir(
     }
     let raw = std::fs::read_to_string(&path)?;
     let content = substitute_env_vars(&raw).map_err(|source| ModelError::EnvSubstitution {
-        path: path.display().to_string(),
+        path: path.display().to_string().into(),
         source: Box::new(source),
     })?;
     let defs: std::collections::HashMap<String, NamedTest> =
         toml::from_str(&content).map_err(|e| ModelError::ParseFrontmatter {
-            path: path.display().to_string(),
-            source: e,
+            path: path.display().to_string().into(),
+            error: e,
         })?;
     Ok(defs)
 }
@@ -1110,8 +1119,8 @@ fn resolve_test_refs(
                 test_defs
                     .and_then(|m| m.get(&r.name))
                     .ok_or_else(|| ModelError::UnknownTest {
-                        model: model.to_string(),
-                        name: r.name.clone(),
+                        model: model.to_string().into(),
+                        name: r.name.clone().into(),
                     })?;
             Ok(TestDecl {
                 test_type: def.test_type.clone(),
@@ -1144,11 +1153,12 @@ fn resolve_group_schema(
     let resolved = parsed.resolve_template(template, "_");
     if resolved.contains('{') {
         return Err(ModelError::InvalidGroup {
-            model: model.to_string(),
-            reason: format!(
+            model: model.to_string().into(),
+            reason: (format!(
                 "group '{group}' schema_template '{template}' has unfilled placeholder(s); \
                  supply them under the model's [args]"
-            ),
+            ))
+            .into(),
         });
     }
     // The resolved schema flows into `format_table_ref`, which validates every
@@ -1158,11 +1168,12 @@ fn resolve_group_schema(
     // load/run never disagree on what's acceptable.
     if rocky_sql::validation::validate_identifier(&resolved).is_err() {
         return Err(ModelError::InvalidGroup {
-            model: model.to_string(),
-            reason: format!(
+            model: model.to_string().into(),
+            reason: (format!(
                 "group '{group}' schema_template resolved to '{resolved}', which is not a valid \
                  SQL identifier; check the model's [args] values"
-            ),
+            ))
+            .into(),
         });
     }
     Ok(resolved)
@@ -1211,8 +1222,8 @@ fn resolve_model_config(
                 ctx.groups
                     .and_then(|m| m.get(g))
                     .ok_or_else(|| ModelError::UnknownGroup {
-                        model: name.clone(),
-                        group: g.to_string(),
+                        model: name.clone().into(),
+                        group: g.to_string().into(),
                     })?,
             )
         }
@@ -1260,8 +1271,8 @@ fn resolve_model_config(
         let group_name = raw.group.as_deref().unwrap_or_default();
         if g.strategy.is_some() && raw.strategy.is_some() {
             return Err(ModelError::GroupOverride {
-                model: name.clone(),
-                group: group_name.to_string(),
+                model: name.clone().into(),
+                group: group_name.to_string().into(),
                 field: "strategy".into(),
             });
         }
@@ -1273,8 +1284,8 @@ fn resolve_model_config(
                 .is_some()
         {
             return Err(ModelError::GroupOverride {
-                model: name.clone(),
-                group: group_name.to_string(),
+                model: name.clone().into(),
+                group: group_name.to_string().into(),
                 field: "target.schema".into(),
             });
         }
@@ -1300,8 +1311,8 @@ fn resolve_model_config(
             .is_some()
     {
         return Err(ModelError::GroupArgsWithPinnedSchema {
-            model: name.clone(),
-            group: raw.group.as_deref().unwrap_or_default().to_string(),
+            model: name.clone().into(),
+            group: raw.group.as_deref().unwrap_or_default().to_string().into(),
         });
     }
 
@@ -1345,7 +1356,7 @@ fn resolve_model_config(
         .catalog
         .or_else(|| dir_target.and_then(|t| t.catalog.clone()))
         .ok_or_else(|| ModelError::MissingTarget {
-            model: name.clone(),
+            model: name.clone().into(),
             field: "catalog".into(),
         })?;
 
@@ -1377,7 +1388,7 @@ fn resolve_model_config(
         .or(group_schema)
         .or_else(|| dir_target.and_then(|t| t.schema.clone()))
         .ok_or_else(|| ModelError::MissingTarget {
-            model: name.clone(),
+            model: name.clone().into(),
             field: "schema".into(),
         })?;
 
@@ -1394,9 +1405,9 @@ fn resolve_model_config(
         Some(value) => {
             let policy = RetentionPolicy::from_str(value).map_err(|e: RetentionParseError| {
                 ModelError::InvalidRetention {
-                    model: name.clone(),
-                    value: value.to_string(),
-                    reason: e.to_string(),
+                    model: name.clone().into(),
+                    value: value.to_string().into(),
+                    reason: e.to_string().into(),
                 }
             })?;
             Some(policy)
@@ -1743,13 +1754,13 @@ pub fn load_model_pair_with_context(
     let declared = extract_declared_fields(&raw_toml);
     let toml_content =
         substitute_env_vars(&raw_toml).map_err(|source| ModelError::EnvSubstitution {
-            path: toml_path.display().to_string(),
+            path: toml_path.display().to_string().into(),
             source: Box::new(source),
         })?;
     let raw: RawModelConfig =
         toml::from_str(&toml_content).map_err(|e| ModelError::ParseFrontmatter {
-            path: toml_path.display().to_string(),
-            source: e,
+            path: toml_path.display().to_string().into(),
+            error: e,
         })?;
 
     let file_stem = sql_path
@@ -1808,21 +1819,23 @@ pub fn parse_model_inline_with_context(
     // a diagnostic is text — and it never reaches `Model::file_path`.
     let displayed = || file_path.display().to_string();
 
-    let (frontmatter, sql) = split_frontmatter(content)
-        .ok_or_else(|| ModelError::MissingFrontmatter { path: displayed() })?;
+    let (frontmatter, sql) =
+        split_frontmatter(content).ok_or_else(|| ModelError::MissingFrontmatter {
+            path: displayed().into(),
+        })?;
 
     let declared = extract_declared_fields(frontmatter);
 
     let frontmatter =
         substitute_env_vars(frontmatter).map_err(|source| ModelError::EnvSubstitution {
-            path: displayed(),
+            path: displayed().into(),
             source: Box::new(source),
         })?;
 
     let raw: RawModelConfig =
         toml::from_str(&frontmatter).map_err(|e| ModelError::ParseFrontmatter {
-            path: displayed(),
-            source: e,
+            path: displayed().into(),
+            error: e,
         })?;
 
     let file_stem = file_path
@@ -2009,13 +2022,13 @@ pub fn load_unit_tests_from_dir(
 
         let substituted =
             substitute_env_vars(&toml_src).map_err(|source| ModelError::EnvSubstitution {
-                path: path.display().to_string(),
+                path: path.display().to_string().into(),
                 source: Box::new(source),
             })?;
         let sidecar: UnitTestSidecar =
             toml::from_str(&substituted).map_err(|e| ModelError::ParseFrontmatter {
-                path: path.display().to_string(),
-                source: e,
+                path: path.display().to_string().into(),
+                error: e,
             })?;
         if sidecar.test.is_empty() {
             continue;
@@ -2093,13 +2106,13 @@ pub fn load_column_docs_from_dir(
 
         let substituted =
             substitute_env_vars(&toml_src).map_err(|source| ModelError::EnvSubstitution {
-                path: path.display().to_string(),
+                path: path.display().to_string().into(),
                 source: Box::new(source),
             })?;
         let sidecar: ColumnDocsSidecar =
             toml::from_str(&substituted).map_err(|e| ModelError::ParseFrontmatter {
-                path: path.display().to_string(),
-                source: e,
+                path: path.display().to_string().into(),
+                error: e,
             })?;
         let descriptions: std::collections::HashMap<String, String> = sidecar
             .columns
@@ -2199,13 +2212,13 @@ pub fn load_surrogate_keys_from_dir_filtered(
 
         let substituted =
             substitute_env_vars(&toml_src).map_err(|source| ModelError::EnvSubstitution {
-                path: path.display().to_string(),
+                path: path.display().to_string().into(),
                 source: Box::new(source),
             })?;
         let sidecar: SurrogateKeySidecar =
             toml::from_str(&substituted).map_err(|e| ModelError::ParseFrontmatter {
-                path: path.display().to_string(),
-                source: e,
+                path: path.display().to_string().into(),
+                error: e,
             })?;
         if sidecar.surrogate_key.is_empty() {
             continue;
@@ -2252,11 +2265,12 @@ pub fn surrogate_key_metadata_columns(
                 dialect.surrogate_key_expr(&cols),
             )
             .map_err(|e| ModelError::InvalidSurrogateKey {
-                model: model.to_string(),
-                reason: format!(
+                model: model.to_string().into(),
+                reason: (format!(
                     "key '{}' renders an unusable SQL expression: {e}",
                     spec.name
-                ),
+                ))
+                .into(),
             })
         })
         .collect()
@@ -2268,8 +2282,8 @@ pub fn surrogate_key_metadata_columns(
 /// fails loudly rather than emitting broken SQL.
 fn validate_surrogate_key_spec(spec: &SurrogateKeySpec, model: &str) -> Result<(), ModelError> {
     let invalid = |reason: String| ModelError::InvalidSurrogateKey {
-        model: model.to_string(),
-        reason,
+        model: model.to_string().into(),
+        reason: reason.into(),
     };
     if rocky_sql::validation::validate_identifier(&spec.name).is_err() {
         return Err(invalid(format!(
@@ -4004,6 +4018,45 @@ columns = ["order_id"]
                 matches!(err, ModelError::InvalidSurrogateKey { .. }),
                 "expected InvalidSurrogateKey for name={name:?} {columns_line}, got {err:?}"
             );
+        }
+    }
+
+    /// #1897 class B, closed for every printer by #1919. `${VAR}` is expanded
+    /// before the TOML parse, so a parse error echoes the resolved value in
+    /// its source line. The error must print the placeholder instead, both in
+    /// `Display` and in an `{e:#}` chain.
+    #[test]
+    fn a_frontmatter_parse_error_prints_the_placeholder_not_the_value() {
+        use tempfile::tempdir;
+        const SECRET: &str = "ROCKY-1919-SIDECAR-SECRET-e5a0";
+        // SAFETY: test-only; the variable name is unique to this test.
+        unsafe { std::env::set_var("ROCKY_T1919_SIDECAR", SECRET) };
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("_defaults.toml");
+        std::fs::write(
+            &path,
+            "[target]\nschema = \"${ROCKY_T1919_SIDECAR}\" trailing\n",
+        )
+        .unwrap();
+        let err = load_dir_defaults(&path).unwrap_err();
+        // SAFETY: as above.
+        unsafe { std::env::remove_var("ROCKY_T1919_SIDECAR") };
+        assert!(
+            matches!(err, ModelError::ParseFrontmatter { .. }),
+            "expected a parse error, got {err:?}"
+        );
+        let display = err.to_string();
+        // What an `{e:#}` chain render prints: every error in the source chain.
+        let mut chain = String::new();
+        let mut cur: Option<&dyn std::error::Error> = Some(&err);
+        while let Some(e) = cur {
+            chain.push_str(&e.to_string());
+            chain.push_str(": ");
+            cur = e.source();
+        }
+        for printed in [&display, &chain] {
+            assert!(!printed.contains(SECRET), "leaked: {printed}");
+            assert!(printed.contains("${ROCKY_T1919_SIDECAR}"), "{printed}");
         }
     }
 

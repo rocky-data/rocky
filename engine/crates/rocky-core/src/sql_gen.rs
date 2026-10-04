@@ -539,7 +539,9 @@ pub fn generate_transformation_sql_with_warehouse(
 /// makes the half-open `[start, end)` window empty — so the model's WHERE
 /// clause filters out every upstream row, and we end up with a zero-row
 /// table whose **schema** matches what the model would produce on a real
-/// run.
+/// run. The rendered body is also wrapped in
+/// `SELECT * FROM (<body>) AS __rocky_bootstrap WHERE 1 = 0`, so the table
+/// is empty even when the placeholders filter nothing (#2233).
 ///
 /// Wrapping the rendered body in `dialect.create_table_as_new` deliberately
 /// uses non-replacing CREATE TABLE AS syntax. If the existence probe failed
@@ -605,7 +607,14 @@ pub fn generate_time_interval_bootstrap_sql(
         end: sentinel,
     };
 
-    let body = substitute_partition_placeholders(&model_ir.sql, &bootstrap_window);
+    // The empty window empties the body only when the placeholders filter
+    // its rows. Compile checks that (E024), but a caller can skip the
+    // compile gate, so the bootstrap also wraps the body in `WHERE 1 = 0`:
+    // it is empty by its shape, not only by its window (#2233). The newline
+    // before `)` closes a trailing `--` comment in the body.
+    let rendered = substitute_partition_placeholders(&model_ir.sql, &bootstrap_window);
+    let rendered = rendered.trim().trim_end_matches(';');
+    let body = format!("SELECT * FROM (\n{rendered}\n) AS __rocky_bootstrap WHERE 1 = 0");
     if redshift_table_options(model_ir).is_some() && model_ir.format.is_some() {
         return Err(redshift_options_refused(model_ir));
     }
@@ -2539,6 +2548,11 @@ SELECT id, name, email FROM cat.sch.src WHERE active = true";
         // Bare placeholder tokens should be gone.
         assert!(!sql.contains("@start_date"));
         assert!(!sql.contains("@end_date"));
+        // #2233: empty by shape, not only by the window.
+        assert!(
+            sql.ends_with(") AS __rocky_bootstrap WHERE 1 = 0"),
+            "bootstrap must wrap the body in WHERE 1 = 0, got: {sql}"
+        );
     }
 
     #[test]

@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+from enum import StrEnum
+
 from pydantic import AwareDatetime, BaseModel, conint
 
 
@@ -48,6 +50,47 @@ class RunModelRecord(BaseModel):
     """
     rows_affected: conint(ge=0) | None = None
     status: str
+
+
+class UnrecordedRunEvidence1(StrEnum):
+    """
+    A replication run's resume checkpoint header.
+    """
+
+    checkpoint = "checkpoint"
+
+
+class UnrecordedRunEvidence2(StrEnum):
+    """
+    A non-replication run's start marker (transformation, quality, snapshot, model-only, backfill).
+    """
+
+    run_started = "run_started"
+
+
+class UnrecordedRunRecord(BaseModel):
+    """
+    A run whose start is in the ledger but whose run record is not (#1884). See [`HistoryOutput::unrecorded_runs`].
+    """
+
+    evidence: UnrecordedRunEvidence1 | UnrecordedRunEvidence2
+    """
+    The ledger evidence the run left: a replication `checkpoint` header or, for every other run kind, a `run_started` marker.
+    """
+    pipeline: str | None = None
+    """
+    The pipeline the run was building, when recorded.
+    """
+    run_id: str
+    started_at: AwareDatetime
+    superseded: bool
+    """
+    `true` when a later recorded run of the same tables retired this checkpoint for resume. The record is still missing. Always `false` for a `run_started` marker.
+    """
+    total_tables: conint(ge=0) | None = None
+    """
+    Tables the run planned to copy. Set for checkpoint evidence only.
+    """
 
 
 class RunHistoryRecord(BaseModel):
@@ -126,4 +169,8 @@ class HistoryOutput(BaseModel):
     command: str
     count: conint(ge=0)
     runs: list[RunHistoryRecord]
+    unrecorded_runs: list[UnrecordedRunRecord] | None = None
+    """
+    Runs that started — a replication run's checkpoint header or another run kind's start marker is in the ledger — but have NO run record: still running, crashed, or the record write failed (#1884). Their presence means `runs` is not the complete history. Not counted in `count`. Omitted when empty.
+    """
     version: str

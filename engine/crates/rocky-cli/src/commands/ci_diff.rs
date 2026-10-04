@@ -896,7 +896,7 @@ pub fn extract_base_compile_matching(
 
 /// [`extract_base_compile`], with the git invocations optionally rooted at an
 /// explicit repository directory. See [`git_in`].
-fn extract_base_compile_in(
+pub(crate) fn extract_base_compile_in(
     base_ref: &str,
     models_dir: &Path,
     source_schemas: HashMap<String, Vec<rocky_compiler::types::TypedColumn>>,

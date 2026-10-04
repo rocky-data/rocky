@@ -455,6 +455,65 @@ impl WarehouseAdapter for FailingWriteWarehouseAdapter {
     }
 }
 
+/// A Databricks-dialect warehouse for the #2234 view-governance guard.
+/// It answers the governance probe with canned rows (or a failure) and
+/// records every query and statement in order.
+pub(crate) struct GovernedViewWarehouse {
+    dialect: rocky_databricks::dialect::DatabricksSqlDialect,
+    probe: Result<Vec<Vec<serde_json::Value>>, String>,
+    log: std::sync::Mutex<Vec<String>>,
+}
+
+impl GovernedViewWarehouse {
+    pub(crate) fn new(probe: Result<Vec<Vec<serde_json::Value>>, String>) -> Self {
+        Self {
+            dialect: rocky_databricks::dialect::DatabricksSqlDialect,
+            probe,
+            log: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    pub(crate) fn log(&self) -> Vec<String> {
+        self.log.lock().unwrap().clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl rocky_core::traits::WarehouseAdapter for GovernedViewWarehouse {
+    fn dialect(&self) -> &dyn rocky_core::traits::SqlDialect {
+        &self.dialect
+    }
+
+    async fn execute_statement(&self, sql: &str) -> rocky_core::traits::AdapterResult<()> {
+        self.log.lock().unwrap().push(format!("statement: {sql}"));
+        Ok(())
+    }
+
+    async fn execute_query(
+        &self,
+        sql: &str,
+    ) -> rocky_core::traits::AdapterResult<rocky_core::traits::QueryResult> {
+        if !sql.contains("information_schema.table_tags") {
+            return Err(rocky_core::traits::AdapterError::msg("unexpected query"));
+        }
+        self.log.lock().unwrap().push("probe".to_string());
+        match &self.probe {
+            Ok(rows) => Ok(rocky_core::traits::QueryResult {
+                columns: vec![],
+                rows: rows.clone(),
+            }),
+            Err(msg) => Err(rocky_core::traits::AdapterError::msg(msg.clone())),
+        }
+    }
+
+    async fn describe_table(
+        &self,
+        _table: &rocky_ir::TableRef,
+    ) -> rocky_core::traits::AdapterResult<Vec<rocky_ir::ColumnInfo>> {
+        Err(rocky_core::traits::AdapterError::msg("no describe"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -880,57 +880,80 @@ pub async fn execute_content_addressed_model(
     // correctness surface. Partitioned models therefore record no per-column
     // hashes (empty ⇒ a safe rebuild in the later skip gate), scoping this
     // capture to unpartitioned tables first.
-    let (last_blake3, last_commit_version, last_file_path, total_size_bytes, output_column_hashes) =
-        if partition_columns.is_empty() {
-            let write_result = writer
-                .write_batch_with_state(batch, state)
-                .await
-                .map_err(|e| anyhow!("write_batch failed: {e}"))?;
-            (
-                write_result.blake3_hash,
-                write_result.commit_version,
-                write_result.file_path,
-                write_result.size_bytes,
-                write_result.column_hashes,
-            )
-        } else {
-            // Partitioned: group rows by partition tuple and emit one
-            // commit per group. Bump `state.next_commit_version` manually
-            // between groups so the cond-put loop in the writer doesn't
-            // burn a retry per group on the already-claimed version.
-            let groups =
-                group_batch_by_partition_tuple(&batch, partition_columns, &model_ir.typed_columns)?;
-            if groups.is_empty() {
-                return Err(anyhow!(
-                    "partitioned content_addressed: model SQL returned 0 rows; \
+    let (
+        last_blake3,
+        last_commit_version,
+        last_file_path,
+        total_size_bytes,
+        output_column_hashes,
+        written_files,
+    ) = if partition_columns.is_empty() {
+        let write_result = writer
+            .write_batch_with_state(batch, state)
+            .await
+            .map_err(|e| anyhow!("write_batch failed: {e}"))?;
+        let written_files = vec![WrittenFile {
+            blake3_hash: write_result.blake3_hash.clone(),
+            file_path: write_result.file_path.clone(),
+            commit_version: write_result.commit_version,
+            size_bytes: write_result.size_bytes,
+        }];
+        (
+            write_result.blake3_hash,
+            write_result.commit_version,
+            write_result.file_path,
+            write_result.size_bytes,
+            write_result.column_hashes,
+            written_files,
+        )
+    } else {
+        // Partitioned: group rows by partition tuple and emit one
+        // commit per group. Bump `state.next_commit_version` manually
+        // between groups so the cond-put loop in the writer doesn't
+        // burn a retry per group on the already-claimed version.
+        let groups =
+            group_batch_by_partition_tuple(&batch, partition_columns, &model_ir.typed_columns)?;
+        if groups.is_empty() {
+            return Err(anyhow!(
+                "partitioned content_addressed: model SQL returned 0 rows; \
                      no commits emitted (this is likely a bug in the model — fail loud rather \
                      than silent no-op)"
-                ));
-            }
-            let mut last_blake3 = String::new();
-            let mut last_commit_version = 0_u64;
-            let mut last_file_path = String::new();
-            let mut total_size_bytes = 0_u64;
-            for (pv_map, sub_batch) in groups {
-                let write_result = writer
-                    .write_partitioned_batch_with_state(sub_batch, pv_map, state.clone())
-                    .await
-                    .map_err(|e| anyhow!("write_partitioned_batch failed: {e}"))?;
-                state.next_commit_version = write_result.commit_version + 1;
-                last_blake3 = write_result.blake3_hash;
-                last_commit_version = write_result.commit_version;
-                last_file_path = write_result.file_path;
-                total_size_bytes = total_size_bytes.saturating_add(write_result.size_bytes);
-            }
-            (
-                last_blake3,
-                last_commit_version,
-                last_file_path,
-                total_size_bytes,
-                // Partitioned outputs: no per-column table hash (deferred fold).
-                Vec::new(),
-            )
-        };
+            ));
+        }
+        let mut last_blake3 = String::new();
+        let mut last_commit_version = 0_u64;
+        let mut last_file_path = String::new();
+        let mut total_size_bytes = 0_u64;
+        // Every group's file, so the ledger records one row per group
+        // rather than only the last group's hash.
+        let mut written_files = Vec::with_capacity(groups.len());
+        for (pv_map, sub_batch) in groups {
+            let write_result = writer
+                .write_partitioned_batch_with_state(sub_batch, pv_map, state.clone())
+                .await
+                .map_err(|e| anyhow!("write_partitioned_batch failed: {e}"))?;
+            state.next_commit_version = write_result.commit_version + 1;
+            written_files.push(WrittenFile {
+                blake3_hash: write_result.blake3_hash.clone(),
+                file_path: write_result.file_path.clone(),
+                commit_version: write_result.commit_version,
+                size_bytes: write_result.size_bytes,
+            });
+            last_blake3 = write_result.blake3_hash;
+            last_commit_version = write_result.commit_version;
+            last_file_path = write_result.file_path;
+            total_size_bytes = total_size_bytes.saturating_add(write_result.size_bytes);
+        }
+        (
+            last_blake3,
+            last_commit_version,
+            last_file_path,
+            total_size_bytes,
+            // Partitioned outputs: no per-column table hash (deferred fold).
+            Vec::new(),
+            written_files,
+        )
+    };
 
     // 7. Sync iceberg metadata so cross-engine readers see the new
     // commit(s). One MSCK call covers all the commits the partitioned loop
@@ -946,6 +969,7 @@ pub async fn execute_content_addressed_model(
         output_column_hashes,
         // A normal BUILD wrote fresh bytes — no point-to provenance.
         reused_from: None,
+        written_files,
     })
 }
 
@@ -1199,6 +1223,14 @@ async fn attempt_point_to_reuse(
         // still correct; this field is purely the run-output rows_copied
         // display.
         num_rows: write_result.num_records,
+        // The point-to references exactly one file: R's. Reuse is gated to
+        // unpartitioned targets (`eligible_shape`), so there is no group list.
+        written_files: vec![WrittenFile {
+            blake3_hash: write_result.blake3_hash.clone(),
+            file_path: write_result.file_path.clone(),
+            commit_version: write_result.commit_version,
+            size_bytes: write_result.size_bytes,
+        }],
         blake3_hash: write_result.blake3_hash,
         commit_version: write_result.commit_version,
         file_path: write_result.file_path,
@@ -1410,6 +1442,49 @@ pub struct ContentAddressedRunSummary {
     /// reuse case — by design, so the runner records the shared-bytes
     /// reference without re-counting.
     pub reused_from: Option<ReuseProvenance>,
+    /// Every parquet file this model run committed (or referenced, on a
+    /// point-to reuse), in commit order. One entry for an unpartitioned build
+    /// or a reuse; one entry **per partition group** for a partitioned build.
+    ///
+    /// The scalar `blake3_hash` / `file_path` / `commit_version` above carry
+    /// only the **last** file. The artifact ledger must record every file, or
+    /// the refcount sweep undercounts every group but the last. Use
+    /// [`artifact_records`] to build the ledger rows.
+    pub written_files: Vec<WrittenFile>,
+}
+
+/// One parquet file a content-addressed model run committed or referenced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WrittenFile {
+    pub blake3_hash: String,
+    pub file_path: String,
+    pub commit_version: u64,
+    pub size_bytes: u64,
+}
+
+/// Build one artifact ledger row per file in `summary.written_files`.
+///
+/// The ledger key is `{run_id}|{model_name}|{file_path}`, so each partition
+/// group lands on its own row with its own hash, commit version and size.
+pub(crate) fn artifact_records(
+    summary: &ContentAddressedRunSummary,
+    run_id: &str,
+    model_name: &str,
+    written_at: chrono::DateTime<chrono::Utc>,
+) -> Vec<rocky_core::state::ArtifactRecord> {
+    summary
+        .written_files
+        .iter()
+        .map(|file| rocky_core::state::ArtifactRecord {
+            blake3_hash: file.blake3_hash.clone(),
+            run_id: run_id.to_string(),
+            model_name: model_name.to_string(),
+            file_path: file.file_path.clone(),
+            commit_version: file.commit_version,
+            size_bytes: file.size_bytes,
+            written_at,
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -2405,6 +2480,252 @@ mod tests {
         let mut bad = serde_json::Map::new();
         bad.insert("stats".into(), serde_json::Value::String("not json".into()));
         assert_eq!(num_records_from_recovered_add(&bad), 0);
+    }
+
+    // --- Partitioned ledger: every group's hash (plans defect 1) -----------
+
+    /// A warehouse double that answers the model query with fixed rows and
+    /// accepts every statement (the post-commit MSCK). It borrows the
+    /// recording adapter's dialect so it states no SQL of its own.
+    struct FixedRowsWarehouse {
+        dialect_source: crate::testing::RecordingWarehouseAdapter,
+        result: QueryResult,
+    }
+
+    #[async_trait::async_trait]
+    impl rocky_core::traits::WarehouseAdapter for FixedRowsWarehouse {
+        fn dialect(&self) -> &dyn rocky_core::traits::SqlDialect {
+            self.dialect_source.dialect()
+        }
+        async fn execute_statement(&self, _sql: &str) -> rocky_core::traits::AdapterResult<()> {
+            Ok(())
+        }
+        async fn execute_query(
+            &self,
+            _sql: &str,
+        ) -> rocky_core::traits::AdapterResult<QueryResult> {
+            Ok(self.result.clone())
+        }
+        async fn describe_table(
+            &self,
+            _table: &rocky_ir::ir::TableRef,
+        ) -> rocky_core::traits::AdapterResult<Vec<rocky_ir::ir::ColumnInfo>> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// Seed a `v=0` bootstrap for an `(id BIGINT, region STRING)` table
+    /// partitioned by `region`.
+    async fn seed_region_partitioned_bootstrap(store: &InMemory, prefix: &str) {
+        let protocol = serde_json::json!({"protocol": {
+            "minReaderVersion": 2,
+            "minWriterVersion": 7,
+            "writerFeatures": ["columnMapping", "icebergCompatV2", "invariants", "appendOnly"],
+        }});
+        let metadata = serde_json::json!({"metaData": {
+            "id": "00000000-0000-0000-0000-000000000000",
+            "format": {"provider": "parquet", "options": {}},
+            "schemaString": serde_json::to_string(&serde_json::json!({
+                "type": "struct",
+                "fields": [
+                    {"name": "id", "type": "long", "nullable": false, "metadata": {
+                        "delta.columnMapping.id": 1,
+                        "delta.columnMapping.physicalName": "col-id-uuid"
+                    }},
+                    {"name": "region", "type": "string", "nullable": false, "metadata": {
+                        "delta.columnMapping.id": 2,
+                        "delta.columnMapping.physicalName": "col-region-uuid"
+                    }}
+                ]
+            })).unwrap(),
+            "partitionColumns": ["region"],
+            "configuration": {
+                "delta.columnMapping.mode": "name",
+                "delta.universalFormat.enabledFormats": "iceberg",
+                "delta.enableIcebergCompatV2": "true"
+            },
+            "createdTime": 0
+        }});
+        let body = format!(
+            "{}\n{}\n",
+            serde_json::to_string(&protocol).unwrap(),
+            serde_json::to_string(&metadata).unwrap(),
+        );
+        store
+            .put(
+                &ObjPath::from(format!("{prefix}/_delta_log/00000000000000000000.json")),
+                PutPayload::from(body.into_bytes()),
+            )
+            .await
+            .unwrap();
+    }
+
+    fn fixed_rows_warehouse(key: &str, result: QueryResult) -> FixedRowsWarehouse {
+        FixedRowsWarehouse {
+            dialect_source: crate::testing::RecordingWarehouseAdapter::new(key),
+            result,
+        }
+    }
+
+    /// A partitioned content-addressed build must hand back one written file
+    /// per partition group, and the ledger rows built from it must give every
+    /// group's hash a refcount of 1. Before the fix only the last group's hash
+    /// reached the ledger, so the other groups had a refcount of 0 and the
+    /// refcount sweep saw their live files as unreferenced.
+    #[tokio::test]
+    async fn partitioned_build_records_every_group_hash_in_the_ledger() {
+        use rocky_ir::{GovernanceConfig, TargetRef};
+
+        let prefix = format!("partitioned_ledger_{}", uuid::Uuid::new_v4().simple());
+        let storage_prefix = format!("s3://test-bucket/{prefix}");
+        let store: Arc<InMemory> = Arc::new(InMemory::new());
+        seed_region_partitioned_bootstrap(&store, &prefix).await;
+        register_test_object_store(&storage_prefix, store.clone() as Arc<dyn ObjectStore>);
+
+        let mut model = ModelIr::transformation(
+            TargetRef {
+                catalog: "c".into(),
+                schema: "s".into(),
+                table: "t".into(),
+            },
+            MaterializationStrategy::ContentAddressed {
+                storage_prefix: storage_prefix.clone(),
+                partition_columns: vec!["region".to_string()],
+            },
+            vec![],
+            "SELECT id, region FROM src".into(),
+            GovernanceConfig {
+                permissions_file: None,
+                auto_create_catalogs: false,
+                auto_create_schemas: false,
+            },
+            None,
+            None,
+        );
+        model.name = Arc::from("fct_regions");
+        model.typed_columns = vec![
+            col("id", RockyType::Int64, false),
+            col("region", RockyType::String, false),
+        ];
+        // Three partition groups: eu, us, ap.
+        let warehouse = fixed_rows_warehouse(
+            "run_content_addressed::partitioned-ledger",
+            QueryResult {
+                columns: vec!["id".into(), "region".into()],
+                rows: vec![
+                    vec![serde_json::json!(1), serde_json::json!("eu")],
+                    vec![serde_json::json!(2), serde_json::json!("us")],
+                    vec![serde_json::json!(3), serde_json::json!("eu")],
+                    vec![serde_json::json!(4), serde_json::json!("ap")],
+                ],
+            },
+        );
+
+        let summary = execute_content_addressed_model(&model, &warehouse, None)
+            .await
+            .expect("partitioned build must succeed");
+
+        // One file per group, in commit order, each with its own commit.
+        assert_eq!(
+            summary.written_files.len(),
+            3,
+            "{:?}",
+            summary.written_files
+        );
+        let versions: Vec<u64> = summary
+            .written_files
+            .iter()
+            .map(|f| f.commit_version)
+            .collect();
+        assert_eq!(versions, vec![1, 2, 3]);
+        let distinct: std::collections::HashSet<&str> = summary
+            .written_files
+            .iter()
+            .map(|f| f.blake3_hash.as_str())
+            .collect();
+        assert_eq!(
+            distinct.len(),
+            3,
+            "each group's bytes differ, so each hash differs"
+        );
+        // The scalar fields still describe the last file; the size is the total.
+        let last = summary.written_files.last().unwrap();
+        assert_eq!(summary.blake3_hash, last.blake3_hash);
+        assert_eq!(summary.file_path, last.file_path);
+        assert_eq!(
+            summary.size_bytes,
+            summary
+                .written_files
+                .iter()
+                .map(|f| f.size_bytes)
+                .sum::<u64>()
+        );
+
+        // The ledger built from the summary: one row per group, refcount 1 each.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = rocky_core::state::StateStore::open(&tmp.path().join("state.redb")).unwrap();
+        let rows = artifact_records(&summary, "run-p", "fct_regions", chrono::Utc::now());
+        assert_eq!(rows.len(), 3);
+        for row in &rows {
+            state.record_artifact(row).unwrap();
+        }
+        assert_eq!(state.list_artifacts_for_run("run-p").unwrap().len(), 3);
+        for file in &summary.written_files {
+            assert_eq!(
+                state.refcount_for_hash(&file.blake3_hash).unwrap(),
+                1,
+                "group hash {} must be referenced exactly once",
+                file.blake3_hash
+            );
+            let row = state
+                .get_artifact("run-p", "fct_regions", &file.file_path)
+                .unwrap()
+                .expect("one ledger row per group file");
+            assert_eq!(row.commit_version, file.commit_version);
+            assert_eq!(row.size_bytes, file.size_bytes);
+        }
+    }
+
+    /// An unpartitioned build still yields exactly one written file, equal to
+    /// the scalar summary fields, so its ledger row is unchanged.
+    #[tokio::test]
+    async fn unpartitioned_build_records_one_file_matching_the_summary() {
+        let prefix = format!("unpartitioned_ledger_{}", uuid::Uuid::new_v4().simple());
+        let storage_prefix = format!("s3://test-bucket/{prefix}");
+        let store: Arc<InMemory> = Arc::new(InMemory::new());
+        seed_id_only_bootstrap(&store, &prefix).await;
+        register_test_object_store(&storage_prefix, store.clone() as Arc<dyn ObjectStore>);
+
+        let mut model = dummy_model_ir();
+        model.materialization = MaterializationStrategy::ContentAddressed {
+            storage_prefix: storage_prefix.clone(),
+            partition_columns: vec![],
+        };
+        model.typed_columns = vec![col("id", RockyType::Int64, false)];
+        let warehouse = fixed_rows_warehouse(
+            "run_content_addressed::unpartitioned-ledger",
+            QueryResult {
+                columns: vec!["id".into()],
+                rows: vec![vec![serde_json::json!(7)], vec![serde_json::json!(8)]],
+            },
+        );
+
+        let summary = execute_content_addressed_model(&model, &warehouse, None)
+            .await
+            .expect("unpartitioned build must succeed");
+        assert_eq!(
+            summary.written_files,
+            vec![WrittenFile {
+                blake3_hash: summary.blake3_hash.clone(),
+                file_path: summary.file_path.clone(),
+                commit_version: summary.commit_version,
+                size_bytes: summary.size_bytes,
+            }]
+        );
+        let rows = artifact_records(&summary, "run-u", "fct_orders", chrono::Utc::now());
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].blake3_hash, summary.blake3_hash);
+        assert_eq!(rows[0].file_path, summary.file_path);
     }
 }
 

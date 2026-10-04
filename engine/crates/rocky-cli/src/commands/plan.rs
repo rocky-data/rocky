@@ -99,6 +99,14 @@ pub async fn plan(
     state_path: &Path,
     output_json: bool,
 ) -> Result<()> {
+    // #2239: an agent-authored run plan is reviewable, and a reviewed approval
+    // does not yet cover the models a `--dag` apply dispatches. Refuse before
+    // any work, so no such plan is persisted.
+    anyhow::ensure!(
+        !(run_options.dag && run_options.principal == Some(PolicyPrincipal::Agent)),
+        "{}",
+        super::review::reviewable_dag_refusal("`rocky plan --dag --principal agent`")
+    );
     if let Some(branch_name) = run_options.branch.as_deref() {
         crate::commands::branch::validate_branch_name_pub(branch_name)?;
     }
@@ -340,6 +348,16 @@ pub async fn plan(
             // with the 1970 sentinel watermark the runner replaces at execute
             // time, merge → MERGE INTO, view / materialized_view → their DDL).
             let sql = replication_copy_sql(&model_ir, dialect)?;
+
+            if matches!(model_ir.materialization, MaterializationStrategy::View)
+                && let Some(check) = view_governance_check_preview(dialect, &model_ir.target)
+            {
+                output.statements.push(PlannedStatement {
+                    purpose: "view_governance_check".into(),
+                    target: target_label.clone(),
+                    sql: check,
+                });
+            }
 
             output.statements.push(PlannedStatement {
                 purpose: purpose.into(),
@@ -905,6 +923,33 @@ fn replication_copy_purpose(strategy: &MaterializationStrategy) -> &'static str 
         MaterializationStrategy::MaterializedView => "materialized_view",
         _ => "full_refresh_copy",
     }
+}
+
+/// The `view_governance_check` preview row for a view `rocky run` replaces
+/// (#2234). `None` when the dialect has no governance probe.
+///
+/// The row shows the probe `rocky run` sends before its `CREATE OR REPLACE
+/// VIEW`. The probe reads live catalog state, so the offline plan cannot
+/// show its answer. It shows the check and the rule instead.
+pub(crate) fn view_governance_check_preview(
+    dialect: &dyn SqlDialect,
+    target: &TargetRef,
+) -> Option<String> {
+    let probe = dialect.view_governance_probe_sql(&TableRef {
+        catalog: target.catalog.clone(),
+        schema: target.schema.clone(),
+        table: target.table.clone(),
+    })?;
+    Some(match probe {
+        Ok(sql) => format!(
+            "-- rocky run refuses to replace this view when the probe returns a tag the \
+             model does not declare, or any row filter or column mask (#2234)\n{sql}"
+        ),
+        Err(e) => format!(
+            "-- rocky run refuses to replace this view: cannot build the governance \
+             probe: {e} (#2234)"
+        ),
+    })
 }
 
 /// Render the forward-looking copy SQL for one replication table, matching the
@@ -1512,6 +1557,16 @@ fn plan_preview_output_for_pipeline(
                         purpose: "conditional_drop".to_string(),
                         target: target_label.clone(),
                         sql: drop,
+                    });
+                }
+                if matches!(model_ir.materialization, MaterializationStrategy::View)
+                    && let Some(check) =
+                        view_governance_check_preview(dialect.as_ref(), &model_ir.target)
+                {
+                    output.statements.push(PlannedStatement {
+                        purpose: "view_governance_check".to_string(),
+                        target: target_label.clone(),
+                        sql: check,
                     });
                 }
                 // Multi-statement strategies (DeleteInsert, lakehouse DDL)
@@ -3151,6 +3206,44 @@ mod tests {
         assert!(!message.contains("failed to load config"), "{message}");
     }
 
+    /// #2239: an agent-authored `--dag` plan is reviewable, and its approval
+    /// cannot cover the models the DAG dispatches. `rocky plan` refuses it
+    /// before any config IO, so no such plan is persisted. A human `--dag`
+    /// plan is not reviewable and is not refused by this guard.
+    #[tokio::test]
+    async fn plan_refuses_agent_dag_before_config_io() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing_config = temp.path().join("missing.toml");
+        let state = temp.path().join("missing.redb");
+        let run = |principal| {
+            let options = super::PlanRunOptions {
+                dag: true,
+                principal,
+                ..Default::default()
+            };
+            let (config, state) = (missing_config.clone(), state.clone());
+            async move {
+                format!(
+                    "{:#}",
+                    super::plan(
+                        &config, None, None, None, &options, false, "main", &state, false
+                    )
+                    .await
+                    .unwrap_err()
+                )
+            }
+        };
+        let agent = run(Some(rocky_core::config::PolicyPrincipal::Agent)).await;
+        assert_eq!(
+            agent,
+            super::super::review::reviewable_dag_refusal("`rocky plan --dag --principal agent`")
+        );
+        for principal in [None, Some(rocky_core::config::PolicyPrincipal::Human)] {
+            let human = run(principal).await;
+            assert!(human.contains("failed to load config"), "{human}");
+        }
+    }
+
     /// The identity must change across a state-schema version bump, because the
     /// remote ledger key embeds it. Without this a plan made under one version
     /// compares equal under the next while reading a different object.
@@ -3416,6 +3509,33 @@ mod tests {
             !sql.contains("INSERT INTO"),
             "view must not preview as an INSERT (the pre-fix regression), got:\n{sql}"
         );
+    }
+
+    /// #2234: the plan shows the governance probe `rocky run` sends before
+    /// it replaces a Databricks view, with the same SQL the run uses. A
+    /// dialect without a probe shows no check row.
+    #[test]
+    fn view_preview_shows_the_governance_check_run_performs() {
+        let ir = replication_ir(MaterializationStrategy::View);
+        let databricks = dialect_for_adapter_type("databricks");
+        let check = view_governance_check_preview(databricks.as_ref(), &ir.target)
+            .expect("databricks previews the governance check");
+        let probe = databricks
+            .view_governance_probe_sql(&TableRef {
+                catalog: ir.target.catalog.clone(),
+                schema: ir.target.schema.clone(),
+                table: ir.target.table.clone(),
+            })
+            .unwrap()
+            .unwrap();
+        assert!(
+            check.starts_with("-- rocky run refuses to replace this view"),
+            "{check}"
+        );
+        assert!(check.ends_with(&probe), "{check}");
+
+        let duckdb = dialect_for_adapter_type("duckdb");
+        assert!(view_governance_check_preview(duckdb.as_ref(), &ir.target).is_none());
     }
 
     #[test]

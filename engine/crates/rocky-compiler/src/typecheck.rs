@@ -6,6 +6,7 @@
 //! incompatibilities, and provides diagnostics with suggestions.
 
 use std::collections::{HashMap, HashSet};
+use std::ops::ControlFlow;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -13,7 +14,7 @@ use std::time::Instant;
 
 use indexmap::IndexMap;
 use rayon::prelude::*;
-use sqlparser::ast::{self, Expr, SelectItem, SetExpr, Statement, TableFactor};
+use sqlparser::ast::{self, Expr, SelectItem, SetExpr, Statement, TableFactor, Visit, Visitor};
 use sqlparser::parser::Parser;
 
 use crate::compile::default_type_mapper;
@@ -964,7 +965,7 @@ fn has_provably_fixed_output_names(sql: &str) -> bool {
 /// | E021  | Error    | `time_column` is not a date/timestamp type |
 /// | E022  | Error    | `time_column` is nullable |
 /// | E023  | Error    | `time_column` failed SQL identifier validation |
-/// | E024  | Error    | Either `@start_date` or `@end_date` absent from SQL |
+/// | E024  | Error    | `@start_date` or `@end_date` does not filter the emitted rows |
 /// | E025  | Error    | `granularity = "hour"` requires TIMESTAMP, not DATE |
 /// | E026  | Error    | `first_partition` is not a valid canonical key for grain |
 fn check_time_interval_strategy(
@@ -1456,19 +1457,47 @@ fn watermark_is_direct_passthrough(sql: &str, watermark: &str) -> bool {
     }
 }
 
-/// E024 — both `@start_date` and `@end_date` must appear in the model SQL.
+/// E024 — both `@start_date` and `@end_date` must bound the rows the model
+/// emits.
+///
+/// A placeholder counts only where it filters rows: a `WHERE`, `HAVING`,
+/// `QUALIFY` or `PREWHERE` clause, or the `ON` clause of an inner or semi
+/// join. A placeholder in a comment, inside a longer string literal, or only
+/// in the projection does not count (#2233): such a model copies every source
+/// row on each partition run. The quoted form `'@start_date'` counts, because
+/// the runtime substitutes it like the bare form.
+///
+/// When the SQL does not parse, the check cannot see where the placeholders
+/// are, so it fails closed with E024.
 fn check_time_interval_placeholders(model_name: &str, sql: &str) -> Vec<Diagnostic> {
+    let Ok(statements) = Parser::parse_sql(&rocky_sql::dialect::DatabricksDialect, sql) else {
+        return vec![
+            Diagnostic::error(
+                E024,
+                model_name,
+                "time_interval model SQL does not parse, so Rocky cannot verify that \
+                 `@start_date` and `@end_date` bound the rows it emits",
+            )
+            .with_suggestion(
+                "Write the model as one SELECT with `WHERE <ts_col> >= @start_date AND \
+                 <ts_col> < @end_date`",
+            ),
+        ];
+    };
+    let mut scan = WindowFilterScan::default();
+    // `pre_visit_query` never breaks, so the visit always runs to the end.
+    let _ = statements.visit(&mut scan);
     let mut diags = Vec::new();
-    let has_start = contains_placeholder(sql, "@start_date");
-    let has_end = contains_placeholder(sql, "@end_date");
-    match (has_start, has_end) {
+    match (scan.start, scan.end) {
         (true, true) => {}
         (false, false) => {
             diags.push(
                 Diagnostic::error(
                     E024,
                     model_name,
-                    "time_interval model must reference both `@start_date` and `@end_date` in its SQL",
+                    "time_interval model must filter its rows on both `@start_date` and \
+                     `@end_date` (in a WHERE, HAVING, QUALIFY or inner JOIN ON clause; a \
+                     comment, a string literal or the SELECT list does not count)",
                 )
                 .with_suggestion(
                     "Add `WHERE <ts_col> >= @start_date AND <ts_col> < @end_date` to the model SQL",
@@ -1480,7 +1509,7 @@ fn check_time_interval_placeholders(model_name: &str, sql: &str) -> Vec<Diagnost
                 Diagnostic::error(
                     E024,
                     model_name,
-                    "time_interval model references `@start_date` but not `@end_date` — partition window is unbounded above",
+                    "time_interval model filters on `@start_date` but not `@end_date` — partition window is unbounded above",
                 )
                 .with_suggestion("Add `AND <ts_col> < @end_date` to bound the upper end of the window"),
             );
@@ -1490,7 +1519,7 @@ fn check_time_interval_placeholders(model_name: &str, sql: &str) -> Vec<Diagnost
                 Diagnostic::error(
                     E024,
                     model_name,
-                    "time_interval model references `@end_date` but not `@start_date` — partition window is unbounded below",
+                    "time_interval model filters on `@end_date` but not `@start_date` — partition window is unbounded below",
                 )
                 .with_suggestion("Add `<ts_col> >= @start_date AND` to bound the lower end of the window"),
             );
@@ -1499,25 +1528,107 @@ fn check_time_interval_placeholders(model_name: &str, sql: &str) -> Vec<Diagnost
     diags
 }
 
-/// Match a placeholder as a whole token (word boundary on the right side).
-/// `@start_date` matches `@start_date AND` but not `@start_date_extra`.
-fn contains_placeholder(sql: &str, placeholder: &str) -> bool {
-    let bytes = sql.as_bytes();
-    let needle = placeholder.as_bytes();
-    let mut i = 0;
-    while i + needle.len() <= bytes.len() {
-        if &bytes[i..i + needle.len()] == needle {
-            // Trailing character must not be an identifier character.
-            let trailing = bytes.get(i + needle.len()).copied();
-            let is_word_char =
-                matches!(trailing, Some(c) if c.is_ascii_alphanumeric() || c == b'_');
-            if !is_word_char {
-                return true;
+/// Records whether `@start_date` / `@end_date` appear in a row filter of any
+/// `SELECT` in a statement. The visitor reaches every nested query (CTEs,
+/// derived tables, subqueries); each query's own `SELECT`s are scanned here.
+///
+/// The scan does not prove that a filter dominates the output: a `UNION ALL`
+/// branch or an unused CTE can still carry the only filter.
+#[derive(Default)]
+struct WindowFilterScan {
+    start: bool,
+    end: bool,
+}
+
+impl Visitor for WindowFilterScan {
+    type Break = ();
+
+    fn pre_visit_query(&mut self, query: &ast::Query) -> ControlFlow<Self::Break> {
+        self.scan_set_expr(&query.body);
+        ControlFlow::Continue(())
+    }
+}
+
+impl WindowFilterScan {
+    fn scan_set_expr(&mut self, body: &SetExpr) {
+        match body {
+            SetExpr::Select(select) => self.scan_select(select),
+            SetExpr::SetOperation { left, right, .. } => {
+                self.scan_set_expr(left);
+                self.scan_set_expr(right);
+            }
+            // A nested `Query` is reached by the visitor itself. The other
+            // sqlparser bodies (VALUES, TABLE, DML, ...) carry no row filter.
+            _ => {}
+        }
+    }
+
+    fn scan_select(&mut self, select: &ast::Select) {
+        for filter in [
+            &select.selection,
+            &select.having,
+            &select.qualify,
+            &select.prewhere,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            self.scan_filter(filter);
+        }
+        for table in &select.from {
+            self.scan_table_with_joins(table);
+        }
+    }
+
+    fn scan_table_with_joins(&mut self, table: &ast::TableWithJoins) {
+        self.scan_nested_join(&table.relation);
+        for join in &table.joins {
+            self.scan_nested_join(&join.relation);
+            // Only an `ON` that drops non-matching rows bounds the output.
+            // An outer or anti join keeps rows the `ON` does not match.
+            let constraint = match &join.join_operator {
+                ast::JoinOperator::Join(c)
+                | ast::JoinOperator::Inner(c)
+                | ast::JoinOperator::StraightJoin(c)
+                | ast::JoinOperator::Semi(c)
+                | ast::JoinOperator::LeftSemi(c)
+                | ast::JoinOperator::RightSemi(c) => c,
+                _ => continue,
+            };
+            if let ast::JoinConstraint::On(on) = constraint {
+                self.scan_filter(on);
             }
         }
-        i += 1;
     }
-    false
+
+    fn scan_nested_join(&mut self, relation: &TableFactor) {
+        if let TableFactor::NestedJoin {
+            table_with_joins, ..
+        } = relation
+        {
+            self.scan_table_with_joins(table_with_joins);
+        }
+    }
+
+    fn scan_filter(&mut self, filter: &Expr) {
+        let _ = ast::visit_expressions(filter, |expr| {
+            if let Expr::Value(v) = expr {
+                // The runtime substitutes the bare placeholder and the
+                // whole-literal quoted form `'@start_date'` alike.
+                let token = match &v.value {
+                    ast::Value::Placeholder(p) => p.as_str(),
+                    ast::Value::SingleQuotedString(s) => s.as_str(),
+                    _ => "",
+                };
+                match token {
+                    "@start_date" => self.start = true,
+                    "@end_date" => self.end = true,
+                    _ => {}
+                }
+            }
+            ControlFlow::<()>::Continue(())
+        });
+    }
 }
 
 /// E026 — `first_partition`, if present, must parse to a canonical key for
@@ -5245,8 +5356,7 @@ mod tests {
 
     #[test]
     fn test_placeholder_word_boundary() {
-        // `@start_date_extra` should NOT match `@start_date`. Test the
-        // word-boundary logic in contains_placeholder.
+        // `@start_date_extra` should NOT match `@start_date`.
         let mut model = make_time_interval_model("m", "order_date", TimeGrain::Day, None);
         model.sql = "SELECT order_date FROM upstream WHERE x = @start_date_extra".into();
         let cols = vec![typed_col("order_date", RockyType::Date, false)];
@@ -5254,6 +5364,78 @@ mod tests {
         // Should fire E024 (neither placeholder present, since @start_date_extra
         // doesn't count).
         assert!(diags.iter().any(|d| &*d.code == "E024"));
+    }
+
+    /// E024 verdict for one SQL body: `true` when E024 fires as an error.
+    fn e024_fires(sql: &str) -> bool {
+        let mut model = make_time_interval_model("m", "order_date", TimeGrain::Day, None);
+        model.sql = sql.into();
+        let cols = vec![typed_col("order_date", RockyType::Date, false)];
+        check_time_interval_strategy(&model, &cols)
+            .iter()
+            .any(|d| &*d.code == "E024" && d.is_error())
+    }
+
+    /// #2233: placeholders that bound nothing must not satisfy E024. Each of
+    /// these bodies copies every source row on every partition run.
+    #[test]
+    fn test_e024_placeholders_that_bound_nothing() {
+        for sql in [
+            // The issue's repro: only in a block comment.
+            "SELECT order_date FROM upstream /* @start_date @end_date */",
+            // Only in a line comment.
+            "SELECT order_date FROM upstream -- @start_date @end_date\n",
+            // Inside a longer string literal in the WHERE.
+            "SELECT order_date FROM upstream WHERE note <> 'x @start_date @end_date'",
+            // Only in the SELECT list.
+            "SELECT order_date, @start_date AS s, @end_date AS e FROM upstream",
+            // A LEFT JOIN ON keeps every left row whatever the ON says.
+            "SELECT u.order_date FROM upstream u LEFT JOIN cal c \
+             ON u.order_date >= @start_date AND u.order_date < @end_date",
+            // One bound in a filter, the other only in a comment.
+            "SELECT order_date FROM upstream WHERE order_date >= @start_date /* @end_date */",
+        ] {
+            assert!(e024_fires(sql), "E024 must fire for: {sql}");
+        }
+    }
+
+    /// The filter positions that do bound the rows keep passing E024.
+    #[test]
+    fn test_e024_placeholders_in_row_filters_pass() {
+        for sql in [
+            "SELECT order_date FROM upstream \
+             WHERE order_date >= @start_date AND order_date < @end_date",
+            // The quoted form, which the runtime also substitutes.
+            "SELECT order_date FROM upstream \
+             WHERE order_date >= '@start_date' AND order_date < '@end_date'",
+            // In a CTE.
+            "WITH w AS (SELECT order_date FROM upstream \
+             WHERE order_date >= @start_date AND order_date < @end_date) \
+             SELECT order_date FROM w",
+            // In a derived table.
+            "SELECT * FROM (SELECT order_date FROM upstream \
+             WHERE order_date BETWEEN @start_date AND @end_date) AS x",
+            // In an inner JOIN ON.
+            "SELECT u.order_date FROM upstream u JOIN cal c \
+             ON u.order_date >= @start_date AND u.order_date < @end_date",
+            // In HAVING.
+            "SELECT order_date FROM upstream GROUP BY order_date \
+             HAVING order_date >= @start_date AND order_date < @end_date",
+            // A comment beside a real filter is harmless.
+            "SELECT order_date FROM upstream /* @start_date */ \
+             WHERE order_date >= @start_date AND order_date < @end_date",
+        ] {
+            assert!(!e024_fires(sql), "E024 must not fire for: {sql}");
+        }
+    }
+
+    /// SQL that does not parse cannot be checked, so E024 fails closed.
+    #[test]
+    fn test_e024_unparseable_sql_fails_closed() {
+        assert!(e024_fires(
+            "SELECT order_date FROM upstream WHERE order_date >= @start_date \
+             AND order_date < @end_date AND ((("
+        ));
     }
 
     // ----- W006: merge unique_key existence -----

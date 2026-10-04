@@ -205,6 +205,72 @@
         "status"
       ],
       "type": "object"
+    },
+    "UnrecordedRunEvidence": {
+      "description": "What left an [`UnrecordedRunRecord`] in the ledger (#1884).",
+      "oneOf": [
+        {
+          "description": "A replication run's resume checkpoint header.",
+          "enum": [
+            "checkpoint"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "A non-replication run's start marker (transformation, quality, snapshot, model-only, backfill).",
+          "enum": [
+            "run_started"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "UnrecordedRunRecord": {
+      "description": "A run whose start is in the ledger but whose run record is not (#1884). See [`HistoryOutput::unrecorded_runs`].",
+      "properties": {
+        "evidence": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/UnrecordedRunEvidence"
+            }
+          ],
+          "description": "The ledger evidence the run left: a replication `checkpoint` header or, for every other run kind, a `run_started` marker."
+        },
+        "pipeline": {
+          "description": "The pipeline the run was building, when recorded.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "run_id": {
+          "type": "string"
+        },
+        "started_at": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "superseded": {
+          "description": "`true` when a later recorded run of the same tables retired this checkpoint for resume. The record is still missing. Always `false` for a `run_started` marker.",
+          "type": "boolean"
+        },
+        "total_tables": {
+          "description": "Tables the run planned to copy. Set for checkpoint evidence only.",
+          "format": "uint",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "evidence",
+        "run_id",
+        "started_at",
+        "superseded"
+      ],
+      "type": "object"
     }
   },
   "description": "JSON output for `rocky history` (all runs view).\n\nWhen invoked with `--model <name>`, the dispatch returns `ModelHistoryOutput` instead. The two shapes share the version/command header but differ in their primary collection field, which is why they are separate types rather than one enum.",
@@ -220,6 +286,13 @@
     "runs": {
       "items": {
         "$ref": "#/definitions/RunHistoryRecord"
+      },
+      "type": "array"
+    },
+    "unrecorded_runs": {
+      "description": "Runs that started — a replication run's checkpoint header or another run kind's start marker is in the ledger — but have NO run record: still running, crashed, or the record write failed (#1884). Their presence means `runs` is not the complete history. Not counted in `count`. Omitted when empty.",
+      "items": {
+        "$ref": "#/definitions/UnrecordedRunRecord"
       },
       "type": "array"
     },

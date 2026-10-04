@@ -48,7 +48,8 @@ pub const E021: &str = "E021";
 pub const E022: &str = "E022";
 /// `time_column` failed SQL identifier validation.
 pub const E023: &str = "E023";
-/// Neither `@start_date` nor `@end_date` referenced in the model SQL.
+/// `@start_date` or `@end_date` does not filter the rows a `time_interval`
+/// model emits (absent, or only in a comment, string or the SELECT list).
 pub const E024: &str = "E024";
 /// `granularity = "hour"` requires a TIMESTAMP column, not DATE.
 pub const E025: &str = "E025";

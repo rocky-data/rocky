@@ -7,8 +7,44 @@
 use std::fmt::Write;
 
 use rocky_core::traits::{AdapterError, AdapterResult, LiteralEscape, SqlDialect};
-use rocky_ir::{ColumnSelection, MetadataColumn};
+use rocky_ir::{ColumnSelection, MetadataColumn, TableRef};
 use rocky_sql::validation;
+
+/// Builds the governance probe for [`SqlDialect::view_governance_probe_sql`].
+///
+/// The catalog goes through the same identifier validation as every target
+/// reference. The schema and view names are string literals, matched
+/// case-insensitively because Unity Catalog stores names lower-cased.
+fn view_governance_probe_sql(
+    dialect: &DatabricksSqlDialect,
+    view: &TableRef,
+) -> AdapterResult<String> {
+    dialect.format_table_ref(&view.catalog, &view.schema, &view.table)?;
+    let info = format!(
+        "{}.information_schema",
+        dialect.quote_identifier(&view.catalog)
+    );
+    let schema = rocky_core::sql_gen::string_literal(dialect, &view.schema);
+    let name = rocky_core::sql_gen::string_literal(dialect, &view.table);
+    let tag_filter =
+        format!("lower(schema_name) = lower({schema}) AND lower(table_name) = lower({name})");
+    let policy_filter =
+        format!("lower(table_schema) = lower({schema}) AND lower(table_name) = lower({name})");
+    Ok(format!(
+        "SELECT 'table_tag' AS kind, CAST(NULL AS STRING) AS column_name, \
+         tag_name AS name, tag_value AS value \
+         FROM {info}.table_tags WHERE {tag_filter}\n\
+         UNION ALL\n\
+         SELECT 'column_tag', column_name, tag_name, tag_value \
+         FROM {info}.column_tags WHERE {tag_filter}\n\
+         UNION ALL\n\
+         SELECT 'row_filter', CAST(NULL AS STRING), filter_name, CAST(NULL AS STRING) \
+         FROM {info}.row_filters WHERE {policy_filter}\n\
+         UNION ALL\n\
+         SELECT 'column_mask', column_name, mask_name, CAST(NULL AS STRING) \
+         FROM {info}.column_masks WHERE {policy_filter}"
+    ))
+}
 
 /// Databricks SQL dialect for Unity Catalog.
 ///
@@ -254,6 +290,17 @@ impl SqlDialect for DatabricksSqlDialect {
         Ok(format!(
             "CREATE OR REPLACE MATERIALIZED VIEW {target} AS\n{select_sql}"
         ))
+    }
+
+    /// Lists a view's table tags, column tags, row filters and column masks
+    /// from the catalog's `information_schema` (#2234).
+    ///
+    /// Unity Catalog drops all four when `CREATE OR REPLACE VIEW` replaces
+    /// the view. The rows follow the `kind, column_name, name, value` shape
+    /// that [`rocky_core::view_governance::parse_probe_rows`] reads. A view
+    /// that does not exist yet returns no rows.
+    fn view_governance_probe_sql(&self, view: &TableRef) -> Option<AdapterResult<String>> {
+        Some(view_governance_probe_sql(self, view))
     }
 
     fn row_hash_expr(&self, columns: &[String]) -> AdapterResult<String> {
@@ -629,6 +676,48 @@ mod tests {
             sql,
             "CREATE OR REPLACE VIEW cat.sch.tbl AS\nSELECT * FROM src"
         );
+    }
+
+    #[test]
+    fn view_governance_probe_reads_tags_filters_and_masks() {
+        let d = dialect();
+        let view = TableRef {
+            catalog: "cat".into(),
+            schema: "Sch".into(),
+            table: "v".into(),
+        };
+        let sql = d
+            .view_governance_probe_sql(&view)
+            .expect("databricks probes view governance")
+            .unwrap();
+        for source in [
+            "FROM `cat`.information_schema.table_tags WHERE lower(schema_name) = lower('Sch') AND lower(table_name) = lower('v')",
+            "FROM `cat`.information_schema.column_tags WHERE lower(schema_name) = lower('Sch') AND lower(table_name) = lower('v')",
+            "FROM `cat`.information_schema.row_filters WHERE lower(table_schema) = lower('Sch') AND lower(table_name) = lower('v')",
+            "FROM `cat`.information_schema.column_masks WHERE lower(table_schema) = lower('Sch') AND lower(table_name) = lower('v')",
+        ] {
+            assert!(sql.contains(source), "missing {source} in:\n{sql}");
+        }
+        assert_eq!(sql.matches("UNION ALL").count(), 3, "{sql}");
+        for kind in [
+            "'table_tag'",
+            "'column_tag'",
+            "'row_filter'",
+            "'column_mask'",
+        ] {
+            assert!(sql.contains(kind), "missing {kind} in:\n{sql}");
+        }
+    }
+
+    #[test]
+    fn view_governance_probe_refuses_an_invalid_identifier() {
+        let d = dialect();
+        let view = TableRef {
+            catalog: "cat`; DROP".into(),
+            schema: "s".into(),
+            table: "v".into(),
+        };
+        assert!(d.view_governance_probe_sql(&view).unwrap().is_err());
     }
 
     #[test]

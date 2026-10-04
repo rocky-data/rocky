@@ -1632,6 +1632,58 @@ mod time_interval_e2e {
         );
     }
 
+    /// #2233: a body whose placeholders sit only in a comment filters
+    /// nothing, so the sentinel window cannot empty it. The bootstrap must
+    /// still create a zero-row table and not copy the source rows.
+    #[tokio::test]
+    async fn test_time_interval_bootstrap_is_empty_when_placeholders_filter_nothing() {
+        let adapter = DuckDbWarehouseAdapter::in_memory().expect("open duckdb");
+        adapter
+            .execute_statement(
+                "CREATE TABLE main.events (id INTEGER NOT NULL, event_at TIMESTAMP NOT NULL)",
+            )
+            .await
+            .expect("create source");
+        // One row far outside any partition the test would run.
+        adapter
+            .execute_statement(
+                "INSERT INTO main.events VALUES (1, TIMESTAMP '2020-01-01 00:00:00')",
+            )
+            .await
+            .expect("insert out-of-partition row");
+
+        let mut plan = time_interval_ir("2026-04-07");
+        plan.target.table = "fct_events".into();
+        plan.sql = "SELECT id, event_at FROM main.events -- @start_date @end_date".into();
+        let dialect: &dyn SqlDialect = adapter.dialect();
+        let bootstrap_sql = sql_gen::generate_time_interval_bootstrap_sql(&plan, dialect)
+            .expect("bootstrap render");
+        adapter
+            .execute_statement(&bootstrap_sql)
+            .await
+            .expect("execute bootstrap");
+
+        let count = adapter
+            .execute_query("SELECT COUNT(*) FROM main.fct_events")
+            .await
+            .expect("count after bootstrap");
+        assert_eq!(
+            as_u64(&count.rows[0][0]),
+            0,
+            "bootstrap must not copy source rows: {bootstrap_sql}"
+        );
+        let cols = adapter
+            .execute_query(
+                "SELECT column_name FROM information_schema.columns \
+                 WHERE table_schema = 'main' AND table_name = 'fct_events' \
+                 ORDER BY ordinal_position",
+            )
+            .await
+            .expect("describe columns");
+        let col_names: Vec<&str> = cols.rows.iter().filter_map(|r| r[0].as_str()).collect();
+        assert_eq!(col_names, vec!["id", "event_at"]);
+    }
+
     #[tokio::test]
     async fn test_time_interval_window_metadata_is_inclusive_start_exclusive_end() {
         // Edge case: a row at exactly the start boundary should be included,

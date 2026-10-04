@@ -847,7 +847,7 @@ table = "fct_daily_activity"
 
 An alias for `time_interval` that defaults to `hour` granularity. The name matches dbt's for partition-based incremental processing.
 
-The model SQL must use both `@start_date` and `@end_date` to bound each partition. Missing either is a compile error (`E024`). Each run replaces its selected partitions instead of appending the full result again.
+The model SQL must use both `@start_date` and `@end_date` to bound each partition. Missing either is a compile error (`E024`). A placeholder that is only in a comment, a string or the `SELECT` list counts as missing. Each run replaces its selected partitions instead of appending the full result again.
 
 **SQL** (`models/fct_hourly_events.sql`):
 
