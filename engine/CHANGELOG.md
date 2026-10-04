@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- `rocky profile <model> --sample N` returns up to N distinct non-null values per column, as `sample_values`. N is at most 100. Rocky picks the values by a hash of each value, so a re-run on unchanged data returns the same values. Unlike `observed_values`, it covers high-cardinality columns. DuckDB only, like the rest of `rocky profile`. Without `--sample` the output is unchanged.
+
 ## [1.76.0] — 2026-10-03
 
 This release carries five breaking changes, each marked **Breaking:** below.
