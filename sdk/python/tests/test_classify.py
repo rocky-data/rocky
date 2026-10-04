@@ -63,6 +63,40 @@ def test_rules_classifier(column, values, type_, kind):
     assert rules_classifier(_col(column, values, type_))[0] == kind
 
 
+def test_a_number_that_fails_luhn_is_not_financial():
+    assert rules_classifier(_col("card", ("1234567890123456",) * 5))[0] != "financial"
+
+
+@pytest.mark.parametrize(
+    ("column", "values", "type_"),
+    [
+        (
+            "hire_date",
+            ("2024-01-15", "2023-03-02", "2022-07-30", "2021-11-11", "2020-05-05"),
+            "Date",
+        ),
+        ("opened_at", ("2024-01-15 10:00:00",) * 5, "Timestamp"),
+        ("shift_start", ("12:30", "10:45", "09:15", "08:00", "17:20"), "String"),
+        ("company_name", ("Acme", "Globex"), "String"),
+    ],
+)
+def test_rules_ignore_dates_times_and_company_names(column, values, type_):
+    assert rules_classifier(_col(column, values, type_))[0] == "none"
+
+
+@pytest.mark.parametrize(
+    ("column", "kind"),
+    [("client_ip", "network_id"), ("user_dob", "birth_date"), ("mobile_tel", "phone")],
+)
+def test_name_rules_split_on_underscores(column, kind):
+    assert rules_classifier(_col(column))[0] == kind
+
+
+def test_ipv6_values_still_match():
+    vals = ("2001:db8::1", "fe80::1", "2001:db8:0:0::2", "::1", "2001:db8::ff")
+    assert rules_classifier(_col("addr6", vals))[0] == "network_id"
+
+
 @pytest.mark.parametrize(
     ("warehouse", "rocky"),
     [
@@ -75,10 +109,6 @@ def test_rules_classifier(column, values, type_, kind):
         ("GEOMETRY", "GEOMETRY"),
     ],
 )
-def test_a_number_that_fails_luhn_is_not_financial():
-    assert rules_classifier(_col("card", ("1234567890123456",) * 5))[0] != "financial"
-
-
 def test_rocky_type_name(warehouse, rocky):
     assert rocky_type_name(warehouse) == rocky
 
@@ -131,6 +161,43 @@ def test_apply_refuses_a_dotted_key_classification(tmp_path):
     with pytest.raises(ValueError, match="by hand"):
         apply_accepted(side, [_s("phone")])
     assert side.read_text() == 'classification.email = "pii"\n'
+
+
+def test_apply_keeps_crlf_line_endings(tmp_path):
+    side = tmp_path / "m.toml"
+    side.write_bytes(b'name = "x"\r\n\r\n[classification]\r\nold = "pii"\r\n')
+    apply_accepted(side, [_s("new")])
+    assert side.read_bytes() == (
+        b'name = "x"\r\n\r\n[classification]\r\nnew = "pii"\r\nold = "pii"\r\n'
+    )
+
+
+def test_apply_header_at_end_of_file_without_newline(tmp_path):
+    side = tmp_path / "m.toml"
+    side.write_text('name = "x"\n[classification]')
+    apply_accepted(side, [_s("email")])
+    assert tomllib.loads(side.read_text())["classification"] == {"email": "pii"}
+
+
+def test_apply_quotes_unicode_and_odd_keys(tmp_path):
+    side = tmp_path / "m.toml"
+    side.write_text('name = "x"\n')
+    cols = ["h\U0001f600", "café", "a\n", 'q"uote']
+    assert apply_accepted(side, [_s(c) for c in cols]) == cols
+    assert tomllib.loads(side.read_text())["classification"] == {c: "pii" for c in cols}
+
+
+def test_apply_refuses_a_byte_order_mark(tmp_path):
+    side = tmp_path / "m.toml"
+    side.write_bytes(b'\xef\xbb\xbfname = "x"\n')
+    with pytest.raises(ValueError, match="byte-order mark"):
+        apply_accepted(side, [_s("email")])
+
+
+def test_apply_needs_the_sidecar(tmp_path):
+    with pytest.raises(FileNotFoundError):
+        apply_accepted(tmp_path / "absent.toml", [_s("email")])
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_existing_classification_missing_file(tmp_path):

@@ -24,18 +24,19 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// guards library callers.
 pub const MAX_SAMPLE_VALUES: u32 = 100;
 
-/// Seed for the reservoir sample, so a re-run on unchanged data returns the
-/// same values.
-const SAMPLE_SEED: u32 = 42;
-
-/// Up to `n` distinct non-null values of `column`, drawn by a seeded
-/// reservoir sample and sorted.
+/// Up to `n` distinct non-null values of `column`, sorted.
+///
+/// The values are the `n` with the lowest `hash(value)`: a pseudo-random
+/// choice that is the same on every run while the column's values are
+/// unchanged, whatever order the scan returns rows in (a seeded `USING
+/// SAMPLE` fixes the generator but not the input order of a parallel
+/// `DISTINCT`, so it is not repeatable on large tables). New rows only change
+/// the sample when one of them hashes lower.
 ///
 /// DuckDB syntax: `rocky profile` is DuckDB-only this release (see
-/// `duckdb_only_refusal`). The sample sits on a subquery so it draws from the
-/// non-null distinct values rather than from raw rows (DuckDB applies
-/// `USING SAMPLE` before `WHERE`). SQL is built from the already-validated
-/// `table_ref` and a freshly-validated column identifier.
+/// `duckdb_only_refusal`). The `DISTINCT` scans the whole column. SQL is built
+/// from the already-validated `table_ref` and a freshly-validated column
+/// identifier.
 async fn sample_column_values(
     adapter: &dyn WarehouseAdapter,
     table_ref: &str,
@@ -45,9 +46,12 @@ async fn sample_column_values(
     let col = rocky_sql::validation::validate_identifier(column)
         .map_err(|e| anyhow::anyhow!("invalid column identifier: {e}"))?;
     let n = n.min(MAX_SAMPLE_VALUES);
+    if n == 0 {
+        return Ok(Vec::new());
+    }
     let sql = format!(
         "SELECT v FROM (SELECT DISTINCT CAST({col} AS VARCHAR) AS v FROM {table_ref} \
-         WHERE {col} IS NOT NULL) AS s USING SAMPLE reservoir({n} ROWS) REPEATABLE ({SAMPLE_SEED})"
+         WHERE {col} IS NOT NULL) AS s ORDER BY hash(v), v LIMIT {n}"
     );
     let qr = adapter
         .execute_query(&sql)
@@ -427,7 +431,7 @@ mod tests {
     /// sorted, the same set on a re-run, and every value in the column's
     /// domain. Without `--sample` the field is absent.
     #[tokio::test]
-    async fn sample_returns_seeded_distinct_non_null_values() {
+    async fn sample_returns_stable_distinct_non_null_values() {
         let (_tmp, config_path, models_dir) = scaffold_fallback_poc(true).await;
         let state_path = config_path.parent().unwrap().join(".rocky_state");
         let run = |sample| {
@@ -458,7 +462,7 @@ mod tests {
         assert_eq!(
             again.columns[0].sample_values.as_ref(),
             Some(&values),
-            "seeded"
+            "same values on a re-run"
         );
 
         // Asking for more than the column holds returns every distinct value.
@@ -507,6 +511,23 @@ mod tests {
             .await
             .unwrap();
         assert!(b.is_empty());
+        let zero = sample_column_values(adapter.as_ref(), "main.t", "a", 0).await.unwrap();
+        assert!(zero.is_empty());
+
+        // The choice depends on the values, not on the order rows arrive in:
+        // the same 5,000 values loaded ascending and descending give one sample.
+        for stmt in [
+            "CREATE TABLE main.up AS SELECT CAST(i AS VARCHAR) AS v FROM range(5000) t(i) ORDER BY i",
+            "CREATE TABLE main.down AS SELECT CAST(i AS VARCHAR) AS v FROM range(5000) t(i) ORDER BY i DESC",
+        ] {
+            adapter.execute_statement(stmt).await.unwrap();
+        }
+        let up = sample_column_values(adapter.as_ref(), "main.up", "v", 7).await.unwrap();
+        let down = sample_column_values(adapter.as_ref(), "main.down", "v", 7).await.unwrap();
+        assert_eq!(up.len(), 7);
+        assert_eq!(up, down);
+        // Not just the first rows of the scan.
+        assert_ne!(up, (0..7).map(|i| i.to_string()).collect::<Vec<_>>());
         // A hostile identifier is refused before any SQL is built.
         assert!(
             sample_column_values(adapter.as_ref(), "main.t", "a; DROP TABLE main.t", 5)

@@ -3063,8 +3063,9 @@ pub struct ProfileColumnStats {
     pub min: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max: Option<String>,
-    /// Up to N distinct non-null values drawn at random (seeded, so a re-run
-    /// on unchanged data returns the same set), sorted. Present only when
+    /// Up to N distinct non-null values, sorted. Chosen pseudo-randomly by a
+    /// hash of each value, so a re-run on unchanged data returns the same
+    /// set whatever the scan order. Present only when
     /// `rocky profile --sample N` asked for them; unlike `observed_values` it
     /// covers high-cardinality columns too.
     #[serde(skip_serializing_if = "Option::is_none")]

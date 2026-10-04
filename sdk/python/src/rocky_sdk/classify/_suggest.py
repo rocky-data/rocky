@@ -83,14 +83,18 @@ class Suggestion:
 # --------------------------------------------------------------------- rules
 _NAME_RULES: list[tuple[str, str]] = [
     ("email", r"e-?mail"),
-    ("phone", r"phone|mobile|telemovel|telefone|\btel\b"),
-    ("birth_date", r"birth|\bdob\b|nascimento"),
-    ("gov_id", r"\bssn\b|passport|national_insurance|\bnif\b|tax_id|\bnino?\b"),
-    ("financial", r"iban|card_number|account_number|\bpan\b"),
-    ("network_id", r"\bip\b|ip_address|\bmac\b"),
+    ("phone", r"phone|mobile|telemovel|telefone|(^|_)tel($|_)"),
+    ("birth_date", r"birth|(^|_)dob($|_)|nascimento"),
+    ("gov_id", r"(^|_)ssn($|_)|passport|national_insurance|(^|_)nif($|_)|tax_id|(^|_)nino?($|_)"),
+    ("financial", r"iban|card_number|account_number|(^|_)pan($|_)"),
+    ("network_id", r"(^|_)ip($|_)|ip_address|(^|_)mac($|_)"),
     ("address", r"address|morada|street"),
-    ("name", r"first_name|last_name|full_name|\bnome|\bname$"),
+    ("name", r"first_name|last_name|full_name|(^|_)nome|(^|_)name$"),
 ]
+#: A ``_name`` column that names a thing, not a person.
+_NOT_A_PERSON = re.compile(
+    r"product|company|table|file|bank|brand|host|domain|event|column|schema|vendor|carrier"
+)
 _VALUE_RULES: list[tuple[str, str]] = [
     ("email", r"^[^@\s]+@[^@\s]+\.[a-z]{2,}$"),
     ("financial", r"^[A-Z]{2}\d{2}[A-Z0-9]{10,30}$"),
@@ -98,10 +102,20 @@ _VALUE_RULES: list[tuple[str, str]] = [
     ("gov_id", r"^\d{3}-\d{2}-\d{4}$"),
     (
         "network_id",
-        r"^(\d{1,3}\.){3}\d{1,3}$|^[0-9a-f:]+::?[0-9a-f]*$|^([0-9A-F]{2}:){5}[0-9A-F]{2}$",
+        r"^(\d{1,3}\.){3}\d{1,3}$|^(?=(?:[0-9a-f]*:){2})[0-9a-f:]+$|^([0-9A-F]{2}:){5}[0-9A-F]{2}$",
     ),
     ("phone", r"^\+?[\d\s()-]{9,17}$"),
 ]
+
+
+#: Value rules that never fire on a column of these Rocky types. Dates and
+#: times look like phone numbers and IPv6 addresses to the patterns.
+_VALUE_RULE_SKIPS: dict[str, tuple[str, ...]] = {
+    "phone": ("Date", "Timestamp", "Decimal"),
+    "network_id": ("Date", "Timestamp", "Int64", "Decimal"),
+    "financial": ("Date", "Timestamp", "Decimal"),
+    "gov_id": ("Date", "Timestamp", "Decimal"),
+}
 
 
 def _luhn(digits: str) -> bool:
@@ -124,11 +138,13 @@ def rules_classifier(col: ColumnEvidence) -> tuple[str, float]:
     if col.type == "Boolean":
         return "none", 1.0
     for kind, pattern in _NAME_RULES:
-        if re.search(pattern, name) and not (kind == "name" and "product" in name):
+        if re.search(pattern, name) and not (kind == "name" and _NOT_A_PERSON.search(name)):
             return kind, 1.0
     if col.values:
         need = max(1, round(len(col.values) * 0.8))
         for kind, pattern in _VALUE_RULES:
+            if col.type in _VALUE_RULE_SKIPS.get(kind, ()):
+                continue
             hits = sum(bool(re.match(pattern, v, re.I)) for v in col.values)
             if hits >= need:
                 if pattern == r"^\d{13,19}$" and not all(_luhn(v) for v in col.values):

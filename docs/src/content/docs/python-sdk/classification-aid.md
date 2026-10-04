@@ -27,14 +27,16 @@ The aid needs a DuckDB target today, because `rocky profile` is DuckDB only.
 
 ## How often the aid is wrong
 
-The aid was measured on a blind test set of 160 columns. 72 of those columns held personal data.
+The aid was measured on a test set of 160 columns. 72 of those columns held personal data.
 
 | Setup | Personal-data columns found | Suggestions that were right |
 |---|---|---|
-| Rules only | 38 of 72 | 38 of 48 |
-| Rules, then the model | 69 of 72 | 69 of 100 |
+| Rules only | 36 of 72 | 36 of 38 |
+| Rules, then the model | 68 of 72 | 68 of 92 |
 
-About 1 suggestion in 3 is wrong with the model on. That is why a person must check each one. The model makes two kinds of mistake often:
+The rules were changed after the first measurement, so that dates and times no longer match as phone numbers or IP addresses. These numbers are for the changed rules on the same set, so they are likely better than you will see on your own data.
+
+About 1 suggestion in 4 is wrong with the model on. That is why a person must check each one. The model makes two kinds of mistake often:
 
 - It reads many dates and numeric codes as phone numbers.
 - It reads short text, such as job titles or carrier names, as person names.
