@@ -49,6 +49,10 @@ pub(super) fn rebuilds_on_full_refresh(strategy: &MaterializationStrategy) -> bo
         | MaterializationStrategy::Ephemeral
         | MaterializationStrategy::Microbatch { .. }
         | MaterializationStrategy::ContentAddressed { .. } => false,
+        // A snapshot's table is its history; rebuilding it from the current
+        // SELECT would erase every closed version (dbt also ignores
+        // `--full-refresh` for snapshots).
+        MaterializationStrategy::Snapshot(_) => false,
     }
 }
 

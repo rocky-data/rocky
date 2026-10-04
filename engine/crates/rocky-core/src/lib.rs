@@ -63,6 +63,7 @@ pub mod secret_registry;
 pub mod seeds;
 pub mod selector;
 pub mod shadow;
+pub mod snapshot_model;
 pub mod snapshots;
 pub mod source;
 pub mod source_freshness;

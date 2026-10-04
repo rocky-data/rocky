@@ -1433,6 +1433,9 @@ fn transformation_promote_kind(
         StrategyConfig::DynamicTable { .. } => {
             anyhow::bail!("branch promotion is undefined for dynamic_table models")
         }
+        StrategyConfig::Snapshot { .. } => {
+            anyhow::bail!("branch promotion is undefined for snapshot models")
+        }
         StrategyConfig::ContentAddressed { .. } => {
             anyhow::bail!("branch promotion is undefined for content_addressed models")
         }

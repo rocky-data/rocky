@@ -267,6 +267,7 @@ pub fn strategy_kind(strategy: &StrategyConfig) -> &'static str {
         StrategyConfig::ContentAddressed { .. } => "content_addressed",
         StrategyConfig::View => "view",
         StrategyConfig::MaterializedView => "materialized_view",
+        StrategyConfig::Snapshot { .. } => "snapshot",
         StrategyConfig::DynamicTable { .. } => "dynamic_table",
     }
 }

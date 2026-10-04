@@ -321,7 +321,7 @@ fn annotate_unsupported_jinja(sql: &str) -> String {
     out
 }
 
-fn render_model_sidecar(config: &ModelConfig) -> String {
+pub(crate) fn render_model_sidecar(config: &ModelConfig) -> String {
     // Lean serializer — matches the pattern used by `rocky ai` for sidecars
     // (see CHANGELOG #414): we deliberately do NOT serialize empty default
     // collections (`depends_on = []`, etc.) so the file stays compact. Every
@@ -469,6 +469,9 @@ fn render_model_sidecar(config: &ModelConfig) -> String {
         StrategyConfig::ContentAddressed { .. } => {
             out.push_str("type = \"full_refresh\"\n");
         }
+        StrategyConfig::Snapshot { .. } => {
+            render_snapshot_strategy(&config.strategy, &mut out);
+        }
     }
     out.push('\n');
 
@@ -525,6 +528,86 @@ fn render_model_sidecar(config: &ModelConfig) -> String {
 /// filename component: non-empty, no path separators, no parent-/absolute-path
 /// escape. A dbt manifest node name is third-party input, so a name failing
 /// this (`../x`, `/etc/x`, `a/b`) must not reach a `models_dir.join(...)`.
+/// The body of a `type = "snapshot"` `[strategy]` block. Every key stays in
+/// the `[strategy]` table (inline tables only), so the caller's next header
+/// still starts a new table.
+fn render_snapshot_strategy(strategy: &StrategyConfig, out: &mut String) {
+    let StrategyConfig::Snapshot {
+        unique_key,
+        snapshot_strategy,
+        updated_at,
+        check_cols,
+        hard_deletes,
+        invalidate_hard_deletes,
+        snapshot_meta_column_names,
+        valid_to_current,
+    } = strategy
+    else {
+        return;
+    };
+    let list = |items: &[String]| {
+        items
+            .iter()
+            .map(|c| format!("\"{}\"", toml_escape(c)))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    out.push_str("type = \"snapshot\"\n");
+    if let Some(key) = unique_key {
+        out.push_str(&format!("unique_key = [{}]\n", list(&key.columns())));
+    }
+    if let Some(kind) = snapshot_strategy {
+        let kind = match kind {
+            rocky_core::snapshot_model::SnapshotStrategyKind::Timestamp => "timestamp",
+            rocky_core::snapshot_model::SnapshotStrategyKind::Check => "check",
+        };
+        out.push_str(&format!("strategy = \"{kind}\"\n"));
+    }
+    if let Some(col) = updated_at {
+        out.push_str(&format!("updated_at = \"{}\"\n", toml_escape(col)));
+    }
+    match check_cols {
+        None => {}
+        Some(rocky_core::snapshot_model::SnapshotCheckColsConfig::Keyword(word)) => {
+            out.push_str(&format!("check_cols = \"{}\"\n", toml_escape(word)));
+        }
+        Some(rocky_core::snapshot_model::SnapshotCheckColsConfig::List(cols)) => {
+            out.push_str(&format!("check_cols = [{}]\n", list(cols)));
+        }
+    }
+    if let Some(mode) = hard_deletes {
+        out.push_str(&format!("hard_deletes = \"{}\"\n", mode.as_str()));
+    }
+    if let Some(flag) = invalidate_hard_deletes {
+        out.push_str(&format!("invalidate_hard_deletes = {flag}\n"));
+    }
+    if let Some(expr) = valid_to_current {
+        out.push_str(&format!("valid_to_current = \"{}\"\n", toml_escape(expr)));
+    }
+    if let Some(meta) = snapshot_meta_column_names {
+        let mut fields = vec![
+            format!("valid_from = \"{}\"", toml_escape(&meta.valid_from)),
+            format!("valid_to = \"{}\"", toml_escape(&meta.valid_to)),
+        ];
+        match meta.is_current.name() {
+            Some(name) => fields.push(format!("is_current = \"{}\"", toml_escape(name))),
+            None => fields.push("is_current = false".to_string()),
+        }
+        fields.push(format!("scd_id = \"{}\"", toml_escape(&meta.scd_id)));
+        if let Some(col) = &meta.updated_at {
+            fields.push(format!("updated_at = \"{}\"", toml_escape(col)));
+        }
+        fields.push(format!(
+            "is_deleted = \"{}\"",
+            toml_escape(&meta.is_deleted)
+        ));
+        out.push_str(&format!(
+            "snapshot_meta_column_names = {{ {} }}\n",
+            fields.join(", ")
+        ));
+    }
+}
+
 fn is_safe_model_file_stem(name: &str) -> bool {
     !name.is_empty()
         && !name.contains('/')

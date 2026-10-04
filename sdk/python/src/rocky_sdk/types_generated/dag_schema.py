@@ -43,22 +43,6 @@ class LineageQualifiedColumn(BaseModel):
     model: str
 
 
-class OnSchemaChange(StrEnum):
-    """
-    Stop the run and name the added and removed columns. The default: nothing is written, and `rocky run --full-refresh` rebuilds the table.
-    """
-
-    fail = "fail"
-
-
-class OnSchemaChange5(StrEnum):
-    """
-    Add each new output column to the target with `ALTER TABLE ... ADD COLUMN`, then load. Existing rows hold `NULL` in the new column. A column removed from the model still fails the run.
-    """
-
-    append_new_columns = "append_new_columns"
-
-
 class PartitionShapeOutput(BaseModel):
     """
     Partition shape metadata for time-interval nodes.
@@ -74,11 +58,77 @@ class PartitionShapeOutput(BaseModel):
     """
 
 
+class SnapshotHardDeletes(StrEnum):
+    """
+    Keep the last version current. The default, as in dbt.
+    """
+
+    ignore = "ignore"
+
+
+class SnapshotHardDeletes6(StrEnum):
+    """
+    Close the current version: set `valid_to` and clear `is_current`.
+    """
+
+    invalidate = "invalidate"
+
+
+class SnapshotHardDeletes7(StrEnum):
+    """
+    Close the current version and insert a deletion-marker version with `is_deleted = TRUE`.
+    """
+
+    new_record = "new_record"
+
+
+class SnapshotMetaColumns(BaseModel):
+    """
+    Names of the metadata columns a snapshot model adds to its rows.
+
+    The defaults match the `snapshot` pipeline. Each key also accepts the dbt spelling (`dbt_valid_from`, `dbt_valid_to`, `dbt_scd_id`, `dbt_updated_at`, `dbt_is_deleted`) so an imported `snapshot_meta_column_names` block reads unchanged.
+    """
+
+    is_current: str | bool | None = "is_current"
+    """
+    `TRUE` on the current version of each key. Default `is_current`; `false` writes no flag (dbt has no such column).
+    """
+    is_deleted: str | None = "is_deleted"
+    """
+    Deletion marker, written only under `hard_deletes = "new_record"`. Default `is_deleted`.
+    """
+    scd_id: str | None = "snapshot_id"
+    """
+    Deterministic per-version id: a hash of the key and `valid_from`. Default `snapshot_id`.
+    """
+    updated_at: str | None = None
+    """
+    Optional copy of the version's change timestamp (dbt's `dbt_updated_at`). Not written unless named.
+    """
+    valid_from: str | None = "valid_from"
+    """
+    When this version became current. Default `valid_from`.
+    """
+    valid_to: str | None = "valid_to"
+    """
+    When this version stopped being current. Default `valid_to`.
+    """
+
+
+class SnapshotStrategyKind(StrEnum):
+    """
+    The `strategy` key inside a snapshot `[strategy]` block.
+    """
+
+    timestamp = "timestamp"
+    check = "check"
+
+
 class Type(StrEnum):
     full_refresh = "full_refresh"
 
 
-class StrategyConfig12(BaseModel):
+class StrategyConfig13(BaseModel):
     """
     Materialization strategy for a model, defaulting to full refresh.
     """
@@ -86,42 +136,8 @@ class StrategyConfig12(BaseModel):
     type: Type
 
 
-class Type12(StrEnum):
-    incremental = "incremental"
-
-
-class StrategyConfig13(BaseModel):
-    """
-    Load only rows newer than the target's current watermark.
-
-    On a transformation model the model SQL marks where the filter goes with `@incremental_filter` (`filter_column` names a qualified or renamed input column to compare). Each incremental run resolves it to `<col> > (SELECT MAX(<watermark>) FROM <target>)`, minus `lookback`; the first run and `rocky run --full-refresh` resolve it to `TRUE`. With no placeholder, a watermark column that the model passes straight through from one input is filtered on the model's output instead; anything else is refused (E046). No watermark at all is refused (E037).
-    """
-
-    filter_column: str | None = None
-    """
-    The input column `@incremental_filter` compares, when it is not the watermark itself: a qualified column in a join (`"o.updated_at"`) or a source column the model renames (`"_synced_at"`). The bound is still `MAX(<timestamp_column>)` over the target.
-    """
-    lookback: str | None = None
-    """
-    Re-read this far below the watermark, e.g. `"3 days"`, to catch late-arriving rows. Pair it with `unique_key`, or the re-read rows are appended again (W046).
-    """
-    on_schema_change: OnSchemaChange | OnSchemaChange5 | None = "fail"
-    """
-    What a run does when the model's output columns no longer match the target: `fail` (default) or `append_new_columns`.
-    """
-    timestamp_column: str | None = None
-    """
-    The watermark column: an output column of the model whose maximum in the target marks what is already loaded. `watermark` is accepted as an alias.
-    """
-    type: Type12
-    unique_key: list[str] | None = []
-    """
-    Upsert on these columns with `MERGE` instead of appending.
-    """
-
-
 class Type13(StrEnum):
-    merge = "merge"
+    incremental = "incremental"
 
 
 class StrategyConfig14(BaseModel):
@@ -129,32 +145,45 @@ class StrategyConfig14(BaseModel):
     Materialization strategy for a model, defaulting to full refresh.
     """
 
+    timestamp_column: str
     type: Type13
+
+
+class Type14(StrEnum):
+    merge = "merge"
+
+
+class StrategyConfig15(BaseModel):
+    """
+    Materialization strategy for a model, defaulting to full refresh.
+    """
+
+    type: Type14
     unique_key: list[str]
     update_columns: list[str] | None = None
 
 
-class Type14(StrEnum):
+class Type15(StrEnum):
     time_interval = "time_interval"
 
 
-class Type15(StrEnum):
+class Type16(StrEnum):
     ephemeral = "ephemeral"
 
 
-class StrategyConfig16(BaseModel):
+class StrategyConfig17(BaseModel):
     """
-    Ephemeral model — never materialized. `rocky compile` inlines its SQL as a `__rocky_ephemeral__<name>` CTE into every model that reads it, and `rocky run` skips the node. Invalid uses are E038.
+    Ephemeral model — refused at compile time (E038). No table is created and no consumer inlines it, so it is kept only to name the refusal.
     """
 
-    type: Type15
+    type: Type16
 
 
-class Type16(StrEnum):
+class Type17(StrEnum):
     delete_insert = "delete_insert"
 
 
-class StrategyConfig17(BaseModel):
+class StrategyConfig18(BaseModel):
     """
     Delete+Insert: delete matching rows by partition key, then insert.
     """
@@ -163,42 +192,42 @@ class StrategyConfig17(BaseModel):
     """
     Column(s) used to identify the partition to delete.
     """
-    type: Type16
-
-
-class Type17(StrEnum):
-    microbatch = "microbatch"
+    type: Type17
 
 
 class Type18(StrEnum):
-    view = "view"
-
-
-class StrategyConfig19(BaseModel):
-    """
-    SQL view — no physical storage. Every read against the target re-runs the model SELECT. Supported on every Rocky-targeted warehouse.
-    """
-
-    type: Type18
+    microbatch = "microbatch"
 
 
 class Type19(StrEnum):
-    materialized_view = "materialized_view"
+    view = "view"
 
 
 class StrategyConfig20(BaseModel):
     """
-    Materialized view — warehouse manages refresh. Supported on Databricks, Snowflake, and BigQuery. DuckDB / Trino surface a "not supported" error at SQL-gen time.
+    SQL view — no physical storage. Every read against the target re-runs the model SELECT. Supported on every Rocky-targeted warehouse.
     """
 
     type: Type19
 
 
 class Type20(StrEnum):
-    dynamic_table = "dynamic_table"
+    materialized_view = "materialized_view"
 
 
 class StrategyConfig21(BaseModel):
+    """
+    Materialized view — warehouse manages refresh. Supported on Databricks, Snowflake, and BigQuery. DuckDB / Trino surface a "not supported" error at SQL-gen time.
+    """
+
+    type: Type20
+
+
+class Type21(StrEnum):
+    dynamic_table = "dynamic_table"
+
+
+class StrategyConfig22(BaseModel):
     """
     Snowflake dynamic table — warehouse manages lag-based refresh. `target_lag` is a Snowflake lag specifier (e.g. `"1 minute"`, `"5 hours"`, `"downstream"`). Non-Snowflake adapters surface a "not supported" error at SQL-gen time.
     """
@@ -207,14 +236,14 @@ class StrategyConfig21(BaseModel):
     """
     Snowflake lag specifier — alphanumeric + space only. Examples: `"1 minute"`, `"5 hours"`, `"downstream"`.
     """
-    type: Type20
+    type: Type21
 
 
-class Type21(StrEnum):
+class Type22(StrEnum):
     content_addressed = "content_addressed"
 
 
-class StrategyConfig22(BaseModel):
+class StrategyConfig23(BaseModel):
     """
     Content-addressed write to a Delta UniForm table via the `rocky-iceberg` writer. The runtime executes the model SQL, converts the result to Arrow, blake3-hashes the Parquet bytes, uploads to `storage_prefix`, and emits a Delta log commit. Cross-engine reads (DuckDB iceberg_scan, etc.) require MSCK REPAIR after each commit; the runtime issues this automatically.
     """
@@ -227,7 +256,53 @@ class StrategyConfig22(BaseModel):
     """
     Object-store key prefix that holds `_delta_log/` + Parquet files for the target table. Typically `s3://<bucket>/<path>/<table>` for AWS-backed deployments.
     """
-    type: Type21
+    type: Type22
+
+
+class Type23(StrEnum):
+    snapshot = "snapshot"
+
+
+class StrategyConfig24(BaseModel):
+    """
+    SCD Type 2 snapshot of the model's SELECT (dbt `snapshot` parity). Each run closes changed versions and opens new ones; see [`crate::snapshot_model`]. Every field is optional here so a missing one is reported as E049 by `rocky compile` rather than as a TOML parse error.
+    """
+
+    check_cols: str | list[str] | None = None
+    """
+    Check-strategy columns: a list, or `"all"`.
+    """
+    hard_deletes: (
+        SnapshotHardDeletes | SnapshotHardDeletes6 | SnapshotHardDeletes7 | None
+    ) = None
+    """
+    `"ignore"` (default), `"invalidate"` or `"new_record"`.
+    """
+    invalidate_hard_deletes: bool | None = None
+    """
+    dbt's legacy spelling of `hard_deletes = "invalidate"`.
+    """
+    snapshot_meta_column_names: SnapshotMetaColumns | None = None
+    """
+    Metadata column names (Rocky defaults; dbt keys accepted).
+    """
+    strategy: SnapshotStrategyKind | None = None
+    """
+    `"timestamp"` or `"check"`.
+    """
+    type: Type23
+    unique_key: str | list[str] | None = None
+    """
+    Column, or list of columns, identifying a row of the output.
+    """
+    updated_at: str | None = None
+    """
+    Timestamp-strategy change column.
+    """
+    valid_to_current: str | None = None
+    """
+    SQL expression for `valid_to` on current versions instead of NULL.
+    """
 
 
 class TargetConfig(BaseModel):
@@ -284,7 +359,7 @@ class ModelFreshnessConfig(BaseModel):
 
     Declares the maximum allowed lag between successive materializations of the model plus the optional timestamp column used by the runtime freshness check.
 
-    `rocky freshness` enforces the TTL at run time: it reads `MAX(time_column)` from the model's target table (or, without a `time_column`, the model's last successful build in the state store) and reports `warn`, or `error` when `severity = "error"`. `rocky run` does not gate on it. The compiler checks the `time_column` (E050 when absent from a provably complete output, W050 when not temporal), and soft-warns (W005) when a model has at least one temporal output column but no `freshness` declaration anywhere in scope (per-model or project-level default).
+    The compiler does not enforce the TTL — it's metadata consumed by downstream observability tooling (`dagster-rocky` `FreshnessPolicy`, `rocky doctor --freshness`, etc.). The compiler does however soft-warn (W005) when a model has at least one temporal output column but no `freshness` declaration anywhere in scope (per-model or project-level default).
     """
 
     max_lag_seconds: conint(ge=0)
@@ -303,7 +378,7 @@ class ModelFreshnessConfig(BaseModel):
     """
 
 
-class StrategyConfig15(BaseModel):
+class StrategyConfig16(BaseModel):
     """
     Partition-keyed materialization. Each run targets specific partitions rather than appending past a watermark. Idempotent and backfill-friendly.
 
@@ -330,10 +405,10 @@ class StrategyConfig15(BaseModel):
     """
     Column on the model output that holds the partition value. Must be a non-nullable date or timestamp column. Validated by the compiler against the typed output schema.
     """
-    type: Type14
+    type: Type15
 
 
-class StrategyConfig18(BaseModel):
+class StrategyConfig19(BaseModel):
     """
     Microbatch: alias for time_interval with hourly defaults. dbt-compatible naming for partition-based incremental processing.
     """
@@ -346,7 +421,7 @@ class StrategyConfig18(BaseModel):
     """
     Timestamp column for micro-batch boundaries.
     """
-    type: Type17
+    type: Type18
 
 
 class DagNodeOutput(BaseModel):
@@ -385,8 +460,7 @@ class DagNodeOutput(BaseModel):
     Pipeline name from `rocky.toml`, if applicable.
     """
     strategy: (
-        StrategyConfig12
-        | StrategyConfig13
+        StrategyConfig13
         | StrategyConfig14
         | StrategyConfig15
         | StrategyConfig16
@@ -396,6 +470,8 @@ class DagNodeOutput(BaseModel):
         | StrategyConfig20
         | StrategyConfig21
         | StrategyConfig22
+        | StrategyConfig23
+        | StrategyConfig24
         | None
     ) = None
     """

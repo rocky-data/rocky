@@ -79,6 +79,72 @@ class Severity(StrEnum):
     Info = "Info"
 
 
+class SnapshotHardDeletes1(StrEnum):
+    """
+    Keep the last version current. The default, as in dbt.
+    """
+
+    ignore = "ignore"
+
+
+class SnapshotHardDeletes2(StrEnum):
+    """
+    Close the current version: set `valid_to` and clear `is_current`.
+    """
+
+    invalidate = "invalidate"
+
+
+class SnapshotHardDeletes3(StrEnum):
+    """
+    Close the current version and insert a deletion-marker version with `is_deleted = TRUE`.
+    """
+
+    new_record = "new_record"
+
+
+class SnapshotMetaColumns(BaseModel):
+    """
+    Names of the metadata columns a snapshot model adds to its rows.
+
+    The defaults match the `snapshot` pipeline. Each key also accepts the dbt spelling (`dbt_valid_from`, `dbt_valid_to`, `dbt_scd_id`, `dbt_updated_at`, `dbt_is_deleted`) so an imported `snapshot_meta_column_names` block reads unchanged.
+    """
+
+    is_current: str | bool | None = "is_current"
+    """
+    `TRUE` on the current version of each key. Default `is_current`; `false` writes no flag (dbt has no such column).
+    """
+    is_deleted: str | None = "is_deleted"
+    """
+    Deletion marker, written only under `hard_deletes = "new_record"`. Default `is_deleted`.
+    """
+    scd_id: str | None = "snapshot_id"
+    """
+    Deterministic per-version id: a hash of the key and `valid_from`. Default `snapshot_id`.
+    """
+    updated_at: str | None = None
+    """
+    Optional copy of the version's change timestamp (dbt's `dbt_updated_at`). Not written unless named.
+    """
+    valid_from: str | None = "valid_from"
+    """
+    When this version became current. Default `valid_from`.
+    """
+    valid_to: str | None = "valid_to"
+    """
+    When this version stopped being current. Default `valid_to`.
+    """
+
+
+class SnapshotStrategyKind(StrEnum):
+    """
+    The `strategy` key inside a snapshot `[strategy]` block.
+    """
+
+    timestamp = "timestamp"
+    check = "check"
+
+
 class SourceSpan(BaseModel):
     """
     Location in a source file.
@@ -243,6 +309,52 @@ class StrategyConfig11(BaseModel):
     Object-store key prefix that holds `_delta_log/` + Parquet files for the target table. Typically `s3://<bucket>/<path>/<table>` for AWS-backed deployments.
     """
     type: Type10
+
+
+class Type11(StrEnum):
+    snapshot = "snapshot"
+
+
+class StrategyConfig12(BaseModel):
+    """
+    SCD Type 2 snapshot of the model's SELECT (dbt `snapshot` parity). Each run closes changed versions and opens new ones; see [`crate::snapshot_model`]. Every field is optional here so a missing one is reported as E049 by `rocky compile` rather than as a TOML parse error.
+    """
+
+    check_cols: str | list[str] | None = None
+    """
+    Check-strategy columns: a list, or `"all"`.
+    """
+    hard_deletes: (
+        SnapshotHardDeletes1 | SnapshotHardDeletes2 | SnapshotHardDeletes3 | None
+    ) = None
+    """
+    `"ignore"` (default), `"invalidate"` or `"new_record"`.
+    """
+    invalidate_hard_deletes: bool | None = None
+    """
+    dbt's legacy spelling of `hard_deletes = "invalidate"`.
+    """
+    snapshot_meta_column_names: SnapshotMetaColumns | None = None
+    """
+    Metadata column names (Rocky defaults; dbt keys accepted).
+    """
+    strategy: SnapshotStrategyKind | None = None
+    """
+    `"timestamp"` or `"check"`.
+    """
+    type: Type11
+    unique_key: str | list[str] | None = None
+    """
+    Column, or list of columns, identifying a row of the output.
+    """
+    updated_at: str | None = None
+    """
+    Timestamp-strategy change column.
+    """
+    valid_to_current: str | None = None
+    """
+    SQL expression for `valid_to` on current versions instead of NULL.
+    """
 
 
 class TargetConfig(BaseModel):
@@ -424,6 +536,7 @@ class ModelDetail(BaseModel):
         | StrategyConfig9
         | StrategyConfig10
         | StrategyConfig11
+        | StrategyConfig12
     )
     """
     Materialization strategy as the wire-shape `StrategyConfig` (`{"type": "...", ...}`).

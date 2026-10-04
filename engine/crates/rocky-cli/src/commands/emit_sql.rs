@@ -75,7 +75,7 @@ fn resolve_dialect(
 struct EmittedModel {
     name: String,
     sql: String,
-    /// `true` for merge/delete_insert statements that operate on an existing
+    /// `true` for merge/delete_insert/snapshot statements that operate on an existing
     /// target. `rocky run` creates the target table on first build, which a
     /// static emit does not reproduce, so this SQL is the steady-state
     /// operation, not a from-scratch build.
@@ -96,7 +96,7 @@ fn assumes_existing_target(strategy: &rocky_ir::MaterializationStrategy) -> bool
     use rocky_ir::MaterializationStrategy::*;
     matches!(
         strategy,
-        Incremental { .. } | Merge { .. } | DeleteInsert { .. }
+        Incremental { .. } | Merge { .. } | DeleteInsert { .. } | Snapshot(_)
     )
 }
 

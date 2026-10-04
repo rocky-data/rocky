@@ -122,6 +122,9 @@ pub struct DbtNodeConfig {
     /// Rocky does not auto-generate `{model}.contract.toml` on import; the
     /// importer surfaces this so the migration is never silently lossy.
     pub contract: Option<DbtContractConfig>,
+    /// Snapshot config (`strategy`, `updated_at`, `check_cols`,
+    /// `hard_deletes`, …) — `Some` only for `resource_type: snapshot` nodes.
+    pub snapshot: Option<super::dbt_snapshots::DbtSnapshotConfig>,
 }
 
 /// dbt model `contract` config — whether the model enforces a declared
@@ -411,6 +414,25 @@ struct RawNodeConfig {
     /// `contract` — dbt model contract enforcement block.
     #[serde(default)]
     contract: Option<RawContract>,
+    // Snapshot-node config. Read only for `resource_type: snapshot`.
+    #[serde(default)]
+    strategy: Option<String>,
+    #[serde(default)]
+    updated_at: Option<String>,
+    #[serde(default)]
+    check_cols: Option<serde_json::Value>,
+    #[serde(default)]
+    hard_deletes: Option<String>,
+    #[serde(default)]
+    invalidate_hard_deletes: Option<bool>,
+    #[serde(default)]
+    snapshot_meta_column_names: Option<std::collections::BTreeMap<String, Option<String>>>,
+    #[serde(default)]
+    dbt_valid_to_current: Option<String>,
+    #[serde(default)]
+    target_schema: Option<String>,
+    #[serde(default)]
+    target_database: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -457,8 +479,9 @@ struct RawManifestSource {
 
 /// Parse a manifest.json file.
 ///
-/// Uses a buffered reader for efficiency with large manifests. Only model
-/// nodes are retained; tests, seeds, and snapshots are filtered out.
+/// Uses a buffered reader for efficiency with large manifests. Model and
+/// snapshot nodes are retained (snapshots import as `type = "snapshot"`
+/// models); tests and seeds are filtered out.
 pub fn parse_manifest(path: &Path) -> Result<DbtManifest, String> {
     let file =
         std::fs::File::open(path).map_err(|e| format!("failed to open {}: {e}", path.display()))?;
@@ -479,11 +502,9 @@ pub fn parse_manifest(path: &Path) -> Result<DbtManifest, String> {
     };
 
     let dropped = DbtDroppedCounts {
-        snapshots: raw
-            .nodes
-            .values()
-            .filter(|n| n.resource_type == "snapshot")
-            .count(),
+        // Snapshots convert to `type = "snapshot"` models; one that cannot
+        // convert is reported as an import failure with its reason.
+        snapshots: 0,
         metrics: raw.metrics.len(),
         semantic_models: raw.semantic_models.len(),
         exposures: raw.exposures.len(),
@@ -492,7 +513,7 @@ pub fn parse_manifest(path: &Path) -> Result<DbtManifest, String> {
     let nodes = raw
         .nodes
         .into_iter()
-        .filter(|(_, n)| n.resource_type == "model")
+        .filter(|(_, n)| n.resource_type == "model" || n.resource_type == "snapshot")
         .map(|(id, n)| {
             let node = convert_node(n);
             (id, node)
@@ -577,7 +598,37 @@ fn rows_from_json(v: serde_json::Value) -> Vec<serde_json::Value> {
 
 fn convert_node(raw: RawNode) -> DbtManifestNode {
     let depends_on = raw.depends_on.unwrap_or_default();
-    let config = raw.config.unwrap_or_default();
+    let mut config = raw.config.unwrap_or_default();
+
+    let snapshot = (raw.resource_type == "snapshot").then(|| {
+        // Target dbt's resolved relation, so `rocky run` continues the
+        // history dbt built: the node's `schema` is after
+        // `generate_schema_name` (a YAML snapshot's `schema: snapshots` can
+        // land in `analytics_snapshots`). Fall back to `target_schema`.
+        match raw.schema.as_deref().filter(|s| !s.is_empty()) {
+            Some(resolved) => config.schema = Some(resolved.to_string()),
+            None => {
+                if config.schema.is_none() {
+                    config.schema = config.target_schema.clone();
+                }
+            }
+        }
+        super::dbt_snapshots::DbtSnapshotConfig {
+            unique_key: config.unique_key.clone(),
+            strategy: config.strategy.take(),
+            updated_at: config.updated_at.take(),
+            check_cols: config.check_cols.take(),
+            hard_deletes: config.hard_deletes.take(),
+            invalidate_hard_deletes: config.invalidate_hard_deletes,
+            snapshot_meta_column_names: config.snapshot_meta_column_names.take(),
+            dbt_valid_to_current: config.dbt_valid_to_current.take(),
+            target_schema: config.target_schema.clone(),
+            target_database: config.target_database.clone(),
+            schema: config.schema.clone(),
+            database: None,
+            alias: config.alias.clone(),
+        }
+    });
 
     let unique_key = config.unique_key.and_then(|v| match v {
         serde_json::Value::String(s) => Some(UniqueKeyValue::Single(s)),
@@ -663,6 +714,7 @@ fn convert_node(raw: RawNode) -> DbtManifestNode {
             contract: config.contract.map(|c| DbtContractConfig {
                 enforced: c.enforced,
             }),
+            snapshot,
         },
         columns,
         description: raw.description.filter(|d| !d.is_empty()),
@@ -706,7 +758,7 @@ pub fn extract_model_name(unique_id: &str) -> &str {
 pub fn depends_on_to_rocky(nodes: &[String]) -> Vec<String> {
     nodes
         .iter()
-        .filter(|n| n.starts_with("model."))
+        .filter(|n| n.starts_with("model.") || n.starts_with("snapshot."))
         .map(|n| extract_model_name(n).to_string())
         .collect()
 }

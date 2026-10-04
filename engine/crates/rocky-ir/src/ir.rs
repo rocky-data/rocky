@@ -147,6 +147,14 @@ pub enum MaterializationStrategy {
         /// `UniformWriter::discover()` returns; mismatch is a hard error.
         partition_columns: Vec<String>,
     },
+    /// SCD Type 2 snapshot of the model's SELECT (dbt `snapshot` parity).
+    ///
+    /// Each run closes the current version of every changed key and inserts
+    /// a new version; `hard_deletes` decides what happens to keys that leave
+    /// the result. SQL generation needs the model's output column list, so
+    /// the runner resolves it from the existing target (`describe_table`)
+    /// and `sql_gen` falls back to the typed columns for `plan`/`emit-sql`.
+    Snapshot(Box<crate::snapshot::SnapshotSpec>),
 }
 
 /// A single partition's time window, used to substitute `@start_date` /
@@ -1318,6 +1326,16 @@ mod tests {
                 timestamp_column: "event_time".into(),
                 granularity: TimeGrain::Hour,
             },
+            MaterializationStrategy::Snapshot(Box::new(crate::snapshot::SnapshotSpec {
+                unique_key: vec!["id".into(), "region".into()],
+                change: crate::snapshot::SnapshotChangeStrategy::Check {
+                    check_cols: crate::snapshot::SnapshotCheckColumns::All,
+                    updated_at: Some("changed_at".into()),
+                },
+                hard_deletes: crate::snapshot::SnapshotHardDeletes::NewRecord,
+                meta_columns: crate::snapshot::SnapshotMetaColumns::default(),
+                valid_to_current: Some("'9999-12-31'".into()),
+            })),
         ];
 
         for strategy in &strategies {

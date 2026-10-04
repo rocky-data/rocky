@@ -479,6 +479,29 @@ pub fn generate_transformation_sql_with_warehouse(
                     .to_string(),
             ))
         }
+        MaterializationStrategy::Snapshot(spec) => {
+            // Steady-state statements against an existing target. The runner
+            // (`execute_snapshot_model` in rocky-cli) reads the column list
+            // from the target itself; this preview path (`rocky plan`,
+            // `emit-sql`) uses the compiler's typed output columns.
+            // The compiler adds the metadata columns to a snapshot's typed
+            // output; only the SELECT's own columns are source columns.
+            let metadata = spec.meta_columns.written(spec.hard_deletes);
+            let columns: Vec<String> = model_ir
+                .typed_columns
+                .iter()
+                .map(|c| c.name.clone())
+                .filter(|name| !metadata.iter().any(|m| m.eq_ignore_ascii_case(name)))
+                .collect();
+            crate::snapshot_model::preview_snapshot_model_sql(
+                spec,
+                &target,
+                &model_ir.sql,
+                dialect,
+                &columns,
+                chrono::Utc::now(),
+            )
+        }
     }
 }
 
@@ -642,6 +665,33 @@ pub fn generate_transformation_initial_ddl(
         &model_ir.target.table,
     )?;
 
+    // A snapshot's first load is every row as its first current version:
+    // the model SELECT plus the SCD2 metadata columns.
+    let body = match &model_ir.materialization {
+        MaterializationStrategy::Snapshot(spec) => {
+            crate::snapshot_model::generate_snapshot_bootstrap_select(
+                spec,
+                &model_ir.sql,
+                dialect,
+                chrono::Utc::now(),
+            )?
+        }
+        // Exhaustive (no `_ =>`): a new strategy must decide its bootstrap body.
+        MaterializationStrategy::FullRefresh
+        | MaterializationStrategy::Incremental { .. }
+        | MaterializationStrategy::Merge { .. }
+        | MaterializationStrategy::View
+        | MaterializationStrategy::MaterializedView
+        | MaterializationStrategy::DynamicTable { .. }
+        | MaterializationStrategy::TimeInterval { .. }
+        | MaterializationStrategy::Ephemeral
+        | MaterializationStrategy::DeleteInsert { .. }
+        | MaterializationStrategy::Microbatch { .. }
+        // Every other strategy keeps the body chosen above (for `incremental`,
+        // the unfiltered first load with `@incremental_filter` as `TRUE`).
+        | MaterializationStrategy::ContentAddressed { .. } => body.to_string(),
+    };
+
     if let Some(ref format) = model_ir.format {
         let opts = model_ir
             .format_options
@@ -649,11 +699,11 @@ pub fn generate_transformation_initial_ddl(
             .cloned()
             .unwrap_or_default();
         return Ok(lakehouse::generate_lakehouse_initial_ddl(
-            format, &target, body, &opts, dialect,
+            format, &target, &body, &opts, dialect,
         )?);
     }
 
-    Ok(vec![dialect.create_table_as_new(&target, body)])
+    Ok(vec![dialect.create_table_as_new(&target, &body)])
 }
 
 /// The incremental-run statement of a transformation `incremental` model.

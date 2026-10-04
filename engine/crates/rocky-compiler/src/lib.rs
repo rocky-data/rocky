@@ -34,6 +34,7 @@ pub mod salsa_compile;
 pub mod schema_cache;
 pub mod semantic;
 pub mod source_refs;
+pub mod snapshot;
 pub mod typecheck;
 pub mod types;
 pub mod udf;

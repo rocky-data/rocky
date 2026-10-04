@@ -81,6 +81,7 @@ fn strategy_label(strategy: &StrategyConfig) -> String {
         StrategyConfig::View => "view".into(),
         StrategyConfig::MaterializedView => "materialized_view".into(),
         StrategyConfig::DynamicTable { .. } => "dynamic_table".into(),
+        StrategyConfig::Snapshot { .. } => "snapshot".into(),
     }
 }
 
@@ -219,6 +220,7 @@ pub fn generate_index_html(index: &DocIndex) -> String {
   .strategy-ephemeral { background: #21262d; color: #8b949e; }
   .strategy-delete_insert { background: #2d1a1a; color: #f85149; }
   .strategy-microbatch { background: #1a2332; color: #79c0ff; }
+  .strategy-snapshot { background: #1f2a1a; color: #a5d6a7; }
 
   .count { color: #8b949e; font-variant-numeric: tabular-nums; }
 

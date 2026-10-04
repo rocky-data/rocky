@@ -20315,6 +20315,101 @@
         ],
         "type": "object"
       },
+      "SnapshotCheckColsConfig": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        ],
+        "description": "`check_cols` accepts a list of columns or the string `\"all\"`."
+      },
+      "SnapshotFlagColumn": {
+        "anyOf": [
+          {
+            "description": "Write the flag under this column name.",
+            "type": "string"
+          },
+          {
+            "description": "`false`: write no flag column. `true` means the default name.",
+            "type": "boolean"
+          }
+        ],
+        "description": "The `is_current` metadata column: a name, or `false` for none.\n\nA snapshot table built by dbt has no `is_current` column. Setting `is_current = false` lets Rocky continue such a table: a version is then current when its `valid_to` is NULL (or equals `valid_to_current`)."
+      },
+      "SnapshotHardDeletes": {
+        "description": "What a snapshot does with a key that disappears from the model's result.",
+        "oneOf": [
+          {
+            "description": "Keep the last version current. The default, as in dbt.",
+            "enum": [
+              "ignore"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "Close the current version: set `valid_to` and clear `is_current`.",
+            "enum": [
+              "invalidate"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "Close the current version and insert a deletion-marker version with `is_deleted = TRUE`.",
+            "enum": [
+              "new_record"
+            ],
+            "type": "string"
+          }
+        ]
+      },
+      "SnapshotMetaColumns": {
+        "description": "Names of the metadata columns a snapshot model adds to its rows.\n\nThe defaults match the `snapshot` pipeline. Each key also accepts the dbt spelling (`dbt_valid_from`, `dbt_valid_to`, `dbt_scd_id`, `dbt_updated_at`, `dbt_is_deleted`) so an imported `snapshot_meta_column_names` block reads unchanged.",
+        "properties": {
+          "is_current": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/SnapshotFlagColumn"
+              }
+            ],
+            "default": "is_current",
+            "description": "`TRUE` on the current version of each key. Default `is_current`; `false` writes no flag (dbt has no such column)."
+          },
+          "is_deleted": {
+            "default": "is_deleted",
+            "description": "Deletion marker, written only under `hard_deletes = \"new_record\"`. Default `is_deleted`.",
+            "type": "string"
+          },
+          "scd_id": {
+            "default": "snapshot_id",
+            "description": "Deterministic per-version id: a hash of the key and `valid_from`. Default `snapshot_id`.",
+            "type": "string"
+          },
+          "updated_at": {
+            "description": "Optional copy of the version's change timestamp (dbt's `dbt_updated_at`). Not written unless named.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "valid_from": {
+            "default": "valid_from",
+            "description": "When this version became current. Default `valid_from`.",
+            "type": "string"
+          },
+          "valid_to": {
+            "default": "valid_to",
+            "description": "When this version stopped being current. Default `valid_to`.",
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
       "SnapshotOutput": {
         "description": "Output for `rocky snapshot --output json`.",
         "properties": {
@@ -20527,6 +20622,14 @@
         ],
         "type": "object"
       },
+      "SnapshotStrategyKind": {
+        "description": "The `strategy` key inside a snapshot `[strategy]` block.",
+        "enum": [
+          "timestamp",
+          "check"
+        ],
+        "type": "string"
+      },
       "SnapshotTargetConfig": {
         "additionalProperties": false,
         "description": "Target table for a snapshot pipeline (explicit single-table reference + governance).",
@@ -20568,6 +20671,20 @@
           "table"
         ],
         "type": "object"
+      },
+      "SnapshotUniqueKey": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        ],
+        "description": "`unique_key` accepts one column name or a list (dbt parity)."
       },
       "SourceEvaluation": {
         "description": "One demand source's outcome within a pipeline's evaluation.",
@@ -21525,6 +21642,97 @@
             },
             "required": [
               "storage_prefix",
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "SCD Type 2 snapshot of the model's SELECT (dbt `snapshot` parity). Each run closes changed versions and opens new ones; see [`crate::snapshot_model`]. Every field is optional here so a missing one is reported as E049 by `rocky compile` rather than as a TOML parse error.",
+            "properties": {
+              "check_cols": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/SnapshotCheckColsConfig"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "Check-strategy columns: a list, or `\"all\"`."
+              },
+              "hard_deletes": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/SnapshotHardDeletes"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "`\"ignore\"` (default), `\"invalidate\"` or `\"new_record\"`."
+              },
+              "invalidate_hard_deletes": {
+                "description": "dbt's legacy spelling of `hard_deletes = \"invalidate\"`.",
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "snapshot_meta_column_names": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/SnapshotMetaColumns"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "Metadata column names (Rocky defaults; dbt keys accepted)."
+              },
+              "strategy": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/SnapshotStrategyKind"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "`\"timestamp\"` or `\"check\"`."
+              },
+              "type": {
+                "enum": [
+                  "snapshot"
+                ],
+                "type": "string"
+              },
+              "unique_key": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/SnapshotUniqueKey"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "Column, or list of columns, identifying a row of the output."
+              },
+              "updated_at": {
+                "description": "Timestamp-strategy change column.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "valid_to_current": {
+                "description": "SQL expression for `valid_to` on current versions instead of NULL.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "required": [
               "type"
             ],
             "type": "object"

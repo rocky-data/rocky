@@ -404,6 +404,7 @@ span, and sometimes a suggested fix.
 | `E050` | A freshness declaration cannot be evaluated: no threshold, a bad duration, `error_after` shorter than `warn_after`, a bad `loaded_at_field` or `filter`, or a model `time_column` absent from a complete output |
 | `E037` | A transformation model declares `type = "incremental"` with no `timestamp_column` (watermark), which would append every row again on each run. Declare the watermark and use `@incremental_filter`, or use `merge`, `delete_insert`, `time_interval` or `full_refresh` |
 | `E046` | An `incremental` model's watermark filter has no safe place: no `@incremental_filter` and the watermark is not a provable passthrough column; or the watermark is not an output column or not a plain name; or `@incremental_filter` appears under another strategy |
+| `E049` | A `type = "snapshot"` model has an invalid config: no `unique_key` or `strategy`, `timestamp` without `updated_at`, `check` without `check_cols`, a key or change column that is an expression, an `updated_at` or `check_cols` entry the model's explicit SELECT does not output, a key computed with `random()`/`uuid()`/`now()`, or an output column named like a snapshot metadata column |
 | `W001` | Unused model (no downstream consumers) |
 | `W002` | Duplicate column in model output |
 | `W004` | Classification tag with no matching `[mask]` strategy |
@@ -421,6 +422,7 @@ span, and sometimes a suggested fix.
 | `W041` | A direct reference names a column absent from an external source schema that may be out of date (seed or old cache entry) |
 | `W051` | A user-defined function call could not be fully verified: an unknown argument type, or an argument the warehouse must convert implicitly |
 | `W046` | An `incremental` model sets `lookback` without `unique_key`, so the re-read window is appended again on each run |
+| `W049` | A `type = "snapshot"` model is valid but risky: a `unique_key` the SELECT does not output (it may be a `[[surrogate_key]]` column), `check` over more than 20 columns, an `updated_at` that is not a timestamp or date, or a key or change column missing from a `SELECT *` model's compile-time schema (which may be stale) |
 | `I001` | Model dependency inferred from SQL |
 | `I002` | Some, but not all, output columns have unknown types — provide source schemas for more type checking |
 | `I003` | A contract declares a type for a column whose type Rocky could not infer, so `E011` did not check it |
