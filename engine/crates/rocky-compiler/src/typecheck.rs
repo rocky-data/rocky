@@ -71,7 +71,7 @@ pub struct TypeCheckResult {
 /// table + column keys look up independently (a flat `(String, String)`
 /// key would need `format!("{table}.{col}")` at the lookup site and
 /// re-introduce the allocation).
-struct TypeScope {
+pub(crate) struct TypeScope {
     /// column_name → (type, nullable) for all columns in scope.
     columns: HashMap<CiKey<'static>, (RockyType, bool)>,
     /// table → { column → (type, nullable) } for qualified references.
@@ -1857,7 +1857,7 @@ fn enhanced_inference(
 ///
 /// This is the core expression-level type inference function.
 /// Used by both the enhanced inference pass and for ad-hoc type checking.
-fn infer_expr_type(expr: &Expr, scope: &TypeScope) -> (RockyType, bool) {
+pub(crate) fn infer_expr_type(expr: &Expr, scope: &TypeScope) -> (RockyType, bool) {
     match expr {
         // Column reference
         Expr::Identifier(ident) => scope.lookup(&ident.value),
@@ -2284,8 +2284,8 @@ pub fn infer_select_types(
 }
 
 #[derive(Default)]
-struct SelectInference {
-    columns: Vec<TypedColumn>,
+pub(crate) struct SelectInference {
+    pub(crate) columns: Vec<TypedColumn>,
     // Projection indexes keep metadata aligned with duplicate wildcard names.
     reference_outputs: HashSet<usize>,
 }
@@ -2329,7 +2329,7 @@ fn infer_select_types_with_lookup<'a>(
     infer_query_types(query, lookup)
 }
 
-fn infer_query_types<'a>(
+pub(crate) fn infer_query_types<'a>(
     query: &ast::Query,
     lookup: &dyn Fn(&str) -> Option<&'a [TypedColumn]>,
 ) -> Result<SelectInference, String> {
@@ -2351,32 +2351,7 @@ fn infer_query_types<'a>(
         SetExpr::Query(query) => return infer_query_types(query, &lookup),
         _ => return Err("unsupported query form".to_string()),
     };
-    let mut from_scope = JoinScope::default();
-    for from in &select.from {
-        let joined = infer_join_relations(from, &lookup);
-        from_scope.relations.extend(joined.relations);
-        from_scope.columns.extend(joined.columns);
-    }
-    let mut type_scope = TypeScope::new();
-    for col in &from_scope.columns {
-        type_scope
-            .columns
-            .entry(CiKey::owned(col.name.clone()))
-            .and_modify(|ty| *ty = (RockyType::Unknown, true))
-            .or_insert_with(|| (col.data_type.clone(), col.nullable));
-    }
-    for relation in &from_scope.relations {
-        for col in &relation.columns {
-            type_scope
-                .qualified
-                .entry(CiKey::owned(relation.qualifier.clone()))
-                .or_default()
-                .insert(
-                    CiKey::owned(col.name.clone()),
-                    (col.data_type.clone(), col.nullable),
-                );
-        }
-    }
+    let (from_scope, type_scope) = select_type_scope(select, &lookup);
 
     let mut inferred = SelectInference::default();
 
@@ -2421,13 +2396,50 @@ fn infer_query_types<'a>(
     Ok(inferred)
 }
 
-struct RelationColumns {
+/// Build the relation scope of one `SELECT`: its `FROM` / `JOIN` relations
+/// and the [`TypeScope`] that resolves bare and qualified column names
+/// against them. A bare name exposed by more than one relation is ambiguous
+/// and resolves to `Unknown`.
+pub(crate) fn select_type_scope<'a>(
+    select: &ast::Select,
+    lookup: &dyn Fn(&str) -> Option<&'a [TypedColumn]>,
+) -> (JoinScope, TypeScope) {
+    let mut from_scope = JoinScope::default();
+    for from in &select.from {
+        let joined = infer_join_relations(from, lookup);
+        from_scope.relations.extend(joined.relations);
+        from_scope.columns.extend(joined.columns);
+    }
+    let mut type_scope = TypeScope::new();
+    for col in &from_scope.columns {
+        type_scope
+            .columns
+            .entry(CiKey::owned(col.name.clone()))
+            .and_modify(|ty| *ty = (RockyType::Unknown, true))
+            .or_insert_with(|| (col.data_type.clone(), col.nullable));
+    }
+    for relation in &from_scope.relations {
+        for col in &relation.columns {
+            type_scope
+                .qualified
+                .entry(CiKey::owned(relation.qualifier.clone()))
+                .or_default()
+                .insert(
+                    CiKey::owned(col.name.clone()),
+                    (col.data_type.clone(), col.nullable),
+                );
+        }
+    }
+    (from_scope, type_scope)
+}
+
+pub(crate) struct RelationColumns {
     qualifier: String,
     columns: Vec<TypedColumn>,
 }
 
 #[derive(Default)]
-struct JoinScope {
+pub(crate) struct JoinScope {
     // Qualified references retain each side's columns. USING/NATURAL keys
     // merge only in the unqualified output used by SELECT * and bare names.
     relations: Vec<RelationColumns>,
@@ -2605,7 +2617,7 @@ fn infer_relation_columns<'a>(
     }
 }
 
-fn rename_relation_columns(columns: &mut [TypedColumn], alias: &ast::TableAlias) {
+pub(crate) fn rename_relation_columns(columns: &mut [TypedColumn], alias: &ast::TableAlias) {
     for (col, alias) in columns.iter_mut().zip(&alias.columns) {
         col.name.clone_from(&alias.name.value);
     }

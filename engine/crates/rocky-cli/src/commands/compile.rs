@@ -38,8 +38,9 @@ pub fn run_compile(
     with_seed: bool,
     cache_ttl_override: Option<u64>,
     run_vars: &rocky_core::run_vars::RunVars,
+    deny_warning_codes: &[String],
 ) -> Result<()> {
-    let (output, text_data) = compile_inner(
+    let (mut output, text_data) = compile_inner(
         config_path,
         state_path,
         models_dir,
@@ -51,6 +52,10 @@ pub fn run_compile(
         cache_ttl_override,
         run_vars,
     )?;
+
+    if deny_warnings(&mut output.diagnostics, deny_warning_codes) {
+        output.has_errors = true;
+    }
 
     if output_json {
         print_json(&output)?;
@@ -221,6 +226,22 @@ fn compile_inner(
         }
     }
 
+    // Aggregate-argument and comparison-operand checks (E042/W042,
+    // E043/W043). These judge against the warehouse that will run the SQL,
+    // so they need a dialect the compiler core does not carry; see
+    // `resolve_operand_dialect` for the precedence.
+    let operand_dialect = resolve_operand_dialect(target_dialect, project_config.as_ref());
+    let operand_diags = rocky_compiler::operand_check::check_operand_types(
+        &result.project.models,
+        &result.semantic_graph,
+        &result.type_check.typed_models,
+        operand_dialect,
+    );
+    if operand_diags.iter().any(|d| d.severity == Severity::Error) {
+        result.has_errors = true;
+    }
+    result.diagnostics.extend(operand_diags);
+
     // Load macros and expand model SQL when --expand-macros is set.
     let expanded_sql = if do_expand_macros {
         let macros_dir = models_dir.join("../macros");
@@ -385,6 +406,66 @@ fn compile_inner(
     .with_expanded_sql(expanded_sql);
 
     Ok((output, text_data))
+}
+
+/// The warehouse dialect the E042/E043 operand checks judge against.
+///
+/// Precedence: an explicit `--target-dialect` flag, then the adapter type of
+/// the pipelines' target adapter (only when every pipeline targets the same
+/// dialect, or — with no pipelines — when every warehouse adapter does), then
+/// `[portability] target_dialect`. `None` when nothing resolves; the checks
+/// then report the least severe verdict across all dialects (warnings only).
+fn resolve_operand_dialect(
+    target_dialect: Option<Dialect>,
+    config: Option<&rocky_config::RockyConfig>,
+) -> Option<rocky_compiler::operand_check::OperandDialect> {
+    use rocky_compiler::operand_check::OperandDialect;
+
+    if let Some(dialect) = target_dialect {
+        return Some(dialect.into());
+    }
+    let config = config?;
+    let adapter_dialect = |name: &str| {
+        config
+            .adapters
+            .get(name)
+            .and_then(|a| OperandDialect::from_adapter_type(&a.adapter_type))
+    };
+    let dialects: std::collections::HashSet<OperandDialect> = if config.pipelines.is_empty() {
+        config
+            .adapters
+            .values()
+            .filter_map(|a| OperandDialect::from_adapter_type(&a.adapter_type))
+            .collect()
+    } else {
+        config
+            .pipelines
+            .values()
+            .filter_map(|p| adapter_dialect(p.target_adapter()))
+            .collect()
+    };
+    if dialects.len() == 1 {
+        return dialects.into_iter().next();
+    }
+    config.portability.target_dialect.map(Into::into)
+}
+
+/// Escalate warning diagnostics whose code is listed in `--deny-warnings` to
+/// errors. Codes match case-insensitively; non-warning diagnostics are left
+/// as they are. Returns whether any diagnostic was escalated.
+fn deny_warnings(diagnostics: &mut [Diagnostic], codes: &[String]) -> bool {
+    let mut escalated = false;
+    for diag in diagnostics {
+        if diag.severity == Severity::Warning
+            && codes
+                .iter()
+                .any(|c| c.trim().eq_ignore_ascii_case(&diag.code))
+        {
+            diag.severity = Severity::Error;
+            escalated = true;
+        }
+    }
+    escalated
 }
 
 /// Extra data the `rocky compile` text renderer needs from the raw
@@ -714,6 +795,7 @@ schema_template = "s"
             false,
             None,
             &rocky_core::run_vars::RunVars::new(),
+            &[],
         )
         .unwrap_err();
         assert!(
@@ -742,6 +824,7 @@ schema_template = "s"
             false,
             None,
             &rocky_core::run_vars::RunVars::new(),
+            &[],
         )
         .expect("compile should succeed without lint");
     }
@@ -766,6 +849,7 @@ schema_template = "s"
             false,
             None,
             &rocky_core::run_vars::RunVars::new(),
+            &[],
         )
         .expect("snowflake target should accept NVL");
     }
@@ -792,6 +876,7 @@ schema_template = "s"
             false,
             None,
             &rocky_core::run_vars::RunVars::new(),
+            &[],
         )
         .unwrap_err();
         assert!(
@@ -825,6 +910,7 @@ schema_template = "s"
             false,
             None,
             &rocky_core::run_vars::RunVars::new(),
+            &[],
         )
         .unwrap_err();
         assert!(err.to_string().contains("compilation failed"));
@@ -854,6 +940,7 @@ schema_template = "s"
             false,
             None,
             &rocky_core::run_vars::RunVars::new(),
+            &[],
         )
         .expect("allow-listed NVL should not trip the lint");
     }
@@ -883,6 +970,7 @@ schema_template = "s"
             false,
             None,
             &rocky_core::run_vars::RunVars::new(),
+            &[],
         )
         .expect("pragma-exempted model should not trip the lint");
     }
@@ -913,6 +1001,7 @@ schema_template = "s"
             false,
             None,
             &rocky_core::run_vars::RunVars::new(),
+            &[],
         )
         .unwrap_err();
         assert!(
@@ -943,6 +1032,7 @@ schema_template = "s"
             false,
             None,
             &rocky_core::run_vars::RunVars::new(),
+            &[],
         )
         .expect("missing config should fall through, not error");
     }
@@ -968,6 +1058,7 @@ schema_template = "s"
             false,
             None,
             &rocky_core::run_vars::RunVars::new(),
+            &[],
         )
         .unwrap_err();
 
@@ -1034,6 +1125,7 @@ schema_template = "s"
             true,
             None,
             &rocky_core::run_vars::RunVars::new(),
+            &[],
         )
         .expect("with-seed compile should succeed");
     }
@@ -1059,6 +1151,7 @@ schema_template = "s"
             true,
             None,
             &rocky_core::run_vars::RunVars::new(),
+            &[],
         )
         .unwrap_err();
         let msg = err.to_string();
@@ -1087,6 +1180,7 @@ schema_template = "s"
             true,
             None,
             &rocky_core::run_vars::RunVars::new(),
+            &[],
         )
         .unwrap_err();
         assert!(
@@ -1193,6 +1287,7 @@ schema_template = "s"
             false,
             None,
             &rocky_core::run_vars::RunVars::new(),
+            &[],
         )
         .expect("compile with cache-backed source_schemas should succeed");
     }
@@ -1304,6 +1399,7 @@ schema_template = "s"
             false,
             None,
             &rocky_core::run_vars::RunVars::new(),
+            &[],
         )
         .unwrap_err();
         assert!(
@@ -1333,6 +1429,7 @@ schema_template = "s"
             false,
             None,
             &rocky_core::run_vars::RunVars::new(),
+            &[],
         )
         .expect("model without budget should compile cleanly");
     }
@@ -1365,6 +1462,7 @@ schema_template = "s"
             false,
             None,
             &rocky_core::run_vars::RunVars::new(),
+            &[],
         )
         .unwrap_err();
         assert!(
@@ -1394,6 +1492,7 @@ schema_template = "s"
             false,
             None,
             &rocky_core::run_vars::RunVars::new(),
+            &[],
         )
         .expect("generous budget should not trigger E027");
     }
@@ -1423,6 +1522,7 @@ schema_template = "s"
             false,
             None,
             &rocky_core::run_vars::RunVars::new(),
+            &[],
         )
         .expect("compile without state file should succeed");
         assert!(

@@ -23,6 +23,7 @@ pub mod cost_check;
 pub mod diagnostic;
 pub mod import;
 pub mod limits;
+pub mod operand_check;
 pub mod partial;
 pub mod project;
 pub mod resolve;

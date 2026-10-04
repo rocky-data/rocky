@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- `rocky compile` checks aggregate arguments and comparison operands against the target warehouse. `SUM(VARCHAR)` is `E042` where the warehouse has no such overload (DuckDB, BigQuery, Trino) and `W042` where it casts at run time (Snowflake, Databricks). A `BIGINT` column compared with a `VARCHAR` column is `W043` on DuckDB, Snowflake and Databricks, and `E043` on BigQuery and Trino. Numeric string literals, date literals, `DATE` vs `TIMESTAMP` and unknown types stay clean. The warehouse comes from `--target-dialect`, then the target adapter type, then `[portability] target_dialect`.
+- `rocky compile --deny-warnings <CODES>` reports the listed warning codes as errors, such as `--deny-warnings W042,W043`.
+
 ## [1.76.0] — 2026-10-03
 
 This release carries five breaking changes, each marked **Breaking:** below.
