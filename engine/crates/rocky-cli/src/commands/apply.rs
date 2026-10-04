@@ -529,15 +529,21 @@ async fn run_apply_run_plan(
 
     // Finding 3 (pre-run half): the plain rule decision the gate just recorded
     // must survive `run`'s start-download, which REPLACES the local ledger from
-    // remote. Push it to remote NOW so `run`'s download pulls it back — otherwise
-    // the budget-burn PAIR (rule decision + verify-after custody) never both reach
-    // remote and a failed apply doesn't burn the budget. Only when a verify-after
-    // requirement exists (the budget-relevant case).
+    // remote. Commit it to remote NOW so `run`'s download pulls it back —
+    // otherwise the budget-burn PAIR (rule decision + verify-after custody)
+    // never both reach remote and a failed apply doesn't burn the budget. Only
+    // when a verify-after requirement exists (the budget-relevant case). The
+    // seam re-evaluates the gate on the fresh winner (#1242).
     if !verify_checks.is_empty() {
-        upload_remote_ledger_fail_closed(
-            Some(&loaded.config),
+        commit_governed_rule_decision(
+            &loaded.config,
+            root,
+            plan_id,
+            principal,
+            &touched,
+            &models_dir,
+            models_glob.as_deref(),
             state_path,
-            "governed rule decision",
         )
         .await?;
     }
@@ -673,15 +679,25 @@ async fn finish_apply_verify_after(
         verify_checks.dedup();
     }
 
-    let verify_result =
-        run_verify_after(plan_id, principal, &verify_checks, apply_run_id, state_path);
-    // Finding 3 (post-verify half): the verify-after custody row lands AFTER
-    // `run`'s end-upload. Push it to remote fail-closed even when verification
-    // failed, then propagate the verification result.
-    if !verify_checks.is_empty() {
-        upload_remote_ledger_fail_closed(Some(cfg), state_path, "verify-after custody").await?;
+    if remote_ledger_config(Some(cfg)).is_none() {
+        // Local backend: the on-disk file IS the state.
+        return run_verify_after(plan_id, principal, &verify_checks, apply_run_id, state_path);
     }
-    verify_result
+    if verify_checks.is_empty() {
+        return Ok(());
+    }
+    // Finding 3 (post-verify half): the verify-after custody row lands AFTER
+    // `run`'s end-upload. Commit it to remote fail-closed even when
+    // verification failed, then propagate the verification result. The
+    // verdict is computed ONCE from this apply's own run record; the seam
+    // replays the constructed row verbatim on the winner (#1242).
+    let verdict = {
+        let store = open_ledger_with_retry(state_path)
+            .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
+        evaluate_verify_after(&store, plan_id, principal, &verify_checks, apply_run_id)?
+    };
+    commit_verify_after_custody(Some(cfg), state_path, &verdict.record).await?;
+    verdict.into_result(plan_id, &verify_checks)
 }
 
 /// Build the [`GovernedRunContext`] for a two-step apply — `Some` only for an
@@ -1504,35 +1520,177 @@ pub(crate) async fn download_remote_ledger_unconditional(
     Ok(())
 }
 
-/// Upload the local `[state]` ledger to a REMOTE backend, FAIL-CLOSED
-/// (`on_upload_failure = Fail`), so a governed ledger mutation is durable.
-///
-/// Used for the restore/backfill upload-after (finding 2) and to make the
-/// budget-burn decision pair (rule decision + verify-after custody) reach remote
-/// (finding 3). No-op for the Local backend or an unloadable config.
-pub(crate) async fn upload_remote_ledger_fail_closed(
+/// `cfg` when it names a REMOTE `[state]` backend — the only case in which a
+/// ledger seam publishes anything. An absent config or the Local backend has
+/// no remote: the on-disk file IS the state, so the caller mutates it
+/// directly.
+pub(crate) fn remote_ledger_config(
     cfg: Option<&rocky_core::config::RockyConfig>,
+) -> Option<&rocky_core::config::RockyConfig> {
+    cfg.filter(|c| !matches!(c.state.backend, StateBackend::Local))
+}
+
+/// Wrap a caller's domain failure inside a ledger-seam attempt. The session
+/// aborts without publishing; the caller's message survives in the chain.
+pub(crate) fn seam_transition_error(e: &anyhow::Error) -> rocky_core::state_sync::StateSyncError {
+    rocky_core::state_sync::StateSyncError::SeamTransition(format!("{e:#}"))
+}
+
+/// Commit a governed ledger transition to the REMOTE `[state]` ledger through
+/// a [`rocky_core::state_sync::LedgerSeamSession`] (#1242,
+/// ADR-CONCURRENCY D1 seam class = RETRY).
+///
+/// This is the only way the apply-family seams (governed rule decision,
+/// verify-after custody, restore) publish the shared ledger. Each attempt
+/// downloads the remote winner, runs `attempt` against that fresh store, and
+/// publishes with `on_upload_failure` forced to `fail` — a governed mutation
+/// that commits locally but never reaches the remote would be reverted by the
+/// next run's start-download while the command reported success. Under
+/// effective CAS the publish is conditional on the attempt's own generation
+/// and a conflict replays the whole transition on the new winner (three
+/// attempts, then a typed `LedgerSeamConflict` that preserves the winner).
+/// Without effective CAS it is the legacy one-download, one-upload half-seam.
+///
+/// `attempt` must therefore re-establish everything it needs from the fresh
+/// store: any row written to the local file BEFORE this call is replaced by
+/// the download.
+pub(crate) async fn commit_remote_ledger_seam<T, F>(
+    cfg: &rocky_core::config::RockyConfig,
     state_path: &Path,
     context_label: &str,
-) -> Result<()> {
-    let Some(cfg) = cfg else {
-        return Ok(());
-    };
-    if matches!(cfg.state.backend, StateBackend::Local) {
-        return Ok(());
-    }
-    // WP-01 PR-B (2b): the half-seam owns the forced-`Fail` durability policy.
-    rocky_core::state_sync::RemoteStateSession::upload_only_fail_closed(
+    attempt: F,
+) -> Result<T>
+where
+    T: Send,
+    F: for<'a> FnMut(
+            &'a StateStore,
+            Option<&'a rocky_core::object_store::Generation>,
+        ) -> rocky_core::state_sync::LedgerSeamAttempt<'a, T>
+        + Send,
+{
+    rocky_core::state_sync::LedgerSeamSession::new(
         &cfg.state,
         state_path,
-        context_label,
         cfg.cache.schemas.replicate,
     )
+    .execute(attempt)
     .await
     .with_context(|| {
-        format!("failed to upload remote state after {context_label} (fail-closed)")
-    })?;
-    Ok(())
+        format!(
+            "failed to commit {context_label} to the shared remote `[state]` ledger \
+             (fail-closed)"
+        )
+    })
+}
+
+/// Finding 3 (pre-run half), migrated to the ledger seam (#1242): make this
+/// apply's rule decision durable on the remote ledger BEFORE `run`'s
+/// start-download replaces the local file, so the budget-burn PAIR (rule
+/// decision + verify-after custody) can both reach remote.
+///
+/// The gate is RE-EVALUATED inside every attempt, over the freshly
+/// downloaded ledger and a fresh freeze-marker LIST, and its rows are
+/// recorded into that fresh store. A winner that landed after the pre-run
+/// gate — a new freeze, or a verify-after failure that newly exhausts an
+/// autonomy budget — therefore refuses this apply rather than publishing the
+/// stale `Allow` over it. The decision rows keep the gate's own durability
+/// split: an ordinary audit-row write failure only warns, a budget-relevant
+/// one fails closed (both inside
+/// [`evaluate_apply_policy_with_policy_matching_dual`]).
+///
+/// No-op for the Local backend: the gate already recorded its rows into the
+/// on-disk file, which is the state.
+#[allow(clippy::too_many_arguments)]
+async fn commit_governed_rule_decision(
+    cfg: &rocky_core::config::RockyConfig,
+    root: &Path,
+    plan_id: &str,
+    principal: PolicyPrincipal,
+    touched: &BTreeMap<String, PolicyCapability>,
+    models_dir: &Path,
+    models_glob: Option<&str>,
+    state_path: &Path,
+) -> Result<()> {
+    let Some(cfg) = remote_ledger_config(Some(cfg)) else {
+        return Ok(());
+    };
+    // The attempt future must OWN everything it touches (the session's
+    // `for<'a>` bound): master copies move into the closure, and each attempt
+    // clones what its future needs.
+    let seam_cfg = cfg.clone();
+    let seam_root = root.to_path_buf();
+    let seam_plan_id = plan_id.to_string();
+    let seam_touched = touched.clone();
+    let seam_models_dir = models_dir.to_path_buf();
+    let seam_models_glob = models_glob.map(str::to_string);
+    commit_remote_ledger_seam(
+        cfg,
+        state_path,
+        "the governed rule decision",
+        move |fresh_store, _fresh_base| {
+            let cfg = seam_cfg.clone();
+            let root = seam_root.clone();
+            let plan_id = seam_plan_id.clone();
+            let touched = seam_touched.clone();
+            let models_dir = seam_models_dir.clone();
+            let models_glob = seam_models_glob.clone();
+            Box::pin(async move {
+                let marker_freezes = marker_freezes_before_gate(&cfg, &touched)
+                    .await
+                    .map_err(|e| seam_transition_error(&e))?;
+                let gate = evaluate_apply_policy_with_policy_matching_dual(
+                    cfg.policy.as_ref(),
+                    &plan_id,
+                    principal,
+                    &touched,
+                    &models_dir,
+                    models_glob.as_deref(),
+                    GateLedger::Store(fresh_store),
+                    &marker_freezes,
+                    None,
+                    GateSubjects::CompiledModels,
+                );
+                apply_policy_gate(&root, &plan_id, gate).map_err(|e| seam_transition_error(&e))
+            })
+        },
+    )
+    .await
+}
+
+/// Finding 3 (post-verify half), migrated to the ledger seam (#1242): make the
+/// verify-after custody row durable on the remote ledger.
+///
+/// The row is REPLAYED VERBATIM into every attempt's fresh store — the exact
+/// constructed record, timestamp included. Budget consumers key on the
+/// record's event time, so a re-constructed record would forge a second audit
+/// identity. A write failure is fail-closed (the custody row is the
+/// budget-burning half of the pair).
+///
+/// On the Local backend the row is written straight to the on-disk file.
+async fn commit_verify_after_custody(
+    cfg: Option<&rocky_core::config::RockyConfig>,
+    state_path: &Path,
+    record: &PolicyDecisionRecord,
+) -> Result<()> {
+    let Some(cfg) = remote_ledger_config(cfg) else {
+        let store = open_ledger_with_retry(state_path)
+            .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
+        return record_verify_after_custody(&store, record);
+    };
+    let seam_record = record.clone();
+    commit_remote_ledger_seam(
+        cfg,
+        state_path,
+        "the verify-after custody row",
+        move |fresh_store, _fresh_base| {
+            let record = seam_record.clone();
+            Box::pin(async move {
+                record_verify_after_custody(fresh_store, &record)
+                    .map_err(|e| seam_transition_error(&e))
+            })
+        },
+    )
+    .await
 }
 
 /// Evaluate the agent-policy plane over a plan's touched `(model, capability)`
@@ -1640,7 +1798,7 @@ pub(crate) fn evaluate_apply_policy_with_policy_matching(
         touched,
         models_dir,
         models_glob,
-        state_path,
+        GateLedger::Path(state_path),
         marker_freezes,
         None,
         subjects,
@@ -1713,11 +1871,24 @@ pub fn evaluate_apply_policy_with_extra_classifications(
         touched,
         models_dir,
         None,
-        state_path,
+        GateLedger::Path(state_path),
         marker_freezes,
         Some(prior_classifications),
         GateSubjects::CompiledModels,
     )
+}
+
+/// Where a policy gate reads its decision-ledger snapshot and records its
+/// decision rows.
+#[derive(Clone, Copy)]
+enum GateLedger<'a> {
+    /// Open the ledger file at this path (read-only snapshot, then a write
+    /// handle with a bounded retry on advisory-lock contention).
+    Path(&'a Path),
+    /// Use an already-open store — the freshly downloaded store a
+    /// [`rocky_core::state_sync::LedgerSeamSession`] attempt holds (#1242).
+    /// redb forbids a second handle on the same file within a process.
+    Store(&'a StateStore),
 }
 
 /// The shared body behind [`evaluate_apply_policy_with_policy_matching`] and
@@ -1743,7 +1914,7 @@ fn evaluate_apply_policy_with_policy_matching_dual(
     touched: &BTreeMap<String, PolicyCapability>,
     models_dir: &Path,
     models_glob: Option<&str>,
-    state_path: &Path,
+    ledger: GateLedger<'_>,
     marker_freezes: &[rocky_core::freeze_marker::ActiveMarkerFreeze],
     prior_classifications: Option<&BTreeMap<String, Vec<String>>>,
     subjects: GateSubjects<'_>,
@@ -1780,22 +1951,42 @@ fn evaluate_apply_policy_with_policy_matching_dual(
     // freeze/budget projection. The reader handle is dropped before the write
     // handle below is opened — redb forbids two live handles on one file
     // within a process.
-    let prior_snapshot: Option<Vec<PolicyDecisionRecord>> = StateStore::open_read_only(state_path)
-        .ok()
-        .and_then(|reader| reader.list_policy_decisions().ok());
+    //
+    // A [`GateLedger::Store`] caller (a ledger-seam attempt, #1242) already
+    // holds the only handle this process may open on the file — the freshly
+    // downloaded store — so the snapshot and the record sink both go through
+    // it.
+    let owned_ledger: Option<StateStore>;
+    let (prior_snapshot, ledger): (Option<Vec<PolicyDecisionRecord>>, Option<&StateStore>) =
+        match ledger {
+            GateLedger::Path(state_path) => {
+                let prior_snapshot: Option<Vec<PolicyDecisionRecord>> =
+                    StateStore::open_read_only(state_path)
+                        .ok()
+                        .and_then(|reader| reader.list_policy_decisions().ok());
 
-    // Ledger write handle, opened with a bounded retry on transient advisory-lock
-    // contention. Finding 6 (scoped, red-team round 6): budget / `verify_after`
-    // durability is enforced PER WINNING RULE in the record sink below — a dropped
-    // decision row for a rule that actually governs a touched target fails closed,
-    // while an ordinary audit-row hiccup never blocks the apply. So an UNRELATED
-    // budget rule for a different target no longer forces a false-deny.
-    let ledger = open_ledger_with_retry(state_path).ok();
+                // Ledger write handle, opened with a bounded retry on transient
+                // advisory-lock contention. Finding 6 (scoped, red-team round 6):
+                // budget / `verify_after` durability is enforced PER WINNING RULE
+                // in the record sink below — a dropped decision row for a rule
+                // that actually governs a touched target fails closed, while an
+                // ordinary audit-row hiccup never blocks the apply. So an
+                // UNRELATED budget rule for a different target no longer forces a
+                // false-deny.
+                owned_ledger = open_ledger_with_retry(state_path).ok();
 
-    // Rare fallback: the read-only open lost a transient redb open race but a
-    // write handle succeeded — snapshot through it rather than reading nothing.
-    let prior_snapshot =
-        prior_snapshot.or_else(|| ledger.as_ref().and_then(|s| s.list_policy_decisions().ok()));
+                // Rare fallback: the read-only open lost a transient redb open
+                // race but a write handle succeeded — snapshot through it rather
+                // than reading nothing.
+                let prior_snapshot = prior_snapshot.or_else(|| {
+                    owned_ledger
+                        .as_ref()
+                        .and_then(|s| s.list_policy_decisions().ok())
+                });
+                (prior_snapshot, owned_ledger.as_ref())
+            }
+            GateLedger::Store(store) => (store.list_policy_decisions().ok(), Some(store)),
+        };
 
     let snapshot_unreadable = prior_snapshot.is_none();
     let prior_decisions: Vec<PolicyDecisionRecord> = prior_snapshot.unwrap_or_default();
@@ -1858,7 +2049,7 @@ fn evaluate_apply_policy_with_policy_matching_dual(
                 .and_then(|idx| policy.rules.get(idx))
                 .map(|r| r.autonomy_budget.is_some() || !r.verify_after.is_empty())
                 .unwrap_or(false);
-            match &ledger {
+            match ledger {
                 Some(store) => {
                     if let Err(e) = store.record_policy_decision(record) {
                         if rec_budget_relevant {
@@ -3670,7 +3861,60 @@ fn run_verify_after(
     // best-effort open) so the custody half of the budget-burn pair is durable.
     let store = open_ledger_with_retry(state_path)
         .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
+    let verdict = evaluate_verify_after(&store, plan_id, principal, required, run_id)?;
+    record_verify_after_custody(&store, &verdict.record)?;
+    drop(store);
+    verdict.into_result(plan_id, required)
+}
 
+/// The outcome of a post-apply `verify_after` evaluation: the custody row to
+/// persist and the checks that could not be confirmed.
+struct VerifyAfterVerdict {
+    /// The exact custody row. Persisted once on the Local backend, replayed
+    /// verbatim by every ledger-seam attempt on a remote one (#1242).
+    record: PolicyDecisionRecord,
+    /// Unconfirmed required checks; empty means the gate passed.
+    failures: Vec<String>,
+}
+
+impl VerifyAfterVerdict {
+    /// Report the verdict: `Ok` when every required check was confirmed, the
+    /// halt-only error otherwise. Call AFTER the custody row is durable.
+    fn into_result(self, plan_id: &str, required: &[String]) -> Result<()> {
+        if self.failures.is_empty() {
+            eprintln!(
+                "verify_after: {} post-apply check(s) passed [{}].",
+                required.len(),
+                required.join(", ")
+            );
+            return Ok(());
+        }
+        // Alert: a post-apply verification failure is an operational event, not
+        // a routine warning.
+        warn!(
+            target: "rocky::policy",
+            plan_id,
+            failures = %self.failures.join("; "),
+            "verify_after post-apply gate FAILED"
+        );
+        bail!(
+            "verify_after gate FAILED for plan '{plan_id}': {}. \
+             No rollback substrate is available, so the mutation HAS ALREADY LANDED and remains in \
+             place — it must be reverted manually. The failure is recorded in the policy-decision ledger.",
+            self.failures.join("; ")
+        )
+    }
+}
+
+/// Evaluate this apply's required `verify_after` checks against its own run
+/// record and construct the custody row. Reads only; writes nothing.
+fn evaluate_verify_after(
+    store: &StateStore,
+    plan_id: &str,
+    principal: PolicyPrincipal,
+    required: &[String],
+    run_id: &str,
+) -> Result<VerifyAfterVerdict> {
     // Resolve *this apply's own* run by id (not "latest"). `None` means no run
     // was recorded under this id — fail closed below (every check unverifiable).
     let run = store
@@ -3707,8 +3951,6 @@ fn run_verify_after(
             failures.join("; ")
         )
     };
-    // Best-effort custody entry — the gate below is the safety boundary; the
-    // ledger is the trail.
     let record = PolicyDecisionRecord {
         keys_recorded: false,
         models: Vec::new(),
@@ -3723,44 +3965,26 @@ fn run_verify_after(
             PolicyEffect::Deny
         },
         rule_id: None,
-        reason: reason.clone(),
+        reason,
         verify_after: required.to_vec(),
         auto_apply: None,
     };
-    // Finding 6: FAIL-CLOSED — the verify custody row is the budget-burning half
-    // of the pair, so a write failure must abort (not warn-and-continue) rather
-    // than silently leave the failed apply un-burnable.
-    store.record_policy_decision(&record).with_context(|| {
-        format!(
-            "fail-closed: could not persist the verify_after custody row for plan '{plan_id}' — \
-             the autonomy-budget pair would be incomplete, so a later agent action could \
-             auto-allow. Retry when the state store is not contended."
-        )
-    })?;
+    Ok(VerifyAfterVerdict { record, failures })
+}
 
-    if passed {
-        eprintln!(
-            "verify_after: {} post-apply check(s) passed [{}].",
-            required.len(),
-            required.join(", ")
-        );
-        Ok(())
-    } else {
-        // Alert: a post-apply verification failure is an operational event, not
-        // a routine warning.
-        warn!(
-            target: "rocky::policy",
-            plan_id,
-            failures = %failures.join("; "),
-            "verify_after post-apply gate FAILED"
-        );
-        bail!(
-            "verify_after gate FAILED for plan '{plan_id}': {}. \
-             No rollback substrate is available, so the mutation HAS ALREADY LANDED and remains in \
-             place — it must be reverted manually. The failure is recorded in the policy-decision ledger.",
-            failures.join("; ")
+/// Persist a verify-after custody row. Finding 6: FAIL-CLOSED — the verify
+/// custody row is the budget-burning half of the pair, so a write failure must
+/// abort (not warn-and-continue) rather than silently leave the failed apply
+/// un-burnable.
+fn record_verify_after_custody(store: &StateStore, record: &PolicyDecisionRecord) -> Result<()> {
+    store.record_policy_decision(record).with_context(|| {
+        format!(
+            "fail-closed: could not persist the verify_after custody row for plan '{}' — \
+             the autonomy-budget pair would be incomplete, so a later agent action could \
+             auto-allow. Retry when the state store is not contended.",
+            record.plan_id
         )
-    }
+    })
 }
 
 /// Apply a `PlanKind::AiAuthored` plan.
@@ -3910,10 +4134,15 @@ async fn run_apply_ai_authored_plan(
     // before `run`'s start-download replaces the local ledger — see the twin in
     // `run_apply_run_plan`.
     if !verify_checks.is_empty() {
-        upload_remote_ledger_fail_closed(
-            Some(&loaded.config),
+        commit_governed_rule_decision(
+            &loaded.config,
+            root,
+            plan_id,
+            principal,
+            &touched,
+            &models_dir,
+            models_glob.as_deref(),
             state_path,
-            "governed rule decision",
         )
         .await?;
     }
@@ -6848,16 +7077,18 @@ default_agent_effect = "require_review"
             Ok(rocky_core::config::load_rocky_config(&path)?)
         };
 
-        // Local backend (no [state]) + absent config ⇒ both helpers no-op Ok.
+        // Local backend (no [state]) + absent config ⇒ the download is a no-op
+        // and no seam publishes (the on-disk file IS the state).
         let local_cfg = load("local.toml", NO_POLICY_TOML.to_string())?;
         assert!(matches!(local_cfg.state.backend, StateBackend::Local));
         for cfg in [Some(&local_cfg), None] {
             super::download_remote_ledger_unconditional(cfg, &state, "test")
                 .await
                 .expect("Local/absent ⇒ download is a no-op");
-            super::upload_remote_ledger_fail_closed(cfg, &state, "test")
-                .await
-                .expect("Local/absent ⇒ upload is a no-op");
+            assert!(
+                super::remote_ledger_config(cfg).is_none(),
+                "Local/absent ⇒ no remote ledger seam"
+            );
         }
 
         // Remote backend (S3, no bucket) ⇒ both helpers ATTEMPT the transfer
@@ -6873,17 +7104,30 @@ default_agent_effect = "require_review"
                 .is_err(),
             "the unconditional download must attempt (and fail closed) on a remote backend"
         );
-        // The upload helper needs a local file to exist (else upload_state
-        // early-returns Ok before the backend is touched).
         {
             let s = StateStore::open(&state)?;
             drop(s);
         }
+        // The custody seam downloads first and fails closed on the remote error.
+        let record = PolicyDecisionRecord {
+            keys_recorded: false,
+            models: Vec::new(),
+            timestamp: chrono::Utc::now(),
+            plan_id: "plan-x".to_string(),
+            principal: PolicyPrincipal::Agent,
+            capability: PolicyCapability::Apply,
+            model: "*".to_string(),
+            effect: PolicyEffect::Allow,
+            rule_id: None,
+            reason: "verify_after passed: [row_count]".to_string(),
+            verify_after: vec!["row_count".to_string()],
+            auto_apply: None,
+        };
         assert!(
-            super::upload_remote_ledger_fail_closed(Some(&remote_cfg), &state, "test")
+            super::commit_verify_after_custody(Some(&remote_cfg), &state, &record)
                 .await
                 .is_err(),
-            "the fail-closed upload must propagate a remote failure (on_upload_failure = Fail)"
+            "the fail-closed custody seam must propagate a remote failure"
         );
         Ok(())
     }
@@ -11200,6 +11444,363 @@ schema_template = "s__{source}"
         assert!(
             msg.contains("verify_after gate FAILED") && msg.contains("row_count"),
             "duplicate-name AND-aggregation must surface the failure: {msg}"
+        );
+    }
+}
+
+/// #1242: the apply-family ledger seams (governed rule decision, verify-after
+/// custody) publish through `LedgerSeamSession`. Every test drives the real
+/// session against the two-pod in-memory "S3" harness; interleavings are
+/// injected by publishing the winner from pod A before the seam runs on a
+/// stale pod B, or by arming deterministic CAS precondition failures — no
+/// sleeps, no scheduler dependence.
+#[cfg(test)]
+mod ledger_seam_cas_tests {
+    use std::collections::BTreeMap;
+    use std::path::Path;
+
+    use chrono::{TimeZone, Utc};
+    use rocky_core::config::{PolicyCapability, PolicyEffect, PolicyPrincipal};
+    use rocky_core::fault_store::PutKind;
+    use rocky_core::state::{PolicyDecisionRecord, StateStore};
+    use rocky_core::test_harness::{CrossPodHarness, Pod};
+
+    const WINNER_KEY: &str = "winner_table";
+
+    fn state_key() -> String {
+        format!(
+            "v{}/state.redb",
+            rocky_core::state::current_schema_version()
+        )
+    }
+
+    /// `[state]` on the harness "S3" with CAS, plus `policy_rules`.
+    fn cas_config(dir: &Path, policy_rules: &str) -> rocky_core::config::RockyConfig {
+        let path = dir.join("rocky.toml");
+        std::fs::write(
+            &path,
+            format!(
+                "[state]\nbackend = \"s3\"\ns3_bucket = \"test\"\nconcurrency_control = \"cas\"\n\
+                 on_upload_failure = \"skip\"\n\n[state.retry]\nmax_retries = 0\n\n\
+                 [policy]\nversion = 1\n{policy_rules}"
+            ),
+        )
+        .unwrap();
+        rocky_core::config::load_rocky_config(&path).unwrap()
+    }
+
+    /// An agent `apply` rule with a one-failure autonomy budget and a
+    /// `verify_after` — the budget-relevant shape that reaches both seams.
+    const BUDGET_RULE: &str = r#"
+[[policy.rules]]
+principal = "agent"
+capability = "apply"
+scope = { any = true }
+effect = "allow"
+verify_after = ["row_count"]
+autonomy_budget = { failures = 1, window = "7d" }
+"#;
+
+    fn row(
+        plan_id: &str,
+        rule_id: Option<usize>,
+        verify_after: &[&str],
+        effect: PolicyEffect,
+    ) -> PolicyDecisionRecord {
+        PolicyDecisionRecord {
+            keys_recorded: false,
+            models: Vec::new(),
+            timestamp: Utc::now(),
+            plan_id: plan_id.to_string(),
+            principal: PolicyPrincipal::Agent,
+            capability: PolicyCapability::Apply,
+            model: "*".to_string(),
+            effect,
+            rule_id,
+            reason: "seeded".to_string(),
+            verify_after: verify_after.iter().map(|s| (*s).to_string()).collect(),
+            auto_apply: None,
+        }
+    }
+
+    /// Publish a winner from `pod`: download, mutate, unconditional upload —
+    /// exactly what a concurrent `rocky run` end-upload looks like on the
+    /// shared blob.
+    async fn publish_winner(pod: &Pod, mutate: impl FnOnce(&StateStore)) {
+        let _authority = rocky_core::state_sync::download_state(&pod.cfg, &pod.state_path, false)
+            .await
+            .unwrap();
+        {
+            let store = StateStore::open(&pod.state_path).unwrap();
+            mutate(&store);
+        }
+        rocky_core::state_sync::upload_state(&pod.cfg, &pod.state_path, false)
+            .await
+            .unwrap();
+    }
+
+    fn winner_watermark(store: &StateStore) {
+        store
+            .set_watermark(
+                WINNER_KEY,
+                &rocky_ir::WatermarkState {
+                    last_value: Utc.with_ymd_and_hms(2026, 1, 2, 3, 4, 5).unwrap(),
+                    updated_at: Utc::now(),
+                },
+            )
+            .unwrap();
+    }
+
+    /// Read the PUBLISHED blob through a fresh pod-A download.
+    async fn published(harness: &CrossPodHarness) -> StateStore {
+        let _authority = rocky_core::state_sync::download_state(
+            &harness.pod_a.cfg,
+            &harness.pod_a.state_path,
+            false,
+        )
+        .await
+        .unwrap();
+        StateStore::open(&harness.pod_a.state_path).unwrap()
+    }
+
+    fn touched() -> BTreeMap<String, PolicyCapability> {
+        let mut t = BTreeMap::new();
+        t.insert("orders".to_string(), PolicyCapability::Apply);
+        t
+    }
+
+    async fn commit_decision(
+        cfg: &rocky_core::config::RockyConfig,
+        root: &Path,
+        state_path: &Path,
+    ) -> anyhow::Result<()> {
+        super::commit_governed_rule_decision(
+            cfg,
+            root,
+            "plan-x",
+            PolicyPrincipal::Agent,
+            &touched(),
+            &root.join("models"),
+            None,
+            state_path,
+        )
+        .await
+    }
+
+    fn rule_rows_for<'a>(
+        rows: &'a [PolicyDecisionRecord],
+        plan_id: &str,
+    ) -> Vec<&'a PolicyDecisionRecord> {
+        rows.iter()
+            .filter(|d| d.plan_id == plan_id && d.verify_after.is_empty())
+            .collect()
+    }
+
+    /// The pre-run decision must be RE-EVALUATED on the winner. The winner
+    /// (another apply's verify-after failure) lands after this apply's
+    /// pre-run gate and newly exhausts the one-failure budget: the fresh
+    /// evaluation degrades `allow` to `require_review`, and with no review
+    /// marker the seam refuses. The winner's burn pair survives untouched.
+    /// Under the old half-seam the stale local ledger was uploaded verbatim:
+    /// the command succeeded and the winner's burn pair was erased.
+    #[tokio::test]
+    async fn rule_decision_seam_refuses_when_the_winner_newly_exhausts_the_budget() {
+        let _serial = rocky_core::state_sync::remote_testing::serial_guard();
+        let harness = CrossPodHarness::new_s3_like();
+        let root = tempfile::tempdir().unwrap();
+        let cfg = cas_config(root.path(), BUDGET_RULE);
+
+        // The stale view this apply's pre-run gate cleared against.
+        publish_winner(&harness.pod_b, |_| {}).await;
+        // The winner: another plan's rule decision + failed custody row.
+        publish_winner(&harness.pod_a, |store| {
+            store
+                .record_policy_decision(&row("other-plan", Some(0), &[], PolicyEffect::Allow))
+                .unwrap();
+            store
+                .record_policy_decision(&row(
+                    "other-plan",
+                    None,
+                    &["row_count"],
+                    PolicyEffect::Deny,
+                ))
+                .unwrap();
+        })
+        .await;
+
+        let err = commit_decision(&cfg, root.path(), &harness.pod_b.state_path)
+            .await
+            .expect_err("a fresh require_review with no marker must refuse");
+        assert!(
+            format!("{err:#}").contains("requires human review"),
+            "the refusal must come from the fresh evaluation: {err:#}"
+        );
+
+        let remote = published(&harness).await;
+        let rows = remote.list_policy_decisions().unwrap();
+        assert_eq!(
+            rows.iter().filter(|d| d.plan_id == "other-plan").count(),
+            2,
+            "the winner's burn pair must survive"
+        );
+        assert!(
+            rule_rows_for(&rows, "plan-x").is_empty(),
+            "a refused decision must not be published"
+        );
+    }
+
+    /// Run winner + seam loser both survive, through two forced CAS
+    /// conflicts: the decision row lands exactly once (each replay starts
+    /// from a fresh download, so a lost attempt's rows never accumulate),
+    /// and the seam never falls back to an unconditional blob put.
+    #[tokio::test]
+    async fn rule_decision_seam_replays_onto_the_winner_and_both_survive() {
+        let _serial = rocky_core::state_sync::remote_testing::serial_guard();
+        let harness = CrossPodHarness::new_s3_like();
+        let root = tempfile::tempdir().unwrap();
+        let cfg = cas_config(root.path(), BUDGET_RULE);
+
+        publish_winner(&harness.pod_b, |_| {}).await;
+        publish_winner(&harness.pod_a, winner_watermark).await;
+
+        let key = state_key();
+        let updates = harness.faults.put_count(&key, PutKind::Update);
+        let unconditional = harness.faults.put_count(&key, PutKind::Unconditional);
+        harness.faults.arm_precondition_failures(&key, 2);
+
+        commit_decision(&cfg, root.path(), &harness.pod_b.state_path)
+            .await
+            .expect("the third attempt must commit");
+
+        assert_eq!(
+            harness.faults.put_count(&key, PutKind::Update) - updates,
+            3,
+            "two conflicts must force exactly three CAS attempts"
+        );
+        assert_eq!(
+            harness.faults.put_count(&key, PutKind::Unconditional) - unconditional,
+            0,
+            "the seam must never fall back to an unconditional blob put"
+        );
+        let remote = published(&harness).await;
+        assert!(
+            remote.get_watermark(WINNER_KEY).unwrap().is_some(),
+            "the concurrent run's committed watermark must survive (#1228)"
+        );
+        let rows = remote.list_policy_decisions().unwrap();
+        let mine = rule_rows_for(&rows, "plan-x");
+        assert_eq!(mine.len(), 1, "exactly one decision row: {mine:?}");
+        assert_eq!(mine[0].effect, PolicyEffect::Allow);
+        assert_eq!(mine[0].rule_id, Some(0));
+    }
+
+    /// Exhaustion: three straight conflicts fail the command with the typed
+    /// seam-conflict error and preserve the remote winner; nothing of this
+    /// apply is force-published.
+    #[tokio::test]
+    async fn rule_decision_seam_exhaustion_preserves_the_winner() {
+        let _serial = rocky_core::state_sync::remote_testing::serial_guard();
+        let harness = CrossPodHarness::new_s3_like();
+        let root = tempfile::tempdir().unwrap();
+        let cfg = cas_config(root.path(), BUDGET_RULE);
+
+        publish_winner(&harness.pod_a, winner_watermark).await;
+        harness.faults.arm_precondition_failures(state_key(), 3);
+
+        let err = commit_decision(&cfg, root.path(), &harness.pod_b.state_path)
+            .await
+            .expect_err("exhaustion must fail the command");
+        assert!(
+            err.chain()
+                .filter_map(|c| c.downcast_ref::<rocky_core::state_sync::StateSyncError>())
+                .any(|e| matches!(
+                    e,
+                    rocky_core::state_sync::StateSyncError::LedgerSeamConflict { .. }
+                )),
+            "got: {err:#}"
+        );
+        let remote = published(&harness).await;
+        assert!(remote.get_watermark(WINNER_KEY).unwrap().is_some());
+        assert!(rule_rows_for(&remote.list_policy_decisions().unwrap(), "plan-x").is_empty());
+    }
+
+    fn custody_record() -> PolicyDecisionRecord {
+        PolicyDecisionRecord {
+            // A fixed, distinctive event time: budget consumers key on it, so
+            // the published row must carry exactly this value.
+            timestamp: Utc.with_ymd_and_hms(2026, 3, 4, 5, 6, 7).unwrap()
+                + chrono::Duration::nanoseconds(123_456_789),
+            ..row("plan-x", None, &["row_count"], PolicyEffect::Deny)
+        }
+    }
+
+    /// The custody row is REPLAYED VERBATIM onto the winner across two forced
+    /// conflicts: one row, byte-identical event time (no second audit
+    /// identity), and the concurrent run's watermark survives. Under the old
+    /// half-seam the stale local ledger was uploaded over the winner.
+    #[tokio::test]
+    async fn custody_seam_replays_the_exact_record_and_both_survive() {
+        let _serial = rocky_core::state_sync::remote_testing::serial_guard();
+        let harness = CrossPodHarness::new_s3_like();
+        let root = tempfile::tempdir().unwrap();
+        let cfg = cas_config(root.path(), BUDGET_RULE);
+
+        publish_winner(&harness.pod_b, |_| {}).await;
+        publish_winner(&harness.pod_a, winner_watermark).await;
+        let key = state_key();
+        let updates = harness.faults.put_count(&key, PutKind::Update);
+        harness.faults.arm_precondition_failures(&key, 2);
+
+        let record = custody_record();
+        super::commit_verify_after_custody(Some(&cfg), &harness.pod_b.state_path, &record)
+            .await
+            .expect("the third attempt must commit");
+
+        assert_eq!(harness.faults.put_count(&key, PutKind::Update) - updates, 3);
+        let remote = published(&harness).await;
+        assert!(remote.get_watermark(WINNER_KEY).unwrap().is_some());
+        let custody: Vec<PolicyDecisionRecord> = remote
+            .list_policy_decisions()
+            .unwrap()
+            .into_iter()
+            .filter(|d| d.plan_id == "plan-x" && !d.verify_after.is_empty())
+            .collect();
+        assert_eq!(custody.len(), 1, "exactly one custody row: {custody:?}");
+        assert_eq!(
+            custody[0].timestamp, record.timestamp,
+            "the replay must carry the constructed event time, not a new one"
+        );
+        assert_eq!(custody[0].effect, PolicyEffect::Deny);
+        assert_eq!(custody[0].reason, record.reason);
+    }
+
+    /// Custody exhaustion fails closed and preserves the winner.
+    #[tokio::test]
+    async fn custody_seam_exhaustion_preserves_the_winner() {
+        let _serial = rocky_core::state_sync::remote_testing::serial_guard();
+        let harness = CrossPodHarness::new_s3_like();
+        let root = tempfile::tempdir().unwrap();
+        let cfg = cas_config(root.path(), BUDGET_RULE);
+
+        publish_winner(&harness.pod_a, winner_watermark).await;
+        harness.faults.arm_precondition_failures(state_key(), 3);
+
+        super::commit_verify_after_custody(
+            Some(&cfg),
+            &harness.pod_b.state_path,
+            &custody_record(),
+        )
+        .await
+        .expect_err("exhaustion must fail the command");
+        let remote = published(&harness).await;
+        assert!(remote.get_watermark(WINNER_KEY).unwrap().is_some());
+        assert!(
+            remote
+                .list_policy_decisions()
+                .unwrap()
+                .iter()
+                .all(|d| d.plan_id != "plan-x"),
+            "nothing of the losing seam may be published"
         );
     }
 }
