@@ -70,7 +70,7 @@ The `.toml` file names the model, lists what it depends on, picks a materializat
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `type` | string | `"full_refresh"` | Materialization type. One of `"full_refresh"`, `"merge"`, `"time_interval"`, `"view"`, `"materialized_view"`, `"dynamic_table"`, `"delete_insert"`, `"microbatch"`, `"content_addressed"`. Two are refused: `"incremental"` on a transformation model (`E037`, see [Incremental](#incremental)), and `"ephemeral"` outright (`E038`, see [Ephemeral](#ephemeral)). |
+| `type` | string | `"full_refresh"` | Materialization type. One of `"full_refresh"`, `"incremental"`, `"merge"`, `"time_interval"`, `"view"`, `"materialized_view"`, `"dynamic_table"`, `"delete_insert"`, `"microbatch"`, `"content_addressed"`. `"incremental"` needs a watermark column (`E037` without one, see [Incremental](#incremental)). `"ephemeral"` is refused outright (`E038`, see [Ephemeral](#ephemeral)). |
 | `timestamp_column` | string | | Replication watermark column. Required for transformation `microbatch`; it names the output partition column. |
 | `unique_key` | list of strings | | Key columns for merge matching. Required when `type = "merge"`. |
 | `update_columns` | list of strings | | Columns to update on merge match. Defaults to all non-key columns if omitted. |
@@ -615,30 +615,79 @@ WHERE _fivetran_deleted = false
 
 ### Incremental
 
-A transformation model cannot use `type = "incremental"`. Rocky has no watermark to apply to a model's SQL, so the only statement this strategy could emit is `INSERT INTO <target> <model SQL>`. That appends the whole result again on every run.
+Loads only the rows newer than what the target already holds. Use it when the source has a column whose values only grow, such as `updated_at`. The column is the model's watermark (the value of the newest row already loaded).
 
-`rocky compile` reports the model as error `E037`, with this message:
+**SQL** (`models/fct_orders.sql`):
 
-> model 'fct_orders' uses `type = "incremental"`, which is not supported on transformation models: it emits an unfiltered INSERT and appends every row again on each run
+```sql
+SELECT order_id, customer_id, amount, status, updated_at
+FROM raw.orders
+WHERE @incremental_filter
+```
 
-`rocky test`, `rocky ci` and `rocky emit-sql` fail on the same error. `rocky plan` also refuses to write a plan when this model is in scope. The SQL generator refuses the model too, so `rocky estimate` cannot produce SQL for it.
+**Config** (`models/fct_orders.toml`):
 
-`rocky run` records the model as a failed table and leaves its existing table alone. If an earlier run built that table, it keeps the rows those runs appended again. By default, Rocky also withholds every model that depends on the failed one, directly or through another model. That includes an explicit `depends_on` entry and a bare, unqualified SQL read of the failed model's name. None of them build from that stale or missing table.
+```toml
+[strategy]
+type = "incremental"
+timestamp_column = "updated_at"   # the watermark; `watermark` is an alias
+unique_key = ["order_id"]         # optional: MERGE on this key instead of appending
+lookback = "2 days"               # optional: re-read this far below the watermark
+on_schema_change = "fail"         # or "append_new_columns"
+```
 
-This boundary follows the model graph: `depends_on` plus a bare-name read of another model. Under plain `rocky run`, a read of the same table by its qualified physical name (`schema.table` or `catalog.schema.table`) still escapes it. Add `depends_on` when that relationship must be withheld too. `rocky run --dag` also matches a read's last name segment against every model, so it withholds a qualified read of a failed model.
+| Key | Required | Meaning |
+|---|---|---|
+| `timestamp_column` | yes | An output column. Rocky reads `MAX` of it from the target each run. Alias: `watermark`. |
+| `unique_key` | no | Upsert on these columns with `MERGE`. Without it, Rocky appends. |
+| `lookback` | no | `"<n> seconds"`, `"minutes"`, `"hours"` or `"days"`. Re-reads late rows. Pair it with `unique_key`, or the re-read rows are appended again (`W046`). |
+| `on_schema_change` | no | `fail` (default) stops the run when the model's columns differ from the target's. `append_new_columns` adds new columns with `ALTER TABLE ... ADD COLUMN`. A removed column fails the run in both modes. |
+| `filter_column` | no | The input column `@incremental_filter` compares, when it is not the watermark itself: `"o.updated_at"` in a join, or `"_synced_at"` when the model renames it. |
 
-Set `contain_failures = true` under `[resilience]` to widen the hold to any model whose reads Rocky cannot prove are unrelated. It also contains a runtime failure the same way, reporting `PartialFailure` instead of stopping the run. See [`[resilience]`](/reference/configuration/#resilience). Rebuild the table before you trust it, for example with one `full_refresh` run.
+#### How Rocky resolves `@incremental_filter`
 
-Pick the strategy that matches what you need. These are the four the error names:
+The placeholder marks where the filter goes. Rocky replaces it on every run:
+
+```
+ run                          @incremental_filter becomes
+ ───────────────────────────  ──────────────────────────────────────────────
+ first run (no target yet)    TRUE                    → CREATE TABLE AS
+ rocky run --full-refresh     TRUE                    → CREATE OR REPLACE
+ every later run              (updated_at > (SELECT MAX(updated_at)
+                                 FROM <target>)
+                               OR NOT EXISTS
+                                 (SELECT 1 FROM <target>))
+                                                      → INSERT or MERGE
+```
+
+Rocky reads the watermark from the target, not from its state store. A manual edit of the target therefore moves the watermark too. The `NOT EXISTS` arm loads every row when the target exists but is empty. A `lookback` subtracts its interval from `MAX`. Rows whose watermark is `NULL` load only on the first run and on a full refresh, because `NULL` never compares greater.
+
+The run output reports the watermark. `metadata.watermark` holds the new `MAX` when it is a timestamp, and `notes` names the value the run started from.
+
+#### A model without the placeholder
+
+Rocky can filter the model's output instead of its input. It then runs `SELECT * FROM (<model>) AS _rocky_incremental WHERE <filter on the output column>`. This gives the same rows only when the watermark column is copied unchanged from one input table. `rocky compile` checks that with column lineage. It refuses a column read from a CTE or a subquery, and a model with a top-level `LIMIT`. `filter_column` has no effect on this path. When it cannot prove it, the compile fails with `E046` and asks for the placeholder. A model in the `.rocky` DSL always takes this path, because the DSL has no placeholder.
+
+#### What `rocky compile` refuses
+
+| Code | Cause |
+|---|---|
+| `E037` | `type = "incremental"` with no `timestamp_column`. Rocky could only append every row again on each run. |
+| `E046` | No placeholder and the watermark is not a provable passthrough. Also: the watermark is missing from the model's output, `timestamp_column` or `filter_column` is not a plain column name, or `@incremental_filter` appears in a model of another strategy. |
+| `W046` | `lookback` without `unique_key`. |
+
+`rocky run` records a refused model as a failed table and leaves its existing table alone. By default, Rocky also withholds every model that depends on it. Set `contain_failures = true` under `[resilience]` to widen that hold. See [`[resilience]`](/reference/configuration/#resilience).
+
+Other strategies fit other needs:
 
 | You need | Use |
 |---|---|
-| Update existing rows by key, insert new ones | [`merge`](#merge) with `unique_key` |
+| Update existing rows by key from the whole result | [`merge`](#merge) with `unique_key` |
 | Replace whole partitions | [`delete_insert`](#delete--insert) with `partition_by` |
 | Process one time window per run, with late data | [`time_interval`](#time-interval), with `@start_date` and `@end_date` in the SQL |
 | Rebuild the table from the model's SQL | [`full_refresh`](#full-refresh) |
 
-`incremental` still works on a replication pipeline. There Rocky copies source tables and filters each copy on a stored watermark. See [Incremental processing](/concepts/incremental/).
+On a replication pipeline, `incremental` copies source tables and filters each copy on a watermark in the state store. See [Incremental processing](/concepts/incremental/).
 
 ---
 
