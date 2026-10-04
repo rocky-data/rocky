@@ -3754,7 +3754,19 @@ impl StateStore {
             if !key.value().starts_with(RUN_STARTED_KEY_PREFIX) {
                 break;
             }
-            let marker: RunStartedMarker = serde_json::from_str(value.value())?;
+            // A row that cannot be read is skipped, not fatal: this listing
+            // feeds `rocky history`, which must still show the recorded runs.
+            let marker: RunStartedMarker = match serde_json::from_str(value.value()) {
+                Ok(marker) => marker,
+                Err(error) => {
+                    tracing::warn!(
+                        key = key.value(),
+                        error = %error,
+                        "skipping an unreadable run-started marker"
+                    );
+                    continue;
+                }
+            };
             if runs.get(marker.run_id.as_str())?.is_none() {
                 found.push(marker);
             }
@@ -4308,8 +4320,19 @@ impl StateStore {
         let runs = txn.open_table(RUN_HISTORY)?;
         let mut found = Vec::new();
         for row in headers.iter()? {
-            let (_, value) = row?;
-            let progress: RunProgress = serde_json::from_slice(value.value())?;
+            let (key, value) = row?;
+            // Skipped, not fatal, for the same reason as the marker listing.
+            let progress: RunProgress = match serde_json::from_slice(value.value()) {
+                Ok(progress) => progress,
+                Err(error) => {
+                    tracing::warn!(
+                        key = key.value(),
+                        error = %error,
+                        "skipping an unreadable run_progress header"
+                    );
+                    continue;
+                }
+            };
             if runs.get(progress.run_id.as_str())?.is_none() {
                 found.push(progress);
             }
@@ -4756,6 +4779,7 @@ impl StateStore {
             let (deleted, kept) = self.sweep_run_history(cutoff, min_keep)?;
             report.runs_deleted = deleted;
             report.runs_kept = kept;
+            self.sweep_stale_run_started_markers(cutoff)?;
         } else {
             report.runs_kept = self.count_run_history()?;
         }
@@ -4867,6 +4891,47 @@ impl StateStore {
         }
 
         Ok((deleted, total.saturating_sub(deleted)))
+    }
+
+    /// Drop run-started markers (#1884) whose run started before `cutoff`.
+    ///
+    /// `record_run` removes a marker with its record, so a marker that
+    /// survives is a run that crashed or lost its record. Past the history
+    /// retention window it would only keep `rocky history` reporting an
+    /// incomplete history forever, so it ages out with the records. Returns
+    /// how many markers were removed. An unreadable marker is left in place.
+    fn sweep_stale_run_started_markers(
+        &self,
+        cutoff: chrono::DateTime<chrono::Utc>,
+    ) -> Result<u64, StateError> {
+        let stale: Vec<String> = {
+            let txn = self.db.begin_read()?;
+            let metadata = txn.open_table(METADATA)?;
+            let mut stale = Vec::new();
+            for row in metadata.range(RUN_STARTED_KEY_PREFIX..)? {
+                let (key, value) = row?;
+                if !key.value().starts_with(RUN_STARTED_KEY_PREFIX) {
+                    break;
+                }
+                if let Ok(marker) = serde_json::from_str::<RunStartedMarker>(value.value())
+                    && marker.started_at < cutoff
+                {
+                    stale.push(key.value().to_string());
+                }
+            }
+            stale
+        };
+        if !stale.is_empty() {
+            let txn = self.db.begin_write()?;
+            {
+                let mut metadata = txn.open_table(METADATA)?;
+                for key in &stale {
+                    metadata.remove(key.as_str())?;
+                }
+            }
+            self.commit_write(txn)?;
+        }
+        Ok(stale.len() as u64)
     }
 
     /// Plan-only counterpart: returns `(would_delete, would_keep)` without
@@ -13828,10 +13893,6 @@ mod tests {
         assert!(store.get_watermark("wh.raw.orders").unwrap().is_some());
     }
 
-    /// A swept run record takes its checkpoint with it — the `run_progress`
-    /// header and its per-table entries — while the checkpoints of kept
-    /// runs, of a run whose id shares a prefix, and of a record-less
-    /// (crashed) run stay put.
     /// #1884: a checkpoint header whose run has no record is listed, newest
     /// first; a header beside its record is not.
     #[test]
@@ -13908,6 +13969,77 @@ mod tests {
         assert!(store.list_recordless_run_progress(10).unwrap().is_empty());
     }
 
+    /// #1884: a marker that outlives the history retention window is swept
+    /// with the records; a recent one is kept.
+    #[test]
+    fn sweep_retention_drops_stale_run_started_markers() {
+        let (store, _dir) = temp_store();
+        let now = Utc::now();
+        for (run_id, age) in [
+            ("crashed-long-ago", chrono::Duration::days(700)),
+            ("crashed-recently", chrono::Duration::hours(1)),
+        ] {
+            store
+                .mark_run_started(&RunStartedMarker {
+                    run_id: run_id.to_string(),
+                    started_at: now - age,
+                    pipeline: None,
+                })
+                .unwrap();
+        }
+        let policy = StateRetentionConfig {
+            max_age_days: 30,
+            min_runs_kept: 0,
+            applies_to: vec![StateRetentionDomain::History],
+            ..StateRetentionConfig::default()
+        };
+        store.sweep_retention_dry_run(&policy).unwrap();
+        assert_eq!(
+            store.list_recordless_run_markers(10).unwrap().len(),
+            2,
+            "a dry run deletes nothing"
+        );
+        store.sweep_retention(&policy).unwrap();
+        let left: Vec<String> = store
+            .list_recordless_run_markers(10)
+            .unwrap()
+            .into_iter()
+            .map(|m| m.run_id)
+            .collect();
+        assert_eq!(left, vec!["crashed-recently".to_string()]);
+    }
+
+    /// #1884: one unreadable marker is skipped; the readable ones are still
+    /// listed, so `rocky history` does not fail on a bad row.
+    #[test]
+    fn an_unreadable_run_started_marker_is_skipped_not_fatal() {
+        let (store, _dir) = temp_store();
+        store
+            .mark_run_started(&RunStartedMarker {
+                run_id: "readable".to_string(),
+                started_at: Utc::now(),
+                pipeline: None,
+            })
+            .unwrap();
+        {
+            let txn = store.db.begin_write().unwrap();
+            {
+                let mut metadata = txn.open_table(METADATA).unwrap();
+                metadata
+                    .insert(run_started_key("garbled").as_str(), "{not json")
+                    .unwrap();
+            }
+            txn.commit().unwrap();
+        }
+        let found = store.list_recordless_run_markers(10).unwrap();
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].run_id, "readable");
+    }
+
+    /// A swept run record takes its checkpoint with it — the `run_progress`
+    /// header and its per-table entries — while the checkpoints of kept
+    /// runs, of a run whose id shares a prefix, and of a record-less
+    /// (crashed) run stay put.
     #[test]
     fn sweep_retention_drops_the_checkpoint_with_its_run_record() {
         let (store, _dir) = temp_store();

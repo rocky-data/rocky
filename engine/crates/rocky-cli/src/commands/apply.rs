@@ -577,7 +577,25 @@ async fn run_apply_run_plan(
         &apply_run_id,
         governed.as_ref(),
     )
-    .await?;
+    .await;
+    let termination = match termination {
+        Err(e) if is_lost_run_record(&e) => {
+            return Err(verify_after_despite_lost_record(
+                e,
+                finish_apply_verify_after(
+                    plan_id,
+                    principal,
+                    verify_checks,
+                    &apply_run_id,
+                    state_path,
+                    &loaded.config,
+                    governed.as_ref(),
+                ),
+            )
+            .await);
+        }
+        other => other?,
+    };
     finish_apply_verify_after(
         plan_id,
         principal,
@@ -702,6 +720,30 @@ async fn finish_apply_verify_after(
     };
     commit_verify_after_custody(Some(cfg), state_path, &verdict.record).await?;
     verdict.into_result(plan_id, &verify_checks)
+}
+
+/// Whether `e` is a run that succeeded but whose record did not land (#1884).
+fn is_lost_run_record(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<crate::commands::run::RunRecordNotPersisted>()
+        .is_some()
+}
+
+/// Run the `verify_after` custody step for a run that succeeded but lost its
+/// record (#1884), then return the run's error.
+///
+/// The run fails non-zero, but its custody row must still land. With no run
+/// record the gate fails closed and writes a `Deny` row, and that row is what
+/// burns the agent's autonomy budget. Skipping it would let repeated
+/// lost-record applies never use up the budget. The returned error stays a
+/// [`crate::commands::run::RunRecordNotPersisted`] for `downcast_ref`.
+async fn verify_after_despite_lost_record(
+    e: anyhow::Error,
+    finish: impl std::future::Future<Output = Result<()>>,
+) -> anyhow::Error {
+    match finish.await {
+        Ok(()) => e,
+        Err(verify) => e.context(format!("{verify:#}")),
+    }
 }
 
 /// Build the [`GovernedRunContext`] for a two-step apply — `Some` only for an
@@ -4178,7 +4220,25 @@ async fn run_apply_ai_authored_plan(
         &apply_run_id,
         governed.as_ref(),
     )
-    .await?;
+    .await;
+    let termination = match termination {
+        Err(e) if is_lost_run_record(&e) => {
+            return Err(verify_after_despite_lost_record(
+                e,
+                finish_apply_verify_after(
+                    plan_id,
+                    principal,
+                    verify_checks,
+                    &apply_run_id,
+                    state_path,
+                    &loaded.config,
+                    governed.as_ref(),
+                ),
+            )
+            .await);
+        }
+        other => other?,
+    };
     finish_apply_verify_after(
         plan_id,
         principal,
@@ -4955,7 +5015,25 @@ async fn run_apply_replication_plan(
         Some((plan_id, replication_plan.source_state_snapshot.as_slice())), // #1460
     )
     .await
-    .with_context(|| format!("rocky apply replication plan '{plan_id}' failed"))?;
+    .with_context(|| format!("rocky apply replication plan '{plan_id}' failed"));
+    let termination = match termination {
+        Err(e) if is_lost_run_record(&e) => {
+            return Err(verify_after_despite_lost_record(
+                e,
+                finish_apply_verify_after(
+                    plan_id,
+                    principal,
+                    Vec::new(),
+                    &apply_run_id,
+                    state_path,
+                    &loaded.config,
+                    governed.as_ref(),
+                ),
+            )
+            .await);
+        }
+        other => other?,
+    };
 
     // Replication targets and their winning rules are discovered inside `run`.
     // Enforce the captured requirements after the run and persist/upload the
@@ -11827,6 +11905,50 @@ schema_template = "s__{source}"
             .is_ok(),
             "a measured pass still confirms"
         );
+    }
+
+    /// #1884: a governed run that succeeded but lost its record still gets
+    /// its `verify_after` custody row. The gate finds no record, fails closed,
+    /// and writes a `Deny` row — the row that burns the autonomy budget. The
+    /// run's own error is what comes back.
+    #[tokio::test]
+    async fn a_lost_run_record_still_writes_the_verify_after_custody_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state.redb");
+        let checks = vec!["row_count".to_string()];
+        let lost: anyhow::Error = crate::commands::run::RunRecordNotPersisted {
+            run_id: "run-lost".into(),
+        }
+        .into();
+        assert!(super::is_lost_run_record(&lost));
+
+        let err = super::verify_after_despite_lost_record(lost, async {
+            super::run_verify_after(
+                "plan-x",
+                PolicyPrincipal::Agent,
+                &checks,
+                "run-lost",
+                &state,
+            )
+        })
+        .await;
+        assert!(
+            super::is_lost_run_record(&err),
+            "the run's error must survive: {err:#}"
+        );
+        let decisions = rocky_core::state::StateStore::open(&state)
+            .unwrap()
+            .list_policy_decisions()
+            .unwrap();
+        assert!(
+            decisions.iter().any(
+                |d| d.plan_id == "plan-x" && d.effect == rocky_core::config::PolicyEffect::Deny
+            ),
+            "the fail-closed custody row must land: {decisions:?}"
+        );
+        assert!(!super::is_lost_run_record(&anyhow::anyhow!(
+            "other failure"
+        )));
     }
 
     #[test]

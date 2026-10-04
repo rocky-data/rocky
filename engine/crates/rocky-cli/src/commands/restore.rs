@@ -459,10 +459,16 @@ enum RestoreOneOutcome {
 ///
 /// Ledger rows are inside the blob the seam publishes, so a refused attempt
 /// discards them. An object write is not: once the bytes land they stay. So
-/// the policy gate is re-checked right before every such write — a freeze
-/// marker or ledger freeze that lands between the attempt's gate and this
-/// write refuses it. The pre-publish recheck alone would see that freeze only
-/// after the bytes were already written.
+/// the policy gate is re-checked right before every such write, over a fresh
+/// LIST of freeze markers — a freeze marker that lands between the attempt's
+/// gate and this write refuses it. The pre-publish recheck alone would see
+/// that freeze only after the bytes were already written.
+///
+/// Ledger rows are read from the attempt's own download, so a freeze recorded
+/// only as a ledger row on another pod mid-attempt is not seen here. It is
+/// caught at publish (the CAS conflict replays the attempt, whose gate then
+/// refuses), after the write. Only freeze markers fence the write itself,
+/// which is why `rocky policy freeze` writes them.
 #[async_trait::async_trait]
 pub(crate) trait ObjectWriteFence: Send + Sync {
     /// `Err` refuses the write and aborts the restore transition.
