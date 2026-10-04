@@ -71,9 +71,20 @@ SELECT order_id, cents_to_dollars(amount_cents) AS amount_usd
 FROM raw.orders
 ```
 
-When the function declares `[target] schema`, a qualified call must name the
-same schema: `util.cents_to_dollars(x)`. Rocky does not treat
-`other.cents_to_dollars(x)` as a call to this project's function.
+A qualified call matches a project function only when every qualifier part
+matches the function's `[target]`. With `schema = "util"`,
+`util.cents_to_dollars(x)` matches and `other.cents_to_dollars(x)` does not.
+With no `[target]`, no qualified call matches: `governance.mask_email(s)` is
+someone else's function, so Rocky does not check it.
+
+Rocky creates a function with a `[target] schema` in that schema. An
+unqualified call resolves in the session's current schema, which may be a
+different one, so Rocky reports `W051` for it. Qualify the call.
+
+Rocky ignores a function whose name is a built-in SQL function, such as
+`round` or `coalesce`, and reports `W051`. On the warehouse the built-in wins,
+so treating calls as the project function would refuse valid SQL. Rename the
+function.
 
 ## What the compiler checks
 
@@ -84,7 +95,7 @@ then each call:
  functions/*.toml + *.sql
           │
           ▼
-   validate definition ──── bad name / type, Python, no body,
+   validate definition ──── bad name / type, Python, no body, `;` in body,
           │                 duplicate name, call cycle ──► E051 on the function
           ▼
    check each model call ── wrong argument count,
@@ -129,12 +140,15 @@ Only a direct call takes the declared type. An expression over a call, such as
 `cents_to_dollars(x) + 1`, stays `Unknown`, because arithmetic result types
 differ between warehouses.
 
-Some type names mean different widths on different warehouses. `FLOAT` and
-`REAL` are 32-bit on DuckDB and Databricks but 64-bit on Snowflake. `INT` and
-`INTEGER` are `NUMBER(38,0)` on Snowflake. Rocky reads these names as
-`Unknown`, so a contract on such a column reports `I003` (not checked)
-instead of a wrong `E011`. Use `DOUBLE`, `BIGINT`, `FLOAT64`, `INT64` or
-`DECIMAL(p,s)` when you want the contract checked.
+Some return type names mean different types on different warehouses.
+`FLOAT` and `REAL` are 32-bit on DuckDB and Databricks but 64-bit on
+Snowflake. `INT`, `INTEGER` and `BIGINT` are `NUMBER(38,0)` on Snowflake.
+`TIMESTAMP` has no time zone on DuckDB and Snowflake. Rocky reads these
+return types as `Unknown`, so a contract on such a column reports `I003`
+(not checked) instead of a wrong `E011`. Use `DOUBLE`, `FLOAT64`, `INT64`,
+`DECIMAL(p,s)`, `VARCHAR` or `DATE` when you want the contract checked.
+Parameter types are read more loosely, because they only decide whether a
+call is flagged: a `BIGINT` parameter checks as a 64-bit integer.
 
 ### How lineage traces a call
 
@@ -148,6 +162,10 @@ this before the first model runs. A function that calls another function is
 created after its callee. Models that failed to compile, and models outside
 the selection, do not cause their functions to be created.
 
+A function that cannot be created fails only the models that call it, and
+their declared downstream models. Rocky records an error for each of those
+models. Every other model still builds.
+
 Each warehouse gets its own statement. Rocky always uses `CREATE OR REPLACE`,
 so a second run replaces the function in place.
 
@@ -158,6 +176,10 @@ so a second run replaces the function in place.
 | Databricks | `CREATE OR REPLACE FUNCTION name(cents BIGINT) RETURNS DOUBLE LANGUAGE SQL [[NOT] DETERMINISTIC] [COMMENT '…'] RETURN …` |
 | BigQuery | ``CREATE OR REPLACE FUNCTION `project`.`dataset`.`name`(cents INT64) RETURNS FLOAT64 AS (…) [OPTIONS (description = '…')]`` |
 | Trino | Refused with `E051` |
+
+The table shows each statement on one line. In the real statement, the
+parenthesis that closes the body starts a new line, so a trailing
+`-- comment` in the body cannot hide it.
 
 DuckDB macros have no return type, so Rocky wraps the body in a `CAST` to the
 declared type. That makes the column type in the warehouse match the type
@@ -181,7 +203,11 @@ rocky run --model cents_to_dollars       # create it (and its callees) only
 ```
 
 `rocky run --model cents_to_dollars` creates the function and builds no
-model. `rocky compile --output json` lists every valid function under
+model. A governed apply (`rocky apply`) cannot select a function, because the
+plan fingerprint does not cover function DDL.
+
+`rocky test` and `rocky ci` create every valid function as a DuckDB macro
+before they run models locally. `rocky compile --output json` lists every valid function under
 `functions`, with its `signature` and the models that call it (`called_by`).
 The plan preview lists each `CREATE` statement with the purpose
 `create_function`, before the model statements.
@@ -195,6 +221,13 @@ In VS Code, hover over a function name to see its signature and description.
 - `rocky run --shadow` and `--branch` create functions under their declared
   names, not under shadow names. A changed function body therefore replaces
   the function that production models also use.
+- Models that call a project function are never skipped by
+  `--skip-unchanged` and never reused by `[reuse]`, even with
+  `[skip] deterministic = true`. A model's logic hash covers its own SQL,
+  not the bodies of the functions it calls.
+- `rocky run --dag` runs each model as its own sub-run. Each sub-run creates
+  the functions its model needs, so a function can be replaced more than
+  once in one run.
 - A function body is passed to the warehouse unchanged. Rocky parses it only
   to find calls to other project functions. When it cannot parse a body, it
   reports `W051` and does not track calls inside it.

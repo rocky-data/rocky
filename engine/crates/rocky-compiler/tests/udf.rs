@@ -204,3 +204,44 @@ fn incremental_compile_sees_a_function_change() {
         "a stale return type must not survive a function edit"
     );
 }
+
+/// A UDF argument that is itself a call — another UDF, or a function the
+/// type checker does not model — re-enters UDF inference. It must type the
+/// outer call, not panic.
+#[test]
+fn nested_calls_in_udf_arguments_type_check() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    project(root);
+    write_function(
+        root,
+        "add_tax",
+        "returns = \"DOUBLE\"\n\n[[arguments]]\nname = \"usd\"\ntype = \"DOUBLE\"\n",
+        "usd * 1.2",
+    );
+    write_model(
+        root,
+        "fct_orders",
+        "SELECT add_tax(cents_to_dollars(amount_cents)) AS gross, \
+         cents_to_dollars(nvl(amount_cents, 0)) AS usd FROM raw.orders",
+    );
+    let result = compile(&config(root, true)).unwrap();
+    assert!(!result.has_errors, "{:#?}", result.diagnostics);
+    assert_eq!(
+        column_type(&result, "fct_orders", "gross"),
+        RockyType::Float64
+    );
+    assert_eq!(
+        column_type(&result, "fct_orders", "usd"),
+        RockyType::Float64
+    );
+    // The inner UDF's DOUBLE verifies against add_tax's DOUBLE parameter.
+    assert!(
+        !result
+            .diagnostics
+            .iter()
+            .any(|d| d.message.contains("argument 1 of `add_tax`")),
+        "{:#?}",
+        result.diagnostics
+    );
+}

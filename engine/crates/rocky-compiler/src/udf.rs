@@ -128,14 +128,24 @@ impl FunctionRegistry {
         let (last, qualifier) = parts.split_last()?;
         let key = last.to_ascii_lowercase();
         if let Some(sig) = self.valid.get(&key) {
-            // A qualified call names a schema. When the function declares
-            // one, the qualifier must agree, so `other.f(x)` is not mistaken
-            // for this project's `f`.
-            if let (Some(call_schema), Some(target_schema)) =
-                (qualifier.last(), sig.def.config.target.schema.as_deref())
-                && !call_schema.eq_ignore_ascii_case(target_schema)
-            {
-                return None;
+            // A qualified call resolves only when every qualifier part
+            // matches the declared target, so `other.f(x)` or
+            // `governance.f(x, y)` is never mistaken for this project's `f`.
+            if !qualifier.is_empty() {
+                let target = &sig.def.config.target;
+                let declared: Vec<&str> = [target.catalog.as_deref(), target.schema.as_deref()]
+                    .into_iter()
+                    .flatten()
+                    .collect();
+                if qualifier.len() > declared.len()
+                    || !qualifier
+                        .iter()
+                        .rev()
+                        .zip(declared.iter().rev())
+                        .all(|(call, decl)| call.eq_ignore_ascii_case(decl))
+                {
+                    return None;
+                }
             }
             return Some(Resolved::Valid(sig));
         }
@@ -203,9 +213,132 @@ pub fn udf_declared_type(sql_type: &str) -> RockyType {
     let upper = sql_type.trim().to_ascii_uppercase();
     match upper.as_str() {
         "FLOAT" | "FLOAT4" | "FLOAT8" | "REAL" | "INT" | "INTEGER" | "SMALLINT" | "TINYINT"
-        | "BYTEINT" => RockyType::Unknown,
+        | "BYTEINT" | "BIGINT" | "TIMESTAMP" => RockyType::Unknown,
         _ => rocky_core::contracts::warehouse_type_to_rocky(&upper),
     }
+}
+
+/// Map a declared *parameter* type for argument checking.
+///
+/// Looser than [`udf_declared_type`]: a parameter type never reaches a
+/// contract, it only decides whether a call is flagged. `BIGINT` reads as
+/// `Int64` here (it is on DuckDB, Databricks and BigQuery; Snowflake's
+/// `NUMBER(38,0)` is still integral), so typed calls verify without a
+/// warning. The checks that refuse are narrow category mismatches, which a
+/// width difference never triggers.
+#[must_use]
+pub fn udf_param_type(sql_type: &str) -> RockyType {
+    match sql_type.trim().to_ascii_uppercase().as_str() {
+        "BIGINT" => RockyType::Int64,
+        _ => udf_declared_type(sql_type),
+    }
+}
+
+/// Built-in function names the type checker models, plus common ones it
+/// does not. A project function with one of these names is ignored.
+const BUILTIN_NAMES: &[&str] = &[
+    "abs",
+    "avg",
+    "cast",
+    "ceil",
+    "ceiling",
+    "char_length",
+    "character_length",
+    "coalesce",
+    "concat",
+    "concat_ws",
+    "cos",
+    "count",
+    "cume_dist",
+    "current_date",
+    "current_timestamp",
+    "date",
+    "date_add",
+    "date_sub",
+    "date_trunc",
+    "dateadd",
+    "datediff",
+    "datesub",
+    "day",
+    "dayofweek",
+    "dayofyear",
+    "dense_rank",
+    "exp",
+    "first_value",
+    "floor",
+    "greatest",
+    "hour",
+    "if",
+    "iff",
+    "ifnull",
+    "initcap",
+    "instr",
+    "lag",
+    "last_value",
+    "lead",
+    "least",
+    "left",
+    "length",
+    "ln",
+    "log",
+    "log10",
+    "log2",
+    "lower",
+    "lpad",
+    "ltrim",
+    "max",
+    "md5",
+    "min",
+    "minute",
+    "month",
+    "months_between",
+    "now",
+    "nth_value",
+    "ntile",
+    "nullif",
+    "nvl",
+    "octet_length",
+    "percent_rank",
+    "position",
+    "pow",
+    "power",
+    "quarter",
+    "rank",
+    "replace",
+    "reverse",
+    "right",
+    "round",
+    "row_number",
+    "rpad",
+    "rtrim",
+    "second",
+    "sha1",
+    "sha2",
+    "sha256",
+    "sign",
+    "sin",
+    "sqrt",
+    "strpos",
+    "substr",
+    "substring",
+    "sum",
+    "tan",
+    "timestamp",
+    "timestampdiff",
+    "to_date",
+    "to_timestamp",
+    "today",
+    "trim",
+    "trunc",
+    "truncate",
+    "try_cast",
+    "upper",
+    "weekofyear",
+    "year",
+];
+
+fn is_builtin_name(lower: &str) -> bool {
+    BUILTIN_NAMES.contains(&lower)
 }
 
 fn function_span(def: &FunctionDef) -> SourceSpan {
@@ -256,6 +389,24 @@ pub fn build_registry(loaded: LoadedFunctions) -> (FunctionRegistry, Vec<Diagnos
     let mut candidates: Vec<UdfSignature> = Vec::new();
     for def in loaded.functions {
         let key = def.name.to_ascii_lowercase();
+        // A name the warehouse already defines: the builtin wins on the
+        // warehouse, so treating calls as this function would refuse valid
+        // SQL. Report it and leave the function out entirely.
+        if is_builtin_name(&key) {
+            diagnostics.push(
+                Diagnostic::warning(
+                    W051,
+                    &def.name,
+                    format!(
+                        "function `{}` has the name of a built-in SQL function; Rocky ignores it \
+                         (calls resolve to the built-in) — rename it",
+                        def.name
+                    ),
+                )
+                .with_span(function_span(&def)),
+            );
+            continue;
+        }
         let mut problems = def.validation_problems();
         if counts.get(&key).copied().unwrap_or(0) > 1 {
             problems.push(format!(
@@ -284,7 +435,7 @@ pub fn build_registry(loaded: LoadedFunctions) -> (FunctionRegistry, Vec<Diagnos
             .map(|a| UdfParam {
                 name: a.name.clone(),
                 sql_type: a.data_type.trim().to_string(),
-                data_type: udf_declared_type(&a.data_type),
+                data_type: udf_param_type(&a.data_type),
             })
             .collect();
         let returns = udf_declared_type(&def.config.returns);
@@ -500,8 +651,38 @@ pub fn model_calls(sql: &str, registry: &FunctionRegistry) -> BTreeSet<String> {
                 calls.insert(sig.def.name.clone());
             }
         }));
+    } else {
+        // SQL the compiler's parser rejects (dialect syntax) still runs on
+        // the warehouse. Fall back to a word match so its functions are still
+        // created and its skip/reuse exclusion still holds: creating one
+        // function too many is harmless, missing one is not.
+        for sig in registry.valid.values() {
+            if mentions_call(sql, &sig.def.name) {
+                calls.insert(sig.def.name.clone());
+            }
+        }
     }
     calls
+}
+
+/// Whether `sql` contains `name` as a whole word followed by `(`
+/// (case-insensitive, whitespace allowed before the paren).
+fn mentions_call(sql: &str, name: &str) -> bool {
+    let hay = sql.to_ascii_lowercase();
+    let needle = name.to_ascii_lowercase();
+    let is_word = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    let mut from = 0;
+    while let Some(pos) = hay[from..].find(&needle) {
+        let start = from + pos;
+        let end = start + needle.len();
+        let before_ok = hay[..start].chars().next_back().is_none_or(|c| !is_word(c));
+        let after = hay[end..].trim_start();
+        if before_ok && after.starts_with('(') {
+            return true;
+        }
+        from = end;
+    }
+    false
 }
 
 /// `E051` for every call in every model that names an invalid function or
@@ -534,6 +715,33 @@ pub fn check_model_calls(
                     "calls function `{name}`, which failed validation (see its E051) and \
                      cannot be created"
                 ),
+                Some(Resolved::Valid(sig))
+                    if f.name.0.len() == 1 && sig.def.config.target.schema.is_some() =>
+                {
+                    // Created as `schema.f`; an unqualified call resolves in
+                    // the session's schema, which may not be that one.
+                    let message = format!(
+                        "calls `{}` unqualified, but it is created in schema `{}`; the \
+                         warehouse resolves the call in the session's current schema",
+                        sig.def.name,
+                        sig.def.config.target.schema.as_deref().unwrap_or_default()
+                    );
+                    if seen.insert(message.clone()) {
+                        diagnostics.push(
+                            Diagnostic::warning(W051, model_name, message).with_span(span.clone()),
+                        );
+                    }
+                    match positional_args(f) {
+                        Some(args) if args.len() != sig.params.len() => format!(
+                            "calls `{}` with {} argument(s) but it declares {}: {}",
+                            sig.def.name,
+                            args.len(),
+                            sig.params.len(),
+                            sig.signature()
+                        ),
+                        _ => return,
+                    }
+                }
                 Some(Resolved::Valid(sig)) => match positional_args(f) {
                     Some(args) if args.len() != sig.params.len() => format!(
                         "calls `{}` with {} argument(s) but it declares {}: {}",
@@ -690,72 +898,80 @@ pub(crate) fn infer_active_call(
     func: &ast::Function,
     arg_type: &dyn Fn(&Expr) -> (RockyType, bool),
 ) -> Option<(RockyType, bool)> {
-    ACTIVE.with(|stack| {
-        let mut stack = stack.borrow_mut();
-        let scope = stack.last_mut()?;
-        let registry = Arc::clone(&scope.registry);
-        let Some(Resolved::Valid(sig)) = registry.resolve_call(&func.name) else {
-            return None;
-        };
-        let result = Some((sig.returns.clone(), true));
-        // Arity is `check_model_calls`' certain E051; argument checks only
-        // make sense once arguments line up with parameters.
-        let Some(args) = positional_args(func) else {
-            return result;
-        };
-        if args.len() != sig.params.len() {
-            return result;
+    // Take what we need and release the borrow: inferring an argument
+    // re-enters this function for a nested call (`f(g(x))`), and a borrow
+    // held across that recursion would panic.
+    let registry = ACTIVE.with(|stack| stack.borrow().last().map(|s| Arc::clone(&s.registry)))?;
+    let Some(Resolved::Valid(sig)) = registry.resolve_call(&func.name) else {
+        return None;
+    };
+    let result = Some((sig.returns.clone(), true));
+    // Arity is `check_model_calls`' certain E051; argument checks only
+    // make sense once arguments line up with parameters.
+    let Some(args) = positional_args(func) else {
+        return result;
+    };
+    if args.len() != sig.params.len() {
+        return result;
+    }
+    let mut found: Vec<(&'static str, String)> = Vec::new();
+    let mut unverified = Vec::new();
+    for (index, (arg, param)) in args.iter().zip(&sig.params).enumerate() {
+        if matches!(arg, Expr::Value(v) if matches!(v.value, ast::Value::Null)) {
+            continue; // NULL binds to any parameter type
         }
-        let mut unverified = Vec::new();
-        for (index, (arg, param)) in args.iter().zip(&sig.params).enumerate() {
-            if matches!(arg, Expr::Value(v) if matches!(v.value, ast::Value::Null)) {
-                continue; // NULL binds to any parameter type
-            }
-            let (arg_ty, _) = arg_type(arg);
-            let position = index + 1;
-            if arg_ty == RockyType::Unknown || param.data_type == RockyType::Unknown {
-                unverified.push(format!("{position} (`{}`)", param.name));
-                continue;
-            }
-            if crate::types::is_assignable(&arg_ty, &param.data_type) {
-                continue;
-            }
-            let (code, message) = if certainly_incompatible(&arg_ty, &param.data_type) {
-                (
-                    E051,
-                    format!(
-                        "argument {position} of `{}` is {arg_ty} but parameter `{}` is declared \
-                         {}: {}",
-                        sig.def.name,
-                        param.name,
-                        param.sql_type,
-                        sig.signature()
-                    ),
-                )
-            } else {
-                (
-                    W051,
-                    format!(
-                        "argument {position} of `{}` is {arg_ty} but parameter `{}` is declared \
-                         {}; the call relies on the warehouse converting it implicitly",
-                        sig.def.name, param.name, param.sql_type
-                    ),
-                )
-            };
-            push_scope_diagnostic(scope, code, message);
+        let (arg_ty, _) = arg_type(arg);
+        let position = index + 1;
+        if arg_ty == RockyType::Unknown || param.data_type == RockyType::Unknown {
+            unverified.push(format!("{position} (`{}`)", param.name));
+            continue;
         }
-        if !unverified.is_empty() {
-            let message = format!(
+        if crate::types::is_assignable(&arg_ty, &param.data_type) {
+            continue;
+        }
+        found.push(if certainly_incompatible(&arg_ty, &param.data_type) {
+            (
+                E051,
+                format!(
+                    "argument {position} of `{}` is {arg_ty} but parameter `{}` is declared \
+                     {}: {}",
+                    sig.def.name,
+                    param.name,
+                    param.sql_type,
+                    sig.signature()
+                ),
+            )
+        } else {
+            (
+                W051,
+                format!(
+                    "argument {position} of `{}` is {arg_ty} but parameter `{}` is declared \
+                     {}; the call relies on the warehouse converting it implicitly",
+                    sig.def.name, param.name, param.sql_type
+                ),
+            )
+        });
+    }
+    if !unverified.is_empty() {
+        found.push((
+            W051,
+            format!(
                 "cannot verify argument {} of `{}` against its declared type (Rocky could not \
                  infer one of the two types): {}",
                 unverified.join(", "),
                 sig.def.name,
                 sig.signature()
-            );
-            push_scope_diagnostic(scope, W051, message);
+            ),
+        ));
+    }
+    ACTIVE.with(|stack| {
+        if let Some(scope) = stack.borrow_mut().last_mut() {
+            for (code, message) in found {
+                push_scope_diagnostic(scope, code, message);
+            }
         }
-        result
-    })
+    });
+    result
 }
 
 fn push_scope_diagnostic(scope: &mut ActiveScope, code: &str, message: String) {
@@ -866,7 +1082,11 @@ mod tests {
     #[test]
     fn declared_types_map_conservatively() {
         assert_eq!(udf_declared_type("DOUBLE"), RockyType::Float64);
-        assert_eq!(udf_declared_type("bigint"), RockyType::Int64);
+        assert_eq!(udf_param_type("bigint"), RockyType::Int64);
+        // A return type that means different things per warehouse stays
+        // Unknown: Snowflake BIGINT is NUMBER(38,0); DuckDB TIMESTAMP is naive.
+        assert_eq!(udf_declared_type("BIGINT"), RockyType::Unknown);
+        assert_eq!(udf_declared_type("TIMESTAMP"), RockyType::Unknown);
         assert_eq!(udf_declared_type("FLOAT64"), RockyType::Float64);
         assert_eq!(
             udf_declared_type("DECIMAL(10, 2)"),
@@ -1032,6 +1252,40 @@ mod tests {
         );
         assert!(model_calls("SELECT other.f(a) AS b FROM t", &reg).is_empty());
         assert_eq!(model_calls("SELECT f(a) AS b FROM t", &reg).len(), 1);
+        assert!(model_calls("SELECT cat.other.f(a) AS b FROM t", &reg).is_empty());
+
+        // No declared target: any qualified call is someone else's function,
+        // so a different arity there is not this project's E051.
+        let (reg, _) = registry(vec![def("mask_email", &[("s", "VARCHAR")], "VARCHAR", "s")]);
+        assert!(model_calls("SELECT governance.mask_email(s, '*') AS m FROM t", &reg).is_empty());
+        let models = vec![model(
+            "m",
+            "SELECT governance.mask_email(s, '*') AS m FROM t",
+        )];
+        assert!(check_model_calls(&models, &reg).is_empty());
+    }
+
+    #[test]
+    fn builtin_names_are_ignored_not_refused() {
+        let (reg, diags) = registry(vec![def("round", &[("x", "DOUBLE")], "DOUBLE", "x")]);
+        assert!(reg.get("round").is_none() && !reg.declares("round"));
+        assert!(diags.iter().all(|d| !d.is_error()));
+        assert!(
+            diags
+                .iter()
+                .any(|d| &*d.code == W051 && d.message.contains("built-in"))
+        );
+        let models = vec![model("m", "SELECT ROUND(x, 2) AS r FROM t")];
+        assert!(check_model_calls(&models, &reg).is_empty());
+    }
+
+    #[test]
+    fn unparseable_model_sql_still_records_its_calls() {
+        let (reg, _) = registry(vec![def("f", &[("x", "BIGINT")], "BIGINT", "x")]);
+        let sql = "SELECT f (x) AS y, [i FOR i IN xs IF ] FROM t WHERE ((";
+        assert!(parse_query(sql).is_none());
+        assert_eq!(model_calls(sql, &reg).len(), 1);
+        assert!(model_calls("SELECT xf(x), f_other(1) FROM ((", &reg).is_empty());
     }
 
     #[test]

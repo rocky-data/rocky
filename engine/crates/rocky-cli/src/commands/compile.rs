@@ -484,10 +484,13 @@ fn function_adapter_diagnostics(
                 diagnostic::E051,
                 name,
                 format!(
-                    "function `{name}` cannot be created: the Trino adapter does not support                      creating persistent user-defined functions"
+                    "function `{name}` cannot be created: the Trino adapter does not support \
+                     creating persistent user-defined functions"
                 ),
             )
-            .with_suggestion("inline the expression in the calling models, or create the routine outside Rocky")
+            .with_suggestion(
+                "inline the expression in the calling models, or create the routine outside Rocky",
+            )
         })
         .collect()
 }

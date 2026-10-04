@@ -312,6 +312,19 @@ impl FunctionDef {
                 self.file_path.with_extension("sql").display()
             )),
             Some(body) if body.is_empty() => problems.push("the SQL body is empty".to_string()),
+            // A top-level `;` would end the CREATE statement and run the rest
+            // as a second one. Only that certain case refuses; constructs the
+            // scanner calls ambiguous across dialects are left alone.
+            Some(body)
+                if matches!(
+                    rocky_sql::validation::reject_statement_terminator("function body", body),
+                    Err(rocky_sql::validation::ValidationError::StatementTerminator { .. })
+                ) =>
+            {
+                problems.push(
+                    "the SQL body contains a `;`; a function body is one expression".to_string(),
+                );
+            }
             _ => {}
         }
         problems
@@ -426,6 +439,9 @@ pub fn create_function_sql(
     };
 
     match dialect {
+        // The body is closed on a new line in the DuckDB and BigQuery arms so a
+        // trailing `-- comment` in it cannot swallow the closing paren.
+        //
         // DuckDB scalar macro:
         // https://duckdb.org/docs/stable/sql/statements/create_macro
         // Macro parameters are untyped and the macro has no RETURNS clause, so
@@ -441,7 +457,7 @@ pub fn create_function_sql(
                 .collect::<Vec<_>>()
                 .join(", ");
             Ok(format!(
-                "CREATE OR REPLACE MACRO {}({params}) AS CAST(({body}) AS {returns})",
+                "CREATE OR REPLACE MACRO {}({params}) AS CAST(({body}\n) AS {returns})",
                 dotted(|s| s.to_string())
             ))
         }
@@ -515,7 +531,7 @@ pub fn create_function_sql(
                 ));
             }
             let mut sql = format!(
-                "CREATE OR REPLACE FUNCTION {}({})\nRETURNS {returns}\nAS ({body})",
+                "CREATE OR REPLACE FUNCTION {}({})\nRETURNS {returns}\nAS ({body}\n)",
                 dotted(|s| format!("`{s}`")),
                 typed_args()
             );
@@ -576,7 +592,7 @@ mod tests {
     fn duckdb_macro_casts_to_the_declared_return_type() {
         assert_eq!(
             create_function_sql(&cents(), FunctionDialect::DuckDb).unwrap(),
-            "CREATE OR REPLACE MACRO cents_to_dollars(cents) AS CAST((cents / 100.0) AS DOUBLE)"
+            "CREATE OR REPLACE MACRO cents_to_dollars(cents) AS CAST((cents / 100.0\n) AS DOUBLE)"
         );
     }
 
@@ -592,7 +608,7 @@ mod tests {
         assert_eq!(
             create_function_sql(&d, FunctionDialect::DuckDb).unwrap(),
             "CREATE OR REPLACE MACRO util.safe_div(a, b) AS \
-             CAST((CASE WHEN b = 0 THEN NULL ELSE a / b END) AS DOUBLE)"
+             CAST((CASE WHEN b = 0 THEN NULL ELSE a / b END\n) AS DOUBLE)"
         );
     }
 
@@ -675,7 +691,7 @@ mod tests {
         assert_eq!(
             create_function_sql(&d, FunctionDialect::BigQuery).unwrap(),
             "CREATE OR REPLACE FUNCTION `my-project`.`util`.`cents_to_dollars`(cents INT64)\n\
-             RETURNS FLOAT64\nAS (cents / 100.0)\nOPTIONS (description = 'Cents to dollars')"
+             RETURNS FLOAT64\nAS (cents / 100.0\n)\nOPTIONS (description = 'Cents to dollars')"
         );
     }
 
@@ -716,6 +732,25 @@ mod tests {
                 ));
             }
         }
+    }
+
+    #[test]
+    fn a_statement_terminator_in_the_body_is_refused() {
+        let d = def("f", &[], "BIGINT", "1); DROP TABLE t; SELECT (1");
+        assert!(
+            d.validation_problems()
+                .iter()
+                .any(|p| p.contains("contains a `;`"))
+        );
+        // A `;` inside a string literal is data, not a terminator.
+        let ok = def("g", &[], "VARCHAR", "'a;b'");
+        assert!(ok.validation_problems().is_empty());
+        // A trailing comment cannot comment out the closing paren.
+        let commented = def("h", &[("x", "BIGINT")], "BIGINT", "x -- note");
+        assert_eq!(
+            create_function_sql(&commented, FunctionDialect::DuckDb).unwrap(),
+            "CREATE OR REPLACE MACRO h(x) AS CAST((x -- note\n) AS BIGINT)"
+        );
     }
 
     #[test]

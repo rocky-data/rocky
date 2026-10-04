@@ -584,6 +584,44 @@ mod tests {
     /// Every `GateReason` carries a stable, distinct log token and a
     /// non-empty human message. Guards against a silent reason-table drift
     /// (a trust-sensitive surface: a misleading reason is worse than none).
+    /// A model that calls a project UDF is never eligible — not even under
+    /// `[skip] deterministic = true` — because its logic hash covers its own
+    /// SQL, not the function bodies it calls.
+    #[test]
+    fn udf_callers_are_never_eligible() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("m.sql"),
+            "SELECT cents_to_dollars(amount) AS usd FROM raw.orders",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("m.toml"),
+            "[strategy]\ntype = \"full_refresh\"\n[target]\ncatalog = \"c\"\n\
+             schema = \"s\"\n[skip]\ndeterministic = true\n",
+        )
+        .unwrap();
+        let models = rocky_core::models::load_models_from_dir(tmp.path(), None).unwrap();
+        let project = rocky_compiler::project::Project::from_models(models).unwrap();
+        let model = project.model("m").unwrap().clone();
+        let ir = model.to_model_ir();
+        let cfg = super::super::run::SkipGateConfig {
+            feature_enabled: true,
+            force_rebuild: false,
+            rowcount_fallback: false,
+            lag_tolerance_seconds: 0,
+            shadow_or_branch: false,
+        };
+        let gate = SkipGate::new(cfg, &project);
+        assert!(
+            gate.is_eligible(&model, &ir),
+            "the assertion alone makes it eligible"
+        );
+        let gate = SkipGate::new(cfg, &project)
+            .with_function_callers(std::iter::once("m".to_string()).collect());
+        assert!(!gate.is_eligible(&model, &ir));
+    }
+
     #[test]
     fn gate_reason_tables_are_stable_and_distinct() {
         let all = [

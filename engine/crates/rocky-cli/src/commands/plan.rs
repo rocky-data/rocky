@@ -1405,9 +1405,15 @@ fn plan_preview_output_for_pipeline(
     // User-defined functions the previewed models call, in the order
     // `rocky run` creates them: before every model, callees first. A function
     // this warehouse cannot create is reported, not previewed.
+    let compile_failed: std::collections::HashSet<&str> = result
+        .diagnostics
+        .iter()
+        .filter(|d| d.is_error())
+        .map(|d| d.model.as_str())
+        .collect();
     match super::functions_ddl::function_statements(
         &result,
-        |name| filter.is_none_or(|f| f == name),
+        |name| filter.is_none_or(|f| f == name) && !compile_failed.contains(name),
         dialect.name(),
     ) {
         Ok(statements) => {

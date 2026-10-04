@@ -94,23 +94,60 @@ pub(crate) fn statements_for<'a>(
         .collect()
 }
 
-/// Execute `statements` in order. Returns how many were created.
-///
-/// # Errors
-///
-/// The first warehouse failure, naming the function.
+/// Execute `statements` in order and return the functions that could not
+/// be created, with the error. A function whose callee failed is not
+/// attempted; it fails too.
 pub(crate) async fn create_functions(
     warehouse: &dyn rocky_core::traits::WarehouseAdapter,
+    compile_result: &CompileResult,
     statements: &[FunctionStatement],
-) -> Result<usize> {
+) -> std::collections::BTreeMap<String, String> {
+    let registry = compile_result.semantic_graph.functions();
+    let mut failed = std::collections::BTreeMap::new();
     for stmt in statements {
+        let blocked_by = registry.get(&stmt.name).and_then(|sig| {
+            sig.calls
+                .iter()
+                .find(|callee| failed.contains_key(callee.as_str()))
+                .cloned()
+        });
+        if let Some(callee) = blocked_by {
+            failed.insert(
+                stmt.name.clone(),
+                format!("not created: it calls '{callee}', which failed"),
+            );
+            continue;
+        }
         tracing::info!(function = %stmt.name, target = %stmt.target, "creating user-defined function");
-        warehouse
-            .execute_statement(&stmt.sql)
-            .await
-            .map_err(|e| anyhow::anyhow!("failed to create function '{}': {e}", stmt.name))?;
+        if let Err(e) = warehouse.execute_statement(&stmt.sql).await {
+            failed.insert(stmt.name.clone(), format!("failed to create function: {e}"));
+        }
     }
-    Ok(statements.len())
+    failed
+}
+
+/// Models in `models` whose calls (directly or through other functions)
+/// reach a function in `failed`, mapped to the failed function they need.
+pub(crate) fn callers_of_failed(
+    compile_result: &CompileResult,
+    failed: &std::collections::BTreeMap<String, String>,
+) -> std::collections::BTreeMap<String, String> {
+    let registry = compile_result.semantic_graph.functions();
+    let mut out = std::collections::BTreeMap::new();
+    if failed.is_empty() {
+        return out;
+    }
+    for model in &compile_result.project.models {
+        let calls = rocky_compiler::udf::model_calls(&model.sql, registry);
+        if let Some(sig) = registry
+            .creation_order(calls.iter().map(String::as_str))
+            .into_iter()
+            .find(|sig| failed.contains_key(&sig.def.name))
+        {
+            out.insert(model.config.name.clone(), sig.def.name.clone());
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -169,7 +206,7 @@ mod tests {
         assert_eq!(&purposes[..2], ["create_function", "create_function"]);
         assert_eq!(
             out.statements[0].sql,
-            "CREATE OR REPLACE MACRO scale(x) AS CAST((x / 100.0) AS DOUBLE)"
+            "CREATE OR REPLACE MACRO scale(x) AS CAST((x / 100.0\n) AS DOUBLE)"
         );
         assert_eq!(out.statements[1].target, "cents_to_dollars");
         assert!(

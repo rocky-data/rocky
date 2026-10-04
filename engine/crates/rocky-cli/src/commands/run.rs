@@ -11217,12 +11217,23 @@ pub(crate) async fn execute_models_with_explicit_contracts(
             .get(name)
             .is_some()
     {
+        // Function DDL is not covered by the governed-apply fingerprint or
+        // the freeze fence, so a governed apply may not select a function.
+        anyhow::ensure!(
+            exec_fp_gate.is_none(),
+            "a governed apply cannot select user-defined function '{name}': function DDL is \
+             not covered by the plan fingerprint"
+        );
         let statements = super::functions_ddl::statements_for(
             &compile_result,
             [name],
             warehouse.dialect().name(),
         )?;
-        super::functions_ddl::create_functions(warehouse, &statements).await?;
+        let failed =
+            super::functions_ddl::create_functions(warehouse, &compile_result, &statements).await;
+        if let Some((function, e)) = failed.into_iter().next() {
+            anyhow::bail!("function '{function}': {e}");
+        }
         return Ok(GovernanceSnapshot::default());
     }
 
@@ -11663,16 +11674,64 @@ pub(crate) async fn execute_models_with_explicit_contracts(
 
     // User-defined functions (`functions/`): create every function a model
     // this invocation builds calls — callees first — before any model runs.
-    let function_statements = super::functions_ddl::function_statements(
+    // A function that cannot be created fails only the models that need it
+    // (and their declared descendants); everything else still builds.
+    let in_run = |name: &str| {
+        model_name_filter.is_none_or(|selected| selected == name)
+            && model_set.is_none_or(|set| set.contains(name))
+    };
+    let function_failures = match super::functions_ddl::function_statements(
         &compile_result,
-        |name| {
-            model_name_filter.is_none_or(|selected| selected == name)
-                && model_set.is_none_or(|set| set.contains(name))
-                && !compile_excluded_models.contains(name)
-        },
+        |name| in_run(name) && !compile_excluded_models.contains(name),
         dialect.name(),
-    )?;
-    super::functions_ddl::create_functions(warehouse, &function_statements).await?;
+    ) {
+        Ok(statements) => {
+            super::functions_ddl::create_functions(warehouse, &compile_result, &statements).await
+        }
+        Err(e) => compile_result
+            .semantic_graph
+            .functions()
+            .functions()
+            .map(|f| (f.def.name.clone(), format!("{e:#}")))
+            .collect(),
+    };
+    let function_blocked =
+        super::functions_ddl::callers_of_failed(&compile_result, &function_failures);
+    let mut newly_excluded: BTreeSet<String> = BTreeSet::new();
+    for (model, function) in &function_blocked {
+        if !in_run(model) || compile_excluded_models.contains(model) {
+            continue;
+        }
+        newly_excluded.insert(model.clone());
+        output.tables_failed += 1;
+        output.errors.push(crate::output::TableErrorOutput {
+            asset_key: vec![model.clone()],
+            error: format!(
+                "model '{model}' was not built: function '{function}' {}",
+                function_failures
+                    .get(function)
+                    .map(String::as_str)
+                    .unwrap_or("could not be created")
+            ),
+            failure_kind: crate::output::FailureKind::CompileError,
+            cooldown_seconds: None,
+        });
+    }
+    // Declared descendants keep their existing targets rather than reading a
+    // producer that was not rebuilt.
+    let mut changed = !newly_excluded.is_empty();
+    while changed {
+        changed = false;
+        for node in &compile_result.project.dag_nodes {
+            if !newly_excluded.contains(&node.name)
+                && node.depends_on.iter().any(|d| newly_excluded.contains(d))
+            {
+                newly_excluded.insert(node.name.clone());
+                changed = true;
+            }
+        }
+    }
+    compile_excluded_models.extend(newly_excluded);
 
     let mut models_executed = 0usize;
 
