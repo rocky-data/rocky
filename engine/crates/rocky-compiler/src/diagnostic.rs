@@ -164,8 +164,8 @@ pub const E038: &str = "E038";
 /// A direct projection reads a column absent from a complete in-project model.
 ///
 /// Emitted only when Rocky can prove the upstream model's output names are
-/// complete. External source schemas do not carry completeness or freshness
-/// provenance, so their unresolved references remain conservative `Unknown`s.
+/// complete. External sources are covered separately, by [`E041`] / [`W041`],
+/// which weigh where the source schema came from.
 pub const E039: &str = "E039";
 
 /// A `.rocky` string literal contains a backslash, whose SQL meaning varies
@@ -196,6 +196,26 @@ pub const E042: &str = "E042";
 /// depends on the data, the same pair is [`W043`]. A same-named join key whose
 /// type differs across upstream models stays [`E001`]/[`W001`]'s.
 pub const E043: &str = "E043";
+/// A direct column reference names a column absent from an external source
+/// whose schema Rocky holds as authoritative.
+///
+/// Emitted by `rocky compile` (and the compile `rocky run` performs before it
+/// executes) from [`crate::source_refs::check_source_column_refs`]. The source
+/// schema counts as authoritative when it was introspected live during this
+/// invocation, when it came from a schema-cache entry younger than
+/// `[cache.schemas] trusted_max_age_seconds`, or when strict sources are on
+/// (`rocky compile --strict-sources` or `[cache.schemas] strict_sources`).
+/// Without one of those the same finding is [`W041`].
+///
+/// It fires only when the reference binds unambiguously: every relation the
+/// name could resolve against is a known source (no CTE, derived table,
+/// in-project model or table function in scope), no `SELECT` alias or
+/// relation name matches it, a `a.b` reference cannot also be read as a
+/// struct field, and the name is neither quoted (`"x"` is a string in BigQuery
+/// and, by default, Databricks) nor `_`-prefixed (warehouse metadata columns).
+/// Anything else keeps the conservative `Unknown` result. The
+/// message names the column and the source, and suggests close column names.
+pub const E041: &str = "E041";
 
 // Warnings
 /// Unused model (no downstream consumers).
@@ -310,6 +330,18 @@ pub const W042: &str = "W042";
 /// string literal that parses as a number is not reported. Escalate with
 /// `rocky compile --deny-warnings W043`.
 pub const W043: &str = "W043";
+/// A direct column reference names a column absent from an external source
+/// schema that may be out of date.
+///
+/// Same finding as [`E041`], at warning severity, for a source schema Rocky
+/// cannot treat as current: one read from a seed file
+/// (`rocky compile --with-seed`) or from a schema-cache entry older than
+/// `[cache.schemas] trusted_max_age_seconds` (unset by default, so every cache
+/// entry). The warehouse may already carry the column, so the compile still
+/// succeeds. Refresh the schema (fix the seed, or re-warm the cache with
+/// `rocky discover --with-schemas`), or escalate to [`E041`] with
+/// `rocky compile --strict-sources` or `[cache.schemas] strict_sources = true`.
+pub const W041: &str = "W041";
 
 // Info
 /// Model dependency inferred from SQL.

@@ -872,7 +872,7 @@ fn check_known_missing_projection_refs(
     diagnostics
 }
 
-fn is_warehouse_pseudo_column(name: &str) -> bool {
+pub(crate) fn is_warehouse_pseudo_column(name: &str) -> bool {
     name.eq_ignore_ascii_case("rowid")
         || name.eq_ignore_ascii_case("_metadata")
         || name.eq_ignore_ascii_case("_partitiontime")

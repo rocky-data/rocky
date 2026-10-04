@@ -23,7 +23,8 @@ use anyhow::Context;
 use chrono::Utc;
 use tracing::{debug, info};
 
-use rocky_compiler::schema_cache::load_source_schemas_from_cache;
+use rocky_compiler::schema_cache::load_source_schemas_with_provenance_from_cache;
+use rocky_compiler::source_refs::SourceProvenance;
 use rocky_compiler::types::TypedColumn;
 use rocky_core::config::SchemaCacheConfig;
 use rocky_core::state::StateStore;
@@ -49,7 +50,7 @@ static CLI_PARTIAL_HIT_LOGGED: OnceLock<()> = OnceLock::new();
 /// 4. Scan fails (rare — version mismatch on a table we didn't create
 ///    here) -> empty map + debug log.
 /// 5. Otherwise -> the TTL-filtered map from
-///    [`load_source_schemas_from_cache`].
+///    [`rocky_compiler::schema_cache::load_source_schemas_from_cache`].
 ///
 /// Emits an [`tracing::info!`] line once per CLI process (via
 /// [`CLI_PARTIAL_HIT_LOGGED`]) when the scan returns at least one entry —
@@ -61,8 +62,21 @@ pub(crate) fn load_cached_source_schemas(
     config: &SchemaCacheConfig,
     state_path: &Path,
 ) -> HashMap<String, Vec<TypedColumn>> {
+    load_cached_source_schemas_with_provenance(config, state_path).0
+}
+
+/// [`load_cached_source_schemas`], plus the provenance the E041 / W041
+/// missing-source-column check needs: each entry's cache timestamp, whether it
+/// is within `[cache.schemas] trusted_max_age_seconds`, and
+/// `[cache.schemas] strict_sources`. Every degraded path returns an empty
+/// provenance, which turns the check off.
+pub(crate) fn load_cached_source_schemas_with_provenance(
+    config: &SchemaCacheConfig,
+    state_path: &Path,
+) -> (HashMap<String, Vec<TypedColumn>>, SourceProvenance) {
+    let empty = || (HashMap::new(), SourceProvenance::default());
     if !config.enabled {
-        return HashMap::new();
+        return empty();
     }
 
     // `open_read_only` doesn't take the advisory write lock, so concurrent
@@ -70,25 +84,30 @@ pub(crate) fn load_cached_source_schemas(
     // run `rocky compile` and `rocky run` side by side.
     let store = match StateStore::open_read_only(state_path) {
         Ok(s) => s,
-        Err(rocky_core::state::StateError::NotFound { .. }) => return HashMap::new(),
+        Err(rocky_core::state::StateError::NotFound { .. }) => return empty(),
         Err(e) => {
             debug!(
                 error = %e,
                 path = %state_path.display(),
                 "schema cache: state store open failed; degrading to Unknown types"
             );
-            return HashMap::new();
+            return empty();
         }
     };
 
-    let map = match load_source_schemas_from_cache(&store, Utc::now(), config.ttl()) {
-        Ok(m) => m,
+    let (map, provenance) = match load_source_schemas_with_provenance_from_cache(
+        &store,
+        Utc::now(),
+        config.ttl(),
+        config.trusted_max_age(),
+    ) {
+        Ok(loaded) => loaded,
         Err(e) => {
             debug!(
                 error = %e,
                 "schema cache: scan failed; degrading to Unknown types"
             );
-            return HashMap::new();
+            return empty();
         }
     };
 
@@ -102,7 +121,7 @@ pub(crate) fn load_cached_source_schemas(
         );
     }
 
-    map
+    (map, provenance.with_strict(config.strict_sources))
 }
 
 /// Load `source_schemas` for a command that seeds its compile from the project
@@ -299,6 +318,7 @@ mod tests {
             enabled: false,
             ttl_seconds: 86_400,
             replicate: false,
+            ..SchemaCacheConfig::default()
         };
         let map = load_cached_source_schemas(&config, &path);
         assert!(map.is_empty(), "disabled config must short-circuit");

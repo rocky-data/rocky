@@ -504,6 +504,7 @@ impl RockyLsp {
             allow_unmasked,
             project_freshness,
             run_vars: rocky_core::run_vars::RunVars::new(),
+            source_provenance: Default::default(),
         };
 
         match rocky_compiler::compile::compile(&config) {
@@ -1419,6 +1420,7 @@ impl LanguageServer for RockyLsp {
                     allow_unmasked,
                     project_freshness,
                     run_vars: rocky_core::run_vars::RunVars::new(),
+                    source_provenance: Default::default(),
                 };
 
                 // Try incremental compilation if we have a previous result.
@@ -6392,6 +6394,7 @@ mod tests {
             allow_unmasked: cfg.classifications.allow_unmasked,
             project_freshness,
             run_vars: rocky_core::run_vars::RunVars::new(),
+            source_provenance: Default::default(),
         };
         let result = rocky_compiler::compile::compile(&compile_config).unwrap();
 

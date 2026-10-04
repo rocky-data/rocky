@@ -1346,6 +1346,14 @@ enum Command {
         #[arg(long)]
         with_seed: bool,
 
+        /// Treat every known source schema as authoritative: a direct
+        /// reference to a column the source lacks is the E041 error even when
+        /// the schema came from a seed (`--with-seed`) or an untrusted cache
+        /// entry, which otherwise warn with W041. Same as
+        /// `[cache.schemas] strict_sources = true`.
+        #[arg(long)]
+        strict_sources: bool,
+
         /// Per-run variable substituted into model SQL (repeatable). Resolves
         /// `@var(name)` markers to the supplied value so `rocky compile` type-
         /// checks the same SQL `rocky run --var …` would execute. A required
@@ -4272,12 +4280,13 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             expand_macros,
             target_dialect,
             with_seed,
+            strict_sources,
             var,
             deny_warnings,
         } => {
             let run_vars = rocky_core::run_vars::RunVars::parse_pairs(&var)
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
-            rocky_cli::commands::run_compile(
+            rocky_cli::commands::run_compile_with_strict_sources(
                 Some(cli.config.as_path()),
                 &state_path,
                 &models,
@@ -4289,6 +4298,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                 with_seed,
                 cli.cache_ttl,
                 &run_vars,
+                strict_sources,
                 &deny_warnings,
             )
         }

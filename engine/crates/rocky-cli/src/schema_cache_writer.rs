@@ -187,6 +187,7 @@ mod tests {
             enabled: false,
             ttl_seconds: 86_400,
             replicate: false,
+            ..SchemaCacheConfig::default()
         };
         let mut tap = SchemaCacheWriteTap::default();
         let batch = batch(&[("orders", cols(&[("id", "BIGINT", false)]))]);

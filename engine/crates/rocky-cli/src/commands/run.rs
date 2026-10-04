@@ -11127,27 +11127,45 @@ pub(crate) async fn execute_models_with_explicit_contracts(
     // production capture failure → refuse (do NOT fall through to the live cache).
     // Only a genuinely-legacy plan (`None` + `!require`) and the non-gated paths
     // (bare `rocky run`, human apply) load the live cache — byte-identical.
+    //
+    // The cache path also carries each entry's provenance, so the compile
+    // below surfaces the E041 / W041 missing-source-column check before any
+    // model executes (an E041 model is excluded like any error-severity one).
+    // A reviewed snapshot carries no provenance: it is replayed as reviewed,
+    // and the check stays off for it.
     let cache_source_schemas = || {
         if schema_cache_config.enabled {
             match state_store {
-                Some(store) => rocky_compiler::schema_cache::load_source_schemas_from_cache(
-                    store,
-                    chrono::Utc::now(),
-                    schema_cache_config.ttl(),
-                )
-                .unwrap_or_default(),
-                None => std::collections::HashMap::new(),
+                Some(store) => {
+                    rocky_compiler::schema_cache::load_source_schemas_with_provenance_from_cache(
+                        store,
+                        chrono::Utc::now(),
+                        schema_cache_config.ttl(),
+                        schema_cache_config.trusted_max_age(),
+                    )
+                    .map(|(schemas, provenance)| {
+                        (
+                            schemas,
+                            provenance.with_strict(schema_cache_config.strict_sources),
+                        )
+                    })
+                    .unwrap_or_default()
+                }
+                None => Default::default(),
             }
         } else {
-            std::collections::HashMap::new()
+            Default::default()
         }
     };
-    let source_schemas = match exec_fp_gate {
+    let (source_schemas, source_provenance) = match exec_fp_gate {
         Some(gate) => match &gate.reviewed_source_schemas {
-            Some(snapshot) => snapshot
-                .iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect::<std::collections::HashMap<_, _>>(),
+            Some(snapshot) => (
+                snapshot
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect::<std::collections::HashMap<_, _>>(),
+                Default::default(),
+            ),
             None if gate.require => {
                 anyhow::bail!(
                     "refusing to execute plan '{}': it is a governed plan carrying no reviewed \
@@ -11173,6 +11191,7 @@ pub(crate) async fn execute_models_with_explicit_contracts(
         // This pre-execution compile stays scoped to typecheck +
         // contract diagnostics to avoid broadening its signature.
         run_vars: run_vars.clone(),
+        source_provenance,
         ..Default::default()
     };
 
@@ -11377,6 +11396,21 @@ pub(crate) async fn execute_models_with_explicit_contracts(
     //     `DagExecutor` then skipped the healthy descendants of nodes that had
     //     actually materialized successfully. The broken model's OWN node
     //     still reports it, which is where it belongs.
+    // W041 (a source column missing from a possibly-stale cached schema) does
+    // not block execution — the warehouse may have the column — but say so
+    // before the warehouse is touched, so a failure that follows is explained.
+    for d in compile_result
+        .diagnostics
+        .iter()
+        .filter(|d| d.code.as_ref() == rocky_compiler::diagnostic::W041)
+    {
+        warn!(
+            model = d.model.as_str(),
+            code = &*d.code,
+            message = &*d.message,
+            "compile warning"
+        );
+    }
     if compile_result.has_errors {
         let mut reported: BTreeSet<&str> = BTreeSet::new();
         for d in &compile_result.diagnostics {

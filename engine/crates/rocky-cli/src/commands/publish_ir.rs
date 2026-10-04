@@ -86,6 +86,7 @@ pub fn run_publish_ir(
         allow_unmasked: Vec::new(),
         project_freshness: Default::default(),
         run_vars: rocky_core::run_vars::RunVars::new(),
+        source_provenance: Default::default(),
     };
 
     let result = compile::compile(&config)?;

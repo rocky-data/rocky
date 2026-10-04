@@ -978,11 +978,20 @@ Control how long a cached table shape stays trusted, and whether other machines 
 | `enabled` | bool | `true` | Enable schema cache reads + writes. Set to `false` for strict CI where every typecheck should resolve against the current warehouse. |
 | `ttl_seconds` | integer | `86400` | TTL for cache entries in seconds (default 24h). Lower for high-DDL-churn teams. |
 | `replicate` | bool | `false` | Replicate the schema cache via `[state]` sync. Default is off; a fresh clone should warm its cache from its own `rocky apply`, not inherit another machine's stale types. |
+| `trusted_max_age_seconds` | integer | unset | Cache entries younger than this are trusted as current. A reference to a column a trusted entry lacks is the `E041` error. Older entries, and every entry when the key is unset, give the `W041` warning. |
+| `strict_sources` | bool | `false` | Trust every known source schema, including seeds and old cache entries. Every `W041` becomes `E041`. `rocky compile --strict-sources` does the same for one invocation. |
 
 ```toml
 [cache.schemas]
 ttl_seconds = 3600   # 1h TTL for teams with high-DDL churn
 replicate = true     # opt in to share cache via the remote state backend
+```
+
+`trusted_max_age_seconds` and `strict_sources` control the missing-source-column check. See [Missing columns in external sources](/concepts/compiler/#missing-columns-in-external-sources-e041--w041).
+
+```toml
+[cache.schemas]
+trusted_max_age_seconds = 3600   # entries cached in the last hour refuse with E041
 ```
 
 A Valkey-backed runtime cache exists in the codebase but `rocky.toml` does not reach it yet. A future `[cache.valkey]` key is reserved for it.

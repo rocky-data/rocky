@@ -18,6 +18,7 @@ use crate::contracts::{self, CompilerContract};
 use crate::diagnostic::{Diagnostic, W011};
 use crate::project::{Project, ProjectError};
 use crate::semantic::{self, SemanticGraph};
+use crate::source_refs;
 use crate::typecheck::{self, TypeCheckResult};
 use crate::types::{RockyType, TypedColumn};
 
@@ -134,6 +135,12 @@ pub struct CompilerConfig {
     /// E028 error diagnostic naming the variable. Distinct from `${ENV}`
     /// config-time interpolation, which resolves while parsing `rocky.toml`.
     pub run_vars: rocky_core::run_vars::RunVars,
+    /// Where each [`Self::source_schemas`] entry came from (live
+    /// introspection, schema cache, seed), plus the strict-sources switch.
+    /// Drives the E041 / W041 missing-source-column check in
+    /// [`crate::source_refs`]. The default records no origin, so the check
+    /// stays off for callers that don't know their schemas' provenance.
+    pub source_provenance: crate::source_refs::SourceProvenance,
 }
 
 /// Result of compilation.
@@ -478,6 +485,13 @@ pub fn compile_project(
     diagnostics.extend(lakehouse_diagnostics);
     diagnostics.extend(run_var_diagnostics);
     diagnostics.extend(target_collision_diagnostics(&project));
+    // E041 / W041: direct references to columns absent from a source schema
+    // with known provenance. Whole-project and recomputed on every call.
+    diagnostics.extend(source_refs::check_source_column_refs(
+        &project.models,
+        &config.source_schemas,
+        &config.source_provenance,
+    ));
     // Dependency-resolution warnings (D011 depends_on mismatch, D012 an edge
     // derived from a name match a warehouse run does not honour). Produced by
     // `resolve::resolve_dependencies` and parked on the project until now;
@@ -716,6 +730,13 @@ pub fn compile_incremental(
     diagnostics.extend(lakehouse_diagnostics);
     diagnostics.extend(run_var_diagnostics);
     diagnostics.extend(target_collision_diagnostics(&project));
+    // E041 / W041: direct references to columns absent from a source schema
+    // with known provenance. Whole-project and recomputed on every call.
+    diagnostics.extend(source_refs::check_source_column_refs(
+        &project.models,
+        &config.source_schemas,
+        &config.source_provenance,
+    ));
     // Dependency-resolution warnings (D011 depends_on mismatch, D012 an edge
     // derived from a name match a warehouse run does not honour). Produced by
     // `resolve::resolve_dependencies` and parked on the project until now;

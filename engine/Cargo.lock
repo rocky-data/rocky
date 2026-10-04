@@ -4123,6 +4123,7 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "sqlparser",
+ "strsim",
  "tempfile",
  "thiserror",
  "toml",

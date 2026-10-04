@@ -28,7 +28,7 @@ Two mandatory sections (`[adapter]` + at least one `[pipeline.<name>]`) plus opt
 
 # Optional globals:
 [state]                  # Embedded state store backend
-[cache.schemas]          # Schema (DESCRIBE) cache: enabled, ttl_seconds, replicate
+[cache.schemas]          # Schema (DESCRIBE) cache: enabled, ttl_seconds, replicate, trusted_max_age_seconds, strict_sources
 [cost]                   # Cost model for `rocky optimize`
 [hook.<event>]           # Lifecycle hooks (one per event)
 # Governance (tags, grants, workspace bindings) is NOT a top-level table:
@@ -441,6 +441,8 @@ enabled = false   # default; preview-only, NOT live-verified — leave off in pr
 enabled     = true     # default; false for strict CI (every typecheck hits the warehouse)
 ttl_seconds = 86400    # default 24h; lower for high-DDL-churn teams
 replicate   = false    # default; true to ship the cache through state_sync
+# trusted_max_age_seconds = 3600  # unset by default; entries younger than this make a missing source column E041
+# strict_sources = true           # default false; every W041 (seed / old cache entry) becomes E041
 ```
 
 `[cache.schemas]` is the only `[cache]` table (`CacheConfig` in `config.rs`): it stores `DESCRIBE TABLE` results in `state.redb` so leaf models typecheck against real warehouse types without a live round-trip on every compile. There is no `[cache] valkey_url` key: `ValkeyCacheConfig` exists as a type but is not wired into `RockyConfig`, and a `[cache]` table with any other key is refused (`deny_unknown_fields`). The Valkey tier is a `[state]` backend, not a cache setting.
