@@ -240,6 +240,79 @@ rocky import-dbt --dbt-project ~/projects/acme-dbt --output-dir ./acme-rocky --o
 
 ---
 
+## `rocky package`
+
+Vendor a dbt Hub package, such as a Fivetran connector package, as Rocky models. dbt runs once per `add` or `update` to compile the package. After that, Rocky owns the models. See [Use dbt Packages](/guides/dbt-packages/) for the walkthrough.
+
+```bash
+rocky package add <namespace>/<name>[@<version-spec>] [flags]
+rocky package update [<name>] [flags]
+rocky package list
+rocky package remove <name> [--force]
+```
+
+`add` and `update` run `dbt deps`, `dbt run --empty --full-refresh` and `dbt compile --full-refresh` in a temporary dbt project. The profile comes from the `rocky.toml` adapter (`duckdb`, `snowflake`, `databricks`, `bigquery` or `postgres`). Rocky writes the package's models to `models/packages/<package>/` and records them in `rocky-packages.lock` at the project root.
+
+### Flags (`add` and `update`)
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--vars <KEY=VALUE>` | `string` (repeatable) | lockfile vars on `update` | A dbt var for the package. The value is read as YAML. Recorded in the lockfile and reused by `update`. |
+| `--adapter <NAME>` | `string` | the only warehouse adapter | The `rocky.toml` adapter dbt compiles against. |
+| `--target-schema <NAME>` | `string` | the warehouse default schema (`main` on DuckDB, `public` on Postgres, `PUBLIC` on Snowflake, `default` on Databricks) | Schema the vendored models build into. Required on BigQuery. |
+| `--dbt <PATH>` | `PathBuf` | `dbt` on `PATH` | The dbt executable. |
+| `--compiled <DIR>` | `PathBuf` | | Import an already-compiled dbt project (`<DIR>/target/manifest.json` + `<DIR>/package-lock.yml`) instead of running dbt. |
+| `--no-build-empty` | `bool` | `false` | Skip `dbt run --empty`. Macros that read upstream columns at compile time then see none; Rocky refuses models compiled with a placeholder. |
+
+`remove --force` also deletes vendored files you edited.
+
+### Update rules
+
+`update` never overwrites a file you edited. When the package also changed that file, the new version goes to `<file>.incoming` and `W055` names it. Unedited files are written, deleted or restored to match the package. See [Update a package](/guides/dbt-packages/#update-a-package).
+
+### Codes
+
+- `E055`: refused. A bad spec, `dbt` not found, an adapter with no profile mapping, a failed `dbt deps` or `dbt compile`, a model name the project or another package already owns, or `remove` of edited files without `--force`. Nothing is written.
+- `W055`: vendored, with something to review. An `.incoming` file, an edited file upstream removed, a model that could not be vendored, an incremental model that fell back to full refresh, dropped dbt tests, or a `dbt run --empty` failure.
+
+### JSON output
+
+`--output json` prints `PackageAddOutput` (`command: "package_add"`), `PackageUpdateOutput`, `PackageListOutput` or `PackageRemoveOutput`. The schemas are in `schemas/package_*.schema.json`.
+
+```json
+{
+  "version": "1.76.0",
+  "command": "package_add",
+  "lockfile": "./rocky-packages.lock",
+  "package": {
+    "name": "stripe",
+    "hub": "fivetran/stripe",
+    "version": "1.10.1",
+    "version_spec": ">=1.0.0,<2.0.0",
+    "dbt_version": "1.12.5",
+    "adapter": "duckdb",
+    "target_schema": "main",
+    "vars_hash": "blake3:af13…",
+    "build_empty": true,
+    "includes": [],
+    "models": ["int_stripe__account_daily", "..."],
+    "models_added": ["int_stripe__account_daily", "..."],
+    "models_removed": [],
+    "sources": [{ "name": "stripe.charge", "catalog": "dev", "schema": "stripe", "table": "charge" }],
+    "tests_mapped": 15,
+    "tests_dropped": [],
+    "incremental_fallbacks": [],
+    "failed_models": [],
+    "files_written": ["models/packages/stripe/int_stripe__account_daily.sql", "..."],
+    "files_incoming": [],
+    "files_deleted": [],
+    "files_kept_edited": [],
+    "files_unchanged": 0
+  },
+  "diagnostics": []
+}
+```
+
 ## `rocky serve`
 
 Start an HTTP server for the project. It answers under `/api/v1` with typed, schema-backed payloads: models, lineage and the DAG, runs and schedules, products, the review queue, and the governor's brief, audit and custody reads. A route that matches a CLI command returns what that command's `--output json` prints. The routes with no CLI counterpart, such as `/models` and `/dag/layers`, have their own shapes. It also runs `run`, `plan` and `apply` as background jobs. `--ui` adds the [browser UI](#the-browser-ui), and `--scheduler` adds the resident scheduler. The [Embedding guide](/guides/embedding/#serve-api) covers the routes, and the [OpenAPI document](/openapi.json) lists every one.
