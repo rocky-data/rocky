@@ -56,7 +56,7 @@ class AuditVerifyEntry(BaseModel):
 
     checks: list[str]
     """
-    The named post-apply checks the verification required.
+    The named post-apply checks the verification required. A resolved `${VAR}` value prints as `${NAME}` (#1919).
     """
     passed: bool
     """
@@ -68,7 +68,7 @@ class AuditVerifyEntry(BaseModel):
     """
     reason: str
     """
-    The recorded outcome, verbatim from the custody row.
+    The recorded outcome from the custody row, with each resolved `${VAR}` value printed as `${NAME}` (#1919).
     """
     timestamp: str
     """
@@ -337,7 +337,7 @@ class AuditDecisionEntry(BaseModel):
     """
     model: str
     """
-    The model the decision was about.
+    The model the decision was about. A resolved `${VAR}` value prints as `${NAME}` (#1919).
     """
     plan_id: str
     """
@@ -349,7 +349,7 @@ class AuditDecisionEntry(BaseModel):
     """
     reason: str
     """
-    Human-readable explanation of how the effect was reached.
+    Human-readable explanation of how the effect was reached. A resolved `${VAR}` value prints as `${NAME}` (#1919).
     """
     rule_id: conint(ge=0) | None = None
     """

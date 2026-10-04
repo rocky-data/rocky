@@ -45,6 +45,11 @@ use rocky_core::test_harness::CrossPodHarness;
 use rocky_core::traits::WarehouseAdapter;
 use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
 
+/// The startup conditional-write probe writes (and deletes) a throwaway object
+/// under this prefix (#1228). It is not a state upload, so "nothing was
+/// uploaded" assertions count puts outside it.
+const STARTUP_PROBE_PREFIX: &str = "cas-probe/";
+
 /// Drive an async assertion block from a sync `#[test]` body (the freeze
 /// command itself is synchronous).
 fn block_on<T>(fut: impl std::future::Future<Output = T>) -> T {
@@ -890,7 +895,7 @@ async fn list_failure_refuses_governed_entry() {
         "the refusal must cite the fail-closed marker LIST; got: {err:#}"
     );
     assert_eq!(
-        harness.faults.count(FaultOp::Put),
+        harness.faults.put_count_outside(STARTUP_PROBE_PREFIX),
         0,
         "a refused entry must not upload anything"
     );

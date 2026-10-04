@@ -189,7 +189,7 @@ class AuditDecisionEntry(BaseModel):
     """
     model: str
     """
-    The model the decision was about.
+    The model the decision was about. A resolved `${VAR}` value prints as `${NAME}` (#1919).
     """
     plan_id: str
     """
@@ -201,7 +201,7 @@ class AuditDecisionEntry(BaseModel):
     """
     reason: str
     """
-    Human-readable explanation of how the effect was reached.
+    Human-readable explanation of how the effect was reached. A resolved `${VAR}` value prints as `${NAME}` (#1919).
     """
     rule_id: conint(ge=0) | None = None
     """

@@ -45,6 +45,11 @@ use rocky_core::test_harness::CrossPodHarness;
 use rocky_core::traits::WarehouseAdapter;
 use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
 
+/// The startup conditional-write probe writes (and deletes) a throwaway object
+/// under this prefix (#1228). It is not a state upload, so "nothing was
+/// uploaded" assertions count puts outside it.
+const STARTUP_PROBE_PREFIX: &str = "cas-probe/";
+
 /// Seed `raw__acme.orders` in the persistent DuckDB file, dropping the
 /// connection before returning so `rocky run` can reopen the file.
 async fn seed_source(db: &Path) {
@@ -374,7 +379,7 @@ async fn error_run_abandons_without_upload() {
 
     harness.faults.clear();
     assert_eq!(
-        harness.faults.count(FaultOp::Put),
+        harness.faults.put_count_outside(STARTUP_PROBE_PREFIX),
         0,
         "an error-path exit must abandon the session — never upload"
     );

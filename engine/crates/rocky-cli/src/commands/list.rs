@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use anyhow::Result;
+use rocky_core::secret_registry::render_placeholders;
 
 use crate::output::*;
 
@@ -87,7 +88,8 @@ fn build_adapter_entries(cfg: &rocky_core::config::RockyConfig) -> Vec<ListAdapt
         .map(|(name, ac)| ListAdapterEntry {
             name: name.clone(),
             adapter_type: ac.adapter_type.clone(),
-            host: ac.host.clone(),
+            // A resolved `${VAR}` value prints as `${NAME}` (#1919).
+            host: ac.host.as_deref().map(render_placeholders),
         })
         .collect()
 }
@@ -133,6 +135,8 @@ fn build_model_entries(models_dir: &Path) -> Result<Vec<ListModelEntry>> {
     let entries: Vec<ListModelEntry> = models
         .iter()
         .map(|m| {
+            // The target prints resolved, as `rocky run`'s `asset_key` does
+            // (#1919): target coordinates are not rendered as `${NAME}`.
             let target = format!(
                 "{}.{}.{}",
                 m.config.target.catalog, m.config.target.schema, m.config.target.table
@@ -155,7 +159,12 @@ fn build_model_entries(models_dir: &Path) -> Result<Vec<ListModelEntry>> {
                 name: m.config.name.clone(),
                 target,
                 strategy,
-                depends_on: m.config.depends_on.clone(),
+                depends_on: m
+                    .config
+                    .depends_on
+                    .iter()
+                    .map(|d| render_placeholders(d))
+                    .collect(),
                 has_contract: m.contract_path.is_some(),
             }
         })
@@ -219,10 +228,15 @@ fn build_source_entries(cfg: &rocky_core::config::RockyConfig) -> Vec<ListSource
             Some(ListSourceEntry {
                 pipeline: name.clone(),
                 adapter: repl.source.adapter.clone(),
-                catalog: repl.source.catalog.clone(),
-                schema_prefix: Some(pattern.prefix.clone()),
+                // Resolved `${VAR}` values print as `${NAME}` (#1919).
+                catalog: repl.source.catalog.as_deref().map(render_placeholders),
+                schema_prefix: Some(render_placeholders(&pattern.prefix)),
                 discovery_adapter: repl.source.discovery.as_ref().map(|d| d.adapter.clone()),
-                components: pattern.components.clone(),
+                components: pattern
+                    .components
+                    .iter()
+                    .map(|c| render_placeholders(c))
+                    .collect(),
             })
         })
         .collect()
@@ -336,4 +350,88 @@ pub fn list_consumers(model_name: &str, models_dir: &Path, json: bool) -> Result
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// #1919: `rocky list adapters | sources | models --output json` print a
+    /// resolved `${VAR}` value as `${NAME}`, never the value. A model's
+    /// `target` is the exception: it prints resolved, as `rocky run`'s
+    /// `asset_key` does.
+    #[test]
+    fn list_outputs_print_a_resolved_value_as_its_placeholder() {
+        const SECRET: &str = "rocky1919listvalue77";
+        const CATALOG: &str = "rocky1919listcatalog";
+        let dir = tempfile::TempDir::new().unwrap();
+        let cfg_path = dir.path().join("rocky.toml");
+        std::fs::write(
+            &cfg_path,
+            r#"
+[adapter.wh]
+type = "databricks"
+host = "${ROCKY_T1919_LIST}.cloud.databricks.com"
+http_path = "/sql/1.0/warehouses/abc"
+token = "dapi-not-a-real-token"
+
+[adapter.src]
+type = "duckdb"
+path = ":memory:"
+
+[pipeline.p]
+type = "replication"
+strategy = "full_refresh"
+
+[pipeline.p.source]
+adapter = "src"
+catalog = "${ROCKY_T1919_LIST}"
+
+[pipeline.p.source.schema_pattern]
+prefix = "${ROCKY_T1919_LIST}__"
+separator = "__"
+components = ["source"]
+
+[pipeline.p.target]
+adapter = "src"
+catalog_template = "c"
+schema_template = "s__{source}"
+"#,
+        )
+        .unwrap();
+        let models_dir = dir.path().join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        std::fs::write(models_dir.join("m1.sql"), "SELECT 1 AS id").unwrap();
+        std::fs::write(
+            models_dir.join("m1.toml"),
+            "name = \"m1\"\ndepends_on = [\"${ROCKY_T1919_LIST}\"]\n\n\
+             [strategy]\ntype = \"full_refresh\"\n\n\
+             [target]\ncatalog = \"${ROCKY_T1919_LIST_CATALOG}\"\nschema = \"s\"\ntable = \"m1\"\n",
+        )
+        .unwrap();
+
+        // SAFETY: test-only; the variable name is unique to this test.
+        unsafe {
+            std::env::set_var("ROCKY_T1919_LIST", SECRET);
+            std::env::set_var("ROCKY_T1919_LIST_CATALOG", CATALOG);
+        }
+        let cfg = rocky_core::config::load_rocky_config(&cfg_path);
+        let models = build_model_entries(&models_dir);
+        // SAFETY: as above.
+        unsafe {
+            std::env::remove_var("ROCKY_T1919_LIST");
+            std::env::remove_var("ROCKY_T1919_LIST_CATALOG");
+        }
+        let cfg = cfg.expect("config loads");
+
+        let adapters = serde_json::to_string(&build_adapter_entries(&cfg)).unwrap();
+        let sources = serde_json::to_string(&build_source_entries(&cfg)).unwrap();
+        let models = models.expect("models load");
+        assert_eq!(models[0].target, format!("{CATALOG}.s.m1"));
+        let models = serde_json::to_string(&models).unwrap();
+        for printed in [&adapters, &sources, &models] {
+            assert!(!printed.contains(SECRET), "leaked: {printed}");
+            assert!(printed.contains("${ROCKY_T1919_LIST}"), "{printed}");
+        }
+    }
 }

@@ -4,6 +4,7 @@ pub mod arrow_loader;
 pub mod auto_apply;
 pub mod breaking_change;
 pub mod bridge;
+pub mod cas_vacuum;
 pub mod catalog;
 pub mod checks;
 pub mod ci_diff;

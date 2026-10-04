@@ -66,6 +66,11 @@ use rocky_core::state::{LoadedFileRecord, StateStore};
 use rocky_core::state_sync::remote_testing;
 use rocky_core::test_harness::{CrossPodHarness, Pod};
 
+/// The startup conditional-write probe writes (and deletes) a throwaway object
+/// under this prefix (#1228). It is not a state upload, so "nothing was
+/// uploaded" assertions count puts outside it.
+const STARTUP_PROBE_PREFIX: &str = "cas-probe/";
+
 /// A loaded-file marker row seeded into a pod's store — the replicated-table
 /// canary the download-before-read assertions look for.
 fn marker_record() -> LoadedFileRecord {
@@ -541,7 +546,7 @@ async fn download_failure_fails_closed_load() {
         "the refusal must cite the failed download; got: {err:#}"
     );
     assert_eq!(
-        harness.faults.count(FaultOp::Put),
+        harness.faults.put_count_outside(STARTUP_PROBE_PREFIX),
         0,
         "a refused load must not upload anything"
     );
@@ -563,7 +568,7 @@ async fn ungoverned_continues_and_suppresses_model_only() {
     harness.faults.clear();
 
     assert_eq!(
-        harness.faults.count(FaultOp::Put),
+        harness.faults.put_count_outside(STARTUP_PROBE_PREFIX),
         0,
         "an Indeterminate-authority model-only run must suppress the terminal upload"
     );
@@ -583,7 +588,7 @@ async fn ungoverned_continues_and_suppresses_transformation() {
     harness.faults.clear();
 
     assert_eq!(
-        harness.faults.count(FaultOp::Put),
+        harness.faults.put_count_outside(STARTUP_PROBE_PREFIX),
         0,
         "an Indeterminate-authority transformation run must suppress the terminal upload"
     );
@@ -1135,14 +1140,14 @@ async fn backfill_forward_incompat_recreate_suppresses_upload() {
         .upload(&harness.pod_a)
         .await
         .expect("newer pod's upload");
-    let puts_before = harness.faults.count(FaultOp::Put);
+    let puts_before = harness.faults.put_count_outside(STARTUP_PROBE_PREFIX);
 
     drive_backfill_apply(&project, &plan_id)
         .await
         .expect("a recreate-policy backfill proceeds as a fresh full rebuild");
 
     assert_eq!(
-        harness.faults.count(FaultOp::Put),
+        harness.faults.put_count_outside(STARTUP_PROBE_PREFIX),
         puts_before,
         "a forward-incompat recreated store must suppress the backfill's terminal upload \
          — uploading would push the downgraded blob over the newer shared state"
@@ -1201,7 +1206,7 @@ async fn transformation_forward_incompat_recreate_proceeds_and_suppresses_upload
         .upload(&harness.pod_a)
         .await
         .expect("newer pod's upload");
-    let puts_before = harness.faults.count(FaultOp::Put);
+    let puts_before = harness.faults.put_count_outside(STARTUP_PROBE_PREFIX);
 
     // Property 1. This is the assertion that was RED before the fix.
     drive_run(&project, None, None)
@@ -1211,7 +1216,7 @@ async fn transformation_forward_incompat_recreate_proceeds_and_suppresses_upload
     // Property 2, ordered first among the post-conditions so a revert fails
     // on the consequence — a clobbered remote — not on a version number.
     assert_eq!(
-        harness.faults.count(FaultOp::Put),
+        harness.faults.put_count_outside(STARTUP_PROBE_PREFIX),
         puts_before,
         "a forward-incompat recreated store must suppress the transformation run's \
          terminal upload — uploading would push the downgraded blob over the newer \

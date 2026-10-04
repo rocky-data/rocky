@@ -146,11 +146,11 @@ pub enum Expr {
     FunctionCall { name: String, args: Vec<Expr> },
     /// IS NULL / IS NOT NULL.
     IsNull { expr: Arc<Expr>, negated: bool },
-    /// IN [list].
+    /// `expr in [v1, v2]` / `expr not in [v1, v2]`.
     ///
-    /// TODO(plan-15): The parser does not yet support `in [...]` / `not in [...]`
-    /// syntax. This node can only be constructed programmatically. Add parser
-    /// support for `expr in [val1, val2]` and `expr not in [val1, val2]`.
+    /// Lowers to SQL `IN (...)` / `NOT IN (...)` with SQL's three-valued
+    /// semantics. Unlike `!=`, `not in` is **not** NULL-safe: a NULL `expr`,
+    /// or a NULL in the list when nothing matches, yields NULL.
     InList {
         expr: Arc<Expr>,
         list: Vec<Expr>,

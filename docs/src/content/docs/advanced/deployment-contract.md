@@ -62,8 +62,8 @@ This is why the rule says persistent volume. The state backend does not change i
 
 | `[state] concurrency_control` | Backend | What the loser's run does at the end |
 |---|---|---|
-| `"off"` (default) | any | Uploads unconditionally. Last writer wins, silently: the other run's watermarks are overwritten. |
-| `"cas"` | `s3`, `gcs`, `tiered` | Uploads only if the remote still carries the generation this run downloaded. The loser fails closed: a nonzero exit and an error naming the race, and the winner's state stands. |
+| `"off"` (default on `local`, `valkey`) | any | Uploads unconditionally. Last writer wins, silently: the other run's watermarks are overwritten. On an object store, the upload is refused instead once a `cas` writer has created the `cas-required` marker. |
+| `"cas"` (default on `s3`, `gcs`, `tiered`) | `s3`, `gcs`, `tiered` | Uploads only if the remote still carries the generation this run downloaded. The loser fails closed: a nonzero exit and an error naming the race, and the winner's state stands. |
 | `"cas"` | `valkey` | No generation to compare against; falls back to an unconditional upload and warns once at the start of the run. |
 | `"cas"` | `local` | No remote write at all; the file on the volume is the state. |
 
@@ -94,6 +94,8 @@ The state store carries a schema version. Two directions:
 
 - **A newer engine opens an older store.** It migrates the store forward on first open. Every command does this; there is no separate migration step.
 - **An older engine opens a newer store.** `rocky serve` and every inspection command (`state`, `history`, `doctor`, `metrics`, the branch commands) refuse to open it. `rocky run` and `rocky load` follow `[state] on_schema_mismatch`: the default, `recreate`, logs one warning, starts from a fresh local state, runs once as a full refresh, and never writes that downgraded state back to a shared backend; `fail` refuses like the rest.
+
+On a remote backend, the newer engine finds no state under its own schema version and restores the newest older version's state instead. It never writes or deletes the older copy. See [What a schema upgrade does to remote state](/concepts/state-management/#what-a-schema-upgrade-does-to-remote-state).
 
 So a fleet mid-upgrade is safe in one direction only. Upgrade every process that shares a volume or a remote backend together, old stopped before new started, and keep a copy of the store from before the upgrade: rolling back with the history intact means restoring that copy under the older engine. The changelog names every release that changes the schema version.
 

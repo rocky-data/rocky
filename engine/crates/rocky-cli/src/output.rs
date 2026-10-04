@@ -2948,6 +2948,16 @@ pub struct AiSyncProposal {
     pub intent: String,
     pub diff: String,
     pub proposed_source: String,
+    /// Whether a stored upstream-schema baseline existed for this model.
+    /// `false` on the first sync of a model: the proposal follows declared
+    /// intent only, and the current upstream schemas become the baseline.
+    /// Optional on the wire: an engine older than this field never had one.
+    #[serde(default)]
+    pub upstream_baseline_found: bool,
+    /// Upstream column changes since the baseline, one human-readable line
+    /// each. Empty when there is no baseline or nothing changed.
+    #[serde(default)]
+    pub upstream_changes: Vec<String>,
 }
 
 /// JSON output for `rocky ai-explain`.
@@ -4222,6 +4232,20 @@ pub struct ReplicationPlan {
     /// subset would silently break replay. Cheaper to keep the whole
     /// config and let the hash do its job.
     pub config_snapshot: serde_json::Value,
+    /// A keyed digest of each top-level config section, taken over the
+    /// RESOLVED values (#1919).
+    ///
+    /// Since #1919 `config_snapshot` holds each resolved `${VAR}` value as
+    /// `${NAME}`, so an environment value that changes between plan and apply
+    /// leaves it unchanged. These digests do change, and apply compares them.
+    /// Keyed (BLAKE3 with the project's `.rocky/plan-digest.key`), so a short
+    /// value cannot be guessed back from the plan file. Credentials still
+    /// serialize as `"***"` and are not covered, as before.
+    ///
+    /// `None` on a plan written before this field. Its snapshot holds the
+    /// resolved values, and apply compares those the old way.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_digests: Option<std::collections::BTreeMap<String, String>>,
     /// Credential-free identity of the state authority this plan was reviewed
     /// against — which ledger holds its watermarks, freezes, budgets and
     /// idempotency keys.
@@ -4763,10 +4787,14 @@ impl ValidateOutput {
     }
 
     /// Push a message and downgrade `valid` to false if severity is "error".
-    pub fn push(&mut self, msg: ValidateMessage) {
+    ///
+    /// A message can quote a config value, so its text prints each resolved
+    /// `${VAR}` value as `${NAME}` (#1919). Every message goes through here.
+    pub fn push(&mut self, mut msg: ValidateMessage) {
         if msg.severity == "error" {
             self.valid = false;
         }
+        msg.message = rocky_core::secret_registry::render_placeholders(&msg.message);
         self.messages.push(msg);
     }
 }
@@ -6539,7 +6567,12 @@ pub struct SettingsOutput {
     /// when there was no readable config — `config_status` says which.
     pub state_backend: Option<rocky_core::config::StateBackend>,
     /// `[state] concurrency_control`, read at the same moment as
-    /// `state_backend`. `null` on the same condition.
+    /// `state_backend`: the explicit setting, or the backend default when it is
+    /// unset (`cas` on `s3`, `gcs` and `tiered`; `off` on `local` and
+    /// `valkey`). This is the requested mode — the writers' startup
+    /// conditional-write probe is not run for it, so `rocky doctor` is where a
+    /// store that falls back to `off` shows up. `null` on the same condition as
+    /// `state_backend`.
     pub concurrency_control: Option<rocky_core::config::ConcurrencyControl>,
     /// What happened when `rocky.toml` was read.
     ///
@@ -8744,16 +8777,18 @@ pub struct AuditDecisionEntry {
     pub principal: rocky_core::config::PolicyPrincipal,
     /// The capability that was evaluated.
     pub capability: rocky_core::config::PolicyCapability,
-    /// The model the decision was about.
-    pub model: String,
+    /// The model the decision was about. A resolved `${VAR}` value prints as
+    /// `${NAME}` (#1919).
+    pub model: EnvString,
     /// The resolved verdict (`allow` / `require_review` / `deny`).
     pub effect: rocky_core::config::PolicyEffect,
     /// Index of the winning `[[policy.rules]]` entry, or `null` for the
     /// default posture.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rule_id: Option<usize>,
-    /// Human-readable explanation of how the effect was reached.
-    pub reason: String,
+    /// Human-readable explanation of how the effect was reached. A resolved
+    /// `${VAR}` value prints as `${NAME}` (#1919).
+    pub reason: EnvString,
 }
 
 // ---------------------------------------------------------------------------
@@ -8935,13 +8970,15 @@ pub struct AuditVerifyEntry {
     /// The plan id the custody row was filed under (the applied plan, or the
     /// auto-apply path's `autoapply-verify:<run_id>`).
     pub plan_id: String,
-    /// The named post-apply checks the verification required.
-    pub checks: Vec<String>,
+    /// The named post-apply checks the verification required. A resolved
+    /// `${VAR}` value prints as `${NAME}` (#1919).
+    pub checks: Vec<EnvString>,
     /// Whether the verification passed (`allow` custody row) or failed
     /// (`deny`).
     pub passed: bool,
-    /// The recorded outcome, verbatim from the custody row.
-    pub reason: String,
+    /// The recorded outcome from the custody row, with each resolved `${VAR}`
+    /// value printed as `${NAME}` (#1919).
+    pub reason: EnvString,
 }
 
 /// Blast-radius link of the custody chain: the models that transitively

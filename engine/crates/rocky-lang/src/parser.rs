@@ -775,6 +775,23 @@ impl Parser {
             });
         }
 
+        // IN [list] / NOT IN [list]. A `not` here is only the infix
+        // `not in`; prefix `not` is consumed by `parse_unary`.
+        let negated_in = self.peek() == Some(&Token::Not)
+            && self.tokens.get(self.pos + 1).map(|(t, _)| t) == Some(&Token::In);
+        if negated_in || self.peek() == Some(&Token::In) {
+            if negated_in {
+                self.advance();
+            }
+            self.advance();
+            let list = self.parse_in_list()?;
+            return Ok(Expr::InList {
+                expr: Arc::new(left),
+                list,
+                negated: negated_in,
+            });
+        }
+
         // Comparison operators
         let op = match self.peek() {
             Some(Token::Eq) => Some(BinOp::Eq),
@@ -797,6 +814,31 @@ impl Parser {
         }
 
         Ok(left)
+    }
+
+    /// Parse the bracketed list of an `in` / `not in` test: `[e1, e2, ...]`.
+    /// At least one element is required, since SQL rejects `IN ()`; a
+    /// trailing comma is accepted.
+    fn parse_in_list(&mut self) -> Result<Vec<Expr>, ParseError> {
+        self.expect(&Token::LBracket)?;
+        let mut list = Vec::new();
+        while self.peek() != Some(&Token::RBracket) {
+            list.push(self.parse_expr()?);
+            if self.peek() == Some(&Token::Comma) {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        if list.is_empty() {
+            return Err(ParseError::UnexpectedToken {
+                expected: "at least one value in the `in` list".into(),
+                found: "RBracket".into(),
+                offset: self.current_offset(),
+            });
+        }
+        self.expect(&Token::RBracket)?;
+        Ok(list)
     }
 
     fn parse_additive(&mut self) -> Result<Expr, ParseError> {
@@ -1148,6 +1190,83 @@ mod tests {
         } else {
             panic!("expected IS NOT NULL");
         }
+    }
+
+    #[test]
+    fn test_parse_in_list() {
+        let file = parse("from orders\nwhere status in [\"active\", \"pending\"]").unwrap();
+        match &file.pipeline[1] {
+            PipelineStep::Where(Expr::InList {
+                expr,
+                list,
+                negated,
+            }) => {
+                assert_eq!(expr.as_ref(), &Expr::Column("status".into()));
+                assert_eq!(
+                    list,
+                    &vec![
+                        Expr::StringLit("active".into()),
+                        Expr::StringLit("pending".into())
+                    ]
+                );
+                assert!(!negated);
+            }
+            other => panic!("expected InList, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_not_in_list_with_null_and_trailing_comma() {
+        let file = parse("from orders\nwhere priority not in [1, null, 3,]").unwrap();
+        match &file.pipeline[1] {
+            PipelineStep::Where(Expr::InList { list, negated, .. }) => {
+                assert!(negated);
+                assert_eq!(
+                    list,
+                    &vec![
+                        Expr::NumberLit("1".into()),
+                        Expr::Null,
+                        Expr::NumberLit("3".into())
+                    ]
+                );
+            }
+            other => panic!("expected negated InList, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_in_list_binds_tighter_than_and() {
+        // `a in [1] and b == 2` must be `(a in [1]) and (b == 2)`.
+        let file = parse("from t\nwhere a + 1 in [2, 3] and b == 2").unwrap();
+        match &file.pipeline[1] {
+            PipelineStep::Where(Expr::BinaryOp {
+                left,
+                op: BinOp::And,
+                ..
+            }) => match left.as_ref() {
+                Expr::InList { expr, .. } => {
+                    assert!(matches!(
+                        expr.as_ref(),
+                        Expr::BinaryOp { op: BinOp::Add, .. }
+                    ));
+                }
+                other => panic!("expected InList on the left of and, got {other:?}"),
+            },
+            other => panic!("expected and, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_in_list_empty_is_rejected() {
+        let err = parse("from t\nwhere a in []").unwrap_err();
+        assert!(err.to_string().contains("at least one value"), "got: {err}");
+    }
+
+    #[test]
+    fn test_parse_in_list_requires_brackets() {
+        assert!(parse("from t\nwhere a in (1, 2)").is_err());
+        assert!(parse("from t\nwhere a in [1, 2").is_err());
+        assert!(parse("from t\nwhere a in [1 2]").is_err());
     }
 
     #[test]

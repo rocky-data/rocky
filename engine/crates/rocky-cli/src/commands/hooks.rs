@@ -16,19 +16,7 @@ pub fn run_hooks_list(config_path: &Path, json: bool) -> Result<()> {
     let registry = HookRegistry::from_config(&config.hooks);
 
     if json {
-        let mut entries: Vec<HookEntry> = Vec::new();
-        for event in HookEvent::all() {
-            let hooks = registry.hooks_for(event);
-            for hook in hooks {
-                entries.push(HookEntry {
-                    event: event.config_key().to_string(),
-                    command: hook.command.clone(),
-                    timeout_ms: hook.timeout_ms,
-                    on_failure: format!("{:?}", hook.on_failure),
-                    env_keys: hook.env.keys().cloned().collect(),
-                });
-            }
-        }
+        let entries = hook_entries(&registry);
         let output = HooksListOutput {
             total: entries.len(),
             hooks: entries,
@@ -52,7 +40,9 @@ pub fn run_hooks_list(config_path: &Path, json: bool) -> Result<()> {
                 for hook in hooks {
                     println!(
                         "    - {} (timeout: {}ms, on_failure: {:?})",
-                        hook.command, hook.timeout_ms, hook.on_failure
+                        rocky_core::secret_registry::render_placeholders(&hook.command),
+                        hook.timeout_ms,
+                        hook.on_failure
                     );
                 }
             }
@@ -119,13 +109,21 @@ pub async fn run_hooks_test(config_path: &Path, event_name: &str, json: bool) ->
             event: event_name.to_string(),
             status: status.to_string(),
             message: None,
-            result: Some(format!("{result:?}")),
+            // The abort reason quotes the hook command or webhook URL (#1919).
+            result: Some(rocky_core::secret_registry::render_placeholders(&format!(
+                "{result:?}"
+            ))),
         };
         println!("{}", serde_json::to_string_pretty(&output)?);
     } else {
         match &result {
             HookResult::Continue => println!("All hooks passed."),
-            HookResult::Abort { reason } => println!("Hook aborted: {reason}"),
+            HookResult::Abort { reason } => {
+                println!(
+                    "Hook aborted: {}",
+                    rocky_core::secret_registry::render_placeholders(reason)
+                );
+            }
         }
         if async_summary.total > 0 {
             println!(
@@ -133,10 +131,63 @@ pub async fn run_hooks_test(config_path: &Path, event_name: &str, json: bool) ->
                 async_summary.succeeded, async_summary.total, async_summary.failed,
             );
             for (url, err) in &async_summary.failures {
-                println!("  ! {url} — {err}");
+                println!(
+                    "  ! {} — {}",
+                    rocky_core::secret_registry::render_placeholders(url),
+                    rocky_core::secret_registry::render_placeholders(err)
+                );
             }
         }
     }
 
     Ok(())
+}
+
+/// The `rocky hooks list --output json` rows.
+fn hook_entries(registry: &HookRegistry) -> Vec<HookEntry> {
+    let mut entries: Vec<HookEntry> = Vec::new();
+    for event in HookEvent::all() {
+        for hook in registry.hooks_for(event) {
+            entries.push(HookEntry {
+                event: event.config_key().to_string(),
+                // A resolved `${VAR}` value prints as `${NAME}` (#1919).
+                command: rocky_core::secret_registry::render_placeholders(&hook.command),
+                timeout_ms: hook.timeout_ms,
+                on_failure: format!("{:?}", hook.on_failure),
+                env_keys: hook.env.keys().cloned().collect(),
+            });
+        }
+    }
+    entries
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// #1919: a hook command expanded from `${VAR}` prints as `${NAME}` in
+    /// `rocky hooks list --output json`.
+    #[test]
+    fn hooks_list_prints_a_resolved_command_as_its_placeholder() {
+        const SECRET: &str = "rocky-1919-hook-token-8f8f";
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("rocky.toml");
+        std::fs::write(
+            &path,
+            "[adapter]\ntype = \"duckdb\"\npath = \":memory:\"\n\n\
+             [[hook.on_pipeline_start]]\ncommand = \"notify.sh --token ${ROCKY_T1919_HOOK}\"\n",
+        )
+        .unwrap();
+        // SAFETY: test-only; the variable name is unique to this test.
+        unsafe { std::env::set_var("ROCKY_T1919_HOOK", SECRET) };
+        let config = load_rocky_config(&path);
+        // SAFETY: as above.
+        unsafe { std::env::remove_var("ROCKY_T1919_HOOK") };
+        let config = config.expect("config loads");
+        let entries = hook_entries(&HookRegistry::from_config(&config.hooks));
+        assert_eq!(entries.len(), 1, "PRECONDITION: the hook loaded");
+        let json = serde_json::to_string(&entries).unwrap();
+        assert!(!json.contains(SECRET), "leaked: {json}");
+        assert!(json.contains("--token ${ROCKY_T1919_HOOK}"), "{json}");
+    }
 }

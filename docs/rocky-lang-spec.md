@@ -376,10 +376,20 @@ part. Check that your warehouse reads that value the way you expect.
 | `<=` | `<=` | |
 | `is null` | `IS NULL` | |
 | `is not null` | `IS NOT NULL` | |
+| `in [v, …]` | `IN (v, …)` | List membership |
+| `not in [v, …]` | `NOT IN (v, …)` | Not NULL-safe; see below |
 
 **`!=` is NULL-safe.** `status != "cancelled"` keeps the rows where `status` is
 `NULL`. SQL's `status != 'cancelled'` drops them, because comparing anything
 with `NULL` yields `NULL` rather than true.
+
+**`not in` is not NULL-safe.** It lowers to SQL's `NOT IN` with three-valued
+logic, unlike `!=`. When `a` is `NULL`, `a not in [1, 2]` is `NULL`, so `where`
+drops the row. A `NULL` in the list makes `not in` never true:
+`a not in [1, null]` is `NULL` or `FALSE` for every row. Write
+`a is null or a not in [...]` to keep `NULL` rows. The list needs at least one
+value; a trailing comma is allowed. The compiler types `in` / `not in` as a
+Boolean that is nullable when the operand or any list value is nullable.
 
 A single comparison takes at most one operator. Rocky does not chain them, so
 write `a < b and b < c` rather than `a < b < c`.
@@ -409,7 +419,7 @@ Operators bind in this order, loosest first:
 ```
 or
 and
-==  !=  <  <=  >  >=
+==  !=  <  <=  >  >=  in  not in
 +   -
 *   /   %
 not  -            (prefix, binds tightest)
@@ -567,6 +577,8 @@ It bounds the parser's stack use, which matters most in the WebAssembly build.
 | `a == b` | `a = b` |
 | `a != b` | `a IS DISTINCT FROM b` |
 | `e is null` | `e IS NULL` |
+| `e in [a, b]` | `e IN (a, b)` |
+| `e not in [a, b]` | `e NOT IN (a, b)` |
 | `f(x)` | `F(x)` |
 | `f(x) over (…)` | `F(x) OVER (…)` |
 | `match e { > v => r, _ => d }` | `CASE WHEN e > v THEN r ELSE d END` |
@@ -610,6 +622,7 @@ expr           = or_expr
 or_expr        = and_expr ("or" and_expr)*
 and_expr       = comparison ("and" comparison)*
 comparison     = additive "is" "not"? "null"
+               | additive "not"? "in" "[" expr ("," expr)* ","? "]"
                | additive (("==" | "!=" | "<" | "<=" | ">" | ">=") additive)?
 additive       = multiplicative (("+" | "-") multiplicative)*
 multiplicative = unary (("*" | "/" | "%") unary)*
