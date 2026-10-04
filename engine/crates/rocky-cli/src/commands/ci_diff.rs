@@ -1030,7 +1030,12 @@ fn build_diff_results(
                 // path. On the fallback path it is a filename stem, which is
                 // not a warehouse identity — leave it unset rather than
                 // publishing a stem as though it were one.
-                resolved_target: change.resolved_target.clone(),
+                // Published, so each resolved `${VAR}` value prints as
+                // `${NAME}` (#1919).
+                resolved_target: change
+                    .resolved_target
+                    .as_deref()
+                    .map(rocky_core::secret_registry::render_placeholders),
                 row_count_before: None,
                 row_count_after: None,
                 column_changes,

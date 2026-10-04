@@ -41,6 +41,7 @@ use anyhow::{Context, Result, bail};
 use rocky_core::config::{PolicyCapability, PolicyEffect, PolicyPrincipal, StateBackend};
 use rocky_core::policy::{self, ModelAttributes};
 use rocky_core::schema::SchemaPattern;
+use rocky_core::secret_registry::render_placeholders;
 use rocky_core::state::{PolicyDecisionRecord, StateStore};
 use tracing::warn;
 
@@ -3884,27 +3885,30 @@ impl VerifyAfterVerdict {
     /// Report the verdict: `Ok` when every required check was confirmed, the
     /// halt-only error otherwise. Call AFTER the custody row is durable.
     fn into_result(self, plan_id: &str, required: &[String]) -> Result<()> {
+        // Check names come from `verify_after` config and may hold a resolved
+        // `${VAR}`. Every message below prints the `${NAME}` form (#1919).
+        let render = rocky_core::secret_registry::render_placeholders;
         if self.failures.is_empty() {
             eprintln!(
                 "verify_after: {} post-apply check(s) passed [{}].",
                 required.len(),
-                required.join(", ")
+                render(&required.join(", "))
             );
             return Ok(());
         }
+        let failures = render(&self.failures.join("; "));
         // Alert: a post-apply verification failure is an operational event, not
         // a routine warning.
         warn!(
             target: "rocky::policy",
             plan_id,
-            failures = %self.failures.join("; "),
+            failures = %failures,
             "verify_after post-apply gate FAILED"
         );
         bail!(
-            "verify_after gate FAILED for plan '{plan_id}': {}. \
+            "verify_after gate FAILED for plan '{plan_id}': {failures}. \
              No rollback substrate is available, so the mutation HAS ALREADY LANDED and remains in \
-             place — it must be reverted manually. The failure is recorded in the policy-decision ledger.",
-            self.failures.join("; ")
+             place — it must be reverted manually. The failure is recorded in the policy-decision ledger."
         )
     }
 }
@@ -3946,14 +3950,18 @@ fn evaluate_verify_after(
     }
     let passed = failures.is_empty();
 
-    let reason = if passed {
+    // The ledger row is read later by processes that never loaded this config
+    // (`rocky audit` reads only the state store), so their registry cannot
+    // render it. Store the `${NAME}` form, not the resolved check names
+    // (#1919).
+    let reason = render_placeholders(&if passed {
         format!("verify_after passed: [{}]", required.join(", "))
     } else {
         format!(
             "verify_after FAILED: {}. No rollback substrate available — the mutation stands; halt-only.",
             failures.join("; ")
         )
-    };
+    });
     let record = PolicyDecisionRecord {
         keys_recorded: false,
         models: Vec::new(),
@@ -3969,7 +3977,7 @@ fn evaluate_verify_after(
         },
         rule_id: None,
         reason,
-        verify_after: required.to_vec(),
+        verify_after: required.iter().map(|n| render_placeholders(n)).collect(),
         auto_apply: None,
     };
     Ok(VerifyAfterVerdict { record, failures })
@@ -4661,11 +4669,51 @@ async fn run_apply_replication_plan(
     // Closing (2) needs a credential-free state-authority identity persisted in
     // the plan (backend, host/port/database, key prefix, resolved namespace).
     // That is a payload change, tracked separately rather than bolted on here.
-    let live_config_snapshot = serde_json::to_value(rocky_cfg)
-        .context("failed to serialize the live config for the plan comparison")?;
-    if live_config_snapshot != replication_plan.config_snapshot {
-        let changed =
-            changed_config_sections(&replication_plan.config_snapshot, &live_config_snapshot);
+    //
+    // Since #1919 the snapshot holds each resolved `${VAR}` value as `${NAME}`,
+    // so the comparison has two halves: the printable snapshot (structure and
+    // literal values) and a keyed digest per section (the resolved values).
+    // A plan written before that has no digests and a resolved snapshot, and
+    // is compared the old way.
+    let (differs, changed) = match &replication_plan.config_digests {
+        Some(reviewed_digests) => {
+            let (live_snapshot, live_digests) = crate::commands::plan::config_snapshot_forms(
+                root, rocky_cfg, false,
+            )
+            .with_context(|| {
+                format!(
+                    "cannot verify plan '{plan_id}' against the live config. \
+                             Nothing was written. Re-plan with `rocky plan` and apply the \
+                             new plan_id"
+                )
+            })?;
+            let mut changed =
+                changed_config_sections(&replication_plan.config_snapshot, &live_snapshot);
+            let mut sections: std::collections::BTreeSet<&String> =
+                reviewed_digests.keys().collect();
+            sections.extend(live_digests.keys());
+            for section in sections {
+                if reviewed_digests.get(section) != live_digests.get(section)
+                    && !changed.contains(section)
+                {
+                    changed.push(section.clone());
+                }
+            }
+            changed.sort();
+            let differs = live_snapshot != replication_plan.config_snapshot
+                || live_digests != *reviewed_digests;
+            (differs, changed)
+        }
+        None => {
+            let live_snapshot = serde_json::to_value(rocky_cfg)
+                .context("failed to serialize the live config for the plan comparison")?;
+            let differs = live_snapshot != replication_plan.config_snapshot;
+            let changed =
+                changed_config_sections(&replication_plan.config_snapshot, &live_snapshot);
+            (differs, changed)
+        }
+    };
+    if differs {
         bail!(
             "config has changed since plan '{plan_id}' was created{}.\n\
              The plan is the reviewed artifact, so applying it against a \
@@ -10492,6 +10540,7 @@ schema_template = "s__{source}"
             branch: None,
             governance_override: None,
             config_snapshot: serde_json::json!({"adapter": {"default": {"type": "duckdb"}}}),
+            config_digests: None,
             state_authority: None,
             source_state_snapshot: vec![ReplicationConnectorSnapshot {
                 id: "raw__orders".to_string(),
@@ -10692,6 +10741,122 @@ schema_template = "s__{source}"
                 "an unchanged config must pass the comparison, got: {msg}"
             );
         }
+        Ok(())
+    }
+
+    /// Plan, then apply, with `catalog_template` read from `var`. Returns the
+    /// plan file's text and the apply result. `planned` and `applied` are the
+    /// variable's value at each step.
+    async fn plan_then_apply_with_env_catalog(
+        var: &str,
+        planned: &str,
+        applied: &str,
+        remove_key: bool,
+    ) -> anyhow::Result<(String, anyhow::Result<ApplyOutcome>)> {
+        let dir = tempfile::tempdir()?;
+        let cfg_path = dir.path().join("rocky.toml");
+        std::fs::write(
+            &cfg_path,
+            REPLICATION_TOML.replace(
+                r#"catalog_template = "c""#,
+                &format!(r#"catalog_template = "${{{var}}}""#),
+            ),
+        )?;
+        // SAFETY: test-only; each caller passes a variable name no other test
+        // reads.
+        unsafe { std::env::set_var(var, planned) };
+        let cfg = rocky_core::config::load_rocky_config(&cfg_path)?;
+        let mut rp = minimal_replication_plan();
+        rp.pipeline = Some("p".to_string());
+        rp.filter = None;
+        let (snapshot, digests) =
+            crate::commands::plan::config_snapshot_forms(dir.path(), &cfg, true)?;
+        rp.config_snapshot = snapshot;
+        rp.config_digests = Some(digests);
+        let plan_id = write_plan(dir.path(), PlanKind::Replication, &rp)?;
+        let plan_text = std::fs::read_to_string(
+            dir.path()
+                .join(".rocky")
+                .join("plans")
+                .join(format!("{plan_id}.json")),
+        )?;
+        if remove_key {
+            std::fs::remove_file(crate::plan_store::plan_digest_key_path(dir.path()))?;
+        }
+
+        // SAFETY: as above.
+        unsafe { std::env::set_var(var, applied) };
+        let res = super::run_apply_replication_plan(
+            dir.path(),
+            &cfg_path,
+            &plan_id,
+            &dir.path().join("state.redb"),
+            PolicyPrincipal::Human,
+            true,
+        )
+        .await;
+        // SAFETY: as above.
+        unsafe { std::env::remove_var(var) };
+        Ok((plan_text, res))
+    }
+
+    /// #1919: the plan file holds `${NAME}`, never the resolved value. And
+    /// because both values render as the same `${NAME}`, only the keyed
+    /// digest can see the change: apply must still refuse.
+    #[tokio::test]
+    async fn replication_apply_refuses_an_env_value_changed_behind_a_placeholder()
+    -> anyhow::Result<()> {
+        const PLANNED: &str = "rocky_1919_planned_catalog";
+        const APPLIED: &str = "rocky_1919_applied_catalog";
+        let (plan_text, res) =
+            plan_then_apply_with_env_catalog("ROCKY_T1919_APPLY_CAT", PLANNED, APPLIED, false)
+                .await?;
+        assert!(
+            !plan_text.contains(PLANNED),
+            "plan file leaked: {plan_text}"
+        );
+        assert!(
+            plan_text.contains("${ROCKY_T1919_APPLY_CAT}"),
+            "the plan file must name the variable: {plan_text}"
+        );
+        let msg = format!("{:#}", res.expect_err("a changed env value must refuse"));
+        assert!(msg.contains("config has changed since plan"), "{msg}");
+        assert!(msg.contains("pipeline"), "names the section: {msg}");
+        assert!(
+            !msg.contains(PLANNED) && !msg.contains(APPLIED),
+            "the refusal must not print either value: {msg}"
+        );
+        Ok(())
+    }
+
+    /// The companion: the same env value at apply passes the config check, so
+    /// the refusal above is caused by the change.
+    #[tokio::test]
+    async fn replication_apply_passes_when_the_env_value_behind_a_placeholder_is_unchanged()
+    -> anyhow::Result<()> {
+        const VALUE: &str = "rocky_1919_same_catalog";
+        let (_, res) =
+            plan_then_apply_with_env_catalog("ROCKY_T1919_APPLY_SAME", VALUE, VALUE, false).await?;
+        if let Err(e) = res {
+            let msg = format!("{e:#}");
+            assert!(
+                !msg.contains("config has changed since plan") && !msg.contains("digest key"),
+                "an unchanged env value must pass the comparison, got: {msg}"
+            );
+        }
+        Ok(())
+    }
+
+    /// Fail closed: without the key the digests cannot be checked, so apply
+    /// refuses rather than skip the check.
+    #[tokio::test]
+    async fn replication_apply_refuses_when_the_digest_key_is_missing() -> anyhow::Result<()> {
+        const VALUE: &str = "rocky_1919_nokey_catalog";
+        let (_, res) =
+            plan_then_apply_with_env_catalog("ROCKY_T1919_APPLY_NOKEY", VALUE, VALUE, true).await?;
+        let msg = format!("{:#}", res.expect_err("a missing key must refuse"));
+        assert!(msg.contains("plan digest key"), "{msg}");
+        assert!(msg.contains("Nothing was written"), "{msg}");
         Ok(())
     }
 
@@ -11355,6 +11520,46 @@ schema_template = "s__{source}"
         );
         // The halt-only state (no rollback substrate) must be stated plainly.
         assert!(msg.contains("HAS ALREADY LANDED"), "halt-only state: {msg}");
+    }
+
+    /// #1919: a `verify_after` check name can hold a resolved `${VAR}`. The
+    /// ledger row is read later by `rocky audit`, which never loads the
+    /// config, so the row itself must hold `${NAME}`. So must the gate's
+    /// own error.
+    #[test]
+    fn verify_after_stores_and_prints_a_resolved_check_name_as_its_placeholder() {
+        const SECRET: &str = "rocky_1919_verify_check_c0ffee";
+        rocky_core::secret_registry::register_substitution("ROCKY_T1919_VERIFY", SECRET);
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state.redb");
+        let run_id = record_run_with_checks(&state, &[(SECRET, false)]);
+        let err = super::run_verify_after(
+            "plan-1919",
+            PolicyPrincipal::Agent,
+            &[SECRET.to_string()],
+            &run_id,
+            &state,
+        )
+        .expect_err("a failing named check halts the apply");
+        let msg = format!("{err:#}");
+        assert!(!msg.contains(SECRET), "gate error leaked: {msg}");
+        assert!(msg.contains("${ROCKY_T1919_VERIFY}"), "{msg}");
+
+        let store = StateStore::open_read_only(&state).unwrap();
+        let row = store
+            .list_policy_decisions()
+            .unwrap()
+            .into_iter()
+            .find(|d| d.plan_id == "plan-1919")
+            .expect("the custody row was written");
+        let stored = serde_json::to_string(&row).unwrap();
+        assert!(!stored.contains(SECRET), "ledger row leaked: {stored}");
+        assert_eq!(row.verify_after, vec!["${ROCKY_T1919_VERIFY}".to_string()]);
+        assert!(
+            row.reason.contains("${ROCKY_T1919_VERIFY}"),
+            "{}",
+            row.reason
+        );
     }
 
     #[test]

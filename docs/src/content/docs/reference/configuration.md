@@ -108,12 +108,39 @@ Rocky prints the placeholder, not the value. Some fields print `${DATABRICKS_TOK
 |---|---|
 | `rocky serve` responses | Every value of 8 bytes or more, anywhere in the response. |
 | `rocky policy show`, text and `--output json` | Policy `scope` (`models`, `tags`, `classifications`, `exclude_classifications`, `layer`), `verify_after` and `autonomy_budget.window`. |
+| `rocky policy check` | The model's `tags`, `classifications` and `layer`. |
 | `rocky brief` | A degraded rule's budget `window`. |
+| `rocky compile` | `models_detail` (`target`, `strategy`, `freshness`, `tags`, `depends_on`, `name`) and the diagnostics text. |
+| `rocky dag` | Each model node's `target`, `strategy`, `freshness` and `partition_shape`. |
+| `rocky list models`, `list adapters`, `list sources` | A model's `target` and `depends_on`; an adapter's `host`; a source's `catalog`, `schema_prefix` and `components`. |
+| `rocky catalog`, `rocky lineage`, `rocky ci-diff` | An asset's `fqn`, `intent` and column descriptions; a node's `target_schema`; a diff's `resolved_target`. |
+| `rocky validate` | A pipeline's `strategy`, `catalog_template` and `schema_template`, and the text of every message. |
+| `rocky doctor` | Every check message, detail and suggestion. |
+| `rocky hooks list`, `rocky hooks test` | A hook's `command`, and the abort reason (which quotes a command or webhook URL). |
+| `rocky schedule status` | `timezone`, and each pipeline's `cron`, `after` and config error. |
+| `rocky history --audit` | A run's `target_catalog`. |
+| `rocky audit` | A decision's `model` and `reason`, and a verification's `checks` and `reason`. |
+| The policy-decision ledger | A `verify_after` check name and its outcome text are stored as `${NAME}`, so a later reader never needs the value. |
+| `rocky plan` (replication) plan files | `config_snapshot` holds `${NAME}`. A keyed digest of each config section is stored beside it, so `rocky apply` still refuses when an environment value changed. The key is `.rocky/plan-digest.key`; without it, apply refuses. |
 | Config errors and model-file errors | Every value of 8 bytes or more that the error quotes, including a TOML parse error in a sidecar, `_defaults.toml` or frontmatter. |
 
-A value shorter than 8 bytes is not treated as a secret and prints as itself. The literal in `${VAR:-default}` is already in the file, so it prints as itself too.
+A value shorter than 8 bytes is not treated as a secret and prints as itself. The literal in `${VAR:-default}` is already in the file, so it prints as itself too. A value inside a TOML basic string that the parser unescapes (for example `\u0041` or `\t`) is matched in its unescaped form too.
 
-Other `--output json` fields and log lines can still show a resolved value. Do not put a secret in a field that is not listed above.
+Rocky matches the value, not the field. So a value of 8 bytes or more is rewritten wherever it appears in the outputs above, including inside a longer name: with `CATALOG=analytics_prod`, a target `analytics_prod.s.orders` prints as `${CATALOG}.s.orders`.
+
+Some outputs still show a resolved value:
+
+- SQL that Rocky generates, in `rocky plan`, `rocky run`, `rocky preview` and their previews. It names the resolved catalog, schema and table.
+- `rocky run` and `rocky discover` results, including each materialization's `asset_key`. These carry the resolved target.
+- The `config_identity` a governed plan stores in its plan file.
+- `rocky docs` HTML.
+- Log lines.
+
+Do not put a secret in a field these outputs carry.
+
+:::caution[dagster-rocky and a `${VAR}` in a model target]
+`dagster-rocky` builds a derived model's asset key from `rocky compile`'s `target`, and matches it against the `asset_key` that `rocky run` reports. When a model's `[target]` holds a `${VAR}` value of 8 bytes or more, the first prints `${NAME}` and the second the value, so the two do not match. Put a literal in `[target]`, or keep the value under 8 bytes, until `rocky run` prints the placeholder too.
+:::
 
 ### Default Values
 

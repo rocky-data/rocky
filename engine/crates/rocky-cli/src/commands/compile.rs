@@ -11,6 +11,7 @@ use rocky_compiler::diagnostic::{self, Diagnostic, Severity};
 use rocky_compiler::types::TypedColumn;
 use rocky_core::config as rocky_config;
 use rocky_core::macros::{expand_macros, load_macros_from_dir};
+use rocky_core::secret_registry::{render_placeholders, render_placeholders_in};
 use rocky_sql::portability::{self, PortabilityIssue};
 use rocky_sql::pragma;
 use rocky_sql::transpile::Dialect;
@@ -295,11 +296,19 @@ fn compile_inner(
     }
 
     // Re-apply model filter to diagnostics (may now include E027).
+    // A diagnostic can quote a sidecar value (a target collision names the
+    // resolved target), so its text prints each resolved `${VAR}` value as
+    // `${NAME}` (#1919).
     let diagnostics: Vec<_> = result
         .diagnostics
         .iter()
         .filter(|d| in_scope(&d.model))
-        .cloned()
+        .map(|d| Diagnostic {
+            message: render_placeholders(&d.message).into(),
+            model: render_placeholders(&d.model),
+            suggestion: d.suggestion.as_deref().map(render_placeholders),
+            ..d.clone()
+        })
         .collect();
 
     let models_detail: Vec<ModelDetail> = result
@@ -318,18 +327,30 @@ fn compile_inner(
                     rocky_core::cost::Confidence::Low => "low".to_string(),
                 },
             });
-            ModelDetail {
-                name: model.config.name.clone(),
-                strategy: model.config.strategy.clone(),
-                target: model.config.target.clone(),
-                freshness: model.config.freshness.clone(),
+            // Sidecar values were `${VAR}`-expanded before parsing. Every
+            // field below is written with each resolved value as `${NAME}`
+            // (#1919). The copies are for printing only.
+            let render = render_placeholders;
+            Ok(ModelDetail {
+                name: render(&model.config.name),
+                strategy: render_placeholders_in(&model.config.strategy)
+                    .context("failed to render the model strategy for output")?,
+                target: render_placeholders_in(&model.config.target)
+                    .context("failed to render the model target for output")?,
+                freshness: render_placeholders_in(&model.config.freshness)
+                    .context("failed to render the model freshness for output")?,
                 contract_source: model.contract_path.as_ref().map(|_| "auto".to_string()),
                 cost_hint,
-                depends_on: model.config.depends_on.clone(),
-                tags: model.config.tags.clone(),
-            }
+                depends_on: model.config.depends_on.iter().map(|d| render(d)).collect(),
+                tags: model
+                    .config
+                    .tags
+                    .iter()
+                    .map(|(k, v)| (render(k), render(v)))
+                    .collect(),
+            })
         })
-        .collect();
+        .collect::<Result<_>>()?;
 
     // Data the text renderer needs from the raw `CompileResult` but which is
     // not carried on `CompileOutput`: execution order, per-model typed-column
@@ -720,6 +741,55 @@ schema_template = "s"
             err.to_string().contains("compilation failed"),
             "expected bail, got: {err}"
         );
+    }
+
+    /// #1919: a sidecar value expanded from `${VAR}` prints only as `${NAME}`
+    /// in `rocky compile --output json` (`models_detail`), never as the value.
+    #[test]
+    fn compile_output_prints_a_resolved_sidecar_value_as_its_placeholder() {
+        const SECRET: &str = "rocky_1919_compile_catalog_d00d";
+        let dir = TempDir::new().unwrap();
+        let models_dir = dir.path().join("models");
+        fs::create_dir_all(&models_dir).unwrap();
+        fs::write(
+            models_dir.join("m1.sql"),
+            "SELECT 1 AS id, CURRENT_DATE AS ts",
+        )
+        .unwrap();
+        fs::write(
+            models_dir.join("m1.toml"),
+            "name = \"m1\"\n\n\
+             [strategy]\ntype = \"incremental\"\ntimestamp_column = \"${ROCKY_T1919_COMPILE}\"\n\n\
+             [target]\ncatalog = \"${ROCKY_T1919_COMPILE}\"\nschema = \"s\"\ntable = \"m1\"\n\n\
+             [tags]\nowner = \"${ROCKY_T1919_COMPILE}\"\n",
+        )
+        .unwrap();
+        // SAFETY: test-only; the variable name is unique to this test.
+        unsafe { std::env::set_var("ROCKY_T1919_COMPILE", SECRET) };
+        let out = compile_output(
+            None,
+            &dir.path().join(".rocky-state.redb"),
+            &models_dir,
+            None,
+            None,
+            false,
+            None,
+            false,
+            None,
+        );
+        // SAFETY: as above.
+        unsafe { std::env::remove_var("ROCKY_T1919_COMPILE") };
+        let out = out.expect("compiles");
+        assert_eq!(out.models_detail.len(), 1, "PRECONDITION: the model loaded");
+        let json = serde_json::to_string(&out).unwrap();
+        assert!(!json.contains(SECRET), "leaked: {json}");
+        let detail = serde_json::to_value(&out.models_detail[0]).unwrap();
+        assert_eq!(detail["target"]["catalog"], "${ROCKY_T1919_COMPILE}");
+        assert_eq!(
+            detail["strategy"]["timestamp_column"],
+            "${ROCKY_T1919_COMPILE}"
+        );
+        assert_eq!(detail["tags"]["owner"], "${ROCKY_T1919_COMPILE}");
     }
 
     #[test]

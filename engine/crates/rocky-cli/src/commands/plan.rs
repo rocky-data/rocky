@@ -2087,6 +2087,88 @@ pub(crate) fn state_authority_identity(
     parts.join(" ")
 }
 
+/// The config forms a replication plan persists (#1919).
+///
+/// ```text
+///   snapshot  every resolved ${VAR} value written as ${NAME}   printable
+///   digests   BLAKE3 keyed hash of each top-level section,     comparable
+///             taken over the resolved values
+/// ```
+///
+/// The snapshot alone cannot see an environment value change, because both
+/// values render as the same `${NAME}`. The digests can, and they hold no
+/// value. Credentials serialize as `"***"` in both, as before, so neither
+/// covers a rotated secret.
+pub(crate) fn config_snapshot_forms(
+    root: &std::path::Path,
+    rocky_cfg: &rocky_core::config::RockyConfig,
+    create_key: bool,
+) -> Result<(
+    serde_json::Value,
+    std::collections::BTreeMap<String, String>,
+)> {
+    let resolved =
+        rocky_core::env_string::with_env_values_scope(|| serde_json::to_value(rocky_cfg))
+            .context("failed to serialize RockyConfig for the plan's config snapshot")?;
+    let key = crate::plan_store::plan_digest_key(root, create_key)?;
+    let digests = config_section_digests(&key, &resolved);
+    let snapshot = rocky_core::secret_registry::render_json_placeholders(resolved);
+    Ok((snapshot, digests))
+}
+
+/// One keyed digest per top-level section of a serialized config.
+fn config_section_digests(
+    key: &[u8; 32],
+    resolved: &serde_json::Value,
+) -> std::collections::BTreeMap<String, String> {
+    let mut digests = std::collections::BTreeMap::new();
+    if let Some(sections) = resolved.as_object() {
+        for (name, section) in sections {
+            let mut canonical = String::new();
+            write_canonical_json(section, &mut canonical);
+            digests.insert(
+                name.clone(),
+                blake3::keyed_hash(key, canonical.as_bytes())
+                    .to_hex()
+                    .to_string(),
+            );
+        }
+    }
+    digests
+}
+
+/// JSON with every object's keys sorted, so the digest does not depend on map
+/// iteration order (a `HashMap` field, or `serde_json`'s `preserve_order`).
+fn write_canonical_json(value: &serde_json::Value, out: &mut String) {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut entries: Vec<_> = map.iter().collect();
+            entries.sort_by(|a, b| a.0.cmp(b.0));
+            out.push('{');
+            for (i, (k, v)) in entries.into_iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                out.push_str(&serde_json::Value::String(k.clone()).to_string());
+                out.push(':');
+                write_canonical_json(v, out);
+            }
+            out.push('}');
+        }
+        serde_json::Value::Array(items) => {
+            out.push('[');
+            for (i, v) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                write_canonical_json(v, out);
+            }
+            out.push(']');
+        }
+        other => out.push_str(&other.to_string()),
+    }
+}
+
 fn build_and_persist_replication_plan(
     rocky_cfg: &rocky_core::config::RockyConfig,
     connectors: &[DiscoveredConnector],
@@ -2096,8 +2178,8 @@ fn build_and_persist_replication_plan(
     run_options: &PlanRunOptions,
     state_path: &std::path::Path,
 ) -> Result<(ReplicationPlan, String, chrono::DateTime<Utc>)> {
-    let config_snapshot = serde_json::to_value(rocky_cfg)
-        .context("failed to serialize RockyConfig for replication plan")?;
+    let cwd = std::env::current_dir().context("failed to get current working directory")?;
+    let (config_snapshot, config_digests) = config_snapshot_forms(&cwd, rocky_cfg, true)?;
     let state_authority = state_authority_identity(&rocky_cfg.state, state_path);
     let source_state_snapshot = build_source_state_snapshot(connectors);
 
@@ -2125,11 +2207,11 @@ fn build_and_persist_replication_plan(
         branch: run_options.branch.clone(),
         governance_override: run_options.governance_override.clone(),
         config_snapshot,
+        config_digests: Some(config_digests),
         state_authority: Some(state_authority),
         source_state_snapshot,
     };
 
-    let cwd = std::env::current_dir().context("failed to get current working directory")?;
     let plan_id = write_plan(&cwd, PlanKind::Replication, &replication_plan)
         .context("failed to write replication plan")?;
 

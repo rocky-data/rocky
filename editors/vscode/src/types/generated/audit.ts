@@ -67,7 +67,7 @@ export interface AuditDecisionEntry {
    */
   effect: PolicyEffect;
   /**
-   * The model the decision was about.
+   * The model the decision was about. A resolved `${VAR}` value prints as `${NAME}` (#1919).
    */
   model: string;
   /**
@@ -79,7 +79,7 @@ export interface AuditDecisionEntry {
    */
   principal: PolicyPrincipal;
   /**
-   * Human-readable explanation of how the effect was reached.
+   * Human-readable explanation of how the effect was reached. A resolved `${VAR}` value prints as `${NAME}` (#1919).
    */
   reason: string;
   /**

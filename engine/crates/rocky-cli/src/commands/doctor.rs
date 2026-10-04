@@ -73,6 +73,23 @@ pub async fn doctor(
         "healthy"
     };
 
+    // A check message, detail or suggestion can quote a config value or an
+    // adapter error that embeds one (a host, a URL). Print each resolved
+    // `${VAR}` value as `${NAME}` (#1919).
+    let render = rocky_core::secret_registry::render_placeholders;
+    let checks = checks
+        .into_iter()
+        .map(|c| HealthCheck {
+            message: render(&c.message),
+            details: c
+                .details
+                .iter()
+                .map(|(k, v)| (render(k), render(v)))
+                .collect(),
+            ..c
+        })
+        .collect();
+    let suggestions = suggestions.iter().map(|s| render(s)).collect();
     let doctor_output = DoctorOutput {
         command: "doctor".into(),
         overall: overall.into(),

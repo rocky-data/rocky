@@ -32,6 +32,7 @@ use rocky_core::freeze_marker::{
 };
 use rocky_core::path_presence::{PathPresence, classify_not_found};
 use rocky_core::policy::{self, ActiveFreeze, ModelAttributes};
+use rocky_core::secret_registry::render_placeholders;
 use rocky_core::state::{PolicyDecisionRecord, StateStore};
 use rocky_core::state_sync::StateSyncError;
 
@@ -119,10 +120,20 @@ pub fn compute_policy_check(
         effect: decision.effect,
         matched_rule: decision.matched_rule,
         reason: decision.reason,
+        // Sidecar values print each resolved `${VAR}` value as `${NAME}`,
+        // as `rocky policy show` does for the rule side (#1919).
         model_attributes: PolicyModelAttributes {
-            tags: attrs.tags,
-            classifications: attrs.classifications.into_iter().collect(),
-            layer: attrs.layer,
+            tags: attrs
+                .tags
+                .iter()
+                .map(|(k, v)| (render_placeholders(k), render_placeholders(v)))
+                .collect(),
+            classifications: attrs
+                .classifications
+                .iter()
+                .map(|c| render_placeholders(c))
+                .collect(),
+            layer: attrs.layer.as_deref().map(render_placeholders),
             contracted: attrs.contracted,
             downstreams: attrs.downstreams,
             reachable_downstreams: attrs.reachable_downstreams,

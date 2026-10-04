@@ -2545,6 +2545,54 @@ struct EnvExpansion {
     missing: Vec<(String, std::ops::Range<usize>)>,
 }
 
+/// Register an environment value, and every form TOML escape processing can
+/// turn it into.
+///
+/// The value is pasted into the config text before the TOML is parsed. Inside
+/// a basic string (`"..."` or `"""..."""`) the parser then processes escapes,
+/// so a value holding `\u0041` or `\t` is stored in the parsed field as `A`
+/// or a tab. That stored form is what an output struct copies, and it is not
+/// the registered bytes, so it would print as itself (#1919).
+///
+/// So each unescaped form that differs from the raw value is registered too,
+/// under the same name. A value that is not a valid basic-string body (for
+/// example one holding a bare `"`) yields no extra form here; the raw form
+/// is still registered. Escapes that span the boundary between the value and
+/// the text around it are not modelled.
+fn register_env_value(name: &str, value: &str) {
+    crate::secret_registry::register_substitution(name, value);
+    if !value.contains('\\') {
+        return;
+    }
+    for wrapped in [
+        format!("v = \"{value}\""),
+        format!("v = \"\"\"{value}\"\"\""),
+    ] {
+        let Ok(table) = toml::from_str::<toml::Table>(&wrapped) else {
+            continue;
+        };
+        if let Some(toml::Value::String(unescaped)) = table.get("v")
+            && unescaped != value
+        {
+            crate::secret_registry::register_substitution(name, unescaped);
+        }
+    }
+}
+
+/// Register every `${VAR}` value `rocky.toml` at `path` references, without
+/// parsing or validating it.
+///
+/// A command that reads only the state store never loads the config, so its
+/// registry is empty and it cannot render a stored value as `${NAME}`. Calling
+/// this first gives it the same registry a config-loading command has
+/// (#1919). It never fails: an unreadable file or an unset variable registers
+/// nothing more.
+pub fn prime_secret_registry(path: &Path) {
+    if let Ok(text) = std::fs::read_to_string(path) {
+        let _ = substitute_env_vars_inner(&text);
+    }
+}
+
 /// The expansion itself, with no policy attached.
 ///
 /// An unset `${VAR}` is left in the text verbatim either way. Whether that is
@@ -2590,7 +2638,7 @@ fn substitute_env_vars_inner(input: &str) -> EnvExpansion {
             // anyone who can read the file can already read it; redacting it
             // would mangle diagnostics for no secrecy gain (#1897).
             if let Some(value) = &from_env {
-                crate::secret_registry::register_substitution(var_name, value);
+                register_env_value(var_name, value);
             }
             let value = from_env.unwrap_or_else(|| default_value.to_string());
             result.push_str(&value);
@@ -2601,7 +2649,7 @@ fn substitute_env_vars_inner(input: &str) -> EnvExpansion {
         } else {
             match std::env::var(expr) {
                 Ok(value) => {
-                    crate::secret_registry::register_substitution(expr, &value);
+                    register_env_value(expr, &value);
                     result.push_str(&value);
                     substitutions.push(EnvVarSubstitution {
                         name: expr.to_string(),
@@ -10029,6 +10077,46 @@ autonomy_budget = { failures = 2, window = "${ROCKY_T1919_POLICY}" }
             assert!(printed.contains("${ROCKY_T1919_POLICY}"), "{printed}");
         }
         assert!(json.contains("${ROCKY_T1919_POLICY}_*"), "{json}");
+    }
+
+    /// A value the TOML parser unescapes is stored in its unescaped form,
+    /// which is not the registered bytes. It must still print as `${NAME}`.
+    #[test]
+    fn a_value_changed_by_toml_escape_processing_still_prints_as_its_placeholder() {
+        // `A` and `\t` are TOML escapes: the parsed field holds `A` and
+        // a tab, not the six and two bytes the environment held.
+        const RAW: &str = r"ROCKY-1919-ESCA-tab\t-end";
+        const PARSED: &str = "ROCKY-1919-ESCA-tab\t-end";
+        // SAFETY: test-only; the variable name is unique to this test.
+        unsafe { std::env::set_var("ROCKY_T1919_ESCAPE", RAW) };
+        let text = substitute_env_vars(
+            r#"
+[policy]
+version = 1
+
+[[policy.rules]]
+principal = "agent"
+capability = "apply"
+scope = { any = true }
+effect = "allow"
+verify_after = ["${ROCKY_T1919_ESCAPE}"]
+"#,
+        )
+        .unwrap();
+        // SAFETY: as above.
+        unsafe { std::env::remove_var("ROCKY_T1919_ESCAPE") };
+        let cfg = parse(&text);
+        let check = &cfg.policy.as_ref().expect("policy").rules[0].verify_after[0];
+        assert_eq!(
+            check.expose(),
+            PARSED,
+            "PRECONDITION: the parser unescaped it"
+        );
+        let json = serde_json::to_string(&cfg.policy).expect("serialize");
+        for printed in [check.to_string(), format!("{check:?}"), json] {
+            assert!(!printed.contains("ROCKY-1919-ESCA"), "leaked: {printed}");
+            assert!(printed.contains("${ROCKY_T1919_ESCAPE}"), "{printed}");
+        }
     }
 
     /// One of the two `ConfigError` sites #1934 added after the original

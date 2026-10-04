@@ -3424,6 +3424,11 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
     // this invocation to its own `<models>/.rocky-state/<key>.redb`. An
     // explicit `--state-path` is a hard override that disables namespacing.
     // The default (neither set) is byte-identical to today.
+    // Every command, including the ones that read only the state store
+    // (`rocky audit`, `rocky history`), renders a resolved `${VAR}` value as
+    // `${NAME}` only if the registry holds it. Prime it from the config text
+    // up front; this never fails (#1919).
+    rocky_core::config::prime_secret_registry(&cli.config);
     let state_namespace: Option<String> = resolve_state_namespace(&cli)?;
     let resolved = rocky_core::state::resolve_state_path_ns(
         cli.state_path.as_deref(),
