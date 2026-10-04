@@ -411,6 +411,31 @@ impl SqlDialect for ClickHouseDialect {
         false
     }
 
+    /// `maxOrNull(c)`: ClickHouse's `max` over no rows returns the type's
+    /// default (`1970-01-01 00:00:00`), so an empty table would read as
+    /// fresh-in-1970 and record a 1970 watermark. The `-OrNull` combinator
+    /// returns `NULL` instead (clickhouse.com/docs/sql-reference/aggregate-functions/combinators#-ornull).
+    fn max_aggregate(&self, column: &str) -> String {
+        format!("maxOrNull({column})")
+    }
+
+    /// `ALTER TABLE t ADD COLUMN c Nullable(T)`.
+    ///
+    /// A new column is nullable on every dialect (see
+    /// [`rocky_core::drift::generate_add_column_sql`]). ClickHouse is the
+    /// exception to the ANSI default: a bare `T` is NOT NULL, so rows that
+    /// existed before the column would read `''` / `0` instead of `NULL`.
+    /// `describe_table` reports types with `Nullable(…)` peeled off, so the
+    /// wrapper is added here. Types ClickHouse refuses inside `Nullable`
+    /// (`Array`, `Map`, `Variant`, …, or an already-wrapped type) are kept
+    /// as written; they hold an empty value, not `NULL`, by design.
+    fn add_column_sql(&self, table_ref: &str, column: &str, data_type: &str) -> String {
+        format!(
+            "ALTER TABLE {table_ref} ADD COLUMN {column} {}",
+            nullable_type(data_type)
+        )
+    }
+
     /// `ALTER TABLE t MODIFY COLUMN c T`. Not reached while
     /// [`Self::is_safe_type_widening`] refuses every change; ClickHouse does
     /// not accept the ANSI `ALTER COLUMN … TYPE` form.
@@ -425,6 +450,35 @@ impl SqlDialect for ClickHouseDialect {
         Ok(format!(
             "ALTER TABLE {table_ref} MODIFY COLUMN {column} {new_type}"
         ))
+    }
+}
+
+/// `Nullable(data_type)`, or `data_type` unchanged when ClickHouse cannot
+/// wrap it (composite types, `Nullable` / `LowCardinality` already present).
+fn nullable_type(data_type: &str) -> String {
+    const NOT_WRAPPABLE: &[&str] = &[
+        "Nullable",
+        "LowCardinality",
+        "Array",
+        "Map",
+        "Tuple",
+        "Nested",
+        "Variant",
+        "Dynamic",
+        "JSON",
+        "Object",
+        "AggregateFunction",
+        "SimpleAggregateFunction",
+    ];
+    let trimmed = data_type.trim();
+    let head = trimmed
+        .split(|c: char| c == '(' || c.is_whitespace())
+        .next()
+        .unwrap_or("");
+    if NOT_WRAPPABLE.iter().any(|w| head.eq_ignore_ascii_case(w)) {
+        trimmed.to_string()
+    } else {
+        format!("Nullable({trimmed})")
     }
 }
 
@@ -620,6 +674,75 @@ mod tests {
         assert_eq!(
             d().alter_column_type_sql("m.t", "c", "BIGINT").unwrap(),
             "ALTER TABLE m.t MODIFY COLUMN c BIGINT"
+        );
+    }
+
+    /// A drifted-in column must read `NULL` for the rows that predate it.
+    /// `describe_table` hands drift `TEXT` for a `Nullable(String)` source
+    /// column; a bare `ADD COLUMN c TEXT` would build a NOT NULL `String`.
+    #[test]
+    fn added_columns_are_nullable() {
+        let table = rocky_ir::TableRef {
+            catalog: String::new(),
+            schema: "m".into(),
+            table: "t".into(),
+        };
+        let added = |data_type: &str| rocky_ir::ColumnInfo {
+            name: "c".into(),
+            data_type: data_type.into(),
+            nullable: true,
+        };
+        let sql = |data_type: &str| {
+            rocky_core::drift::generate_add_column_sql(&table, &[added(data_type)], &d())
+                .unwrap()
+                .remove(0)
+        };
+        assert_eq!(sql("TEXT"), "ALTER TABLE m.t ADD COLUMN c Nullable(TEXT)");
+        assert_eq!(
+            sql("DECIMAL(18,2)"),
+            "ALTER TABLE m.t ADD COLUMN c Nullable(DECIMAL(18,2))"
+        );
+        assert_eq!(
+            sql("DateTime64(3)"),
+            "ALTER TABLE m.t ADD COLUMN c Nullable(DateTime64(3))"
+        );
+        // ClickHouse refuses these inside `Nullable(…)`.
+        assert_eq!(
+            sql("Array(Int32)"),
+            "ALTER TABLE m.t ADD COLUMN c Array(Int32)"
+        );
+        assert_eq!(
+            sql("Nullable(Int64)"),
+            "ALTER TABLE m.t ADD COLUMN c Nullable(Int64)"
+        );
+    }
+
+    /// `MAX` over an empty ClickHouse table is `1970-01-01`, not NULL: the
+    /// freshness and watermark reads use `maxOrNull` so "no rows" stays NULL.
+    #[test]
+    fn max_reads_are_null_over_no_rows() {
+        let sql = rocky_core::source_freshness::generate_max_loaded_at_sql(
+            "",
+            "raw",
+            "events",
+            "loaded_at",
+            Some("region = 'eu'"),
+            &d(),
+        )
+        .unwrap();
+        assert_eq!(
+            sql,
+            "SELECT COUNT(*) AS row_count, maxOrNull(loaded_at) AS max_loaded_at FROM raw.events \
+             WHERE (region = 'eu')"
+        );
+        let table = rocky_ir::TableRef {
+            catalog: String::new(),
+            schema: "raw".into(),
+            table: "events".into(),
+        };
+        assert_eq!(
+            rocky_core::checks::generate_freshness_sql(&table, "ts", &d()).unwrap(),
+            "SELECT maxOrNull(ts) AS max_ts FROM raw.events"
         );
     }
 

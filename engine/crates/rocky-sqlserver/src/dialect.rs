@@ -441,6 +441,17 @@ impl SqlDialect for SqlServerDialect {
         ))
     }
 
+    /// `CAST('YYYY-MM-DDThh:mm:ss' AS DATETIME2(7))` for a `time_interval`
+    /// window bound. A bare `'YYYY-MM-DD hh:mm:ss'` compared with a
+    /// `DATETIME` column is read under the session's `DATEFORMAT`, so
+    /// `SET DATEFORMAT dmy` (or `SET LANGUAGE British`) turns `2026-04-07`
+    /// into July 4th. ISO 8601 with the `T` separator, cast to `DATETIME2`,
+    /// reads the same under every language — as [`Self::watermark_where`]'s
+    /// literal does.
+    fn timestamp_literal(&self, ts: &chrono::DateTime<chrono::Utc>) -> String {
+        format!("CAST('{}' AS DATETIME2(7))", ts.format("%Y-%m-%dT%H:%M:%S"))
+    }
+
     /// The `INFORMATION_SCHEMA.COLUMNS` query the plan preview shows; the
     /// adapter's `describe_table` runs the same view.
     fn describe_table_sql(&self, table_ref: &str) -> String {
@@ -889,6 +900,121 @@ mod tests {
             ),
             "INSERT INTO [m].[t] ([b], [a])\nSELECT [b], [a] FROM (\nSELECT a, b FROM s\n) AS _rocky_incoming"
         );
+    }
+
+    /// The inliner's output for two ephemeral models that each end in
+    /// `WITH final AS …`, read by a consumer with its own `final`. Every
+    /// statement that embeds it carries exactly one `WITH`, at its head, and
+    /// no nested one — T-SQL refuses both.
+    #[test]
+    fn inlined_ephemerals_with_shared_cte_names_render_one_leading_with() {
+        let model = "WITH __rocky_ephemeral__stg_a AS (WITH final AS (SELECT id, v FROM raw) \
+                     SELECT * FROM final), __rocky_ephemeral__stg_b AS (WITH final AS \
+                     (SELECT id, v + 1 AS w FROM raw) SELECT * FROM final), final AS \
+                     (SELECT a.id, a.v, b.w FROM __rocky_ephemeral__stg_a AS a JOIN \
+                     __rocky_ephemeral__stg_b AS b ON a.id = b.id) SELECT * FROM final";
+        let one_leading_with = |path: &str, stmt: &str| {
+            let words: Vec<String> = stmt
+                .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                .map(str::to_ascii_uppercase)
+                .collect();
+            assert_eq!(
+                words.iter().filter(|w| *w == "WITH").count(),
+                1,
+                "{path}: {stmt}"
+            );
+            assert!(!stmt.contains("(WITH"), "{path}: {stmt}");
+            assert!(
+                stmt.contains("final__2 AS (") && stmt.contains("final__3 AS ("),
+                "{path}: {stmt}"
+            );
+        };
+        let full = d().create_table_as("[an].[marts].[fct]", model);
+        // Each statement of the script (staging build, swap) on its own.
+        for stmt in full.split(";\n").filter(|s| s.contains("final")) {
+            assert!(stmt.trim_start().starts_with("WITH "), "{stmt}");
+            one_leading_with("full_refresh", stmt);
+        }
+        let view = d().view_ddl("[an].[marts].[fct]", model).unwrap();
+        assert!(
+            view.starts_with("CREATE OR ALTER VIEW [marts].[fct] AS\nWITH "),
+            "{view}"
+        );
+        one_leading_with("view", &view);
+        let merge = d()
+            .merge_into(
+                "[an].[marts].[fct]",
+                model,
+                &keys(&["id"]),
+                &explicit(&["id", "v", "w"]),
+            )
+            .unwrap();
+        // `WITH (HOLDLOCK)` is a table hint, not a CTE.
+        let merge_ctes = merge.replace("WITH (HOLDLOCK)", "");
+        assert!(merge_ctes.starts_with("WITH "), "{merge}");
+        one_leading_with("merge", &merge_ctes);
+    }
+
+    /// A `time_interval` window renders language-independent literals: a
+    /// bare `'2026-04-07 00:00:00'` against a `DATETIME` column reads as
+    /// July 4th under `SET DATEFORMAT dmy`.
+    #[test]
+    fn time_interval_window_literals_are_iso_datetime2() {
+        use chrono::TimeZone;
+        use rocky_ir::{
+            GovernanceConfig, MaterializationStrategy, ModelIr, PartitionWindow, SourceRef,
+            TargetRef, TimeGrain,
+        };
+        let ir = ModelIr::transformation(
+            TargetRef {
+                catalog: "an".into(),
+                schema: "marts".into(),
+                table: "daily".into(),
+            },
+            MaterializationStrategy::TimeInterval {
+                time_column: "order_date".into(),
+                granularity: TimeGrain::Day,
+                window: Some(PartitionWindow {
+                    key: "2026-04-07".into(),
+                    start: chrono::Utc.with_ymd_and_hms(2026, 4, 7, 0, 0, 0).unwrap(),
+                    end: chrono::Utc.with_ymd_and_hms(2026, 4, 8, 0, 0, 0).unwrap(),
+                }),
+            },
+            vec![SourceRef {
+                catalog: "an".into(),
+                schema: "raw".into(),
+                table: "orders".into(),
+            }],
+            "SELECT order_date FROM raw.orders WHERE order_date >= @start_date \
+             AND order_date < '@end_date'"
+                .into(),
+            GovernanceConfig {
+                permissions_file: None,
+                auto_create_catalogs: false,
+                auto_create_schemas: false,
+            },
+            None,
+            None,
+        );
+        let sql = rocky_core::sql_gen::generate_transformation_sql(&ir, &d())
+            .unwrap()
+            .join("\n");
+        assert!(
+            sql.contains(
+                "DELETE FROM [an].[marts].[daily] WHERE order_date >= \
+                 CAST('2026-04-07T00:00:00' AS DATETIME2(7)) AND order_date < \
+                 CAST('2026-04-08T00:00:00' AS DATETIME2(7))"
+            ),
+            "{sql}"
+        );
+        assert!(
+            sql.contains(
+                "WHERE order_date >= CAST('2026-04-07T00:00:00' AS DATETIME2(7)) \
+                 AND order_date < CAST('2026-04-08T00:00:00' AS DATETIME2(7))"
+            ),
+            "{sql}"
+        );
+        assert!(!sql.contains("'2026-04-07 00:00:00'"), "{sql}");
     }
 
     #[test]

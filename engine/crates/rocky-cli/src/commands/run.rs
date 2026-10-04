@@ -8292,7 +8292,10 @@ async fn run_batched_checks(
             let table_ref = dialect
                 .format_table_ref(&br.catalog, &br.schema, &br.table)
                 .map_err(anyhow::Error::from)?;
-            let sql = format!("SELECT COUNT(*), MAX({timestamp_column}) FROM {table_ref}");
+            let sql = format!(
+                "SELECT COUNT(*), {} FROM {table_ref}",
+                dialect.max_aggregate(timestamp_column)
+            );
             match warehouse.execute_query(&sql).await {
                 Ok(result) => {
                     // One row, two cells: the count, then the maximum. A
@@ -15804,7 +15807,10 @@ pub(crate) async fn query_target_max_timestamp(
                 target.full_name()
             )
         })?;
-    let sql = format!("SELECT MAX({timestamp_column}) FROM {target_ref}");
+    let sql = format!(
+        "SELECT {} FROM {target_ref}",
+        dialect.max_aggregate(timestamp_column)
+    );
 
     let result = warehouse
         .execute_query(&sql)

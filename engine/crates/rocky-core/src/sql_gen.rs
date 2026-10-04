@@ -453,16 +453,18 @@ pub fn generate_transformation_sql_with_warehouse(
             })?;
 
             // Build the partition filter. Timestamps are formatted by chrono
-            // from a fixed format string — never user input. Single-quoted
-            // literals match the existing pattern in the rest of sql_gen.
+            // from a fixed format string — never user input — into the
+            // dialect's literal (`'YYYY-MM-DD HH:MM:SS'` unless overridden).
             let filter = format!(
-                "{tc} >= '{start}' AND {tc} < '{end}'",
+                "{tc} >= {start} AND {tc} < {end}",
                 tc = time_column,
-                start = window.start.format("%Y-%m-%d %H:%M:%S"),
-                end = window.end.format("%Y-%m-%d %H:%M:%S"),
+                start = dialect.timestamp_literal(&window.start),
+                end = dialect.timestamp_literal(&window.end),
             );
 
-            let substituted = substitute_partition_placeholders(&model_ir.sql, window);
+            let substituted = substitute_partition_placeholders_for(&model_ir.sql, window, &|ts| {
+                dialect.timestamp_literal(ts)
+            });
 
             Ok(dialect.insert_overwrite_partition(&target, &filter, &substituted)?)
         }
@@ -602,7 +604,9 @@ pub fn generate_time_interval_bootstrap_sql(
     // compile gate, so the bootstrap also wraps the body in `WHERE 1 = 0`:
     // it is empty by its shape, not only by its window (#2233). The newline
     // before `)` closes a trailing `--` comment in the body.
-    let rendered = substitute_partition_placeholders(&model_ir.sql, &bootstrap_window);
+    let rendered = substitute_partition_placeholders_for(&model_ir.sql, &bootstrap_window, &|ts| {
+        dialect.timestamp_literal(ts)
+    });
     let rendered = rendered.trim().trim_end_matches(';');
     let body = format!("SELECT * FROM (\n{rendered}\n) AS __rocky_bootstrap WHERE 1 = 0");
     if has_table_options(model_ir) && model_ir.format.is_some() {
@@ -913,8 +917,20 @@ fn ephemeral_refused(model_ir: &ModelIr) -> SqlGenError {
 /// The documented form is bare, but tolerate an already single-quoted
 /// placeholder without adding a second pair of quotes.
 fn substitute_partition_placeholders(sql: &str, window: &PartitionWindow) -> String {
-    let start = format!("'{}'", window.start.format("%Y-%m-%d %H:%M:%S"));
-    let end = format!("'{}'", window.end.format("%Y-%m-%d %H:%M:%S"));
+    substitute_partition_placeholders_for(sql, window, &|ts| {
+        format!("'{}'", ts.format("%Y-%m-%d %H:%M:%S"))
+    })
+}
+
+/// [`substitute_partition_placeholders`] with each bound rendered by
+/// `literal` (a dialect's [`SqlDialect::timestamp_literal`]).
+fn substitute_partition_placeholders_for(
+    sql: &str,
+    window: &PartitionWindow,
+    literal: &dyn Fn(&chrono::DateTime<chrono::Utc>) -> String,
+) -> String {
+    let start = literal(&window.start);
+    let end = literal(&window.end);
 
     sql.replace("'@start_date'", &start)
         .replace("@start_date", &start)

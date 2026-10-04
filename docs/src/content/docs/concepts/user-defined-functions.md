@@ -201,7 +201,9 @@ Redshift SQL functions take no argument names. The body refers to arguments
 as `$1`, `$2`, and so on, in declaration order. Rocky writes the body with
 names and rewrites each argument reference for you. It parses the body
 first, so a string literal or function name that spells an argument stays
-as it is. The rewritten body is printed back from the parsed SQL, so
+as it is. So does the date part of `DATEADD`, `DATEDIFF` and `DATE_PART`:
+in `DATEADD(day, n, day)` with arguments `day` and `n`, the first `day` is
+the date-part keyword and becomes nothing else. The rewritten body is printed back from the parsed SQL, so
 comments in it are dropped. Rocky refuses a Redshift function when:
 
 - the body does not parse as one expression,
@@ -214,8 +216,10 @@ Redshift requires a volatility clause. `deterministic = true` gives
 `IMMUTABLE`. Otherwise Rocky writes `VOLATILE`, which promises nothing.
 Rocky does not set a description on Redshift either.
 
-`rocky compile` does not check these per-warehouse rules. The plan preview
-and `rocky run` refuse such a function with `E051`.
+`rocky compile` renders each called function for PostgreSQL and Redshift
+and reports these refusals as `E051` when every configured warehouse refuses
+the function. Otherwise the plan preview and `rocky run` refuse it with
+`E051` on the warehouse that cannot create it.
 
 Rocky's Trino adapter cannot create persistent functions. `rocky compile`
 reports `E051` when Trino is the only warehouse adapter in `rocky.toml`.

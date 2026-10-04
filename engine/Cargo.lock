@@ -4693,6 +4693,7 @@ dependencies = [
  "rocky-ir",
  "rocky-sql",
  "serde_json",
+ "sqlparser",
  "thiserror",
  "tiberius",
  "tokio",

@@ -132,11 +132,15 @@ WHEN MATCHED THEN UPDATE SET [amount] = rocky_s.[amount]
 WHEN NOT MATCHED BY TARGET THEN INSERT ([order_id], [amount]) VALUES (rocky_s.[order_id], rocky_s.[amount]);
 ```
 
-Rocky leaves the SQL as written, and the server reports its own error, when lifting could change the meaning: two CTEs with the same name, or a nested CTE name that the rest of the statement also uses as a bare name.
+One list cannot hold two CTEs with the same name. This happens when an inlined `ephemeral` model and its consumer both define `final`. Rocky then renames the nested CTE (`final` → `final__2`) through the parsed SQL. Only the references that read that CTE, in its own scope, change. A renamed table reference keeps the old name as its alias, so `final.id` still binds.
+
+Some models still cannot be lifted: a nested CTE named like a column the outer query also reads, or SQL the parser cannot read. When every configured warehouse is SQL Server, `rocky compile` reports `E054` on such a model. Otherwise `rocky run` sends the SQL as written, and the server reports its own error.
 
 **IDENTITY columns.** `SELECT … INTO` copies a source column's `IDENTITY` property, which would make every later insert of that column fail. Rocky adds an empty `UNION ALL SELECT TOP (0) …` branch to each `SELECT … INTO`; a `UNION` is the documented way to drop the property.
 
 **Incremental models.** `@incremental_filter` becomes `(1 = 1)` on a run that loads every row, because T-SQL has no `TRUE`. A `lookback` renders as `DATEADD(hour, -2, MAX(updated_at))`. A watermark literal carries 7 fractional digits, `DATETIME2`'s precision, rounded up. So the row it came from does not pass the next run's `>` filter again, including a `DATETIME` value such as `.003`, which the server compares as 3.333… ms.
+
+**Time-interval windows.** The partition filter and the `@start_date` / `@end_date` placeholders render as `CAST('2026-04-07T00:00:00' AS DATETIME2(7))`. A bare `'2026-04-07 00:00:00'` compared with a `DATETIME` column follows the session's `DATEFORMAT`, so `SET DATEFORMAT dmy` reads it as 4 July. The ISO form reads the same under every language.
 
 **Merge.** `HOLDLOCK` stops two concurrent upserts from both inserting the same new key. Fabric does not accept table hints, so `flavor = "fabric"` leaves it out. A key-only merge has no `WHEN MATCHED` arm and only inserts missing keys.
 

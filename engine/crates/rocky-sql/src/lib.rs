@@ -1,5 +1,6 @@
 pub mod check_expression;
 pub mod consumed_columns;
+pub mod cte_names;
 pub mod defer;
 pub mod determinism;
 pub mod dialect;

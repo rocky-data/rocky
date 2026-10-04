@@ -297,7 +297,8 @@ pub fn generate_max_loaded_at_sql(
         None => String::new(),
     };
     Ok(format!(
-        "SELECT COUNT(*) AS row_count, MAX({field}) AS max_loaded_at FROM {table_ref}{where_clause}"
+        "SELECT COUNT(*) AS row_count, {} AS max_loaded_at FROM {table_ref}{where_clause}",
+        dialect.max_aggregate(field)
     ))
 }
 

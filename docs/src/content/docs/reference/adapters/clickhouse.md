@@ -191,6 +191,10 @@ Rocky reads column types from `system.columns`. It peels `Nullable(…)` into th
 
 Other types keep their ClickHouse name and are unknown to the type checker: unsigned and 128/256-bit integers, `FixedString`, `Date32`, `UUID`, `Enum`, `Array`, `Map`, `Tuple` and `JSON`. An unknown type is never an error. A contract on such a column reports "not checked".
 
+A column added by drift (or by `on_schema_change = "append_new_columns"`) is added as `Nullable(T)`, so rows that predate it read `NULL`, not `''` or `0`. Types ClickHouse cannot wrap in `Nullable` (`Array`, `Map`, `Tuple`, `Variant`, …) are added as they are.
+
+`MAX` over no rows returns the type's default in ClickHouse (`1970-01-01 00:00:00` for a `DateTime`). Freshness checks and watermark reads use `maxOrNull`, so an empty table reads as empty, not as fresh in 1970.
+
 When a source column's type changes, Rocky rebuilds the target table. It does not run `ALTER TABLE … MODIFY COLUMN`, because the reported type has no `Nullable` wrapper and the change could drop a column's nullability.
 
 ## Compile-time checks

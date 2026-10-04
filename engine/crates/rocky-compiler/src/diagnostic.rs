@@ -318,6 +318,20 @@ pub const E052: &str = "E052";
 ///   compile time; `rocky run` refuses at SQL generation if the model runs on
 ///   ClickHouse.
 pub const E053: &str = "E053";
+/// SQL Server cannot run a model's SQL as written: its CTEs cannot be lifted
+/// to the head of the statement.
+///
+/// T-SQL accepts `WITH` only at the start of a statement, so Rocky lifts
+/// every CTE — nested ones included, such as those an inlined `ephemeral`
+/// model brings — into one leading list
+/// (`rocky_sqlserver::tsql::hoist_ctes`). Nested CTEs whose names collide are
+/// renamed in their own scope first (`final` → `final__2`). Emitted by the
+/// CLI's adapter check when every configured warehouse is SQL Server and the
+/// lift is still impossible: the SQL does not parse for the rename, or a
+/// nested CTE's name is also used unqualified elsewhere in the statement
+/// (for example as a column). A project that also configures another
+/// warehouse is not refused at compile time.
+pub const E054: &str = "E054";
 
 // Warnings
 /// Unused model (no downstream consumers).

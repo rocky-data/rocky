@@ -561,7 +561,10 @@ async fn query_max_ts(
     if rocky_sql::validation::validate_identifier(ts_column).is_err() {
         return None;
     }
-    let sql = format!("SELECT MAX({ts_column}) FROM {table_ref}");
+    let sql = format!(
+        "SELECT {} FROM {table_ref}",
+        warehouse.dialect().max_aggregate(ts_column)
+    );
     let result = warehouse.execute_query(&sql).await.ok()?;
     let cell = result.rows.first().and_then(|r| r.first())?;
     cell.as_str().and_then(super::run::parse_timestamp_cell)

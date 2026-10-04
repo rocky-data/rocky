@@ -612,6 +612,10 @@ pub(crate) struct CteScopeStack {
     frames: Vec<CteScope>,
     case_rules: IdentifierCaseRules,
     recursive_visibility: RecursiveCteVisibility,
+    /// Treat every `WITH` as recursive. T-SQL has no `RECURSIVE` keyword: a
+    /// CTE that names itself is recursive, so its own alias is in scope in
+    /// its body.
+    implicit_recursion: bool,
 }
 
 impl CteScopeStack {
@@ -623,7 +627,14 @@ impl CteScopeStack {
             frames: Vec::new(),
             case_rules,
             recursive_visibility,
+            implicit_recursion: false,
         }
+    }
+
+    /// Every `WITH` counts as recursive (T-SQL; see the field).
+    pub(crate) fn with_implicit_recursion(mut self) -> Self {
+        self.implicit_recursion = true;
+        self
     }
 
     /// The lookup form of an identifier: resolved the way the warehouse
@@ -662,7 +673,10 @@ impl CteScopeStack {
         let mut frame = CteScope {
             aliases: Vec::new(),
             body_addr: HashMap::new(),
-            recursive: query.with.as_ref().is_some_and(|w| w.recursive),
+            recursive: query
+                .with
+                .as_ref()
+                .is_some_and(|w| w.recursive || self.implicit_recursion),
             region: Region::Body,
         };
         if let Some(with) = &query.with {
@@ -684,6 +698,29 @@ impl CteScopeStack {
         if let Some(parent) = self.frames.last_mut() {
             parent.region = Region::Body;
         }
+    }
+
+    /// The CTE `value` binds to at this point of the walk: the frame's depth
+    /// (0 = outermost query) and the alias's index in that query's `WITH`
+    /// list. The innermost visible alias wins.
+    pub(crate) fn resolve(&self, value: &str, quoted: bool) -> Option<(usize, usize)> {
+        let name = self.lookup_form(value, quoted);
+        self.frames
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(depth, frame)| {
+                frame
+                    .visible(self.recursive_visibility)
+                    .iter()
+                    .rposition(|alias| *alias == name)
+                    .map(|index| (depth, index))
+            })
+    }
+
+    /// The number of queries the walk is currently inside.
+    pub(crate) fn depth(&self) -> usize {
+        self.frames.len()
     }
 
     /// Whether `value` names a CTE in scope at this point of the walk.

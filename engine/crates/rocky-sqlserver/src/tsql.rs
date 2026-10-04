@@ -17,11 +17,17 @@
 //! leading list and returns the CTE-free remainder, so the dialect can put
 //! the `WITH` where T-SQL wants it.
 //!
-//! The rewrite is refused (`None`, and the caller sends the text unchanged
-//! so the server reports its own error) when it could change meaning: two
-//! CTEs with the same name, or a nested CTE name that the rest of the
-//! statement also uses as an unqualified name (lifting it would make that
-//! reference resolve to the CTE).
+//! Lifting as written could change meaning when two CTEs share a name (an
+//! inlined ephemeral model and its consumer both define `final`) or a
+//! nested CTE name is also used unqualified elsewhere in the statement
+//! (lifting it would make that reference resolve to the CTE). Then the
+//! statement goes through the SQL AST first
+//! ([`rocky_sql::cte_names::uniquify_cte_names`]): each colliding nested
+//! CTE gets a distinct name (`final__2`) and only the references that bind
+//! to it in its own scope are rewritten. The rewrite is refused (`None`)
+//! only when even the renamed statement cannot be lifted, or the text does
+//! not parse; `rocky compile` reports that as `E054`, and at run time the
+//! caller sends the text unchanged so the server reports its own error.
 
 /// `[name]`, with `]` doubled — T-SQL's delimited identifier.
 #[must_use]
@@ -295,11 +301,22 @@ impl Hoisted {
 
 /// Lift every CTE in `sql` — leading or nested at any depth — into one
 /// leading `WITH` list. A text with no CTE comes back unchanged with an
-/// empty `with_clause`. `None` when the rewrite could change the
-/// statement's meaning or a `WITH` does not parse as a CTE list (see the
+/// empty `with_clause`. Colliding nested CTE names are renamed in scope
+/// through the SQL AST first. `None` when the lift could still change the
+/// statement's meaning, or a `WITH` does not parse as a CTE list (see the
 /// module docs).
 #[must_use]
 pub fn hoist_ctes(sql: &str) -> Option<Hoisted> {
+    if let Some(hoisted) = hoist_as_written(sql) {
+        return Some(hoisted);
+    }
+    let dialect = sqlparser::dialect::MsSqlDialect {};
+    let renamed = rocky_sql::cte_names::uniquify_cte_names(sql, &dialect).ok()??;
+    hoist_as_written(&renamed)
+}
+
+/// [`hoist_ctes`] without the rename: `None` on any name collision.
+fn hoist_as_written(sql: &str) -> Option<Hoisted> {
     let trimmed = sql.trim_start_matches(|c: char| c.is_whitespace() || c == ';');
     let toks = scan(trimmed);
 
@@ -508,22 +525,67 @@ mod tests {
     }
 
     #[test]
-    fn meaning_changing_rewrites_are_refused() {
-        // Two CTEs named `x`.
-        assert!(
-            hoist_ctes("WITH x AS (SELECT 1 AS v) SELECT * FROM (WITH x AS (SELECT 2 AS v) SELECT v FROM x) AS s").is_none()
+    fn colliding_nested_names_are_renamed_in_scope_before_lifting() {
+        // Two CTEs named `x`: the nested one becomes `x__2`, and only the
+        // read inside its own scope follows it.
+        let h = hoist(
+            "WITH x AS (SELECT 1 AS v) SELECT * FROM (WITH x AS (SELECT 2 AS v) SELECT v FROM x) AS s",
         );
+        assert_eq!(
+            h.with_clause,
+            "WITH x AS (SELECT 1 AS v\n),\nx__2 AS (SELECT 2 AS v\n)"
+        );
+        assert_eq!(h.body, "SELECT * FROM (\nSELECT v FROM x__2 AS x\n) AS s");
         // The outer query reads a TABLE named `x`; lifting the nested CTE
-        // `x` would redirect it.
-        assert!(
-            hoist_ctes(
-                "SELECT * FROM x JOIN (WITH x AS (SELECT 2 AS v) SELECT v FROM x) AS s ON 1 = 1"
-            )
-            .is_none()
+        // `x` as written would redirect it, so the CTE is renamed instead.
+        let h =
+            hoist("SELECT * FROM x JOIN (WITH x AS (SELECT 2 AS v) SELECT v FROM x) AS s ON 1 = 1");
+        assert_eq!(h.with_clause, "WITH x__2 AS (SELECT 2 AS v\n)");
+        assert_eq!(
+            h.body,
+            "SELECT * FROM x JOIN (\nSELECT v FROM x__2 AS x\n) AS s ON 1 = 1"
         );
         // A qualified `[marts].[x]` is not captured by a CTE named `x`.
         let h = hoist("MERGE_TARGET [marts].[x] (WITH x AS (SELECT 2 AS v) SELECT v FROM x)");
         assert_eq!(h.with_clause, "WITH x AS (SELECT 2 AS v\n)");
+    }
+
+    /// The inliner's output for two ephemeral models that each end in
+    /// `WITH final AS …`, read by a consumer with its own `final`.
+    #[test]
+    fn ephemeral_inlining_with_shared_cte_names_lifts_to_one_with() {
+        let sql = "WITH __rocky_ephemeral__stg_a AS (WITH final AS (SELECT id, v FROM raw) SELECT * FROM final), \
+                   __rocky_ephemeral__stg_b AS (WITH final AS (SELECT id, v + 1 AS w FROM raw) SELECT * FROM final), \
+                   final AS (SELECT a.id, a.v, b.w FROM __rocky_ephemeral__stg_a AS a JOIN __rocky_ephemeral__stg_b AS b ON a.id = b.id) \
+                   SELECT * FROM final";
+        let h = hoist(sql);
+        assert_eq!(
+            h.with_clause,
+            "WITH final__2 AS (SELECT id, v FROM raw\n),\n\
+             __rocky_ephemeral__stg_a AS (SELECT * FROM final__2 AS final\n),\n\
+             final__3 AS (SELECT id, v + 1 AS w FROM raw\n),\n\
+             __rocky_ephemeral__stg_b AS (SELECT * FROM final__3 AS final\n),\n\
+             final AS (SELECT a.id, a.v, b.w FROM __rocky_ephemeral__stg_a AS a JOIN __rocky_ephemeral__stg_b AS b ON a.id = b.id\n)"
+        );
+        assert_eq!(h.body, "SELECT * FROM final");
+        assert_eq!(h.with_clause.matches("WITH").count(), 1);
+    }
+
+    #[test]
+    fn unliftable_statements_are_refused() {
+        // The nested CTE `v` shares its name with a column the outer query
+        // reads unqualified; no CTE collides, so nothing is renamed and the
+        // token check still refuses.
+        assert!(
+            hoist_ctes("SELECT v FROM (WITH v AS (SELECT 1 AS v) SELECT v FROM v) AS s").is_none()
+        );
+        // A collision in text the SQL parser cannot read.
+        assert!(
+            hoist_ctes(
+                "WITH x AS (SELECT 1 AS v) SELECT * FROM (WITH x AS (SELECT 2 AS v) SELECT v FROM x) AS s ~~ ("
+            )
+            .is_none()
+        );
     }
 
     #[test]

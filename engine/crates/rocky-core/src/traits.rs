@@ -1451,6 +1451,18 @@ pub trait SqlDialect: Send + Sync {
         format!("ALTER TABLE {table_ref} ADD COLUMN {column} {data_type}")
     }
 
+    /// The maximum of `column` over the rows read, `NULL` when there are
+    /// none. Used by every `MAX(<timestamp>)` read Rocky interprets as "no
+    /// rows yet" when NULL: freshness, the incremental watermark, the
+    /// replication watermark. `column` is validated by the caller.
+    ///
+    /// Default: `MAX(<column>)`, which is NULL over no rows in standard SQL.
+    /// ClickHouse overrides: its `max` over no rows returns the type's
+    /// default (`1970-01-01 00:00:00` for a `DateTime`), not NULL.
+    fn max_aggregate(&self, column: &str) -> String {
+        format!("MAX({column})")
+    }
+
     /// `expr` minus `amount` `unit`s, where `unit` is a singular upper-case
     /// keyword (`SECOND`, `MINUTE`, `HOUR`, `DAY`). Used for an incremental
     /// model's `lookback` against `MAX(<watermark>)`.
@@ -1541,6 +1553,17 @@ pub trait SqlDialect: Send + Sync {
     /// it requires `DATE_SUB(CURRENT_DATE(), INTERVAL N DAY)`.
     fn date_minus_days_expr(&self, days: u32) -> AdapterResult<String> {
         Ok(format!("CURRENT_DATE - INTERVAL '{days}' DAY"))
+    }
+
+    /// A timestamp literal for a `time_interval` window bound: the partition
+    /// filter (`<time_column> >= <start> AND … < <end>`) and the
+    /// `@start_date` / `@end_date` placeholders. `ts` is whole seconds, UTC.
+    ///
+    /// Default: `'YYYY-MM-DD HH:MM:SS'`. SQL Server overrides: under
+    /// `SET DATEFORMAT dmy` (or a language that implies it) that string
+    /// compared with a `DATETIME` column reads as year-day-month.
+    fn timestamp_literal(&self, ts: &DateTime<Utc>) -> String {
+        format!("'{}'", ts.format("%Y-%m-%d %H:%M:%S"))
     }
 
     /// A SQL interval literal of `amount` units, where `unit` is a singular

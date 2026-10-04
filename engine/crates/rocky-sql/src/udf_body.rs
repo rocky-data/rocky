@@ -10,10 +10,17 @@
 //!
 //! The rewrite walks the parsed expression, never the raw text, so a string
 //! literal or a function name that happens to spell an argument is left alone.
+//! So is the date-part argument of `DATEADD` / `DATEDIFF` / `DATE_PART`
+//! (`DATEADD(day, n, d)`): Redshift reads a bare word there as a date-part
+//! keyword, never as a value, so an argument named `day` does not bind there.
 
+use std::collections::HashSet;
 use std::ops::ControlFlow;
 
-use sqlparser::ast::{Expr, SelectItem, SetExpr, Statement, Value, visit_expressions_mut};
+use sqlparser::ast::{
+    Expr, FunctionArg, FunctionArgExpr, FunctionArguments, SelectItem, SetExpr, Statement, Value,
+    VisitMut, VisitorMut,
+};
 use sqlparser::dialect::RedshiftSqlDialect;
 use sqlparser::parser::Parser;
 
@@ -53,31 +60,13 @@ pub fn positional_params(body: &str, params: &[&str]) -> Result<String, String> 
         return Err("the body is not a single scalar expression".to_string());
     };
 
-    let position = |name: &str| {
-        params
-            .iter()
-            .position(|p| p.eq_ignore_ascii_case(name))
-            .map(|i| i + 1)
+    let mut visitor = Positional {
+        params,
+        dateparts: HashSet::new(),
+        qualified: None,
     };
-    let mut qualified = None;
-    let _: ControlFlow<()> = visit_expressions_mut(&mut expr, |e| {
-        match e {
-            Expr::Identifier(ident) => {
-                if let Some(n) = position(&ident.value) {
-                    *e = Expr::value(Value::Placeholder(format!("${n}")));
-                }
-            }
-            Expr::CompoundIdentifier(parts) => {
-                if let Some(first) = parts.first()
-                    && position(&first.value).is_some()
-                {
-                    qualified.get_or_insert_with(|| first.value.clone());
-                }
-            }
-            _ => {}
-        }
-        ControlFlow::Continue(())
-    });
+    let _: ControlFlow<()> = VisitMut::visit(&mut expr, &mut visitor);
+    let qualified = visitor.qualified;
     if let Some(name) = qualified {
         return Err(format!(
             "the body uses argument `{name}` in a qualified reference, which has no \
@@ -85,6 +74,78 @@ pub fn positional_params(body: &str, params: &[&str]) -> Result<String, String> 
         ));
     }
     Ok(expr.to_string())
+}
+
+/// Functions whose FIRST argument is a Redshift date part (`day`, `month`,
+/// …): an identifier literal, not an expression. `DATE_TRUNC` is not here —
+/// it takes the date part as a string expression.
+/// <https://docs.aws.amazon.com/redshift/latest/dg/r_Dateparts_for_datetime_functions.html>
+const DATEPART_FIRST: &[&str] = &[
+    "dateadd",
+    "date_add",
+    "datediff",
+    "date_diff",
+    "date_part",
+    "datepart",
+    "pgdate_part",
+];
+
+struct Positional<'a> {
+    params: &'a [&'a str],
+    /// Addresses of the date-part argument expressions, which are never
+    /// parameter references.
+    dateparts: HashSet<usize>,
+    qualified: Option<String>,
+}
+
+impl Positional<'_> {
+    fn position(&self, name: &str) -> Option<usize> {
+        self.params
+            .iter()
+            .position(|p| p.eq_ignore_ascii_case(name))
+            .map(|i| i + 1)
+    }
+}
+
+impl VisitorMut for Positional<'_> {
+    type Break = ();
+
+    fn pre_visit_expr(&mut self, e: &mut Expr) -> ControlFlow<()> {
+        let addr = std::ptr::from_mut(e).addr();
+        match e {
+            Expr::Function(f)
+                if f.name.0.last().and_then(|p| p.as_ident()).is_some_and(|i| {
+                    DATEPART_FIRST
+                        .iter()
+                        .any(|n| i.value.eq_ignore_ascii_case(n))
+                }) =>
+            {
+                if let FunctionArguments::List(list) = &mut f.args
+                    && let Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(first))) =
+                        list.args.first_mut()
+                    && matches!(first, Expr::Identifier(_))
+                {
+                    self.dateparts.insert(std::ptr::from_mut(first).addr());
+                }
+            }
+            Expr::Identifier(ident) => {
+                if !self.dateparts.contains(&addr)
+                    && let Some(n) = self.position(&ident.value)
+                {
+                    *e = Expr::value(Value::Placeholder(format!("${n}")));
+                }
+            }
+            Expr::CompoundIdentifier(parts) => {
+                if let Some(first) = parts.first()
+                    && self.position(&first.value).is_some()
+                {
+                    self.qualified.get_or_insert_with(|| first.value.clone());
+                }
+            }
+            _ => {}
+        }
+        ControlFlow::Continue(())
+    }
 }
 
 #[cfg(test)]
@@ -116,6 +177,34 @@ mod tests {
         assert_eq!(
             positional_params("upper(x) || x", &["x"]).unwrap(),
             "upper($1) || $1"
+        );
+    }
+
+    /// `DATEADD(day, n, day)` with arguments `day, n`: the first `day` is the
+    /// date-part keyword, the last is the argument.
+    #[test]
+    fn date_part_keywords_are_not_parameters() {
+        assert_eq!(
+            positional_params("DATEADD(day, n, day) + INTERVAL '1 day'", &["day", "n"]).unwrap(),
+            "DATEADD(day, $2, $1) + INTERVAL '1 day'"
+        );
+        assert_eq!(
+            positional_params(
+                "datediff(Month, month, m) + date_part(month, month)",
+                &["month", "m"]
+            )
+            .unwrap(),
+            "datediff(Month, $1, $2) + date_part(month, $1)"
+        );
+        // Outside the date-part position the same name is the argument.
+        assert_eq!(
+            positional_params("day + DATE_TRUNC(day, x) + upper(day)", &["day", "x"]).unwrap(),
+            "$1 + DATE_TRUNC($1, $2) + upper($1)"
+        );
+        // A nested call in date-part position is an expression, not a keyword.
+        assert_eq!(
+            positional_params("DATEADD(day, 1, DATEADD(day, day, x))", &["day", "x"]).unwrap(),
+            "DATEADD(day, 1, DATEADD(day, $1, $2))"
         );
     }
 

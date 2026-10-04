@@ -203,7 +203,10 @@ pub(super) async fn query_max(
     rocky_sql::validation::validate_identifier(column)
         .with_context(|| format!("invalid watermark column '{column}'"))?;
     let result = warehouse
-        .execute_query(&format!("SELECT MAX({column}) FROM {target_ref}"))
+        .execute_query(&format!(
+            "SELECT {} FROM {target_ref}",
+            warehouse.dialect().max_aggregate(column)
+        ))
         .await
         .map_err(anyhow::Error::from)
         .with_context(|| format!("reading MAX({column}) from {target_ref} failed"))?;
