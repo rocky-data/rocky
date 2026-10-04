@@ -426,7 +426,13 @@ pub(crate) fn config_posture(config_path: Option<&Path>) -> rocky_server::state:
     match rocky_core::config::load_optional_project_config(config_path) {
         Ok(Some(config)) => ConfigLabels {
             state_backend: Some(config.state.backend),
-            concurrency_control: Some(config.state.concurrency_control),
+            // The requested mode: the explicit setting, or the backend default
+            // when unset. No probe runs here — this is a label read, not a
+            // writer — so a store that turns out not to honour conditional
+            // writes is reported by `rocky doctor`, not by this field.
+            concurrency_control: Some(
+                rocky_core::state_sync::requested_concurrency_control(&config.state).0,
+            ),
             config_status: ConfigStatus::Loaded,
         },
         Ok(None) => ConfigLabels {
@@ -1180,6 +1186,39 @@ mod tests {
         assert_eq!(labels.config_status, ConfigStatus::Loaded);
         assert_eq!(labels.state_backend, Some(StateBackend::S3));
         assert_eq!(labels.concurrency_control, Some(ConcurrencyControl::Cas));
+    }
+
+    /// An unset `concurrency_control` reports the backend default, not `off`:
+    /// `cas` on a conditional-write backend (#1228).
+    #[test]
+    fn an_unset_concurrency_control_reports_the_backend_default() {
+        use rocky_core::config::ConcurrencyControl;
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("rocky.toml");
+        for (state, expected) in [
+            (
+                "backend = \"s3\"\ns3_bucket = \"example\"\n",
+                ConcurrencyControl::Cas,
+            ),
+            ("backend = \"local\"\n", ConcurrencyControl::Off),
+        ] {
+            std::fs::write(
+                &config,
+                format!(
+                    "[adapter]\ntype = \"duckdb\"\n\n\
+                     [pipeline.p]\ntype = \"transformation\"\nmodels = \"models/**\"\n\n\
+                     [pipeline.p.target]\nadapter = \"default\"\n\n\
+                     [state]\n{state}"
+                ),
+            )
+            .unwrap();
+            assert_eq!(
+                config_posture(Some(&config)).concurrency_control,
+                Some(expected),
+                "{state}"
+            );
+        }
     }
 
     /// Neither set → loopback-only mode, exactly as before.

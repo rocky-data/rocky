@@ -82,6 +82,9 @@ struct FaultState {
     armed: HashMap<FaultOp, FaultMode>,
     /// Deterministic conditional conflicts, targeted to an exact object path.
     precondition_failures: HashMap<String, u32>,
+    /// Simulate a store that accepts conditional-write headers and ignores
+    /// them (older S3-compatible stores): every put lands unconditionally.
+    ignore_conditional_writes: bool,
 }
 
 fn lock(state: &Mutex<FaultState>) -> std::sync::MutexGuard<'_, FaultState> {
@@ -156,6 +159,26 @@ impl FaultHandle {
         lock(&self.0)
             .precondition_failures
             .insert(path.into(), count);
+    }
+
+    /// Make the store accept conditional writes and silently ignore their
+    /// preconditions, as some older S3-compatible stores do. Each put is still
+    /// counted by the kind the caller asked for.
+    pub fn ignore_conditional_writes(&self, ignore: bool) {
+        lock(&self.0).ignore_conditional_writes = ignore;
+    }
+
+    /// `put_opts` calls observed on paths that do NOT start with `prefix`,
+    /// across every write condition. Lets a test count state writes while
+    /// ignoring the startup conditional-write probe's throwaway object
+    /// (`cas-probe/…`). Faulted puts are not counted.
+    pub fn put_count_outside(&self, prefix: &str) -> u64 {
+        lock(&self.0)
+            .put_counts
+            .iter()
+            .filter(|((path, _), _)| !path.starts_with(prefix))
+            .map(|(_, n)| *n)
+            .sum()
     }
 
     /// Number of `put_opts` calls observed for an exact object path and write
@@ -236,6 +259,14 @@ impl ObjectStore for FaultingStore {
     ) -> object_store::Result<PutResult> {
         self.check(FaultOp::Put)?;
         self.record_put(location, &opts.mode)?;
+        let opts = if lock(&self.state).ignore_conditional_writes {
+            PutOptions {
+                mode: PutMode::Overwrite,
+                ..opts
+            }
+        } else {
+            opts
+        };
         self.inner.put_opts(location, payload, opts).await
     }
 

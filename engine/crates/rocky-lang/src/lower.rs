@@ -596,8 +596,20 @@ fn lower_expr(expr: &Expr) -> String {
             list,
             negated,
         } => {
-            let e = lower_expr(expr);
+            // Parenthesise a compound operand so SQL precedence cannot regroup
+            // it. Prefix `not` binds tightest in the DSL, so the AST for
+            // `not flag in [...]` is `(not flag) in [...]`; bare `NOT flag IN
+            // (...)` would read as `NOT (flag IN (...))` in SQL.
+            let e = match expr.as_ref() {
+                Expr::BinaryOp { .. } | Expr::UnaryOp { .. } => {
+                    format!("({})", lower_expr(expr))
+                }
+                _ => lower_expr(expr),
+            };
             let items: Vec<String> = list.iter().map(lower_expr).collect();
+            // `not in` keeps SQL's three-valued `NOT IN`, unlike the NULL-safe
+            // `!=`: a NULL operand, or a NULL in the list with no match, makes
+            // the test NULL, so `where` drops the row.
             let not = if *negated { "NOT " } else { "" };
             format!("{e} {not}IN ({})", items.join(", "))
         }
@@ -2339,8 +2351,6 @@ where amount > 100"#,
 
     #[test]
     fn test_lower_in_list() {
-        // NOTE: Parser does not yet support `in [...]` syntax (TODO: Plan 16).
-        // Test the lowering handler directly via constructed AST.
         let file = RockyFile {
             let_bindings: vec![],
             pipeline: vec![
@@ -2925,6 +2935,47 @@ derive {
         .unwrap();
         let sql = lower_to_sql(&file).unwrap();
         assert!(sql.contains("amount % 10 AS remainder"), "got: {sql}");
+    }
+
+    // --- InList from source text ---
+
+    #[test]
+    fn test_lower_parsed_in_and_not_in() {
+        let file = crate::parser::parse(
+            "from orders\nwhere status in [\"active\", \"pending\"] and region not in [\"eu\"]",
+        )
+        .unwrap();
+        let sql = lower_to_sql(&file).unwrap();
+        assert!(
+            sql.contains("WHERE status IN ('active', 'pending') AND region NOT IN ('eu')"),
+            "got: {sql}"
+        );
+    }
+
+    #[test]
+    fn test_lower_parsed_not_in_with_null_keeps_sql_semantics() {
+        // Decision: `not in` matches SQL `NOT IN` (three-valued), it is NOT
+        // rewritten into a NULL-safe form the way `!=` is. A NULL in the
+        // list therefore makes the predicate NULL for every non-matching row.
+        let file = crate::parser::parse("from orders\nwhere priority not in [1, null]").unwrap();
+        let sql = lower_to_sql(&file).unwrap();
+        assert!(
+            sql.contains("WHERE priority NOT IN (1, NULL)"),
+            "got: {sql}"
+        );
+        assert!(!sql.contains("DISTINCT FROM"), "got: {sql}");
+    }
+
+    #[test]
+    fn test_lower_parsed_in_parenthesises_compound_operand() {
+        // Prefix `not` binds tightest: `(not flag) in [...]`, kept grouped.
+        let file = crate::parser::parse("from t\nwhere not flag in [true]").unwrap();
+        let sql = lower_to_sql(&file).unwrap();
+        assert!(sql.contains("WHERE (NOT flag) IN (TRUE)"), "got: {sql}");
+
+        let file = crate::parser::parse("from t\nderive { hit: a + 1 in [2, 3] }").unwrap();
+        let sql = lower_to_sql(&file).unwrap();
+        assert!(sql.contains("(a + 1) IN (2, 3) AS hit"), "got: {sql}");
     }
 
     // --- InList edge: single element ---

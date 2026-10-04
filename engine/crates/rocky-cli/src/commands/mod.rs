@@ -2,6 +2,7 @@ mod adapter;
 mod ai;
 mod ai_contract;
 pub mod apply;
+pub(crate) mod approval_scope;
 mod archive;
 pub(crate) mod audit;
 mod backfill;

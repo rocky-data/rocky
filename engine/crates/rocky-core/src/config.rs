@@ -682,34 +682,43 @@ impl std::fmt::Display for StateBackend {
 /// outside the retry), `rocky gc`, `rocky restore`, and `rocky apply`'s
 /// governed rule decision and verify-after custody (#1242). The guarantee
 /// holds only when every writer sharing the `[state]` location runs with
-/// `cas`: one writer left on `off` still uploads unconditionally and can
-/// overwrite the others.
+/// `cas`. To keep one writer left on `off` from overwriting the others, the
+/// first compare-and-swap upload creates a `cas-required` marker beside the
+/// state object, and an unconditional upload that finds the marker refuses
+/// (#1228).
 //
 // Kept free of rustdoc intra-doc links on purpose: `schemars` exports this
 // comment verbatim as the JSON Schema `description`, which surfaces in editor
 // tooltips and the OpenAPI document, where `[text][path]` renders as noise.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+//
+// Deliberately no `Default` impl: the default is per backend (see
+// `StateConfig::concurrency_control`), so a context-free default would be
+// the wrong answer on every backend that supports compare-and-swap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum ConcurrencyControl {
-    /// Unconditional last-writer-wins upload (default) — byte-identical to the
-    /// pre-CAS behaviour. Correct for single-writer-per-prefix deployments
-    /// (one run at a time, orchestrator-serialized).
-    #[default]
+    /// Unconditional last-writer-wins upload — byte-identical to the pre-CAS
+    /// behaviour. The default on `local` and `valkey`, and an explicit opt-out
+    /// elsewhere. Correct for single-writer-per-prefix deployments (one run at
+    /// a time, orchestrator-serialized). An `off` writer refuses to upload
+    /// once a `cas-required` marker exists beside the state object.
     Off,
-    /// Compare-and-swap: the end-of-run upload is conditional on the remote
-    /// object still carrying the generation the run downloaded. A run that lost
-    /// a cross-pod race fail-closes (nonzero exit) instead of erasing the
-    /// winner. Requires a backend with a durable conditional-write object tier
-    /// (`s3`, `gcs`, or `tiered`); auto-downgrades to `off` (with a warn) on
-    /// `local` and `valkey`, which have no such tier.
+    /// Compare-and-swap: every write of the shared state object is conditional
+    /// on the remote object still carrying the generation the writer
+    /// downloaded. A run that lost a cross-pod race fail-closes (nonzero exit)
+    /// instead of erasing the winner; a ledger seam replays its transition onto
+    /// the winner. The default on `s3`, `gcs`, and `tiered`. Requires a backend
+    /// with a durable conditional-write object tier; auto-downgrades to `off`
+    /// (with a warn) on `local` and `valkey`, which have no such tier. When set
+    /// explicitly, a startup probe that finds the store does not honour
+    /// conditional writes is an error rather than a silent downgrade.
     ///
     /// On `tiered` the compare-and-swap runs against the durable S3 leg and the
     /// Valkey tier is kept coherent with it: a cached copy is stored together
     /// with the generation it was committed at, and a read may only use it
     /// after that generation is confirmed to still be the durable object's.
     /// Enabling `cas` also disables the mid-run periodic state uploader, on
-    /// every backend. It protects the end-of-run upload only — see the
-    /// type-level note on the ledger-seam writers that still bypass it.
+    /// every backend.
     Cas,
 }
 
@@ -902,21 +911,24 @@ pub struct StateConfig {
     #[serde(default)]
     pub freeze_marker_writes: bool,
 
-    /// Concurrency control for remote state writes. Default
-    /// [`ConcurrencyControl::Off`] (unconditional last-writer-wins, byte-
-    /// identical to pre-CAS). Set to `"cas"` on live multi-pod deployments with
-    /// a durable object tier (`s3`, `gcs`, `tiered`) so a writer that lost a
-    /// cross-pod race is reconciled by writer class instead of silently
-    /// overwriting the winner: the end-of-run upload fail-closes, and the
-    /// ledger seams — `rocky policy` freeze/unfreeze, `rocky gc`, `rocky
-    /// restore`, and `rocky apply`'s governed rule decision and verify-after
-    /// custody — replay their transition onto the winner (#1242). The
-    /// protection holds only between writers that all run with `cas`: a writer
-    /// on the same state with `off` still uploads unconditionally. On `tiered`
-    /// it additionally makes the Valkey tier coherent with the durable object.
-    /// Auto-downgrades to `off` (with a warn) on `local` and `valkey`.
+    /// Concurrency control for remote state writes: `"cas"` or `"off"`.
+    /// Unset means the backend default, resolved at startup: `cas` on
+    /// backends with a durable conditional-write object tier (`s3`, `gcs`,
+    /// `tiered`), `off` on `local` and `valkey`. On the `cas` backends a cheap
+    /// startup probe confirms the store really honours conditional writes
+    /// (some S3-compatible stores do not); an unset mode falls back to `off`
+    /// with a warning when it does not, and an explicit `"cas"` fails with an
+    /// error. Under `cas` a writer that lost a cross-pod race is reconciled by
+    /// writer class instead of silently overwriting the winner: the end-of-run
+    /// upload fail-closes, and the ledger seams — `rocky policy`
+    /// freeze/unfreeze, `rocky gc`, `rocky restore`, and `rocky apply`'s
+    /// governed rule decision and verify-after custody — replay their
+    /// transition onto the winner (#1242). The first `cas` upload creates a
+    /// `cas-required` marker beside the state object; an `off` writer that
+    /// finds it refuses its unconditional upload (#1228). On `tiered` `cas`
+    /// additionally makes the Valkey tier coherent with the durable object.
     #[serde(default)]
-    pub concurrency_control: ConcurrencyControl,
+    pub concurrency_control: Option<ConcurrencyControl>,
 }
 
 impl Default for StateConfig {
@@ -937,7 +949,7 @@ impl Default for StateConfig {
             namespacing: StateNamespacing::default(),
             on_schema_mismatch: SchemaMismatchPolicy::default(),
             freeze_marker_writes: false,
-            concurrency_control: ConcurrencyControl::default(),
+            concurrency_control: None,
         }
     }
 }

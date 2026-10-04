@@ -238,6 +238,29 @@ from orders
 where email is not null
 ```
 
+### List membership: `in` and `not in`
+
+Test a value against a bracketed list:
+
+```
+from orders
+where status in ["active", "pending"] and region not in ["test"]
+```
+
+Lowers to `WHERE status IN ('active', 'pending') AND region NOT IN ('test')`.
+
+`not in` is **not** NULL-safe. It keeps SQL's `NOT IN` semantics, unlike `!=`:
+
+| Rocky | SQL | NULL behavior |
+|-------|-----|---------------|
+| `a in [1, 2]` | `a IN (1, 2)` | `NULL` when `a` is `NULL` |
+| `a not in [1, 2]` | `a NOT IN (1, 2)` | `NULL` when `a` is `NULL`, so `where` drops the row |
+| `a not in [1, null]` | `a NOT IN (1, NULL)` | Never true: `NULL` or `FALSE` for every row |
+
+Keep `NULL` out of a `not in` list. To keep rows where `a` is `NULL`, write `a is null or a not in [...]`.
+
+The list needs at least one value. A trailing comma is allowed. A prefix `not` binds tightest, so write `a not in [...]`, not `not a in [...]`.
+
 ## Window functions
 
 Window functions use an `over` clause with `partition`, `sort`, and optional frame:
