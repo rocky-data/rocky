@@ -273,6 +273,20 @@ pub const E046: &str = "E046";
 /// Absence is only an error when the model lists its columns itself; under
 /// `SELECT *` the compile-time schema may be stale, so it is W049 instead.
 pub const E049: &str = "E049";
+/// A model references a `private` model outside that model's ownership group.
+///
+/// Emitted by `rocky compile` for each such reference, on the consumer. Also
+/// emitted on a `private` model that belongs to no group (it could never be
+/// referenced). On the cross-project path it fires when a consumer's
+/// `[[sources]]` entry reads a producer model the producer did not publish as
+/// `public`. See `rocky_core::model_governance`.
+pub const E047: &str = "E047";
+
+/// A model-version problem: a version declaration whose `latest_version` is
+/// not declared, a declared version with no `<name>_v<N>` model, or a
+/// reference to a version that is not declared (or to the bare name of a
+/// versioned model whose `latest_alias` is off).
+pub const E048: &str = "E048";
 
 // Warnings
 /// Unused model (no downstream consumers).
@@ -441,6 +455,11 @@ pub const W046: &str = "W046";
 /// date, or a key / change column missing from a `SELECT *` model's
 /// compile-time schema, which may be stale.
 pub const W049: &str = "W049";
+/// A model references a model version whose `deprecation_date` has passed or
+/// falls within the next 30 days. The reference still compiles; move it to
+/// the latest version. The date is checked against today's UTC date, or
+/// `ROCKY_GOVERNANCE_TODAY` (`YYYY-MM-DD`) when set.
+pub const W048: &str = "W048";
 
 // Info
 /// Model dependency inferred from SQL.

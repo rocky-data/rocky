@@ -53,7 +53,11 @@ use std::path::Path;
 use rocky_compiler::diagnostic::{self, Diagnostic};
 use rocky_core::breaking_change::{BreakingChange, diff_project_ir};
 use rocky_core::config::RockyConfig;
-use rocky_core::imports::{ImportsError, PinStatus, load_snapshot, verify_pin};
+use rocky_core::imports::{
+    ImportsError, PinStatus, SnapshotGovernance, load_snapshot, load_snapshot_with_governance,
+    verify_pin,
+};
+use rocky_core::model_governance::{DeprecationStatus, deprecation_status};
 use rocky_core::models::Model;
 
 /// How a consumer model references a producer target.
@@ -162,18 +166,46 @@ pub fn imports_diagnostics(
     config_dir: &Path,
     consumer_models: &[Model],
 ) -> Vec<Diagnostic> {
+    imports_diagnostics_at(
+        config,
+        config_dir,
+        consumer_models,
+        rocky_core::model_governance::governance_today(),
+    )
+}
+
+/// [`imports_diagnostics`] with an injected "today" for the W048
+/// deprecation window.
+pub fn imports_diagnostics_at(
+    config: &RockyConfig,
+    config_dir: &Path,
+    consumer_models: &[Model],
+    today: chrono::NaiveDate,
+) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
 
     for (import_name, entry) in &config.imports {
         let dir = config_dir.join(&entry.path);
 
-        let current = match load_snapshot(&dir, &entry.snapshot) {
-            Ok(ir) => ir,
+        let (current, governance) = match load_snapshot_with_governance(&dir, &entry.snapshot) {
+            Ok(loaded) => loaded,
             Err(e) => {
                 diagnostics.push(load_failure_diagnostic(import_name, "snapshot", &e));
                 continue;
             }
         };
+
+        // E047 / W048 — access and deprecation of the producer models each
+        // consumer reads through `[[sources]]`. Needs no baseline.
+        if let Some(gov) = &governance {
+            governance_import_diagnostics(
+                &mut diagnostics,
+                import_name,
+                gov,
+                consumer_models,
+                today,
+            );
+        }
 
         // E033 — recipe-hash pin verification.
         if let PinStatus::Mismatch { expected, actual } = verify_pin(&current, entry.pin.as_deref())
@@ -319,6 +351,70 @@ pub fn imports_diagnostics(
     }
 
     diagnostics
+}
+
+/// E047 for a consumer source that names a producer model the producer
+/// withheld (not `public`); W048 for one that names a deprecated version.
+fn governance_import_diagnostics(
+    diagnostics: &mut Vec<Diagnostic>,
+    import_name: &str,
+    gov: &SnapshotGovernance,
+    consumer_models: &[Model],
+    today: chrono::NaiveDate,
+) {
+    for model in consumer_models {
+        for source in &model.config.sources {
+            let target = source_full_name(source);
+            if let Some(withheld) = gov.withheld.get(&target) {
+                diagnostics.push(
+                    Diagnostic::error(
+                        diagnostic::E047,
+                        &model.config.name,
+                        format!(
+                            "import '{import_name}': model '{}' reads '{target}', but producer \
+                             model '{}' is {} — only public models may be referenced from \
+                             another project",
+                            model.config.name, withheld.name, withheld.access
+                        ),
+                    )
+                    .with_suggestion(format!(
+                        "ask the producer to set `access = \"public\"` on '{}' and republish, \
+                         or read a public model instead",
+                        withheld.name
+                    )),
+                );
+                continue;
+            }
+            let Some(info) = gov.models.get(&target).and_then(|m| m.version.as_ref()) else {
+                continue;
+            };
+            let Some(date) = info.deprecation_date else {
+                continue;
+            };
+            let when = match deprecation_status(Some(date), today) {
+                DeprecationStatus::NotDeprecated => continue,
+                DeprecationStatus::Past { .. } => format!("was deprecated on {date}"),
+                DeprecationStatus::Upcoming { days } => {
+                    format!("will be deprecated on {date} (in {days} day(s))")
+                }
+            };
+            diagnostics.push(
+                Diagnostic::warning(
+                    diagnostic::W048,
+                    &model.config.name,
+                    format!(
+                        "import '{import_name}': model '{}' reads '{target}', a version of \
+                         '{}' that {when}",
+                        model.config.name, info.model
+                    ),
+                )
+                .with_suggestion(format!(
+                    "move to the latest version (v{}) of '{}'",
+                    info.latest_version, info.model
+                )),
+            );
+        }
+    }
 }
 
 /// Classify a snapshot load failure. A snapshot declaring a too-new format

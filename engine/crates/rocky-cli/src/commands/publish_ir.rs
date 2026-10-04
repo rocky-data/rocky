@@ -30,6 +30,9 @@ use anyhow::{Context, Result};
 use rocky_compiler::compile::{self, CompilerConfig};
 use rocky_ir::ProjectIr;
 
+use rocky_core::imports::{ExportedModelGovernance, SnapshotGovernance, WithheldModel};
+use rocky_core::model_governance::ModelAccess;
+
 use super::ci_diff::project_ir_from_compile;
 use super::compile::load_source_schemas_from_seed;
 
@@ -53,6 +56,69 @@ fn degenerate_models(ir: &ProjectIr) -> Vec<String> {
         .filter(|m| m.typed_columns.is_empty())
         .map(|m| m.target.full_name())
         .collect()
+}
+
+/// Keep only the models a consumer may read, and describe the rest.
+///
+/// A model is exported when its access is `public`. A project in which no
+/// model declares `access` at all predates access levels: every model is
+/// exported, as before, with a notice on stderr. Once any model declares
+/// `access`, only `public` models are exported; the others are listed as
+/// withheld so a consumer that reads one gets E047 rather than a silent miss.
+fn governed_export(
+    result: &rocky_compiler::compile::CompileResult,
+    mut ir: ProjectIr,
+) -> Result<(ProjectIr, SnapshotGovernance)> {
+    let models = &result.project.models;
+    let legacy = models.iter().all(|m| m.config.governance.access.is_none());
+    let mut governance = SnapshotGovernance::default();
+    let mut exported = std::collections::HashSet::new();
+    for m in models {
+        let gov = &m.config.governance;
+        let t = &m.config.target;
+        let target = format!("{}.{}.{}", t.catalog, t.schema, t.table);
+        let access = gov.effective_access();
+        if legacy || access == ModelAccess::Public {
+            exported.insert(m.config.name.clone());
+            governance.models.insert(
+                target,
+                ExportedModelGovernance {
+                    name: m.config.name.clone(),
+                    access: gov.access,
+                    access_group: gov.access_group.clone(),
+                    owner: gov.owner.clone(),
+                    version: gov.version.clone(),
+                },
+            );
+        } else {
+            governance.withheld.insert(
+                target,
+                WithheldModel {
+                    name: m.config.name.clone(),
+                    access,
+                },
+            );
+        }
+    }
+    if legacy {
+        if !models.is_empty() {
+            eprintln!(
+                "notice: no model declares `access`, so all {} model(s) are published. Set \
+                 `access = \"public\"` on the models other projects may read; once any model \
+                 declares `access`, only public models are published.",
+                models.len()
+            );
+        }
+        return Ok((ir, governance));
+    }
+    if exported.is_empty() {
+        anyhow::bail!(
+            "refusing to publish an IR snapshot with no models: models declare `access`, but \
+             none is `access = \"public\"`, and only public models are published"
+        );
+    }
+    ir.models.retain(|m| exported.contains(m.name.as_ref()));
+    Ok((ir, governance))
 }
 
 /// Execute `rocky publish-ir`.
@@ -111,7 +177,7 @@ pub fn run_publish_ir(
         );
     }
 
-    let project_ir = project_ir_from_compile(&result);
+    let (project_ir, governance) = governed_export(&result, project_ir_from_compile(&result))?;
 
     // Guard the silent-no-op footgun. A snapshot whose models carry no
     // `typed_columns` looks enforced to a consumer but can never detect a
@@ -153,11 +219,19 @@ pub fn run_publish_ir(
 
     // Write through the versioned envelope ({snapshot_version, ir}) so a
     // future format bump is detectable by older consumers (which fail closed).
-    rocky_core::imports::write_snapshot(&project_ir, out_path)
+    rocky_core::imports::write_snapshot_with_governance(&project_ir, Some(&governance), out_path)
         .with_context(|| format!("failed to write snapshot to {}", out_path.display()))?;
 
+    let withheld = if governance.withheld.is_empty() {
+        String::new()
+    } else {
+        format!(
+            ", {} non-public model(s) withheld",
+            governance.withheld.len()
+        )
+    };
     println!(
-        "published IR snapshot: {} model(s) -> {} (recipe_hash {})",
+        "published IR snapshot: {} model(s) -> {} (recipe_hash {}{withheld})",
         project_ir.models.len(),
         out_path.display(),
         recipe_hash,

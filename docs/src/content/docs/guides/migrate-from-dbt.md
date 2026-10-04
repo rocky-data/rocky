@@ -303,6 +303,7 @@ It translates the rest of the project like this:
 - `{{ var('name') }}` / `{{ var('name', default) }}` → an `@var(name)` / `@var(name, default)` run-variable marker left in the emitted SQL, resolved at run time by `rocky run --var name=value` (see [Handle unsupported Jinja](#3-handle-unsupported-jinja))
 - dbt **tags** (node- and folder-level) → the sidecar `[tags]` block (`<tag> = "true"`)
 - `{{ this }}` → the model's own fully-qualified `catalog.schema.table`
+- dbt **model governance** → [Rocky model governance](/concepts/model-governance/). See [Access, groups and versions](#access-groups-and-versions) below.
 - **dbt generic tests** (`unique`, `not_null`, `accepted_values`, `relationships`) → `[[tests]]` blocks, column by column. This includes the *configured* forms that carry `severity:` (a `warn` becomes a Rocky warning, not a hard error) and `where:` (a row filter). See [Generic test mapping](#generic-test-mapping) below.
 - model-level **`dbt_utils.unique_combination_of_columns`** → a Rocky `composite` uniqueness `[[tests]]` block over the same column tuple. The columns come from the test config, so Rocky needs no model schema.
 - Top-level `dbt_project.yml` → the project name and the seeds path
@@ -604,6 +605,30 @@ region = "emea"
 A group differs from a dbt folder default in one way that matters when you migrate. A dbt folder default applies to every model in the directory on its own. A Rocky config group applies only to the models that name it with `group = "<name>"`. Precedence runs per-model sidecar over group over `models/_defaults.toml`, so a member can still override anything the group sets.
 
 A group also takes `enforce = true`. With that set, a member model that pins a field the group controls, its target schema or its strategy, fails to load. It does not diverge quietly. The group stops being an overridable default and becomes a guarantee that every model in it routes and materializes the same way.
+
+### Access, groups and versions
+
+dbt's [model governance](https://docs.getdbt.com/docs/mesh/govern/about-model-governance) maps onto [Rocky model governance](/concepts/model-governance/). The importer carries each part over:
+
+| dbt | Rocky |
+|---|---|
+| `access: private \| protected \| public` | `access = "..."` in the model sidecar. The meaning is the same. |
+| `group: finance` on a model | `access_group = "finance"` in the model sidecar. |
+| `groups:` entry with `owner: {name, email}` | `models/groups/finance.toml` with an `[owner]` table. |
+| `versions:` with `v: 1`, `v: 2` | Models `orders_v1` and `orders_v2`, plus the version declaration `models/orders.toml`. |
+| `latest_version: 2` | `latest_version = 2` in the declaration. `FROM orders` reads the latest version through a view. |
+| `deprecation_date` on a version | `deprecation_date = "YYYY-MM-DD"` on the version in the declaration. A reader gets `W048`. |
+| `{{ ref('orders', v=1) }}` | `orders_v1`, a pinned version. |
+| `{{ ref('orders') }}` to a versioned model | `orders`, the latest version. |
+
+Two points to check:
+
+- As in dbt, only `public` models may be read from another project. Rocky checks this in `rocky publish-ir` and in the consumer's `[[sources]]`.
+- Rocky versions are whole numbers. A dbt version such as `1.5` is refused with a reason; rename it to a whole number first.
+
+When dbt's latest version already materializes to the unversioned name (an `alias`), the importer sets `latest_alias = false` in the declaration, so the alias view does not collide with that table.
+
+With a manifest, dbt has already resolved every `access` and `group`, including `+access` and `+group` folder defaults from `dbt_project.yml`. Without a manifest, the importer reads `access` and `group` only from the model YAML or its `config:` block. It does not read the folder defaults, so set those on the models after import.
 
 ## 5. Compile the Imported Models
 
