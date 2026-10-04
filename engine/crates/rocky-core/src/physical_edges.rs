@@ -42,6 +42,12 @@ pub struct PhysicalEdgeModel<'a> {
     /// The configured adapter name for this model. Runtime scheduling treats
     /// distinct names as routing hints, not proof of distinct tables.
     pub adapter: Option<&'a str>,
+    /// The adapter's warehouse type (`duckdb`, `databricks`, `snowflake`, …).
+    /// Two models whose adapters are of different types write through
+    /// different engines, so they never write one table (#2202). Two adapters
+    /// of one type may still be aliases of one warehouse or metastore, so a
+    /// shared type proves nothing.
+    pub adapter_type: Option<&'a str>,
     pub catalog: &'a str,
     pub schema: &'a str,
     pub table: &'a str,
@@ -79,6 +85,7 @@ impl<'a> PhysicalEdgeModel<'a> {
         Self {
             name: &m.config.name,
             adapter: None,
+            adapter_type: None,
             catalog: &m.config.target.catalog,
             schema: &m.config.target.schema,
             table: &m.config.target.table,
@@ -99,6 +106,13 @@ impl<'a> PhysicalEdgeModel<'a> {
     #[must_use]
     pub fn with_adapter(mut self, adapter: &'a str) -> Self {
         self.adapter = Some(adapter);
+        self
+    }
+
+    /// Record the adapter's warehouse type. See [`Self::adapter_type`].
+    #[must_use]
+    pub fn with_adapter_type(mut self, adapter_type: &'a str) -> Self {
+        self.adapter_type = Some(adapter_type).filter(|t| !t.trim().is_empty());
         self
     }
 }
@@ -356,8 +370,18 @@ pub fn derive_physical_edges(
     for same_target in by_three.values() {
         for (index, first) in same_target.iter().enumerate() {
             for second in same_target.iter().skip(index + 1) {
-                // Different adapter names can still address one metastore.
-                // Skip a collision only when both catalogs are known to differ.
+                // Adapters of different warehouse types write through
+                // different engines: the same spelled target is two tables
+                // (#2202). Compared folded, as the config spells the type.
+                if matches!(
+                    (first.adapter_type, second.adapter_type),
+                    (Some(a), Some(b)) if fold_identifier(a) != fold_identifier(b)
+                ) {
+                    continue;
+                }
+                // Different adapter names of ONE type can still address one
+                // metastore. Skip a collision only when both catalogs are
+                // known to differ.
                 let first_catalog = first
                     .effective_catalog
                     .filter(|_| fold_identifier(first.catalog).is_empty())
@@ -662,6 +686,7 @@ mod tests {
         PhysicalEdgeModel {
             name,
             adapter: None,
+            adapter_type: None,
             catalog,
             schema,
             table,
@@ -884,6 +909,35 @@ mod tests {
         assert_eq!(d.unbound_reads[0].reason, UnboundReason::SeveralProducers);
         assert_eq!(d.unbound_reads[0].candidates, vec!["local", "remote"]);
         assert_eq!(d.target_collisions, vec![("local".into(), "remote".into())]);
+    }
+
+    /// #2202: two adapters of different warehouse types never write one
+    /// table, whatever the target is spelled. Two adapters of ONE type still
+    /// collide when their catalogs are not known to differ: they may be
+    /// aliases of one metastore.
+    #[test]
+    fn adapters_of_different_types_never_collide() {
+        let models = [
+            m("on_duck", "c", "s", "orders", "SELECT 1 AS x")
+                .with_adapter("local")
+                .with_adapter_type("duckdb"),
+            m("on_snow", "c", "s", "orders", "SELECT 2 AS x")
+                .with_adapter("warehouse")
+                .with_adapter_type("snowflake"),
+        ];
+        let d = derive_physical_edges(&models, &[]);
+        assert!(d.target_collisions.is_empty(), "{d:?}");
+
+        let models = [
+            m("east", "c", "s", "orders", "SELECT 1 AS x")
+                .with_adapter("east")
+                .with_adapter_type("databricks"),
+            m("west", "c", "s", "orders", "SELECT 2 AS x")
+                .with_adapter("west")
+                .with_adapter_type("Databricks"),
+        ];
+        let d = derive_physical_edges(&models, &[]);
+        assert_eq!(d.target_collisions, vec![("east".into(), "west".into())]);
     }
 
     /// Producers that ALL declare a catalog can never be the table a read of

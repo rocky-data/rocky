@@ -3386,14 +3386,113 @@ mod tests {
         }
     }
 
+    /// #2202 item 2: a seed and a model writing one table are refused at
+    /// graph build even when nothing reads the table. Before, the model gate
+    /// looked at models only, so the two became unordered nodes and
+    /// whichever finished last decided the rows.
+    #[test]
+    fn a_seed_and_a_model_writing_one_table_are_refused_without_a_reader() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write_fixture_project(
+            root,
+            &transformation_block("t"),
+            &[("orders_copy", "main", "seeds", "orders", "SELECT 1 AS id")],
+        );
+        std::fs::create_dir_all(root.join("seeds")).unwrap();
+        std::fs::write(root.join("seeds/orders.csv"), "id\n1\n").unwrap();
+        let err = plan_fixture(root).expect_err("two writers of one table must refuse");
+        let message = format!("{err:#}");
+        assert!(
+            matches!(
+                err.downcast_ref::<unified_dag::UnifiedDagError>(),
+                Some(unified_dag::UnifiedDagError::DuplicateProducerTarget { .. })
+            ),
+            "{message}"
+        );
+        assert!(
+            message.contains("model 'orders_copy' (target main.seeds.orders)")
+                && message.contains("seed 'orders' (target main.seeds.orders)")
+                && message.contains("adapter 'local'"),
+            "{message}"
+        );
+
+        // The control: the model writes another schema, and the plan builds.
+        write_fixture_project(
+            root,
+            &transformation_block("t"),
+            &[("orders_copy", "main", "silver", "orders", "SELECT 1 AS id")],
+        );
+        plan_fixture(root).expect("different tables plan cleanly");
+    }
+
+    /// #2202 item 2: a load pipeline and a model writing one table are
+    /// refused at graph build, as two models would be.
+    #[test]
+    fn a_load_pipeline_and_a_model_writing_one_table_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write_fixture_project(
+            root,
+            &format!(
+                "{}[pipeline.ingest]\ntype = \"load\"\nsource_dir = \"data/\"\n\n\
+                 [pipeline.ingest.target]\nadapter = \"local\"\ncatalog = \"prod\"\n\
+                 schema = \"bronze\"\ntable = \"events\"\n",
+                transformation_block("t")
+            ),
+            &[("events_copy", "prod", "bronze", "events", "SELECT 1 AS id")],
+        );
+        let err = plan_fixture(root).expect_err("two writers of one table must refuse");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("load pipeline 'ingest' (target prod.bronze.events)")
+                && message.contains("model 'events_copy' (target prod.bronze.events)"),
+            "{message}"
+        );
+    }
+
+    /// #2202 item 3 through the production planner: a model whose
+    /// `depends_on` names a label a seed and a model share is refused, not
+    /// bound to whichever node was built last.
+    #[test]
+    fn depends_on_a_label_a_seed_and_a_model_share_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write_fixture_project(
+            root,
+            &transformation_block("t"),
+            &[
+                ("orders", "main", "silver", "orders", "SELECT 1 AS id"),
+                ("mart", "main", "marts", "mart", "SELECT 1 AS id"),
+            ],
+        );
+        std::fs::write(
+            root.join("models/mart.toml"),
+            "name = \"mart\"\ndepends_on = [\"orders\"]\n\n[strategy]\ntype = \"full_refresh\"\n\n\
+             [target]\ncatalog = \"main\"\nschema = \"marts\"\ntable = \"mart\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("seeds")).unwrap();
+        std::fs::write(root.join("seeds/orders.csv"), "id\n1\n").unwrap();
+        let message = format!(
+            "{:#}",
+            plan_fixture(root).expect_err("an ambiguous depends_on must refuse")
+        );
+        assert!(
+            message.contains("model 'mart' declares depends_on 'orders'")
+                && message.contains("model 'orders' and seed 'orders'"),
+            "{message}"
+        );
+    }
+
     /// Two writers of one table, through the production planner and real seed
     /// discovery. A model `orders` writes `main.seeds.orders`, and so does the
     /// sidecar-free seed `orders.csv`: the seed loader defaults it to the
     /// `seeds` schema and to the catalog of the pipeline the seeds load
     /// against (`main`, its fallback, for a project with no replication
-    /// pipeline), and drops and recreates whatever is there. A read of
-    /// `main.seeds.orders` cannot be pinned to the model alone — it is
-    /// refused, not resolved to one of two definite writers.
+    /// pipeline), and drops and recreates whatever is there. Since #2202 the
+    /// duplicate-target gate refuses the two writers before any read is
+    /// resolved; the message still names both, with their targets.
     #[test]
     fn a_sidecar_free_seed_and_a_model_writing_one_table_make_its_readers_ambiguous() {
         let dir = tempfile::tempdir().unwrap();
