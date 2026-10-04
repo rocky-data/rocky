@@ -21,7 +21,7 @@
           "description": "The resolved verdict (`allow` / `require_review` / `deny`)."
         },
         "model": {
-          "description": "The model the decision was about.",
+          "description": "The model the decision was about. A resolved `${VAR}` value prints as `${NAME}` (#1919).",
           "type": "string"
         },
         "plan_id": {
@@ -37,7 +37,7 @@
           "description": "Who was acting (`human` / `agent`)."
         },
         "reason": {
-          "description": "Human-readable explanation of how the effect was reached.",
+          "description": "Human-readable explanation of how the effect was reached. A resolved `${VAR}` value prints as `${NAME}` (#1919).",
           "type": "string"
         },
         "rule_id": {

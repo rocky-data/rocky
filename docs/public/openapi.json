@@ -1428,7 +1428,7 @@
             "description": "The resolved verdict (`allow` / `require_review` / `deny`)."
           },
           "model": {
-            "description": "The model the decision was about.",
+            "description": "The model the decision was about. A resolved `${VAR}` value prints as `${NAME}` (#1919).",
             "type": "string"
           },
           "plan_id": {
@@ -1444,7 +1444,7 @@
             "description": "Who was acting (`human` / `agent`)."
           },
           "reason": {
-            "description": "Human-readable explanation of how the effect was reached.",
+            "description": "Human-readable explanation of how the effect was reached. A resolved `${VAR}` value prints as `${NAME}` (#1919).",
             "type": "string"
           },
           "rule_id": {
@@ -1867,7 +1867,7 @@
         "description": "One post-apply verification outcome inside [`AuditChainVerify`] — a decision-ledger custody row with a non-empty `verify_after` check list.\n\nThe ledger records the required check names, the aggregate verdict (`allow` = every named check passed, `deny` = a check failed or was absent and the apply halted), and a human-readable reason; per-check pass/fail detail beyond that lives only in the reason string, which is rendered verbatim rather than re-parsed.",
         "properties": {
           "checks": {
-            "description": "The named post-apply checks the verification required.",
+            "description": "The named post-apply checks the verification required. A resolved `${VAR}` value prints as `${NAME}` (#1919).",
             "items": {
               "type": "string"
             },
@@ -1882,7 +1882,7 @@
             "type": "string"
           },
           "reason": {
-            "description": "The recorded outcome, verbatim from the custody row.",
+            "description": "The recorded outcome from the custody row, with each resolved `${VAR}` value printed as `${NAME}` (#1919).",
             "type": "string"
           },
           "timestamp": {

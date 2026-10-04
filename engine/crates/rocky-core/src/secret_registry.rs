@@ -224,6 +224,50 @@ pub fn render_placeholders(text: &str) -> String {
     out
 }
 
+/// [`render_placeholders`] over every string in a JSON document: string
+/// values and object keys, at any depth. Numbers, booleans and structure are
+/// left as they are.
+///
+/// For an output that is built as a `serde_json::Value` from a config type
+/// rather than from typed fields, such as a plan's config snapshot (#1919).
+pub fn render_json_placeholders(value: serde_json::Value) -> serde_json::Value {
+    use serde_json::Value;
+    if is_empty() {
+        return value;
+    }
+    match value {
+        Value::String(s) => Value::String(render_placeholders(&s)),
+        Value::Array(items) => {
+            Value::Array(items.into_iter().map(render_json_placeholders).collect())
+        }
+        Value::Object(map) => Value::Object(
+            map.into_iter()
+                .map(|(k, v)| (render_placeholders(&k), render_json_placeholders(v)))
+                .collect(),
+        ),
+        other => other,
+    }
+}
+
+/// A copy of `value` with every registered value in it written as `${NAME}`.
+///
+/// Serializes to JSON, renders every string with [`render_json_placeholders`]
+/// and reads the result back as the same type. For an output struct that
+/// embeds a config type wholesale, such as a model's `TargetConfig` in
+/// `rocky compile` (#1919), so its JSON schema stays the config type's own.
+///
+/// The returned copy is for printing only. Its strings are placeholders, not
+/// the values the code runs with.
+pub fn render_placeholders_in<T>(value: &T) -> Result<T, serde_json::Error>
+where
+    T: serde::Serialize + serde::de::DeserializeOwned,
+{
+    if is_empty() {
+        return serde_json::from_value(serde_json::to_value(value)?);
+    }
+    serde_json::from_value(render_json_placeholders(serde_json::to_value(value)?))
+}
+
 /// Whether anything has been registered.
 ///
 /// The middleware uses this to skip the scan entirely on a server whose config
@@ -317,6 +361,24 @@ mod tests {
         assert!(!out.contains("RENDER-XYZ"), "{out}");
         assert_eq!(out, "x ${ROCKY_RENDER_A}${ROCKY_RENDER_B} y");
         assert_eq!(render_placeholders("nothing here"), "nothing here");
+    }
+
+    #[test]
+    fn render_json_placeholders_rewrites_values_and_keys_at_any_depth() {
+        let secret = "ROCKY-RENDER-JSON-5e0c71aa";
+        register_substitution("ROCKY_RENDER_JSON", secret);
+        let doc = serde_json::json!({
+            "adapter": { secret: { "path": format!("/data/{secret}.db"), "port": 5432 } },
+            "list": [secret, true, null],
+        });
+        let out = render_json_placeholders(doc).to_string();
+        assert!(!out.contains(secret), "{out}");
+        assert!(out.contains("/data/${ROCKY_RENDER_JSON}.db"), "{out}");
+        assert!(
+            out.contains("\"${ROCKY_RENDER_JSON}\":{"),
+            "keys too: {out}"
+        );
+        assert!(out.contains("5432"), "{out}");
     }
 
     /// Two variables carrying the same value is not an error, and the map must

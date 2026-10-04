@@ -216,6 +216,8 @@ pub fn compute_catalog_output(
         let t = &m.config.target;
         target_fqns.insert(
             m.config.name.clone(),
+            // A target prints resolved, as `rocky run`'s `asset_key` does
+            // (#1919).
             format!("{}.{}.{}", t.catalog, t.schema, t.table),
         );
     }
@@ -225,7 +227,10 @@ pub fn compute_catalog_output(
     let mut intents: HashMap<String, String> = HashMap::new();
     for m in &result.project.models {
         if let Some(intent) = &m.config.intent {
-            intents.insert(m.config.name.clone(), intent.clone());
+            intents.insert(
+                m.config.name.clone(),
+                rocky_core::secret_registry::render_placeholders(intent),
+            );
         }
     }
 
@@ -282,7 +287,7 @@ pub fn compute_catalog_output(
                     description: column_docs
                         .get(name)
                         .and_then(|cols| cols.get(&col.name))
-                        .cloned(),
+                        .map(|doc| rocky_core::secret_registry::render_placeholders(doc)),
                 }
             })
             .collect();
