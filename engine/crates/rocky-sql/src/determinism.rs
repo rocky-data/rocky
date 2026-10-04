@@ -64,6 +64,22 @@ pub(crate) const VOLATILE_FUNCTIONS: &[&str] = &[
     "CURRENT_CATALOG",
     "CURRENT_SCHEMA",
     "CURRENT_DATABASE",
+    // DuckDB and Postgres spellings. DuckDB pins the "now" family to the
+    // transaction start, so two builds in one transaction agree on them;
+    // only a static scan can see that the SQL reads the clock at all.
+    "GET_CURRENT_TIMESTAMP",
+    "GET_CURRENT_TIME",
+    "TODAY",
+    "TRANSACTION_TIMESTAMP",
+    "STATEMENT_TIMESTAMP",
+    "CLOCK_TIMESTAMP",
+    "CURRENT_LOCALTIMESTAMP",
+    "CURRENT_LOCALTIME",
+    "UUIDV4",
+    "UUIDV7",
+    "SETSEED",
+    "NEXTVAL",
+    "CURRVAL",
 ];
 
 /// Volatile builtins that take no parentheses and therefore parse as a bare
@@ -295,6 +311,122 @@ pub fn is_deterministic(sql: &str) -> bool {
     query_is_deterministic(&query)
 }
 
+/// Returns `true` when `sql` calls a known volatile builtin: a clock, random,
+/// UUID, sequence or session function from [`VOLATILE_FUNCTIONS`] /
+/// [`VOLATILE_BARE_IDENTIFIERS`].
+///
+/// This is narrower than [`is_deterministic`]. It does **not** flag unknown
+/// functions, so ordinary warehouse-specific functions do not trip it. Use
+/// it where a separate check (for example, building the SQL twice and
+/// comparing) covers the unknown functions.
+///
+/// Fail-safe: when `sql` does not parse, the scan falls back to a lexical
+/// pass. That pass flags any word outside string literals, quoted
+/// identifiers and comments that equals a volatile name, with or without
+/// parentheses. A column named `today` then reads as volatile, which is the
+/// safe direction.
+#[must_use]
+pub fn contains_volatile_builtin(sql: &str) -> bool {
+    match parse_single_statement(sql) {
+        Ok(statement) => {
+            let mut found = false;
+            let _: ControlFlow<()> = visit_expressions(&statement, |expr| {
+                if is_volatile_builtin_expr(expr) {
+                    found = true;
+                    return ControlFlow::Break(());
+                }
+                ControlFlow::Continue(())
+            });
+            found
+        }
+        Err(_) => lexical_volatile_scan(sql),
+    }
+}
+
+/// Returns `true` when `sql` has a row limit (`LIMIT` / `FETCH` / `TOP`) on a
+/// query with no `ORDER BY`, at any nesting depth. The rows such a query
+/// returns are implementation-defined.
+///
+/// Fail-safe: SQL that does not parse returns `true` when the word `LIMIT`,
+/// `FETCH` or `TOP` appears outside literals and comments.
+#[must_use]
+pub fn contains_unordered_limit(sql: &str) -> bool {
+    match parse_single_statement(sql) {
+        Ok(Statement::Query(query)) => any_unordered_limit(&query),
+        Ok(_) => false,
+        Err(_) => sql_words(sql)
+            .iter()
+            .any(|w| matches!(w.as_str(), "LIMIT" | "FETCH" | "TOP")),
+    }
+}
+
+fn is_volatile_builtin_expr(expr: &Expr) -> bool {
+    match expr {
+        Expr::Identifier(ident) => {
+            VOLATILE_BARE_IDENTIFIERS.contains(&ident.value.to_uppercase().as_str())
+        }
+        Expr::Function(func) => func
+            .name
+            .0
+            .last()
+            .and_then(|p| p.as_ident())
+            .is_some_and(|name| VOLATILE_FUNCTIONS.contains(&name.value.to_uppercase().as_str())),
+        _ => false,
+    }
+}
+
+fn lexical_volatile_scan(sql: &str) -> bool {
+    sql_words(sql).iter().any(|w| {
+        VOLATILE_FUNCTIONS.contains(&w.as_str()) || VOLATILE_BARE_IDENTIFIERS.contains(&w.as_str())
+    })
+}
+
+/// Upper-cased bare words of `sql`, skipping `'...'` string literals,
+/// `"..."` and `` `...` `` quoted identifiers, `--` line comments and
+/// `/* */` block comments.
+fn sql_words(sql: &str) -> Vec<String> {
+    let chars: Vec<char> = sql.chars().collect();
+    let mut words = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '\'' || c == '"' || c == '`' {
+            i += 1;
+            while i < chars.len() {
+                if chars[i] == c {
+                    // A doubled quote is an escaped quote, not the end.
+                    if chars.get(i + 1) == Some(&c) {
+                        i += 2;
+                        continue;
+                    }
+                    break;
+                }
+                i += 1;
+            }
+            i += 1;
+        } else if c == '-' && chars.get(i + 1) == Some(&'-') {
+            while i < chars.len() && chars[i] != '\n' {
+                i += 1;
+            }
+        } else if c == '/' && chars.get(i + 1) == Some(&'*') {
+            i += 2;
+            while i < chars.len() && !(chars[i] == '*' && chars.get(i + 1) == Some(&'/')) {
+                i += 1;
+            }
+            i += 2;
+        } else if c.is_ascii_alphabetic() || c == '_' {
+            let start = i;
+            while i < chars.len() && (chars[i].is_ascii_alphanumeric() || chars[i] == '_') {
+                i += 1;
+            }
+            words.push(chars[start..i].iter().collect::<String>().to_uppercase());
+        } else {
+            i += 1;
+        }
+    }
+    words
+}
+
 fn query_is_deterministic(query: &Query) -> bool {
     // Two independent reasons a query can be non-deterministic:
     //
@@ -404,6 +536,58 @@ fn expr_is_deterministic(expr: &Expr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn volatile_builtin_scan_flags_clock_random_and_uuid() {
+        for sql in [
+            "SELECT id, CURRENT_TIMESTAMP AS t FROM s.t",
+            "SELECT id, now() AS t FROM s.t",
+            "SELECT id FROM s.t WHERE random() < 0.5",
+            "SELECT gen_random_uuid() AS u FROM s.t",
+            "SELECT get_current_timestamp() AS t FROM s.t",
+            "SELECT today() AS d FROM s.t",
+            "SELECT transaction_timestamp() AS t FROM s.t",
+            "SELECT uuidv4() AS u, uuidv7() AS v FROM s.t",
+            "SELECT setseed(0.5)",
+            "SELECT current_user AS u FROM s.t",
+            "WITH c AS (SELECT id, rand() AS r FROM s.t) SELECT id FROM c",
+        ] {
+            assert!(contains_volatile_builtin(sql), "{sql} must be flagged");
+        }
+    }
+
+    #[test]
+    fn volatile_builtin_scan_ignores_unknown_and_pure_functions() {
+        // `is_deterministic` flags unknown functions; this scan must not.
+        for sql in [
+            "SELECT id, list_sort(xs) AS s FROM s.t",
+            "SELECT id, strftime(d, '%Y') AS y FROM s.t",
+            "SELECT customer_id, SUM(amount) AS t FROM s.o GROUP BY customer_id",
+            "SELECT 'now()' AS label, \"random\" AS r FROM s.t",
+        ] {
+            assert!(!contains_volatile_builtin(sql), "{sql} must not be flagged");
+        }
+    }
+
+    #[test]
+    fn volatile_builtin_scan_falls_back_to_words_on_unparseable_sql() {
+        // `USING SAMPLE` is DuckDB-only syntax the parser rejects.
+        assert!(contains_volatile_builtin(
+            "SELECT id, random() AS r FROM s.t USING SAMPLE 10 ROWS ((("
+        ));
+        assert!(!contains_volatile_builtin(
+            "SELECT id, 'random()' AS r FROM s.t USING SAMPLE 10 ROWS ((( -- now()"
+        ));
+    }
+
+    #[test]
+    fn unordered_limit_scan() {
+        assert!(contains_unordered_limit("SELECT id FROM s.t LIMIT 5"));
+        assert!(!contains_unordered_limit(
+            "SELECT id FROM s.t ORDER BY id LIMIT 5"
+        ));
+        assert!(!contains_unordered_limit("SELECT id FROM s.t"));
+    }
 
     #[test]
     fn plain_select_is_deterministic() {

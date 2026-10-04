@@ -55,6 +55,9 @@ pub struct PlanRunOptions {
     /// (the CLI-surface default). Stamped onto the persisted plan so a later
     /// `rocky apply` evaluates the plan against the identity that authored it.
     pub principal: Option<PolicyPrincipal>,
+    /// `--intent` (RV2-P1, experimental). Recorded in the persisted
+    /// `RunPlan`; the verdict that checks it goes on `PlanOutput` only.
+    pub intent: Option<PlanIntent>,
 }
 
 /// Execute `rocky plan` — dry-run SQL generation plus optional run-plan blueprint.
@@ -87,6 +90,15 @@ pub struct PlanRunOptions {
 /// hard gate lives on `rocky plan promote`. When no baseline is available
 /// (the `base_ref` models do not compile, or there is no `models/`
 /// directory) the verdict is omitted — never fabricated.
+///
+/// ## Intent check (experimental, report-only)
+///
+/// When `run_options.intent` is set (`--intent refactor`), `rocky plan`
+/// builds each changed model from `base_ref` and from the working tree in
+/// one DuckDB transaction and compares the outputs (see
+/// `commands::intent_check`). The verdict goes on `output.intent_check`
+/// only; the intent itself is persisted in the `RunPlan`. The verdict never
+/// gates and never changes the exit code.
 #[allow(clippy::too_many_arguments)]
 pub async fn plan(
     config_path: &Path,
@@ -478,6 +490,41 @@ pub async fn plan(
         .models_dir
         .clone()
         .unwrap_or_else(|| models_dir.clone());
+
+    // --- Intent check (RV2-P1, experimental — report-only) ---------------
+    //
+    // REPORT-ONLY, like `--semantic`: the verdict goes on `output`, never
+    // into the persisted payload (plan files are a trusted input, #1943, so
+    // an unsigned verdict there would be forgeable). It relaxes no gate and
+    // never changes the exit code (#1459). The INTENT itself is persisted
+    // via `run_options.intent` in `build_and_persist_run_plan`.
+    if let Some(intent) = run_options.intent {
+        anyhow::ensure!(
+            !run_options.dag,
+            "--intent checks the models of one pipeline and cannot be combined with --dag"
+        );
+        anyhow::ensure!(
+            blueprint_models_dir.is_dir(),
+            "--intent needs a models directory; '{}' not found",
+            blueprint_models_dir.display()
+        );
+        let adapter_type = rocky_cfg
+            .adapters
+            .get(&pipeline.target.adapter)
+            .map(|a| a.adapter_type.as_str())
+            .unwrap_or("");
+        output.intent_check = Some(
+            super::intent_check::run_intent_check(
+                intent,
+                base_ref,
+                &blueprint_models_dir,
+                run_options.model.as_deref(),
+                adapter_type,
+                warehouse_adapter.as_ref(),
+            )
+            .await?,
+        );
+    }
     if let Some(model) = run_options.model.as_deref() {
         // `--model` runs a single compiled model and skips replication;
         // `--dag` runs every pipeline as a unified DAG (including
@@ -685,6 +732,9 @@ pub async fn plan(
         render_governance_preview_text(&output);
         render_budget_diagnostics_text(&output);
         render_semantic_verdict_text(&output);
+        if let Some(check) = &output.intent_check {
+            super::intent_check::render_text(check);
+        }
         for skipped in &output.skipped {
             eprintln!("Skipped model '{}': {}", skipped.model, skipped.reason);
         }
@@ -1688,6 +1738,10 @@ fn build_and_persist_run_plan(
         // none, so its plans keep today's bytes and ids.
         product_id: None,
         spec_digest: None,
+        // RV2-P1: the stated intent is part of the hashed payload, so a plan
+        // checked as a refactor has a different id from its unchecked twin.
+        // `None` keeps the legacy bytes and plan_id.
+        intent: run_options.intent,
     };
 
     let (plan_id, persisted_at) = (|| -> Result<(String, chrono::DateTime<Utc>)> {

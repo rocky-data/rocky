@@ -619,6 +619,7 @@ fn build_run_plan(
         // A backfill re-runs existing recipes; it is never product-bound.
         product_id: None,
         spec_digest: None,
+        intent: None,
     }
 }
 

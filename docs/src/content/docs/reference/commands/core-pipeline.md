@@ -305,7 +305,7 @@ Four plan kinds are always gated, whatever the policy: `ai_authored`, `backfill`
 
 ### Flags
 
-Every flag below applies to the default `rocky plan` form, not to `rocky plan promote`. The set overlaps [`rocky run`](#rocky-run) without matching it. `rocky plan` adds `--semantic` and `--base`, which `rocky run` does not have. `rocky run` has several flags that `rocky plan` does not, including `--watch`, a re-run loop with no plan to persist. `--parallel` also defaults to `1` here, against `4` for a `rocky run` without `--dag` and no default at all for one with it.
+Every flag below applies to the default `rocky plan` form, not to `rocky plan promote`. The set overlaps [`rocky run`](#rocky-run) without matching it. `rocky plan` adds `--semantic`, `--intent` and `--base`, which `rocky run` does not have. `rocky run` has several flags that `rocky plan` does not, including `--watch`, a re-run loop with no plan to persist. `--parallel` also defaults to `1` here, against `4` for a `rocky run` without `--dag` and no default at all for one with it.
 
 Rocky records the execution flags in the plan file, so `rocky apply` replays the same intent. The recorded set is:
 
@@ -315,6 +315,8 @@ Rocky records the execution flags in the plan file, so `rocky apply` replays the
 - other: `--governance-override`, `--resume`, `--resume-latest`, `--idempotency-key`
 
 `--semantic` and `--base` are not recorded. They only add the `breaking_verdict` field to the `rocky plan` output, so `rocky apply` never repeats that classification.
+
+`--intent` is recorded as the `intent` key of the plan. The verdict that checks it is not recorded. It goes only into the `intent_check` field of the `rocky plan` output. A plan without `--intent` has no `intent` key, so its `plan_id` does not change.
 
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
@@ -341,9 +343,50 @@ Rocky records the execution flags in the plan file, so `rocky apply` replays the
 | `--idempotency-key <KEY>` | `string` | `$ROCKY_IDEMPOTENCY_KEY` | Opaque caller-supplied key that dedups this run against prior runs with the same key. Supported on the `local`, `valkey`, and `tiered` state backends; an `s3`-only or `gcs`-only backend errors when the flag is parsed. Keys are stored verbatim, so never put a secret in one. |
 | `--env <NAME>` | `string` | | Scope the governance preview (`mask_actions`) to one environment, so `[mask.<env>]` overrides overlay the workspace `[mask]` defaults. Classification tagging and retention policies are the same in every environment and are previewed regardless. |
 | `--semantic` | `bool` | `false` | Also run the breaking-change classifier against `--base` and attach the change-impact verdict under `breaking_verdict`. Decision-support only — never gates the plan and never changes the exit code. |
-| `--base <ref>` | `string` | `main` | Git ref the working tree is diffed against for `--semantic`. Ignored without `--semantic`. |
+| `--intent <INTENT>` | `string` | | **Experimental.** State what the change is meant to do, and check it on the data. The only value is `refactor`. See [Check a refactor with `--intent`](#check-a-refactor-with---intent). |
+| `--base <ref>` | `string` | `main` | Git ref the working tree is compared against. `--semantic` and `--intent` use it. The change classification that every run plan carries uses it too. |
 
 > The `--semantic` verdict diffs **output schema** only and is **blind to schema-stable value changes** (a `WHERE` / `JOIN`-key / `CASE` rewrite that changes values but not the schema). An empty `findings` list is not a safety signal: the verdict's `caveat` field states this verbatim. See the [CI/CD guide](/guides/ci-cd/#semantic-breaking-change-findings-and-the-promote-gate) for the full flow and the [`plan` schema](https://github.com/rocky-data/rocky/blob/main/schemas/plan.schema.json) for the `SemanticPlanVerdict` shape.
+
+### Check a refactor with `--intent`
+
+**Experimental.** `--intent refactor` says that a change keeps the output of every changed model. Rocky checks that claim on the data and reports one verdict per model. A changed model is one whose compiled form differs between `--base` and the working tree.
+
+```
+  --base ref ──► base SQL ──┐      one DuckDB transaction per model
+                            ├──►  build base 6 times, head 2 times
+  working tree ► head SQL ──┘     compare schema, then rows
+                                  roll back: nothing is kept
+```
+
+The check passes when the schema is the same and the two outputs hold the same rows. The schema is the column names, types and order. Rows are compared as multisets (a duplicate row counts). Equality is exact, with no tolerance for floats.
+
+| Verdict | Reason | Meaning |
+|---|---|---|
+| `match` | | The same schema and the same rows on the current data. |
+| `mismatch` | `schema_differs` | A column name, type or position changed. Both schemas are in the output. |
+| `mismatch` | `rows_differ` | The rows differ. The output gives the row counts and the rows only on each side. |
+| `mismatch` | `model_removed` | The model exists at `--base` and not in the working tree. |
+| `unverified` | `nondeterministic` | The SQL reads the clock, a random value, a UUID, a sequence or the session. Or two builds of the same SQL differ. |
+| `unverified` | `no_base` | The model is new. |
+| `unverified` | `base_unavailable` | Rocky could not read or compile the models at `--base`. |
+| `unverified` | `adapter_unsupported` | The target is not DuckDB. Rocky runs no query. |
+| `unverified` | `unsupported_strategy` | The model is `incremental`, `time_interval`, `microbatch` or `ephemeral`. |
+| `unverified` | `build_failed` | A build or a compare query failed. `detail` has the error. |
+
+Know these limits before you trust a `match`:
+
+- A `match` means no difference on the current data. It is not a proof for other data. A `WHERE` change that no current row reaches still gives `match`.
+- Rocky checks the `SELECT` output only. It does not check masks, classifications, targets, the strategy or other model config.
+- Each model reads the upstream tables that already exist in the warehouse. When an upstream model also changed, the verdict lists it in `upstream_changed`. Per-model matches do not add up to a match for the whole chain.
+- The verdict is report-only. It relaxes no gate, it does not replace review, and it never changes the exit code.
+- The check works where `rocky plan --model` works: a project with a replication pipeline. It cannot be combined with `--dag`. It pays for the extra builds on your DuckDB database.
+
+The `--intent` flag is not the free-text `intent = "..."` key in a model sidecar. That key describes a model for the AI commands. `--intent` states what one change does.
+
+```bash
+rocky plan --intent refactor --base main --output json
+```
 
 ### `rocky plan promote`
 

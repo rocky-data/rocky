@@ -650,6 +650,12 @@ class PlanResult(BaseModel):
     #: ``--semantic`` ran with a usable baseline. Kept as a loose ``dict`` — the
     #: nested shape lives on the generated ``PlanOutput.breaking_verdict``.
     breaking_verdict: dict | None = None
+    #: Experimental. Result of ``rocky plan --intent refactor``: one
+    #: ``match`` / ``mismatch`` / ``unverified`` verdict per changed model.
+    #: Report-only. Present only when ``--intent`` is set. Kept as a loose
+    #: ``dict`` — the nested shape lives on the generated
+    #: ``PlanOutput.intent_check``.
+    intent_check: dict | None = None
     #: Budget diagnostics raised at plan time. Empty when no ``[budget]`` block
     #: is configured.
     budget_diagnostics: list[Diagnostic] = []
