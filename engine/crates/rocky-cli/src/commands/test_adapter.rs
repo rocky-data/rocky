@@ -18,7 +18,14 @@ use crate::output::{TestAdapterOutput, TestAdapterTestResult};
 /// the PATH-based `rocky-<name>` process-adapter resolution so the same
 /// `--adapter <name>` flag works for both shipped adapters and installed
 /// process adapters.
-const BUILTIN_ADAPTERS: &[&str] = &["databricks", "snowflake", "duckdb", "postgres", "redshift"];
+const BUILTIN_ADAPTERS: &[&str] = &[
+    "databricks",
+    "snowflake",
+    "duckdb",
+    "postgres",
+    "redshift",
+    "sqlserver",
+];
 
 /// Run the conformance test suite against a process adapter.
 ///
@@ -158,6 +165,20 @@ pub async fn run_test_adapter_builtin(
             create_schema: true,
             merge: true,
             tablesample: false,
+            file_load: false,
+        },
+        // SQL Server / Azure SQL: MERGE, schemas but no catalogs (the
+        // database is the connection), page-level `TABLESAMPLE`. No
+        // governance or batch checks yet.
+        "sqlserver" => AdapterCapabilities {
+            warehouse: true,
+            discovery: false,
+            governance: false,
+            batch_checks: false,
+            create_catalog: false,
+            create_schema: true,
+            merge: true,
+            tablesample: true,
             file_load: false,
         },
         _ => {

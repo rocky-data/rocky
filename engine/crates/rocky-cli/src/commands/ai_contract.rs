@@ -369,9 +369,14 @@ pub(crate) async fn profile_column(
     // For low-cardinality columns, fetch the observed domain as evidence —
     // only when `--with-data` opted into shipping raw cell values.
     let observed_values = if with_data && distinct > 0 && distinct <= LOW_CARDINALITY_CAP {
-        let domain_sql = format!(
-            "SELECT DISTINCT CAST({col} AS VARCHAR) AS v FROM {table_ref} \
-             WHERE {col} IS NOT NULL ORDER BY v LIMIT {DOMAIN_FETCH_LIMIT}"
+        let dialect = adapter.dialect();
+        let domain_sql = dialect.select_limited(
+            &format!(
+                "DISTINCT CAST({col} AS {}) AS v",
+                dialect.string_type_name()
+            ),
+            &format!("FROM {table_ref} WHERE {col} IS NOT NULL ORDER BY v"),
+            DOMAIN_FETCH_LIMIT,
         );
         let dr = adapter.execute_query(&domain_sql).await.map_err(|e| {
             anyhow::anyhow!("domain query failed for column '{}': {e}", typed_col.name)
@@ -766,8 +771,10 @@ adapter = "warehouse"
         }
         #[async_trait::async_trait]
         impl WarehouseAdapter for WithDataAdapter {
+            // The domain query takes its row limit and text type from the
+            // dialect (`TOP` on SQL Server, `LIMIT` here).
             fn dialect(&self) -> &dyn SqlDialect {
-                unimplemented!()
+                &rocky_databricks::dialect::DatabricksSqlDialect
             }
             async fn execute_statement(&self, _sql: &str) -> AdapterResult<()> {
                 unimplemented!()

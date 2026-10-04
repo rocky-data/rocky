@@ -9782,6 +9782,9 @@ pub(crate) fn rewrite_quote_style(
         "bigquery" => Ok(Some('`')),
         // `format_table_ref` renders double quotes on both.
         "snowflake" | "trino" => Ok(Some('"')),
+        // `format_table_ref` renders `[brackets]`; sqlparser's `Ident` renders
+        // a `[` quote style as `[name]`.
+        "sqlserver" => Ok(Some('[')),
         other => anyhow::bail!(
             "cannot rewrite upstream references for dialect '{other}': its identifier quoting \
              is unknown, so a rewritten reference could name a different object than the one \
@@ -9981,6 +9984,15 @@ pub(crate) fn dialect_case_rules(
         // `apply_shadow_rewrite` answers it with its own always-folding
         // `collision_identity`. Do not reuse this function for it.
         "bigquery" => Ok(uniform(true)),
+        // SQL Server: identifier case follows the database COLLATION, quoted or
+        // not — the default `SQL_Latin1_General_CP1_CI_AS` folds case, a `_CS_`
+        // or `_BIN2` collation does not —
+        // learn.microsoft.com/sql/relational-databases/collations/collation-and-unicode-support
+        // The collation is database state Rocky does not read here, so this
+        // assumes case-sensitive, the fail-closed answer for the redirect
+        // question (same narrow reading as the BigQuery / Snowflake note
+        // above).
+        "sqlserver" => Ok(uniform(true)),
         // Snowflake carries a SECOND identity axis on top of case: it resolves
         // an UNQUOTED identifier by upper-casing it, while
         // `SnowflakeSqlDialect::format_table_ref` renders every component of a
@@ -14413,7 +14425,7 @@ async fn execute_one_plain_model(
     if exec_ctx.full_refresh
         && super::run_incremental::rebuilds_on_full_refresh(&model_ir.materialization)
     {
-        let rebuilt = super::run_incremental::full_refresh_ir(&model_ir);
+        let rebuilt = super::run_incremental::full_refresh_ir(&model_ir, dialect);
         recipe_ir = Some(std::mem::replace(&mut model_ir, rebuilt));
     }
     let target_ref = dialect

@@ -71,6 +71,16 @@
 //!   signature errors).
 //! - Trino — <https://trino.io/docs/current/functions/conversion.html>
 //!   ("Trino will not convert between character and numeric types").
+//! - SQL Server —
+//!   <https://learn.microsoft.com/sql/t-sql/data-types/data-type-conversion-database-engine>
+//!   (character types convert implicitly to the numeric and date/time types;
+//!   by data type precedence the character side is converted, per row, and a
+//!   malformed value fails with "Conversion failed") and
+//!   <https://learn.microsoft.com/sql/t-sql/functions/sum-transact-sql>
+//!   (`SUM` / `AVG` take "the exact numeric or approximate numeric data type
+//!   category" only: `SUM(varchar)` is "Operand data type varchar is invalid
+//!   for sum operator"). `STRING_AGG` converts non-string input to
+//!   `NVARCHAR`, so numbers are clean.
 
 use std::collections::HashSet;
 
@@ -93,15 +103,17 @@ pub enum OperandDialect {
     Databricks,
     BigQuery,
     Trino,
+    SqlServer,
 }
 
 impl OperandDialect {
-    const ALL: [OperandDialect; 5] = [
+    const ALL: [OperandDialect; 6] = [
         OperandDialect::DuckDb,
         OperandDialect::Snowflake,
         OperandDialect::Databricks,
         OperandDialect::BigQuery,
         OperandDialect::Trino,
+        OperandDialect::SqlServer,
     ];
 
     /// Map a `rocky.toml` adapter `type` to a dialect. Returns `None` for
@@ -113,6 +125,7 @@ impl OperandDialect {
             "databricks" => Some(Self::Databricks),
             "bigquery" => Some(Self::BigQuery),
             "trino" => Some(Self::Trino),
+            "sqlserver" => Some(Self::SqlServer),
             _ => None,
         }
     }
@@ -124,6 +137,7 @@ impl OperandDialect {
             Self::Databricks => "Databricks",
             Self::BigQuery => "BigQuery",
             Self::Trino => "Trino",
+            Self::SqlServer => "SQL Server",
         }
     }
 }
@@ -205,21 +219,23 @@ fn aggregate_verdict(dialect: OperandDialect, kind: AggregateKind, arg: Family) 
     match (kind, arg) {
         // Text into a numeric or boolean aggregate: DuckDB, BigQuery and
         // Trino have no overload; Snowflake and Databricks cast the text at
-        // run time.
+        // run time. SQL Server's SUM / AVG refuse a character operand at bind
+        // time (its boolean-aggregate names do not exist at all, so a call is
+        // refused either way).
         (AggregateKind::Numeric | AggregateKind::Boolean, Family::Text) => match dialect {
-            DuckDb | BigQuery | Trino => Verdict::Refused,
+            DuckDb | BigQuery | Trino | SqlServer => Verdict::Refused,
             Snowflake | Databricks => Verdict::ValueDependent,
         },
         // BigQuery `STRING_AGG` takes STRING or BYTES only.
         (AggregateKind::StringAgg, Family::Numeric) => match dialect {
             BigQuery => Verdict::Refused,
-            DuckDb | Snowflake | Databricks | Trino => Verdict::Clean,
+            DuckDb | Snowflake | Databricks | Trino | SqlServer => Verdict::Clean,
         },
         // Trino `LISTAGG` takes VARCHAR only, and Trino never converts
         // numbers to text implicitly.
         (AggregateKind::ListAgg, Family::Numeric) => match dialect {
             Trino => Verdict::Refused,
-            DuckDb | Snowflake | Databricks | BigQuery => Verdict::Clean,
+            DuckDb | Snowflake | Databricks | BigQuery | SqlServer => Verdict::Clean,
         },
         _ => Verdict::Clean,
     }
@@ -245,7 +261,7 @@ fn comparison_verdict(dialect: OperandDialect, a: &Operand<'_>, b: &Operand<'_>)
             // only as a warning, because literal coercion rules vary.
             Some(_) => Verdict::ValueDependent,
             None => match dialect {
-                DuckDb | Snowflake | Databricks => Verdict::ValueDependent,
+                DuckDb | Snowflake | Databricks | SqlServer => Verdict::ValueDependent,
                 BigQuery | Trino => Verdict::Refused,
             },
         },
@@ -254,7 +270,7 @@ fn comparison_verdict(dialect: OperandDialect, a: &Operand<'_>, b: &Operand<'_>)
             None => match dialect {
                 // Trino's rule for date-vs-varchar columns is not stated in
                 // its conversion docs; warn rather than refuse.
-                DuckDb | Snowflake | Databricks | Trino => Verdict::ValueDependent,
+                DuckDb | Snowflake | Databricks | Trino | SqlServer => Verdict::ValueDependent,
                 BigQuery => Verdict::Refused,
             },
         },
@@ -966,6 +982,7 @@ mod tests {
         for (dialect, code) in [
             (OperandDialect::BigQuery, "E042"),
             (OperandDialect::Trino, "E042"),
+            (OperandDialect::SqlServer, "E042"),
             (OperandDialect::Snowflake, "W042"),
             (OperandDialect::Databricks, "W042"),
         ] {
@@ -975,7 +992,11 @@ mod tests {
         // Unknown dialect: the least severe verdict across dialects.
         let diags = run(&[("bad_agg", D2)], None);
         assert_eq!(codes(&diags), vec!["W042"], "{diags:?}");
-        assert!(diags[0].message.contains("DuckDB, BigQuery, Trino"));
+        assert!(
+            diags[0]
+                .message
+                .contains("DuckDB, BigQuery, Trino, SQL Server")
+        );
     }
 
     #[test]
@@ -990,7 +1011,13 @@ mod tests {
         assert_eq!(codes(&diags), vec!["E043"], "{diags:?}");
         let diags = run(&[("bad_join", D5)], Some(OperandDialect::Trino));
         assert_eq!(codes(&diags), vec!["E043"], "{diags:?}");
-        for d in [OperandDialect::Snowflake, OperandDialect::Databricks] {
+        // SQL Server converts the VARCHAR side per row (data type
+        // precedence): value-dependent, like Snowflake and Databricks.
+        for d in [
+            OperandDialect::Snowflake,
+            OperandDialect::Databricks,
+            OperandDialect::SqlServer,
+        ] {
             assert_eq!(codes(&run(&[("bad_join", D5)], Some(d))), vec!["W043"]);
         }
         assert_eq!(codes(&run(&[("bad_join", D5)], None)), vec!["W043"]);

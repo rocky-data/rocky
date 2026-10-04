@@ -356,6 +356,7 @@ Rocky **writes** to a warehouse. It **reads** from a source to learn what tables
 | Trino | write | Check, plan, run. No merge yet, so `strategy = "merge"` is refused. |
 | PostgreSQL | write | Check, plan, run, merge (`MERGE` or `ON CONFLICT`), views, materialized views. Tested live. |
 | Redshift (Beta) | write | Check, plan, run, merge, dist and sort keys, late-binding views. Password auth only; SQL is unit-tested, not run live. |
+| SQL Server (Beta) | write | Check, plan, run, merge, views, incremental, `delete_insert`, `time_interval`. SQL auth or Entra ID tokens. Tested live against SQL Server 2022; Azure SQL and Fabric Warehouse are not run live. |
 | DuckDB | write | Local work and tests. No account needed. |
 | Fivetran | read | Find your connectors and the tables they land |
 | Airbyte | read | Find your connections and the tables they land |

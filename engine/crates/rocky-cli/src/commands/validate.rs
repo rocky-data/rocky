@@ -725,6 +725,30 @@ fn validate_adapter(
                 }
             }
         }
+        "sqlserver" => {
+            // Same parse the registry runs before connecting: a missing
+            // host / database, no or several auth methods, or an unknown
+            // `extra` key is reported here rather than at `rocky run`.
+            match crate::registry::sqlserver_config(name, adapter) {
+                Ok(_) => msgs.push(ValidateMessage {
+                    severity: "ok".into(),
+                    code: "V010".into(),
+                    message: format!("adapter.{name}: sqlserver"),
+                    file: None,
+                    field: None,
+                }),
+                Err(e) => {
+                    ok = false;
+                    msgs.push(ValidateMessage {
+                        severity: "warn".into(),
+                        code: "V011".into(),
+                        message: format!("{e:#}"),
+                        file: None,
+                        field: Some(format!("adapter.{name}")),
+                    });
+                }
+            }
+        }
         "airbyte" => {
             msgs.push(ValidateMessage {
                 severity: "ok".into(),

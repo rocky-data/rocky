@@ -140,6 +140,24 @@ late_binding_views = true     # views don't lock the tables they read
 ```
 
 </TabItem>
+<TabItem label="SQL Server">
+
+SQL Server, Azure SQL and Fabric Warehouse are Beta. Use SQL auth, an Entra ID access token (`oauth_token`), or an Entra ID service principal. The default port is `1433`:
+
+```toml
+[adapter.prod]
+type = "sqlserver"
+host = "${MSSQL_HOST}"        # host or host,port
+database = "analytics"
+username = "${MSSQL_USER}"
+password = "${MSSQL_PASSWORD}"
+
+[adapter.prod.extra]
+encrypt = "mandatory"         # mandatory (default) | strict | optional
+# flavor = "fabric"           # Fabric Warehouse: Entra ID auth only
+```
+
+</TabItem>
 <TabItem label="DuckDB">
 
 DuckDB runs inside the Rocky process and needs no credentials. It backs the playground and `rocky test`. Use it for local development against a file:
@@ -154,7 +172,7 @@ path = "warehouse.duckdb"
 </Tabs>
 
 :::note[Adapter status]
-Databricks is production-grade. PostgreSQL is tested live against PostgreSQL 16. Snowflake, BigQuery, and Trino are Beta: connection, execution, and the core run loop work, but conformance coverage is still growing. Redshift is Beta too, and its SQL has not yet run against a live cluster. See the [Roadmap](/getting-started/roadmap/) for the full breakdown.
+Databricks is production-grade. PostgreSQL is tested live against PostgreSQL 16. Snowflake, BigQuery, and Trino are Beta: connection, execution, and the core run loop work, but conformance coverage is still growing. Redshift is Beta too, and its SQL has not yet run against a live cluster. SQL Server is Beta: tested live against SQL Server 2022; Azure SQL and Fabric Warehouse are not run live. See the [Roadmap](/getting-started/roadmap/) for the full breakdown.
 :::
 
 ## Run against it
@@ -172,7 +190,7 @@ rocky apply "$plan_id"
 
 For a replication pipeline, scope the run with `--filter`. For example, `rocky plan --filter tenant=acme` plans one tenant.
 
-Each adapter has its own reference page for fields, authentication, and examples: [DuckDB](/reference/adapters/duckdb/), [Databricks](/reference/adapters/databricks/), [Snowflake](/reference/adapters/snowflake/), [BigQuery](/reference/adapters/bigquery/), [PostgreSQL](/reference/adapters/postgres/), [Redshift](/reference/adapters/redshift/), [Fivetran](/reference/adapters/fivetran/). The fields every adapter type shares are in [Configuration](/reference/configuration/#adaptername). Databricks auth detail is in [Authentication](/reference/authentication/).
+Each adapter has its own reference page for fields, authentication, and examples: [DuckDB](/reference/adapters/duckdb/), [Databricks](/reference/adapters/databricks/), [Snowflake](/reference/adapters/snowflake/), [BigQuery](/reference/adapters/bigquery/), [PostgreSQL](/reference/adapters/postgres/), [Redshift](/reference/adapters/redshift/), [SQL Server](/reference/adapters/sqlserver/), [Fivetran](/reference/adapters/fivetran/). The fields every adapter type shares are in [Configuration](/reference/configuration/#adaptername). Databricks auth detail is in [Authentication](/reference/authentication/).
 
 ## Next steps
 

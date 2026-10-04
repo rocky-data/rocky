@@ -299,13 +299,17 @@ fn prepare_preview(
                 None,
             ));
         }
-        wrap_with_limit(ad_trimmed, limit)
+        wrap_with_limit(&adapter_type, ad_trimmed, limit)
     } else if let Some(cte_name) = cte {
         let isolated = rocky_sql::parser::isolate_cte(&expanded, cte_name)
             .map_err(|e| fail("cte_error", &format!("{e}"), None))?;
-        wrap_with_limit(isolated.trim().trim_end_matches(';').trim(), limit)
+        wrap_with_limit(
+            &adapter_type,
+            isolated.trim().trim_end_matches(';').trim(),
+            limit,
+        )
     } else if masked.is_empty() {
-        wrap_with_limit(inner, limit)
+        wrap_with_limit(&adapter_type, inner, limit)
     } else {
         let ordered: Vec<String> = result
             .type_check
@@ -492,8 +496,15 @@ fn pipeline_target_adapter(pipeline: &PipelineConfig) -> String {
 
 /// Wrap an arbitrary `SELECT` (or `WITH … SELECT`) so it always returns at
 /// most `limit` rows, regardless of any inner `LIMIT`/`ORDER BY`.
-fn wrap_with_limit(inner: &str, limit: u32) -> String {
-    format!("SELECT * FROM ({inner}) AS rocky_preview LIMIT {limit}")
+///
+/// The adapter's dialect shapes the limit (`TOP (n)` on SQL Server, which
+/// also needs the inner query's CTEs lifted out of the derived table); an
+/// adapter type with no known dialect keeps the `LIMIT` form.
+fn wrap_with_limit(adapter_type: &str, inner: &str, limit: u32) -> String {
+    match crate::registry::warehouse_dialect_for_type(adapter_type) {
+        Some(dialect) => dialect.wrap_select_limited(inner, "rocky_preview", "*", u64::from(limit)),
+        None => format!("SELECT * FROM ({inner}) AS rocky_preview LIMIT {limit}"),
+    }
 }
 
 /// How a model's classified columns resolve against the masks in force for
@@ -645,10 +656,15 @@ fn build_masking_projection(
         return Err(unmaskable);
     }
 
-    Ok(format!(
-        "SELECT {} FROM ({inner}) AS rocky_src LIMIT {limit}",
-        items.join(", ")
-    ))
+    let list = items.join(", ");
+    Ok(
+        match crate::registry::warehouse_dialect_for_type(adapter_type) {
+            Some(dialect) => {
+                dialect.wrap_select_limited(inner, "rocky_src", &list, u64::from(limit))
+            }
+            None => format!("SELECT {list} FROM ({inner}) AS rocky_src LIMIT {limit}"),
+        },
+    )
 }
 
 /// Heuristic: does an adapter error look like a missing upstream table?
@@ -872,8 +888,13 @@ mod tests {
     #[test]
     fn test_wrap_with_limit() {
         assert_eq!(
-            wrap_with_limit("SELECT a FROM t", 100),
+            wrap_with_limit("databricks", "SELECT a FROM t", 100),
             "SELECT * FROM (SELECT a FROM t) AS rocky_preview LIMIT 100"
+        );
+        // T-SQL: TOP, and the model's CTE lifted out of the derived table.
+        assert_eq!(
+            wrap_with_limit("sqlserver", "WITH x AS (SELECT 1 AS a) SELECT a FROM x", 5),
+            "WITH x AS (SELECT 1 AS a\n)\nSELECT TOP (5) * FROM (\nSELECT a FROM x\n) AS rocky_preview"
         );
     }
 

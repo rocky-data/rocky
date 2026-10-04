@@ -55,6 +55,8 @@ use rocky_trino::{TrinoAdapter, TrinoAuth, TrinoClientConfig};
 
 use rocky_postgres::PostgresWarehouseAdapter;
 
+use rocky_sqlserver::SqlServerWarehouseAdapter;
+
 /// Adapter type strings recognised by [`AdapterRegistry::from_config`].
 ///
 /// This is the **single source of truth** for "which adapter types does
@@ -71,6 +73,7 @@ pub const KNOWN_ADAPTER_TYPES: &[&str] = &[
     "trino",
     "postgres",
     "redshift",
+    "sqlserver",
     "fivetran",
     "airbyte",
     "iceberg",
@@ -95,8 +98,61 @@ pub fn warehouse_dialect_for_type(
         // and shapes, which those options do not change.
         "postgres" => Some(&POSTGRES_DIALECT),
         "redshift" => Some(&REDSHIFT_DIALECT),
+        // SQL Server / Azure SQL rendering; `flavor = "fabric"` gets its
+        // dialect from `sqlserver_dialect_for_config`.
+        "sqlserver" => Some(&SQLSERVER_DIALECT),
         _ => None,
     }
+}
+
+static SQLSERVER_DIALECT: rocky_sqlserver::SqlServerDialect =
+    rocky_sqlserver::SqlServerDialect::const_default();
+
+/// The SQL Server connection settings an `[adapter]` block describes.
+/// Shared by the registry (which connects) and `rocky validate`.
+pub(crate) fn sqlserver_config(
+    name: &str,
+    adapter_cfg: &AdapterConfig,
+) -> Result<rocky_sqlserver::SqlServerConfig> {
+    fn expose(v: &Option<rocky_core::redacted::RedactedString>) -> Option<&str> {
+        v.as_ref().map(rocky_core::redacted::RedactedString::expose)
+    }
+    let creds = rocky_sqlserver::Credentials {
+        username: adapter_cfg.username.as_deref(),
+        password: expose(&adapter_cfg.password),
+        access_token: expose(&adapter_cfg.oauth_token),
+        client_id: adapter_cfg.client_id.as_deref(),
+        client_secret: expose(&adapter_cfg.client_secret),
+    };
+    rocky_sqlserver::SqlServerConfig::new(
+        adapter_cfg.host.as_deref(),
+        adapter_cfg.database.as_deref(),
+        &creds,
+        Duration::from_secs(adapter_cfg.timeout_secs.unwrap_or(300)),
+        &adapter_cfg.extra,
+    )
+    .with_context(|| format!("adapters.{name}: invalid sqlserver configuration"))
+}
+
+/// The dialect a `sqlserver` adapter block renders with, honouring its
+/// `extra.flavor`. `None` for any other adapter type, or when the flavor
+/// does not parse (the caller falls back to the default dialect; `rocky
+/// validate` and the registry report the error).
+pub(crate) fn sqlserver_dialect_for_config(
+    adapter_cfg: &AdapterConfig,
+) -> Option<Box<dyn rocky_core::traits::SqlDialect>> {
+    if adapter_cfg.adapter_type != "sqlserver" {
+        return None;
+    }
+    let flavor = adapter_cfg
+        .extra
+        .get("flavor")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|f| rocky_sqlserver::Flavor::parse(f).ok())
+        .unwrap_or_default();
+    Some(Box::new(rocky_sqlserver::SqlServerDialect::with_flavor(
+        flavor,
+    )))
 }
 
 static POSTGRES_DIALECT: rocky_postgres::PostgresDialect =
@@ -620,6 +676,18 @@ impl AdapterRegistry {
                     let late_binding = redshift_late_binding_views(name, adapter_cfg)?;
                     let pg_cfg = postgres_config(name, adapter_cfg)?;
                     let adapter = PostgresWarehouseAdapter::from_config(pg_cfg, late_binding)
+                        .with_context(|| format!("adapters.{name}: failed to build adapter"))?;
+                    warehouse.insert(name.clone(), Arc::new(adapter) as Arc<dyn WarehouseAdapter>);
+                }
+                "sqlserver" => {
+                    // Shared slots: `host` (optionally `host,port`),
+                    // `database`, and one auth method — `username` +
+                    // `password`, `oauth_token`, or `client_id` +
+                    // `client_secret` (+ `extra.tenant_id`). Adapter-specific
+                    // keys live under `[adapter.<name>.extra]`; unknown keys
+                    // are refused.
+                    let cfg = sqlserver_config(name, adapter_cfg)?;
+                    let adapter = SqlServerWarehouseAdapter::new(cfg)
                         .with_context(|| format!("adapters.{name}: failed to build adapter"))?;
                     warehouse.insert(name.clone(), Arc::new(adapter) as Arc<dyn WarehouseAdapter>);
                 }

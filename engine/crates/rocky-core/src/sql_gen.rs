@@ -478,14 +478,9 @@ pub fn generate_transformation_sql_with_warehouse(
                 validation::validate_identifier(col)?;
             }
 
-            // Build the subquery to identify partition values
-            let partition_cols = partition_by.join(", ");
-            let delete_sql = format!(
-                "DELETE FROM {target} WHERE ({partition_cols}) IN (\
-                 SELECT DISTINCT {partition_cols} FROM ({source_sql}) AS _rocky_incoming\
-                 )",
-                source_sql = model_ir.sql,
-            );
+            // The DELETE that clears the incoming partitions (dialect-shaped:
+            // T-SQL has no row-value IN).
+            let delete_sql = dialect.delete_partitions_sql(&target, partition_by, &model_ir.sql);
             let insert_sql = dialect.insert_into(&target, &model_ir.sql);
             Ok(dialect.delete_insert_statements(delete_sql, insert_sql))
         }
@@ -828,10 +823,7 @@ pub fn generate_incremental_transformation_sql(
             for column in columns {
                 validation::validate_identifier(column)?;
             }
-            let list = columns.join(", ");
-            Ok(vec![format!(
-                "INSERT INTO {target} ({list})\nSELECT {list} FROM (\n{body}\n) AS _rocky_incoming"
-            )])
+            Ok(vec![dialect.insert_into_columns(&target, columns, &body)])
         }
     }
 }
