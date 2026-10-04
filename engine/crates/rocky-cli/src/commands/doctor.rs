@@ -781,6 +781,29 @@ async fn state_concurrency_check(
                 ),
             )
         }
+        // Resolved `off` and the marker could not be checked. The upload path
+        // fails closed on the same error, so say uploads may be refused
+        // rather than giving the plain `off` warning.
+        Ok(r) if r.mode == ConcurrencyControl::Off && marker.is_err() => {
+            let e = marker
+                .as_ref()
+                .err()
+                .map(ToString::to_string)
+                .unwrap_or_default();
+            suggestions.push(format!(
+                "state_concurrency: check read access to '{marker_key}' on the '{backend}' \
+                 state location, then re-run rocky doctor"
+            ));
+            (
+                HealthStatus::Warning,
+                format!(
+                    "[state] concurrency_control resolves to \"off\" on the '{backend}' backend, \
+                     and the cas-required marker '{marker_key}' could not be checked ({e}). An \
+                     \"off\" upload checks the marker first and is refused while it cannot be \
+                     checked, so uploads from this writer may fail. {summary}"
+                ),
+            )
+        }
         Ok(r) if r.mode == ConcurrencyControl::Cas => match &r.probe {
             Some(CasProbeOutcome::Inconclusive(why)) => {
                 suggestions.push(format!(
@@ -918,6 +941,12 @@ async fn state_concurrency_check(
                 matches!(&resolution, Ok(r) if r.mode == ConcurrencyControl::Cas).to_string(),
             ),
             ("cas_required_marker".into(), marker_text),
+            // Only the default state file's marker is inspected; with
+            // `namespacing = "pipeline"` each namespace has its own.
+            (
+                "cas_required_marker_scope".into(),
+                "default state file only".to_string(),
+            ),
         ]
     } else {
         Vec::new()
@@ -1479,9 +1508,14 @@ mod tests {
         )
         .unwrap();
         let state_path = dir.path().join("state.redb");
-        collect_health_checks(&config_path, &state_path, Some("state_concurrency"), verbose)
-            .await
-            .0
+        collect_health_checks(
+            &config_path,
+            &state_path,
+            Some("state_concurrency"),
+            verbose,
+        )
+        .await
+        .0
     }
 
     fn the_check(checks: &[HealthCheck]) -> &HealthCheck {
@@ -1504,8 +1538,7 @@ mod tests {
     /// so — resolved mode, where it came from, and the probe result.
     #[tokio::test]
     async fn unset_concurrency_control_on_s3_defaults_to_cas_and_reports_the_probe() {
-        let checks =
-            state_concurrency_checks("backend = \"s3\"\ns3_bucket = \"example\"\n").await;
+        let checks = state_concurrency_checks("backend = \"s3\"\ns3_bucket = \"example\"\n").await;
         let check = the_check(&checks);
         assert!(
             matches!(check.status, HealthStatus::Healthy),
@@ -1628,7 +1661,11 @@ mod tests {
             check.status,
             check.message
         );
-        assert!(check.message.contains("refuses to start"), "{}", check.message);
+        assert!(
+            check.message.contains("refuses to start"),
+            "{}",
+            check.message
+        );
     }
 
     /// A local state file has one writer by construction, so `off` is correct

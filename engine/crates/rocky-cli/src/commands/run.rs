@@ -3368,9 +3368,9 @@ pub async fn run_with_explicit_contracts(
             loaded.config.cache.schemas.replicate,
         );
         if let Err(e) = model_session.acquire().await {
-            // `Err` = double-acquire misuse, or an explicit `cas` the store's
-            // conditional-write probe refuses (#1228);
-            // consume defensively so no exit path can leak the session.
+            // `Err` = double-acquire misuse, or a #1228 concurrency refusal
+            // (`CasUnsupported` / `CasRequired`); consume defensively so no
+            // exit path can leak the session.
             model_session.abandon("model-only acquire failed").await;
             return Err(e.into());
         }
@@ -3797,8 +3797,8 @@ pub async fn run_with_explicit_contracts(
                     loaded.config.cache.schemas.replicate,
                 );
                 if let Err(e) = session.acquire().await {
-                    // `Err` = double-acquire misuse, or an explicit `cas` the
-                    // store's conditional-write probe refuses (#1228); consume
+                    // `Err` = double-acquire misuse, or a #1228 concurrency
+                    // refusal (`CasUnsupported` / `CasRequired`); consume
                     // defensively so no exit leaks the session.
                     session.abandon("transformation acquire failed").await;
                     return Err(e.into());

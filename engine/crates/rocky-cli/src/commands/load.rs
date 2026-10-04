@@ -174,9 +174,9 @@ pub async fn run_load(
         rocky_cfg.cache.schemas.replicate,
     );
     if let Err(e) = session.acquire().await {
-        // `Err` = double-acquire misuse, or an explicit `cas` the store's
-            // conditional-write probe refuses (#1228);
-        // consume defensively so no exit path can leak the session.
+        // `Err` = double-acquire misuse, or a #1228 concurrency refusal
+        // (`CasUnsupported` / `CasRequired`); consume defensively so no
+        // exit path can leak the session.
         session.abandon("load acquire failed").await;
         return Err(e.into());
     }

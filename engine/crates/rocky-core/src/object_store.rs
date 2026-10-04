@@ -295,13 +295,13 @@ impl ObjectStoreProvider {
         &self.bucket
     }
 
-    /// Build an absolute path within the provider's prefix.
     /// The full object key (prefix included) for a relative path, for
-    /// operator-facing messages.
+    /// operator-facing messages and process-wide cache keys.
     pub fn absolute_key(&self, relative: &str) -> String {
         self.absolute_path(relative).to_string()
     }
 
+    /// Build an absolute path within the provider's prefix.
     fn absolute_path(&self, relative: &str) -> ObjectPath {
         let relative = relative.trim_start_matches('/');
         if self.prefix.is_empty() {

@@ -723,7 +723,9 @@ concurrency_control unset ──► backend default
             └─ inconclusive  → cas  (never fall back to unconditional on a guess)
 ```
 
-The probe writes a small object under its own unique key and checks that the store refuses a create over an existing object and a write with a stale generation. It then deletes the object. It never touches the state object. `rocky doctor` runs the same probe and reports the result (see `state_concurrency`).
+The probe writes a small object under `<prefix>/cas-probe/` with a unique name. It checks that the store refuses a create over an existing object and a write with a stale generation, then deletes the object. It never touches the state object. It needs put and delete access under the state prefix; without delete access, one small probe object stays behind per process. `rocky doctor` runs the same probe and reports the result (see `state_concurrency`).
+
+An inconclusive probe (a network error, a timeout, or no write access) keeps `cas` and logs a warning. That is not confirmed protection: on a store that ignores conditional headers, a `cas` write still overwrites. Fix the access problem, then run `rocky doctor` to confirm the probe passes.
 
 Set `concurrency_control = "off"` to opt out. That is correct for a deployment with one writer per `[state]` prefix.
 
@@ -731,7 +733,7 @@ Set `concurrency_control = "off"` to opt out. That is correct for a deployment w
 
 A writer on `off` uploads unconditionally, so one such writer could still overwrite every CAS writer. The marker stops that. The first CAS upload of a state object creates a small `cas-required` object beside it, for example `<prefix>/v9/state.redb.cas-required`. The write is create-once on its own key, like a freeze marker.
 
-A writer whose mode resolves to `off` checks for the marker before each upload. If it exists, the writer refuses the upload and names the fix. Reads are not affected. The fix is to set `concurrency_control = "cas"`, or to remove the explicit `"off"`, on that writer. Delete the marker only on purpose, when every writer of that state is deliberately moving to `"off"`. `rocky doctor` warns when the configured mode and the marker disagree.
+A writer whose mode resolves to `off` checks for the marker when it starts, before it does any work, and again before each upload. If the marker exists, the writer stops with an error that names the fix. Reads are not affected. The fix is to set `concurrency_control = "cas"`, or to remove the explicit `"off"`, on that writer. Delete the marker only on purpose, when every writer of that state is deliberately moving to `"off"`. `rocky doctor` warns when the configured mode and the marker disagree.
 
 #### Upgrading to the `cas` default
 

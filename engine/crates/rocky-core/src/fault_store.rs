@@ -168,6 +168,19 @@ impl FaultHandle {
         lock(&self.0).ignore_conditional_writes = ignore;
     }
 
+    /// `put_opts` calls observed on paths that do NOT start with `prefix`,
+    /// across every write condition. Lets a test count state writes while
+    /// ignoring the startup conditional-write probe's throwaway object
+    /// (`cas-probe/…`). Faulted puts are not counted.
+    pub fn put_count_outside(&self, prefix: &str) -> u64 {
+        lock(&self.0)
+            .put_counts
+            .iter()
+            .filter(|((path, _), _)| !path.starts_with(prefix))
+            .map(|(_, n)| *n)
+            .sum()
+    }
+
     /// Number of `put_opts` calls observed for an exact object path and write
     /// condition.
     pub fn put_count(&self, path: &str, kind: PutKind) -> u64 {

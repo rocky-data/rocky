@@ -839,9 +839,11 @@ pub struct ResolvedConcurrency {
 /// | `cas` / unset        | inconclusive   | `cas`, with a warning       |
 ///
 /// An inconclusive probe keeps `cas`: falling back to an unconditional upload
-/// on a guess would reopen the lost update this default exists to close. If
-/// the store really lacks conditional writes, the CAS write itself then fails
-/// instead of overwriting.
+/// on a guess would reopen the lost update this default exists to close. That
+/// is not protection either: on a store that IGNORES conditional headers, a
+/// `cas` write commits as a silent overwrite. A store that REJECTS them fails
+/// the write instead. So an inconclusive probe means "unconfirmed", and the
+/// writer warns; `rocky doctor` reports it as a Warning.
 ///
 /// # Errors
 ///
@@ -852,6 +854,14 @@ pub async fn resolve_concurrency_control(
 ) -> Result<ResolvedConcurrency, StateSyncError> {
     let (requested, source) = requested_concurrency_control(cfg);
     if requested == ConcurrencyControl::Off || !cas_supported_on(cfg.backend) {
+        if requested == ConcurrencyControl::Cas {
+            warn!(
+                backend = %cfg.backend,
+                "concurrency_control = cas needs a durable object tier (s3, gcs, or \
+                 tiered) and this backend has none; using an unconditional state upload \
+                 (auto-downgraded to off)"
+            );
+        }
         return Ok(ResolvedConcurrency {
             mode: ConcurrencyControl::Off,
             source,
@@ -910,8 +920,9 @@ async fn resolved_state_config(cfg: &StateConfig) -> Result<StateConfig, StateSy
 
 /// Process-wide probe cache: one probe per store location per process. Only
 /// definitive outcomes are cached; an inconclusive probe is retried next time.
-static CAS_PROBE_CACHE: std::sync::Mutex<Option<std::collections::HashMap<String, CasProbeOutcome>>> =
-    std::sync::Mutex::new(None);
+static CAS_PROBE_CACHE: std::sync::Mutex<
+    Option<std::collections::HashMap<String, CasProbeOutcome>>,
+> = std::sync::Mutex::new(None);
 
 /// Cache key for the probe: the durable tier's scheme, bucket and prefix.
 fn cas_probe_cache_key(cfg: &StateConfig) -> String {
@@ -936,7 +947,8 @@ fn cas_probe_cache_key(cfg: &StateConfig) -> String {
 /// outcome would leak from one test's store into another's.
 fn cas_probe_cache_enabled() -> bool {
     #[cfg(any(test, feature = "test-support"))]
-    if test_support::current_override().is_some() || test_support::current_global_override().is_some()
+    if test_support::current_override().is_some()
+        || test_support::current_global_override().is_some()
     {
         return false;
     }
@@ -955,8 +967,8 @@ async fn cached_probe_conditional_writes(cfg: &StateConfig) -> CasProbeOutcome {
     {
         return hit;
     }
-    let outcome = probe_conditional_writes(cfg).await;
-    if use_cache && !matches!(outcome, CasProbeOutcome::Inconclusive(_)) {
+    let (outcome, cacheable) = probe_conditional_writes_inner(cfg).await;
+    if use_cache && cacheable {
         CAS_PROBE_CACHE
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -988,32 +1000,59 @@ async fn cached_probe_conditional_writes(cfg: &StateConfig) -> CasProbeOutcome {
 ///
 /// Returns `Unsupported` without I/O for a backend with no durable object tier.
 pub async fn probe_conditional_writes(cfg: &StateConfig) -> CasProbeOutcome {
+    probe_conditional_writes_inner(cfg).await.0
+}
+
+/// The probe plus whether its verdict may be cached for the process. Only a
+/// verdict that rests on the store's own behaviour is cacheable: `Supported`,
+/// and `Unsupported` because a precondition was IGNORED. "Conditional write
+/// rejected, unconditional accepted" could still be two transport blips in a
+/// row, so it is re-probed next time rather than pinned for the process.
+async fn probe_conditional_writes_inner(cfg: &StateConfig) -> (CasProbeOutcome, bool) {
     let provider = match durable_tier_provider(cfg) {
         Ok(Some(provider)) => provider,
         Ok(None) => {
-            return CasProbeOutcome::Unsupported(format!(
-                "the '{}' backend has no conditional-write object tier",
-                cfg.backend
-            ));
+            return (
+                CasProbeOutcome::Unsupported(format!(
+                    "the '{}' backend has no conditional-write object tier",
+                    cfg.backend
+                )),
+                true,
+            );
         }
-        Err(e) => return CasProbeOutcome::Inconclusive(e.to_string()),
+        Err(e) => return (CasProbeOutcome::Inconclusive(e.to_string()), false),
     };
-    let key = format!("cas-{}", probe_key());
+    let key = cas_probe_key();
+    let timeout = transfer_timeout(cfg);
     let span = info_span!("state.cas_probe", backend = %cfg.backend);
-    let outcome = with_transfer_timeout(transfer_timeout(cfg), async {
+    let (outcome, cacheable) = with_transfer_timeout(timeout, async {
         Ok(cas_probe_steps(&provider, &key).await)
     })
     .instrument(span)
     .await
-    .unwrap_or_else(|e| CasProbeOutcome::Inconclusive(e.to_string()));
-    if let Err(e) = provider.delete(&key).await {
-        debug!(error = %e, key = %key, "conditional-write probe cleanup failed");
+    .unwrap_or_else(|e| (CasProbeOutcome::Inconclusive(e.to_string()), false));
+    match with_transfer_timeout(timeout, async { Ok(provider.delete(&key).await?) }).await {
+        Ok(()) => {}
+        Err(e) => debug!(error = %e, key = %key, "conditional-write probe cleanup failed"),
     }
     info!(outcome = %outcome, "state conditional-write probe finished");
-    outcome
+    let cacheable = cacheable && !matches!(outcome, CasProbeOutcome::Inconclusive(_));
+    (outcome, cacheable)
 }
 
-async fn cas_probe_steps(provider: &ObjectStoreProvider, key: &str) -> CasProbeOutcome {
+/// Unique key for one conditional-write probe, under `cas-probe/` at the
+/// configured prefix (never the state object, never a doctor probe name).
+fn cas_probe_key() -> String {
+    let doctor_style = probe_key();
+    let unique = doctor_style
+        .strip_prefix("doctor-probe-")
+        .unwrap_or(&doctor_style);
+    format!("cas-probe/{unique}")
+}
+
+/// Returns the outcome and whether it is cacheable (see
+/// [`probe_conditional_writes_inner`]).
+async fn cas_probe_steps(provider: &ObjectStoreProvider, key: &str) -> (CasProbeOutcome, bool) {
     // One conditional put, retried once on a non-precondition error so a
     // single transport blip is not read as "conditional writes rejected"
     // (that verdict is cached for the process). A retry after an ambiguous
@@ -1046,8 +1085,8 @@ async fn cas_probe_steps(provider: &ObjectStoreProvider, key: &str) -> CasProbeO
         key: &str,
         step: &str,
         err: ObjectStoreError,
-    ) -> CasProbeOutcome {
-        match provider
+    ) -> (CasProbeOutcome, bool) {
+        let outcome = match provider
             .put(key, Bytes::from_static(b"rocky cas probe (unconditional)"))
             .await
         {
@@ -1056,14 +1095,16 @@ async fn cas_probe_steps(provider: &ObjectStoreProvider, key: &str) -> CasProbeO
                  unconditional one"
             )),
             Err(_) => CasProbeOutcome::Inconclusive(format!("{step}: {err}")),
-        }
+        };
+        (outcome, false)
     }
 
     let first = match put_cond(provider, key, b"rocky cas probe 1", None).await {
         Ok(PutIfMatchOutcome::Committed(generation)) => generation,
         Ok(PutIfMatchOutcome::Conflict) => {
-            return CasProbeOutcome::Inconclusive(
-                "the unique probe key already existed".to_string(),
+            return (
+                CasProbeOutcome::Inconclusive("the unique probe key already existed".to_string()),
+                false,
             );
         }
         Err(e) => return classify(provider, key, "create-if-absent", e).await,
@@ -1071,37 +1112,52 @@ async fn cas_probe_steps(provider: &ObjectStoreProvider, key: &str) -> CasProbeO
     match put_cond(provider, key, b"rocky cas probe 2", None).await {
         Ok(PutIfMatchOutcome::Conflict) => {}
         Ok(PutIfMatchOutcome::Committed(_)) => {
-            return CasProbeOutcome::Unsupported(
-                "the store accepted a create-if-absent write over an existing object \
-                 (If-None-Match ignored)"
-                    .to_string(),
+            return (
+                CasProbeOutcome::Unsupported(
+                    "the store accepted a create-if-absent write over an existing object \
+                     (If-None-Match ignored)"
+                        .to_string(),
+                ),
+                true,
             );
         }
-        Err(e) => return classify(provider, key, "create-if-absent on an existing object", e).await,
+        Err(e) => {
+            return classify(provider, key, "create-if-absent on an existing object", e).await;
+        }
     }
     if first.e_tag.is_none() && first.version.is_none() {
-        return CasProbeOutcome::Unsupported(
-            "the store returned no ETag or version for a write, so there is nothing to \
-             compare-and-swap against"
-                .to_string(),
+        return (
+            CasProbeOutcome::Unsupported(
+                "the store returned no ETag or version for a write, so there is nothing to \
+                 compare-and-swap against"
+                    .to_string(),
+            ),
+            true,
         );
     }
     match put_cond(provider, key, b"rocky cas probe 3", Some(&first)).await {
         Ok(PutIfMatchOutcome::Committed(_)) => {}
         Ok(PutIfMatchOutcome::Conflict) => {
-            return CasProbeOutcome::Unsupported(
-                "the store refused an if-match write carrying the object's current generation"
-                    .to_string(),
+            return (
+                CasProbeOutcome::Unsupported(
+                    "the store refused an if-match write carrying the object's current \
+                     generation"
+                        .to_string(),
+                ),
+                true,
             );
         }
         Err(e) => return classify(provider, key, "if-match", e).await,
     }
     match put_cond(provider, key, b"rocky cas probe 4", Some(&first)).await {
-        Ok(PutIfMatchOutcome::Conflict) => CasProbeOutcome::Supported,
-        Ok(PutIfMatchOutcome::Committed(_)) => CasProbeOutcome::Unsupported(
-            "the store accepted an if-match write carrying a stale generation (If-Match \
-             ignored)"
-                .to_string(),
+        Ok(PutIfMatchOutcome::Conflict) => (CasProbeOutcome::Supported, true),
+        Ok(PutIfMatchOutcome::Committed(_)) => (
+            CasProbeOutcome::Unsupported(
+                "the store accepted an if-match write carrying a stale generation (If-Match \
+                 ignored)"
+                    .to_string(),
+            ),
+            true,
         ),
         Err(e) => classify(provider, key, "if-match with a stale generation", e).await,
     }
@@ -1137,7 +1193,12 @@ async fn ensure_cas_required_marker(
     remote_key: &str,
 ) -> Result<(), StateSyncError> {
     let key = cas_required_marker_key(remote_key);
-    let cache_key = format!("{}/{}/{key}", provider.scheme(), provider.bucket());
+    let cache_key = format!(
+        "{}://{}/{}",
+        provider.scheme(),
+        provider.bucket(),
+        provider.absolute_key(&key)
+    );
     let use_cache = cas_probe_cache_enabled();
     if use_cache
         && CAS_MARKER_KNOWN
@@ -1197,6 +1258,42 @@ async fn refuse_unconditional_upload_if_cas_required(
         return Err(StateSyncError::CasRequired { marker });
     }
     Ok(())
+}
+
+/// Startup half of the marker rule: a writer whose resolved mode is `off`
+/// refuses BEFORE it does any work when the marker already exists, so a run
+/// does not reach its warehouse writes only to have its state upload refused
+/// at the end (its watermarks would then never be published, and the next run
+/// could re-load the same rows). The upload-time check in [`dispatch_upload`]
+/// still covers a marker that appears mid-run.
+///
+/// A marker check that cannot complete here is warned and left to the
+/// upload-time check, which fails closed — startup must not turn a transient
+/// HEAD error into a refusal the download path would have tolerated.
+async fn refuse_off_writer_at_start(
+    cfg: &StateConfig,
+    state_path: &Path,
+) -> Result<(), StateSyncError> {
+    if matches!(cfg.backend, StateBackend::Local) || cas_effective(cfg) {
+        return Ok(());
+    }
+    match with_transfer_timeout(
+        transfer_timeout(cfg),
+        refuse_unconditional_upload_if_cas_required(cfg, &remote_state_key(state_path)),
+    )
+    .await
+    {
+        Ok(()) => Ok(()),
+        Err(e @ StateSyncError::CasRequired { .. }) => Err(e),
+        Err(e) => {
+            warn!(
+                error = %e,
+                "could not check for the cas-required marker at startup; the state upload \
+                 re-checks it and refuses if it cannot"
+            );
+            Ok(())
+        }
+    }
 }
 
 /// Whether the `cas-required` marker exists for the state object backing
@@ -1317,6 +1414,7 @@ impl LedgerSeamSession {
         // for an unset mode, confirmed by the startup probe, pinned for every
         // attempt of this transition.
         let cfg = resolved_state_config(&self.cfg).await?;
+        refuse_off_writer_at_start(&cfg, &self.state_path).await?;
         let this = Self {
             cfg,
             state_path: self.state_path.clone(),
@@ -1539,10 +1637,13 @@ impl RemoteStateSession {
     /// # Errors
     ///
     /// Never `Err` for a download failure. `Err` is reserved for internal
-    /// misuse (calling `acquire` twice on one session) and for
-    /// [`StateSyncError::CasUnsupported`]: `concurrency_control = "cas"` set
+    /// misuse (calling `acquire` twice on one session), for
+    /// [`StateSyncError::CasUnsupported`] (`concurrency_control = "cas"` set
     /// explicitly on a store the startup probe proves ignores conditional
-    /// writes (see [`resolve_concurrency_control`]).
+    /// writes — see [`resolve_concurrency_control`]), and for
+    /// [`StateSyncError::CasRequired`] (the mode resolved to `off` while the
+    /// `cas-required` marker exists — refused before any work, not at the
+    /// end-of-run upload).
     pub async fn acquire(&mut self) -> Result<StateAuthority, StateSyncError> {
         if self.acquired {
             return Err(StateSyncError::Io(std::io::Error::other(
@@ -1568,6 +1669,7 @@ impl RemoteStateSession {
         // checkpoint, periodic and finalize all agree. An explicit `cas` the
         // store cannot honour is an error, not a silent downgrade.
         self.cfg = resolved_state_config(&self.cfg).await?;
+        refuse_off_writer_at_start(&self.cfg, &self.state_path).await?;
 
         // Under CAS on a backend with a durable object tier, capture the durable
         // object's generation as this run's base so `finalize` can conditionally
@@ -1581,14 +1683,8 @@ impl RemoteStateSession {
                     authority
                 })
         } else {
-            if self.cfg.concurrency_control == Some(ConcurrencyControl::Cas) {
-                warn!(
-                    backend = %self.cfg.backend,
-                    "concurrency_control = cas needs a durable object tier (s3, gcs, or \
-                     tiered) and this backend has none; using an unconditional state upload \
-                     (auto-downgraded to off)"
-                );
-            }
+            // (An explicit `cas` on a tier-less backend already warned in
+            // `resolve_concurrency_control`.)
             download_state(&self.cfg, &self.state_path, self.replicate_schema_cache).await
         };
 
@@ -3277,7 +3373,11 @@ async fn dispatch_upload(
     // Checked once, before any leg — a refused tiered upload must not reach
     // Valkey either.
     if !matches!(config.backend, StateBackend::Local) {
-        refuse_unconditional_upload_if_cas_required(config, remote_key).await?;
+        with_transfer_timeout(
+            transfer_timeout(config),
+            refuse_unconditional_upload_if_cas_required(config, remote_key),
+        )
+        .await?;
     }
     dispatch_upload_legs(config, local_path, remote_key).await
 }
@@ -3455,7 +3555,11 @@ async fn dispatch_upload_cas(
     // is a transport failure of this upload (subject to `on_upload_failure`),
     // never a reason to fall back to an unconditional write.
     if let Some(provider) = durable_tier_provider(config)?
-        && let Err(e) = ensure_cas_required_marker(&provider, remote_key).await
+        && let Err(e) = with_transfer_timeout(
+            transfer_timeout(config),
+            ensure_cas_required_marker(&provider, remote_key),
+        )
+        .await
     {
         // No commit was attempted, but keep the tiered rule that a failed
         // upload leaves nothing cached for this key.
@@ -7756,9 +7860,8 @@ mod tests {
         let (store, faults) = crate::fault_store::FaultingStore::wrap(std::sync::Arc::new(
             object_store::memory::InMemory::new(),
         ));
-        let provider = test_support::install(ObjectStoreProvider::from_store(
-            store, "s3", "bucket", "",
-        ));
+        let provider =
+            test_support::install(ObjectStoreProvider::from_store(store, "s3", "bucket", ""));
         (faults, provider)
     }
 
@@ -8026,10 +8129,7 @@ mod tests {
         let _ = stale.acquire().await.unwrap();
         run_session(&cfg, &local).await.expect("racer commits");
         let err = stale.finalize().await.unwrap_err();
-        assert!(
-            matches!(err, StateSyncError::CasConflict { .. }),
-            "{err:?}"
-        );
+        assert!(matches!(err, StateSyncError::CasConflict { .. }), "{err:?}");
 
         assert_eq!(
             provider.get(&marker).await.unwrap(),
@@ -8170,5 +8270,108 @@ mod tests {
             "the durable leg must not be written"
         );
         test_support::clear();
+    }
+
+    /// Review finding #1: an `off` writer that finds the marker refuses at
+    /// `acquire`, before any work — not at the end-of-run upload, after its
+    /// warehouse writes. The ledger seam refuses before running its
+    /// transition.
+    #[tokio::test]
+    async fn off_writer_refuses_at_acquire_when_the_marker_is_present() {
+        test_support::clear();
+        let (_faults, provider) = install_probe_provider();
+        let dir = TempDir::new().unwrap();
+        let local = dir.path().join(".rocky-state.redb");
+        seed_state_file(&local);
+        run_session(&s3_unset_config(), &local)
+            .await
+            .expect("CAS writer commits and creates the marker");
+        let committed = provider
+            .get(&object_store_state_key(&remote_state_key(&local)))
+            .await
+            .unwrap();
+
+        let off = with_mode(&s3_unset_config(), ConcurrencyControl::Off);
+        let mut session =
+            RemoteStateSession::new(&off, &local, FinalizeDurability::ConfigDefault, false);
+        let err = session.acquire().await.unwrap_err();
+        session.abandon("test: refused at acquire").await;
+        assert!(matches!(err, StateSyncError::CasRequired { .. }), "{err:?}");
+
+        let seam = LedgerSeamSession::new(&off, &local, false);
+        let ran = std::sync::atomic::AtomicBool::new(false);
+        let err = seam
+            .execute(|_store, _base| {
+                ran.store(true, std::sync::atomic::Ordering::SeqCst);
+                Box::pin(async { Ok(()) })
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StateSyncError::CasRequired { .. }), "{err:?}");
+        assert!(
+            !ran.load(std::sync::atomic::Ordering::SeqCst),
+            "the seam transition must not run"
+        );
+        assert_eq!(
+            provider
+                .get(&object_store_state_key(&remote_state_key(&local)))
+                .await
+                .unwrap(),
+            committed
+        );
+        test_support::clear();
+    }
+
+    /// Review finding #4: "conditional write rejected, unconditional
+    /// accepted" may be two transport blips in a row, so that verdict is not
+    /// cached for the process. A verdict from an IGNORED precondition is.
+    #[tokio::test]
+    async fn only_store_behaviour_verdicts_are_cacheable() {
+        test_support::clear();
+        let (faults, _provider) = install_probe_provider();
+        // Both tries of the first conditional put fail; the unconditional
+        // fallback then succeeds.
+        faults.arm(
+            crate::fault_store::FaultOp::Put,
+            crate::fault_store::FaultMode::FailNext(2),
+        );
+        let (outcome, cacheable) = probe_conditional_writes_inner(&s3_unset_config()).await;
+        assert!(
+            matches!(outcome, CasProbeOutcome::Unsupported(_)),
+            "{outcome:?}"
+        );
+        assert!(
+            !cacheable,
+            "a rejection verdict must be re-probed, not pinned"
+        );
+        test_support::clear();
+
+        let (faults, _provider) = install_probe_provider();
+        faults.ignore_conditional_writes(true);
+        let (outcome, cacheable) = probe_conditional_writes_inner(&s3_unset_config()).await;
+        assert!(
+            matches!(outcome, CasProbeOutcome::Unsupported(_)),
+            "{outcome:?}"
+        );
+        assert!(cacheable);
+        test_support::clear();
+
+        let (_faults, _provider) = install_probe_provider();
+        assert_eq!(
+            probe_conditional_writes_inner(&s3_unset_config()).await,
+            (CasProbeOutcome::Supported, true)
+        );
+        test_support::clear();
+    }
+
+    /// The probe object lives under its own `cas-probe/` key.
+    #[test]
+    fn cas_probe_key_is_its_own_namespace() {
+        let key = cas_probe_key();
+        assert!(
+            key.starts_with("cas-probe/") && !key.contains("doctor"),
+            "{key}"
+        );
+        assert_ne!(cas_probe_key(), key);
     }
 }
