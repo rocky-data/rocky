@@ -981,19 +981,37 @@ static CAS_PROBE_CACHE: std::sync::Mutex<
     Option<std::collections::HashMap<String, CasProbeOutcome>>,
 > = std::sync::Mutex::new(None);
 
-/// Cache key for the probe: the durable tier's scheme, bucket and prefix.
+/// Cache key for the probe: the durable tier's scheme, bucket and prefix, plus
+/// the endpoint and region the object-store client reads from the
+/// environment. The same bucket name on a different endpoint (an
+/// S3-compatible store beside AWS) is a different store with its own verdict.
 fn cas_probe_cache_key(cfg: &StateConfig) -> String {
+    let env = |names: &[&str]| -> String {
+        names
+            .iter()
+            .map(|name| format!("{name}={}", std::env::var(name).unwrap_or_default()))
+            .collect::<Vec<_>>()
+            .join(",")
+    };
     match cfg.backend {
         StateBackend::Gcs => format!(
-            "gs://{}/{}",
+            "gs://{}/{} [{}]",
             cfg.gcs_bucket.as_deref().unwrap_or_default(),
-            cfg.gcs_prefix.as_deref().unwrap_or(DEFAULT_GCS_PREFIX)
+            cfg.gcs_prefix.as_deref().unwrap_or(DEFAULT_GCS_PREFIX),
+            env(&["GOOGLE_BASE_URL", "GOOGLE_CLOUD_STORAGE_BASE_URL"])
         ),
         StateBackend::S3 | StateBackend::Tiered | StateBackend::Local | StateBackend::Valkey => {
             format!(
-                "s3://{}/{}",
+                "s3://{}/{} [{}]",
                 cfg.s3_bucket.as_deref().unwrap_or_default(),
-                cfg.s3_prefix.as_deref().unwrap_or(DEFAULT_S3_PREFIX)
+                cfg.s3_prefix.as_deref().unwrap_or(DEFAULT_S3_PREFIX),
+                env(&[
+                    "AWS_ENDPOINT_URL",
+                    "AWS_ENDPOINT",
+                    "AWS_ENDPOINT_URL_S3",
+                    "AWS_REGION",
+                    "AWS_DEFAULT_REGION",
+                ])
             )
         }
     }
@@ -1112,25 +1130,27 @@ fn cas_probe_key() -> String {
 async fn cas_probe_steps(provider: &ObjectStoreProvider, key: &str) -> (CasProbeOutcome, bool) {
     // One conditional put, retried once on a non-precondition error so a
     // single transport blip is not read as "conditional writes rejected"
-    // (that verdict is cached for the process). A retry after an ambiguous
-    // failure that in fact landed shows up as a precondition outcome, which
-    // the steps below treat as inconclusive or as the expected refusal.
+    // (that verdict is cached for the process). Also reports whether it
+    // retried: a failed first attempt may still have landed, and a retry after
+    // one that did shows up as a precondition outcome. The steps below treat
+    // that as inconclusive where it could be mistaken for a store verdict.
     async fn put_cond(
         provider: &ObjectStoreProvider,
         key: &str,
         data: &'static [u8],
         expected: Option<&Generation>,
-    ) -> Result<PutIfMatchOutcome, ObjectStoreError> {
+    ) -> (Result<PutIfMatchOutcome, ObjectStoreError>, bool) {
         match provider
             .put_if_match(key, Bytes::from_static(data), expected)
             .await
         {
-            Err(_) => {
+            Err(_) => (
                 provider
                     .put_if_match(key, Bytes::from_static(data), expected)
-                    .await
-            }
-            outcome => outcome,
+                    .await,
+                true,
+            ),
+            outcome => (outcome, false),
         }
     }
 
@@ -1156,7 +1176,7 @@ async fn cas_probe_steps(provider: &ObjectStoreProvider, key: &str) -> (CasProbe
         (outcome, false)
     }
 
-    let first = match put_cond(provider, key, b"rocky cas probe 1", None).await {
+    let first = match put_cond(provider, key, b"rocky cas probe 1", None).await.0 {
         Ok(PutIfMatchOutcome::Committed(generation)) => generation,
         Ok(PutIfMatchOutcome::Conflict) => {
             return (
@@ -1166,7 +1186,9 @@ async fn cas_probe_steps(provider: &ObjectStoreProvider, key: &str) -> (CasProbe
         }
         Err(e) => return classify(provider, key, "create-if-absent", e).await,
     };
-    match put_cond(provider, key, b"rocky cas probe 2", None).await {
+    // A retried create that found the object is the expected refusal either
+    // way: the object exists since step 1.
+    match put_cond(provider, key, b"rocky cas probe 2", None).await.0 {
         Ok(PutIfMatchOutcome::Conflict) => {}
         Ok(PutIfMatchOutcome::Committed(_)) => {
             return (
@@ -1193,8 +1215,21 @@ async fn cas_probe_steps(provider: &ObjectStoreProvider, key: &str) -> (CasProbe
         );
     }
     match put_cond(provider, key, b"rocky cas probe 3", Some(&first)).await {
-        Ok(PutIfMatchOutcome::Committed(_)) => {}
-        Ok(PutIfMatchOutcome::Conflict) => {
+        (Ok(PutIfMatchOutcome::Committed(_)), _) => {}
+        // The failed first attempt may have committed, moving the generation
+        // on, and then the retry's refusal is the store working correctly.
+        // Not a verdict either way, so not cached.
+        (Ok(PutIfMatchOutcome::Conflict), true) => {
+            return (
+                CasProbeOutcome::Inconclusive(
+                    "an if-match write carrying the current generation failed, and its \
+                     retry was refused; the first attempt may have landed"
+                        .to_string(),
+                ),
+                false,
+            );
+        }
+        (Ok(PutIfMatchOutcome::Conflict), false) => {
             return (
                 CasProbeOutcome::Unsupported(
                     "the store refused an if-match write carrying the object's current \
@@ -1204,9 +1239,12 @@ async fn cas_probe_steps(provider: &ObjectStoreProvider, key: &str) -> (CasProbe
                 true,
             );
         }
-        Err(e) => return classify(provider, key, "if-match", e).await,
+        (Err(e), _) => return classify(provider, key, "if-match", e).await,
     }
-    match put_cond(provider, key, b"rocky cas probe 4", Some(&first)).await {
+    match put_cond(provider, key, b"rocky cas probe 4", Some(&first))
+        .await
+        .0
+    {
         Ok(PutIfMatchOutcome::Conflict) => (CasProbeOutcome::Supported, true),
         Ok(PutIfMatchOutcome::Committed(_)) => (
             CasProbeOutcome::Unsupported(
@@ -1304,8 +1342,7 @@ async fn refuse_unconditional_upload_if_cas_required(
     let Some(provider) = durable_tier_provider(config)? else {
         return Ok(());
     };
-    let key = cas_required_marker_key(remote_key);
-    if provider.exists(&key).await? {
+    if let Some(key) = find_cas_required_marker(&provider, remote_key).await? {
         let marker = format!(
             "{}://{}/{}",
             provider.scheme(),
@@ -1315,6 +1352,43 @@ async fn refuse_unconditional_upload_if_cas_required(
         return Err(StateSyncError::CasRequired { marker });
     }
     Ok(())
+}
+
+/// The `cas-required` marker keys that bind a writer of `remote_key`, newest
+/// first: the current schema version's, then each older version's down to the
+/// carry-forward floor.
+///
+/// The marker lives under its schema-version prefix, and a schema bump does not
+/// move it. Without the older keys, the first writer after a bump would find no
+/// marker under the new prefix, so an `off` writer would upload unguarded
+/// until the first CAS commit at the new version recreated it. A marker at an
+/// older version means the fleet that carried this state forward was on `cas`,
+/// so it binds the new version too. Deleting the marker on purpose therefore
+/// means deleting it at every version that has one.
+fn cas_required_marker_keys(remote_key: &str) -> Vec<String> {
+    std::iter::once(cas_required_marker_key(remote_key))
+        .chain(carry_forward_versions().into_iter().map(|version| {
+            format!(
+                "{}{CAS_REQUIRED_MARKER_SUFFIX}",
+                object_store_state_key_at(version, remote_key)
+            )
+        }))
+        .collect()
+}
+
+/// The first `cas-required` marker that exists among
+/// [`cas_required_marker_keys`], or `None`. Stops at the first hit; any
+/// existence check that fails is an error (fail-closed, as before).
+async fn find_cas_required_marker(
+    provider: &ObjectStoreProvider,
+    remote_key: &str,
+) -> Result<Option<String>, StateSyncError> {
+    for key in cas_required_marker_keys(remote_key) {
+        if provider.exists(&key).await? {
+            return Ok(Some(key));
+        }
+    }
+    Ok(None)
 }
 
 /// Startup half of the marker rule: a writer whose resolved mode is `off`
@@ -1354,8 +1428,10 @@ async fn refuse_off_writer_at_start(
 }
 
 /// Whether the `cas-required` marker exists for the state object backing
-/// `state_path`. `Ok(None)` for a backend with no durable object tier, which
-/// never carries a marker. Used by `rocky doctor`.
+/// `state_path`, at the current schema version or an older one down to the
+/// carry-forward floor (see [`cas_required_marker_keys`]). `Ok(None)` for a
+/// backend with no durable object tier, which never carries a marker. Used by
+/// `rocky doctor`.
 ///
 /// # Errors
 ///
@@ -1367,8 +1443,8 @@ pub async fn cas_required_marker_present(
     let Some(provider) = durable_tier_provider(cfg)? else {
         return Ok(None);
     };
-    let key = cas_required_marker_key(&remote_state_key(state_path));
-    Ok(Some(provider.exists(&key).await?))
+    let found = find_cas_required_marker(&provider, &remote_state_key(state_path)).await?;
+    Ok(Some(found.is_some()))
 }
 
 /// The marker's object key (relative to the configured prefix) for the state
@@ -8953,6 +9029,65 @@ mod tests {
         test_support::clear();
     }
 
+    /// P3-6: the marker sits under its schema-version prefix and a bump does
+    /// not move it. A marker left at an older version by a CAS fleet still
+    /// binds an explicit-`off` writer at the current version, at start and at
+    /// upload.
+    #[tokio::test]
+    async fn an_older_version_marker_refuses_an_off_writer_after_a_bump() {
+        test_support::clear();
+        let (faults, provider) = install_probe_provider();
+        let dir = TempDir::new().unwrap();
+        let local = dir.path().join(".rocky-state.redb");
+        seed_state_file(&local);
+        let remote = remote_state_key(&local);
+        let previous = current_version() - 1;
+        let old_marker = format!(
+            "{}{CAS_REQUIRED_MARKER_SUFFIX}",
+            object_store_state_key_at(previous, &remote)
+        );
+        provider
+            .put(&old_marker, Bytes::from_static(b"{}"))
+            .await
+            .unwrap();
+        assert!(
+            !provider
+                .exists(&cas_required_marker_key(&remote))
+                .await
+                .unwrap(),
+            "PRECONDITION: no marker at the current version"
+        );
+
+        let off = StateConfig {
+            on_upload_failure: StateUploadFailureMode::Fail,
+            ..with_mode(&s3_unset_config(), ConcurrencyControl::Off)
+        };
+        let mut session =
+            RemoteStateSession::new(&off, &local, FinalizeDurability::ConfigDefault, false);
+        let err = session.acquire().await.unwrap_err();
+        session.abandon("test: refused at acquire").await;
+        match &err {
+            StateSyncError::CasRequired { marker } => {
+                assert!(marker.contains(&format!("v{previous}/")), "{marker}");
+            }
+            other => panic!("expected CasRequired, got {other:?}"),
+        }
+        let err = upload_state(&off, &local, false).await.unwrap_err();
+        assert!(matches!(err, StateSyncError::CasRequired { .. }), "{err:?}");
+        let state_key = object_store_state_key(&remote);
+        assert_eq!(
+            faults.put_count(&state_key, crate::fault_store::PutKind::Unconditional),
+            0,
+            "the refused writer never reached the state object"
+        );
+        assert_eq!(
+            cas_required_marker_present(&off, &local).await.unwrap(),
+            Some(true),
+            "doctor sees the older marker too"
+        );
+        test_support::clear();
+    }
+
     /// Without the marker, explicit `off` keeps uploading unconditionally —
     /// the opt-out still works for a fleet that never ran `cas`.
     #[tokio::test]
@@ -9093,6 +9228,36 @@ mod tests {
             (CasProbeOutcome::Supported, true)
         );
         test_support::clear();
+    }
+
+    /// P3-7: step 3's first attempt lands but its response is lost, so its
+    /// retry carries a generation the write itself just moved on and is
+    /// refused. That is the store working, not "conditional writes
+    /// unsupported": the verdict is inconclusive and not cached.
+    #[tokio::test]
+    async fn a_conflict_after_a_retried_if_match_is_inconclusive() {
+        test_support::clear();
+        let (faults, _provider) = install_probe_provider();
+        // Puts: 1 create, 2 create-again, 3 if-match (lands, then errors).
+        faults.land_then_fail_nth_put(3);
+        let (outcome, cacheable) = probe_conditional_writes_inner(&s3_unset_config()).await;
+        assert!(
+            matches!(outcome, CasProbeOutcome::Inconclusive(_)),
+            "{outcome:?}"
+        );
+        assert!(!cacheable, "an inconclusive probe is never cached");
+        test_support::clear();
+    }
+
+    /// P3-7: the probe cache key names the endpoint, so the same bucket name
+    /// on another S3-compatible endpoint is probed on its own.
+    #[test]
+    fn the_probe_cache_key_names_the_endpoint_and_region() {
+        let key = cas_probe_cache_key(&s3_unset_config());
+        assert!(
+            key.contains("AWS_ENDPOINT_URL=") && key.contains("AWS_REGION="),
+            "{key}"
+        );
     }
 
     /// The probe object lives under its own `cas-probe/` key.
