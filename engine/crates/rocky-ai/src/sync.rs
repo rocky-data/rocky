@@ -3,7 +3,9 @@
 //! Compares column schemas between compilations to detect changes,
 //! then uses LLM + intent to propose updates to downstream models.
 
+use indexmap::IndexMap;
 use rocky_compiler::compile::CompileResult;
+use rocky_compiler::types::TypedColumn;
 use serde::{Deserialize, Serialize};
 
 use crate::client::{AiError, LlmClient};
@@ -53,10 +55,25 @@ pub fn detect_schema_changes(
     previous: &CompileResult,
     current: &CompileResult,
 ) -> Vec<SchemaChange> {
+    detect_schema_changes_between(
+        &previous.type_check.typed_models,
+        &current.type_check.typed_models,
+    )
+}
+
+/// Detect schema changes between two `model -> typed columns` maps.
+///
+/// The map form of [`detect_schema_changes`], for a previous schema that was
+/// persisted rather than held as a whole [`CompileResult`] (`rocky ai-sync`
+/// keeps such a snapshot next to the state store).
+pub fn detect_schema_changes_between(
+    previous: &IndexMap<String, Vec<TypedColumn>>,
+    current: &IndexMap<String, Vec<TypedColumn>>,
+) -> Vec<SchemaChange> {
     let mut changes = Vec::new();
 
-    for (model_name, current_cols) in &current.type_check.typed_models {
-        let prev_cols = match previous.type_check.typed_models.get(model_name) {
+    for (model_name, current_cols) in current {
+        let prev_cols = match previous.get(model_name) {
             Some(c) => c,
             None => {
                 // Entirely new model
@@ -162,8 +179,8 @@ pub fn detect_schema_changes(
     }
 
     // Detect removed models
-    for model_name in previous.type_check.typed_models.keys() {
-        if !current.type_check.typed_models.contains_key(model_name) {
+    for model_name in previous.keys() {
+        if !current.contains_key(model_name) {
             changes.push(SchemaChange {
                 model: model_name.clone(),
                 change_type: SchemaChangeType::ColumnRemoved {
@@ -184,6 +201,38 @@ pub async fn sync_model(
     client: &LlmClient,
     compile_result: &CompileResult,
 ) -> Result<SyncProposal, AiError> {
+    let intent = model
+        .config
+        .intent
+        .as_deref()
+        .unwrap_or("No intent specified");
+    let (system, user) = sync_prompts(model, upstream_changes, compile_result);
+
+    let response = client.generate(&system, &user, None).await?;
+    let proposed = crate::generate::extract_code(&response.content);
+
+    // Generate a simple diff
+    let diff = generate_diff(&model.sql, &proposed);
+
+    Ok(SyncProposal {
+        model: model.config.name.clone(),
+        intent: intent.to_string(),
+        current_source: model.sql.clone(),
+        proposed_source: proposed,
+        upstream_changes: upstream_changes.to_vec(),
+        diff,
+    })
+}
+
+/// Build the `(system, user)` prompt pair for [`sync_model`].
+///
+/// Split out so the prompt can be checked without an LLM call: the upstream
+/// schema changes must reach the system prompt verbatim.
+pub fn sync_prompts(
+    model: &rocky_core::models::Model,
+    upstream_changes: &[SchemaChange],
+    compile_result: &CompileResult,
+) -> (String, String) {
     let intent = model
         .config
         .intent
@@ -228,20 +277,7 @@ pub async fn sync_model(
         model.sql
     );
 
-    let response = client.generate(&system, &user, None).await?;
-    let proposed = crate::generate::extract_code(&response.content);
-
-    // Generate a simple diff
-    let diff = generate_diff(&model.sql, &proposed);
-
-    Ok(SyncProposal {
-        model: model.config.name.clone(),
-        intent: intent.to_string(),
-        current_source: model.sql.clone(),
-        proposed_source: proposed,
-        upstream_changes: upstream_changes.to_vec(),
-        diff,
-    })
+    (system, user)
 }
 
 /// Generate a simple unified diff between two strings.
