@@ -60,7 +60,7 @@ Top-level adapter fields are strict (`deny_unknown_fields` — typos are parse e
 
 | Adapter type | `kind` rule |
 |---|---|
-| `databricks`, `snowflake`, `bigquery`, `postgres`, `redshift` | Optional — defaults to `"data"`. Setting `"discovery"` is a parse error. |
+| `databricks`, `snowflake`, `bigquery`, `postgres`, `redshift`, `clickhouse` | Optional — defaults to `"data"`. Setting `"discovery"` is a parse error. |
 | `fivetran`, `airbyte`, `iceberg`, `manual` | **Required — must be `"discovery"`.** Omitting it is a parse error: these adapters have no data path. |
 | `duckdb` | Optional — absent means "register both roles" (the common DuckDB case). Setting `"data"` or `"discovery"` narrows to a single role. |
 
@@ -128,6 +128,25 @@ sslmode = "verify-full"                          # disable | prefer (default) | 
 ```
 
 Redshift models can set table attributes in the sidecar `[redshift]` block (`dist_style`, `dist_key`, `sort_key`, `sort_style`); `rocky compile` validates it (E052 / W052) and any other adapter refuses it at SQL generation. IAM auth for Redshift is not built in yet.
+
+### ClickHouse (beta; HTTP interface, user/password, TLS)
+
+```toml
+[adapter]
+type     = "clickhouse"
+host     = "${CLICKHOUSE_HOST}"                  # host or host:port (default 8123, 8443 with secure)
+username = "${CLICKHOUSE_USER}"                  # default "default"
+password = "${CLICKHOUSE_PASSWORD}"
+# database = "default"                           # session default database for unqualified names
+# timeout_secs = 300                             # per statement; also max_execution_time
+
+[adapter.extra]                                  # unknown keys are refused
+secure = true                                    # HTTPS, certificate always verified
+# ca_cert = "/etc/ssl/ch-ca.pem"                 # extra PEM roots (needs secure = true)
+# port = 9443                                    # wins over host:port
+```
+
+A Rocky schema is a ClickHouse database: set every model's `catalog = ""` (a non-empty catalog is refused). Models can set `[clickhouse]` (`engine` = a parameterless MergeTree-family name, `order_by` = columns, `partition_by` = a column or `fn(column)`); `rocky compile` validates it (E053 / W053). `merge` and `incremental` with `unique_key` are refused (E053, no `MERGE`), as are snapshots (E049), UDFs (E051) and `materialized_view`.
 
 ### Fivetran (discovery-only)
 
