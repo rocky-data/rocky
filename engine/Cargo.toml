@@ -11,6 +11,7 @@ members = [
     "crates/rocky-trino",
     "crates/rocky-postgres",
     "crates/rocky-clickhouse",
+    "crates/rocky-sqlserver",
     "crates/rocky-ai",
     "crates/rocky-server",
     "crates/rocky-engine",
@@ -152,6 +153,14 @@ futures = "0.3"
 tokio-postgres = { version = "0.7.18", default-features = false, features = ["runtime"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["aws_lc_rs", "logging", "tls12"] }
 webpki-roots = "1"
+
+# Microsoft SQL Server / Azure SQL / Fabric TDS protocol (rocky-sqlserver).
+# Pure Rust. Default features off (they pull native-tls and winauth); TLS is
+# rustls with the `webpki-roots` trust store — the same tokio-rustls 0.26 /
+# rustls 0.23 / aws-lc-rs stack as reqwest and rocky-postgres. `tds80` enables
+# TDS 8.0 strict encryption (`encrypt = "strict"`).
+tiberius = { version = "0.13", default-features = false, features = ["tds80", "rustls-webpki-roots", "chrono"] }
+tokio-util = { version = "0.7", features = ["compat"] }
 
 # Redis/Valkey
 redis = "1.2"

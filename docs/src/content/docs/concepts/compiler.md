@@ -132,12 +132,13 @@ For `USING` and `NATURAL` joins, Rocky distinguishes merged join keys from quali
 `rocky compile` also checks two kinds of operands against the target warehouse:
 
 - **Aggregate arguments.** `SUM(customer_name)` over a `VARCHAR` column has no
-  overload on DuckDB, BigQuery or Trino. Rocky reports `E042`. Snowflake and
-  Databricks cast the text at run time instead, so there it is `W042`.
+  overload on DuckDB, BigQuery, Trino or SQL Server. Rocky reports `E042`.
+  Snowflake and Databricks cast the text at run time instead, so there it is
+  `W042`.
 - **Comparison operands.** This covers `=`, `<>`, `<`, `>`, `<=`, `>=`, `IN`,
   `BETWEEN` and join `ON` predicates. A `BIGINT` column compared with a
-  `VARCHAR` column casts the text on every row on DuckDB, Snowflake and
-  Databricks. The query fails on the first value that does not parse, so Rocky
+  `VARCHAR` column casts the text on every row on DuckDB, Snowflake,
+  Databricks and SQL Server. The query fails on the first value that does not parse, so Rocky
   reports `W043`. BigQuery and Trino refuse the pair outright: `E043`.
 
 The warehouse comes from, in order: `--target-dialect`, the adapter `type` of
@@ -400,7 +401,7 @@ span, and sometimes a suggested fix.
 | `E042` | Aggregate argument type has no overload on the target warehouse, such as `SUM(VARCHAR)` on DuckDB |
 | `E043` | Comparison between types the target warehouse refuses, such as `INT64 = STRING` on BigQuery |
 | `E041` | A direct reference names a column absent from an external source whose schema Rocky trusts. See [Missing columns in external sources](#missing-columns-in-external-sources-e041--w041) |
-| `E051` | A [user-defined function](/concepts/user-defined-functions/) or a call to one is invalid: bad definition, Python language, wrong argument count, a certainly incompatible argument type, or a warehouse that cannot create functions (Trino) |
+| `E051` | A [user-defined function](/concepts/user-defined-functions/) or a call to one is invalid: bad definition, Python language, wrong argument count, a certainly incompatible argument type, or a warehouse that cannot create functions (Trino, ClickHouse, SQL Server) |
 | `E050` | A freshness declaration cannot be evaluated: no threshold, a bad duration, `error_after` shorter than `warn_after`, a bad `loaded_at_field` or `filter`, or a model `time_column` absent from a complete output |
 | `E037` | A transformation model declares `type = "incremental"` with no `timestamp_column` (watermark), which would append every row again on each run. Declare the watermark and use `@incremental_filter`, or use `merge`, `delete_insert`, `time_interval` or `full_refresh` |
 | `E046` | An `incremental` model's watermark filter has no safe place: no `@incremental_filter` and the watermark is not a provable passthrough column; or the watermark is not an output column or not a plain name; or `@incremental_filter` appears under another strategy |

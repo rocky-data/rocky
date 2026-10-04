@@ -1391,6 +1391,97 @@ pub trait SqlDialect: Send + Sync {
         format!("DELETE FROM {target} WHERE {where_clause}")
     }
 
+    /// The `DELETE` a `delete_insert` model runs before its INSERT: remove
+    /// every target row whose `partition_cols` values appear in `source_sql`.
+    ///
+    /// Default: `DELETE FROM t WHERE (a, b) IN (SELECT DISTINCT a, b FROM
+    /// (<source>) AS _rocky_incoming)`. SQL Server overrides — T-SQL has no
+    /// row-value `IN` and no CTE inside a derived table — with a correlated
+    /// `EXISTS`, which matches the same rows (a NULL partition value matches
+    /// nothing under either form).
+    ///
+    /// `partition_cols` are validated identifiers.
+    fn delete_partitions_sql(
+        &self,
+        target: &str,
+        partition_cols: &[std::sync::Arc<str>],
+        source_sql: &str,
+    ) -> String {
+        let cols = partition_cols.join(", ");
+        format!(
+            "DELETE FROM {target} WHERE ({cols}) IN (\
+             SELECT DISTINCT {cols} FROM ({source_sql}) AS _rocky_incoming\
+             )"
+        )
+    }
+
+    /// `INSERT INTO target (columns) SELECT columns FROM (<select>) AS …` —
+    /// an append that names its columns, for an incremental model whose
+    /// output column order differs from the target's.
+    ///
+    /// `columns` are validated identifiers. SQL Server overrides to lift the
+    /// model's CTEs out of the derived table.
+    fn insert_into_columns(&self, target: &str, columns: &[String], select_sql: &str) -> String {
+        let list = columns.join(", ");
+        format!(
+            "INSERT INTO {target} ({list})\nSELECT {list} FROM (\n{select_sql}\n) AS _rocky_incoming"
+        )
+    }
+
+    /// `ALTER TABLE … ADD COLUMN <column> <type>` for schema drift and an
+    /// incremental model's new columns.
+    ///
+    /// Default: the ANSI `ADD COLUMN` form. SQL Server overrides — T-SQL
+    /// spells it `ALTER TABLE t ADD <column> <type>` and refuses the
+    /// `COLUMN` keyword. Callers validate `column` and `data_type` first.
+    fn add_column_sql(&self, table_ref: &str, column: &str, data_type: &str) -> String {
+        format!("ALTER TABLE {table_ref} ADD COLUMN {column} {data_type}")
+    }
+
+    /// `expr` minus `amount` `unit`s, where `unit` is a singular upper-case
+    /// keyword (`SECOND`, `MINUTE`, `HOUR`, `DAY`). Used for an incremental
+    /// model's `lookback` against `MAX(<watermark>)`.
+    ///
+    /// Default: `<expr> - <interval_literal>`. SQL Server has no interval
+    /// type and overrides with `DATEADD(<unit>, -<amount>, <expr>)`.
+    fn subtract_interval_expr(&self, expr: &str, amount: u32, unit: &str) -> String {
+        format!("{expr} - {}", self.interval_literal(amount, unit))
+    }
+
+    /// A predicate that is always true, for an `@incremental_filter` on a
+    /// run that loads every row.
+    ///
+    /// Default: `TRUE`. SQL Server has no boolean literal and overrides with
+    /// `(1 = 1)`.
+    fn true_predicate(&self) -> &'static str {
+        "TRUE"
+    }
+
+    /// `SELECT <select_list> <rest>`, returning at most `limit` rows. `rest`
+    /// starts at `FROM` and may carry `WHERE` / `GROUP BY` / `ORDER BY`.
+    ///
+    /// Default: a trailing `LIMIT <n>`. SQL Server overrides with `SELECT
+    /// TOP (<n>)` — T-SQL has no `LIMIT`.
+    fn select_limited(&self, select_list: &str, rest: &str, limit: u64) -> String {
+        format!("SELECT {select_list} {rest} LIMIT {limit}")
+    }
+
+    /// `SELECT <select_list> FROM (<inner>) AS <alias>`, returning at most
+    /// `limit` rows. `inner` is a whole query, possibly starting with `WITH`.
+    ///
+    /// Default: `SELECT … FROM (<inner>) AS <alias> LIMIT <n>`. SQL Server
+    /// overrides to use `TOP` and to lift `inner`'s CTEs, which T-SQL refuses
+    /// inside a derived table.
+    fn wrap_select_limited(
+        &self,
+        inner: &str,
+        alias: &str,
+        select_list: &str,
+        limit: u64,
+    ) -> String {
+        format!("SELECT {select_list} FROM ({inner}) AS {alias} LIMIT {limit}")
+    }
+
     /// SQL query that returns one row per user table in a catalog/schema,
     /// with `table_name` as the first column.
     ///

@@ -57,7 +57,7 @@ use sqlparser::ast::{
 };
 use sqlparser::dialect::{
     BigQueryDialect, ClickHouseDialect, DatabricksDialect, Dialect, DuckDbDialect, GenericDialect,
-    PostgreSqlDialect, RedshiftSqlDialect, SnowflakeDialect,
+    MsSqlDialect, PostgreSqlDialect, RedshiftSqlDialect, SnowflakeDialect,
 };
 use sqlparser::parser::Parser;
 use sqlparser::tokenizer::Token;
@@ -926,6 +926,7 @@ pub fn dialect_for(name: &str) -> Box<dyn Dialect> {
         "postgres" => Box::new(PostgreSqlDialect {}),
         "redshift" => Box::new(RedshiftSqlDialect {}),
         "clickhouse" => Box::new(ClickHouseDialect {}),
+        "sqlserver" => Box::new(MsSqlDialect {}),
         _ => Box::new(GenericDialect),
     }
 }

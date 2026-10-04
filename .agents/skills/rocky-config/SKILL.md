@@ -60,7 +60,7 @@ Top-level adapter fields are strict (`deny_unknown_fields` — typos are parse e
 
 | Adapter type | `kind` rule |
 |---|---|
-| `databricks`, `snowflake`, `bigquery`, `postgres`, `redshift`, `clickhouse` | Optional — defaults to `"data"`. Setting `"discovery"` is a parse error. |
+| `databricks`, `snowflake`, `bigquery`, `postgres`, `redshift`, `clickhouse`, `sqlserver` | Optional — defaults to `"data"`. Setting `"discovery"` is a parse error. |
 | `fivetran`, `airbyte`, `iceberg`, `manual` | **Required — must be `"discovery"`.** Omitting it is a parse error: these adapters have no data path. |
 | `duckdb` | Optional — absent means "register both roles" (the common DuckDB case). Setting `"data"` or `"discovery"` narrows to a single role. |
 
@@ -147,6 +147,32 @@ secure = true                                    # HTTPS, certificate always ver
 ```
 
 A Rocky schema is a ClickHouse database: set every model's `catalog = ""` (a non-empty catalog is refused). Models can set `[clickhouse]` (`engine` = a parameterless MergeTree-family name, `order_by` = columns, `partition_by` = a column or `fn(column)`); `rocky compile` validates it (E053 / W053). `merge` and `incremental` with `unique_key` are refused (E053, no `MERGE`), as are snapshots (E049), UDFs (E051) and `materialized_view`.
+
+### SQL Server / Azure SQL / Fabric Warehouse (beta)
+
+```toml
+[adapter]
+type     = "sqlserver"
+host     = "${MSSQL_HOST}"                       # host, host,port or host:port (default 1433)
+database = "analytics"                           # the connected database = the only valid catalog
+# exactly ONE auth method:
+username = "${MSSQL_USER}"                       # SQL auth (not on Fabric)
+password = "${MSSQL_PASSWORD}"
+# oauth_token = "${MSSQL_ACCESS_TOKEN}"          # Entra ID access token (not refreshed)
+# client_id = "${AZURE_CLIENT_ID}"               # Entra ID service principal, with extra.tenant_id
+# client_secret = "${AZURE_CLIENT_SECRET}"
+
+[adapter.extra]                                  # unknown keys are refused
+# encrypt = "mandatory"                          # mandatory (default) | strict (TDS 8.0) | optional
+# trust_server_certificate = true                # local/test servers only
+# ca_cert = "/etc/ssl/corp-ca.pem"
+# flavor = "fabric"                              # Fabric Warehouse renderings
+# tenant_id = "${AZURE_TENANT_ID}"
+# port = 1433
+# max_connections = 8
+```
+
+Snapshots, `materialized_view`, UDFs (E051) and `regex_match` checks are refused on SQL Server.
 
 ### Fivetran (discovery-only)
 

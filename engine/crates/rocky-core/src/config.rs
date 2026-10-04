@@ -4612,6 +4612,7 @@ impl AdapterConfig {
     /// | `trino`      | `host`, `catalog` (the `database` slot)                    |
     /// | `postgres`, `redshift` | `host`, `database`, `port` (from `[extra]`, when set) |
     /// | `clickhouse` | `host`, `port` (from `[extra]`, when set)                  |
+    /// | `sqlserver`  | `host`, `database`, `port` (from `[extra]`, when set)     |
     /// | `fivetran`   | `destination_id`                                           |
     /// | `airbyte`, `iceberg` | `host`                                             |
     /// | `manual`     | the type alone                                             |
@@ -4624,7 +4625,8 @@ impl AdapterConfig {
     /// Never in the identity: `username`, `password`, `token`, `oauth_token`,
     /// `pat`, `private_key_path`, `client_id`, `client_secret`, `api_key`,
     /// `api_secret`, `role`, and the `[extra]` table (except a PostgreSQL /
-    /// Redshift / ClickHouse `port`, which is a locator). A Snowflake session
+    /// Redshift / ClickHouse / SQL Server `port`, which is a locator). A
+    /// Snowflake session
     /// with no `database` (a PAT or OAuth session, say) writes into the
     /// session's default database, and the identity does **not** stand a
     /// user name in for it: two such sessions on one account are one
@@ -4718,6 +4720,15 @@ impl AdapterConfig {
                 // Every target names its database, so the session's default
                 // `database` does not locate them; host and port do.
                 push("host", self.host.as_deref());
+                let port = self.extra.get("port").map(|p| match p {
+                    serde_json::Value::String(s) => s.trim().to_string(),
+                    other => other.to_string(),
+                });
+                push("port", port.as_deref());
+            }
+            "sqlserver" => {
+                push("host", self.host.as_deref());
+                push("database", self.database.as_deref());
                 let port = self.extra.get("port").map(|p| match p {
                     serde_json::Value::String(s) => s.trim().to_string(),
                     other => other.to_string(),

@@ -671,7 +671,10 @@ fn warehouse_adapters(
 
 /// E051 for every valid function a model calls when every warehouse adapter
 /// the project configures cannot create functions: Trino, and every adapter
-/// with no function DDL (an unknown type). A project
+/// with no function DDL (ClickHouse, SQL Server, an unknown type).
+/// SQL Server is refused, not rendered: a T-SQL scalar UDF takes
+/// `@`-prefixed parameters and must be called schema-qualified
+/// (`dbo.f(x)`), so a model's bare `f(x)` call would not resolve to it. A project
 /// that also configures a capable warehouse is not refused here —
 /// `rocky run` refuses at the boundary if the model runs on the other one.
 fn function_adapter_diagnostics(
@@ -1193,6 +1196,7 @@ schema_template = "s"
     fn udf_on_warehouse_without_function_ddl_is_e051() {
         for adapters in [
             TRINO.to_string(),
+            PG.replace("postgres", "sqlserver"),
             // A discovery-only adapter is not a warehouse.
             format!(
                 "{TRINO}\n[adapter.src]\ntype = \"fivetran\"\nkind = \"discovery\"\n\
@@ -1260,6 +1264,7 @@ schema_template = "s"
         for adapters in [
             format!("{PG}\n[adapter.wh.extra]\nmerge_mode = \"on_conflict\"\n"),
             PG.replace("postgres", "redshift"),
+            PG.replace("postgres", "sqlserver"),
         ] {
             let dir = TempDir::new().unwrap();
             let config = snapshot_project(dir.path(), &adapters);

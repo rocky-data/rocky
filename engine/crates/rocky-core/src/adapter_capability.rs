@@ -56,7 +56,7 @@ impl AdapterCapability {
 /// adapter implementations in the workspace.
 pub fn capability_for(adapter_type: &str) -> Option<AdapterCapability> {
     let cap = match adapter_type {
-        "databricks" | "snowflake" | "postgres" | "redshift" | "clickhouse" => {
+        "databricks" | "snowflake" | "postgres" | "redshift" | "clickhouse" | "sqlserver" => {
             AdapterCapability::DATA_ONLY
         }
         "fivetran" | "airbyte" | "iceberg" | "manual" => AdapterCapability::DISCOVERY_ONLY,

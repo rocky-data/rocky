@@ -66,6 +66,9 @@ rocky-postgres = { path = "../crates/rocky-postgres" }
 # `clickhouse_live_pipeline` seeds and reads back a live ClickHouse through
 # the adapter (skipped unless ROCKY_CLICKHOUSE_TEST_HOST is set).
 rocky-clickhouse = { path = "../crates/rocky-clickhouse" }
+# `sqlserver_live_pipeline` seeds and reads back a live SQL Server through the
+# adapter (skipped unless ROCKY_SQLSERVER_TEST_HOST is set).
+rocky-sqlserver = { path = "../crates/rocky-sqlserver" }
 
 [lints]
 workspace = true
