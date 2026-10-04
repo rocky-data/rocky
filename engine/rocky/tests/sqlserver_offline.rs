@@ -238,7 +238,8 @@ fn emit_sql_renders_tsql() {
     assert!(
         out.contains(
             "SELECT * INTO [analytics].[marts].[stg_orders__rocky_new] FROM (\n\
-             SELECT order_id, customer_id, amount FROM raw.orders\n) AS rocky_src;"
+             SELECT order_id, customer_id, amount FROM raw.orders\n) AS rocky_src\n\
+             UNION ALL\n"
         ),
         "{out}"
     );

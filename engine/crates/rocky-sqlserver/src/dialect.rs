@@ -130,12 +130,24 @@ fn staging_name(table: &str) -> String {
 }
 
 impl SqlServerDialect {
+    /// `SELECT * INTO target` from the model, built so the new table does
+    /// NOT inherit an `IDENTITY` property from a source column.
+    ///
+    /// `SELECT … INTO` copies `IDENTITY` through a derived table, a join
+    /// and a `WHERE 1 = 0`; a `UNION` is one of the documented exceptions
+    /// (learn.microsoft.com/sql/t-sql/queries/select-into-clause-transact-sql,
+    /// "Working with identity columns"; verified on SQL Server 2022). An
+    /// inherited `IDENTITY` would make every later `INSERT` / `MERGE` of
+    /// that column fail (error 8101). The empty `TOP (0)` branch adds no
+    /// rows and has the same column types.
     fn select_into(&self, target: &str, select_sql: &str) -> String {
         let h = hoist(select_sql);
+        let body = h.body.trim();
         format!(
-            "{}SELECT * INTO {target} FROM (\n{}\n) AS rocky_src",
+            "{}SELECT * INTO {target} FROM (\n{body}\n) AS rocky_src\n\
+             UNION ALL\n\
+             SELECT TOP (0) * FROM (\n{body}\n) AS rocky_no_identity",
             h.prefix(),
-            h.body.trim()
         )
     }
 
@@ -407,6 +419,15 @@ impl SqlDialect for SqlServerDialect {
             || "1970-01-01 00:00:00.0000000".to_string(),
             |t| {
                 use chrono::Timelike;
+                // Round UP to DATETIME2's 100 ns tick. A `DATETIME` value is
+                // a 1/300 s tick that the server compares exactly
+                // (`.003` is 3.333… ms) while it reads back truncated
+                // (3_333_333 ns); a truncated or rounded literal would sit
+                // below it and re-admit the row it came from. No `DATETIME`
+                // or `DATETIME2(7)` value lies strictly between the true
+                // value and this ceiling, so no new row is skipped.
+                let t = *t
+                    + chrono::Duration::nanoseconds(i64::from((100 - t.nanosecond() % 100) % 100));
                 format!(
                     "{}.{:07}",
                     t.format("%Y-%m-%d %H:%M:%S"),
@@ -803,7 +824,8 @@ mod tests {
             sql,
             "SET XACT_ABORT ON;\n\
              DROP TABLE IF EXISTS [marts].[fct__rocky_new];\n\
-             SELECT * INTO [marts].[fct__rocky_new] FROM (\nSELECT 1 AS a\n) AS rocky_src;\n\
+             SELECT * INTO [marts].[fct__rocky_new] FROM (\nSELECT 1 AS a\n) AS rocky_src\n\
+             UNION ALL\nSELECT TOP (0) * FROM (\nSELECT 1 AS a\n) AS rocky_no_identity;\n\
              BEGIN TRANSACTION;\n\
              DROP TABLE IF EXISTS [marts].[fct];\n\
              EXEC sp_rename N'[marts].[fct__rocky_new]', N'fct';\n\
@@ -826,7 +848,8 @@ mod tests {
         assert!(
             sql.contains(
                 "WITH base AS (SELECT id FROM [raw].[orders]\n)\n\
-                 SELECT * INTO [marts].[fct__rocky_new] FROM (\nSELECT id FROM base\n) AS rocky_src;"
+                 SELECT * INTO [marts].[fct__rocky_new] FROM (\nSELECT id FROM base\n) AS rocky_src\n\
+                 UNION ALL\nSELECT TOP (0) * FROM (\nSELECT id FROM base\n) AS rocky_no_identity;"
             ),
             "{sql}"
         );
@@ -847,7 +870,8 @@ mod tests {
     fn first_create_is_select_into() {
         assert_eq!(
             d().create_table_as_new("[m].[t]", "SELECT 1 AS a"),
-            "SELECT * INTO [m].[t] FROM (\nSELECT 1 AS a\n) AS rocky_src"
+            "SELECT * INTO [m].[t] FROM (\nSELECT 1 AS a\n) AS rocky_src\nUNION ALL\n\
+             SELECT TOP (0) * FROM (\nSELECT 1 AS a\n) AS rocky_no_identity"
         );
     }
 
@@ -1110,6 +1134,14 @@ mod tests {
         assert_eq!(
             d().watermark_where("_loaded_at", Some(&prior)).unwrap(),
             "WHERE [_loaded_at] > CAST('2026-09-15 10:00:00.1234567' AS DATETIME2(7))"
+        );
+        // DATETIME's 1/300 s ticks round UP: `.007` reads back as
+        // 6_666_666 ns but compares as 6.666… ms.
+        let datetime_tick = chrono::Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap()
+            + chrono::Duration::nanoseconds(6_666_666);
+        assert_eq!(
+            d().watermark_where("ts", Some(&datetime_tick)).unwrap(),
+            "WHERE [ts] > CAST('2026-01-01 00:00:00.0066667' AS DATETIME2(7))"
         );
         assert_eq!(
             d().watermark_where("ts", None).unwrap(),

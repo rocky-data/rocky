@@ -134,7 +134,9 @@ WHEN NOT MATCHED BY TARGET THEN INSERT ([order_id], [amount]) VALUES (rocky_s.[o
 
 Rocky leaves the SQL as written, and the server reports its own error, when lifting could change the meaning: two CTEs with the same name, or a nested CTE name that the rest of the statement also uses as a bare name.
 
-**Incremental models.** `@incremental_filter` becomes `(1 = 1)` on a run that loads every row, because T-SQL has no `TRUE`. A `lookback` renders as `DATEADD(hour, -2, MAX(updated_at))`. A watermark literal carries 7 fractional digits, `DATETIME2`'s precision, so the row it came from does not pass the next run's `>` filter again.
+**IDENTITY columns.** `SELECT … INTO` copies a source column's `IDENTITY` property, which would make every later insert of that column fail. Rocky adds an empty `UNION ALL SELECT TOP (0) …` branch to each `SELECT … INTO`; a `UNION` is the documented way to drop the property.
+
+**Incremental models.** `@incremental_filter` becomes `(1 = 1)` on a run that loads every row, because T-SQL has no `TRUE`. A `lookback` renders as `DATEADD(hour, -2, MAX(updated_at))`. A watermark literal carries 7 fractional digits, `DATETIME2`'s precision, rounded up. So the row it came from does not pass the next run's `>` filter again, including a `DATETIME` value such as `.003`, which the server compares as 3.333… ms.
 
 **Merge.** `HOLDLOCK` stops two concurrent upserts from both inserting the same new key. Fabric does not accept table hints, so `flavor = "fabric"` leaves it out. A key-only merge has no `WHEN MATCHED` arm and only inserts missing keys.
 
@@ -192,6 +194,13 @@ Set `flavor = "fabric"`. It changes these renderings:
 - `MERGE` has no `HOLDLOCK` hint.
 - Null-rate checks scan the whole table, because Fabric has no `TABLESAMPLE`.
 - SQL authentication is refused. Use an access token or a service principal.
+
+## Known limits
+
+- A model whose SELECT ends in `ORDER BY` (without `TOP` or `OFFSET`), `OPTION (…)` or `FOR JSON` / `FOR XML` fails on every write. T-SQL refuses those inside the derived table Rocky wraps the model in (error 1033). Remove the clause.
+- An hour, minute or second `lookback` on a `DATE` watermark column fails: `DATEADD(hour, …)` does not accept a `DATE`. Use a day lookback, or a `DATETIME2` watermark.
+- `on_schema_change = "append_new_columns"` builds a probe table named `<table>__rocky_probe_<pid>_<nonce>`. A target name over about 85 characters makes it longer than 128 characters, and the run fails.
+- `rows_copied` for a multi-statement write is the last non-zero count the server reported.
 
 ## Not supported yet
 

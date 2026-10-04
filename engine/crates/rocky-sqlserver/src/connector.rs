@@ -344,8 +344,8 @@ impl SqlServerClient {
         })
     }
 
-    /// Run one or more statements. Returns the row count of the last
-    /// statement that reported one.
+    /// Run one or more statements. Returns the last non-zero row count the
+    /// statements reported.
     ///
     /// # Errors
     ///
@@ -361,7 +361,16 @@ impl SqlServerClient {
             .await
             .map_err(|e| map_error(e, self.config.timeout))?;
         pooled.release();
-        Ok(result.rows_affected().last().copied())
+        // A script reports a count per statement, and 0 for statements that
+        // touch no rows (DDL, `sp_rename`, `COMMIT`); the last non-zero count
+        // is the write's (`SELECT INTO`, or the INSERT after a DELETE).
+        let counts = result.rows_affected();
+        Ok(counts
+            .iter()
+            .rev()
+            .find(|n| **n > 0)
+            .or(counts.last())
+            .copied())
     }
 
     /// Run a query and return its last result set as text cells (`NULL` is

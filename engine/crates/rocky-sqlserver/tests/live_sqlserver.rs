@@ -746,3 +746,94 @@ async fn auth_failure_is_permanent_and_classified() {
         rocky_core::failure_class::FailureClass::Permanent
     );
 }
+
+/// A source `IDENTITY` column must not become an `IDENTITY` on the table
+/// Rocky creates: later inserts of that column would fail (error 8101).
+#[tokio::test]
+async fn identity_source_columns_are_not_inherited() {
+    let s = "rocky_live_ident";
+    let Some(a) = setup(s).await else {
+        return;
+    };
+    let d = a.dialect();
+    a.execute_statement(&format!(
+        "CREATE TABLE [{s}].[src] (id INT IDENTITY, v INT); \
+         INSERT INTO [{s}].[src] (v) VALUES (1), (2)"
+    ))
+    .await
+    .unwrap();
+    let src = d.format_table_ref("", s, "src").unwrap();
+    for (table, create) in [
+        (
+            "first",
+            d.create_table_as_new(
+                &d.format_table_ref("", s, "first").unwrap(),
+                &format!("SELECT id, v FROM {src}"),
+            ),
+        ),
+        (
+            "full",
+            d.create_table_as(
+                &d.format_table_ref("", s, "full").unwrap(),
+                &format!("SELECT id, v FROM {src}"),
+            ),
+        ),
+    ] {
+        a.execute_statement(&create).await.unwrap();
+        let t = d.format_table_ref("", s, table).unwrap();
+        assert_eq!(
+            scalar(
+                &a,
+                &format!(
+                    "SELECT CAST(OBJECTPROPERTY(OBJECT_ID(N'{t}'), 'TableHasIdentity') AS INT)"
+                )
+            )
+            .await
+            .as_deref(),
+            Some("0"),
+            "{table}"
+        );
+        assert_eq!(count(&a, &t).await, "2");
+        a.execute_statement(&d.insert_into(&t, &format!("SELECT id, v FROM {src}")))
+            .await
+            .unwrap();
+        assert_eq!(count(&a, &t).await, "4");
+    }
+}
+
+/// A `DATETIME` watermark (1/300 s ticks) does not re-admit its own row.
+#[tokio::test]
+async fn datetime_watermark_does_not_readmit_its_row() {
+    let s = "rocky_live_dtwm";
+    let Some(a) = setup(s).await else {
+        return;
+    };
+    let d = a.dialect();
+    a.execute_statement(&format!(
+        "CREATE TABLE [{s}].[src] (id INT, ts DATETIME); \
+         INSERT INTO [{s}].[src] VALUES (1, '2026-01-01 00:00:00.007'), \
+         (2, '2026-01-01 00:00:00.003'), (3, '2026-01-01 00:00:00.010')"
+    ))
+    .await
+    .unwrap();
+    let src = d.format_table_ref("", s, "src").unwrap();
+    for id in 1..=3 {
+        let max = scalar(&a, &format!("SELECT ts FROM {src} WHERE id = {id}"))
+            .await
+            .unwrap();
+        let parsed = chrono::NaiveDateTime::parse_from_str(&max, "%Y-%m-%d %H:%M:%S%.f")
+            .unwrap()
+            .and_utc();
+        let wh = d.watermark_where("ts", Some(&parsed)).unwrap();
+        let r = scalar(
+            &a,
+            &format!("SELECT COUNT(*) FROM {src} {wh} AND id = {id}"),
+        )
+        .await;
+        assert_eq!(
+            r.as_deref(),
+            Some("0"),
+            "row {id} ({max}) re-admitted by {wh}"
+        );
+    }
+}

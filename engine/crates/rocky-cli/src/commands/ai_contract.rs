@@ -333,9 +333,12 @@ pub(crate) async fn profile_column(
     // on every path. MIN/MAX (which are real cell values) are only selected
     // when the caller opted into `--with-data`.
     let agg_sql = if with_data {
+        // The dialect's text type: a bare `VARCHAR` is `VARCHAR(30)` in a
+        // T-SQL `CAST` and not a type at all on BigQuery.
+        let text = adapter.dialect().string_type_name();
         format!(
             "SELECT COUNT(*) AS n, COUNT({col}) AS non_null, COUNT(DISTINCT {col}) AS distinct_n, \
-             CAST(MIN({col}) AS VARCHAR) AS min_v, CAST(MAX({col}) AS VARCHAR) AS max_v \
+             CAST(MIN({col}) AS {text}) AS min_v, CAST(MAX({col}) AS {text}) AS max_v \
              FROM {table_ref}"
         )
     } else {

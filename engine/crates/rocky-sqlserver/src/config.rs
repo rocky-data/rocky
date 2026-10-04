@@ -254,7 +254,15 @@ impl SqlServerConfig {
                 "tenant_id" => tenant_id = Some(value_as_str(key, value)?.trim().to_string()),
                 "authority_host" => {
                     let raw = value_as_str(key, value)?.trim().trim_end_matches('/');
-                    if !raw.starts_with("https://") && !raw.starts_with("http://127.0.0.1") {
+                    // Plain HTTP only for a loopback stand-in (tests): the
+                    // client secret is posted to this host.
+                    let loopback = raw.strip_prefix("http://127.0.0.1").is_some_and(|rest| {
+                        rest.is_empty()
+                            || rest
+                                .strip_prefix(':')
+                                .is_some_and(|p| p.parse::<u16>().is_ok())
+                    });
+                    if !raw.starts_with("https://") && !loopback {
                         return Err(SqlServerError::Config(
                             "extra.authority_host must be an https:// URL".into(),
                         ));
@@ -643,6 +651,16 @@ mod tests {
         let mut extra = BTreeMap::new();
         extra.insert("authority_host".into(), serde_json::json!("http://evil"));
         assert!(build("db", &sql_creds(), &extra).is_err());
+        extra.insert(
+            "authority_host".into(),
+            serde_json::json!("http://127.0.0.1.attacker.example"),
+        );
+        assert!(build("db", &sql_creds(), &extra).is_err());
+        extra.insert(
+            "authority_host".into(),
+            serde_json::json!("http://127.0.0.1:8080"),
+        );
+        assert!(build("db", &sql_creds(), &extra).is_ok());
         extra.insert(
             "authority_host".into(),
             serde_json::json!("https://login.microsoftonline.us/"),
