@@ -208,7 +208,12 @@ async fn compare_bisection_detects_null_key_rows_with_different_values() {
 async fn compare_bisection_detects_extra_null_key_row() {
     let adapter = DuckDbWarehouseAdapter::in_memory().unwrap();
     seed(&adapter, "base", &[(Some(1), "a"), (None, "x")]).await;
-    seed(&adapter, "branch", &[(Some(1), "a"), (None, "x"), (None, "x")]).await;
+    seed(
+        &adapter,
+        "branch",
+        &[(Some(1), "a"), (None, "x"), (None, "x")],
+    )
+    .await;
 
     let result = diff(&adapter, 1, 2, 1000).await;
 
@@ -223,8 +228,18 @@ async fn compare_bisection_detects_extra_null_key_row() {
 #[tokio::test]
 async fn compare_bisection_detects_duplicate_null_key_rows_changed_together() {
     let adapter = DuckDbWarehouseAdapter::in_memory().unwrap();
-    seed(&adapter, "base", &[(Some(1), "a"), (None, "x"), (None, "x")]).await;
-    seed(&adapter, "branch", &[(Some(1), "a"), (None, "y"), (None, "y")]).await;
+    seed(
+        &adapter,
+        "base",
+        &[(Some(1), "a"), (None, "x"), (None, "x")],
+    )
+    .await;
+    seed(
+        &adapter,
+        "branch",
+        &[(Some(1), "a"), (None, "y"), (None, "y")],
+    )
+    .await;
 
     let result = diff(&adapter, 1, 2, 1000).await;
 
@@ -275,7 +290,10 @@ async fn compare_bisection_unchanged_large_tables_stop_at_root() {
 
     let result = diff(&adapter, 0, 10_000, 100).await;
 
-    assert_eq!(result.rows_added + result.rows_removed + result.rows_changed, 0);
+    assert_eq!(
+        result.rows_added + result.rows_removed + result.rows_changed,
+        0
+    );
     assert_eq!(result.stats.depth_max, 0);
     assert_eq!(result.stats.leaves_materialized, 0);
     assert_eq!(

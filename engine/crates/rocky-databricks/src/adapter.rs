@@ -418,9 +418,12 @@ impl WarehouseAdapter for DatabricksWarehouseAdapter {
         // Hash the key with the values: a value-only hash cannot see
         // values that swap between keys, and lets equal value tuples at
         // different keys cancel under the XOR.
-        let row_hash = self.dialect.row_hash_expr(
-            &rocky_core::compare::bisection::checksum_hash_columns(pk_column, value_columns),
-        )?;
+        let row_hash =
+            self.dialect
+                .row_hash_expr(&rocky_core::compare::bisection::checksum_hash_columns(
+                    pk_column,
+                    value_columns,
+                ))?;
         let last_id = k - 1;
 
         let sql = format!(

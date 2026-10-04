@@ -270,8 +270,7 @@ pub async fn bisection_diff(
         },
         config.k,
     )?;
-    if null_key_groups_differ(base, branch, target, null_pk_rows_base, null_pk_rows_branch).await?
-    {
+    if null_key_groups_differ(base, branch, target, null_pk_rows_base, null_pk_rows_branch).await? {
         diff_null_key_rows(base, branch, target, &mut state).await?;
     }
 
@@ -389,8 +388,10 @@ async fn fetch_null_key_hashes(
     let dialect = adapter.dialect();
     let table_ref = dialect.format_table_ref(&table.catalog, &table.schema, &table.table)?;
     let pk = dialect.quote_identifier(target.pk_column);
-    let row_hash =
-        dialect.row_hash_expr(&checksum_hash_columns(target.pk_column, target.value_columns))?;
+    let row_hash = dialect.row_hash_expr(&checksum_hash_columns(
+        target.pk_column,
+        target.value_columns,
+    ))?;
     let sql = format!("SELECT {row_hash} FROM {table_ref} WHERE {pk} IS NULL");
     let result = adapter.execute_query(&sql).await?;
     let mut hashes = result
@@ -509,9 +510,8 @@ async fn fetch_null_key_rows(
         .rows
         .into_iter()
         .map(|row| {
-            serde_json::to_string(&row).map_err(|e| {
-                AdapterError::msg(format!("failed to serialize a null-pk row: {e}"))
-            })
+            serde_json::to_string(&row)
+                .map_err(|e| AdapterError::msg(format!("failed to serialize a null-pk row: {e}")))
         })
         .collect()
 }

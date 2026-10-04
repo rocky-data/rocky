@@ -290,7 +290,9 @@ impl SqlDialect for DuckDbSqlDialect {
             .map(|c| format!("\"{c}\""))
             .collect::<Vec<_>>()
             .join(", ");
-        Ok(format!("CAST(hash(CAST(row({arg_list}) AS VARCHAR)) AS HUGEINT)"))
+        Ok(format!(
+            "CAST(hash(CAST(row({arg_list}) AS VARCHAR)) AS HUGEINT)"
+        ))
     }
 }
 
