@@ -702,3 +702,111 @@ async fn snapshot_sql_runs_on_postgres() {
         ]
     );
 }
+
+fn udf(
+    name: &str,
+    schema: &str,
+    args: &[(&str, &str)],
+    returns: &str,
+    body: &str,
+) -> rocky_core::functions::FunctionDef {
+    use rocky_core::functions::{FunctionArgument, FunctionConfig, FunctionDef, FunctionTarget};
+    FunctionDef {
+        name: name.to_string(),
+        config: FunctionConfig {
+            name: None,
+            description: None,
+            language: "sql".to_string(),
+            returns: returns.to_string(),
+            arguments: args
+                .iter()
+                .map(|(n, t)| FunctionArgument {
+                    name: (*n).to_string(),
+                    data_type: (*t).to_string(),
+                })
+                .collect(),
+            deterministic: Some(true),
+            target: FunctionTarget {
+                catalog: None,
+                schema: Some(schema.to_string()),
+            },
+        },
+        body: Some(body.to_string()),
+        file_path: std::path::PathBuf::from(format!("functions/{name}.toml")),
+    }
+}
+
+/// The function DDL `rocky run` emits for PostgreSQL creates a callable
+/// function, and re-running it replaces it in place. The Redshift rendering
+/// (unnamed arguments referenced as `$1`, `$2`) is valid PostgreSQL too, so
+/// its positional rewrite is executed here as well — a syntax and semantics
+/// check of the rewrite, not a substitute for a Redshift run.
+#[tokio::test]
+async fn user_defined_functions_create_and_call() {
+    use rocky_core::functions::{FunctionDialect, create_function_sql};
+    let schema = "rocky_live_udf";
+    let Some(a) = setup(schema, MergeMode::Merge).await else {
+        return;
+    };
+    let body = "CASE WHEN b = 0 THEN NULL ELSE a / b END -- trailing note";
+    let pg = udf(
+        "safe_div",
+        schema,
+        &[("a", "NUMERIC"), ("b", "NUMERIC")],
+        "NUMERIC",
+        body,
+    );
+    let rs = udf(
+        "safe_div_rs",
+        schema,
+        &[("a", "NUMERIC"), ("b", "NUMERIC")],
+        "NUMERIC",
+        body,
+    );
+    for (def, dialect) in [
+        (&pg, FunctionDialect::Postgres),
+        (&rs, FunctionDialect::Redshift),
+    ] {
+        let ddl = create_function_sql(def, dialect).expect("ddl");
+        a.execute_statement(&ddl).await.expect("create function");
+        a.execute_statement(&ddl).await.expect("replace function");
+        let name = &def.name;
+        assert_eq!(
+            scalar(&a, &format!("SELECT {schema}.{name}(7, 2)::text"))
+                .await
+                .as_deref(),
+            Some("3.5000000000000000"),
+            "{ddl}"
+        );
+        assert_eq!(
+            scalar(&a, &format!("SELECT {schema}.{name}(7, 0)::text")).await,
+            None,
+            "{ddl}"
+        );
+    }
+    let volatility = scalar(
+        &a,
+        &format!(
+            "SELECT provolatile::text FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
+             WHERE n.nspname = '{schema}' AND p.proname = 'safe_div'"
+        ),
+    )
+    .await;
+    assert_eq!(
+        volatility.as_deref(),
+        Some("i"),
+        "deterministic → IMMUTABLE"
+    );
+
+    // A body that spells a string literal with `$$` still works on
+    // PostgreSQL: the definition is quoted with Rocky's own tag.
+    let lit = udf("dollars", schema, &[("x", "TEXT")], "TEXT", "x || '$$'");
+    let ddl = create_function_sql(&lit, FunctionDialect::Postgres).expect("ddl");
+    a.execute_statement(&ddl).await.expect("create function");
+    assert_eq!(
+        scalar(&a, &format!("SELECT {schema}.dollars('a')"))
+            .await
+            .as_deref(),
+        Some("a$$")
+    );
+}

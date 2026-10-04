@@ -264,4 +264,32 @@ mod tests {
         assert!(refusal.reason.starts_with("[E051]"), "{}", refusal.reason);
         assert!(refusal.reason.contains("Trino"), "{}", refusal.reason);
     }
+
+    #[test]
+    fn plan_preview_renders_postgres_and_redshift_function_ddl() {
+        let pg = "[adapter]\ntype = \"postgres\"\nhost = \"localhost\"\ndatabase = \"d\"\n\
+                  username = \"u\"\npassword = \"x\"\n";
+        let tmp = tempfile::tempdir().unwrap();
+        let (cfg, models) = project(tmp.path(), pg);
+        let out = plan_preview_output(Some(&cfg), &models, None, None).unwrap();
+        assert_eq!(
+            out.statements[0].sql,
+            "CREATE OR REPLACE FUNCTION scale(x DOUBLE)\n  RETURNS DOUBLE\n  LANGUAGE sql\n  \
+             AS $rocky$\nSELECT x / 100.0\n$rocky$"
+        );
+
+        let tmp = tempfile::tempdir().unwrap();
+        let (cfg, models) = project(tmp.path(), &pg.replace("postgres", "redshift"));
+        let out = plan_preview_output(Some(&cfg), &models, None, None).unwrap();
+        assert_eq!(
+            out.statements[0].sql,
+            "CREATE OR REPLACE FUNCTION scale(DOUBLE)\n  RETURNS DOUBLE\n  VOLATILE\n  \
+             AS $$\nSELECT $1 / 100.0\n$$ LANGUAGE sql"
+        );
+        assert_eq!(
+            out.statements[1].sql,
+            "CREATE OR REPLACE FUNCTION cents_to_dollars(BIGINT)\n  RETURNS DOUBLE\n  VOLATILE\n  \
+             AS $$\nSELECT scale($1)\n$$ LANGUAGE sql"
+        );
+    }
 }
