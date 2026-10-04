@@ -33,6 +33,32 @@ class CostHint(BaseModel):
     """
 
 
+class FunctionDetail(BaseModel):
+    """
+    A user-defined function in `CompileOutput.functions`.
+    """
+
+    called_by: list[str]
+    """
+    Models that call this function directly. `rocky run` creates the function before any of them is built.
+    """
+    calls: list[str] | None = None
+    """
+    Other project functions this function's body calls (created first).
+    """
+    description: str | None = None
+    deterministic: bool | None = None
+    name: str
+    returns: str
+    """
+    Declared return type, as written.
+    """
+    signature: str
+    """
+    `name(arg TYPE, ...) RETURNS TYPE`, as declared.
+    """
+
+
 class OnSchemaChange1(StrEnum):
     """
     Stop the run and name the added and removed columns. The default: nothing is written, and `rocky run --full-refresh` rebuilds the table.
@@ -225,7 +251,7 @@ class Type4(StrEnum):
 
 class StrategyConfig5(BaseModel):
     """
-    Ephemeral model — refused at compile time (E038). No table is created and no consumer inlines it, so it is kept only to name the refusal.
+    Ephemeral model — never materialized. `rocky compile` inlines its SQL as a `__rocky_ephemeral__<name>` CTE into every model that reads it, and `rocky run` skips the node. Invalid uses are E038.
     """
 
     type: Type4
@@ -435,7 +461,7 @@ class ModelFreshnessConfig(BaseModel):
 
     Declares the maximum allowed lag between successive materializations of the model plus the optional timestamp column used by the runtime freshness check.
 
-    The compiler does not enforce the TTL — it's metadata consumed by downstream observability tooling (`dagster-rocky` `FreshnessPolicy`, `rocky doctor --freshness`, etc.). The compiler does however soft-warn (W005) when a model has at least one temporal output column but no `freshness` declaration anywhere in scope (per-model or project-level default).
+    `rocky freshness` enforces the TTL at run time: it reads `MAX(time_column)` from the model's target table (or, without a `time_column`, the model's last successful build in the state store) and reports `warn`, or `error` when `severity = "error"`. `rocky run` does not gate on it. The compiler checks the `time_column` (E050 when absent from a provably complete output, W050 when not temporal), and soft-warns (W005) when a model has at least one temporal output column but no `freshness` declaration anywhere in scope (per-model or project-level default).
     """
 
     max_lag_seconds: conint(ge=0)
@@ -573,6 +599,10 @@ class CompileOutput(BaseModel):
     expanded_sql: dict[str, str] | None = None
     """
     Expanded SQL for each model after macro substitution. Only populated when `--expand-macros` is passed. Keys are model names, values are the SQL after all `@macro()` calls have been replaced.
+    """
+    functions: list[FunctionDetail] | None = None
+    """
+    User-defined functions declared under `functions/` that passed validation, with the models that call each one. Under `--model`, only the selected function, or the functions the selected model calls. Empty (and omitted) when the project declares none.
     """
     has_errors: bool
     """

@@ -84,6 +84,55 @@
       ],
       "type": "object"
     },
+    "FunctionDetail": {
+      "description": "A user-defined function in `CompileOutput.functions`.",
+      "properties": {
+        "called_by": {
+          "description": "Models that call this function directly. `rocky run` creates the function before any of them is built.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "calls": {
+          "description": "Other project functions this function's body calls (created first).",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "deterministic": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "name": {
+          "type": "string"
+        },
+        "returns": {
+          "description": "Declared return type, as written.",
+          "type": "string"
+        },
+        "signature": {
+          "description": "`name(arg TYPE, ...) RETURNS TYPE`, as declared.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "called_by",
+        "name",
+        "returns",
+        "signature"
+      ],
+      "type": "object"
+    },
     "IncrementalLookback": {
       "type": "string"
     },
@@ -161,7 +210,7 @@
       "type": "object"
     },
     "ModelFreshnessConfig": {
-      "description": "Per-model freshness configuration.\n\nDeclares the maximum allowed lag between successive materializations of the model plus the optional timestamp column used by the runtime freshness check.\n\nThe compiler does not enforce the TTL — it's metadata consumed by downstream observability tooling (`dagster-rocky` `FreshnessPolicy`, `rocky doctor --freshness`, etc.). The compiler does however soft-warn (W005) when a model has at least one temporal output column but no `freshness` declaration anywhere in scope (per-model or project-level default).",
+      "description": "Per-model freshness configuration.\n\nDeclares the maximum allowed lag between successive materializations of the model plus the optional timestamp column used by the runtime freshness check.\n\n`rocky freshness` enforces the TTL at run time: it reads `MAX(time_column)` from the model's target table (or, without a `time_column`, the model's last successful build in the state store) and reports `warn`, or `error` when `severity = \"error\"`. `rocky run` does not gate on it. The compiler checks the `time_column` (E050 when absent from a provably complete output, W050 when not temporal), and soft-warns (W005) when a model has at least one temporal output column but no `freshness` declaration anywhere in scope (per-model or project-level default).",
       "properties": {
         "max_lag_seconds": {
           "description": "Maximum lag in seconds before the model is considered stale.\n\nAccepts both `max_lag_seconds` (legacy field name, preserved for existing sidecar fixtures + dagster Pydantic + VS Code bindings) and `expected_lag_seconds` (the documented public-facing name matching dbt freshness + SQLMesh defaults). Both deserialize to the same field; the serialized name stays `max_lag_seconds` so existing JSON/codegen consumers keep working unchanged.",
@@ -567,7 +616,7 @@
           "type": "object"
         },
         {
-          "description": "Ephemeral model — refused at compile time (E038). No table is created and no consumer inlines it, so it is kept only to name the refusal.",
+          "description": "Ephemeral model — never materialized. `rocky compile` inlines its SQL as a `__rocky_ephemeral__<name>` CTE into every model that reads it, and `rocky run` skips the node. Invalid uses are E038.",
           "properties": {
             "type": {
               "enum": [
@@ -881,6 +930,13 @@
       },
       "description": "Expanded SQL for each model after macro substitution. Only populated when `--expand-macros` is passed. Keys are model names, values are the SQL after all `@macro()` calls have been replaced.",
       "type": "object"
+    },
+    "functions": {
+      "description": "User-defined functions declared under `functions/` that passed validation, with the models that call each one. Under `--model`, only the selected function, or the functions the selected model calls. Empty (and omitted) when the project declares none.",
+      "items": {
+        "$ref": "#/definitions/FunctionDetail"
+      },
+      "type": "array"
     },
     "has_errors": {
       "description": "Whether the diagnostics this result describes include error-severity entries — and, for the CLI, whether the command exits non-zero.\n\nUnder `--model` this is computed from the exact-attribution filter above, so it says nothing about whether the selected model's upstreams compile: an error attributed to another model is filtered out and leaves this `false`, even though `rocky run` would classify that model as a compile error and exclude it from execution. A failure that aborts compilation outright rather than emitting a diagnostic — an unparseable model, a semantic-graph or contract-load failure — fails the command before any scoping applies. To learn whether a model can be built, compile without a selector.",
