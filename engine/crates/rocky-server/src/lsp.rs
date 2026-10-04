@@ -505,6 +505,9 @@ impl RockyLsp {
             project_freshness,
             run_vars: rocky_core::run_vars::RunVars::new(),
             source_provenance: Default::default(),
+            // Diagnostics and symbols map onto the authored text, so keep it
+            // rather than the ephemeral-inlined form.
+            preserve_authored_sql: true,
         };
 
         match rocky_compiler::compile::compile(&config) {
@@ -1421,6 +1424,9 @@ impl LanguageServer for RockyLsp {
                     project_freshness,
                     run_vars: rocky_core::run_vars::RunVars::new(),
                     source_provenance: Default::default(),
+                    // Diagnostics and symbols map onto the authored text, so keep it
+                    // rather than the ephemeral-inlined form.
+                    preserve_authored_sql: true,
                 };
 
                 // Try incremental compilation if we have a previous result.
@@ -6409,6 +6415,9 @@ mod tests {
             project_freshness,
             run_vars: rocky_core::run_vars::RunVars::new(),
             source_provenance: Default::default(),
+            // Diagnostics and symbols map onto the authored text, so keep it
+            // rather than the ephemeral-inlined form.
+            preserve_authored_sql: true,
         };
         let result = rocky_compiler::compile::compile(&compile_config).unwrap();
 

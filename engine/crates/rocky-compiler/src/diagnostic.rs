@@ -149,16 +149,21 @@ pub const E035: &str = "E035";
 /// target-collision check in `compile.rs`, which emits it as a literal.
 pub const E037: &str = "E037";
 
-/// A model declares `type = "ephemeral"`.
+/// An `ephemeral` model is used in a way that cannot work.
 ///
-/// Emitted by `rocky compile` (`check_ephemeral_strategy` in `typecheck.rs`).
-/// An ephemeral model is never materialized, and nothing inlines it: no pass
-/// in `rocky-compiler` or `rocky-sql` rewrites a consumer's `FROM <model>`
-/// into a CTE (#1996). A consumer therefore reads whatever physical table
-/// happens to carry that name — a catalog error when none exists, a silent
-/// read of a stale or unrelated table when one does. The error names
-/// `type = "view"`, which gives the same always-fresh reads with no copied
-/// data, on every dialect.
+/// Ephemeral models are supported: each consumer executes with the model's
+/// SQL inlined as a `__rocky_ephemeral__<model>` CTE (`ephemeral.rs`). Until
+/// that inlining existed (#1996) this code refused `type = "ephemeral"`
+/// outright; it now marks only the uses inlining cannot serve:
+///
+/// - `[[tests]]` on an ephemeral model — there is no table to test;
+/// - a qualified read of an ephemeral model's nominal `[target]`
+///   (`main.eph_orders`) — no table backs that name;
+/// - a consumer the inliner cannot rewrite (the SQL is not one parseable
+///   `SELECT`, or a `WITH RECURSIVE` CTE would capture a name the inlined
+///   SQL reads);
+/// - `rocky run --model <ephemeral>` — there is nothing to build (emitted
+///   by the CLI, not by `rocky compile`).
 pub const E038: &str = "E038";
 
 /// A direct projection reads a column absent from a complete in-project model.

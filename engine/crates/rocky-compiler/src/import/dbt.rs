@@ -100,7 +100,7 @@ pub enum ImportMethod {
 /// Category of import warning.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WarningCategory {
-    /// View or ephemeral materialization not natively supported.
+    /// A dbt materialization Rocky has no equivalent for.
     UnsupportedMaterialization,
     /// Jinja control flow that cannot be translated faithfully.
     JinjaControlFlow,
@@ -1190,23 +1190,10 @@ fn map_manifest_strategy(
         "table" => StrategyConfig::FullRefresh,
         "view" => StrategyConfig::View,
         "materialized_view" => StrategyConfig::MaterializedView,
-        "ephemeral" => {
-            warnings.push(ImportWarning {
-                model: model_name.to_string(),
-                category: WarningCategory::UnsupportedMaterialization,
-                message: "materialized='ephemeral' has no Rocky equivalent — using full_refresh"
-                    .to_string(),
-                suggestion: Some(
-                    "dbt inlines an ephemeral model into its consumers; Rocky does not, and refuses `type = \"ephemeral\"` (E038). Use `type = \"view\"`, fold the SQL into the consumer, or keep the `full_refresh` table".to_string(),
-                ),
-            });
-            structured.push(ImportDbtStructuredWarning::UnsupportedMaterialization {
-                model: model_name.to_string(),
-                dbt_materialization: "ephemeral".to_string(),
-                action: "fell back to full_refresh".to_string(),
-            });
-            StrategyConfig::FullRefresh
-        }
+        // Rocky inlines an ephemeral model into each consumer as a CTE, the
+        // same contract as dbt. A consumer imported from `compiled_code`
+        // already carries dbt's `__dbt__cte__<name>` CTE and runs as-is.
+        "ephemeral" => StrategyConfig::Ephemeral,
         "incremental" => map_incremental_strategy(
             config,
             model_name,
@@ -1407,7 +1394,7 @@ fn map_incremental_strategy(
 
 /// Record a model whose dbt `incremental` config fell back to `full_refresh`
 /// as a structured `UnsupportedMaterialization`, the same shape the
-/// `ephemeral` and unrecognised-materialization fallbacks use, so it lands in
+/// unrecognised-materialization fallback uses, so it lands in
 /// MIGRATION-NOTES.md's "Items to translate manually" list and not only among
 /// the flat warnings.
 fn push_append_fallback(
@@ -2194,14 +2181,7 @@ fn import_single_model(
                     strategy = StrategyConfig::MaterializedView;
                 }
                 "ephemeral" => {
-                    warnings.push(ImportWarning {
-                        model: name.to_string(),
-                        category: WarningCategory::UnsupportedMaterialization,
-                        message: "project config materialized='ephemeral' has no Rocky equivalent — using full_refresh".to_string(),
-                        suggestion: Some(
-                            "override per-model with `type = \"full_refresh\"` or `type = \"view\"`; Rocky refuses `type = \"ephemeral\"` (E038)".to_string(),
-                        ),
-                    });
+                    strategy = StrategyConfig::Ephemeral;
                 }
                 _ => {}
             }
@@ -3070,12 +3050,12 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_config_ephemeral_warns() {
+    fn test_extract_config_ephemeral_maps_to_ephemeral() {
         let input = "{{ config(materialized='ephemeral') }}";
         let (strategy, warnings) =
             extract_dbt_config(input, inline_dbt_materialization(input).as_deref());
-        assert!(matches!(strategy, StrategyConfig::FullRefresh));
-        assert!(!warnings.is_empty());
+        assert!(matches!(strategy, StrategyConfig::Ephemeral));
+        assert!(warnings.is_empty(), "{warnings:?}");
     }
 
     #[test]
@@ -4223,7 +4203,7 @@ FROM {{ ref('stg_events') }}
     }
 
     #[test]
-    fn test_manifest_ephemeral_emits_warning() {
+    fn test_manifest_ephemeral_imports_as_ephemeral() {
         let manifest = serde_json::json!({
             "metadata": { "project_name": "p" },
             "nodes": {
@@ -4243,9 +4223,9 @@ FROM {{ ref('stg_events') }}
         let result = import_from_manifest_json(&manifest);
         assert!(matches!(
             result.imported[0].config.strategy,
-            StrategyConfig::FullRefresh
+            StrategyConfig::Ephemeral
         ));
-        assert!(result.structured_warnings.iter().any(|w| matches!(
+        assert!(!result.structured_warnings.iter().any(|w| matches!(
             w,
             ImportDbtStructuredWarning::UnsupportedMaterialization { dbt_materialization, .. }
                 if dbt_materialization == "ephemeral"

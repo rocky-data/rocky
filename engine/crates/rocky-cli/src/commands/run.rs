@@ -10004,29 +10004,11 @@ fn apply_shadow_rewrite(
                     model.config.name
                 );
             }
-            // Ephemeral models emit no statements
-            // (`sql_gen::generate_transformation_sql` returns an empty vec), and
-            // the comments throughout this codebase describe them as "inlined as
-            // CTEs in downstream queries". No such inlining exists: nothing in
-            // `rocky-compiler` or `rocky-sql` rewrites a consumer's `FROM eph`
-            // into a CTE, and the dbt importer states outright that
-            // `materialized='ephemeral'` has no Rocky equivalent.
-            //
-            // So a consumer of an ephemeral model reads whatever physical table
-            // happens to carry that name. Under shadow that is the PRODUCTION
-            // table — the one thing this routing exists to prevent — and no
-            // rewrite here can fix it, because there is no shadow object to
-            // point the read at. Fail closed until inlining is real, the same
-            // way the two strategies above do.
-            rocky_core::models::StrategyConfig::Ephemeral => {
-                anyhow::bail!(
-                    "shadow/branch execution is not supported for ephemeral model '{}': \
-                     ephemeral models are not materialized and are not inlined into their \
-                     consumers, so a consumer would read the production table instead of an \
-                     isolated one. Give the model a materialized strategy to shadow it",
-                    model.config.name
-                );
-            }
+            // An ephemeral model builds nothing, so it has no shadow object.
+            // Its SQL is already inlined into each consumer, whose reads of
+            // the ephemeral model's upstreams this rewrite routes like any
+            // other read.
+            rocky_core::models::StrategyConfig::Ephemeral => continue,
             // The incremental family cannot produce a comparable shadow
             // (#1273). These strategies build on what the target ALREADY
             // holds, and a shadow target holds nothing:
@@ -10531,6 +10513,11 @@ fn collect_auto_create_targets(
         if model_name_filter.is_some_and(|selected| selected != model.config.name)
             || model_set.is_some_and(|set| !set.contains(&model.config.name))
             || compile_failed.contains(&model.config.name)
+            // Ephemeral models write nothing, so they need no schema.
+            || matches!(
+                model.config.strategy,
+                rocky_core::models::StrategyConfig::Ephemeral
+            )
         {
             continue;
         }
@@ -11397,6 +11384,17 @@ pub(crate) async fn execute_models_with_explicit_contracts(
         let selected = compile_result.project.model(name).ok_or_else(|| {
             anyhow::anyhow!("model '{name}' not found (no transformation model with that name)")
         })?;
+        // E038: an ephemeral model builds nothing on its own. `rocky run
+        // --dag` never dispatches one (`run_dag_exec.rs`), so only a direct
+        // `--model <ephemeral>` reaches this.
+        anyhow::ensure!(
+            !matches!(
+                selected.config.strategy,
+                rocky_core::models::StrategyConfig::Ephemeral
+            ),
+            "[E038] model '{name}' is ephemeral: it is inlined as a CTE into each model that \
+             reads it and has nothing to build on its own. Run a model that reads it instead"
+        );
         if contracts_dir.is_some() {
             anyhow::ensure!(
                 matches!(
@@ -11698,7 +11696,12 @@ pub(crate) async fn execute_models_with_explicit_contracts(
         for model in &compile_result.project.models {
             let selected = model_name_filter.is_none_or(|f| f == model.config.name)
                 && model_set.is_none_or(|set| set.contains(&model.config.name));
-            if !selected {
+            // An ephemeral model has no shadow object (it is never routed).
+            let ephemeral = matches!(
+                model.config.strategy,
+                rocky_core::models::StrategyConfig::Ephemeral
+            );
+            if !selected || ephemeral {
                 continue;
             }
             shadow_objects.push(crate::commands::shadow_lifecycle::ShadowObject {
@@ -12158,6 +12161,14 @@ pub(crate) async fn execute_models_with_explicit_contracts(
             // rebuilding from a failed producer's stale output.
             .filter(|name| !compile_excluded_models.contains(name.as_str()))
             .filter_map(|name| compile_result.project.model(name).map(|m| (name, m)))
+            // An ephemeral model is never executed: compile already inlined
+            // its SQL into every consumer. It reports no materialization.
+            .filter(|(_, m)| {
+                !matches!(
+                    m.config.strategy,
+                    rocky_core::models::StrategyConfig::Ephemeral
+                )
+            })
             .enumerate()
             .map(|(idx, (name, model))| (idx, name, model))
             .collect();
@@ -16075,10 +16086,12 @@ async fn process_table(
                 );
             }
             MaterializationStrategy::Ephemeral => {
-                // Ephemeral models are never materialized — skip.
+                // A replicated table must land somewhere; ephemeral means
+                // "never materialized" and is inlined only into SQL models.
                 anyhow::bail!(
-                    "ephemeral strategy is not supported on replication tables — \
-                     it only applies to transformation models"
+                    "ephemeral strategy is not supported on replication tables (E038) — \
+                     it only applies to transformation models, which inline it into the \
+                     models that read them"
                 );
             }
             MaterializationStrategy::DeleteInsert { .. } => {
@@ -33303,23 +33316,22 @@ auto_create_schemas = true
 
     #[cfg(feature = "duckdb")]
     #[test]
-    fn shadow_rejects_ephemeral_models() {
+    fn shadow_skips_ephemeral_models_and_routes_their_inlined_reads() {
         let tmp = tempfile::TempDir::new().expect("temp dir");
         let models_dir = tmp.path().join("models");
         std::fs::create_dir(&models_dir).expect("mkdir models");
-        std::fs::write(models_dir.join("eph.sql"), "SELECT 1 AS id\n").expect("write sql");
+        write_model_with_target(&models_dir, "src", "SELECT 1 AS id", "main", "src");
+        std::fs::write(models_dir.join("eph.sql"), "SELECT id FROM src\n").expect("write sql");
         std::fs::write(
             models_dir.join("eph.toml"),
             "[strategy]\ntype = \"ephemeral\"\n\n\
              [target]\ncatalog = \"\"\nschema = \"main\"\ntable = \"eph\"\n",
         )
         .expect("write toml");
-        // Reads the ephemeral model's nominal target by physical name. Nothing
-        // inlines that read, so under shadow it would resolve to production.
         write_model_with_target(
             &models_dir,
             "consumer",
-            "SELECT id FROM main.eph",
+            "SELECT id FROM eph",
             "main",
             "consumer",
         );
@@ -33330,20 +33342,39 @@ auto_create_schemas = true
                 ..Default::default()
             })
             .expect("compile models");
+        assert!(!compiled.has_errors, "{:?}", compiled.diagnostics);
+        let config = rocky_core::shadow::ShadowConfig::default();
         let dialect = rocky_duckdb::dialect::DuckDbSqlDialect;
-        let err = super::apply_shadow_rewrite(
-            &mut compiled,
-            None,
-            None,
-            &rocky_core::shadow::ShadowConfig::default(),
-            &dialect,
-            false,
-        )
-        .expect_err("an ephemeral model must be rejected, not silently left on production");
-        let message = format!("{err:#}");
+        super::apply_shadow_rewrite(&mut compiled, None, None, &config, &dialect, false)
+            .expect("an ephemeral model has nothing to shadow and must not block the run");
+        let shadow_src = rocky_core::shadow::shadow_target(
+            &rocky_ir::TargetRef {
+                catalog: String::new(),
+                schema: "main".to_string(),
+                table: "src".to_string(),
+            },
+            &config,
+        );
+        let consumer = compiled.project.model("consumer").expect("consumer");
+        // The inlined CTE's read of `src` is routed to src's shadow, so the
+        // consumer never reads production through the ephemeral model.
         assert!(
-            message.contains("ephemeral model 'eph'") && message.contains("not inlined"),
-            "error must name the model and why it cannot be shadowed: {message}"
+            consumer.sql.contains(&shadow_src.table)
+                && consumer.sql.contains("__rocky_ephemeral__eph"),
+            "{}",
+            consumer.sql
+        );
+        // The ephemeral model itself keeps its production-shaped target: it is
+        // never executed, so it has no shadow object.
+        assert_eq!(
+            compiled
+                .project
+                .model("eph")
+                .expect("eph")
+                .config
+                .target
+                .table,
+            "eph"
         );
     }
 
@@ -36228,15 +36259,14 @@ auto_create_schemas = true
         }
     }
 
-    /// #1996 end to end through `execute_models`: an `ephemeral` model fails
-    /// compile with E038 and is excluded from the run, which records it as a
-    /// failed table. It writes nothing, so nothing reads its rows by accident.
+    /// End to end through `execute_models`: an invalid ephemeral use (here
+    /// `[[tests]]`, which need a table) fails compile with E038 and is
+    /// excluded from the run, which records it as a failed table. It writes
+    /// nothing, so nothing reads its rows by accident.
     ///
     /// Its declared dependent follows the same compile-error policy as E037:
     /// the failing model and its declared descendants are withheld even when
-    /// an old table carries the failed model's name. The ephemeral case makes
-    /// the stale-read risk especially visible because the model itself never
-    /// writes that table.
+    /// an old table carries the failed model's name.
     #[cfg(feature = "duckdb")]
     #[tokio::test]
     async fn an_e038_model_is_excluded_from_run_and_its_dependent_follows_policy() {
@@ -36276,10 +36306,11 @@ auto_create_schemas = true
             std::fs::write(
                 models_dir.join("up.toml"),
                 "[strategy]\ntype = \"ephemeral\"\n\n\
-                 [target]\ncatalog = \"\"\nschema = \"main\"\ntable = \"up\"\n",
+                 [target]\ncatalog = \"\"\nschema = \"main\"\ntable = \"up\"\n\n\
+                 [[tests]]\ntype = \"not_null\"\ncolumn = \"id\"\n",
             )
             .unwrap();
-            std::fs::write(models_dir.join("down.sql"), "SELECT id FROM main.up\n").unwrap();
+            std::fs::write(models_dir.join("down.sql"), "SELECT id FROM up\n").unwrap();
             std::fs::write(
                 models_dir.join("down.toml"),
                 "depends_on = [\"up\"]\n\n[strategy]\ntype = \"full_refresh\"\n\n\
@@ -36429,10 +36460,11 @@ auto_create_schemas = true
         std::fs::write(
             models_dir.join("up.toml"),
             "[strategy]\ntype = \"ephemeral\"\n\n\
-             [target]\ncatalog = \"\"\nschema = \"main\"\ntable = \"up\"\n",
+             [target]\ncatalog = \"\"\nschema = \"main\"\ntable = \"up\"\n\n\
+             [[tests]]\ntype = \"not_null\"\ncolumn = \"id\"\n",
         )
         .unwrap();
-        std::fs::write(models_dir.join("down.sql"), "SELECT id FROM main.up\n").unwrap();
+        std::fs::write(models_dir.join("down.sql"), "SELECT id FROM up\n").unwrap();
         std::fs::write(
             models_dir.join("down.toml"),
             "depends_on = [\"up\"]\n\n[strategy]\ntype = \"full_refresh\"\n\n\

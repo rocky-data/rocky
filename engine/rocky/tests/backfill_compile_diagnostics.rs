@@ -14,14 +14,21 @@ fn project(root: &Path) {
     fs::create_dir(root.join("models")).unwrap();
 }
 
+/// An `ephemeral` model here carries `[[tests]]`, an invalid ephemeral use,
+/// so it is the E038 error fixture.
 fn model(root: &Path, name: &str, strategy: &str, sql: &str) {
     let models = root.join("models");
     fs::write(models.join(format!("{name}.sql")), sql).unwrap();
+    let tests = if strategy == "ephemeral" {
+        "\n[[tests]]\ntype = \"not_null\"\ncolumn = \"id\"\n"
+    } else {
+        ""
+    };
     fs::write(
         models.join(format!("{name}.toml")),
         format!(
             "name = \"{name}\"\n\n[strategy]\ntype = \"{strategy}\"\n\n\
-             [target]\ncatalog = \"c\"\nschema = \"s\"\ntable = \"{name}\"\n"
+             [target]\ncatalog = \"c\"\nschema = \"s\"\ntable = \"{name}\"\n{tests}"
         ),
     )
     .unwrap();

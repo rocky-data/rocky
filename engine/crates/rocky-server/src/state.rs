@@ -555,6 +555,7 @@ impl ServerState {
             project_freshness,
             run_vars: rocky_core::run_vars::RunVars::new(),
             source_provenance: Default::default(),
+            preserve_authored_sql: false,
         };
 
         // The compile pass walks the model directory, parses every

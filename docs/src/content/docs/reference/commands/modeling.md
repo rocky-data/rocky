@@ -651,7 +651,9 @@ Full-refresh models emit a complete `CREATE OR REPLACE TABLE … AS …` that ru
 MERGE INTO ...
 ```
 
-`emit-sql` refuses a project with any compile error, before it filters by model. `type = "incremental"` on a transformation model fails with `E037`, and `type = "ephemeral"` fails with `E038`. Either stops the whole export, even when `--model` names a different model.
+`emit-sql` refuses a project with any compile error, before it filters by model. `type = "incremental"` on a transformation model fails with `E037`, and an invalid `ephemeral` use fails with `E038`. Either stops the whole export, even when `--model` names a different model.
+
+An `ephemeral` model gets no file of its own and is reported as skipped. Each consumer's statement carries it as a `__rocky_ephemeral__<model>` CTE.
 
 A model whose SQL cannot be rendered offline is reported on stderr rather than silently dropped. So you never mistake the emitted set for the complete project. A Snowflake dynamic table is one: it needs a live compute-warehouse name.
 

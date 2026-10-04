@@ -11,20 +11,19 @@ A staging model that other models read, carried by a view: no copied data, and
 every read sees the source as it is now. Use it for the intermediate steps that
 do not deserve a table — filters, renames, type casts.
 
-This POC used to demonstrate `strategy = "ephemeral"`, on the claim that Rocky
-inlined such a model as a CTE. It never did. Nothing rewrote a consumer's
-`FROM stg_events` into a CTE, so a consumer read whatever table already carried
-that name — a catalog error when none existed, someone else's table when one
-did. `rocky compile` now refuses the strategy (E038) and names `view`, which is
-what this POC shows. See #1996.
+This POC used to demonstrate `strategy = "ephemeral"` before Rocky could
+inline such a model (#1996). Rocky now inlines an ephemeral model as a CTE into
+each consumer, so `type = "ephemeral"` is the other choice for this staging
+step: no warehouse object at all, at the cost of running the staging SQL once
+per consumer.
 
 ## Why it's distinctive
 
 - **No copied rows** — the view stores none; `user_metrics` reads through it.
 - **Always fresh** — a change to `seeds.raw_events` shows up on the next read.
 - **One object per model** — the cost of a view, against a table's full copy.
-- **dbt comparison:** dbt offers `materialized='ephemeral'` and inlines it with
-  Jinja. Rocky does not inline, and says so instead of failing at run time.
+- **dbt comparison:** dbt's `materialized='ephemeral'` maps to Rocky's
+  `type = "ephemeral"`, inlined as a CTE the same way.
 
 ## Layout
 

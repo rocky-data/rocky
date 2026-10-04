@@ -141,6 +141,12 @@ pub struct CompilerConfig {
     /// [`crate::source_refs`]. The default records no origin, so the check
     /// stays off for callers that don't know their schemas' provenance.
     pub source_provenance: crate::source_refs::SourceProvenance,
+    /// Keep each consumer's authored SQL instead of replacing it with the
+    /// form that inlines its ephemeral upstreams as CTEs
+    /// ([`crate::ephemeral::apply_ephemerals`]). The language server sets
+    /// this: it maps diagnostics and symbols onto the authored text. Every
+    /// command that executes or renders SQL leaves it `false`.
+    pub preserve_authored_sql: bool,
 }
 
 /// Result of compilation.
@@ -358,7 +364,7 @@ fn substitute_run_vars_into_models(
 /// are merged into the final diagnostic set. Callers that don't use per-run
 /// variables pass an empty `Vec`.
 pub fn compile_project(
-    project: Project,
+    mut project: Project,
     config: &CompilerConfig,
     run_var_diagnostics: Vec<Diagnostic>,
 ) -> Result<CompileResult, CompileError> {
@@ -515,6 +521,12 @@ pub fn compile_project(
     // without this merge they were written and never read, so the one place
     // that knows an edge is questionable said nothing.
     diagnostics.extend(project.resolve_diagnostics.iter().cloned());
+    // Ephemeral models: E038 checks, then inline them into their consumers.
+    // Last, so every pass above ran on the authored SQL.
+    diagnostics.extend(crate::ephemeral::apply_ephemerals(
+        &mut project,
+        !config.preserve_authored_sql,
+    ));
 
     let has_errors = diagnostics
         .iter()
@@ -780,6 +792,12 @@ pub fn compile_incremental(
     // without this merge they were written and never read, so the one place
     // that knows an edge is questionable said nothing.
     diagnostics.extend(project.resolve_diagnostics.iter().cloned());
+    // Same as the full path: ephemeral checks and inlining run last.
+    let mut project = project;
+    diagnostics.extend(crate::ephemeral::apply_ephemerals(
+        &mut project,
+        !config.preserve_authored_sql,
+    ));
 
     let has_errors = diagnostics
         .iter()

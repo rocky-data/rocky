@@ -223,6 +223,7 @@ fn infer_column_map(
         project_freshness: rocky_cfg.freshness.clone(),
         run_vars: run_vars.clone(),
         source_provenance: Default::default(),
+        preserve_authored_sql: true,
     };
     // The models are already loaded (and were loaded strictly), so compile
     // them directly instead of re-reading the directory — one load, and the

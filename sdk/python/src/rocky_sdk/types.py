@@ -655,9 +655,9 @@ class PlanResult(BaseModel):
     budget_diagnostics: list[Diagnostic] = []
     #: ``True`` when at least one ``budget_diagnostics`` entry is error-level.
     has_budget_errors: bool = False
-    #: Models the preview could not render, with the reason. A refused
-    #: strategy (``ephemeral``, E038) and a strategy that needs a live
-    #: warehouse both land here. Empty when every model rendered.
+    #: Models the preview could not render, with the reason. An
+    #: ``ephemeral`` model (inlined into its consumers) and a strategy that
+    #: needs a live warehouse both land here. Empty when every model rendered.
     skipped: list[SkippedModel] = []
 
 

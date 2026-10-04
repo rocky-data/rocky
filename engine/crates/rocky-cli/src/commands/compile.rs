@@ -242,6 +242,7 @@ fn compile_inner(
         project_freshness,
         run_vars: run_vars.clone(),
         source_provenance,
+        preserve_authored_sql: false,
     };
 
     let mut result = compile::compile(&config)?;

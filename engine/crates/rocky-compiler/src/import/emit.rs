@@ -1241,19 +1241,17 @@ mod tests {
         }
     }
 
-    /// The emitter writes each model's strategy as the importer mapped it.
-    ///
-    /// It used to rewrite a listed model to `ephemeral` at write time, a
-    /// leftover of the pre-Wave-2 `view → ephemeral` mapping whose only
-    /// caller passed an empty list. `ephemeral` does not compile at all now
-    /// (E038, #1996), so an emitted sidecar must never carry it.
+    /// The emitter writes each model's strategy as the importer mapped it —
+    /// no rewrite at write time. A dbt `ephemeral` model stays ephemeral (Rocky
+    /// inlines it into its consumers); a `view` stays a view.
     #[test]
-    fn an_emitted_sidecar_never_carries_ephemeral() {
+    fn an_emitted_sidecar_carries_the_mapped_strategy() {
         let dbt_dir = tempfile::TempDir::new().unwrap();
         let out_dir = tempfile::TempDir::new().unwrap();
         let imported = vec![
             make_model("v_users", StrategyConfig::View, "SELECT 1"),
             make_model("t_users", StrategyConfig::FullRefresh, "SELECT 1"),
+            make_model("e_users", StrategyConfig::Ephemeral, "SELECT 1"),
         ];
         let result = empty_result(imported);
         let profile = resolution_for_kind(AdapterKind::DuckDb, "duckdb");
@@ -1270,14 +1268,17 @@ mod tests {
         })
         .unwrap();
 
-        for (model, expected) in [("v_users", "view"), ("t_users", "full_refresh")] {
+        for (model, expected) in [
+            ("v_users", "view"),
+            ("t_users", "full_refresh"),
+            ("e_users", "ephemeral"),
+        ] {
             let body = std::fs::read_to_string(out_dir.path().join(format!("models/{model}.toml")))
                 .unwrap();
             assert!(
                 body.contains(&format!("type = \"{expected}\"")),
                 "{model}: {body}"
             );
-            assert!(!body.contains("ephemeral"), "{model}: {body}");
         }
     }
 

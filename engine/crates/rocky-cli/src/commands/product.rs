@@ -3962,6 +3962,7 @@ effect = "require_review"
                 project_freshness: cfg.freshness.clone(),
                 run_vars: rocky_core::run_vars::RunVars::new(),
                 source_provenance: Default::default(),
+                preserve_authored_sql: false,
             })
         };
         let diagnostics = |result: &compile::CompileResult, code: &str| -> Vec<String> {

@@ -290,6 +290,7 @@ The importer translates each `{{ config(...) }}` key onto a Rocky sidecar field:
 | dbt `{{ config(...) }}` | Rocky sidecar |
 |---|---|
 | `materialized='table' \| 'incremental' \| 'view'` | The `[strategy]` block. `view` maps to Rocky's own `view` strategy. |
+| `materialized='ephemeral'` | `type = "ephemeral"`. Rocky inlines the model into each consumer as a CTE, as dbt does. A consumer imported from the manifest's compiled SQL already carries dbt's `__dbt__cte__<model>` CTE and runs as-is. |
 | `unique_key=...` | The `merge` strategy, with `unique_key` as an array. |
 | `alias='name'` | `[target].table`, the output relation, so the data lands in the aliased table rather than one named after the node. Dropping this would mis-route data silently. |
 | `materialized='microbatch'` | A `merge` strategy by default, or `time_interval`. Choose with `--microbatch-as <merge\|time_interval>`. `merge` reuses the dbt `unique_key` for an idempotent key-upsert, so dbt microbatch's partition-replace becomes a key upsert. `time_interval` maps the batch onto Rocky's partition-window model. Either way, `MIGRATION-NOTES.md` records the choice for review. |

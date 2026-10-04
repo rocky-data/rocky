@@ -79,9 +79,9 @@ pub enum MaterializationStrategy {
         /// `Some(...)` when invoked by the runtime; `None` during static planning.
         window: Option<PartitionWindow>,
     },
-    /// Ephemeral model — refused (E038). It is not materialized, and nothing
-    /// inlines it into a consumer, so a consumer reads whatever table already
-    /// carries the name. Use `View` for an intermediate other models read.
+    /// Ephemeral model — never materialized and renders no statement. The
+    /// compiler inlines its SQL as a CTE into each consumer's `sql`, so a
+    /// consumer's IR already carries it.
     Ephemeral,
     /// Delete matching rows by partition key, then insert fresh data.
     /// Common dbt pattern for partition-based incremental loads where

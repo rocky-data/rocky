@@ -411,12 +411,12 @@ A model excluded from the preview or refused by compilation is listed in `skippe
   "skipped": [
     {
       "model": "stg_events",
-      "reason": "[E038] model 'stg_events' uses `type = \"ephemeral\"`, which is not supported: an ephemeral model is not materialized and is not inlined into its consumers, so a consumer reads whatever table already carries the name"
+      "reason": "invalid SQL generation request: model 'stg_events': `type = \"ephemeral\"` renders no statement of its own — it is inlined as a CTE into each model that reads it, so there is nothing to build (E038 when selected directly)"
     }
   ]
 ```
 
-The `reason` gives the compiler diagnostic or SQL generation error. A refused strategy puts a model there, and so does one that needs a live warehouse, such as a Snowflake dynamic table. The MCP `plan_preview` tool reports preview exclusions. The key is absent when nothing was skipped.
+The `reason` gives the compiler diagnostic or SQL generation error. An `ephemeral` model is always there: its SQL appears inside each consumer's statement instead. A model that needs a live warehouse, such as a Snowflake dynamic table, is there too. The MCP `plan_preview` tool reports preview exclusions. The key is absent when nothing was skipped.
 
 Plan with table output and a custom config:
 
@@ -732,7 +732,6 @@ rocky compare --filter client=acme
 Shadow mode is only useful if it truly isolates the run from production. Rocky refuses the run rather than write a target it cannot isolate. A shadow or branch run fails closed in any of these cases.
 
 - The selected transformation set contains a `content_addressed` or `time_interval` model. Both need extra storage or partition-state isolation that shadow mode does not give them.
-- The selected set contains an `ephemeral` model. Compile already reports it as `E038`, and the shadow path refuses it again by name. A consumer would read the production table, because Rocky neither materializes nor inlines it.
 - The chosen suffix or schema would collide with a production target, or with another selected shadow target.
 - All three of the following hold at once:
   - the dialect treats identifier case as part of object identity (Snowflake and BigQuery);

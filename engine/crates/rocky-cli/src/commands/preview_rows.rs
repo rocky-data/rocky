@@ -216,6 +216,7 @@ fn prepare_preview(
         project_freshness: rocky_cfg.freshness.clone(),
         run_vars: rocky_core::run_vars::RunVars::new(),
         source_provenance: Default::default(),
+        preserve_authored_sql: false,
     };
     let result = compile::compile(&compiler_cfg)
         .map_err(|e| fail("compile_error", &format!("compile failed: {e}"), None))?;

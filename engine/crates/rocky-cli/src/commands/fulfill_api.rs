@@ -1131,7 +1131,8 @@ mod tests {
             write_file(&models_dir.join("bad.sql"), b"SELECT 1 AS id\n");
             write_file(
                 &models_dir.join("bad.toml"),
-                b"name = \"bad\"\n[strategy]\ntype = \"ephemeral\"\n[target]\ncatalog = \"warehouse\"\nschema = \"main\"\ntable = \"bad\"\n",
+                // `[[tests]]` on an ephemeral model is an invalid use: E038.
+                b"name = \"bad\"\n[strategy]\ntype = \"ephemeral\"\n[target]\ncatalog = \"warehouse\"\nschema = \"main\"\ntable = \"bad\"\n[[tests]]\ntype = \"not_null\"\ncolumn = \"id\"\n",
             );
             let config_path = root.join("rocky.toml");
             write_file(

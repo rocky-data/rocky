@@ -1748,7 +1748,8 @@ pub struct PlanOutput {
     pub retention_actions: Vec<RetentionAction>,
     /// Models excluded from the SQL preview or refused by compilation, with
     /// the reason for each. This includes SQL that needs a live warehouse to
-    /// render and compiler errors such as E038 for an `ephemeral` model.
+    /// render, compiler errors, and `ephemeral` models, which are inlined into
+    /// their consumers and render no statement of their own.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub skipped: Vec<SkippedModel>,
 

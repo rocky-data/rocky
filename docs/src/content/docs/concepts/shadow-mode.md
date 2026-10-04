@@ -105,18 +105,14 @@ for should not be withheld because a leftover table could not be removed.
 
 ## Models a shadow run refuses
 
-Shadow and branch runs reject `content_addressed`, `time_interval`, `ephemeral`
-and the incremental family (`incremental`, `merge`, `delete_insert`,
-`microbatch`).
+Shadow and branch runs reject `content_addressed`, `time_interval` and the
+incremental family (`incremental`, `merge`, `delete_insert`, `microbatch`).
+An `ephemeral` model is skipped, not refused: it builds nothing, and the reads
+inside its inlined SQL are routed to shadow targets like any other read.
 
 - `content_addressed` and `time_interval` models persist object-storage or
   partition-state identities. Rewriting the warehouse target alone cannot
   isolate those yet.
-- An `ephemeral` model is neither materialized nor inlined into its consumers.
-  The consumer would read the production table, and no rewrite could redirect
-  that read. Compile already refuses the strategy on any run (`E038`), and the
-  shadow path refuses it again by name. Use `view` for an intermediate other
-  models read.
 - An **incremental** model appends to whatever its target already holds. A
   shadow target starts empty while production holds full history, so the first
   run compares a partial table against a complete one, and every later run

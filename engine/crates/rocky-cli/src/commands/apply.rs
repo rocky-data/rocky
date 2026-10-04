@@ -3308,8 +3308,7 @@ pub(crate) fn model_target_fqns(
     for m in &models {
         // An ephemeral model materializes nothing, so it has no table to
         // compact or archive. Same exclusion the gate makes (#1815, review
-        // round seven). E038 refuses the strategy outright, so this is now
-        // unreachable through a compiling project.
+        // round seven). Its SQL is inlined into each consumer instead.
         if matches!(
             m.config.strategy,
             rocky_core::models::StrategyConfig::Ephemeral

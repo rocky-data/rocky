@@ -87,6 +87,7 @@ pub fn run_publish_ir(
         project_freshness: Default::default(),
         run_vars: rocky_core::run_vars::RunVars::new(),
         source_provenance: Default::default(),
+        preserve_authored_sql: false,
     };
 
     let result = compile::compile(&config)?;

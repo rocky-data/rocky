@@ -1086,6 +1086,7 @@ pub(crate) fn conditional_drops_for_run_plan(
         project_freshness: Default::default(),
         run_vars: rocky_core::run_vars::RunVars::new(),
         source_provenance: Default::default(),
+        preserve_authored_sql: false,
     };
     let compiled = match models_glob {
         Some(glob) => compile::compile_matching(&config, glob),
@@ -1291,6 +1292,7 @@ fn plan_preview_output_for_pipeline(
         project_freshness: Default::default(),
         run_vars: rocky_core::run_vars::RunVars::new(),
         source_provenance: Default::default(),
+        preserve_authored_sql: false,
     };
     let result = match compile::compile(&config) {
         Ok(r) => r,
@@ -1566,6 +1568,7 @@ fn build_and_persist_run_plan(
         project_freshness: Default::default(),
         run_vars: rocky_core::run_vars::RunVars::new(),
         source_provenance: Default::default(),
+        preserve_authored_sql: false,
     };
 
     let result = compile::compile(&config).context("failed to compile models for run plan")?;
@@ -2232,6 +2235,7 @@ pub fn populate_governance_actions(
         project_freshness: cfg.freshness.clone(),
         run_vars: rocky_core::run_vars::RunVars::new(),
         source_provenance: Default::default(),
+        preserve_authored_sql: false,
     })
     .context("failed to compile project for governance preview")?;
 
@@ -2335,6 +2339,7 @@ async fn check_plan_budget(
         project_freshness: Default::default(),
         run_vars: rocky_core::run_vars::RunVars::new(),
         source_provenance: Default::default(),
+        preserve_authored_sql: false,
     };
     let result = match rocky_compiler::compile::compile(&compile_cfg) {
         Ok(r) => r,
@@ -4403,9 +4408,8 @@ table = "users"
 
     /// #1996: an ephemeral model renders no statement, and the preview used
     /// to drop it into a `debug!` log. An ephemeral-only project previewed as
-    /// an empty plan with exit 0 — the same silence that let the strategy
-    /// look like it worked. The model is now named in `skipped`, with the
-    /// refusal as its reason.
+    /// an empty plan with exit 0. The model is now named in `skipped`, with
+    /// the reason: it is inlined into its consumers instead.
     #[test]
     fn plan_preview_names_a_model_it_could_not_render() {
         let tmp = TempDir::new().unwrap();
@@ -4448,9 +4452,9 @@ table = "stg_users"
         // from drifting apart silently.
         assert_eq!(
             out.skipped[0].reason,
-            "invalid SQL generation request: model 'stg_users': `type = \"ephemeral\"` is not \
-             supported (E038) — an ephemeral model is not materialized and is not inlined into \
-             its consumers; use `type = \"view\"`"
+            "invalid SQL generation request: model 'stg_users': `type = \"ephemeral\"` renders \
+             no statement of its own — it is inlined as a CTE into each model that reads it, so \
+             there is nothing to build (E038 when selected directly)"
         );
     }
 
