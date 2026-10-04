@@ -299,6 +299,17 @@ pub const E048: &str = "E048";
 /// `ephemeral`) or alongside a lakehouse `format`. The option rules are shared
 /// with the Redshift dialect's SQL-generation guard, so the two cannot drift.
 pub const E052: &str = "E052";
+/// `rocky package` refused to vendor a dbt Hub package.
+///
+/// Emitted by `rocky package add|update|remove` (`commands/package.rs`) for a
+/// malformed `<namespace>/<name>[@<version>]` spec, `dbt` missing from `PATH`,
+/// a Rocky adapter with no dbt profile mapping (supported: duckdb, snowflake,
+/// databricks, bigquery, postgres), a failed `dbt deps` / `dbt compile`, a
+/// package model whose name an existing project or package model already
+/// owns (package models keep their dbt names; Rocky never prefixes them), or
+/// a `remove` that would delete locally edited vendored files without
+/// `--force`. Nothing is written when it fires.
+pub const E055: &str = "E055";
 
 // Warnings
 /// Unused model (no downstream consumers).
@@ -480,6 +491,17 @@ pub const W048: &str = "W048";
 /// lineage extraction; Redshift rejects the `CREATE TABLE` at run time if the
 /// column really is missing.
 pub const W052: &str = "W052";
+/// `rocky package` vendored a dbt package with something to review.
+///
+/// Emitted by `rocky package add|update` for: a locally edited vendored file
+/// the new upstream version changed (kept; the new version is written beside
+/// it as `<file>.incoming`), or one upstream removed (kept); a package model
+/// that could not be vendored (including one dbt compiled with an
+/// introspection placeholder); a dbt `incremental` model that did not map to a
+/// Rocky incremental strategy; dbt tests outside `not_null`, `unique`,
+/// `accepted_values` and `relationships` (dropped, counted); and a
+/// `dbt run --empty` that did not build every model.
+pub const W055: &str = "W055";
 
 // Info
 /// Model dependency inferred from SQL.

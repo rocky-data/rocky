@@ -4189,6 +4189,7 @@ name = "rocky-compiler"
 version = "1.76.0"
 dependencies = [
  "anyhow",
+ "blake3",
  "bumpalo",
  "chrono",
  "glob",

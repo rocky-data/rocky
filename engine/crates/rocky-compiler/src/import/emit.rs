@@ -406,7 +406,7 @@ pub(crate) fn strip_null_fixture_cells(test: &UnitTestDef) -> UnitTestDef {
 
 /// Inject a comment line above any TODO/Jinja-leftover marker so reviewers
 /// can grep for `# TODO: dbt-jinja-not-translated` in generated bodies.
-fn annotate_unsupported_jinja(sql: &str) -> String {
+pub(crate) fn annotate_unsupported_jinja(sql: &str) -> String {
     if !sql.contains("TODO: unsupported Jinja") {
         return sql.to_string();
     }

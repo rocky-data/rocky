@@ -1,0 +1,1879 @@
+//! dbt Hub package vendoring — the pure half of `rocky package`.
+//!
+//! `rocky package add fivetran/stripe` runs dbt once (`dbt deps` +
+//! `dbt compile --full-refresh`) in a throwaway project, then hands the
+//! resulting `target/manifest.json` to this module. Everything here is
+//! deterministic and needs no dbt, no warehouse and no network, so CI covers
+//! it with a recorded manifest:
+//!
+//! - [`parse_package_info`] reads the manifest fields the general importer
+//!   does not keep (`package_name`, test nodes, source identifiers).
+//! - [`import_package`] selects one package's models (plus the upstream
+//!   models they read from other packages), runs the existing manifest
+//!   importer over just those nodes, builds every model into one schema (so
+//!   bare-name reads resolve at run time), declares its package sources, and
+//!   maps the four canonical dbt generic tests.
+//! - [`render_package_files`] renders the vendored `.sql` + `.toml` files.
+//! - [`plan_update`] three-way compares freshly rendered files against the
+//!   hashes in `rocky-packages.lock` and the files on disk, so a file the user
+//!   edited is never overwritten.
+//!
+//! Package model names keep their dbt names. A name that collides with a
+//! project model or another package's model is refused ([`find_collisions`]),
+//! never silently prefixed: downstream project models read package models by
+//! bare name, and a rename would break every such reference.
+
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::path::Path;
+
+use serde::{Deserialize, Serialize};
+
+use rocky_core::models::{SourceConfig, StrategyConfig, TargetConfig};
+use rocky_core::tests::{TestDecl, TestSeverity, TestType};
+
+use super::dbt::{
+    ImportFailure, ImportWarning, ImportedModel, MicrobatchMode, import_from_manifest,
+};
+use super::dbt_manifest::DbtManifest;
+
+/// Lockfile name, at the project root next to `rocky.toml`.
+pub const LOCKFILE_NAME: &str = "rocky-packages.lock";
+
+/// Directory (relative to the project root) that holds vendored packages.
+pub const PACKAGES_DIR: &str = "models/packages";
+
+/// Suffix of the file `rocky package update` writes beside a locally edited
+/// vendored file instead of overwriting it.
+pub const INCOMING_SUFFIX: &str = ".incoming";
+
+/// Current lockfile format version.
+pub const LOCK_VERSION: u32 = 1;
+
+/// First line of every vendored `.sql` file. Constant on purpose: a header
+/// that carried the package version would make every file look changed
+/// upstream on each version bump, and every locally edited file would then
+/// get a spurious `.incoming` copy.
+const SQL_HEADER: &str = "-- Vendored by `rocky package` from a dbt package. Edit freely: `rocky package update`\n\
+     -- keeps edited files and writes the new upstream version beside them as `.incoming`.\n";
+
+// ---------------------------------------------------------------------------
+// Manifest fields the general importer drops
+// ---------------------------------------------------------------------------
+
+/// Package-level facts from `manifest.json` that [`DbtManifest`] does not
+/// carry: which package owns each node, the generic test nodes, and the
+/// physical identifiers of sources.
+#[derive(Debug, Clone, Default)]
+pub struct PackageManifestInfo {
+    /// The root project name (the throwaway project `rocky package` creates).
+    pub project_name: String,
+    pub nodes: HashMap<String, InfoNode>,
+    pub sources: HashMap<String, InfoSource>,
+}
+
+/// One manifest node, reduced to what package vendoring needs.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct InfoNode {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub resource_type: String,
+    #[serde(default)]
+    pub package_name: String,
+    #[serde(default)]
+    pub schema: Option<String>,
+    #[serde(default)]
+    pub database: Option<String>,
+    #[serde(default)]
+    pub depends_on: InfoDependsOn,
+    #[serde(default)]
+    pub test_metadata: Option<InfoTestMetadata>,
+    #[serde(default)]
+    pub attached_node: Option<String>,
+    #[serde(default)]
+    pub column_name: Option<String>,
+    #[serde(default)]
+    pub config: InfoNodeConfig,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct InfoDependsOn {
+    #[serde(default)]
+    pub nodes: Vec<String>,
+}
+
+/// `test_metadata` on a generic test node.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct InfoTestMetadata {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub namespace: Option<String>,
+    #[serde(default)]
+    pub kwargs: serde_json::Map<String, serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct InfoNodeConfig {
+    #[serde(default)]
+    pub materialized: Option<String>,
+    #[serde(default)]
+    pub severity: Option<String>,
+    #[serde(default, rename = "where")]
+    pub where_clause: Option<String>,
+    #[serde(default)]
+    pub enabled: Option<bool>,
+}
+
+/// One manifest source, with the identifier dbt resolved from the package's
+/// `*_schema` / `*_database` / `*_identifier` vars.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct InfoSource {
+    #[serde(default)]
+    pub package_name: String,
+    #[serde(default)]
+    pub source_name: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub database: Option<String>,
+    #[serde(default)]
+    pub schema: Option<String>,
+    #[serde(default)]
+    pub identifier: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct RawInfo {
+    #[serde(default)]
+    metadata: RawInfoMetadata,
+    #[serde(default)]
+    nodes: HashMap<String, InfoNode>,
+    #[serde(default)]
+    sources: HashMap<String, InfoSource>,
+}
+
+#[derive(Deserialize, Default)]
+struct RawInfoMetadata {
+    #[serde(default)]
+    project_name: Option<String>,
+}
+
+/// Read the package-level manifest facts. Companion to
+/// [`super::dbt_manifest::parse_manifest`], which reads the same file for the
+/// model bodies.
+pub fn parse_package_info(path: &Path) -> Result<PackageManifestInfo, String> {
+    let file =
+        std::fs::File::open(path).map_err(|e| format!("failed to open {}: {e}", path.display()))?;
+    let raw: RawInfo = serde_json::from_reader(std::io::BufReader::new(file))
+        .map_err(|e| format!("failed to parse {}: {e}", path.display()))?;
+    Ok(PackageManifestInfo {
+        project_name: raw.metadata.project_name.unwrap_or_default(),
+        nodes: raw.nodes,
+        sources: raw.sources,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Import
+// ---------------------------------------------------------------------------
+
+/// A raw source table a package reads, as dbt resolved it at compile time.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct PackageSource {
+    /// `<source_name>.<table>` as the package declares it (`stripe.charge`).
+    pub name: String,
+    pub catalog: String,
+    pub schema: String,
+    pub table: String,
+}
+
+/// A dbt test on a package model that Rocky did not map.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DroppedTest {
+    /// The dbt test node name.
+    pub test: String,
+    /// The model (or source) the test is attached to, when known.
+    pub attached_to: Option<String>,
+    pub reason: String,
+}
+
+/// One vendored model: the imported model plus where it came from.
+pub struct VendoredModel {
+    pub model: ImportedModel,
+    /// dbt package that owns the model (the requested package, or one of its
+    /// dependencies when the requested package reads its models).
+    pub owner_package: String,
+    /// dbt materialization as compiled (`table`, `view`, `incremental`, ...).
+    pub dbt_materialized: String,
+}
+
+/// Result of importing one package from a compiled manifest.
+pub struct PackageImport {
+    /// dbt project name of the package (`stripe` for `fivetran/stripe`).
+    pub package: String,
+    pub models: Vec<VendoredModel>,
+    pub failed: Vec<ImportFailure>,
+    pub warnings: Vec<ImportWarning>,
+    pub sources: Vec<PackageSource>,
+    /// Generic tests mapped to Rocky `[[tests]]`.
+    pub tests_mapped: usize,
+    pub tests_dropped: Vec<DroppedTest>,
+    /// dbt `incremental` models that did not become a Rocky incremental
+    /// strategy (imported as full refresh, or failed).
+    pub incremental_fallbacks: Vec<String>,
+    pub dbt_version: Option<String>,
+}
+
+/// Import one package's models from a compiled manifest.
+///
+/// Selection: every enabled `model` / `snapshot` node whose `package_name` is
+/// `package`, plus — transitively — any upstream model it depends on from
+/// another package (older Fivetran packages split `*_source` staging into a
+/// separate package). The root project's own nodes are never selected.
+pub fn import_package(
+    manifest: &DbtManifest,
+    info: &PackageManifestInfo,
+    package: &str,
+    default_target: &TargetConfig,
+) -> Result<PackageImport, String> {
+    let selected = select_package_nodes(info, package)?;
+
+    let mut filtered = manifest.clone();
+    filtered.nodes.retain(|id, _| selected.contains_key(id));
+    let selected_names: BTreeSet<String> =
+        filtered.nodes.values().map(|n| n.name.clone()).collect();
+    filtered
+        .unit_tests
+        .retain(|_, ut| selected_names.contains(&ut.model));
+    filtered.dropped = Default::default();
+
+    let mut result = import_from_manifest(&filtered, default_target, false, MicrobatchMode::Merge);
+
+    // rocky name -> unique_id, for every selected node.
+    let mut by_rocky_name: HashMap<String, String> = HashMap::new();
+    for (id, node) in &filtered.nodes {
+        let name =
+            super::dbt_governance::rocky_model_name(&node.name, node.governance.version.as_deref())
+                .unwrap_or_else(|_| node.name.clone());
+        by_rocky_name.insert(name, id.clone());
+    }
+
+    let mut used_sources: BTreeSet<PackageSource> = BTreeSet::new();
+    let mut models = Vec::new();
+    for mut imported in std::mem::take(&mut result.imported) {
+        let Some(id) = by_rocky_name.get(&imported.name) else {
+            continue;
+        };
+        let node = &filtered.nodes[id];
+        // Every vendored model builds into ONE schema, `default_target.schema`.
+        // The SQL reads upstream package models by bare name (that is what
+        // makes them DAG edges Rocky type-checks), and the warehouse resolves
+        // a bare name through the connection's current schema. dbt's per-folder
+        // `+schema` (`main_stg_stripe`, `main_stripe`) would put upstreams
+        // where a bare read cannot reach them.
+        imported.config.target.schema = default_target.schema.clone();
+        if !node.database.is_empty() {
+            imported.config.target.catalog = node.database.clone();
+        }
+        // Declare the package sources this model reads.
+        let mut model_sources = Vec::new();
+        for dep in &node.depends_on.nodes {
+            if let Some(src) = info.sources.get(dep).and_then(package_source) {
+                model_sources.push(SourceConfig {
+                    catalog: src.catalog.clone(),
+                    schema: src.schema.clone(),
+                    table: src.table.clone(),
+                });
+                used_sources.insert(src);
+            }
+        }
+        imported.config.sources = model_sources;
+        models.push(VendoredModel {
+            owner_package: selected[id].clone(),
+            dbt_materialized: node.config.materialized.clone(),
+            model: imported,
+        });
+    }
+    models.sort_by(|a, b| a.model.name.cmp(&b.model.name));
+
+    // A model dbt compiled before its upstream existed carries an
+    // introspection placeholder instead of a column list. Refuse it.
+    let mut failed = std::mem::take(&mut result.failed);
+    models.retain(|vm| {
+        if vm.model.sql.contains(INTROSPECTION_PLACEHOLDER) {
+            failed.push(ImportFailure {
+                name: vm.model.name.clone(),
+                reason: "dbt compiled this model before an upstream relation existed, so a \
+                         column-introspecting macro (dbt_utils.star) emitted a placeholder `*`; \
+                         re-run without --no-build-empty so dbt builds empty upstreams first"
+                    .to_string(),
+            });
+            false
+        } else {
+            true
+        }
+    });
+    result.failed = failed;
+
+    // Incremental models that did not stay incremental.
+    let mut incremental_fallbacks = Vec::new();
+    for vm in &models {
+        if vm.dbt_materialized == "incremental"
+            && matches!(vm.model.config.strategy, StrategyConfig::FullRefresh)
+        {
+            incremental_fallbacks.push(vm.model.name.clone());
+        }
+    }
+    for failure in &result.failed {
+        let materialized = by_rocky_name
+            .get(&failure.name)
+            .and_then(|id| filtered.nodes.get(id))
+            .map(|n| n.config.materialized.as_str());
+        if materialized == Some("incremental") {
+            incremental_fallbacks.push(failure.name.clone());
+        }
+    }
+    incremental_fallbacks.sort();
+    incremental_fallbacks.dedup();
+
+    let (tests_mapped, tests_dropped) = map_generic_tests(info, &selected, &mut models);
+
+    Ok(PackageImport {
+        package: package.to_string(),
+        models,
+        failed: result.failed,
+        warnings: result.warnings,
+        sources: used_sources.into_iter().collect(),
+        tests_mapped,
+        tests_dropped,
+        incremental_fallbacks,
+        dbt_version: result.dbt_version,
+    })
+}
+
+/// Select `package`'s model nodes plus their upstream closure, mapped to the
+/// package that owns each.
+fn select_package_nodes(
+    info: &PackageManifestInfo,
+    package: &str,
+) -> Result<BTreeMap<String, String>, String> {
+    let is_model = |n: &InfoNode| {
+        (n.resource_type == "model" || n.resource_type == "snapshot")
+            && n.config.enabled != Some(false)
+    };
+    let mut selected: BTreeMap<String, String> = BTreeMap::new();
+    let mut queue: VecDeque<String> = VecDeque::new();
+    let mut roots: Vec<&String> = info
+        .nodes
+        .iter()
+        .filter(|(_, n)| n.package_name == package && is_model(n))
+        .map(|(id, _)| id)
+        .collect();
+    roots.sort();
+    if roots.is_empty() {
+        let mut known: Vec<&str> = info
+            .nodes
+            .values()
+            .filter(|n| is_model(n) && n.package_name != info.project_name)
+            .map(|n| n.package_name.as_str())
+            .collect();
+        known.sort_unstable();
+        known.dedup();
+        return Err(format!(
+            "the compiled manifest has no models for package '{package}' (packages with models: {})",
+            if known.is_empty() {
+                "none".to_string()
+            } else {
+                known.join(", ")
+            }
+        ));
+    }
+    for id in roots {
+        selected.insert(id.clone(), package.to_string());
+        queue.push_back(id.clone());
+    }
+    while let Some(id) = queue.pop_front() {
+        let Some(node) = info.nodes.get(&id) else {
+            continue;
+        };
+        for dep in &node.depends_on.nodes {
+            if selected.contains_key(dep) {
+                continue;
+            }
+            let Some(up) = info.nodes.get(dep) else {
+                continue;
+            };
+            if !is_model(up) || up.package_name == info.project_name {
+                continue;
+            }
+            selected.insert(dep.clone(), up.package_name.clone());
+            queue.push_back(dep.clone());
+        }
+    }
+    Ok(selected)
+}
+
+fn package_source(src: &InfoSource) -> Option<PackageSource> {
+    let table = src
+        .identifier
+        .clone()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| src.name.clone());
+    if table.is_empty() {
+        return None;
+    }
+    Some(PackageSource {
+        name: format!("{}.{}", src.source_name, src.name),
+        catalog: src.database.clone().unwrap_or_default(),
+        schema: src.schema.clone().unwrap_or_default(),
+        table,
+    })
+}
+
+/// Map dbt generic test nodes attached to vendored models onto Rocky
+/// `[[tests]]`. Only the four built-ins (`not_null`, `unique`,
+/// `accepted_values`, `relationships`) map; every other test (package
+/// macros such as `dbt_utils.*`, singular tests, tests on sources) is
+/// returned as dropped so the caller reports it.
+fn map_generic_tests(
+    info: &PackageManifestInfo,
+    selected: &BTreeMap<String, String>,
+    models: &mut [VendoredModel],
+) -> (usize, Vec<DroppedTest>) {
+    // unique_id -> index in `models`; model name -> target FQN.
+    let mut index_of: HashMap<&str, usize> = HashMap::new();
+    let mut target_of: HashMap<String, String> = HashMap::new();
+    for (i, vm) in models.iter().enumerate() {
+        let t = &vm.model.config.target;
+        target_of.insert(
+            vm.model.name.clone(),
+            format!("{}.{}.{}", t.catalog, t.schema, t.table),
+        );
+        if let Some((id, _)) = selected
+            .iter()
+            .find(|(id, _)| info.nodes.get(*id).is_some_and(|n| n.name == vm.model.name))
+        {
+            index_of.insert(id.as_str(), i);
+        }
+    }
+
+    let mut test_ids: Vec<&String> = info
+        .nodes
+        .iter()
+        .filter(|(_, n)| n.resource_type == "test" && n.config.enabled != Some(false))
+        .map(|(id, _)| id)
+        .collect();
+    test_ids.sort();
+
+    let mut mapped = 0;
+    let mut dropped = Vec::new();
+    for id in test_ids {
+        let test = &info.nodes[id];
+        // Attach by `attached_node`, else by the single model it depends on.
+        let attached = test.attached_node.clone().or_else(|| {
+            let models: Vec<&String> = test
+                .depends_on
+                .nodes
+                .iter()
+                .filter(|d| d.starts_with("model.") || d.starts_with("snapshot."))
+                .collect();
+            (models.len() == 1).then(|| models[0].clone())
+        });
+        let Some(attached) = attached else {
+            // A test touching nothing we vendored is not ours to report.
+            continue;
+        };
+        if !selected.contains_key(&attached) {
+            if attached.starts_with("source.")
+                && info
+                    .sources
+                    .get(&attached)
+                    .is_some_and(|s| selected.values().any(|p| *p == s.package_name))
+            {
+                dropped.push(DroppedTest {
+                    test: test.name.clone(),
+                    attached_to: Some(attached.clone()),
+                    reason: "tests on dbt sources are not mapped; Rocky does not build sources"
+                        .to_string(),
+                });
+            }
+            continue;
+        }
+        let Some(&model_idx) = index_of.get(attached.as_str()) else {
+            dropped.push(DroppedTest {
+                test: test.name.clone(),
+                attached_to: Some(attached.clone()),
+                reason: "the model it tests was not imported".to_string(),
+            });
+            continue;
+        };
+        match test_decl(test, &target_of) {
+            Ok(decl) => {
+                models[model_idx].model.config.tests.push(decl);
+                mapped += 1;
+            }
+            Err(reason) => dropped.push(DroppedTest {
+                test: test.name.clone(),
+                attached_to: Some(models[model_idx].model.name.clone()),
+                reason,
+            }),
+        }
+    }
+    (mapped, dropped)
+}
+
+/// Convert one dbt generic test node into a Rocky [`TestDecl`].
+fn test_decl(test: &InfoNode, target_of: &HashMap<String, String>) -> Result<TestDecl, String> {
+    let Some(meta) = &test.test_metadata else {
+        return Err("singular (custom SQL) test".to_string());
+    };
+    if meta.namespace.as_deref().is_some_and(|ns| ns != "dbt") {
+        return Err(format!(
+            "generic test `{}.{}` has no Rocky equivalent",
+            meta.namespace.as_deref().unwrap_or_default(),
+            meta.name
+        ));
+    }
+    let kwarg = |key: &str| -> Option<&serde_json::Value> {
+        meta.kwargs.get(key).or_else(|| {
+            meta.kwargs
+                .get("arguments")
+                .and_then(|a| a.as_object())
+                .and_then(|a| a.get(key))
+        })
+    };
+    let column = kwarg("column_name")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .or_else(|| test.column_name.clone())
+        .filter(|c| !c.is_empty());
+    let severity = match test.config.severity.as_deref() {
+        Some(s) if s.eq_ignore_ascii_case("warn") => TestSeverity::Warning,
+        _ => TestSeverity::Error,
+    };
+    let filter = test
+        .config
+        .where_clause
+        .clone()
+        .filter(|w| !w.trim().is_empty());
+    let test_type = match meta.name.as_str() {
+        "not_null" => TestType::NotNull,
+        "unique" => TestType::Unique,
+        "accepted_values" => {
+            let values = kwarg("values")
+                .and_then(|v| v.as_array())
+                .ok_or_else(|| "accepted_values without a literal `values` list".to_string())?;
+            let values: Vec<String> = values
+                .iter()
+                .map(|v| match v {
+                    serde_json::Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                })
+                .collect();
+            TestType::AcceptedValues { values }
+        }
+        "relationships" => {
+            let to = kwarg("to")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| "relationships without `to`".to_string())?;
+            let field = kwarg("field")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| "relationships without `field`".to_string())?;
+            let to_model = super::dbt::strip_ref_wrapper(to);
+            let to_table = target_of.get(&to_model).cloned().ok_or_else(|| {
+                format!("relationships target `{to}` is not a vendored model of this package")
+            })?;
+            TestType::Relationships {
+                to_table,
+                to_column: field.to_string(),
+            }
+        }
+        other => return Err(format!("generic test `{other}` has no Rocky equivalent")),
+    };
+    if column.is_none() {
+        return Err(format!("`{}` test without a column", meta.name));
+    }
+    Ok(TestDecl {
+        test_type,
+        column,
+        severity,
+        filter,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Rendering, collisions, lockfile, update planning
+// ---------------------------------------------------------------------------
+
+/// True when `name` is safe as one path component and a Rocky model name.
+pub fn is_safe_package_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+/// Project-relative directory of a vendored package.
+pub fn package_dir(package: &str) -> String {
+    format!("{PACKAGES_DIR}/{package}")
+}
+
+/// Render every vendored file, keyed by project-relative path (`/`-separated).
+///
+/// Models from a dependency package land under that package's own directory,
+/// so the tree mirrors dbt's package boundaries.
+pub fn render_package_files(import: &PackageImport) -> Result<BTreeMap<String, String>, String> {
+    let mut files = BTreeMap::new();
+    for vm in &import.models {
+        let name = &vm.model.name;
+        if !is_safe_package_name(name) || name.contains('-') {
+            return Err(format!(
+                "model name {name:?} is not a safe file name; refusing to vendor it"
+            ));
+        }
+        let dir = package_dir(&vm.owner_package);
+        let sql = format!(
+            "{SQL_HEADER}{}\n",
+            super::emit::annotate_unsupported_jinja(&vm.model.sql)
+        );
+        let mut toml = super::emit::render_model_sidecar(&vm.model.config);
+        if !vm.model.unit_tests.is_empty() {
+            toml.push_str(&super::emit::render_unit_tests(name, &vm.model.unit_tests));
+        }
+        files.insert(format!("{dir}/{name}.sql"), sql);
+        files.insert(format!("{dir}/{name}.toml"), toml);
+    }
+    Ok(files)
+}
+
+/// A model name that is already taken.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Collision {
+    pub model: String,
+    /// `project` or the name of the package that owns the existing model.
+    pub owner: String,
+}
+
+/// Names the new package's models would collide with. `existing` maps every
+/// model name already in the project to each of its owners (`project` or a
+/// lock entry name); an owner in `replacing` (the package being re-vendored)
+/// is expected to be replaced and never collides.
+pub fn find_collisions(
+    import: &PackageImport,
+    existing: &BTreeMap<String, BTreeSet<String>>,
+    replacing: &BTreeSet<String>,
+) -> Vec<Collision> {
+    let mut out = Vec::new();
+    for vm in &import.models {
+        let Some(owners) = existing.get(&vm.model.name) else {
+            continue;
+        };
+        for owner in owners.difference(replacing) {
+            out.push(Collision {
+                model: vm.model.name.clone(),
+                owner: owner.clone(),
+            });
+        }
+    }
+    out
+}
+
+/// Content hash recorded in the lockfile (`blake3:<hex>`).
+pub fn content_hash(content: &str) -> String {
+    format!("blake3:{}", blake3::hash(content.as_bytes()).to_hex())
+}
+
+/// Hash of the vars a package was compiled with (order-independent).
+pub fn vars_hash(vars: &BTreeMap<String, String>) -> String {
+    let canonical: String = vars.iter().map(|(k, v)| format!("{k}={v}\n")).collect();
+    content_hash(&canonical)
+}
+
+/// `rocky-packages.lock`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct PackagesLock {
+    pub version: u32,
+    #[serde(default, rename = "package")]
+    pub packages: Vec<LockedPackage>,
+}
+
+/// One vendored package in the lockfile.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct LockedPackage {
+    /// dbt project name of the package (`stripe`); the directory under
+    /// `models/packages/`.
+    pub name: String,
+    /// dbt Hub name (`fivetran/stripe`).
+    pub hub: String,
+    /// Version requirement as given to `add` (`>=1.0.0,<2.0.0`), or empty
+    /// for "latest".
+    #[serde(default)]
+    pub version_spec: String,
+    /// Version `dbt deps` resolved.
+    pub version: String,
+    pub dbt_version: String,
+    /// Rocky adapter type dbt compiled against.
+    pub adapter: String,
+    /// Rocky adapter name in `rocky.toml`.
+    #[serde(default)]
+    pub adapter_name: String,
+    /// dbt target schema used for the throwaway profile.
+    #[serde(default)]
+    pub target_schema: String,
+    pub compiled_at: String,
+    pub vars_hash: String,
+    /// dbt vars (`key = "yaml value"`) replayed by `rocky package update`.
+    #[serde(default)]
+    pub vars: BTreeMap<String, String>,
+    /// Dependency packages whose models were vendored alongside.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub includes: Vec<String>,
+    /// Raw source tables the package reads.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sources: Vec<PackageSource>,
+    /// Project-relative path → hash of the content Rocky last wrote.
+    #[serde(default)]
+    pub files: BTreeMap<String, String>,
+}
+
+impl PackagesLock {
+    /// Read the lockfile; an absent file is an empty lock.
+    pub fn read(path: &Path) -> Result<Self, String> {
+        match std::fs::read_to_string(path) {
+            Ok(text) => {
+                let lock: Self = toml::from_str(&text)
+                    .map_err(|e| format!("failed to parse {}: {e}", path.display()))?;
+                if lock.version > LOCK_VERSION {
+                    return Err(format!(
+                        "{} has lock version {}; this Rocky reads version {LOCK_VERSION}. Upgrade Rocky",
+                        path.display(),
+                        lock.version
+                    ));
+                }
+                Ok(lock)
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self {
+                version: LOCK_VERSION,
+                packages: Vec::new(),
+            }),
+            Err(e) => Err(format!("failed to read {}: {e}", path.display())),
+        }
+    }
+
+    /// Render the lockfile, packages sorted by name.
+    pub fn render(&self) -> Result<String, String> {
+        let mut lock = self.clone();
+        lock.version = LOCK_VERSION;
+        lock.packages.sort_by(|a, b| a.name.cmp(&b.name));
+        let body = toml::to_string_pretty(&lock).map_err(|e| e.to_string())?;
+        Ok(format!(
+            "# Generated by `rocky package`. Records what Rocky vendored under {PACKAGES_DIR}/\n\
+             # and the hash of every file it wrote, so `rocky package update` can tell your\n\
+             # edits from upstream changes. Commit this file.\n\n{body}"
+        ))
+    }
+
+    pub fn get(&self, name: &str) -> Option<&LockedPackage> {
+        self.packages.iter().find(|p| p.name == name)
+    }
+
+    /// Insert or replace the entry for `pkg.name`.
+    pub fn upsert(&mut self, pkg: LockedPackage) {
+        self.packages.retain(|p| p.name != pkg.name);
+        self.packages.push(pkg);
+    }
+
+    /// Package name that owns a vendored path, if any.
+    pub fn owner_of(&self, path: &str) -> Option<&str> {
+        self.packages
+            .iter()
+            .find(|p| p.files.contains_key(path))
+            .map(|p| p.name.as_str())
+    }
+}
+
+/// What `rocky package update` (and a re-`add`) does to each file.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UpdatePlan {
+    /// New or changed files whose on-disk copy is untouched: written in place.
+    pub write: BTreeMap<String, String>,
+    /// Files changed upstream AND edited locally: the new upstream content is
+    /// written to `<path>.incoming`; the user's file is left alone.
+    pub incoming: BTreeMap<String, String>,
+    /// Files no longer produced upstream whose on-disk copy is untouched:
+    /// deleted.
+    pub delete: Vec<String>,
+    /// Edited files kept as they are (no upstream change, or removed upstream).
+    pub kept_edited: Vec<String>,
+    /// Files identical to what is already on disk.
+    pub unchanged: Vec<String>,
+    /// Hashes to record in the lockfile: always the hash of the latest
+    /// upstream content, so a later update compares against it.
+    pub lock_files: BTreeMap<String, String>,
+}
+
+/// Three-way compare: `planned` (fresh upstream render) vs `locked` (hash of
+/// what Rocky last wrote) vs `disk` (current file content, `None` if absent).
+///
+/// | on disk vs lock | upstream vs lock | action |
+/// |---|---|---|
+/// | same (clean) | changed or new | write |
+/// | same | same | unchanged |
+/// | edited | changed | write `.incoming`, keep user file |
+/// | edited | same | keep user file |
+/// | clean | removed | delete |
+/// | edited | removed | keep user file |
+/// | absent | any | write (a deleted vendored file is restored) |
+///
+/// A file not in the lock but present on disk (the user created a file with
+/// a vendored name before this run) is treated as edited, so it is never
+/// overwritten silently.
+pub fn plan_update(
+    planned: &BTreeMap<String, String>,
+    locked: &BTreeMap<String, String>,
+    disk: &dyn Fn(&str) -> Option<String>,
+) -> UpdatePlan {
+    let mut plan = UpdatePlan::default();
+    for (path, content) in planned {
+        let new_hash = content_hash(content);
+        plan.lock_files.insert(path.clone(), new_hash.clone());
+        match disk(path) {
+            None => {
+                plan.write.insert(path.clone(), content.clone());
+            }
+            Some(current) => {
+                let current_hash = content_hash(&current);
+                if current_hash == new_hash {
+                    plan.unchanged.push(path.clone());
+                    continue;
+                }
+                let clean = locked.get(path) == Some(&current_hash);
+                if clean {
+                    plan.write.insert(path.clone(), content.clone());
+                } else if locked.get(path) == Some(&new_hash) {
+                    // Upstream did not change; the user's edit stands.
+                    plan.kept_edited.push(path.clone());
+                } else {
+                    plan.incoming.insert(path.clone(), content.clone());
+                }
+            }
+        }
+    }
+    for (path, locked_hash) in locked {
+        if planned.contains_key(path) {
+            continue;
+        }
+        match disk(path) {
+            None => {}
+            Some(current) if &content_hash(&current) == locked_hash => {
+                plan.delete.push(path.clone());
+            }
+            Some(_) => {
+                plan.kept_edited.push(path.clone());
+            }
+        }
+    }
+    plan.kept_edited.sort();
+    plan
+}
+
+/// Model names the lock's files declare (`<dir>/<name>.sql`).
+pub fn locked_model_names(pkg: &LockedPackage) -> BTreeSet<String> {
+    pkg.files
+        .keys()
+        .filter_map(|p| p.strip_suffix(".sql"))
+        .filter_map(|p| p.rsplit('/').next())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Parse `package-lock.yml` (written by `dbt deps`, dbt 1.7+) and return
+/// `(project name, resolved version)` for the hub package `hub`.
+pub fn resolve_from_package_lock(text: &str, hub: &str) -> Result<(String, String), String> {
+    #[derive(Deserialize)]
+    struct Lock {
+        #[serde(default)]
+        packages: Vec<Entry>,
+    }
+    #[derive(Deserialize)]
+    struct Entry {
+        #[serde(default)]
+        name: Option<String>,
+        #[serde(default)]
+        package: Option<String>,
+        #[serde(default)]
+        version: Option<serde_yaml::Value>,
+    }
+    let lock: Lock =
+        serde_yaml::from_str(text).map_err(|e| format!("failed to parse package-lock.yml: {e}"))?;
+    let entry = lock
+        .packages
+        .into_iter()
+        .find(|e| {
+            e.package
+                .as_deref()
+                .is_some_and(|p| p.eq_ignore_ascii_case(hub))
+        })
+        .ok_or_else(|| format!("package-lock.yml has no entry for `{hub}`"))?;
+    let name = entry.name.filter(|n| !n.is_empty()).ok_or_else(|| {
+        format!(
+            "package-lock.yml has no `name` for `{hub}`; dbt-core 1.8 or newer writes it — upgrade dbt"
+        )
+    })?;
+    let version = match entry.version {
+        Some(serde_yaml::Value::String(s)) => s,
+        Some(serde_yaml::Value::Number(n)) => n.to_string(),
+        _ => String::new(),
+    };
+    Ok((name, version))
+}
+
+// ---------------------------------------------------------------------------
+// The throwaway dbt project
+// ---------------------------------------------------------------------------
+
+/// Text dbt-utils' `star()` writes in place of a column list when the relation
+/// it introspects does not exist yet. A model compiled with it selects `*`
+/// where the package meant an explicit list, which is plausible-looking and
+/// wrong (it broke a `UNION ALL` in `fivetran/stripe`), so such a model is
+/// refused rather than vendored.
+pub const INTROSPECTION_PLACEHOLDER: &str =
+    "No columns were returned. Maybe the relation doesn't exist yet";
+
+/// Split `<namespace>/<name>[@<version-spec>]`. The spec is a comma-separated
+/// requirement list (`>=1.0.0,<2.0.0`) or one exact version; empty means
+/// "whatever the Hub resolves".
+pub fn parse_package_spec(spec: &str) -> Result<(String, String), String> {
+    let (hub, version) = match spec.split_once('@') {
+        Some((h, v)) => (h.trim(), v.trim()),
+        None => (spec.trim(), ""),
+    };
+    let valid = hub.split_once('/').is_some_and(|(ns, name)| {
+        is_safe_package_name(ns) && is_safe_package_name(name) && !name.contains('/')
+    });
+    if !valid {
+        return Err(format!(
+            "`{spec}` is not a dbt Hub package; expected `<namespace>/<name>[@<version>]`, \
+             e.g. `fivetran/stripe@>=1.0.0,<2.0.0`"
+        ));
+    }
+    if version.contains(['\n', '"', '\'']) {
+        return Err(format!(
+            "version spec `{version}` contains a quote or newline"
+        ));
+    }
+    Ok((hub.to_string(), version.to_string()))
+}
+
+/// `packages.yml` for the throwaway project.
+pub fn render_packages_yml(hub: &str, version_spec: &str) -> String {
+    let mut pkg = serde_yaml::Mapping::new();
+    pkg.insert("package".into(), hub.into());
+    let reqs: Vec<serde_yaml::Value> = version_spec
+        .split(',')
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(Into::into)
+        .collect();
+    if !reqs.is_empty() {
+        pkg.insert("version".into(), serde_yaml::Value::Sequence(reqs));
+    }
+    let mut root = serde_yaml::Mapping::new();
+    root.insert(
+        "packages".into(),
+        serde_yaml::Value::Sequence(vec![serde_yaml::Value::Mapping(pkg)]),
+    );
+    serde_yaml::to_string(&root).unwrap_or_default()
+}
+
+/// Parse `--vars key=value` flags. Keys are identifiers; values keep their
+/// text and are read as YAML when dbt sees them (`false`, `5`, `[a, b]`).
+pub fn parse_vars(flags: &[String]) -> Result<BTreeMap<String, String>, String> {
+    let mut vars = BTreeMap::new();
+    for flag in flags {
+        let (k, v) = flag
+            .split_once('=')
+            .ok_or_else(|| format!("--vars `{flag}` is not `key=value`"))?;
+        let k = k.trim();
+        if k.is_empty() || !k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            return Err(format!("--vars key `{k}` must be letters, digits and `_`"));
+        }
+        serde_yaml::from_str::<serde_yaml::Value>(v)
+            .map_err(|e| format!("--vars `{k}`: value is not valid YAML: {e}"))?;
+        vars.insert(k.to_string(), v.trim().to_string());
+    }
+    Ok(vars)
+}
+
+/// `dbt_project.yml` for the throwaway project, carrying `vars` as dbt reads
+/// them (each value parsed as YAML).
+pub fn render_dbt_project_yml(
+    name: &str,
+    vars: &BTreeMap<String, String>,
+) -> Result<String, String> {
+    let mut root = serde_yaml::Mapping::new();
+    root.insert("name".into(), name.into());
+    root.insert("version".into(), "1.0.0".into());
+    root.insert("config-version".into(), 2.into());
+    root.insert("profile".into(), name.into());
+    if !vars.is_empty() {
+        let mut map = serde_yaml::Mapping::new();
+        for (k, v) in vars {
+            let value: serde_yaml::Value = serde_yaml::from_str(v)
+                .map_err(|e| format!("var `{k}`: value is not valid YAML: {e}"))?;
+            map.insert(k.as_str().into(), value);
+        }
+        root.insert("vars".into(), serde_yaml::Value::Mapping(map));
+    }
+    serde_yaml::to_string(&root).map_err(|e| e.to_string())
+}
+
+/// A rendered `profiles.yml` plus the environment it reads secrets from.
+/// Secrets never touch disk: the profile names an `env_var()` and the
+/// caller sets it on the dbt process only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DbtProfile {
+    pub yaml: String,
+    pub env: Vec<(String, String)>,
+}
+
+/// Rocky adapter types `rocky package add` can generate a dbt profile for.
+pub const PROFILE_ADAPTERS: &[&str] =
+    &["duckdb", "snowflake", "databricks", "bigquery", "postgres"];
+
+/// The schema Rocky builds vendored models into when `--target-schema` is
+/// not given: the schema a bare table name resolves to on a fresh
+/// connection. `None` where there is no such default (BigQuery datasets).
+pub fn default_target_schema(adapter_type: &str) -> Option<&'static str> {
+    match adapter_type {
+        "duckdb" => Some("main"),
+        "postgres" => Some("public"),
+        "snowflake" => Some("PUBLIC"),
+        "databricks" => Some("default"),
+        _ => None,
+    }
+}
+
+/// Generate a one-target `profiles.yml` from a Rocky adapter block.
+///
+/// `dbt_schema` is the dbt target schema (where `dbt run --empty` builds its
+/// empty relations). `duckdb_path` is the adapter's database file, already
+/// resolved to an absolute path. Refuses adapters dbt has no profile mapping
+/// for here.
+pub fn render_profiles_yml(
+    profile_name: &str,
+    adapter: &rocky_core::config::AdapterConfig,
+    dbt_schema: &str,
+    duckdb_path: Option<&Path>,
+) -> Result<DbtProfile, String> {
+    use serde_yaml::{Mapping, Value};
+    let mut out = Mapping::new();
+    let mut env: Vec<(String, String)> = Vec::new();
+    let mut secret = |out: &mut Mapping, key: &str, value: &str, var: &str| {
+        env.push((var.to_string(), value.to_string()));
+        out.insert(key.into(), format!("{{{{ env_var(\"{var}\") }}}}").into());
+    };
+    let need = |field: &str, v: Option<&String>| -> Result<String, String> {
+        v.filter(|s| !s.is_empty()).cloned().ok_or_else(|| {
+            format!(
+                "the {} adapter has no `{field}`; dbt needs it to compile the package",
+                adapter.adapter_type
+            )
+        })
+    };
+    out.insert("type".into(), adapter.adapter_type.as_str().into());
+    out.insert("threads".into(), 4.into());
+    match adapter.adapter_type.as_str() {
+        "duckdb" => {
+            let path = duckdb_path.ok_or_else(|| {
+                "the duckdb adapter has no `path`. dbt must compile against the database that \
+                 holds the package's source tables, and an in-memory database is empty; set \
+                 `path` in the [adapter] block"
+                    .to_string()
+            })?;
+            out.insert("path".into(), path.display().to_string().into());
+            out.insert("schema".into(), dbt_schema.into());
+        }
+        "snowflake" => {
+            out.insert(
+                "account".into(),
+                need("account", adapter.account.as_ref())?.into(),
+            );
+            out.insert(
+                "user".into(),
+                need("username", adapter.username.as_ref())?.into(),
+            );
+            out.insert(
+                "database".into(),
+                need("database", adapter.database.as_ref())?.into(),
+            );
+            if let Some(w) = &adapter.warehouse {
+                out.insert("warehouse".into(), w.as_str().into());
+            }
+            if let Some(r) = &adapter.role {
+                out.insert("role".into(), r.as_str().into());
+            }
+            out.insert("schema".into(), dbt_schema.into());
+            if let Some(t) = &adapter.oauth_token {
+                out.insert("authenticator".into(), "oauth".into());
+                secret(&mut out, "token", t.expose(), "ROCKY_DBT_SNOWFLAKE_TOKEN");
+            } else if let Some(k) = &adapter.private_key_path {
+                out.insert("private_key_path".into(), k.as_str().into());
+            } else if let Some(p) = adapter.password.as_ref().or(adapter.pat.as_ref()) {
+                secret(
+                    &mut out,
+                    "password",
+                    p.expose(),
+                    "ROCKY_DBT_SNOWFLAKE_PASSWORD",
+                );
+            } else {
+                return Err(
+                    "the snowflake adapter has no oauth_token, private_key_path, password or pat"
+                        .to_string(),
+                );
+            }
+        }
+        "databricks" => {
+            let host = need("host", adapter.host.as_ref())?;
+            let host = host
+                .trim_start_matches("https://")
+                .trim_start_matches("http://")
+                .trim_end_matches('/')
+                .to_string();
+            out.insert("host".into(), host.into());
+            out.insert(
+                "http_path".into(),
+                need("http_path", adapter.http_path.as_ref())?.into(),
+            );
+            if let Some(c) = &adapter.database {
+                out.insert("catalog".into(), c.as_str().into());
+            }
+            out.insert("schema".into(), dbt_schema.into());
+            if let Some(t) = &adapter.token {
+                secret(&mut out, "token", t.expose(), "ROCKY_DBT_DATABRICKS_TOKEN");
+            } else if let (Some(id), Some(cs)) = (&adapter.client_id, &adapter.client_secret) {
+                out.insert("auth_type".into(), "oauth".into());
+                out.insert("client_id".into(), id.as_str().into());
+                secret(
+                    &mut out,
+                    "client_secret",
+                    cs.expose(),
+                    "ROCKY_DBT_DATABRICKS_CLIENT_SECRET",
+                );
+            } else {
+                return Err(
+                    "the databricks adapter has no token or client_id + client_secret".to_string(),
+                );
+            }
+        }
+        "bigquery" => {
+            out.insert(
+                "project".into(),
+                need("project_id", adapter.project_id.as_ref())?.into(),
+            );
+            out.insert("dataset".into(), dbt_schema.into());
+            if let Some(l) = &adapter.location {
+                out.insert("location".into(), l.as_str().into());
+            }
+            match adapter.extra.get("keyfile").and_then(|v| v.as_str()) {
+                Some(keyfile) => {
+                    out.insert("method".into(), "service-account".into());
+                    out.insert("keyfile".into(), keyfile.into());
+                }
+                None => {
+                    // Application Default Credentials, the same chain the
+                    // Rocky BigQuery adapter uses.
+                    out.insert("method".into(), "oauth".into());
+                }
+            }
+        }
+        "postgres" => {
+            out.insert("host".into(), need("host", adapter.host.as_ref())?.into());
+            let port = match adapter.extra.get("port") {
+                Some(serde_json::Value::Number(n)) => n.as_u64().unwrap_or(5432),
+                Some(serde_json::Value::String(s)) => s.trim().parse().unwrap_or(5432),
+                _ => 5432,
+            };
+            out.insert("port".into(), port.into());
+            out.insert(
+                "user".into(),
+                need("username", adapter.username.as_ref())?.into(),
+            );
+            out.insert(
+                "dbname".into(),
+                need("database", adapter.database.as_ref())?.into(),
+            );
+            out.insert("schema".into(), dbt_schema.into());
+            if let Some(p) = &adapter.password {
+                secret(
+                    &mut out,
+                    "password",
+                    p.expose(),
+                    "ROCKY_DBT_POSTGRES_PASSWORD",
+                );
+            } else {
+                out.insert("password".into(), "".into());
+            }
+        }
+        other => {
+            return Err(format!(
+                "no dbt profile mapping for adapter type `{other}`; `rocky package` supports {}. \
+                 Compile the package yourself and pass `--compiled <dbt project dir>`",
+                PROFILE_ADAPTERS.join(", ")
+            ));
+        }
+    }
+    let mut outputs = Mapping::new();
+    outputs.insert("rocky".into(), Value::Mapping(out));
+    let mut profile = Mapping::new();
+    profile.insert("target".into(), "rocky".into());
+    profile.insert("outputs".into(), Value::Mapping(outputs));
+    let mut root = Mapping::new();
+    root.insert(profile_name.into(), Value::Mapping(profile));
+    Ok(DbtProfile {
+        yaml: serde_yaml::to_string(&root).map_err(|e| e.to_string())?,
+        env,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::import::dbt_manifest::parse_manifest;
+
+    /// A two-package manifest shaped like a compiled Fivetran package: a
+    /// `stripe` package whose mart reads a staging model from a separate
+    /// `stripe_source` package, a source with a var-resolved schema, generic
+    /// tests (mappable and not), and an incremental model.
+    fn fixture_manifest() -> serde_json::Value {
+        serde_json::json!({
+            "metadata": {
+                "dbt_version": "1.12.5",
+                "project_name": "rocky_vendor",
+                "invocation_id": "inv-1"
+            },
+            "nodes": {
+                "model.stripe_source.stg_stripe__charge": {
+                    "unique_id": "model.stripe_source.stg_stripe__charge",
+                    "name": "stg_stripe__charge",
+                    "resource_type": "model",
+                    "package_name": "stripe_source",
+                    "compiled_code": "select id as charge_id, amount, status, customer_id from \"dev\".\"raw_stripe\".\"charge\"",
+                    "raw_code": "select * from {{ source('stripe', 'charge') }}",
+                    "depends_on": {"nodes": ["source.stripe_source.stripe.charge"], "macros": []},
+                    "config": {"materialized": "table", "schema": "stg_stripe"},
+                    "schema": "main_stg_stripe",
+                    "database": "dev",
+                    "relation_name": "\"dev\".\"main_stg_stripe\".\"stg_stripe__charge\""
+                },
+                "model.stripe_source.stg_stripe__customer": {
+                    "unique_id": "model.stripe_source.stg_stripe__customer",
+                    "name": "stg_stripe__customer",
+                    "resource_type": "model",
+                    "package_name": "stripe_source",
+                    "compiled_code": "select id as customer_id, email from \"dev\".\"raw_stripe\".\"customer\"",
+                    "raw_code": "select * from {{ source('stripe', 'customer') }}",
+                    "depends_on": {"nodes": ["source.stripe_source.stripe.customer"], "macros": []},
+                    "config": {"materialized": "table", "schema": "stg_stripe"},
+                    "schema": "main_stg_stripe",
+                    "database": "dev",
+                    "relation_name": "\"dev\".\"main_stg_stripe\".\"stg_stripe__customer\""
+                },
+                "model.stripe.stripe__charges": {
+                    "unique_id": "model.stripe.stripe__charges",
+                    "name": "stripe__charges",
+                    "resource_type": "model",
+                    "package_name": "stripe",
+                    "compiled_code": "select c.charge_id, c.amount, c.status, u.email from \"dev\".\"main_stg_stripe\".\"stg_stripe__charge\" c left join \"dev\".\"main_stg_stripe\".\"stg_stripe__customer\" u on c.customer_id = u.customer_id",
+                    "raw_code": "select ... from {{ ref('stg_stripe__charge') }}",
+                    "depends_on": {"nodes": ["model.stripe_source.stg_stripe__charge", "model.stripe_source.stg_stripe__customer"], "macros": []},
+                    "config": {"materialized": "table", "schema": "stripe"},
+                    "schema": "main_stripe",
+                    "database": "dev",
+                    "relation_name": "\"dev\".\"main_stripe\".\"stripe__charges\""
+                },
+                "model.other_pkg.unrelated": {
+                    "unique_id": "model.other_pkg.unrelated",
+                    "name": "unrelated",
+                    "resource_type": "model",
+                    "package_name": "other_pkg",
+                    "compiled_code": "select 1 as x",
+                    "raw_code": "select 1 as x",
+                    "depends_on": {"nodes": [], "macros": []},
+                    "config": {"materialized": "view"},
+                    "schema": "main",
+                    "database": "dev"
+                },
+                "test.stripe.not_null_stripe__charges_charge_id.abc": {
+                    "unique_id": "test.stripe.not_null_stripe__charges_charge_id.abc",
+                    "name": "not_null_stripe__charges_charge_id",
+                    "resource_type": "test",
+                    "package_name": "stripe",
+                    "test_metadata": {"name": "not_null", "kwargs": {"column_name": "charge_id", "model": "{{ get_where_subquery(ref('stripe__charges')) }}"}, "namespace": null},
+                    "attached_node": "model.stripe.stripe__charges",
+                    "column_name": "charge_id",
+                    "depends_on": {"nodes": ["model.stripe.stripe__charges"]},
+                    "config": {"severity": "ERROR", "where": null}
+                },
+                "test.stripe.accepted_values_stripe__charges_status.def": {
+                    "unique_id": "test.stripe.accepted_values_stripe__charges_status.def",
+                    "name": "accepted_values_stripe__charges_status",
+                    "resource_type": "test",
+                    "package_name": "stripe",
+                    "test_metadata": {"name": "accepted_values", "kwargs": {"column_name": "status", "values": ["succeeded", "failed"]}, "namespace": null},
+                    "attached_node": "model.stripe.stripe__charges",
+                    "column_name": "status",
+                    "depends_on": {"nodes": ["model.stripe.stripe__charges"]},
+                    "config": {"severity": "warn", "where": "amount > 0"}
+                },
+                "test.stripe_source.relationships_charge_customer.ghi": {
+                    "unique_id": "test.stripe_source.relationships_charge_customer.ghi",
+                    "name": "relationships_charge_customer",
+                    "resource_type": "test",
+                    "package_name": "stripe_source",
+                    "test_metadata": {"name": "relationships", "kwargs": {"column_name": "customer_id", "to": "ref('stg_stripe__customer')", "field": "customer_id"}, "namespace": null},
+                    "attached_node": "model.stripe_source.stg_stripe__charge",
+                    "column_name": "customer_id",
+                    "depends_on": {"nodes": ["model.stripe_source.stg_stripe__customer", "model.stripe_source.stg_stripe__charge"]},
+                    "config": {"severity": "ERROR"}
+                },
+                "test.stripe.dbt_utils_unique_combination.jkl": {
+                    "unique_id": "test.stripe.dbt_utils_unique_combination.jkl",
+                    "name": "dbt_utils_unique_combination_of_columns_stripe__charges",
+                    "resource_type": "test",
+                    "package_name": "stripe",
+                    "test_metadata": {"name": "unique_combination_of_columns", "kwargs": {"combination_of_columns": ["charge_id", "status"]}, "namespace": "dbt_utils"},
+                    "attached_node": "model.stripe.stripe__charges",
+                    "depends_on": {"nodes": ["model.stripe.stripe__charges"]},
+                    "config": {"severity": "ERROR"}
+                },
+                "test.stripe_source.not_null_source_charge_id.mno": {
+                    "unique_id": "test.stripe_source.not_null_source_charge_id.mno",
+                    "name": "source_not_null_stripe_charge_id",
+                    "resource_type": "test",
+                    "package_name": "stripe_source",
+                    "test_metadata": {"name": "not_null", "kwargs": {"column_name": "id"}, "namespace": null},
+                    "attached_node": "source.stripe_source.stripe.charge",
+                    "depends_on": {"nodes": ["source.stripe_source.stripe.charge"]},
+                    "config": {"severity": "ERROR"}
+                }
+            },
+            "sources": {
+                "source.stripe_source.stripe.charge": {
+                    "unique_id": "source.stripe_source.stripe.charge",
+                    "name": "charge",
+                    "source_name": "stripe",
+                    "package_name": "stripe_source",
+                    "database": "dev",
+                    "schema": "raw_stripe",
+                    "identifier": "charge"
+                },
+                "source.stripe_source.stripe.customer": {
+                    "unique_id": "source.stripe_source.stripe.customer",
+                    "name": "customer",
+                    "source_name": "stripe",
+                    "package_name": "stripe_source",
+                    "database": "dev",
+                    "schema": "raw_stripe",
+                    "identifier": "customer"
+                }
+            }
+        })
+    }
+
+    fn load_fixture() -> (DbtManifest, PackageManifestInfo, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("manifest.json");
+        std::fs::write(&path, fixture_manifest().to_string()).unwrap();
+        (
+            parse_manifest(&path).unwrap(),
+            parse_package_info(&path).unwrap(),
+            dir,
+        )
+    }
+
+    fn target() -> TargetConfig {
+        TargetConfig {
+            catalog: "dev".into(),
+            schema: "main".into(),
+            table: String::new(),
+        }
+    }
+
+    #[test]
+    fn selects_package_plus_upstream_dependency_package() {
+        let (manifest, info, _d) = load_fixture();
+        let import = import_package(&manifest, &info, "stripe", &target()).unwrap();
+        let names: Vec<(&str, &str)> = import
+            .models
+            .iter()
+            .map(|m| (m.model.name.as_str(), m.owner_package.as_str()))
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                ("stg_stripe__charge", "stripe_source"),
+                ("stg_stripe__customer", "stripe_source"),
+                ("stripe__charges", "stripe"),
+            ],
+            "the unrelated package is not vendored; the source package is"
+        );
+    }
+
+    #[test]
+    fn upstream_refs_become_bare_names_and_models_share_one_schema() {
+        let (manifest, info, _d) = load_fixture();
+        let import = import_package(&manifest, &info, "stripe", &target()).unwrap();
+        let mart = import
+            .models
+            .iter()
+            .find(|m| m.model.name == "stripe__charges")
+            .unwrap();
+        assert!(
+            mart.model.sql.contains("from stg_stripe__charge c"),
+            "{}",
+            mart.model.sql
+        );
+        assert!(
+            !mart.model.sql.contains("main_stg_stripe"),
+            "{}",
+            mart.model.sql
+        );
+        assert_eq!(
+            mart.model.config.target.schema, "main",
+            "not dbt's per-folder `main_stripe`: bare reads must resolve"
+        );
+        assert_eq!(mart.model.config.target.catalog, "dev");
+        assert_eq!(
+            mart.model.config.depends_on,
+            vec![
+                "stg_stripe__charge".to_string(),
+                "stg_stripe__customer".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn package_sources_are_declared_on_models_and_listed() {
+        let (manifest, info, _d) = load_fixture();
+        let import = import_package(&manifest, &info, "stripe", &target()).unwrap();
+        let stg = import
+            .models
+            .iter()
+            .find(|m| m.model.name == "stg_stripe__charge")
+            .unwrap();
+        assert_eq!(stg.model.config.sources.len(), 1);
+        assert_eq!(stg.model.config.sources[0].schema, "raw_stripe");
+        assert_eq!(stg.model.config.sources[0].table, "charge");
+        assert!(
+            stg.model.sql.contains("\"raw_stripe\".\"charge\""),
+            "sources stay qualified"
+        );
+        let names: Vec<&str> = import.sources.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["stripe.charge", "stripe.customer"]);
+    }
+
+    #[test]
+    fn maps_canonical_tests_and_reports_the_rest() {
+        let (manifest, info, _d) = load_fixture();
+        let import = import_package(&manifest, &info, "stripe", &target()).unwrap();
+        assert_eq!(
+            import.tests_mapped, 3,
+            "not_null + accepted_values + relationships"
+        );
+        let mart = import
+            .models
+            .iter()
+            .find(|m| m.model.name == "stripe__charges")
+            .unwrap();
+        let av = mart
+            .model
+            .config
+            .tests
+            .iter()
+            .find(|t| matches!(t.test_type, TestType::AcceptedValues { .. }))
+            .unwrap();
+        assert_eq!(av.severity, TestSeverity::Warning);
+        assert_eq!(av.filter.as_deref(), Some("amount > 0"));
+        let stg = import
+            .models
+            .iter()
+            .find(|m| m.model.name == "stg_stripe__charge")
+            .unwrap();
+        match &stg.model.config.tests[0].test_type {
+            TestType::Relationships {
+                to_table,
+                to_column,
+            } => {
+                assert_eq!(to_table, "dev.main.stg_stripe__customer");
+                assert_eq!(to_column, "customer_id");
+            }
+            other => panic!("expected relationships, got {other:?}"),
+        }
+        let dropped: Vec<&str> = import
+            .tests_dropped
+            .iter()
+            .map(|d| d.test.as_str())
+            .collect();
+        assert_eq!(
+            dropped,
+            vec![
+                "dbt_utils_unique_combination_of_columns_stripe__charges",
+                "source_not_null_stripe_charge_id"
+            ]
+        );
+    }
+
+    #[test]
+    fn unknown_package_is_refused_and_names_the_known_ones() {
+        let (manifest, info, _d) = load_fixture();
+        let err = import_package(&manifest, &info, "hubspot", &target())
+            .err()
+            .unwrap();
+        assert!(err.contains("no models for package 'hubspot'"), "{err}");
+        assert!(err.contains("stripe"), "{err}");
+    }
+
+    #[test]
+    fn collisions_with_project_and_other_packages_are_found() {
+        let (manifest, info, _d) = load_fixture();
+        let import = import_package(&manifest, &info, "stripe", &target()).unwrap();
+        let owners = |names: &[&str]| -> BTreeSet<String> {
+            names.iter().map(ToString::to_string).collect()
+        };
+        let mut existing = BTreeMap::new();
+        // The package's own copy AND a project model: still a collision.
+        existing.insert(
+            "stripe__charges".to_string(),
+            owners(&["stripe", "project"]),
+        );
+        existing.insert("stg_stripe__customer".to_string(), owners(&["hubspot"]));
+        existing.insert("stg_stripe__charge".to_string(), owners(&["stripe"]));
+        let replacing: BTreeSet<String> = owners(&["stripe"]);
+        let collisions = find_collisions(&import, &existing, &replacing);
+        assert_eq!(
+            collisions,
+            vec![
+                Collision {
+                    model: "stg_stripe__customer".into(),
+                    owner: "hubspot".into()
+                },
+                Collision {
+                    model: "stripe__charges".into(),
+                    owner: "project".into()
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn rendered_files_live_under_each_owning_package() {
+        let (manifest, info, _d) = load_fixture();
+        let import = import_package(&manifest, &info, "stripe", &target()).unwrap();
+        let files = render_package_files(&import).unwrap();
+        let paths: Vec<&str> = files.keys().map(String::as_str).collect();
+        assert!(paths.contains(&"models/packages/stripe/stripe__charges.sql"));
+        assert!(paths.contains(&"models/packages/stripe_source/stg_stripe__charge.toml"));
+        let sidecar = &files["models/packages/stripe_source/stg_stripe__charge.toml"];
+        assert!(sidecar.contains("[[sources]]"), "{sidecar}");
+        assert!(sidecar.contains("[[tests]]"), "{sidecar}");
+        assert!(sidecar.contains("schema = \"main\""), "{sidecar}");
+    }
+
+    #[test]
+    fn plan_update_protects_edited_files() {
+        let old_clean = "select 1".to_string();
+        let old_edited_base = "select 2".to_string();
+        let removed_clean = "select 3".to_string();
+        let removed_edited = "select 4".to_string();
+        let same = "select 5".to_string();
+        let mut locked = BTreeMap::new();
+        locked.insert("a.sql".to_string(), content_hash(&old_clean));
+        locked.insert("b.sql".to_string(), content_hash(&old_edited_base));
+        locked.insert("c.sql".to_string(), content_hash(&removed_clean));
+        locked.insert("d.sql".to_string(), content_hash(&removed_edited));
+        locked.insert("e.sql".to_string(), content_hash(&same));
+        locked.insert("f.sql".to_string(), content_hash("select 6"));
+
+        let mut planned = BTreeMap::new();
+        planned.insert("a.sql".to_string(), "select 1 -- v2".to_string());
+        planned.insert("b.sql".to_string(), "select 2 -- v2".to_string());
+        planned.insert("e.sql".to_string(), same.clone());
+        planned.insert("f.sql".to_string(), "select 6".to_string());
+        planned.insert("new.sql".to_string(), "select 7".to_string());
+
+        let disk = |p: &str| -> Option<String> {
+            match p {
+                "a.sql" => Some(old_clean.clone()),
+                "b.sql" => Some("select 2 -- my edit".to_string()),
+                "c.sql" => Some(removed_clean.clone()),
+                "d.sql" => Some("select 4 -- my edit".to_string()),
+                "e.sql" => Some(same.clone()),
+                "f.sql" => Some("select 6 -- my edit".to_string()),
+                _ => None,
+            }
+        };
+        let plan = plan_update(&planned, &locked, &disk);
+        assert_eq!(
+            plan.write.keys().collect::<Vec<_>>(),
+            vec!["a.sql", "new.sql"]
+        );
+        assert_eq!(plan.incoming.keys().collect::<Vec<_>>(), vec!["b.sql"]);
+        assert_eq!(plan.delete, vec!["c.sql".to_string()]);
+        assert_eq!(
+            plan.kept_edited,
+            vec!["d.sql".to_string(), "f.sql".to_string()]
+        );
+        assert_eq!(plan.unchanged, vec!["e.sql".to_string()]);
+        assert_eq!(plan.lock_files["b.sql"], content_hash("select 2 -- v2"));
+        assert!(!plan.lock_files.contains_key("c.sql"));
+    }
+
+    #[test]
+    fn unlocked_file_on_disk_is_never_overwritten() {
+        let mut planned = BTreeMap::new();
+        planned.insert("x.sql".to_string(), "select 1".to_string());
+        let plan = plan_update(&planned, &BTreeMap::new(), &|_| {
+            Some("select 'mine'".to_string())
+        });
+        assert!(plan.write.is_empty());
+        assert_eq!(plan.incoming.keys().collect::<Vec<_>>(), vec!["x.sql"]);
+    }
+
+    #[test]
+    fn lockfile_round_trips() {
+        let mut lock = PackagesLock {
+            version: LOCK_VERSION,
+            packages: vec![],
+        };
+        let mut vars = BTreeMap::new();
+        vars.insert("stripe_schema".to_string(), "raw_stripe".to_string());
+        lock.upsert(LockedPackage {
+            name: "stripe".into(),
+            hub: "fivetran/stripe".into(),
+            version_spec: ">=1.0.0,<2.0.0".into(),
+            version: "1.10.1".into(),
+            dbt_version: "1.12.5".into(),
+            adapter: "duckdb".into(),
+            adapter_name: "default".into(),
+            target_schema: "main".into(),
+            compiled_at: "2026-10-04T00:00:00Z".into(),
+            vars_hash: vars_hash(&vars),
+            vars,
+            includes: vec![],
+            sources: vec![PackageSource {
+                name: "stripe.charge".into(),
+                catalog: "dev".into(),
+                schema: "raw_stripe".into(),
+                table: "charge".into(),
+            }],
+            files: [(
+                "models/packages/stripe/a.sql".to_string(),
+                content_hash("x"),
+            )]
+            .into_iter()
+            .collect(),
+        });
+        let text = lock.render().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(LOCKFILE_NAME);
+        std::fs::write(&path, &text).unwrap();
+        assert_eq!(PackagesLock::read(&path).unwrap(), lock);
+        assert_eq!(
+            lock.owner_of("models/packages/stripe/a.sql"),
+            Some("stripe")
+        );
+        let absent = PackagesLock::read(&dir.path().join("nope.lock")).unwrap();
+        assert!(absent.packages.is_empty());
+    }
+
+    #[test]
+    fn vars_hash_is_order_independent_and_value_sensitive() {
+        let a: BTreeMap<String, String> = [("b", "2"), ("a", "1")]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let b: BTreeMap<String, String> = [("a", "1"), ("b", "2")]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        assert_eq!(vars_hash(&a), vars_hash(&b));
+        let mut c = b.clone();
+        c.insert("a".into(), "3".into());
+        assert_ne!(vars_hash(&a), vars_hash(&c));
+    }
+
+    #[test]
+    fn package_lock_yml_resolution() {
+        let text = "packages:\n  - name: stripe\n    package: fivetran/stripe\n    version: 1.10.1\n  - name: fivetran_utils\n    package: fivetran/fivetran_utils\n    version: 0.4.13\nsha1_hash: abc\n";
+        assert_eq!(
+            resolve_from_package_lock(text, "fivetran/stripe").unwrap(),
+            ("stripe".to_string(), "1.10.1".to_string())
+        );
+        assert!(resolve_from_package_lock(text, "fivetran/hubspot").is_err());
+        let old = "packages:\n  - package: fivetran/stripe\n    version: 1.10.1\n";
+        assert!(
+            resolve_from_package_lock(old, "fivetran/stripe")
+                .unwrap_err()
+                .contains("upgrade dbt")
+        );
+    }
+
+    #[test]
+    fn package_names_are_path_safe() {
+        assert!(is_safe_package_name("stripe"));
+        assert!(is_safe_package_name("fivetran_log"));
+        assert!(!is_safe_package_name("../x"));
+        assert!(!is_safe_package_name("a/b"));
+        assert!(!is_safe_package_name(""));
+    }
+
+    #[test]
+    fn introspection_placeholder_models_are_refused() {
+        let mut json = fixture_manifest();
+        json["nodes"]["model.stripe.stripe__charges"]["compiled_code"] = serde_json::Value::String(
+            "select\n*\n/* No columns were returned. Maybe the relation doesn't exist yet\nor all columns were excluded. */\nfrom \"dev\".\"main_stg_stripe\".\"stg_stripe__charge\"".to_string(),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("manifest.json");
+        std::fs::write(&path, json.to_string()).unwrap();
+        let manifest = parse_manifest(&path).unwrap();
+        let info = parse_package_info(&path).unwrap();
+        let import = import_package(&manifest, &info, "stripe", &target()).unwrap();
+        assert!(
+            import
+                .models
+                .iter()
+                .all(|m| m.model.name != "stripe__charges")
+        );
+        assert!(
+            import
+                .failed
+                .iter()
+                .any(|f| f.name == "stripe__charges" && f.reason.contains("--no-build-empty"))
+        );
+        assert_eq!(import.models.len(), 2, "the clean upstreams still vendor");
+    }
+
+    #[test]
+    fn package_spec_parsing() {
+        assert_eq!(
+            parse_package_spec("fivetran/stripe").unwrap(),
+            ("fivetran/stripe".to_string(), String::new())
+        );
+        assert_eq!(
+            parse_package_spec("fivetran/stripe@>=1.0.0,<2.0.0").unwrap(),
+            ("fivetran/stripe".to_string(), ">=1.0.0,<2.0.0".to_string())
+        );
+        assert!(parse_package_spec("stripe").is_err());
+        assert!(parse_package_spec("fivetran/../x").is_err());
+        assert!(parse_package_spec("a/b@1\"\nx").is_err());
+        let yml = render_packages_yml("fivetran/stripe", ">=1.0.0, <2.0.0");
+        let v: serde_yaml::Value = serde_yaml::from_str(&yml).unwrap();
+        assert_eq!(v["packages"][0]["package"], "fivetran/stripe");
+        assert_eq!(v["packages"][0]["version"][1], "<2.0.0");
+        let latest: serde_yaml::Value =
+            serde_yaml::from_str(&render_packages_yml("fivetran/stripe", "")).unwrap();
+        assert!(latest["packages"][0].get("version").is_none());
+    }
+
+    #[test]
+    fn vars_are_typed_as_yaml_in_dbt_project() {
+        let vars = parse_vars(&[
+            "stripe_schema=raw_stripe".to_string(),
+            "stripe__using_invoices=false".to_string(),
+            "stripe_sources=[a, b]".to_string(),
+        ])
+        .unwrap();
+        let yml = render_dbt_project_yml("rocky_package_build", &vars).unwrap();
+        let v: serde_yaml::Value = serde_yaml::from_str(&yml).unwrap();
+        assert_eq!(v["vars"]["stripe_schema"], "raw_stripe");
+        assert_eq!(v["vars"]["stripe__using_invoices"], false);
+        assert_eq!(v["vars"]["stripe_sources"][1], "b");
+        assert_eq!(v["profile"], "rocky_package_build");
+        assert!(parse_vars(&["noequals".to_string()]).is_err());
+        assert!(parse_vars(&["bad key=1".to_string()]).is_err());
+    }
+
+    fn adapter(toml_text: &str) -> rocky_core::config::AdapterConfig {
+        toml::from_str(toml_text).unwrap()
+    }
+
+    #[test]
+    fn duckdb_profile_points_at_the_rocky_database_file() {
+        let a = adapter("type = \"duckdb\"\npath = \"dev.duckdb\"\n");
+        let p = render_profiles_yml(
+            "rocky_package_build",
+            &a,
+            "rocky_package_build",
+            Some(Path::new("/abs/dev.duckdb")),
+        )
+        .unwrap();
+        let v: serde_yaml::Value = serde_yaml::from_str(&p.yaml).unwrap();
+        let out = &v["rocky_package_build"]["outputs"]["rocky"];
+        assert_eq!(out["type"], "duckdb");
+        assert_eq!(out["path"], "/abs/dev.duckdb");
+        assert_eq!(out["schema"], "rocky_package_build");
+        assert!(p.env.is_empty());
+        let mem = adapter("type = \"duckdb\"\n");
+        assert!(
+            render_profiles_yml("p", &mem, "s", None)
+                .unwrap_err()
+                .contains("path")
+        );
+    }
+
+    #[test]
+    fn secrets_go_through_env_vars_never_the_profile_text() {
+        let a = adapter(
+            "type = \"snowflake\"\naccount = \"xy1\"\nusername = \"u\"\ndatabase = \"DB\"\nwarehouse = \"WH\"\npassword = \"hunter2\"\n",
+        );
+        let p = render_profiles_yml("p", &a, "S", None).unwrap();
+        assert!(!p.yaml.contains("hunter2"), "{}", p.yaml);
+        assert!(
+            p.yaml.contains("env_var(\"ROCKY_DBT_SNOWFLAKE_PASSWORD\")"),
+            "{}",
+            p.yaml
+        );
+        assert_eq!(
+            p.env,
+            vec![(
+                "ROCKY_DBT_SNOWFLAKE_PASSWORD".to_string(),
+                "hunter2".to_string()
+            )]
+        );
+
+        let d = adapter(
+            "type = \"databricks\"\nhost = \"https://adb.example.net/\"\nhttp_path = \"/sql/1\"\ntoken = \"dapi\"\n",
+        );
+        let p = render_profiles_yml("p", &d, "s", None).unwrap();
+        let v: serde_yaml::Value = serde_yaml::from_str(&p.yaml).unwrap();
+        assert_eq!(v["p"]["outputs"]["rocky"]["host"], "adb.example.net");
+        assert!(!p.yaml.contains("dapi"));
+
+        let pg = adapter(
+            "type = \"postgres\"\nhost = \"h\"\nusername = \"u\"\ndatabase = \"d\"\npassword = \"pw\"\n[extra]\nport = 6543\n",
+        );
+        let p = render_profiles_yml("p", &pg, "public", None).unwrap();
+        let v: serde_yaml::Value = serde_yaml::from_str(&p.yaml).unwrap();
+        assert_eq!(v["p"]["outputs"]["rocky"]["port"], 6543);
+        assert_eq!(v["p"]["outputs"]["rocky"]["dbname"], "d");
+
+        let bq = adapter("type = \"bigquery\"\nproject_id = \"proj\"\n");
+        let p = render_profiles_yml("p", &bq, "ds", None).unwrap();
+        let v: serde_yaml::Value = serde_yaml::from_str(&p.yaml).unwrap();
+        assert_eq!(v["p"]["outputs"]["rocky"]["method"], "oauth");
+        assert_eq!(v["p"]["outputs"]["rocky"]["dataset"], "ds");
+    }
+
+    #[test]
+    fn unsupported_adapters_are_refused_by_name() {
+        let t = adapter("type = \"trino\"\nhost = \"h\"\n");
+        let err = render_profiles_yml("p", &t, "s", None).unwrap_err();
+        assert!(err.contains("`trino`"), "{err}");
+        assert!(err.contains("--compiled"), "{err}");
+        assert_eq!(default_target_schema("duckdb"), Some("main"));
+        assert_eq!(default_target_schema("bigquery"), None);
+    }
+}
