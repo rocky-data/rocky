@@ -1234,12 +1234,13 @@ fn import_manifest_node(
     collect_unresolvable_macros(&sql, &node.name, result);
 
     // Map dependencies. Resolve through the relation map first so a versioned
-    // upstream (`model.p.orders.v1`) maps to `orders_v1`, not to `v1`.
+    // upstream (`model.p.orders.v1`) maps to `orders_v1`, not to `v1`. A
+    // snapshot upstream (`snapshot.p.orders_snap`) is a Rocky model too.
     let depends_on = node
         .depends_on
         .nodes
         .iter()
-        .filter(|id| id.starts_with("model."))
+        .filter(|id| id.starts_with("model.") || id.starts_with("snapshot."))
         .map(|id| match model_relations.get(id) {
             Some(upstream) => upstream.bare_name.clone(),
             None => dbt_manifest::extract_model_name(id).to_string(),
