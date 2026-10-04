@@ -5742,21 +5742,6 @@ mod tests {
         }
     }
 
-    /// Spawn the clap parser on a scoped thread with an 8 MB stack.
-    ///
-    /// `Cli`/`Command` is intentionally large — `Command` carries every
-    /// subcommand's argument set inline (see
-    /// `#[allow(clippy::large_enum_variant)]` on `enum Command`). The
-    /// flag-surface parity work (#535) widened `Command::Plan` materially,
-    /// and clap's generated `FromArgMatches` code now allocates a parsed
-    /// `Cli` that exceeds Rust's default 2 MB test-thread stack on Linux
-    /// (macOS gets larger defaults; CI is where the overflow shows up).
-    /// A scoped thread keeps the workaround local to test code; production
-    /// `main()` uses the OS-default 8 MB thread stack and is unaffected.
-    #[allow(
-        clippy::disallowed_methods,
-        reason = "this IS the sanctioned wrapper the disallowed-methods entry points callers at"
-    )]
     /// The grouped root help, rendered on a big stack (see
     /// [`command_with_big_stack`]).
     fn grouped_root_help_with_big_stack() -> (Vec<String>, String) {
@@ -5833,6 +5818,21 @@ mod tests {
         assert!(!help.contains("\nCommands:"), "the flat list is replaced");
     }
 
+    /// Spawn the clap parser on a scoped thread with an 8 MB stack.
+    ///
+    /// `Cli`/`Command` is intentionally large — `Command` carries every
+    /// subcommand's argument set inline (see
+    /// `#[allow(clippy::large_enum_variant)]` on `enum Command`). The
+    /// flag-surface parity work (#535) widened `Command::Plan` materially,
+    /// and clap's generated `FromArgMatches` code now allocates a parsed
+    /// `Cli` that exceeds Rust's default 2 MB test-thread stack on Linux
+    /// (macOS gets larger defaults; CI is where the overflow shows up).
+    /// A scoped thread keeps the workaround local to test code; production
+    /// `main()` uses the OS-default 8 MB thread stack and is unaffected.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "this IS the sanctioned wrapper the disallowed-methods entry points callers at"
+    )]
     fn try_parse_with_big_stack(args: &[&str]) -> Cli {
         std::thread::scope(|s| {
             std::thread::Builder::new()
