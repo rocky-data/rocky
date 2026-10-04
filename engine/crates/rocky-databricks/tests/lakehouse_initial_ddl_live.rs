@@ -196,6 +196,7 @@ fn incremental_iceberg_model(
             // this fixture asserts the format + partitioning, not raw TBLPROPERTIES.
             table_properties: vec![],
             comment: Some("incremental iceberg mart".into()),
+            redshift: None,
         }),
     )
 }

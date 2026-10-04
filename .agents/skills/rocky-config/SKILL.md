@@ -60,7 +60,7 @@ Top-level adapter fields are strict (`deny_unknown_fields` — typos are parse e
 
 | Adapter type | `kind` rule |
 |---|---|
-| `databricks`, `snowflake`, `bigquery` | Optional — defaults to `"data"`. Setting `"discovery"` is a parse error. |
+| `databricks`, `snowflake`, `bigquery`, `postgres`, `redshift` | Optional — defaults to `"data"`. Setting `"discovery"` is a parse error. |
 | `fivetran`, `airbyte`, `iceberg`, `manual` | **Required — must be `"discovery"`.** Omitting it is a parse error: these adapters have no data path. |
 | `duckdb` | Optional — absent means "register both roles" (the common DuckDB case). Setting `"data"` or `"discovery"` narrows to a single role. |
 
@@ -106,6 +106,28 @@ private_key_path = "${SNOWFLAKE_KEY_PATH}"
 # Password (lowest priority):
 # password = "${SNOWFLAKE_PASSWORD}"
 ```
+
+### PostgreSQL / Redshift (password auth, libpq-style `sslmode`)
+
+```toml
+[adapter]
+type     = "postgres"                            # or "redshift" (beta)
+host     = "${PGHOST}"                           # host or host:port (default 5432 / 5439)
+database = "analytics"                           # the connected database = the only valid catalog
+username = "${PGUSER}"
+password = "${PGPASSWORD}"
+# timeout_secs = 300                             # connect timeout + statement_timeout
+
+[adapter.extra]                                  # unknown keys are refused
+sslmode = "verify-full"                          # disable | prefer (default) | require | verify-full
+# sslrootcert = "/etc/ssl/rds-ca.pem"            # extra PEM roots under verify-full
+# port = 6543                                    # wins over host:port
+# max_connections = 8
+# merge_mode = "on_conflict"                     # postgres < 15 only; needs a unique index on unique_key
+# late_binding_views = true                      # redshift only: views WITH NO SCHEMA BINDING
+```
+
+Redshift models can set table attributes in the sidecar `[redshift]` block (`dist_style`, `dist_key`, `sort_key`, `sort_style`); `rocky compile` validates it (E052 / W052) and any other adapter refuses it at SQL generation. IAM auth for Redshift is not built in yet.
 
 ### Fivetran (discovery-only)
 

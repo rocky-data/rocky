@@ -354,6 +354,8 @@ Rocky **writes** to a warehouse. It **reads** from a source to learn what tables
 | Snowflake | write | Check, plan, run, incremental and merge loads, cost per run |
 | BigQuery | write | Check, plan, run, incremental and merge loads, cost per run |
 | Trino | write | Check, plan, run. No merge yet, so `strategy = "merge"` is refused. |
+| PostgreSQL | write | Check, plan, run, merge (`MERGE` or `ON CONFLICT`), views, materialized views. Tested live. |
+| Redshift (Beta) | write | Check, plan, run, merge, dist and sort keys, late-binding views. Password auth only; SQL is unit-tested, not run live. |
 | DuckDB | write | Local work and tests. No account needed. |
 | Fivetran | read | Find your connectors and the tables they land |
 | Airbyte | read | Find your connections and the tables they land |
@@ -362,7 +364,7 @@ Rocky **writes** to a warehouse. It **reads** from a source to learn what tables
 
 The checker works the same everywhere, because Rocky checks your models before it talks to a warehouse. Databricks is the most complete on everything after that.
 
-Building a connector for ClickHouse, Redshift, or another warehouse? See the [Adapter SDK guide](https://rocky-data.dev/guides/adapter-sdk/) and the [skeleton POC](examples/playground/pocs/07-adapters/06-rust-native-adapter-skeleton/).
+Building a connector for ClickHouse or another warehouse? See the [Adapter SDK guide](https://rocky-data.dev/guides/adapter-sdk/) and the [skeleton POC](examples/playground/pocs/07-adapters/06-rust-native-adapter-skeleton/).
 
 ## Building from source
 

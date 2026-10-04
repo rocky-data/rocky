@@ -1034,6 +1034,31 @@ pub trait SqlDialect: Send + Sync {
         format!("CREATE TABLE {target} AS\n{select_sql}")
     }
 
+    /// `CREATE TABLE … AS` carrying a model's `[redshift]` table attributes
+    /// (`DISTSTYLE` / `DISTKEY` / `SORTKEY`).
+    ///
+    /// `replace` selects the full-refresh form (replace an existing table,
+    /// like [`SqlDialect::create_table_as`]) or the first-run form (fail if
+    /// the table exists, like [`SqlDialect::create_table_as_new`]).
+    ///
+    /// The default refuses: only the Redshift dialect has these attributes,
+    /// and silently dropping them would build a table with the wrong
+    /// distribution. A model that sets `[redshift]` and targets another
+    /// warehouse fails at SQL generation with this message.
+    fn create_table_as_with_redshift_options(
+        &self,
+        _target: &str,
+        _select_sql: &str,
+        _options: &rocky_ir::RedshiftTableOptions,
+        _replace: bool,
+    ) -> AdapterResult<String> {
+        Err(AdapterError::msg(format!(
+            "the model sets `[redshift]` table options (dist_key / sort_key), which only the \
+             redshift adapter applies; this model targets {}",
+            self.name()
+        )))
+    }
+
     /// INSERT INTO ... SELECT (incremental append).
     fn insert_into(&self, target: &str, select_sql: &str) -> String;
 

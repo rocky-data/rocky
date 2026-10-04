@@ -206,6 +206,178 @@ pub struct LakehouseOptions {
     /// Optional comment on the table/view.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub comment: Option<String>,
+
+    /// Amazon Redshift table attributes (`DISTSTYLE` / `DISTKEY` /
+    /// `SORTKEY`), from a model sidecar's `[redshift]` block. Unlike the
+    /// fields above it applies WITHOUT a lakehouse `format`: it shapes the
+    /// plain `CREATE TABLE … AS` the Redshift dialect emits. Any other
+    /// dialect refuses a model that sets it rather than dropping it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redshift: Option<RedshiftTableOptions>,
+}
+
+// ---------------------------------------------------------------------------
+// Redshift table attributes
+// ---------------------------------------------------------------------------
+
+/// Redshift distribution style (`DISTSTYLE`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum RedshiftDistStyle {
+    Auto,
+    Even,
+    All,
+    Key,
+}
+
+impl RedshiftDistStyle {
+    /// The SQL keyword.
+    #[must_use]
+    pub fn as_sql(self) -> &'static str {
+        match self {
+            Self::Auto => "AUTO",
+            Self::Even => "EVEN",
+            Self::All => "ALL",
+            Self::Key => "KEY",
+        }
+    }
+}
+
+/// Redshift sort-key style.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum RedshiftSortStyle {
+    /// `COMPOUND SORTKEY (…)` — Redshift's default when columns are given.
+    Compound,
+    /// `INTERLEAVED SORTKEY (…)` — at most 8 columns.
+    Interleaved,
+    /// `SORTKEY AUTO` — Redshift chooses; takes no columns.
+    Auto,
+}
+
+/// Redshift table attributes for a model's `CREATE TABLE … AS`.
+///
+/// ```toml
+/// [redshift]
+/// dist_style = "key"          # auto | even | all | key (implied by dist_key)
+/// dist_key   = "customer_id"
+/// sort_key   = ["order_date"]
+/// sort_style = "compound"     # compound (default) | interleaved | auto
+/// ```
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RedshiftTableOptions {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dist_style: Option<RedshiftDistStyle>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dist_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sort_key: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sort_style: Option<RedshiftSortStyle>,
+}
+
+/// Redshift's documented cap on interleaved sort-key columns.
+pub const REDSHIFT_MAX_INTERLEAVED_SORT_KEYS: usize = 8;
+
+impl RedshiftTableOptions {
+    /// Every reason these options cannot render, as messages. Empty when
+    /// they are valid. Shared by `rocky compile` (E052) and the Redshift
+    /// dialect, so the compile-time and run-time checks cannot drift.
+    #[must_use]
+    pub fn violations(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if let Some(key) = &self.dist_key
+            && validation::validate_identifier(key).is_err()
+        {
+            out.push(format!(
+                "redshift.dist_key '{key}' is not a valid column name"
+            ));
+        }
+        for col in &self.sort_key {
+            if validation::validate_identifier(col).is_err() {
+                out.push(format!(
+                    "redshift.sort_key entry '{col}' is not a valid column name"
+                ));
+            }
+        }
+        match (self.dist_style, &self.dist_key) {
+            (Some(RedshiftDistStyle::Key), None) => {
+                out.push("redshift.dist_style = \"key\" needs a dist_key column".to_string())
+            }
+            (
+                Some(
+                    style @ (RedshiftDistStyle::Auto
+                    | RedshiftDistStyle::Even
+                    | RedshiftDistStyle::All),
+                ),
+                Some(_),
+            ) => {
+                out.push(format!(
+                    "redshift.dist_key is only valid with dist_style = \"key\", not \"{}\"",
+                    style.as_sql().to_ascii_lowercase()
+                ));
+            }
+            _ => {}
+        }
+        match self.sort_style {
+            Some(RedshiftSortStyle::Auto) if !self.sort_key.is_empty() => {
+                out.push("redshift.sort_style = \"auto\" takes no sort_key columns".to_string())
+            }
+            Some(RedshiftSortStyle::Compound | RedshiftSortStyle::Interleaved)
+                if self.sort_key.is_empty() =>
+            {
+                out.push("redshift.sort_style needs at least one sort_key column".to_string());
+            }
+            Some(RedshiftSortStyle::Interleaved)
+                if self.sort_key.len() > REDSHIFT_MAX_INTERLEAVED_SORT_KEYS =>
+            {
+                out.push(format!(
+                    "redshift interleaved sort keys allow at most {REDSHIFT_MAX_INTERLEAVED_SORT_KEYS} columns, got {}",
+                    self.sort_key.len()
+                ));
+            }
+            _ => {}
+        }
+        out
+    }
+
+    /// The table-attribute clause (`DISTSTYLE KEY DISTKEY (c) COMPOUND
+    /// SORTKEY (d)`), or the violations when the options are invalid.
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`Self::violations`] messages joined with `; `.
+    pub fn to_sql(&self) -> Result<String, String> {
+        let violations = self.violations();
+        if !violations.is_empty() {
+            return Err(violations.join("; "));
+        }
+        let mut parts = Vec::new();
+        let style = self
+            .dist_style
+            .or(self.dist_key.as_ref().map(|_| RedshiftDistStyle::Key));
+        if let Some(style) = style {
+            parts.push(format!("DISTSTYLE {}", style.as_sql()));
+        }
+        if let Some(key) = &self.dist_key {
+            parts.push(format!("DISTKEY ({key})"));
+        }
+        match self.sort_style {
+            Some(RedshiftSortStyle::Auto) => parts.push("SORTKEY AUTO".to_string()),
+            Some(RedshiftSortStyle::Interleaved) => {
+                parts.push(format!(
+                    "INTERLEAVED SORTKEY ({})",
+                    self.sort_key.join(", ")
+                ));
+            }
+            Some(RedshiftSortStyle::Compound) | None if !self.sort_key.is_empty() => {
+                parts.push(format!("COMPOUND SORTKEY ({})", self.sort_key.join(", ")));
+            }
+            _ => {}
+        }
+        Ok(parts.join(" "))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -215,6 +387,92 @@ pub struct LakehouseOptions {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn redshift_options_render() {
+        let opts = RedshiftTableOptions {
+            dist_key: Some("customer_id".into()),
+            sort_key: vec!["order_date".into(), "order_id".into()],
+            ..RedshiftTableOptions::default()
+        };
+        assert_eq!(
+            opts.to_sql().unwrap(),
+            "DISTSTYLE KEY DISTKEY (customer_id) COMPOUND SORTKEY (order_date, order_id)"
+        );
+        let even = RedshiftTableOptions {
+            dist_style: Some(RedshiftDistStyle::Even),
+            sort_style: Some(RedshiftSortStyle::Auto),
+            ..RedshiftTableOptions::default()
+        };
+        assert_eq!(even.to_sql().unwrap(), "DISTSTYLE EVEN SORTKEY AUTO");
+        let inter = RedshiftTableOptions {
+            sort_key: vec!["a".into(), "b".into()],
+            sort_style: Some(RedshiftSortStyle::Interleaved),
+            ..RedshiftTableOptions::default()
+        };
+        assert_eq!(inter.to_sql().unwrap(), "INTERLEAVED SORTKEY (a, b)");
+        assert_eq!(RedshiftTableOptions::default().to_sql().unwrap(), "");
+    }
+
+    #[test]
+    fn redshift_options_violations() {
+        let bad = |o: RedshiftTableOptions| o.violations();
+        assert_eq!(
+            bad(RedshiftTableOptions {
+                dist_style: Some(RedshiftDistStyle::Key),
+                ..Default::default()
+            })
+            .len(),
+            1
+        );
+        assert_eq!(
+            bad(RedshiftTableOptions {
+                dist_style: Some(RedshiftDistStyle::All),
+                dist_key: Some("a".into()),
+                ..Default::default()
+            })
+            .len(),
+            1
+        );
+        assert_eq!(
+            bad(RedshiftTableOptions {
+                dist_key: Some("a; DROP".into()),
+                sort_key: vec!["b c".into()],
+                ..Default::default()
+            })
+            .len(),
+            2
+        );
+        assert_eq!(
+            bad(RedshiftTableOptions {
+                sort_key: vec!["a".into()],
+                sort_style: Some(RedshiftSortStyle::Auto),
+                ..Default::default()
+            })
+            .len(),
+            1
+        );
+        assert_eq!(
+            bad(RedshiftTableOptions {
+                sort_key: (0..9).map(|i| format!("c{i}")).collect(),
+                sort_style: Some(RedshiftSortStyle::Interleaved),
+                ..Default::default()
+            })
+            .len(),
+            1
+        );
+        assert!(bad(RedshiftTableOptions::default()).is_empty());
+    }
+
+    #[test]
+    fn redshift_options_parse_and_refuse_typos() {
+        let opts: RedshiftTableOptions = serde_json::from_str(
+            r#"{"dist_key": "c", "sort_key": ["d"], "sort_style": "interleaved"}"#,
+        )
+        .unwrap();
+        assert_eq!(opts.sort_style, Some(RedshiftSortStyle::Interleaved));
+        assert!(serde_json::from_str::<RedshiftTableOptions>(r#"{"distkey": "c"}"#).is_err());
+    }
 
     #[test]
     fn iceberg_partition_and_cluster_together_is_rejected() {

@@ -22,6 +22,7 @@ rocky-duckdb = { path = "../rocky-duckdb", optional = true }
 rocky-snowflake = { path = "../rocky-snowflake" }
 rocky-bigquery = { path = "../rocky-bigquery" }
 rocky-trino = { path = "../rocky-trino" }
+rocky-postgres = { path = "../rocky-postgres" }
 rocky-fivetran = { path = "../rocky-fivetran", features = ["valkey"] }
 rocky-airbyte = { path = "../rocky-airbyte" }
 rocky-catalog-core = { path = "../rocky-catalog-core" }

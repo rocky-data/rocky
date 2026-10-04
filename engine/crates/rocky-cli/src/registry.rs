@@ -53,6 +53,8 @@ use rocky_bigquery::governance::BigQueryGovernanceAdapter;
 
 use rocky_trino::{TrinoAdapter, TrinoAuth, TrinoClientConfig};
 
+use rocky_postgres::PostgresWarehouseAdapter;
+
 /// Adapter type strings recognised by [`AdapterRegistry::from_config`].
 ///
 /// This is the **single source of truth** for "which adapter types does
@@ -67,6 +69,8 @@ pub const KNOWN_ADAPTER_TYPES: &[&str] = &[
     "snowflake",
     "bigquery",
     "trino",
+    "postgres",
+    "redshift",
     "fivetran",
     "airbyte",
     "iceberg",
@@ -85,6 +89,99 @@ pub fn warehouse_dialect_for_type(
         "snowflake" => Some(&rocky_snowflake::dialect::SnowflakeSqlDialect),
         "bigquery" => Some(&rocky_bigquery::dialect::BigQueryDialect),
         "trino" => Some(&rocky_trino::dialect::TrinoDialect),
+        // Default renderings. A config that sets `merge_mode` /
+        // `late_binding_views` gets its dialect from
+        // `postgres_dialect_for_config`; draft validation only needs names
+        // and shapes, which those options do not change.
+        "postgres" => Some(&POSTGRES_DIALECT),
+        "redshift" => Some(&REDSHIFT_DIALECT),
+        _ => None,
+    }
+}
+
+static POSTGRES_DIALECT: rocky_postgres::PostgresDialect =
+    rocky_postgres::PostgresDialect::const_default();
+static REDSHIFT_DIALECT: rocky_postgres::RedshiftDialect =
+    rocky_postgres::RedshiftDialect::const_default();
+
+/// The PostgreSQL / Redshift connection settings an `[adapter]` block
+/// describes. Shared by the registry (which connects) and the offline SQL
+/// preview (which only needs the dialect options), so both read
+/// `[adapter.<name>.extra]` the same way.
+pub(crate) fn postgres_config(
+    name: &str,
+    adapter_cfg: &AdapterConfig,
+) -> Result<rocky_postgres::PgConfig> {
+    let flavor = match adapter_cfg.adapter_type.as_str() {
+        "redshift" => rocky_postgres::Flavor::Redshift,
+        _ => rocky_postgres::Flavor::Postgres,
+    };
+    // `late_binding_views` is a dialect option, not a connection setting;
+    // `PgConfig::apply_extra` refuses keys it does not know, so it is
+    // peeled off here.
+    let mut extra = adapter_cfg.extra.clone();
+    extra.remove("late_binding_views");
+    let cfg = rocky_postgres::PgConfig::new(
+        flavor,
+        adapter_cfg.host.as_deref(),
+        adapter_cfg.database.as_deref(),
+        adapter_cfg.username.as_deref(),
+        adapter_cfg
+            .password
+            .as_ref()
+            .map(rocky_core::redacted::RedactedString::expose),
+        Duration::from_secs(adapter_cfg.timeout_secs.unwrap_or(300)),
+    )
+    .and_then(|cfg| cfg.apply_extra(&extra))
+    .with_context(|| {
+        format!(
+            "adapters.{name}: invalid {} configuration",
+            flavor.adapter_type()
+        )
+    })?;
+    Ok(cfg)
+}
+
+/// `[adapter.<name>.extra] late_binding_views` (Redshift only).
+pub(crate) fn redshift_late_binding_views(name: &str, adapter_cfg: &AdapterConfig) -> Result<bool> {
+    match adapter_cfg.extra.get("late_binding_views") {
+        None => Ok(false),
+        Some(_) if adapter_cfg.adapter_type != "redshift" => bail!(
+            "adapters.{name}: late_binding_views is a redshift option; {} has no late-binding views",
+            adapter_cfg.adapter_type
+        ),
+        Some(serde_json::Value::Bool(b)) => Ok(*b),
+        Some(serde_json::Value::String(s)) if s == "true" || s == "false" => Ok(s == "true"),
+        Some(_) => bail!("adapters.{name}: extra.late_binding_views must be true or false"),
+    }
+}
+
+/// The dialect a `postgres` / `redshift` adapter block renders with,
+/// honouring its `merge_mode` / `late_binding_views` options. `None` for any
+/// other adapter type, or when the block's options do not parse (the caller
+/// falls back to the default dialect; `rocky validate` and the registry
+/// report the error).
+pub(crate) fn postgres_dialect_for_config(
+    adapter_cfg: &AdapterConfig,
+) -> Option<Box<dyn rocky_core::traits::SqlDialect>> {
+    match adapter_cfg.adapter_type.as_str() {
+        "postgres" => {
+            let mode = adapter_cfg
+                .extra
+                .get("merge_mode")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|m| rocky_postgres::MergeMode::parse(m).ok())
+                .unwrap_or_default();
+            Some(Box::new(rocky_postgres::PostgresDialect::with_merge_mode(
+                mode,
+            )))
+        }
+        "redshift" => {
+            let late = redshift_late_binding_views("", adapter_cfg).unwrap_or(false);
+            Some(Box::new(
+                rocky_postgres::RedshiftDialect::with_late_binding_views(late),
+            ))
+        }
         _ => None,
     }
 }
@@ -512,6 +609,19 @@ impl AdapterRegistry {
                         .with_timeout(Duration::from_secs(adapter_cfg.timeout_secs.unwrap_or(300)));
                     let adapter = Arc::new(TrinoAdapter::new(cfg, auth));
                     warehouse.insert(name.clone(), adapter as Arc<dyn WarehouseAdapter>);
+                }
+                "postgres" | "redshift" => {
+                    // Shared slots: `host` (optionally `host:port`),
+                    // `database`, `username`, `password`, `timeout_secs`.
+                    // Adapter-specific keys live under `[adapter.<name>.extra]`
+                    // (`port`, `sslmode`, `sslrootcert`, `max_connections`,
+                    // `merge_mode`, and Redshift's `late_binding_views`);
+                    // unknown keys are refused.
+                    let late_binding = redshift_late_binding_views(name, adapter_cfg)?;
+                    let pg_cfg = postgres_config(name, adapter_cfg)?;
+                    let adapter = PostgresWarehouseAdapter::from_config(pg_cfg, late_binding)
+                        .with_context(|| format!("adapters.{name}: failed to build adapter"))?;
+                    warehouse.insert(name.clone(), Arc::new(adapter) as Arc<dyn WarehouseAdapter>);
                 }
                 // Test-only. Compiled out of every released binary, and
                 // deliberately absent from `KNOWN_ADAPTER_TYPES` — `rocky

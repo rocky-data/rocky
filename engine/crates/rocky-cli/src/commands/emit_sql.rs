@@ -38,7 +38,7 @@ use rocky_core::models::SurrogateKeySpec;
 use rocky_core::sql_gen;
 use tracing::{debug, info};
 
-use super::plan::dialect_for_adapter_type;
+use super::plan::{dialect_for_adapter, dialect_for_adapter_type};
 use crate::registry;
 
 /// Resolve the model target dialect from the loaded config. Models use the
@@ -53,7 +53,7 @@ fn resolve_dialect(
             .adapters
             .get(&adapter_name)
             .ok_or_else(|| anyhow::anyhow!("target adapter '{adapter_name}' is not configured"))?;
-        return Ok(dialect_for_adapter_type(&adapter.adapter_type));
+        return Ok(dialect_for_adapter(adapter));
     }
     let adapter_type = config
         .and_then(|cfg| {

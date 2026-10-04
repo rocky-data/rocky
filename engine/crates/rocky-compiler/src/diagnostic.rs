@@ -172,6 +172,18 @@ pub const E039: &str = "E039";
 /// by target dialect. Use a `.sql` model with the target's own escaping.
 pub const E040: &str = "E040";
 
+/// A model's `[redshift]` table options cannot render.
+///
+/// Emitted by `rocky compile` (`redshift_options::check_redshift_table_options`)
+/// for an invalid `dist_key` / `sort_key` column name, a contradictory
+/// combination (`dist_style = "key"` without `dist_key`, `dist_key` with
+/// another `dist_style`, `sort_style = "auto"` with columns, more than 8
+/// interleaved sort columns), or `[redshift]` on a strategy that builds no
+/// table (`view`, `materialized_view`, `dynamic_table`, `content_addressed`,
+/// `ephemeral`) or alongside a lakehouse `format`. The option rules are shared
+/// with the Redshift dialect's SQL-generation guard, so the two cannot drift.
+pub const E052: &str = "E052";
+
 // Warnings
 /// Unused model (no downstream consumers).
 pub const W001: &str = "W001";
@@ -272,6 +284,15 @@ pub const W030: &str = "W030";
 /// reads keep working — but the consumer's own declared output type may now
 /// be too small, hence a warning rather than silence.
 pub const W031: &str = "W031";
+
+/// A `[redshift]` `dist_key` / `sort_key` names a column the model does not
+/// output.
+///
+/// Emitted only when the model's output columns are provably complete (the
+/// W006 guard). A warning, not an error, because that enumeration comes from
+/// lineage extraction; Redshift rejects the `CREATE TABLE` at run time if the
+/// column really is missing.
+pub const W052: &str = "W052";
 
 // Info
 /// Model dependency inferred from SQL.

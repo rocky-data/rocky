@@ -697,6 +697,34 @@ fn validate_adapter(
                 field: None,
             });
         }
+        "postgres" | "redshift" => {
+            // Same parse the registry runs before connecting, so a missing
+            // host / database / username or an unknown `extra` key is
+            // reported here rather than at `rocky run`.
+            let parsed = crate::registry::redshift_late_binding_views(name, adapter)
+                .and_then(|_| crate::registry::postgres_config(name, adapter));
+            match parsed {
+                Ok(_) => msgs.push(ValidateMessage {
+                    severity: "ok".into(),
+                    code: "V010".into(),
+                    message: format!("adapter.{name}: {}", adapter.adapter_type),
+                    file: None,
+                    field: None,
+                }),
+                Err(e) => {
+                    ok = false;
+                    // `warn`, like the Databricks missing-host check: the
+                    // same problem fails `rocky run` with this message.
+                    msgs.push(ValidateMessage {
+                        severity: "warn".into(),
+                        code: "V011".into(),
+                        message: format!("{e:#}"),
+                        file: None,
+                        field: Some(format!("adapter.{name}")),
+                    });
+                }
+            }
+        }
         "airbyte" => {
             msgs.push(ValidateMessage {
                 severity: "ok".into(),

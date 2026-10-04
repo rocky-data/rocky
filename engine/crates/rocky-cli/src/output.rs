@@ -779,6 +779,31 @@ impl From<&rocky_trino::connector::TrinoError> for FailureKind {
     }
 }
 
+impl From<&rocky_postgres::PgError> for FailureKind {
+    fn from(err: &rocky_postgres::PgError) -> Self {
+        use rocky_postgres::PgError as E;
+        if err.is_auth() {
+            return Self::AuthFailed;
+        }
+        if err.is_missing_object() {
+            return Self::NotFound;
+        }
+        match err {
+            E::Config(_) | E::Tls(_) => Self::ConnectionFailed,
+            // No SQLSTATE: the server never answered (DNS, refused, TLS).
+            E::Connect { sqlstate: None, .. } => Self::ConnectionFailed,
+            E::Connect { .. } | E::Query { .. } if err.is_transient() => Self::Transient,
+            // 53xxx insufficient resources other than too-many-connections
+            // (disk full, out of memory) and 54xxx program limits.
+            E::Query { sqlstate, .. } if sqlstate.starts_with("53") => Self::QuotaExceeded,
+            E::Connect { .. } => Self::ConnectionFailed,
+            E::Query { .. } => Self::QueryRejected,
+            E::Transport(_) | E::Timeout { .. } => Self::Transient,
+            E::NotFound { .. } => Self::NotFound,
+        }
+    }
+}
+
 impl From<&rocky_bigquery::connector::BigQueryError> for FailureKind {
     fn from(err: &rocky_bigquery::connector::BigQueryError) -> Self {
         type E = rocky_bigquery::connector::BigQueryError;
@@ -870,6 +895,9 @@ fn classify_cause(cause: &(dyn std::error::Error + 'static)) -> Option<FailureKi
     if let Some(e) = cause.downcast_ref::<rocky_bigquery::connector::BigQueryError>() {
         return Some(e.into());
     }
+    if let Some(e) = cause.downcast_ref::<rocky_postgres::PgError>() {
+        return Some(e.into());
+    }
     None
 }
 
@@ -892,6 +920,9 @@ fn classify_cause_with_cooldown(
         return Some((e.into(), None));
     }
     if let Some(e) = cause.downcast_ref::<rocky_bigquery::connector::BigQueryError>() {
+        return Some((e.into(), None));
+    }
+    if let Some(e) = cause.downcast_ref::<rocky_postgres::PgError>() {
         return Some((e.into(), None));
     }
     None
