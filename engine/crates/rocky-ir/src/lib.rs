@@ -40,6 +40,7 @@ pub mod ir;
 pub mod lakehouse;
 pub mod lineage;
 pub mod mask;
+pub mod snapshot;
 pub mod time_grain;
 pub mod types;
 
@@ -50,5 +51,9 @@ pub use ir::*;
 pub use lakehouse::{LakehouseError, LakehouseFormat, LakehouseOptions};
 pub use lineage::{LineageEdge, QualifiedColumn};
 pub use mask::MaskStrategy;
+pub use snapshot::{
+    SnapshotChangeStrategy, SnapshotCheckColumns, SnapshotFlagColumn, SnapshotHardDeletes,
+    SnapshotMetaColumns, SnapshotSpec,
+};
 pub use time_grain::TimeGrain;
 pub use types::{RockyType, StructField, TypedColumn, common_supertype, is_assignable};

@@ -70,7 +70,7 @@ The `.toml` file names the model, lists what it depends on, picks a materializat
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `type` | string | `"full_refresh"` | Materialization type. One of `"full_refresh"`, `"merge"`, `"time_interval"`, `"view"`, `"materialized_view"`, `"dynamic_table"`, `"delete_insert"`, `"microbatch"`, `"content_addressed"`. Two are refused: `"incremental"` on a transformation model (`E037`, see [Incremental](#incremental)), and `"ephemeral"` outright (`E038`, see [Ephemeral](#ephemeral)). |
+| `type` | string | `"full_refresh"` | Materialization type. One of `"full_refresh"`, `"merge"`, `"time_interval"`, `"view"`, `"materialized_view"`, `"dynamic_table"`, `"delete_insert"`, `"microbatch"`, `"content_addressed"`, `"snapshot"` (see [Snapshot](#snapshot)). Two are refused: `"incremental"` on a transformation model (`E037`, see [Incremental](#incremental)), and `"ephemeral"` outright (`E038`, see [Ephemeral](#ephemeral)). |
 | `timestamp_column` | string | | Replication watermark column. Required for transformation `microbatch`; it names the output partition column. |
 | `unique_key` | list of strings | | Key columns for merge matching. Required when `type = "merge"`. |
 | `update_columns` | list of strings | | Columns to update on merge match. Defaults to all non-key columns if omitted. |
@@ -806,6 +806,92 @@ table = "fct_events"
 ```
 
 The runtime executes the model SQL, converts the result to Arrow, hashes the Parquet bytes, uploads to `storage_prefix`, and emits a Delta log commit. `partition_columns` may be omitted for unpartitioned tables. Backed by the `rocky-iceberg` writer (shipped in engine v1.30.0 across Phases 1–5: discover, write, sync, partitioned, rowTracking, schema evolution).
+
+---
+
+### Snapshot
+
+A snapshot keeps the history of its model's rows. This is a slowly changing dimension of type 2 (SCD2): each change to a row adds a new version and closes the old one. Rocky follows [dbt snapshots](https://docs.getdbt.com/docs/build/snapshots), but a snapshot here is an ordinary model. It runs in the model DAG under `rocky run`, and downstream models can read it.
+
+**Config** (`models/customers_history.toml`):
+
+```toml
+[strategy]
+type = "snapshot"
+unique_key = "customer_id"     # one column, or a list for a composite key
+strategy = "timestamp"         # or "check"
+updated_at = "updated_at"      # timestamp strategy: the change column
+# check_cols = ["name", "email"] # check strategy: a list, or "all"
+hard_deletes = "invalidate"    # "ignore" (default), "invalidate", "new_record"
+
+[target]
+catalog = "analytics"
+schema = "snapshots"
+table = "customers_history"
+```
+
+The model SQL is a plain SELECT, for example `SELECT customer_id, name, email, updated_at FROM raw.customers`.
+
+**How a change is detected:**
+
+- `timestamp`: a row changed when its `updated_at` is later than the current version's. The new version's `valid_from` is that `updated_at`.
+- `check`: a row changed when a column in `check_cols` differs from the current version. NULL counts as a value. `"all"` compares every column except the key. The new version's `valid_from` is the run time.
+
+**Columns Rocky adds to each row:**
+
+| Column | Meaning |
+|---|---|
+| `valid_from` | When this version became current. |
+| `valid_to` | When this version stopped being current. NULL on the current version. |
+| `is_current` | `TRUE` on the current version of each key. |
+| `snapshot_id` | A hash of the key and `valid_from`, unique per version. |
+| `is_deleted` | Only with `hard_deletes = "new_record"`: `TRUE` on a deletion marker. |
+
+These are the names the `snapshot` pipeline uses. Rename any of them with `snapshot_meta_column_names`. The dbt key names are accepted too, so an imported dbt config reads unchanged:
+
+```toml
+[strategy]
+type = "snapshot"
+unique_key = ["id", "region"]
+strategy = "check"
+check_cols = "all"
+snapshot_meta_column_names = { valid_from = "dbt_valid_from", valid_to = "dbt_valid_to", scd_id = "dbt_scd_id", updated_at = "dbt_updated_at", is_current = false }
+valid_to_current = "CAST('9999-12-31' AS TIMESTAMP)"
+```
+
+- `updated_at` in `snapshot_meta_column_names` adds a copy of the version's change time (dbt's `dbt_updated_at`). It is off by default.
+- `is_current = false` writes no flag column. A version is then current when its `valid_to` is NULL or equals `valid_to_current`. Use this to continue a snapshot table that dbt built.
+- `valid_to_current` (dbt's `dbt_valid_to_current`) is a SQL expression written to `valid_to` on current versions, in place of NULL.
+- `invalidate_hard_deletes = true` is accepted as dbt's older spelling of `hard_deletes = "invalidate"`.
+
+**What a run does:**
+
+```text
+first run   CREATE TABLE ... AS: every row becomes its first current version
+later runs  1. MERGE   close the current version of each changed key
+            2. INSERT  a new current version for each key with no current version
+            3. hard deletes (when not "ignore"):
+               invalidate  UPDATE: close the current version of each key that left the result
+               new_record  INSERT a deletion marker, then UPDATE: close the version it replaces
+```
+
+The statements run one after the other, without a transaction. Not every warehouse has multi-statement transactions. Instead, each step is safe to repeat:
+
+- A run that stops after step 1 leaves some keys with no current version. The next run's step 2 opens them.
+- Step 2 only inserts where no current version exists.
+- A deletion marker is not inserted twice.
+- A run over an unchanged source matches nothing, so it writes nothing.
+
+All statements in one run use one timestamp for "now". A version closed at step 1 and its successor from step 2 meet exactly.
+
+**Limits:**
+
+- The target keeps the columns it was created with. A column added to the model later is not captured, and `rocky run` reports it in the model's `notes`. Drop the target to rebuild the history with the new column.
+- The key must be unique in the model's result. Databricks and Snowflake refuse the MERGE when it is not.
+- `rocky plan` and `rocky emit-sql` show the steady-state statements, built from the compile-time column list. `rocky run` reads the column list from the target.
+- A `branch` promotion and a shadow run refuse a snapshot model, like the other strategies that build on rows the target already holds.
+
+`rocky compile` reports an invalid config as `E049` and a risky one as `W049`. See the [diagnostic codes](/concepts/compiler/).
 
 ---
 

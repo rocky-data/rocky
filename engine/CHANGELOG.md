@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Snapshot models.** A transformation model with `[strategy] type = "snapshot"` keeps the history of its SELECT (SCD Type 2, dbt snapshot parity) and runs in the model DAG under `rocky run`, so downstream models can read it. It takes `unique_key` (one column or a list), `strategy = "timestamp"` with `updated_at` or `strategy = "check"` with `check_cols` (a list or `"all"`), `hard_deletes = "ignore" | "invalidate" | "new_record"`, `snapshot_meta_column_names` and `valid_to_current`. The metadata columns default to the `snapshot` pipeline's names (`valid_from`, `valid_to`, `is_current`, `snapshot_id`). The statements run without a transaction, in an order that makes a repeated or interrupted run safe; a rerun over an unchanged source writes nothing. `rocky compile` reports an invalid config as `E049` and a risky one as `W049`.
+- `rocky import-dbt` converts dbt snapshots, both legacy `{% snapshot %}` blocks and YAML snapshots, into snapshot models instead of dropping them. They keep dbt's column names and write no `is_current` column, so `rocky run` can continue a table dbt built.
+
 ## [1.76.0] — 2026-10-03
 
 This release carries five breaking changes, each marked **Breaking:** below.

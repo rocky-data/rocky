@@ -615,6 +615,47 @@ fn diff_materialization(
                 });
             }
         }
+        (MaterializationStrategy::Snapshot(o), MaterializationStrategy::Snapshot(n)) => {
+            // A new key re-identifies every history row; renamed metadata
+            // columns break every reader of the history. Change-detection and
+            // hard-delete settings only affect future versions.
+            let o_uk: Vec<String> = o.unique_key.iter().map(ToString::to_string).collect();
+            let n_uk: Vec<String> = n.unique_key.iter().map(ToString::to_string).collect();
+            if o_uk != n_uk {
+                findings.push(BreakingFinding {
+                    change: BreakingChange::MaterializationKeyChanged {
+                        model: model.to_string(),
+                        key_kind: "unique_key".to_string(),
+                        old: o_uk,
+                        new: n_uk,
+                    },
+                    severity: BreakingSeverity::Breaking,
+                });
+            }
+            let o_meta: Vec<String> = o
+                .meta_columns
+                .written(o.hard_deletes)
+                .into_iter()
+                .map(str::to_string)
+                .collect();
+            let n_meta: Vec<String> = n
+                .meta_columns
+                .written(n.hard_deletes)
+                .into_iter()
+                .map(str::to_string)
+                .collect();
+            if o_meta != n_meta {
+                findings.push(BreakingFinding {
+                    change: BreakingChange::MaterializationKeyChanged {
+                        model: model.to_string(),
+                        key_kind: "snapshot_meta_column_names".to_string(),
+                        old: o_meta,
+                        new: n_meta,
+                    },
+                    severity: BreakingSeverity::Breaking,
+                });
+            }
+        }
         // FullRefresh / MaterializedView / Ephemeral have no variant fields.
         _ => {}
     }
@@ -810,6 +851,7 @@ fn strategy_tag(s: &MaterializationStrategy) -> &'static str {
         MaterializationStrategy::DeleteInsert { .. } => "delete_insert",
         MaterializationStrategy::Microbatch { .. } => "microbatch",
         MaterializationStrategy::ContentAddressed { .. } => "content_addressed",
+        MaterializationStrategy::Snapshot(_) => "snapshot",
     }
 }
 

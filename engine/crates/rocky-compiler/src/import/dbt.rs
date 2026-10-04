@@ -440,7 +440,7 @@ fn record_dropped_constructs(dropped: &dbt_manifest::DbtDroppedCounts, result: &
         (
             "snapshot",
             dropped.snapshots,
-            "Rocky has no snapshot pipeline yet — re-implement as a [snapshot] pipeline or keep it in dbt",
+            "the snapshot could not be read from the manifest",
         ),
         (
             "metric",
@@ -1005,6 +1005,21 @@ fn import_manifest_node(
     model_relations: &HashMap<String, UpstreamModel>,
     result: &mut ImportResult,
 ) {
+    // A snapshot node converts to a `type = "snapshot"` model, or fails with
+    // the reason; it is never dropped.
+    let snapshot_strategy = match &node.config.snapshot {
+        Some(cfg) => match super::dbt_snapshots::snapshot_strategy_from_dbt(cfg) {
+            Ok(strategy) => Some(strategy),
+            Err(reason) => {
+                result.failed.push(ImportFailure {
+                    name: node.name.clone(),
+                    reason,
+                });
+                return;
+            }
+        },
+        None => None,
+    };
     if node.config.materialized == "incremental" {
         if node.config.full_refresh == Some(false) {
             result.failed.push(ImportFailure {
@@ -1039,6 +1054,21 @@ fn import_manifest_node(
     // name via `convert_jinja_to_sql`, so it needs no rewrite. (FR-046)
     let mut sql = match &node.compiled_code {
         Some(code) => rewrite_upstream_refs_to_bare(code, node, model_relations),
+        None if snapshot_strategy.is_some() => {
+            // A legacy snapshot's raw_code is the whole `{% snapshot %}` block;
+            // only its body is the SELECT.
+            let body = super::dbt_snapshots::legacy_snapshot_blocks(&node.raw_code)
+                .first()
+                .map_or(node.raw_code.as_str(), |b| b.body);
+            if body.contains("{%") {
+                result.failed.push(ImportFailure {
+                    name: node.name.clone(),
+                    reason: RAW_JINJA_CONTROL_REFUSED.to_string(),
+                });
+                return;
+            }
+            convert_jinja_to_sql(body, &this_ref)
+        }
         None => {
             if node.raw_code.contains("{%") {
                 result.failed.push(ImportFailure {
@@ -1074,7 +1104,14 @@ fn import_manifest_node(
         strategy,
         warnings: strategy_warnings,
         structured,
-    } = map_manifest_strategy(&node.config, &node.name, microbatch_mode);
+    } = match snapshot_strategy {
+        Some(strategy) => StrategyMappingOutput {
+            strategy,
+            warnings: vec![super::dbt_snapshots::snapshot_import_note(&node.name)],
+            structured: Vec::new(),
+        },
+        None => map_manifest_strategy(&node.config, &node.name, microbatch_mode),
+    };
 
     // #1990: an incremental dbt model with no Rocky append equivalent falls
     // back to `full_refresh`. That is safe only when the SQL has no dbt
@@ -1829,7 +1866,7 @@ fn collect_unresolvable_macros(sql: &str, model_name: &str, result: &mut ImportR
 /// catching symlink-based escapes too. A not-yet-existing joined path that
 /// passed the syntactic check is allowed through (the caller already tolerates
 /// missing model dirs).
-fn safe_join_under(base: &Path, rel: &Path) -> Result<std::path::PathBuf, String> {
+pub(super) fn safe_join_under(base: &Path, rel: &Path) -> Result<std::path::PathBuf, String> {
     use std::path::Component;
 
     if rel.is_absolute() {
@@ -1998,6 +2035,11 @@ pub fn import_dbt_project(
         }
     }
 
+    // dbt snapshots (legacy `{% snapshot %}` blocks and YAML snapshots) live
+    // under `snapshot-paths`, not the model paths; convert them to
+    // `type = "snapshot"` models instead of dropping them.
+    super::dbt_snapshots::import_raw_snapshots(dbt_dir, default_target, &source_map, &mut result)?;
+
     // Phase 2: Scan model YAML files for test definitions and convert them
     // to canonical Rocky `[[tests]]` (`TestDecl`) entries on each imported
     // model. Tests outside the four canonical built-ins emit structured
@@ -2018,6 +2060,35 @@ pub fn import_dbt_project(
     }
 
     Ok(result)
+}
+
+/// An empty raw-path result, for unit tests of the per-construct importers.
+#[cfg(test)]
+pub(super) fn empty_import_result() -> ImportResult {
+    ImportResult {
+        imported: Vec::new(),
+        warnings: Vec::new(),
+        structured_warnings: Vec::new(),
+        failed: Vec::new(),
+        sources_found: 0,
+        sources_mapped: 0,
+        import_method: ImportMethod::Regex,
+        project_name: None,
+        dbt_version: None,
+        tests_found: 0,
+        tests_converted: 0,
+        tests_converted_custom: 0,
+        tests_skipped: 0,
+        macros_detected: 0,
+        macros_expanded: 0,
+        macros_manifest_resolved: 0,
+        macros_unsupported: 0,
+        unit_tests_found: 0,
+        unit_tests_converted: 0,
+        unit_tests_skipped: 0,
+        constructs_dropped: 0,
+        contracts_dropped: 0,
+    }
 }
 
 struct RawModelSettings<'a> {
@@ -2521,7 +2592,7 @@ fn inline_dbt_materialization(content: &str) -> Option<String> {
         .next_back()
 }
 
-fn dbt_config_calls(content: &str) -> Vec<&str> {
+pub(super) fn dbt_config_calls(content: &str) -> Vec<&str> {
     let mut calls = Vec::new();
     let mut rest = content;
     while let Some(start) = rest.find("{{") {
@@ -2600,7 +2671,7 @@ fn is_literal_config_value(value: &str) -> bool {
     false
 }
 
-fn quoted_literal_contents(value: &str) -> Option<&str> {
+pub(super) fn quoted_literal_contents(value: &str) -> Option<&str> {
     let quote = value.chars().next()?;
     if quote != '\'' && quote != '"' || !value.ends_with(quote) || value.len() < 2 {
         return None;
@@ -2619,7 +2690,7 @@ fn quoted_literal_contents(value: &str) -> Option<&str> {
     (!escaped).then_some(inner)
 }
 
-fn split_literal_items(value: &str) -> Option<Vec<&str>> {
+pub(super) fn split_literal_items(value: &str) -> Option<Vec<&str>> {
     if value.trim().is_empty() {
         return Some(Vec::new());
     }
@@ -2721,6 +2792,7 @@ fn extract_dbt_config(
         // not present in the inline `config()` call); contract detection is
         // manifest-only.
         contract: None,
+        snapshot: None,
     };
 
     // The regex (`--no-manifest`) path always uses the default microbatch
@@ -2787,7 +2859,7 @@ fn strip_surrounding_quotes(s: &str) -> &str {
     }
 }
 
-fn convert_jinja_to_sql(content: &str, this_ref: &str) -> String {
+pub(super) fn convert_jinja_to_sql(content: &str, this_ref: &str) -> String {
     let mut sql = strip_dbt_config_tags(content);
 
     // {{ ref('model_name') }} -> model_name
@@ -4022,9 +4094,79 @@ FROM {{ ref('stg_events') }}
         });
         let result = import_from_manifest_json(&manifest);
         assert_eq!(result.imported.len(), 1, "only the model imports");
-        assert_eq!(result.constructs_dropped, 2, "1 snapshot + 1 metric");
-        assert!(result.structured_warnings.iter().any(|w| matches!(w,
+        // A snapshot is no longer a dropped construct: one it cannot read
+        // (here, no config at all) is an import failure with the reason.
+        assert_eq!(result.constructs_dropped, 1, "1 metric");
+        assert!(
+            result
+                .failed
+                .iter()
+                .any(|f| f.name == "snap" && f.reason.contains("unique_key"))
+        );
+        assert!(!result.structured_warnings.iter().any(|w| matches!(w,
             ImportDbtStructuredWarning::DroppedConstruct { construct, .. } if construct == "snapshot")));
+    }
+
+    #[test]
+    fn test_manifest_snapshot_node_converts_to_snapshot_model() {
+        let manifest = serde_json::json!({
+            "metadata": { "project_name": "p" },
+            "nodes": {
+                "snapshot.p.orders_snap": {
+                    "unique_id": "snapshot.p.orders_snap", "name": "orders_snap",
+                    "resource_type": "snapshot",
+                    "compiled_code": "select * from \"d\".\"raw\".\"orders\"",
+                    "raw_code": "{% snapshot orders_snap %}{{ config(unique_key='id') }} select * from {{ source('raw','orders') }} {% endsnapshot %}",
+                    "depends_on": { "nodes": ["source.p.raw.orders"], "macros": [] },
+                    "config": {
+                        "materialized": "snapshot", "target_schema": "snapshots",
+                        "unique_key": ["id", "region"], "strategy": "check",
+                        "check_cols": "all", "hard_deletes": "invalidate",
+                        "snapshot_meta_column_names": { "dbt_valid_from": "start_at", "dbt_scd_id": null }
+                    },
+                    "tags": [], "schema": "snapshots", "database": "d"
+                },
+                "model.p.current_orders": model_node("current_orders",
+                    serde_json::json!({ "materialized": "table" }), serde_json::json!([]))
+            },
+            "sources": {}
+        });
+        let mut manifest = manifest;
+        manifest["nodes"]["model.p.current_orders"]["depends_on"] =
+            serde_json::json!({ "nodes": ["snapshot.p.orders_snap"], "macros": [] });
+        let result = import_from_manifest_json(&manifest);
+        assert!(
+            result.failed.is_empty(),
+            "{:?}",
+            result.failed.iter().map(|f| &f.reason).collect::<Vec<_>>()
+        );
+        let snap = result
+            .imported
+            .iter()
+            .find(|m| m.name == "orders_snap")
+            .expect("snapshot imported");
+        assert_eq!(snap.config.target.schema, "snapshots");
+        assert_eq!(snap.sql, "select * from \"d\".\"raw\".\"orders\"");
+        let lowered = snap
+            .config
+            .strategy
+            .snapshot_lowered()
+            .expect("snapshot strategy");
+        assert!(lowered.problems.is_empty(), "{:?}", lowered.problems);
+        assert_eq!(lowered.spec.unique_key.len(), 2);
+        assert_eq!(
+            lowered.spec.hard_deletes,
+            rocky_ir::SnapshotHardDeletes::Invalidate
+        );
+        assert_eq!(lowered.spec.meta_columns.valid_from, "start_at");
+        assert_eq!(lowered.spec.meta_columns.scd_id, "dbt_scd_id");
+        let consumer = result
+            .imported
+            .iter()
+            .find(|m| m.name == "current_orders")
+            .expect("consumer imported");
+        assert_eq!(consumer.config.depends_on, vec!["orders_snap".to_string()]);
+        assert_eq!(result.constructs_dropped, 0);
     }
 
     #[test]
@@ -5712,6 +5854,7 @@ FROM {{ ref('stg_events') }}
                 merge_update_columns: None,
                 merge_exclude_columns: None,
                 contract: None,
+                snapshot: None,
             },
             columns: HashMap::new(),
             description: None,

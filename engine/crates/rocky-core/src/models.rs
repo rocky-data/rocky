@@ -471,6 +471,78 @@ pub enum StrategyConfig {
         #[serde(default)]
         partition_columns: Vec<String>,
     },
+    /// SCD Type 2 snapshot of the model's SELECT (dbt `snapshot` parity).
+    /// Each run closes changed versions and opens new ones; see
+    /// [`crate::snapshot_model`]. Every field is optional here so a missing
+    /// one is reported as E049 by `rocky compile` rather than as a TOML
+    /// parse error.
+    #[serde(rename = "snapshot")]
+    Snapshot {
+        /// Column, or list of columns, identifying a row of the output.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        unique_key: Option<crate::snapshot_model::SnapshotUniqueKey>,
+        /// `"timestamp"` or `"check"`.
+        #[serde(default, rename = "strategy", skip_serializing_if = "Option::is_none")]
+        snapshot_strategy: Option<crate::snapshot_model::SnapshotStrategyKind>,
+        /// Timestamp-strategy change column.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        updated_at: Option<String>,
+        /// Check-strategy columns: a list, or `"all"`.
+        #[serde(
+            default,
+            alias = "check_columns",
+            skip_serializing_if = "Option::is_none"
+        )]
+        check_cols: Option<crate::snapshot_model::SnapshotCheckColsConfig>,
+        /// `"ignore"` (default), `"invalidate"` or `"new_record"`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        hard_deletes: Option<rocky_ir::SnapshotHardDeletes>,
+        /// dbt's legacy spelling of `hard_deletes = "invalidate"`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        invalidate_hard_deletes: Option<bool>,
+        /// Metadata column names (Rocky defaults; dbt keys accepted).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        snapshot_meta_column_names: Option<rocky_ir::SnapshotMetaColumns>,
+        /// SQL expression for `valid_to` on current versions instead of NULL.
+        #[serde(
+            default,
+            alias = "dbt_valid_to_current",
+            skip_serializing_if = "Option::is_none"
+        )]
+        valid_to_current: Option<String>,
+    },
+}
+
+impl StrategyConfig {
+    /// Lower a `type = "snapshot"` strategy to its IR spec plus the config
+    /// problems found on the way (E049). `None` for every other strategy.
+    pub fn snapshot_lowered(&self) -> Option<crate::snapshot_model::LoweredSnapshot> {
+        let StrategyConfig::Snapshot {
+            unique_key,
+            snapshot_strategy,
+            updated_at,
+            check_cols,
+            hard_deletes,
+            invalidate_hard_deletes,
+            snapshot_meta_column_names,
+            valid_to_current,
+        } = self
+        else {
+            return None;
+        };
+        Some(crate::snapshot_model::lower_snapshot_config(
+            crate::snapshot_model::SnapshotConfigFields {
+                unique_key: unique_key.as_ref(),
+                strategy: *snapshot_strategy,
+                updated_at: updated_at.as_deref(),
+                check_cols: check_cols.as_ref(),
+                hard_deletes: *hard_deletes,
+                invalidate_hard_deletes: *invalidate_hard_deletes,
+                meta_columns: snapshot_meta_column_names.as_ref(),
+                valid_to_current: valid_to_current.as_deref(),
+            },
+        ))
+    }
 }
 
 fn default_batch_size() -> NonZeroU32 {
@@ -1393,6 +1465,32 @@ impl Model {
             StrategyConfig::DynamicTable { target_lag } => MaterializationStrategy::DynamicTable {
                 target_lag: target_lag.clone(),
             },
+            // Invalid configs still lower (with empty fields); `rocky compile`
+            // reports them as E049 and SQL generation refuses them.
+            StrategyConfig::Snapshot {
+                unique_key,
+                snapshot_strategy,
+                updated_at,
+                check_cols,
+                hard_deletes,
+                invalidate_hard_deletes,
+                snapshot_meta_column_names,
+                valid_to_current,
+            } => MaterializationStrategy::Snapshot(Box::new(
+                crate::snapshot_model::lower_snapshot_config(
+                    crate::snapshot_model::SnapshotConfigFields {
+                        unique_key: unique_key.as_ref(),
+                        strategy: *snapshot_strategy,
+                        updated_at: updated_at.as_deref(),
+                        check_cols: check_cols.as_ref(),
+                        hard_deletes: *hard_deletes,
+                        invalidate_hard_deletes: *invalidate_hard_deletes,
+                        meta_columns: snapshot_meta_column_names.as_ref(),
+                        valid_to_current: valid_to_current.as_deref(),
+                    },
+                )
+                .spec,
+            )),
         };
 
         // Collapse a fully-absent budget (both cost fields None) into

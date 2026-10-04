@@ -29,6 +29,7 @@ pub mod resolve;
 pub mod salsa_compile;
 pub mod schema_cache;
 pub mod semantic;
+pub mod snapshot;
 pub mod typecheck;
 pub mod types;
 

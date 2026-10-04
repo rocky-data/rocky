@@ -60,6 +60,7 @@ pub mod schema_cache;
 pub mod secret_registry;
 pub mod seeds;
 pub mod shadow;
+pub mod snapshot_model;
 pub mod snapshots;
 pub mod source;
 pub mod sql_gen;

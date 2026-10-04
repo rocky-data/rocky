@@ -876,6 +876,7 @@ fn strategy_purpose(strategy: &MaterializationStrategy) -> &'static str {
         MaterializationStrategy::DeleteInsert { .. } => "delete_insert",
         MaterializationStrategy::Microbatch { .. } => "microbatch",
         MaterializationStrategy::ContentAddressed { .. } => "content_addressed",
+        MaterializationStrategy::Snapshot(_) => "snapshot",
     }
 }
 

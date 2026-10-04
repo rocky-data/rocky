@@ -29,6 +29,7 @@ export function materializationColor(materialization: string | null): string {
       return chart("green");
     case "merge":
     case "delete_insert":
+    case "snapshot":
       return chart("purple");
     case "time_interval":
       return chart("orange");

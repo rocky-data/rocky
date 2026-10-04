@@ -148,6 +148,7 @@ fn build_model_entries(models_dir: &Path) -> Result<Vec<ListModelEntry>> {
                 rocky_core::models::StrategyConfig::ContentAddressed { .. } => "content_addressed",
                 rocky_core::models::StrategyConfig::View => "view",
                 rocky_core::models::StrategyConfig::MaterializedView => "materialized_view",
+                rocky_core::models::StrategyConfig::Snapshot { .. } => "snapshot",
                 rocky_core::models::StrategyConfig::DynamicTable { .. } => "dynamic_table",
             }
             .to_string();

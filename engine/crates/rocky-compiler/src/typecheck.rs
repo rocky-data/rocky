@@ -620,6 +620,12 @@ fn compute_model_typecheck(
             &typed_cols,
             model_schema.schema_is_complete(),
         ));
+        diagnostics.extend(crate::snapshot::check_snapshot_strategy(
+            model,
+            &typed_cols,
+            model_schema.schema_is_complete(),
+            model_schema.has_star,
+        ));
     }
 
     // Step 6: Enrich diagnostics with the model's file path as a SourceSpan
@@ -770,11 +776,31 @@ fn check_known_missing_projection_refs(
     let qualifier = alias
         .as_ref()
         .map_or(relation_name, |alias| alias.name.value.as_str());
+    // A snapshot model's table holds its SELECT's columns plus the SCD2
+    // metadata columns (`valid_from`, `is_current`, ...), which the semantic
+    // graph does not list. Readers of the snapshot may project them.
+    let snapshot_meta: Vec<String> = upstream_model
+        .config
+        .strategy
+        .snapshot_lowered()
+        .map(|lowered| {
+            lowered
+                .spec
+                .meta_columns
+                .reserved()
+                .into_iter()
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
     let column_exists = |name: &str| {
         upstream_schema
             .columns
             .iter()
             .any(|column| column.name.eq_ignore_ascii_case(name))
+            || snapshot_meta
+                .iter()
+                .any(|meta| meta.eq_ignore_ascii_case(name))
     };
 
     let mut diagnostics = Vec::new();
@@ -4001,6 +4027,45 @@ mod tests {
         assert!(diagnostic.message.contains("'stg_orders'"));
         assert_eq!(diagnostic.span.as_ref().map(|span| span.line), Some(1));
         assert_eq!(diagnostic.span.as_ref().map(|span| span.col), Some(1));
+    }
+
+    /// A snapshot model's table also holds the SCD2 metadata columns, so a
+    /// reader projecting them must not get E039; a truly absent column still
+    /// does.
+    #[test]
+    fn snapshot_metadata_columns_are_readable_downstream() {
+        let mut snap = make_model(
+            "snap",
+            "SELECT order_id, amount, updated_at FROM raw.orders",
+        );
+        snap.config.strategy = toml::from_str(
+            "type = \"snapshot\"\nunique_key = \"order_id\"\nstrategy = \"timestamp\"\n\
+             updated_at = \"updated_at\"\nsnapshot_meta_column_names = { scd_id = \"version_id\" }",
+        )
+        .unwrap();
+        let result = compile_typechecks(vec![
+            snap.clone(),
+            make_model(
+                "reader",
+                "SELECT order_id, valid_from, valid_to, is_current, version_id FROM snap",
+            ),
+        ]);
+        assert!(
+            e039_diagnostics(&result).is_empty(),
+            "{:?}",
+            result.diagnostics
+        );
+
+        let result = compile_typechecks(vec![
+            snap,
+            make_model("reader", "SELECT order_id, snapshot_id FROM snap"),
+        ]);
+        assert_eq!(
+            e039_diagnostics(&result).len(),
+            1,
+            "{:?}",
+            result.diagnostics
+        );
     }
 
     #[test]

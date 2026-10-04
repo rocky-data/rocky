@@ -9966,7 +9966,8 @@ fn apply_shadow_rewrite(
             rocky_core::models::StrategyConfig::Incremental { .. }
             | rocky_core::models::StrategyConfig::Merge { .. }
             | rocky_core::models::StrategyConfig::DeleteInsert { .. }
-            | rocky_core::models::StrategyConfig::Microbatch { .. } => {
+            | rocky_core::models::StrategyConfig::Microbatch { .. }
+            | rocky_core::models::StrategyConfig::Snapshot { .. } => {
                 anyhow::bail!(
                     "shadow/branch execution is not supported for model '{}': its \
                      '{}' strategy builds on rows the target already holds, and a shadow \
@@ -9978,6 +9979,7 @@ fn apply_shadow_rewrite(
                         rocky_core::models::StrategyConfig::Incremental { .. } => "incremental",
                         rocky_core::models::StrategyConfig::Merge { .. } => "merge",
                         rocky_core::models::StrategyConfig::DeleteInsert { .. } => "delete_insert",
+                        rocky_core::models::StrategyConfig::Snapshot { .. } => "snapshot",
                         _ => "microbatch",
                     }
                 );
@@ -13492,6 +13494,7 @@ fn transformation_strategy_name(strategy: &MaterializationStrategy) -> &'static 
         MaterializationStrategy::DeleteInsert { .. } => "delete_insert",
         MaterializationStrategy::Microbatch { .. } => "microbatch",
         MaterializationStrategy::ContentAddressed { .. } => "content_addressed",
+        MaterializationStrategy::Snapshot(_) => "snapshot",
     }
 }
 
@@ -13728,7 +13731,8 @@ fn strategy_implies_object_kind(
         | S::Ephemeral
         | S::DeleteInsert { .. }
         | S::Microbatch { .. }
-        | S::ContentAddressed { .. } => None,
+        | S::ContentAddressed { .. }
+        | S::Snapshot(_) => None,
     }
 }
 
@@ -13836,6 +13840,22 @@ async fn execute_one_plain_model(
             &model_ir.target.table,
         )
         .map_err(anyhow::Error::from)?;
+
+    // A snapshot model reads its target's columns before generating SQL, so
+    // it takes its own path (bootstrap, or close-and-open versions).
+    if let rocky_ir::MaterializationStrategy::Snapshot(spec) = &model_ir.materialization {
+        return execute_snapshot_model(
+            &model_ir,
+            spec,
+            &target_ref,
+            warehouse,
+            dialect,
+            model_name,
+            model_start,
+            exec_ctx,
+        )
+        .await;
+    }
 
     // Strategy/target-kind reconciliation (#2037). `FullRefresh` and `View` each issue `CREATE OR REPLACE
     // <kind>` further down — `TABLE` for `FullRefresh`, `VIEW` for `View`
@@ -14175,6 +14195,158 @@ async fn execute_one_plain_model(
         // Not the content-addressed write path — no in-process column bytes.
         output_column_hashes: None,
         // Consumer baseline is content-addressed-path only.
+        consumed_column_baseline: None,
+    })
+}
+
+/// Execute one `type = "snapshot"` model (SCD Type 2 over the model SELECT).
+///
+/// First run: the target is absent, so a non-replacing CTAS loads every row
+/// as its first current version. Later runs: describe the target, take the
+/// model's columns from it (everything but the metadata columns), and run the
+/// close / open / hard-delete statements from
+/// [`rocky_core::snapshot_model::generate_snapshot_model_sql`]. The statements
+/// run in order without a transaction; that module documents why a run that
+/// stops part-way is safe to repeat.
+#[allow(clippy::too_many_arguments)]
+async fn execute_snapshot_model(
+    model_ir: &rocky_ir::ModelIr,
+    spec: &rocky_ir::SnapshotSpec,
+    target_ref: &str,
+    warehouse: &dyn rocky_core::traits::WarehouseAdapter,
+    dialect: &dyn rocky_core::traits::SqlDialect,
+    model_name: &str,
+    model_start: Instant,
+    exec_ctx: ExecutionContext<'_>,
+) -> Result<MaterializationOutput> {
+    use rocky_core::snapshot_model;
+
+    let problems = spec.problems();
+    if !problems.is_empty() {
+        anyhow::bail!(
+            "model '{model_name}' has an invalid snapshot config (E049): {}",
+            problems.join("; ")
+        );
+    }
+    let model_started_at = Utc::now();
+    let target_table = rocky_ir::TableRef {
+        catalog: model_ir.target.catalog.clone(),
+        schema: model_ir.target.schema.clone(),
+        table: model_ir.target.table.clone(),
+    };
+    // Same existence probe as the other bootstrap strategies: a retryable
+    // failure must not be read as "absent".
+    let existing = match warehouse.describe_table(&target_table).await {
+        Ok(columns) => Some(columns),
+        Err(e) if warehouse.classify_failure(&e).is_retryable() => {
+            return Err(anyhow::Error::from(e).context(format!(
+                "target existence probe for snapshot model '{model_name}' failed with a \
+                 retryable error; refusing to assume '{target_ref}' is absent"
+            )));
+        }
+        Err(_) => None,
+    };
+
+    let mut notes = Vec::new();
+    let statements = match &existing {
+        None => rocky_core::sql_gen::generate_transformation_initial_ddl(model_ir, dialect)?,
+        Some(columns) => {
+            let names: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
+            let mut stmts = Vec::new();
+            if snapshot_model::missing_is_deleted_column(spec, &names) {
+                stmts.push(snapshot_model::add_is_deleted_column_sql(
+                    spec, target_ref, dialect,
+                )?);
+            }
+            let source_columns = snapshot_model::snapshot_source_columns(spec, &names)
+                .with_context(|| format!("snapshot model '{model_name}' failed"))?;
+            // The history keeps the columns it was created with. Say so when
+            // the model has grown a column the target cannot hold.
+            if let Some(typed) = exec_ctx.typed_models.get(model_name) {
+                for col in typed {
+                    if !source_columns
+                        .iter()
+                        .any(|c| c.eq_ignore_ascii_case(&col.name))
+                    {
+                        notes.push(format!(
+                            "snapshot model '{model_name}': column '{}' is not in {target_ref} \
+                             and is not captured; rebuild the snapshot to add it",
+                            col.name
+                        ));
+                    }
+                }
+            }
+            stmts.extend(snapshot_model::generate_snapshot_model_sql(
+                spec,
+                target_ref,
+                &model_ir.sql,
+                dialect,
+                &source_columns,
+                Utc::now(),
+            )?);
+            stmts
+        }
+    };
+    for note in &notes {
+        warn!("{note}");
+    }
+    info!(
+        model = model_name,
+        target = target_ref,
+        statements = statements.len(),
+        bootstrap = existing.is_none(),
+        "executing snapshot model"
+    );
+
+    let mut bytes_scanned_acc: Option<u64> = None;
+    let mut bytes_written_acc: Option<u64> = None;
+    let mut job_ids_acc: Vec<String> = Vec::new();
+    for sql in &statements {
+        let stats = warehouse
+            .execute_statement_with_stats(sql)
+            .await
+            .map_err(|e| anyhow::Error::from(e).context(format!("model '{model_name}' failed")))?;
+        bytes_scanned_acc = accumulate_bytes(bytes_scanned_acc, stats.bytes_scanned);
+        bytes_written_acc = accumulate_bytes(bytes_written_acc, stats.bytes_written);
+        if let Some(jid) = stats.job_id {
+            job_ids_acc.push(jid);
+        }
+    }
+
+    Ok(MaterializationOutput {
+        asset_key: vec![
+            model_ir.target.catalog.clone(),
+            model_ir.target.schema.clone(),
+            model_ir.target.table.clone(),
+        ],
+        notes,
+        attempts: Vec::new(),
+        rows_copied: None,
+        duration_ms: model_start.elapsed().as_millis() as u64,
+        started_at: model_started_at,
+        metadata: MaterializationMetadata {
+            strategy: transformation_strategy_name(&model_ir.materialization).to_string(),
+            watermark: None,
+            target_table_full_name: Some(format!(
+                "{}.{}.{}",
+                model_ir.target.catalog, model_ir.target.schema, model_ir.target.table
+            )),
+            sql_hash: Some(crate::output::sql_fingerprint(&statements)),
+            column_count: exec_ctx.column_count_for(model_name),
+            compile_time_ms: exec_ctx.compile_time_ms_for(model_name),
+        },
+        partition: None,
+        cost_usd: None,
+        bytes_scanned: bytes_scanned_acc,
+        bytes_written: bytes_written_acc,
+        tenant: None,
+        job_ids: job_ids_acc,
+        skip_internal: None,
+        recipe_identity: Some(crate::output::recipe_identity_internal(
+            model_ir,
+            warehouse.dialect().name(),
+        )),
+        output_column_hashes: None,
         consumed_column_baseline: None,
     })
 }
@@ -15807,6 +15979,14 @@ async fn process_table(
                 anyhow::bail!(
                     "content_addressed strategy is not supported on replication tables — \
                      it only applies to transformation models"
+                );
+            }
+            MaterializationStrategy::Snapshot(_) => {
+                // A model snapshot historizes a model's SELECT; replication
+                // tables use the `snapshot` pipeline instead.
+                anyhow::bail!(
+                    "snapshot strategy is not supported on replication tables — \
+                     use a `type = \"snapshot\"` pipeline or a snapshot model"
                 );
             }
         }

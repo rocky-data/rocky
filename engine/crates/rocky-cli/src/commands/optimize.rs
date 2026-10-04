@@ -276,6 +276,7 @@ fn current_strategy_label(strategy: &StrategyConfig) -> String {
         StrategyConfig::ContentAddressed { .. } => "content_addressed".to_string(),
         StrategyConfig::MaterializedView => "materialized_view".to_string(),
         StrategyConfig::DynamicTable { .. } => "dynamic_table".to_string(),
+        StrategyConfig::Snapshot { .. } => "snapshot".to_string(),
     }
 }
 
