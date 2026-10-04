@@ -27,6 +27,7 @@ rocky compile [flags]
 | `--expand-macros` | `bool` | `false` | Expand macros from `macros/` and include the expanded SQL in the output. |
 | `--target-dialect <DIALECT>` | `dbx` \| `sf` \| `bq` \| `duckdb` | | Run the **P001 dialect-portability lint** against the chosen target. Non-portable constructs emit `error`-severity diagnostics. Precedence: flag > `[portability] target_dialect` in `rocky.toml` > unset. See [Portability linting](/concepts/linters/). |
 | `--with-seed` | `bool` | `false` | Execute `data/seed.sql` against an in-memory DuckDB and use its `information_schema` as the source-of-truth for raw source schemas. Turns leaf `.sql` models from `Unknown` columns into concrete types. Requires the `duckdb` feature (enabled by default in the shipped binary). |
+| `--dbt-project <DIR>` | `PathBuf` | | **Experimental.** Compile a dbt project in place (attach mode). See [Attach to a dbt project](#attach-to-a-dbt-project-experimental). Conflicts with `--models` and `--with-seed`. |
 
 ### Examples
 
@@ -187,6 +188,34 @@ rocky compile --with-seed
 ```
 
 `--with-seed` looks for `data/seed.sql` relative to the project root (one level up from `--models`). It opens an in-memory DuckDB, runs the seed, and feeds the resulting `information_schema.columns` back into the compiler so type inference gets concrete types instead of `RockyType::Unknown`. Bails if `data/seed.sql` is missing or fails to execute.
+
+#### Attach to a dbt project (experimental)
+
+:::caution
+`--dbt-project` is an experimental spike. Its behavior can change in any release.
+:::
+
+Compile a dbt project without migrating it:
+
+```bash
+dbt compile --full-refresh
+rocky compile --dbt-project path/to/dbt
+```
+
+Each run does these steps:
+
+```
+<DIR>/target/manifest.json ──▶ version check ──▶ import-dbt rules ──▶ temp dir ──▶ compile
+   (+ run_results.json)          (v12 only)       (in memory)         (removed)
+```
+
+- Rocky reads `<DIR>/target/manifest.json` and its sibling `run_results.json` on every run.
+- Rocky writes nothing under `<DIR>`. The translated project lives in a private temp directory. Rocky removes it when the command ends.
+- Rocky refuses the same models that `rocky import-dbt` refuses, with the same reason. The error names each model and its construct, and the command exits non-zero.
+- An incremental model needs a matching `run_results.json` from `dbt compile --full-refresh`. Without it, Rocky refuses the model and names that command.
+- Rocky accepts manifest schema `v12` (dbt 1.8 and later). It refuses any other `dbt_schema_version` by name.
+- `--config` is ignored. The adapter comes from `<DIR>/profiles.yml`, as in `rocky import-dbt`.
+- `--output json` prints the normal `rocky compile` JSON. Attach notes and warnings go to stderr. Diagnostic file paths point into the temp directory.
 
 ### Related Commands
 

@@ -1352,6 +1352,19 @@ enum Command {
         /// `@var(name)` with no value and no inline default is a compile error.
         #[arg(long = "var", value_name = "NAME=VALUE")]
         var: Vec<String>,
+
+        /// EXPERIMENTAL. Attach to a dbt project instead of reading Rocky
+        /// models: read `<DIR>/target/manifest.json` (and `run_results.json`)
+        /// on every invocation, translate it in memory with the
+        /// `rocky import-dbt` rules, and compile the result. Writes nothing
+        /// under `<DIR>`; ignores `--config`. Refuses what `import-dbt`
+        /// refuses.
+        #[arg(
+            long = "dbt-project",
+            value_name = "DIR",
+            conflicts_with_all = ["models", "with_seed"]
+        )]
+        dbt_project: Option<PathBuf>,
     },
 
     /// Publish a snapshot of this project's compiled IR for consumers to
@@ -4267,22 +4280,36 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             target_dialect,
             with_seed,
             var,
+            dbt_project,
         } => {
             let run_vars = rocky_core::run_vars::RunVars::parse_pairs(&var)
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
-            rocky_cli::commands::run_compile(
-                Some(cli.config.as_path()),
-                &state_path,
-                &models,
-                contracts.as_deref(),
-                model.as_deref(),
-                json,
-                expand_macros,
-                target_dialect.map(Into::into),
-                with_seed,
-                cli.cache_ttl,
-                &run_vars,
-            )
+            if let Some(dbt_project) = dbt_project {
+                rocky_cli::commands::run_compile_dbt_attach(
+                    &dbt_project,
+                    contracts.as_deref(),
+                    model.as_deref(),
+                    json,
+                    expand_macros,
+                    target_dialect.map(Into::into),
+                    cli.cache_ttl,
+                    &run_vars,
+                )
+            } else {
+                rocky_cli::commands::run_compile(
+                    Some(cli.config.as_path()),
+                    &state_path,
+                    &models,
+                    contracts.as_deref(),
+                    model.as_deref(),
+                    json,
+                    expand_macros,
+                    target_dialect.map(Into::into),
+                    with_seed,
+                    cli.cache_ttl,
+                    &run_vars,
+                )
+            }
         }
         Command::PublishIr {
             models,

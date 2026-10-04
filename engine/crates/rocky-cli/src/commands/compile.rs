@@ -65,6 +65,87 @@ pub fn run_compile(
     Ok(())
 }
 
+/// Execute `rocky compile --dbt-project <DIR>` (experimental "attach mode").
+///
+/// Reads `<DIR>/target/manifest.json` (and its sibling `run_results.json`)
+/// through the same importer `rocky import-dbt` uses, so it refuses the same
+/// constructs with the same reasons. The translated project is written to a
+/// private temp directory, compiled with [`run_compile`], and removed when
+/// this function returns. Nothing is written under `<DIR>`: the config, the
+/// models and the state path all point into the temp directory.
+///
+/// Attach notes (manifest read, warnings) go to stderr so `--output json`
+/// keeps the unchanged [`CompileOutput`] shape on stdout. Diagnostics name
+/// file paths inside the temp directory.
+#[allow(clippy::too_many_arguments)]
+pub fn run_compile_dbt_attach(
+    dbt_project: &Path,
+    contracts_dir: Option<&Path>,
+    model_filter: Option<&str>,
+    output_json: bool,
+    do_expand_macros: bool,
+    target_dialect: Option<Dialect>,
+    cache_ttl_override: Option<u64>,
+    run_vars: &rocky_core::run_vars::RunVars,
+) -> Result<()> {
+    use rocky_compiler::import::dbt_attach;
+    use rocky_compiler::import::emit::{self, EmitInputs, OverwritePolicy};
+
+    if !dbt_project.is_dir() {
+        anyhow::bail!("--dbt-project {} is not a directory", dbt_project.display());
+    }
+
+    let attached = dbt_attach::attach_dbt_project(dbt_project)?;
+
+    eprintln!(
+        "rocky compile (experimental dbt attach): read {} (manifest schema v{}), {} model(s)",
+        attached.manifest_path.display(),
+        attached.schema_version,
+        attached.import.imported.len()
+    );
+    if let Some(reason) = &attached.profile.fallback_reason {
+        eprintln!("  warning: <profiles.yml>: {reason}");
+    }
+    for w in &attached.import.warnings {
+        eprintln!("  warning: {}: {}", w.model, w.message);
+    }
+
+    // `TempDir` removes the directory on drop, including on every early
+    // return below. The project goes one level down so `emit_repo` sees a
+    // fresh, absent directory and never needs `ReplaceContents`.
+    let scratch = tempfile::Builder::new()
+        .prefix("rocky-dbt-attach-")
+        .tempdir()
+        .context("failed to create a temp directory for dbt attach mode")?;
+    let project_dir = scratch.path().join("project");
+
+    emit::emit_repo(&EmitInputs {
+        dbt_project_dir: dbt_project,
+        out_dir: &project_dir,
+        overwrite: OverwritePolicy::Reject,
+        profile: &attached.profile,
+        default_catalog: &attached.default_target.catalog,
+        default_schema: &attached.default_target.schema,
+        import: &attached.import,
+        adapter_override_label: None,
+    })
+    .map_err(|e| anyhow::anyhow!("dbt attach mode could not materialize the project: {e}"))?;
+
+    run_compile(
+        Some(&project_dir.join("rocky.toml")),
+        &scratch.path().join("state.redb"),
+        &project_dir.join("models"),
+        contracts_dir,
+        model_filter,
+        output_json,
+        do_expand_macros,
+        target_dialect,
+        false,
+        cache_ttl_override,
+        run_vars,
+    )
+}
+
 /// Compile body shared by the JSON core ([`compile_output`]) and the text
 /// renderer in [`run_compile`]. Returns the typed [`CompileOutput`] plus the
 /// extra raw data the text path needs ([`CompileTextData`]).
