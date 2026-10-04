@@ -55,6 +55,8 @@ use rocky_trino::{TrinoAdapter, TrinoAuth, TrinoClientConfig};
 
 use rocky_postgres::PostgresWarehouseAdapter;
 
+use rocky_clickhouse::ClickHouseWarehouseAdapter;
+
 /// Adapter type strings recognised by [`AdapterRegistry::from_config`].
 ///
 /// This is the **single source of truth** for "which adapter types does
@@ -71,6 +73,7 @@ pub const KNOWN_ADAPTER_TYPES: &[&str] = &[
     "trino",
     "postgres",
     "redshift",
+    "clickhouse",
     "fivetran",
     "airbyte",
     "iceberg",
@@ -95,6 +98,7 @@ pub fn warehouse_dialect_for_type(
         // and shapes, which those options do not change.
         "postgres" => Some(&POSTGRES_DIALECT),
         "redshift" => Some(&REDSHIFT_DIALECT),
+        "clickhouse" => Some(&rocky_clickhouse::dialect::ClickHouseDialect),
         _ => None,
     }
 }
@@ -140,6 +144,27 @@ pub(crate) fn postgres_config(
         )
     })?;
     Ok(cfg)
+}
+
+/// The ClickHouse connection settings an `[adapter]` block describes.
+/// Shared by the registry (which connects) and `rocky validate` (which only
+/// parses), so both read `[adapter.<name>.extra]` the same way.
+pub(crate) fn clickhouse_config(
+    name: &str,
+    adapter_cfg: &AdapterConfig,
+) -> Result<rocky_clickhouse::ChConfig> {
+    rocky_clickhouse::ChConfig::new(
+        adapter_cfg.host.as_deref(),
+        adapter_cfg.database.as_deref(),
+        adapter_cfg.username.as_deref(),
+        adapter_cfg
+            .password
+            .as_ref()
+            .map(rocky_core::redacted::RedactedString::expose),
+        Duration::from_secs(adapter_cfg.timeout_secs.unwrap_or(300)),
+    )
+    .and_then(|cfg| cfg.apply_extra(&adapter_cfg.extra))
+    .with_context(|| format!("adapters.{name}: invalid clickhouse configuration"))
 }
 
 /// `[adapter.<name>.extra] late_binding_views` (Redshift only).
@@ -620,6 +645,18 @@ impl AdapterRegistry {
                     let late_binding = redshift_late_binding_views(name, adapter_cfg)?;
                     let pg_cfg = postgres_config(name, adapter_cfg)?;
                     let adapter = PostgresWarehouseAdapter::from_config(pg_cfg, late_binding)
+                        .with_context(|| format!("adapters.{name}: failed to build adapter"))?;
+                    warehouse.insert(name.clone(), Arc::new(adapter) as Arc<dyn WarehouseAdapter>);
+                }
+                "clickhouse" => {
+                    // Shared slots: `host` (optionally `host:port`),
+                    // `database` (the session's default database, `default`
+                    // when unset), `username` (`default` when unset),
+                    // `password`, `timeout_secs`. `[adapter.<name>.extra]`
+                    // carries `port`, `secure` and `ca_cert`; unknown keys
+                    // are refused.
+                    let ch_cfg = clickhouse_config(name, adapter_cfg)?;
+                    let adapter = ClickHouseWarehouseAdapter::new(ch_cfg)
                         .with_context(|| format!("adapters.{name}: failed to build adapter"))?;
                     warehouse.insert(name.clone(), Arc::new(adapter) as Arc<dyn WarehouseAdapter>);
                 }

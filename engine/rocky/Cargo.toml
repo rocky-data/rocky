@@ -63,6 +63,9 @@ toml = { workspace = true }
 # `postgres_live_pipeline` seeds and reads back a live PostgreSQL through the
 # adapter (skipped unless ROCKY_POSTGRES_TEST_HOST is set).
 rocky-postgres = { path = "../crates/rocky-postgres" }
+# `clickhouse_live_pipeline` seeds and reads back a live ClickHouse through
+# the adapter (skipped unless ROCKY_CLICKHOUSE_TEST_HOST is set).
+rocky-clickhouse = { path = "../crates/rocky-clickhouse" }
 
 [lints]
 workspace = true

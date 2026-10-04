@@ -1059,6 +1059,30 @@ pub trait SqlDialect: Send + Sync {
         )))
     }
 
+    /// `CREATE TABLE … AS` carrying a model's `[clickhouse]` table attributes
+    /// (`ENGINE` / `PARTITION BY` / `ORDER BY`).
+    ///
+    /// `replace` has the same meaning as on
+    /// [`SqlDialect::create_table_as_with_redshift_options`].
+    ///
+    /// The default refuses: only the ClickHouse dialect has these
+    /// attributes, and silently dropping them would build a table with the
+    /// wrong sorting key. A model that sets `[clickhouse]` and targets
+    /// another warehouse fails at SQL generation with this message.
+    fn create_table_as_with_clickhouse_options(
+        &self,
+        _target: &str,
+        _select_sql: &str,
+        _options: &rocky_ir::ClickHouseTableOptions,
+        _replace: bool,
+    ) -> AdapterResult<String> {
+        Err(AdapterError::msg(format!(
+            "the model sets `[clickhouse]` table options (engine / order_by / partition_by), \
+             which only the clickhouse adapter applies; this model targets {}",
+            self.name()
+        )))
+    }
+
     /// INSERT INTO ... SELECT (incremental append).
     fn insert_into(&self, target: &str, select_sql: &str) -> String;
 
@@ -1348,6 +1372,16 @@ pub trait SqlDialect: Send + Sync {
     /// with the reason instead of emitting SQL the warehouse rejects.
     /// Default `None`: every dialect that predates the hook runs it.
     fn snapshot_unsupported_reason(&self) -> Option<&'static str> {
+        None
+    }
+
+    /// `Some(reason)` when this dialect has no upsert to render
+    /// [`SqlDialect::merge_into`] with: a `merge` model, and an `incremental`
+    /// model with a `unique_key`, cannot run on it. `rocky compile` reports
+    /// the reason (E053) when every configured warehouse refuses, and
+    /// `merge_into` refuses with it at SQL generation. Default `None`: every
+    /// dialect that predates the hook renders a MERGE.
+    fn merge_unsupported_reason(&self) -> Option<&'static str> {
         None
     }
 

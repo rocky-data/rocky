@@ -498,6 +498,12 @@ pub fn compile_project(
         &type_check.typed_models,
         &semantic_graph,
     );
+    // ClickHouse `[clickhouse]` table options (E053 / W053).
+    let clickhouse_diagnostics = crate::clickhouse_options::check_clickhouse_table_options(
+        &project.models,
+        &type_check.typed_models,
+        &semantic_graph,
+    );
 
     // 10. Merge all diagnostics.
     let mut diagnostics = type_check.diagnostics.clone();
@@ -508,6 +514,7 @@ pub fn compile_project(
     diagnostics.extend(model_freshness_diagnostics);
     diagnostics.extend(lakehouse_diagnostics);
     diagnostics.extend(redshift_diagnostics);
+    diagnostics.extend(clickhouse_diagnostics);
     diagnostics.extend(run_var_diagnostics);
     diagnostics.extend(target_collision_diagnostics(&project));
     // E041 / W041: direct references to columns absent from a source schema
@@ -784,6 +791,12 @@ pub fn compile_incremental(
         &type_check.typed_models,
         &semantic_graph,
     );
+    // ClickHouse `[clickhouse]` table options (E053 / W053).
+    let clickhouse_diagnostics = crate::clickhouse_options::check_clickhouse_table_options(
+        &project.models,
+        &type_check.typed_models,
+        &semantic_graph,
+    );
 
     let mut diagnostics = type_check.diagnostics.clone();
     diagnostics.extend(contract_diagnostics.iter().cloned());
@@ -793,6 +806,7 @@ pub fn compile_incremental(
     diagnostics.extend(model_freshness_diagnostics);
     diagnostics.extend(lakehouse_diagnostics);
     diagnostics.extend(redshift_diagnostics);
+    diagnostics.extend(clickhouse_diagnostics);
     diagnostics.extend(run_var_diagnostics);
     diagnostics.extend(target_collision_diagnostics(&project));
     // E041 / W041: direct references to columns absent from a source schema
@@ -946,8 +960,21 @@ pub fn default_type_mapper(warehouse_type: &str) -> RockyType {
         "TIMESTAMP" => RockyType::Timestamp,
         "TIMESTAMP_NTZ" => RockyType::TimestampNtz,
         "VARIANT" => RockyType::Variant,
+        // ClickHouse `DateTime64(p)`: an instant with sub-second precision.
+        // The ClickHouse adapter reports it with its precision so drift sees
+        // a precision change; every precision is a `Timestamp` here.
+        _ if is_clickhouse_datetime64(&upper) => RockyType::Timestamp,
         _ => decimal_family_type(&upper),
     }
+}
+
+/// `DATETIME64(p)` (upper-cased ClickHouse `DateTime64(p)`), `p` in 0..=9.
+fn is_clickhouse_datetime64(upper: &str) -> bool {
+    upper
+        .strip_prefix("DATETIME64(")
+        .and_then(|rest| rest.strip_suffix(')'))
+        .and_then(|p| p.trim().parse::<u8>().ok())
+        .is_some_and(|p| p <= 9)
 }
 
 /// The decimal family as this mapper reads it: `DECIMAL` and `NUMERIC`.
@@ -1642,6 +1669,9 @@ mod tests {
             }
         );
         assert_eq!(default_type_mapper("unknown_type"), RockyType::Unknown);
+        // ClickHouse `DateTime64(p)`, as the ClickHouse adapter reports it.
+        assert_eq!(default_type_mapper("DateTime64(6)"), RockyType::Timestamp);
+        assert_eq!(default_type_mapper("DateTime64(x)"), RockyType::Unknown);
     }
 
     /// The decimal family has a grammar here too (#1646). Until this change
