@@ -42,7 +42,7 @@
 //! on an unloadable config. There is no breaking-change gate on them to
 //! degrade — reviewing is purely the human sign-off.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -331,6 +331,7 @@ pub async fn compute_review_with_disclosure(
         approve,
         disclose,
         || Ok(()),
+        None,
     )
     .await
 }
@@ -348,6 +349,9 @@ async fn compute_review_with_disclosure_and_seam(
         &Option<Vec<BreakingFinding>>,
     ) -> Result<()>,
     after_drop_snapshot: impl FnOnce() -> Result<()>,
+    // The git repository the base compile reads. Production passes `None`
+    // (the process cwd); tests pass a scratch repository.
+    repo_dir: Option<&Path>,
 ) -> Result<ReviewOutput> {
     let plan = read_plan(root, plan_id)
         .with_context(|| format!("failed to read plan '{plan_id}' for review"))?;
@@ -421,8 +425,25 @@ async fn compute_review_with_disclosure_and_seam(
     // `?` here is the whole point of the change: a present-but-unloadable
     // `rocky.toml` propagates BEFORE the `--approve` branch below, so no marker
     // is written and no zero count is recorded.
-    let findings =
-        compute_review_findings(&resolved_config_path, &models_dir, state_path, base_ref)?;
+    //
+    // #2236: findings cover the set apply executes, not the whole directory.
+    // Run plans compile through the pipeline glob above, and a `--model` plan
+    // keeps only that model. A backfill compiles its whole persisted
+    // directory, as `execute_backfill_set` does, and keeps its rebuild closure.
+    let executed_models: Option<BTreeSet<String>> = if plan.kind == PlanKind::Backfill {
+        Some(run_plan.models.iter().cloned().collect())
+    } else {
+        run_plan.model.clone().map(|model| BTreeSet::from([model]))
+    };
+    let findings = compute_review_findings(
+        &resolved_config_path,
+        &models_dir,
+        models_glob.as_deref(),
+        executed_models.as_ref(),
+        state_path,
+        base_ref,
+        repo_dir,
+    )?;
     let breaking_count = findings
         .as_ref()
         .map(|f| f.iter().filter(|x| x.is_breaking()).count())
@@ -797,11 +818,18 @@ fn review_gate_paths(root: &Path, selected_dir: &Path) -> (PathBuf, PathBuf) {
 ///   breaking changes" — and `--approve` used to record that as a signed-off
 ///   zero. Refusing here is what keeps the marker's count honest, because the
 ///   caller propagates before any marker is written.
+///
+/// `models_glob` narrows both compiles to the files the run executor loads.
+/// `executed_models`, when set, keeps only findings on those models (by model
+/// name, on either side of the diff).
 fn compute_review_findings(
     config_path: &Path,
     models_dir: &Path,
+    models_glob: Option<&str>,
+    executed_models: Option<&BTreeSet<String>>,
     state_path: &Path,
     base_ref: &str,
+    repo_dir: Option<&Path>,
 ) -> Result<Option<Vec<BreakingFinding>>> {
     use rocky_compiler::compile::CompilerConfig;
 
@@ -846,7 +874,11 @@ fn compute_review_findings(
             source_schemas: source_schemas.clone(),
             ..Default::default()
         };
-        match rocky_compiler::compile::compile(&config) {
+        let compiled = match models_glob {
+            Some(glob) => rocky_compiler::compile::compile_matching(&config, glob),
+            None => rocky_compiler::compile::compile(&config),
+        };
+        match compiled {
             Ok(r) => r,
             Err(e) => {
                 tracing::warn!(
@@ -859,22 +891,40 @@ fn compute_review_findings(
         }
     };
 
-    let base_compile =
-        match super::ci_diff::extract_base_compile(base_ref, models_dir, source_schemas) {
-            Ok(r) => r,
-            Err(reason) => {
-                tracing::warn!(
-                    target: "rocky::review",
-                    reason = %reason,
-                    "base compile failed — breaking-change gate skipped"
-                );
-                return Ok(None);
-            }
-        };
+    let base_compile = match super::ci_diff::extract_base_compile_in(
+        base_ref,
+        models_dir,
+        source_schemas,
+        models_glob,
+        repo_dir,
+    ) {
+        Ok(r) => r,
+        Err(reason) => {
+            tracing::warn!(
+                target: "rocky::review",
+                reason = %reason,
+                "base compile failed — breaking-change gate skipped"
+            );
+            return Ok(None);
+        }
+    };
 
     let base_ir = super::ci_diff::project_ir_from_compile(&base_compile);
     let head_ir = super::ci_diff::project_ir_from_compile(&head_compile);
-    Ok(Some(breaking_change::diff_project_ir(&base_ir, &head_ir)))
+    let mut findings = breaking_change::diff_project_ir(&base_ir, &head_ir);
+    if let Some(names) = executed_models {
+        // Findings are keyed by target name. Map each executed model to its
+        // target on BOTH sides, so a removed or retargeted model still shows.
+        let targets: BTreeSet<String> = base_ir
+            .models
+            .iter()
+            .chain(head_ir.models.iter())
+            .filter(|model| names.contains(model.name.as_ref()))
+            .map(|model| model.target.full_name())
+            .collect();
+        findings.retain(|finding| targets.contains(finding.change.model()));
+    }
+    Ok(Some(findings))
 }
 
 /// Write the review marker to `<root>/.rocky/plans/<plan_id>.reviewed.json`.
@@ -1669,6 +1719,7 @@ mod tests {
                 std::fs::write(&sidecar, &saved_sidecar)?;
                 Ok(())
             },
+            None,
         )
         .await
         .expect_err("restoring the model after DROP capture must not approve it");
@@ -1924,6 +1975,163 @@ mod tests {
         assert_eq!(
             review.conditional_drops[0].drop_sql,
             "DROP TABLE IF EXISTS main.recovery"
+        );
+        Ok(())
+    }
+
+    /// Commit `files` as the base, then write `head` over the working tree.
+    fn git_project(
+        root: &Path,
+        config: &str,
+        base: &[(&str, &str)],
+        head: &[(&str, &str)],
+    ) -> anyhow::Result<()> {
+        let git = |args: &[&str]| -> anyhow::Result<()> {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .output()?;
+            anyhow::ensure!(out.status.success(), "git {args:?} failed: {out:?}");
+            Ok(())
+        };
+        std::fs::create_dir_all(root.join("models"))?;
+        std::fs::write(root.join("rocky.toml"), config)?;
+        for (path, body) in base {
+            std::fs::write(root.join(path), body)?;
+        }
+        git(&["init", "-q"])?;
+        git(&["add", "-A"])?;
+        git(&[
+            "-c",
+            "user.email=t@example.com",
+            "-c",
+            "user.name=t",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-q",
+            "-m",
+            "base",
+        ])?;
+        for (path, body) in head {
+            std::fs::write(root.join(path), body)?;
+        }
+        Ok(())
+    }
+
+    fn sidecar(name: &str) -> String {
+        format!(
+            "name = \"{name}\"\n[strategy]\ntype = \"full_refresh\"\n[target]\ncatalog = \"\"\nschema = \"main\"\ntable = \"{name}\"\n"
+        )
+    }
+
+    async fn dry_review(root: &Path, plan_id: &str) -> anyhow::Result<ReviewOutput> {
+        compute_review_with_disclosure_and_seam(
+            root,
+            Path::new("rocky.toml"),
+            Some(&root.join("state.redb")),
+            plan_id,
+            "HEAD",
+            false,
+            |_, _| Ok(()),
+            || Ok(()),
+            Some(root),
+        )
+        .await
+    }
+
+    fn finding_models(review: &ReviewOutput) -> BTreeSet<String> {
+        review
+            .breaking_changes
+            .as_ref()
+            .expect("the breaking-change gate must run")
+            .iter()
+            .filter(|finding| finding.is_breaking())
+            .map(|finding| finding.change.model().to_string())
+            .collect()
+    }
+
+    const GLOB_CONFIG_2236: &str = "[adapter.default]\ntype = \"duckdb\"\ndatabase = \":memory:\"\n\n\
+        [pipeline.p]\ntype = \"transformation\"\nmodels = \"models/a.sql\"\n\n\
+        [pipeline.p.target]\nadapter = \"default\"\n";
+
+    /// #2236: a run plan's findings compile the pipeline glob, the set apply
+    /// executes. Pre-fix, review compiled the whole directory: an invalid
+    /// model outside the glob failed the compile and the gate was skipped,
+    /// which hid the breaking change in the executed model.
+    #[tokio::test]
+    async fn run_plan_findings_use_the_executed_pipeline_glob() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path();
+        let a_toml = sidecar("a");
+        let b_toml = sidecar("b");
+        git_project(
+            root,
+            GLOB_CONFIG_2236,
+            &[
+                ("models/a.sql", "SELECT 1 AS id, 'x' AS name\n"),
+                ("models/a.toml", &a_toml),
+                ("models/b.sql", "SELECT 1 AS id\n"),
+                ("models/b.toml", &b_toml),
+            ],
+            &[
+                ("models/a.sql", "SELECT 1 AS id\n"),
+                ("models/b.sql", "SELECT id FROM\n"),
+            ],
+        )?;
+        let payload = serde_json::json!({"parallel": 1, "pipeline": "p", "models": []});
+        let plan_id = crate::plan_store::write_plan(root, PlanKind::AiAuthored, &payload)?;
+        let review = dry_review(root, &plan_id).await?;
+        assert_eq!(
+            finding_models(&review),
+            BTreeSet::from([".main.a".to_string()])
+        );
+        Ok(())
+    }
+
+    /// #2236: a backfill's findings come from its persisted directory and
+    /// keep only its rebuild closure; a `--model` run plan keeps only that
+    /// model. Pre-fix, both reported the breaking change in `b`, which the
+    /// apply does not execute.
+    #[tokio::test]
+    async fn backfill_and_model_findings_keep_only_the_executed_models() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path();
+        let a_toml = sidecar("a");
+        let b_toml = sidecar("b");
+        git_project(
+            root,
+            GLOB_CONFIG_2236,
+            &[
+                ("models/a.sql", "SELECT 1 AS id, 'x' AS name\n"),
+                ("models/a.toml", &a_toml),
+                ("models/b.sql", "SELECT 1 AS id, 'y' AS label\n"),
+                ("models/b.toml", &b_toml),
+            ],
+            &[
+                ("models/a.sql", "SELECT 1 AS id\n"),
+                ("models/b.sql", "SELECT 1 AS id\n"),
+            ],
+        )?;
+        // The pipeline glob names only `a`; a backfill must ignore it, so the
+        // closure `b` (outside the glob) still reports.
+        let backfill = crate::plan_store::write_plan(
+            root,
+            PlanKind::Backfill,
+            &serde_json::json!({"parallel": 1, "pipeline": "p", "models_dir": "models", "models": ["b"]}),
+        )?;
+        assert_eq!(
+            finding_models(&dry_review(root, &backfill).await?),
+            BTreeSet::from([".main.b".to_string()])
+        );
+        let model_run = crate::plan_store::write_plan(
+            root,
+            PlanKind::AiAuthored,
+            &serde_json::json!({"parallel": 1, "models_dir": "models", "model": "a", "models": ["a"]}),
+        )?;
+        assert_eq!(
+            finding_models(&dry_review(root, &model_run).await?),
+            BTreeSet::from([".main.a".to_string()])
         );
         Ok(())
     }
@@ -2718,13 +2926,23 @@ mod tests {
         // the base compile has no git repo to read.
         let (models_dir, state_path) = review_gate_paths(root, Path::new("models"));
         assert!(
-            compute_review_findings(&config_path, &models_dir, &state_path, "HEAD").is_ok(),
+            compute_review_findings(
+                &config_path,
+                &models_dir,
+                None,
+                None,
+                &state_path,
+                "HEAD",
+                None
+            )
+            .is_ok(),
             "an absent rocky.toml must skip the gate, never refuse it"
         );
         let broken = root.join("broken.toml");
         std::fs::write(&broken, BROKEN_CONFIG_1680)?;
         assert!(
-            compute_review_findings(&broken, &models_dir, &state_path, "HEAD").is_err(),
+            compute_review_findings(&broken, &models_dir, None, None, &state_path, "HEAD", None)
+                .is_err(),
             "a present-but-broken rocky.toml must refuse the gate"
         );
 
