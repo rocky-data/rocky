@@ -5543,9 +5543,20 @@ pub async fn run_with_explicit_contracts(
         std::collections::HashSet::new()
     };
 
+    // The whole plan, before a resume removes what its checkpoint copied.
+    // Owed checks on a target outside it retire (#2235).
+    let full_plan_targets: std::collections::HashSet<String> =
+        tables_to_process.iter().map(table_key).collect();
     let original_count = tables_to_process.len();
+    // Tables a resume skips. They are not copied again, but their checks run
+    // (#2235): the run that copied them stopped before its check phase.
+    let mut resumed_tasks: Vec<TableTask> = Vec::new();
     if !completed_keys.is_empty() {
-        tables_to_process.retain(|task| !completed_keys.contains(&table_key(task)));
+        let (skipped_tasks, remaining_tasks) = std::mem::take(&mut tables_to_process)
+            .into_iter()
+            .partition(|task| completed_keys.contains(&table_key(task)));
+        tables_to_process = remaining_tasks;
+        resumed_tasks = skipped_tasks;
         let skipped = original_count - tables_to_process.len();
         output.tables_skipped = skipped;
         info!(
@@ -5586,8 +5597,21 @@ pub async fn run_with_explicit_contracts(
     // prove completeness as a set rather than a count (#1674).
     let planned_table_keys: Vec<String> = tables_to_process.iter().map(table_key).collect();
     let planned_target_names = recovery_target_names(&tables_to_process);
-    let unrecorded_check_targets = state_store
-        .complete_recordless_check_targets(&resume_scope, &planned_target_names)?;
+    let OwedCheckPlan {
+        forced: unrecorded_check_targets,
+        retired_unchecked: owed_retired_unchecked,
+        warnings: owed_check_warnings,
+    } = plan_owed_checks(
+        &state_store,
+        &resume_scope,
+        pipeline_name,
+        pipeline,
+        rocky_cfg,
+        &planned_target_names,
+        &full_plan_targets,
+        &output.excluded_tables,
+    )?;
+    output.scheduling_warnings.extend(owed_check_warnings);
     let recovery_tables = if recovery_enabled {
         tables_to_process
             .iter()
@@ -6311,6 +6335,38 @@ pub async fn run_with_explicit_contracts(
             }
         }
 
+        // Every table this run copied, and every table a resume skipped, owes
+        // its post-copy checks: the check phase below never runs (#2235). The
+        // record-less rule cannot see them, because this exit writes a record.
+        // When the list cannot be written, the record is withheld instead, so
+        // the record-less rule still owes a complete copy's checks.
+        let owed_checks_tracked = {
+            let mut owed: Vec<String> = shared_state
+                .get_run_progress(&shared_run_id)
+                .ok()
+                .flatten()
+                .map(|p| {
+                    p.tables
+                        .iter()
+                        .filter(|t| t.status == rocky_core::state::TableStatus::Success)
+                        .map(|t| t.table_key.clone())
+                        .collect()
+                })
+                .unwrap_or_default();
+            owed.extend(resumed_tasks.iter().map(table_key));
+            match shared_state.mark_owed_check_targets(&shared_run_id, &owed) {
+                Ok(()) => true,
+                Err(e) => {
+                    tracing::error!(
+                        error = %e,
+                        "could not record the post-copy checks this interrupted run owes; \
+                         withholding its run record so recovery still owes them"
+                    );
+                    false
+                }
+            }
+        };
+
         // Stop the periodic uploader through the session — abort AND join
         // (RD-004), so no upload task is still mid-`put` while the interrupted
         // exit below runs. The session itself is abandoned (no terminal
@@ -6337,15 +6393,17 @@ pub async fn run_with_explicit_contracts(
         // above so `derive_run_status` picks the right variant.
         {
             let state = shared_state.as_ref();
-            persist_run_record(
-                Some(state),
-                &output,
-                &shared_run_id,
-                started_at,
-                &config_hash,
-                &audit,
-                Some(pipeline_name),
-            );
+            if owed_checks_tracked {
+                persist_run_record(
+                    Some(state),
+                    &output,
+                    &shared_run_id,
+                    started_at,
+                    &config_hash,
+                    &audit,
+                    Some(pipeline_name),
+                );
+            }
             finalize_idempotency(&mut idempotency_ctx, Some(state), &shared_run_id, &output).await;
         }
 
@@ -6607,6 +6665,25 @@ pub async fn run_with_explicit_contracts(
     // See the `_governance_span` note above — same reason.
     let _checks_span = info_span!("batched_checks");
     let checks_start = Instant::now();
+
+    // A resume skipped these tables because its checkpoint copied them. That
+    // run stopped before its check phase, so their checks run here, on the
+    // targets as they stand, without a second copy (#2235).
+    for task in &resumed_tasks {
+        collect_resumed_table_checks(
+            shared_warehouse.as_ref(),
+            task,
+            &mut CheckSinks {
+                pending_checks: &mut pending_checks,
+                source_batch_refs: &mut source_batch_refs,
+                target_batch_refs: &mut target_batch_refs,
+                freshness_batch_refs: &mut freshness_batch_refs,
+                batch_asset_keys: &mut batch_asset_keys,
+                assertion_targets: &mut assertion_targets,
+            },
+        )
+        .await;
+    }
 
     run_batched_checks(
         shared_warehouse.as_ref(),
@@ -7130,15 +7207,19 @@ pub async fn run_with_explicit_contracts(
         &audit,
         Some(pipeline_name),
     ));
+    // Owed post-copy checks retire per target, and only after this run's
+    // record exists (#2235): a target this run checked, or one
+    // `plan_owed_checks` retired without a check.
+    let retired_check_targets: std::collections::HashSet<String> = checked_targets
+        .union(&owed_retired_unchecked)
+        .cloned()
+        .collect();
     if record_custody == RecordCustody::Persisted
         && let Some(store) = state_store.as_ref()
-        && let Err(error) = store.supersede_complete_recordless_checkpoints(
-            &run_id,
-            &resume_scope,
-            &checked_targets,
-        )
+        && let Err(error) =
+            store.retire_owed_check_targets(&run_id, &resume_scope, &retired_check_targets)
     {
-        warn!(error = %error, "could not supersede a checked orphan checkpoint");
+        warn!(error = %error, "could not retire owed post-copy checks");
     }
 
     // Post-apply `verify_after` gate for any additive drift this run
@@ -15079,6 +15160,113 @@ async fn recovered_target_watermark(
     }))
 }
 
+/// What this run does about owed post-copy checks (#2235).
+struct OwedCheckPlan {
+    /// Planned targets that owe checks. Pruning is off for them, so they copy
+    /// and their checks run.
+    forced: std::collections::HashSet<String>,
+    /// Owed targets this run retires without checking them. Retired only
+    /// once this run's record is written.
+    retired_unchecked: std::collections::HashSet<String>,
+    /// One line per target retired because no current plan names it.
+    warnings: Vec<String>,
+}
+
+/// Decide what this run does about owed post-copy checks (#2235).
+///
+/// An owed target never refuses a run. The retirement rule:
+///
+/// - A planned target owes checks: this run copies it and runs its checks.
+///   The record then retires it (see `retire_owed_check_targets`).
+/// - The pipeline defines no post-copy check: a planned owed target retires
+///   without a forced copy, because no check exists to run.
+/// - No current plan names the target (the table was removed, or the pipeline
+///   was renamed away): it retires with a warning. Only an unfiltered,
+///   unshadowed run that excluded no table for a missing source can say this.
+///   An entry from another pipeline that is still configured is left for
+///   that pipeline.
+#[allow(clippy::too_many_arguments)]
+fn plan_owed_checks(
+    state: &StateStore,
+    scope: &ResumeScope,
+    pipeline_name: &str,
+    pipeline: &rocky_core::config::ReplicationPipelineConfig,
+    rocky_cfg: &rocky_core::config::RockyConfig,
+    planned: &std::collections::HashSet<String>,
+    full_plan: &std::collections::HashSet<String>,
+    excluded: &[ExcludedTableOutput],
+) -> Result<OwedCheckPlan> {
+    let owed_planned = state.owed_check_targets(scope, planned)?;
+    let mut plan = if pipeline_defines_no_checks(&pipeline.checks) {
+        OwedCheckPlan {
+            forced: std::collections::HashSet::new(),
+            retired_unchecked: owed_planned,
+            warnings: Vec::new(),
+        }
+    } else {
+        OwedCheckPlan {
+            forced: owed_planned,
+            retired_unchecked: std::collections::HashSet::new(),
+            warnings: Vec::new(),
+        }
+    };
+    let whole_plan = scope.filter.is_none()
+        && scope
+            .target
+            .as_ref()
+            .is_some_and(|target| target.shadow.is_none())
+        && !excluded
+            .iter()
+            .any(|table| table.reason == "missing_from_source");
+    if !whole_plan {
+        return Ok(plan);
+    }
+    for entry in state.owed_check_entries(scope)? {
+        if entry.pipeline != pipeline_name && rocky_cfg.pipelines.contains_key(&entry.pipeline) {
+            continue;
+        }
+        for target in entry.targets {
+            if full_plan.contains(&target) || !plan.retired_unchecked.insert(target.clone()) {
+                continue;
+            }
+            plan.warnings.push(format!(
+                "post-copy checks owed by run '{}' (pipeline '{}') on '{target}' are retired \
+                 unchecked: no current plan of this pipeline names that target",
+                entry.run_id, entry.pipeline
+            ));
+        }
+    }
+    Ok(plan)
+}
+
+/// Whether the pipeline defines no post-copy check at all (#2235).
+///
+/// Destructured without `..`: a new check kind stops compiling here until it
+/// says whether it counts. `enabled` is not a gate on the replication path.
+fn pipeline_defines_no_checks(checks: &rocky_core::config::ChecksConfig) -> bool {
+    let rocky_core::config::ChecksConfig {
+        enabled: _,
+        row_count,
+        column_match,
+        freshness,
+        null_rate,
+        custom,
+        cross_source_overlap,
+        assertions,
+        quarantine,
+        anomaly_threshold_pct: _,
+        fail_on_error: _,
+    } = checks;
+    !row_count.enabled()
+        && !column_match.enabled()
+        && freshness.is_none()
+        && null_rate.is_none()
+        && custom.is_empty()
+        && cross_source_overlap.is_none()
+        && assertions.is_empty()
+        && quarantine.is_none()
+}
+
 /// Full `catalog.schema.table` names of every target this run plans to write
 /// or prune. Recovery uses these to detect even partial overlap with older
 /// unconfirmed intent.
@@ -15942,62 +16130,13 @@ async fn process_table(
     // `source_cols` nor `target_cols` is touched: `target_exists`, drift
     // detection, the pre-drop decision and merge-column resolution all have to
     // keep reading the pre-copy state.
-    let mut probe_rate_limited = false;
-    let column_match_check = if let Some(column_match_severity) = task.column_match {
-        let (source_probe, target_probe) = tokio::join!(
-            probe_columns_after_copy(warehouse, &source_table),
-            probe_columns_after_copy(warehouse, &target_table),
-        );
-        let (mut check, rate_limited) = post_copy_column_match(
-            &source_table,
-            &target_table,
-            source_probe,
-            target_probe,
-            &task.column_match_exclude,
-        );
-        // The configured severity, not `check_column_match`'s hard-coded
-        // `Error` (#1666) — and only for a check that RAN (#1871). A column
-        // probe that failed is `column_match_not_evaluated`, which chooses
-        // `Error`; downgrading that to the configured `warning` cleared the
-        // gate on a run that had compared nothing.
-        if check.not_evaluated.is_none() {
-            check.severity = column_match_severity;
-        }
-        probe_rate_limited = rate_limited;
-        Some(check)
-    } else {
-        None
-    };
-
-    let source_batch_ref = if task.check_row_count {
-        Some(TableRef {
-            catalog: source_table.catalog.clone(),
-            schema: source_table.schema.clone(),
-            table: source_table.table.clone(),
-        })
-    } else {
-        None
-    };
-
-    let target_batch_ref = if task.check_row_count {
-        Some(TableRef {
-            catalog: target_table.catalog.clone(),
-            schema: target_table.schema.clone(),
-            table: target_table.table.clone(),
-        })
-    } else {
-        None
-    };
-
-    let freshness_batch_ref = if task.check_freshness {
-        Some(TableRef {
-            catalog: target_table.catalog.clone(),
-            schema: target_table.schema.clone(),
-            table: target_table.table.clone(),
-        })
-    } else {
-        None
-    };
+    let PostCopyCheckInputs {
+        column_match_check,
+        probe_rate_limited,
+        source_batch_ref,
+        target_batch_ref,
+        freshness_batch_ref,
+    } = post_copy_check_inputs(warehouse, task, &source_table, &target_table).await;
 
     let target_table_full_name = table_key(task);
 
@@ -16088,6 +16227,92 @@ async fn process_table(
         deferred_tags,
         deferred_watermark,
     })))
+}
+
+/// The check inputs one replication target contributes after its copy.
+struct PostCopyCheckInputs {
+    column_match_check: Option<rocky_core::checks::CheckResult>,
+    probe_rate_limited: bool,
+    source_batch_ref: Option<TableRef>,
+    target_batch_ref: Option<TableRef>,
+    freshness_batch_ref: Option<TableRef>,
+}
+
+/// Build the post-copy check inputs for `task`.
+///
+/// Shared by a copied table and by a table a resume skipped because its
+/// checkpoint already copied it (#2235). The second case reads the target as
+/// it stands, so both run the same checks.
+async fn post_copy_check_inputs(
+    warehouse: &dyn WarehouseAdapter,
+    task: &TableTask,
+    source_table: &TableRef,
+    target_table: &TableRef,
+) -> PostCopyCheckInputs {
+    let mut probe_rate_limited = false;
+    let column_match_check = if let Some(column_match_severity) = task.column_match {
+        let (source_probe, target_probe) = tokio::join!(
+            probe_columns_after_copy(warehouse, source_table),
+            probe_columns_after_copy(warehouse, target_table),
+        );
+        let (mut check, rate_limited) = post_copy_column_match(
+            source_table,
+            target_table,
+            source_probe,
+            target_probe,
+            &task.column_match_exclude,
+        );
+        // The configured severity, not `check_column_match`'s hard-coded
+        // `Error` (#1666) — and only for a check that RAN (#1871). A column
+        // probe that failed is `column_match_not_evaluated`, which chooses
+        // `Error`; downgrading that to the configured `warning` cleared the
+        // gate on a run that had compared nothing.
+        if check.not_evaluated.is_none() {
+            check.severity = column_match_severity;
+        }
+        probe_rate_limited = rate_limited;
+        Some(check)
+    } else {
+        None
+    };
+
+    let source_batch_ref = if task.check_row_count {
+        Some(TableRef {
+            catalog: source_table.catalog.clone(),
+            schema: source_table.schema.clone(),
+            table: source_table.table.clone(),
+        })
+    } else {
+        None
+    };
+
+    let target_batch_ref = if task.check_row_count {
+        Some(TableRef {
+            catalog: target_table.catalog.clone(),
+            schema: target_table.schema.clone(),
+            table: target_table.table.clone(),
+        })
+    } else {
+        None
+    };
+
+    let freshness_batch_ref = if task.check_freshness {
+        Some(TableRef {
+            catalog: target_table.catalog.clone(),
+            schema: target_table.schema.clone(),
+            table: target_table.table.clone(),
+        })
+    } else {
+        None
+    };
+
+    PostCopyCheckInputs {
+        column_match_check,
+        probe_rate_limited,
+        source_batch_ref,
+        target_batch_ref,
+        freshness_batch_ref,
+    }
 }
 
 /// Adjusts the semaphore capacity to match the throttle's current recommendation.
@@ -16301,33 +16526,26 @@ async fn collect_materialized_table(
         sinks.output.drift.actions_taken.push(drift_action);
     }
 
-    if let Some(check) = column_match_check {
-        let entry = sinks
-            .pending_checks
-            .entry(target_full_name.clone())
-            .or_insert_with(|| PendingCheck {
-                asset_key: asset_key.clone(),
-                checks: Vec::new(),
-            });
-        entry.checks.push(check);
-    }
-
-    if let Some(src_ref) = source_batch_ref {
-        sinks.source_batch_refs.push(src_ref);
-    }
-    if let Some(tgt_ref) = target_batch_ref {
-        sinks.target_batch_refs.push(tgt_ref);
-    }
-    sinks
-        .batch_asset_keys
-        .push((target_full_name.clone(), asset_key.clone()));
-    sinks
-        .assertion_targets
-        .push((target_ref, asset_key.clone()));
-
-    if let Some(fresh_ref) = freshness_batch_ref {
-        sinks.freshness_batch_refs.push(fresh_ref);
-    }
+    feed_check_inputs(
+        &mut CheckSinks {
+            pending_checks: sinks.pending_checks,
+            source_batch_refs: sinks.source_batch_refs,
+            target_batch_refs: sinks.target_batch_refs,
+            freshness_batch_refs: sinks.freshness_batch_refs,
+            batch_asset_keys: sinks.batch_asset_keys,
+            assertion_targets: sinks.assertion_targets,
+        },
+        &target_full_name,
+        &asset_key,
+        PostCopyCheckInputs {
+            column_match_check,
+            probe_rate_limited,
+            source_batch_ref,
+            target_batch_ref,
+            freshness_batch_ref,
+        },
+        target_ref,
+    );
 
     if let Some(tags) = deferred_tags {
         sinks.deferred_tags.push(tags);
@@ -16351,6 +16569,81 @@ async fn collect_materialized_table(
         },
     )
     .await;
+}
+
+/// The run-level check inputs a resume-skipped table feeds (#2235).
+struct CheckSinks<'a> {
+    pending_checks: &'a mut HashMap<String, PendingCheck>,
+    source_batch_refs: &'a mut Vec<TableRef>,
+    target_batch_refs: &'a mut Vec<TableRef>,
+    freshness_batch_refs: &'a mut Vec<TableRef>,
+    batch_asset_keys: &'a mut Vec<(String, Vec<String>)>,
+    assertion_targets: &'a mut Vec<(TableRef, Vec<String>)>,
+}
+
+/// Feed the checks of a table a resume skipped (#2235).
+///
+/// The resumed checkpoint copied this table, so the resume does not copy it
+/// again. The run that copied it stopped before its check phase, so its
+/// checks are still owed. They run on the target as it stands, from the same
+/// inputs [`collect_materialized_table`] takes from a copied table. Nothing
+/// else is recorded: no materialization, watermark or checkpoint row.
+async fn collect_resumed_table_checks(
+    warehouse: &dyn WarehouseAdapter,
+    task: &TableTask,
+    sinks: &mut CheckSinks<'_>,
+) {
+    let (source_table, target_table) = copy_endpoints(task);
+    let inputs = post_copy_check_inputs(warehouse, task, &source_table, &target_table).await;
+    let mut asset_key = task.asset_key_prefix.clone();
+    asset_key.push(task.target_table_name.clone());
+    feed_check_inputs(sinks, &table_key(task), &asset_key, inputs, target_table);
+}
+
+/// Push one target's check inputs into the run-level sinks.
+///
+/// The ONE place `assertion_targets` is pushed (#1718), shared by a copied
+/// table and a resume-skipped table (#2235).
+fn feed_check_inputs(
+    sinks: &mut CheckSinks<'_>,
+    target_full_name: &str,
+    asset_key: &[String],
+    inputs: PostCopyCheckInputs,
+    target_ref: TableRef,
+) {
+    let PostCopyCheckInputs {
+        column_match_check,
+        probe_rate_limited: _,
+        source_batch_ref,
+        target_batch_ref,
+        freshness_batch_ref,
+    } = inputs;
+    if let Some(check) = column_match_check {
+        sinks
+            .pending_checks
+            .entry(target_full_name.to_string())
+            .or_insert_with(|| PendingCheck {
+                asset_key: asset_key.to_vec(),
+                checks: Vec::new(),
+            })
+            .checks
+            .push(check);
+    }
+    if let Some(src_ref) = source_batch_ref {
+        sinks.source_batch_refs.push(src_ref);
+    }
+    if let Some(tgt_ref) = target_batch_ref {
+        sinks.target_batch_refs.push(tgt_ref);
+    }
+    sinks
+        .batch_asset_keys
+        .push((target_full_name.to_string(), asset_key.to_vec()));
+    sinks
+        .assertion_targets
+        .push((target_ref, asset_key.to_vec()));
+    if let Some(fresh_ref) = freshness_batch_ref {
+        sinks.freshness_batch_refs.push(fresh_ref);
+    }
 }
 
 /// Processes a single completed task result during the spawn loop's inline
@@ -18682,6 +18975,7 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
                 watermarks_confirmed: false,
                 watermark_recovery_tables: None,
                 superseded: false,
+                owed_check_targets: None,
             }
         };
 
@@ -44126,6 +44420,7 @@ timestamp_column = "ts"
                         watermarks_confirmed: false,
                         watermark_recovery_tables: None,
                         superseded: false,
+                        owed_check_targets: None,
                     },
                 )
                 .unwrap();
@@ -44662,12 +44957,7 @@ timestamp_column = "ts"
         ));
         let target = selected;
         let planned = [target.clone()].into_iter().collect();
-        assert_eq!(
-            state
-                .complete_recordless_check_targets(&scope, &planned)
-                .unwrap(),
-            planned
-        );
+        assert_eq!(state.owed_check_targets(&scope, &planned).unwrap(), planned);
         let TableOutcome::Materialized(result) = process_table_with_replacement_recovery(
             &StableMarker(&warehouse),
             &state,
@@ -44676,7 +44966,7 @@ timestamp_column = "ts"
             true,
             false,
             state
-                .complete_recordless_check_targets(&scope, &planned)
+                .owed_check_targets(&scope, &planned)
                 .unwrap()
                 .contains(&target),
         )
@@ -44721,14 +45011,21 @@ timestamp_column = "ts"
         state.record_run(&fresh_record).unwrap();
         assert!(!state.get_run("fresh").unwrap().unwrap().check_outcomes[0].passed);
         state
-            .supersede_complete_recordless_checkpoints("fresh", &scope, &planned)
+            .retire_owed_check_targets("fresh", &scope, &planned)
             .unwrap();
+        // Per target (#2235): the checked target retires, the other still owes.
         assert!(!state.get_run_progress("crash").unwrap().unwrap().superseded);
-        assert_eq!(
+        assert!(
             state
-                .complete_recordless_check_targets(&scope, &planned)
-                .unwrap(),
-            planned
+                .owed_check_targets(&scope, &planned)
+                .unwrap()
+                .is_empty()
+        );
+        let both: std::collections::HashSet<String> =
+            [target.clone(), other_key.clone()].into_iter().collect();
+        assert_eq!(
+            state.owed_check_targets(&scope, &both).unwrap(),
+            [other_key.clone()].into_iter().collect()
         );
         for next in [&task, &other] {
             let TableOutcome::Materialized(_) = process_table_with_replacement_recovery(
@@ -44765,12 +45062,12 @@ timestamp_column = "ts"
         seed_run_record(&state, "full", "PartialFailure");
         let full_plan = [target.clone(), other_key].into_iter().collect();
         state
-            .supersede_complete_recordless_checkpoints("full", &scope, &full_plan)
+            .retire_owed_check_targets("full", &scope, &full_plan)
             .unwrap();
         assert!(state.get_run_progress("crash").unwrap().unwrap().superseded);
         assert!(
             state
-                .complete_recordless_check_targets(&scope, &planned)
+                .owed_check_targets(&scope, &planned)
                 .unwrap()
                 .is_empty()
         );
@@ -45277,5 +45574,366 @@ timestamp_column = "ts"
                 Utc.with_ymd_and_hms(2026, 3, 2, 12, 0, 0).unwrap()
             );
         }
+    }
+
+    // ----- #2235: owed post-copy checks -----
+
+    /// Interrupt `rep` right after its copy loop, before the check phase.
+    /// Returns the config, the state path, the run's scope and its targets.
+    #[cfg(feature = "duckdb")]
+    async fn owed_checks_after_interrupt(
+        dir: &std::path::Path,
+        run_id: &str,
+    ) -> (
+        std::path::PathBuf,
+        std::path::PathBuf,
+        ResumeScope,
+        std::collections::HashSet<String>,
+    ) {
+        let config = write_many_table_project(dir, 2, Some(1)).await;
+        let state_path = dir.join("state.redb");
+        super::INTERRUPT_AFTER_COPY_FOR_TEST
+            .lock()
+            .unwrap()
+            .insert(run_id.to_string());
+        let error = checkpoint_ordering_run(&config, &state_path, run_id, false)
+            .await
+            .unwrap_err();
+        assert!(error.is::<super::Interrupted>(), "{error:#}");
+        let store = StateStore::open(&state_path).unwrap();
+        assert_eq!(
+            store.get_run(run_id).unwrap().unwrap().status,
+            rocky_core::state::RunStatus::PartialFailure,
+            "the interrupted exit writes a record, so the record-less rule is blind"
+        );
+        let progress = store.get_run_progress(run_id).unwrap().unwrap();
+        let scope = progress.scope.clone().unwrap();
+        let targets: std::collections::HashSet<String> = progress
+            .planned_tables
+            .clone()
+            .unwrap()
+            .into_iter()
+            .collect();
+        assert_eq!(targets.len(), 2);
+        (config, state_path, scope, targets)
+    }
+
+    /// The records of the latest run `pipeline` wrote.
+    #[cfg(feature = "duckdb")]
+    fn latest_record(state_path: &std::path::Path) -> rocky_core::state::RunRecord {
+        let store = StateStore::open(state_path).unwrap();
+        let run_id = store.get_latest_run_progress().unwrap().unwrap().run_id;
+        store.get_run(&run_id).unwrap().unwrap()
+    }
+
+    #[cfg(feature = "duckdb")]
+    fn not_null_outcomes(record: &rocky_core::state::RunRecord) -> usize {
+        record
+            .check_outcomes
+            .iter()
+            .filter(|c| c.name == "not_null:id")
+            .count()
+    }
+
+    /// #2235 path 1. A signal after the last copy wrote a `PartialFailure`
+    /// record before the checks ran. Before the fix nothing owed those checks,
+    /// so a later run could prune both tables and never check them. Now the
+    /// interrupted run owes them, the next run checks both, and they retire.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn interrupt_after_the_last_copy_owes_the_checks_until_a_run_checks_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let (config, state_path, scope, targets) =
+            owed_checks_after_interrupt(dir.path(), "stopped-2235").await;
+        {
+            let store = StateStore::open(&state_path).unwrap();
+            assert_eq!(
+                store.owed_check_targets(&scope, &targets).unwrap(),
+                targets,
+                "both copied targets owe their checks, so pruning is off for them"
+            );
+        }
+        let (result, record) = drive_run_for_record(&config, &state_path, "fresh-2235").await;
+        result.unwrap();
+        assert_eq!(record.status, rocky_core::state::RunStatus::Success);
+        assert_eq!(not_null_outcomes(&record), 2, "{:?}", record.check_outcomes);
+        let store = StateStore::open(&state_path).unwrap();
+        assert!(
+            store
+                .owed_check_targets(&scope, &targets)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
+                .get_run_progress("stopped-2235")
+                .unwrap()
+                .unwrap()
+                .superseded
+        );
+    }
+
+    /// #2235 path 2. The checkpoint copied `t00`; `t01` is unfinished. The
+    /// resume skips `t00`. Before the fix it built check inputs only for
+    /// `t01`, so `t00`'s failing assertion never ran and the resume recorded
+    /// `Success`. Now `t00` is checked where it stands, without a copy.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resume_runs_the_checks_of_tables_its_checkpoint_already_copied() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = write_many_table_project(dir.path(), 2, Some(1)).await;
+        let state_path = dir.path().join("state.redb");
+        let (result, _) = drive_run_for_record(&config, &state_path, "first-2235").await;
+        result.unwrap();
+        {
+            let store = StateStore::open(&state_path).unwrap();
+            store
+                .record_table_progress(
+                    "first-2235",
+                    &table_entry(
+                        1,
+                        "warehouse.staging__acme.t01",
+                        rocky_core::state::TableStatus::Failed,
+                    ),
+                )
+                .unwrap();
+            seed_run_record(&store, "first-2235", "PartialFailure");
+        }
+        let warehouse = rocky_duckdb::adapter::DuckDbWarehouseAdapter::open(
+            &dir.path().join("warehouse.duckdb"),
+        )
+        .unwrap();
+        warehouse
+            .execute_statement("INSERT INTO staging__acme.t00 VALUES (NULL)")
+            .await
+            .unwrap();
+        drop(warehouse);
+
+        let _ = drive_resume_test_run(&config, &state_path, "rep", None, true).await;
+        let record = latest_record(&state_path);
+        assert_ne!(record.run_id, "first-2235");
+        assert_eq!(
+            not_null_outcomes(&record),
+            2,
+            "the skipped table's assertion runs too: {:?}",
+            record.check_outcomes
+        );
+        assert!(
+            record
+                .check_outcomes
+                .iter()
+                .any(|c| c.name == "not_null:id" && !c.passed),
+            "the NULL in the skipped target fails its check: {:?}",
+            record.check_outcomes
+        );
+        assert_ne!(record.status, rocky_core::state::RunStatus::Success);
+        let warehouse = rocky_duckdb::adapter::DuckDbWarehouseAdapter::open(
+            &dir.path().join("warehouse.duckdb"),
+        )
+        .unwrap();
+        assert_eq!(
+            warehouse
+                .execute_query("SELECT COUNT(*) FROM staging__acme.t00")
+                .await
+                .unwrap()
+                .rows[0][0],
+            serde_json::json!("2"),
+            "the skipped table is checked as it stands, not copied again"
+        );
+    }
+
+    /// #2235 path 3 and a healthy rename. The pipeline is renamed and plans
+    /// only `t00` of the two owed targets. `t00` is checked and retires;
+    /// `t01` has no current plan and retires with a warning. The run is not
+    /// blocked.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn renamed_pipeline_with_partial_overlap_checks_its_share_and_is_not_blocked() {
+        let dir = tempfile::tempdir().unwrap();
+        let (config, state_path, scope, targets) =
+            owed_checks_after_interrupt(dir.path(), "stopped-rename").await;
+        let raw = std::fs::read_to_string(&config).unwrap();
+        let renamed = raw
+            .replace("[pipeline.rep]", "[pipeline.rep2]")
+            .replace("[pipeline.rep.", "[pipeline.rep2.")
+            + "\n[[pipeline.rep2.table_overrides]]\nenabled = false\n[pipeline.rep2.table_overrides.match]\ntable = \"t01\"\n";
+        std::fs::write(&config, renamed).unwrap();
+
+        let loaded = rocky_core::config::load_rocky_config_fingerprinted(&config).unwrap();
+        let rocky_cfg = &loaded.config;
+        let pipeline = rocky_cfg.pipelines["rep2"].as_replication().unwrap();
+        let mut renamed_scope = scope.clone();
+        renamed_scope.pipeline = "rep2".into();
+        let t00: std::collections::HashSet<String> = ["warehouse.staging__acme.t00".to_string()]
+            .into_iter()
+            .collect();
+        {
+            let store = StateStore::open(&state_path).unwrap();
+            let plan = plan_owed_checks(
+                &store,
+                &renamed_scope,
+                "rep2",
+                pipeline,
+                rocky_cfg,
+                &t00,
+                &t00,
+                &[],
+            )
+            .unwrap();
+            assert_eq!(plan.forced, t00, "the shared target owes its checks");
+            assert_eq!(
+                plan.retired_unchecked,
+                ["warehouse.staging__acme.t01".to_string()]
+                    .into_iter()
+                    .collect(),
+                "the target no current plan names retires"
+            );
+            assert_eq!(plan.warnings.len(), 1);
+            assert!(
+                plan.warnings[0].contains("stopped-rename"),
+                "{:?}",
+                plan.warnings
+            );
+
+            // The retirement rule never fires on a plan that cannot see the
+            // whole pipeline: a filter, a shadow run, a missing source.
+            let mut filtered = renamed_scope.clone();
+            filtered.filter = Some("table=t00".into());
+            let mut shadowed = renamed_scope.clone();
+            shadowed.target.as_mut().unwrap().shadow =
+                Some(rocky_core::state::ResumeShadow::Suffix("_shadow".into()));
+            for (scope, excluded) in [
+                (&filtered, Vec::new()),
+                (&shadowed, Vec::new()),
+                (
+                    &renamed_scope,
+                    vec![ExcludedTableOutput {
+                        asset_key: vec!["t01".into()],
+                        source_schema: "raw__acme".into(),
+                        table_name: "t01".into(),
+                        reason: "missing_from_source".into(),
+                    }],
+                ),
+            ] {
+                let plan = plan_owed_checks(
+                    &store, scope, "rep2", pipeline, rocky_cfg, &t00, &t00, &excluded,
+                )
+                .unwrap();
+                assert_eq!(plan.forced, t00);
+                assert!(plan.retired_unchecked.is_empty(), "{scope:?}");
+                assert!(plan.warnings.is_empty());
+            }
+            // An owing pipeline that is still configured keeps its entry.
+            let mut both_cfg = rocky_cfg.clone();
+            both_cfg
+                .pipelines
+                .insert("rep".into(), rocky_cfg.pipelines["rep2"].clone());
+            let plan = plan_owed_checks(
+                &store,
+                &renamed_scope,
+                "rep2",
+                pipeline,
+                &both_cfg,
+                &t00,
+                &t00,
+                &[],
+            )
+            .unwrap();
+            assert!(plan.retired_unchecked.is_empty());
+        }
+
+        let _ = drive_resume_test_run(&config, &state_path, "rep2", None, false).await;
+        let record = latest_record(&state_path);
+        assert_eq!(
+            record.status,
+            rocky_core::state::RunStatus::Success,
+            "{record:?}"
+        );
+        assert_eq!(not_null_outcomes(&record), 1);
+        let store = StateStore::open(&state_path).unwrap();
+        assert!(
+            store
+                .owed_check_targets(&scope, &targets)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
+                .get_run_progress("stopped-rename")
+                .unwrap()
+                .unwrap()
+                .superseded
+        );
+    }
+
+    /// #2235 healthy runs: owed checks never block a run after the config
+    /// drops every check, or when the owed target is empty.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn owed_checks_never_block_after_removed_checks_or_on_an_empty_target() {
+        // Removed checks: the planned owed targets retire with no check.
+        let dir = tempfile::tempdir().unwrap();
+        let (config, state_path, scope, targets) =
+            owed_checks_after_interrupt(dir.path(), "stopped-nochecks").await;
+        let raw = std::fs::read_to_string(&config).unwrap();
+        let cut = raw.find("\n[[pipeline.rep.checks.assertions]]").unwrap();
+        std::fs::write(&config, &raw[..cut]).unwrap();
+        {
+            let loaded = rocky_core::config::load_rocky_config_fingerprinted(&config).unwrap();
+            let pipeline = loaded.config.pipelines["rep"].as_replication().unwrap();
+            assert!(pipeline_defines_no_checks(&pipeline.checks));
+            let store = StateStore::open(&state_path).unwrap();
+            let plan = plan_owed_checks(
+                &store,
+                &scope,
+                "rep",
+                pipeline,
+                &loaded.config,
+                &targets,
+                &targets,
+                &[],
+            )
+            .unwrap();
+            assert!(plan.forced.is_empty(), "no check exists to force");
+            assert_eq!(plan.retired_unchecked, targets);
+        }
+        let (result, record) = drive_run_for_record(&config, &state_path, "nochecks-2235").await;
+        result.unwrap();
+        assert_eq!(record.status, rocky_core::state::RunStatus::Success);
+        let store = StateStore::open(&state_path).unwrap();
+        assert!(
+            store
+                .owed_check_targets(&scope, &targets)
+                .unwrap()
+                .is_empty()
+        );
+        drop(store);
+
+        // Empty target: the forced copy and check run on zero rows.
+        let dir = tempfile::tempdir().unwrap();
+        let (config, state_path, scope, targets) =
+            owed_checks_after_interrupt(dir.path(), "stopped-empty").await;
+        let warehouse = rocky_duckdb::adapter::DuckDbWarehouseAdapter::open(
+            &dir.path().join("warehouse.duckdb"),
+        )
+        .unwrap();
+        for table in ["raw__acme.t00", "raw__acme.t01"] {
+            warehouse
+                .execute_statement(&format!("DELETE FROM {table}"))
+                .await
+                .unwrap();
+        }
+        drop(warehouse);
+        let (result, record) = drive_run_for_record(&config, &state_path, "empty-2235").await;
+        result.unwrap();
+        assert_eq!(record.status, rocky_core::state::RunStatus::Success);
+        assert_eq!(not_null_outcomes(&record), 2);
+        let store = StateStore::open(&state_path).unwrap();
+        assert!(
+            store
+                .owed_check_targets(&scope, &targets)
+                .unwrap()
+                .is_empty()
+        );
     }
 }
