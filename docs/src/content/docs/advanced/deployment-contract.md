@@ -95,6 +95,8 @@ The state store carries a schema version. Two directions:
 - **A newer engine opens an older store.** It migrates the store forward on first open. Every command does this; there is no separate migration step.
 - **An older engine opens a newer store.** `rocky serve` and every inspection command (`state`, `history`, `doctor`, `metrics`, the branch commands) refuse to open it. `rocky run` and `rocky load` follow `[state] on_schema_mismatch`: the default, `recreate`, logs one warning, starts from a fresh local state, runs once as a full refresh, and never writes that downgraded state back to a shared backend; `fail` refuses like the rest.
 
+On a remote backend, the newer engine finds no state under its own schema version and restores the newest older version's state instead. It never writes or deletes the older copy. See [What a schema upgrade does to remote state](/concepts/state-management/#what-a-schema-upgrade-does-to-remote-state).
+
 So a fleet mid-upgrade is safe in one direction only. Upgrade every process that shares a volume or a remote backend together, old stopped before new started, and keep a copy of the store from before the upgrade: rolling back with the history intact means restoring that copy under the older engine. The changelog names every release that changes the schema version.
 
 ## Webhooks and timers
