@@ -43,6 +43,7 @@ mod imports_check;
 mod imports_update;
 mod init;
 mod init_adapter;
+mod intent_check;
 mod lineage;
 mod lineage_diff;
 mod list;

@@ -267,6 +267,7 @@ _LAZY: dict[str, tuple[str, str]] = {
     "PermissionSummary": ("run_schema", "PermissionSummary"),
     "PhaseTimings": ("compile_schema", "PhaseTimings"),
     "PipelineDemandStatus": ("tick_schema", "PipelineDemandStatus"),
+    "IntentCheckOutput": ("plan_schema", "IntentCheckOutput"),
     "PlanOutput": ("plan_schema", "PlanOutput"),
     "PlannedStatement": ("plan_schema", "PlannedStatement"),
     "PolicyAutonomyBudgetOutput": ("policy_show_schema", "PolicyAutonomyBudgetOutput"),
@@ -523,6 +524,7 @@ if TYPE_CHECKING:
         OptimizeRecommendation,
     )
     from .plan_schema import (
+        IntentCheckOutput,
         PlannedStatement,
         PlanOutput,
     )
@@ -939,6 +941,7 @@ __all__ = [
     "OptimizeOutput",
     "OptimizeRecommendation",
     "PlanOutput",
+    "IntentCheckOutput",
     "PlannedStatement",
     "RunOutput",
     "MaterializationOutput",

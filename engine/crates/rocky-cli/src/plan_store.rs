@@ -1662,6 +1662,7 @@ mod tests {
             execution_layers: Vec::new(),
             product_id: None,
             spec_digest: None,
+            intent: None,
         }
     }
 
@@ -1733,6 +1734,19 @@ mod tests {
         assert_ne!(
             bound_id, GOLDEN_MINIMAL_PLAN_ID,
             "a product-bound plan must hash to a different id than its unbound twin"
+        );
+
+        // RV2-P1: the stated intent is in the hashed payload too. Unset, it
+        // is absent from the bytes (the goldens above); set, it moves the id.
+        let intent_bound = crate::output::RunPlan {
+            intent: Some(crate::output::PlanIntent::Refactor),
+            ..baseline()
+        };
+        assert!(serde_json::to_string(&intent_bound)?.contains("\"intent\":\"refactor\""));
+        assert_ne!(
+            write_plan(dir.path(), PlanKind::Run, &intent_bound)?,
+            GOLDEN_MINIMAL_PLAN_ID,
+            "an intent-bound plan must hash to a different id than its unbound twin"
         );
         Ok(())
     }

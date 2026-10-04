@@ -919,8 +919,23 @@ enum Command {
         /// Applies to the default plan subcommand only.
         #[arg(long, global = false)]
         semantic: bool,
-        /// Git ref the working tree is diffed against for `--semantic`
-        /// (default: main). Ignored unless `--semantic` is set.
+        /// State the intent of this change, and check it on the data.
+        /// **Experimental.** The only value is `refactor`: the change must
+        /// keep each changed model's output schema and rows. Rocky builds
+        /// each changed model from `--base` and from the working tree, in
+        /// one DuckDB transaction, and compares the outputs exactly. The
+        /// result goes under `intent_check` in the JSON output.
+        ///
+        /// Report-only: the verdict relaxes no gate and never changes the
+        /// exit code. The intent is recorded in the persisted plan; the
+        /// verdict is not. DuckDB targets only; other adapters report
+        /// `unverified`. Works where `rocky plan --model` works.
+        /// Applies to the default plan subcommand only.
+        #[arg(long, value_enum, global = false)]
+        intent: Option<rocky_cli::output::PlanIntent>,
+        /// Git ref the working tree is compared against (default: main).
+        /// Used by `--semantic`, by `--intent`, and by the change
+        /// classification embedded in every persisted run plan.
         /// Applies to the default plan subcommand only.
         #[arg(long, default_value = "main", global = false)]
         base: String,
@@ -3851,6 +3866,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             idempotency_key,
             env,
             semantic,
+            intent,
             base,
         } => {
             // #1550: a default-plan flag alongside a plan subcommand used to be
@@ -3885,6 +3901,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                     ("--idempotency-key", idempotency_key.is_some()),
                     ("--env", env.is_some()),
                     ("--semantic", semantic),
+                    ("--intent", intent.is_some()),
                     ("--base", base != "main"),
                 ])
             {
@@ -3940,6 +3957,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                         models_dir,
                         partition_opts,
                         principal: Some(resolve_cli_principal(cli.principal)?),
+                        intent,
                     };
                     rocky_cli::commands::plan(
                         &cli.config,
@@ -6376,6 +6394,7 @@ mod tests {
                 // `crates/rocky-cli/src/commands/plan.rs`; this run/plan
                 // flag-parity helper does not thread them.
                 semantic: _,
+                intent: _,
                 base: _,
             } => extract(
                 filter,

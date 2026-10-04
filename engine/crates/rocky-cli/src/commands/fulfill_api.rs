@@ -331,6 +331,7 @@ pub(crate) fn build_ai_run_plan(
         execution_layers,
         product_id,
         spec_digest,
+        intent: None,
     })
 }
 

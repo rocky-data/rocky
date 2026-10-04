@@ -6509,6 +6509,7 @@ mod tests {
             execution_layers: vec![vec!["schema.orders".to_string()]],
             product_id: None,
             spec_digest: None,
+            intent: None,
         }
     }
 
@@ -10315,6 +10316,7 @@ schema_template = "s__{source}"
             execution_layers: vec![vec!["db.s.orders".to_string()]],
             product_id: Some("product:revenue_daily".to_string()),
             spec_digest: Some("sha256:abc123".to_string()),
+            intent: None,
         };
         let plan_id = write_plan(dir.path(), PlanKind::Run, &rp)?;
         let persisted = read_plan(dir.path(), &plan_id)?;
@@ -10645,6 +10647,7 @@ schema_template = "s__{source}"
             ],
             product_id: None,
             spec_digest: None,
+            intent: None,
         };
         let plan_id = write_plan(dir.path(), PlanKind::Run, &rp)?;
         let persisted = read_plan(dir.path(), &plan_id)?;

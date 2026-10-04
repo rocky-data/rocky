@@ -140,6 +140,29 @@ export type BreakingSeverity = "breaking" | "warning" | "info";
  * Serialized in PascalCase (`"Error"`, `"Warning"`, `"Info"`) to stay compatible with existing dagster fixtures and the hand-written `Severity` StrEnum in `integrations/dagster/src/dagster_rocky/types.py`.
  */
 export type Severity = "Error" | "Warning" | "Info";
+/**
+ * The closed list of intents `rocky plan --intent` accepts.
+ *
+ * Version 1 has one intent. Each intent has a written predicate that the check measures on the data. clap rejects any other value.
+ */
+export type PlanIntent = "refactor";
+/**
+ * Why a model got `mismatch` or `unverified`. A closed list.
+ */
+export type IntentCheckReason =
+  | "schema_differs"
+  | "rows_differ"
+  | "model_removed"
+  | "adapter_unsupported"
+  | "no_base"
+  | "base_unavailable"
+  | "nondeterministic"
+  | "unsupported_strategy"
+  | "build_failed";
+/**
+ * The verdict for one changed model.
+ */
+export type IntentVerdict = "match" | "mismatch" | "unverified";
 
 export interface PlanOutput {
   /**
@@ -172,6 +195,10 @@ export interface PlanOutput {
    * `true` when at least one entry in `budget_diagnostics` has error-level severity (`on_breach = "error"`). Callers can use this flag to fail a pipeline-as-code check without inspecting individual diagnostic severities.
    */
   has_budget_errors?: boolean;
+  /**
+   * Result of `rocky plan --intent <intent>`: one verdict per changed model. **Experimental.** Present only when `--intent` is set. REPORT-ONLY: it relaxes no gate and never changes the exit code. It lives on the output, not in the persisted plan, so it does not enter `plan_id`. See [`IntentCheckOutput`] and its `caveat`.
+   */
+  intent_check?: IntentCheckOutput | null;
   /**
    * Masking-policy applications the governance reconciler would issue via `apply_masking_policy`. One row per `(model, column, tag)` where the tag resolves to a strategy for the active env. Unresolved tags are intentionally omitted — `rocky compliance` is the diagnostic surface for that gap.
    */
@@ -291,6 +318,103 @@ export interface ClassificationAction {
    * Free-form classification tag (e.g. `"pii"`, `"confidential"`).
    */
   tag: string;
+  [k: string]: unknown;
+}
+/**
+ * Result of `rocky plan --intent <intent>`. **Experimental. Report-only.**
+ *
+ * Rocky builds each changed model twice, once from the SQL at `base_ref` and once from the working tree, in one DuckDB transaction, and compares the two outputs exactly. See [`INTENT_CHECK_CAVEAT`] for what a `match` does and does not mean.
+ */
+export interface IntentCheckOutput {
+  /**
+   * The target adapter type (for example `"duckdb"`).
+   */
+  adapter: string;
+  /**
+   * The git ref the working tree was compared against (`--base`).
+   */
+  base_ref: string;
+  /**
+   * What a verdict means and what it does not check. Always set.
+   */
+  caveat: string;
+  /**
+   * The intent that was checked.
+   */
+  intent: PlanIntent;
+  /**
+   * One verdict per changed model, sorted by model name.
+   */
+  models: ModelIntentVerdict[];
+  /**
+   * Extra builds of the base SQL used to detect nondeterminism.
+   */
+  probes: number;
+  summary: IntentCheckSummary;
+  [k: string]: unknown;
+}
+/**
+ * The intent verdict for one changed model.
+ */
+export interface ModelIntentVerdict {
+  /**
+   * Plain-text detail, such as the error text of a failed build.
+   */
+  detail?: string | null;
+  /**
+   * The model name, as declared in its sidecar.
+   */
+  model: string;
+  /**
+   * Set for every `mismatch` and every `unverified`. Unset for `match`.
+   */
+  reason?: IntentCheckReason | null;
+  /**
+   * Row count of the base build.
+   */
+  rows_base?: number | null;
+  /**
+   * Row count of the head build.
+   */
+  rows_head?: number | null;
+  /**
+   * Rows in the base output and not in the head output (multiset).
+   */
+  rows_only_in_base?: number | null;
+  /**
+   * Rows in the head output and not in the base output (multiset).
+   */
+  rows_only_in_head?: number | null;
+  /**
+   * The base output columns. Set only when `reason` is `schema_differs`.
+   */
+  schema_base?: IntentColumn[] | null;
+  /**
+   * The head output columns. Set only when `reason` is `schema_differs`.
+   */
+  schema_head?: IntentColumn[] | null;
+  /**
+   * Changed models upstream of this one. Both builds read the materialized upstream tables, so this model's verdict does not cover the upstream change. Empty when no upstream model changed.
+   */
+  upstream_changed?: string[];
+  verdict: IntentVerdict;
+  [k: string]: unknown;
+}
+/**
+ * One column of a built output: its name and its warehouse type.
+ */
+export interface IntentColumn {
+  name: string;
+  type: string;
+  [k: string]: unknown;
+}
+/**
+ * Counts of each verdict in [`IntentCheckOutput::models`].
+ */
+export interface IntentCheckSummary {
+  match: number;
+  mismatch: number;
+  unverified: number;
   [k: string]: unknown;
 }
 /**

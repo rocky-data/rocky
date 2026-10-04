@@ -591,6 +591,193 @@
       ],
       "type": "object"
     },
+    "IntentCheckOutput": {
+      "description": "Result of `rocky plan --intent <intent>`. **Experimental. Report-only.**\n\nRocky builds each changed model twice, once from the SQL at `base_ref` and once from the working tree, in one DuckDB transaction, and compares the two outputs exactly. See [`INTENT_CHECK_CAVEAT`] for what a `match` does and does not mean.",
+      "properties": {
+        "adapter": {
+          "description": "The target adapter type (for example `\"duckdb\"`).",
+          "type": "string"
+        },
+        "base_ref": {
+          "description": "The git ref the working tree was compared against (`--base`).",
+          "type": "string"
+        },
+        "caveat": {
+          "description": "What a verdict means and what it does not check. Always set.",
+          "type": "string"
+        },
+        "intent": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/PlanIntent"
+            }
+          ],
+          "description": "The intent that was checked."
+        },
+        "models": {
+          "description": "One verdict per changed model, sorted by model name.",
+          "items": {
+            "$ref": "#/definitions/ModelIntentVerdict"
+          },
+          "type": "array"
+        },
+        "probes": {
+          "description": "Extra builds of the base SQL used to detect nondeterminism.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "summary": {
+          "$ref": "#/definitions/IntentCheckSummary"
+        }
+      },
+      "required": [
+        "adapter",
+        "base_ref",
+        "caveat",
+        "intent",
+        "models",
+        "probes",
+        "summary"
+      ],
+      "type": "object"
+    },
+    "IntentCheckReason": {
+      "description": "Why a model got `mismatch` or `unverified`. A closed list.",
+      "oneOf": [
+        {
+          "description": "Mismatch: the column names, types or order differ.",
+          "enum": [
+            "schema_differs"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Mismatch: the outputs are different multisets of rows.",
+          "enum": [
+            "rows_differ"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Mismatch: the model exists at the base ref and not in the working tree.",
+          "enum": [
+            "model_removed"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Unverified: the target adapter is not DuckDB.",
+          "enum": [
+            "adapter_unsupported"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Unverified: the model does not exist at the base ref.",
+          "enum": [
+            "no_base"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Unverified: the models at the base ref could not be read or compiled.",
+          "enum": [
+            "base_unavailable"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Unverified: the SQL calls a volatile builtin, or two builds of the same SQL disagree.",
+          "enum": [
+            "nondeterministic"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Unverified: the materialization strategy is not supported.",
+          "enum": [
+            "unsupported_strategy"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Unverified: a build or a comparison query failed.",
+          "enum": [
+            "build_failed"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "IntentCheckSummary": {
+      "description": "Counts of each verdict in [`IntentCheckOutput::models`].",
+      "properties": {
+        "match": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "mismatch": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "unverified": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "match",
+        "mismatch",
+        "unverified"
+      ],
+      "type": "object"
+    },
+    "IntentColumn": {
+      "description": "One column of a built output: its name and its warehouse type.",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "type": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "type"
+      ],
+      "type": "object"
+    },
+    "IntentVerdict": {
+      "description": "The verdict for one changed model.",
+      "oneOf": [
+        {
+          "description": "The effect satisfies the intent on the recorded inputs.",
+          "enum": [
+            "match"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "The effect breaks the intent. `reason` says how.",
+          "enum": [
+            "mismatch"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "The check could not decide. `reason` says why.",
+          "enum": [
+            "unverified"
+          ],
+          "type": "string"
+        }
+      ]
+    },
     "MaskAction": {
       "description": "Masking-policy application row in `PlanOutput.mask_actions`.",
       "properties": {
@@ -618,6 +805,116 @@
         "tag"
       ],
       "type": "object"
+    },
+    "ModelIntentVerdict": {
+      "description": "The intent verdict for one changed model.",
+      "properties": {
+        "detail": {
+          "description": "Plain-text detail, such as the error text of a failed build.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "model": {
+          "description": "The model name, as declared in its sidecar.",
+          "type": "string"
+        },
+        "reason": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/IntentCheckReason"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Set for every `mismatch` and every `unverified`. Unset for `match`."
+        },
+        "rows_base": {
+          "description": "Row count of the base build.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "rows_head": {
+          "description": "Row count of the head build.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "rows_only_in_base": {
+          "description": "Rows in the base output and not in the head output (multiset).",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "rows_only_in_head": {
+          "description": "Rows in the head output and not in the base output (multiset).",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "schema_base": {
+          "description": "The base output columns. Set only when `reason` is `schema_differs`.",
+          "items": {
+            "$ref": "#/definitions/IntentColumn"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "schema_head": {
+          "description": "The head output columns. Set only when `reason` is `schema_differs`.",
+          "items": {
+            "$ref": "#/definitions/IntentColumn"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "upstream_changed": {
+          "description": "Changed models upstream of this one. Both builds read the materialized upstream tables, so this model's verdict does not cover the upstream change. Empty when no upstream model changed.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "verdict": {
+          "$ref": "#/definitions/IntentVerdict"
+        }
+      },
+      "required": [
+        "model",
+        "verdict"
+      ],
+      "type": "object"
+    },
+    "PlanIntent": {
+      "description": "The closed list of intents `rocky plan --intent` accepts.\n\nVersion 1 has one intent. Each intent has a written predicate that the check measures on the data. clap rejects any other value.",
+      "oneOf": [
+        {
+          "description": "Same schema. The base and head outputs are equal multisets of rows.",
+          "enum": [
+            "refactor"
+          ],
+          "type": "string"
+        }
+      ]
     },
     "PlannedStatement": {
       "properties": {
@@ -803,6 +1100,17 @@
     "has_budget_errors": {
       "description": "`true` when at least one entry in `budget_diagnostics` has error-level severity (`on_breach = \"error\"`). Callers can use this flag to fail a pipeline-as-code check without inspecting individual diagnostic severities.",
       "type": "boolean"
+    },
+    "intent_check": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/IntentCheckOutput"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Result of `rocky plan --intent <intent>`: one verdict per changed model. **Experimental.** Present only when `--intent` is set. REPORT-ONLY: it relaxes no gate and never changes the exit code. It lives on the output, not in the persisted plan, so it does not enter `plan_id`. See [`IntentCheckOutput`] and its `caveat`."
     },
     "mask_actions": {
       "description": "Masking-policy applications the governance reconciler would issue via `apply_masking_policy`. One row per `(model, column, tag)` where the tag resolves to a strategy for the active env. Unresolved tags are intentionally omitted — `rocky compliance` is the diagnostic surface for that gap.",
