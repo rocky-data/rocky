@@ -2208,9 +2208,9 @@ schema_template = "s"
             .0
         };
 
-        let trusted = compile_with("[cache.schemas]\ntrusted_max_age_seconds = 3600\n");
-        assert!(trusted.has_errors);
-        assert_eq!(count(&trusted, "E041"), 1, "{:?}", trusted.diagnostics);
+        let fresh_cache = compile_with("[cache.schemas]\ntrusted_max_age_seconds = 3600\n");
+        assert!(fresh_cache.has_errors);
+        assert_eq!(count(&fresh_cache, "E041"), 1, "{:?}", fresh_cache.diagnostics);
 
         let aged = compile_with("[cache.schemas]\ntrusted_max_age_seconds = 60\n");
         assert!(!aged.has_errors, "{:?}", aged.diagnostics);
