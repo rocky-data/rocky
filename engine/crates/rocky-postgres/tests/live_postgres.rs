@@ -300,12 +300,9 @@ async fn merge_round_trip(mode: MergeMode, schema: &str) {
     let Some(a) = setup(schema, mode).await else {
         return;
     };
-    let unique = if mode == MergeMode::OnConflict {
-        // ON CONFLICT needs a unique index on exactly the key.
-        ", PRIMARY KEY (id)"
-    } else {
-        ""
-    };
+    // No unique index up front: as on a table Rocky's first-run CTAS
+    // created. `on_conflict` must build the one it needs.
+    let unique = "";
     a.execute_statement(&format!(
         "CREATE TABLE {schema}.tgt (id INTEGER, name TEXT, amount INTEGER{unique}); \
          INSERT INTO {schema}.tgt VALUES (1, 'a', 10), (2, 'b', 20)"
@@ -607,4 +604,101 @@ async fn unknown_extra_key_is_refused_before_connecting() {
     let mut extra = BTreeMap::new();
     extra.insert("sslmdoe".to_string(), serde_json::json!("require"));
     assert!(cfg.apply_extra(&extra).is_err());
+}
+
+#[tokio::test]
+async fn delete_insert_is_atomic() {
+    let s = "rocky_live_di";
+    let Some(a) = setup(s, MergeMode::Merge).await else {
+        return;
+    };
+    a.execute_statement(&format!(
+        "CREATE TABLE {s}.t (k INTEGER, v INTEGER); INSERT INTO {s}.t VALUES (1, 1), (2, 2)"
+    ))
+    .await
+    .unwrap();
+    let d = a.dialect();
+    let t = d.format_table_ref("", s, "t").unwrap();
+    let stmts = d.delete_insert_statements(
+        format!("DELETE FROM {t} WHERE k IN (SELECT 1)"),
+        d.insert_into(&t, "SELECT 1 AS k, 1/0 AS v"),
+    );
+    assert_eq!(stmts.len(), 1);
+    assert!(a.execute_statement(&stmts[0]).await.is_err());
+    // The failed INSERT rolled back the DELETE.
+    assert_eq!(
+        scalar(&a, &format!("SELECT count(*) FROM {t}"))
+            .await
+            .as_deref(),
+        Some("2")
+    );
+}
+
+/// The generic SCD2 snapshot SQL runs on PostgreSQL 15+: bootstrap, close a
+/// changed row, insert its new version, invalidate a hard delete.
+#[tokio::test]
+async fn snapshot_sql_runs_on_postgres() {
+    let s = "rocky_live_snap";
+    let Some(a) = setup(s, MergeMode::Merge).await else {
+        return;
+    };
+    a.execute_statement(&format!(
+        "CREATE TABLE {s}.src (id INTEGER, name TEXT, updated_at TIMESTAMP); \
+         INSERT INTO {s}.src VALUES (1, 'a', '2026-01-01'), (2, 'b', '2026-01-01')"
+    ))
+    .await
+    .unwrap();
+    let ir = rocky_ir::ModelIr::snapshot(
+        rocky_ir::TargetRef {
+            catalog: String::new(),
+            schema: s.into(),
+            table: "snap".into(),
+        },
+        rocky_ir::SourceRef {
+            catalog: String::new(),
+            schema: s.into(),
+            table: "src".into(),
+        },
+        vec![Arc::from("id")],
+        "updated_at".into(),
+        true,
+        rocky_ir::GovernanceConfig {
+            permissions_file: None,
+            auto_create_catalogs: false,
+            auto_create_schemas: false,
+        },
+    );
+    let cols: Vec<String> = vec!["id".into(), "name".into(), "updated_at".into()];
+    async fn run(a: &PostgresWarehouseAdapter, ir: &rocky_ir::ModelIr, cols: &[String]) {
+        for stmt in rocky_core::sql_gen::generate_snapshot_sql(ir, a.dialect(), cols).unwrap() {
+            a.execute_statement(&stmt).await.unwrap();
+        }
+    }
+    run(&a, &ir, &cols).await;
+    a.execute_statement(&format!(
+        "UPDATE {s}.src SET name = 'a2', updated_at = '2026-01-02' WHERE id = 1; \
+         DELETE FROM {s}.src WHERE id = 2"
+    ))
+    .await
+    .unwrap();
+    run(&a, &ir, &cols).await;
+    let r = a
+        .execute_query(&format!(
+            "SELECT id::text, name, (valid_to IS NULL)::text FROM {s}.snap ORDER BY id, valid_from"
+        ))
+        .await
+        .unwrap();
+    let got: Vec<Vec<&str>> = r
+        .rows
+        .iter()
+        .map(|row| row.iter().map(|v| v.as_str().unwrap()).collect())
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            vec!["1", "a", "false"],
+            vec!["1", "a2", "true"],
+            vec!["2", "b", "false"],
+        ]
+    );
 }

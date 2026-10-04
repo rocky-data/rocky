@@ -61,7 +61,7 @@ CREATE TABLE marts.fct_orders DISTSTYLE KEY DISTKEY (customer_id)
   COMPOUND SORTKEY (order_date, order_id) AS …
 ```
 
-The attributes apply when Rocky creates the table: on every `full_refresh`, and on the first run of `merge`, `delete_insert` and `time_interval`.
+The attributes apply when Rocky creates the table: on every `full_refresh`, and on the first run of `merge`, `delete_insert` and `time_interval`. Changing them later does not alter an existing table. Run the model once as `full_refresh`, or run `ALTER TABLE … ALTER DISTKEY` / `ALTER SORTKEY` yourself.
 
 `rocky compile` checks the block:
 
@@ -88,7 +88,8 @@ Redshift needs every table in a late-binding view to name its schema: `marts.fct
 
 | Concern | Redshift |
 |---------|----------|
-| `MERGE` | `MERGE INTO <target> USING (<model SQL>) AS rocky_src ON <table>.<key> = rocky_src.<key>` — no target alias, and both `WHEN` arms are always present |
+| `MERGE` | `MERGE INTO <target> USING (<model SQL>) AS rocky_src ON <table>.<key> = rocky_src.<key>` — no target alias, and both `WHEN` arms are always present. A model whose only columns are its keys inserts the missing keys with `INSERT … WHERE NOT EXISTS` instead. |
+| Snapshots (SCD2) | Refused. The generic snapshot SQL uses `CREATE TABLE IF NOT EXISTS … AS`, a MERGE target alias and a conditional `WHEN MATCHED`. |
 | Names | Up to 127 bytes. Names fold to lower case. |
 | String literals | A backslash is an escape: Rocky writes `\'` and `\\` (from the Redshift lexer's PostgreSQL 8.0 roots — not verified live) |
 | Current time | `GETDATE()` |
@@ -104,6 +105,7 @@ Redshift needs every table in a late-binding view to name its schema: `marts.fct
 - IAM authentication.
 - Governance, checksum-bisection `rocky compare`, and Redshift as a discovery source.
 - `AUTO REFRESH`, `BACKUP` and attributes on materialized views.
+- Snapshot pipelines.
 
 ## See also
 

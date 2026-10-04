@@ -487,7 +487,7 @@ pub fn generate_transformation_sql_with_warehouse(
                 source_sql = model_ir.sql,
             );
             let insert_sql = dialect.insert_into(&target, &model_ir.sql);
-            Ok(vec![delete_sql, insert_sql])
+            Ok(dialect.delete_insert_statements(delete_sql, insert_sql))
         }
         MaterializationStrategy::Microbatch { .. } => {
             Err(microbatch_transformation_refused(model_ir))
@@ -1135,6 +1135,13 @@ pub fn generate_snapshot_sql(
 ) -> Result<Vec<String>, SqlGenError> {
     if model_ir.variant() != ModelIrVariant::Snapshot {
         return Err(variant_mismatch(model_ir, "Snapshot"));
+    }
+    if let Some(reason) = dialect.snapshot_unsupported_reason() {
+        return Err(SqlGenError::InvalidRequest(format!(
+            "snapshot '{}' cannot run on {}: {reason}",
+            model_ir.name,
+            dialect.name()
+        )));
     }
     let source_ref = model_ir
         .source

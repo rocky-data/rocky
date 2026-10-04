@@ -1248,7 +1248,12 @@ fn resolve_model_config(
         freshness,
         tests,
         format: raw.format,
-        format_options: match raw.redshift {
+        // An empty `[redshift]` block sets nothing; it must not make another
+        // dialect refuse the model.
+        format_options: match raw
+            .redshift
+            .filter(|r| *r != rocky_ir::RedshiftTableOptions::default())
+        {
             // `[redshift]` wins over a `[format_options.redshift]` spelling of
             // the same thing; both land in one place.
             Some(redshift) => {

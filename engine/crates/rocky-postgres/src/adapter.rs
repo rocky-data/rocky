@@ -177,11 +177,15 @@ impl WarehouseAdapter for PostgresWarehouseAdapter {
         let Some(pg) = err.inner().downcast_ref::<PgError>() else {
             return FailureClass::Unknown;
         };
+        // A client-side timeout says nothing about whether the server
+        // committed; never retried (see `PgError::is_transient`).
+        if matches!(pg, PgError::Timeout { .. }) {
+            return FailureClass::Unknown;
+        }
         if !pg.is_transient() {
             return FailureClass::Permanent;
         }
         let kind = match pg {
-            PgError::Timeout { .. } => TransientKind::Timeout,
             PgError::Transport(_) | PgError::Connect { .. } => TransientKind::Network,
             PgError::Query { sqlstate, .. } if sqlstate.starts_with("08") => TransientKind::Network,
             PgError::Query { .. } => TransientKind::ServerBusy,

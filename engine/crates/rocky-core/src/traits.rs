@@ -1314,6 +1314,26 @@ pub trait SqlDialect: Send + Sync {
         select_sql: &str,
     ) -> AdapterResult<Vec<String>>;
 
+    /// The statements a `delete_insert` model executes, from its DELETE and
+    /// INSERT.
+    ///
+    /// Default: the two as separate statements, run in order — so the
+    /// DELETE commits before the INSERT runs. A dialect whose connector runs
+    /// a `;`-joined string as one transaction (PostgreSQL / Redshift) joins
+    /// them, so a failed INSERT leaves the deleted rows in place.
+    fn delete_insert_statements(&self, delete_sql: String, insert_sql: String) -> Vec<String> {
+        vec![delete_sql, insert_sql]
+    }
+
+    /// `Some(reason)` when this dialect cannot run the generic SCD2 snapshot
+    /// SQL (`CREATE TABLE IF NOT EXISTS … AS`, `MERGE INTO … AS target`
+    /// with a conditional `WHEN MATCHED AND …`). Snapshot generation refuses
+    /// with the reason instead of emitting SQL the warehouse rejects.
+    /// Default `None`: every dialect that predates the hook runs it.
+    fn snapshot_unsupported_reason(&self) -> Option<&'static str> {
+        None
+    }
+
     /// DELETE FROM ... WHERE ... for delete+insert strategy.
     /// Default implementation uses ANSI SQL.
     fn delete_where(&self, target: &str, where_clause: &str) -> String {

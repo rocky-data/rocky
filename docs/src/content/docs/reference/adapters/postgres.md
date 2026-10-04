@@ -77,12 +77,15 @@ Rocky sends a write that needs more than one statement as one string. PostgreSQL
 | `materialized_view` | `DROP MATERIALIZED VIEW IF EXISTS t; CREATE MATERIALIZED VIEW t AS …` | Yes |
 | `merge` | `MERGE INTO …` or `INSERT … ON CONFLICT` | Yes (one statement) |
 | `time_interval` | `DELETE FROM t WHERE <window>; INSERT INTO t …` | Yes |
-| `delete_insert` | `DELETE …` then `INSERT …`, two statements | No |
+| `delete_insert` | `DELETE …; INSERT …` | Yes |
+| snapshot (SCD2) | `MERGE` plus `INSERT` / `UPDATE` statements | Each statement; needs PostgreSQL 15+ |
 | `dynamic_table` | — | Refused: Snowflake only |
 
 **Materialized views.** PostgreSQL has no `CREATE OR REPLACE MATERIALIZED VIEW`. Each run drops and recreates the view in one transaction. That applies a changed definition and refreshes the data. A bare `REFRESH MATERIALIZED VIEW` would keep a stale definition.
 
 **Dependent views.** PostgreSQL does not let you drop a table that a view reads. A `full_refresh` of such a table fails with the server's "other objects depend on it" error. Rocky does not add `CASCADE`, because that would drop views Rocky does not manage. Use `merge`, `time_interval` or `delete_insert` for a table that views read.
+
+**Grants on a rebuilt table.** A `full_refresh` drops and recreates the table, so grants and comments on it are lost on each run. The adapter does not manage grants yet. Re-grant after the run, or grant on the schema with `ALTER DEFAULT PRIVILEGES`.
 
 **Views and columns.** `CREATE OR REPLACE VIEW` can add columns at the end, but it cannot drop or rename one. A view model that removes a column fails until you drop the view.
 
@@ -106,7 +109,9 @@ SELECT customer_id, name, email FROM (<model SQL>) AS s
 ON CONFLICT (customer_id) DO UPDATE SET name = EXCLUDED.name, email = EXCLUDED.email
 ```
 
-`ON CONFLICT` needs a unique index or constraint on exactly the `unique_key` columns. PostgreSQL refuses the statement without one.
+`ON CONFLICT` needs a unique index on exactly the `unique_key` columns. Rocky creates one in the same transaction (`CREATE UNIQUE INDEX IF NOT EXISTS <table>__rocky_mk_<hash>`), so a table Rocky built works on the first merge. If the table already holds duplicate keys, the index build fails and the merge stops. That is correct: an upsert by those keys is undefined.
+
+Snapshots use `MERGE`, so `merge_mode = "on_conflict"` refuses snapshot pipelines.
 
 `rocky plan` and `rocky emit-sql` read `merge_mode` from the adapter block, so the preview matches what `rocky run` executes.
 

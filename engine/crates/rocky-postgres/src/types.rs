@@ -17,6 +17,9 @@
 #[must_use]
 pub fn canonical_type(raw: &str) -> String {
     let lower = raw.trim().to_ascii_lowercase();
+    if let Some(element) = lower.strip_suffix("[]") {
+        return format!("{}[]", canonical_type(element));
+    }
     let (base, modifier) = match lower.split_once('(') {
         Some((b, rest)) => {
             // `timestamp(3) without time zone` carries words after `)`.
@@ -109,6 +112,7 @@ mod tests {
             ("uuid", "UUID"),
             ("super", "SUPER"),
             ("integer[]", "INTEGER[]"),
+            ("character varying(40)[]", "VARCHAR(40)[]"),
         ];
         for (raw, want) in cases {
             assert_eq!(canonical_type(raw), want, "{raw}");

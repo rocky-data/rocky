@@ -8,9 +8,10 @@
 //!   Statements in a Simple Query"). The dialect relies on this to make
 //!   multi-statement writes atomic on a pooled connection: a full refresh
 //!   (`DROP TABLE IF EXISTS …; CREATE TABLE … AS …`), a `time_interval`
-//!   overwrite (`DELETE …; INSERT …`) and a `delete_insert` are each one
-//!   string, so either every statement commits or none does — and no other
-//!   task's statement can land between them.
+//!   overwrite and a `delete_insert` (`DELETE …; INSERT …`, via
+//!   `SqlDialect::delete_insert_statements`) are each one string, so either
+//!   every statement commits or none does — and no other task's statement
+//!   can land between them.
 //! - Results come back as text, which is the shape every other Rocky adapter
 //!   already returns in [`QueryResult`] cells.
 //!
@@ -86,7 +87,11 @@ impl PgError {
     #[must_use]
     pub fn is_transient(&self) -> bool {
         match self {
-            PgError::Transport(_) | PgError::Timeout { .. } => true,
+            PgError::Transport(_) => true,
+            // The client stopped waiting, but the server may still commit
+            // the statement. A write retried after that could apply twice
+            // (an append, a partition overwrite), so a timeout fails closed.
+            PgError::Timeout { .. } => false,
             PgError::Connect { sqlstate, .. } => match sqlstate.as_deref() {
                 // Authentication failures (class 28) and unknown database
                 // (3D000) will not heal on retry.

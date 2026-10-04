@@ -308,6 +308,25 @@ fn merge_columns(
     Ok(MergeColumns { insert, update })
 }
 
+/// Name of the unique index `merge_mode = "on_conflict"` maintains:
+/// `<table prefix>__rocky_mk_<hash>`, at most 63 bytes so PostgreSQL never
+/// truncates it. The key list is part of the hash, so a changed
+/// `unique_key` builds a new index instead of reusing a mismatched one.
+fn merge_key_index_name(table: &str, keys: &[Arc<str>]) -> String {
+    // FNV-1a over table + keys: stable across releases, no dependency.
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in std::iter::once(table)
+        .chain(keys.iter().map(|k| &**k))
+        .flat_map(|part| part.bytes().chain(std::iter::once(0u8)))
+    {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    // 36 + "__rocky_mk_" (11) + 16 hex = 63. Identifiers are ASCII.
+    let prefix = &table[..table.len().min(36)];
+    format!("{prefix}__rocky_mk_{hash:016x}")
+}
+
 fn is_safe_varchar_growth(target: &str, source: &str) -> bool {
     fn len(t: &str) -> Option<u32> {
         let inner = t
@@ -435,12 +454,21 @@ impl SqlDialect for PostgresDialect {
                             .join(", ")
                     )
                 };
+                // `ON CONFLICT (keys)` needs a unique index on exactly the
+                // keys, and the first-run `CREATE TABLE … AS` makes none.
+                // Creating it here, in the same transaction, makes the
+                // strategy work on a table Rocky created; existing duplicate
+                // keys fail the index build loudly, which is correct — an
+                // upsert by those keys is undefined.
+                let key_list = keys.iter().map(|k| &**k).collect::<Vec<_>>().join(", ");
+                let table = target.rsplit('.').next().unwrap_or(target);
                 Ok(format!(
-                    "INSERT INTO {target} ({cols})\n\
+                    "CREATE UNIQUE INDEX IF NOT EXISTS {index} ON {target} ({key_list});\n\
+                     INSERT INTO {target} ({cols})\n\
                      SELECT {cols} FROM (\n{source_sql}\n) AS s\n\
-                     ON CONFLICT ({keys}) {action}",
+                     ON CONFLICT ({key_list}) {action}",
+                    index = merge_key_index_name(table, keys),
                     cols = cols.insert.join(", "),
-                    keys = keys.iter().map(|k| &**k).collect::<Vec<_>>().join(", "),
                 ))
             }
         }
@@ -509,6 +537,21 @@ impl SqlDialect for PostgresDialect {
         Ok(vec![format!(
             "DELETE FROM {target} WHERE {partition_filter};\nINSERT INTO {target}\n{select_sql}"
         )])
+    }
+
+    fn delete_insert_statements(&self, delete_sql: String, insert_sql: String) -> Vec<String> {
+        // One string → one implicit transaction (see the module docs).
+        vec![format!("{delete_sql};\n{insert_sql}")]
+    }
+
+    fn snapshot_unsupported_reason(&self) -> Option<&'static str> {
+        match self.merge_mode {
+            MergeMode::Merge => None,
+            MergeMode::OnConflict => Some(
+                "snapshots use MERGE, which merge_mode = \"on_conflict\" says this server lacks \
+                 (PostgreSQL 15+ is required)",
+            ),
+        }
     }
 
     fn list_tables_sql(&self, catalog: &str, schema: &str) -> AdapterResult<String> {
@@ -647,8 +690,9 @@ impl SqlDialect for RedshiftDialect {
 
     /// Redshift MERGE: `MERGE INTO target USING source [AS alias] ON …` with
     /// no target alias, and BOTH `WHEN MATCHED` and `WHEN NOT MATCHED`
-    /// required. With no non-key column to update, the matched arm assigns
-    /// the first key to itself — a no-op that satisfies the grammar.
+    /// required. With no non-key column to update there is no valid matched
+    /// arm, so the dialect inserts the missing keys with `INSERT … WHERE NOT
+    /// EXISTS` instead.
     fn merge_into(
         &self,
         target: &str,
@@ -664,16 +708,29 @@ impl SqlDialect for RedshiftDialect {
             .map(|k| format!("{table}.{k} = {s}.{k}"))
             .collect::<Vec<_>>()
             .join(" AND ");
-        let sets = if cols.update.is_empty() {
-            let k = &keys[0];
-            format!("{k} = {s}.{k}")
-        } else {
-            cols.update
-                .iter()
-                .map(|c| format!("{c} = {s}.{c}"))
-                .collect::<Vec<_>>()
-                .join(", ")
-        };
+        if cols.update.is_empty() {
+            // Nothing to update: Redshift MERGE still requires a WHEN
+            // MATCHED arm, and the only candidate would assign a match
+            // column. Insert the missing keys instead — the same result.
+            return Ok(format!(
+                "INSERT INTO {target} ({cols})\n\
+                 SELECT {sel} FROM (\n{source_sql}\n) AS {s}\n\
+                 WHERE NOT EXISTS (SELECT 1 FROM {target} WHERE {on})",
+                cols = cols.insert.join(", "),
+                sel = cols
+                    .insert
+                    .iter()
+                    .map(|c| format!("{s}.{c}"))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            ));
+        }
+        let sets = cols
+            .update
+            .iter()
+            .map(|c| format!("{c} = {s}.{c}"))
+            .collect::<Vec<_>>()
+            .join(", ");
         Ok(format!(
             "MERGE INTO {target}\n\
              USING (\n{source_sql}\n) AS {s}\n\
@@ -756,6 +813,20 @@ impl SqlDialect for RedshiftDialect {
         Ok(vec![format!(
             "DELETE FROM {target} WHERE {partition_filter};\nINSERT INTO {target}\n{select_sql}"
         )])
+    }
+
+    fn delete_insert_statements(&self, delete_sql: String, insert_sql: String) -> Vec<String> {
+        vec![format!("{delete_sql};\n{insert_sql}")]
+    }
+
+    /// The generic snapshot SQL uses `CREATE TABLE IF NOT EXISTS … AS`, a
+    /// target alias on MERGE and a conditional `WHEN MATCHED AND …` — none
+    /// of which Redshift's grammar documents.
+    fn snapshot_unsupported_reason(&self) -> Option<&'static str> {
+        Some(
+            "the SCD2 snapshot SQL uses CREATE TABLE IF NOT EXISTS ... AS, a MERGE target alias \
+             and a conditional WHEN MATCHED, which Redshift does not support",
+        )
     }
 
     fn list_tables_sql(&self, catalog: &str, schema: &str) -> AdapterResult<String> {
@@ -906,11 +977,51 @@ mod tests {
                 &explicit(&["id", "a", "b"]),
             )
             .unwrap();
+        let index = merge_key_index_name("t", &keys(&["id"]));
         assert_eq!(
             sql,
-            "INSERT INTO m.t (id, a, b)\n\
-             SELECT id, a, b FROM (\nSELECT id, a, b FROM s\n) AS s\n\
-             ON CONFLICT (id) DO UPDATE SET a = EXCLUDED.a, b = EXCLUDED.b"
+            format!(
+                "CREATE UNIQUE INDEX IF NOT EXISTS {index} ON m.t (id);\n\
+                 INSERT INTO m.t (id, a, b)\n\
+                 SELECT id, a, b FROM (\nSELECT id, a, b FROM s\n) AS s\n\
+                 ON CONFLICT (id) DO UPDATE SET a = EXCLUDED.a, b = EXCLUDED.b"
+            )
+        );
+        assert!(index.starts_with("t__rocky_mk_"), "{index}");
+    }
+
+    #[test]
+    fn merge_key_index_name_fits_and_tracks_the_keys() {
+        let long = "a".repeat(63);
+        let name = merge_key_index_name(&long, &keys(&["id"]));
+        assert_eq!(name.len(), 63, "{name}");
+        assert_ne!(
+            merge_key_index_name("t", &keys(&["id"])),
+            merge_key_index_name("t", &keys(&["id", "region"]))
+        );
+        assert_eq!(
+            merge_key_index_name("t", &keys(&["id"])),
+            merge_key_index_name("t", &keys(&["id"]))
+        );
+    }
+
+    #[test]
+    fn delete_insert_and_snapshot_hooks() {
+        let pg = PostgresDialect::new();
+        assert_eq!(
+            pg.delete_insert_statements("DELETE FROM t".into(), "INSERT INTO t SELECT 1".into()),
+            vec!["DELETE FROM t;\nINSERT INTO t SELECT 1".to_string()]
+        );
+        assert!(pg.snapshot_unsupported_reason().is_none());
+        assert!(
+            PostgresDialect::with_merge_mode(MergeMode::OnConflict)
+                .snapshot_unsupported_reason()
+                .is_some()
+        );
+        assert!(
+            RedshiftDialect::new()
+                .snapshot_unsupported_reason()
+                .is_some()
         );
     }
 
@@ -954,13 +1065,14 @@ mod tests {
              WHEN MATCHED THEN UPDATE SET amount = rocky_src.amount\n\
              WHEN NOT MATCHED THEN INSERT (id, amount) VALUES (rocky_src.id, rocky_src.amount)"
         );
-        // Key-only: the matched arm is still present (Redshift requires it).
+        // Key-only: no MATCHED arm can be valid, so missing keys are inserted.
         let key_only = RedshiftDialect::new()
             .merge_into("m.t", "SELECT 1", &keys(&["id"]), &explicit(&["id"]))
             .unwrap();
-        assert!(
-            key_only.contains("WHEN MATCHED THEN UPDATE SET id = rocky_src.id"),
-            "{key_only}"
+        assert_eq!(
+            key_only,
+            "INSERT INTO m.t (id)\nSELECT rocky_src.id FROM (\nSELECT 1\n) AS rocky_src\n\
+             WHERE NOT EXISTS (SELECT 1 FROM m.t WHERE t.id = rocky_src.id)"
         );
         // A target named like the alias gets a different alias.
         let clash = RedshiftDialect::new()
