@@ -358,6 +358,8 @@ pub enum FunctionDialect {
     Snowflake,
     Databricks,
     BigQuery,
+    Postgres,
+    Redshift,
     Trino,
 }
 
@@ -371,6 +373,8 @@ impl FunctionDialect {
             "snowflake" => Some(Self::Snowflake),
             "databricks" => Some(Self::Databricks),
             "bigquery" => Some(Self::BigQuery),
+            "postgres" => Some(Self::Postgres),
+            "redshift" => Some(Self::Redshift),
             "trino" => Some(Self::Trino),
             _ => None,
         }
@@ -540,6 +544,89 @@ pub fn create_function_sql(
             }
             Ok(sql)
         }
+        // PostgreSQL SQL-language function:
+        // https://www.postgresql.org/docs/current/sql-createfunction.html
+        // `CREATE [ OR REPLACE ] FUNCTION name ( [ argname argtype [, ...] ] )
+        //  RETURNS rettype LANGUAGE sql { IMMUTABLE | STABLE | VOLATILE }
+        //  AS 'definition'`. Arguments are referenced by name in the body
+        // (https://www.postgresql.org/docs/current/xfunc-sql.html, since 9.2).
+        // The definition is dollar-quoted with a Rocky-specific tag, so only a
+        // body containing that tag is refused. Without `deterministic` the
+        // warehouse default (VOLATILE) stands. A description would need a
+        // separate `COMMENT ON FUNCTION` statement, so it is not emitted.
+        FunctionDialect::Postgres => {
+            plain_catalog()?;
+            const TAG: &str = "$rocky$";
+            if body.contains(TAG) {
+                return Err(invalid(format!(
+                    "the body contains `{TAG}`, which cannot appear inside the \
+                     dollar-quoted function definition"
+                )));
+            }
+            let mut sql = format!(
+                "CREATE OR REPLACE FUNCTION {}({})\n  RETURNS {returns}\n  LANGUAGE sql",
+                dotted(ToString::to_string),
+                typed_args()
+            );
+            match def.config.deterministic {
+                Some(true) => sql.push_str("\n  IMMUTABLE"),
+                Some(false) => sql.push_str("\n  VOLATILE"),
+                None => {}
+            }
+            sql.push_str(&format!("\n  AS {TAG}\nSELECT {body}\n{TAG}"));
+            Ok(sql)
+        }
+        // Redshift scalar SQL UDF:
+        // https://docs.aws.amazon.com/redshift/latest/dg/r_CREATE_FUNCTION.html
+        // `CREATE [ OR REPLACE ] FUNCTION f_function_name ( [sql_arg_data_type [, ...]] )
+        //  RETURNS data_type { VOLATILE | STABLE | IMMUTABLE }
+        //  AS $$ SELECT_clause $$ LANGUAGE sql`.
+        // Arguments are unnamed and the body references them as `$1`, `$2`, …
+        // (https://docs.aws.amazon.com/redshift/latest/dg/udf-creating-a-scalar-sql-udf.html),
+        // so named references are rewritten through the parsed expression.
+        // The volatility clause is required; without `deterministic` Rocky
+        // emits VOLATILE, the clause that promises nothing.
+        FunctionDialect::Redshift => {
+            plain_catalog()?;
+            if def.config.target.catalog.is_some() {
+                return Err(unsupported(
+                    "Redshift functions are created in the connected database; drop \
+                     `[target] catalog` and keep `schema`"
+                        .to_string(),
+                ));
+            }
+            let params: Vec<&str> = def
+                .config
+                .arguments
+                .iter()
+                .map(|a| a.name.as_str())
+                .collect();
+            let positional = rocky_sql::udf_body::positional_params(body, &params)
+                .map_err(|e| invalid(format!("cannot render the body for Redshift: {e}")))?;
+            if positional.contains("$$") {
+                return Err(invalid(
+                    "the body contains `$$`, which cannot appear inside Redshift's \
+                     dollar-quoted function definition"
+                        .to_string(),
+                ));
+            }
+            let types = def
+                .config
+                .arguments
+                .iter()
+                .map(|a| a.data_type.trim())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let volatility = match def.config.deterministic {
+                Some(true) => "IMMUTABLE",
+                Some(false) | None => "VOLATILE",
+            };
+            Ok(format!(
+                "CREATE OR REPLACE FUNCTION {}({types})\n  RETURNS {returns}\n  {volatility}\n  \
+                 AS $$\nSELECT {positional}\n$$ LANGUAGE sql",
+                dotted(ToString::to_string)
+            ))
+        }
         // Trino stores SQL routines only in connectors that implement routine
         // storage (https://trino.io/docs/current/udf/sql.html), and Rocky's
         // Trino adapter does not manage that. Refuse rather than emit DDL the
@@ -705,6 +792,111 @@ mod tests {
     }
 
     #[test]
+    fn postgres_function_syntax() {
+        let mut d = def(
+            "safe_div",
+            &[("a", "NUMERIC"), ("b", "NUMERIC")],
+            "NUMERIC",
+            "CASE WHEN b = 0 THEN NULL ELSE a / b END",
+        );
+        d.config.target.schema = Some("util".to_string());
+        d.config.deterministic = Some(true);
+        d.config.description = Some("not emitted".to_string());
+        assert_eq!(
+            create_function_sql(&d, FunctionDialect::Postgres).unwrap(),
+            "CREATE OR REPLACE FUNCTION util.safe_div(a NUMERIC, b NUMERIC)\n  \
+             RETURNS NUMERIC\n  LANGUAGE sql\n  IMMUTABLE\n  \
+             AS $rocky$\nSELECT CASE WHEN b = 0 THEN NULL ELSE a / b END\n$rocky$"
+        );
+        d.config.deterministic = Some(false);
+        assert!(
+            create_function_sql(&d, FunctionDialect::Postgres)
+                .unwrap()
+                .contains("\n  VOLATILE\n")
+        );
+        d.config.deterministic = None;
+        let sql = create_function_sql(&d, FunctionDialect::Postgres).unwrap();
+        assert!(
+            !sql.contains("VOLATILE") && !sql.contains("IMMUTABLE"),
+            "{sql}"
+        );
+    }
+
+    #[test]
+    fn postgres_dollar_quotes_without_the_rocky_tag_are_fine() {
+        let d = def("f", &[], "TEXT", "'$$' || '$tag$'");
+        assert!(create_function_sql(&d, FunctionDialect::Postgres).is_ok());
+        let tagged = def("g", &[], "TEXT", "'$rocky$'");
+        assert!(matches!(
+            create_function_sql(&tagged, FunctionDialect::Postgres),
+            Err(FunctionError::Invalid { .. })
+        ));
+    }
+
+    #[test]
+    fn postgres_trailing_comment_cannot_swallow_the_closing_tag() {
+        let d = def("h", &[("x", "BIGINT")], "BIGINT", "x -- note");
+        assert_eq!(
+            create_function_sql(&d, FunctionDialect::Postgres).unwrap(),
+            "CREATE OR REPLACE FUNCTION h(x BIGINT)\n  RETURNS BIGINT\n  LANGUAGE sql\n  \
+             AS $rocky$\nSELECT x -- note\n$rocky$"
+        );
+    }
+
+    #[test]
+    fn redshift_function_uses_positional_arguments() {
+        let mut d = def(
+            "f_safe_div",
+            &[("a", "FLOAT8"), ("b", "FLOAT8")],
+            "FLOAT8",
+            "CASE WHEN b = 0 THEN NULL ELSE a / b END",
+        );
+        d.config.target.schema = Some("util".to_string());
+        d.config.deterministic = Some(true);
+        assert_eq!(
+            create_function_sql(&d, FunctionDialect::Redshift).unwrap(),
+            "CREATE OR REPLACE FUNCTION util.f_safe_div(FLOAT8, FLOAT8)\n  \
+             RETURNS FLOAT8\n  IMMUTABLE\n  \
+             AS $$\nSELECT CASE WHEN $2 = 0 THEN NULL ELSE $1 / $2 END\n$$ LANGUAGE sql"
+        );
+        d.config.deterministic = None;
+        assert!(
+            create_function_sql(&d, FunctionDialect::Redshift)
+                .unwrap()
+                .contains("\n  VOLATILE\n")
+        );
+    }
+
+    #[test]
+    fn redshift_leaves_literals_alone_and_refuses_what_it_cannot_render() {
+        let d = def("f", &[("x", "VARCHAR")], "VARCHAR", "x || 'x'");
+        assert!(
+            create_function_sql(&d, FunctionDialect::Redshift)
+                .unwrap()
+                .contains("SELECT $1 || 'x'\n")
+        );
+        let dollars = def("g", &[], "VARCHAR", "'$$'");
+        assert!(matches!(
+            create_function_sql(&dollars, FunctionDialect::Redshift),
+            Err(FunctionError::Invalid { .. })
+        ));
+        let qualified = def("h", &[("p", "SUPER")], "VARCHAR", "p.field");
+        assert!(matches!(
+            create_function_sql(&qualified, FunctionDialect::Redshift),
+            Err(FunctionError::Invalid { .. })
+        ));
+        let mut cataloged = def("k", &[], "INT", "1");
+        cataloged.config.target = FunctionTarget {
+            catalog: Some("dev".to_string()),
+            schema: Some("util".to_string()),
+        };
+        assert!(matches!(
+            create_function_sql(&cataloged, FunctionDialect::Redshift),
+            Err(FunctionError::Unsupported { .. })
+        ));
+    }
+
+    #[test]
     fn trino_is_refused() {
         let err = create_function_sql(&cents(), FunctionDialect::Trino).unwrap_err();
         assert!(matches!(err, FunctionError::Unsupported { .. }));
@@ -725,6 +917,8 @@ mod tests {
                 FunctionDialect::Snowflake,
                 FunctionDialect::Databricks,
                 FunctionDialect::BigQuery,
+                FunctionDialect::Postgres,
+                FunctionDialect::Redshift,
             ] {
                 assert!(matches!(
                     create_function_sql(&d, dialect),
@@ -805,6 +999,14 @@ mod tests {
         assert_eq!(
             FunctionDialect::from_dialect_name("duckdb"),
             Some(FunctionDialect::DuckDb)
+        );
+        assert_eq!(
+            FunctionDialect::from_dialect_name("postgres"),
+            Some(FunctionDialect::Postgres)
+        );
+        assert_eq!(
+            FunctionDialect::from_dialect_name("redshift"),
+            Some(FunctionDialect::Redshift)
         );
         assert_eq!(FunctionDialect::from_dialect_name("unknown"), None);
     }

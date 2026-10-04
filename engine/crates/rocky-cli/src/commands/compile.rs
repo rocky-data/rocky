@@ -667,7 +667,7 @@ fn warehouse_adapters(
 
 /// E051 for every valid function a model calls when every warehouse adapter
 /// the project configures cannot create functions: Trino, and every adapter
-/// with no function DDL (PostgreSQL, Redshift, an unknown type). A project
+/// with no function DDL (an unknown type). A project
 /// that also configures a capable warehouse is not refused here —
 /// `rocky run` refuses at the boundary if the model runs on the other one.
 fn function_adapter_diagnostics(
@@ -690,7 +690,9 @@ fn function_adapter_diagnostics(
             FunctionDialect::DuckDb
             | FunctionDialect::Snowflake
             | FunctionDialect::Databricks
-            | FunctionDialect::BigQuery,
+            | FunctionDialect::BigQuery
+            | FunctionDialect::Postgres
+            | FunctionDialect::Redshift,
         ) => true,
     };
     if registry.is_empty() || warehouses.is_empty() || warehouses.iter().any(|(_, w)| can_create(w))
@@ -1118,17 +1120,18 @@ schema_template = "s"
         config
     }
 
-    /// Postgres and Redshift have no function DDL. With no other
-    /// warehouse configured, a UDF is refused at compile time (E051)
-    /// instead of failing mid-run.
+    const TRINO: &str = "[adapter.wh]\ntype = \"trino\"\nhost = \"localhost\"\n";
+
+    /// Trino cannot create persistent functions. With no other warehouse
+    /// configured, a UDF is refused at compile time (E051) instead of
+    /// failing mid-run.
     #[test]
     fn udf_on_warehouse_without_function_ddl_is_e051() {
         for adapters in [
-            PG.to_string(),
-            PG.replace("postgres", "redshift"),
+            TRINO.to_string(),
             // A discovery-only adapter is not a warehouse.
             format!(
-                "{PG}\n[adapter.src]\ntype = \"fivetran\"\nkind = \"discovery\"\n\
+                "{TRINO}\n[adapter.src]\ntype = \"fivetran\"\nkind = \"discovery\"\n\
                      destination_id = \"d\"\napi_key = \"k\"\napi_secret = \"s\"\n"
             ),
         ] {
@@ -1142,12 +1145,28 @@ schema_template = "s"
         }
     }
 
-    /// A capable warehouse beside Postgres keeps compile quiet: the run
-    /// refuses at the boundary if the model lands on Postgres.
+    /// PostgreSQL and Redshift create SQL functions, so a project whose
+    /// only warehouse is one of them compiles clean.
+    #[test]
+    fn udf_on_postgres_or_redshift_is_not_e051() {
+        for adapters in [PG.to_string(), PG.replace("postgres", "redshift")] {
+            let dir = TempDir::new().unwrap();
+            let config = udf_project(dir.path(), &adapters);
+            let codes = compile_codes(dir.path(), &config);
+            assert!(
+                !codes.iter().any(|(c, _)| c == "E051"),
+                "{adapters}: {codes:?}"
+            );
+        }
+    }
+
+    /// A capable warehouse beside Trino keeps compile quiet: the run
+    /// refuses at the boundary if the model lands on Trino.
     #[test]
     fn udf_with_a_capable_warehouse_configured_is_not_e051() {
         let dir = TempDir::new().unwrap();
-        let adapters = format!("{PG}\n[adapter.local]\ntype = \"duckdb\"\npath = \":memory:\"\n");
+        let adapters =
+            format!("{TRINO}\n[adapter.local]\ntype = \"duckdb\"\npath = \":memory:\"\n");
         let config = udf_project(dir.path(), &adapters);
         let codes = compile_codes(dir.path(), &config);
         assert!(!codes.iter().any(|(c, _)| c == "E051"), "{codes:?}");
