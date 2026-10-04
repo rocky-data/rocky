@@ -455,9 +455,6 @@ async fn run_apply_run_plan(
     let run_plan: RunPlan = serde_json::from_value(plan.payload.clone())
         .context("failed to deserialize run plan payload")?;
 
-    // #2239: before any other gate, whoever applies the plan.
-    super::review::refuse_reviewable_dag_plan(&plan, plan_id, &run_plan)?;
-
     if super::review::plan_is_reviewable(&plan) {
         require_reviewable_plan_fingerprint(&plan, plan_id)?;
     }
@@ -566,6 +563,7 @@ async fn run_apply_run_plan(
         config_path,
         !run_plan.models.is_empty(),
     );
+    verify_reviewed_dag_scope(&plan, plan_id, &loaded.config, config_path, &run_plan)?;
     let termination = execute_run_plan(
         config_path,
         std::sync::Arc::clone(&loaded),
@@ -4028,9 +4026,6 @@ async fn run_apply_ai_authored_plan(
     let run_plan: RunPlan = serde_json::from_value(plan.payload.clone())
         .context("failed to deserialize ai_authored plan payload")?;
 
-    // #2239: before any other gate, whoever applies the plan.
-    super::review::refuse_reviewable_dag_plan(&plan, plan_id, &run_plan)?;
-
     require_reviewable_plan_fingerprint(&plan, plan_id)?;
 
     validate_run_plan_execution_shape(plan_id, &run_plan)?;
@@ -4164,6 +4159,7 @@ async fn run_apply_ai_authored_plan(
         config_path,
         !run_plan.models.is_empty(),
     );
+    verify_reviewed_dag_scope(&plan, plan_id, &loaded.config, config_path, &run_plan)?;
     let termination = execute_run_plan(
         config_path,
         std::sync::Arc::clone(&loaded),
@@ -4186,6 +4182,24 @@ async fn run_apply_ai_authored_plan(
     )
     .await?;
     Ok(apply_outcome_for(termination, &apply_run_id))
+}
+
+/// #2239: a reviewable `--dag` plan executes only if every model the DAG
+/// runs, in every pipeline's directory, still matches the fingerprint the plan
+/// and its approval recorded. Runs whoever applies the plan, as late as
+/// possible before execution. A plan without `--dag`, or one that is not
+/// review-gated, is unaffected.
+fn verify_reviewed_dag_scope(
+    plan: &PersistedPlan,
+    plan_id: &str,
+    config: &rocky_core::config::RockyConfig,
+    config_path: &Path,
+    run_plan: &RunPlan,
+) -> Result<()> {
+    if !run_plan.dag || !super::review::plan_is_reviewable(plan) {
+        return Ok(());
+    }
+    super::approval_scope::verify_dag_scope_for_apply(plan, plan_id, config, config_path, run_plan)
 }
 
 fn require_reviewable_plan_fingerprint(plan: &PersistedPlan, plan_id: &str) -> Result<()> {
@@ -9591,78 +9605,212 @@ autonomy_budget = { failures = 3, window = "7d" }
         Ok(())
     }
 
-    /// #2239: a reviewable `--dag` plan is refused at apply, whoever applies
-    /// it. Its approval covers one models directory, but the DAG runner also
-    /// runs every other pipeline's models. Pre-fix, a HUMAN applying an
-    /// agent-stamped (or approved AI-authored) `--dag` plan had no governed
-    /// context, so the DAG guard did not fire and the DAG ran.
-    #[tokio::test]
-    async fn reviewable_dag_plan_is_refused_whoever_applies_it() -> anyhow::Result<()> {
-        let mut rp = minimal_run_plan();
-        rp.dag = true;
-        rp.models = vec![];
-        rp.execution_layers = vec![];
-        for kind in [PlanKind::Run, PlanKind::AiAuthored] {
-            let dir = tempfile::tempdir()?;
-            let config = dir.path().join("rocky.toml");
+    /// A project with two transformation pipelines, each reading its own
+    /// models directory (`silver/`, `gold/`), on one DuckDB file.
+    fn two_pipeline_dag_project(root: &Path) -> anyhow::Result<PathBuf> {
+        let model = |dir: &str, name: &str, value: u32| -> anyhow::Result<()> {
+            std::fs::create_dir_all(root.join(dir))?;
             std::fs::write(
-                &config,
+                root.join(dir).join(format!("{name}.sql")),
+                format!("SELECT {value} AS v\n"),
+            )?;
+            std::fs::write(
+                root.join(dir).join(format!("{name}.toml")),
                 format!(
-                    "[adapter]\ntype = \"duckdb\"\npath = \"{}\"\n\n[pipeline.p]\n\
-                     type = \"transformation\"\nmodels = \"models/**\"\n",
-                    dir.path().join("w.duckdb").display()
+                    "depends_on = []\n\n[strategy]\ntype = \"full_refresh\"\n\n\
+                     [target]\ncatalog = \"proj\"\nschema = \"marts\"\ntable = \"{name}\"\n"
                 ),
             )?;
-            let plan_id = crate::plan_store::write_plan_governed(
-                dir.path(),
-                kind.clone(),
-                &rp,
-                PolicyPrincipal::Agent,
-                crate::plan_store::EmbeddedCapabilities {
-                    models_fingerprint: Some("reviewed-fingerprint".to_string()),
-                    config_identity: Some("reviewed-config".to_string()),
-                    fingerprint_version: crate::plan_store::CURRENT_FINGERPRINT_VERSION,
-                    reviewed_source_schemas: Some(BTreeMap::new()),
-                    ..Default::default()
-                },
-            )?;
-            // An approval marker exists, so only the #2239 guard can refuse
-            // the AI-authored plan before dispatch.
-            super::super::review::write_test_review_marker(dir.path(), &plan_id);
-            let state = dir.path().join("state.redb");
-            let apply = if kind == PlanKind::Run {
-                super::run_apply_run_plan(
-                    dir.path(),
-                    &config,
-                    &plan_id,
-                    &state,
-                    PolicyPrincipal::Human,
-                    true,
+            Ok(())
+        };
+        model("silver", "orders", 1)?;
+        model("gold", "totals", 2)?;
+        let config = root.join("rocky.toml");
+        let pipeline = |name: &str| {
+            format!(
+                "[pipeline.{name}]\ntype = \"transformation\"\nmodels = \"{name}/**\"\n\n\
+                 [pipeline.{name}.target]\nadapter = \"local\"\n\n\
+                 [pipeline.{name}.target.governance]\nauto_create_catalogs = true\n\
+                 auto_create_schemas = true\n\n"
+            )
+        };
+        std::fs::write(
+            &config,
+            format!(
+                "[adapter.local]\ntype = \"duckdb\"\npath = \"{}\"\n\n{}{}",
+                root.join("proj.duckdb").display(),
+                pipeline("silver"),
+                pipeline("gold"),
+            ),
+        )?;
+        Ok(config)
+    }
+
+    /// Persist a `--dag` run plan through the production capability path,
+    /// stamped with `principal`.
+    fn write_dag_plan(
+        root: &Path,
+        config: &Path,
+        principal: PolicyPrincipal,
+    ) -> anyhow::Result<String> {
+        let rp = RunPlan {
+            dag: true,
+            models: vec![],
+            execution_layers: vec![],
+            ..minimal_run_plan()
+        };
+        let cfg = rocky_core::config::load_optional_project_config(Some(config))?;
+        let scope = super::super::approval_scope::approval_scope(cfg.as_ref(), config, &rp)?;
+        let capabilities = super::super::plan::compute_embedded_capabilities_for_scope(
+            config,
+            Some(&scope),
+            "HEAD",
+            Some(&root.join("state.redb")),
+            None,
+            false,
+        )?;
+        assert!(capabilities.models_fingerprint.is_some());
+        Ok(crate::plan_store::write_plan_governed(
+            root,
+            PlanKind::Run,
+            &rp,
+            principal,
+            capabilities,
+        )?)
+    }
+
+    async fn apply_dag_plan_as_human(
+        root: &Path,
+        config: &Path,
+        plan_id: &str,
+    ) -> Result<ApplyOutcome> {
+        super::run_apply_run_plan(
+            root,
+            config,
+            plan_id,
+            &root.join(".rocky-state.redb"),
+            PolicyPrincipal::Human,
+            false,
+        )
+        .await
+    }
+
+    /// #2239: a reviewed `--dag` plan's fingerprint covers every pipeline's
+    /// models, so a model added to, changed in or removed from ANOTHER
+    /// pipeline's directory after the plan refuses the apply before anything
+    /// runs. Pre-fix the fingerprint covered `models/` alone (and the plan was
+    /// refused outright as an interim measure).
+    #[tokio::test]
+    async fn reviewed_dag_plan_refuses_when_another_pipelines_models_change() -> anyhow::Result<()>
+    {
+        let edits: [(&str, fn(&Path) -> std::io::Result<()>); 3] = [
+            ("changed", |root| {
+                std::fs::write(root.join("gold/totals.sql"), "SELECT 3 AS v\n")
+            }),
+            ("added", |root| {
+                std::fs::write(root.join("gold/extra.sql"), "SELECT 4 AS v\n")?;
+                std::fs::copy(root.join("gold/totals.toml"), root.join("gold/extra.toml"))?;
+                std::fs::write(
+                    root.join("gold/extra.toml"),
+                    std::fs::read_to_string(root.join("gold/extra.toml"))?
+                        .replace("table = \"totals\"", "table = \"extra\""),
                 )
+            }),
+            ("removed", |root| {
+                std::fs::remove_file(root.join("gold/totals.sql"))?;
+                std::fs::remove_file(root.join("gold/totals.toml"))
+            }),
+        ];
+        for (label, edit) in edits {
+            let dir = tempfile::tempdir()?;
+            let root = dir.path();
+            let config = two_pipeline_dag_project(root)?;
+            let plan_id = write_dag_plan(root, &config, PolicyPrincipal::Agent)?;
+            super::super::review::write_test_review_marker(root, &plan_id);
+            edit(root)?;
+
+            let err = apply_dag_plan_as_human(root, &config, &plan_id)
                 .await
-            } else {
-                super::run_apply_ai_authored_plan(
-                    dir.path(),
-                    &config,
-                    &plan_id,
-                    &state,
-                    PolicyPrincipal::Human,
-                    true,
-                )
-                .await
-            };
-            let err = apply.expect_err("a reviewable --dag plan must be refused");
-            assert_eq!(
-                err.to_string(),
-                super::super::review::reviewable_dag_refusal(&format!("plan '{plan_id}'")),
-                "{kind}"
-            );
-            assert!(!state.exists(), "{kind}: refused before state is opened");
+                .expect_err("a reviewed --dag plan must refuse a model change in any pipeline");
+            let msg = format!("{err:#}");
             assert!(
-                !dir.path().join("w.duckdb").exists(),
-                "{kind}: refused before the warehouse is opened"
+                msg.contains("added, removed or changed since the plan was written"),
+                "{label}: {msg}"
+            );
+            assert!(
+                !root.join("proj.duckdb").exists(),
+                "{label}: refused before the warehouse is opened"
             );
         }
+        Ok(())
+    }
+
+    /// #2239: an unchanged reviewed `--dag` plan applies, and builds the
+    /// models of BOTH pipelines.
+    #[tokio::test]
+    async fn unchanged_reviewed_dag_plan_applies_every_pipeline() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path();
+        let config = two_pipeline_dag_project(root)?;
+        let plan_id = write_dag_plan(root, &config, PolicyPrincipal::Agent)?;
+        super::super::review::write_test_review_marker(root, &plan_id);
+
+        apply_dag_plan_as_human(root, &config, &plan_id)
+            .await
+            .expect("an unchanged reviewed --dag plan must apply");
+
+        let adapter =
+            rocky_duckdb::adapter::DuckDbWarehouseAdapter::open(&root.join("proj.duckdb"))?;
+        let conn = adapter.shared_connector();
+        let guard = conn.lock().unwrap();
+        for table in ["orders", "totals"] {
+            let rows = guard.execute_sql(&format!("SELECT v FROM proj.marts.{table}"))?;
+            assert_eq!(rows.rows.len(), 1, "{table} materialized");
+        }
+        Ok(())
+    }
+
+    /// #2239: a human-authored `--dag` plan is not review-gated, so the scope
+    /// check does not run and an edit after planning still applies, exactly as
+    /// before.
+    #[tokio::test]
+    async fn human_authored_dag_plan_is_not_scope_checked() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path();
+        let config = two_pipeline_dag_project(root)?;
+        let plan_id = write_dag_plan(root, &config, PolicyPrincipal::Human)?;
+        std::fs::write(root.join("gold/totals.sql"), "SELECT 3 AS v\n")?;
+
+        apply_dag_plan_as_human(root, &config, &plan_id)
+            .await
+            .expect("a human-authored --dag plan applies the current models");
+        Ok(())
+    }
+
+    /// An agent applying a reviewed `--dag` plan is still refused: the DAG's
+    /// sub-runs carry no governance context, so the governed DAG guard stands.
+    #[tokio::test]
+    async fn agent_apply_of_a_reviewed_dag_plan_is_still_refused() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path();
+        let config = two_pipeline_dag_project(root)?;
+        let plan_id = write_dag_plan(root, &config, PolicyPrincipal::Agent)?;
+        super::super::review::write_test_review_marker(root, &plan_id);
+        let err = super::run_apply_run_plan(
+            root,
+            &config,
+            &plan_id,
+            &root.join(".rocky-state.redb"),
+            PolicyPrincipal::Agent,
+            false,
+        )
+        .await
+        .expect_err("an agent --dag apply is not policy-gated, so it is refused");
+        assert!(
+            format!("{err:#}").contains("a `--dag` apply is not yet policy-gated"),
+            "{err:#}"
+        );
+        assert!(!root.join("proj.duckdb").exists());
         Ok(())
     }
 
