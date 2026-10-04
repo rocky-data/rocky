@@ -41,7 +41,7 @@ pub fn run_compile(
     run_vars: &rocky_core::run_vars::RunVars,
     deny_warning_codes: &[String],
 ) -> Result<()> {
-    run_compile_with_strict_sources(
+    run_compile_with_options(
         config_path,
         state_path,
         models_dir,
@@ -55,16 +55,23 @@ pub fn run_compile(
         run_vars,
         false,
         deny_warning_codes,
+        None,
     )
 }
 
-/// [`run_compile`] with `rocky compile --strict-sources`.
+/// [`run_compile`] with every invocation option.
 ///
-/// `strict_sources` escalates every W041 (a source column missing from a seed
-/// or untrusted cached schema) to E041 for this invocation. It ORs with
-/// `[cache.schemas] strict_sources`; it can turn strictness on, never off.
+/// `strict_sources` (`rocky compile --strict-sources`) escalates every W041
+/// (a source column missing from a seed or untrusted cached schema) to E041
+/// for this invocation. It ORs with `[cache.schemas] strict_sources`; it can
+/// turn strictness on, never off.
+///
+/// `selection` (`--select` / `--exclude`) scopes the report: the whole
+/// project still compiles (types flow across models); only the selected
+/// models' details and diagnostics are reported, and only their errors fail
+/// the command — the same scoping `--model` applies.
 #[allow(clippy::too_many_arguments)]
-pub fn run_compile_with_strict_sources(
+pub fn run_compile_with_options(
     config_path: Option<&Path>,
     state_path: &Path,
     models_dir: &Path,
@@ -78,6 +85,7 @@ pub fn run_compile_with_strict_sources(
     run_vars: &rocky_core::run_vars::RunVars,
     strict_sources: bool,
     deny_warning_codes: &[String],
+    selection: Option<&crate::selection::SelectionArgs>,
 ) -> Result<()> {
     let (mut output, text_data) = compile_inner(
         config_path,
@@ -91,6 +99,7 @@ pub fn run_compile_with_strict_sources(
         cache_ttl_override,
         run_vars,
         strict_sources,
+        selection,
     )?;
 
     if deny_warnings(&mut output.diagnostics, deny_warning_codes) {
@@ -131,6 +140,7 @@ fn compile_inner(
     cache_ttl_override: Option<u64>,
     run_vars: &rocky_core::run_vars::RunVars,
     strict_sources: bool,
+    selection: Option<&crate::selection::SelectionArgs>,
 ) -> Result<(CompileOutput, CompileTextData)> {
     // Load the project config ONCE, and let a failure fail the command.
     //
@@ -244,7 +254,24 @@ fn compile_inner(
     {
         return Err(anyhow::Error::new(ModelNotFound(filter.to_string())));
     }
-    let in_scope = |name: &str| model_filter.is_none_or(|filter| name == filter);
+    let selected: Option<std::collections::BTreeSet<String>> = match selection {
+        Some(args) if args.is_active() => Some(crate::selection::resolve(
+            args,
+            &result.project,
+            models_dir,
+            &crate::selection::StateContext {
+                config_path: config_path.unwrap_or_else(|| Path::new("rocky.toml")),
+                state_path,
+                cache_ttl_override,
+            },
+        )?),
+        _ => None,
+    };
+    let in_scope = |name: &str| {
+        model_filter.is_none_or(|filter| name == filter)
+            && selected.as_ref().is_none_or(|set| set.contains(name))
+    };
+    let scoped = model_filter.is_some() || selected.is_some();
 
     // A warehouse that cannot create functions refuses them here (E051), at
     // compile time, rather than mid-run.
@@ -462,7 +489,7 @@ fn compile_inner(
             .collect(),
     };
 
-    let execution_layers = if model_filter.is_some() {
+    let execution_layers = if scoped {
         result
             .project
             .layers
@@ -472,7 +499,7 @@ fn compile_inner(
     } else {
         result.project.layers.len()
     };
-    let has_errors = if model_filter.is_some() {
+    let has_errors = if scoped {
         diagnostics.iter().any(|d| d.severity == Severity::Error)
     } else {
         result.has_errors
@@ -704,6 +731,7 @@ pub fn compile_output(
         // No `--strict-sources` flag on these surfaces; `[cache.schemas]
         // strict_sources` still applies.
         false,
+        None,
     )?;
     Ok(output)
 }
@@ -1752,6 +1780,7 @@ schema_template = "s"
             None,
             &rocky_core::run_vars::RunVars::new(),
             strict_sources,
+            None,
         )
         .expect("compile should produce output")
         .0
@@ -1807,7 +1836,7 @@ schema_template = "s"
         assert_eq!(count(&output, "E041"), 1, "{:?}", output.diagnostics);
         assert_eq!(count(&output, "W041"), 0);
 
-        let err = run_compile_with_strict_sources(
+        let err = run_compile_with_options(
             None,
             &models_dir.join(".rocky-state.redb"),
             &models_dir,
@@ -1821,6 +1850,7 @@ schema_template = "s"
             &rocky_core::run_vars::RunVars::new(),
             true,
             &[],
+            None,
         )
         .unwrap_err();
         assert!(err.to_string().contains("compilation failed"), "{err}");
@@ -1947,6 +1977,7 @@ schema_template = "s"
                 None,
                 &rocky_core::run_vars::RunVars::new(),
                 false,
+                None,
             )
             .unwrap()
             .0

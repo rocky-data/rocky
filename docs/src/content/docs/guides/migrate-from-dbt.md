@@ -707,6 +707,26 @@ rocky apply "$plan_id"
 
 Then compare row counts, column types, and data values between the dbt tables and the Rocky tables.
 
+### Select models the way you did in dbt
+
+Rocky accepts dbt's node selection syntax on `--select` and `--exclude`. The table maps the common dbt commands. See [Node selection](/reference/node-selection/) for the full grammar.
+
+| dbt | Rocky |
+|---|---|
+| `dbt ls --select <sel>` | `rocky list --select <sel>` |
+| `dbt compile --select <sel>` | `rocky compile --select <sel>`, or `rocky emit-sql --select <sel>` for the SQL |
+| `dbt run --select <sel>` | `rocky run --select <sel>` |
+| `dbt test --select <sel>` | `rocky test --select <sel>` |
+| `dbt docs generate --select <sel>` | `rocky docs --select <sel>` |
+| `--select +model`, `model+`, `2+model`, `@model` | The same graph operators |
+| `--select tag:nightly` | `--select tag:nightly`. Rocky matches a `[tags]` key or value. |
+| `--select path:models/staging` | The same |
+| `--select config.materialized:incremental` | The same. `table` matches Rocky's `full_refresh`. |
+| `--select source:raw+` | The same. Rocky matches the external tables a model reads. |
+| `--select state:modified+ --state path/to/artifacts` | `--select state:modified+ --state-ref main`. Rocky compares against a git ref, not a manifest. |
+| `--exclude <sel>` | The same |
+| `--defer --state path/to/artifacts` | `--defer`, optionally `--defer-to <schema>` |
+
 ## 9. Convert dbt Tests to Rocky Tests and Contracts
 
 `rocky import-dbt` translates two kinds of dbt test onto Rocky sidecars:

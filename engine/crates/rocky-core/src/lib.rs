@@ -60,6 +60,7 @@ pub mod schema;
 pub mod schema_cache;
 pub mod secret_registry;
 pub mod seeds;
+pub mod selector;
 pub mod shadow;
 pub mod snapshots;
 pub mod source;

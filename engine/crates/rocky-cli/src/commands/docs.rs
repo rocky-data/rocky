@@ -26,6 +26,7 @@ pub fn run_docs(
     cache_ttl_override: Option<u64>,
     run_vars: &rocky_core::run_vars::RunVars,
     json: bool,
+    selection: Option<&crate::selection::SelectionArgs>,
 ) -> Result<()> {
     let start = Instant::now();
 
@@ -52,6 +53,34 @@ pub fn run_docs(
         anyhow::bail!("no models found in {}", models_dir.display());
     }
 
+    // `--select` / `--exclude` narrow which models the catalog documents.
+    // Selection resolves against the full project so graph operators see
+    // every edge; an empty selection is refused like an empty project.
+    let all_models = models;
+    let models = match selection {
+        Some(args) if args.is_active() => {
+            let project = rocky_compiler::project::Project::from_models(all_models.clone())
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            let selected = crate::selection::resolve(
+                args,
+                &project,
+                models_dir,
+                &crate::selection::StateContext {
+                    config_path,
+                    state_path,
+                    cache_ttl_override,
+                },
+            )?;
+            anyhow::ensure!(!selected.is_empty(), "the selection matched no models");
+            all_models
+                .iter()
+                .filter(|m| selected.contains(&m.config.name))
+                .cloned()
+                .collect::<Vec<_>>()
+        }
+        _ => all_models.clone(),
+    };
+
     let models_count = models.len();
 
     info!(
@@ -71,9 +100,11 @@ pub fn run_docs(
     // failing. A project that loads but does not compile degrades to no
     // column tables, which is what every project got before this map was
     // wired up (#1444).
+    // Compile the whole project: a selected model's columns infer from its
+    // unselected upstreams.
     let column_map = infer_column_map(
         &rocky_cfg,
-        models.clone(),
+        all_models,
         models_dir,
         state_path,
         cache_ttl_override,

@@ -171,6 +171,20 @@ fn git_changed_files(base_ref: &str, repo_dir: Option<&Path>) -> Result<Vec<Chan
     parse_name_status(&output.stdout)
 }
 
+/// Changed files between `base_ref...HEAD` as `(git status, repo-relative
+/// path)` pairs, for the `state:` node selectors. A rename contributes its old
+/// path too, so a moved model reads as changed on both sides.
+pub(crate) fn changed_paths(base_ref: &str) -> Result<Vec<(char, String)>> {
+    validate_base_ref(base_ref)?;
+    Ok(git_changed_files(base_ref, None)?
+        .into_iter()
+        .flat_map(|file| {
+            let old = file.old_path.map(|path| (file.status, path));
+            std::iter::once((file.status, file.path)).chain(old)
+        })
+        .collect())
+}
+
 /// Parse the output of `git diff --name-status`.
 fn parse_name_status(raw: &[u8]) -> Result<Vec<ChangedFile>> {
     let text = String::from_utf8_lossy(raw);
