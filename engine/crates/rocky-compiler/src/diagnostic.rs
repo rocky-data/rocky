@@ -181,6 +181,21 @@ pub const E040: &str = "E040";
 /// projection aliases, and arguments of unknown functions stay silent. See
 /// `rocky_compiler::group_by` for the full rule set.
 pub const E044: &str = "E044";
+/// An aggregate's argument type has no overload on the target dialect, and the
+/// dialect does not cast it implicitly — e.g. `SUM(VARCHAR)` on DuckDB,
+/// BigQuery or Trino. The statement can never run. Emitted by `rocky compile`
+/// from [`crate::operand_check`], which carries the per-dialect table and its
+/// documentation sources. Where the dialect casts at run time instead, the
+/// same argument is [`W042`].
+pub const E042: &str = "E042";
+
+/// A comparison (`=`, `<>`, `<`, `IN`, `BETWEEN`, join `ON`, …) pairs types
+/// the target dialect refuses outright — e.g. `INT64 = STRING` on BigQuery or
+/// `bigint = varchar` on Trino. Emitted by `rocky compile` from
+/// [`crate::operand_check`]. Where the dialect casts implicitly and failure
+/// depends on the data, the same pair is [`W043`]. A same-named join key whose
+/// type differs across upstream models stays [`E001`]/[`W001`]'s.
+pub const E043: &str = "E043";
 
 // Warnings
 /// Unused model (no downstream consumers).
@@ -282,6 +297,19 @@ pub const W030: &str = "W030";
 /// reads keep working — but the consumer's own declared output type may now
 /// be too small, hence a warning rather than silence.
 pub const W031: &str = "W031";
+
+/// An aggregate's argument is implicitly cast at run time — e.g. `SUM(VARCHAR)`
+/// on Snowflake or Databricks — so the query fails on the first value that
+/// does not convert. Also emitted for [`E042`]'s cases when no target dialect
+/// is known. Escalate with `rocky compile --deny-warnings W042`.
+pub const W042: &str = "W042";
+
+/// A comparison relies on a value-dependent implicit cast — e.g. a `BIGINT`
+/// column compared with a `VARCHAR` column on DuckDB, Snowflake or Databricks,
+/// which fails at run time on the first text value that does not parse. A
+/// string literal that parses as a number is not reported. Escalate with
+/// `rocky compile --deny-warnings W043`.
+pub const W043: &str = "W043";
 
 // Info
 /// Model dependency inferred from SQL.

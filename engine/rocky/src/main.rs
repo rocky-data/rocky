@@ -1352,6 +1352,12 @@ enum Command {
         /// `@var(name)` with no value and no inline default is a compile error.
         #[arg(long = "var", value_name = "NAME=VALUE")]
         var: Vec<String>,
+
+        /// Treat these warning codes as errors (comma-separated or
+        /// repeatable), e.g. `--deny-warnings W042,W043`. A listed warning
+        /// is reported at error severity and fails the compile.
+        #[arg(long = "deny-warnings", value_name = "CODES", value_delimiter = ',')]
+        deny_warnings: Vec<String>,
     },
 
     /// Publish a snapshot of this project's compiled IR for consumers to
@@ -4267,6 +4273,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             target_dialect,
             with_seed,
             var,
+            deny_warnings,
         } => {
             let run_vars = rocky_core::run_vars::RunVars::parse_pairs(&var)
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -4282,6 +4289,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                 with_seed,
                 cli.cache_ttl,
                 &run_vars,
+                &deny_warnings,
             )
         }
         Command::PublishIr {

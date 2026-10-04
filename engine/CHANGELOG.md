@@ -10,6 +10,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **`rocky compile` reports E044 when an aggregating query reads a column that is neither grouped nor aggregated.** For example, `SELECT customer_id, status, SUM(amount) FROM raw.orders GROUP BY customer_id` now fails with `column 'status' in the SELECT list is neither in GROUP BY nor inside an aggregate`. The suggestion is to add the column to `GROUP BY` or wrap it in `ANY_VALUE`. The check covers the `SELECT` list, `HAVING`, and `ORDER BY` in every query scope. It fires only when the column belongs to a relation whose columns Rocky knows. `GROUP BY ALL`, ordinals, `SELECT` aliases, `ROLLUP`/`CUBE`/`GROUPING SETS`, unknown functions, `QUALIFY`, and unresolved names stay silent. **Breaking:** a project with such a query now fails `rocky compile`.
+- `rocky compile` checks aggregate arguments and comparison operands against the target warehouse. `SUM(VARCHAR)` is `E042` where the warehouse has no such overload (DuckDB, BigQuery, Trino) and `W042` where it casts at run time (Snowflake, Databricks). A `BIGINT` column compared with a `VARCHAR` column is `W043` on DuckDB, Snowflake and Databricks, and `E043` on BigQuery and Trino. Numeric string literals, date literals, `DATE` vs `TIMESTAMP` and unknown types stay clean. The warehouse comes from `--target-dialect`, then the target adapter type, then `[portability] target_dialect`.
+- `rocky compile --deny-warnings <CODES>` reports the listed warning codes as errors, such as `--deny-warnings W042,W043`.
 
 ## [1.76.0] — 2026-10-03
 

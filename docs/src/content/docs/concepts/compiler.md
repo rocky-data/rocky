@@ -111,7 +111,7 @@ It infers types from:
 - Arithmetic operators (numeric promotion rules)
 - Literals (string, numeric, boolean, date)
 - `CASE`/`WHEN` branches (common supertype)
-- Comparison operators (infer a Boolean result; operand checks have limits)
+- Comparison operators (infer a Boolean result; see the operand checks below)
 - Join keys (can report compatible-type problems when types are known)
 
 Each compiled model schema contains `TypedColumn` entries with a name, a
@@ -126,6 +126,38 @@ This analysis is conservative: a later `WHERE` filter does not narrow nullabilit
 It does not change the existing nullability inference for casts of computed expressions.
 
 For `USING` and `NATURAL` joins, Rocky distinguishes merged join keys from qualified references to either input.
+
+#### Aggregate and comparison operands
+
+`rocky compile` also checks two kinds of operands against the target warehouse:
+
+- **Aggregate arguments.** `SUM(customer_name)` over a `VARCHAR` column has no
+  overload on DuckDB, BigQuery or Trino. Rocky reports `E042`. Snowflake and
+  Databricks cast the text at run time instead, so there it is `W042`.
+- **Comparison operands.** This covers `=`, `<>`, `<`, `>`, `<=`, `>=`, `IN`,
+  `BETWEEN` and join `ON` predicates. A `BIGINT` column compared with a
+  `VARCHAR` column casts the text on every row on DuckDB, Snowflake and
+  Databricks. The query fails on the first value that does not parse, so Rocky
+  reports `W043`. BigQuery and Trino refuse the pair outright: `E043`.
+
+The warehouse comes from, in order: `--target-dialect`, the adapter `type` of
+the pipelines' target adapter, then `[portability] target_dialect`. With none
+of these, Rocky reports the mildest verdict across all warehouses. That is
+always a warning.
+
+These stay clean, so valid SQL is never refused:
+
+- An operand whose type Rocky does not know.
+- A string literal that parses as a number, such as `10::BIGINT = '10'::VARCHAR`.
+- A string literal compared with a date, such as `order_date >= '2024-01-01'`.
+- `DATE` compared with `TIMESTAMP`, and numbers of different widths.
+- `MIN`, `MAX`, `COUNT(*)` and `COUNT(DISTINCT x)` over any type.
+
+A same-named join key whose type differs between two upstream models is still
+reported once, as `E001` or `W001`.
+
+To fail the compile on the warnings, run
+`rocky compile --deny-warnings W042,W043`.
 
 ### 5. Validate contracts
 
@@ -323,6 +355,8 @@ span, and sometimes a suggested fix.
 | `E039` | A direct projection names a column absent from a complete in-project upstream model |
 | `E040` | A `.rocky` string literal contains a backslash; use a `.sql` model with the target's own escaping |
 | `E044` | An aggregating query reads a column that is neither in `GROUP BY` nor inside an aggregate |
+| `E042` | Aggregate argument type has no overload on the target warehouse, such as `SUM(VARCHAR)` on DuckDB |
+| `E043` | Comparison between types the target warehouse refuses, such as `INT64 = STRING` on BigQuery |
 | `W001` | Unused model (no downstream consumers) |
 | `W002` | Duplicate column in model output |
 | `W004` | Classification tag with no matching `[mask]` strategy |
@@ -334,6 +368,8 @@ span, and sometimes a suggested fix.
 | `W013` | `rocky.toml` is present but could not be read, so every project-level check is silent (`rocky lsp` and `rocky serve` only; one-shot commands refuse instead) |
 | `W030` | Imported producer added a column, surfaced only to consumers reading it via `SELECT *` |
 | `W031` | Imported producer widened the type of a column this project reads (cross-team contract) |
+| `W042` | Aggregate argument is cast implicitly at run time and fails on values that do not convert (escalate with `--deny-warnings W042`) |
+| `W043` | Comparison relies on an implicit cast that fails on values that do not convert, such as a `BIGINT` column compared with a `VARCHAR` column on DuckDB (escalate with `--deny-warnings W043`) |
 | `I001` | Model dependency inferred from SQL |
 | `I002` | Some, but not all, output columns have unknown types — provide source schemas for more type checking |
 | `I003` | A contract declares a type for a column whose type Rocky could not infer, so `E011` did not check it |
