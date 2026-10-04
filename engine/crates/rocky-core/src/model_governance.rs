@@ -295,8 +295,8 @@ pub fn load_version_decls_from_dir(dir: &Path) -> Result<Vec<(VersionDecl, PathB
         }
         let mut decl: VersionDecl =
             toml::from_str(&text).map_err(|e| ModelError::ParseFrontmatter {
-                path: path.display().to_string(),
-                source: e,
+                path: path.display().to_string().into(),
+                error: e,
             })?;
         if decl.name.is_none() {
             decl.name = Some(stem.to_string());
