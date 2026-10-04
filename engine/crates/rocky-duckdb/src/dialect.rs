@@ -270,17 +270,29 @@ impl SqlDialect for DuckDbSqlDialect {
         for col in columns {
             validation::validate_identifier(col).map_err(AdapterError::new)?;
         }
-        // DuckDB's `hash(expr_list)` accepts any number of arguments and
-        // returns UBIGINT (xxhash64). Cast to HUGEINT so `BIT_XOR(...)`
-        // widens cleanly to i128 — matches the [`ChunkChecksum::checksum`]
-        // u128 contract without truncation when the hash's high bit is
-        // set.
+        // Hash ONE string: the row rendered as text. Do not hash the
+        // columns as separate arguments. DuckDB combines the per-column
+        // hashes of `hash(a, b)` (and of `row`, `struct_pack` and list
+        // values) linearly under XOR, so `BIT_XOR` over a chunk cancels
+        // each column's share. Rows `(1,'a'),(2,'a')` and `(1,'b'),(2,'b')`
+        // then give the same chunk checksum, and so does a value swap
+        // between keys (checked against DuckDB 1.5.5). A string hash mixes
+        // all columns together. The text form of a `row(...)` quotes and
+        // escapes strings, so `NULL` and `'NULL'` render differently and
+        // `'a, b'` cannot split into two columns.
+        //
+        // `hash` returns UBIGINT (xxhash64). Cast to HUGEINT so
+        // `BIT_XOR(...)` widens cleanly to i128 — matches the
+        // [`ChunkChecksum::checksum`] u128 contract without truncation
+        // when the hash's high bit is set.
         let arg_list = columns
             .iter()
             .map(|c| format!("\"{c}\""))
             .collect::<Vec<_>>()
             .join(", ");
-        Ok(format!("CAST(hash({arg_list}) AS HUGEINT)"))
+        Ok(format!(
+            "CAST(hash(CAST(row({arg_list}) AS VARCHAR)) AS HUGEINT)"
+        ))
     }
 }
 
@@ -404,6 +416,21 @@ mod catalog_name_for_path_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The row hash must hash the row as ONE string. DuckDB's multi-arg
+    /// `hash(a, b)` is linear under XOR, so a `BIT_XOR` chunk checksum
+    /// over it misses equal-value changes and value swaps. The behavior
+    /// is pinned in `rocky-core/tests/bisection_checksum.rs`.
+    #[test]
+    fn row_hash_expr_hashes_the_serialized_row() {
+        let sql = DuckDbSqlDialect
+            .row_hash_expr(&["id".into(), "name".into()])
+            .unwrap();
+        assert_eq!(
+            sql,
+            "CAST(hash(CAST(row(\"id\", \"name\") AS VARCHAR)) AS HUGEINT)"
+        );
+    }
 
     fn dialect() -> DuckDbSqlDialect {
         DuckDbSqlDialect

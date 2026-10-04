@@ -99,6 +99,7 @@ _COMMAND_SCHEMA: dict[str, str] = {
     "ai_explain": "ai_explain.schema.json",
     "ai_test": "ai_test.schema.json",
     "ai_contract": "ai_contract.schema.json",
+    "profile": "profile.schema.json",
     "validate-migration": "validate_migration.schema.json",
     "doctor": "doctor.schema.json",
     "dag": "dag.schema.json",

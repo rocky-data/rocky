@@ -312,19 +312,21 @@ impl SqlDialect for DatabricksSqlDialect {
         for col in columns {
             validation::validate_identifier(col).map_err(AdapterError::new)?;
         }
-        // `xxhash64(col_a, col_b, ...)` — Spark's multi-arg form hashes
-        // the binary representation of each column with positional NULL
-        // handling built in: `xxhash64(NULL, 'x')` ≠ `xxhash64('x', NULL)`,
-        // so two rows that swap a NULL across columns hash differently
-        // (a `concat_ws`-based scheme would silently collide them
-        // because `concat_ws` skips NULL arguments). Type-aware as a
-        // bonus: an INT-to-STRING column-type change shows up as a
-        // diff. `xxhash64` returns BIGINT; `BIT_XOR(BIGINT)` returns
-        // BIGINT, which round-trips cleanly to the kernel's `i128`
-        // slot (sign-extended; the parser bit-casts into `u128`).
+        // `xxhash64(a, isnull(a), b, isnull(b), ...)`. Spark's hash
+        // functions SKIP a NULL argument: the running hash passes through
+        // unchanged (`InterpretedHashFunction.hash` returns the seed for
+        // `null`). So bare `xxhash64(NULL, 'x')` equals
+        // `xxhash64('x', NULL)`, and a NULL that moves between columns is
+        // invisible. The `isnull(...)` flag after each column is never
+        // NULL, so it pins which positions held a NULL. The hash stays
+        // type-aware: an INT-to-STRING change still shows up as a diff.
+        //
+        // `xxhash64` returns BIGINT; `BIT_XOR(BIGINT)` returns BIGINT,
+        // which round-trips cleanly to the kernel's `i128` slot
+        // (sign-extended; the parser bit-casts into `u128`).
         let arg_list = columns
             .iter()
-            .map(|c| format!("`{c}`"))
+            .map(|c| format!("`{c}`, isnull(`{c}`)"))
             .collect::<Vec<_>>()
             .join(", ");
         Ok(format!("xxhash64({arg_list})"))
@@ -776,14 +778,17 @@ mod tests {
     fn test_row_hash_expr_emits_multi_arg_xxhash64() {
         let d = dialect();
         let sql = d.row_hash_expr(&["name".into(), "value".into()]).unwrap();
-        assert_eq!(sql, "xxhash64(`name`, `value`)");
+        assert_eq!(
+            sql,
+            "xxhash64(`name`, isnull(`name`), `value`, isnull(`value`))"
+        );
     }
 
     #[test]
     fn test_row_hash_expr_single_column() {
         let d = dialect();
         let sql = d.row_hash_expr(&["only".into()]).unwrap();
-        assert_eq!(sql, "xxhash64(`only`)");
+        assert_eq!(sql, "xxhash64(`only`, isnull(`only`))");
     }
 
     #[test]

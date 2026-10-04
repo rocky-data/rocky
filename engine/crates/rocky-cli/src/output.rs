@@ -2948,6 +2948,16 @@ pub struct AiSyncProposal {
     pub intent: String,
     pub diff: String,
     pub proposed_source: String,
+    /// Whether a stored upstream-schema baseline existed for this model.
+    /// `false` on the first sync of a model: the proposal follows declared
+    /// intent only, and the current upstream schemas become the baseline.
+    /// Optional on the wire: an engine older than this field never had one.
+    #[serde(default)]
+    pub upstream_baseline_found: bool,
+    /// Upstream column changes since the baseline, one human-readable line
+    /// each. Empty when there is no baseline or nothing changed.
+    #[serde(default)]
+    pub upstream_changes: Vec<String>,
 }
 
 /// JSON output for `rocky ai-explain`.
@@ -3101,6 +3111,13 @@ pub struct ProfileColumnStats {
     pub min: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max: Option<String>,
+    /// Up to N distinct non-null values, sorted. Chosen pseudo-randomly by a
+    /// hash of each value, so a re-run on unchanged data returns the same
+    /// set whatever the scan order. Present only when
+    /// `rocky profile --sample N` asked for them; unlike `observed_values` it
+    /// covers high-cardinality columns too.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sample_values: Option<Vec<String>>,
 }
 
 /// JSON output for `rocky lineage-diff <base_ref>`.
@@ -6550,7 +6567,12 @@ pub struct SettingsOutput {
     /// when there was no readable config — `config_status` says which.
     pub state_backend: Option<rocky_core::config::StateBackend>,
     /// `[state] concurrency_control`, read at the same moment as
-    /// `state_backend`. `null` on the same condition.
+    /// `state_backend`: the explicit setting, or the backend default when it is
+    /// unset (`cas` on `s3`, `gcs` and `tiered`; `off` on `local` and
+    /// `valkey`). This is the requested mode — the writers' startup
+    /// conditional-write probe is not run for it, so `rocky doctor` is where a
+    /// store that falls back to `off` shows up. `null` on the same condition as
+    /// `state_backend`.
     pub concurrency_control: Option<rocky_core::config::ConcurrencyControl>,
     /// What happened when `rocky.toml` was read.
     ///

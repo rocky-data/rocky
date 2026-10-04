@@ -53,6 +53,10 @@ use rocky_core::state::{PolicyDecisionRecord, StateStore};
 use serde::{Deserialize, Serialize};
 
 use crate::commands::apply::{ai_plan_is_reviewed, review_marker_path};
+use crate::commands::approval_scope::{
+    ApprovalScope, CompiledUnit, NoModels, OwnedScopeIdentities, ScopeUnit, approval_scope,
+    scope_fingerprint,
+};
 use crate::commands::audit::{blast_radius_union, compile_project_with_schemas, plan_file_path};
 use crate::output::{
     ApproverIdentity, ReviewOutput, ReviewQueueEntry, ReviewQueueOutput, RunPlan, print_json,
@@ -248,34 +252,6 @@ pub fn plan_is_reviewable(plan: &crate::plan_store::PersistedPlan) -> bool {
         && plan.resolved_principal() == rocky_core::config::PolicyPrincipal::Agent)
 }
 
-/// Refuse a reviewable plan that carries `--dag` (#2239).
-///
-/// The approval of a reviewable plan (its conditional DROP disclosure and its
-/// execution fingerprint) covers one models directory. The DAG runner loads
-/// each pipeline's models from that pipeline's own directory, so it can run
-/// models the approval never covered. Until the approval covers every model
-/// the DAG dispatches, `rocky plan`, `rocky review` and `rocky apply` refuse
-/// this shape, whoever applies it.
-pub(crate) fn refuse_reviewable_dag_plan(
-    plan: &crate::plan_store::PersistedPlan,
-    plan_id: &str,
-    run_plan: &RunPlan,
-) -> Result<()> {
-    if run_plan.dag && plan_is_reviewable(plan) {
-        bail!("{}", reviewable_dag_refusal(&format!("plan '{plan_id}'")));
-    }
-    Ok(())
-}
-
-/// The shared refusal text for a reviewable `--dag` plan (#2239).
-pub(crate) fn reviewable_dag_refusal(subject: &str) -> String {
-    format!(
-        "refusing {subject}: a reviewable (agent-authored) plan cannot use --dag. Its approval \
-         covers one models directory, but the DAG runner also runs models from every other \
-         pipeline's directory, which the approval does not cover (#2239). Re-plan without --dag."
-    )
-}
-
 pub async fn compute_review(
     root: &Path,
     config_path: &Path,
@@ -391,7 +367,6 @@ async fn compute_review_with_disclosure_and_seam(
 
     let run_plan: RunPlan = serde_json::from_value(plan.payload.clone())
         .context("failed to deserialize plan payload")?;
-    refuse_reviewable_dag_plan(&plan, plan_id, &run_plan)?;
     let resolved_config_path = root.join(config_path);
 
     // Run plans use apply's execution selection, including the pipeline glob.
@@ -435,15 +410,43 @@ async fn compute_review_with_disclosure_and_seam(
     } else {
         run_plan.model.clone().map(|model| BTreeSet::from([model]))
     };
-    let findings = compute_review_findings(
-        &resolved_config_path,
-        &models_dir,
-        models_glob.as_deref(),
-        executed_models.as_ref(),
-        state_path,
-        base_ref,
-        repo_dir,
-    )?;
+    //
+    // #2239: the review covers the same scope the plan fingerprinted and apply
+    // executes. For a run plan that is the directory and glob selected above;
+    // for a `--dag` plan, every transformation pipeline's directory and glob.
+    let scope = if plan.kind == PlanKind::Backfill {
+        ApprovalScope {
+            dag: false,
+            units: vec![ScopeUnit {
+                pipeline: None,
+                models_dir: models_dir.clone(),
+                models_glob: None,
+            }],
+            seeds_dir: None,
+        }
+    } else {
+        let cfg = rocky_core::config::load_optional_project_config(Some(&resolved_config_path))?;
+        approval_scope(cfg.as_ref(), &resolved_config_path, &run_plan)?.anchored_at(root)
+    };
+    let findings = if scope.dag {
+        dag_review_findings(
+            &resolved_config_path,
+            &scope,
+            state_path,
+            base_ref,
+            repo_dir,
+        )?
+    } else {
+        compute_review_findings(
+            &resolved_config_path,
+            &models_dir,
+            models_glob.as_deref(),
+            executed_models.as_ref(),
+            state_path,
+            base_ref,
+            repo_dir,
+        )?
+    };
     let breaking_count = findings
         .as_ref()
         .map(|f| f.iter().filter(|x| x.is_breaking()).count())
@@ -453,48 +456,50 @@ async fn compute_review_with_disclosure_and_seam(
     // A proposed plan can name compiled models even when its implicit pipeline
     // is replication. Those declarations still need DROP disclosure and a
     // fingerprinted approval; only a plan with no models can skip both.
+    // A `--dag` plan runs every transformation pipeline, whatever the
+    // pipeline its payload names, so it is never replication-only.
     let replication_only = plan.kind != PlanKind::Backfill
+        && !run_plan.dag
         && run_plan.models.is_empty()
         && loaded_config
             .as_ref()
             .is_some_and(|cfg| super::apply::is_replication_only(cfg, &run_plan));
     let approval_models = if approve && !replication_only {
-        Some(compile_approval_models(&plan, &models_dir)?)
+        Some(compile_approval_models(&plan, &scope)?)
     } else {
         None
     };
-    let mut conditional_drops = if replication_only {
-        Vec::new()
-    } else if let Some(models) = &approval_models {
-        super::plan::conditional_drops_from_models(
-            &resolved_config_path,
-            models,
-            models_glob.as_deref(),
-            state_path,
-            &run_plan,
-        )?
+    let mut conditional_drops = Vec::new();
+    if replication_only {
+        // No models run, so nothing can be dropped.
+    } else if let Some(units) = &approval_models {
+        for unit in units {
+            conditional_drops.extend(super::plan::conditional_drops_from_models(
+                &resolved_config_path,
+                unit.models(),
+                unit.unit.models_glob.as_deref(),
+                state_path,
+                &unit.unit.run_plan_for(&run_plan),
+            )?);
+        }
     } else {
-        super::plan::conditional_drops_for_run_plan(
-            &resolved_config_path,
-            &models_dir,
-            models_glob.as_deref(),
-            state_path,
-            &run_plan,
-        )?
-    };
+        for unit in disclosed_units(&scope) {
+            conditional_drops.extend(super::plan::conditional_drops_for_run_plan(
+                &resolved_config_path,
+                &unit.models_dir,
+                unit.models_glob.as_deref(),
+                state_path,
+                &unit.run_plan_for(&run_plan),
+            )?);
+        }
+    }
     if plan.kind == PlanKind::Backfill {
         conditional_drops.retain(|drop| run_plan.models.iter().any(|model| model == &drop.model));
     }
 
     after_drop_snapshot()?;
-    if let Some(models) = &approval_models {
-        verify_current_models_for_approval(
-            &plan,
-            &run_plan,
-            &resolved_config_path,
-            &models_dir,
-            models,
-        )?;
+    if let Some(units) = &approval_models {
+        verify_current_models_for_approval(&plan, &run_plan, &resolved_config_path, &scope, units)?;
     }
 
     disclose(&conditional_drops, &findings)?;
@@ -556,13 +561,51 @@ async fn compute_review_with_disclosure_and_seam(
     })
 }
 
-/// Compile the approval snapshot once, including the plan's reviewed schemas.
+/// The units whose DROPs a review discloses: a plain plan's single unit, or
+/// every `--dag` pipeline whose directory exists (the DAG skips the rest).
+fn disclosed_units(scope: &ApprovalScope) -> Vec<&ScopeUnit> {
+    if scope.dag {
+        scope.present_units().collect()
+    } else {
+        scope.units.iter().collect()
+    }
+}
+
+/// Breaking-change findings for a `--dag` plan: each pipeline's directory
+/// and glob, concatenated (#2239). The gate is skipped (`None`) when any
+/// pipeline's compare is skipped, never reported as a partial clean list.
+fn dag_review_findings(
+    config_path: &Path,
+    scope: &ApprovalScope,
+    state_path: &Path,
+    base_ref: &str,
+    repo_dir: Option<&Path>,
+) -> Result<Option<Vec<BreakingFinding>>> {
+    let mut findings = Vec::new();
+    for unit in scope.present_units() {
+        let Some(unit_findings) = compute_review_findings(
+            config_path,
+            &unit.models_dir,
+            unit.models_glob.as_deref(),
+            None,
+            state_path,
+            base_ref,
+            repo_dir,
+        )?
+        else {
+            return Ok(None);
+        };
+        findings.extend(unit_findings);
+    }
+    Ok(Some(findings))
+}
+
+/// Compile the approval snapshot once, including the plan's reviewed schemas,
+/// over the scope apply executes (#2239).
 fn compile_approval_models(
     plan: &PersistedPlan,
-    models_dir: &Path,
-) -> Result<Vec<rocky_core::models::Model>> {
-    use rocky_compiler::compile::{self, CompilerConfig};
-
+    scope: &ApprovalScope,
+) -> Result<Vec<CompiledUnit>> {
     let stale =
         || anyhow::anyhow!("the models changed since this plan was written; re-run `rocky plan`");
     let capabilities = plan.embedded_capabilities();
@@ -570,30 +613,22 @@ fn compile_approval_models(
         return Err(stale());
     }
     let source_schemas = capabilities.reviewed_source_schemas.ok_or_else(stale)?;
-    let config = CompilerConfig {
-        models_dir: models_dir.to_path_buf(),
-        source_schemas: source_schemas.into_iter().collect(),
-        ..Default::default()
-    };
-    let compiled = compile::compile(&config);
-    match compiled {
-        Ok(result) => Ok(result.project.models),
-        Err(compile::CompileError::Project(rocky_compiler::project::ProjectError::NoModels {
-            ..
-        })) => Ok(Vec::new()),
-        Err(error) => Err(error).context("failed to compile models for conditional DROP review"),
-    }
+    scope
+        .compile(&source_schemas.into_iter().collect(), NoModels::Empty)
+        .context("failed to compile models for conditional DROP review")
 }
 
 /// Recompute the plan-time execution fingerprint from the disclosed snapshot.
 /// This also makes a `NoModels` DROP preview safe: a removed model cannot turn
-/// a previously disclosed DROP into an empty approval.
+/// a previously disclosed DROP into an empty approval. For a `--dag` plan the
+/// snapshot holds every pipeline's models, so a model added, removed or
+/// changed in any pipeline's directory refuses the approval (#2239).
 fn verify_current_models_for_approval(
     plan: &PersistedPlan,
     run_plan: &RunPlan,
     config_path: &Path,
-    models_dir: &Path,
-    models: &[rocky_core::models::Model],
+    scope: &ApprovalScope,
+    units: &[CompiledUnit],
 ) -> Result<()> {
     let stale =
         || anyhow::anyhow!("the models changed since this plan was written; re-run `rocky plan`");
@@ -606,38 +641,18 @@ fn verify_current_models_for_approval(
         return Err(stale());
     }
     let config = rocky_core::config::load_optional_project_config(Some(config_path))?;
-    let config_identity = config
-        .as_ref()
-        .map(super::apply::config_policy_identity)
-        .unwrap_or_default();
-    let governance_identity = config
-        .as_ref()
-        .map(super::apply::governance_policy_identity)
-        .unwrap_or_default();
-    let exec_control_identity = config
-        .as_ref()
-        .map(super::apply::execution_control_identity)
-        .unwrap_or_default();
-    let resolved_mask = config
-        .as_ref()
-        .filter(|cfg| {
-            plan.kind != PlanKind::Backfill
-                && super::apply::pipeline_is_replication(cfg, run_plan.pipeline.as_deref())
-                && (run_plan.run_all || run_plan.models_dir.is_some())
-                && run_plan.model.is_none()
-        })
-        .map(|cfg| cfg.resolve_mask_for_env(run_plan.env.as_deref()))
-        .unwrap_or_default();
-    let surrogate_keys =
-        super::apply::resolved_surrogate_keys(models_dir, models).map_err(|_| stale())?;
-    let extras = super::apply::ExecutionExtras::build(&surrogate_keys, models, &resolved_mask);
-    let actual = super::apply::execution_ir_fingerprint(
-        models,
-        &config_identity,
-        &governance_identity,
-        &exec_control_identity,
-        &extras,
+    let binds_mask = config.as_ref().is_some_and(|cfg| {
+        plan.kind != PlanKind::Backfill
+            && !scope.dag
+            && super::apply::pipeline_is_replication(cfg, run_plan.pipeline.as_deref())
+            && (run_plan.run_all || run_plan.models_dir.is_some())
+            && run_plan.model.is_none()
+    });
+    let ids = OwnedScopeIdentities::from_config(
+        config.as_ref(),
+        binds_mask.then_some(run_plan.env.as_deref()),
     );
+    let actual = scope_fingerprint(scope, units, &ids.borrowed()).map_err(|_| stale())?;
     if actual.as_deref() != Some(expected) {
         return Err(stale());
     }
@@ -2136,41 +2151,194 @@ mod tests {
         Ok(())
     }
 
-    /// #2239: an approval of a `--dag` plan would cover one models directory
-    /// while the DAG runs every pipeline's models, so review refuses it and
-    /// writes no marker.
-    #[tokio::test]
-    async fn review_refuses_a_reviewable_dag_plan_without_a_marker() -> anyhow::Result<()> {
-        let dir = tempfile::tempdir()?;
-        let legacy = seed_reviewable_plan(dir.path())?;
-        let mut plan: RunPlan = serde_json::from_value(read_plan(dir.path(), &legacy)?.payload)?;
-        plan.dag = true;
-        let capabilities = super::super::plan::compute_embedded_capabilities(
-            &dir.path().join("rocky.toml"),
-            &dir.path().join("models"),
+    /// Two transformation pipelines, each with its own models directory.
+    const DAG_CONFIG_2239: &str = "[adapter.default]\ntype = \"duckdb\"\ndatabase = \":memory:\"\n\n\
+        [pipeline.silver]\ntype = \"transformation\"\nmodels = \"models/**\"\n\n\
+        [pipeline.silver.target]\nadapter = \"default\"\n\n\
+        [pipeline.gold]\ntype = \"transformation\"\nmodels = \"gold/**\"\n\n\
+        [pipeline.gold.target]\nadapter = \"default\"\n";
+
+    /// Persist an agent-stamped `--dag` run plan through the production
+    /// capability path.
+    fn write_agent_dag_plan(root: &Path) -> anyhow::Result<String> {
+        let run_plan: RunPlan = serde_json::from_value(serde_json::json!({
+            "parallel": 1, "dag": true, "models": []
+        }))?;
+        let config = root.join("rocky.toml");
+        let cfg = rocky_core::config::load_optional_project_config(Some(&config))?;
+        let scope = approval_scope(cfg.as_ref(), &config, &run_plan)?;
+        let capabilities = super::super::plan::compute_embedded_capabilities_for_scope(
+            &config,
+            Some(&scope),
             "HEAD",
-            Some(&dir.path().join("state.redb")),
+            Some(&root.join("state.redb")),
             None,
             false,
         )?;
-        let dag_id = crate::plan_store::write_plan_governed(
-            dir.path(),
+        crate::plan_store::write_plan_governed(
+            root,
+            PlanKind::Run,
+            &run_plan,
+            PolicyPrincipal::Agent,
+            capabilities,
+        )
+    }
+
+    /// #2239: a `--dag` plan's breaking-change findings cover every pipeline
+    /// the DAG runs, not only `models/`. Pre-fix the review was refused (and
+    /// before that interim refusal, compiled `models/` alone).
+    #[tokio::test]
+    async fn dag_plan_findings_cover_every_pipeline() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("gold"))?;
+        let a_toml = sidecar("a");
+        let b_toml = sidecar("b");
+        git_project(
+            root,
+            DAG_CONFIG_2239,
+            &[
+                ("models/a.sql", "SELECT 1 AS id, 'x' AS name\n"),
+                ("models/a.toml", &a_toml),
+                ("gold/b.sql", "SELECT 1 AS id, 'y' AS label\n"),
+                ("gold/b.toml", &b_toml),
+            ],
+            &[
+                ("models/a.sql", "SELECT 1 AS id\n"),
+                ("gold/b.sql", "SELECT 1 AS id\n"),
+            ],
+        )?;
+        let plan_id = write_agent_dag_plan(root)?;
+        assert_eq!(
+            finding_models(&dry_review(root, &plan_id).await?),
+            BTreeSet::from([".main.a".to_string(), ".main.b".to_string()])
+        );
+        Ok(())
+    }
+
+    /// #2239: approving a `--dag` plan discloses every pipeline's conditional
+    /// DROP, and a model that changes in ANOTHER pipeline's directory after
+    /// the plan refuses the approval and writes no marker.
+    #[tokio::test]
+    async fn dag_plan_approval_covers_every_pipelines_models() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path();
+        std::fs::write(root.join("rocky.toml"), DAG_CONFIG_2239)?;
+        for (dir, name) in [("models", "a"), ("gold", "b")] {
+            std::fs::create_dir_all(root.join(dir))?;
+            std::fs::write(
+                root.join(dir).join(format!("{name}.sql")),
+                "SELECT 1 AS id\n",
+            )?;
+            std::fs::write(
+                root.join(dir).join(format!("{name}.toml")),
+                format!(
+                    "name = \"{name}\"\ndrop_existing_kind = \"table\"\n[strategy]\n\
+                     type = \"view\"\n[target]\ncatalog = \"\"\nschema = \"main\"\n"
+                ),
+            )?;
+        }
+        let state = root.join("state.redb");
+        let review = |plan_id: String| {
+            let state = state.clone();
+            async move {
+                compute_review_with_state_path(
+                    root,
+                    Path::new("rocky.toml"),
+                    Some(&state),
+                    &plan_id,
+                    "HEAD",
+                    true,
+                )
+                .await
+            }
+        };
+
+        let plan_id = write_agent_dag_plan(root)?;
+        let approved = review(plan_id.clone()).await?;
+        assert!(approved.marker_written);
+        let dropped: BTreeSet<&str> = approved
+            .conditional_drops
+            .iter()
+            .map(|drop| drop.model.as_str())
+            .collect();
+        assert_eq!(dropped, BTreeSet::from(["a", "b"]));
+
+        std::fs::remove_file(review_marker_path(root, &plan_id))?;
+        std::fs::write(root.join("gold/b.sql"), "SELECT 2 AS id\n")?;
+        let err = review(plan_id.clone())
+            .await
+            .expect_err("a model changed in another pipeline's directory");
+        assert!(
+            err.to_string()
+                .contains("the models changed since this plan was written"),
+            "{err:#}"
+        );
+        assert!(matches!(
+            review_marker_state(root, &plan_id),
+            ReviewMarkerState::Absent
+        ));
+        Ok(())
+    }
+
+    /// The approval snapshot and plan fingerprint use the pipeline glob, the
+    /// set apply executes, as findings do (#2236). Pre-fix both compiled the
+    /// whole directory, so an invalid model OUTSIDE the glob left the plan
+    /// with no fingerprint and the approval refused.
+    #[tokio::test]
+    async fn run_plan_approval_uses_the_pipeline_glob() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path();
+        std::fs::write(root.join("rocky.toml"), GLOB_CONFIG_2236)?;
+        std::fs::create_dir_all(root.join("models"))?;
+        std::fs::write(root.join("models/a.sql"), "SELECT 1 AS id\n")?;
+        std::fs::write(root.join("models/a.toml"), sidecar("a"))?;
+        // Outside the glob, and does not compile.
+        std::fs::write(root.join("models/b.sql"), "SELEC oops\n")?;
+        std::fs::write(root.join("models/b.toml"), "name = [\n")?;
+
+        let run_plan: RunPlan = serde_json::from_value(serde_json::json!({
+            "parallel": 1, "pipeline": "p", "models": ["a"]
+        }))?;
+        let config = root.join("rocky.toml");
+        let cfg = rocky_core::config::load_optional_project_config(Some(&config))?;
+        let scope = approval_scope(cfg.as_ref(), &config, &run_plan)?;
+        assert_eq!(
+            scope.units[0]
+                .models_glob
+                .as_deref()
+                .map(|g| g.ends_with("models/a.sql")),
+            Some(true)
+        );
+        let capabilities = super::super::plan::compute_embedded_capabilities_for_scope(
+            &config,
+            Some(&scope),
+            "HEAD",
+            Some(&root.join("state.redb")),
+            None,
+            false,
+        )?;
+        assert!(
+            capabilities.models_fingerprint.is_some(),
+            "the executed set compiles, so the plan is fingerprinted"
+        );
+        let plan_id = crate::plan_store::write_plan_governed(
+            root,
             PlanKind::AiAuthored,
-            &plan,
+            &run_plan,
             PolicyPrincipal::Agent,
             capabilities,
         )?;
-        let err = compute_review(dir.path(), Path::new("rocky.toml"), &dag_id, "HEAD", true)
-            .await
-            .expect_err("a reviewable --dag plan must not be approved");
-        assert_eq!(
-            err.to_string(),
-            reviewable_dag_refusal(&format!("plan '{dag_id}'"))
-        );
-        assert!(matches!(
-            review_marker_state(dir.path(), &dag_id),
-            ReviewMarkerState::Absent
-        ));
+        let approved = compute_review_with_state_path(
+            root,
+            Path::new("rocky.toml"),
+            Some(&root.join("state.redb")),
+            &plan_id,
+            "HEAD",
+            true,
+        )
+        .await?;
+        assert!(approved.marker_written);
         Ok(())
     }
 

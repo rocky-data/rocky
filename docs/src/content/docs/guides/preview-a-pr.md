@@ -84,7 +84,7 @@ Rocky compares two runs from the state store. The branch run is the newest run r
 **Row-level diff.** A per-model row delta, produced by one of two algorithms. A discriminator on the JSON output tells you which one ran.
 
 - `kind: "sampled"` (default): a row-count delta computed off the two `RunRecord`s. It does not read row content yet, so it always reports `coverage: "not_yet_sampled"` and `coverage_warning: true`. A change that does not shift row counts will not surface here.
-- `kind: "bisection"`: exhaustive checksum-bisection over a single-column integer or numeric `unique_key`. It walks the chunk lattice, recurses into mismatched chunks, and surfaces every row-level diff. See the [How Preview Works](/concepts/preview-internals/) page for the algorithm. It runs only on Merge-strategy models with a single integer PK; other models stay on sampled, and the skip reason is logged via `tracing::warn`.
+- `kind: "bisection"`: checksum-bisection over a single-column integer or numeric `unique_key`. It walks the chunk lattice, recurses into mismatched chunks, and surfaces the row-level diffs. It covers the whole table, including rows with a NULL key. It can miss a change only on a 64-bit hash collision or on duplicate key-and-value rows. See the [How Preview Works](/concepts/preview-internals/) page for the algorithm. It runs only on Merge-strategy models with a single integer PK; other models stay on sampled, and the skip reason is logged via `tracing::warn`.
 
 **Unknown counts.** When a run recorded no row count for a model, Rocky cannot compute that model's delta. It reports `rows_added` as `null`, never as `0`. If the model ran on both sides, `rows_removed` is `null` too. The Markdown shows `?`, and `summary.models_unknown` counts the model. An ordinary transformation run records no row count, so this is the usual case for those models.
 
@@ -96,7 +96,7 @@ The full `PreviewDiffOutput` shape (`--output json`) carries the rendered PR-com
 # Default — sampled (compares the row counts the two runs recorded)
 rocky preview diff --name pr_preview_fix_price
 
-# Exhaustive — checksum-bisection (covers the whole table)
+# Checksum-bisection (covers the whole table)
 rocky preview diff --name pr_preview_fix_price --algorithm bisection
 ```
 
@@ -211,7 +211,7 @@ The aggregate `summary.any_coverage_warning` fires on either of two conditions: 
 
 When you see the warning on a sampled diff, you have two options:
 
-- **Re-run with `--algorithm bisection`.** It covers the whole table exhaustively. It works for any model with a single-column integer or numeric `unique_key`.
+- **Re-run with `--algorithm bisection`.** It covers the whole table, with the limits listed on the [How Preview Works](/concepts/preview-internals/) page. It works for any Merge model with a single-column integer or numeric `unique_key`.
 - **Inspect the changed columns directly** with `rocky compile --model <name>`, and reason about the change yourself.
 
 A clean sample with `coverage_warning: true` is **not** evidence the PR is a no-op for that model.

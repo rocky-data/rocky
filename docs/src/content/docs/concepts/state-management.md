@@ -41,6 +41,12 @@ plan_id=$(rocky --config rocky.toml --state-path /var/lib/rocky/state.redb plan 
 rocky --state-path /var/lib/rocky/state.redb apply "$plan_id"
 ```
 
+## Schema version
+
+The store carries a schema version. A newer engine migrates an older store forward on first open. An older engine refuses a newer store, or, for `rocky run` under the default `[state] on_schema_mismatch = "recreate"`, starts from a fresh local store and does one full refresh. See [Mixed versions during an upgrade](/advanced/deployment-contract/#mixed-versions-during-an-upgrade).
+
+The version moves when an older engine would misread a newer record. Schema v31 is one such move. A checkpoint can list the targets whose post-copy checks still owe a run. An engine at v30 or older ignores that list and treats a recorded run as owing nothing, so it would skip those checks. From v31 on, an older engine never reaches that checkpoint.
+
 ## Per-namespace state files
 
 redb permits **one writer per state file**. Fan out one `rocky run` per pipeline or per client, and every run competes for the same lock on the global `.rocky-state.redb`. They serialize even though they touch unrelated watermarks. Namespacing gives each run its own state file, so the runs proceed at the same time.
@@ -216,9 +222,11 @@ The `tiered` backend combines Valkey (fast) with S3 (durable):
 - **Download**: try Valkey first (sub-millisecond reads); on miss or error, fall back to S3.
 - **Upload**: write to both Valkey (best-effort) and S3 (required).
 
-By default Rocky trusts the cached copy as it finds it. A Valkey write that fails while the S3 write succeeds therefore leaves a stale copy in the cache, and the next read serves it.
+With `concurrency_control = "off"`, Rocky trusts the cached copy as it finds it. A Valkey write that fails while the S3 write succeeds therefore leaves a stale copy in the cache, and the next read serves it.
 
-Set `concurrency_control = "cas"` to close that gap. The end-of-run upload commits to S3 first. Rocky then stores the cached copy, stamped with the generation it committed at. A read can therefore check the cache against the durable object before it uses it. The ledger-seam commands (`policy`, `gc`, `restore`, `apply`) commit the same way. See [Concurrent writers](/reference/configuration/#concurrent-writers).
+`concurrency_control = "cas"` closes that gap, and it is the default on `tiered`. The upload commits to S3 first. Rocky then stores the cached copy, stamped with the generation it committed at. A read can therefore check the cache against the durable object before it uses it. The ledger-seam commands (`policy`, `gc`, `restore`, `apply`) commit the same way.
+
+At startup each writer probes the store once to confirm it really enforces conditional writes. The first compare-and-swap upload then creates a `cas-required` marker beside the state object. A writer set to `"off"` that finds the marker refuses to upload, so it cannot overwrite the others. See [Concurrent writers](/reference/configuration/#concurrent-writers).
 
 ### Sync Lifecycle
 
@@ -242,6 +250,39 @@ When `backend` is not `local`, Rocky syncs the state file around each run.
 ```
 
 If the download fails, Rocky logs a warning and starts fresh from target-table metadata. The [retry + failure policy](#retry-and-failure-policy) below governs what an upload failure does.
+
+### What a Schema Upgrade Does to Remote State
+
+This section says which remote state a new engine reads after a schema upgrade. Rocky stores remote state under a key that names the state schema version (the format version of the state file). The key looks like `<s3_prefix>v30/state.redb` on S3 or GCS and `<valkey_prefix>v30:state.redb` on Valkey. An engine release that changes the schema version therefore looks for a key that does not exist yet.
+
+When the current key is absent, Rocky looks for an older key. It probes older versions newest first, down to `v22`, and restores the first one it finds. The run then opens that state, migrates it in place, and uploads it under the current key. The policy ledger, the run history, and the watermarks all carry over.
+
+```
+   download: v31 key? ── present ──▶ restore v31
+                 │
+               absent
+                 ▼
+             v30 key? ── present ──▶ restore v30, upload writes v31
+                 │
+               absent
+                 ▼
+               ...  down to v22, then start fresh
+```
+
+- Rocky never writes or deletes an older key. It stays in the bucket as your pre-upgrade copy.
+- Rocky never probes a newer key. An older engine never reads state that a newer engine wrote.
+- Under `concurrency_control = "cas"`, the first upload creates the current key. It does not compare against the older object.
+- The Valkey cache of the `tiered` backend reads only the current key. The S3 tier does the lookup for older keys.
+- The download logs `outcome = "carried_forward"` and names the version it restored in `carried_forward_from`.
+
+This assumes that every process that shares the backend runs the same engine version, as the [deployment contract](/advanced/deployment-contract/#mixed-versions-during-an-upgrade) requires. An older engine that keeps writing its own key after the upgrade writes state that the new engine never reads again.
+
+Four effects to know before you upgrade or reset:
+
+- **Deleting only the current key does not reset state.** The next download restores the newest older key instead. To reset, delete every version key under the prefix, or point `s3_prefix`, `gcs_prefix` or `valkey_prefix` at a new prefix.
+- **A rollback reads the older key as it was.** If you go back to the older engine, it reads its own frozen key. Nothing written after the upgrade is in it, and nothing is merged back.
+- **A fresh start makes up to 9 existence checks, not 1.** All of them share `transfer_timeout_seconds`. A check that fails stops the download. An IAM policy that allows only the current version's path refuses the older paths, so the first run after an upgrade fails. Grant read access to the whole prefix.
+- **Fields added since the older version read as empty.** For example, a run recorded before v25 does not carry the `check_gate_failed` flag, so it reads as `false`. Treat `--resume` of a run from before the upgrade with care.
 
 ### Retry and Failure Policy
 
@@ -274,6 +315,7 @@ circuit_breaker_threshold = 5
 |---|---|
 | `ok` | Transfer completed successfully. |
 | `absent` | Remote state was empty — first run against this backend. |
+| `carried_forward` | The current schema version had no remote state. Rocky restored the newest older version's state. |
 | `timeout` | Hit `transfer_timeout_seconds` wall-clock cap. |
 | `error_then_fresh` | Existence check failed; Rocky started fresh. |
 | `transient_exhausted` | `max_retries` exhausted on transient errors. |

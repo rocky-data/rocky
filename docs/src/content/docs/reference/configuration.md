@@ -679,7 +679,7 @@ Choose where Rocky keeps what it remembers between runs: watermarks, run history
 | `transfer_timeout_seconds` | int | `300` | Wall-clock budget for each transfer (upload *or* download). Retries share this budget rather than extending it; raise for large state or slow networks. |
 | `on_upload_failure` | string | `"skip"` | Upload failure policy. `"skip"` warns and continues; recovery requires a surviving local ledger or successfully published recovery intent. `"fail"` propagates the error. Governed runs require durability. |
 | `namespacing` | string | `"none"` | State-file namespacing policy. `"none"` (default) keeps one global state file — byte-identical to a project that omits this key. `"pipeline"` gives each pipeline its own state file (see [State namespacing](#state-namespacing) below). |
-| `concurrency_control` | string | `"off"` | `"off"` (default) uploads unconditionally — last writer wins. `"cas"` makes the end-of-run upload conditional on the remote object still carrying the generation this run downloaded, so a run that lost a cross-pod race fails closed instead of erasing the winner. The ledger-seam commands (`policy`, `gc`, `restore`, `apply`) retry onto the winner instead. See [Concurrent writers](#concurrent-writers) below. |
+| `concurrency_control` | string | per backend | `"cas"` or `"off"`. Unset means `"cas"` on `s3`, `gcs`, and `tiered`, and `"off"` on `local` and `valkey`. `"cas"` makes each state upload conditional on the remote object still carrying the generation this writer downloaded. A run that lost a cross-pod race then fails closed instead of erasing the winner. The ledger-seam commands (`policy`, `gc`, `restore`, `apply`) retry onto the winner instead. `"off"` uploads unconditionally (last writer wins). See [Concurrent writers](#concurrent-writers) below. |
 | `on_schema_mismatch` | string | `"recreate"` | What to do when the binary opens a state store written by a **newer** binary, which happens mid-way through a rolling upgrade. `"recreate"` logs one warning, starts from fresh local state, does one full-refresh run, and never writes the downgraded state back to the shared tier. `"fail"` aborts the open instead. Only the run path honours this; inspection and branch commands always hard-fail on a forward-incompatible store. |
 | `freeze_marker_writes` | bool | `false` | Write durable freeze and unfreeze marker objects beside the remote state file (under `<prefix>/freeze/` and `<prefix>/unfreeze/`) when `rocky policy freeze` / `unfreeze` run. Reading and enforcing markers is always on wherever a durable object tier exists. You can therefore upgrade a whole fleet to marker readers before any marker is written. Requires `backend = "s3"`, `"gcs"`, or `"tiered"`; setting it on `"local"` or `"valkey"` is a hard error rather than a silent no-op. |
 
@@ -720,26 +720,55 @@ Tiered downloads from Valkey first (fast), falls back to S3 (durable). Uploads t
 
 ### Concurrent writers
 
-Stop a second run from erasing a first when both share one `[state]` prefix. By default Rocky overwrites the remote state unconditionally. Two concurrent runs both download the ledger, both change it, and the second upload wipes the first. The first run's watermarks, run records, and policy rows are lost, and Rocky raises no error.
+Stop a second run from erasing a first when both share one `[state]` prefix. Without protection, two concurrent runs both download the ledger, both change it, and the second upload wipes the first. The first run's watermarks, run records, and policy rows are lost, and Rocky raises no error.
 
-Set `concurrency_control = "cas"` to close that:
+Compare-and-swap (CAS: a write that succeeds only if the object has not changed since you read it) closes that. It is the default on `s3`, `gcs`, and `tiered`, so this config is protected with no extra setting:
 
 ```toml
 [state]
 backend = "s3"
 s3_bucket = "${ROCKY_STATE_BUCKET}"
-concurrency_control = "cas"
 ```
 
-The end-of-run upload then commits only if the remote object still carries the generation this run downloaded. A run that lost the race exits non-zero with a compare-and-swap conflict rather than overwriting the winner.
+Each upload then commits only if the remote object still carries the generation this run downloaded. A run that lost the race exits non-zero with a compare-and-swap conflict rather than overwriting the winner.
 
 What it does not do is reconcile the two runs. You re-run the loser yourself. Rocky does not roll back the warehouse writes it already made, so a non-merge strategy can duplicate rows on that re-run. Prefer merge-style strategies for pipelines you expect to contend.
 
-It needs a backend with a durable object tier: `s3`, `gcs`, or `tiered`. On `local` and `valkey` it downgrades to `off` with a warning, because neither offers a conditional write. Turning it on also stops the mid-run periodic uploader on every backend. A crashed run then leaves the remote ledger at its last committed generation instead of a partial mid-run snapshot.
+It needs a backend with a durable object tier: `s3`, `gcs`, or `tiered`. On `local` and `valkey` an unset mode is `off`, and an explicit `"cas"` downgrades to `off` with a warning, because neither offers a conditional write. `cas` also stops the mid-run periodic uploader on every backend. A crashed run then leaves the remote ledger at its last committed generation instead of a partial mid-run snapshot.
+
+#### How Rocky picks the mode at startup
+
+Some S3-compatible stores (older MinIO releases, some gateways) accept the conditional-write headers and ignore them. A CAS write there would silently act as an unconditional one. So every writer checks the store once per process before it relies on CAS:
+
+```
+concurrency_control unset ──► backend default
+                               s3 / gcs / tiered → cas    local / valkey → off
+            │
+  cas on s3 / gcs / tiered ──► conditional-write probe
+            ├─ supported     → cas
+            ├─ unsupported   → unset: warn, use off     explicit "cas": error, writer stops
+            └─ inconclusive  → cas  (never fall back to unconditional on a guess)
+```
+
+The probe writes a small object under `<prefix>/cas-probe/` with a unique name. It checks that the store refuses a create over an existing object and a write with a stale generation, then deletes the object. It never touches the state object. It needs put and delete access under the state prefix; without delete access, one small probe object stays behind per process. `rocky doctor` runs the same probe and reports the result (see `state_concurrency`).
+
+An inconclusive probe (a network error, a timeout, or no write access) keeps `cas` and logs a warning. That is not confirmed protection: on a store that ignores conditional headers, a `cas` write still overwrites. Fix the access problem, then run `rocky doctor` to confirm the probe passes.
+
+Set `concurrency_control = "off"` to opt out. That is correct for a deployment with one writer per `[state]` prefix.
+
+#### The `cas-required` marker
+
+A writer on `off` uploads unconditionally, so one such writer could still overwrite every CAS writer. The marker stops that. The first CAS upload of a state object creates a small `cas-required` object beside it, for example `<prefix>/v9/state.redb.cas-required`. The write is create-once on its own key, like a freeze marker.
+
+A writer whose mode resolves to `off` checks for the marker when it starts, before it does any work, and again before each upload. If the marker exists, the writer stops with an error that names the fix. Reads are not affected. The fix is to set `concurrency_control = "cas"`, or to remove the explicit `"off"`, on that writer. Delete the marker only on purpose, when every writer of that state is deliberately moving to `"off"`. `rocky doctor` warns when the configured mode and the marker disagree.
+
+#### Upgrading to the `cas` default
+
+This release changes the default on `s3`, `gcs`, and `tiered` from `off` to `cas`. Older binaries do not know the marker exists and keep uploading unconditionally. So upgrade every writer that shares a `[state]` prefix together, or keep the interim rule of one writer per prefix until the whole fleet runs this release. To keep the old behaviour, set `concurrency_control = "off"` explicitly before you upgrade. Run `rocky doctor` on each writer afterwards to confirm the resolved mode.
 
 **What `cas` covers.** Every write of the shared state object goes through it. The end-of-run upload fails closed when it loses a race. The ledger seams retry instead: `rocky policy freeze` / `unfreeze`, `rocky gc`, `rocky restore` (and a restore-shaped `rocky apply <plan-id>`), and the policy rows a run-shaped `rocky apply` writes when a `[policy]` rule sets `verify_after`. A seam that loses a race downloads the winner and replays its change on top. Where the change rests on a policy decision (a restore, or the rule decision a governed `rocky apply` records before it runs), the decision is re-made against the winner first. It gives up after three attempts with a conflict error and leaves the winner in place. It never falls back to an unconditional upload. A restore re-proves each artifact on every attempt. With a `[policy]` block it also re-checks freezes right before each object write, because a written object cannot be taken back. This applies equally to `s3`, `gcs`, and `tiered`.
 
-**The guarantee holds only between writers that all run with `cas`.** A pod left on `off` still uploads unconditionally and can overwrite the others. `cas` defaults to `off`, so switch every writer that shares a `[state]` prefix before you rely on it. Until then, keep one writer per `[state]` prefix.
+**The guarantee holds only between writers that all run with `cas`.** Once the `cas-required` marker exists, a writer on `off` refuses to upload rather than overwrite. Before the first CAS upload, and for binaries older than this release, nothing stops it. Until every writer that shares a `[state]` prefix runs `cas` on this release, keep one writer per `[state]` prefix.
 
 **On `tiered`,** `cas` additionally makes the Valkey tier coherent with the durable object. The compare-and-swap runs against S3 first; only after it commits is the Valkey copy written, stored together with the generation it was committed at. A read may use the cached copy only after confirming that generation is still the durable object's — otherwise it reads S3. So a Valkey write that fails, a process that dies between the two, or a cache entry left over from an earlier run can no longer shadow durable state. Cached copies are held under a separate key from the `off` path's, so a fleet can move pods from `off` to `cas` one at a time.
 
@@ -781,7 +810,7 @@ circuit_breaker_threshold = 3
 circuit_breaker_recovery_timeout_secs = 30
 ```
 
-Every transfer ends with a structured `outcome` field on its `state.upload` or `state.download` event: `ok`, `absent`, `timeout`, `error_then_fresh`, `skipped_after_failure`, `transient_exhausted`, `circuit_open`, or `budget_exhausted`. Build alerts on those values, not on the free-form log message.
+Every transfer ends with a structured `outcome` field on its `state.upload` or `state.download` event: `ok`, `absent`, `carried_forward`, `timeout`, `error_then_fresh`, `skipped_after_failure`, `transient_exhausted`, `circuit_open`, or `budget_exhausted`. Build alerts on those values, not on the free-form log message.
 
 ### `[state.idempotency]`
 
