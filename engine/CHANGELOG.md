@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **Breaking (Databricks):** Rocky refuses to replace a Databricks view that carries tags, row filters or column masks the model does not declare. `CREATE OR REPLACE VIEW` drops them, so a replace would remove governance Rocky does not manage. The probe reads the catalog's `information_schema` (`table_tags`, `column_tags`, `row_filters`, `column_masks`). A failed probe also refuses. Tags the model declares in `[governance.tags]` never refuse. `rocky branch promote` refuses on any tag on the production view, because promote does not re-apply tags. `rocky plan` shows the probe. Remove the foreign governance, or declare the tags in the model. Not yet run against a live workspace. (#2234)
+- Rocky refuses reviewable (agent-authored) `--dag` plans at `rocky plan`, `rocky review` and `rocky apply`, whoever applies them. The approval covered only `models/`, while a DAG apply can run models from other pipelines' directories. Human-authored `--dag` plans are unchanged. #2239 stays open for an approval that covers every model the DAG runs. (#2239)
+- `rocky review` computes breaking-change findings over the set apply executes: the pipeline glob for run plans, the single model for `--model` plans, and the rebuild set for backfills. An invalid model outside that set no longer disables the check. (#2236)
+- Replication recovery no longer records Success while copied tables' post-copy checks never ran. This covers an interrupt after the last copy, an incomplete `--resume-latest`, and a renamed pipeline with partial target overlap. Owed checks are tracked per target. A resume runs the checks of tables its checkpoint already copied, without copying them again. An owed target retires when a later run checks it, when its pipeline defines no post-copy check, or, with a warning, when no current plan names it. An owed check never blocks a run. (#2235)
+- A partitioned content-addressed write records every partition group's hash in the artifact ledger, not only the last group's. The refcount sweep is now correct on partitioned tables. Partitioned models still stay out of the reuse index.
+
 ## [1.76.0] — 2026-10-03
 
 This release carries five breaking changes, each marked **Breaking:** below.
