@@ -105,6 +105,23 @@ partition window must have both bounds. Each placeholder must appear in a
 placeholder in a comment, in a longer string or only in the `SELECT` list
 does not count. The compiler also emits `E024` when it cannot parse the SQL.
 
+The filter must reach every row the model emits:
+
+- **Set operations.** Each `UNION` / `UNION ALL` branch needs its own filter,
+  or one filter must wrap the whole union. `INTERSECT` needs one filtered
+  side. `EXCEPT` needs a filtered left side.
+- **CTEs and subqueries.** A filter inside a CTE or derived table counts only
+  when the output reads it. A filter in a CTE nothing reads counts for
+  nothing. So does a filter inside a scalar subquery in the `SELECT` list.
+- **Joins.** An inner or semi join is bounded when either side is. A `LEFT`
+  join is bounded only by its left side, a `RIGHT` join by its right side. A
+  `FULL OUTER` join needs both sides bounded.
+- **Date spines.** A table function such as
+  `GENERATE_SERIES(@start_date, @end_date, INTERVAL 1 DAY)` does not count on
+  its own. Its end is inclusive in most warehouses, so it emits a row that
+  belongs to the next partition. Add
+  `WHERE d >= @start_date AND d < @end_date` on the spine column.
+
 ## Partition key format
 
 Canonical ISO format, derived from `granularity`. These keys appear in

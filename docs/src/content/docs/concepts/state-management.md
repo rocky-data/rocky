@@ -41,6 +41,12 @@ plan_id=$(rocky --config rocky.toml --state-path /var/lib/rocky/state.redb plan 
 rocky --state-path /var/lib/rocky/state.redb apply "$plan_id"
 ```
 
+## Schema version
+
+The store carries a schema version. A newer engine migrates an older store forward on first open. An older engine refuses a newer store, or, for `rocky run` under the default `[state] on_schema_mismatch = "recreate"`, starts from a fresh local store and does one full refresh. See [Mixed versions during an upgrade](/advanced/deployment-contract/#mixed-versions-during-an-upgrade).
+
+The version moves when an older engine would misread a newer record. Schema v31 is one such move. A checkpoint can list the targets whose post-copy checks still owe a run. An engine at v30 or older ignores that list and treats a recorded run as owing nothing, so it would skip those checks. From v31 on, an older engine never reaches that checkpoint.
+
 ## Per-namespace state files
 
 redb permits **one writer per state file**. Fan out one `rocky run` per pipeline or per client, and every run competes for the same lock on the global `.rocky-state.redb`. They serialize even though they touch unrelated watermarks. Namespacing gives each run its own state file, so the runs proceed at the same time.
