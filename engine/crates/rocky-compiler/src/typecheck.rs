@@ -6,7 +6,6 @@
 //! incompatibilities, and provides diagnostics with suggestions.
 
 use std::collections::{HashMap, HashSet};
-use std::ops::ControlFlow;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -1497,36 +1496,251 @@ fn table_factor_window_bound(relation: &TableFactor, scope: &mut CteScope) -> Wi
     }
 }
 
-/// The placeholders a row filter mentions. The bare placeholder and the
-/// whole-literal quoted form `'@start_date'` count alike, because the
-/// runtime substitutes both. An `x IN (subquery)` also counts when the
-/// subquery's rows are bounded, so it can read a bounded CTE.
+/// The window placeholders a row filter bounds its rows by (#2233 follow-up).
+///
+/// A placeholder counts only in a top-level `AND` conjunct of this filter
+/// that bounds a column on the right side of the window:
+///
+/// - `<col> >= @start_date` (or `>`, or `=`), or `@start_date <= <col>`;
+/// - `<col> < @end_date` (or `<=`, or `=`), or `@end_date > <col>`;
+/// - `<col> BETWEEN @start_date AND @end_date`;
+/// - `<col> IN (<subquery>)`, when the subquery's rows are bounded, so a
+///   semi-join can read a bounded CTE.
+///
+/// The column side may wrap the column in a cast or a function
+/// (`DATE(ts)`); the placeholder side may cast it or shift it by a constant
+/// (`@start_date - INTERVAL 1 DAY`). The bare placeholder and the
+/// whole-literal quoted form `'@start_date'` count alike, because the runtime
+/// substitutes both.
+///
+/// Anything else bounds nothing, because it can let rows outside the window
+/// through: a conjunct under `OR` or `NOT` (`ts >= @start_date OR 1=1`,
+/// `@start_date IS NULL OR ...`), a comparison facing the wrong way
+/// (`ts <= @start_date`), `NOT IN`, and `EXISTS`. A subquery is never
+/// searched for placeholders: its filter bounds its own rows, not this one's.
 fn filter_window_bound(filter: &Expr, scope: &mut CteScope) -> WindowBound {
+    let mut conjuncts = Vec::new();
+    top_level_conjuncts(filter, &mut conjuncts);
+    conjuncts
+        .into_iter()
+        .fold(WindowBound::default(), |bound, conjunct| {
+            bound.or(conjunct_window_bound(conjunct, scope))
+        })
+}
+
+/// Split `expr` on top-level `AND`, looking through parentheses.
+fn top_level_conjuncts<'a>(expr: &'a Expr, out: &mut Vec<&'a Expr>) {
+    match expr {
+        Expr::BinaryOp {
+            left,
+            op: ast::BinaryOperator::And,
+            right,
+        } => {
+            top_level_conjuncts(left, out);
+            top_level_conjuncts(right, out);
+        }
+        Expr::Nested(inner) => top_level_conjuncts(inner, out),
+        other => out.push(other),
+    }
+}
+
+/// One edge of the partition window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WindowEdge {
+    Start,
+    End,
+}
+
+fn conjunct_window_bound(conjunct: &Expr, scope: &mut CteScope) -> WindowBound {
     let mut bound = WindowBound::default();
-    let _ = ast::visit_expressions(filter, |expr| {
-        match expr {
-            Expr::Value(v) => {
-                let token = match &v.value {
-                    ast::Value::Placeholder(p) => p.as_str(),
-                    ast::Value::SingleQuotedString(s) => s.as_str(),
-                    _ => "",
-                };
-                match token {
-                    "@start_date" => bound.start = true,
-                    "@end_date" => bound.end = true,
-                    _ => {}
+    match conjunct {
+        Expr::BinaryOp { left, op, right } => {
+            // Normalise to `<column> <op> <placeholder>`.
+            let (op, edge) = if is_column_term(left) {
+                match placeholder_term(right) {
+                    Some(edge) => (op.clone(), edge),
+                    None => return bound,
+                }
+            } else if is_column_term(right) {
+                match (placeholder_term(left), flip_comparison(op)) {
+                    (Some(edge), Some(op)) => (op, edge),
+                    _ => return bound,
+                }
+            } else {
+                return bound;
+            };
+            use ast::BinaryOperator as B;
+            match (edge, op) {
+                (WindowEdge::Start, B::GtEq | B::Gt | B::Eq) => bound.start = true,
+                (WindowEdge::End, B::Lt | B::LtEq | B::Eq) => bound.end = true,
+                _ => {}
+            }
+        }
+        Expr::Between {
+            expr,
+            negated: false,
+            low,
+            high,
+        } if is_column_term(expr) => {
+            bound.start = placeholder_term(low) == Some(WindowEdge::Start);
+            bound.end = placeholder_term(high) == Some(WindowEdge::End);
+        }
+        Expr::InSubquery {
+            subquery,
+            negated: false,
+            ..
+        } => bound = query_window_bound(subquery, scope),
+        _ => {}
+    }
+    bound
+}
+
+/// The comparison with its operands swapped: `a < b` is `b > a`. `None` for
+/// an operator that is not an ordering comparison.
+fn flip_comparison(op: &ast::BinaryOperator) -> Option<ast::BinaryOperator> {
+    use ast::BinaryOperator as B;
+    Some(match op {
+        B::Lt => B::Gt,
+        B::LtEq => B::GtEq,
+        B::Gt => B::Lt,
+        B::GtEq => B::LtEq,
+        B::Eq => B::Eq,
+        _ => return None,
+    })
+}
+
+/// Which window placeholder `expr` is, allowing a cast, a function of it
+/// alone (`DATE(@start_date)`, `DATEADD(day, -1, @start_date)`), and a shift
+/// by a constant (`@start_date - INTERVAL 1 DAY`).
+fn placeholder_term(expr: &Expr) -> Option<WindowEdge> {
+    match expr {
+        Expr::Value(v) => placeholder_token(&v.value),
+        Expr::TypedString(ts) => placeholder_token(&ts.value.value),
+        Expr::Nested(inner) | Expr::Cast { expr: inner, .. } => placeholder_term(inner),
+        Expr::BinaryOp {
+            left,
+            op: ast::BinaryOperator::Plus | ast::BinaryOperator::Minus,
+            right,
+        } if is_constant(right) => placeholder_term(left),
+        Expr::BinaryOp {
+            left,
+            op: ast::BinaryOperator::Plus,
+            right,
+        } if is_constant(left) => placeholder_term(right),
+        Expr::Function(function) => {
+            let args = plain_function_args(function)?;
+            let mut edge = None;
+            for arg in args {
+                match placeholder_term(arg) {
+                    Some(found) if edge.is_none() => edge = Some(found),
+                    Some(_) => return None,
+                    None if is_constant(arg) || is_date_part(arg) => {}
+                    None => return None,
                 }
             }
-            Expr::InSubquery {
-                subquery,
-                negated: false,
-                ..
-            } => bound = bound.or(query_window_bound(subquery, scope)),
-            _ => {}
+            edge
         }
-        ControlFlow::<()>::Continue(())
-    });
-    bound
+        _ => None,
+    }
+}
+
+fn placeholder_token(value: &ast::Value) -> Option<WindowEdge> {
+    let token = match value {
+        ast::Value::Placeholder(p) => p.as_str(),
+        ast::Value::SingleQuotedString(s) => s.as_str(),
+        _ => return None,
+    };
+    match token {
+        "@start_date" => Some(WindowEdge::Start),
+        "@end_date" => Some(WindowEdge::End),
+        _ => None,
+    }
+}
+
+/// A column, possibly cast, wrapped in a function of it alone
+/// (`DATE_TRUNC('day', ts)`), or shifted by a constant. Never a subquery and
+/// never a placeholder.
+fn is_column_term(expr: &Expr) -> bool {
+    match expr {
+        Expr::Identifier(_) | Expr::CompoundIdentifier(_) => true,
+        Expr::Nested(inner) | Expr::Cast { expr: inner, .. } => is_column_term(inner),
+        Expr::BinaryOp {
+            left,
+            op: ast::BinaryOperator::Plus | ast::BinaryOperator::Minus,
+            right,
+        } => {
+            (is_column_term(left) && is_constant(right))
+                || (is_constant(left) && is_column_term(right))
+        }
+        Expr::Function(function) => {
+            let Some(args) = plain_function_args(function) else {
+                return false;
+            };
+            let mut columns = 0;
+            for arg in args {
+                if is_column_term(arg) {
+                    columns += 1;
+                } else if !(is_constant(arg) || is_date_part(arg)) {
+                    return false;
+                }
+            }
+            columns > 0
+        }
+        _ => false,
+    }
+}
+
+/// A literal that is not a window placeholder, possibly cast, negated or
+/// written as an interval.
+fn is_constant(expr: &Expr) -> bool {
+    match expr {
+        Expr::Value(v) => {
+            placeholder_token(&v.value).is_none() && !matches!(v.value, ast::Value::Placeholder(_))
+        }
+        Expr::TypedString(ts) => placeholder_token(&ts.value.value).is_none(),
+        Expr::Interval(interval) => is_constant(&interval.value),
+        Expr::Nested(inner) | Expr::Cast { expr: inner, .. } => is_constant(inner),
+        Expr::UnaryOp {
+            op: ast::UnaryOperator::Minus | ast::UnaryOperator::Plus,
+            expr,
+        } => is_constant(expr),
+        _ => false,
+    }
+}
+
+/// A bare date-part keyword in a function argument (`DATEADD(day, ...)`),
+/// which parses as an identifier.
+fn is_date_part(expr: &Expr) -> bool {
+    const PARTS: &[&str] = &[
+        "year", "quarter", "month", "week", "day", "hour", "minute", "second",
+    ];
+    matches!(expr, Expr::Identifier(ident)
+        if PARTS.iter().any(|p| ident.value.eq_ignore_ascii_case(p)))
+}
+
+/// The positional argument expressions of a plain scalar call, or `None` for
+/// a call this check does not look through: a window, `FILTER`, `WITHIN
+/// GROUP`, a subquery argument, or a wildcard or named argument.
+fn plain_function_args(function: &ast::Function) -> Option<Vec<&Expr>> {
+    if function.over.is_some() || function.filter.is_some() || !function.within_group.is_empty() {
+        return None;
+    }
+    if !matches!(function.parameters, ast::FunctionArguments::None) {
+        return None;
+    }
+    let ast::FunctionArguments::List(list) = &function.args else {
+        return None;
+    };
+    if !list.clauses.is_empty() {
+        return None;
+    }
+    list.args
+        .iter()
+        .map(|arg| match arg {
+            ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(e)) => Some(e),
+            _ => None,
+        })
+        .collect()
 }
 
 /// E026 — `first_partition`, if present, must parse to a canonical key for
@@ -5380,6 +5594,82 @@ mod tests {
              UNION ALL VALUES (DATE '2020-01-01')",
         ] {
             assert!(e024_fires(sql), "E024 must fire for: {sql}");
+        }
+    }
+
+    /// #2233 follow-up (P2): a placeholder must sit in a top-level `AND`
+    /// conjunct that bounds a column, in the filter's own scope. Each of these
+    /// mentions both placeholders in a filter, yet copies unbounded rows.
+    #[test]
+    fn test_e024_placeholder_that_does_not_bound_the_filter() {
+        for sql in [
+            // An OR branch lets every row through.
+            "SELECT order_date FROM upstream \
+             WHERE order_date >= @start_date AND order_date < @end_date OR 1 = 1",
+            "SELECT order_date FROM upstream \
+             WHERE (order_date >= @start_date OR 1 = 1) AND order_date < @end_date",
+            // A null test on the placeholder short-circuits the bound.
+            "SELECT order_date FROM upstream \
+             WHERE @start_date IS NULL OR (order_date >= @start_date AND order_date < @end_date)",
+            // NOT inverts the window: every row outside it.
+            "SELECT order_date FROM upstream \
+             WHERE NOT (order_date >= @start_date AND order_date < @end_date)",
+            // A bounded set the outer rows are NOT IN.
+            "SELECT order_date FROM upstream WHERE order_date NOT IN \
+             (SELECT d FROM cal WHERE d >= @start_date AND d < @end_date)",
+            // EXISTS over a bounded subquery restricts nothing per row.
+            "SELECT order_date FROM upstream WHERE EXISTS \
+             (SELECT 1 FROM cal WHERE d >= @start_date AND d < @end_date)",
+            // A scalar subquery compared to a column: the placeholders bound
+            // the subquery's rows, not this filter's.
+            "SELECT order_date FROM upstream WHERE order_date >= \
+             (SELECT MIN(d) FROM cal WHERE d >= @start_date AND d < @end_date)",
+            // Bounds facing the wrong way.
+            "SELECT order_date FROM upstream \
+             WHERE order_date <= @start_date AND order_date > @end_date",
+            "SELECT order_date FROM upstream \
+             WHERE @start_date >= order_date AND @end_date < order_date",
+            // NOT BETWEEN keeps the rows outside the window.
+            "SELECT order_date FROM upstream \
+             WHERE order_date NOT BETWEEN @start_date AND @end_date",
+            // A comparison between the placeholders bounds no column.
+            "SELECT order_date FROM upstream WHERE @start_date < @end_date",
+            // A CASE that only sometimes uses the window.
+            "SELECT order_date FROM upstream WHERE order_date >= \
+             CASE WHEN flag THEN @start_date ELSE DATE '1900-01-01' END \
+             AND order_date < @end_date",
+        ] {
+            assert!(e024_fires(sql), "E024 must fire for: {sql}");
+        }
+    }
+
+    /// The forms a real window filter takes keep passing.
+    #[test]
+    fn test_e024_column_bounds_in_common_forms_pass() {
+        for sql in [
+            // Placeholder on the left.
+            "SELECT order_date FROM upstream \
+             WHERE @start_date <= order_date AND @end_date > order_date",
+            // Parenthesised conjuncts and extra unrelated conjuncts.
+            "SELECT order_date FROM upstream \
+             WHERE (order_date >= @start_date) AND (status = 'ok' OR status = 'late') \
+             AND (order_date < @end_date)",
+            // A cast or function on either side.
+            "SELECT order_date FROM upstream \
+             WHERE CAST(ts AS DATE) >= CAST(@start_date AS DATE) AND DATE(ts) < DATE(@end_date)",
+            "SELECT order_date FROM upstream \
+             WHERE DATE_TRUNC('day', ts) >= @start_date AND ts < TIMESTAMP '@end_date'",
+            // A lookback shift by a constant.
+            "SELECT order_date FROM upstream \
+             WHERE order_date >= @start_date - INTERVAL 1 DAY AND order_date < @end_date",
+            // A qualified column.
+            "SELECT u.order_date FROM upstream u \
+             WHERE u.order_date >= @start_date AND u.order_date < @end_date",
+            // An EXISTS beside a real window filter is harmless.
+            "SELECT order_date FROM upstream WHERE EXISTS (SELECT 1 FROM cal) \
+             AND order_date >= @start_date AND order_date < @end_date",
+        ] {
+            assert!(!e024_fires(sql), "E024 must not fire for: {sql}");
         }
     }
 

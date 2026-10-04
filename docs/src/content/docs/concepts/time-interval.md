@@ -105,6 +105,23 @@ partition window must have both bounds. Each placeholder must appear in a
 placeholder in a comment, in a longer string or only in the `SELECT` list
 does not count. The compiler also emits `E024` when it cannot parse the SQL.
 
+Inside that clause, a placeholder counts only in a comparison that bounds a
+column and is joined to the rest of the clause by `AND`:
+
+- `<col> >= @start_date` (or `>`, `=`) and `<col> < @end_date` (or `<=`, `=`).
+  Either operand order works, so `@start_date <= <col>` counts too.
+- `<col> BETWEEN @start_date AND @end_date`.
+- The column may be cast or wrapped in a function, such as `DATE(ts)`. The
+  placeholder may be cast or shifted by a constant, such as
+  `@start_date - INTERVAL 1 DAY`.
+- `<col> IN (SELECT ...)` counts when that subquery's rows are bounded.
+
+Anything that can let rows outside the window through does not count: a
+comparison under `OR` or `NOT` (`ts >= @start_date OR 1 = 1`,
+`@start_date IS NULL OR ...`), a bound that faces the wrong way
+(`ts <= @start_date`), `NOT BETWEEN`, `NOT IN` and `EXISTS`. A placeholder
+inside a subquery bounds that subquery's rows, not the clause around it.
+
 The filter must reach every row the model emits:
 
 - **Set operations.** Each `UNION` / `UNION ALL` branch needs its own filter,
