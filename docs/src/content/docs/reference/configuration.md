@@ -212,7 +212,9 @@ tables = ["orders", "order_items"]
 adapter = "local_discovery"
 ```
 
-The adapter discovers exactly what it lists. It makes no network call and checks nothing in the warehouse, so a listed table that does not exist fails at `rocky run`, not at `rocky plan`. A listed schema whose name does not start with the pipeline's `schema_pattern.prefix` is not discovered.
+The adapter discovers exactly what it lists, with no network call. It does not check that the tables exist. `rocky plan` plans every listed table, so a missing table fails at `rocky run`. `rocky discover` is different: when the pipeline sets `source.catalog`, it asks the source warehouse which tables exist and leaves out the missing ones, as it does for every discovery adapter.
+
+A listed schema is used only when the pipeline's `schema_pattern` parses it: the name must start with `prefix` (case-sensitive) and the rest must split into the declared `components`. Other listed schemas are skipped.
 
 `rocky validate` reports each of these as a `V057` error, and every command that loads the config (`plan`, `run`, `discover`) refuses it with the same message:
 
@@ -222,7 +224,7 @@ The adapter discovers exactly what it lists. It makes no network call and checks
 - a schema listed twice, or a table listed twice in one schema (compared ignoring case);
 - `schemas` on an adapter whose type is not `manual`.
 
-When no listed schema starts with the prefix of a pipeline that uses the adapter, `rocky validate` warns with `V058`: `plan` and `run` would find no table.
+When the `schema_pattern` of a pipeline that uses the adapter parses none of the listed schemas, `rocky validate` warns with `V058`: `plan` and `run` would find no table.
 
 ### `[adapter.NAME.retry]`
 

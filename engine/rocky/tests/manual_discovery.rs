@@ -152,3 +152,68 @@ fn a_manual_adapter_with_no_schemas_is_refused_by_validate_and_plan() {
         "the pre-#1994 failure must be gone: {stderr}"
     );
 }
+
+/// `rocky discover` returns the listed schemas that match the prefix, with
+/// their tables, and `source_type = "manual"`.
+#[test]
+fn discover_returns_the_listed_schemas() {
+    let dir = project(
+        r#"
+[[adapter.local_discovery.schemas]]
+name = "raw__orders"
+tables = ["orders", "order_items"]
+
+[[adapter.local_discovery.schemas]]
+name = "other__x"
+tables = ["x"]
+"#,
+    );
+    let out = rocky(dir.path(), &["-o", "json", "discover"]);
+    assert!(
+        out.status.success(),
+        "discover: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let body = json(&out, "discover");
+    let sources = body["sources"].as_array().expect("sources");
+    assert_eq!(sources.len(), 1, "{body:#}");
+    assert_eq!(sources[0]["source_type"], "manual");
+    let tables: Vec<&str> = sources[0]["tables"]
+        .as_array()
+        .expect("tables")
+        .iter()
+        .map(|t| t["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(tables, ["orders", "order_items"], "{body:#}");
+}
+
+/// A listed schema the pattern cannot parse: validate warns V058 and plan
+/// plans nothing. The two agree that nothing would be built.
+#[test]
+fn a_schema_the_pattern_cannot_parse_warns_and_plans_nothing() {
+    let dir = project(
+        r#"
+[[adapter.local_discovery.schemas]]
+name = "orders"
+tables = ["orders"]
+"#,
+    );
+    let validate = rocky(dir.path(), &["-o", "json", "validate"]);
+    let body = json(&validate, "validate");
+    let v058 = body["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .filter(|m| m["code"] == "V058" && m["severity"] == "warn")
+        .count();
+    assert_eq!(v058, 1, "{body:#}");
+
+    let plan = rocky(dir.path(), &["-o", "json", "plan"]);
+    assert!(plan.status.success());
+    let body = json(&plan, "plan");
+    assert_eq!(
+        body["statements"].as_array().map(Vec::len),
+        Some(0),
+        "{body:#}"
+    );
+}

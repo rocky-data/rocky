@@ -29,6 +29,11 @@ export DATABRICKS_HTTP_PATH="/sql/1.0/warehouses/<warehouse-id>"
 ./run.sh
 ```
 
+The source table comes from the manual discovery adapter in `rocky.toml`,
+which lists `raw__orders.orders`. It must exist as `main.raw__orders.orders`
+in your workspace; edit `[[adapter.local_discovery.schemas]]` to point at a
+table you have.
+
 ## Expected output
 
 `run.sh` validates the config, then writes golden JSON to `expected/`:

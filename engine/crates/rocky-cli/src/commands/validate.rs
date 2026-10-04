@@ -1239,12 +1239,15 @@ fn validate_replication_pipeline(
         });
     }
 
-    // V058: a manual discovery adapter discovers only the schemas it lists
-    // whose name starts with the pipeline's `schema_pattern.prefix` — the
-    // same prefix match every discovery adapter applies. When none match,
-    // `plan` and `run` find no table and do nothing, silently (#1994). A
-    // warning, like V054: the config is loadable, it just plans nothing.
-    // An empty list is already the V057 error, so it is not re-reported.
+    // V058: a manual discovery adapter discovers only the schemas it lists,
+    // and `plan` / `run` then keep only the ones `schema_pattern` parses:
+    // the prefix must match (case-sensitively) and the rest must split into
+    // the declared components. A schema that fails either is skipped
+    // silently, so when none parses, plan and run find no table (#1994).
+    // Uses the same `SchemaPattern::parse` the executing paths use, so the
+    // warning and the plan cannot disagree. A warning, like V054: the config
+    // is loadable, it just plans nothing. An empty list is already the V057
+    // error, so it is not re-reported.
     if let Ok(pattern) = &pattern_result
         && let Some(ref disc) = pipeline.source.discovery
         && let Some(disc_adapter) = cfg.adapters.get(&disc.adapter)
@@ -1253,16 +1256,17 @@ fn validate_replication_pipeline(
         && !disc_adapter
             .schemas
             .iter()
-            .any(|schema| schema.name.starts_with(pattern.prefix.as_str()))
+            .any(|schema| pattern.parse(&schema.name).is_ok())
     {
         msgs.push(ValidateMessage {
             severity: "warn".into(),
             code: "V058".into(),
             message: format!(
-                "pipeline.{name}: no schema listed on manual discovery adapter '{}' starts with \
-                 the schema_pattern prefix '{}', so plan and run find no table. Rename a \
-                 schema in [[adapter.{}.schemas]] or change the prefix.",
-                disc.adapter, pattern.prefix, disc.adapter
+                "pipeline.{name}: no schema listed on manual discovery adapter '{}' matches the \
+                 schema_pattern (prefix '{}', components {:?}; the prefix match is \
+                 case-sensitive), so plan and run find no table. Rename a schema in \
+                 [[adapter.{}.schemas]] or change the pattern.",
+                disc.adapter, pattern.prefix, pipeline.source.schema_pattern.components, disc.adapter
             ),
             file: None,
             field: Some(format!("adapter.{}.schemas", disc.adapter)),
@@ -3513,6 +3517,29 @@ tables = ["orders"]
             Some("adapter.local_discovery.schemas")
         );
         assert!(v058[0].message.contains("'raw__'"));
+    }
+
+    /// The review's case: the name starts with the prefix but has fewer
+    /// segments than `components` binds, so `plan` skips it. V058 must agree.
+    #[test]
+    fn manual_schemas_with_too_few_segments_are_v058_warning() {
+        let toml = manual_pipeline_toml(
+            r#"
+[[adapter.local_discovery.schemas]]
+name = "raw__orders"
+tables = ["orders"]
+"#,
+            "raw__",
+        )
+        .replace(r#"components = ["source"]"#, r#"components = ["tenant", "source"]"#)
+        .replace("staging__{source}", "staging__{tenant}__{source}");
+        let out = validate_toml(&toml);
+        assert_eq!(
+            messages_with(&out, "V058", "warn").len(),
+            1,
+            "{:?}",
+            out.messages
+        );
     }
 
     /// #2152 review: an unclosed `{` (`"{source"`, no closing `}`) is
