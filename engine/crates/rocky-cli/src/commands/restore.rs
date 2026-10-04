@@ -489,8 +489,25 @@ impl ObjectWriteFence for NoFence {
 /// [`execute_restore_apply`] stopped because a pre-mutation fence refused an
 /// object write. Carried as a typed error so the seam can abort the whole
 /// attempt instead of publishing it as a business error.
+///
+/// `written` names the objects this attempt had already written before the
+/// refusal. An object write cannot be taken back, so those bytes stay even
+/// though the attempt's ledger rows are discarded; the error says so rather
+/// than claiming nothing happened.
 #[derive(Debug)]
-pub(crate) struct RestoreFenced(pub(crate) String);
+pub(crate) struct RestoreFenced {
+    pub(crate) reason: String,
+    pub(crate) written: Vec<String>,
+}
+
+impl RestoreFenced {
+    fn new(reason: String) -> Self {
+        Self {
+            reason,
+            written: Vec::new(),
+        }
+    }
+}
 
 impl std::fmt::Display for RestoreFenced {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -498,9 +515,31 @@ impl std::fmt::Display for RestoreFenced {
             f,
             "restore refused before an object-store write: {} — nothing more was written, and \
              no ledger row of this attempt was published",
-            self.0
-        )
+            self.reason
+        )?;
+        if !self.written.is_empty() {
+            write!(
+                f,
+                ". Already written by this attempt before the refusal (the bytes stay): {}",
+                self.written.join(", ")
+            )?;
+        }
+        Ok(())
     }
+}
+
+/// Name the objects a restore already wrote on an error that stops it, so the
+/// operator learns of every irreversible effect, not only the refusal.
+fn with_written_paths(err: anyhow::Error, written: &[String]) -> anyhow::Error {
+    if written.is_empty() {
+        return err;
+    }
+    err.context(format!(
+        "restore stopped after writing {} object(s) to the object store, which stay (a \
+         re-apply verifies their hash and keeps them): {}",
+        written.len(),
+        written.join(", ")
+    ))
 }
 
 impl std::error::Error for RestoreFenced {}
@@ -741,7 +780,7 @@ async fn restore_one(
             Ok(wrote) => wrote,
             Err(e) => {
                 if let Some(fenced) = e.downcast_ref::<RestoreFenced>() {
-                    return RestoreOneOutcome::Fenced(fenced.0.clone());
+                    return RestoreOneOutcome::Fenced(fenced.reason.clone());
                 }
                 return refuse(format!("{e:#}"));
             }
@@ -842,7 +881,7 @@ async fn verify_or_create(
         Err(object_store::Error::NotFound { .. }) => {
             // The only irreversible effect of a restoration: fence it.
             if let Err(e) = fence.check().await {
-                return Err(anyhow::Error::new(RestoreFenced(format!("{e:#}"))));
+                return Err(anyhow::Error::new(RestoreFenced::new(format!("{e:#}"))));
             }
             let opts = PutOptions {
                 mode: PutMode::Create,
@@ -918,7 +957,14 @@ async fn execute_restore_apply(
             RestoreOneOutcome::AlreadyRestored(hash) => already_restored.push(hash),
             RestoreOneOutcome::Refused(r) => refused.push(r),
             RestoreOneOutcome::Fenced(reason) => {
-                return Err(anyhow::Error::new(RestoreFenced(reason)));
+                return Err(anyhow::Error::new(RestoreFenced {
+                    reason,
+                    written: restored
+                        .iter()
+                        .filter(|r| r.bytes_written)
+                        .map(|r| r.file_path.clone())
+                        .collect(),
+                }));
             }
         }
     }
@@ -1272,6 +1318,12 @@ pub(crate) async fn restore_apply_output(
                 if let Err(e) = &exec
                     && let Some(fenced) = e.downcast_ref::<RestoreFenced>()
                 {
+                    // The bytes written before the fence stay: record them
+                    // so the command's error names them.
+                    written
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .extend(fenced.written.iter().cloned());
                     return Err(rocky_core::state_sync::StateSyncError::SeamTransition(
                         fenced.to_string(),
                     ));
@@ -1304,8 +1356,19 @@ pub(crate) async fn restore_apply_output(
             })
         },
     )
-    .await?;
-    let mut output = exec_result?;
+    .await;
+    // A refusal after an object write (a fence mid-loop, the pre-publish
+    // regate, or a seam that gave up) must still name what was written.
+    let written_so_far = || -> Vec<String> {
+        written_paths
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .cloned()
+            .collect()
+    };
+    let exec_result = exec_result.map_err(|e| with_written_paths(e, &written_so_far()))?;
+    let mut output = exec_result.map_err(|e| with_written_paths(e, &written_so_far()))?;
     // The output of record comes from the CAS-winning attempt; only the
     // physical-write fact is folded in from the attempts before it.
     let written = written_paths
@@ -2376,6 +2439,110 @@ mod tests {
                     .refcount_for_hash(&wr.blake3_hash)
                     .unwrap(),
                 0
+            );
+        }
+
+        /// P4-10: a fence that refuses the SECOND object write of a restore
+        /// must name the first object, which was already written and stays.
+        /// The error used to say only "nothing more was written".
+        #[tokio::test]
+        async fn a_fence_refusal_mid_loop_names_the_objects_already_written() {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+
+            let dir = TempDir::new().unwrap();
+            let state_path = dir.path().join("state.redb");
+            let cas = Arc::new(InMemory::new());
+            seed_bootstrap(&cas).await;
+            let ir_a = orders_ir();
+            let mut ir_b = orders_ir();
+            ir_b.sql = "SELECT id, name FROM (VALUES (CAST(4 AS BIGINT), 'dave')) AS t(id, name)"
+                .to_string();
+            let wr_a = produce_real_bytes(cas.clone(), &ir_a).await;
+            let wr_b = produce_real_bytes(cas.clone(), &ir_b).await;
+            assert_ne!(
+                wr_a.file_path, wr_b.file_path,
+                "PRECONDITION: two artifacts"
+            );
+
+            let store = StateStore::open(&state_path).unwrap();
+            let mut restorations = Vec::new();
+            let mut paths = Vec::new();
+            for (ir, wr, run) in [(&ir_a, &wr_a, "r1"), (&ir_b, &wr_b, "r2")] {
+                seed_ledger(&store, ir, run, wr, Utc::now() - Duration::days(30));
+                let tomb = TombstoneRecord {
+                    size_bytes: wr.size_bytes,
+                    commit_version: wr.commit_version,
+                    ..tombstone(&wr.blake3_hash, run, "orders", &wr.file_path, None)
+                };
+                store
+                    .evict_artifact(&tomb, run, "orders", &wr.file_path)
+                    .unwrap();
+                // The physical delete, so the restore has to write the bytes.
+                let obj_path = ObjPath::from(format!(
+                    "{KEY_PREFIX}/{}",
+                    wr.file_path.rsplit('/').next().unwrap()
+                ));
+                cas.delete(&obj_path).await.unwrap();
+                paths.push(obj_path);
+                restorations.push(RestorePlanRestoration {
+                    model_name: "orders".to_string(),
+                    run_id: run.to_string(),
+                    blake3_hash: wr.blake3_hash.clone(),
+                    file_path: wr.file_path.clone(),
+                    size_bytes: wr.size_bytes,
+                    commit_version: wr.commit_version,
+                    evicted_at: Utc::now().to_rfc3339(),
+                    gc_plan_id: "gc".to_string(),
+                    recipe_hash: None,
+                    input_hash: None,
+                    input_proof_class: Some("strong".to_string()),
+                });
+            }
+
+            /// Lets the first object write through and refuses every later one,
+            /// as a freeze landing mid-restore does.
+            struct SecondWriteRefused(AtomicUsize);
+            #[async_trait::async_trait]
+            impl ObjectWriteFence for SecondWriteRefused {
+                async fn check(&self) -> Result<()> {
+                    if self.0.fetch_add(1, Ordering::SeqCst) == 0 {
+                        Ok(())
+                    } else {
+                        anyhow::bail!("a freeze landed mid-restore")
+                    }
+                }
+            }
+
+            let err = execute_restore_apply(
+                &store,
+                &SharedStore(cas.clone()),
+                &fresh_duckdb(),
+                "restore-plan",
+                &RestorePlan {
+                    version: VERSION.to_string(),
+                    target: "orders".to_string(),
+                    restorations,
+                },
+                Utc::now(),
+                &SecondWriteRefused(AtomicUsize::new(0)),
+            )
+            .await
+            .expect_err("the second write is fenced");
+            let fenced = err
+                .downcast_ref::<RestoreFenced>()
+                .unwrap_or_else(|| panic!("a fence refusal, got: {err:#}"));
+            assert_eq!(fenced.written, vec![wr_a.file_path.clone()], "{err:#}");
+            assert!(err.to_string().contains(&wr_a.file_path), "{err}");
+            assert!(
+                cas.get(&paths[0]).await.is_ok(),
+                "PRECONDITION: the first object really was written"
+            );
+            assert!(
+                matches!(
+                    cas.get(&paths[1]).await,
+                    Err(object_store::Error::NotFound { .. })
+                ),
+                "the fenced object was not written"
             );
         }
 
