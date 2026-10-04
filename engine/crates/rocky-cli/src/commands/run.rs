@@ -10469,6 +10469,11 @@ pub(crate) fn resolve_model_run_target(
 /// plan`) against the same models a `--model` run would compile: the
 /// `--models` override, else the owning transformation pipeline's configured
 /// directory and glob, else `./models`.
+///
+/// Ephemeral models are dropped from the result (they are never built on
+/// their own), except one named by the literal `--model` flag, which the
+/// runner refuses with E038. A selection of only ephemeral models is empty:
+/// "nothing to do".
 pub fn resolve_run_selection(
     config_path: &Path,
     state_path: &Path,
@@ -10504,7 +10509,7 @@ pub fn resolve_run_selection(
         "models directory '{}' not found (required for --select)",
         mdir.display()
     );
-    crate::selection::resolve_in_dir(
+    crate::selection::resolve_buildable_in_dir(
         selection,
         &mdir,
         models_glob.as_deref(),
@@ -14667,6 +14672,10 @@ async fn execute_snapshot_model(
             problems.join("; ")
         );
     }
+    // A warehouse that cannot run the SCD2 MERGE refuses before any probe,
+    // CTAS or ALTER reaches it.
+    snapshot_model::refuse_unsupported_dialect(dialect)
+        .with_context(|| format!("snapshot model '{model_name}' failed"))?;
     let model_started_at = Utc::now();
     let target_table = rocky_ir::TableRef {
         catalog: model_ir.target.catalog.clone(),

@@ -285,12 +285,49 @@ pub fn resolve_in_dir(
     models_glob: Option<&str>,
     ctx: &StateContext<'_>,
 ) -> Result<BTreeSet<String>> {
+    let project = load_project(models_dir, models_glob)?;
+    resolve(args, &project, models_dir, ctx)
+}
+
+/// [`resolve_in_dir`] for commands that build models (`rocky run`): drop
+/// every `ephemeral` model from the selection. An ephemeral model is never
+/// materialized — its consumers inline it — so selecting one (for example
+/// through `state:modified`) builds nothing. A model named by the literal
+/// `--model` flag (`args.required_model`) stays, so the runner refuses it
+/// with E038 rather than silently doing nothing.
+pub fn resolve_buildable_in_dir(
+    args: &SelectionArgs,
+    models_dir: &Path,
+    models_glob: Option<&str>,
+    ctx: &StateContext<'_>,
+) -> Result<BTreeSet<String>> {
+    let project = load_project(models_dir, models_glob)?;
+    let mut selected = resolve(args, &project, models_dir, ctx)?;
+    let had_models = !selected.is_empty();
+    selected.retain(|name| {
+        args.required_model.as_deref() == Some(name.as_str())
+            || !project.model(name).is_some_and(|m| {
+                matches!(
+                    m.config.strategy,
+                    rocky_core::models::StrategyConfig::Ephemeral
+                )
+            })
+    });
+    if had_models && selected.is_empty() {
+        warn!(
+            "Nothing to do: the selection matched only ephemeral models, which are inlined \
+             into their consumers and never built on their own"
+        );
+    }
+    Ok(selected)
+}
+
+fn load_project(models_dir: &Path, models_glob: Option<&str>) -> Result<Project> {
     let models = match models_glob {
         Some(glob) => crate::models_loader::load_project_models_matching(models_dir, glob, None)?,
         None => crate::models_loader::load_project_models(models_dir, None)?,
     };
-    let project = Project::from_models(models)
+    Project::from_models(models)
         .map_err(|e| anyhow::anyhow!("{e}"))
-        .context("failed to resolve the model graph for --select")?;
-    resolve(args, &project, models_dir, ctx)
+        .context("failed to resolve the model graph for --select")
 }

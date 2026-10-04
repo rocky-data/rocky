@@ -268,6 +268,38 @@ fn model_without_time_column_uses_state_store_and_never_built_is_stale() {
     );
 }
 
+/// An ephemeral model has no table, so `rocky freshness` does not grade it,
+/// even when a `[freshness]` block (its own or the project's) covers it.
+#[test]
+fn ephemeral_models_are_not_graded() {
+    let dir = project("\n[freshness]\nexpected_lag_seconds = 3600\n");
+    let models = dir.path().join("models");
+    fs::create_dir_all(&models).unwrap();
+    fs::write(models.join("eph.sql"), "SELECT 1 AS n").unwrap();
+    fs::write(
+        models.join("eph.toml"),
+        "name = \"eph\"\n\n[strategy]\ntype = \"ephemeral\"\n\n\
+         [target]\ncatalog = \"fixture\"\nschema = \"main\"\ntable = \"eph\"\n\n\
+         [freshness]\nmax_lag_seconds = 3600\n",
+    )
+    .unwrap();
+    fs::write(models.join("m.sql"), "SELECT n FROM eph").unwrap();
+    fs::write(
+        models.join("m.toml"),
+        "name = \"m\"\n\n[target]\ncatalog = \"fixture\"\nschema = \"main\"\ntable = \"m\"\n",
+    )
+    .unwrap();
+    let out = rocky(dir.path(), &["freshness"]);
+    let v = json(&out);
+    let names: Vec<&str> = v["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, vec!["m"], "{v:#}");
+}
+
 // ----- compile-time: E050 / W050 -----
 
 fn compile_project(config_tail: &str, seed_sql: &str) -> tempfile::TempDir {

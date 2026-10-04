@@ -277,7 +277,14 @@ fn load_models_with_freshness(
     let glob = crate::models_loader::resolved_models_glob(&tx.models, config_path);
     let mut models =
         crate::models_loader::load_project_models_matching(&dir, &glob, Some(&cfg.freshness))?;
-    models.retain(|m| m.config.freshness.is_some());
+    // An ephemeral model has no table to measure: its consumers inline it.
+    models.retain(|m| {
+        m.config.freshness.is_some()
+            && !matches!(
+                m.config.strategy,
+                rocky_core::models::StrategyConfig::Ephemeral
+            )
+    });
     models.sort_by(|a, b| a.config.name.cmp(&b.config.name));
     Ok(models)
 }

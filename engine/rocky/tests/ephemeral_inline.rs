@@ -252,3 +252,112 @@ fn selecting_an_ephemeral_model_directly_is_e038() {
     assert!(all.contains("E038"), "{all}");
     assert!(!relation_exists(root, "eph_orders"));
 }
+
+/// `--select` that resolves to only an ephemeral model (e.g. a
+/// `state:modified` run where only the ephemeral SQL changed) is "nothing to
+/// do", not E038: an ephemeral model is never built on its own. Only the
+/// literal `--model <ephemeral>` above refuses.
+#[test]
+fn selecting_only_an_ephemeral_model_is_nothing_to_do() {
+    let tmp = project();
+    let root = tmp.path();
+    let out = rocky(root, &["run", "--select", "eph_orders", "--output", "json"]);
+    assert!(
+        out.status.success(),
+        "run must exit 0\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v = json(&out);
+    assert_eq!(
+        v["materializations"].as_array().map(Vec::len),
+        Some(0),
+        "{v:#}"
+    );
+    assert!(!relation_exists(root, "eph_orders"));
+    assert!(!relation_exists(root, "fct"));
+
+    // An ephemeral model next to one buildable model collapses to that
+    // model alone and builds it.
+    let out = rocky(
+        root,
+        &["run", "--select", "eph_orders", "fct", "--output", "json"],
+    );
+    assert!(
+        out.status.success(),
+        "run must exit 0\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(relation_exists(root, "fct"));
+    assert!(!relation_exists(root, "eph_orders"));
+}
+
+/// The SQL lints that `rocky compile` runs after typecheck (E042/E043
+/// operand checks, P001 portability) judge each model as authored. An
+/// ephemeral model's defect is reported once, on the ephemeral model — not
+/// again on every consumer that inlines it.
+#[test]
+fn ephemeral_defects_are_reported_once_not_on_every_consumer() {
+    let tmp = project();
+    let root = tmp.path();
+    let models = root.join("models");
+    fs::create_dir_all(root.join("data")).unwrap();
+    fs::write(
+        root.join("data/seed.sql"),
+        "CREATE SCHEMA IF NOT EXISTS raw;
+         CREATE TABLE raw.orders (order_id BIGINT, customer_id BIGINT, amount DOUBLE, \
+           status VARCHAR, order_date DATE);",
+    )
+    .unwrap();
+    // SUM over a VARCHAR column (E042 on DuckDB) and NVL (P001 for BigQuery).
+    fs::write(
+        models.join("eph_bad.sql"),
+        "SELECT order_id, SUM(status) AS s, NVL(amount, 0) AS a FROM raw.orders \
+         GROUP BY order_id, amount\n",
+    )
+    .unwrap();
+    fs::write(models.join("eph_bad.toml"), sidecar("ephemeral")).unwrap();
+    for consumer in ["c1", "c2"] {
+        fs::write(
+            models.join(format!("{consumer}.sql")),
+            "SELECT order_id, s, a FROM eph_bad\n",
+        )
+        .unwrap();
+        fs::write(
+            models.join(format!("{consumer}.toml")),
+            sidecar("full_refresh"),
+        )
+        .unwrap();
+    }
+
+    let per_code = |args: &[&str], code: &str| -> Vec<String> {
+        let out = rocky(root, args);
+        let v = json(&out);
+        v["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|d| d["code"] == code)
+            .map(|d| d["model"].as_str().unwrap().to_string())
+            .collect()
+    };
+    assert_eq!(
+        per_code(&["compile", "--with-seed", "--output", "json"], "E042"),
+        vec!["eph_bad".to_string()]
+    );
+    assert_eq!(
+        per_code(
+            &[
+                "compile",
+                "--with-seed",
+                "--target-dialect",
+                "bq",
+                "--output",
+                "json"
+            ],
+            "P001"
+        ),
+        vec!["eph_bad".to_string()]
+    );
+}

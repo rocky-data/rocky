@@ -242,7 +242,12 @@ fn compile_inner(
         project_freshness,
         run_vars: run_vars.clone(),
         source_provenance,
-        preserve_authored_sql: false,
+        // The lints below (P001, E042/E043, imports E030/E033) judge each
+        // model's SQL as authored. Against the inlined form, an ephemeral
+        // model's defect would be reported again on every consumer, at
+        // spans that do not exist in the consumer's file. The inlined form
+        // is written back after them, for `--expand-macros`.
+        preserve_authored_sql: true,
     };
 
     let mut result = compile::compile(&config)?;
@@ -280,6 +285,10 @@ fn compile_inner(
         result
             .diagnostics
             .extend(function_adapter_diagnostics(config, &result));
+        // Likewise a warehouse that cannot run the SCD2 snapshot MERGE.
+        result
+            .diagnostics
+            .extend(snapshot_adapter_diagnostics(config, &result));
     }
 
     // Portability lint. Effective target_dialect = CLI flag > [portability]
@@ -335,28 +344,6 @@ fn compile_inner(
     }
     result.diagnostics.extend(operand_diags);
 
-    // Load macros and expand model SQL when --expand-macros is set.
-    let expanded_sql = if do_expand_macros {
-        let macros_dir = models_dir.join("../macros");
-        let macro_defs = if macros_dir.is_dir() {
-            load_macros_from_dir(&macros_dir)?
-        } else {
-            vec![]
-        };
-
-        let mut expanded = HashMap::new();
-        for model in &result.project.models {
-            if !in_scope(&model.config.name) {
-                continue;
-            }
-            let sql = expand_macros(&model.sql, &macro_defs)?;
-            expanded.insert(model.config.name.clone(), sql);
-        }
-        expanded
-    } else {
-        HashMap::new()
-    };
-
     // Compute DAG-propagated cost estimates for all models.
     // Uses hardcoded stub statistics for leaf nodes — real catalog stats
     // (per-adapter `DESCRIBE DETAIL` / Iceberg snapshot summary) will replace
@@ -407,6 +394,43 @@ fn compile_inner(
         }
         result.diagnostics.extend(import_diags);
     }
+
+    // Every lint that reads model SQL has run on the authored text. Keep
+    // that text for the miette source map (diagnostic spans point into it),
+    // then write back the form that inlines ephemeral upstreams as CTEs —
+    // the statement `rocky run` executes, which `--expand-macros` shows.
+    // The E038 diagnostics this returns were already reported by
+    // `compile::compile`, which ran the same checks.
+    let authored_source_map: HashMap<String, String> = result
+        .project
+        .models
+        .iter()
+        .filter(|model| in_scope(&model.config.name))
+        .map(|m| (m.file_path.display().to_string(), m.sql.clone()))
+        .collect();
+    let _already_reported = rocky_compiler::ephemeral::apply_ephemerals(&mut result.project, true);
+
+    // Load macros and expand model SQL when --expand-macros is set.
+    let expanded_sql = if do_expand_macros {
+        let macros_dir = models_dir.join("../macros");
+        let macro_defs = if macros_dir.is_dir() {
+            load_macros_from_dir(&macros_dir)?
+        } else {
+            vec![]
+        };
+
+        let mut expanded = HashMap::new();
+        for model in &result.project.models {
+            if !in_scope(&model.config.name) {
+                continue;
+            }
+            let sql = expand_macros(&model.sql, &macro_defs)?;
+            expanded.insert(model.config.name.clone(), sql);
+        }
+        expanded
+    } else {
+        HashMap::new()
+    };
 
     // E050 / W050 for transformation pipelines' declared source freshness
     // (`[[pipeline.<name>.sources]]`). The source schemas are the same map the
@@ -481,13 +505,7 @@ fn compile_inner(
             .filter(|(name, _)| in_scope(name))
             .map(|(name, cols)| (name.clone(), cols.len()))
             .collect(),
-        source_map: result
-            .project
-            .models
-            .iter()
-            .filter(|model| in_scope(&model.config.name))
-            .map(|m| (m.file_path.display().to_string(), m.sql.clone()))
-            .collect(),
+        source_map: authored_source_map,
     };
 
     let execution_layers = if scoped {
@@ -633,30 +651,56 @@ fn function_details(
         .collect()
 }
 
+/// The adapter blocks that act as warehouses (the data role): every block
+/// except a discovery-only type (`fivetran`, `airbyte`, …) or one declared
+/// `kind = "discovery"`. An adapter type Rocky does not know counts as a
+/// warehouse, so the checks below treat it as unable to run the feature.
+fn warehouse_adapters(
+    config: &rocky_config::RockyConfig,
+) -> impl Iterator<Item = &rocky_config::AdapterConfig> {
+    config.adapters.values().filter(|a| {
+        a.kind != Some(rocky_config::AdapterKind::Discovery)
+            && rocky_core::adapter_capability::capability_for(&a.adapter_type)
+                .is_none_or(|cap| cap.supports_data)
+    })
+}
+
 /// E051 for every valid function a model calls when every warehouse adapter
-/// the project configures is one that cannot create functions (Trino). A
-/// project that also configures a capable warehouse is not refused here —
-/// `rocky run` refuses at the boundary if the model runs on Trino.
+/// the project configures cannot create functions: Trino, and every adapter
+/// with no function DDL (PostgreSQL, Redshift, an unknown type). A project
+/// that also configures a capable warehouse is not refused here —
+/// `rocky run` refuses at the boundary if the model runs on the other one.
 fn function_adapter_diagnostics(
     config: &rocky_config::RockyConfig,
     result: &compile::CompileResult,
 ) -> Vec<Diagnostic> {
     use rocky_core::functions::FunctionDialect;
     let registry = result.semantic_graph.functions();
-    let warehouses: Vec<Option<FunctionDialect>> = config
-        .adapters
-        .values()
-        .filter_map(|a| FunctionDialect::from_dialect_name(&a.adapter_type))
-        .map(Some)
+    let warehouses: Vec<(&str, Option<FunctionDialect>)> = warehouse_adapters(config)
+        .map(|a| {
+            (
+                a.adapter_type.as_str(),
+                FunctionDialect::from_dialect_name(&a.adapter_type),
+            )
+        })
         .collect();
-    if registry.is_empty()
-        || warehouses.is_empty()
-        || !warehouses
-            .iter()
-            .all(|w| *w == Some(FunctionDialect::Trino))
+    let can_create = |w: &Option<FunctionDialect>| match w {
+        Some(FunctionDialect::Trino) | None => false,
+        Some(
+            FunctionDialect::DuckDb
+            | FunctionDialect::Snowflake
+            | FunctionDialect::Databricks
+            | FunctionDialect::BigQuery,
+        ) => true,
+    };
+    if registry.is_empty() || warehouses.is_empty() || warehouses.iter().any(|(_, w)| can_create(w))
     {
         return Vec::new();
     }
+    let mut types: Vec<&str> = warehouses.iter().map(|(t, _)| *t).collect();
+    types.sort_unstable();
+    types.dedup();
+    let types = types.join(", ");
     let usage = rocky_compiler::udf::function_usage(&result.project.models, registry);
     usage
         .keys()
@@ -665,12 +709,66 @@ fn function_adapter_diagnostics(
                 diagnostic::E051,
                 name,
                 format!(
-                    "function `{name}` cannot be created: the Trino adapter does not support \
-                     creating persistent user-defined functions"
+                    "function `{name}` cannot be created: Rocky cannot create persistent \
+                     user-defined functions on the configured warehouse ({types})"
                 ),
             )
             .with_suggestion(
                 "inline the expression in the calling models, or create the routine outside Rocky",
+            )
+        })
+        .collect()
+}
+
+/// E049 for every snapshot model when every warehouse adapter the project
+/// configures cannot run the SCD2 snapshot SQL
+/// ([`rocky_core::traits::SqlDialect::snapshot_unsupported_reason`]):
+/// PostgreSQL under `merge_mode = "on_conflict"`, and Redshift. Conservative
+/// like E051: a project that also configures a capable warehouse is not
+/// refused here; `rocky run` refuses at the boundary instead.
+fn snapshot_adapter_diagnostics(
+    config: &rocky_config::RockyConfig,
+    result: &compile::CompileResult,
+) -> Vec<Diagnostic> {
+    let mut reasons: Vec<(String, &'static str)> = Vec::new();
+    for adapter in warehouse_adapters(config) {
+        let reason = match crate::registry::postgres_dialect_for_config(adapter) {
+            Some(dialect) => dialect.snapshot_unsupported_reason(),
+            None => crate::registry::warehouse_dialect_for_type(&adapter.adapter_type)
+                .and_then(rocky_core::traits::SqlDialect::snapshot_unsupported_reason),
+        };
+        // One capable (or unknown) warehouse is enough to stay silent.
+        let Some(reason) = reason else {
+            return Vec::new();
+        };
+        reasons.push((adapter.adapter_type.clone(), reason));
+    }
+    let Some((adapter_type, reason)) = reasons.first() else {
+        return Vec::new();
+    };
+    result
+        .project
+        .models
+        .iter()
+        .filter(|m| {
+            matches!(
+                m.config.strategy,
+                rocky_core::models::StrategyConfig::Snapshot { .. }
+            )
+        })
+        .map(|m| {
+            Diagnostic::error(
+                diagnostic::E049,
+                &m.config.name,
+                format!(
+                    "snapshot model `{}` cannot run on the configured {adapter_type} warehouse: \
+                     {reason}",
+                    m.config.name
+                ),
+            )
+            .with_suggestion(
+                "use a warehouse that supports MERGE (PostgreSQL 15+ with merge_mode = \"merge\"), \
+                 or change the model's strategy",
             )
         })
         .collect()
@@ -967,6 +1065,132 @@ schema_template = "s"
         );
         fs::write(&path, body).unwrap();
         path
+    }
+
+    /// A transformation project rooted at `root` with the given `[adapter.*]`
+    /// blocks. Returns the config path.
+    fn adapter_project(root: &Path, adapters: &str) -> std::path::PathBuf {
+        fs::create_dir_all(root.join("models")).unwrap();
+        let path = root.join("rocky.toml");
+        fs::write(
+            &path,
+            format!(
+                "{adapters}\n[pipeline.p]\ntype = \"transformation\"\nmodels = \"models/**\"\n\
+                 target = {{ adapter = \"wh\" }}\n"
+            ),
+        )
+        .unwrap();
+        path
+    }
+
+    fn compile_codes(root: &Path, config: &Path) -> Vec<(String, String)> {
+        let out = compile_output(
+            Some(config),
+            &root.join("state.redb"),
+            &root.join("models"),
+            None,
+            None,
+            false,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        out.diagnostics
+            .iter()
+            .map(|d| (d.code.to_string(), d.model.clone()))
+            .collect()
+    }
+
+    const PG: &str = "[adapter.wh]\ntype = \"postgres\"\nhost = \"localhost\"\n\
+                      database = \"d\"\nusername = \"u\"\npassword = \"x\"\n";
+
+    fn udf_project(root: &Path, adapters: &str) -> std::path::PathBuf {
+        let config = adapter_project(root, adapters);
+        fs::create_dir_all(root.join("functions")).unwrap();
+        fs::write(
+            root.join("functions/dbl.toml"),
+            "returns = \"DOUBLE\"\n\n[[arguments]]\nname = \"x\"\ntype = \"DOUBLE\"\n",
+        )
+        .unwrap();
+        fs::write(root.join("functions/dbl.sql"), "x * 2\n").unwrap();
+        write_model(&root.join("models"), "uf", "SELECT dbl(1.0) AS a2");
+        config
+    }
+
+    /// Postgres and Redshift have no function DDL. With no other
+    /// warehouse configured, a UDF is refused at compile time (E051)
+    /// instead of failing mid-run.
+    #[test]
+    fn udf_on_warehouse_without_function_ddl_is_e051() {
+        for adapters in [
+            PG.to_string(),
+            PG.replace("postgres", "redshift"),
+            // A discovery-only adapter is not a warehouse.
+            format!(
+                "{PG}\n[adapter.src]\ntype = \"fivetran\"\nkind = \"discovery\"\n\
+                     destination_id = \"d\"\napi_key = \"k\"\napi_secret = \"s\"\n"
+            ),
+        ] {
+            let dir = TempDir::new().unwrap();
+            let config = udf_project(dir.path(), &adapters);
+            let codes = compile_codes(dir.path(), &config);
+            assert!(
+                codes.contains(&("E051".to_string(), "dbl".to_string())),
+                "{adapters}: {codes:?}"
+            );
+        }
+    }
+
+    /// A capable warehouse beside Postgres keeps compile quiet: the run
+    /// refuses at the boundary if the model lands on Postgres.
+    #[test]
+    fn udf_with_a_capable_warehouse_configured_is_not_e051() {
+        let dir = TempDir::new().unwrap();
+        let adapters = format!("{PG}\n[adapter.local]\ntype = \"duckdb\"\npath = \":memory:\"\n");
+        let config = udf_project(dir.path(), &adapters);
+        let codes = compile_codes(dir.path(), &config);
+        assert!(!codes.iter().any(|(c, _)| c == "E051"), "{codes:?}");
+    }
+
+    fn snapshot_project(root: &Path, adapters: &str) -> std::path::PathBuf {
+        let config = adapter_project(root, adapters);
+        let models = root.join("models");
+        fs::write(
+            models.join("snap.sql"),
+            "SELECT 1 AS id, CAST('2024-01-01' AS TIMESTAMP) AS updated_at",
+        )
+        .unwrap();
+        fs::write(
+            models.join("snap.toml"),
+            "[strategy]\ntype = \"snapshot\"\nunique_key = \"id\"\nstrategy = \"timestamp\"\n\
+             updated_at = \"updated_at\"\n\n[target]\ncatalog = \"c\"\nschema = \"s\"\n",
+        )
+        .unwrap();
+        config
+    }
+
+    /// PostgreSQL under `merge_mode = "on_conflict"` and Redshift cannot run
+    /// the SCD2 snapshot MERGE: compile refuses the snapshot model (E049).
+    #[test]
+    fn snapshot_on_warehouse_without_merge_is_e049() {
+        for adapters in [
+            format!("{PG}\n[adapter.wh.extra]\nmerge_mode = \"on_conflict\"\n"),
+            PG.replace("postgres", "redshift"),
+        ] {
+            let dir = TempDir::new().unwrap();
+            let config = snapshot_project(dir.path(), &adapters);
+            let codes = compile_codes(dir.path(), &config);
+            assert!(
+                codes.contains(&("E049".to_string(), "snap".to_string())),
+                "{adapters}: {codes:?}"
+            );
+        }
+        // PostgreSQL 15+ (the default `merge_mode = "merge"`) runs them.
+        let dir = TempDir::new().unwrap();
+        let config = snapshot_project(dir.path(), PG);
+        let codes = compile_codes(dir.path(), &config);
+        assert!(!codes.iter().any(|(c, _)| c == "E049"), "{codes:?}");
     }
 
     #[test]

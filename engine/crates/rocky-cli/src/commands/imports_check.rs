@@ -941,4 +941,69 @@ mod tests {
         assert_eq!(e034.len(), 1, "expected one E034, got: {diags:?}");
         assert_eq!(e034[0].severity, diagnostic::Severity::Error);
     }
+
+    /// `rocky compile` checks imports against each model as authored. An
+    /// ephemeral model that reads a dropped producer column gets one E030.
+    /// Its consumers (which declare the same producer source) read only
+    /// `id`; checked against their inlined SQL they would repeat the E030.
+    #[test]
+    fn e030_on_an_ephemeral_model_is_not_repeated_on_its_consumers() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let baseline = producer_snapshot(&["id", "customer_id", "shipped_at"]);
+        let current = producer_snapshot(&["id", "customer_id"]);
+        for (file, ir) in [("baseline.json", &baseline), ("current.json", &current)] {
+            std::fs::write(root.join(file), serde_json::to_string_pretty(ir).unwrap()).unwrap();
+        }
+        std::fs::write(
+            root.join("rocky.toml"),
+            "[adapter]\ntype = \"duckdb\"\npath = \":memory:\"\n\n\
+             [pipeline.p]\ntype = \"transformation\"\nmodels = \"models/**\"\n\
+             target = { adapter = \"default\" }\n\n\
+             [imports.orders]\npath = \".\"\nsnapshot = \"current.json\"\n\
+             baseline = \"baseline.json\"\npin = \"*\"\n",
+        )
+        .unwrap();
+        let models = root.join("models");
+        std::fs::create_dir_all(&models).unwrap();
+        let sidecar = |strategy: &str| {
+            format!(
+                "[strategy]\ntype = \"{strategy}\"\n\n[target]\ncatalog = \"c\"\nschema = \"s\"\n\n\
+                 [[sources]]\ncatalog = \"shop\"\nschema = \"core\"\ntable = \"orders\"\n"
+            )
+        };
+        std::fs::write(
+            models.join("eph.sql"),
+            "SELECT id, shipped_at FROM shop.core.orders",
+        )
+        .unwrap();
+        std::fs::write(models.join("eph.toml"), sidecar("ephemeral")).unwrap();
+        for consumer in ["c1", "c2"] {
+            std::fs::write(models.join(format!("{consumer}.sql")), "SELECT id FROM eph").unwrap();
+            std::fs::write(
+                models.join(format!("{consumer}.toml")),
+                sidecar("full_refresh"),
+            )
+            .unwrap();
+        }
+        let out = crate::commands::compile_output(
+            Some(&root.join("rocky.toml")),
+            &root.join("state.redb"),
+            &models,
+            None,
+            None,
+            false,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        let e030: Vec<&str> = out
+            .diagnostics
+            .iter()
+            .filter(|d| &*d.code == "E030")
+            .map(|d| d.model.as_str())
+            .collect();
+        assert_eq!(e030, vec!["eph"], "{:?}", out.diagnostics);
+    }
 }
