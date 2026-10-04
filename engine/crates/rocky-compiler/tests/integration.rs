@@ -1170,12 +1170,6 @@ fn lookback_without_unique_key_warns_w046() {
     assert!(!result.has_errors, "{:?}", result.diagnostics);
 }
 
-/// #1996: an ephemeral model is never materialized and never inlined, so a
-/// consumer reads whatever physical table carries the name. The refusal must
-/// be an ERROR on the model that declares the strategy, for the same reason
-/// E037 must: `rocky run` excludes a model from execution only on an
-/// error-severity diagnostic keyed on its name.
-
 /// #1996: `type = "ephemeral"` used to be refused outright with E038, because
 /// nothing inlined it. Consumers now inline it as a CTE, so a plain ephemeral
 /// model compiles clean; E038 only marks the uses inlining cannot serve
