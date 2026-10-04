@@ -67,6 +67,21 @@ rocky history
 
 A run made with `rocky run --branch <name>` also carries `rocky_branch`, the literal `<name>`. Rocky leaves the field out of any other run. It is not an audit field, so it appears with or without `--audit`. `rocky preview diff` and `rocky preview cost` find a branch's run by it. It differs from `git_branch`, the git branch you had checked out, which appears only with `--audit`.
 
+A run can start without leaving a record. It may still be running, it may have crashed, or its record write may have failed. When the ledger holds evidence of such a run, the document adds `unrecorded_runs`. A replication run leaves a `checkpoint` header. Every other kind of run leaves a `run_started` marker. These runs are not counted in `count`. When the list is present, `runs` is not the complete history. Rocky leaves the field out when it is empty, and when you filter by `--trigger`.
+
+```json
+"unrecorded_runs": [
+  {
+    "run_id": "run_20260401_120000",
+    "started_at": "2026-04-01T12:00:00Z",
+    "pipeline": "orders",
+    "evidence": "checkpoint",
+    "total_tables": 12,
+    "superseded": false
+  }
+]
+```
+
 Show one run by id. The document has the list's shape with `count` set to `1`; add `--audit` for its governance trail:
 
 ```bash

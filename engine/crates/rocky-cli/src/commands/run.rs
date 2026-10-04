@@ -343,6 +343,77 @@ impl RecordCustody {
     }
 }
 
+/// A run that otherwise SUCCEEDED, whose [`rocky_core::state::RunRecord`] did
+/// not land (#1884).
+///
+/// The run's data is correct and its other state (watermarks, committed
+/// models' state, checkpoint header) still rides the terminal upload — a
+/// caller holding the session must FINALIZE on this, never abandon. Only the
+/// exit code changes, and only where [`record_custody_exit_result`] says so.
+///
+/// An arm whose session the dispatcher holds (transformation, quality,
+/// snapshot) returns this sentinel and lets the dispatcher apply the rule
+/// after its terminal upload; see [`take_record_not_persisted`].
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "refusing to exit 0: run {run_id} succeeded and its state was uploaded, but its run record \
+     could not be written to the state store — `rocky history`, `rocky replay`, `rocky trace`, \
+     `rocky cost` and the schedule reconciler's `after`/`freshness` demands will not see this \
+     run. Retry once the state store is writable"
+)]
+pub struct RunRecordNotPersisted {
+    pub run_id: String,
+}
+
+/// The exit rule for a successful run whose record did not land (#1884,
+/// ruled 2026-09-30: option D).
+///
+/// - Record persisted ⇒ `Ok`.
+/// - Lost, on an ordinary run under the default `[state] on_upload_failure =
+///   "skip"` ⇒ `Ok` (exit 0). [`persist_run_record`] already warned.
+/// - Lost, under `on_upload_failure = "fail"` or on a governed run (a
+///   [`rocky_core::state_sync::FinalizeDurability::Durable`] session — the
+///   class that already fails the run on a lost terminal upload) ⇒
+///   [`RunRecordNotPersisted`], exit non-zero.
+///
+/// Call it only AFTER the terminal upload: the rule changes the exit code,
+/// never what is uploaded. The same split as `watermark_flush_exit_result`
+/// (#1854).
+pub(crate) fn record_custody_exit_result(
+    custody: RecordCustody,
+    run_id: &str,
+    governed: bool,
+    mode: rocky_core::config::StateUploadFailureMode,
+) -> Result<()> {
+    match custody {
+        RecordCustody::Persisted => Ok(()),
+        RecordCustody::Lost
+            if !governed && mode == rocky_core::config::StateUploadFailureMode::Skip =>
+        {
+            Ok(())
+        }
+        RecordCustody::Lost => Err(RunRecordNotPersisted {
+            run_id: run_id.to_string(),
+        }
+        .into()),
+    }
+}
+
+/// Split a dispatched arm's result into its run outcome and a deferred
+/// [`RunRecordNotPersisted`] (#1884).
+///
+/// An arm returns the sentinel for a run that succeeded but lost its record.
+/// The dispatcher must treat that run as a SUCCESS — stamp idempotency,
+/// finalize the session — and only then apply [`record_custody_exit_result`].
+/// Returns `(Ok(()), Lost)` for the sentinel and `(result, Persisted)`
+/// otherwise.
+pub(crate) fn take_record_not_persisted(result: Result<()>) -> (Result<()>, RecordCustody) {
+    match result {
+        Err(e) if e.is::<RunRecordNotPersisted>() => (Ok(()), RecordCustody::Lost),
+        other => (other, RecordCustody::Persisted),
+    }
+}
+
 #[derive(Debug)]
 pub struct PartialFailure {
     pub count: usize,
@@ -1344,11 +1415,14 @@ pub(crate) fn capture_run_output_for_test(_run_id: &str, _output: &RunOutput) {}
 /// sentinel as a [`RecordCustody`] so [`session_disposition`] decides on the
 /// fact rather than on the error type (#1836).
 ///
-/// A SUCCESSFUL run whose record write failed still finalizes and still exits
-/// 0. That is deliberate, not an oversight: its session also carries the run's
-/// other state writes, and abandoning to punish a lost record would discard
-/// those too. Making that run non-zero changes `rocky run`'s exit contract and
-/// is #1836's open half.
+/// A SUCCESSFUL run whose record write failed still finalizes: its session
+/// also carries the run's other state writes, and abandoning to punish a lost
+/// record would discard those too. Its exit code follows
+/// [`record_custody_exit_result`] (#1884): non-zero under `on_upload_failure =
+/// "fail"` or on a governed run, 0 under the default `skip`. On a replication
+/// run the `run_progress` header written before the first copy travels in the
+/// same upload, and `rocky history` lists a header with no record as an
+/// unrecorded run, so other pods do not read the history as complete.
 pub(crate) fn persist_run_record(
     state_store: Option<&StateStore>,
     output: &RunOutput,
@@ -1410,6 +1484,37 @@ pub(crate) fn persist_run_record(
             );
             false
         }
+    }
+}
+
+/// Write this run's [`rocky_core::state::RunStartedMarker`] (#1884): the
+/// ledger's own evidence of a run whose record may not land. Every run kind
+/// except replication writes one — a replication run's `run_progress` header,
+/// written before its first copy, already plays this role — and
+/// `StateStore::record_run` retires it atomically with the record, so it
+/// reaches another pod only beside a missing record. `rocky history` lists it
+/// under `unrecorded_runs`.
+///
+/// Best effort: a store that cannot take this write will usually not take the
+/// record either, and [`record_custody_exit_result`] decides the exit code.
+pub(crate) fn mark_run_started(
+    store: &StateStore,
+    run_id: &str,
+    started_at: DateTime<Utc>,
+    pipeline: Option<&str>,
+) {
+    let marker = rocky_core::state::RunStartedMarker {
+        run_id: run_id.to_string(),
+        started_at,
+        pipeline: pipeline.map(str::to_string),
+    };
+    if let Err(error) = store.mark_run_started(&marker) {
+        warn!(
+            error = %error,
+            run_id,
+            "could not write the run-started marker; a lost run record would leave no \
+             ledger evidence"
+        );
     }
 }
 
@@ -3310,6 +3415,9 @@ pub async fn run_with_explicit_contracts(
                 )));
             }
         };
+        if let Some(store) = state_store.as_ref() {
+            mark_run_started(store, &run_id, started_at, None);
+        }
         // Forward-incompat recreate ⇒ never push the downgraded ledger back
         // over newer shared state (same suppression as the replication seam).
         if state_store
@@ -3533,7 +3641,15 @@ pub async fn run_with_explicit_contracts(
         // compile is recorded in `output.errors` / `tables_failed` by
         // `execute_models`; propagate the non-zero exit so it doesn't
         // report exit 0 with a JSON payload that says the model failed.
-        return run_status_exit_result(&output, &run_id, custody);
+        run_status_exit_result(&output, &run_id, custody)?;
+        // A successful run whose record did not land (#1884): the upload
+        // above already happened; only the exit code follows the rule.
+        return record_custody_exit_result(
+            custody,
+            &run_id,
+            governed,
+            loaded.config.state.on_upload_failure,
+        );
     }
 
     let (pipeline_name, pipeline_config) =
@@ -3830,6 +3946,9 @@ pub async fn run_with_explicit_contracts(
                 governed_ctx.is_some_and(|c| c.expects_models),
             )
             .await;
+            // A success whose record did not land is still a success here
+            // (#1884): stamp, finalize, then apply the exit rule.
+            let (dispatch_result, record_custody) = take_record_not_persisted(dispatch_result);
             match dispatch_result {
                 Ok(()) => {
                     finalize_idempotency_on_success(&mut idempotency_ctx, state_path, &run_id)
@@ -3844,7 +3963,12 @@ pub async fn run_with_explicit_contracts(
                              persisted to the remote [state] backend",
                         )?;
                     }
-                    return Ok(());
+                    return record_custody_exit_result(
+                        record_custody,
+                        &run_id,
+                        governed,
+                        loaded.config.state.on_upload_failure,
+                    );
                 }
                 Err(e) => {
                     // `session_disposition` decides. A typed run-status
@@ -3976,6 +4100,7 @@ pub async fn run_with_explicit_contracts(
                 pipeline_name,
             )
             .await;
+            let (dispatch_result, record_custody) = take_record_not_persisted(dispatch_result);
             match dispatch_result {
                 Ok(()) => {
                     finalize_idempotency_on_success(&mut idempotency_ctx, state_path, &run_id)
@@ -3984,7 +4109,12 @@ pub async fn run_with_explicit_contracts(
                         "refusing to exit 0: the state ledger mutation could not be \
                          persisted to the remote [state] backend",
                     )?;
-                    return Ok(());
+                    return record_custody_exit_result(
+                        record_custody,
+                        &run_id,
+                        governed,
+                        loaded.config.state.on_upload_failure,
+                    );
                 }
                 Err(e) => {
                     // A typed gate failure means `run_quality` completed its
@@ -4088,6 +4218,7 @@ pub async fn run_with_explicit_contracts(
                 pipeline_name,
             )
             .await;
+            let (dispatch_result, record_custody) = take_record_not_persisted(dispatch_result);
             match dispatch_result {
                 Ok(()) => {
                     finalize_idempotency_on_success(&mut idempotency_ctx, state_path, &run_id)
@@ -4096,7 +4227,12 @@ pub async fn run_with_explicit_contracts(
                         "refusing to exit 0: the state ledger mutation could not be \
                          persisted to the remote [state] backend",
                     )?;
-                    return Ok(());
+                    return record_custody_exit_result(
+                        record_custody,
+                        &run_id,
+                        governed,
+                        loaded.config.state.on_upload_failure,
+                    );
                 }
                 Err(e) => {
                     session
@@ -7582,6 +7718,17 @@ pub async fn run_with_explicit_contracts(
     // terminal-success handling — so it never reaches this happy-path exit.
     let _ = &verify_after_result;
 
+    // A successful run whose record did not land (#1884). The session already
+    // finalized above, so the watermarks and the `run_progress` header — the
+    // ledger's own evidence of the missing record — reached the remote. Only
+    // the exit code follows the rule.
+    record_custody_exit_result(
+        record_custody,
+        &run_id,
+        governed,
+        rocky_cfg.state.on_upload_failure,
+    )?;
+
         Ok(())
     }
     .await;
@@ -10627,6 +10774,9 @@ pub(crate) async fn execute_backfill_set(
             )
             .with_context(|| format!("failed to open state store at {}", state_path.display()))?,
         );
+        if let Some(store) = state_store.as_ref() {
+            mark_run_started(store, &run_id, started_at, None);
+        }
         // Forward-incompat recreate ⇒ never push the downgraded ledger back
         // over newer shared state (the state.rs caller obligation; same
         // suppression as the replication / model-only / load arms). The
@@ -10799,7 +10949,15 @@ pub(crate) async fn execute_backfill_set(
             capture_run_output_for_test(&run_id, &output);
         }
         budget_result?;
-        run_status_exit_result(&output, &run_id, custody)
+        run_status_exit_result(&output, &run_id, custody)?;
+        // A backfill's session is `Durable` (governed), so a lost record on a
+        // successful backfill fails the apply after the upload below (#1884).
+        record_custody_exit_result(
+            custody,
+            &run_id,
+            true,
+            rocky_core::config::StateUploadFailureMode::Fail,
+        )
     }
     .await;
 
@@ -17625,6 +17783,216 @@ max_retries = 0
         assert!(
             remote.get_run(run_id).unwrap().is_some(),
             "the failed run rode the terminal upload; abandoning would strand it locally"
+        );
+    }
+
+    /// Drive a SUCCEEDING transformation run on pod A through `run()`'s
+    /// dispatcher, with `[state] on_upload_failure = mode` and, when
+    /// `governed`, a governed-apply context (a `Durable` session).
+    #[cfg(feature = "duckdb")]
+    fn run_succeeding_transformation_on_pod_a(
+        rt: &tokio::runtime::Runtime,
+        harness: &rocky_core::test_harness::CrossPodHarness,
+        project: &std::path::Path,
+        run_id: &str,
+        mode: &str,
+        governed: bool,
+    ) -> anyhow::Result<super::RunTermination> {
+        let models = project.join("models");
+        std::fs::create_dir_all(&models).unwrap();
+        std::fs::write(models.join("ok.sql"), "SELECT 1 AS id\n").unwrap();
+        std::fs::write(
+            models.join("ok.toml"),
+            "[strategy]\ntype = \"full_refresh\"\n\n[target]\ncatalog = \"\"\nschema = \"main\"\n",
+        )
+        .unwrap();
+
+        let config_path = project.join("rocky.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                r#"
+[adapter]
+type = "duckdb"
+path = '{}'
+
+[pipeline.tx]
+type = "transformation"
+models = '{}'
+
+[pipeline.tx.target]
+adapter = "default"
+
+[state]
+backend = "s3"
+s3_bucket = "test"
+on_upload_failure = "{mode}"
+
+[state.retry]
+max_retries = 0
+"#,
+                project.join("tx.duckdb").display(),
+                models.join("**").display(),
+            ),
+        )
+        .unwrap();
+
+        let ctx = crate::commands::apply::GovernedRunContext {
+            principal: rocky_core::config::PolicyPrincipal::Agent,
+            plan_id: "record-not-persisted-transformation-plan",
+            root: project,
+            config_path: &config_path,
+            expected_ir_fingerprint: None,
+            expected_config_identity: None,
+            require_fingerprint: false,
+            reviewed_source_schemas: None,
+            expects_models: true,
+            replication_verify_after: std::sync::Mutex::new(std::collections::BTreeSet::new()),
+        };
+        rt.block_on(async {
+            let loaded = std::sync::Arc::new(
+                rocky_core::config::load_rocky_config_fingerprinted(&config_path).unwrap(),
+            );
+            super::run(
+                &config_path,
+                loaded,
+                None,
+                Some("tx"),
+                &harness.pod_a.state_path,
+                None,
+                true,
+                None,
+                false,
+                None,
+                false,
+                None,
+                &PartitionRunOptions::default(),
+                None,
+                None,
+                None,
+                None,
+                &DeferOptions::default(),
+                &SkipRunOptions::default(),
+                &rocky_core::run_vars::RunVars::new(),
+                Some(run_id),
+                if governed { Some(&ctx) } else { None },
+                false,
+                None,
+            )
+            .await
+        })
+    }
+
+    /// #1884 (ruled 2026-09-30: D plus B), transformation half. A SUCCESSFUL
+    /// transformation run whose record write failed still finalizes — the
+    /// committed models' state must travel — and its exit code follows the
+    /// rule: 0 under the default `skip` on an ordinary run, non-zero under
+    /// `fail` or on a governed run. Either way pod B downloads an
+    /// authoritative ledger that carries the run's `run_started` marker and no
+    /// record, which `rocky history` lists as an unrecorded run.
+    #[cfg(feature = "duckdb")]
+    #[test]
+    fn a_successful_transformation_whose_record_did_not_land_is_marked_and_follows_the_exit_rule() {
+        use rocky_core::test_harness::CrossPodHarness;
+
+        let _serial = rocky_core::state_sync::remote_testing::serial_guard();
+        let rt = remote_state_test_runtime();
+        for (mode, governed, succeeds) in [
+            ("skip", false, true),
+            ("fail", false, false),
+            ("skip", true, false),
+        ] {
+            let harness = CrossPodHarness::new_s3_like();
+            let project = tempfile::tempdir().unwrap();
+            let run_id = format!("tx-record-lost-{mode}-{governed}");
+
+            *super::FAIL_RECORD_WRITE_FOR_TEST.lock().unwrap() = Some(run_id.clone());
+            let outcome = run_succeeding_transformation_on_pod_a(
+                &rt,
+                &harness,
+                project.path(),
+                &run_id,
+                mode,
+                governed,
+            );
+            *super::FAIL_RECORD_WRITE_FOR_TEST.lock().unwrap() = None;
+
+            assert_eq!(
+                outcome.is_ok(),
+                succeeds,
+                "mode={mode}, governed={governed}: {outcome:?}"
+            );
+            if let Err(error) = &outcome {
+                assert!(
+                    error.is::<super::RunRecordNotPersisted>(),
+                    "mode={mode}, governed={governed}: the exit must be the typed \
+                     record-not-persisted sentinel, got {error:#}"
+                );
+            }
+
+            let authority = rt
+                .block_on(harness.download(&harness.pod_b))
+                .expect("pod B downloads the shared state");
+            assert!(
+                matches!(
+                    authority,
+                    rocky_core::state_sync::StateAuthority::Authoritative
+                ),
+                "mode={mode}, governed={governed}: the session must finalize, not abandon: \
+                 {authority:?}"
+            );
+            let remote = harness.open_store(&harness.pod_b);
+            assert!(
+                remote.get_run(&run_id).unwrap().is_none(),
+                "precondition: the injected record-write failure held"
+            );
+            let markers = remote.list_recordless_run_markers(10).unwrap();
+            assert!(
+                markers
+                    .iter()
+                    .any(|m| m.run_id == run_id && m.pipeline.as_deref() == Some("tx")),
+                "mode={mode}, governed={governed}: the uploaded ledger must carry the run's \
+                 start marker so other pods do not read the history as complete: {markers:?}"
+            );
+            assert!(
+                remote.get_latest_run_progress().unwrap().is_none(),
+                "the marker must not be a resume checkpoint (`--resume-latest` reads those)"
+            );
+        }
+    }
+
+    /// The negative control for the marker: a successful transformation whose
+    /// record DID land retires its marker in the same transaction, so pod B
+    /// sees the record and no unrecorded run.
+    #[cfg(feature = "duckdb")]
+    #[test]
+    fn a_successful_transformation_whose_record_landed_leaves_no_marker() {
+        use rocky_core::test_harness::CrossPodHarness;
+
+        let _serial = rocky_core::state_sync::remote_testing::serial_guard();
+        let rt = remote_state_test_runtime();
+        let harness = CrossPodHarness::new_s3_like();
+        let project = tempfile::tempdir().unwrap();
+        let run_id = "tx-record-landed";
+
+        run_succeeding_transformation_on_pod_a(
+            &rt,
+            &harness,
+            project.path(),
+            run_id,
+            "fail",
+            false,
+        )
+        .expect("a clean transformation run succeeds");
+
+        let _authority = rt
+            .block_on(harness.download(&harness.pod_b))
+            .expect("pod B downloads the shared state");
+        let remote = harness.open_store(&harness.pod_b);
+        assert!(remote.get_run(run_id).unwrap().is_some());
+        assert!(
+            remote.list_recordless_run_markers(10).unwrap().is_empty(),
+            "a recorded run must leave no start marker behind"
         );
     }
 
@@ -44021,6 +44389,46 @@ timestamp_column = "ts"
         }
     }
 
+    /// #1884: the lost-record exit rule is the flush rule's twin — a
+    /// persisted record never fails, a lost one fails exactly under `fail` or
+    /// on a governed run, and the failure is the typed sentinel.
+    #[test]
+    fn record_custody_exit_rule_follows_durability_policy() {
+        use rocky_core::config::StateUploadFailureMode::{Fail, Skip};
+        for governed in [false, true] {
+            for mode in [Skip, Fail] {
+                assert!(
+                    record_custody_exit_result(RecordCustody::Persisted, "r", governed, mode)
+                        .is_ok()
+                );
+                let result = record_custody_exit_result(RecordCustody::Lost, "r", governed, mode);
+                assert_eq!(result.is_err(), governed || mode == Fail);
+                if let Err(error) = result {
+                    assert!(error.is::<RunRecordNotPersisted>(), "{error:#}");
+                }
+            }
+        }
+    }
+
+    /// #1884: the dispatcher strips only the record-not-persisted sentinel.
+    /// Every other error stays an error, so a real failure is never laundered
+    /// into a finalize.
+    #[test]
+    fn take_record_not_persisted_strips_only_its_own_sentinel() {
+        let (result, custody) =
+            take_record_not_persisted(Err(RunRecordNotPersisted { run_id: "r".into() }.into()));
+        assert!(result.is_ok());
+        assert_eq!(custody, RecordCustody::Lost);
+
+        let (result, custody) = take_record_not_persisted(Ok(()));
+        assert!(result.is_ok());
+        assert_eq!(custody, RecordCustody::Persisted);
+
+        let (result, custody) = take_record_not_persisted(Err(anyhow::anyhow!("boom")));
+        assert!(result.is_err());
+        assert_eq!(custody, RecordCustody::Persisted);
+    }
+
     #[cfg(feature = "duckdb")]
     async fn checkpoint_recovery_boundary_fixture() -> (
         tempfile::TempDir,
@@ -45402,6 +45810,83 @@ timestamp_column = "ts"
                     "{error:#}"
                 );
             }
+        }
+    }
+
+    /// #1884 (ruled 2026-09-30: D plus B), replication half. A SUCCESSFUL
+    /// replication run whose record write failed still uploads: the
+    /// watermark and the `run_progress` checkpoint header ride the terminal
+    /// upload. Only the exit code follows the rule — 0 under the default
+    /// `skip` on an ordinary run, non-zero under `fail` or on a governed run.
+    /// Pod B then reads the committed watermark and the header with no
+    /// record, which `rocky history` lists as an unrecorded run.
+    ///
+    /// Building D the obvious way (turn the success into an error) would
+    /// abandon the session and discard the watermark — #1854's duplicate
+    /// rows on another pod's next run. The watermark assertion pins that.
+    #[cfg(feature = "duckdb")]
+    #[test]
+    fn a_successful_replication_whose_record_did_not_land_uploads_and_follows_the_exit_rule() {
+        use rocky_core::test_harness::CrossPodHarness;
+        let _serial = rocky_core::state_sync::remote_testing::serial_guard();
+        let rt = remote_state_test_runtime();
+        for (mode, governed, succeeds) in [
+            ("skip", false, true),
+            ("fail", false, false),
+            ("skip", true, false),
+        ] {
+            let harness = CrossPodHarness::new_s3_like();
+            let config = rt.block_on(checkpoint_ordering_project(harness.pod_a.dir.path(), mode));
+            let run_id = format!("record-lost-{mode}-{governed}");
+
+            *super::FAIL_RECORD_WRITE_FOR_TEST.lock().unwrap() = Some(run_id.clone());
+            let outcome = rt.block_on(checkpoint_ordering_run(
+                &config,
+                &harness.pod_a.state_path,
+                &run_id,
+                governed,
+            ));
+            *super::FAIL_RECORD_WRITE_FOR_TEST.lock().unwrap() = None;
+
+            assert_eq!(
+                outcome.is_ok(),
+                succeeds,
+                "mode={mode}, governed={governed}: {outcome:?}"
+            );
+            if let Err(error) = &outcome {
+                assert!(
+                    error.is::<super::RunRecordNotPersisted>(),
+                    "mode={mode}, governed={governed}: the exit must be the typed \
+                     record-not-persisted sentinel, got {error:#}"
+                );
+            }
+
+            let authority = rt
+                .block_on(harness.download(&harness.pod_b))
+                .expect("pod B downloads the shared state");
+            assert!(
+                matches!(
+                    authority,
+                    rocky_core::state_sync::StateAuthority::Authoritative
+                ),
+                "mode={mode}, governed={governed}: the run must upload: {authority:?}"
+            );
+            let remote = harness.open_store(&harness.pod_b);
+            assert!(
+                remote.get_run(&run_id).unwrap().is_none(),
+                "precondition: the injected record-write failure held"
+            );
+            assert!(
+                !remote.list_watermarks().unwrap().is_empty(),
+                "mode={mode}, governed={governed}: the committed watermark must travel; \
+                 abandoning would make another pod re-copy (#1854)"
+            );
+            let unrecorded = remote.list_recordless_run_progress(10).unwrap();
+            assert!(
+                unrecorded.iter().any(|p| p.run_id == run_id),
+                "mode={mode}, governed={governed}: the checkpoint header must mark the \
+                 missing record: {unrecorded:?}"
+            );
         }
     }
 

@@ -6,6 +6,11 @@
  */
 
 /**
+ * What left an [`UnrecordedRunRecord`] in the ledger (#1884).
+ */
+export type UnrecordedRunEvidence = "checkpoint" | "run_started";
+
+/**
  * JSON output for `rocky history` (all runs view).
  *
  * When invoked with `--model <name>`, the dispatch returns `ModelHistoryOutput` instead. The two shapes share the version/command header but differ in their primary collection field, which is why they are separate types rather than one enum.
@@ -14,6 +19,10 @@ export interface HistoryOutput {
   command: string;
   count: number;
   runs: RunHistoryRecord[];
+  /**
+   * Runs that started — a replication run's checkpoint header or another run kind's start marker is in the ledger — but have NO run record: still running, crashed, or the record write failed (#1884). Their presence means `runs` is not the complete history. Not counted in `count`. Omitted when empty.
+   */
+  unrecorded_runs?: UnrecordedRunRecord[];
   version: string;
   [k: string]: unknown;
 }
@@ -122,5 +131,29 @@ export interface RecipeIdentityView {
    * The program **identity** key: blake3 (hex) of the canonical `ModelIr` JSON. Stable across environments and engine versions for the same program text. The value `rocky history --recipe <hash>` filters on.
    */
   recipe_hash?: string | null;
+  [k: string]: unknown;
+}
+/**
+ * A run whose start is in the ledger but whose run record is not (#1884). See [`HistoryOutput::unrecorded_runs`].
+ */
+export interface UnrecordedRunRecord {
+  /**
+   * The ledger evidence the run left: a replication `checkpoint` header or, for every other run kind, a `run_started` marker.
+   */
+  evidence: UnrecordedRunEvidence;
+  /**
+   * The pipeline the run was building, when recorded.
+   */
+  pipeline?: string | null;
+  run_id: string;
+  started_at: string;
+  /**
+   * `true` when a later recorded run of the same tables retired this checkpoint for resume. The record is still missing. Always `false` for a `run_started` marker.
+   */
+  superseded: boolean;
+  /**
+   * Tables the run planned to copy. Set for checkpoint evidence only.
+   */
+  total_tables?: number | null;
   [k: string]: unknown;
 }

@@ -3669,15 +3669,73 @@ struct RunOrderKey {
 
 impl StateStore {
     /// Record a pipeline run.
+    ///
+    /// Retires the run's [`RunStartedMarker`], if any, in the same
+    /// transaction (#1884): the record and the marker's removal land together
+    /// or not at all, so a marker survives exactly when its record is missing.
     pub fn record_run(&self, run: &RunRecord) -> Result<(), StateError> {
         let bytes = serde_json::to_vec(run)?;
         let txn = self.db.begin_write()?;
         {
             let mut table = txn.open_table(RUN_HISTORY)?;
             table.insert(run.run_id.as_str(), bytes.as_slice())?;
+            let mut metadata = txn.open_table(METADATA)?;
+            metadata.remove(run_started_key(&run.run_id).as_str())?;
         }
         self.commit_write(txn)?;
         Ok(())
+    }
+
+    /// Write a [`RunStartedMarker`] for a non-replication run (#1884).
+    ///
+    /// Such a run writes no `run_progress` header — that table is the
+    /// replication resume checkpoint, and a header there would be a
+    /// `--resume-latest` candidate. The marker lives under its own key in
+    /// [`METADATA`] instead, so it adds no table, moves no schema version, and
+    /// no resume selector reads it. [`Self::record_run`] removes it
+    /// atomically with the record.
+    pub fn mark_run_started(&self, marker: &RunStartedMarker) -> Result<(), StateError> {
+        let bytes = serde_json::to_string(marker)?;
+        let txn = self.db.begin_write()?;
+        {
+            let mut metadata = txn.open_table(METADATA)?;
+            metadata.insert(run_started_key(&marker.run_id).as_str(), bytes.as_str())?;
+        }
+        self.commit_write(txn)?;
+        Ok(())
+    }
+
+    /// Run-started markers whose run has NO record, newest first, at most
+    /// `limit` (#1884). See [`Self::mark_run_started`].
+    ///
+    /// The record check is repeated here, not only trusted to
+    /// [`Self::record_run`]'s removal, so a marker restored from an older
+    /// ledger beside a record cannot report a recorded run as missing.
+    pub fn list_recordless_run_markers(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<RunStartedMarker>, StateError> {
+        let txn = self.db.begin_read()?;
+        let metadata = txn.open_table(METADATA)?;
+        let runs = txn.open_table(RUN_HISTORY)?;
+        let mut found = Vec::new();
+        for row in metadata.range(RUN_STARTED_KEY_PREFIX..)? {
+            let (key, value) = row?;
+            if !key.value().starts_with(RUN_STARTED_KEY_PREFIX) {
+                break;
+            }
+            let marker: RunStartedMarker = serde_json::from_str(value.value())?;
+            if runs.get(marker.run_id.as_str())?.is_none() {
+                found.push(marker);
+            }
+        }
+        found.sort_by(|a, b| {
+            b.started_at
+                .cmp(&a.started_at)
+                .then_with(|| b.run_id.cmp(&a.run_id))
+        });
+        found.truncate(limit);
+        Ok(found)
     }
 
     /// Get a run by ID.
@@ -4198,6 +4256,41 @@ impl StateStore {
             }
         }
         Ok(targets.into_iter().collect())
+    }
+
+    /// Checkpoint headers with NO run record, newest first, at most `limit`
+    /// (#1884).
+    ///
+    /// A replication run writes its `run_progress` header before its first
+    /// copy, and retention removes a header only together with its record,
+    /// so a header with no record is the ledger's own evidence that a run
+    /// started and its record is missing: it is still running, it crashed,
+    /// or its record write failed. `rocky history` lists these so a reader
+    /// does not take the run history as complete. Superseded headers are
+    /// included — superseding retires a checkpoint for resume, it does not
+    /// produce the missing record.
+    pub fn list_recordless_run_progress(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<RunProgress>, StateError> {
+        let txn = self.db.begin_read()?;
+        let headers = txn.open_table(RUN_PROGRESS)?;
+        let runs = txn.open_table(RUN_HISTORY)?;
+        let mut found = Vec::new();
+        for row in headers.iter()? {
+            let (_, value) = row?;
+            let progress: RunProgress = serde_json::from_slice(value.value())?;
+            if runs.get(progress.run_id.as_str())?.is_none() {
+                found.push(progress);
+            }
+        }
+        found.sort_by(|a, b| {
+            b.started_at
+                .cmp(&a.started_at)
+                .then_with(|| b.run_id.cmp(&a.run_id))
+        });
+        found.truncate(limit);
+        Ok(found)
     }
 
     /// Get the most recent run progress (for `--resume-latest`).
@@ -5052,6 +5145,31 @@ const LAST_RETENTION_SWEEP_AT_KEY: &str = "last_retention_sweep_at";
 /// Metadata key for the `rocky brief --since last` digest cursor (see
 /// [`StateStore::get_last_brief_at`]).
 const LAST_BRIEF_AT_KEY: &str = "last_brief_at";
+
+/// Metadata key prefix for a [`RunStartedMarker`] (#1884). Every key under it
+/// is `run_started:{run_id}`.
+const RUN_STARTED_KEY_PREFIX: &str = "run_started:";
+
+fn run_started_key(run_id: &str) -> String {
+    format!("{RUN_STARTED_KEY_PREFIX}{run_id}")
+}
+
+/// Ledger evidence that a run started (#1884).
+///
+/// Written by every run kind except replication, and removed in the same
+/// transaction as its [`RunRecord`]. One that survives into an uploaded
+/// ledger means the run's record is missing — the run is still going, crashed
+/// after a periodic upload, or its record write failed — so `rocky history`
+/// lists it and a reader does not take the run history as complete. The
+/// replication twin is a `run_progress` header with no record.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RunStartedMarker {
+    pub run_id: String,
+    pub started_at: chrono::DateTime<chrono::Utc>,
+    /// The pipeline the run builds, when it is a single-pipeline run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pipeline: Option<String>,
+}
 
 // ---------------------------------------------------------------------------
 // Idempotency-key persistence (see `crate::idempotency`)
@@ -13576,6 +13694,82 @@ mod tests {
     /// header and its per-table entries — while the checkpoints of kept
     /// runs, of a run whose id shares a prefix, and of a record-less
     /// (crashed) run stay put.
+    /// #1884: a checkpoint header whose run has no record is listed, newest
+    /// first; a header beside its record is not.
+    #[test]
+    fn recordless_run_progress_lists_only_headers_without_a_record() {
+        let (store, _dir) = temp_store();
+        let scope = progress_scope("p1");
+        for run_id in ["recorded", "lost-1", "lost-2"] {
+            store
+                .init_run_progress(run_id, &planned_keys(1), Some(&scope))
+                .unwrap();
+        }
+        store.record_run(&run_at("recorded", Utc::now())).unwrap();
+
+        let found: Vec<String> = store
+            .list_recordless_run_progress(10)
+            .unwrap()
+            .into_iter()
+            .map(|p| p.run_id)
+            .collect();
+        assert_eq!(found.len(), 2, "{found:?}");
+        assert!(!found.contains(&"recorded".to_string()));
+        assert_eq!(
+            store.list_recordless_run_progress(1).unwrap().len(),
+            1,
+            "the limit caps the listing"
+        );
+    }
+
+    /// #1884: the transformation run-started marker survives exactly when its
+    /// record is missing — `record_run` retires it in the same transaction —
+    /// and it is never a resume checkpoint.
+    #[test]
+    fn run_started_marker_is_retired_by_its_record_and_is_not_a_checkpoint() {
+        let (store, _dir) = temp_store();
+        let now = Utc::now();
+        for (run_id, offset) in [("tx-recorded", 0), ("tx-lost", 1)] {
+            store
+                .mark_run_started(&RunStartedMarker {
+                    run_id: run_id.to_string(),
+                    started_at: now + chrono::Duration::seconds(offset),
+                    pipeline: Some("tx".to_string()),
+                })
+                .unwrap();
+        }
+        // Unrelated metadata keys on either side of the prefix stay invisible.
+        store.set_last_brief_at(now).unwrap();
+        store.set_last_retention_sweep_at(now).unwrap();
+        store.record_run(&run_at("tx-recorded", now)).unwrap();
+
+        let markers = store.list_recordless_run_markers(10).unwrap();
+        assert_eq!(
+            markers,
+            vec![RunStartedMarker {
+                run_id: "tx-lost".to_string(),
+                started_at: now + chrono::Duration::seconds(1),
+                pipeline: Some("tx".to_string()),
+            }]
+        );
+        {
+            let txn = store.db.begin_read().unwrap();
+            let metadata = txn.open_table(METADATA).unwrap();
+            assert!(
+                metadata
+                    .get(run_started_key("tx-recorded").as_str())
+                    .unwrap()
+                    .is_none(),
+                "record_run must delete the marker, not merely hide it"
+            );
+        }
+        assert!(
+            store.get_latest_run_progress().unwrap().is_none(),
+            "a marker is not a `--resume-latest` candidate"
+        );
+        assert!(store.list_recordless_run_progress(10).unwrap().is_empty());
+    }
+
     #[test]
     fn sweep_retention_drops_the_checkpoint_with_its_run_record() {
         let (store, _dir) = temp_store();

@@ -2547,6 +2547,43 @@ pub struct HistoryOutput {
     pub command: String,
     pub runs: Vec<RunHistoryRecord>,
     pub count: usize,
+    /// Runs that started — a replication run's checkpoint header or another
+    /// run kind's start marker is in the ledger — but have NO run record: still running, crashed, or the record write failed (#1884). Their presence means `runs` is not the
+    /// complete history. Not counted in `count`. Omitted when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unrecorded_runs: Vec<UnrecordedRunRecord>,
+}
+
+/// A run whose start is in the ledger but whose run record is not (#1884).
+/// See [`HistoryOutput::unrecorded_runs`].
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct UnrecordedRunRecord {
+    pub run_id: String,
+    pub started_at: DateTime<Utc>,
+    /// The pipeline the run was building, when recorded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pipeline: Option<String>,
+    /// The ledger evidence the run left: a replication `checkpoint` header
+    /// or, for every other run kind, a `run_started` marker.
+    pub evidence: UnrecordedRunEvidence,
+    /// Tables the run planned to copy. Set for checkpoint evidence only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_tables: Option<usize>,
+    /// `true` when a later recorded run of the same tables retired this
+    /// checkpoint for resume. The record is still missing. Always `false`
+    /// for a `run_started` marker.
+    pub superseded: bool,
+}
+
+/// What left an [`UnrecordedRunRecord`] in the ledger (#1884).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum UnrecordedRunEvidence {
+    /// A replication run's resume checkpoint header.
+    Checkpoint,
+    /// A non-replication run's start marker (transformation, quality,
+    /// snapshot, model-only, backfill).
+    RunStarted,
 }
 
 /// JSON output for `rocky history --model <name>`.

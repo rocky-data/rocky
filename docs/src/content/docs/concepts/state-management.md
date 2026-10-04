@@ -266,6 +266,8 @@ circuit_breaker_threshold = 5
 | `"skip"` (default) | Log a warning, mark the run successful, leave remote state stale. The next run re-derives watermarks from target-table metadata. | Most callers — the de-facto pre-1.13 behaviour. Trades state durability for run liveness. |
 | `"fail"` | Propagate a `StateSyncError::RetryBudgetExhausted` or `CircuitOpen` to the caller; the run fails. | Strict environments where re-deriving watermarks is prohibitively expensive (long-running backfills, multi-hour syncs). |
 
+**A lost run record follows the same rule.** A run can succeed and still fail to write its run record, for example on a full disk. Rocky still uploads the run's other state, such as watermarks, because discarding them would make the next run re-copy data. Under `"skip"` the run warns and exits 0. Under `"fail"`, or on a governed run (`rocky apply`), it exits non-zero after the upload. Either way the uploaded ledger keeps evidence of the run, and [`rocky history`](/reference/commands/administration/#rocky-history) lists it under `unrecorded_runs`.
+
 **Terminal outcomes are structured.** Every `state.upload` and `state.download` event carries an `outcome` field. Alert on it instead of matching log messages with a regular expression:
 
 | `outcome` | Meaning |
