@@ -12646,7 +12646,7 @@
             "type": "array"
           },
           "skipped": {
-            "description": "Models excluded from the SQL preview or refused by compilation, with the reason for each. This includes SQL that needs a live warehouse to render and compiler errors such as E038 for an `ephemeral` model.",
+            "description": "Models excluded from the SQL preview or refused by compilation, with the reason for each. This includes SQL that needs a live warehouse to render, compiler errors, and `ephemeral` models, which are inlined into their consumers and render no statement of their own.",
             "items": {
               "$ref": "#/components/schemas/SkippedModel"
             },
@@ -21012,7 +21012,7 @@
             "type": "object"
           },
           {
-            "description": "Ephemeral model — refused at compile time (E038). No table is created and no consumer inlines it, so it is kept only to name the refusal.",
+            "description": "Ephemeral model — never materialized. `rocky compile` inlines its SQL as a `__rocky_ephemeral__<name>` CTE into every model that reads it, and `rocky run` skips the node. Invalid uses are E038.",
             "properties": {
               "type": {
                 "enum": [

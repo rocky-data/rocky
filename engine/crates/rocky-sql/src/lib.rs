@@ -3,6 +3,7 @@ pub mod consumed_columns;
 pub mod defer;
 pub mod determinism;
 pub mod dialect;
+pub mod ephemeral;
 pub mod lineage;
 pub mod lineage_complete;
 pub mod literal;

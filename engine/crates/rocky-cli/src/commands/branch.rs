@@ -1436,6 +1436,7 @@ fn transformation_promote_kind(
         StrategyConfig::ContentAddressed { .. } => {
             anyhow::bail!("branch promotion is undefined for content_addressed models")
         }
+        // Skipped by the caller; reaching here is a caller bug.
         StrategyConfig::Ephemeral => {
             anyhow::bail!("branch promotion is undefined for ephemeral models")
         }
@@ -1844,6 +1845,11 @@ fn plan_transformation_from_models(
         else {
             continue;
         };
+        // An ephemeral model has no branch object to promote: each consumer's
+        // compiled SQL already inlines it.
+        if matches!(strategy, rocky_core::models::StrategyConfig::Ephemeral) {
+            continue;
+        }
         let kind = transformation_promote_kind(&strategy)
             .with_context(|| format!("cannot promote model '{model_name}'"))?;
         let key = rocky_sql::defer::CollisionIdentity::of(&prod.catalog, &prod.schema, &prod.table);
@@ -4662,6 +4668,39 @@ adapter = "default"
         assert_eq!(rows.rows[0][1].as_str(), Some("3"));
     }
 
+    /// An ephemeral model has no branch object: promotion skips it and plans
+    /// only its consumer, whose compiled SQL already inlines it.
+    #[test]
+    fn promote_skips_ephemeral_models() {
+        let tmp = TempDir::new().unwrap();
+        let models = tmp.path().join("models");
+        std::fs::create_dir(&models).unwrap();
+        std::fs::write(models.join("eph.sql"), "SELECT 1 AS id").unwrap();
+        std::fs::write(
+            models.join("eph.toml"),
+            "name = \"eph\"\n[strategy]\ntype = \"ephemeral\"\n[target]\ncatalog = \"warehouse\"\nschema = \"marts\"\ntable = \"eph\"\n",
+        )
+        .unwrap();
+        write_transformation_model(
+            &models,
+            "fct",
+            "warehouse",
+            "marts",
+            "fct",
+            "SELECT id FROM eph",
+        );
+        let snapshot = crate::models_loader::load_project_models_matching(
+            &models,
+            &format!("{}/**", models.display()),
+            None,
+        )
+        .unwrap();
+        let planned =
+            plan_transformation_from_models(snapshot, &sample_record("fix"), None).unwrap();
+        assert_eq!(planned.len(), 1, "only the consumer is promoted");
+        assert_eq!(planned[0].prod.table, "fct");
+    }
+
     #[test]
     fn promote_uses_loaded_sidecar_snapshot_for_view_destination() {
         let tmp = TempDir::new().unwrap();
@@ -5264,7 +5303,6 @@ adapter = "default"
                 "content_addressed",
                 "storage_prefix = \"s3://bucket/model\"\n",
             ),
-            ("ephemeral", ""),
         ] {
             std::fs::write(models.join("unsupported.toml"), format!("name = \"unsupported\"\n[strategy]\ntype = \"{kind}\"\n{extra}[target]\ncatalog = \"memory\"\nschema = \"main\"\ntable = \"unsupported\"\n")).unwrap();
             let err = discover_branch_targets_for_plan(

@@ -596,7 +596,8 @@ impl CteScope {
     }
 }
 
-/// The CTE scope stack shared by both rewriters in this module.
+/// The CTE scope stack shared by both rewriters in this module, and by the
+/// ephemeral-model inliner in [`crate::ephemeral`].
 ///
 /// Both need the identical alias rule, so this is one struct rather than a
 /// trait. Owning it in both visitors is what keeps them from drifting apart:
@@ -607,14 +608,17 @@ impl CteScope {
 /// case-insensitive dialect `WITH Orders … FROM orders` was not treated as
 /// shadowed (those are ONE CTE there) and the reference was rewritten to a
 /// table the author never named.
-struct CteScopeStack {
+pub(crate) struct CteScopeStack {
     frames: Vec<CteScope>,
     case_rules: IdentifierCaseRules,
     recursive_visibility: RecursiveCteVisibility,
 }
 
 impl CteScopeStack {
-    fn new(case_rules: IdentifierCaseRules, recursive_visibility: RecursiveCteVisibility) -> Self {
+    pub(crate) fn new(
+        case_rules: IdentifierCaseRules,
+        recursive_visibility: RecursiveCteVisibility,
+    ) -> Self {
         Self {
             frames: Vec::new(),
             case_rules,
@@ -646,7 +650,7 @@ impl CteScopeStack {
     /// Call from `pre_visit_query`. Positions the PARENT frame — this query is
     /// either one of its CTE bodies or part of its body — then pushes this
     /// query's own frame.
-    fn enter_query(&mut self, query: &Query) {
+    pub(crate) fn enter_query(&mut self, query: &Query) {
         let addr = Self::addr_of(query);
         if let Some(parent) = self.frames.last_mut() {
             parent.region = parent
@@ -675,7 +679,7 @@ impl CteScopeStack {
 
     /// Call from `post_visit_query`. Leaving a child returns the parent to its
     /// own body, where every alias is visible again.
-    fn exit_query(&mut self) {
+    pub(crate) fn exit_query(&mut self) {
         self.frames.pop();
         if let Some(parent) = self.frames.last_mut() {
             parent.region = Region::Body;
@@ -683,7 +687,7 @@ impl CteScopeStack {
     }
 
     /// Whether `value` names a CTE in scope at this point of the walk.
-    fn is_shadowed(&self, value: &str, quoted: bool) -> bool {
+    pub(crate) fn is_shadowed(&self, value: &str, quoted: bool) -> bool {
         let name = self.lookup_form(value, quoted);
         self.frames
             .iter()

@@ -536,7 +536,7 @@ class PlanOutput(BaseModel):
     """
     skipped: list[SkippedModel] | None = None
     """
-    Models excluded from the SQL preview or refused by compilation, with the reason for each. This includes SQL that needs a live warehouse to render and compiler errors such as E038 for an `ephemeral` model.
+    Models excluded from the SQL preview or refused by compilation, with the reason for each. This includes SQL that needs a live warehouse to render, compiler errors, and `ephemeral` models, which are inlined into their consumers and render no statement of their own.
     """
     statements: list[PlannedStatement]
     version: str

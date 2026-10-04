@@ -413,8 +413,9 @@ pub enum StrategyConfig {
         #[serde(default)]
         first_partition: Option<String>,
     },
-    /// Ephemeral model — refused at compile time (E038). No table is created
-    /// and no consumer inlines it, so it is kept only to name the refusal.
+    /// Ephemeral model — never materialized. `rocky compile` inlines its SQL
+    /// as a `__rocky_ephemeral__<name>` CTE into every model that reads it,
+    /// and `rocky run` skips the node. Invalid uses are E038.
     #[serde(rename = "ephemeral")]
     Ephemeral,
     /// Delete+Insert: delete matching rows by partition key, then insert.

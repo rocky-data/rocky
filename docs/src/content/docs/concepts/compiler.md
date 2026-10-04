@@ -284,6 +284,7 @@ span, and sometimes a suggested fix.
 | `E035` | Managed-Iceberg `format_options` declares a combination the warehouse rejects (e.g. `partition_by` + `cluster_by`) |
 | `E036` | Two or more models write the same target table |
 | `E037` | A transformation model declares `type = "incremental"`, which would append every row again on each run. Use `merge`, `delete_insert`, `time_interval` or `full_refresh` |
+| `E038` | An `ephemeral` model is used in a way inlining cannot serve: it declares `[[tests]]`, another model reads its nominal target by a qualified name, a consumer's SQL cannot be rewritten, or `rocky run --model` selects it directly |
 | `E039` | A direct projection names a column absent from a complete in-project upstream model |
 | `E040` | A `.rocky` string literal contains a backslash; use a `.sql` model with the target's own escaping |
 | `W001` | Unused model (no downstream consumers) |

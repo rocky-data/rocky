@@ -8,7 +8,7 @@
 //! Results are emitted as a [`DagRunOutput`] in JSON mode so orchestrators
 //! can correlate per-node status, timing, and errors.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -263,6 +263,7 @@ pub async fn run_with_dag(
         runtime,
         seeds_dir,
         seed_pipeline,
+        ephemeral_nodes,
     } = plan_runtime_dag(config_path, cfg)?;
     let dag = runtime.dag;
     let physical_edge_warnings = runtime.warnings;
@@ -349,6 +350,7 @@ pub async fn run_with_dag(
         state_path: state_path.to_path_buf(),
         seeds_dir,
         node_pipelines,
+        ephemeral_nodes,
         seed_pipeline,
         seed_pipeline_refusal,
         partition_opts: partition_opts.clone(),
@@ -418,6 +420,9 @@ struct PlannedDag {
     /// needs the catalog it implies for a seed's target, and the dispatcher
     /// must load the seeds against the very pipeline the graph assumed.
     seed_pipeline: std::result::Result<String, SeedPipelineRefusal>,
+    /// Transformation nodes of `ephemeral` models. They build nothing — every
+    /// consumer's SQL already inlines them — so the dispatcher skips them.
+    ephemeral_nodes: HashSet<NodeId>,
 }
 
 /// Load the project's models and seeds and build the graph `--dag` executes.
@@ -439,6 +444,17 @@ fn plan_runtime_dag(
     // consume (`add_transformation_nodes`), so an unrelated broken model there
     // failed a replication-only run that `rocky run` executes happily.
     let models_by_pipeline = load_transformation_models(config_path, cfg)?.by_pipeline;
+    let ephemeral_nodes: HashSet<NodeId> = models_by_pipeline
+        .values()
+        .flatten()
+        .filter(|m| {
+            matches!(
+                m.config.strategy,
+                rocky_core::models::StrategyConfig::Ephemeral
+            )
+        })
+        .map(|m| NodeId::new("transformation", &m.config.name))
+        .collect();
 
     // Seed-discovery errors are NOT recoverable into "no seeds": seed nodes and
     // the seed→model edges that order a model after the seed it reads are built
@@ -482,6 +498,7 @@ fn plan_runtime_dag(
         runtime,
         seeds_dir,
         seed_pipeline,
+        ephemeral_nodes,
     })
 }
 
@@ -821,6 +838,10 @@ struct CliDispatcher {
     /// Maps each pipeline-bound node to its owning pipeline name. Seed and
     /// source-marker nodes carry no entry (their `pipeline` is `None`).
     node_pipelines: HashMap<NodeId, String>,
+    /// Transformation nodes of `ephemeral` models, which the dispatcher skips:
+    /// a direct sub-run of one is refused (E038), and there is nothing to
+    /// build — compile inlines the model into each consumer.
+    ephemeral_nodes: HashSet<NodeId>,
     /// The pipeline `Seed` nodes load against — [`sole_adapter_pipeline`]
     /// resolved once for the whole DAG, since every seed uses the same rule
     /// (#2018). `None` when unresolved (see [`SeedPipelineRefusal`], carried
@@ -978,6 +999,9 @@ impl NodeDispatcher for CliDispatcher {
                 // entry is informational. Return None → marked Skipped.
                 None
             }
+            // An ephemeral model builds nothing: each consumer's SQL inlines
+            // it. Skipped (not failed), so its descendants still run.
+            NodeKind::Transformation if self.ephemeral_nodes.contains(id) => None,
             NodeKind::Source => {
                 // Source nodes represent the extract side of a replication
                 // pipeline — handled by the corresponding load node, so the
@@ -1203,6 +1227,7 @@ mod run_opts_threading_tests {
             state_path: std::path::PathBuf::from(".rocky-state.redb"),
             seeds_dir: std::path::PathBuf::from("seeds"),
             node_pipelines,
+            ephemeral_nodes: std::collections::HashSet::new(),
             seed_pipeline: None,
             seed_pipeline_refusal: None,
             partition_opts,
@@ -1498,6 +1523,7 @@ mod state_turnstile_tests {
             state_path: std::path::PathBuf::from(state_path),
             seeds_dir: std::path::PathBuf::from("seeds"),
             node_pipelines,
+            ephemeral_nodes: std::collections::HashSet::new(),
             seed_pipeline: None,
             seed_pipeline_refusal: None,
             partition_opts: PartitionRunOptions::default(),
@@ -1796,6 +1822,7 @@ mod tests {
             state_path: root.join(".rocky-state.redb"),
             seeds_dir: root.join("seeds"),
             node_pipelines: HashMap::new(),
+            ephemeral_nodes: std::collections::HashSet::new(),
             seed_pipeline: None,
             seed_pipeline_refusal: None,
             partition_opts: PartitionRunOptions::default(),
@@ -2333,6 +2360,7 @@ mod tests {
             state_path: root.join(".rocky-state.redb"),
             seeds_dir: root.join("seeds"),
             node_pipelines: HashMap::new(),
+            ephemeral_nodes: std::collections::HashSet::new(),
             seed_pipeline: None,
             seed_pipeline_refusal: Some(refusal),
             partition_opts: PartitionRunOptions::default(),
@@ -2442,6 +2470,7 @@ mod tests {
             state_path: root.join(".rocky-state.redb"),
             seeds_dir: root.join("seeds"),
             node_pipelines: HashMap::new(),
+            ephemeral_nodes: std::collections::HashSet::new(),
             seed_pipeline: None,
             seed_pipeline_refusal: Some(refusal),
             partition_opts: PartitionRunOptions::default(),

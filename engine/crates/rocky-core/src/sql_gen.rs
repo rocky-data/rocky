@@ -670,17 +670,19 @@ fn microbatch_transformation_refused(model_ir: &ModelIr) -> SqlGenError {
     ))
 }
 
-/// The refusal every transformation generator returns for `ephemeral` (#1996):
+/// The refusal every transformation generator returns for `ephemeral`.
 ///
-/// An ephemeral model is not materialized, and nothing rewrites a consumer's
-/// `FROM <model>` into a CTE. Returning an empty statement list left the
-/// consumer reading whatever physical table carried the name, which is a
-/// catalog error when none exists and a stale table when one does.
-/// `rocky compile` reports the same thing as E038.
+/// An ephemeral model has no statement of its own: `rocky compile` inlines
+/// its SQL as a CTE into each model that reads it (`rocky-compiler`'s
+/// `ephemeral.rs`), and `rocky run` skips the node. Reaching a generator with
+/// one is a caller bug — the old behavior, an empty statement list, left a
+/// consumer reading whatever physical table carried the name (#1996). So it
+/// stays an error, and the message says where the model's SQL went.
 fn ephemeral_refused(model_ir: &ModelIr) -> SqlGenError {
     SqlGenError::InvalidRequest(format!(
-        "model '{}': `type = \"ephemeral\"` is not supported (E038) — an ephemeral model is \
-         not materialized and is not inlined into its consumers; use `type = \"view\"`",
+        "model '{}': `type = \"ephemeral\"` renders no statement of its own — it is inlined as \
+         a CTE into each model that reads it, so there is nothing to build (E038 when selected \
+         directly)",
         model_ir.name
     ))
 }
@@ -1807,7 +1809,7 @@ mod tests {
             let msg = err.to_string();
             assert!(matches!(err, SqlGenError::InvalidRequest(_)), "{msg}");
             assert!(msg.contains("stg_orders"), "the model is named: {msg}");
-            assert!(msg.contains("E038") && msg.contains("view"), "{msg}");
+            assert!(msg.contains("E038") && msg.contains("inlined"), "{msg}");
         }
     }
 

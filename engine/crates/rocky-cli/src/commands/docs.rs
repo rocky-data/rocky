@@ -191,6 +191,7 @@ fn infer_column_map(
         allow_unmasked: rocky_cfg.classifications.allow_unmasked.clone(),
         project_freshness: rocky_cfg.freshness.clone(),
         run_vars: run_vars.clone(),
+        preserve_authored_sql: true,
     };
     // The models are already loaded (and were loaded strictly), so compile
     // them directly instead of re-reading the directory — one load, and the

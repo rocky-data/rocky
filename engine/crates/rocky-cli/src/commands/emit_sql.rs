@@ -17,8 +17,9 @@
 //! `MERGE` / `DELETE` + `INSERT` that operates on an existing target); `rocky
 //! run` creates the target table on first build, which a static emit cannot
 //! reproduce. Those files carry a leading note to that effect. (`incremental`
-//! is refused on transformation models, E037, and `ephemeral` is refused
-//! outright, E038; neither reaches this file.)
+//! is refused on transformation models, E037.) An `ephemeral` model emits no
+//! file of its own: compile inlines it as a CTE into each consumer, so the
+//! consumer's file carries it, and the model is listed as skipped.
 //!
 //! The dialect is the adapter `rocky run --model` selects from `rocky.toml`
 //! without credentials. With no project file it defaults to DuckDB. A
@@ -134,6 +135,7 @@ fn emit_models(
             .map(|c| c.freshness.clone())
             .unwrap_or_default(),
         run_vars: run_vars.clone(),
+        preserve_authored_sql: false,
     };
     let result = match compile::compile(&config) {
         Ok(r) => r,
@@ -239,6 +241,18 @@ fn emit_models(
                 continue;
             }
             filter_matched = true;
+        }
+
+        // An ephemeral model has no statement of its own: its SQL is already
+        // inlined as a CTE into every model that reads it.
+        if matches!(
+            model_ir.materialization,
+            rocky_ir::MaterializationStrategy::Ephemeral
+        ) {
+            skipped.push(format!(
+                "{model_name} (ephemeral: inlined as a CTE into each model that reads it)"
+            ));
+            continue;
         }
 
         let mut model_ir = model_ir.clone();

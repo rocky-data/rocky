@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **`type = "ephemeral"` works, as in dbt.** An ephemeral model is never materialized. `rocky compile` inlines its SQL as a `__rocky_ephemeral__<model>` CTE into each model that reads it, in front of any existing `WITH` clause, and rewrites the references through the SQL AST (bare model names only; a same-named CTE in scope wins; chains inline transitively, each CTE once per consumer). Type inference, contracts and lineage still run on the authored SQL, through the model graph. `rocky run` skips the node and never reports it as materialized; `rocky run --dag` marks it skipped; `rocky plan` and `rocky emit-sql` list it as skipped, and each consumer's statement carries the CTE; shadow runs skip it and route the reads inside its inlined SQL. The language server keeps the authored SQL. `rocky import-dbt` maps dbt `materialized='ephemeral'` to `type = "ephemeral"` instead of `full_refresh`. **Changed meaning:** `E038` no longer refuses the strategy. It marks the uses inlining cannot serve: `[[tests]]` on an ephemeral model, a qualified read of an ephemeral model's nominal target, a consumer whose SQL cannot be rewritten, and `rocky run --model <ephemeral>`. (#1996)
+
 ## [1.76.0] — 2026-10-03
 
 This release carries five breaking changes, each marked **Breaking:** below.

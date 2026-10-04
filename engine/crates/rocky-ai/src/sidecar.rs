@@ -43,11 +43,12 @@ pub enum SidecarError {
     )]
     IncrementalRefused,
 
-    /// `ephemeral` is refused for every model (#1996, E038).
+    /// `ephemeral` is not offered for a generated model: it builds nothing on
+    /// its own, and a newly generated model has no consumer to inline it into.
     #[error(
-        "--materialization ephemeral is not supported: an ephemeral model is not materialized \
-         and is not inlined into its consumers, so a consumer reads whatever table already \
-         carries the name (E038). Use `view`, or `full_refresh`"
+        "--materialization ephemeral is not offered: an ephemeral model builds nothing on its \
+         own — it is inlined into the models that read it, and a newly generated model has \
+         none yet. Use `view`, or `full_refresh`"
     )]
     EphemeralRefused,
 
@@ -62,8 +63,8 @@ pub enum SidecarError {
 /// `time_interval`, `delete_insert`, and `microbatch` exist in the engine's
 /// strategy enum but require richer flag plumbing (granularity, partition
 /// columns) than this first cut bothers with — adding them is a follow-up.
-/// `incremental` is refused on transformation models (#1990) and `ephemeral`
-/// is refused outright (#1996), so neither is offered here.
+/// `incremental` is refused on transformation models (#1990), and `ephemeral`
+/// builds nothing until another model reads it, so neither is offered here.
 #[derive(Debug, Clone)]
 pub enum SidecarMaterialization {
     FullRefresh,
@@ -484,14 +485,14 @@ mod tests {
         assert!(matches!(model.config.strategy, StrategyConfig::FullRefresh));
     }
 
-    /// `--materialization ephemeral` is refused, not written: the sidecar it
-    /// would have produced does not compile (E038, #1996).
+    /// `--materialization ephemeral` is refused, not written: a generated
+    /// model has no consumer yet, so an ephemeral one would build nothing.
     #[test]
     fn ephemeral_is_refused_with_the_strategy_that_works() {
         let err = SidecarMaterialization::parse("ephemeral", None)
             .expect_err("ephemeral must be refused");
         let msg = err.to_string();
-        assert!(msg.contains("E038") && msg.contains("view"), "{msg}");
+        assert!(msg.contains("inlined") && msg.contains("view"), "{msg}");
     }
 
     #[test]

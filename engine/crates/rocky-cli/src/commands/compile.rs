@@ -173,6 +173,7 @@ fn compile_inner(
         allow_unmasked,
         project_freshness,
         run_vars: run_vars.clone(),
+        preserve_authored_sql: false,
     };
 
     let mut result = compile::compile(&config)?;

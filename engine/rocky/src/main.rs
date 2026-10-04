@@ -1510,8 +1510,8 @@ enum Command {
         ///
         /// Accepted: `full_refresh` (default), `merge`.
         /// `incremental` is refused: on a transformation model it re-inserts
-        /// every row on each run (E037). `ephemeral` is refused: it is not
-        /// materialized and not inlined into its consumers (E038). Other
+        /// every row on each run (E037). `ephemeral` is refused: a generated
+        /// model has no consumer yet to inline it into. Other
         /// strategies in `StrategyConfig` (`time_interval`, `delete_insert`,
         /// `microbatch`) require richer flag plumbing and are deliberately
         /// out of scope for this first cut.

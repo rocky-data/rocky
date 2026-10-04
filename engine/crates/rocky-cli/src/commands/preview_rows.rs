@@ -215,6 +215,7 @@ fn prepare_preview(
         allow_unmasked: rocky_cfg.classifications.allow_unmasked.clone(),
         project_freshness: rocky_cfg.freshness.clone(),
         run_vars: rocky_core::run_vars::RunVars::new(),
+        preserve_authored_sql: false,
     };
     let result = compile::compile(&compiler_cfg)
         .map_err(|e| fail("compile_error", &format!("compile failed: {e}"), None))?;

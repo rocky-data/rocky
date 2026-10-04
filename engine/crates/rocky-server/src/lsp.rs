@@ -504,6 +504,9 @@ impl RockyLsp {
             allow_unmasked,
             project_freshness,
             run_vars: rocky_core::run_vars::RunVars::new(),
+            // Diagnostics and symbols map onto the authored text, so keep it
+            // rather than the ephemeral-inlined form.
+            preserve_authored_sql: true,
         };
 
         match rocky_compiler::compile::compile(&config) {
@@ -1419,6 +1422,9 @@ impl LanguageServer for RockyLsp {
                     allow_unmasked,
                     project_freshness,
                     run_vars: rocky_core::run_vars::RunVars::new(),
+                    // Diagnostics and symbols map onto the authored text, so keep it
+                    // rather than the ephemeral-inlined form.
+                    preserve_authored_sql: true,
                 };
 
                 // Try incremental compilation if we have a previous result.
@@ -6392,6 +6398,9 @@ mod tests {
             allow_unmasked: cfg.classifications.allow_unmasked,
             project_freshness,
             run_vars: rocky_core::run_vars::RunVars::new(),
+            // Diagnostics and symbols map onto the authored text, so keep it
+            // rather than the ephemeral-inlined form.
+            preserve_authored_sql: true,
         };
         let result = rocky_compiler::compile::compile(&compile_config).unwrap();
 

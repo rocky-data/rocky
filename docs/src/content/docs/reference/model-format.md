@@ -70,7 +70,7 @@ The `.toml` file names the model, lists what it depends on, picks a materializat
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `type` | string | `"full_refresh"` | Materialization type. One of `"full_refresh"`, `"merge"`, `"time_interval"`, `"view"`, `"materialized_view"`, `"dynamic_table"`, `"delete_insert"`, `"microbatch"`, `"content_addressed"`. Two are refused: `"incremental"` on a transformation model (`E037`, see [Incremental](#incremental)), and `"ephemeral"` outright (`E038`, see [Ephemeral](#ephemeral)). |
+| `type` | string | `"full_refresh"` | Materialization type. One of `"full_refresh"`, `"merge"`, `"time_interval"`, `"view"`, `"materialized_view"`, `"dynamic_table"`, `"delete_insert"`, `"microbatch"`, `"content_addressed"`, `"ephemeral"` (see [Ephemeral](#ephemeral)). `"incremental"` is refused on a transformation model (`E037`, see [Incremental](#incremental)). |
 | `timestamp_column` | string | | Replication watermark column. Required for transformation `microbatch`; it names the output partition column. |
 | `unique_key` | list of strings | | Key columns for merge matching. Required when `type = "merge"`. |
 | `update_columns` | list of strings | | Columns to update on merge match. Defaults to all non-key columns if omitted. |
@@ -713,18 +713,58 @@ When `update_columns` is omitted, Rocky updates all non-key columns.
 
 ### Ephemeral
 
-`type = "ephemeral"` is refused. `rocky compile` reports the model as error `E038`, with this message:
+An ephemeral model is never materialized. Rocky creates no table or view for it. Instead, each model that reads it gets the ephemeral model's SQL as a CTE (a named subquery in a `WITH` clause). This matches dbt's `materialized='ephemeral'`.
 
-> model 'stg_recent_orders' uses `type = "ephemeral"`, which is not supported: an ephemeral model is not materialized and is not inlined into its consumers, so a consumer reads whatever table already carries the name
+**Config** (`models/eph_paid_orders.toml`):
 
-Rocky never inlined such a model. Nothing rewrote a consumer's `FROM <model>` into a `WITH` clause. So the consumer read whatever physical table already carried that name: an error when none existed, an unrelated table when one did.
+```toml
+[strategy]
+type = "ephemeral"
+```
 
-Two strategies cover what it was for:
+**SQL** (`models/eph_paid_orders.sql`):
 
-| You want | Use |
+```sql
+SELECT order_id, customer_id, amount FROM raw.orders WHERE status = 'paid'
+```
+
+A consumer reads it by its bare name, `FROM eph_paid_orders`. Rocky runs the consumer as:
+
+```sql
+WITH __rocky_ephemeral__eph_paid_orders AS (
+  SELECT order_id, customer_id, amount FROM raw.orders WHERE status = 'paid'
+)
+SELECT customer_id, SUM(amount) AS total
+FROM __rocky_ephemeral__eph_paid_orders AS eph_paid_orders
+GROUP BY customer_id
+```
+
+How the inlining works:
+
+- The CTE is named `__rocky_ephemeral__<model>`. If that name is already used in the statement, Rocky adds `_2`, `_3`, and so on.
+- A reference with no alias keeps the model name as its alias. So `eph_paid_orders.amount` still works.
+- The CTE goes in front of any `WITH` clause the consumer already has.
+- An ephemeral model that reads another ephemeral model works. Each one becomes one CTE, in dependency order, once per consumer.
+- Only a bare model name is a reference. A CTE of the same name in the consumer wins, and the model is not inlined.
+- The rewrite works on the parsed SQL, not on the text. The consumer's executed SQL loses its comments and original spacing.
+
+What each command does with an ephemeral model:
+
+| Command | Behavior |
 |---|---|
-| An intermediate that several models read | `type = "view"`. No copied data, always-fresh reads, one view object per model, on every dialect. |
-| An intermediate only one model reads | An earlier step of that model, in a [`.rocky` file](/concepts/rocky-dsl/). The step folds into the later ones when Rocky lowers the model. |
+| `rocky compile` | Type-checks the model and its consumers as written. Column types and lineage flow through the ephemeral model as through any other model. `--expand-macros` shows each consumer's SQL with the CTE inlined. |
+| `rocky run` | Skips the model. It never appears in `materializations`. `rocky run --dag` marks its node as skipped, and its consumers still run. |
+| `rocky run --model <ephemeral>` | Fails with `E038`. There is nothing to build. Run a model that reads it instead. |
+| `rocky plan`, `rocky emit-sql` | List the model as skipped. Its SQL appears inside each consumer's statement. |
+| Shadow and branch runs | Skip the model. The reads inside its inlined SQL are routed to shadow targets like any other read. |
+
+`rocky compile` reports `E038` for a use that cannot work:
+
+- The model declares `[[tests]]`. There is no table to test. Move the tests to a model that reads it.
+- Another model reads the model's nominal `[target]` by a qualified name, such as `main.eph_paid_orders`. No table has that name. Read the model by its bare name.
+- A consumer cannot be rewritten: its SQL is not one `SELECT` the parser accepts, or a `WITH RECURSIVE` CTE has the same name as a table the inlined SQL reads.
+
+A contract on an ephemeral model is checked at compile time against the inferred columns, as for any model.
 
 ---
 

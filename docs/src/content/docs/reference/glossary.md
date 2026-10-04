@@ -93,7 +93,7 @@ A [config group](#config-group) with `enforce = true`. The group's fields become
 
 ### Ephemeral
 
-A dbt strategy Rocky refuses. `type = "ephemeral"` is error `E038`: Rocky never inlined such a model into its consumers, so a consumer read whatever table already carried the name. `rocky plan` refuses to persist a plan that includes it. Use `view` for an intermediate several models read. See [Ephemeral](/reference/model-format/#ephemeral).
+A model that is never materialized. `type = "ephemeral"` makes Rocky inline the model's SQL as a CTE into each model that reads it, as dbt does. `rocky run` skips it. Error `E038` marks a use that cannot work, such as `[[tests]]` on the model. See [Ephemeral](/reference/model-format/#ephemeral).
 
 ### Exit code
 

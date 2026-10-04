@@ -47,7 +47,7 @@ pub struct PhysicalEdgeModel<'a> {
     pub table: &'a str,
     pub sql: &'a str,
     /// Whether this model actually writes its configured target. An
-    /// ephemeral model (refused by E038, no table created) must never be
+    /// ephemeral model (inlined into its consumers, no table created) must never be
     /// indexed as a PRODUCER: its configured target does not exist, so a
     /// physical read of that name is a read of something else — deriving an
     /// edge to the phantom would order the reader after a producer that
