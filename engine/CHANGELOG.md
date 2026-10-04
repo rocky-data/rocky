@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **`rocky compile` reports E044 when an aggregating query reads a column that is neither grouped nor aggregated.** For example, `SELECT customer_id, status, SUM(amount) FROM raw.orders GROUP BY customer_id` now fails with `column 'status' in the SELECT list is neither in GROUP BY nor inside an aggregate`. The suggestion is to add the column to `GROUP BY` or wrap it in `ANY_VALUE`. The check covers the `SELECT` list, `HAVING`, and `ORDER BY` in every query scope. It fires only when the column belongs to a relation whose columns Rocky knows. `GROUP BY ALL`, ordinals, `SELECT` aliases, `ROLLUP`/`CUBE`/`GROUPING SETS`, unknown functions, `QUALIFY`, and unresolved names stay silent. **Breaking:** a project with such a query now fails `rocky compile`.
+
 ## [1.76.0] — 2026-10-03
 
 This release carries five breaking changes, each marked **Breaking:** below.

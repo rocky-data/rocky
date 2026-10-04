@@ -564,6 +564,32 @@ fn compute_model_typecheck(
         model_by_name,
     ));
 
+    // Step 2c: GROUP BY validity (E044). Names resolve only against upstream
+    // models this model depends on and known source schemas; anything else
+    // is unknown and stays silent.
+    if let Some(model) = model_by_name.get(model_name) {
+        let relation_columns = |name: &str| -> Option<Vec<String>> {
+            let columns = if name.contains('.') {
+                typed_models.get(name).or_else(|| {
+                    typed_models
+                        .iter()
+                        .find(|(key, _)| key.contains('.') && key.eq_ignore_ascii_case(name))
+                        .map(|(_, columns)| columns)
+                })
+            } else if model_schema.upstream.iter().any(|up| up == name) {
+                typed_models.get(name)
+            } else {
+                None
+            }?;
+            Some(columns.iter().map(|column| column.name.clone()).collect())
+        };
+        diagnostics.extend(crate::group_by::check_group_by(
+            model_name,
+            &model.sql,
+            &relation_columns,
+        ));
+    }
+
     // Step 3: SELECT * warning
     let schema_incomplete = model_schema.has_star
         && model_schema

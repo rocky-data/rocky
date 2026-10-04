@@ -191,6 +191,42 @@ rules. The exemption requires a complete plain `SELECT` `FROM` or `JOIN` read
 set. CTEs, subqueries, and set operations keep local failure dependencies.
 An invalid external schema still fails when the warehouse runs the SQL.
 
+### GROUP BY validity
+
+Rocky reports `E044` when an aggregating query reads a column that is not
+grouped. The check covers the `SELECT` list, `HAVING`, and `ORDER BY`. A query
+aggregates when it has `GROUP BY`, `HAVING`, or an aggregate in its `SELECT`
+list. Without `GROUP BY`, every column read outside an aggregate is reported.
+
+```sql
+-- E044: column 'status' in the SELECT list is neither in GROUP BY nor inside an aggregate
+SELECT customer_id, status, SUM(amount) AS t
+FROM raw.orders
+GROUP BY customer_id
+```
+
+Fix it by adding the column to `GROUP BY`, or by wrapping it in an aggregate
+such as `ANY_VALUE(status)`.
+
+`E044` fires only when Rocky is certain. The column must belong to a relation
+in the same query whose columns Rocky knows: an upstream model, a source
+schema from `--with-seed` or the schema cache, a CTE, or a subquery in `FROM`.
+These shapes stay silent:
+
+- `GROUP BY ALL`, `ROLLUP`, `CUBE`, and `GROUPING SETS` columns.
+- Grouping by ordinal (`GROUP BY 1`) or by a `SELECT` alias.
+- Any name that is also a `SELECT` alias, such as a lateral column alias.
+- Expressions built only from grouped columns, such as `UPPER(status)`.
+- A column inside a grouped expression. `order_date` is accepted when
+  `DATE_TRUNC('month', order_date)` is grouped.
+- Arguments of aggregates, `FILTER`, and unknown functions. An unknown
+  function may be a user-defined aggregate.
+- `QUALIFY`, and outer references inside a subquery.
+- Names Rocky cannot place: unknown relations, stale schemas, session
+  variables.
+
+Each subquery and CTE is checked as its own query.
+
 ### Numeric promotion
 
 When two numeric types meet in one expression (arithmetic, `COALESCE`, `CASE`,
@@ -286,6 +322,7 @@ span, and sometimes a suggested fix.
 | `E037` | A transformation model declares `type = "incremental"`, which would append every row again on each run. Use `merge`, `delete_insert`, `time_interval` or `full_refresh` |
 | `E039` | A direct projection names a column absent from a complete in-project upstream model |
 | `E040` | A `.rocky` string literal contains a backslash; use a `.sql` model with the target's own escaping |
+| `E044` | An aggregating query reads a column that is neither in `GROUP BY` nor inside an aggregate |
 | `W001` | Unused model (no downstream consumers) |
 | `W002` | Duplicate column in model output |
 | `W004` | Classification tag with no matching `[mask]` strategy |
