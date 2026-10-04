@@ -99,8 +99,11 @@ The same rule applies at every grain. For `granularity = "hour"`, partition key
 - `@start_date` → `'2026-04-07 13:00:00'`
 - `@end_date` → `'2026-04-07 14:00:00'`
 
-The compiler emits `E024` if either placeholder is missing. A partition
-window must have both bounds.
+The compiler emits `E024` if either placeholder does not filter the rows. A
+partition window must have both bounds. Each placeholder must appear in a
+`WHERE`, `HAVING` or `QUALIFY` clause, or in the `ON` of an inner join. A
+placeholder in a comment, in a longer string or only in the `SELECT` list
+does not count. The compiler also emits `E024` when it cannot parse the SQL.
 
 ## Partition key format
 
