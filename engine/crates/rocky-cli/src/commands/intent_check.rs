@@ -917,6 +917,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn duplicate_counts_are_part_of_the_multiset() {
+        // Same rows as sets and the same count; only the duplicate moved.
+        // Set EXCEPT would see no difference. EXCEPT ALL must.
+        let adapter = seeded().await;
+        let v = check_one(
+            &adapter,
+            "duckdb",
+            candidate(
+                "SELECT 1 AS x UNION ALL SELECT 1 UNION ALL SELECT 2",
+                "SELECT 1 AS x UNION ALL SELECT 2 UNION ALL SELECT 2",
+            ),
+        )
+        .await;
+        assert_eq!(v.verdict, IntentVerdict::Mismatch, "{v:?}");
+        assert_eq!(
+            (v.rows_only_in_base, v.rows_only_in_head),
+            (Some(1), Some(1))
+        );
+    }
+
+    #[tokio::test]
     async fn type_change_is_schema_differs() {
         let adapter = seeded().await;
         let v = check_one(
