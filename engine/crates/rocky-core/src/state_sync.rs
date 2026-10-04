@@ -8306,7 +8306,7 @@ mod tests {
             .unwrap();
 
         let cfg = StateConfig {
-            concurrency_control: ConcurrencyControl::Cas,
+            concurrency_control: Some(ConcurrencyControl::Cas),
             ..s3_session_config(StateUploadFailureMode::Fail)
         };
         let mut session = RemoteStateSession::new(&cfg, &local, FinalizeDurability::Durable, false);
@@ -8396,6 +8396,9 @@ mod tests {
         let cfg = StateConfig {
             backend: StateBackend::Tiered,
             s3_bucket: Some("bucket".into()),
+            // Explicit `off`: tiered now defaults to `cas` (#1228), which
+            // reads the durable leg only. This test pins the cache-leg path.
+            concurrency_control: Some(ConcurrencyControl::Off),
             ..Default::default()
         };
         let outcome = download_state_inner(&cfg, &local, &remote_key, None)
@@ -8437,6 +8440,9 @@ mod tests {
         let cfg = StateConfig {
             backend: StateBackend::Tiered,
             s3_bucket: Some("bucket".into()),
+            // Explicit `off`: tiered now defaults to `cas` (#1228), which
+            // reads the durable leg only. This test pins the cache-leg path.
+            concurrency_control: Some(ConcurrencyControl::Off),
             ..Default::default()
         };
         let outcome = download_state_inner(&cfg, &local, &remote_key, None)
