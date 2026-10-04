@@ -41,6 +41,10 @@ DEFAULT_KIND_TO_TAG: dict[str, str] = {
     "financial": "financial",
 }
 
+#: Shown beside any model suggestion for a date or timestamp column, unless it
+#: says birth date. The model tags ordinary dates as phones, addresses, and more.
+_DATE_WARNING = "The model often mislabels ordinary dates. Check that this is personal data."
+
 #: Patterns the model is known to get wrong, shown beside its suggestions.
 _MODEL_WARNINGS: dict[str, str] = {
     "phone": "The model often reads dates and numeric codes as phone numbers.",
@@ -177,6 +181,14 @@ def rocky_type_name(warehouse_type: str) -> str:
 
 
 # --------------------------------------------------------------------- suggest
+def _warning(source: str, kind: str, rocky_type: str) -> str | None:
+    if source != "model":
+        return None
+    if rocky_type in ("Date", "Timestamp") and kind != "birth_date":
+        return _DATE_WARNING
+    return _MODEL_WARNINGS.get(kind)
+
+
 def evidence_from_profile(profile, *, table: str | None = None) -> list[ColumnEvidence]:
     """Build :class:`ColumnEvidence` from a ``rocky profile`` result."""
     tbl = table or (profile.profiled_table or profile.model).split(".")[-1]
@@ -250,7 +262,7 @@ def suggest(
                 source=source,
                 probability=round(prob, 4),
                 sample_values=col.values,
-                warning=_MODEL_WARNINGS.get(kind) if source == "model" else None,
+                warning=_warning(source, kind, col.type),
                 reason=f"{source} classified this column as {KINDS[kind]}",
             )
         )

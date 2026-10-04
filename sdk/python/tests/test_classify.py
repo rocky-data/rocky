@@ -240,6 +240,7 @@ def test_suggest_runs_rules_then_the_model_on_untagged_columns(tmp_path):
             _stats("email", "VARCHAR", ["a@x.com"] * 5),
             _stats("author", "VARCHAR", ["Ana Silva", "Tom Hughes"]),
             _stats("hire_date", "DATE", ["2024-01-02"]),
+            _stats("signup_date", "DATE", ["2024-03-04"]),
             _stats("status", "VARCHAR", ["open"]),
             _stats("ssn", "VARCHAR", ["123-45-6789"]),
         ]
@@ -248,7 +249,11 @@ def test_suggest_runs_rules_then_the_model_on_untagged_columns(tmp_path):
 
     def model(col):
         seen.append(col.column)
-        answers = {"author": ("name", 0.91), "hire_date": ("phone", 0.7)}
+        answers = {
+            "author": ("name", 0.91),
+            "hire_date": ("phone", 0.7),
+            "signup_date": ("address", 0.53),
+        }
         return answers.get(col.column, ("none", 0.9))
 
     client = _client()
@@ -258,12 +263,13 @@ def test_suggest_runs_rules_then_the_model_on_untagged_columns(tmp_path):
         ["profile", "stg_customers", "--models", "models", "--sample", "5"]
     )
     by_col = {s.column: s for s in out}
-    assert set(by_col) == {"email", "author", "hire_date"}
+    assert set(by_col) == {"email", "author", "hire_date", "signup_date"}
+    assert "ordinary dates" in by_col["signup_date"].warning
     assert by_col["email"].source == "rules" and by_col["email"].warning is None
     assert by_col["author"].source == "model" and by_col["author"].tag == "pii"
     assert "dates" in by_col["hire_date"].warning
     # The model never sees columns the rules already flagged or the sidecar tags.
-    assert seen == ["author", "hire_date", "status"]
+    assert seen == ["author", "hire_date", "signup_date", "status"]
     # Writing nothing until a person accepts.
     assert existing_classification(side) == {"ssn": "confidential"}
 

@@ -511,7 +511,9 @@ mod tests {
             .await
             .unwrap();
         assert!(b.is_empty());
-        let zero = sample_column_values(adapter.as_ref(), "main.t", "a", 0).await.unwrap();
+        let zero = sample_column_values(adapter.as_ref(), "main.t", "a", 0)
+            .await
+            .unwrap();
         assert!(zero.is_empty());
 
         // The choice depends on the values, not on the order rows arrive in:
@@ -522,8 +524,12 @@ mod tests {
         ] {
             adapter.execute_statement(stmt).await.unwrap();
         }
-        let up = sample_column_values(adapter.as_ref(), "main.up", "v", 7).await.unwrap();
-        let down = sample_column_values(adapter.as_ref(), "main.down", "v", 7).await.unwrap();
+        let up = sample_column_values(adapter.as_ref(), "main.up", "v", 7)
+            .await
+            .unwrap();
+        let down = sample_column_values(adapter.as_ref(), "main.down", "v", 7)
+            .await
+            .unwrap();
         assert_eq!(up.len(), 7);
         assert_eq!(up, down);
         // Not just the first rows of the scan.

@@ -38,10 +38,10 @@ The rules were changed after the first measurement, so that dates and times no l
 
 About 1 suggestion in 4 is wrong with the model on. That is why a person must check each one. The model makes two kinds of mistake often:
 
-- It reads many dates and numeric codes as phone numbers.
+- It tags ordinary dates as personal data: often as phone numbers, sometimes as addresses.
 - It reads short text, such as job titles or carrier names, as person names.
 
-Each suggestion from the model carries a `warning` when it falls into one of these kinds. Its `probability` is shown, but do not rely on it. The model's probabilities are not well calibrated.
+Each suggestion from the model carries a `warning` when it falls into one of these patterns. A model suggestion on a date column always carries one, unless the kind is `birth_date`. Its `probability` is shown, but do not rely on it. The model's probabilities are not well calibrated.
 
 ## Install
 
