@@ -12519,30 +12519,26 @@ pub(crate) async fn execute_models_with_explicit_contracts(
                         // rather than failing the run (the run is
                         // already durable in the Delta log; missing
                         // refcount data is recoverable, an aborted run
-                        // is not). TODO(Phase 6): the partitioned write
-                        // loop in `execute_content_addressed_model` only
-                        // returns the *last* group's hash here — every
-                        // group's artifact needs to be recorded for the
-                        // refcount sweep to be correct on partitioned
-                        // tables. Tracked on the spike memo.
+                        // is not). One row per written file: a partitioned
+                        // write commits one file per partition group, and
+                        // every group's hash must reach the ledger for the
+                        // refcount sweep to be correct on partitioned tables.
                         if let Some(store) = state_store {
-                            let artifact = rocky_core::state::ArtifactRecord {
-                                blake3_hash: summary.blake3_hash.clone(),
-                                run_id: run_id.to_string(),
-                                model_name: model_name.to_string(),
-                                file_path: summary.file_path.clone(),
-                                commit_version: summary.commit_version,
-                                size_bytes: summary.size_bytes,
-                                written_at: Utc::now(),
-                            };
-                            if let Err(e) = store.record_artifact(&artifact) {
-                                warn!(
-                                    error = %e,
-                                    model = model_name,
-                                    blake3 = summary.blake3_hash.as_str(),
-                                    "failed to persist content-addressed artifact record \
-                                     (run still successful; Phase 6 refcount may be incomplete)"
-                                );
+                            for artifact in super::run_content_addressed::artifact_records(
+                                &summary,
+                                run_id,
+                                model_name,
+                                Utc::now(),
+                            ) {
+                                if let Err(e) = store.record_artifact(&artifact) {
+                                    warn!(
+                                        error = %e,
+                                        model = model_name,
+                                        blake3 = artifact.blake3_hash.as_str(),
+                                        "failed to persist content-addressed artifact record \
+                                         (run still successful; Phase 6 refcount may be incomplete)"
+                                    );
+                                }
                             }
                         }
                         // Auditable-reuse spine. When `[reuse]` is enabled,
@@ -12558,11 +12554,13 @@ pub(crate) async fn execute_models_with_explicit_contracts(
                         // population is deferred). Best-effort and additive: it
                         // never changes what was materialized.
                         //
-                        // Only UNPARTITIONED writes participate: the
-                        // partitioned ledger is last-group-only (the Phase 6
-                        // TODO above), so a partitioned hash is incomplete and
-                        // is recorded neither as this model's identity nor as a
-                        // resolvable upstream.
+                        // Only UNPARTITIONED writes participate. The ledger
+                        // now records every partition group, but a
+                        // partitioned model has no single whole-output hash:
+                        // the reuse identity (`reuse_outputs`), the point-to
+                        // commit and its `eligible_shape` gate all assume one
+                        // file. So a partitioned model is recorded neither as
+                        // this model's identity nor as a resolvable upstream.
                         if reuse_enabled {
                             let is_unpartitioned = !matches!(
                                 &model_ir.materialization,
