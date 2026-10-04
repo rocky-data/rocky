@@ -173,11 +173,53 @@ directly project a name from one complete in-project model. The name must be
 absent from that model's output. Other shapes can remain `Unknown`. `E039`
 does not validate them.
 
-External source schemas do not prove completeness or freshness. Incomplete
-scopes, duplicate output names, struct field reads, and warehouse metadata
-columns remain conservative. The upstream output must use plain column
-projections or aliased columns and literals. Functions and other expressions
-remain conservative.
+`E039` covers in-project models only. Incomplete scopes, duplicate output
+names, struct field reads, and warehouse metadata columns remain conservative.
+The upstream output must use plain column projections or aliased columns and
+literals. Functions and other expressions remain conservative.
+
+### Missing columns in external sources (`E041` / `W041`)
+
+An external source is a table such as `raw.orders` that Rocky reads but does
+not build. Rocky knows its columns only from a source schema: a seed file
+(`rocky compile --with-seed`) or the schema cache. A reference to a column the
+source schema lacks is `E041` or `W041`. The code depends on how much Rocky
+trusts that schema:
+
+| Where the schema came from | Without strict sources | With strict sources |
+|---|---|---|
+| Read from the warehouse during this invocation (an embedding caller; no CLI command does this for a compile yet) | `E041` (error) | `E041` |
+| Schema cache, younger than `trusted_max_age_seconds` | `E041` (error) | `E041` |
+| Schema cache, older (or the key is unset) | `W041` (warning) | `E041` |
+| Seed file (`--with-seed`) | `W041` (warning) | `E041` |
+| Unknown | nothing (`Unknown`) | nothing |
+
+A seed or an old cache entry can miss a column the warehouse already has. So
+by default these schemas only warn, and the compile exits `0`. Turn on strict
+sources with `rocky compile --strict-sources` or
+`[cache.schemas] strict_sources = true`. Every `W041` then becomes `E041`.
+Both codes name the column and the source. They suggest close column names,
+or list the source's columns. `W041` also says how to refresh the schema.
+
+Rocky reports the name only when it binds to known sources and nothing else.
+Every relation the name could resolve against must be a known source. That
+includes enclosing scopes, for correlated and lateral subqueries. These keep
+the name `Unknown`:
+
+- A CTE, derived table, in-project model, or table function in scope.
+- A `SELECT` alias with that name, including DuckDB lateral aliases.
+- A relation binding with that name (a whole-row reference).
+- A qualified `a.b` where `a` can also be a column (a struct field read).
+- A 3-part reference, a lambda parameter, or a keyword-like function
+  argument such as `day` in `DATEADD(day, 1, ts)`.
+- A quoted name. BigQuery, and Databricks by default, read `"shipped"` as a
+  string, not a column.
+- A name that starts with `_`. Warehouses use these for metadata columns,
+  such as BigQuery `_FILE_NAME`.
+
+`rocky run` compiles against the schema cache before it executes. An `E041`
+model is excluded like any model with an error, before Rocky touches the
+warehouse. A `W041` is logged as a warning and the model runs.
 
 During `rocky run`, a selected model with an `Error` diagnostic records a
 `compile-error`. Rocky withholds that model's declared DAG descendants. Healthy
@@ -286,6 +328,7 @@ span, and sometimes a suggested fix.
 | `E037` | A transformation model declares `type = "incremental"`, which would append every row again on each run. Use `merge`, `delete_insert`, `time_interval` or `full_refresh` |
 | `E039` | A direct projection names a column absent from a complete in-project upstream model |
 | `E040` | A `.rocky` string literal contains a backslash; use a `.sql` model with the target's own escaping |
+| `E041` | A direct reference names a column absent from an external source whose schema Rocky trusts. See [Missing columns in external sources](#missing-columns-in-external-sources-e041--w041) |
 | `W001` | Unused model (no downstream consumers) |
 | `W002` | Duplicate column in model output |
 | `W004` | Classification tag with no matching `[mask]` strategy |
@@ -297,6 +340,7 @@ span, and sometimes a suggested fix.
 | `W013` | `rocky.toml` is present but could not be read, so every project-level check is silent (`rocky lsp` and `rocky serve` only; one-shot commands refuse instead) |
 | `W030` | Imported producer added a column, surfaced only to consumers reading it via `SELECT *` |
 | `W031` | Imported producer widened the type of a column this project reads (cross-team contract) |
+| `W041` | A direct reference names a column absent from an external source schema that may be out of date (seed or old cache entry) |
 | `I001` | Model dependency inferred from SQL |
 | `I002` | Some, but not all, output columns have unknown types — provide source schemas for more type checking |
 | `I003` | A contract declares a type for a column whose type Rocky could not infer, so `E011` did not check it |

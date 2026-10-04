@@ -8,6 +8,7 @@ use anyhow::{Context, Result};
 use rocky_compiler::compile::{self, CompilerConfig, default_type_mapper};
 use rocky_compiler::cost_check;
 use rocky_compiler::diagnostic::{self, Diagnostic, Severity};
+use rocky_compiler::source_refs::{SourceProvenance, SourceSchemaOrigin};
 use rocky_compiler::types::TypedColumn;
 use rocky_core::config as rocky_config;
 use rocky_core::macros::{expand_macros, load_macros_from_dir};
@@ -39,6 +40,42 @@ pub fn run_compile(
     cache_ttl_override: Option<u64>,
     run_vars: &rocky_core::run_vars::RunVars,
 ) -> Result<()> {
+    run_compile_with_strict_sources(
+        config_path,
+        state_path,
+        models_dir,
+        contracts_dir,
+        model_filter,
+        output_json,
+        do_expand_macros,
+        target_dialect,
+        with_seed,
+        cache_ttl_override,
+        run_vars,
+        false,
+    )
+}
+
+/// [`run_compile`] with `rocky compile --strict-sources`.
+///
+/// `strict_sources` escalates every W041 (a source column missing from a seed
+/// or untrusted cached schema) to E041 for this invocation. It ORs with
+/// `[cache.schemas] strict_sources`; it can turn strictness on, never off.
+#[allow(clippy::too_many_arguments)]
+pub fn run_compile_with_strict_sources(
+    config_path: Option<&Path>,
+    state_path: &Path,
+    models_dir: &Path,
+    contracts_dir: Option<&Path>,
+    model_filter: Option<&str>,
+    output_json: bool,
+    do_expand_macros: bool,
+    target_dialect: Option<Dialect>,
+    with_seed: bool,
+    cache_ttl_override: Option<u64>,
+    run_vars: &rocky_core::run_vars::RunVars,
+    strict_sources: bool,
+) -> Result<()> {
     let (output, text_data) = compile_inner(
         config_path,
         state_path,
@@ -50,6 +87,7 @@ pub fn run_compile(
         with_seed,
         cache_ttl_override,
         run_vars,
+        strict_sources,
     )?;
 
     if output_json {
@@ -85,6 +123,7 @@ fn compile_inner(
     with_seed: bool,
     cache_ttl_override: Option<u64>,
     run_vars: &rocky_core::run_vars::RunVars,
+    strict_sources: bool,
 ) -> Result<(CompileOutput, CompileTextData)> {
     // Load the project config ONCE, and let a failure fail the command.
     //
@@ -123,12 +162,23 @@ fn compile_inner(
     //   2. Otherwise, the schema cache if `[cache.schemas] enabled`.
     //   3. Cold-cache fallback: empty map — typecheck degrades to
     //      Unknown.
-    let source_schemas = if with_seed {
+    //
+    // Each tier also records where its schemas came from, for the E041 /
+    // W041 missing-source-column check: a seed is `Seed` (W041 unless
+    // strict), a cache entry is `Cache` with its timestamp (E041 only within
+    // `[cache.schemas] trusted_max_age_seconds`). `--strict-sources` and
+    // `[cache.schemas] strict_sources` escalate every W041 to E041.
+    let config_strict_sources = project_config
+        .as_ref()
+        .is_some_and(|config| config.cache.schemas.strict_sources);
+    let (source_schemas, source_provenance) = if with_seed {
         // Seed loader: run `data/seed.sql` in in-memory DuckDB, read
         // columns from its `information_schema`. Turns leaf .sql models
         // from `RockyType::Unknown` into concrete types for any project
         // that ships a runnable seed (the entire playground).
-        load_source_schemas_from_seed(models_dir)?
+        let schemas = load_source_schemas_from_seed(models_dir)?;
+        let provenance = SourceProvenance::uniform(schemas.keys(), &SourceSchemaOrigin::Seed);
+        (schemas, provenance)
     } else if let Some(config) = &project_config {
         // TTL-filtered load from `state.redb`'s `SCHEMA_CACHE` table.
         // Honours `[cache.schemas] enabled` + `ttl_seconds` (after
@@ -138,10 +188,11 @@ fn compile_inner(
             .schemas
             .clone()
             .with_ttl_override(cache_ttl_override);
-        crate::source_schemas::load_cached_source_schemas(&schema_cfg, state_path)
+        crate::source_schemas::load_cached_source_schemas_with_provenance(&schema_cfg, state_path)
     } else {
-        HashMap::new()
+        (HashMap::new(), SourceProvenance::default())
     };
+    let source_provenance = source_provenance.with_strict(strict_sources || config_strict_sources);
 
     // Load `[mask]` + `[classifications.allow_unmasked]` for the W004
     // classification-tag completeness check. No rocky.toml (standalone
@@ -173,6 +224,7 @@ fn compile_inner(
         allow_unmasked,
         project_freshness,
         run_vars: run_vars.clone(),
+        source_provenance,
     };
 
     let mut result = compile::compile(&config)?;
@@ -440,6 +492,9 @@ pub fn compile_output(
         // `compile_output` backs commands that don't expose `--var`
         // (ci / dag); an `@var()` model would surface an E028 diagnostic.
         &rocky_core::run_vars::RunVars::new(),
+        // No `--strict-sources` flag on these surfaces; `[cache.schemas]
+        // strict_sources` still applies.
+        false,
     )?;
     Ok(output)
 }
@@ -1429,5 +1484,254 @@ schema_template = "s"
             !state_path.exists(),
             "compile must not create state.redb as a side effect"
         );
+    }
+
+    // ---- E041 / W041: missing external source columns ----
+
+    /// The brief's reference seed.
+    const REFERENCE_SEED: &str = "CREATE SCHEMA raw;\n\
+        CREATE TABLE raw.orders (order_id BIGINT, customer_id BIGINT, amount DOUBLE, \
+        status VARCHAR, order_date DATE);\n\
+        CREATE TABLE raw.customers (customer_id BIGINT, customer_name VARCHAR, email VARCHAR);\n";
+
+    const D1: &str = "SELECT order_id, customer_id, order_total FROM raw.orders";
+
+    fn seeded_project(seed: &str, models: &[(&str, &str)]) -> (TempDir, std::path::PathBuf) {
+        let dir = TempDir::new().unwrap();
+        let models_dir = dir.path().join("models");
+        fs::create_dir_all(&models_dir).unwrap();
+        for (name, sql) in models {
+            write_model(&models_dir, name, sql);
+        }
+        write_seed(dir.path(), seed);
+        (dir, models_dir)
+    }
+
+    fn compile_seeded(
+        config: Option<&Path>,
+        models_dir: &Path,
+        strict_sources: bool,
+    ) -> CompileOutput {
+        compile_inner(
+            config,
+            &models_dir.join(".rocky-state.redb"),
+            models_dir,
+            None,
+            None,
+            false,
+            None,
+            true,
+            None,
+            &rocky_core::run_vars::RunVars::new(),
+            strict_sources,
+        )
+        .expect("compile should produce output")
+        .0
+    }
+
+    fn count(output: &CompileOutput, code: &str) -> usize {
+        output
+            .diagnostics
+            .iter()
+            .filter(|d| d.code.as_ref() == code)
+            .count()
+    }
+
+    #[test]
+    #[cfg(feature = "duckdb")]
+    fn d1_with_seed_warns_w041_and_exits_zero() {
+        let (_dir, models_dir) = seeded_project(REFERENCE_SEED, &[("stg_orders", D1)]);
+        let output = compile_seeded(None, &models_dir, false);
+        assert!(!output.has_errors, "{:?}", output.diagnostics);
+        assert_eq!(count(&output, "W041"), 1, "{:?}", output.diagnostics);
+        let w041 = output
+            .diagnostics
+            .iter()
+            .find(|d| d.code.as_ref() == "W041");
+        let w041 = w041.unwrap();
+        assert!(w041.message.contains("order_total"), "{}", w041.message);
+        assert!(w041.message.contains("raw.orders"), "{}", w041.message);
+
+        // The process-level contract: `run_compile` returns Ok (exit 0).
+        run_compile(
+            None,
+            &models_dir.join(".rocky-state.redb"),
+            &models_dir,
+            None,
+            None,
+            true,
+            false,
+            None,
+            true,
+            None,
+            &rocky_core::run_vars::RunVars::new(),
+        )
+        .expect("a seed-backed W041 must not fail the compile");
+    }
+
+    #[test]
+    #[cfg(feature = "duckdb")]
+    fn d1_with_seed_and_strict_sources_refuses_e041() {
+        let (_dir, models_dir) = seeded_project(REFERENCE_SEED, &[("stg_orders", D1)]);
+        let output = compile_seeded(None, &models_dir, true);
+        assert!(output.has_errors);
+        assert_eq!(count(&output, "E041"), 1, "{:?}", output.diagnostics);
+        assert_eq!(count(&output, "W041"), 0);
+
+        let err = run_compile_with_strict_sources(
+            None,
+            &models_dir.join(".rocky-state.redb"),
+            &models_dir,
+            None,
+            None,
+            true,
+            false,
+            None,
+            true,
+            None,
+            &rocky_core::run_vars::RunVars::new(),
+            true,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("compilation failed"), "{err}");
+    }
+
+    #[test]
+    #[cfg(feature = "duckdb")]
+    fn strict_sources_config_key_escalates_like_the_flag() {
+        let (dir, models_dir) = seeded_project(REFERENCE_SEED, &[("stg_orders", D1)]);
+        let config = write_rocky_toml(dir.path(), "[cache.schemas]\nstrict_sources = true\n");
+        let output = compile_seeded(Some(&config), &models_dir, false);
+        assert!(output.has_errors);
+        assert_eq!(count(&output, "E041"), 1, "{:?}", output.diagnostics);
+    }
+
+    #[test]
+    #[cfg(feature = "duckdb")]
+    fn reference_valid_controls_stay_clean_even_under_strict_sources() {
+        let (_dir, models_dir) = seeded_project(
+            REFERENCE_SEED,
+            &[
+                (
+                    "stg_orders",
+                    "SELECT order_id, customer_id, amount FROM raw.orders",
+                ),
+                (
+                    "fct_revenue",
+                    "SELECT c.customer_name, SUM(o.amount) AS total FROM stg_orders o \
+                     JOIN raw.customers c ON o.customer_id = c.customer_id \
+                     GROUP BY c.customer_name",
+                ),
+                (
+                    "v1",
+                    "SELECT order_id AS id2, id2 + 1 AS next_id FROM raw.orders",
+                ),
+                ("v2", "SELECT 10::BIGINT = '10'::VARCHAR AS equal_value"),
+                (
+                    "v3",
+                    "SELECT scoped.order_id FROM (SELECT order_id FROM raw.orders) AS scoped",
+                ),
+                (
+                    "v4",
+                    "SELECT sha256(customer_name) AS customer_hash FROM raw.customers",
+                ),
+                (
+                    "g1_s2",
+                    "WITH stg_orders AS (SELECT order_id, amount FROM raw.orders) \
+                     SELECT stg_orders.amount FROM stg_orders",
+                ),
+                ("stg_star", "SELECT * FROM raw.orders"),
+                ("g1_s3", "SELECT s.amount FROM stg_star AS s"),
+            ],
+        );
+        let output = compile_seeded(None, &models_dir, true);
+        assert_eq!(
+            count(&output, "E041") + count(&output, "W041"),
+            0,
+            "{:?}",
+            output.diagnostics
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "duckdb")]
+    fn g1_s4_stale_seed_stays_exit_zero_without_escalation() {
+        // The seed lacks `amount`; the warehouse has it.
+        let (_dir, models_dir) = seeded_project(
+            "CREATE SCHEMA raw;\n\
+             CREATE TABLE raw.orders (order_id BIGINT, customer_id BIGINT, status VARCHAR);\n",
+            &[(
+                "stg_orders",
+                "SELECT order_id, customer_id, amount AS order_amount FROM raw.orders",
+            )],
+        );
+        let output = compile_seeded(None, &models_dir, false);
+        assert!(!output.has_errors, "{:?}", output.diagnostics);
+        assert_eq!(count(&output, "W041"), 1, "{:?}", output.diagnostics);
+    }
+
+    /// A cache entry inside `[cache.schemas] trusted_max_age_seconds` is
+    /// authoritative: D1 refuses without any strict flag. Outside it (or with
+    /// the key unset) the same entry only warns.
+    #[test]
+    fn d1_against_trusted_cache_entry_refuses_e041() {
+        use rocky_core::schema_cache::{SchemaCacheEntry, StoredColumn, schema_cache_key};
+        use rocky_core::state::StateStore;
+
+        let dir = TempDir::new().unwrap();
+        let models_dir = dir.path().join("models");
+        fs::create_dir_all(&models_dir).unwrap();
+        write_model(&models_dir, "stg_orders", D1);
+        let state_path = dir.path().join(".rocky-state.redb");
+        {
+            let store = StateStore::open(&state_path).unwrap();
+            let columns = ["order_id", "customer_id", "amount", "status", "order_date"]
+                .into_iter()
+                .map(|name| StoredColumn {
+                    name: name.into(),
+                    data_type: "BIGINT".into(),
+                    nullable: true,
+                })
+                .collect();
+            store
+                .write_schema_cache_entry(
+                    &schema_cache_key("cat", "raw", "orders"),
+                    &SchemaCacheEntry {
+                        columns,
+                        cached_at: chrono::Utc::now() - chrono::Duration::minutes(10),
+                    },
+                )
+                .unwrap();
+        }
+        let compile_with = |cache_block: &str| {
+            let config = write_rocky_toml(dir.path(), cache_block);
+            compile_inner(
+                Some(&config),
+                &state_path,
+                &models_dir,
+                None,
+                None,
+                false,
+                None,
+                false,
+                None,
+                &rocky_core::run_vars::RunVars::new(),
+                false,
+            )
+            .unwrap()
+            .0
+        };
+
+        let trusted = compile_with("[cache.schemas]\ntrusted_max_age_seconds = 3600\n");
+        assert!(trusted.has_errors);
+        assert_eq!(count(&trusted, "E041"), 1, "{:?}", trusted.diagnostics);
+
+        let aged = compile_with("[cache.schemas]\ntrusted_max_age_seconds = 60\n");
+        assert!(!aged.has_errors, "{:?}", aged.diagnostics);
+        assert_eq!(count(&aged, "W041"), 1, "{:?}", aged.diagnostics);
+
+        let unset = compile_with("");
+        assert!(!unset.has_errors, "{:?}", unset.diagnostics);
+        assert_eq!(count(&unset, "W041"), 1, "{:?}", unset.diagnostics);
     }
 }

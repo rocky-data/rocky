@@ -27,6 +27,7 @@ rocky compile [flags]
 | `--expand-macros` | `bool` | `false` | Expand macros from `macros/` and include the expanded SQL in the output. |
 | `--target-dialect <DIALECT>` | `dbx` \| `sf` \| `bq` \| `duckdb` | | Run the **P001 dialect-portability lint** against the chosen target. Non-portable constructs emit `error`-severity diagnostics. Precedence: flag > `[portability] target_dialect` in `rocky.toml` > unset. See [Portability linting](/concepts/linters/). |
 | `--with-seed` | `bool` | `false` | Execute `data/seed.sql` against an in-memory DuckDB and use its `information_schema` as the source-of-truth for raw source schemas. Turns leaf `.sql` models from `Unknown` columns into concrete types. Requires the `duckdb` feature (enabled by default in the shipped binary). |
+| `--strict-sources` | `bool` | `false` | Treat every known source schema as current. A reference to a column the source lacks is the `E041` error, even when the schema came from a seed or an old cache entry. Without the flag, those schemas give the `W041` warning. Same as `[cache.schemas] strict_sources = true`. See [Missing columns in external sources](/concepts/compiler/#missing-columns-in-external-sources-e041--w041). |
 
 ### Examples
 
@@ -187,6 +188,12 @@ rocky compile --with-seed
 ```
 
 `--with-seed` looks for `data/seed.sql` relative to the project root (one level up from `--models`). It opens an in-memory DuckDB, runs the seed, and feeds the resulting `information_schema.columns` back into the compiler so type inference gets concrete types instead of `RockyType::Unknown`. Bails if `data/seed.sql` is missing or fails to execute.
+
+A seed can be out of date. So a reference to a column the seed lacks is the `W041` warning, and the compile still exits `0`. Add `--strict-sources` to refuse it with the `E041` error instead:
+
+```bash
+rocky compile --with-seed --strict-sources
+```
 
 ### Related Commands
 

@@ -2431,6 +2431,28 @@ pub struct SchemaCacheConfig {
     /// another machine's stale type stamps. Opt in to `true` for teams
     /// that want cross-machine cache warm-up via a shared state backend.
     pub replicate: bool,
+    /// Treat every source schema the compiler knows as authoritative for
+    /// missing-column checks. Defaults to `false`.
+    ///
+    /// A direct reference to a column a known source schema lacks is a
+    /// `W041` warning when that schema came from a seed file
+    /// (`rocky compile --with-seed`) or from a cache entry older than
+    /// `trusted_max_age_seconds`: a stale schema must not fail a
+    /// valid build. Set this to `true` to escalate those warnings to the
+    /// `E041` error, matching a strict "refuse what you cannot prove"
+    /// posture. `rocky compile --strict-sources` sets it for one
+    /// invocation.
+    pub strict_sources: bool,
+    /// Age, in seconds, under which a cached source schema is trusted as
+    /// current. Defaults to unset: no cache entry is trusted, so a missing
+    /// source column found against the cache is a `W041` warning.
+    ///
+    /// When set, a missing source column found against a cache entry
+    /// younger than this is the `E041` error instead. Only entries that
+    /// survive `ttl_seconds` are read at all, so a value above the
+    /// TTL trusts every cached entry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trusted_max_age_seconds: Option<u64>,
 }
 
 impl Default for SchemaCacheConfig {
@@ -2439,6 +2461,8 @@ impl Default for SchemaCacheConfig {
             enabled: true,
             ttl_seconds: 86_400,
             replicate: false,
+            strict_sources: false,
+            trusted_max_age_seconds: None,
         }
     }
 }
@@ -2447,6 +2471,13 @@ impl SchemaCacheConfig {
     /// Convenience: TTL as a `chrono::Duration` for the read path.
     pub fn ttl(&self) -> chrono::Duration {
         chrono::Duration::seconds(self.ttl_seconds as i64)
+    }
+
+    /// Convenience: [`Self::trusted_max_age_seconds`] as a
+    /// `chrono::Duration`, saturating at `i64::MAX` seconds.
+    pub fn trusted_max_age(&self) -> Option<chrono::Duration> {
+        self.trusted_max_age_seconds
+            .map(|secs| chrono::Duration::seconds(i64::try_from(secs).unwrap_or(i64::MAX)))
     }
 
     /// Apply an optional `--cache-ttl <seconds>` CLI override.
@@ -13312,6 +13343,7 @@ max_rows = 1000
             enabled: true,
             ttl_seconds: 7200,
             replicate: false,
+            ..SchemaCacheConfig::default()
         };
         let overridden = cfg.clone().with_ttl_override(None);
         assert_eq!(overridden.ttl_seconds, 7200);
@@ -13327,6 +13359,7 @@ max_rows = 1000
             enabled: true,
             ttl_seconds: 86_400,
             replicate: true,
+            ..SchemaCacheConfig::default()
         };
         let overridden = cfg.with_ttl_override(Some(60));
         assert_eq!(overridden.ttl_seconds, 60);

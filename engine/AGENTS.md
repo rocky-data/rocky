@@ -432,7 +432,7 @@ Section reference:
 - `[pipeline.<name>.target.governance]` — auto_create_catalogs, auto_create_schemas, tags, isolation, grants (per target; there is no top-level `[governance]` table)
 - `[cost]` — storage_cost_per_gb_month, compute_cost_per_dbu, warehouse_size
 - `[state]` — backend (local/s3/gcs/valkey/tiered)
-- `[cache.schemas]` — the schema cache: enabled, ttl_seconds, replicate (there is no other `[cache]` key)
+- `[cache.schemas]` — the schema cache: enabled, ttl_seconds, replicate, trusted_max_age_seconds, strict_sources (the last two drive the E041/W041 missing-source-column check; there is no other `[cache]` key)
 
 **Key defaults** (omit when redundant):
 - `pipeline.type` → `"replication"`, unnamed `[adapter]` → `adapter.default`

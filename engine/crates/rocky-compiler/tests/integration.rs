@@ -1206,3 +1206,158 @@ fn defaulted_dsl_microbatch_is_refused_and_defaulted_sql_window_compiles() {
         bounded_only.diagnostics
     );
 }
+
+// ---- E041 / W041: missing external source columns ----
+
+mod source_column_refs {
+    use std::collections::HashMap;
+    use std::path::Path;
+
+    use rocky_compiler::compile::{CompilerConfig, compile};
+    use rocky_compiler::diagnostic::Severity;
+    use rocky_compiler::source_refs::{SourceProvenance, SourceSchemaOrigin};
+    use rocky_compiler::types::{RockyType, TypedColumn};
+
+    fn write_model(dir: &Path, name: &str, sql: &str) {
+        std::fs::write(dir.join(format!("{name}.sql")), sql).unwrap();
+        std::fs::write(
+            dir.join(format!("{name}.toml")),
+            format!(
+                "name = \"{name}\"\n\n[strategy]\ntype = \"full_refresh\"\n\n[target]\n\
+                 catalog = \"c\"\nschema = \"s\"\ntable = \"{name}\"\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    fn cols(names: &[&str]) -> Vec<TypedColumn> {
+        names
+            .iter()
+            .map(|name| TypedColumn {
+                name: (*name).to_string(),
+                data_type: RockyType::Unknown,
+                nullable: true,
+            })
+            .collect()
+    }
+
+    /// The brief's seed: `raw.orders` and `raw.customers`.
+    fn sources() -> HashMap<String, Vec<TypedColumn>> {
+        HashMap::from([
+            (
+                "raw.orders".to_string(),
+                cols(&["order_id", "customer_id", "amount", "status", "order_date"]),
+            ),
+            (
+                "raw.customers".to_string(),
+                cols(&["customer_id", "customer_name", "email"]),
+            ),
+        ])
+    }
+
+    fn compile_with(
+        models: &[(&str, &str)],
+        origin: Option<SourceSchemaOrigin>,
+    ) -> rocky_compiler::compile::CompileResult {
+        let dir = tempfile::TempDir::new().unwrap();
+        for (name, sql) in models {
+            write_model(dir.path(), name, sql);
+        }
+        let source_schemas = sources();
+        let source_provenance = origin
+            .map(|origin| SourceProvenance::uniform(source_schemas.keys(), &origin))
+            .unwrap_or_default();
+        compile(&CompilerConfig {
+            models_dir: dir.path().to_path_buf(),
+            source_schemas,
+            source_provenance,
+            ..Default::default()
+        })
+        .unwrap()
+    }
+
+    fn codes(result: &rocky_compiler::compile::CompileResult, code: &str) -> usize {
+        result
+            .diagnostics
+            .iter()
+            .filter(|d| d.code.as_ref() == code)
+            .count()
+    }
+
+    const D1: &str = "SELECT order_id, customer_id, order_total FROM raw.orders";
+
+    #[test]
+    fn d1_against_live_schema_fails_compile_with_e041() {
+        let result = compile_with(&[("stg_orders", D1)], Some(SourceSchemaOrigin::Live));
+        assert!(result.has_errors);
+        let e041: Vec<_> = result
+            .diagnostics
+            .iter()
+            .filter(|d| d.code.as_ref() == "E041")
+            .collect();
+        assert_eq!(e041.len(), 1, "{:?}", result.diagnostics);
+        assert_eq!(e041[0].severity, Severity::Error);
+        assert_eq!(e041[0].model, "stg_orders");
+        assert!(e041[0].message.contains("order_total"));
+        assert!(e041[0].message.contains("raw.orders"));
+    }
+
+    #[test]
+    fn d1_against_seed_schema_warns_and_compiles() {
+        let result = compile_with(&[("stg_orders", D1)], Some(SourceSchemaOrigin::Seed));
+        assert!(!result.has_errors, "{:?}", result.diagnostics);
+        assert_eq!(codes(&result, "W041"), 1);
+    }
+
+    #[test]
+    fn d1_without_provenance_is_unchanged() {
+        let result = compile_with(&[("stg_orders", D1)], None);
+        assert!(!result.has_errors, "{:?}", result.diagnostics);
+        assert_eq!(codes(&result, "E041") + codes(&result, "W041"), 0);
+    }
+
+    #[test]
+    fn valid_controls_stay_clean_against_live_schema() {
+        let result = compile_with(
+            &[
+                (
+                    "stg_orders",
+                    "SELECT order_id, customer_id, amount FROM raw.orders",
+                ),
+                (
+                    "fct_revenue",
+                    "SELECT c.customer_name, SUM(o.amount) AS total FROM stg_orders o \
+                     JOIN raw.customers c ON o.customer_id = c.customer_id \
+                     GROUP BY c.customer_name",
+                ),
+                (
+                    "v1",
+                    "SELECT order_id AS id2, id2 + 1 AS next_id FROM raw.orders",
+                ),
+                ("v2", "SELECT 10::BIGINT = '10'::VARCHAR AS equal_value"),
+                (
+                    "v3",
+                    "SELECT scoped.order_id FROM (SELECT order_id FROM raw.orders) AS scoped",
+                ),
+                (
+                    "v4",
+                    "SELECT sha256(customer_name) AS customer_hash FROM raw.customers",
+                ),
+                (
+                    "g1_s2",
+                    "WITH stg_orders AS (SELECT order_id, amount FROM raw.orders) \
+                     SELECT stg_orders.amount FROM stg_orders",
+                ),
+                ("stg_star", "SELECT * FROM raw.orders"),
+                ("g1_s3", "SELECT s.amount FROM stg_star AS s"),
+            ],
+            Some(SourceSchemaOrigin::Live),
+        );
+        assert_eq!(
+            codes(&result, "E041") + codes(&result, "W041"),
+            0,
+            "{:?}",
+            result.diagnostics
+        );
+    }
+}

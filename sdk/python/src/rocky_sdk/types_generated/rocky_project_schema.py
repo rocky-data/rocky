@@ -1587,6 +1587,18 @@ class SchemaCacheConfig(BaseModel):
     """
     Replicate the schema cache via `state_sync` to the remote backend. Defaults to `false`: a dev on a fresh clone should not inherit another machine's stale type stamps. Opt in to `true` for teams that want cross-machine cache warm-up via a shared state backend.
     """
+    strict_sources: bool | None = False
+    """
+    Treat every source schema the compiler knows as authoritative for missing-column checks. Defaults to `false`.
+
+    A direct reference to a column a known source schema lacks is a `W041` warning when that schema came from a seed file (`rocky compile --with-seed`) or from a cache entry older than `trusted_max_age_seconds`: a stale schema must not fail a valid build. Set this to `true` to escalate those warnings to the `E041` error, matching a strict "refuse what you cannot prove" posture. `rocky compile --strict-sources` sets it for one invocation.
+    """
+    trusted_max_age_seconds: conint(ge=0) | None = None
+    """
+    Age, in seconds, under which a cached source schema is trusted as current. Defaults to unset: no cache entry is trusted, so a missing source column found against the cache is a `W041` warning.
+
+    When set, a missing source column found against a cache entry younger than this is the `E041` error instead. Only entries that survive `ttl_seconds` are read at all, so a value above the TTL trusts every cached entry.
+    """
     ttl_seconds: conint(ge=0) | None = 86400
     """
     TTL for cache entries in seconds. Defaults to 86400 (24 hours). Lower it for high-DDL-churn teams; raise it for projects whose sources change on a weekly or slower cadence.
@@ -2059,7 +2071,12 @@ class CacheConfig(BaseModel):
         extra="forbid",
     )
     schemas: SchemaCacheConfig | None = Field(
-        {"enabled": True, "replicate": False, "ttl_seconds": 86400},
+        {
+            "enabled": True,
+            "replicate": False,
+            "strict_sources": False,
+            "ttl_seconds": 86400,
+        },
         validate_default=True,
     )
     """
@@ -3816,7 +3833,14 @@ class RockyConfig(BaseModel):
     Declarative run-level budget. See [`BudgetConfig`] for the semantics of each limit and the breach action.
     """
     cache: CacheConfig | None = Field(
-        {"schemas": {"enabled": True, "replicate": False, "ttl_seconds": 86400}},
+        {
+            "schemas": {
+                "enabled": True,
+                "replicate": False,
+                "strict_sources": False,
+                "ttl_seconds": 86400,
+            }
+        },
         validate_default=True,
     )
     """
