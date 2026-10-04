@@ -104,7 +104,10 @@ fn compile_target_equals_run_asset_key_for_a_var_templated_target() {
         target["table"].as_str().expect("table").to_string(),
     ];
 
-    let run = rocky(dir, &["run", "--pipeline", "transform", "--models", "models"]);
+    let run = rocky(
+        dir,
+        &["run", "--pipeline", "transform", "--models", "models"],
+    );
     let run_keys: Vec<Vec<String>> = run["materializations"]
         .as_array()
         .expect("materializations array")
