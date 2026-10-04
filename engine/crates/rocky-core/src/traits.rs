@@ -1034,6 +1034,31 @@ pub trait SqlDialect: Send + Sync {
         format!("CREATE TABLE {target} AS\n{select_sql}")
     }
 
+    /// `CREATE TABLE … AS` carrying a model's `[redshift]` table attributes
+    /// (`DISTSTYLE` / `DISTKEY` / `SORTKEY`).
+    ///
+    /// `replace` selects the full-refresh form (replace an existing table,
+    /// like [`SqlDialect::create_table_as`]) or the first-run form (fail if
+    /// the table exists, like [`SqlDialect::create_table_as_new`]).
+    ///
+    /// The default refuses: only the Redshift dialect has these attributes,
+    /// and silently dropping them would build a table with the wrong
+    /// distribution. A model that sets `[redshift]` and targets another
+    /// warehouse fails at SQL generation with this message.
+    fn create_table_as_with_redshift_options(
+        &self,
+        _target: &str,
+        _select_sql: &str,
+        _options: &rocky_ir::RedshiftTableOptions,
+        _replace: bool,
+    ) -> AdapterResult<String> {
+        Err(AdapterError::msg(format!(
+            "the model sets `[redshift]` table options (dist_key / sort_key), which only the \
+             redshift adapter applies; this model targets {}",
+            self.name()
+        )))
+    }
+
     /// INSERT INTO ... SELECT (incremental append).
     fn insert_into(&self, target: &str, select_sql: &str) -> String;
 
@@ -1288,6 +1313,26 @@ pub trait SqlDialect: Send + Sync {
         partition_filter: &str,
         select_sql: &str,
     ) -> AdapterResult<Vec<String>>;
+
+    /// The statements a `delete_insert` model executes, from its DELETE and
+    /// INSERT.
+    ///
+    /// Default: the two as separate statements, run in order — so the
+    /// DELETE commits before the INSERT runs. A dialect whose connector runs
+    /// a `;`-joined string as one transaction (PostgreSQL / Redshift) joins
+    /// them, so a failed INSERT leaves the deleted rows in place.
+    fn delete_insert_statements(&self, delete_sql: String, insert_sql: String) -> Vec<String> {
+        vec![delete_sql, insert_sql]
+    }
+
+    /// `Some(reason)` when this dialect cannot run the generic SCD2 snapshot
+    /// SQL (`CREATE TABLE IF NOT EXISTS … AS`, `MERGE INTO … AS target`
+    /// with a conditional `WHEN MATCHED AND …`). Snapshot generation refuses
+    /// with the reason instead of emitting SQL the warehouse rejects.
+    /// Default `None`: every dialect that predates the hook runs it.
+    fn snapshot_unsupported_reason(&self) -> Option<&'static str> {
+        None
+    }
 
     /// DELETE FROM ... WHERE ... for delete+insert strategy.
     /// Default implementation uses ANSI SQL.

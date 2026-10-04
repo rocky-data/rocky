@@ -492,6 +492,13 @@ pub fn compile_project(
     //    a first-run warehouse rejection. (FR-044)
     let lakehouse_diagnostics = typecheck::check_lakehouse_format_options(&project.models);
 
+    // 9b. Redshift `[redshift]` table options (E052 / W052).
+    let redshift_diagnostics = crate::redshift_options::check_redshift_table_options(
+        &project.models,
+        &type_check.typed_models,
+        &semantic_graph,
+    );
+
     // 10. Merge all diagnostics.
     let mut diagnostics = type_check.diagnostics.clone();
     diagnostics.extend(contract_diagnostics.iter().cloned());
@@ -500,6 +507,7 @@ pub fn compile_project(
     diagnostics.extend(freshness_diagnostics);
     diagnostics.extend(model_freshness_diagnostics);
     diagnostics.extend(lakehouse_diagnostics);
+    diagnostics.extend(redshift_diagnostics);
     diagnostics.extend(run_var_diagnostics);
     diagnostics.extend(target_collision_diagnostics(&project));
     // E041 / W041: direct references to columns absent from a source schema
@@ -770,6 +778,12 @@ pub fn compile_incremental(
     // E035: managed-Iceberg format_options, mirroring the full-compile path so
     // the LSP (incremental) surface matches `rocky compile`. (FR-044)
     let lakehouse_diagnostics = typecheck::check_lakehouse_format_options(&project.models);
+    // E052 / W052, mirroring the full-compile path.
+    let redshift_diagnostics = crate::redshift_options::check_redshift_table_options(
+        &project.models,
+        &type_check.typed_models,
+        &semantic_graph,
+    );
 
     let mut diagnostics = type_check.diagnostics.clone();
     diagnostics.extend(contract_diagnostics.iter().cloned());
@@ -778,6 +792,7 @@ pub fn compile_incremental(
     diagnostics.extend(freshness_diagnostics);
     diagnostics.extend(model_freshness_diagnostics);
     diagnostics.extend(lakehouse_diagnostics);
+    diagnostics.extend(redshift_diagnostics);
     diagnostics.extend(run_var_diagnostics);
     diagnostics.extend(target_collision_diagnostics(&project));
     // E041 / W041: direct references to columns absent from a source schema

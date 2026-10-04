@@ -675,6 +675,11 @@ pub struct RawModelConfig {
     pub format: Option<LakehouseFormat>,
     #[serde(default)]
     pub format_options: Option<LakehouseOptions>,
+    /// Amazon Redshift table attributes from a `[redshift]` sidecar block.
+    /// Folded into [`LakehouseOptions::redshift`] on resolve, so it reaches
+    /// the IR (and the recipe hash) through `format_options`.
+    #[serde(default)]
+    pub redshift: Option<rocky_ir::RedshiftTableOptions>,
     /// Column classification tags from the `[classification]` sidecar
     /// block. See [`ModelConfig::classification`].
     #[serde(default)]
@@ -1413,7 +1418,21 @@ fn resolve_model_config(
         freshness,
         tests,
         format: raw.format,
-        format_options: raw.format_options,
+        // An empty `[redshift]` block sets nothing; it must not make another
+        // dialect refuse the model.
+        format_options: match raw
+            .redshift
+            .filter(|r| *r != rocky_ir::RedshiftTableOptions::default())
+        {
+            // `[redshift]` wins over a `[format_options.redshift]` spelling of
+            // the same thing; both land in one place.
+            Some(redshift) => {
+                let mut opts = raw.format_options.unwrap_or_default();
+                opts.redshift = Some(redshift);
+                Some(opts)
+            }
+            None => raw.format_options,
+        },
         classification: raw.classification,
         tags,
         governance,

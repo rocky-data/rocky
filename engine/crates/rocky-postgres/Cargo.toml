@@ -1,0 +1,32 @@
+[package]
+name = "rocky-postgres"
+version = "1.76.0"
+description = "PostgreSQL and Amazon Redshift warehouse adapters for Rocky"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rocky-core = { path = "../rocky-core" }
+rocky-ir = { path = "../rocky-ir" }
+rocky-sql = { path = "../rocky-sql" }
+async-trait = { workspace = true }
+chrono = { workspace = true }
+futures = { workspace = true }
+rustls = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-postgres = { workspace = true }
+tokio-rustls = { workspace = true }
+tracing = { workspace = true }
+webpki-roots = { workspace = true }
+
+[dev-dependencies]
+# `test-support` exposes `MetadataColumn::new_unchecked`, which the dialect
+# tests use to build the hostile metadata columns `select_clause` must refuse.
+rocky-ir = { path = "../rocky-ir", features = ["test-support"] }
+tokio = { workspace = true }
+
+[lints]
+workspace = true

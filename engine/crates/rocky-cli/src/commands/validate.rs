@@ -697,6 +697,34 @@ fn validate_adapter(
                 field: None,
             });
         }
+        "postgres" | "redshift" => {
+            // Same parse the registry runs before connecting, so a missing
+            // host / database / username or an unknown `extra` key is
+            // reported here rather than at `rocky run`.
+            let parsed = crate::registry::redshift_late_binding_views(name, adapter)
+                .and_then(|_| crate::registry::postgres_config(name, adapter));
+            match parsed {
+                Ok(_) => msgs.push(ValidateMessage {
+                    severity: "ok".into(),
+                    code: "V010".into(),
+                    message: format!("adapter.{name}: {}", adapter.adapter_type),
+                    file: None,
+                    field: None,
+                }),
+                Err(e) => {
+                    ok = false;
+                    // `warn`, like the Databricks missing-host check: the
+                    // same problem fails `rocky run` with this message.
+                    msgs.push(ValidateMessage {
+                        severity: "warn".into(),
+                        code: "V011".into(),
+                        message: format!("{e:#}"),
+                        file: None,
+                        field: Some(format!("adapter.{name}")),
+                    });
+                }
+            }
+        }
         "airbyte" => {
             msgs.push(ValidateMessage {
                 severity: "ok".into(),
@@ -3847,7 +3875,7 @@ schema_template = "demo"
         let out = validate_toml(
             r#"
 [adapter.mystery]
-type = "postgres"
+type = "clickhouse"
 
 [pipeline.poc]
 type = "replication"
@@ -3868,13 +3896,13 @@ schema_template = "demo"
         );
         let unknown: Vec<_> = out.messages.iter().filter(|m| m.code == "V017").collect();
         assert_eq!(unknown.len(), 1);
-        assert!(unknown[0].message.contains("postgres"));
+        assert!(unknown[0].message.contains("clickhouse"));
         // An unknown adapter type is a hard error: `rocky run` rejects it,
         // so `rocky validate` must report `valid = false` (non-zero exit),
         // not a cosmetic warning.
         assert_eq!(unknown[0].severity, "error");
         assert!(!out.valid, "unknown adapter type must invalidate config");
-        // No close match for "postgres" — message lists supported types
+        // No close match for "clickhouse" — message lists supported types
         // but offers no suggestion.
         assert!(unknown[0].message.contains("Supported:"));
         assert!(!unknown[0].message.contains("Did you mean"));

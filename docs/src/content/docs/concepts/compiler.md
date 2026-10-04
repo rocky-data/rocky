@@ -407,6 +407,7 @@ span, and sometimes a suggested fix.
 | `E049` | A `type = "snapshot"` model has an invalid config: no `unique_key` or `strategy`, `timestamp` without `updated_at`, `check` without `check_cols`, a key or change column that is an expression, an `updated_at` or `check_cols` entry the model's explicit SELECT does not output, a key computed with `random()`/`uuid()`/`now()`, or an output column named like a snapshot metadata column |
 | `E047` | A model reads a `private` model outside its ownership group, or a producer model that is not `public` (see [Model governance](/concepts/model-governance/)) |
 | `E048` | A model-version problem: undeclared latest version, missing version file, or a reference to an undeclared version |
+| `E052` | A model's `[redshift]` table options cannot render (an invalid or contradictory `dist_key` / `sort_key`), or sit on a strategy that builds no table. See [Redshift](/reference/adapters/redshift/#table-distribution-and-sort-keys) |
 | `W001` | Unused model (no downstream consumers) |
 | `W002` | Duplicate column in model output |
 | `W004` | Classification tag with no matching `[mask]` strategy |
@@ -426,6 +427,7 @@ span, and sometimes a suggested fix.
 | `W046` | An `incremental` model sets `lookback` without `unique_key`, so the re-read window is appended again on each run |
 | `W049` | A `type = "snapshot"` model is valid but risky: a `unique_key` the SELECT does not output (it may be a `[[surrogate_key]]` column), `check` over more than 20 columns, an `updated_at` that is not a timestamp or date, or a key or change column missing from a `SELECT *` model's compile-time schema (which may be stale) |
 | `W048` | A model reads a model version whose `deprecation_date` has passed or is less than 30 days away |
+| `W052` | A `[redshift]` `dist_key` or `sort_key` column is not in the model's output |
 | `I001` | Model dependency inferred from SQL |
 | `I002` | Some, but not all, output columns have unknown types — provide source schemas for more type checking |
 | `I003` | A contract declares a type for a column whose type Rocky could not infer, so `E011` did not check it |

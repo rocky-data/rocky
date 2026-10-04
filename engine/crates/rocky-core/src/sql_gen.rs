@@ -327,6 +327,22 @@ pub fn generate_transformation_sql_with_warehouse(
         dialect.format_table_ref(&source.catalog, &source.schema, &source.table)?;
     }
 
+    // `[redshift]` table attributes shape a table's first CREATE. A view, a
+    // materialized view or a dynamic table has no such CREATE here, and the
+    // lakehouse DDL has its own grammar — refuse rather than drop them.
+    let redshift_options = redshift_table_options(model_ir);
+    if let Some(_opts) = redshift_options
+        && (model_ir.format.is_some()
+            || matches!(
+                model_ir.materialization,
+                MaterializationStrategy::View
+                    | MaterializationStrategy::MaterializedView
+                    | MaterializationStrategy::DynamicTable { .. }
+            ))
+    {
+        return Err(redshift_options_refused(model_ir));
+    }
+
     // `FullRefresh` rebuilds the whole table every run, so it always emits a
     // format-aware CTAS here when a lakehouse `format` is set. The other
     // strategies that create a table on first run (Merge and DeleteInsert)
@@ -369,7 +385,15 @@ pub fn generate_transformation_sql_with_warehouse(
             if dialect.full_refresh_needs_predrop() {
                 stmts.push(dialect.drop_table_sql(&target));
             }
-            stmts.push(dialect.create_table_as(&target, &model_ir.sql));
+            match redshift_options {
+                Some(opts) => stmts.push(dialect.create_table_as_with_redshift_options(
+                    &target,
+                    &model_ir.sql,
+                    opts,
+                    true,
+                )?),
+                None => stmts.push(dialect.create_table_as(&target, &model_ir.sql)),
+            }
             Ok(stmts)
         }
         MaterializationStrategy::Incremental { .. } => {
@@ -463,7 +487,7 @@ pub fn generate_transformation_sql_with_warehouse(
                 source_sql = model_ir.sql,
             );
             let insert_sql = dialect.insert_into(&target, &model_ir.sql);
-            Ok(vec![delete_sql, insert_sql])
+            Ok(dialect.delete_insert_statements(delete_sql, insert_sql))
         }
         MaterializationStrategy::Microbatch { .. } => {
             Err(microbatch_transformation_refused(model_ir))
@@ -582,6 +606,9 @@ pub fn generate_time_interval_bootstrap_sql(
     };
 
     let body = substitute_partition_placeholders(&model_ir.sql, &bootstrap_window);
+    if redshift_table_options(model_ir).is_some() && model_ir.format.is_some() {
+        return Err(redshift_options_refused(model_ir));
+    }
 
     // When a lakehouse format is specified, the bootstrap table must be
     // created using format-specific DDL (e.g., USING DELTA / USING ICEBERG)
@@ -600,6 +627,9 @@ pub fn generate_time_interval_bootstrap_sql(
         return Ok(stmts.join(";\n"));
     }
 
+    if let Some(opts) = redshift_table_options(model_ir) {
+        return Ok(dialect.create_table_as_with_redshift_options(&target, &body, opts, false)?);
+    }
     Ok(dialect.create_table_as_new(&target, &body))
 }
 
@@ -692,6 +722,9 @@ pub fn generate_transformation_initial_ddl(
         | MaterializationStrategy::ContentAddressed { .. } => body.to_string(),
     };
 
+    if redshift_table_options(model_ir).is_some() && model_ir.format.is_some() {
+        return Err(redshift_options_refused(model_ir));
+    }
     if let Some(ref format) = model_ir.format {
         let opts = model_ir
             .format_options
@@ -703,7 +736,35 @@ pub fn generate_transformation_initial_ddl(
         )?);
     }
 
+    if let Some(opts) = redshift_table_options(model_ir) {
+        return Ok(vec![dialect.create_table_as_with_redshift_options(
+            &target,
+            &body,
+            opts,
+            false,
+        )?]);
+    }
     Ok(vec![dialect.create_table_as_new(&target, &body)])
+}
+
+/// The model's `[redshift]` table attributes, when it declares any.
+fn redshift_table_options(model_ir: &ModelIr) -> Option<&rocky_ir::RedshiftTableOptions> {
+    model_ir
+        .format_options
+        .as_ref()
+        .and_then(|o| o.redshift.as_ref())
+}
+
+/// `[redshift]` table attributes on a model with no plain table CREATE to
+/// carry them (a view / materialized view / dynamic table, or a lakehouse
+/// `format`). `rocky compile` reports the same thing as E052.
+fn redshift_options_refused(model_ir: &ModelIr) -> SqlGenError {
+    SqlGenError::InvalidRequest(format!(
+        "model '{}': `[redshift]` table options (dist_key / sort_key) apply only to a table \
+         created with CREATE TABLE AS — not to a view, materialized view, dynamic table or a \
+         lakehouse `format` (E052)",
+        model_ir.name
+    ))
 }
 
 /// The incremental-run statement of a transformation `incremental` model.
@@ -1189,6 +1250,13 @@ pub fn generate_snapshot_sql(
 ) -> Result<Vec<String>, SqlGenError> {
     if model_ir.variant() != ModelIrVariant::Snapshot {
         return Err(variant_mismatch(model_ir, "Snapshot"));
+    }
+    if let Some(reason) = dialect.snapshot_unsupported_reason() {
+        return Err(SqlGenError::InvalidRequest(format!(
+            "snapshot '{}' cannot run on {}: {reason}",
+            model_ir.name,
+            dialect.name()
+        )));
     }
     let source_ref = model_ir
         .source
@@ -2210,6 +2278,50 @@ FROM source_catalog.src__acme__us_west__shopify.orders";
         )
     }
 
+    fn with_redshift_options(mut ir: ModelIr) -> ModelIr {
+        ir.format_options = Some(rocky_ir::LakehouseOptions {
+            redshift: Some(rocky_ir::RedshiftTableOptions {
+                dist_key: Some("id".into()),
+                ..Default::default()
+            }),
+            ..rocky_ir::LakehouseOptions::default()
+        });
+        ir
+    }
+
+    /// `[redshift]` reaches the dialect hook on every table-creating path,
+    /// and a dialect without the hook refuses rather than dropping it.
+    #[test]
+    fn redshift_options_route_to_the_dialect_hook_or_refuse() {
+        let full = with_redshift_options(sample_transformation_ir());
+        let err = generate_transformation_sql(&full, &dialect()).unwrap_err();
+        assert!(err.to_string().contains("only the"), "{err}");
+
+        let mut merge = with_redshift_options(sample_transformation_ir());
+        merge.materialization = MaterializationStrategy::Merge {
+            unique_key: vec!["id".into()],
+            update_columns: rocky_ir::ColumnSelection::Explicit(vec!["name".into()]),
+        };
+        let err = generate_transformation_initial_ddl(&merge, &dialect()).unwrap_err();
+        assert!(err.to_string().contains("only the"), "{err}");
+
+        // Without options the same paths are unchanged.
+        assert!(generate_transformation_sql(&sample_transformation_ir(), &dialect()).is_ok());
+    }
+
+    #[test]
+    fn redshift_options_on_a_view_or_with_a_format_are_refused() {
+        let mut view = with_redshift_options(sample_transformation_ir());
+        view.materialization = MaterializationStrategy::View;
+        let err = generate_transformation_sql(&view, &dialect()).unwrap_err();
+        assert!(err.to_string().contains("E052"), "{err}");
+
+        let mut fmt = with_redshift_options(sample_transformation_ir());
+        fmt.format = Some(rocky_ir::LakehouseFormat::DeltaTable);
+        let err = generate_transformation_sql(&fmt, &dialect()).unwrap_err();
+        assert!(err.to_string().contains("E052"), "{err}");
+    }
+
     #[test]
     fn test_generate_materialized_view_sql() {
         let mut ir = sample_transformation_ir();
@@ -2490,6 +2602,7 @@ SELECT id, name, email FROM cat.sch.src WHERE active = true";
                 cluster_by: vec!["id".into()],
                 table_properties: vec![("delta.enableChangeDataFeed".into(), "true".into())],
                 comment: Some("Orders fact table".into()),
+                redshift: None,
             },
             MaterializationStrategy::FullRefresh,
         );

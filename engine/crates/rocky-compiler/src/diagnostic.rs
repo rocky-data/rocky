@@ -287,6 +287,17 @@ pub const E047: &str = "E047";
 /// reference to a version that is not declared (or to the bare name of a
 /// versioned model whose `latest_alias` is off).
 pub const E048: &str = "E048";
+/// A model's `[redshift]` table options cannot render.
+///
+/// Emitted by `rocky compile` (`redshift_options::check_redshift_table_options`)
+/// for an invalid `dist_key` / `sort_key` column name, a contradictory
+/// combination (`dist_style = "key"` without `dist_key`, `dist_key` with
+/// another `dist_style`, `sort_style = "auto"` with columns, more than 8
+/// interleaved sort columns), or `[redshift]` on a strategy that builds no
+/// table (`view`, `materialized_view`, `dynamic_table`, `content_addressed`,
+/// `ephemeral`) or alongside a lakehouse `format`. The option rules are shared
+/// with the Redshift dialect's SQL-generation guard, so the two cannot drift.
+pub const E052: &str = "E052";
 
 // Warnings
 /// Unused model (no downstream consumers).
@@ -460,6 +471,14 @@ pub const W049: &str = "W049";
 /// the latest version. The date is checked against today's UTC date, or
 /// `ROCKY_GOVERNANCE_TODAY` (`YYYY-MM-DD`) when set.
 pub const W048: &str = "W048";
+/// A `[redshift]` `dist_key` / `sort_key` names a column the model does not
+/// output.
+///
+/// Emitted only when the model's output columns are provably complete (the
+/// W006 guard). A warning, not an error, because that enumeration comes from
+/// lineage extraction; Redshift rejects the `CREATE TABLE` at run time if the
+/// column really is missing.
+pub const W052: &str = "W052";
 
 // Info
 /// Model dependency inferred from SQL.

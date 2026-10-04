@@ -322,8 +322,9 @@ The following are deferred:
 - **Rocky DSL placeholder syntax** — `@start_date` / `@end_date` are
   recognized in `.sql` files only. The `.rocky` parser will gain `@var`
   syntax in v1.1.
-- **Postgres adapter** — it doesn't exist yet. When it ships, `time_interval`
-  will route via a parent table plus a child-partition truncate.
+- **Native partitions on PostgreSQL and Redshift** — both adapters run
+  `time_interval` as `DELETE` then `INSERT` in one transaction. A
+  declarative-partition (child-table truncate) route is a follow-up.
 - **Sub-day granularities** below `hour` — belongs in streaming systems.
 - **Multi-column partitions** — single time column only in v1.
 - **Partition column transformations** — `time_column` must be a real

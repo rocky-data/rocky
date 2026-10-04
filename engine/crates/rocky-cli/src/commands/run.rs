@@ -9548,7 +9548,7 @@ pub(crate) fn rewrite_quote_style(
 ) -> Result<Option<char>> {
     match dialect.name() {
         // `format_table_ref` renders bare identifiers.
-        "duckdb" | "databricks" => Ok(None),
+        "duckdb" | "databricks" | "postgres" | "redshift" => Ok(None),
         // `format_table_ref` renders backticks; its own comment gives the
         // reason (project IDs may contain hyphens).
         "bigquery" => Ok(Some('`')),
@@ -9719,6 +9719,18 @@ pub(crate) fn dialect_case_rules(
         // Trino: "Identifiers are not treated as case sensitive" —
         // trino.io/docs/current/language/reserved.html
         "duckdb" | "databricks" | "trino" => Ok(uniform(false)),
+        // PostgreSQL folds an UNQUOTED identifier to lower case, and
+        // `PostgresDialect::format_table_ref` renders every target bare — so
+        // two configured targets differing only by case are created as ONE
+        // object, and an unquoted reference resolves onto it the same way.
+        // (A quoted mixed-case reference in user SQL names a different
+        // object; Rocky never creates one.) —
+        // postgresql.org/docs/current/sql-syntax-lexical.html
+        // Redshift: identifiers are case-insensitive and folded to lower case,
+        // quoted ones included, unless the session sets
+        // `enable_case_sensitive_identifier` (off by default) —
+        // docs.aws.amazon.com/redshift/latest/dg/r_names.html
+        "postgres" | "redshift" => Ok(uniform(false)),
         // Two targets differing only by case can name two objects.
         //
         // BigQuery: dataset and table names are case-sensitive by default, so

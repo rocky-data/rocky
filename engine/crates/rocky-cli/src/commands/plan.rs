@@ -723,6 +723,8 @@ pub(crate) fn dialect_for_adapter_type(
         "snowflake" => Box::new(rocky_snowflake::dialect::SnowflakeSqlDialect),
         "bigquery" => Box::new(rocky_bigquery::dialect::BigQueryDialect),
         "trino" => Box::new(rocky_trino::dialect::TrinoDialect),
+        "postgres" => Box::new(rocky_postgres::PostgresDialect::new()),
+        "redshift" => Box::new(rocky_postgres::RedshiftDialect::new()),
         #[cfg(feature = "duckdb")]
         "duckdb" => Box::new(rocky_duckdb::dialect::DuckDbSqlDialect),
         other => {
@@ -734,6 +736,17 @@ pub(crate) fn dialect_for_adapter_type(
             Box::new(rocky_databricks::dialect::DatabricksSqlDialect)
         }
     }
+}
+
+/// [`dialect_for_adapter_type`] for a whole `[adapter]` block, so options
+/// that change the rendered SQL (`postgres` `merge_mode`, `redshift`
+/// `late_binding_views`) reach the preview exactly as `rocky run` will use
+/// them.
+pub(crate) fn dialect_for_adapter(
+    adapter: &rocky_core::config::AdapterConfig,
+) -> Box<dyn rocky_core::traits::SqlDialect> {
+    crate::registry::postgres_dialect_for_config(adapter)
+        .unwrap_or_else(|| dialect_for_adapter_type(&adapter.adapter_type))
 }
 
 /// Resolve the dialect an OFFLINE renderer previews SQL in, refusing a
@@ -804,19 +817,20 @@ pub(crate) fn preview_dialect(
                     .unwrap_or_default()
             )
         })?;
-    let adapter_type = config
-        .and_then(|cfg| {
-            // Prefer the default replication pipeline's target adapter; fall
-            // back to the first adapter declared in the config.
-            let target_adapter_name = registry::resolve_replication_pipeline(&cfg, None)
-                .ok()
-                .map(|(_, pipeline)| pipeline.target.adapter.clone());
-            target_adapter_name
-                .and_then(|name| cfg.adapters.get(&name).map(|a| a.adapter_type.clone()))
-                .or_else(|| cfg.adapters.values().next().map(|a| a.adapter_type.clone()))
-        })
-        .unwrap_or_else(|| "duckdb".to_string());
-    Ok(dialect_for_adapter_type(&adapter_type))
+    let adapter = config.and_then(|cfg| {
+        // Prefer the default replication pipeline's target adapter; fall
+        // back to the first adapter declared in the config.
+        let target_adapter_name = registry::resolve_replication_pipeline(&cfg, None)
+            .ok()
+            .map(|(_, pipeline)| pipeline.target.adapter.clone());
+        target_adapter_name
+            .and_then(|name| cfg.adapters.get(&name).cloned())
+            .or_else(|| cfg.adapters.values().next().cloned())
+    });
+    Ok(match adapter {
+        Some(adapter) => dialect_for_adapter(&adapter),
+        None => dialect_for_adapter_type("duckdb"),
+    })
 }
 
 /// Resolve the configured target adapter's standalone [`SqlDialect`] from a
@@ -851,14 +865,10 @@ pub(crate) fn resolve_dialect_from_config(
     let (_name, pipeline) = registry::resolve_pipeline(rocky_cfg, None)
         .context("failed to resolve pipeline to determine the target dialect")?;
     let adapter_name = pipeline.target_adapter();
-    let adapter_type = rocky_cfg
-        .adapters
-        .get(adapter_name)
-        .map(|a| a.adapter_type.as_str())
-        .with_context(|| {
-            format!("pipeline target adapter '{adapter_name}' is not defined in [adapters]")
-        })?;
-    Ok(dialect_for_adapter_type(adapter_type))
+    let adapter = rocky_cfg.adapters.get(adapter_name).with_context(|| {
+        format!("pipeline target adapter '{adapter_name}' is not defined in [adapters]")
+    })?;
+    Ok(dialect_for_adapter(adapter))
 }
 
 /// Map a transformation [`MaterializationStrategy`] to the `purpose` label used
@@ -1128,13 +1138,11 @@ pub(crate) fn conditional_drops_from_models(
                     .target_adapter()
                     .to_string()
             };
-            let adapter_type = cfg
+            let adapter = cfg
                 .adapters
                 .get(&adapter_name)
-                .with_context(|| format!("target adapter '{adapter_name}' is not configured"))?
-                .adapter_type
-                .as_str();
-            dialect_for_adapter_type(adapter_type)
+                .with_context(|| format!("target adapter '{adapter_name}' is not configured"))?;
+            dialect_for_adapter(adapter)
         }
         None => preview_dialect(Some(config_path))?,
     };
@@ -1277,7 +1285,7 @@ fn plan_preview_output_for_pipeline(
                 .adapters
                 .get(&adapter_name)
                 .with_context(|| format!("target adapter '{adapter_name}' is not configured"))?;
-            dialect_for_adapter_type(&adapter.adapter_type)
+            dialect_for_adapter(adapter)
         }
         _ => preview_dialect(config_path)?,
     };

@@ -50,7 +50,10 @@ pub use compact_plan::CompactPlanIr;
 pub use dag::{DagError, DagNode, execution_layers, topological_sort};
 pub use incremental::{IncrementalLookback, LookbackUnit, OnSchemaChange};
 pub use ir::*;
-pub use lakehouse::{LakehouseError, LakehouseFormat, LakehouseOptions};
+pub use lakehouse::{
+    LakehouseError, LakehouseFormat, LakehouseOptions, RedshiftDistStyle, RedshiftSortStyle,
+    RedshiftTableOptions,
+};
 pub use lineage::{LineageEdge, QualifiedColumn};
 pub use mask::MaskStrategy;
 pub use snapshot::{

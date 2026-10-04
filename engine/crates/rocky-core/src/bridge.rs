@@ -368,7 +368,7 @@ mod tests {
 
     #[test]
     fn unknown_adapter_has_no_capabilities() {
-        let caps = adapter_capabilities("postgres");
+        let caps = adapter_capabilities("clickhouse");
         assert!(!caps.can_export);
         assert!(!caps.can_import);
         assert!(!caps.cloud_storage);

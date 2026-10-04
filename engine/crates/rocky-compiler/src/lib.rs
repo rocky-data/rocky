@@ -30,6 +30,7 @@ pub mod limits;
 pub mod operand_check;
 pub mod partial;
 pub mod project;
+pub mod redshift_options;
 pub mod resolve;
 pub mod salsa_compile;
 pub mod schema_cache;
