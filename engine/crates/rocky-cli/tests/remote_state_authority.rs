@@ -323,10 +323,14 @@ fn policy_freeze_download_failure_fails_closed() {
     .expect_err("a remote-backend freeze must fail closed when the download fails");
 
     harness.faults.clear();
+    // Since #1242 the download runs inside the ledger-seam session on every
+    // remote backend (CAS or not), so the failure surfaces with the seam's
+    // context, and the underlying download error below it.
     assert!(
-        format!("{err:#}")
-            .contains("failed to download remote state before recording the policy freeze"),
-        "the freeze seam must keep its existing fail-closed context; got: {err:#}"
+        format!("{err:#}").contains(
+            "failed to commit the policy freeze ledger transition to shared remote state"
+        ),
+        "the freeze seam must fail closed with the seam context; got: {err:#}"
     );
     assert_eq!(
         harness.faults.count(FaultOp::Put),

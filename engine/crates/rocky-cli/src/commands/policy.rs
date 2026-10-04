@@ -903,8 +903,8 @@ fn marker_error_to_sync(e: FreezeMarkerError) -> StateSyncError {
 /// With effective blob CAS, this command replays its exact ledger rows on a
 /// fresh shared `state.redb` blob and generation after a conflict. When CAS is
 /// off or unsupported, the legacy half-seam remains last-writer-wins. The
-/// enforcement truth that survives either mode — and the still-unconditional
-/// gc/apply blob writers during the partial #1228 rollout — is a separate
+/// enforcement truth that survives either mode — and any writer on the same
+/// state still running with `concurrency_control = "off"` — is a separate
 /// **add-wins marker set** beside the state file (see
 /// [`rocky_core::freeze_marker`]): `freeze` writes one create-once object
 /// `<prefix>/freeze/<freeze_id>.json` per principal, `unfreeze` writes
@@ -995,37 +995,17 @@ pub fn run_policy_freeze(
     } else {
         None
     };
-    let seam_cas = rocky_core::state_sync::cas_effective(&state_cfg);
-
-    // SEAM-SCOPED SYNC — download half. Pull the authoritative remote ledger
-    // (overwriting the local file) BEFORE opening the store, so the freeze is
-    // recorded on top of other pods' decisions rather than over an empty local.
+    // SEAM-SCOPED SYNC. A remote ledger is pulled and published only through
+    // the LedgerSeamSession below (#1242): it downloads the authoritative
+    // remote ledger inside each attempt, so the freeze is recorded on top of
+    // other pods' decisions rather than over a stale local file. Under
+    // effective CAS the bytes and generation are captured together; without
+    // it the session is the legacy one-download, one-upload half-seam.
     //
-    // Effective CAS moves this download into each LedgerSeamSession attempt so
-    // the installed bytes and generation are captured together. The legacy
-    // half-seam remains unchanged when CAS is off or unsupported.
-    if remote_state && !seam_cas {
-        // WP-01 PR-B (2b): the session half-seam owns the download shape; a
-        // successful download of either usable variant means the local ledger
-        // now mirrors remote truth; failure still `?`-bails fail-closed
-        // (unchanged).
-        let _authority =
-            block_on_state_sync(rocky_core::state_sync::RemoteStateSession::download_only(
-                &state_cfg,
-                state_path,
-                replicate_schema_cache,
-            ))
-            .with_context(|| {
-                "failed to download remote state before recording the policy freeze; \
-                 a remote-backend freeze requires the state backend to be reachable"
-            })?;
-    }
-
-    // Preserve the legacy open-before-timestamp ordering when CAS is inert.
-    // Under effective CAS, LedgerSeamSession opens and drops a fresh store in
-    // every attempt.
-    let legacy_store =
-        if seam_cas {
+    // The Local backend has no remote: the on-disk file IS the state, so the
+    // records are written straight to it (open-before-timestamp ordering).
+    let local_store =
+        if remote_state {
             None
         } else {
             Some(StateStore::open(state_path).with_context(|| {
@@ -1093,7 +1073,7 @@ pub fn run_policy_freeze(
             // auto-apply, so it carries no auto-apply custody.
             auto_apply: None,
         };
-        if let Some(store) = &legacy_store {
+        if let Some(store) = &local_store {
             store
                 .record_policy_decision(&record)
                 .context("failed to record the freeze decision to the ledger")?;
@@ -1108,15 +1088,9 @@ pub fn run_policy_freeze(
         });
     }
 
-    // SEAM-SCOPED SYNC — upload half, FAIL-CLOSED. Push the freeze back to the
-    // remote backend so the next `rocky run`'s start-download inherits it instead
-    // of reverting it. Drop the store first to release the advisory lock and
-    // flush the file. Durability is the whole point of a kill switch, so the
-    // upload is forced to `Fail` regardless of the configured `on_upload_failure`
-    // (default `skip`): a freeze that commits locally but never reaches the
-    // remote — while the command reports success — would leave every other pod
-    // unfrozen. A failed upload aborts (finding 5).
-    drop(legacy_store);
+    // Release the Local backend's store (advisory lock + flush) before the
+    // marker and seam work below.
+    drop(local_store);
 
     // Durable freeze markers are written BEFORE the ledger upload (engage
     // early): if the blob upload then fails, the un-erasable marker is
@@ -1141,12 +1115,14 @@ pub fn run_policy_freeze(
         }
     }
 
-    if seam_cas {
+    if remote_state {
         // Freeze is always allowed and has no dynamic authorization or
         // external proof to refresh. Its complete replayable transition is the
         // exact set of pre-constructed ledger records above. The marker is
         // deliberately outside this closure because its create-once UUID
-        // cannot be replayed.
+        // cannot be replayed. The session forces `on_upload_failure = "fail"`:
+        // a freeze that commits locally but never reaches the remote would
+        // leave every other pod unfrozen while the command reported success.
         let session = rocky_core::state_sync::LedgerSeamSession::new(
             &state_cfg,
             state_path,
@@ -1167,18 +1143,6 @@ pub fn run_policy_freeze(
                 || "failed to commit the policy freeze ledger transition to shared remote state",
             )?;
         debug_assert_eq!(committed_record_count, expected_record_count);
-    } else if remote_state {
-        // WP-01 PR-B (2b): the half-seam owns the forced-`Fail` durability
-        // policy (previously a local `StateConfig` clone here).
-        block_on_state_sync(
-            rocky_core::state_sync::RemoteStateSession::upload_only_fail_closed(
-                &state_cfg,
-                state_path,
-                "policy freeze",
-                replicate_schema_cache,
-            ),
-        )
-        .with_context(|| "failed to upload remote state after recording the policy freeze")?;
     }
 
     // The unfreeze marker lands only once the superseding audit row is
@@ -1798,9 +1762,14 @@ expcet = \"deny\"
             true,
         )
         .expect_err("a remote-backend freeze must abort when the backend is unreachable");
+        // Since #1242 the download runs inside the ledger-seam session on
+        // every remote backend, so the seam's context leads and the download
+        // failure sits below it in the chain.
         assert!(
-            err.to_string().contains("download remote state"),
-            "download-before-open must be wired and fatal on a remote backend: {err}"
+            format!("{err:#}").contains(
+                "failed to commit the policy freeze ledger transition to shared remote state"
+            ),
+            "download-before-open must be wired and fatal on a remote backend: {err:#}"
         );
         assert!(
             !state.exists(),

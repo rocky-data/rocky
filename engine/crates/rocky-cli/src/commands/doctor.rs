@@ -648,48 +648,27 @@ async fn collect_health_checks(
 /// a protected deployment is unprotected, which pushes an operator off a correct
 /// configuration.
 ///
-/// A remote backend never reports Healthy today — see *No remote deployment is
-/// fully protected yet* below. The three Warnings are worded apart so an
-/// operator can tell them apart from the message alone:
+/// One remote combination is Healthy and three are Warnings, each worded
+/// apart so an operator can tell them apart from the message alone:
 ///
+/// - `concurrency_control = "cas"` on a backend that **does** honour it —
+///   Healthy. Every write of the shared state object from this writer commits
+///   by compare-and-swap: the end-of-run upload, and every ledger seam
+///   (`rocky policy` freeze/unfreeze, `rocky gc`, `rocky restore`, and `rocky
+///   apply`'s governed rule decision and verify-after custody). Since #1242
+///   no production path uploads the shared object unconditionally under
+///   effective CAS — the old `upload_only_fail_closed` half-seam is deleted,
+///   not merely bypassed, so this verdict does not rest on a predicate that
+///   could lie. The message still says the guarantee is between writers that
+///   ALL run with `cas`: this check reads one config, so it cannot see a pod
+///   left on `off` against the same state.
 /// - `concurrency_control = "off"` on a backend that **would** honour `cas` —
 ///   you have not enabled it. Names the setting as the fix.
 /// - `concurrency_control = "cas"` on a backend that **cannot** honour it — you
 ///   enabled it and the engine silently downgrades to an unconditional upload,
 ///   so the config claims a protection the deployment does not have.
-/// - `concurrency_control = "cas"` on a backend that **does** honour it — runs
-///   are compare-and-swap protected, but the ledger-seam writers still are not.
-///
-/// # No remote deployment is fully protected yet
-///
-/// `docs/adr/ADR-CONCURRENCY.md` is normative: compare-and-swap applies to
-/// *every* remote state write, split by writer class. Most of it is now
-/// implemented — the end-of-run upload, `rocky policy` freeze/unfreeze, and
-/// (since #1372) `rocky gc` all commit through the compare-and-swap seam.
-///
-/// What is left is narrower than this arm used to claim, and the exposed set
-/// is not the one it named:
-///
-/// * `rocky restore` calls the unconditional
-///   [`upload_state`][rocky_core::state_sync::upload_state] on **every**
-///   remote backend, on every restore apply, including a failing one.
-/// * `rocky apply` of a RESTORE plan reaches the same unconditional upload,
-///   on every remote backend and with no `verify_after` involved: the
-///   `PlanKind::Restore` arm routes into `run_restore_apply_in`, which calls
-///   `upload_remote_ledger_fail_closed` on every path. "Fail-closed" there
-///   names the DURABILITY policy (the command fails if the upload fails), not
-///   a compare-and-swap — it funnels into the same `upload_state`.
-/// * `rocky apply` of any OTHER plan kind reaches that upload only for its
-///   verify-after custody rows, which are gated on a non-empty `verify_after`
-///   — so a project with no `[policy]` block never reaches it.
-///
-/// A concurrent restore can still silently erase a run's just-committed state.
-///
-/// That exposure is backend-independent, which is why `cas` on a
-/// conditional-write backend earns a Warning rather than a Healthy: a green
-/// verdict there would overclaim exactly as much as it would anywhere else.
-/// Issue #1228 tracks closing the seam half; when it lands, this arm is the one
-/// that becomes Healthy.
+/// - `concurrency_control = "off"` on a backend that cannot honour `cas`
+///   either.
 fn state_concurrency_check(
     config_path: &Path,
     verbose: bool,
@@ -735,32 +714,20 @@ fn state_concurrency_check(
     let cas_supported = rocky_core::state_sync::cas_supported_on(backend);
 
     let (status, message) = match (config.state.concurrency_control, cas_supported) {
-        // The best configuration available today, and still not Healthy: the
-        // remaining ledger-seam writers bypass CAS on every backend, so a green
-        // here would certify a protection no deployment currently has. This is
-        // the arm that flips to Healthy once the last seam lands.
-        (ConcurrencyControl::Cas, true) => {
-            suggestions.push(
-                "state_concurrency: end-of-run uploads, the `rocky policy` freeze/unfreeze \
-                 ledger write and `rocky gc` are compare-and-swap protected. `rocky restore` \
-                 still writes state unconditionally, as does `rocky apply` when `verify_after` \
-                 is configured — until issue #1228 lands, do not run those two concurrently \
-                 with a pipeline run"
-                    .into(),
-            );
-            (
-                HealthStatus::Warning,
-                format!(
-                    "[state] concurrency_control = \"cas\" protects this writer's end-of-run \
-                     upload, the `rocky policy` freeze/unfreeze ledger write and `rocky gc` on \
-                     the '{backend}' backend. `rocky restore` still uploads state \
-                     unconditionally on every backend, and `rocky apply` does so when \
-                     `verify_after` is configured — a concurrent one can silently overwrite a \
-                     run's committed state. Avoid running those alongside a pipeline run; \
-                     tracked in issue #1228"
-                ),
-            )
-        }
+        // Every writer of the shared object from this config commits by
+        // compare-and-swap (#1242 removed the last unconditional seam). The
+        // message keeps the one condition this check cannot see.
+        (ConcurrencyControl::Cas, true) => (
+            HealthStatus::Healthy,
+            format!(
+                "[state] concurrency_control = \"cas\" protects every state write from this \
+                 writer on the '{backend}' backend: the end-of-run upload and the ledger seams \
+                 (`rocky policy`, `rocky gc`, `rocky restore`, `rocky apply`) all commit by \
+                 compare-and-swap. The protection holds between writers that all run with \
+                 \"cas\" — a writer on this state with concurrency_control = \"off\" still \
+                 uploads unconditionally"
+            ),
+        ),
         // Requested but unsupported. Distinct from the `off` cases on purpose:
         // the operator has already made the right decision and the engine is
         // silently not honouring it, so the wording must not read as "you
@@ -1433,12 +1400,12 @@ mod tests {
         );
     }
 
-    /// `cas` on a conditional-write backend is the best configuration available
-    /// today and still must not report Healthy: the ledger-seam writers bypass
-    /// compare-and-swap on every backend, so a green here would certify a
-    /// protection no deployment currently has.
+    /// `cas` on a conditional-write backend is Healthy since #1242: every
+    /// writer of the shared object, the ledger seams included, commits by
+    /// compare-and-swap. The message must still name the one condition the
+    /// check cannot see — a writer left on `off`.
     #[tokio::test]
-    async fn cas_on_an_object_store_backend_warns_about_the_seam_writers() {
+    async fn cas_on_an_object_store_backend_is_healthy_once_every_seam_is_cas() {
         let checks = state_concurrency_checks(
             "backend = \"s3\"\nconcurrency_control = \"cas\"\ns3_bucket = \"example\"\n",
         )
@@ -1448,48 +1415,43 @@ mod tests {
             .find(|c| c.name == "state_concurrency")
             .expect("a remote backend must emit the check");
         assert!(
-            matches!(check.status, HealthStatus::Warning),
-            "seam writers bypass CAS, so this must not be Healthy, got {:?}",
+            matches!(check.status, HealthStatus::Healthy),
+            "every writer commits by CAS, so this must be Healthy, got {:?}",
             check.status,
         );
+        for writer in [
+            "end-of-run",
+            "rocky policy",
+            "rocky gc",
+            "rocky restore",
+            "rocky apply",
+        ] {
+            assert!(
+                check.message.contains(writer),
+                "the message must name `{writer}` as protected: {}",
+                check.message,
+            );
+        }
         assert!(
-            check.message.contains("end-of-run"),
-            "the message must say what IS protected: {}",
-            check.message,
-        );
-        // Pin the CORRECTED writer list (#1372 migrated gc; restore is what is
-        // left). A `contains("rocky gc") && contains("unconditionally")` check
-        // passes against BOTH the old and the corrected message — `rocky gc`
-        // now appears in the protected list and `unconditionally` refers to
-        // restore — so it cannot tell the true claim from the false one.
-        assert!(
-            check.message.contains("rocky restore") && check.message.contains("unconditionally"),
-            "the message must name `rocky restore`, the only unconditionally exposed \
-             writer left, as bypassing CAS: {}",
-            check.message,
-        );
-        let protected_half = check
-            .message
-            .split("still uploads state")
-            .next()
-            .unwrap_or("");
-        assert!(
-            protected_half.contains("rocky gc"),
-            "`rocky gc` has been compare-and-swap protected since #1372, so it must appear \
-             in the PROTECTED half of the message, not among the bypassing writers: {}",
+            !check
+                .message
+                .contains("still uploads state unconditionally on every backend"),
+            "no seam bypasses CAS any more: {}",
             check.message,
         );
         assert!(
-            check.message.contains("#1228"),
-            "the message must point at the tracking issue: {}",
+            check
+                .message
+                .contains("concurrency_control = \"off\" still uploads unconditionally"),
+            "the message must say the guarantee needs every writer on cas: {}",
             check.message,
         );
     }
 
-    /// Every remote combination is a Warning today, and each of the four is
-    /// distinguishable from its message alone — an operator has to be able to
-    /// tell "not enabled" from "cannot be honoured" from "runs protected, seams
-    /// are not" without reading the source.
+    /// Each of the four remote combinations is distinguishable from its message
+    /// alone — an operator has to be able to tell "not enabled" from "cannot be
+    /// honoured" from "protected" without reading the source. Only effective
+    /// CAS is Healthy.
     #[tokio::test]
     async fn every_remote_warning_is_distinguishable_from_its_message() {
         let cases = [
@@ -1508,7 +1470,7 @@ mod tests {
             ),
             (
                 "backend = \"s3\"\ns3_bucket = \"example\"\nconcurrency_control = \"cas\"\n",
-                "#1228",
+                "all commit by compare-and-swap",
             ),
         ];
 
@@ -1519,9 +1481,11 @@ mod tests {
                 .iter()
                 .find(|c| c.name == "state_concurrency")
                 .expect("a remote backend must emit the check");
-            assert!(
-                matches!(check.status, HealthStatus::Warning),
-                "no remote configuration is fully protected yet, got {:?} for {block}",
+            let effective = block.contains("s3") && block.contains("\"cas\"");
+            assert_eq!(
+                matches!(check.status, HealthStatus::Healthy),
+                effective,
+                "only effective CAS is Healthy, got {:?} for {block}",
                 check.status,
             );
             assert!(
@@ -1544,9 +1508,8 @@ mod tests {
     /// remote backend and both settings: the check reports `cas` as taking
     /// effect exactly when `cas_effective` says compare-and-swap really happens.
     ///
-    /// Status alone can no longer carry this property — every remote case is a
-    /// Warning until the seam writers stop bypassing CAS — so the assertion is
-    /// on which *message class* is emitted. This is what keeps the check correct
+    /// Both the status (Healthy exactly when CAS is effective) and the
+    /// *message class* must track the predicate. This is what keeps the check correct
     /// when a backend gains compare-and-swap support: a stale hardcoded list
     /// would tell an operator their `cas` setting is a no-op when it is in fact
     /// working, pushing them off a correct configuration.
@@ -1587,19 +1550,19 @@ mod tests {
                     .find(|c| c.name == "state_concurrency")
                     .unwrap_or_else(|| panic!("{backend} must emit the check"));
 
-                // Nothing is fully protected until the seam writers stop
-                // bypassing compare-and-swap.
-                assert!(
-                    matches!(check.status, HealthStatus::Warning),
-                    "{backend} + {control}: every remote case warns today, got {:?}",
-                    check.status,
-                );
-
                 let effective = rocky_core::state_sync::cas_effective(&StateConfig {
                     backend,
                     concurrency_control: control,
                     ..StateConfig::default()
                 });
+                // Healthy exactly when every write commits by CAS (#1242).
+                assert_eq!(
+                    matches!(check.status, HealthStatus::Healthy),
+                    effective,
+                    "{backend} + {control}: Healthy must track cas_effective \
+                     (effective={effective}), got {:?}",
+                    check.status,
+                );
                 // "is a no-op" is the phrase reserved for a `cas` request the
                 // backend cannot honour. It must appear exactly when the engine
                 // says compare-and-swap does NOT take effect — that equivalence
@@ -1615,9 +1578,9 @@ mod tests {
                 );
                 if effective {
                     assert!(
-                        check.message.contains("#1228"),
-                        "{backend} + {control}: an effective-CAS writer must be told what is \
-                         still unprotected — {}",
+                        check.message.contains("still uploads unconditionally"),
+                        "{backend} + {control}: an effective-CAS writer must be told the \
+                         guarantee needs every writer on cas — {}",
                         check.message,
                     );
                 }
