@@ -251,21 +251,124 @@ pub fn render_json_placeholders(value: serde_json::Value) -> serde_json::Value {
 
 /// A copy of `value` with every registered value in it written as `${NAME}`.
 ///
-/// Serializes to JSON, renders every string with [`render_json_placeholders`]
-/// and reads the result back as the same type. For an output struct that
-/// embeds a config type wholesale, such as a model's `TargetConfig` in
-/// `rocky compile` (#1919), so its JSON schema stays the config type's own.
+/// Serializes to JSON, renders every string VALUE with
+/// [`render_placeholders`] and reads the result back as the same type. For an
+/// output struct that embeds a config type wholesale, so its JSON schema stays
+/// the config type's own.
+///
+/// Two things are never rewritten, because the type reads them back as
+/// structure rather than as text:
+///
+/// - **Object keys.** A key is a field name or a map key. Rewriting
+///   `timestamp_column` because a value is `timestamp` would make the copy
+///   unreadable (#1919 follow-up).
+/// - **A string the type will not accept in the `${NAME}` form.** An enum tag
+///   such as `#[serde(tag = "type")]`'s `"incremental"`, or a unit variant,
+///   comes from the type's own fixed vocabulary. If rendering every string at
+///   once produces a document the type rejects, each string is rendered on its
+///   own and kept only where the type still accepts it. A string left as it was
+///   is one the schema spells out, so printing it discloses nothing the schema
+///   does not.
 ///
 /// The returned copy is for printing only. Its strings are placeholders, not
 /// the values the code runs with.
+///
+/// # Errors
+///
+/// Only when `T` does not round-trip through JSON on its own, before any
+/// rendering. A rendered form the type rejects is never an error.
 pub fn render_placeholders_in<T>(value: &T) -> Result<T, serde_json::Error>
 where
     T: serde::Serialize + serde::de::DeserializeOwned,
 {
+    let resolved = serde_json::to_value(value)?;
     if is_empty() {
-        return serde_json::from_value(serde_json::to_value(value)?);
+        return serde_json::from_value(resolved);
     }
-    serde_json::from_value(render_json_placeholders(serde_json::to_value(value)?))
+    if let Ok(rendered) = serde_json::from_value(render_json_string_values(resolved.clone())) {
+        return Ok(rendered);
+    }
+    // One leaf at a time, keeping each rendering the type still accepts.
+    let mut current = resolved;
+    let mut paths = Vec::new();
+    collect_string_leaf_paths(&current, &mut Vec::new(), &mut paths);
+    for path in paths {
+        let mut candidate = current.clone();
+        let Some(serde_json::Value::String(leaf)) = json_at_path_mut(&mut candidate, &path) else {
+            continue;
+        };
+        let rendered = render_placeholders(leaf);
+        if rendered == *leaf {
+            continue;
+        }
+        *leaf = rendered;
+        if serde_json::from_value::<T>(candidate.clone()).is_ok() {
+            current = candidate;
+        }
+    }
+    serde_json::from_value(current)
+}
+
+/// [`render_placeholders`] over every string value in a JSON document, at any
+/// depth. Object keys are left as they are (see [`render_placeholders_in`]).
+fn render_json_string_values(value: serde_json::Value) -> serde_json::Value {
+    use serde_json::Value;
+    match value {
+        Value::String(s) => Value::String(render_placeholders(&s)),
+        Value::Array(items) => {
+            Value::Array(items.into_iter().map(render_json_string_values).collect())
+        }
+        Value::Object(map) => Value::Object(
+            map.into_iter()
+                .map(|(k, v)| (k, render_json_string_values(v)))
+                .collect(),
+        ),
+        other => other,
+    }
+}
+
+/// One step into a JSON document: an object key or an array index.
+#[derive(Clone)]
+enum JsonStep {
+    Key(String),
+    Index(usize),
+}
+
+/// The path of every string leaf in `value`, in document order.
+fn collect_string_leaf_paths(
+    value: &serde_json::Value,
+    prefix: &mut Vec<JsonStep>,
+    out: &mut Vec<Vec<JsonStep>>,
+) {
+    use serde_json::Value;
+    match value {
+        Value::String(_) => out.push(prefix.clone()),
+        Value::Array(items) => {
+            for (i, item) in items.iter().enumerate() {
+                prefix.push(JsonStep::Index(i));
+                collect_string_leaf_paths(item, prefix, out);
+                prefix.pop();
+            }
+        }
+        Value::Object(map) => {
+            for (k, v) in map {
+                prefix.push(JsonStep::Key(k.clone()));
+                collect_string_leaf_paths(v, prefix, out);
+                prefix.pop();
+            }
+        }
+        _ => {}
+    }
+}
+
+fn json_at_path_mut<'a>(
+    value: &'a mut serde_json::Value,
+    path: &[JsonStep],
+) -> Option<&'a mut serde_json::Value> {
+    path.iter().try_fold(value, |node, step| match step {
+        JsonStep::Key(k) => node.get_mut(k.as_str()),
+        JsonStep::Index(i) => node.get_mut(*i),
+    })
 }
 
 /// Whether anything has been registered.
@@ -394,6 +497,65 @@ mod tests {
             .filter(|(v, _)| v == shared)
             .collect();
         assert_eq!(matches.len(), 1, "one entry per value");
-        assert_eq!(matches[0].1, "${ROCKY_FIRST_NAME}", "first name wins");
+        assert_eq!(
+            matches[0].1, "${ROCKY_FIRST_NAME}",
+            "first name wins"
+        );
+    }
+
+    /// The shape of `StrategyConfig` the round-trip has to survive: an
+    /// internally tagged enum with a field named like a value. The registry is
+    /// process-global, so the tag and the field name are made unique here
+    /// rather than reusing `incremental` / `timestamp_column`, which would
+    /// rewrite other tests' text.
+    #[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+    #[serde(tag = "type")]
+    enum Tagged {
+        #[serde(rename = "rockytagmodeqq")]
+        Incremental { rockykeyzzqq_column: String },
+        #[serde(rename = "rockyunitmodeqq")]
+        FullRefresh,
+    }
+
+    /// #1919 follow-up: a registered value equal to an enum tag (`type =
+    /// "${MODE}"` resolving to `incremental`) cannot be rendered, because the
+    /// type would no longer read back. The copy keeps the tag and still
+    /// renders every other string.
+    #[test]
+    fn render_placeholders_in_keeps_an_enum_tag_the_type_needs() {
+        register_substitution("ROCKY_T1919_TAG_MODE", "rockytagmodeqq");
+        register_substitution("ROCKY_T1919_UNIT_MODE", "rockyunitmodeqq");
+        register_substitution("ROCKY_T1919_TAG_COL", "ROCKY-T1919-TAG-COLUMN-3f9a");
+        let value = Tagged::Incremental {
+            rockykeyzzqq_column: "ROCKY-T1919-TAG-COLUMN-3f9a".to_string(),
+        };
+        let out = render_placeholders_in(&value).expect("renders without failing");
+        assert_eq!(
+            out,
+            Tagged::Incremental {
+                rockykeyzzqq_column: "${ROCKY_T1919_TAG_COL}".to_string(),
+            }
+        );
+        assert_eq!(
+            render_placeholders_in(&Tagged::FullRefresh).expect("unit variant"),
+            Tagged::FullRefresh
+        );
+    }
+
+    /// #1919 follow-up: a registered value inside a field NAME (`timestamp`
+    /// inside `timestamp_column`) is never rewritten. Keys are structure.
+    #[test]
+    fn render_placeholders_in_never_rewrites_a_key() {
+        register_substitution("ROCKY_T1919_KEY_TS", "rockykeyzzqq");
+        let value = Tagged::Incremental {
+            rockykeyzzqq_column: "rockykeyzzqq".to_string(),
+        };
+        let out = render_placeholders_in(&value).expect("renders without failing");
+        assert_eq!(
+            out,
+            Tagged::Incremental {
+                rockykeyzzqq_column: "${ROCKY_T1919_KEY_TS}".to_string(),
+            }
+        );
     }
 }

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dagster as dg
+import pytest
 
 from dagster_rocky.partitions import (
     dagster_to_rocky_partition_key,
@@ -117,6 +118,33 @@ def test_model_with_time_interval_returns_partitions_def():
     )
     pdef = partitions_def_for_model_detail(model)
     assert isinstance(pdef, dg.DailyPartitionsDefinition)
+
+
+def test_compile_contract_first_partition_from_a_var():
+    """The dagster half of the engine-vs-dagster partition contract (#1919).
+
+    The engine half is ``engine/rocky/tests/compile_target_matches_run_asset_key.rs``
+    (``compile_prints_first_partition_and_model_names_resolved``): a
+    ``first_partition = "${VAR}"`` prints in ``models_detail[].strategy`` as
+    the resolved date. This test pins what dagster needs from that value: the
+    resolved date builds a partitions definition starting on it, while the
+    ``${NAME}`` placeholder #1919 briefly printed cannot be parsed at all.
+    """
+    printed = {
+        "type": "time_interval",
+        "time_column": "order_date",
+        "granularity": "day",
+        "first_partition": "2024-01-01",
+        "lookback": 0,
+        "batch_size": 1,
+    }
+    pdef = partitions_def_for_model_detail(_model(printed))
+    assert isinstance(pdef, dg.DailyPartitionsDefinition)
+    assert pdef.get_first_partition_key() == "2024-01-01"
+
+    placeholder = {**printed, "first_partition": "${ROCKY_T1919_FIRST}"}
+    with pytest.raises(Exception):  # noqa: B017 - any parse failure breaks the contract
+        partitions_def_for_model_detail(_model(placeholder))
 
 
 def test_model_with_full_refresh_returns_none():

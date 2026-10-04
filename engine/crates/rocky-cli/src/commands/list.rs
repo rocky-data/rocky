@@ -159,12 +159,9 @@ fn build_model_entries(models_dir: &Path) -> Result<Vec<ListModelEntry>> {
                 name: m.config.name.clone(),
                 target,
                 strategy,
-                depends_on: m
-                    .config
-                    .depends_on
-                    .iter()
-                    .map(|d| render_placeholders(d))
-                    .collect(),
+                // Model names print resolved, as `rocky run` prints them:
+                // consumers match `depends_on` against other models' names.
+                depends_on: m.config.depends_on.clone(),
                 has_contract: m.contract_path.is_some(),
             }
         })
@@ -358,8 +355,8 @@ mod tests {
 
     /// #1919: `rocky list adapters | sources | models --output json` print a
     /// resolved `${VAR}` value as `${NAME}`, never the value. A model's
-    /// `target` is the exception: it prints resolved, as `rocky run`'s
-    /// `asset_key` does.
+    /// `target` and `depends_on` are the exceptions: they print resolved, as
+    /// `rocky run` prints them, because consumers match on them.
     #[test]
     fn list_outputs_print_a_resolved_value_as_its_placeholder() {
         const SECRET: &str = "rocky1919listvalue77";
@@ -428,8 +425,10 @@ schema_template = "s__{source}"
         let sources = serde_json::to_string(&build_source_entries(&cfg)).unwrap();
         let models = models.expect("models load");
         assert_eq!(models[0].target, format!("{CATALOG}.s.m1"));
-        let models = serde_json::to_string(&models).unwrap();
-        for printed in [&adapters, &sources, &models] {
+        // A model name prints as `rocky run` prints it, so `depends_on`
+        // stays resolved for consumers that match it against model names.
+        assert_eq!(models[0].depends_on, vec![SECRET.to_string()]);
+        for printed in [&adapters, &sources] {
             assert!(!printed.contains(SECRET), "leaked: {printed}");
             assert!(printed.contains("${ROCKY_T1919_LIST}"), "{printed}");
         }

@@ -11,7 +11,8 @@ use rocky_compiler::diagnostic::{self, Diagnostic, Severity};
 use rocky_compiler::types::TypedColumn;
 use rocky_core::config as rocky_config;
 use rocky_core::macros::{expand_macros, load_macros_from_dir};
-use rocky_core::secret_registry::{render_placeholders, render_placeholders_in};
+use rocky_core::models::strategy_for_output;
+use rocky_core::secret_registry::render_placeholders;
 use rocky_sql::portability::{self, PortabilityIssue};
 use rocky_sql::pragma;
 use rocky_sql::transpile::Dialect;
@@ -379,14 +380,14 @@ fn compile_inner(
     // Re-apply model filter to diagnostics (may now include E027).
     // A diagnostic can quote a sidecar value (a target collision names the
     // resolved target), so its text prints each resolved `${VAR}` value as
-    // `${NAME}` (#1919).
+    // `${NAME}` (#1919). Its `model` is a model name and prints resolved:
+    // dagster-rocky matches it against a contract file's stem.
     let diagnostics: Vec<_> = result
         .diagnostics
         .iter()
         .filter(|d| in_scope(&d.model))
         .map(|d| Diagnostic {
             message: render_placeholders(&d.message).into(),
-            model: render_placeholders(&d.model),
             suggestion: d.suggestion.as_deref().map(render_placeholders),
             ..d.clone()
         })
@@ -408,32 +409,33 @@ fn compile_inner(
                     rocky_core::cost::Confidence::Low => "low".to_string(),
                 },
             });
-            // Sidecar values were `${VAR}`-expanded before parsing. Every
-            // field below except `target` is written with each resolved value
-            // as `${NAME}` (#1919). The copies are for printing only.
-            // `target` prints resolved on purpose: dagster-rocky matches the
-            // asset key it builds from it against `rocky run`'s `asset_key`,
-            // which carries the resolved coordinates.
-            let render = render_placeholders;
-            Ok(ModelDetail {
-                name: render(&model.config.name),
-                strategy: render_placeholders_in(&model.config.strategy)
-                    .context("failed to render the model strategy for output")?,
+            // Sidecar values were `${VAR}`-expanded before parsing. Tags print
+            // each resolved value as `${NAME}` (#1919). The rest prints
+            // resolved, exactly as `rocky run` and `rocky dag` print it,
+            // because dagster-rocky matches on it:
+            // - `name` / `depends_on`: matched against `rocky run`'s model
+            //   names, contract file stems and other models' names;
+            // - `target`: the asset key, matched against `rocky run`'s
+            //   `asset_key`;
+            // - `strategy` / `freshness`: structure (partition start and
+            //   grain, column names). See `strategy_for_output`.
+            ModelDetail {
+                name: model.config.name.clone(),
+                strategy: strategy_for_output(&model.config.strategy),
                 target: model.config.target.clone(),
-                freshness: render_placeholders_in(&model.config.freshness)
-                    .context("failed to render the model freshness for output")?,
+                freshness: model.config.freshness.clone(),
                 contract_source: model.contract_path.as_ref().map(|_| "auto".to_string()),
                 cost_hint,
-                depends_on: model.config.depends_on.iter().map(|d| render(d)).collect(),
+                depends_on: model.config.depends_on.clone(),
                 tags: model
                     .config
                     .tags
                     .iter()
-                    .map(|(k, v)| (render(k), render(v)))
+                    .map(|(k, v)| (render_placeholders(k), render_placeholders(v)))
                     .collect(),
-            })
+            }
         })
-        .collect::<Result<_>>()?;
+        .collect();
 
     // Data the text renderer needs from the raw `CompileResult` but which is
     // not carried on `CompileOutput`: execution order, per-model typed-column
@@ -834,6 +836,7 @@ schema_template = "s"
     fn compile_output_prints_a_resolved_sidecar_value_as_its_placeholder() {
         const SECRET: &str = "rocky_1919_compile_secret_d00d";
         const CATALOG: &str = "rocky_1919_compile_catalog";
+        const COLUMN: &str = "rocky_1919_compile_ts_col";
         let dir = TempDir::new().unwrap();
         let models_dir = dir.path().join("models");
         fs::create_dir_all(&models_dir).unwrap();
@@ -845,7 +848,7 @@ schema_template = "s"
         fs::write(
             models_dir.join("m1.toml"),
             "name = \"m1\"\n\n\
-             [strategy]\ntype = \"incremental\"\ntimestamp_column = \"${ROCKY_T1919_COMPILE}\"\n\n\
+             [strategy]\ntype = \"incremental\"\ntimestamp_column = \"${ROCKY_T1919_COMPILE_COL}\"\n\n\
              [target]\ncatalog = \"${ROCKY_T1919_COMPILE_CATALOG}\"\nschema = \"s\"\ntable = \"m1\"\n\n\
              [tags]\nowner = \"${ROCKY_T1919_COMPILE}\"\n",
         )
@@ -854,6 +857,7 @@ schema_template = "s"
         unsafe {
             std::env::set_var("ROCKY_T1919_COMPILE", SECRET);
             std::env::set_var("ROCKY_T1919_COMPILE_CATALOG", CATALOG);
+            std::env::set_var("ROCKY_T1919_COMPILE_COL", COLUMN);
         }
         let out = compile_output(
             None,
@@ -870,6 +874,7 @@ schema_template = "s"
         unsafe {
             std::env::remove_var("ROCKY_T1919_COMPILE");
             std::env::remove_var("ROCKY_T1919_COMPILE_CATALOG");
+            std::env::remove_var("ROCKY_T1919_COMPILE_COL");
         }
         let out = out.expect("compiles");
         assert_eq!(out.models_detail.len(), 1, "PRECONDITION: the model loaded");
@@ -877,10 +882,8 @@ schema_template = "s"
         assert!(!json.contains(SECRET), "leaked: {json}");
         let detail = serde_json::to_value(&out.models_detail[0]).unwrap();
         assert_eq!(detail["target"]["catalog"], CATALOG);
-        assert_eq!(
-            detail["strategy"]["timestamp_column"],
-            "${ROCKY_T1919_COMPILE}"
-        );
+        // A strategy column is structure, printed as the engine runs it.
+        assert_eq!(detail["strategy"]["timestamp_column"], COLUMN);
         assert_eq!(detail["tags"]["owner"], "${ROCKY_T1919_COMPILE}");
     }
 
