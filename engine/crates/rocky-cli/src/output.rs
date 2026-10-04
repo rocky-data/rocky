@@ -1,3 +1,4 @@
+use rocky_core::env_string::EnvString;
 use std::collections::{BTreeMap, HashMap};
 use std::hash::{DefaultHasher, Hasher};
 
@@ -8532,7 +8533,7 @@ pub struct PolicyRuleEntry {
     /// resolved secret that no key-based redaction could find. It decides
     /// nothing, so nothing is lost by leaving it out.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub verify_after: Vec<String>,
+    pub verify_after: Vec<EnvString>,
     /// The rolling failure ceiling that degrades this rule's effect.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub autonomy_budget: Option<PolicyAutonomyBudgetOutput>,
@@ -8546,14 +8547,14 @@ pub struct PolicyRuleEntry {
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct PolicyRuleScopeOutput {
     pub any: bool,
-    pub models: Vec<String>,
-    pub tags: BTreeMap<String, String>,
-    pub classifications: Vec<String>,
-    pub exclude_classifications: Vec<String>,
+    pub models: Vec<EnvString>,
+    pub tags: BTreeMap<EnvString, EnvString>,
+    pub classifications: Vec<EnvString>,
+    pub exclude_classifications: Vec<EnvString>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub contracted: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub layer: Option<String>,
+    pub layer: Option<EnvString>,
     /// The blast-radius ceiling, applied AFTER the rule matches: an `allow`
     /// degrades to `require_review` when the target's transitive downstream
     /// count exceeds this, or cannot be computed. `deny` and `require_review`
@@ -8566,7 +8567,7 @@ pub struct PolicyRuleScopeOutput {
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct PolicyAutonomyBudgetOutput {
     pub failures: u64,
-    pub window: String,
+    pub window: EnvString,
 }
 
 /// One freeze in force.
@@ -9224,7 +9225,9 @@ pub struct BriefDegradedRule {
     /// The rule's configured failure ceiling.
     pub limit: u64,
     /// The rule's configured window (`7d`, `24h`, …).
-    pub window: String,
+    // A resolved `${VAR}` prints as its `${NAME}` (#1919). A plain comment,
+    // so the exported schema and its generated bindings stay unchanged.
+    pub window: EnvString,
 }
 
 /// An active policy freeze inside [`BriefAutonomySection`].

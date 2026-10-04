@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::warn;
 
+use crate::env_string::EnvString;
 use crate::hooks::HooksConfig;
 use crate::path_presence::{PathPresence, classify_not_found};
 use crate::redacted::RedactedString;
@@ -163,7 +164,7 @@ pub enum ConfigError {
     /// caller carry on against defaults (#1668). `detail` says what was found,
     /// so the refusal is diagnosable without a second look at the disk.
     #[error("config file at '{}' cannot be read: {detail}", .path.display())]
-    UnreadableFile { path: PathBuf, detail: String },
+    UnreadableFile { path: PathBuf, detail: EnvString },
 
     #[error("failed to parse TOML: {0}")]
     ParseToml(#[from] toml::de::Error),
@@ -201,40 +202,52 @@ pub enum ConfigError {
         "adapter '{name}' (type '{adapter_type}') is discovery-only; \
          add `kind = \"discovery\"` to the [adapter.{name}] block"
     )]
-    AdapterMissingDiscoveryKind { name: String, adapter_type: String },
+    AdapterMissingDiscoveryKind {
+        name: EnvString,
+        adapter_type: EnvString,
+    },
 
     #[error(
         "adapter '{name}' has `kind = \"{declared}\"` but type '{adapter_type}' only supports {supported}"
     )]
     AdapterKindUnsupported {
-        name: String,
-        adapter_type: String,
-        declared: String,
-        supported: String,
+        name: EnvString,
+        adapter_type: EnvString,
+        declared: EnvString,
+        supported: EnvString,
     },
 
     #[error(
         "pipeline '{pipeline}' source.adapter = '{adapter}' points to an adapter whose `kind` excludes data movement"
     )]
-    PipelineSourceAdapterNotData { pipeline: String, adapter: String },
+    PipelineSourceAdapterNotData {
+        pipeline: EnvString,
+        adapter: EnvString,
+    },
 
     #[error(
         "pipeline '{pipeline}' source.discovery.adapter = '{adapter}' points to an adapter whose `kind` excludes discovery"
     )]
-    PipelineDiscoveryAdapterNotDiscovery { pipeline: String, adapter: String },
+    PipelineDiscoveryAdapterNotDiscovery {
+        pipeline: EnvString,
+        adapter: EnvString,
+    },
 
     #[error(
         "pipeline '{pipeline}' uses strategy = \"merge\" but neither merge_keys nor merge_keys_fallback is configured. \
          Set [pipeline.{pipeline}.merge_keys = [\"col1\", \"col2\"]] in your rocky.toml."
     )]
-    ReplicationMergeMissingKeys { pipeline: String },
+    ReplicationMergeMissingKeys { pipeline: EnvString },
 
     #[error(
         "pipeline '{pipeline}' table_overrides[{rule_index}] has an empty `match` block. \
          Set at least one of `match.connector` or `match.table`, or remove the rule and \
          change pipeline-level defaults instead."
     )]
-    TableOverrideEmptyMatch { pipeline: String, rule_index: usize },
+    TableOverrideEmptyMatch {
+        pipeline: EnvString,
+        rule_index: usize,
+    },
 
     #[error(
         "pipeline '{pipeline}' table_overrides have two duplicate fully-specific rules \
@@ -242,11 +255,11 @@ pub enum ConfigError {
          {second_index}. Combine them or narrow one further."
     )]
     TableOverrideDuplicate {
-        pipeline: String,
+        pipeline: EnvString,
         first_index: usize,
         second_index: usize,
-        connector: String,
-        table: String,
+        connector: EnvString,
+        table: EnvString,
     },
 
     #[error(
@@ -254,9 +267,9 @@ pub enum ConfigError {
          in `match.table`: {reason}"
     )]
     TableOverrideInvalidGlob {
-        pipeline: String,
+        pipeline: EnvString,
         rule_index: usize,
-        reason: String,
+        reason: EnvString,
     },
 
     #[error(
@@ -264,14 +277,20 @@ pub enum ConfigError {
          but no merge_keys (or merge_keys_fallback) are reachable for the matched tables — \
          neither the override nor the pipeline default supplies any."
     )]
-    TableOverrideMergeMissingKeys { pipeline: String, rule_index: usize },
+    TableOverrideMergeMissingKeys {
+        pipeline: EnvString,
+        rule_index: usize,
+    },
 
     #[error(
         "pipeline '{pipeline}' source.schema_pattern.components contains the reserved \
          name {component:?} — rename it (e.g. `source_{component}`). \
          `table` and `id` are reserved for `--filter` and `[[table_overrides]]`."
     )]
-    SchemaPatternReservedComponent { pipeline: String, component: String },
+    SchemaPatternReservedComponent {
+        pipeline: EnvString,
+        component: EnvString,
+    },
 
     #[error(
         "pipeline '{pipeline}' {field} is {separator:?}, which is outside the allowed set \
@@ -280,9 +299,9 @@ pub enum ConfigError {
          or begins new SQL."
     )]
     UnsafeSeparator {
-        pipeline: String,
-        field: String,
-        separator: String,
+        pipeline: EnvString,
+        field: EnvString,
+        separator: EnvString,
     },
 
     #[error(
@@ -290,9 +309,9 @@ pub enum ConfigError {
          under [adapter.{adapter}.cache] or change `backend`"
     )]
     FivetranCacheMissingField {
-        adapter: String,
-        backend: String,
-        field: String,
+        adapter: EnvString,
+        backend: EnvString,
+        field: EnvString,
     },
 
     #[error(
@@ -300,9 +319,9 @@ pub enum ConfigError {
          under [adapter.{adapter}.ratelimit] or change `backend`"
     )]
     FivetranRatelimitMissingField {
-        adapter: String,
-        backend: String,
-        field: String,
+        adapter: EnvString,
+        backend: EnvString,
+        field: EnvString,
     },
 
     #[error(
@@ -310,9 +329,9 @@ pub enum ConfigError {
          under [adapter.{adapter}.stampede] or change `backend`"
     )]
     FivetranStampedeMissingField {
-        adapter: String,
-        backend: String,
-        field: String,
+        adapter: EnvString,
+        backend: EnvString,
+        field: EnvString,
     },
 
     #[error(
@@ -320,9 +339,9 @@ pub enum ConfigError {
          field under [adapter.{adapter}.circuit_breaker] or change `backend`"
     )]
     FivetranCircuitBreakerMissingField {
-        adapter: String,
-        backend: String,
-        field: String,
+        adapter: EnvString,
+        backend: EnvString,
+        field: EnvString,
     },
 
     #[error("[policy] version = {version} is unsupported; the only supported version is 1")]
@@ -346,7 +365,10 @@ pub enum ConfigError {
         "[policy] rules[{rule_index}] autonomy_budget.window = {window:?} is not a valid \
          duration — use a `<N>d` / `<N>h` span (e.g. \"7d\", \"24h\")"
     )]
-    PolicyBudgetInvalidWindow { rule_index: usize, window: String },
+    PolicyBudgetInvalidWindow {
+        rule_index: usize,
+        window: EnvString,
+    },
     #[error(
         "[checks] assertion name {name:?} on table {table:?} is reserved: it \
          collides with the engine's own {reserved:?} result. Dagster maps \
@@ -355,9 +377,9 @@ pub enum ConfigError {
          the assertion."
     )]
     ReservedAssertionName {
-        table: String,
-        name: String,
-        reserved: String,
+        table: EnvString,
+        name: EnvString,
+        reserved: EnvString,
     },
 
     /// Two DIFFERENT check-name producers (a custom check, a `null_rate`
@@ -374,22 +396,22 @@ pub enum ConfigError {
     )]
     DuplicateCheckName {
         /// The pipeline the collision was found in.
-        pipeline: String,
+        pipeline: EnvString,
         /// `"<kind> \"<name>\""`, e.g. `custom "null rate id"` — kind and
         /// name folded into one field (rather than two) to keep this
         /// variant's size down; `ConfigError` is returned by value on
         /// every config-load path (`Result::Err`), and clippy's
         /// `result_large_err` flags a variant this wide.
-        source_a: String,
-        source_b: String,
+        source_a: EnvString,
+        source_b: EnvString,
         /// Where the collision applies, already naming `pipeline` in
         /// prose: `"on table \"orders\" in pipeline \"p\""` for a
         /// single-table pair (an assertion is involved), or `"on every
         /// table pipeline \"p\" copies"` for two table-independent
         /// producers (custom checks and `null_rate` columns run on EVERY
         /// materialized table).
-        scope: String,
-        sanitized: String,
+        scope: EnvString,
+        sanitized: EnvString,
     },
 
     #[error(
@@ -404,7 +426,7 @@ pub enum ConfigError {
          a silent no-op would report the kill switch as engaged without durably engaging it. \
          Disable the flag or switch the [state] backend."
     )]
-    StateFreezeMarkerWritesUnsupportedBackend { backend: String },
+    StateFreezeMarkerWritesUnsupportedBackend { backend: EnvString },
 
     /// `[pipeline.<name>.checks] anomaly_threshold_pct` is `nan` or
     /// infinite. Detection compares a deviation against the threshold, and
@@ -415,7 +437,10 @@ pub enum ConfigError {
         "pipeline '{pipeline}': checks.anomaly_threshold_pct must be a finite number, got {value}; \
          set it to 0 to disable anomaly detection"
     )]
-    ChecksAnomalyThresholdNotFinite { pipeline: String, value: String },
+    ChecksAnomalyThresholdNotFinite {
+        pipeline: EnvString,
+        value: EnvString,
+    },
 
     /// A `metadata_columns[].value` is not one parseable SQL expression over
     /// allowlisted scalar functions. The value is spliced raw into the
@@ -425,9 +450,9 @@ pub enum ConfigError {
          used: {reason}"
     )]
     MetadataColumnValueRefused {
-        pipeline: String,
-        column: String,
-        reason: String,
+        pipeline: EnvString,
+        column: EnvString,
+        reason: EnvString,
     },
 }
 
@@ -2483,7 +2508,9 @@ pub struct EnvVarSubstitution {
     /// Name of the env var as it appeared in `${NAME}` / `${NAME:-default}`.
     pub name: String,
     /// Value that was actually substituted (either `$NAME` or its default).
-    pub value: String,
+    /// Prints only as `${NAME}`, so a `{:?}` of a report cannot leak it
+    /// (#1919). Use [`crate::env_string::EnvString::expose`] for the bytes.
+    pub value: crate::env_string::EnvString,
 }
 
 /// Substitutes `${VAR_NAME}` and `${VAR_NAME:-default}` patterns with environment variable values.
@@ -2574,7 +2601,7 @@ fn substitute_env_vars_inner(input: &str) -> EnvExpansion {
             result.push_str(&value);
             substitutions.push(EnvVarSubstitution {
                 name: var_name.to_string(),
-                value,
+                value: crate::env_string::EnvString::substituted(var_name, value),
             });
         } else {
             match std::env::var(expr) {
@@ -2583,7 +2610,7 @@ fn substitute_env_vars_inner(input: &str) -> EnvExpansion {
                     result.push_str(&value);
                     substitutions.push(EnvVarSubstitution {
                         name: expr.to_string(),
-                        value,
+                        value: crate::env_string::EnvString::substituted(expr, value),
                     });
                 }
                 Err(_) => {
@@ -2644,11 +2671,11 @@ pub fn redact_substituted_values(text: &str, substitutions: &[EnvVarSubstitution
         .iter()
         .filter(|sub| !sub.value.is_empty())
         .collect();
-    ordered.sort_by_key(|sub| std::cmp::Reverse(sub.value.len()));
+    ordered.sort_by_key(|sub| std::cmp::Reverse(sub.value.expose().len()));
 
     let mut out = text.to_string();
     for sub in ordered {
-        out = out.replace(&sub.value, &format!("${{{}}}", sub.name));
+        out = out.replace(sub.value.expose(), &format!("${{{}}}", sub.name));
     }
     out
 }
@@ -3238,23 +3265,23 @@ pub struct PolicyScope {
     /// Glob selectors over the model name (`*`/`?`). Satisfied when the
     /// model name matches at least one pattern.
     #[serde(default)]
-    pub models: Vec<String>,
+    pub models: Vec<EnvString>,
 
     /// Required model tags (AND of `key = value` pairs). Satisfied when the
     /// model carries every listed tag with the exact value.
     #[serde(default)]
-    pub tags: std::collections::BTreeMap<String, String>,
+    pub tags: std::collections::BTreeMap<EnvString, EnvString>,
 
     /// Classification guard (positive). Satisfied when the model has at
     /// least one column classified with any listed value (e.g. `["pii"]`).
     #[serde(default)]
-    pub classifications: Vec<String>,
+    pub classifications: Vec<EnvString>,
 
     /// Classification guard (negative). Satisfied when the model has *no*
     /// column classified with any listed value — e.g.
     /// `exclude_classifications = ["pii"]` matches only non-PII models.
     #[serde(default)]
-    pub exclude_classifications: Vec<String>,
+    pub exclude_classifications: Vec<EnvString>,
 
     /// Contract-boundary guard. Satisfied when the model's contracted
     /// status equals this value. (v0 reads contracted status best-effort
@@ -3265,7 +3292,7 @@ pub struct PolicyScope {
     /// Medallion/semantic layer guard. Satisfied when the model's `layer`
     /// tag equals this value (v0 reads layer from the model's `layer` tag).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub layer: Option<String>,
+    pub layer: Option<EnvString>,
 
     /// Blast-radius guard: maximum transitive downstream count. Enforced as a
     /// **post-match ceiling on `allow`**, not a scope predicate: the rule
@@ -3314,7 +3341,7 @@ pub struct AutonomyBudget {
     pub failures: u64,
     /// Rolling window over which failures are counted, as a `<N>d` / `<N>h`
     /// duration (e.g. `"7d"`, `"24h"`). Failures older than this do not count.
-    pub window: String,
+    pub window: EnvString,
 }
 
 /// Parse a `<N>d` / `<N>h` budget/window duration string into a [`Duration`].
@@ -3362,7 +3389,7 @@ pub struct PolicyRule {
     /// does, so a failure is halt-only and the mutation stands until a human
     /// reverts it. Empty ⇒ no post-apply gate.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub verify_after: Vec<String>,
+    pub verify_after: Vec<EnvString>,
     /// Optional v1 conditional refinements not yet promoted to typed fields.
     /// **Parsed and ignored** — captured as opaque JSON so a config authored
     /// against a later version still loads.
@@ -3575,7 +3602,7 @@ pub fn validate_policy(config: &RockyConfig) -> Vec<ConfigError> {
             if budget.failures == 0 {
                 errors.push(ConfigError::PolicyBudgetZeroFailures { rule_index: idx });
             }
-            if parse_window_duration(&budget.window).is_none() {
+            if parse_window_duration(budget.window.expose()).is_none() {
                 errors.push(ConfigError::PolicyBudgetInvalidWindow {
                     rule_index: idx,
                     window: budget.window.clone(),
@@ -3602,7 +3629,7 @@ pub fn validate_freeze_marker_writes(config: &RockyConfig) -> Vec<ConfigError> {
         )
     {
         errors.push(ConfigError::StateFreezeMarkerWritesUnsupportedBackend {
-            backend: config.state.backend.to_string(),
+            backend: config.state.backend.to_string().into(),
         });
     }
     errors
@@ -3916,9 +3943,9 @@ pub fn validate_metadata_columns(config: &RockyConfig) -> Vec<ConfigError> {
                 rocky_sql::check_expression::ExpressionUse::ScalarProjection,
             ) {
                 errors.push(ConfigError::MetadataColumnValueRefused {
-                    pipeline: pipeline_name.clone(),
-                    column: mc.name.clone(),
-                    reason: e.to_string(),
+                    pipeline: pipeline_name.clone().into(),
+                    column: mc.name.clone().into(),
+                    reason: e.to_string().into(),
                 });
             }
         }
@@ -3939,8 +3966,8 @@ pub fn validate_checks(config: &RockyConfig) -> Vec<ConfigError> {
         let threshold = pipeline.checks().anomaly_threshold_pct;
         if !threshold.is_finite() {
             errors.push(ConfigError::ChecksAnomalyThresholdNotFinite {
-                pipeline: name.clone(),
-                value: threshold.to_string(),
+                pipeline: name.clone().into(),
+                value: threshold.to_string().into(),
             });
         }
         // EVERY user-nameable check, not just assertions. A custom check
@@ -3974,9 +4001,9 @@ pub fn validate_checks(config: &RockyConfig) -> Vec<ConfigError> {
                 .find(|r| sanitized_check_name(r) == sanitized)
             {
                 errors.push(ConfigError::ReservedAssertionName {
-                    table,
-                    name: declared.to_string(),
-                    reserved: (*reserved).to_string(),
+                    table: table.into(),
+                    name: declared.to_string().into(),
+                    reserved: (*reserved).to_string().into(),
                 });
             }
         }
@@ -3998,15 +4025,15 @@ pub fn validate_checks(config: &RockyConfig) -> Vec<ConfigError> {
         let table_independent = table_independent_check_names(checks, executed_kinds);
         for (a, b, sanitized) in resolved_check_name_collisions(&table_independent) {
             errors.push(ConfigError::DuplicateCheckName {
-                pipeline: name.clone(),
-                source_a: describe_resolved_check_name(&a),
-                source_b: describe_resolved_check_name(&b),
+                pipeline: name.clone().into(),
+                source_a: describe_resolved_check_name(&a).into(),
+                source_b: describe_resolved_check_name(&b).into(),
                 // "checks", not "copies": a quality pipeline runs custom
                 // and null_rate checks against tables it never copies —
                 // "copies" was replication-specific wording on a sentence
                 // that applies to every pipeline type.
-                scope: format!("on every table pipeline {name:?} checks"),
-                sanitized,
+                scope: format!("on every table pipeline {name:?} checks").into(),
+                sanitized: sanitized.into(),
             });
         }
 
@@ -4030,11 +4057,11 @@ pub fn validate_checks(config: &RockyConfig) -> Vec<ConfigError> {
                     continue;
                 }
                 errors.push(ConfigError::DuplicateCheckName {
-                    pipeline: name.clone(),
-                    source_a: describe_resolved_check_name(&a),
-                    source_b: describe_resolved_check_name(&b),
-                    scope: format!("on table {table:?} in pipeline {name:?}"),
-                    sanitized,
+                    pipeline: name.clone().into(),
+                    source_a: describe_resolved_check_name(&a).into(),
+                    source_b: describe_resolved_check_name(&b).into(),
+                    scope: format!("on table {table:?} in pipeline {name:?}").into(),
+                    sanitized: sanitized.into(),
                 });
             }
         }
@@ -4885,9 +4912,9 @@ impl FivetranCacheConfig {
         let need = |field: &str, value: Option<&String>| -> Result<(), ConfigError> {
             if value.map(String::is_empty).unwrap_or(true) {
                 Err(ConfigError::FivetranCacheMissingField {
-                    adapter: adapter_name.to_string(),
-                    backend: backend.as_str().to_string(),
-                    field: field.to_string(),
+                    adapter: adapter_name.to_string().into(),
+                    backend: backend.as_str().to_string().into(),
+                    field: field.to_string().into(),
                 })
             } else {
                 Ok(())
@@ -4989,8 +5016,8 @@ impl FivetranRatelimitConfig {
             FivetranRatelimitBackend::Valkey => {
                 if self.valkey_url.as_deref().is_none_or(str::is_empty) {
                     Err(ConfigError::FivetranRatelimitMissingField {
-                        adapter: adapter_name.to_string(),
-                        backend: self.backend.as_str().to_string(),
+                        adapter: adapter_name.to_string().into(),
+                        backend: self.backend.as_str().to_string().into(),
                         field: "valkey_url".into(),
                     })
                 } else {
@@ -5088,8 +5115,8 @@ impl FivetranStampedeConfig {
             FivetranStampedeBackend::Valkey => {
                 if self.valkey_url.as_deref().is_none_or(str::is_empty) {
                     Err(ConfigError::FivetranStampedeMissingField {
-                        adapter: adapter_name.to_string(),
-                        backend: self.backend.as_str().to_string(),
+                        adapter: adapter_name.to_string().into(),
+                        backend: self.backend.as_str().to_string().into(),
                         field: "valkey_url".into(),
                     })
                 } else {
@@ -5203,8 +5230,8 @@ impl FivetranCircuitBreakerConfig {
             FivetranCircuitBreakerBackend::Valkey => {
                 if self.valkey_url.as_deref().is_none_or(str::is_empty) {
                     Err(ConfigError::FivetranCircuitBreakerMissingField {
-                        adapter: adapter_name.to_string(),
-                        backend: self.backend.as_str().to_string(),
+                        adapter: adapter_name.to_string().into(),
+                        backend: self.backend.as_str().to_string().into(),
                         field: "valkey_url".into(),
                     })
                 } else {
@@ -6607,25 +6634,25 @@ pub fn validate_adapter_kinds(config: &RockyConfig) -> Vec<ConfigError> {
             // the role is self-evident in the raw config file.
             (None, false, true) => {
                 errors.push(ConfigError::AdapterMissingDiscoveryKind {
-                    name: name.clone(),
-                    adapter_type: adapter.adapter_type.clone(),
+                    name: name.clone().into(),
+                    adapter_type: adapter.adapter_type.clone().into(),
                 });
             }
             // Declared `kind` must be a role the adapter actually supports.
             (Some(AdapterKind::Data), false, _) => {
                 errors.push(ConfigError::AdapterKindUnsupported {
-                    name: name.clone(),
-                    adapter_type: adapter.adapter_type.clone(),
-                    declared: "data".to_owned(),
-                    supported: "discovery".to_owned(),
+                    name: name.clone().into(),
+                    adapter_type: adapter.adapter_type.clone().into(),
+                    declared: "data".to_owned().into(),
+                    supported: "discovery".to_owned().into(),
                 });
             }
             (Some(AdapterKind::Discovery), _, false) => {
                 errors.push(ConfigError::AdapterKindUnsupported {
-                    name: name.clone(),
-                    adapter_type: adapter.adapter_type.clone(),
-                    declared: "discovery".to_owned(),
-                    supported: "data".to_owned(),
+                    name: name.clone().into(),
+                    adapter_type: adapter.adapter_type.clone().into(),
+                    declared: "discovery".to_owned().into(),
+                    supported: "data".to_owned().into(),
                 });
             }
             _ => {}
@@ -6644,8 +6671,8 @@ pub fn validate_adapter_kinds(config: &RockyConfig) -> Vec<ConfigError> {
             && !adapter_role_active(source_cfg, AdapterKind::Data)
         {
             errors.push(ConfigError::PipelineSourceAdapterNotData {
-                pipeline: pipeline_name.clone(),
-                adapter: replication.source.adapter.clone(),
+                pipeline: pipeline_name.clone().into(),
+                adapter: replication.source.adapter.clone().into(),
             });
         }
 
@@ -6655,8 +6682,8 @@ pub fn validate_adapter_kinds(config: &RockyConfig) -> Vec<ConfigError> {
             && !adapter_role_active(disc_cfg, AdapterKind::Discovery)
         {
             errors.push(ConfigError::PipelineDiscoveryAdapterNotDiscovery {
-                pipeline: pipeline_name.clone(),
-                adapter: discovery.adapter.clone(),
+                pipeline: pipeline_name.clone().into(),
+                adapter: discovery.adapter.clone().into(),
             });
         }
     }
@@ -6685,7 +6712,7 @@ pub fn validate_replication_strategies(config: &RockyConfig) -> Vec<ConfigError>
         };
         if replication.strategy == "merge" && replication.resolved_merge_keys().is_none() {
             errors.push(ConfigError::ReplicationMergeMissingKeys {
-                pipeline: pipeline_name.clone(),
+                pipeline: pipeline_name.clone().into(),
             });
         }
     }
@@ -6727,7 +6754,7 @@ pub fn validate_replication_overrides(config: &RockyConfig) -> Vec<ConfigError> 
         for (idx, rule) in overrides.iter().enumerate() {
             if rule.match_.connector.is_none() && rule.match_.table.is_none() {
                 errors.push(ConfigError::TableOverrideEmptyMatch {
-                    pipeline: pipeline_name.clone(),
+                    pipeline: pipeline_name.clone().into(),
                     rule_index: idx,
                 });
             }
@@ -6735,16 +6762,16 @@ pub fn validate_replication_overrides(config: &RockyConfig) -> Vec<ConfigError> 
                 if pattern_is_glob(table_pat) {
                     if let Err(reason) = validate_glob_pattern(table_pat) {
                         errors.push(ConfigError::TableOverrideInvalidGlob {
-                            pipeline: pipeline_name.clone(),
+                            pipeline: pipeline_name.clone().into(),
                             rule_index: idx,
-                            reason,
+                            reason: reason.into(),
                         });
                     }
                 } else if table_pat.is_empty() {
                     errors.push(ConfigError::TableOverrideInvalidGlob {
-                        pipeline: pipeline_name.clone(),
+                        pipeline: pipeline_name.clone().into(),
                         rule_index: idx,
-                        reason: "empty table pattern".to_string(),
+                        reason: "empty table pattern".to_string().into(),
                     });
                 }
             }
@@ -6756,7 +6783,7 @@ pub fn validate_replication_overrides(config: &RockyConfig) -> Vec<ConfigError> 
                 let pipeline_has_keys = replication.resolved_merge_keys().is_some();
                 if !override_has_keys && !pipeline_has_keys {
                     errors.push(ConfigError::TableOverrideMergeMissingKeys {
-                        pipeline: pipeline_name.clone(),
+                        pipeline: pipeline_name.clone().into(),
                         rule_index: idx,
                     });
                 }
@@ -6787,11 +6814,11 @@ pub fn validate_replication_overrides(config: &RockyConfig) -> Vec<ConfigError> 
                 }
                 if a.match_.connector == b.match_.connector && a.match_.table == b.match_.table {
                     errors.push(ConfigError::TableOverrideDuplicate {
-                        pipeline: pipeline_name.clone(),
+                        pipeline: pipeline_name.clone().into(),
                         first_index: i,
                         second_index: j,
-                        connector: a.match_.connector.clone().unwrap_or_default(),
-                        table: a_table.to_string(),
+                        connector: a.match_.connector.clone().unwrap_or_default().into(),
+                        table: a_table.to_string().into(),
                     });
                 }
             }
@@ -6823,8 +6850,8 @@ pub fn validate_schema_pattern_reserved_components(config: &RockyConfig) -> Vec<
             let name = component.trim_end_matches("...");
             if RESERVED.contains(&name) {
                 errors.push(ConfigError::SchemaPatternReservedComponent {
-                    pipeline: pipeline_name.clone(),
-                    component: name.to_string(),
+                    pipeline: pipeline_name.clone().into(),
+                    component: name.to_string().into(),
                 });
             }
         }
@@ -6855,9 +6882,9 @@ pub fn validate_separators(config: &RockyConfig) -> Vec<ConfigError> {
         let mut check = |field: &str, separator: &str| {
             if !crate::schema::separator_is_safe(separator) {
                 errors.push(ConfigError::UnsafeSeparator {
-                    pipeline: pipeline_name.clone(),
-                    field: field.to_string(),
-                    separator: separator.to_string(),
+                    pipeline: pipeline_name.clone().into(),
+                    field: field.to_string().into(),
+                    separator: separator.to_string().into(),
                 });
             }
         };
@@ -7005,7 +7032,7 @@ fn classify_read_not_found(path: &Path) -> ConfigError {
         },
         PathPresence::Present { detail } => ConfigError::UnreadableFile {
             path: path.to_path_buf(),
-            detail,
+            detail: detail.into(),
         },
     }
 }
@@ -7378,7 +7405,7 @@ pub fn config_path_if_present(path: &Path) -> Result<Option<&Path>, ConfigError>
             PathPresence::Absent => Ok(None),
             PathPresence::Present { detail } => Err(ConfigError::UnreadableFile {
                 path: path.to_path_buf(),
-                detail,
+                detail: detail.into(),
             }),
         },
         // Could not even stat the path — most often the parent directory is
@@ -7386,7 +7413,7 @@ pub fn config_path_if_present(path: &Path) -> Result<Option<&Path>, ConfigError>
         // reported `false` here and let the caller run on defaults.
         Err(e) => Err(ConfigError::UnreadableFile {
             path: path.to_path_buf(),
-            detail: format!("the path could not be inspected: {e}"),
+            detail: format!("the path could not be inspected: {e}").into(),
         }),
     }
 }
@@ -8256,11 +8283,14 @@ mod tests {
         let subs = vec![
             EnvVarSubstitution {
                 name: "DATABRICKS_TOKEN".to_string(),
-                value: "dapi-SUPERSECRET-abc123".to_string(),
+                value: crate::env_string::EnvString::substituted(
+                    "DATABRICKS_TOKEN",
+                    "dapi-SUPERSECRET-abc123",
+                ),
             },
             EnvVarSubstitution {
                 name: "WAREHOUSE".to_string(),
-                value: "analytics".to_string(),
+                value: crate::env_string::EnvString::substituted("WAREHOUSE", "analytics"),
             },
         ];
         let hint = format_env_var_hint(&subs, &[]);
@@ -8286,7 +8316,10 @@ mod tests {
     fn multibyte_values_are_redacted_without_panicking() {
         let subs = vec![EnvVarSubstitution {
             name: "MOTTO".to_string(),
-            value: "日本語のテキストがここにあります".to_string(),
+            value: crate::env_string::EnvString::substituted(
+                "MOTTO",
+                "日本語のテキストがここにあります",
+            ),
         }];
         let _ = format_env_var_hint(&subs, &[]);
         let out = redact_substituted_values("path = 日本語のテキストがここにあります", &subs);
@@ -8298,7 +8331,7 @@ mod tests {
     fn redaction_replaces_a_resolved_value_with_its_placeholder() {
         let subs = vec![EnvVarSubstitution {
             name: "TOKEN".to_string(),
-            value: "dapi-abc123".to_string(),
+            value: crate::env_string::EnvString::substituted("TOKEN", "dapi-abc123"),
         }];
         let rendered =
             "TOML parse error at line 3\n  |\n3 | path = dapi-abc123\n  |        ^^^^^^^^^^^";
@@ -8322,11 +8355,11 @@ mod tests {
         let subs = vec![
             EnvVarSubstitution {
                 name: "SHORT".to_string(),
-                value: "abc".to_string(),
+                value: crate::env_string::EnvString::substituted("SHORT", "abc"),
             },
             EnvVarSubstitution {
                 name: "LONG".to_string(),
-                value: "xxabcxx".to_string(),
+                value: crate::env_string::EnvString::substituted("LONG", "xxabcxx"),
             },
         ];
         let out = redact_substituted_values("a = xxabcxx", &subs);
@@ -8342,7 +8375,7 @@ mod tests {
     fn an_empty_value_redacts_nothing() {
         let subs = vec![EnvVarSubstitution {
             name: "EMPTY".to_string(),
-            value: String::new(),
+            value: crate::env_string::EnvString::substituted("EMPTY", ""),
         }];
         assert_eq!(redact_substituted_values("a = 1", &subs), "a = 1");
     }
@@ -9842,7 +9875,7 @@ threshold = 0
         }) = found
         {
             assert_eq!(pipeline, "repl", "must name the offending pipeline");
-            let sources = [source_a.as_str(), source_b.as_str()];
+            let sources = [source_a.expose(), source_b.expose()];
             assert!(
                 sources.iter().any(|s| s.contains("null rate amount")),
                 "must name the custom-check source: {sources:?}"
@@ -9916,11 +9949,11 @@ expression = "quantity > 0"
                 "the two sides must be distinguishable, not the identical string twice"
             );
             assert!(
-                source_a.contains('1') || source_b.contains('1'),
+                source_a.expose().contains('1') || source_b.expose().contains('1'),
                 "one side must be identified as assertion #1: {source_a} / {source_b}"
             );
             assert!(
-                source_a.contains('2') || source_b.contains('2'),
+                source_a.expose().contains('2') || source_b.expose().contains('2'),
                 "one side must be identified as assertion #2: {source_a} / {source_b}"
             );
         }
@@ -9949,6 +9982,92 @@ autonomy_budget = { failures = 2, window = "banana" }
             ),
             "got {errors:?}"
         );
+    }
+
+    // --- #1919 / #1878: a resolved `${VAR}` prints only as `${NAME}` ---
+
+    /// The load-bearing policy fields keep the resolved value for the code
+    /// that matches on it, and print only the placeholder: in the validation
+    /// error, in `{:?}`, and in serialized JSON. Before #1919 every one of
+    /// these printed the value.
+    #[test]
+    fn a_resolved_policy_value_prints_only_as_its_placeholder() {
+        const SECRET: &str = "ROCKY-1919-POLICY-SECRET-7f3a91";
+        // SAFETY: test-only; the variable name is unique to this test.
+        unsafe { std::env::set_var("ROCKY_T1919_POLICY", SECRET) };
+        let text = substitute_env_vars(
+            r#"
+[policy]
+version = 1
+
+[[policy.rules]]
+principal = "agent"
+capability = "apply"
+scope = { models = ["${ROCKY_T1919_POLICY}_*"], layer = "${ROCKY_T1919_POLICY}" }
+effect = "allow"
+verify_after = ["${ROCKY_T1919_POLICY}"]
+autonomy_budget = { failures = 2, window = "${ROCKY_T1919_POLICY}" }
+"#,
+        )
+        .unwrap();
+        // SAFETY: as above.
+        unsafe { std::env::remove_var("ROCKY_T1919_POLICY") };
+        let cfg = parse(&text);
+        let rule = &cfg.policy.as_ref().expect("policy").rules[0];
+
+        assert_eq!(rule.scope.models[0].expose(), format!("{SECRET}_*"));
+        assert_eq!(rule.verify_after[0], SECRET);
+
+        let errors = validate_policy(&cfg);
+        assert!(
+            matches!(
+                errors.as_slice(),
+                [ConfigError::PolicyBudgetInvalidWindow { window, .. }] if *window == SECRET
+            ),
+            "the window must still be checked against its real value: {errors:?}"
+        );
+        let display = errors[0].to_string();
+        let debug = format!("{errors:?}");
+        let json = serde_json::to_string(&cfg.policy).expect("serialize");
+        for printed in [&display, &debug, &json] {
+            assert!(!printed.contains(SECRET), "leaked: {printed}");
+            assert!(printed.contains("${ROCKY_T1919_POLICY}"), "{printed}");
+        }
+        assert!(json.contains("${ROCKY_T1919_POLICY}_*"), "{json}");
+    }
+
+    /// One of the two `ConfigError` sites #1934 added after the original
+    /// survey. A separator that holds a resolved value is refused, and the
+    /// refusal names the variable, not the value.
+    #[test]
+    fn an_unsafe_resolved_separator_is_refused_without_printing_it() {
+        const SECRET: &str = "ROCKY-1919-SEP';DROP-4c2e";
+        crate::secret_registry::register_substitution("ROCKY_T1919_SEP", SECRET);
+        let err = ConfigError::UnsafeSeparator {
+            pipeline: "p".into(),
+            field: "target.separator".into(),
+            separator: SECRET.into(),
+        };
+        let printed = format!("{err} {err:?}");
+        assert!(!printed.contains(SECRET), "leaked: {printed}");
+        assert!(printed.contains("${ROCKY_T1919_SEP}"), "{printed}");
+    }
+
+    /// A substitution report is `Debug`, and before #1919 its `{:?}` printed
+    /// every value it held.
+    #[test]
+    fn a_substitution_report_debug_prints_names_not_values() {
+        const SECRET: &str = "ROCKY-1919-REPORT-SECRET-0b8d";
+        // SAFETY: test-only; the variable name is unique to this test.
+        unsafe { std::env::set_var("ROCKY_T1919_REPORT", SECRET) };
+        let (_, report) =
+            substitute_env_vars_with_report("a = \"${ROCKY_T1919_REPORT}\"").expect("substitutes");
+        // SAFETY: as above.
+        unsafe { std::env::remove_var("ROCKY_T1919_REPORT") };
+        let debug = format!("{report:?}");
+        assert!(!debug.contains(SECRET), "leaked: {debug}");
+        assert!(debug.contains("${ROCKY_T1919_REPORT}"), "{debug}");
+        assert_eq!(report[0].value.expose(), SECRET);
     }
 
     // --- [pipeline.*.checks] anomaly_threshold_pct validation (#1816) ---
@@ -11622,7 +11741,7 @@ schema_template = "raw__{{source}}"
             matches!(
                 errors.as_slice(),
                 [ConfigError::MetadataColumnValueRefused { reason, .. }]
-                    if reason.contains("does not parse as a single SQL expression")
+                    if reason.expose().contains("does not parse as a single SQL expression")
             ),
             "an unquoted placeholder must be refused as unparseable, got {errors:?}"
         );
@@ -11634,8 +11753,10 @@ schema_template = "raw__{{source}}"
             unreachable!("pinned by the assertion above");
         };
         assert!(
-            reason.contains("A metadata column value is one scalar expression")
-                && !reason.contains("boolean"),
+            reason
+                .expose()
+                .contains("A metadata column value is one scalar expression")
+                && !reason.expose().contains("boolean"),
             "the refusal must explain a column value, not a check: {reason}"
         );
 

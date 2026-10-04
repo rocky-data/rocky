@@ -100,6 +100,21 @@ table   = "${ROCKY_TABLE_OVERRIDE:-customer_facts}"
 
 A worked example covering all three layers lives in `examples/playground/pocs/00-foundations/07-config-layering/`.
 
+### Where a resolved value is shown
+
+Rocky prints the placeholder, not the value. Some fields print `${DATABRICKS_TOKEN}`, never the token:
+
+| Surface | What prints `${NAME}` |
+|---|---|
+| `rocky serve` responses | Every value of 8 bytes or more, anywhere in the response. |
+| `rocky policy show`, text and `--output json` | Policy `scope` (`models`, `tags`, `classifications`, `exclude_classifications`, `layer`), `verify_after` and `autonomy_budget.window`. |
+| `rocky brief` | A degraded rule's budget `window`. |
+| Config errors and model-file errors | Every value of 8 bytes or more that the error quotes, including a TOML parse error in a sidecar, `_defaults.toml` or frontmatter. |
+
+A value shorter than 8 bytes is not treated as a secret and prints as itself. The literal in `${VAR:-default}` is already in the file, so it prints as itself too.
+
+Other `--output json` fields and log lines can still show a resolved value. Do not put a secret in a field that is not listed above.
+
 ### Default Values
 
 Use `${VAR_NAME:-default}` to provide a fallback when a variable is unset or empty:

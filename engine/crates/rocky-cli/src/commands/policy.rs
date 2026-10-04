@@ -26,6 +26,7 @@ use rocky_core::config::{
     ConfigError, PolicyCapability, PolicyConfig, PolicyEffect, PolicyPrincipal, StateBackend,
     StateConfig,
 };
+use rocky_core::env_string::join_rendered;
 use rocky_core::freeze_marker::{
     self, ActiveMarkerFreeze, FreezeMarker, FreezeMarkerError, UnfreezeMarker,
 };
@@ -571,7 +572,7 @@ fn scope_text(scope: &PolicyRuleScopeOutput) -> String {
         parts.push("any".to_string());
     }
     if !scope.models.is_empty() {
-        parts.push(format!("models={}", scope.models.join(",")));
+        parts.push(format!("models={}", join_rendered(&scope.models, ",")));
     }
     for (k, v) in &scope.tags {
         parts.push(format!("tags.{k}={v}"));
@@ -579,13 +580,13 @@ fn scope_text(scope: &PolicyRuleScopeOutput) -> String {
     if !scope.classifications.is_empty() {
         parts.push(format!(
             "classifications={}",
-            scope.classifications.join(",")
+            join_rendered(&scope.classifications, ",")
         ));
     }
     if !scope.exclude_classifications.is_empty() {
         parts.push(format!(
             "exclude_classifications={}",
-            scope.exclude_classifications.join(",")
+            join_rendered(&scope.exclude_classifications, ",")
         ));
     }
     if let Some(c) = scope.contracted {
@@ -660,7 +661,11 @@ fn render_show_text<W: Write>(w: &mut W, out: &PolicyRulesOutput) -> io::Result<
             write!(w, "  budget={}/{}", b.failures, b.window)?;
         }
         if !rule.verify_after.is_empty() {
-            write!(w, "  verify_after={}", rule.verify_after.join(","))?;
+            write!(
+                w,
+                "  verify_after={}",
+                join_rendered(&rule.verify_after, ",")
+            )?;
         }
         writeln!(w)?;
     }
@@ -2207,7 +2212,11 @@ expect = \"allow\"
         assert_eq!(out.rules[0].effect, PolicyEffect::Deny);
         assert_eq!(out.rules[0].scope.contracted, Some(true));
         assert_eq!(
-            out.rules[1].scope.tags.get("layer").map(String::as_str),
+            out.rules[1]
+                .scope
+                .tags
+                .get(&"layer".into())
+                .map(rocky_core::env_string::EnvString::expose),
             Some("bronze")
         );
         assert_eq!(out.rules[1].scope.max_downstreams, Some(5));
@@ -2544,6 +2553,41 @@ expect = \"allow\"
         );
     }
 
+    /// #1878, the CLI half. The probe from the issue: one `${VAR}` used in two
+    /// load-bearing fields. `GET /api/v1/policy` already redacted it through
+    /// the response filter; `rocky policy show --output json` printed it
+    /// verbatim. Both surfaces now print `${NAME}`, in JSON and in text.
+    #[tokio::test]
+    async fn a_resolved_scope_value_prints_only_as_its_placeholder() {
+        const SECRET: &str = "SENTINELvalue1234567890abcdefg-1878";
+        // SAFETY: test-only; the variable name is unique to this test.
+        unsafe { std::env::set_var("ROCKY_T1878_PROBE", SECRET) };
+        let body = format!(
+            "{NO_POLICY_BODY}\n{POLICY}\n\n[[policy.rules]]\nprincipal = \"agent\"\n\
+             capability = \"schema_change.additive\"\neffect = \"allow\"\n\
+             scope = {{ models = [\"${{ROCKY_T1878_PROBE}}\"] }}\n\
+             verify_after = [\"${{ROCKY_T1878_PROBE}}\"]\n"
+        );
+        let (dir, config) = config_with(&body);
+        let state_path = dir.path().join("state.redb");
+        let out = compute_policy_show(&config, &state_path).await;
+        // SAFETY: as above.
+        unsafe { std::env::remove_var("ROCKY_T1878_PROBE") };
+        let out = out.unwrap();
+
+        let last = out.rules.last().expect("the appended rule");
+        assert_eq!(last.verify_after[0].expose(), SECRET, "the value is intact");
+
+        let json = serde_json::to_string(&out).unwrap();
+        let mut text = Vec::new();
+        render_show_text(&mut text, &out).unwrap();
+        let text = String::from_utf8(text).unwrap();
+        for printed in [&json, &text] {
+            assert!(!printed.contains(SECRET), "leaked: {printed}");
+            assert!(printed.contains("${ROCKY_T1878_PROBE}"), "{printed}");
+        }
+    }
+
     /// A marker must be READ even when `freeze_marker_writes` is false.
     ///
     /// The round-two review called the first version of this test vacuous, and
@@ -2692,20 +2736,18 @@ expect = \"allow\"
                 effect: PolicyEffect::Deny,
                 scope: PolicyRuleScopeOutput {
                     any: false,
-                    models: vec!["orders".to_string()],
-                    tags: [("tier".to_string(), "gold".to_string())]
-                        .into_iter()
-                        .collect(),
+                    models: vec!["orders".into()],
+                    tags: [("tier".into(), "gold".into())].into_iter().collect(),
                     classifications: Vec::new(),
                     exclude_classifications: Vec::new(),
                     contracted: None,
                     layer: None,
                     max_downstreams: None,
                 },
-                verify_after: vec!["freshness".to_string(), "row_count".to_string()],
+                verify_after: vec!["freshness".into(), "row_count".into()],
                 autonomy_budget: Some(PolicyAutonomyBudgetOutput {
                     failures: 3,
-                    window: "24h".to_string(),
+                    window: "24h".into(),
                 }),
             }],
             freezes: vec![PolicyFreezeInForce {

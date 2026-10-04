@@ -3618,7 +3618,7 @@ fn required_verify_after(
         if let Some(idx) = decision.matched_rule
             && let Some(rule) = policy.rules.get(idx)
         {
-            names.extend(rule.verify_after.iter().cloned());
+            names.extend(rule.verify_after.iter().map(|v| v.expose().to_string()));
         }
     }
     names.into_iter().collect()
