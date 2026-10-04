@@ -41,9 +41,9 @@ thread_local! {
 }
 
 /// Returns `true` when the current thread is inside an
-/// [`with_unredacted_scope`] guard. Test-only helper; production code
-/// should never branch on this — the [`Serialize`] impl is the single
-/// consumer.
+/// [`with_unredacted_scope`] guard. Production code should never branch
+/// on this. Its only consumers are the two `Serialize` impls that the scope
+/// governs: [`RedactedString`] and [`crate::env_string::EnvString`].
 #[doc(hidden)]
 pub fn unredacted_scope_active() -> bool {
     UNREDACTED_DEPTH.with(|d| d.get() > 0)

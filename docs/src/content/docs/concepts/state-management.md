@@ -218,7 +218,7 @@ The `tiered` backend combines Valkey (fast) with S3 (durable):
 
 By default Rocky trusts the cached copy as it finds it. A Valkey write that fails while the S3 write succeeds therefore leaves a stale copy in the cache, and the next read serves it.
 
-Set `concurrency_control = "cas"` to close that gap. The end-of-run upload commits to S3 first. Rocky then stores the cached copy, stamped with the generation it committed at. A read can therefore check the cache against the durable object before it uses it. Two ledger-seam writes (`gc apply`, `apply`) are not covered yet. See [Concurrent writers](/reference/configuration/#concurrent-writers).
+Set `concurrency_control = "cas"` to close that gap. The end-of-run upload commits to S3 first. Rocky then stores the cached copy, stamped with the generation it committed at. A read can therefore check the cache against the durable object before it uses it. The ledger-seam commands (`policy`, `gc`, `restore`, `apply`) commit the same way. See [Concurrent writers](/reference/configuration/#concurrent-writers).
 
 ### Sync Lifecycle
 
@@ -265,6 +265,8 @@ circuit_breaker_threshold = 5
 |---|---|---|
 | `"skip"` (default) | Log a warning, mark the run successful, leave remote state stale. The next run re-derives watermarks from target-table metadata. | Most callers — the de-facto pre-1.13 behaviour. Trades state durability for run liveness. |
 | `"fail"` | Propagate a `StateSyncError::RetryBudgetExhausted` or `CircuitOpen` to the caller; the run fails. | Strict environments where re-deriving watermarks is prohibitively expensive (long-running backfills, multi-hour syncs). |
+
+**A lost run record follows the same rule.** A run can succeed and still fail to write its run record, for example on a full disk. Rocky still uploads the run's other state, such as watermarks, because discarding them would make the next run re-copy data. Under `"skip"` the run warns and exits 0. Under `"fail"`, or on a governed run (`rocky apply`), it exits non-zero after the upload. Either way the uploaded ledger keeps evidence of the run, and [`rocky history`](/reference/commands/administration/#rocky-history) lists it under `unrecorded_runs`.
 
 **Terminal outcomes are structured.** Every `state.upload` and `state.download` event carries an `outcome` field. Alert on it instead of matching log messages with a regular expression:
 

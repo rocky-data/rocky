@@ -154,6 +154,12 @@ pub async fn run_transformation(
                 format!("failed to open state store at {}", state_path.display())
             })?;
 
+            // #1884: ledger evidence that this run started, before it does any
+            // work. A later run reads this pipeline's records
+            // (`--skip-unchanged`'s baseline, the schedule reconciler's
+            // `after`/`freshness`), so a lost one must not go unmarked.
+            super::run::mark_run_started(&store, run_id, started_at, pipeline_name);
+
             // Finding #1: baseline failures so a soft model failure skips governance.
             let failures_before = output.tables_failed;
             let exec_result = super::run::execute_models(
@@ -332,6 +338,9 @@ pub async fn run_transformation(
         shadow_config,
     );
     let audit = super::run::audit_to_record(&audit_ctx);
+    // The no-op run (no models dir) opens no store and writes no record by
+    // design; only a run that had a store can have LOST its record (#1884).
+    let record_expected = state_store.is_some();
     let custody = super::run::RecordCustody::from_persisted(super::run::persist_run_record(
         state_store.as_ref(),
         &output,
@@ -389,7 +398,17 @@ pub async fn run_transformation(
     // `PartialFailure` (some models built). The JSON `RunOutput` was
     // already emitted above, so a consumer keying on `status` / `errors`
     // sees the failure; this just propagates the non-zero exit code.
-    super::run::run_status_exit_result(&output, run_id, custody)
+    super::run::run_status_exit_result(&output, run_id, custody)?;
+    // A successful run whose record did not land (#1884): hand the dispatcher
+    // the typed sentinel. It still finalizes the session (the committed
+    // models' state must travel) and then applies the exit rule.
+    if record_expected && custody == super::run::RecordCustody::Lost {
+        return Err(super::run::RunRecordNotPersisted {
+            run_id: run_id.to_string(),
+        }
+        .into());
+    }
+    Ok(())
 }
 
 /// Builds the quality pipeline's `row_count` check from the count query's
@@ -917,6 +936,10 @@ pub async fn run_quality(
     // `run.rs` (`require_shadow_support`) before this function runs (#2161), so
     // there is no `ShadowConfig` here and no Rocky branch to record: a run that
     // reached this function was never given one.
+    // #1884: the marker that survives only if the record write below fails.
+    // This arm opens its store only now, so the marker shares the record's
+    // moment rather than the run's start; it still marks a lost record.
+    super::run::mark_run_started(&store, run_id, started_at, Some(pipeline_name));
     let audit_ctx = super::run_audit::AuditContext::detect(None, None, None);
     let audit = super::run::audit_to_record(&audit_ctx);
     let recorded = super::run::persist_run_record(
@@ -953,6 +976,14 @@ pub async fn run_quality(
         // (#1816).
         return Err(super::run::QualityGateFailure {
             count: error_failures,
+            run_id: run_id.to_string(),
+        }
+        .into());
+    }
+    // A passing quality run whose record did not land (#1884): the
+    // dispatcher finalizes, then applies the exit rule.
+    if !recorded {
+        return Err(super::run::RunRecordNotPersisted {
             run_id: run_id.to_string(),
         }
         .into());
@@ -1578,9 +1609,13 @@ pub async fn run_snapshot(
     // `run.rs` (`require_shadow_support`) before this function runs, as it is
     // for quality. There is no `ShadowConfig` here because a run that reached
     // this function was never given one.
+    // #1884: the marker that survives only if the record write below fails.
+    // This arm opens its store only now, so the marker shares the record's
+    // moment rather than the run's start; it still marks a lost record.
+    super::run::mark_run_started(&store, run_id, started_at, Some(pipeline_name));
     let audit_ctx = super::run_audit::AuditContext::detect(None, None, None);
     let audit = super::run::audit_to_record(&audit_ctx);
-    super::run::persist_run_record(
+    let recorded = super::run::persist_run_record(
         Some(&store),
         &output,
         run_id,
@@ -1592,6 +1627,14 @@ pub async fn run_snapshot(
 
     if tables_failed > 0 {
         anyhow::bail!("snapshot pipeline failed");
+    }
+    // A successful snapshot whose record did not land (#1884): the
+    // dispatcher finalizes, then applies the exit rule.
+    if !recorded {
+        return Err(super::run::RunRecordNotPersisted {
+            run_id: run_id.to_string(),
+        }
+        .into());
     }
     Ok(())
 }

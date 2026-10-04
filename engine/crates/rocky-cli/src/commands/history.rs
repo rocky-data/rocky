@@ -10,7 +10,7 @@ use rocky_core::state::{RunRecord, SessionSource, StateStore};
 use crate::output::{
     HistoryOutput, ModelExecutionRecord, ModelHistoryOutput, RecipeExecutionRecord,
     RecipeHistoryOutput, RecipeIdentityView, RollingDimension, RollingStats, RunHistoryRecord,
-    RunModelRecord, print_json,
+    RunModelRecord, UnrecordedRunEvidence, UnrecordedRunRecord, print_json,
 };
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -194,13 +194,66 @@ pub fn history_runs_output_filtered(
         .iter()
         .map(|r| record_to_history(r, audit))
         .collect();
+    // A trigger filter selects on a field only a record carries, so a
+    // record-less run can never match it.
+    let unrecorded_runs = match trigger {
+        Some(_) => Vec::new(),
+        None => unrecorded_runs(&store, since_ts)?,
+    };
     Ok(HistoryOutput {
         version: VERSION.to_string(),
         command: "history".to_string(),
         count: runs.len(),
         runs,
+        unrecorded_runs,
     })
 }
+
+/// The runs whose start is in the ledger and whose record is not, newest
+/// first, within the same 50-run window and `--since` bound as the recorded
+/// runs (#1884): replication checkpoint headers and the run-started markers
+/// every other run kind writes.
+fn unrecorded_runs(
+    store: &StateStore,
+    since: Option<DateTime<Utc>>,
+) -> Result<Vec<UnrecordedRunRecord>> {
+    let checkpoints = store
+        .list_recordless_run_progress(UNRECORDED_RUN_LIMIT)?
+        .into_iter()
+        .map(|p| UnrecordedRunRecord {
+            pipeline: p.scope.as_ref().map(|scope| scope.pipeline.clone()),
+            run_id: p.run_id,
+            started_at: p.started_at,
+            evidence: UnrecordedRunEvidence::Checkpoint,
+            total_tables: Some(p.total_tables),
+            superseded: p.superseded,
+        });
+    let markers = store
+        .list_recordless_run_markers(UNRECORDED_RUN_LIMIT)?
+        .into_iter()
+        .map(|m| UnrecordedRunRecord {
+            run_id: m.run_id,
+            started_at: m.started_at,
+            pipeline: m.pipeline,
+            evidence: UnrecordedRunEvidence::RunStarted,
+            total_tables: None,
+            superseded: false,
+        });
+    let mut runs: Vec<UnrecordedRunRecord> = checkpoints
+        .chain(markers)
+        .filter(|r| since.is_none_or(|ts| r.started_at >= ts))
+        .collect();
+    runs.sort_by(|a, b| {
+        b.started_at
+            .cmp(&a.started_at)
+            .then_with(|| b.run_id.cmp(&a.run_id))
+    });
+    runs.truncate(UNRECORDED_RUN_LIMIT);
+    Ok(runs)
+}
+
+/// The window [`unrecorded_runs`] lists, matching the recorded-run page.
+const UNRECORDED_RUN_LIMIT: usize = 50;
 
 /// One run by id, as `rocky history --run <id>` prints it: a
 /// [`HistoryOutput`] whose `runs` holds exactly that run. The same envelope
@@ -218,6 +271,7 @@ pub fn history_run_output(state_path: &Path, run_id: &str, audit: bool) -> Resul
         command: "history".to_string(),
         count: runs.len(),
         runs,
+        unrecorded_runs: Vec::new(),
     })
 }
 
@@ -485,6 +539,21 @@ fn print_runs_table(output: &HistoryOutput) {
         );
     }
     println!("\nTotal runs: {}", output.runs.len());
+    if !output.unrecorded_runs.is_empty() {
+        println!(
+            "\n{} run(s) started but have NO run record (still running, crashed, or the \
+             record write failed) — the history above is not complete:",
+            output.unrecorded_runs.len()
+        );
+        for run in &output.unrecorded_runs {
+            println!(
+                "  {:<24} {:<24} {}",
+                run.run_id,
+                run.started_at.format("%Y-%m-%d %H:%M:%S"),
+                run.pipeline.as_deref().unwrap_or("-"),
+            );
+        }
+    }
 }
 
 fn print_audit_table(runs: &[RunRecord]) {
