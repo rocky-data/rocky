@@ -686,7 +686,7 @@ class FulfillDriverConfig1(BaseModel):
     type: Type
 
 
-class Type23(StrEnum):
+class Type25(StrEnum):
     replay = "replay"
 
 
@@ -702,7 +702,7 @@ class FulfillDriverConfig2(BaseModel):
     """
     The recorded session file, relative to the project root.
     """
-    type: Type23
+    type: Type25
 
 
 class GcConfig(BaseModel):
@@ -935,23 +935,23 @@ class OnCollision3(StrEnum):
     error = "error"
 
 
-class Type24(StrEnum):
+class Type26(StrEnum):
     replication = "replication"
 
 
-class Type25(StrEnum):
+class Type27(StrEnum):
     transformation = "transformation"
 
 
-class Type26(StrEnum):
+class Type28(StrEnum):
     quality = "quality"
 
 
-class Type27(StrEnum):
+class Type29(StrEnum):
     snapshot = "snapshot"
 
 
-class Type28(StrEnum):
+class Type30(StrEnum):
     load = "load"
 
 
@@ -1224,55 +1224,55 @@ class PortabilityConfig(BaseModel):
     """
 
 
-class Type29(StrEnum):
+class Type31(StrEnum):
     not_null = "not_null"
 
 
-class Type30(StrEnum):
+class Type32(StrEnum):
     unique = "unique"
 
 
-class Type31(StrEnum):
+class Type33(StrEnum):
     accepted_values = "accepted_values"
 
 
-class Type32(StrEnum):
+class Type34(StrEnum):
     relationships = "relationships"
 
 
-class Type33(StrEnum):
+class Type35(StrEnum):
     expression = "expression"
 
 
-class Type34(StrEnum):
+class Type36(StrEnum):
     row_count_range = "row_count_range"
 
 
-class Type35(StrEnum):
+class Type37(StrEnum):
     in_range = "in_range"
 
 
-class Type36(StrEnum):
+class Type38(StrEnum):
     regex_match = "regex_match"
 
 
-class Type37(StrEnum):
+class Type39(StrEnum):
     aggregate = "aggregate"
 
 
-class Type38(StrEnum):
+class Type40(StrEnum):
     composite = "composite"
 
 
-class Type39(StrEnum):
+class Type41(StrEnum):
     unique_expr = "unique_expr"
 
 
-class Type40(StrEnum):
+class Type42(StrEnum):
     not_in_future = "not_in_future"
 
 
-class Type41(StrEnum):
+class Type43(StrEnum):
     older_than_n_days = "older_than_n_days"
 
 
@@ -2391,7 +2391,7 @@ class QualityAssertion1(BaseModel):
     """
     Table name this assertion applies to. Must match a table discovered from one of the pipeline's `[[tables]]` entries (by unqualified table name).
     """
-    type: Type29
+    type: Type31
 
 
 class QualityAssertion2(BaseModel):
@@ -2423,7 +2423,7 @@ class QualityAssertion2(BaseModel):
     """
     Table name this assertion applies to. Must match a table discovered from one of the pipeline's `[[tables]]` entries (by unqualified table name).
     """
-    type: Type30
+    type: Type32
 
 
 class QualityAssertion3(BaseModel):
@@ -2455,7 +2455,7 @@ class QualityAssertion3(BaseModel):
     """
     Table name this assertion applies to. Must match a table discovered from one of the pipeline's `[[tables]]` entries (by unqualified table name).
     """
-    type: Type31
+    type: Type33
     values: list[str]
     """
     The allowed values. Compared as string literals.
@@ -2499,7 +2499,7 @@ class QualityAssertion4(BaseModel):
     """
     Fully-qualified target table (`catalog.schema.table`).
     """
-    type: Type32
+    type: Type34
 
 
 class QualityAssertion5(BaseModel):
@@ -2535,7 +2535,7 @@ class QualityAssertion5(BaseModel):
     """
     A SQL boolean expression. Rows where `NOT (expression)` are failures.
     """
-    type: Type33
+    type: Type35
 
 
 class QualityAssertion6(BaseModel):
@@ -2575,7 +2575,7 @@ class QualityAssertion6(BaseModel):
     """
     Minimum row count (inclusive). `None` means no lower bound.
     """
-    type: Type34
+    type: Type36
 
 
 class QualityAssertion7(BaseModel):
@@ -2617,7 +2617,7 @@ class QualityAssertion7(BaseModel):
     """
     Minimum value (inclusive). `None` means no lower bound.
     """
-    type: Type35
+    type: Type37
 
 
 class QualityAssertion8(BaseModel):
@@ -2657,7 +2657,7 @@ class QualityAssertion8(BaseModel):
     """
     The regex pattern. Dialect-specific syntax — stick to the portable subset (character classes, anchors, quantifiers).
     """
-    type: Type36
+    type: Type38
 
 
 class QualityAssertion9(BaseModel):
@@ -2699,7 +2699,7 @@ class QualityAssertion9(BaseModel):
     """
     Aggregate operator.
     """
-    type: Type37
+    type: Type39
     value: str
     """
     Threshold to compare against. Parsed as `f64`.
@@ -2745,7 +2745,7 @@ class QualityAssertion10(BaseModel):
     """
     The kind of composite assertion. Currently `unique` only — kept as an enum to leave room for `not_null_any` / `not_null_all` in a later phase without another TestType.
     """
-    type: Type38
+    type: Type40
 
 
 class QualityAssertion11(BaseModel):
@@ -2785,7 +2785,7 @@ class QualityAssertion11(BaseModel):
     """
     SQL scalar expression whose value must be unique across rows.
     """
-    type: Type39
+    type: Type41
 
 
 class QualityAssertion12(BaseModel):
@@ -2817,7 +2817,7 @@ class QualityAssertion12(BaseModel):
     """
     Table name this assertion applies to. Must match a table discovered from one of the pipeline's `[[tables]]` entries (by unqualified table name).
     """
-    type: Type40
+    type: Type42
 
 
 class QualityAssertion13(BaseModel):
@@ -2853,7 +2853,7 @@ class QualityAssertion13(BaseModel):
     """
     N — days in the past. Must be > 0.
     """
-    type: Type41
+    type: Type43
 
 
 class QuarantineConfig(BaseModel):
@@ -3598,7 +3598,7 @@ class PipelineConfig1(ReplicationPipelineConfig):
     Pipeline configuration. The `type` field selects one of five variants — `replication` (default when omitted), `transformation`, `quality`, `snapshot`, or `load`. Each variant has its own field set; see the per-variant subschemas in `definitions`.
     """
 
-    type: Type24 | None = None
+    type: Type26 | None = None
 
 
 class PipelineConfig3(QualityPipelineConfig):
@@ -3606,7 +3606,7 @@ class PipelineConfig3(QualityPipelineConfig):
     Pipeline configuration. The `type` field selects one of five variants — `replication` (default when omitted), `transformation`, `quality`, `snapshot`, or `load`. Each variant has its own field set; see the per-variant subschemas in `definitions`.
     """
 
-    type: Type26
+    type: Type28
 
 
 class PipelineConfig5(LoadPipelineConfig):
@@ -3614,7 +3614,7 @@ class PipelineConfig5(LoadPipelineConfig):
     Pipeline configuration. The `type` field selects one of five variants — `replication` (default when omitted), `transformation`, `quality`, `snapshot`, or `load`. Each variant has its own field set; see the per-variant subschemas in `definitions`.
     """
 
-    type: Type28
+    type: Type30
 
 
 class SnapshotPipelineConfig(BaseModel):
@@ -3756,7 +3756,7 @@ class PipelineConfig2(TransformationPipelineConfig):
     Pipeline configuration. The `type` field selects one of five variants — `replication` (default when omitted), `transformation`, `quality`, `snapshot`, or `load`. Each variant has its own field set; see the per-variant subschemas in `definitions`.
     """
 
-    type: Type25
+    type: Type27
 
 
 class PipelineConfig4(SnapshotPipelineConfig):
@@ -3764,7 +3764,7 @@ class PipelineConfig4(SnapshotPipelineConfig):
     Pipeline configuration. The `type` field selects one of five variants — `replication` (default when omitted), `transformation`, `quality`, `snapshot`, or `load`. Each variant has its own field set; see the per-variant subschemas in `definitions`.
     """
 
-    type: Type27
+    type: Type29
 
 
 class RockyConfig(BaseModel):
