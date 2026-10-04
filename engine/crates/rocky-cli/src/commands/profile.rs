@@ -230,6 +230,7 @@ pub async fn build_profile_output(
 }
 
 /// Execute `rocky profile <model>` — print the observed per-column profile.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_profile(
     config_path: &Path,
     state_path: &Path,
