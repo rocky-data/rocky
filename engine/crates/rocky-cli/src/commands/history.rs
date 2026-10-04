@@ -86,6 +86,7 @@ fn record_to_history(run: &RunRecord, audit: bool) -> RunHistoryRecord {
         // need to pair a run, not a governance-audit field, so it must not
         // require `--audit` to appear.
         rocky_branch: run.rocky_branch.clone(),
+        run_scope: crate::output::RunScopeKind::of(run),
         triggering_identity,
         session_source,
         git_commit,
@@ -524,19 +525,20 @@ pub fn run_history(
 /// The run summary table `rocky history` prints, one row per run.
 fn print_runs_table(output: &HistoryOutput) {
     println!(
-        "{:<24} {:<24} {:<10} {:<8} {:<10}",
-        "RUN ID", "STARTED", "STATUS", "MODELS", "TRIGGER"
+        "{:<24} {:<24} {:<10} {:<8} {:<10} {:<10}",
+        "RUN ID", "STARTED", "STATUS", "MODELS", "TRIGGER", "SCOPE"
     );
-    println!("{}", "-".repeat(78));
+    println!("{}", "-".repeat(89));
 
     for run in &output.runs {
         println!(
-            "{:<24} {:<24} {:<10} {:<8} {:<10}",
+            "{:<24} {:<24} {:<10} {:<8} {:<10} {:<10}",
             run.run_id,
             run.started_at.format("%Y-%m-%d %H:%M:%S"),
             run.status,
             run.models_executed,
             run.trigger,
+            run.run_scope.as_str(),
         );
     }
     println!("\nTotal runs: {}", output.runs.len());
@@ -798,6 +800,35 @@ mod tests {
             Some("pr-preview-governance"),
             "rocky_branch must be emitted even without --audit"
         );
+        // #2201: the scope is emitted without --audit too.
+        assert_eq!(history.run_scope, crate::output::RunScopeKind::Branch);
+    }
+
+    /// #2201: every recorded scope surfaces in `rocky history`, and a record
+    /// written before runs carried a scope reads as `unrecorded`.
+    #[test]
+    fn record_to_history_reports_every_run_scope() {
+        use crate::output::RunScopeKind;
+        use rocky_core::state::RunScope;
+        let mut record = sample_record();
+        record.rocky_branch = None;
+        for (scope, want) in [
+            (Some(RunScope::Production), RunScopeKind::Production),
+            (
+                Some(RunScope::Shadow { schema: None }),
+                RunScopeKind::Shadow,
+            ),
+            (
+                Some(RunScope::Branch { name: "b".into() }),
+                RunScopeKind::Branch,
+            ),
+            (None, RunScopeKind::Unrecorded),
+        ] {
+            record.run_scope = scope;
+            assert_eq!(record_to_history(&record, false).run_scope, want);
+        }
+        let json = serde_json::to_value(record_to_history(&record, false)).unwrap();
+        assert_eq!(json["run_scope"], "unrecorded");
     }
 
     #[test]

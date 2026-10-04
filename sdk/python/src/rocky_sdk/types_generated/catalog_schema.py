@@ -70,6 +70,31 @@ class EdgeConfidence(StrEnum):
     Low = "Low"
 
 
+class ProductionRunScope(BaseModel):
+    """
+    Which runs a report about production counted (#2201).
+
+    Shadow and branch runs are never counted. Runs recorded before runs carried a scope are counted or not per report, and `unrecorded_runs_counted` says which.
+    """
+
+    excluded_runs: conint(ge=0)
+    """
+    Shadow and branch runs the report left out.
+    """
+    production_runs: conint(ge=0)
+    """
+    Runs recorded as production that the report read.
+    """
+    unrecorded_runs: conint(ge=0)
+    """
+    Runs with no recorded scope that the report read.
+    """
+    unrecorded_runs_counted: bool
+    """
+    `true` when runs with no recorded scope count as production in this report. Their write target is unknown.
+    """
+
+
 class RecipeIdentityView(BaseModel):
     """
     The recipe-identity triple surfaced on a model record — the answer to "what exact program, over what inputs, in what environment produced this?".
@@ -178,6 +203,10 @@ class CatalogOutput(BaseModel):
     project_name: str
     """
     Pipeline name used to build the catalog. When the project has multiple pipelines, this is the first one in declaration order.
+    """
+    run_scope: ProductionRunScope | None = None
+    """
+    Which runs the run-history enrichment read (#2201). Shadow and branch runs never set `last_run_id` or an asset's `last_materialized_at`; runs recorded before runs carried a scope do. Absent when the state store could not be read.
     """
     stats: CatalogStats
     version: str

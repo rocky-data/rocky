@@ -13,5 +13,11 @@
       "downstream_references": 0
     }
   ],
-  "total_models_analyzed": 1
+  "total_models_analyzed": 1,
+  "run_scope": {
+    "unrecorded_runs_counted": true,
+    "production_runs": 1,
+    "unrecorded_runs": 0,
+    "excluded_runs": 0
+  }
 }

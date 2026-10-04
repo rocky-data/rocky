@@ -38,6 +38,10 @@ export interface CatalogOutput {
    * Pipeline name used to build the catalog. When the project has multiple pipelines, this is the first one in declaration order.
    */
   project_name: string;
+  /**
+   * Which runs the run-history enrichment read (#2201). Shadow and branch runs never set `last_run_id` or an asset's `last_materialized_at`; runs recorded before runs carried a scope do. Absent when the state store could not be read.
+   */
+  run_scope?: ProductionRunScope | null;
   stats: CatalogStats;
   version: string;
   [k: string]: unknown;
@@ -142,6 +146,30 @@ export interface CatalogEdge {
    * Transform kind: "direct", "cast", "expression", or "aggregation: <fn>". Stringified to match the existing lineage edge shape.
    */
   transform: string;
+  [k: string]: unknown;
+}
+/**
+ * Which runs a report about production counted (#2201).
+ *
+ * Shadow and branch runs are never counted. Runs recorded before runs carried a scope are counted or not per report, and `unrecorded_runs_counted` says which.
+ */
+export interface ProductionRunScope {
+  /**
+   * Shadow and branch runs the report left out.
+   */
+  excluded_runs: number;
+  /**
+   * Runs recorded as production that the report read.
+   */
+  production_runs: number;
+  /**
+   * Runs with no recorded scope that the report read.
+   */
+  unrecorded_runs: number;
+  /**
+   * `true` when runs with no recorded scope count as production in this report. Their write target is unknown.
+   */
+  unrecorded_runs_counted: boolean;
   [k: string]: unknown;
 }
 /**

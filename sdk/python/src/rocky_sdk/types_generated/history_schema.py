@@ -52,6 +52,38 @@ class RunModelRecord(BaseModel):
     status: str
 
 
+class RunScopeKind5(StrEnum):
+    """
+    Wrote production targets.
+    """
+
+    production = "production"
+
+
+class RunScopeKind6(StrEnum):
+    """
+    `rocky run --shadow` / `--shadow-schema`: wrote shadow targets.
+    """
+
+    shadow = "shadow"
+
+
+class RunScopeKind7(StrEnum):
+    """
+    `rocky run --branch <name>`: wrote a named Rocky branch.
+    """
+
+    branch = "branch"
+
+
+class RunScopeKind8(StrEnum):
+    """
+    Recorded before runs carried a scope (#2200). Where it wrote is unknown. Also what a reader of an older payload without the field sees.
+    """
+
+    unrecorded = "unrecorded"
+
+
 class UnrecordedRunEvidence1(StrEnum):
     """
     A replication run's resume checkpoint header.
@@ -138,6 +170,12 @@ class RunHistoryRecord(BaseModel):
     `CARGO_PKG_VERSION` of the `rocky` binary, or `"<pre-audit>"` on schema-v5 rows that predate the audit trail.
     """
     run_id: str
+    run_scope: RunScopeKind5 | RunScopeKind6 | RunScopeKind7 | RunScopeKind8 | None = (
+        "unrecorded"
+    )
+    """
+    Where the run wrote: `production`, `shadow`, `branch`, or `unrecorded` for a run recorded before runs carried a scope (#2201). Always emitted, like [`Self::pipeline`], because readers that report on production count only `production` runs.
+    """
     session_source: str | None = None
     """
     Session origin — `"cli"`, `"dagster"`, `"lsp"`, or `"http_api"`. Emitted as the lowercase variant string so JSON consumers can match on it without knowing the Rust enum shape.

@@ -33,6 +33,7 @@ use rocky_core::cost::{WarehouseType, compute_observed_cost_usd, warehouse_size_
 use rocky_core::policy;
 use rocky_core::state::{
     DagChange, PolicyDecisionRecord, QualitySnapshot, RunRecord, RunStatus, RunTrigger, StateStore,
+    UnrecordedScope,
 };
 
 use crate::commands::apply::ai_plan_is_reviewed;
@@ -44,7 +45,7 @@ use crate::output::{
     BriefEscalationsSection, BriefFailedModel, BriefFreshnessEntry, BriefFreshnessSection,
     BriefOutput, BriefPrincipalActivity, BriefQualityEntry, BriefQualitySection, BriefRunCost,
     BriefRunEntry, BriefRunsSection, BriefSchedulerFailureEntry, BriefSchedulerSection,
-    BriefSinceMode, SectionAvailability, print_json,
+    BriefSinceMode, ProductionRunScope, SectionAvailability, print_json,
 };
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -235,9 +236,21 @@ pub fn compute_brief(
         .list_runs(MAX_HISTORY_SCAN)
         .context("failed to read the run ledger")?;
 
-    let windowed_runs: Vec<&RunRecord> = runs
+    // A brief reports on production (#2201): shadow and branch runs wrote
+    // elsewhere and are left out. Runs recorded before runs carried a scope
+    // ARE counted — the brief exists to surface what happened, and dropping
+    // them could hide a production failure. `run_scope` in the output says
+    // how many of each the window held.
+    let (windowed_runs, run_scope) = ProductionRunScope::select(
+        runs.iter().filter(|r| in_window(r.started_at, since_ts)),
+        UnrecordedScope::Count,
+    );
+    // Quality snapshots carry the run that wrote them; one from a shadow or
+    // branch run measured a non-production table.
+    let non_production_runs: BTreeSet<&str> = runs
         .iter()
-        .filter(|r| in_window(r.started_at, since_ts))
+        .filter(|r| !r.counts_as_production(UnrecordedScope::Count))
+        .map(|r| r.run_id.as_str())
         .collect();
     let mut windowed_decisions: Vec<&PolicyDecisionRecord> = decisions
         .iter()
@@ -259,7 +272,8 @@ pub fn compute_brief(
     let escalations = build_escalations(root, &all_decisions_newest_first);
     let runs_section = build_runs(&windowed_runs);
     let drift = build_drift(&store, since_ts);
-    let (freshness, quality) = build_freshness_and_quality(&store, &windowed_runs, since_ts);
+    let (freshness, quality) =
+        build_freshness_and_quality(&store, &windowed_runs, &non_production_runs, since_ts);
     let cost = build_cost(cfg.as_ref(), &windowed_runs);
     // Autonomy state is a *current-state* projection: each budget uses its own
     // window and freezes are current, so it reads the full ledger, not the
@@ -308,6 +322,7 @@ pub fn compute_brief(
         cost,
         autonomy,
         scheduler,
+        run_scope,
     })
 }
 
@@ -551,6 +566,7 @@ fn build_drift(store: &StateStore, since_ts: Option<DateTime<Utc>>) -> BriefDrif
 fn build_freshness_and_quality(
     store: &StateStore,
     runs: &[&RunRecord],
+    non_production_runs: &BTreeSet<&str>,
     since_ts: Option<DateTime<Utc>>,
 ) -> (BriefFreshnessSection, BriefQualitySection) {
     // Distinct model names seen in the window, in a stable order.
@@ -565,9 +581,14 @@ fn build_freshness_and_quality(
     let mut snapshots: Vec<QualitySnapshot> = Vec::new();
     let mut query_failed = false;
     for name in &model_names {
-        match store.get_quality_trend(name, 1) {
-            Ok(mut trend) => {
-                if let Some(snap) = trend.pop()
+        // The newest snapshot a production run wrote. The read loads every
+        // snapshot of the model before it truncates, so no cap is saved by
+        // asking for fewer.
+        match store.get_quality_trend(name, usize::MAX) {
+            Ok(trend) => {
+                if let Some(snap) = trend
+                    .into_iter()
+                    .find(|s| !non_production_runs.contains(s.run_id.as_str()))
                     && in_window(snap.timestamp, since_ts)
                 {
                     snapshots.push(snap);
@@ -1130,6 +1151,10 @@ fn empty_brief(
             incident_count: 0,
             latest_incident: None,
         },
+        run_scope: ProductionRunScope {
+            unrecorded_runs_counted: true,
+            ..ProductionRunScope::default()
+        },
     }
 }
 
@@ -1231,6 +1256,7 @@ fn build_scheduler(
     let sched_runs = match store.list_runs_matching(scan_cap, |r| {
         matches!(r.trigger, RunTrigger::Schedule | RunTrigger::Webhook)
             && in_window(r.started_at, since_ts)
+            && r.counts_as_production(UnrecordedScope::Count)
     }) {
         Ok(runs) => runs,
         Err(e) => {
@@ -1436,6 +1462,9 @@ fn render_markdown(out: &BriefOutput) -> String {
 
     // Runs.
     s.push_str("\n## Runs\n");
+    if let Some(note) = out.run_scope.note() {
+        s.push_str(&format!("({note})\n"));
+    }
     match out.runs.availability {
         SectionAvailability::Available => {
             s.push_str(&format!(
@@ -2047,6 +2076,7 @@ mod tests {
                 incident_count: 0,
                 latest_incident: None,
             },
+            run_scope: ProductionRunScope::default(),
         };
         let md = render_markdown(&out);
         assert!(md.starts_with("# Rocky estate brief"));
@@ -2629,6 +2659,64 @@ mod tests {
         assert!(
             !note.contains("no rocky.toml"),
             "a present-but-broken config must not be reported as an absent one: {note}"
+        );
+    }
+
+    /// #2201: the digest reports on production. A failed shadow run and a
+    /// failed branch run are left out of the runs section, a pre-#2200 run
+    /// with no scope is counted, and `run_scope` says so.
+    #[test]
+    fn brief_counts_production_runs_only() {
+        use rocky_core::state::RunScope;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let state_path = root.join("state.redb");
+        let store = rocky_core::state::StateStore::open(&state_path).unwrap();
+        store
+            .record_run(&run("prod-ok", RunStatus::Success, vec![]))
+            .unwrap();
+        let mut shadow = run("shadow-bad", RunStatus::Failure, vec![exec("m", "failed")]);
+        shadow.run_scope = Some(RunScope::Shadow { schema: None });
+        store.record_run(&shadow).unwrap();
+        let mut branch = run("branch-bad", RunStatus::Failure, vec![exec("m", "failed")]);
+        branch.run_scope = Some(RunScope::Branch { name: "b".into() });
+        store.record_run(&branch).unwrap();
+        let mut legacy = run("legacy-bad", RunStatus::Failure, vec![exec("m", "failed")]);
+        legacy.run_scope = None;
+        store.record_run(&legacy).unwrap();
+        drop(store);
+
+        let out = compute_brief(
+            root,
+            &state_path,
+            &root.join("rocky.toml"),
+            BriefSince::Days7,
+            ts(10),
+        )
+        .unwrap();
+        assert_eq!(out.runs.total, 2, "{:?}", out.runs);
+        assert_eq!(out.runs.failed, 1);
+        let attention: Vec<&str> = out
+            .runs
+            .attention
+            .iter()
+            .map(|r| r.run_id.as_str())
+            .collect();
+        assert_eq!(attention, vec!["legacy-bad"]);
+        assert_eq!(
+            out.run_scope,
+            ProductionRunScope {
+                unrecorded_runs_counted: true,
+                production_runs: 1,
+                unrecorded_runs: 1,
+                excluded_runs: 2,
+            }
+        );
+        let md = render_markdown(&out);
+        assert!(
+            md.contains("2 shadow/branch run(s) left out")
+                && md.contains("1 run(s) with no recorded scope counted as production"),
+            "{md}"
         );
     }
 

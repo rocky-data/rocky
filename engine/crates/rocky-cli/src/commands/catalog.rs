@@ -31,11 +31,11 @@ use parquet::file::properties::WriterProperties;
 
 use rocky_compiler::compile::{self, CompilerConfig};
 use rocky_compiler::semantic::{LineageEdge, SemanticGraph};
-use rocky_core::state::{RunStatus, StateStore};
+use rocky_core::state::{RunStatus, StateStore, UnrecordedScope};
 
 use crate::output::{
     AssetKind, CatalogAsset, CatalogColumn, CatalogEdge, CatalogOutput, CatalogStats,
-    EdgeConfidence, RecipeIdentityView, config_fingerprint,
+    EdgeConfidence, ProductionRunScope, RecipeIdentityView, config_fingerprint,
 };
 use crate::registry::resolve_pipeline;
 use crate::scope::resolve_managed_tables_in_catalog;
@@ -365,7 +365,7 @@ pub fn compute_catalog_output(
     //     most recent run that produced each model. Falls through
     //     silently when the state store is missing or unreadable: the
     //     command must work pre-first-run.
-    let last_run_id = enrich_with_state_store(state_path, &mut assets);
+    let (last_run_id, run_scope) = enrich_with_state_store(state_path, &mut assets);
 
     let stats = CatalogStats {
         asset_count: assets.len(),
@@ -385,6 +385,7 @@ pub fn compute_catalog_output(
         project_name,
         config_hash,
         last_run_id,
+        run_scope,
         assets,
         edges,
         stats,
@@ -408,9 +409,22 @@ const STATE_RUN_LIMIT: usize = 50;
 /// state-derived fields as `None`. `rocky catalog` is meant to run
 /// before the first `rocky run` has ever populated state, and a hard
 /// error there would be hostile.
-fn enrich_with_state_store(state_path: &Path, assets: &mut [CatalogAsset]) -> Option<String> {
-    let store = StateStore::open_read_only_or_empty(state_path).ok()?;
-    let runs = store.list_runs(STATE_RUN_LIMIT).ok()?;
+///
+/// Production runs only (#2201): the catalog describes the production
+/// assets, so a shadow or branch build never becomes an asset's
+/// `last_materialized_at`. A run recorded before runs carried a scope is
+/// counted, as it was before — the returned tally says how many there were.
+fn enrich_with_state_store(
+    state_path: &Path,
+    assets: &mut [CatalogAsset],
+) -> (Option<String>, Option<ProductionRunScope>) {
+    let Ok(store) = StateStore::open_read_only_or_empty(state_path) else {
+        return (None, None);
+    };
+    let Ok(all_runs) = store.list_runs(STATE_RUN_LIMIT) else {
+        return (None, None);
+    };
+    let (runs, run_scope) = ProductionRunScope::select(&all_runs, UnrecordedScope::Count);
 
     // Project-level: first successful run, newest-first.
     let project_last_run_id = runs
@@ -452,7 +466,7 @@ fn enrich_with_state_store(state_path: &Path, assets: &mut [CatalogAsset]) -> Op
         }
     }
 
-    project_last_run_id
+    (project_last_run_id, Some(run_scope))
 }
 
 /// Filter a [`CatalogOutput`] in place to only include assets whose
@@ -1106,8 +1120,15 @@ mod tests {
         let missing_state = tmp.path().join("nonexistent.redb");
 
         let mut empty_assets = vec![sample_asset("raw_orders")];
-        let project_run = enrich_with_state_store(&missing_state, &mut empty_assets);
+        let (project_run, scope) = enrich_with_state_store(&missing_state, &mut empty_assets);
         assert_eq!(project_run, None);
+        assert_eq!(
+            scope,
+            Some(ProductionRunScope {
+                unrecorded_runs_counted: true,
+                ..ProductionRunScope::default()
+            })
+        );
         assert_eq!(empty_assets[0].last_run_id, None);
         assert_eq!(empty_assets[0].last_materialized_at, None);
 
@@ -1159,7 +1180,7 @@ mod tests {
             // Model with no run history → enrichment leaves it None.
             sample_asset("revenue_summary"),
         ];
-        let project_run = enrich_with_state_store(&state_path, &mut assets);
+        let (project_run, _) = enrich_with_state_store(&state_path, &mut assets);
 
         assert_eq!(project_run.as_deref(), Some("run-002"));
         assert_eq!(assets[0].last_run_id.as_deref(), Some("run-001"));
@@ -1194,6 +1215,37 @@ mod tests {
         let _ = enrich_with_state_store(&state_path, &mut assets);
         assert_eq!(assets[0].last_run_id, None);
         assert_eq!(assets[0].last_materialized_at, None);
+
+        // 4. #2201: a newer successful SHADOW build of `raw_orders` is not a
+        //    production materialization. The asset and the project keep
+        //    their production run, and the tally reports the exclusion.
+        let store = StateStore::open(&state_path).unwrap();
+        let shadow_started = Utc.with_ymd_and_hms(2026, 5, 4, 10, 0, 0).unwrap();
+        let shadow_finished = shadow_started + ChronoDuration::seconds(5);
+        let mut shadow = sample_run_record(
+            "run-004-shadow",
+            shadow_started,
+            shadow_finished,
+            vec![sample_model_execution(
+                "raw_orders",
+                shadow_started,
+                shadow_finished,
+                "success",
+            )],
+        );
+        shadow.run_scope = Some(rocky_core::state::RunScope::Shadow { schema: None });
+        store.record_run(&shadow).unwrap();
+        drop(store);
+
+        let mut assets = vec![sample_asset("raw_orders")];
+        let (project_run, scope) = enrich_with_state_store(&state_path, &mut assets);
+        // The newest production run (run-003 recorded a run-level success),
+        // not the newer shadow run.
+        assert_eq!(project_run.as_deref(), Some("run-003-failed"));
+        assert_eq!(assets[0].last_run_id.as_deref(), Some("run-001"));
+        let scope = scope.expect("readable store reports a tally");
+        assert_eq!(scope.excluded_runs, 1);
+        assert_eq!(scope.production_runs, 3);
 
         fn sample_asset(name: &str) -> CatalogAsset {
             CatalogAsset {
@@ -1321,6 +1373,7 @@ mod tests {
                 project_name: "test".to_string(),
                 config_hash: "test".to_string(),
                 last_run_id: None,
+                run_scope: None,
                 assets: vec![
                     CatalogAsset {
                         fqn: "warehouse_a.public.raw_orders".to_string(),

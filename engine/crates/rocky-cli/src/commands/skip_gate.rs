@@ -281,7 +281,16 @@ impl<'a> SkipGate<'a> {
         // which must itself be a success. We never scan past it for an older
         // success: a more recent failure must force a rebuild (the latest
         // build attempt is the authoritative baseline).
-        let prior = match store.get_model_history(&model.config.name, 1) {
+        //
+        // The latest PRODUCTION execution (#2201). The gate only runs on
+        // production runs, so its baseline must be a production build: a
+        // shadow or branch build of the same SQL wrote another table, and
+        // skipping on it would leave the production table stale. A run
+        // recorded before runs carried a scope is not trusted either — where
+        // it wrote is unknown, and a build is always safe.
+        let prior = match store.get_model_history_matching(&model.config.name, 1, |run| {
+            run.counts_as_production(rocky_core::state::UnrecordedScope::Exclude)
+        }) {
             Ok(mut history) => history.pop(),
             Err(_) => return build(GateReason::NoPriorBuild),
         };

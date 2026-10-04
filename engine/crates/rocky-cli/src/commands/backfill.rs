@@ -396,13 +396,13 @@ pub(crate) fn run_backfill_in(
 /// for an explicit `--model`. Enabling failure containment (`[resilience]
 /// contain_failures`) records the model by name, which makes this trigger
 /// resolve the contained window directly.
+///
+/// "The most recent run" is the most recent production run (#2201): a
+/// backfill rebuilds production targets, so a shadow or branch run's failures
+/// say nothing about what production is missing. A run recorded before runs
+/// carried a scope is eligible, as it was before.
 fn seeds_from_last_run(store: &StateStore, compiled: &CompileResult) -> Result<Vec<String>> {
-    let runs = store
-        .list_runs(1)
-        .context("failed to read run history for --from-last-run")?;
-    let Some(latest) = runs.into_iter().next() else {
-        bail!("no runs recorded yet — nothing to backfill from --from-last-run");
-    };
+    let latest = last_production_run(store)?;
     let mut failed: Vec<String> = latest
         .models_executed
         .iter()
@@ -435,6 +435,19 @@ fn seeds_from_last_run(store: &StateStore, compiled: &CompileResult) -> Result<V
         );
     }
     Ok(seeds)
+}
+
+/// The run `--from-last-run` seeds from: the newest production run, or a
+/// run recorded before runs carried a scope. See [`seeds_from_last_run`].
+fn last_production_run(store: &StateStore) -> Result<rocky_core::state::RunRecord> {
+    let runs = store
+        .list_runs_matching(1, |r| {
+            r.counts_as_production(rocky_core::state::UnrecordedScope::Count)
+        })
+        .context("failed to read run history for --from-last-run")?;
+    runs.into_iter()
+        .next()
+        .context("no production runs recorded yet — nothing to backfill from --from-last-run")
 }
 
 /// The set of models to rebuild: the seeds plus (optionally) their transitive
@@ -684,7 +697,10 @@ fn latest_success_executions(
     let Some(store) = store else {
         return out;
     };
-    let Ok(runs) = store.list_runs(COST_HISTORY_SCAN) else {
+    // Production runs only (#2201): the estimate prices a production rebuild.
+    let Ok(runs) = store.list_runs_matching(COST_HISTORY_SCAN, |r| {
+        r.counts_as_production(rocky_core::state::UnrecordedScope::Count)
+    }) else {
         return out;
     };
     let wanted: BTreeSet<&str> = models.iter().map(String::as_str).collect();
@@ -1218,5 +1234,65 @@ mod tests {
             format!("{err:#}").contains("failed to load config from"),
             "the refusal must name the config file, got: {err:#}"
         );
+    }
+
+    /// #2201: `--from-last-run` seeds from the newest PRODUCTION run, and the
+    /// cost estimate prices from production builds. A newer shadow run's
+    /// failures and timings are not production's.
+    #[test]
+    fn last_run_and_cost_history_read_production_runs_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
+        let record = |id: &str, hour: u32, scope: serde_json::Value, status: &str| {
+            let at = format!("2026-05-01T{hour:02}:00:00Z");
+            let run: rocky_core::state::RunRecord = serde_json::from_value(serde_json::json!({
+                "run_id": id,
+                "started_at": at,
+                "finished_at": at,
+                "status": "PartialFailure",
+                "models_executed": [{
+                    "model_name": "m",
+                    "started_at": at,
+                    "finished_at": at,
+                    "duration_ms": 1,
+                    "rows_affected": null,
+                    "status": status,
+                    "sql_hash": id,
+                }],
+                "trigger": "Manual",
+                "config_hash": "c",
+                "run_scope": scope,
+            }))
+            .unwrap();
+            store.record_run(&run).unwrap();
+        };
+        record("prod", 1, serde_json::json!("production"), "success");
+        record(
+            "shadow",
+            2,
+            serde_json::json!({"shadow": {"schema": null}}),
+            "success",
+        );
+
+        assert_eq!(last_production_run(&store).unwrap().run_id, "prod");
+        let latest = latest_success_executions(Some(&store), &["m".to_string()]);
+        assert_eq!(latest["m"].1, "prod");
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
+        let run: rocky_core::state::RunRecord = serde_json::from_value(serde_json::json!({
+            "run_id": "branch",
+            "started_at": "2026-05-01T00:00:00Z",
+            "finished_at": "2026-05-01T00:00:00Z",
+            "status": "Failure",
+            "models_executed": [],
+            "trigger": "Manual",
+            "config_hash": "c",
+            "run_scope": {"branch": {"name": "b"}},
+        }))
+        .unwrap();
+        store.record_run(&run).unwrap();
+        let err = last_production_run(&store).unwrap_err();
+        assert!(format!("{err:#}").contains("no production runs"), "{err:#}");
     }
 }
