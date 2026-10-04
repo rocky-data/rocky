@@ -69,6 +69,9 @@ pub(crate) struct ModelSide {
     /// `Some(name)` when the check does not support the model's
     /// materialization; `None` when it does.
     pub unsupported_strategy: Option<&'static str>,
+    /// The materialization and target, compared across sides so a `match`
+    /// can say when something outside the SELECT also changed.
+    pub shape: String,
 }
 
 /// A changed model, with both sides as found.
@@ -124,6 +127,24 @@ pub(crate) async fn run_intent_check(
     .await)
 }
 
+/// The limits of a `match`, stated per model: a `match` covers the SELECT
+/// output on the recorded inputs, nothing more.
+fn match_note(candidate: &Candidate, v: &ModelIntentVerdict) -> Option<String> {
+    let mut notes = Vec::new();
+    if let (Some(base), Some(head)) = (&candidate.base, &candidate.head)
+        && base.shape != head.shape
+    {
+        notes.push(
+            "the SELECT output matches, but the materialization or target also \
+             changed, and the check does not cover that",
+        );
+    }
+    if v.rows_base == Some(0) && v.rows_head == Some(0) {
+        notes.push("both outputs are empty, so the inputs did not exercise this model");
+    }
+    (!notes.is_empty()).then(|| notes.join("; "))
+}
+
 /// Decide a verdict for every candidate and assemble the output.
 pub(crate) async fn check_candidates(
     intent: PlanIntent,
@@ -141,6 +162,9 @@ pub(crate) async fn check_candidates(
             Decision::Build { base_sql, head_sql } => {
                 let mut v = probe_model(adapter, &candidate.name, base_sql, head_sql).await;
                 v.upstream_changed = candidate.upstream_changed.clone();
+                if v.verdict == IntentVerdict::Match {
+                    v.detail = match_note(&candidate, &v);
+                }
                 v
             }
         };
@@ -191,18 +215,32 @@ pub(crate) fn changed_models(
     let head_ir = super::ci_diff::project_ir_from_compile(head);
     let findings = rocky_core::breaking_change::diff_project_ir(&base_ir, &head_ir);
 
-    // Findings key on `target.full_name()`. Map back to the model name on
-    // whichever side carries that target.
-    let mut target_to_name: HashMap<String, String> = HashMap::new();
-    for m in base_ir.models.iter().chain(head_ir.models.iter()) {
-        target_to_name
-            .entry(m.target.full_name())
-            .or_insert_with(|| m.name.to_string());
+    // Findings key on `target.full_name()`. Map each target back to the
+    // model name on EACH side: a rename keeps the target and changes the
+    // name, so it must report both names, never only one of them.
+    let names_by_target = |models: &[ModelIr]| -> HashMap<String, String> {
+        models
+            .iter()
+            .map(|m| (m.target.full_name(), m.name.to_string()))
+            .collect()
+    };
+    let base_names = names_by_target(&base_ir.models);
+    let head_names = names_by_target(&head_ir.models);
+    let mut changed: BTreeSet<String> = BTreeSet::new();
+    for f in &findings {
+        let target = f.change.model();
+        changed.extend(base_names.get(target).cloned());
+        changed.extend(head_names.get(target).cloned());
     }
-    let changed: BTreeSet<String> = findings
-        .iter()
-        .filter_map(|f| target_to_name.get(f.change.model()).cloned())
-        .collect();
+    // A model present on one side only is always reported, with or without
+    // an IR finding: a pure rename leaves the SQL and the target equal.
+    let base_set: BTreeSet<&String> = base_names.values().collect();
+    let head_set: BTreeSet<&String> = head_names.values().collect();
+    changed.extend(
+        base_set
+            .symmetric_difference(&head_set)
+            .map(|n| (*n).clone()),
+    );
 
     let base_by_name: BTreeMap<&str, (&ModelIr, &str)> = base
         .project
@@ -270,6 +308,7 @@ fn model_side(ir: &ModelIr, sql: &str) -> ModelSide {
     ModelSide {
         sql: sql.to_string(),
         unsupported_strategy: unsupported_strategy(ir),
+        shape: format!("{:?} -> {}", ir.materialization, ir.target.full_name()),
     }
 }
 
@@ -430,6 +469,11 @@ fn ctas_body(sql: &str) -> &str {
 /// `true` when `sql` has a `;` outside string literals, quoted identifiers
 /// and comments.
 fn has_statement_separator(sql: &str) -> bool {
+    // Two independent guards. The parser counts statements where it can read
+    // the SQL. The lexical scan covers DuckDB syntax the parser refuses.
+    if rocky_sql::parser::parse_sql(sql).is_ok_and(|stmts| stmts.len() > 1) {
+        return true;
+    }
     let chars: Vec<char> = sql.chars().collect();
     let mut i = 0;
     while i < chars.len() {
@@ -457,6 +501,27 @@ fn has_statement_separator(sql: &str) -> bool {
                 i += 1;
             }
             i += 2;
+        } else if c == '$' {
+            // A dollar-quoted string, `$$...$$` or `$tag$...$tag$`. A quote
+            // character inside it must not open a string for this scan.
+            let tag_end = chars[i + 1..]
+                .iter()
+                .position(|ch| !(ch.is_ascii_alphanumeric() || *ch == '_'))
+                .map(|n| i + 1 + n);
+            match tag_end {
+                Some(end)
+                    if chars[end] == '$'
+                        && !chars[i + 1..end].first().is_some_and(char::is_ascii_digit) =>
+                {
+                    let delimiter = &chars[i..=end];
+                    let body_start = end + 1;
+                    match (body_start..chars.len()).find(|&j| chars[j..].starts_with(delimiter)) {
+                        Some(close) => i = close + delimiter.len(),
+                        None => i = chars.len(),
+                    }
+                }
+                _ => i += 1,
+            }
         } else if c == ';' {
             return true;
         } else {
@@ -771,6 +836,7 @@ mod tests {
         Some(ModelSide {
             sql: sql.to_string(),
             unsupported_strategy: None,
+            shape: "FullRefresh -> t".to_string(),
         })
     }
 
@@ -1033,11 +1099,91 @@ mod tests {
         )
         .await;
         assert_eq!(v.reason, Some(IntentCheckReason::BuildFailed), "{v:?}");
+        assert!(
+            v.detail
+                .as_deref()
+                .is_some_and(|d| d.contains("more than one statement")),
+            "the guard, not a failed build, must refuse it: {v:?}"
+        );
         assert_eq!(v.rows_base, None, "no build may run");
         adapter
             .execute_query("SELECT count(*) FROM t")
             .await
             .expect("the table must survive");
+    }
+
+    /// A quote inside a dollar-quoted string must not hide a second
+    /// statement. A `COPY ... TO` outside the transaction would otherwise
+    /// write a file that ROLLBACK cannot undo.
+    #[tokio::test]
+    async fn a_dollar_quoted_quote_does_not_hide_a_second_statement() {
+        let adapter = seeded().await;
+        let dir = tempfile::TempDir::new().unwrap();
+        let out = dir.path().join("leak.csv");
+        let head = format!(
+            "SELECT $$ ' $$ AS a, id FROM t; COPY t TO '{}'",
+            out.display()
+        );
+        let v = check_one(&adapter, "duckdb", candidate("SELECT id FROM t", &head)).await;
+        assert_eq!(v.reason, Some(IntentCheckReason::BuildFailed), "{v:?}");
+        assert!(!out.exists(), "the second statement must never run");
+    }
+
+    /// A `match` states its limits: a changed target or materialization is
+    /// outside the check, and an empty output exercised nothing.
+    #[tokio::test]
+    async fn a_match_states_what_it_does_not_cover() {
+        let adapter = seeded().await;
+        let mut moved = candidate("SELECT id FROM t", "SELECT id FROM t");
+        if let Some(head) = moved.head.as_mut() {
+            head.shape = "View -> t2".to_string();
+        }
+        let out = check_candidates(
+            PlanIntent::Refactor,
+            "main",
+            "duckdb",
+            &adapter,
+            vec![moved],
+            None,
+        )
+        .await;
+        let v = &out.models[0];
+        assert_eq!(v.verdict, IntentVerdict::Match, "{v:?}");
+        assert!(
+            v.detail
+                .as_deref()
+                .is_some_and(|d| d.contains("materialization or target")),
+            "{v:?}"
+        );
+
+        let empty = candidate(
+            "SELECT id FROM t WHERE false",
+            "SELECT id FROM t WHERE 1 = 0",
+        );
+        let out = check_candidates(
+            PlanIntent::Refactor,
+            "main",
+            "duckdb",
+            &adapter,
+            vec![empty],
+            None,
+        )
+        .await;
+        let v = &out.models[0];
+        assert_eq!(v.verdict, IntentVerdict::Match, "{v:?}");
+        assert!(
+            v.detail.as_deref().is_some_and(|d| d.contains("empty")),
+            "{v:?}"
+        );
+    }
+
+    #[test]
+    fn statement_separator_scan_reads_dollar_quotes() {
+        assert!(has_statement_separator("SELECT $$ ' $$; SELECT 1"));
+        assert!(has_statement_separator("SELECT $q$ ; $q$ AS a; SELECT 1"));
+        assert!(!has_statement_separator("SELECT $q$ ; ' $q$ AS a"));
+        assert!(!has_statement_separator("SELECT $1 AS a"));
+        assert!(!has_statement_separator("SELECT ';' AS a -- ;"));
     }
 
     #[tokio::test]

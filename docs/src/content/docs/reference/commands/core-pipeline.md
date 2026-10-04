@@ -366,21 +366,23 @@ The check passes when the schema is the same and the two outputs hold the same r
 | `match` | | The same schema and the same rows on the current data. |
 | `mismatch` | `schema_differs` | A column name, type or position changed. Both schemas are in the output. |
 | `mismatch` | `rows_differ` | The rows differ. The output gives the row counts and the rows only on each side. |
-| `mismatch` | `model_removed` | The model exists at `--base` and not in the working tree. |
-| `unverified` | `nondeterministic` | The SQL reads the clock, a random value, a UUID, a sequence or the session. Or two builds of the same SQL differ. |
+| `mismatch` | `model_removed` | The model exists at `--base` and not in the working tree. A renamed model shows its old name here and its new name as `no_base`. |
+| `unverified` | `nondeterministic` | The SQL reads the clock, a random value, a UUID, a sequence, the session or the environment. Or it has a `LIMIT` with no `ORDER BY`. Or two builds of the same SQL differ. |
 | `unverified` | `no_base` | The model is new. |
 | `unverified` | `base_unavailable` | Rocky could not read or compile the models at `--base`. |
 | `unverified` | `adapter_unsupported` | The target is not DuckDB. Rocky runs no query. |
 | `unverified` | `unsupported_strategy` | The model is `incremental`, `time_interval`, `microbatch` or `ephemeral`. |
-| `unverified` | `build_failed` | A build or a compare query failed. `detail` has the error. |
+| `unverified` | `build_failed` | A build or a compare query failed, or the SQL holds more than one statement. `detail` has the reason. |
 
 Know these limits before you trust a `match`:
 
 - A `match` means no difference on the current data. It is not a proof for other data. A `WHERE` change that no current row reaches still gives `match`.
-- Rocky checks the `SELECT` output only. It does not check masks, classifications, targets, the strategy or other model config.
+- Rocky checks the `SELECT` output only. It does not check masks, classifications, targets, the strategy or other model config. When the target or the strategy also changed, a `match` says so in `detail`.
+- When both outputs are empty, a `match` says so in `detail`. The current data did not exercise the model.
 - Each model reads the upstream tables that already exist in the warehouse. When an upstream model also changed, the verdict lists it in `upstream_changed`. Per-model matches do not add up to a match for the whole chain.
-- The verdict is report-only. It relaxes no gate, it does not replace review, and it never changes the exit code.
-- The check works where `rocky plan --model` works: a project with a replication pipeline. It cannot be combined with `--dag`. It pays for the extra builds on your DuckDB database.
+- The verdict is report-only. It relaxes no gate, it does not replace review, and it never changes the exit code. The flag itself can fail the command: with `--dag`, with no models directory, or when the working tree does not compile.
+- `rocky plan` needs a replication pipeline in `rocky.toml`, so the check runs only in a project that has one. It pays for the extra builds on your DuckDB database.
+- The plan records `intent: refactor` as the author's claim. The plan does not record the verdict, so a stored plan never shows the claim as checked.
 
 The `--intent` flag is not the free-text `intent = "..."` key in a model sidecar. That key describes a model for the AI commands. `--intent` states what one change does.
 

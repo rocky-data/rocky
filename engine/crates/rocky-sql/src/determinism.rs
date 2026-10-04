@@ -80,6 +80,16 @@ pub(crate) const VOLATILE_FUNCTIONS: &[&str] = &[
     "SETSEED",
     "NEXTVAL",
     "CURRVAL",
+    // One-argument `age(ts)` reads the current date. Two-argument `age` does
+    // not, but a name scan cannot tell them apart; flagging both is the safe
+    // direction.
+    "AGE",
+    // Session and environment reads.
+    "CURRENT_SETTING",
+    "GETENV",
+    "VERSION",
+    "CURRENT_QUERY",
+    "TXID_CURRENT",
 ];
 
 /// Volatile builtins that take no parentheses and therefore parse as a bare
@@ -551,6 +561,10 @@ mod tests {
             "SELECT setseed(0.5)",
             "SELECT current_user AS u FROM s.t",
             "WITH c AS (SELECT id, rand() AS r FROM s.t) SELECT id FROM c",
+            "SELECT age(created_at) AS a FROM s.t",
+            "SELECT current_setting('TimeZone') AS z",
+            "SELECT getenv('HOME') AS h",
+            "SELECT version() AS v",
         ] {
             assert!(contains_volatile_builtin(sql), "{sql} must be flagged");
         }
