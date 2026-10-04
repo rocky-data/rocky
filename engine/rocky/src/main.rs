@@ -391,32 +391,8 @@ impl From<PolicyCapabilityArg> for rocky_core::config::PolicyCapability {
     }
 }
 
-/// Command groups (Plan 22 design)
-///
-/// These commands will be reorganized into nested subcommand trees in a
-/// follow-up phase. Top-level aliases will be preserved for backward compat.
-///
-/// ## Pipeline — core pipeline operations
-/// `run`, `plan`, `discover`, `compare`, `state`, `history`
-///
-/// ## Model — model development and analysis
-/// `compile`, `test`, `lineage`, `metrics`, `optimize`, `ci`
-///
-/// ## Infra — infrastructure and maintenance
-/// `doctor`, `hooks`, `archive`, `compact`, `profile-storage`, `watch`
-///
-/// ## Dev — development and tooling
-/// `init`, `playground`, `serve`, `lsp`, `list`, `shell`, `validate`,
-/// `bench`, `export-schemas`
-///
-/// ## Migrate — migration tooling
-/// `import-dbt`, `validate-migration`, `init-adapter`, `test-adapter`
-///
-/// ## Data — data operations
-/// `load`, `seed`, `snapshot`, `docs`
-///
-/// ## AI — AI-powered features
-/// `ai`, `ai-sync`, `ai-explain`, `ai-test`
+/// Every top-level `rocky` verb. `rocky --help` lists them in the groups in
+/// [`HELP_GROUPS`], with the core verbs first (RV5-P3).
 #[derive(Subcommand)]
 #[allow(clippy::large_enum_variant)]
 enum Command {
@@ -3196,12 +3172,185 @@ fn offending_default_plan_flag(flags: &[(&'static str, bool)]) -> Option<&'stati
 /// to stop.
 const RUNTIME_SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// The groups `rocky --help` shows, in order (RV5-P3, ruled 2026-10-04).
+///
+/// The first group is the core verb set. Clap cannot group subcommands under
+/// headings, so [`with_grouped_help`] renders this table into the root help
+/// template. Grouping changes only the help text: every verb, alias and
+/// output schema stays as it is. A visible verb missing from this table is
+/// listed under "Other commands", so a new verb never drops out of help.
+const HELP_GROUPS: &[(&str, &[&str])] = &[
+    (
+        "Core commands",
+        &[
+            "compile", "run", "test", "plan", "review", "apply", "policy",
+        ],
+    ),
+    ("Getting started", &["init", "playground"]),
+    (
+        "Model development",
+        &[
+            "validate",
+            "discover",
+            "dag",
+            "catalog",
+            "lineage",
+            "lineage-diff",
+            "ci",
+            "ci-diff",
+            "preview",
+            "compare",
+            "branch",
+            "list",
+            "emit-sql",
+            "imports",
+            "publish-ir",
+        ],
+    ),
+    ("Data loading", &["load", "seed", "snapshot", "backfill"]),
+    (
+        "Governance",
+        &[
+            "audit",
+            "brief",
+            "compliance",
+            "product",
+            "fulfill",
+            "gc",
+            "restore",
+        ],
+    ),
+    (
+        "Operations",
+        &[
+            "doctor",
+            "state",
+            "history",
+            "replay",
+            "trace",
+            "cost",
+            "metrics",
+            "optimize",
+            "profile",
+            "profile-storage",
+            "compact",
+            "archive",
+            "retention-status",
+            "hooks",
+            "tick",
+        ],
+    ),
+    ("dbt migration", &["import-dbt", "validate-migration"]),
+    (
+        "AI",
+        &[
+            "ai",
+            "ai-sync",
+            "ai-explain",
+            "ai-test",
+            "ai-contract",
+            "mcp",
+        ],
+    ),
+    (
+        "Integrations and tooling",
+        &[
+            "serve",
+            "lsp",
+            "export-schemas",
+            "export-openapi",
+            "completions",
+            "test-adapter",
+            "init-adapter",
+            "adapter",
+        ],
+    ),
+    (
+        "Other tools",
+        &["docs", "shell", "estimate", "bench", "watch", "fmt"],
+    ),
+];
+
+/// Parse the command line with the grouped root help.
+///
+/// Behaves like `Cli::parse()`: a parse error or `--help` prints and exits.
+fn parse_cli() -> Cli {
+    use clap::{CommandFactory, FromArgMatches};
+    let mut cmd = with_grouped_help(Cli::command());
+    let mut matches = cmd.get_matches_mut();
+    Cli::from_arg_matches_mut(&mut matches)
+        .map_err(|e| e.format(&mut cmd))
+        .unwrap_or_else(|e| e.exit())
+}
+
+/// Replace the flat "Commands:" list in the root help with [`HELP_GROUPS`].
+fn with_grouped_help(cmd: clap::Command) -> clap::Command {
+    let listing = grouped_subcommand_listing(&cmd);
+    let header = cmd.get_styles().get_header();
+    let template = format!(
+        "{{before-help}}{{about-with-newline}}\n{{usage-heading}} {{usage}}\n\n{listing}\
+         {}Options:{}\n{{options}}{{after-help}}",
+        header.render(),
+        header.render_reset()
+    );
+    cmd.help_template(template)
+}
+
+/// Render the visible subcommands of `cmd`, grouped by [`HELP_GROUPS`].
+fn grouped_subcommand_listing(cmd: &clap::Command) -> String {
+    use std::fmt::Write as _;
+    let styles = cmd.get_styles();
+    let (header, literal) = (styles.get_header(), styles.get_literal());
+    let visible: Vec<&clap::Command> = cmd.get_subcommands().filter(|c| !c.is_hide_set()).collect();
+    let width = visible
+        .iter()
+        .map(|c| c.get_name().len())
+        .max()
+        .unwrap_or(0);
+
+    let mut out = String::new();
+    let mut section = |title: &str, cmds: &[&clap::Command]| {
+        if cmds.is_empty() {
+            return;
+        }
+        let _ = writeln!(out, "{}{title}:{}", header.render(), header.render_reset());
+        for c in cmds {
+            let about = c.get_about().map(ToString::to_string).unwrap_or_default();
+            let _ = writeln!(
+                out,
+                "  {}{:width$}{}  {about}",
+                literal.render(),
+                c.get_name(),
+                literal.render_reset(),
+            );
+        }
+        out.push('\n');
+    };
+
+    let mut placed = std::collections::HashSet::new();
+    for (title, names) in HELP_GROUPS {
+        let cmds: Vec<&clap::Command> = names
+            .iter()
+            .filter_map(|n| visible.iter().copied().find(|c| c.get_name() == *n))
+            .collect();
+        placed.extend(names.iter().copied());
+        section(title, &cmds);
+    }
+    let rest: Vec<&clap::Command> = visible
+        .iter()
+        .copied()
+        .filter(|c| !placed.contains(c.get_name()))
+        .collect();
+    section("Other commands", &rest);
+    out
+}
+
 fn main() -> Result<()> {
     // Must run before `Cli::parse()`: clap emits `--help` / `--version`
     // through `println!`, which panics on EPIPE if SIGPIPE is ignored.
     reset_sigpipe();
 
-    let cli = Cli::parse();
+    let cli = parse_cli();
     // A Pipes writer must receive EPIPE as a Rust error. With SIG_DFL,
     // Dagster closing its stream would kill this process before the run
     // releases its idempotency claim. Keep the ordinary CLI pipe behavior
@@ -5608,6 +5757,82 @@ mod tests {
         clippy::disallowed_methods,
         reason = "this IS the sanctioned wrapper the disallowed-methods entry points callers at"
     )]
+    /// The grouped root help, rendered on a big stack (see
+    /// [`command_with_big_stack`]).
+    fn grouped_root_help_with_big_stack() -> (Vec<String>, String) {
+        std::thread::scope(|s| {
+            std::thread::Builder::new()
+                .stack_size(8 * 1024 * 1024)
+                .spawn_scoped(s, || {
+                    let cmd = Cli::command();
+                    let visible = cmd
+                        .get_subcommands()
+                        .filter(|c| !c.is_hide_set())
+                        .map(|c| c.get_name().to_string())
+                        .collect();
+                    let help = with_grouped_help(cmd).render_help().to_string();
+                    (visible, help)
+                })
+                .expect("spawn help thread")
+                .join()
+                .expect("help thread panicked")
+        })
+    }
+
+    /// RV5-P3: every verb in `HELP_GROUPS` exists, and none is listed twice.
+    /// A renamed or removed verb fails here instead of silently vanishing
+    /// from its group.
+    #[test]
+    fn help_groups_name_only_real_verbs_once() {
+        let (visible, _) = grouped_root_help_with_big_stack();
+        let mut seen = std::collections::HashSet::new();
+        for (title, names) in HELP_GROUPS {
+            for name in *names {
+                assert!(
+                    visible.iter().any(|v| v == name),
+                    "`{name}` in help group `{title}` is not a visible rocky verb"
+                );
+                assert!(seen.insert(*name), "`{name}` is listed in two help groups");
+            }
+        }
+    }
+
+    /// RV5-P3: the root help lists every visible verb exactly once, leads
+    /// with the core verbs, and still lists the options.
+    #[test]
+    fn root_help_groups_every_verb_with_core_first() {
+        let (visible, help) = grouped_root_help_with_big_stack();
+        let listed: Vec<&str> = help
+            .lines()
+            .filter_map(|l| l.strip_prefix("  "))
+            .filter(|l| !l.starts_with(' ') && !l.starts_with('-'))
+            .filter_map(|l| l.split_whitespace().next())
+            .collect();
+        for verb in &visible {
+            let n = listed.iter().filter(|l| **l == verb.as_str()).count();
+            assert_eq!(
+                n, 1,
+                "`{verb}` must appear exactly once in rocky --help:\n{help}"
+            );
+        }
+        let core = help.find("Core commands:").expect("core heading");
+        for heading in ["Getting started:", "Other tools:", "Options:"] {
+            assert!(
+                help.find(heading).expect(heading) > core,
+                "`{heading}` must come after the core verbs"
+            );
+        }
+        assert_eq!(
+            &listed[..7],
+            &[
+                "compile", "run", "test", "plan", "review", "apply", "policy"
+            ],
+            "the core verbs lead the help"
+        );
+        assert!(help.contains("--config"), "the root options stay listed");
+        assert!(!help.contains("\nCommands:"), "the flat list is replaced");
+    }
+
     fn try_parse_with_big_stack(args: &[&str]) -> Cli {
         std::thread::scope(|s| {
             std::thread::Builder::new()

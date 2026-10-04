@@ -18,6 +18,8 @@ Rocky ships one binary. Every subcommand below is a step in the pipeline lifecyc
 
 The pages under **Reference → Commands** group these same commands by category.
 
+`rocky --help` lists the seven core commands first: `compile`, `run`, `test`, `plan`, `review`, `apply` and `policy`. The other commands follow in groups by task. Every command keeps its name, and none is removed.
+
 ## Command index
 
 One line each, for finding the right command. Commands with a section on this page link to it.
