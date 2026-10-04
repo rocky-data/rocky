@@ -1738,6 +1738,13 @@ enum Command {
         microbatch_as: String,
     },
 
+    /// Vendor dbt Hub packages (e.g. Fivetran connector packages) as Rocky
+    /// models: dbt compiles once, then Rocky owns the models.
+    Package {
+        #[command(subcommand)]
+        action: PackageAction,
+    },
+
     /// Interactive SQL shell against the configured warehouse
     Shell {
         /// Pipeline name (required if multiple pipelines are defined)
@@ -2997,6 +3004,79 @@ enum ImportsAction {
         /// without writing anything.
         #[arg(long)]
         check: bool,
+    },
+}
+
+/// Flags shared by `rocky package add` and `rocky package update`.
+#[derive(clap::Args)]
+struct PackageBuildArgs {
+    /// dbt var for the package, `key=value` (repeatable). The value is read as
+    /// YAML (`false`, `5`, `[a, b]`). Recorded in rocky-packages.lock and
+    /// replayed by `update`.
+    #[arg(long = "vars", value_name = "KEY=VALUE")]
+    vars: Vec<String>,
+    /// The `rocky.toml` adapter dbt compiles against (default: the only
+    /// warehouse adapter).
+    #[arg(long)]
+    adapter: Option<String>,
+    /// Schema the vendored models build into (default: the warehouse's
+    /// default schema, e.g. `main` on DuckDB).
+    #[arg(long = "target-schema")]
+    target_schema: Option<String>,
+    /// Path to the dbt executable (default: `dbt` on PATH).
+    #[arg(long)]
+    dbt: Option<PathBuf>,
+    /// Import an already-compiled dbt project instead of running dbt: reads
+    /// `<dir>/target/manifest.json` and `<dir>/package-lock.yml`.
+    #[arg(long)]
+    compiled: Option<PathBuf>,
+    /// Skip `dbt run --empty`. Without it, macros that introspect upstream
+    /// models at compile time (e.g. Fivetran staging columns,
+    /// `dbt_utils.star`) see no columns.
+    #[arg(long = "no-build-empty")]
+    no_build_empty: bool,
+}
+
+impl PackageBuildArgs {
+    fn into_options(self) -> rocky_cli::commands::PackageBuildOptions {
+        rocky_cli::commands::PackageBuildOptions {
+            vars: self.vars,
+            adapter: self.adapter,
+            target_schema: self.target_schema,
+            dbt: self.dbt,
+            compiled: self.compiled,
+            no_build_empty: self.no_build_empty,
+        }
+    }
+}
+
+/// Subcommands under `rocky package`.
+#[derive(Subcommand)]
+enum PackageAction {
+    /// Vendor a dbt Hub package: `<namespace>/<name>[@<version-spec>]`, e.g.
+    /// `fivetran/stripe@>=1.0.0,<2.0.0`.
+    Add {
+        spec: String,
+        #[command(flatten)]
+        build: PackageBuildArgs,
+    },
+    /// Recompile vendored packages and update their files. Files you edited
+    /// are kept; the new upstream version is written beside them as
+    /// `<file>.incoming`.
+    Update {
+        /// Package to update (default: all).
+        name: Option<String>,
+        #[command(flatten)]
+        build: PackageBuildArgs,
+    },
+    /// List vendored packages and any locally edited files.
+    List,
+    /// Delete a vendored package's files and its lock entry.
+    Remove {
+        name: String,
+        /// Also delete vendored files you edited.
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -4766,6 +4846,24 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             &microbatch_as,
             json,
         ),
+        Command::Package { action } => match action {
+            PackageAction::Add { spec, build } => rocky_cli::commands::run_package_add(
+                &cli.config,
+                &spec,
+                &build.into_options(),
+                json,
+            ),
+            PackageAction::Update { name, build } => rocky_cli::commands::run_package_update(
+                &cli.config,
+                name.as_deref(),
+                &build.into_options(),
+                json,
+            ),
+            PackageAction::List => rocky_cli::commands::run_package_list(&cli.config, json),
+            PackageAction::Remove { name, force } => {
+                rocky_cli::commands::run_package_remove(&cli.config, &name, force, json)
+            }
+        },
         Command::Shell { pipeline } => {
             rocky_cli::commands::run_shell(&cli.config, pipeline.as_deref()).await
         }
