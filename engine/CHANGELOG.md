@@ -19,6 +19,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `rocky review` computes breaking-change findings over the set apply executes: the pipeline glob for run plans, the single model for `--model` plans, and the rebuild set for backfills. An invalid model outside that set no longer disables the check. (#2236)
 - Replication recovery no longer records Success while copied tables' post-copy checks never ran. This covers an interrupt after the last copy, an incomplete `--resume-latest`, and a renamed pipeline with partial target overlap. Owed checks are tracked per target. A resume runs the checks of tables its checkpoint already copied, without copying them again. An owed target retires when a later run checks it, when its pipeline defines no post-copy check, or, with a warning, when no current plan names it. An owed check never blocks a run. (#2235)
 - A partitioned content-addressed write records every partition group's hash in the artifact ledger, not only the last group's. The refcount sweep is now correct on partitioned tables. Partitioned models still stay out of the reuse index.
+- `rocky preview diff --algorithm bisection` no longer reports "no change" for three real changes. The chunk checksum now hashes the primary key with the values, so values that swap between keys, and rows that change to one shared value, are found. Rows with a NULL key are now compared by count and row hashes, and differences show as added or removed rows with the key `NULL`. The key range query now quotes the key for the warehouse, so it no longer reads a string literal on Databricks and BigQuery. The Databricks row hash now marks NULL positions, because `xxhash64` skips NULL arguments. The DuckDB row hash hashes the serialized row, because DuckDB's multi-column `hash` cancels under `BIT_XOR`. Not yet run live on Databricks, Snowflake or BigQuery; Snowflake's multi-column `HASH` may cancel the same way.
+
+### Added
+
+- **Experimental:** `rocky compile --dbt-project <DIR>` compiles a dbt project in place (attach mode). It reads `<DIR>/target/manifest.json` and `run_results.json` on every run and writes nothing under `<DIR>`. It refuses what `rocky import-dbt` refuses, with the same reasons, and refuses any manifest schema other than `v12` by name.
 
 ## [1.76.0] — 2026-10-03
 
