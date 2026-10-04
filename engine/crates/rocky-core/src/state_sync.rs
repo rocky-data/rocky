@@ -87,6 +87,27 @@ pub enum StateSyncError {
          (fail-closed)"
     )]
     LedgerSeamConflict { key: String, attempts: u32 },
+
+    #[error(
+        "concurrency_control = \"cas\" is set, but the '{backend}' state store does not honour \
+         conditional writes: {reason}. Refusing to run with a compare-and-swap setting the store \
+         would silently ignore. Fix the store, or set concurrency_control = \"off\" and serialize \
+         writers so only one writes this state at a time"
+    )]
+    /// `cas` was set explicitly and the startup probe proved the store ignores
+    /// or rejects conditional writes.
+    CasUnsupported { backend: String, reason: String },
+
+    #[error(
+        "refusing an unconditional state upload: '{marker}' exists, so other writers of this \
+         state use compare-and-swap, and an unconditional upload could overwrite their committed \
+         state. Fix: set [state] concurrency_control = \"cas\" (or remove the explicit \"off\") \
+         on this writer. Only if every writer of this state is deliberately moving to \"off\", \
+         delete the marker on purpose"
+    )]
+    /// An unconditional upload found the `cas-required` marker beside the
+    /// state object.
+    CasRequired { marker: String },
 }
 
 /// State file name within the configured prefix.
@@ -760,16 +781,601 @@ pub fn cas_supported_on(backend: StateBackend) -> bool {
 }
 
 /// Whether this `[state]` configuration *actually* performs compare-and-swap
-/// state writes: `concurrency_control = "cas"` requested AND
-/// [`cas_supported_on`] the configured backend.
+/// state writes: `cas` requested (explicitly, or as the backend default when
+/// `concurrency_control` is unset — see [`requested_concurrency_control`])
+/// AND [`cas_supported_on`] the configured backend.
 ///
 /// "Effective" rather than "configured" is the distinction that matters — a
 /// `cas` request on a backend without conditional writes silently downgrades to
 /// an unconditional upload, so the request alone proves nothing about whether
 /// the deployment is protected.
+///
+/// This is the *static* answer. The write paths resolve the config through
+/// [`resolve_concurrency_control`] first, which also consults the startup
+/// conditional-write probe and pins the outcome into the config they carry, so
+/// for them this predicate reads the probed result.
 #[must_use]
 pub fn cas_effective(cfg: &StateConfig) -> bool {
-    cfg.concurrency_control == ConcurrencyControl::Cas && cas_supported_on(cfg.backend)
+    requested_concurrency_control(cfg).0 == ConcurrencyControl::Cas && cas_supported_on(cfg.backend)
+}
+
+/// Where a writer's concurrency mode came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConcurrencySource {
+    /// `concurrency_control` is set in `[state]`.
+    Explicit,
+    /// `concurrency_control` is unset; the backend default applies.
+    Defaulted,
+}
+
+impl std::fmt::Display for ConcurrencySource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ConcurrencySource::Explicit => write!(f, "explicit"),
+            ConcurrencySource::Defaulted => write!(f, "default"),
+        }
+    }
+}
+
+/// The mode an unset `concurrency_control` defaults to on `backend`: `cas`
+/// wherever Rocky performs compare-and-swap writes ([`cas_supported_on`]),
+/// `off` elsewhere. Derived from the capability predicate, never re-listed, so
+/// the default can never ask for a protection the backend cannot give.
+///
+/// `valkey` defaults to `off` because its upload is a plain `SET` with no
+/// compare token — there is no conditional put to default to.
+#[must_use]
+pub fn default_concurrency_control(backend: StateBackend) -> ConcurrencyControl {
+    if cas_supported_on(backend) {
+        ConcurrencyControl::Cas
+    } else {
+        ConcurrencyControl::Off
+    }
+}
+
+/// The requested mode and its source, before the startup probe: the explicit
+/// setting when present, else [`default_concurrency_control`].
+#[must_use]
+pub fn requested_concurrency_control(cfg: &StateConfig) -> (ConcurrencyControl, ConcurrencySource) {
+    match cfg.concurrency_control {
+        Some(mode) => (mode, ConcurrencySource::Explicit),
+        None => (
+            default_concurrency_control(cfg.backend),
+            ConcurrencySource::Defaulted,
+        ),
+    }
+}
+
+/// Result of the startup conditional-write probe ([`probe_conditional_writes`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CasProbeOutcome {
+    /// The store honoured create-if-absent and if-match preconditions.
+    Supported,
+    /// The store accepted a write a precondition should have refused, or
+    /// rejected conditional writes while accepting unconditional ones. The
+    /// string says which.
+    Unsupported(String),
+    /// The probe could not finish (transport, permission, timeout), so it
+    /// says nothing about support either way.
+    Inconclusive(String),
+}
+
+impl std::fmt::Display for CasProbeOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CasProbeOutcome::Supported => write!(f, "supported"),
+            CasProbeOutcome::Unsupported(why) => write!(f, "unsupported ({why})"),
+            CasProbeOutcome::Inconclusive(why) => write!(f, "inconclusive ({why})"),
+        }
+    }
+}
+
+/// A writer's concurrency mode after the startup probe.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedConcurrency {
+    /// The mode the writer runs with.
+    pub mode: ConcurrencyControl,
+    /// Whether the mode was set explicitly or defaulted.
+    pub source: ConcurrencySource,
+    /// The probe outcome, or `None` when no probe ran (`off` requested, or a
+    /// backend without a conditional-write tier).
+    pub probe: Option<CasProbeOutcome>,
+}
+
+/// Resolve `cfg`'s concurrency mode for a writer, probing the store once per
+/// process when `cas` is requested on a backend that supports it.
+///
+/// | requested            | probe          | result                      |
+/// |----------------------|----------------|-----------------------------|
+/// | `off` (explicit)     | not run        | `off`                       |
+/// | unset, no CAS tier   | not run        | `off`                       |
+/// | `cas`, no CAS tier   | not run        | `off` (existing downgrade)  |
+/// | `cas` / unset        | supported      | `cas`                       |
+/// | unset                | unsupported    | `off`, with a warning       |
+/// | `cas` (explicit)     | unsupported    | [`StateSyncError::CasUnsupported`] |
+/// | `cas` / unset        | inconclusive   | `cas`, with a warning       |
+///
+/// An inconclusive probe keeps `cas`: falling back to an unconditional upload
+/// on a guess would reopen the lost update this default exists to close. That
+/// is not protection either: on a store that IGNORES conditional headers, a
+/// `cas` write commits as a silent overwrite. A store that REJECTS them fails
+/// the write instead. So an inconclusive probe means "unconfirmed", and the
+/// writer warns; `rocky doctor` reports it as a Warning.
+///
+/// # Errors
+///
+/// [`StateSyncError::CasUnsupported`] when `cas` is set explicitly and the
+/// probe proves the store does not honour conditional writes.
+pub async fn resolve_concurrency_control(
+    cfg: &StateConfig,
+) -> Result<ResolvedConcurrency, StateSyncError> {
+    let (requested, source) = requested_concurrency_control(cfg);
+    if requested == ConcurrencyControl::Off || !cas_supported_on(cfg.backend) {
+        if requested == ConcurrencyControl::Cas {
+            warn!(
+                backend = %cfg.backend,
+                "concurrency_control = cas needs a durable object tier (s3, gcs, or \
+                 tiered) and this backend has none; using an unconditional state upload \
+                 (auto-downgraded to off)"
+            );
+        }
+        return Ok(ResolvedConcurrency {
+            mode: ConcurrencyControl::Off,
+            source,
+            probe: None,
+        });
+    }
+    let probe = cached_probe_conditional_writes(cfg).await;
+    let mode = match (&probe, source) {
+        (CasProbeOutcome::Supported, _) => ConcurrencyControl::Cas,
+        (CasProbeOutcome::Unsupported(why), ConcurrencySource::Explicit) => {
+            return Err(StateSyncError::CasUnsupported {
+                backend: cfg.backend.to_string(),
+                reason: why.clone(),
+            });
+        }
+        (CasProbeOutcome::Unsupported(why), ConcurrencySource::Defaulted) => {
+            warn!(
+                backend = %cfg.backend,
+                reason = %why,
+                "the state store does not honour conditional writes; concurrency_control is \
+                 unset, so falling back to off (unconditional, last-writer-wins uploads). \
+                 Concurrent writers sharing this state can overwrite each other. Set \
+                 concurrency_control = \"off\" to silence this, or move [state] to a store \
+                 that supports conditional writes"
+            );
+            ConcurrencyControl::Off
+        }
+        (CasProbeOutcome::Inconclusive(why), _) => {
+            warn!(
+                backend = %cfg.backend,
+                reason = %why,
+                "could not confirm the state store honours conditional writes; keeping \
+                 concurrency_control = cas (never falling back to unconditional uploads on an \
+                 inconclusive probe)"
+            );
+            ConcurrencyControl::Cas
+        }
+    };
+    Ok(ResolvedConcurrency {
+        mode,
+        source,
+        probe: Some(probe),
+    })
+}
+
+/// `cfg` with its concurrency mode pinned to the resolved one, so every
+/// downstream gate ([`cas_effective`], the tiered read arm) reads the probed
+/// result rather than the request.
+async fn resolved_state_config(cfg: &StateConfig) -> Result<StateConfig, StateSyncError> {
+    let resolved = resolve_concurrency_control(cfg).await?;
+    Ok(StateConfig {
+        concurrency_control: Some(resolved.mode),
+        ..cfg.clone()
+    })
+}
+
+/// Process-wide probe cache: one probe per store location per process. Only
+/// definitive outcomes are cached; an inconclusive probe is retried next time.
+static CAS_PROBE_CACHE: std::sync::Mutex<
+    Option<std::collections::HashMap<String, CasProbeOutcome>>,
+> = std::sync::Mutex::new(None);
+
+/// Cache key for the probe: the durable tier's scheme, bucket and prefix.
+fn cas_probe_cache_key(cfg: &StateConfig) -> String {
+    match cfg.backend {
+        StateBackend::Gcs => format!(
+            "gs://{}/{}",
+            cfg.gcs_bucket.as_deref().unwrap_or_default(),
+            cfg.gcs_prefix.as_deref().unwrap_or(DEFAULT_GCS_PREFIX)
+        ),
+        StateBackend::S3 | StateBackend::Tiered | StateBackend::Local | StateBackend::Valkey => {
+            format!(
+                "s3://{}/{}",
+                cfg.s3_bucket.as_deref().unwrap_or_default(),
+                cfg.s3_prefix.as_deref().unwrap_or(DEFAULT_S3_PREFIX)
+            )
+        }
+    }
+}
+
+/// Whether the probe cache may be used. Under the test seams every test
+/// installs its own in-memory store at the same bucket name, so a cached
+/// outcome would leak from one test's store into another's.
+fn cas_probe_cache_enabled() -> bool {
+    #[cfg(any(test, feature = "test-support"))]
+    if test_support::current_override().is_some()
+        || test_support::current_global_override().is_some()
+    {
+        return false;
+    }
+    true
+}
+
+async fn cached_probe_conditional_writes(cfg: &StateConfig) -> CasProbeOutcome {
+    let key = cas_probe_cache_key(cfg);
+    let use_cache = cas_probe_cache_enabled();
+    if use_cache
+        && let Some(hit) = CAS_PROBE_CACHE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .and_then(|m| m.get(&key).cloned())
+    {
+        return hit;
+    }
+    let (outcome, cacheable) = probe_conditional_writes_inner(cfg).await;
+    if use_cache && cacheable {
+        CAS_PROBE_CACHE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_or_insert_with(Default::default)
+            .insert(key, outcome.clone());
+    }
+    outcome
+}
+
+/// Probe whether the durable tier of `cfg` honours conditional writes.
+///
+/// Some S3-compatible stores (older MinIO, some gateways) accept the
+/// `If-None-Match` / `If-Match` headers and ignore them, which turns every
+/// compare-and-swap into a silent unconditional overwrite. The probe proves
+/// the preconditions are enforced on a throwaway object under its own unique
+/// key — never the shared state object:
+///
+/// 1. create-if-absent the probe key → must commit;
+/// 2. create-if-absent again → must be refused;
+/// 3. if-match the generation from step 1 → must commit;
+/// 4. if-match the now-stale generation from step 1 → must be refused.
+///
+/// Then it deletes the key, best-effort. Four small PUTs and a DELETE, run
+/// once per process per store location (see [`resolve_concurrency_control`]).
+/// A conditional PUT that errors where an unconditional PUT to the same key
+/// succeeds means conditional writes are rejected — `Unsupported`; anything
+/// else that stops the probe is `Inconclusive`. Bounded by
+/// `transfer_timeout_seconds`.
+///
+/// Returns `Unsupported` without I/O for a backend with no durable object tier.
+pub async fn probe_conditional_writes(cfg: &StateConfig) -> CasProbeOutcome {
+    probe_conditional_writes_inner(cfg).await.0
+}
+
+/// The probe plus whether its verdict may be cached for the process. Only a
+/// verdict that rests on the store's own behaviour is cacheable: `Supported`,
+/// and `Unsupported` because a precondition was IGNORED. "Conditional write
+/// rejected, unconditional accepted" could still be two transport blips in a
+/// row, so it is re-probed next time rather than pinned for the process.
+async fn probe_conditional_writes_inner(cfg: &StateConfig) -> (CasProbeOutcome, bool) {
+    let provider = match durable_tier_provider(cfg) {
+        Ok(Some(provider)) => provider,
+        Ok(None) => {
+            return (
+                CasProbeOutcome::Unsupported(format!(
+                    "the '{}' backend has no conditional-write object tier",
+                    cfg.backend
+                )),
+                true,
+            );
+        }
+        Err(e) => return (CasProbeOutcome::Inconclusive(e.to_string()), false),
+    };
+    let key = cas_probe_key();
+    let timeout = transfer_timeout(cfg);
+    let span = info_span!("state.cas_probe", backend = %cfg.backend);
+    let (outcome, cacheable) = with_transfer_timeout(timeout, async {
+        Ok(cas_probe_steps(&provider, &key).await)
+    })
+    .instrument(span)
+    .await
+    .unwrap_or_else(|e| (CasProbeOutcome::Inconclusive(e.to_string()), false));
+    match with_transfer_timeout(timeout, async { Ok(provider.delete(&key).await?) }).await {
+        Ok(()) => {}
+        Err(e) => debug!(error = %e, key = %key, "conditional-write probe cleanup failed"),
+    }
+    info!(outcome = %outcome, "state conditional-write probe finished");
+    let cacheable = cacheable && !matches!(outcome, CasProbeOutcome::Inconclusive(_));
+    (outcome, cacheable)
+}
+
+/// Unique key for one conditional-write probe, under `cas-probe/` at the
+/// configured prefix (never the state object, never a doctor probe name).
+fn cas_probe_key() -> String {
+    let doctor_style = probe_key();
+    let unique = doctor_style
+        .strip_prefix("doctor-probe-")
+        .unwrap_or(&doctor_style);
+    format!("cas-probe/{unique}")
+}
+
+/// Returns the outcome and whether it is cacheable (see
+/// [`probe_conditional_writes_inner`]).
+async fn cas_probe_steps(provider: &ObjectStoreProvider, key: &str) -> (CasProbeOutcome, bool) {
+    // One conditional put, retried once on a non-precondition error so a
+    // single transport blip is not read as "conditional writes rejected"
+    // (that verdict is cached for the process). A retry after an ambiguous
+    // failure that in fact landed shows up as a precondition outcome, which
+    // the steps below treat as inconclusive or as the expected refusal.
+    async fn put_cond(
+        provider: &ObjectStoreProvider,
+        key: &str,
+        data: &'static [u8],
+        expected: Option<&Generation>,
+    ) -> Result<PutIfMatchOutcome, ObjectStoreError> {
+        match provider
+            .put_if_match(key, Bytes::from_static(data), expected)
+            .await
+        {
+            Err(_) => {
+                provider
+                    .put_if_match(key, Bytes::from_static(data), expected)
+                    .await
+            }
+            outcome => outcome,
+        }
+    }
+
+    // A conditional write failed twice with a non-precondition error. If the
+    // same key accepts an unconditional write, the store rejects conditional
+    // writes specifically; otherwise the probe learned nothing.
+    async fn classify(
+        provider: &ObjectStoreProvider,
+        key: &str,
+        step: &str,
+        err: ObjectStoreError,
+    ) -> (CasProbeOutcome, bool) {
+        let outcome = match provider
+            .put(key, Bytes::from_static(b"rocky cas probe (unconditional)"))
+            .await
+        {
+            Ok(()) => CasProbeOutcome::Unsupported(format!(
+                "the store rejected a conditional write ({step}: {err}) but accepted an \
+                 unconditional one"
+            )),
+            Err(_) => CasProbeOutcome::Inconclusive(format!("{step}: {err}")),
+        };
+        (outcome, false)
+    }
+
+    let first = match put_cond(provider, key, b"rocky cas probe 1", None).await {
+        Ok(PutIfMatchOutcome::Committed(generation)) => generation,
+        Ok(PutIfMatchOutcome::Conflict) => {
+            return (
+                CasProbeOutcome::Inconclusive("the unique probe key already existed".to_string()),
+                false,
+            );
+        }
+        Err(e) => return classify(provider, key, "create-if-absent", e).await,
+    };
+    match put_cond(provider, key, b"rocky cas probe 2", None).await {
+        Ok(PutIfMatchOutcome::Conflict) => {}
+        Ok(PutIfMatchOutcome::Committed(_)) => {
+            return (
+                CasProbeOutcome::Unsupported(
+                    "the store accepted a create-if-absent write over an existing object \
+                     (If-None-Match ignored)"
+                        .to_string(),
+                ),
+                true,
+            );
+        }
+        Err(e) => {
+            return classify(provider, key, "create-if-absent on an existing object", e).await;
+        }
+    }
+    if first.e_tag.is_none() && first.version.is_none() {
+        return (
+            CasProbeOutcome::Unsupported(
+                "the store returned no ETag or version for a write, so there is nothing to \
+                 compare-and-swap against"
+                    .to_string(),
+            ),
+            true,
+        );
+    }
+    match put_cond(provider, key, b"rocky cas probe 3", Some(&first)).await {
+        Ok(PutIfMatchOutcome::Committed(_)) => {}
+        Ok(PutIfMatchOutcome::Conflict) => {
+            return (
+                CasProbeOutcome::Unsupported(
+                    "the store refused an if-match write carrying the object's current \
+                     generation"
+                        .to_string(),
+                ),
+                true,
+            );
+        }
+        Err(e) => return classify(provider, key, "if-match", e).await,
+    }
+    match put_cond(provider, key, b"rocky cas probe 4", Some(&first)).await {
+        Ok(PutIfMatchOutcome::Conflict) => (CasProbeOutcome::Supported, true),
+        Ok(PutIfMatchOutcome::Committed(_)) => (
+            CasProbeOutcome::Unsupported(
+                "the store accepted an if-match write carrying a stale generation (If-Match \
+                 ignored)"
+                    .to_string(),
+            ),
+            true,
+        ),
+        Err(e) => classify(provider, key, "if-match with a stale generation", e).await,
+    }
+}
+
+/// Suffix of the `cas-required` marker, a sibling of the state object.
+const CAS_REQUIRED_MARKER_SUFFIX: &str = ".cas-required";
+
+/// Object key of the `cas-required` marker for a state object:
+/// `v9/state.redb.cas-required` (under the configured prefix). One marker per
+/// state object, so a namespaced state file gets its own.
+fn cas_required_marker_key(remote_key: &str) -> String {
+    format!(
+        "{}{CAS_REQUIRED_MARKER_SUFFIX}",
+        object_store_state_key(remote_key)
+    )
+}
+
+/// Marker keys this process already knows exist (written or seen by a CAS
+/// upload). Skips the create on every later upload of the same object.
+static CAS_MARKER_KNOWN: std::sync::Mutex<Option<std::collections::HashSet<String>>> =
+    std::sync::Mutex::new(None);
+
+/// Create the `cas-required` marker beside the state object, once.
+///
+/// Called by every compare-and-swap upload BEFORE its conditional put, so the
+/// shared object is never CAS-committed without the marker in place. The write
+/// is create-if-absent on its own key — like a freeze marker it never touches
+/// the state object and cannot conflict with another writer's state. A marker
+/// that already exists is success.
+async fn ensure_cas_required_marker(
+    provider: &ObjectStoreProvider,
+    remote_key: &str,
+) -> Result<(), StateSyncError> {
+    let key = cas_required_marker_key(remote_key);
+    let cache_key = format!(
+        "{}://{}/{}",
+        provider.scheme(),
+        provider.bucket(),
+        provider.absolute_key(&key)
+    );
+    let use_cache = cas_probe_cache_enabled();
+    if use_cache
+        && CAS_MARKER_KNOWN
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .is_some_and(|known| known.contains(&cache_key))
+    {
+        return Ok(());
+    }
+    let body = serde_json::json!({
+        "marker": "cas-required",
+        "state_object": object_store_state_key(remote_key),
+        "created_at": chrono::Utc::now().to_rfc3339(),
+        "created_by": format!("rocky {}", env!("CARGO_PKG_VERSION")),
+        "meaning": "Writers of this state object use compare-and-swap. A writer with \
+                    concurrency_control = \"off\" refuses to upload while this marker exists. \
+                    Delete it only on purpose, after every writer is deliberately on \"off\".",
+    });
+    let created = provider
+        .put_if_not_exists(&key, Bytes::from(body.to_string()))
+        .await?;
+    if created == crate::object_store::PutIfNotExistsOutcome::Created {
+        info!(marker = %key, "created the cas-required marker beside the state object");
+    }
+    if use_cache {
+        CAS_MARKER_KNOWN
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_or_insert_with(Default::default)
+            .insert(cache_key);
+    }
+    Ok(())
+}
+
+/// Refuse an unconditional upload of the state object when its `cas-required`
+/// marker exists. Reads are never gated; only this write path is.
+///
+/// Fail-closed: if the marker's existence cannot be determined, the upload is
+/// refused too (as a transport error, subject to `on_upload_failure`), because
+/// an unconditional put that guessed wrong would erase a CAS writer's commit.
+async fn refuse_unconditional_upload_if_cas_required(
+    config: &StateConfig,
+    remote_key: &str,
+) -> Result<(), StateSyncError> {
+    let Some(provider) = durable_tier_provider(config)? else {
+        return Ok(());
+    };
+    let key = cas_required_marker_key(remote_key);
+    if provider.exists(&key).await? {
+        let marker = format!(
+            "{}://{}/{}",
+            provider.scheme(),
+            provider.bucket(),
+            provider.absolute_key(&key)
+        );
+        return Err(StateSyncError::CasRequired { marker });
+    }
+    Ok(())
+}
+
+/// Startup half of the marker rule: a writer whose resolved mode is `off`
+/// refuses BEFORE it does any work when the marker already exists, so a run
+/// does not reach its warehouse writes only to have its state upload refused
+/// at the end (its watermarks would then never be published, and the next run
+/// could re-load the same rows). The upload-time check in [`dispatch_upload`]
+/// still covers a marker that appears mid-run.
+///
+/// A marker check that cannot complete here is warned and left to the
+/// upload-time check, which fails closed — startup must not turn a transient
+/// HEAD error into a refusal the download path would have tolerated.
+async fn refuse_off_writer_at_start(
+    cfg: &StateConfig,
+    state_path: &Path,
+) -> Result<(), StateSyncError> {
+    if matches!(cfg.backend, StateBackend::Local) || cas_effective(cfg) {
+        return Ok(());
+    }
+    match with_transfer_timeout(
+        transfer_timeout(cfg),
+        refuse_unconditional_upload_if_cas_required(cfg, &remote_state_key(state_path)),
+    )
+    .await
+    {
+        Ok(()) => Ok(()),
+        Err(e @ StateSyncError::CasRequired { .. }) => Err(e),
+        Err(e) => {
+            warn!(
+                error = %e,
+                "could not check for the cas-required marker at startup; the state upload \
+                 re-checks it and refuses if it cannot"
+            );
+            Ok(())
+        }
+    }
+}
+
+/// Whether the `cas-required` marker exists for the state object backing
+/// `state_path`. `Ok(None)` for a backend with no durable object tier, which
+/// never carries a marker. Used by `rocky doctor`.
+///
+/// # Errors
+///
+/// Propagates provider construction and existence-check failures.
+pub async fn cas_required_marker_present(
+    cfg: &StateConfig,
+    state_path: &Path,
+) -> Result<Option<bool>, StateSyncError> {
+    let Some(provider) = durable_tier_provider(cfg)? else {
+        return Ok(None);
+    };
+    let key = cas_required_marker_key(&remote_state_key(state_path));
+    Ok(Some(provider.exists(&key).await?))
+}
+
+/// The marker's object key (relative to the configured prefix) for the state
+/// object backing `state_path`, for messages.
+#[must_use]
+pub fn cas_required_marker_relative_key(state_path: &Path) -> String {
+    cas_required_marker_key(&remote_state_key(state_path))
 }
 
 /// Boxed full-transition attempt used by [`LedgerSeamSession`].
@@ -861,6 +1467,24 @@ impl LedgerSeamSession {
             return result;
         }
 
+        // Same resolution as `RemoteStateSession::acquire`: the backend default
+        // for an unset mode, confirmed by the startup probe, pinned for every
+        // attempt of this transition.
+        let cfg = resolved_state_config(&self.cfg).await?;
+        refuse_off_writer_at_start(&cfg, &self.state_path).await?;
+        let this = Self {
+            cfg,
+            state_path: self.state_path.clone(),
+            replicate_schema_cache: self.replicate_schema_cache,
+        };
+        this.execute_resolved(attempt).await
+    }
+
+    async fn execute_resolved<T, F>(&self, mut attempt: F) -> Result<T, StateSyncError>
+    where
+        T: Send,
+        F: for<'a> FnMut(&'a StateStore, Option<&'a Generation>) -> LedgerSeamAttempt<'a, T> + Send,
+    {
         if !cas_effective(&self.cfg) {
             let _authority =
                 download_state(&self.cfg, &self.state_path, self.replicate_schema_cache).await?;
@@ -1070,7 +1694,13 @@ impl RemoteStateSession {
     /// # Errors
     ///
     /// Never `Err` for a download failure. `Err` is reserved for internal
-    /// misuse: calling `acquire` twice on one session.
+    /// misuse (calling `acquire` twice on one session), for
+    /// [`StateSyncError::CasUnsupported`] (`concurrency_control = "cas"` set
+    /// explicitly on a store the startup probe proves ignores conditional
+    /// writes — see [`resolve_concurrency_control`]), and for
+    /// [`StateSyncError::CasRequired`] (the mode resolved to `off` while the
+    /// `cas-required` marker exists — refused before any work, not at the
+    /// end-of-run upload).
     pub async fn acquire(&mut self) -> Result<StateAuthority, StateSyncError> {
         if self.acquired {
             return Err(StateSyncError::Io(std::io::Error::other(
@@ -1089,6 +1719,15 @@ impl RemoteStateSession {
             return Ok(self.authority);
         }
 
+        // Resolve the concurrency mode once, before the download decides
+        // whether to capture a base generation: an unset mode becomes the
+        // backend default, confirmed by the startup conditional-write probe.
+        // The resolved mode is pinned into the session's config so acquire,
+        // checkpoint, periodic and finalize all agree. An explicit `cas` the
+        // store cannot honour is an error, not a silent downgrade.
+        self.cfg = resolved_state_config(&self.cfg).await?;
+        refuse_off_writer_at_start(&self.cfg, &self.state_path).await?;
+
         // Under CAS on a backend with a durable object tier, capture the durable
         // object's generation as this run's base so `finalize` can conditionally
         // commit against it. Tier-less backends fall back to the plain download
@@ -1101,14 +1740,8 @@ impl RemoteStateSession {
                     authority
                 })
         } else {
-            if self.cfg.concurrency_control == ConcurrencyControl::Cas {
-                warn!(
-                    backend = %self.cfg.backend,
-                    "concurrency_control = cas needs a durable object tier (s3, gcs, or \
-                     tiered) and this backend has none; using an unconditional state upload \
-                     (auto-downgraded to off)"
-                );
-            }
+            // (An explicit `cas` on a tier-less backend already warned in
+            // `resolve_concurrency_control`.)
             download_state(&self.cfg, &self.state_path, self.replicate_schema_cache).await
         };
 
@@ -2007,7 +2640,9 @@ async fn download_state_inner(
         // Under `cas` the tiered read is generation-validated against the
         // durable tier — the Valkey copy may only short-circuit when it proves
         // it holds the object's CURRENT generation.
-        StateBackend::Tiered if config.concurrency_control == ConcurrencyControl::Cas => {
+        StateBackend::Tiered
+            if requested_concurrency_control(config).0 == ConcurrencyControl::Cas =>
+        {
             tiered_cas_download(config, dest_path, remote_key, gen_sink).await
         }
         StateBackend::Tiered => {
@@ -2798,6 +3433,28 @@ async fn dispatch_upload(
     local_path: &Path,
     remote_key: &str,
 ) -> Result<(), StateSyncError> {
+    // Every unconditional upload of the shared state object passes here, so
+    // this is the one place the `cas-required` marker is enforced (#1228).
+    // Checked once, before any leg — a refused tiered upload must not reach
+    // Valkey either.
+    if !matches!(config.backend, StateBackend::Local) {
+        with_transfer_timeout(
+            transfer_timeout(config),
+            refuse_unconditional_upload_if_cas_required(config, remote_key),
+        )
+        .await?;
+    }
+    dispatch_upload_legs(config, local_path, remote_key).await
+}
+
+/// The per-backend unconditional upload, without the `cas-required` check
+/// [`dispatch_upload`] performs once up front. Tiered recursion uses this so
+/// the check is not repeated per leg.
+async fn dispatch_upload_legs(
+    config: &StateConfig,
+    local_path: &Path,
+    remote_key: &str,
+) -> Result<(), StateSyncError> {
     match config.backend {
         StateBackend::Local => {
             debug!("State backend: local (no sync needed)");
@@ -2864,13 +3521,14 @@ async fn dispatch_upload(
             // `concurrency_control = "cas"` for the coherent tiered write
             // (`dispatch_upload_cas`), which commits to S3 first and then
             // populates-or-invalidates a generation-tagged cache entry.
-            if let Err(e) = Box::pin(dispatch_upload(&valkey_config, local_path, remote_key)).await
+            if let Err(e) =
+                Box::pin(dispatch_upload_legs(&valkey_config, local_path, remote_key)).await
             {
                 warn!(error = %e, "Valkey upload failed (non-fatal, S3 is durable)");
             }
 
             // S3 second (durable, required)
-            Box::pin(dispatch_upload(&s3_config, local_path, remote_key)).await
+            Box::pin(dispatch_upload_legs(&s3_config, local_path, remote_key)).await
         }
     }
 }
@@ -2957,6 +3615,24 @@ async fn dispatch_upload_cas(
     remote_key: &str,
     base: Option<&Generation>,
 ) -> Result<PutIfMatchOutcome, StateSyncError> {
+    // The `cas-required` marker goes in BEFORE the conditional put, so the
+    // shared object is never CAS-committed without it. A failure to create it
+    // is a transport failure of this upload (subject to `on_upload_failure`),
+    // never a reason to fall back to an unconditional write.
+    if let Some(provider) = durable_tier_provider(config)?
+        && let Err(e) = with_transfer_timeout(
+            transfer_timeout(config),
+            ensure_cas_required_marker(&provider, remote_key),
+        )
+        .await
+    {
+        // No commit was attempted, but keep the tiered rule that a failed
+        // upload leaves nothing cached for this key.
+        if matches!(config.backend, StateBackend::Tiered) {
+            invalidate_coherent_cache(config, remote_key).await;
+        }
+        return Err(e);
+    }
     match config.backend {
         StateBackend::Tiered => {
             let bucket = config.s3_bucket.as_deref().ok_or_else(|| {
@@ -3049,6 +3725,10 @@ fn apply_upload_failure_policy(
         // directly today; this guard keeps the invariant if it ever routes here.)
         Err(e @ StateSyncError::CasConflict { .. }) => Err(e),
         Err(e @ StateSyncError::LedgerSeamConflict { .. }) => Err(e),
+        // Same for the cas-required refusal: `Skip` would turn "this writer
+        // must not overwrite CAS writers" into a silent success that also
+        // drops this run's state.
+        Err(e @ StateSyncError::CasRequired { .. }) => Err(e),
         Err(e) => match config.on_upload_failure {
             StateUploadFailureMode::Skip => {
                 warn!(
@@ -3935,7 +4615,11 @@ fn is_transient(err: &StateSyncError) -> bool {
         | StateSyncError::LedgerSeamConflict { .. }
         // A seam-transition failure is a domain refusal from the caller's
         // closure, not a transport fault — retrying cannot change it.
-        | StateSyncError::SeamTransition(_) => false,
+        | StateSyncError::SeamTransition(_)
+        // Configuration refusals: retrying cannot change the store or the
+        // marker.
+        | StateSyncError::CasUnsupported { .. }
+        | StateSyncError::CasRequired { .. } => false,
     }
 }
 
@@ -5515,7 +6199,7 @@ mod tests {
             .join("recovery.redb");
         std::fs::create_dir_all(local.parent().unwrap()).unwrap();
         let mut cfg = s3_session_config(StateUploadFailureMode::Fail);
-        cfg.concurrency_control = ConcurrencyControl::Cas;
+        cfg.concurrency_control = Some(ConcurrencyControl::Cas);
         let mut session =
             RemoteStateSession::new(&cfg, &local, FinalizeDurability::ConfigDefault, false);
         assert_eq!(session.acquire().await.unwrap(), StateAuthority::FreshStart);
@@ -5629,7 +6313,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let local = dir.path().join(".rocky-state.redb");
         let mut cfg = s3_session_config(StateUploadFailureMode::Skip);
-        cfg.concurrency_control = ConcurrencyControl::Cas;
+        cfg.concurrency_control = Some(ConcurrencyControl::Cas);
         let mut stale =
             RemoteStateSession::new(&cfg, &local, FinalizeDurability::ConfigDefault, false);
         assert_eq!(stale.acquire().await.unwrap(), StateAuthority::FreshStart);
@@ -5694,7 +6378,7 @@ mod tests {
             let dir = TempDir::new().unwrap();
             let local = dir.path().join(".rocky-state.redb");
             let mut cfg = s3_session_config(mode);
-            cfg.concurrency_control = ConcurrencyControl::Cas;
+            cfg.concurrency_control = Some(ConcurrencyControl::Cas);
             let mut session = RemoteStateSession::new(&cfg, &local, durability, false);
             assert_eq!(session.acquire().await.unwrap(), StateAuthority::FreshStart);
             let store = StateStore::open(&local).unwrap();
@@ -5839,6 +6523,10 @@ mod tests {
                 max_retries: 0,
                 ..RetryConfig::default()
             },
+            // Explicit `off`: these tests pin the unconditional-upload
+            // lifecycle. The backend default (`cas` on s3) is covered by the
+            // #1228 default-resolution tests.
+            concurrency_control: Some(ConcurrencyControl::Off),
             ..Default::default()
         }
     }
@@ -6104,7 +6792,7 @@ mod tests {
         let cfg = StateConfig {
             backend: StateBackend::S3,
             s3_bucket: Some("bucket".into()),
-            concurrency_control: ConcurrencyControl::Cas,
+            concurrency_control: Some(ConcurrencyControl::Cas),
             retry: RetryConfig {
                 max_retries: 0,
                 ..RetryConfig::default()
@@ -6148,7 +6836,7 @@ mod tests {
         test_support::clear();
     }
 
-    /// The `off` default routes an unconditional upload even against an
+    /// Explicit `off` routes an unconditional upload even against an
     /// already-present object — byte-identical to pre-CAS: two sequential runs
     /// both finalize successfully, the second overwriting without a base.
     #[tokio::test]
@@ -6158,7 +6846,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let local = dir.path().join(".rocky-state.redb");
         seed_state_file(&local);
-        // s3_session_config leaves concurrency_control at its Off default.
+        // s3_session_config pins concurrency_control = off explicitly.
         let cfg = s3_session_config(StateUploadFailureMode::Fail);
 
         for _ in 0..2 {
@@ -6204,8 +6892,8 @@ mod tests {
         let _serial = test_support::serial_guard();
         test_support::clear();
         let mut harness = crate::test_harness::CrossPodHarness::new_s3_like();
-        harness.pod_a.cfg.concurrency_control = ConcurrencyControl::Cas;
-        harness.pod_b.cfg.concurrency_control = ConcurrencyControl::Cas;
+        harness.pod_a.cfg.concurrency_control = Some(ConcurrencyControl::Cas);
+        harness.pod_b.cfg.concurrency_control = Some(ConcurrencyControl::Cas);
 
         seed_state_file(&harness.pod_a.state_path);
         let mut bootstrap = RemoteStateSession::new(
@@ -6300,8 +6988,8 @@ mod tests {
         let _serial = test_support::serial_guard();
         test_support::clear();
         let mut harness = crate::test_harness::CrossPodHarness::new_s3_like();
-        harness.pod_a.cfg.concurrency_control = ConcurrencyControl::Cas;
-        harness.pod_b.cfg.concurrency_control = ConcurrencyControl::Cas;
+        harness.pod_a.cfg.concurrency_control = Some(ConcurrencyControl::Cas);
+        harness.pod_b.cfg.concurrency_control = Some(ConcurrencyControl::Cas);
         harness.pod_b.cfg.on_upload_failure = StateUploadFailureMode::Skip;
 
         seed_state_file(&harness.pod_a.state_path);
@@ -6396,7 +7084,10 @@ mod tests {
 
         let _serial = test_support::serial_guard();
         test_support::clear();
-        let harness = crate::test_harness::CrossPodHarness::new_s3_like();
+        let mut harness = crate::test_harness::CrossPodHarness::new_s3_like();
+        // Explicit `off`: an unset mode now defaults to `cas` on s3 (#1228).
+        harness.pod_a.cfg.concurrency_control = Some(ConcurrencyControl::Off);
+        harness.pod_b.cfg.concurrency_control = Some(ConcurrencyControl::Off);
         let winner_record = seam_policy_record("off-winner");
         {
             let store = harness.open_store(&harness.pod_a);
@@ -6498,7 +7189,7 @@ mod tests {
         StateConfig {
             backend: StateBackend::Tiered,
             s3_bucket: Some("bucket".into()),
-            concurrency_control: ConcurrencyControl::Cas,
+            concurrency_control: Some(ConcurrencyControl::Cas),
             retry: RetryConfig {
                 max_retries: 0,
                 ..RetryConfig::default()
@@ -7015,7 +7706,7 @@ mod tests {
         let local = dir.path().join(".rocky-state.redb");
         seed_state_file(&local);
         let cfg = StateConfig {
-            concurrency_control: ConcurrencyControl::Off,
+            concurrency_control: Some(ConcurrencyControl::Off),
             ..tiered_cas_config()
         };
         let remote_key = remote_state_key(&local);
@@ -7053,6 +7744,23 @@ mod tests {
         let local = dir.path().join(".rocky-state.redb");
         seed_state_file(&local);
 
+        // `off` first: once the CAS commit below creates the cas-required
+        // marker, an `off` session on this state is refused at acquire (#1228).
+        let off_cfg = StateConfig {
+            concurrency_control: Some(ConcurrencyControl::Off),
+            ..tiered_cas_config()
+        };
+        let mut off =
+            RemoteStateSession::new(&off_cfg, &local, FinalizeDurability::ConfigDefault, false);
+        let _ = off.acquire().await.unwrap();
+        off.start_periodic_uploader(Weak::<StateStore>::new(), Duration::from_secs(3600));
+        assert!(
+            off.periodic.is_some(),
+            "off on tiered keeps the mid-run uploader"
+        );
+        off.stop_periodic().await;
+        off.abandon("test").await;
+
         let mut cas = RemoteStateSession::new(
             &tiered_cas_config(),
             &local,
@@ -7066,21 +7774,6 @@ mod tests {
             "cas on tiered must not start the mid-run uploader"
         );
         cas.finalize().await.expect("terminal CAS commit");
-
-        let off_cfg = StateConfig {
-            concurrency_control: ConcurrencyControl::Off,
-            ..tiered_cas_config()
-        };
-        let mut off =
-            RemoteStateSession::new(&off_cfg, &local, FinalizeDurability::ConfigDefault, false);
-        let _ = off.acquire().await.unwrap();
-        off.start_periodic_uploader(Weak::<StateStore>::new(), Duration::from_secs(3600));
-        assert!(
-            off.periodic.is_some(),
-            "off on tiered keeps the mid-run uploader"
-        );
-        off.stop_periodic().await;
-        off.abandon("test").await;
         test_support::clear();
     }
 
@@ -7819,5 +8512,529 @@ mod tests {
         test_support::clear();
         assert_eq!(authority, StateAuthority::FreshStart);
         assert!(!local.exists());
+    }
+
+    // -----------------------------------------------------------------------
+    // #1228 — backend-default concurrency, startup probe, cas-required marker
+    // -----------------------------------------------------------------------
+
+    /// A fault-counting in-memory provider (thread-local) plus a handle on it.
+    fn install_probe_provider() -> (crate::fault_store::FaultHandle, ObjectStoreProvider) {
+        let (store, faults) = crate::fault_store::FaultingStore::wrap(std::sync::Arc::new(
+            object_store::memory::InMemory::new(),
+        ));
+        let provider =
+            test_support::install(ObjectStoreProvider::from_store(store, "s3", "bucket", ""));
+        (faults, provider)
+    }
+
+    /// `s3` with `concurrency_control` left unset.
+    fn s3_unset_config() -> StateConfig {
+        StateConfig {
+            backend: StateBackend::S3,
+            s3_bucket: Some("bucket".into()),
+            on_upload_failure: StateUploadFailureMode::Fail,
+            retry: RetryConfig {
+                max_retries: 0,
+                ..RetryConfig::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    fn with_mode(cfg: &StateConfig, mode: ConcurrencyControl) -> StateConfig {
+        StateConfig {
+            concurrency_control: Some(mode),
+            ..cfg.clone()
+        }
+    }
+
+    async fn run_session(cfg: &StateConfig, local: &Path) -> Result<(), StateSyncError> {
+        let mut session =
+            RemoteStateSession::new(cfg, local, FinalizeDurability::ConfigDefault, false);
+        if let Err(e) = session.acquire().await {
+            session.abandon("test: acquire failed").await;
+            return Err(e);
+        }
+        session.finalize().await
+    }
+
+    #[test]
+    fn unset_concurrency_control_defaults_per_backend() {
+        use ConcurrencyControl::{Cas, Off};
+        for (backend, expected) in [
+            (StateBackend::S3, Cas),
+            (StateBackend::Gcs, Cas),
+            (StateBackend::Tiered, Cas),
+            (StateBackend::Local, Off),
+            // A plain `SET`, no conditional put — see `upload_to_valkey`.
+            (StateBackend::Valkey, Off),
+        ] {
+            assert_eq!(default_concurrency_control(backend), expected, "{backend}");
+            let cfg = StateConfig {
+                backend,
+                ..Default::default()
+            };
+            assert_eq!(
+                requested_concurrency_control(&cfg),
+                (expected, ConcurrencySource::Defaulted),
+                "{backend}"
+            );
+            assert_eq!(cas_effective(&cfg), expected == Cas, "{backend}");
+        }
+        // `off` stays an explicit opt-out.
+        let explicit_off = with_mode(&s3_unset_config(), Off);
+        assert_eq!(
+            requested_concurrency_control(&explicit_off),
+            (Off, ConcurrencySource::Explicit)
+        );
+        assert!(!cas_effective(&explicit_off));
+    }
+
+    #[test]
+    fn unset_concurrency_control_parses_as_none_and_explicit_values_round_trip() {
+        let unset: StateConfig = toml::from_str("backend = \"s3\"\n").unwrap();
+        assert_eq!(unset.concurrency_control, None);
+        let off: StateConfig =
+            toml::from_str("backend = \"s3\"\nconcurrency_control = \"off\"\n").unwrap();
+        assert_eq!(off.concurrency_control, Some(ConcurrencyControl::Off));
+    }
+
+    #[tokio::test]
+    async fn probe_reports_supported_and_leaves_nothing_behind() {
+        test_support::clear();
+        let (faults, provider) = install_probe_provider();
+        let outcome = probe_conditional_writes(&s3_unset_config()).await;
+        assert_eq!(outcome, CasProbeOutcome::Supported);
+        // Cheap and self-cleaning: four conditional puts, and the probe object
+        // is gone afterwards. It never touched the state object.
+        assert_eq!(faults.count(crate::fault_store::FaultOp::Put), 4);
+        assert!(
+            provider.list("").await.unwrap().is_empty(),
+            "probe must delete its object"
+        );
+        let state_key = object_store_state_key(STATE_FILE);
+        for kind in [
+            crate::fault_store::PutKind::Unconditional,
+            crate::fault_store::PutKind::Create,
+            crate::fault_store::PutKind::Update,
+        ] {
+            assert_eq!(faults.put_count(&state_key, kind), 0);
+        }
+        test_support::clear();
+    }
+
+    /// Older S3-compatible stores accept the conditional headers and ignore
+    /// them. That must read as `Unsupported`, never `Supported`.
+    #[tokio::test]
+    async fn probe_reports_unsupported_when_the_store_ignores_preconditions() {
+        test_support::clear();
+        let (faults, _provider) = install_probe_provider();
+        faults.ignore_conditional_writes(true);
+        let outcome = probe_conditional_writes(&s3_unset_config()).await;
+        assert!(
+            matches!(&outcome, CasProbeOutcome::Unsupported(why) if why.contains("If-None-Match")),
+            "got {outcome:?}"
+        );
+        test_support::clear();
+    }
+
+    /// One transport blip on a conditional put is retried, not read as
+    /// "conditional writes rejected".
+    #[tokio::test]
+    async fn probe_single_transient_error_is_not_unsupported() {
+        test_support::clear();
+        let (faults, _provider) = install_probe_provider();
+        faults.arm(
+            crate::fault_store::FaultOp::Put,
+            crate::fault_store::FaultMode::FailNext(1),
+        );
+        assert_eq!(
+            probe_conditional_writes(&s3_unset_config()).await,
+            CasProbeOutcome::Supported
+        );
+        test_support::clear();
+    }
+
+    #[tokio::test]
+    async fn defaulted_mode_on_a_supporting_store_resolves_to_cas() {
+        test_support::clear();
+        let (_faults, _provider) = install_probe_provider();
+        let resolved = resolve_concurrency_control(&s3_unset_config())
+            .await
+            .unwrap();
+        assert_eq!(resolved.mode, ConcurrencyControl::Cas);
+        assert_eq!(resolved.source, ConcurrencySource::Defaulted);
+        assert_eq!(resolved.probe, Some(CasProbeOutcome::Supported));
+        test_support::clear();
+    }
+
+    /// Defaulted `cas` on a store that ignores conditional writes falls back
+    /// to `off` (with a warning) — the run proceeds unconditionally.
+    #[tokio::test]
+    async fn defaulted_mode_falls_back_to_off_when_the_probe_says_unsupported() {
+        test_support::clear();
+        let (faults, provider) = install_probe_provider();
+        faults.ignore_conditional_writes(true);
+        let cfg = s3_unset_config();
+        let resolved = resolve_concurrency_control(&cfg).await.unwrap();
+        assert_eq!(resolved.mode, ConcurrencyControl::Off);
+        assert!(matches!(
+            resolved.probe,
+            Some(CasProbeOutcome::Unsupported(_))
+        ));
+
+        let dir = TempDir::new().unwrap();
+        let local = dir.path().join(".rocky-state.redb");
+        seed_state_file(&local);
+        run_session(&cfg, &local)
+            .await
+            .expect("defaulted fallback to off still uploads");
+        let marker = cas_required_marker_key(&remote_state_key(&local));
+        assert!(
+            !provider.exists(&marker).await.unwrap(),
+            "an off writer never writes the cas-required marker"
+        );
+        test_support::clear();
+    }
+
+    /// Explicit `cas` on a store that ignores conditional writes is an error,
+    /// on both the run session and the ledger seam — never a silent
+    /// downgrade.
+    #[tokio::test]
+    async fn explicit_cas_errors_when_the_probe_says_unsupported() {
+        test_support::clear();
+        let (faults, provider) = install_probe_provider();
+        faults.ignore_conditional_writes(true);
+        let cfg = with_mode(&s3_unset_config(), ConcurrencyControl::Cas);
+
+        let err = resolve_concurrency_control(&cfg).await.unwrap_err();
+        assert!(
+            matches!(err, StateSyncError::CasUnsupported { .. }),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("concurrency_control = \"off\""));
+
+        let dir = TempDir::new().unwrap();
+        let local = dir.path().join(".rocky-state.redb");
+        seed_state_file(&local);
+        let err = run_session(&cfg, &local).await.unwrap_err();
+        assert!(
+            matches!(err, StateSyncError::CasUnsupported { .. }),
+            "{err:?}"
+        );
+
+        let seam = LedgerSeamSession::new(&cfg, &local, false);
+        let ran = std::sync::atomic::AtomicBool::new(false);
+        let err = seam
+            .execute(|_store, _base| {
+                ran.store(true, std::sync::atomic::Ordering::SeqCst);
+                Box::pin(async { Ok(()) })
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, StateSyncError::CasUnsupported { .. }),
+            "{err:?}"
+        );
+        assert!(!ran.load(std::sync::atomic::Ordering::SeqCst));
+        let state_key = object_store_state_key(STATE_FILE);
+        assert!(
+            !provider.exists(&state_key).await.unwrap(),
+            "nothing may be written"
+        );
+        test_support::clear();
+    }
+
+    /// An inconclusive probe keeps the defaulted `cas`: falling back to
+    /// unconditional uploads on a guess would reopen the lost update.
+    #[tokio::test]
+    async fn inconclusive_probe_keeps_defaulted_cas() {
+        test_support::clear();
+        let (faults, _provider) = install_probe_provider();
+        faults.arm(
+            crate::fault_store::FaultOp::Put,
+            crate::fault_store::FaultMode::FailAll,
+        );
+        let resolved = resolve_concurrency_control(&s3_unset_config())
+            .await
+            .unwrap();
+        assert_eq!(resolved.mode, ConcurrencyControl::Cas);
+        assert!(matches!(
+            resolved.probe,
+            Some(CasProbeOutcome::Inconclusive(_))
+        ));
+        test_support::clear();
+    }
+
+    /// With no setting at all, `s3` now commits by compare-and-swap: a stale
+    /// writer conflicts instead of erasing the winner, the state object is
+    /// never written unconditionally, and the first CAS upload creates the
+    /// `cas-required` marker exactly once.
+    #[tokio::test]
+    async fn defaulted_s3_session_commits_by_cas_and_writes_the_marker_once() {
+        test_support::clear();
+        let (faults, provider) = install_probe_provider();
+        let cfg = s3_unset_config();
+        let dir = TempDir::new().unwrap();
+        let local = dir.path().join(".rocky-state.redb");
+        seed_state_file(&local);
+        let state_key = object_store_state_key(&remote_state_key(&local));
+        let marker = cas_required_marker_key(&remote_state_key(&local));
+
+        run_session(&cfg, &local).await.expect("first run commits");
+        let first_marker = provider.get(&marker).await.expect("marker created");
+        assert!(String::from_utf8_lossy(&first_marker).contains("cas-required"));
+
+        // A stale writer: acquires, then loses to a racer.
+        let mut stale =
+            RemoteStateSession::new(&cfg, &local, FinalizeDurability::ConfigDefault, false);
+        let _ = stale.acquire().await.unwrap();
+        run_session(&cfg, &local).await.expect("racer commits");
+        let err = stale.finalize().await.unwrap_err();
+        assert!(matches!(err, StateSyncError::CasConflict { .. }), "{err:?}");
+
+        assert_eq!(
+            provider.get(&marker).await.unwrap(),
+            first_marker,
+            "the marker is create-once: later CAS uploads never rewrite it"
+        );
+        assert_eq!(
+            faults.put_count(&state_key, crate::fault_store::PutKind::Unconditional),
+            0,
+            "a defaulted s3 writer never uploads the state object unconditionally"
+        );
+        assert_eq!(
+            faults.put_count(&marker, crate::fault_store::PutKind::Unconditional),
+            0
+        );
+        test_support::clear();
+    }
+
+    /// The marker goes in BEFORE the conditional put: if it cannot be created,
+    /// the state object is not committed at all.
+    #[tokio::test]
+    async fn marker_failure_blocks_the_cas_commit() {
+        test_support::clear();
+        let (faults, provider) = install_probe_provider();
+        let cfg = s3_unset_config();
+        let dir = TempDir::new().unwrap();
+        let local = dir.path().join(".rocky-state.redb");
+        seed_state_file(&local);
+        let state_key = object_store_state_key(&remote_state_key(&local));
+        let marker = cas_required_marker_key(&remote_state_key(&local));
+        faults.arm_precondition_failures(marker.clone(), 1);
+
+        let err = run_session(&cfg, &local).await.unwrap_err();
+        assert!(
+            !matches!(err, StateSyncError::CasConflict { .. }),
+            "{err:?}"
+        );
+        assert!(!provider.exists(&state_key).await.unwrap());
+        test_support::clear();
+    }
+
+    /// #1228's core: once a CAS writer has marked the state object, an
+    /// explicit-`off` writer refuses its unconditional upload — even under
+    /// `on_upload_failure = "skip"`, which must not swallow the refusal — and
+    /// the committed state is untouched. Reads are unaffected.
+    #[tokio::test]
+    async fn explicit_off_writer_refuses_when_the_marker_is_present() {
+        test_support::clear();
+        let (faults, provider) = install_probe_provider();
+        let dir = TempDir::new().unwrap();
+        let local = dir.path().join(".rocky-state.redb");
+        seed_state_file(&local);
+        let state_key = object_store_state_key(&remote_state_key(&local));
+
+        run_session(&s3_unset_config(), &local)
+            .await
+            .expect("CAS writer commits and creates the marker");
+        let committed = provider.get(&state_key).await.unwrap();
+
+        for on_upload_failure in [StateUploadFailureMode::Fail, StateUploadFailureMode::Skip] {
+            let off = StateConfig {
+                on_upload_failure,
+                ..with_mode(&s3_unset_config(), ConcurrencyControl::Off)
+            };
+            let err = run_session(&off, &local).await.unwrap_err();
+            assert!(
+                matches!(err, StateSyncError::CasRequired { .. }),
+                "{on_upload_failure:?}: {err:?}"
+            );
+            let message = err.to_string();
+            assert!(
+                message.contains("concurrency_control = \"cas\"")
+                    && message.contains(".cas-required")
+                    && message.contains("delete the marker on purpose"),
+                "the refusal must name both fixes: {message}"
+            );
+            let err = upload_state(&off, &local, false).await.unwrap_err();
+            assert!(matches!(err, StateSyncError::CasRequired { .. }), "{err:?}");
+            // Reads are unaffected.
+            let _ = download_state(&off, &local, false)
+                .await
+                .expect("an off writer can still read");
+        }
+        assert_eq!(provider.get(&state_key).await.unwrap(), committed);
+        assert_eq!(
+            faults.put_count(&state_key, crate::fault_store::PutKind::Unconditional),
+            0,
+            "the refused writer never reached the state object"
+        );
+        test_support::clear();
+    }
+
+    /// Without the marker, explicit `off` keeps uploading unconditionally —
+    /// the opt-out still works for a fleet that never ran `cas`.
+    #[tokio::test]
+    async fn explicit_off_writer_uploads_when_no_marker_exists() {
+        test_support::clear();
+        let (faults, _provider) = install_probe_provider();
+        let dir = TempDir::new().unwrap();
+        let local = dir.path().join(".rocky-state.redb");
+        seed_state_file(&local);
+        let off = with_mode(&s3_unset_config(), ConcurrencyControl::Off);
+        run_session(&off, &local).await.unwrap();
+        run_session(&off, &local).await.unwrap();
+        let state_key = object_store_state_key(&remote_state_key(&local));
+        assert_eq!(
+            faults.put_count(&state_key, crate::fault_store::PutKind::Unconditional),
+            2
+        );
+        test_support::clear();
+    }
+
+    /// The marker check runs once, before any leg: a refused tiered `off`
+    /// upload writes nothing.
+    #[tokio::test]
+    async fn refused_tiered_off_upload_writes_neither_leg() {
+        test_support::clear();
+        let (_faults, provider) = install_tiered_backends();
+        let dir = TempDir::new().unwrap();
+        let local = dir.path().join(".rocky-state.redb");
+        seed_state_file(&local);
+        let marker = cas_required_marker_key(&remote_state_key(&local));
+        provider
+            .put(&marker, Bytes::from_static(b"{}"))
+            .await
+            .unwrap();
+        let off = StateConfig {
+            on_upload_failure: StateUploadFailureMode::Fail,
+            ..with_mode(&tiered_cas_config(), ConcurrencyControl::Off)
+        };
+        let err = upload_state(&off, &local, false).await.unwrap_err();
+        assert!(matches!(err, StateSyncError::CasRequired { .. }), "{err:?}");
+        assert!(
+            !provider
+                .exists(&object_store_state_key(&remote_state_key(&local)))
+                .await
+                .unwrap(),
+            "the durable leg must not be written"
+        );
+        test_support::clear();
+    }
+
+    /// Review finding #1: an `off` writer that finds the marker refuses at
+    /// `acquire`, before any work — not at the end-of-run upload, after its
+    /// warehouse writes. The ledger seam refuses before running its
+    /// transition.
+    #[tokio::test]
+    async fn off_writer_refuses_at_acquire_when_the_marker_is_present() {
+        test_support::clear();
+        let (_faults, provider) = install_probe_provider();
+        let dir = TempDir::new().unwrap();
+        let local = dir.path().join(".rocky-state.redb");
+        seed_state_file(&local);
+        run_session(&s3_unset_config(), &local)
+            .await
+            .expect("CAS writer commits and creates the marker");
+        let committed = provider
+            .get(&object_store_state_key(&remote_state_key(&local)))
+            .await
+            .unwrap();
+
+        let off = with_mode(&s3_unset_config(), ConcurrencyControl::Off);
+        let mut session =
+            RemoteStateSession::new(&off, &local, FinalizeDurability::ConfigDefault, false);
+        let err = session.acquire().await.unwrap_err();
+        session.abandon("test: refused at acquire").await;
+        assert!(matches!(err, StateSyncError::CasRequired { .. }), "{err:?}");
+
+        let seam = LedgerSeamSession::new(&off, &local, false);
+        let ran = std::sync::atomic::AtomicBool::new(false);
+        let err = seam
+            .execute(|_store, _base| {
+                ran.store(true, std::sync::atomic::Ordering::SeqCst);
+                Box::pin(async { Ok(()) })
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StateSyncError::CasRequired { .. }), "{err:?}");
+        assert!(
+            !ran.load(std::sync::atomic::Ordering::SeqCst),
+            "the seam transition must not run"
+        );
+        assert_eq!(
+            provider
+                .get(&object_store_state_key(&remote_state_key(&local)))
+                .await
+                .unwrap(),
+            committed
+        );
+        test_support::clear();
+    }
+
+    /// Review finding #4: "conditional write rejected, unconditional
+    /// accepted" may be two transport blips in a row, so that verdict is not
+    /// cached for the process. A verdict from an IGNORED precondition is.
+    #[tokio::test]
+    async fn only_store_behaviour_verdicts_are_cacheable() {
+        test_support::clear();
+        let (faults, _provider) = install_probe_provider();
+        // Both tries of the first conditional put fail; the unconditional
+        // fallback then succeeds.
+        faults.arm(
+            crate::fault_store::FaultOp::Put,
+            crate::fault_store::FaultMode::FailNext(2),
+        );
+        let (outcome, cacheable) = probe_conditional_writes_inner(&s3_unset_config()).await;
+        assert!(
+            matches!(outcome, CasProbeOutcome::Unsupported(_)),
+            "{outcome:?}"
+        );
+        assert!(
+            !cacheable,
+            "a rejection verdict must be re-probed, not pinned"
+        );
+        test_support::clear();
+
+        let (faults, _provider) = install_probe_provider();
+        faults.ignore_conditional_writes(true);
+        let (outcome, cacheable) = probe_conditional_writes_inner(&s3_unset_config()).await;
+        assert!(
+            matches!(outcome, CasProbeOutcome::Unsupported(_)),
+            "{outcome:?}"
+        );
+        assert!(cacheable);
+        test_support::clear();
+
+        let (_faults, _provider) = install_probe_provider();
+        assert_eq!(
+            probe_conditional_writes_inner(&s3_unset_config()).await,
+            (CasProbeOutcome::Supported, true)
+        );
+        test_support::clear();
+    }
+
+    /// The probe object lives under its own `cas-probe/` key.
+    #[test]
+    fn cas_probe_key_is_its_own_namespace() {
+        let key = cas_probe_key();
+        assert!(
+            key.starts_with("cas-probe/") && !key.contains("doctor"),
+            "{key}"
+        );
+        assert_ne!(cas_probe_key(), key);
     }
 }

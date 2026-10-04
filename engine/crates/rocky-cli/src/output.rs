@@ -6542,7 +6542,12 @@ pub struct SettingsOutput {
     /// when there was no readable config — `config_status` says which.
     pub state_backend: Option<rocky_core::config::StateBackend>,
     /// `[state] concurrency_control`, read at the same moment as
-    /// `state_backend`. `null` on the same condition.
+    /// `state_backend`: the explicit setting, or the backend default when it is
+    /// unset (`cas` on `s3`, `gcs` and `tiered`; `off` on `local` and
+    /// `valkey`). This is the requested mode — the writers' startup
+    /// conditional-write probe is not run for it, so `rocky doctor` is where a
+    /// store that falls back to `off` shows up. `null` on the same condition as
+    /// `state_backend`.
     pub concurrency_control: Option<rocky_core::config::ConcurrencyControl>,
     /// What happened when `rocky.toml` was read.
     ///
