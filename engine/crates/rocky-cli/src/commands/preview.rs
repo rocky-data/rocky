@@ -4438,7 +4438,11 @@ table = "plain"
         assert_eq!(single_column_pk(&StrategyConfig::FullRefresh), None);
         assert_eq!(
             single_column_pk(&StrategyConfig::Incremental {
-                timestamp_column: "ts".into()
+                timestamp_column: Some("ts".into()),
+                unique_key: Vec::new(),
+                lookback: None,
+                filter_column: None,
+                on_schema_change: Default::default(),
             }),
             None
         );

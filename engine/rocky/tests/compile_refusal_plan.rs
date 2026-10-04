@@ -25,7 +25,8 @@ fn model(root: &Path, name: &str, sql: &str, strategy: &str) {
         dir.join(format!("{name}.toml")),
         format!(
             "name = \"{name}\"\n[strategy]\ntype = \"{strategy}\"\n{}[target]\ncatalog = \"warehouse\"\nschema = \"main\"\ntable = \"{name}\"\n",
-            if strategy == "incremental" { "timestamp_column = \"updated_at\"\n" } else { "" }
+            // No watermark: `incremental` without one is E037.
+            ""
         ),
     )
     .unwrap();

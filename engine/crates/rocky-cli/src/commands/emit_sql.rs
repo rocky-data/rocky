@@ -16,9 +16,11 @@
 //! Merge and delete_insert models emit their **steady-state** statement (a bare
 //! `MERGE` / `DELETE` + `INSERT` that operates on an existing target); `rocky
 //! run` creates the target table on first build, which a static emit cannot
-//! reproduce. Those files carry a leading note to that effect. (`incremental`
-//! is refused on transformation models, E037, and `ephemeral` is refused
-//! outright, E038; neither reaches this file.)
+//! reproduce. Those files carry a leading note to that effect. An
+//! `incremental` model emits its incremental-run statement, filtered on the
+//! target's `MAX(<watermark>)`, with the same note. (`incremental` without a
+//! watermark is refused, E037, and `ephemeral` is refused outright, E038;
+//! neither reaches this file.)
 //!
 //! The dialect is the adapter `rocky run --model` selects from `rocky.toml`
 //! without credentials. With no project file it defaults to DuckDB. A
@@ -376,8 +378,8 @@ pub fn run_emit_sql(
 /// The SQL written for one model, prefixed with a note for merge and
 /// delete_insert statements that operate on an existing target (so a reader
 /// running the file against a fresh warehouse understands why a bare
-/// `MERGE`/`DELETE` expects the table to already exist). `incremental` never
-/// reaches here: it is refused on transformation models (#1990).
+/// `MERGE`/`DELETE` expects the table to already exist). An `incremental`
+/// statement also reads `MAX(<watermark>)` from that target.
 fn file_body(m: &EmittedModel) -> String {
     if m.assumes_existing_target {
         format!(

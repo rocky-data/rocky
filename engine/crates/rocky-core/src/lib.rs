@@ -28,6 +28,7 @@ pub mod hooks;
 pub mod idempotency;
 pub mod imports;
 pub mod incremental;
+pub mod incremental_filter;
 pub mod lakehouse;
 pub mod macros;
 pub mod masking;

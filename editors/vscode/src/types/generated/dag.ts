@@ -18,8 +18,27 @@ export type StrategyConfig =
       [k: string]: unknown;
     }
   | {
-      timestamp_column: string;
+      /**
+       * The input column `@incremental_filter` compares, when it is not the watermark itself: a qualified column in a join (`"o.updated_at"`) or a source column the model renames (`"_synced_at"`). The bound is still `MAX(<timestamp_column>)` over the target.
+       */
+      filter_column?: string | null;
+      /**
+       * Re-read this far below the watermark, e.g. `"3 days"`, to catch late-arriving rows. Pair it with `unique_key`, or the re-read rows are appended again (W046).
+       */
+      lookback?: IncrementalLookback | null;
+      /**
+       * What a run does when the model's output columns no longer match the target: `fail` (default) or `append_new_columns`.
+       */
+      on_schema_change?: OnSchemaChange & string;
+      /**
+       * The watermark column: an output column of the model whose maximum in the target marks what is already loaded. `watermark` is accepted as an alias.
+       */
+      timestamp_column?: string | null;
       type: "incremental";
+      /**
+       * Upsert on these columns with `MERGE` instead of appending.
+       */
+      unique_key?: string[];
       [k: string]: unknown;
     }
   | {
@@ -104,6 +123,11 @@ export type StrategyConfig =
       type: "content_addressed";
       [k: string]: unknown;
     };
+export type IncrementalLookback = string;
+/**
+ * What an incremental run does when the model's output columns differ from the existing target's columns.
+ */
+export type OnSchemaChange = "fail" | "append_new_columns";
 /**
  * Partition granularity for `time_interval` materialization.
  *

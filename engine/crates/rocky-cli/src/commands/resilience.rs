@@ -533,7 +533,11 @@ mod tests {
         }));
         assert!(rerun_is_idempotent(&StrategyConfig::View));
         assert!(!rerun_is_idempotent(&StrategyConfig::Incremental {
-            timestamp_column: "ts".into(),
+            timestamp_column: Some("ts".into()),
+            unique_key: Vec::new(),
+            lookback: None,
+            filter_column: None,
+            on_schema_change: Default::default(),
         }));
     }
 

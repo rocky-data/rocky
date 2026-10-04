@@ -455,7 +455,7 @@ mod tests {
     }
 
     /// No branch may recommend a strategy `rocky compile` refuses. `ephemeral`
-    /// is E038 (#1996) and `incremental` is E037 (#1990).
+    /// is E038 (#1996); `incremental` needs a watermark the optimizer cannot pick (E037/E046).
     #[test]
     fn no_recommendation_names_a_refused_strategy() {
         for (duration, size, refs, runs) in [

@@ -33,6 +33,22 @@ class CostHint(BaseModel):
     """
 
 
+class OnSchemaChange1(StrEnum):
+    """
+    Stop the run and name the added and removed columns. The default: nothing is written, and `rocky run --full-refresh` rebuilds the table.
+    """
+
+    fail = "fail"
+
+
+class OnSchemaChange2(StrEnum):
+    """
+    Add each new output column to the target with `ALTER TABLE ... ADD COLUMN`, then load. Existing rows hold `NULL` in the new column. A column removed from the model still fails the run.
+    """
+
+    append_new_columns = "append_new_columns"
+
+
 class PhaseTimings(BaseModel):
     """
     Wall-clock duration of each compile phase.
@@ -91,11 +107,32 @@ class Type1(StrEnum):
 
 class StrategyConfig2(BaseModel):
     """
-    Materialization strategy for a model, defaulting to full refresh.
+    Load only rows newer than the target's current watermark.
+
+    On a transformation model the model SQL marks where the filter goes with `@incremental_filter` (`filter_column` names a qualified or renamed input column to compare). Each incremental run resolves it to `<col> > (SELECT MAX(<watermark>) FROM <target>)`, minus `lookback`; the first run and `rocky run --full-refresh` resolve it to `TRUE`. With no placeholder, a watermark column that the model passes straight through from one input is filtered on the model's output instead; anything else is refused (E046). No watermark at all is refused (E037).
     """
 
-    timestamp_column: str
+    filter_column: str | None = None
+    """
+    The input column `@incremental_filter` compares, when it is not the watermark itself: a qualified column in a join (`"o.updated_at"`) or a source column the model renames (`"_synced_at"`). The bound is still `MAX(<timestamp_column>)` over the target.
+    """
+    lookback: str | None = None
+    """
+    Re-read this far below the watermark, e.g. `"3 days"`, to catch late-arriving rows. Pair it with `unique_key`, or the re-read rows are appended again (W046).
+    """
+    on_schema_change: OnSchemaChange1 | OnSchemaChange2 | None = "fail"
+    """
+    What a run does when the model's output columns no longer match the target: `fail` (default) or `append_new_columns`.
+    """
+    timestamp_column: str | None = None
+    """
+    The watermark column: an output column of the model whose maximum in the target marks what is already loaded. `watermark` is accepted as an alias.
+    """
     type: Type1
+    unique_key: list[str] | None = []
+    """
+    Upsert on these columns with `MERGE` instead of appending.
+    """
 
 
 class Type2(StrEnum):

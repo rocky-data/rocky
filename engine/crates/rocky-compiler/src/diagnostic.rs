@@ -138,15 +138,17 @@ pub const E034: &str = "E034";
 /// can never drift. (FR-044)
 pub const E035: &str = "E035";
 
-/// A transformation model declares `type = "incremental"`.
+/// A transformation model declares `type = "incremental"` with no watermark.
 ///
 /// Emitted by `rocky compile` (`check_incremental_strategy` in `typecheck.rs`).
-/// On a transformation model the strategy lowers to a plain
-/// `INSERT INTO <target> <model SQL>` with no watermark filter, so every run
-/// after the first appends the whole result again (#1990). Replication
-/// pipelines are unaffected: their `incremental` copy does apply a watermark.
-/// The error names the strategies that work instead. `E036` is taken by the
-/// target-collision check in `compile.rs`, which emits it as a literal.
+/// Without a `timestamp_column` (alias `watermark`) the strategy could only
+/// lower to a plain `INSERT INTO <target> <model SQL>` with no filter, so every
+/// run after the first would append the whole result again (#1990). The error
+/// points at the watermark config and the `@incremental_filter` placeholder,
+/// and names the other strategies that work. Replication pipelines are
+/// unaffected: their `incremental` copy applies its own watermark. `E036` is
+/// taken by the target-collision check in `compile.rs`, which emits it as a
+/// literal.
 pub const E037: &str = "E037";
 
 /// A model declares `type = "ephemeral"`.
@@ -171,6 +173,18 @@ pub const E039: &str = "E039";
 /// A `.rocky` string literal contains a backslash, whose SQL meaning varies
 /// by target dialect. Use a `.sql` model with the target's own escaping.
 pub const E040: &str = "E040";
+
+/// A transformation `incremental` model's watermark filter has no safe place.
+///
+/// Emitted by `rocky compile` (`check_incremental_strategy` in `typecheck.rs`)
+/// when the model declares a watermark but its SQL has no
+/// `@incremental_filter` placeholder and lineage cannot prove the watermark is
+/// a direct passthrough of one input column (so filtering the output is not
+/// the same as filtering the input); when the watermark is missing from a
+/// provably complete output schema or is not a plain column name; or when
+/// `@incremental_filter` appears in a model whose strategy is not
+/// `incremental`. The suggestion says where the placeholder goes.
+pub const E046: &str = "E046";
 
 // Warnings
 /// Unused model (no downstream consumers).
@@ -272,6 +286,14 @@ pub const W030: &str = "W030";
 /// reads keep working — but the consumer's own declared output type may now
 /// be too small, hence a warning rather than silence.
 pub const W031: &str = "W031";
+
+/// A transformation `incremental` model sets `lookback` without `unique_key`.
+///
+/// Emitted by `rocky compile` (`check_incremental_strategy` in `typecheck.rs`).
+/// A lookback re-reads rows at or below the target's watermark; appended
+/// without a key to merge on, those rows land in the target again on every
+/// run. A warning, not an error: an append-only consumer may tolerate it.
+pub const W046: &str = "W046";
 
 // Info
 /// Model dependency inferred from SQL.

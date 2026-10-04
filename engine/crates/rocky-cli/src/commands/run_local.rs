@@ -1724,6 +1724,7 @@ mod tests {
             force_rebuild: false,
             no_reuse: false,
             no_prune: false,
+            full_refresh: false,
         };
         super::super::run::run(
             config_path,

@@ -18,8 +18,8 @@ use sqlparser::parser::Parser;
 
 use crate::compile::default_type_mapper;
 use crate::diagnostic::{
-    Diagnostic, E001, E020, E021, E022, E023, E024, E025, E026, E035, E037, E038, E039, I001, I002,
-    SourceSpan, W001, W002, W004, W005, W006,
+    Diagnostic, E001, E020, E021, E022, E023, E024, E025, E026, E035, E037, E038, E039, E046, I001,
+    I002, SourceSpan, W001, W002, W004, W005, W006, W046,
 };
 use crate::semantic::{ModelSchema, SemanticGraph};
 use crate::types::{RockyType, TypedColumn};
@@ -612,7 +612,11 @@ fn compute_model_typecheck(
     // parenthesised or computed item lineage cannot name) and an emptiness
     // check misses the partial case.
     if let Some(model) = model_by_name.get(model_name) {
-        diagnostics.extend(check_incremental_strategy(model));
+        diagnostics.extend(check_incremental_strategy(
+            model,
+            &typed_cols,
+            model_schema.schema_is_complete(),
+        ));
         diagnostics.extend(check_ephemeral_strategy(model));
         diagnostics.extend(check_time_interval_strategy(model, &typed_cols));
         diagnostics.extend(check_merge_strategy(
@@ -1158,39 +1162,231 @@ fn check_merge_strategy(
         .collect()
 }
 
-/// E037 — refuse `type = "incremental"` on a transformation model (#1990).
+/// E037 / E046 / W046 — validate a transformation `incremental` model (#1990).
 ///
-/// The transformation path lowers `incremental` to `INSERT INTO <target>
-/// <model SQL>` with no watermark filter, so every run after the first appends
-/// the whole result again and exits 0. Every [`rocky_core::models::Model`] is a
-/// transformation model (replication tables have no sidecar and never reach
-/// this pass), so no variant check is needed here.
+/// An `incremental` model loads only rows past the target's own
+/// `MAX(<watermark>)`. That needs a watermark column and a place to apply it:
+///
+/// - no `timestamp_column` (alias `watermark`) → **E037**: the only SQL left
+///   is an unfiltered INSERT that appends every row again on each run;
+/// - an `@incremental_filter` placeholder in the SQL → valid;
+/// - no placeholder → the runtime filters the model's *output* column, which
+///   is only equivalent when lineage proves that column is a direct
+///   passthrough (`TransformKind::Direct`) of one input column. Anything else
+///   (an expression, an aggregate, a `SELECT *`, SQL lineage cannot read) →
+///   **E046**, naming where to put the placeholder;
+/// - a watermark absent from a provably complete output schema → **E046**:
+///   the target would have no such column to take `MAX` of;
+/// - `lookback` without `unique_key` → **W046**: the re-read window is
+///   appended again on every run.
+///
+/// A placeholder in a model of any other strategy is **E046** too: nothing
+/// would resolve it, and the warehouse would reject the SQL.
 ///
 /// Loaded `microbatch` models are normalized to `time_interval` before this
 /// check, so they receive the partition-window validation instead.
-fn check_incremental_strategy(model: &rocky_core::models::Model) -> Vec<Diagnostic> {
+fn check_incremental_strategy(
+    model: &rocky_core::models::Model,
+    typed_cols: &[TypedColumn],
+    schema_complete: bool,
+) -> Vec<Diagnostic> {
+    use rocky_core::incremental_filter::{PLACEHOLDER, has_placeholder};
     use rocky_core::models::StrategyConfig;
 
-    let StrategyConfig::Incremental { .. } = &model.config.strategy else {
+    let model_name = model.config.name.as_str();
+    let StrategyConfig::Incremental {
+        timestamp_column,
+        unique_key,
+        lookback,
+        filter_column,
+        ..
+    } = &model.config.strategy
+    else {
+        if has_placeholder(&model.sql) {
+            return vec![
+                Diagnostic::error(
+                    E046,
+                    model_name,
+                    format!(
+                        "model '{model_name}' uses `{PLACEHOLDER}`, but its strategy is not \
+                         `incremental`: nothing resolves the placeholder, so the warehouse \
+                         would reject the SQL"
+                    ),
+                )
+                .with_suggestion(
+                    "Set `[strategy] type = \"incremental\"` with `timestamp_column`, or remove \
+                     the placeholder",
+                ),
+            ];
+        }
         return Vec::new();
     };
-    let model_name = model.config.name.as_str();
-    vec![
-        Diagnostic::error(
-            E037,
-            model_name,
-            format!(
-                "model '{model_name}' uses `type = \"incremental\"`, which is not supported on \
-                 transformation models: it emits an unfiltered INSERT and appends every row \
-                 again on each run"
+
+    let Some(watermark) = timestamp_column.as_deref().filter(|w| !w.is_empty()) else {
+        return vec![
+            Diagnostic::error(
+                E037,
+                model_name,
+                format!(
+                    "model '{model_name}' uses `type = \"incremental\"` with no watermark \
+                     column: without one Rocky can only emit an unfiltered INSERT, which \
+                     appends every row again on each run"
+                ),
+            )
+            .with_suggestion(format!(
+                "Declare the watermark in [strategy] — `timestamp_column = \"updated_at\"` — and \
+                 put `{PLACEHOLDER}` where the filter belongs (`WHERE {PLACEHOLDER}`); or use \
+                 `type = \"merge\"`, `\"delete_insert\"`, `\"time_interval\"` or \
+                 `\"full_refresh\"`"
+            )),
+        ];
+    };
+
+    if rocky_sql::validation::validate_identifier(watermark).is_err() {
+        return vec![
+            Diagnostic::error(
+                E046,
+                model_name,
+                format!(
+                    "model '{model_name}': incremental watermark '{watermark}' is not a plain \
+                 column name"
+                ),
+            )
+            .with_suggestion("Name an output column of the model: letters, digits and `_`"),
+        ];
+    }
+
+    let mut diagnostics = Vec::new();
+
+    if let Some(filter) = filter_column
+        && let Err(reason) = rocky_core::incremental_filter::validate_filter_column(filter)
+    {
+        diagnostics.push(
+            Diagnostic::error(
+                E046,
+                model_name,
+                format!("model '{model_name}': incremental {reason}"),
+            )
+            .with_suggestion(
+                "Set `filter_column` to a column or `<alias>.<column>` of the model's input",
             ),
-        )
-        .with_suggestion(
-            "Use `type = \"merge\"` with a `unique_key`, `type = \"delete_insert\"` with \
-             `partition_by`, `type = \"time_interval\"` with `@start_date`/`@end_date` in the \
-             SQL, or `type = \"full_refresh\"`",
-        ),
-    ]
+        );
+    }
+
+    if schema_complete
+        && !typed_cols.is_empty()
+        && !typed_cols
+            .iter()
+            .any(|c| c.name.eq_ignore_ascii_case(watermark))
+    {
+        diagnostics.push(
+            Diagnostic::error(
+                E046,
+                model_name,
+                format!(
+                    "model '{model_name}': incremental watermark '{watermark}' is not an output \
+                     column, so the target has no '{watermark}' to take MAX() of"
+                ),
+            )
+            .with_suggestion(format!(
+                "Select the watermark in the model output. Output columns: {}",
+                typed_cols
+                    .iter()
+                    .map(|c| c.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )),
+        );
+    }
+
+    if !has_placeholder(&model.sql) && !watermark_is_direct_passthrough(&model.sql, watermark) {
+        diagnostics.push(
+            Diagnostic::error(
+                E046,
+                model_name,
+                format!(
+                    "model '{model_name}' declares incremental watermark '{watermark}' but its \
+                     SQL has no `{PLACEHOLDER}`, and Rocky cannot prove '{watermark}' passes \
+                     straight through from an input column, so filtering the model output on \
+                     it may not select the new input rows"
+                ),
+            )
+            .with_suggestion(format!(
+                "Put `{PLACEHOLDER}` in the WHERE clause that reads the source \
+                 (`WHERE {PLACEHOLDER}`), and set `filter_column = \"<alias>.<column>\"` in \
+                 [strategy] when it compares a qualified or renamed input column"
+            )),
+        );
+    }
+
+    if lookback.is_some_and(|lb| lb.amount > 0) && unique_key.is_empty() {
+        diagnostics.push(
+            Diagnostic::warning(
+                W046,
+                model_name,
+                format!(
+                    "model '{model_name}' sets an incremental `lookback` without `unique_key`: \
+                     each run appends the re-read window again, duplicating those rows"
+                ),
+            )
+            .with_suggestion("Add `unique_key` so the window is merged, or remove `lookback`"),
+        );
+    }
+
+    diagnostics
+}
+
+/// Whether `watermark` is an output column copied unchanged from one column
+/// of a physical input table — the only shape for which filtering the model's
+/// output equals filtering its input. Any doubt answers `false`:
+/// unparseable SQL, a `SELECT *`, an expression, two output columns of that
+/// name, a column read from a CTE or a derived table (whose own body may
+/// aggregate), or a top-level `LIMIT` / `OFFSET` / `FETCH` (which picks rows
+/// before the filter would).
+fn watermark_is_direct_passthrough(sql: &str, watermark: &str) -> bool {
+    use rocky_sql::lineage::{TableBinding, TransformKind};
+
+    let Ok(statements) = Parser::parse_sql(&rocky_sql::dialect::DatabricksDialect, sql) else {
+        return false;
+    };
+    let [Statement::Query(query)] = statements.as_slice() else {
+        return false;
+    };
+    if query.with.is_some() || query.limit_clause.is_some() || query.fetch.is_some() {
+        return false;
+    }
+    let Ok(lineage) = rocky_sql::lineage::extract_lineage(sql) else {
+        return false;
+    };
+    let mut edges = lineage
+        .columns
+        .iter()
+        .filter(|c| c.target_column.eq_ignore_ascii_case(watermark));
+    let (Some(edge), None) = (edges.next(), edges.next()) else {
+        return false;
+    };
+    if !matches!(edge.transform, TransformKind::Direct) {
+        return false;
+    }
+    let physical = |t: &&rocky_sql::lineage::TableReference| {
+        t.binding == TableBinding::Physical && t.name != "(subquery)"
+    };
+    match edge.source_table.as_deref() {
+        Some(qualifier) => lineage.source_tables.iter().any(|t| {
+            let named = t
+                .alias
+                .as_deref()
+                .is_some_and(|a| a.eq_ignore_ascii_case(qualifier))
+                || t.name.eq_ignore_ascii_case(qualifier)
+                || t.name
+                    .rsplit('.')
+                    .next()
+                    .is_some_and(|last| last.eq_ignore_ascii_case(qualifier));
+            named && physical(&t)
+        }),
+        // An unqualified column is unambiguous only with one relation.
+        None => matches!(lineage.source_tables.as_slice(), [only] if physical(&only)),
+    }
 }
 
 /// E038 — refuse `type = "ephemeral"` (#1996).

@@ -518,8 +518,10 @@ impl<'a> SkipGate<'a> {
 /// `SELECT MAX(<col>)` watermark probe against raw sources.
 fn strategy_timestamp_column(strategy: &rocky_core::models::StrategyConfig) -> Option<&str> {
     match strategy {
-        rocky_core::models::StrategyConfig::Incremental { timestamp_column }
-        | rocky_core::models::StrategyConfig::Microbatch {
+        rocky_core::models::StrategyConfig::Incremental {
+            timestamp_column, ..
+        } => timestamp_column.as_deref(),
+        rocky_core::models::StrategyConfig::Microbatch {
             timestamp_column, ..
         } => Some(timestamp_column.as_str()),
         _ => None,

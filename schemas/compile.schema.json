@@ -84,6 +84,9 @@
       ],
       "type": "object"
     },
+    "IncrementalLookback": {
+      "type": "string"
+    },
     "ModelDetail": {
       "description": "Per-model summary projected from `rocky_core::models::ModelConfig`.\n\nIntentionally excludes fields that change run-to-run (timings, diagnostics) — those live on the run-level outputs. This is the stable, declarative shape of one compiled model, suitable for orchestrators that build asset definitions ahead of execution.",
       "properties": {
@@ -190,6 +193,25 @@
       ],
       "type": "object"
     },
+    "OnSchemaChange": {
+      "description": "What an incremental run does when the model's output columns differ from the existing target's columns.",
+      "oneOf": [
+        {
+          "description": "Stop the run and name the added and removed columns. The default: nothing is written, and `rocky run --full-refresh` rebuilds the table.",
+          "enum": [
+            "fail"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Add each new output column to the target with `ALTER TABLE ... ADD COLUMN`, then load. Existing rows hold `NULL` in the new column. A column removed from the model still fails the run.",
+          "enum": [
+            "append_new_columns"
+          ],
+          "type": "string"
+        }
+      ]
+    },
     "PhaseTimings": {
       "description": "Wall-clock duration of each compile phase.\n\nSurfaced in `CompileResult` so callers (CLI, Dagster, LSP) can attribute compile time to a specific stage instead of treating compile as a black box. `typecheck_join_keys_ms` is a sub-timer of `typecheck_ms` so we can decide whether the cross-model join-key check needs further optimization without re-instrumenting later.",
       "properties": {
@@ -286,19 +308,61 @@
           "type": "object"
         },
         {
+          "description": "Load only rows newer than the target's current watermark.\n\nOn a transformation model the model SQL marks where the filter goes with `@incremental_filter` (`filter_column` names a qualified or renamed input column to compare). Each incremental run resolves it to `<col> > (SELECT MAX(<watermark>) FROM <target>)`, minus `lookback`; the first run and `rocky run --full-refresh` resolve it to `TRUE`. With no placeholder, a watermark column that the model passes straight through from one input is filtered on the model's output instead; anything else is refused (E046). No watermark at all is refused (E037).",
           "properties": {
+            "filter_column": {
+              "default": null,
+              "description": "The input column `@incremental_filter` compares, when it is not the watermark itself: a qualified column in a join (`\"o.updated_at\"`) or a source column the model renames (`\"_synced_at\"`). The bound is still `MAX(<timestamp_column>)` over the target.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "lookback": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/IncrementalLookback"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "Re-read this far below the watermark, e.g. `\"3 days\"`, to catch late-arriving rows. Pair it with `unique_key`, or the re-read rows are appended again (W046)."
+            },
+            "on_schema_change": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/OnSchemaChange"
+                }
+              ],
+              "default": "fail",
+              "description": "What a run does when the model's output columns no longer match the target: `fail` (default) or `append_new_columns`."
+            },
             "timestamp_column": {
-              "type": "string"
+              "default": null,
+              "description": "The watermark column: an output column of the model whose maximum in the target marks what is already loaded. `watermark` is accepted as an alias.",
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "type": {
               "enum": [
                 "incremental"
               ],
               "type": "string"
+            },
+            "unique_key": {
+              "default": [],
+              "description": "Upsert on these columns with `MERGE` instead of appending.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
             }
           },
           "required": [
-            "timestamp_column",
             "type"
           ],
           "type": "object"

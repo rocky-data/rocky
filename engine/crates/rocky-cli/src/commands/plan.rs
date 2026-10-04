@@ -3247,6 +3247,9 @@ mod tests {
         assert_eq!(
             replication_copy_purpose(&MaterializationStrategy::Incremental {
                 timestamp_column: "ts".into(),
+                unique_key: Vec::new(),
+                lookback: None,
+                filter_column: None,
             }),
             "incremental_copy"
         );
@@ -3283,6 +3286,9 @@ mod tests {
         let incr = replication_copy_sql(
             &replication_ir(MaterializationStrategy::Incremental {
                 timestamp_column: "_updated_at".into(),
+                unique_key: Vec::new(),
+                lookback: None,
+                filter_column: None,
             }),
             dialect.as_ref(),
         )

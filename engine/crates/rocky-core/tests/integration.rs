@@ -178,6 +178,9 @@ async fn test_incremental_pipeline_two_runs() {
         "events",
         MaterializationStrategy::Incremental {
             timestamp_column: "_fivetran_synced".into(),
+            unique_key: Vec::new(),
+            lookback: None,
+            filter_column: None,
         },
     );
     let sql2 = sql_gen::generate_insert_sql(&plan2, &d, Some(&prior_wm.last_value)).unwrap();

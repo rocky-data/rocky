@@ -1343,6 +1343,18 @@ pub trait SqlDialect: Send + Sync {
         Ok(format!("CURRENT_DATE - INTERVAL '{days}' DAY"))
     }
 
+    /// A SQL interval literal of `amount` units, where `unit` is a singular
+    /// upper-case keyword (`SECOND`, `MINUTE`, `HOUR`, `DAY`). Used for an
+    /// incremental model's `lookback`, subtracted from `MAX(<watermark>)`.
+    ///
+    /// Default: the ANSI `INTERVAL '<n>' <UNIT>` form, which DuckDB,
+    /// Databricks and Trino accept. BigQuery overrides with the unquoted
+    /// `INTERVAL <n> <UNIT>`, Snowflake with the single-string
+    /// `INTERVAL '<n> <UNIT>'`.
+    fn interval_literal(&self, amount: u32, unit: &str) -> String {
+        format!("INTERVAL '{amount}' {unit}")
+    }
+
     /// SQL expression returning the current timestamp. Used by
     /// `TestType::NotInFuture`.
     ///
