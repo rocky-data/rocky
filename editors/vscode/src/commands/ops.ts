@@ -5,6 +5,7 @@ import {
   runRockyWithProgress,
   showRockyError,
 } from "../rockyCli";
+import type { FreshnessOutput } from "../types/generated";
 import type { DoctorResult } from "../types/rockyJson";
 import { showDoctorResult } from "../webviews/doctor";
 import { ensureWorkspace, resolveModelName, showJsonInEditor } from "./ui";
@@ -35,6 +36,48 @@ export async function doctor(): Promise<void> {
       }
     }
     showRockyError("Doctor failed", err);
+  }
+}
+
+/**
+ * `rocky.freshness` — check declared source and model freshness against the
+ * warehouse. `rocky freshness` exits 1 when any check is `error` or
+ * `runtime_error` but still prints the full JSON report, so that report is
+ * shown either way.
+ */
+export async function freshness(): Promise<void> {
+  if (!ensureWorkspace()) return;
+  let stdout: string;
+  try {
+    ({ stdout } = await runRockyWithProgress(
+      "Checking source freshness...",
+      ["freshness", "--output", "json"],
+      { timeoutMs: 120000 },
+    ));
+  } catch (err) {
+    if (err instanceof RockyCliError && err.exitCode === 1 && err.stdout) {
+      stdout = err.stdout;
+    } else {
+      showRockyError("Freshness check failed", err);
+      return;
+    }
+  }
+  let report: FreshnessOutput;
+  try {
+    report = JSON.parse(stdout) as FreshnessOutput;
+  } catch {
+    showRockyError("Freshness check failed", new Error("output was not JSON"));
+    return;
+  }
+  await showJsonInEditor(stdout);
+  const s = report.summary;
+  const line = `Freshness: ${s.pass} pass, ${s.warn} warn, ${s.error} error, ${s.runtime_error} runtime_error`;
+  if (s.error > 0 || s.runtime_error > 0) {
+    void vscode.window.showErrorMessage(line);
+  } else if (s.warn > 0) {
+    void vscode.window.showWarningMessage(line);
+  } else {
+    void vscode.window.showInformationMessage(line);
   }
 }
 

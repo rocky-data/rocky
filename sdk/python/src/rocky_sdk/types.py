@@ -731,10 +731,9 @@ class ModelFreshnessConfig(BaseModel):
     """Per-model freshness configuration projected from model TOML frontmatter.
 
     Mirrors :class:`rocky_core::models::ModelFreshnessConfig` on the Rust
-    side. Declarative-only — the compiler does not enforce anything;
-    downstream consumers (``dagster-rocky`` for ``FreshnessPolicy``,
-    ``rocky doctor --freshness``) read this field from the compile JSON
-    output.
+    side. ``rocky freshness`` enforces it against the warehouse (see
+    :meth:`rocky_sdk.RockyClient.freshness`); ``dagster-rocky`` also reads it
+    from the compile JSON output to attach a ``FreshnessPolicy``.
     """
 
     max_lag_seconds: int
@@ -1339,7 +1338,11 @@ from .types_generated import (  # noqa: E402, F401
     ErrorEnvelope,
     ExecutedRunOutput,
     FailedSourceOutput,
+    FreshnessCheckResult,
     FreshnessConfigOutput,
+    FreshnessOutput,
+    FreshnessStatus,
+    FreshnessSummary,
     FulfillOutput,
     GcApplyOutput,
     HistoryOutput,
@@ -1540,6 +1543,7 @@ RockyOutput = (
     | RestoreApplyOutput
     | ComplianceOutput
     | RetentionStatusOutput
+    | FreshnessOutput
     | CatalogOutput
     | ApproveOutput
     | BranchPromoteOutput
@@ -1588,6 +1592,7 @@ _SIMPLE_DISPATCH: dict[str, type[BaseModel]] = {
     "tick": TickOutput,
     "compliance": ComplianceOutput,
     "retention-status": RetentionStatusOutput,
+    "freshness": FreshnessOutput,
     "catalog": CatalogOutput,
     "branch approve": ApproveOutput,
     "branch promote": BranchPromoteOutput,
