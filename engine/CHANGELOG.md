@@ -15,6 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `rocky --help` lists the seven core commands first: `compile`, `run`, `test`, `plan`, `review`, `apply` and `policy`. The other commands follow under headings by task, such as "Model development", "Operations" and "AI". Only the help text changes: every command, alias, flag and JSON output stays the same.
 - **Breaking (output):** `--output json` prints a resolved `${VAR}` value of 8 bytes or more as `${NAME}` on the config-echo fields of `rocky compile`, `dag`, `list`, `catalog`, `policy check`, `validate`, `doctor`, `hooks`, `schedule status` and `audit`. rocky-sdk and dagster-rocky receive the placeholder. Target coordinates (catalog, schema, table) stay resolved, the same as `rocky run`'s `asset_key`, so dagster-rocky asset keys keep matching. Do not put a secret in a target name. (#1919)
 - **Breaking:** A replication plan's `config_snapshot` holds `${NAME}`, with a keyed digest of each config section's resolved values stored beside it. The key is `.rocky/plan-digest.key`. `rocky apply` still refuses when an environment value changed between plan and apply, and refuses when the key is missing or malformed: copy it with the plans if you plan and apply on different machines. (#1919)
 - **Breaking:** `verify_after` decision-ledger rows store check names and outcome text as `${NAME}`, so `rocky audit` and apply-gate messages no longer print resolved values. A value the TOML parser unescapes (`\uXXXX`, `\t`) is also matched in its unescaped form. (#1919)
