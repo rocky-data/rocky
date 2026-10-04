@@ -866,6 +866,32 @@ class LoadOptionsConfig(BaseModel):
     """
 
 
+class ManualSchemaConfig(BaseModel):
+    """
+    One source schema of a `type = "manual"` discovery adapter, with the tables in it, listed in `rocky.toml` for teams whose source has no discovery API (a Databricks or Snowflake source with no Fivetran in front).
+
+    ```toml [adapter.local_discovery] type = "manual" kind = "discovery"
+
+    [[adapter.local_discovery.schemas]] name = "raw__orders" tables = ["orders", "order_items", "returns"]
+
+    [[adapter.local_discovery.schemas]] name = "raw__customers" tables = ["customers", "addresses"] ```
+
+    The load-time rules (non-empty list, valid identifiers, no duplicates) live in `config::validate_manual_adapters`, so `rocky validate` and every executing command refuse the same configs.
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+    )
+    name: str
+    """
+    Source schema name. Matched against the pipeline's `schema_pattern.prefix` exactly as a discovered schema would be.
+    """
+    tables: list[str]
+    """
+    Tables in the schema.
+    """
+
+
 class MaskStrategy1(StrEnum):
     """
     SHA-256 hex digest of the column value. Deterministic, one-way.
@@ -2013,6 +2039,16 @@ class AdapterConfig(BaseModel):
     role: str | None = None
     """
     Snowflake role to use for the session.
+    """
+    schemas: list[ManualSchemaConfig] | None = None
+    """
+    The source schemas and tables a `type = "manual"` discovery adapter returns, listed in config instead of fetched from an API.
+
+    ```toml [adapter.local_discovery] type = "manual" kind = "discovery"
+
+    [[adapter.local_discovery.schemas]] name = "raw__orders" tables = ["orders", "order_items"] ```
+
+    Required (non-empty) on a `manual` adapter and refused on every other type; see [`validate_manual_adapters`].
     """
     stampede: FivetranStampedeConfig | None = None
     """

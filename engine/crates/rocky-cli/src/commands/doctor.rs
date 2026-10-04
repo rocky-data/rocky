@@ -2261,6 +2261,7 @@ mod tests {
             project_id: None,
             location: None,
             path: None,
+            schemas: Vec::new(),
             retry: rocky_core::config::RetryConfig::default(),
             cache: None,
             ratelimit: None,
