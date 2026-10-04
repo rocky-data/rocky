@@ -432,9 +432,10 @@ async fn null_pk_rows_surfaced_on_stats() {
     .await
     .unwrap();
 
-    // Non-null rows match; null rows don't appear in the diff totals
-    // but are reported on the stats.
-    assert_eq!(result.rows_added, 0);
+    // Non-null rows match. Null-key rows are compared as their own
+    // group: the branch's three extra rows count as added, and both
+    // group sizes are still reported on the stats.
+    assert_eq!(result.rows_added, 3);
     assert_eq!(result.rows_removed, 0);
     assert_eq!(result.rows_changed, 0);
     assert_eq!(result.stats.null_pk_rows_base, 2);

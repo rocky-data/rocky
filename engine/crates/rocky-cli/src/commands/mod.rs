@@ -126,7 +126,7 @@ pub use ci::run_ci;
 pub use ci_diff::{extract_base_compile, project_ir_from_compile, run_ci_diff};
 pub use compact::{run_compact, run_compact_apply, run_compact_catalog, run_measure_dedup};
 pub use compare::compare;
-pub use compile::{compile_output, run_compile};
+pub use compile::{compile_output, run_compile, run_compile_dbt_attach};
 pub use completions::run_completions;
 pub use compliance::{compute_compliance, run_compliance};
 pub use cost::{CostGroupBy, compute_cost, run_cost};

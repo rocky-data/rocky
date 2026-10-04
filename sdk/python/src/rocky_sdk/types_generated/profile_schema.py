@@ -22,6 +22,10 @@ class ProfileColumnStats(BaseModel):
     Observed low-cardinality domain (empty above the cardinality cap).
     """
     rows: conint(ge=0)
+    sample_values: list[str] | None = None
+    """
+    Up to N distinct non-null values, sorted. Chosen pseudo-randomly by a hash of each value, so a re-run on unchanged data returns the same set whatever the scan order. Present only when `rocky profile --sample N` asked for them; unlike `observed_values` it covers high-cardinality columns too.
+    """
     type: str
     """
     Inferred Rocky type name.
