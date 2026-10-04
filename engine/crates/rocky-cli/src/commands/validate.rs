@@ -1266,7 +1266,10 @@ fn validate_replication_pipeline(
                  schema_pattern (prefix '{}', components {:?}; the prefix match is \
                  case-sensitive), so plan and run find no table. Rename a schema in \
                  [[adapter.{}.schemas]] or change the pattern.",
-                disc.adapter, pattern.prefix, pipeline.source.schema_pattern.components, disc.adapter
+                disc.adapter,
+                pattern.prefix,
+                pipeline.source.schema_pattern.components,
+                disc.adapter
             ),
             file: None,
             field: Some(format!("adapter.{}.schemas", disc.adapter)),
@@ -3531,7 +3534,10 @@ tables = ["orders"]
 "#,
             "raw__",
         )
-        .replace(r#"components = ["source"]"#, r#"components = ["tenant", "source"]"#)
+        .replace(
+            r#"components = ["source"]"#,
+            r#"components = ["tenant", "source"]"#,
+        )
         .replace("staging__{source}", "staging__{tenant}__{source}");
         let out = validate_toml(&toml);
         assert_eq!(
