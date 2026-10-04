@@ -42,6 +42,8 @@ rocky ci-diff                    # defaults to main
 rocky ci-diff release/2026-04 --models src/models
 ```
 
+`ci-diff` reads `HEAD` from git, and the base side from the merge base, so uncommitted edits never reach the report. To preview uncommitted work locally, pass `--working-tree`. The JSON output says which ran in `mode`.
+
 In GitHub Actions, post that Markdown block straight to the PR:
 
 ```yaml

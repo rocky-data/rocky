@@ -222,6 +222,9 @@ fn compute_ci_diff_state(
         state_ref,
         models_dir,
         ctx.cache_ttl_override,
+        // Committed `HEAD`, the same snapshot `changed_paths` diffs, so the
+        // file selection and the compiled models agree (G7).
+        crate::output::CiDiffMode::Head,
     )
     .with_context(|| format!("failed to compute `state:` selection against '{state_ref}'"))?;
     let mut state = StateSets::default();

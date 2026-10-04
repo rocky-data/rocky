@@ -518,6 +518,25 @@
         }
       ]
     },
+    "CiDiffMode": {
+      "description": "Which code snapshot `rocky ci-diff` / `rocky lineage-diff` compares against the base.\n\nSelection (which files changed) and compilation (what those files contain) always read the same snapshot, so the report never mixes a committed file list with uncommitted contents.",
+      "oneOf": [
+        {
+          "description": "Compare the HEAD commit, read from git objects. The default.",
+          "enum": [
+            "head"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Compare the working tree: staged, unstaged, untracked, renamed and deleted files on disk (`--working-tree`).",
+          "enum": [
+            "working_tree"
+          ],
+          "type": "string"
+        }
+      ]
+    },
     "ColumnChangeType": {
       "description": "The kind of change observed for a single column.",
       "oneOf": [
@@ -721,6 +740,13 @@
   },
   "description": "JSON output for `rocky ci-diff`.\n\nReports which models changed between two git refs, with optional column-level structural diffs when compilation succeeds on both sides.",
   "properties": {
+    "base_commit": {
+      "description": "Commit the base side was read from: the merge base of `base_ref` and HEAD. Omitted when git could not compute one and `base_ref` itself was used (e.g. a shallow clone).",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
     "base_ref": {
       "description": "Git ref used as the comparison base (e.g. `main`).",
       "type": "string"
@@ -742,6 +768,14 @@
     "markdown": {
       "description": "Pre-rendered Markdown suitable for posting as a GitHub PR comment.",
       "type": "string"
+    },
+    "mode": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/CiDiffMode"
+        }
+      ],
+      "description": "Which snapshot was compared against the base: `head` (the HEAD commit; uncommitted edits ignored) or `working_tree` (files on disk, including staged, unstaged and untracked changes)."
     },
     "models": {
       "description": "Per-model diff results.",
@@ -767,6 +801,7 @@
     "command",
     "head_ref",
     "markdown",
+    "mode",
     "models",
     "summary",
     "version"

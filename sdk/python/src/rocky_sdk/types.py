@@ -876,6 +876,20 @@ class ModelLineageResult(BaseModel):
     nodes: list[dict] = Field(default_factory=list)
 
 
+class RowSelectionEdge(BaseModel):
+    """A row-selection lineage edge: ``source`` decides which rows or groups
+    ``target_model`` produces (join key, filter, group key, window key)."""
+
+    source: QualifiedColumn
+    target_model: str
+    #: The one output column affected (window keys). ``None`` means every
+    #: output column of ``target_model``.
+    target_column: str | None = None
+    #: ``join_key``, ``filter``, ``group_by``, ``having``, ``qualify``,
+    #: ``window_partition`` or ``window_order``.
+    kind: str
+
+
 class ColumnLineageResult(BaseModel):
     """Output of ``rocky lineage <model>.<column> --json`` (single column trace)."""
 
@@ -890,6 +904,10 @@ class ColumnLineageResult(BaseModel):
     #: Downstream consumers of the traced column. Empty when tracing upstream
     #: or when the column has no downstream consumers.
     downstream_consumers: list[QualifiedColumn] = Field(default_factory=list)
+    #: Row-selection edges along the trace (join keys, filters, group and
+    #: window keys). ``trace`` stays value-derivation only. Empty for older
+    #: binaries.
+    row_selection: list[RowSelectionEdge] = Field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------

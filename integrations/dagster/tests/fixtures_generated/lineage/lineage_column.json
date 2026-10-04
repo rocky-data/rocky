@@ -38,5 +38,23 @@
       },
       "transform": "direct"
     }
+  ],
+  "row_selection": [
+    {
+      "source": {
+        "model": "stg_orders",
+        "column": "customer_id"
+      },
+      "target_model": "fct_revenue",
+      "kind": "group_by"
+    },
+    {
+      "source": {
+        "model": "raw_orders",
+        "column": "status"
+      },
+      "target_model": "stg_orders",
+      "kind": "filter"
+    }
   ]
 }

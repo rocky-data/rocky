@@ -2,8 +2,12 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
+use std::ops::ControlFlow;
+
 use sqlparser::ast::{
-    CastKind, Expr, Query, SelectItem, SetExpr, Statement, TableFactor, TableWithJoins,
+    CastKind, Expr, GroupByExpr, JoinConstraint, JoinOperator, NamedWindowDefinition,
+    NamedWindowExpr, Query, Select, SelectItem, SetExpr, Statement, TableFactor, TableWithJoins,
+    Value, Visit, Visitor, WindowSpec, WindowType,
 };
 use sqlparser::parser::Parser;
 
@@ -65,6 +69,71 @@ pub struct ColumnLineage {
     pub transform: TransformKind,
 }
 
+/// Why a column influences which rows (or groups) a model produces.
+///
+/// This is the second lineage edge kind. A [`ColumnLineage`] entry is a
+/// **value derivation**: the source column feeds an output value. A
+/// [`RowSelectionLineage`] entry is a **row selection**: the source column
+/// decides which rows or groups exist, without feeding any output value
+/// directly. Changing or dropping either kind of column changes the model's
+/// output, which is why impact analysis needs both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RowSelectionKind {
+    /// A key in a `JOIN ... ON` / `USING` / ASOF match condition.
+    JoinKey,
+    /// A `WHERE` (or `PREWHERE`) predicate.
+    Filter,
+    /// A `GROUP BY` key.
+    GroupBy,
+    /// A `HAVING` predicate.
+    Having,
+    /// A `QUALIFY` predicate.
+    Qualify,
+    /// A window function's `PARTITION BY` key.
+    WindowPartition,
+    /// A window function's `ORDER BY` key.
+    WindowOrder,
+}
+
+impl fmt::Display for RowSelectionKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let label = match self {
+            RowSelectionKind::JoinKey => "join_key",
+            RowSelectionKind::Filter => "filter",
+            RowSelectionKind::GroupBy => "group_by",
+            RowSelectionKind::Having => "having",
+            RowSelectionKind::Qualify => "qualify",
+            RowSelectionKind::WindowPartition => "window_partition",
+            RowSelectionKind::WindowOrder => "window_order",
+        };
+        f.write_str(label)
+    }
+}
+
+/// A row-selection edge: `source_table.source_column` decides which rows or
+/// groups the query produces. See [`RowSelectionKind`].
+///
+/// Extracted from the top-level `SELECT` only. Not covered (no edge is
+/// recorded): predicates inside a derived table, a `WITH` body or a subquery
+/// expression (`IN (SELECT …)`, `EXISTS`), correlated references, `GROUP BY
+/// ALL`, `NATURAL` joins, `DISTINCT ON`, `ORDER BY … LIMIT` and set
+/// operations. An unqualified column in a multi-table query keeps
+/// `source_table = None` because its table cannot be determined statically.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct RowSelectionLineage {
+    /// Source table (resolved through aliases when the alias is known).
+    pub source_table: Option<String>,
+    /// Source column name.
+    pub source_column: String,
+    /// Which clause the column appears in.
+    pub kind: RowSelectionKind,
+    /// The single output column this edge affects, for window keys. `None`
+    /// means the edge affects every output row of the query.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_column: Option<String>,
+}
+
 /// Full lineage result for a SQL statement.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LineageResult {
@@ -122,6 +191,13 @@ pub struct LineageResult {
     /// strict — do not read a non-empty value here as completeness.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub nested_sources: Vec<String>,
+    /// Row-selection edges: columns used as join keys, filters, group keys or
+    /// window keys. Additive to [`Self::columns`], which stays value-only.
+    /// See [`RowSelectionLineage`] for coverage.
+    ///
+    /// `#[serde(default)]` keeps a cache written by an older build loadable.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub row_selection: Vec<RowSelectionLineage>,
 }
 
 /// What a name in a `FROM`/`JOIN` position actually refers to.
@@ -306,6 +382,7 @@ fn extract_query_lineage(query: &Query, outer_ctes: &CteScope) -> Result<Lineage
             let alias_map = build_alias_map(&source_tables);
             let (columns, has_star, unresolved_projections) =
                 extract_select_columns(&select.projection, &alias_map, &source_tables);
+            let row_selection = extract_row_selection(select, &alias_map, &source_tables);
 
             Ok(LineageResult {
                 source_tables,
@@ -313,6 +390,7 @@ fn extract_query_lineage(query: &Query, outer_ctes: &CteScope) -> Result<Lineage
                 has_star,
                 unresolved_projections,
                 nested_sources,
+                row_selection,
             })
         }
         SetExpr::Query(inner) => {
@@ -614,6 +692,394 @@ fn extract_expr_lineage(
         }
         _ => None,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Row-selection lineage
+// ---------------------------------------------------------------------------
+
+/// A column reference found in an expression: `(qualifier, column)`, where the
+/// qualifier is lower-cased.
+type ColumnRef = (Option<String>, String);
+
+/// Collects column references from an expression tree without descending into
+/// nested queries. A subquery's columns resolve against its own `FROM`, so
+/// attributing them to the outer query would invent edges.
+#[derive(Default)]
+struct ColumnRefCollector {
+    query_depth: usize,
+    /// Collect references inside nested queries too.
+    include_nested: bool,
+    refs: Vec<ColumnRef>,
+}
+
+impl Visitor for ColumnRefCollector {
+    type Break = ();
+
+    fn pre_visit_query(&mut self, _query: &Query) -> ControlFlow<Self::Break> {
+        self.query_depth += 1;
+        ControlFlow::Continue(())
+    }
+
+    fn post_visit_query(&mut self, _query: &Query) -> ControlFlow<Self::Break> {
+        self.query_depth -= 1;
+        ControlFlow::Continue(())
+    }
+
+    fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<Self::Break> {
+        if self.query_depth == 0 || self.include_nested {
+            match expr {
+                Expr::Identifier(ident) => self.refs.push((None, ident.value.clone())),
+                Expr::CompoundIdentifier(parts) if parts.len() >= 2 => self.refs.push((
+                    Some(parts[parts.len() - 2].value.to_lowercase()),
+                    parts[parts.len() - 1].value.clone(),
+                )),
+                _ => {}
+            }
+        }
+        ControlFlow::Continue(())
+    }
+}
+
+/// Every column reference in `node`, outside nested queries.
+fn column_refs<V: Visit>(node: &V) -> Vec<ColumnRef> {
+    let mut collector = ColumnRefCollector::default();
+    let _ = node.visit(&mut collector);
+    collector.refs
+}
+
+/// One column reference anywhere in a statement, as written.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ColumnReference {
+    /// The table qualifier (`t` in `t.col`), lower-cased. `None` when the
+    /// column is unqualified.
+    pub qualifier: Option<String>,
+    /// The column name as written.
+    pub column: String,
+}
+
+/// Every column reference in `sql`, **including** references inside
+/// subqueries, `WITH` bodies and derived tables. No scope resolution is done:
+/// this answers "does the SQL mention this column name anywhere", which is
+/// the conservative question an impact check needs when lineage could not
+/// attribute a reference. Aliases (`expr AS name`) are not references.
+pub fn all_column_references(sql: &str) -> Result<Vec<ColumnReference>, String> {
+    let dialect = DatabricksDialect;
+    let statements = Parser::parse_sql(&dialect, sql).map_err(|e| e.to_string())?;
+    let mut out = Vec::new();
+    for stmt in &statements {
+        let mut collector = ColumnRefCollector {
+            include_nested: true,
+            ..Default::default()
+        };
+        let _ = stmt.visit(&mut collector);
+        out.extend(
+            collector
+                .refs
+                .into_iter()
+                .map(|(qualifier, column)| ColumnReference { qualifier, column }),
+        );
+    }
+    Ok(out)
+}
+
+/// Collects the window specs of window-function calls, outside nested queries.
+#[derive(Default)]
+struct WindowCollector {
+    query_depth: usize,
+    windows: Vec<WindowType>,
+}
+
+impl Visitor for WindowCollector {
+    type Break = ();
+
+    fn pre_visit_query(&mut self, _query: &Query) -> ControlFlow<Self::Break> {
+        self.query_depth += 1;
+        ControlFlow::Continue(())
+    }
+
+    fn post_visit_query(&mut self, _query: &Query) -> ControlFlow<Self::Break> {
+        self.query_depth -= 1;
+        ControlFlow::Continue(())
+    }
+
+    fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<Self::Break> {
+        if self.query_depth == 0
+            && let Expr::Function(func) = expr
+            && let Some(over) = &func.over
+        {
+            self.windows.push(over.clone());
+        }
+        ControlFlow::Continue(())
+    }
+}
+
+/// Resolve a window reference to its inline spec. A `WINDOW w AS (…)` name is
+/// followed one level; a chain of named references is not resolved.
+fn resolve_window<'a>(
+    window: &'a WindowType,
+    named: &'a [NamedWindowDefinition],
+) -> Option<&'a WindowSpec> {
+    match window {
+        WindowType::WindowSpec(spec) => Some(spec),
+        WindowType::NamedWindow(name) => named.iter().find_map(|def| {
+            if def.0.value.eq_ignore_ascii_case(&name.value)
+                && let NamedWindowExpr::WindowSpec(spec) = &def.1
+            {
+                Some(spec)
+            } else {
+                None
+            }
+        }),
+    }
+}
+
+/// The output name and expression of each projection item that has one.
+fn projection_exprs(projection: &[SelectItem]) -> Vec<(Option<String>, &Expr)> {
+    projection
+        .iter()
+        .filter_map(|item| match item {
+            SelectItem::UnnamedExpr(expr) => {
+                let name = match expr {
+                    Expr::Identifier(ident) => Some(ident.value.clone()),
+                    Expr::CompoundIdentifier(parts) => parts.last().map(|p| p.value.clone()),
+                    _ => None,
+                };
+                Some((name, expr))
+            }
+            SelectItem::ExprWithAlias { expr, alias } => Some((Some(alias.value.clone()), expr)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Column references of a `GROUP BY` / `HAVING` / `QUALIFY` expression, with
+/// projection aliases and ordinals substituted by the projected expression.
+///
+/// DuckDB, Snowflake and Databricks accept `GROUP BY 1` and `GROUP BY alias`.
+/// Recording `alias` as a source column would point at a column that does not
+/// exist upstream, so an unqualified name matching a renaming projection alias
+/// is replaced by the references of the aliased expression.
+fn refs_with_projection_substitution(
+    expr: &Expr,
+    projection: &[(Option<String>, &Expr)],
+    allow_ordinal: bool,
+) -> Vec<ColumnRef> {
+    if allow_ordinal
+        && let Expr::Value(v) = expr
+        && let Value::Number(n, _) = &v.value
+        && let Ok(idx) = n.parse::<usize>()
+        && idx >= 1
+        && let Some((_, projected)) = projection.get(idx - 1)
+    {
+        return column_refs(*projected);
+    }
+    let mut out = Vec::new();
+    for (qualifier, column) in column_refs(expr) {
+        if qualifier.is_none()
+            && let Some((_, projected)) = projection.iter().find(|(name, projected)| {
+                name.as_deref()
+                    .is_some_and(|n| n.eq_ignore_ascii_case(&column))
+                    // A plain `SELECT col` projects the column under its own
+                    // name; substituting it would be a no-op.
+                    && !matches!(projected, Expr::Identifier(i) if i.value.eq_ignore_ascii_case(&column))
+            })
+        {
+            out.extend(column_refs(*projected));
+            continue;
+        }
+        out.push((qualifier, column));
+    }
+    out
+}
+
+/// The name a `FROM`/`JOIN` relation is known by (alias first), or `None` for
+/// relations that name no columns (`UNNEST`, table functions, …).
+fn relation_name(factor: &TableFactor) -> Option<String> {
+    match factor {
+        TableFactor::Table { name, alias, .. } => Some(
+            alias
+                .as_ref()
+                .map_or_else(|| name.to_string(), |a| a.name.value.clone()),
+        ),
+        TableFactor::Derived { alias: Some(a), .. } => Some(a.name.value.clone()),
+        _ => None,
+    }
+}
+
+/// The constraint and optional ASOF match condition of a join operator.
+fn join_parts(op: &JoinOperator) -> (Option<&JoinConstraint>, Option<&Expr>) {
+    match op {
+        JoinOperator::Join(c)
+        | JoinOperator::Inner(c)
+        | JoinOperator::Left(c)
+        | JoinOperator::LeftOuter(c)
+        | JoinOperator::Right(c)
+        | JoinOperator::RightOuter(c)
+        | JoinOperator::FullOuter(c)
+        | JoinOperator::CrossJoin(c)
+        | JoinOperator::Semi(c)
+        | JoinOperator::LeftSemi(c)
+        | JoinOperator::RightSemi(c)
+        | JoinOperator::Anti(c)
+        | JoinOperator::LeftAnti(c)
+        | JoinOperator::RightAnti(c)
+        | JoinOperator::StraightJoin(c) => (Some(c), None),
+        JoinOperator::AsOf {
+            match_condition,
+            constraint,
+        } => (Some(constraint), Some(match_condition)),
+        JoinOperator::CrossApply
+        | JoinOperator::OuterApply
+        | JoinOperator::ArrayJoin
+        | JoinOperator::LeftArrayJoin
+        | JoinOperator::InnerArrayJoin => (None, None),
+    }
+}
+
+/// Resolve a column reference's table the same way value lineage does: a
+/// qualifier goes through the alias map; an unqualified name binds to the only
+/// relation when there is exactly one, and stays unknown otherwise.
+fn resolve_ref_table(
+    qualifier: Option<&str>,
+    alias_map: &HashMap<String, String>,
+    source_tables: &[TableReference],
+) -> Option<String> {
+    match qualifier {
+        Some(q) => Some(alias_map.get(q).cloned().unwrap_or_else(|| q.to_string())),
+        None if source_tables.len() == 1 => Some(
+            source_tables[0]
+                .alias
+                .clone()
+                .unwrap_or_else(|| source_tables[0].name.clone()),
+        ),
+        None => None,
+    }
+}
+
+/// Row-selection edges of one `SELECT`. See [`RowSelectionLineage`].
+fn extract_row_selection(
+    select: &Select,
+    alias_map: &HashMap<String, String>,
+    source_tables: &[TableReference],
+) -> Vec<RowSelectionLineage> {
+    let mut out: Vec<RowSelectionLineage> = Vec::new();
+    let mut push = |refs: Vec<ColumnRef>, kind: RowSelectionKind, target: Option<&str>| {
+        for (qualifier, column) in refs {
+            let edge = RowSelectionLineage {
+                source_table: resolve_ref_table(qualifier.as_deref(), alias_map, source_tables),
+                source_column: column,
+                kind,
+                target_column: target.map(str::to_string),
+            };
+            if !out.contains(&edge) {
+                out.push(edge);
+            }
+        }
+    };
+
+    // JOIN keys.
+    for twj in &select.from {
+        let mut preceding: Vec<Option<String>> = vec![relation_name(&twj.relation)];
+        for join in &twj.joins {
+            let right = relation_name(&join.relation);
+            let (constraint, match_condition) = join_parts(&join.join_operator);
+            if let Some(cond) = match_condition {
+                push(column_refs(cond), RowSelectionKind::JoinKey, None);
+            }
+            match constraint {
+                Some(JoinConstraint::On(expr)) => {
+                    push(column_refs(expr), RowSelectionKind::JoinKey, None);
+                }
+                Some(JoinConstraint::Using(names)) => {
+                    // `USING (k)` reads `k` from the right relation and from
+                    // the left side. The left side is unambiguous only when a
+                    // single relation precedes this join.
+                    let left = match preceding.as_slice() {
+                        [Some(only)] => Some(only.clone()),
+                        _ => None,
+                    };
+                    for name in names {
+                        let Some(column) = name.0.last().and_then(|p| p.as_ident()) else {
+                            continue;
+                        };
+                        for side in [right.as_ref(), left.as_ref()].into_iter().flatten() {
+                            push(
+                                vec![(Some(side.to_lowercase()), column.value.clone())],
+                                RowSelectionKind::JoinKey,
+                                None,
+                            );
+                        }
+                    }
+                }
+                Some(JoinConstraint::Natural | JoinConstraint::None) | None => {}
+            }
+            preceding.push(right);
+        }
+    }
+
+    // WHERE / PREWHERE.
+    for expr in [&select.prewhere, &select.selection].into_iter().flatten() {
+        push(column_refs(expr), RowSelectionKind::Filter, None);
+    }
+
+    let projection = projection_exprs(&select.projection);
+
+    // GROUP BY (ordinals and projection aliases resolve to the projected
+    // expression). `GROUP BY ALL` is not resolved.
+    if let GroupByExpr::Expressions(exprs, _) = &select.group_by {
+        for expr in exprs {
+            push(
+                refs_with_projection_substitution(expr, &projection, true),
+                RowSelectionKind::GroupBy,
+                None,
+            );
+        }
+    }
+    if let Some(expr) = &select.having {
+        push(
+            refs_with_projection_substitution(expr, &projection, false),
+            RowSelectionKind::Having,
+            None,
+        );
+    }
+    if let Some(expr) = &select.qualify {
+        push(
+            refs_with_projection_substitution(expr, &projection, false),
+            RowSelectionKind::Qualify,
+            None,
+        );
+    }
+
+    // Window keys, attributed to the output column the window feeds.
+    for (name, expr) in &projection {
+        let Some(name) = name.as_deref() else {
+            continue;
+        };
+        let mut collector = WindowCollector::default();
+        let _ = expr.visit(&mut collector);
+        for window in &collector.windows {
+            let Some(spec) = resolve_window(window, &select.named_window) else {
+                continue;
+            };
+            for key in &spec.partition_by {
+                push(
+                    column_refs(key),
+                    RowSelectionKind::WindowPartition,
+                    Some(name),
+                );
+            }
+            for key in &spec.order_by {
+                push(
+                    column_refs(&key.expr),
+                    RowSelectionKind::WindowOrder,
+                    Some(name),
+                );
+            }
+        }
+    }
+
+    out
 }
 
 #[cfg(test)]
@@ -1265,5 +1731,238 @@ mod tests {
         assert!(!result.has_star, "the OUTER projection names its column");
         assert_eq!(result.unresolved_projections, 0);
         assert_eq!(result.nested_sources, vec!["orders".to_string()]);
+    }
+
+    // --- Row-selection lineage --------------------------------------------
+
+    fn row_sel(sql: &str) -> Vec<(Option<String>, String, RowSelectionKind, Option<String>)> {
+        extract_lineage(sql)
+            .unwrap()
+            .row_selection
+            .into_iter()
+            .map(|r| (r.source_table, r.source_column, r.kind, r.target_column))
+            .collect()
+    }
+
+    fn has_edge(
+        edges: &[(Option<String>, String, RowSelectionKind, Option<String>)],
+        table: Option<&str>,
+        column: &str,
+        kind: RowSelectionKind,
+        target: Option<&str>,
+    ) -> bool {
+        edges.iter().any(|(t, c, k, tc)| {
+            t.as_deref() == table && c == column && *k == kind && tc.as_deref() == target
+        })
+    }
+
+    #[test]
+    fn join_keys_are_row_selection_edges() {
+        let edges = row_sel(
+            "SELECT o.order_id, c.customer_name FROM raw.orders o \
+             JOIN raw.customers c ON o.customer_id = c.customer_id",
+        );
+        assert!(has_edge(
+            &edges,
+            Some("raw.orders"),
+            "customer_id",
+            RowSelectionKind::JoinKey,
+            None
+        ));
+        assert!(has_edge(
+            &edges,
+            Some("raw.customers"),
+            "customer_id",
+            RowSelectionKind::JoinKey,
+            None
+        ));
+        assert_eq!(edges.len(), 2, "{edges:?}");
+    }
+
+    #[test]
+    fn join_using_reads_both_sides() {
+        let edges = row_sel("SELECT a.x FROM a JOIN b USING (k)");
+        assert!(has_edge(
+            &edges,
+            Some("a"),
+            "k",
+            RowSelectionKind::JoinKey,
+            None
+        ));
+        assert!(has_edge(
+            &edges,
+            Some("b"),
+            "k",
+            RowSelectionKind::JoinKey,
+            None
+        ));
+    }
+
+    #[test]
+    fn filters_group_keys_and_having_are_row_selection_edges() {
+        let edges = row_sel(
+            "SELECT customer_id, SUM(amount) AS total FROM raw.orders \
+             WHERE status = 'paid' GROUP BY customer_id HAVING SUM(amount) > 10",
+        );
+        assert!(has_edge(
+            &edges,
+            Some("raw.orders"),
+            "status",
+            RowSelectionKind::Filter,
+            None
+        ));
+        assert!(has_edge(
+            &edges,
+            Some("raw.orders"),
+            "customer_id",
+            RowSelectionKind::GroupBy,
+            None
+        ));
+        assert!(has_edge(
+            &edges,
+            Some("raw.orders"),
+            "amount",
+            RowSelectionKind::Having,
+            None
+        ));
+    }
+
+    #[test]
+    fn value_lineage_is_unchanged_by_row_selection() {
+        // Backward compatibility: `columns` stays value-only. The filter
+        // column `status` must not appear as a value edge.
+        let result = extract_lineage(
+            "SELECT customer_id, SUM(amount) AS total FROM raw.orders \
+             WHERE status = 'paid' GROUP BY customer_id",
+        )
+        .unwrap();
+        let sources: Vec<_> = result
+            .columns
+            .iter()
+            .map(|c| c.source_column.as_str())
+            .collect();
+        assert_eq!(sources, vec!["customer_id", "amount"]);
+    }
+
+    #[test]
+    fn group_by_ordinal_and_alias_resolve_to_the_projected_column() {
+        let edges = row_sel(
+            "SELECT date_trunc('month', order_date) AS m, COUNT(*) AS n FROM raw.orders GROUP BY 1",
+        );
+        assert!(has_edge(
+            &edges,
+            Some("raw.orders"),
+            "order_date",
+            RowSelectionKind::GroupBy,
+            None
+        ));
+        let edges = row_sel(
+            "SELECT date_trunc('month', order_date) AS m, COUNT(*) AS n FROM raw.orders GROUP BY m",
+        );
+        assert!(has_edge(
+            &edges,
+            Some("raw.orders"),
+            "order_date",
+            RowSelectionKind::GroupBy,
+            None
+        ));
+        assert!(!edges.iter().any(|(_, c, _, _)| c == "m"), "{edges:?}");
+    }
+
+    #[test]
+    fn window_keys_attach_to_their_output_column() {
+        let edges = row_sel(
+            "SELECT order_id, ROW_NUMBER() OVER (PARTITION BY customer_id ORDER BY order_date) AS rn \
+             FROM raw.orders QUALIFY rn = 1",
+        );
+        assert!(has_edge(
+            &edges,
+            Some("raw.orders"),
+            "customer_id",
+            RowSelectionKind::WindowPartition,
+            Some("rn")
+        ));
+        assert!(has_edge(
+            &edges,
+            Some("raw.orders"),
+            "order_date",
+            RowSelectionKind::WindowOrder,
+            Some("rn")
+        ));
+        // QUALIFY rn → the window's own keys (alias substitution).
+        assert!(has_edge(
+            &edges,
+            Some("raw.orders"),
+            "customer_id",
+            RowSelectionKind::Qualify,
+            None
+        ));
+    }
+
+    #[test]
+    fn named_window_resolves_one_level() {
+        let edges = row_sel(
+            "SELECT SUM(amount) OVER w AS running FROM raw.orders WINDOW w AS (PARTITION BY customer_id)",
+        );
+        assert!(has_edge(
+            &edges,
+            Some("raw.orders"),
+            "customer_id",
+            RowSelectionKind::WindowPartition,
+            Some("running")
+        ));
+    }
+
+    #[test]
+    fn subquery_predicates_are_not_attributed_to_the_outer_query() {
+        let edges = row_sel(
+            "SELECT order_id FROM raw.orders WHERE customer_id IN (SELECT customer_id FROM raw.vip WHERE tier = 'gold')",
+        );
+        assert!(has_edge(
+            &edges,
+            Some("raw.orders"),
+            "customer_id",
+            RowSelectionKind::Filter,
+            None
+        ));
+        assert!(!edges.iter().any(|(_, c, _, _)| c == "tier"), "{edges:?}");
+    }
+
+    #[test]
+    fn unqualified_reference_in_a_join_has_no_table() {
+        let edges = row_sel("SELECT a.x FROM a JOIN b ON a.k = b.k WHERE flag");
+        assert!(has_edge(
+            &edges,
+            None,
+            "flag",
+            RowSelectionKind::Filter,
+            None
+        ));
+    }
+
+    #[test]
+    fn all_column_references_includes_nested_queries_but_not_aliases() {
+        let refs = all_column_references(
+            "WITH s AS (SELECT amount FROM stg) SELECT o.order_id, x AS amount_alias FROM s o \
+             WHERE o.id IN (SELECT v.id FROM vip v)",
+        )
+        .unwrap();
+        let has = |q: Option<&str>, c: &str| {
+            refs.iter()
+                .any(|r| r.qualifier.as_deref() == q && r.column == c)
+        };
+        assert!(has(None, "amount"));
+        assert!(has(Some("o"), "order_id"));
+        assert!(has(Some("v"), "id"));
+        assert!(has(None, "x"));
+        assert!(!refs.iter().any(|r| r.column == "amount_alias"));
+    }
+
+    #[test]
+    fn plain_select_has_no_row_selection_and_serializes_without_the_field() {
+        let result = extract_lineage("SELECT order_id FROM raw.orders").unwrap();
+        assert!(result.row_selection.is_empty());
+        let json = serde_json::to_string(&result).unwrap();
+        assert!(!json.contains("row_selection"));
     }
 }
