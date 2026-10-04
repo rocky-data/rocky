@@ -1787,6 +1787,7 @@ pub fn compute_embedded_capabilities(
             models_dir: models_dir.to_path_buf(),
             models_glob: None,
         }],
+        seeds_dir: None,
     };
     compute_embedded_capabilities_for_scope(
         config_path,
@@ -1959,7 +1960,7 @@ pub(crate) fn compute_embedded_capabilities_for_scope(
     // swap of either is refused even though `config`+`sql` are byte-identical —
     // built from the SAME `models_dir` the apply choke-point re-reads.
     let models_fingerprint = super::approval_scope::scope_fingerprint(
-        scope.dag,
+        scope,
         &heads,
         &super::approval_scope::ScopeIdentities {
             config: &identity,
@@ -1967,7 +1968,18 @@ pub(crate) fn compute_embedded_capabilities_for_scope(
             exec_control: &exec_control_identity,
             resolved_mask: &resolved_mask,
         },
-    )?;
+    );
+    let models_fingerprint = match models_fingerprint {
+        Ok(fingerprint) => fingerprint,
+        // A `--dag` run refuses a seeds directory it cannot discover, so the
+        // plan carries no fingerprint rather than failing to persist; a
+        // review-gated apply then refuses it.
+        Err(error) if scope.dag => {
+            tracing::warn!(error = %format!("{error:#}"), "--dag plan carries no fingerprint");
+            return Ok(failed(config_identity));
+        }
+        Err(error) => return Err(error),
+    };
 
     // Classify each unit against `base_ref` through the same directory and
     // glob. Any unit without a base costs the per-model classification for

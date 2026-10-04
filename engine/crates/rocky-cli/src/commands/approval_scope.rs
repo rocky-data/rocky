@@ -39,6 +39,10 @@ pub(crate) struct ScopeUnit {
 pub(crate) struct ApprovalScope {
     pub dag: bool,
     pub units: Vec<ScopeUnit>,
+    /// The project seeds directory a `--dag` run loads (its CSVs, sidecars and
+    /// seed hooks run as DAG nodes). `None` for a plain run plan, which runs
+    /// no seeds.
+    pub seeds_dir: Option<PathBuf>,
 }
 
 /// A unit with its compile. `head` is `None` for a `--dag` unit that runs
@@ -74,6 +78,8 @@ pub(crate) fn approval_scope(
         return Ok(ApprovalScope {
             dag: true,
             units: dag_units(cfg, config_path)?,
+            // The same directory `run_dag_exec::plan_runtime_dag` discovers.
+            seeds_dir: Some(config_path.parent().unwrap_or(Path::new(".")).join("seeds")),
         });
     }
     let (models_dir, models_glob) = match config {
@@ -90,6 +96,7 @@ pub(crate) fn approval_scope(
             models_dir,
             models_glob,
         }],
+        seeds_dir: None,
     })
 }
 
@@ -139,6 +146,9 @@ impl ApprovalScope {
     pub(crate) fn anchored_at(mut self, root: &Path) -> Self {
         for unit in &mut self.units {
             unit.models_dir = root.join(&unit.models_dir);
+        }
+        if let Some(seeds_dir) = &mut self.seeds_dir {
+            *seeds_dir = root.join(&*seeds_dir);
         }
         self
     }
@@ -245,10 +255,11 @@ pub(crate) struct ScopeIdentities<'a> {
 /// `Ok(None)` when a model config does not serialize (the caller refuses).
 /// `Err` when a surrogate-key spec is malformed (#1730).
 pub(crate) fn scope_fingerprint(
-    dag: bool,
+    scope: &ApprovalScope,
     compiled: &[CompiledUnit],
     ids: &ScopeIdentities<'_>,
 ) -> Result<Option<String>> {
+    let dag = scope.dag;
     let empty_mask = BTreeMap::new();
     let mask = if dag { &empty_mask } else { ids.resolved_mask };
     let unit_fingerprint = |unit: &CompiledUnit| -> Result<Option<String>> {
@@ -287,7 +298,41 @@ pub(crate) fn scope_fingerprint(
         hasher.update(fingerprint.as_bytes());
         hasher.update(b"\x00");
     }
+    if let Some(seeds_dir) = &scope.seeds_dir {
+        hash_seeds(&mut hasher, seeds_dir)?;
+    }
     Ok(Some(hasher.finalize().to_hex().to_string()))
+}
+
+/// Fold every seed a `--dag` run loads into the scope fingerprint: its name,
+/// its merged sidecar config (target, strategy, column types, and the
+/// pre/post hook SQL it executes) and the bytes of its data file. A seed
+/// added, removed or edited after the plan moves the fingerprint.
+///
+/// An absent directory hashes as "no seeds", as the DAG loads none. A
+/// directory that fails discovery is an error, as it fails the DAG run.
+fn hash_seeds(hasher: &mut blake3::Hasher, seeds_dir: &Path) -> Result<()> {
+    hasher.update(b"seeds\x00");
+    if !seeds_dir.is_dir() {
+        return Ok(());
+    }
+    let mut seeds = rocky_core::seeds::discover_seeds(seeds_dir)
+        .map_err(|e| anyhow::anyhow!("{e}"))
+        .with_context(|| format!("failed to discover seeds in {}", seeds_dir.display()))?;
+    seeds.sort_by(|a, b| a.name.cmp(&b.name));
+    for seed in &seeds {
+        // `to_value` sorts the sidecar's map keys, so the bytes are stable.
+        let config = serde_json::to_vec(&serde_json::to_value(&seed.config)?)?;
+        let data = std::fs::read(&seed.file_path)
+            .with_context(|| format!("failed to read seed {}", seed.file_path.display()))?;
+        hasher.update(seed.name.as_bytes());
+        hasher.update(b"\x00");
+        hasher.update(&config);
+        hasher.update(b"\x00");
+        hasher.update(blake3::hash(&data).to_hex().as_bytes());
+        hasher.update(b"\x00");
+    }
+    Ok(())
 }
 
 /// The identities a scope fingerprint binds, read from the project config.
@@ -365,7 +410,8 @@ pub(crate) fn verify_dag_scope_for_apply(
         .compile(&source_schemas, NoModels::Error)
         .map_err(|e| refuse(&format!("the DAG's models no longer compile ({e:#})")))?;
     let ids = OwnedScopeIdentities::from_config(Some(cfg), None);
-    let actual = scope_fingerprint(true, &compiled, &ids.borrowed())?;
+    let actual = scope_fingerprint(&scope, &compiled, &ids.borrowed())
+        .map_err(|e| refuse(&format!("its fingerprint cannot be recomputed ({e:#})")))?;
     if actual.as_deref() != Some(expected) {
         return Err(refuse(
             "a model the DAG runs was added, removed or changed since the plan was written",

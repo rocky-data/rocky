@@ -422,6 +422,7 @@ async fn compute_review_with_disclosure_and_seam(
                 models_dir: models_dir.clone(),
                 models_glob: None,
             }],
+            seeds_dir: None,
         }
     } else {
         let cfg = rocky_core::config::load_optional_project_config(Some(&resolved_config_path))?;
@@ -498,13 +499,7 @@ async fn compute_review_with_disclosure_and_seam(
 
     after_drop_snapshot()?;
     if let Some(units) = &approval_models {
-        verify_current_models_for_approval(
-            &plan,
-            &run_plan,
-            &resolved_config_path,
-            scope.dag,
-            units,
-        )?;
+        verify_current_models_for_approval(&plan, &run_plan, &resolved_config_path, &scope, units)?;
     }
 
     disclose(&conditional_drops, &findings)?;
@@ -632,7 +627,7 @@ fn verify_current_models_for_approval(
     plan: &PersistedPlan,
     run_plan: &RunPlan,
     config_path: &Path,
-    dag: bool,
+    scope: &ApprovalScope,
     units: &[CompiledUnit],
 ) -> Result<()> {
     let stale =
@@ -648,7 +643,7 @@ fn verify_current_models_for_approval(
     let config = rocky_core::config::load_optional_project_config(Some(config_path))?;
     let binds_mask = config.as_ref().is_some_and(|cfg| {
         plan.kind != PlanKind::Backfill
-            && !dag
+            && !scope.dag
             && super::apply::pipeline_is_replication(cfg, run_plan.pipeline.as_deref())
             && (run_plan.run_all || run_plan.models_dir.is_some())
             && run_plan.model.is_none()
@@ -657,7 +652,7 @@ fn verify_current_models_for_approval(
         config.as_ref(),
         binds_mask.then_some(run_plan.env.as_deref()),
     );
-    let actual = scope_fingerprint(dag, units, &ids.borrowed()).map_err(|_| stale())?;
+    let actual = scope_fingerprint(scope, units, &ids.borrowed()).map_err(|_| stale())?;
     if actual.as_deref() != Some(expected) {
         return Err(stale());
     }

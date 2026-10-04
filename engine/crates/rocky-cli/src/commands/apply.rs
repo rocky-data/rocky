@@ -485,6 +485,9 @@ async fn run_apply_run_plan(
         })?,
     );
     preflight_run_plan_shadow_support(&loaded.config, &run_plan)?;
+    // #2239: before the ledger sync, the policy gate, or any decision row.
+    refuse_governed_dag_apply(&plan, plan_id, &run_plan, runtime_principal)?;
+    verify_reviewed_dag_scope(&plan, plan_id, &loaded.config, config_path, &run_plan)?;
     let (models_dir, models_glob) = run_model_selection(&loaded.config, config_path, &run_plan)?;
     // Gate on the models this apply will ACTUALLY execute (fresh compile +
     // `--model` selection), not the plan's informational `models` list.
@@ -563,7 +566,6 @@ async fn run_apply_run_plan(
         config_path,
         !run_plan.models.is_empty(),
     );
-    verify_reviewed_dag_scope(&plan, plan_id, &loaded.config, config_path, &run_plan)?;
     let termination = execute_run_plan(
         config_path,
         std::sync::Arc::clone(&loaded),
@@ -936,11 +938,7 @@ async fn execute_run_plan(
         // — including replication — UNGATED. Refuse loudly rather than run
         // ungated until DAG sub-runs thread the governance context.
         if governed_ctx.is_some() {
-            bail!(
-                "refusing to apply plan '{plan_id}' as an agent: a `--dag` apply is not yet \
-                 policy-gated (its sub-runs execute ungated). Re-plan without `--dag`, or have a \
-                 human apply it."
-            );
+            bail!("{}", governed_dag_refusal(plan_id));
         }
         // A stored run plan predates the build-escape-hatch flags (they were
         // never captured into the plan), so the DAG replay uses defaults —
@@ -4050,6 +4048,9 @@ async fn run_apply_ai_authored_plan(
         })?,
     );
     preflight_run_plan_shadow_support(&loaded.config, &run_plan)?;
+    // #2239: before the ledger sync, the policy gate, or any decision row.
+    refuse_governed_dag_apply(&plan, plan_id, &run_plan, runtime_principal)?;
+    verify_reviewed_dag_scope(&plan, plan_id, &loaded.config, config_path, &run_plan)?;
     let (models_dir, models_glob) = run_model_selection(&loaded.config, config_path, &run_plan)?;
     // Gate on the models this apply will ACTUALLY execute (fresh compile +
     // `--model` selection), not the plan's informational `models` list.
@@ -4159,7 +4160,6 @@ async fn run_apply_ai_authored_plan(
         config_path,
         !run_plan.models.is_empty(),
     );
-    verify_reviewed_dag_scope(&plan, plan_id, &loaded.config, config_path, &run_plan)?;
     let termination = execute_run_plan(
         config_path,
         std::sync::Arc::clone(&loaded),
@@ -4182,6 +4182,31 @@ async fn run_apply_ai_authored_plan(
     )
     .await?;
     Ok(apply_outcome_for(termination, &apply_run_id))
+}
+
+/// Why an agent (governed) `--dag` apply is refused: the DAG's sub-runs carry
+/// no governance context, so they would execute ungated.
+fn governed_dag_refusal(plan_id: &str) -> String {
+    format!(
+        "refusing to apply plan '{plan_id}' as an agent: a `--dag` apply is not yet \
+         policy-gated (its sub-runs execute ungated). Re-plan without `--dag`, or have a \
+         human apply it."
+    )
+}
+
+/// Refuse a governed `--dag` apply up front, before the remote ledger sync,
+/// the policy gate or a committed rule decision touch any state. The same
+/// refusal in `execute_run_plan` stays as the backstop.
+fn refuse_governed_dag_apply(
+    plan: &PersistedPlan,
+    plan_id: &str,
+    run_plan: &RunPlan,
+    runtime_principal: PolicyPrincipal,
+) -> Result<()> {
+    if run_plan.dag && plan.enforcement_principal(runtime_principal) == PolicyPrincipal::Agent {
+        bail!("{}", governed_dag_refusal(plan_id));
+    }
+    Ok(())
 }
 
 /// #2239: a reviewable `--dag` plan executes only if every model the DAG
@@ -9703,7 +9728,12 @@ autonomy_budget = { failures = 3, window = "7d" }
     #[tokio::test]
     async fn reviewed_dag_plan_refuses_when_another_pipelines_models_change() -> anyhow::Result<()>
     {
-        let edits: [(&str, fn(&Path) -> std::io::Result<()>); 3] = [
+        let edits: [(&str, fn(&Path) -> std::io::Result<()>); 4] = [
+            // A seed is a DAG node too: its CSV, sidecar and hooks run.
+            ("seed added", |root| {
+                std::fs::create_dir_all(root.join("seeds"))?;
+                std::fs::write(root.join("seeds/s.csv"), "id\n1\n")
+            }),
             ("changed", |root| {
                 std::fs::write(root.join("gold/totals.sql"), "SELECT 3 AS v\n")
             }),
