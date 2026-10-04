@@ -347,9 +347,16 @@ mod tests {
     #[test]
     fn quarantine_drop_predrops_valid_table_before_ctas() {
         let (assertions, table, config) = quarantine_case(QuarantineMode::Drop);
-        let plan = compile_quarantine_sql(&assertions, "orders", &table, &TrinoDialect, &config)
-            .unwrap()
-            .unwrap();
+        let plan = compile_quarantine_sql(
+            &assertions,
+            "orders",
+            &table,
+            &TrinoDialect,
+            &config,
+            &rocky_core::quarantine::SourceColumns::read(Vec::new()),
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(plan.statements.len(), 2);
         assert_eq!(plan.statements[0].role, StatementRole::PredropValid);
         assert_eq!(plan.statements[1].role, StatementRole::Valid);
@@ -367,8 +374,15 @@ mod tests {
     #[test]
     fn quarantine_tag_is_refused_before_any_sql() {
         let (assertions, table, config) = quarantine_case(QuarantineMode::Tag);
-        let error = compile_quarantine_sql(&assertions, "orders", &table, &TrinoDialect, &config)
-            .unwrap_err();
+        let error = compile_quarantine_sql(
+            &assertions,
+            "orders",
+            &table,
+            &TrinoDialect,
+            &config,
+            &rocky_core::quarantine::SourceColumns::read(Vec::new()),
+        )
+        .unwrap_err();
         assert_eq!(
             error.to_string(),
             "quarantine mode = \"tag\" is not supported on trino: it rewrites its source table, and this dialect requires a pre-drop before CREATE TABLE AS; use mode = \"drop\""

@@ -5233,6 +5233,88 @@ impl StateStore {
     }
 }
 
+impl StateStore {
+    /// The `_error_*` label columns Rocky recorded writing to `table` with
+    /// quarantine `tag` (#2065). Empty when there is no record.
+    ///
+    /// `table` is the source's dialect-formatted name, the physical identity
+    /// the `tag` statement wrote. A label listed here is a column Rocky may
+    /// replace on the next `tag` run; a same-named column not listed here is
+    /// a user's, and the run refuses rather than overwrite it.
+    ///
+    /// Stored in the existing [`METADATA`] table under a dedicated key prefix,
+    /// so it adds no table and moves no schema version. A record that cannot
+    /// be parsed is an error, not "no record": an empty answer would refuse
+    /// the run anyway, but the error names the real cause.
+    pub fn get_quarantine_owned_labels(&self, table: &str) -> Result<Vec<String>, StateError> {
+        let txn = self.db.begin_read()?;
+        let metadata = txn.open_table(METADATA)?;
+        match metadata.get(quarantine_owned_labels_key(table).as_str())? {
+            Some(value) => Ok(serde_json::from_str(value.value())?),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// Replace the record of the `tag` label columns Rocky owns on `table`
+    /// (#2065). See [`Self::get_quarantine_owned_labels`].
+    pub fn set_quarantine_owned_labels(
+        &self,
+        table: &str,
+        labels: &[String],
+    ) -> Result<(), StateError> {
+        let value = serde_json::to_string(labels)?;
+        let txn = self.db.begin_write()?;
+        {
+            let mut metadata = txn.open_table(METADATA)?;
+            metadata.insert(quarantine_owned_labels_key(table).as_str(), value.as_str())?;
+        }
+        self.commit_write(txn)?;
+        Ok(())
+    }
+}
+
+/// Metadata key prefix for the quarantine `tag` label-ownership record (see
+/// [`StateStore::get_quarantine_owned_labels`]).
+const QUARANTINE_OWNED_LABELS_KEY_PREFIX: &str = "quarantine_owned_labels:";
+
+fn quarantine_owned_labels_key(table: &str) -> String {
+    format!("{QUARANTINE_OWNED_LABELS_KEY_PREFIX}{table}")
+}
+
+#[cfg(test)]
+mod quarantine_owned_labels_tests {
+    use super::StateStore;
+
+    #[test]
+    fn owned_labels_round_trip_per_table_and_default_to_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
+        assert!(
+            store
+                .get_quarantine_owned_labels("\"db\".\"s\".\"orders\"")
+                .unwrap()
+                .is_empty()
+        );
+        let labels = vec!["_error_a".to_string(), "_error_b".to_string()];
+        store
+            .set_quarantine_owned_labels("\"db\".\"s\".\"orders\"", &labels)
+            .unwrap();
+        assert_eq!(
+            store
+                .get_quarantine_owned_labels("\"db\".\"s\".\"orders\"")
+                .unwrap(),
+            labels
+        );
+        // Physical identity: a different spelling is a different record.
+        assert!(
+            store
+                .get_quarantine_owned_labels("\"db\".\"s\".\"Orders\"")
+                .unwrap()
+                .is_empty()
+        );
+    }
+}
+
 /// Metadata key for the timestamp of the most recent end-of-run
 /// auto-sweep (see [`StateStore::get_last_retention_sweep_at`]).
 const LAST_RETENTION_SWEEP_AT_KEY: &str = "last_retention_sweep_at";

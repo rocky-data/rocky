@@ -74,6 +74,53 @@ pub enum QuarantineError {
     )]
     TagNeedsSourceReplacement { dialect: &'static str },
 
+    /// `tag` replaces a label column it wrote on an earlier run with
+    /// star exclusion, and this warehouse has none.
+    #[error(
+        "quarantine mode = \"tag\" cannot replace its earlier label columns on {dialect}: the \
+         rewrite is `SELECT * EXCLUDE (<labels>)`, and {dialect} has no such form"
+    )]
+    TagNeedsStarExclusion { dialect: &'static str },
+
+    /// The source already has a column under a label's name, and Rocky cannot
+    /// prove it wrote that column (#2065). Never overwritten.
+    #[error(
+        "quarantine mode = \"{mode}\" would write the label column '{label}', but the source \
+         table already has a column '{column}' {why}. Rocky does not overwrite a column it \
+         cannot prove it wrote. Rename or drop that column (for example `ALTER TABLE <table> \
+         RENAME COLUMN {column} TO <new_name>`), or give the assertion a `name` so its label \
+         is `_error_<name>`"
+    )]
+    LabelColumnCollision {
+        mode: &'static str,
+        label: String,
+        column: String,
+        /// Why ownership is not proven, for this mode.
+        why: &'static str,
+    },
+
+    /// `split` and `tag` were compiled without the source's column list, so
+    /// a label collision could not be checked (#2065).
+    #[error(
+        "quarantine mode = \"{mode}\" needs the source table's columns to check its label \
+         names against, and they were not read"
+    )]
+    SourceColumnsUnread { mode: &'static str },
+
+    /// A name quarantine would create exceeds the identifier length bound
+    /// (#2065). Refused before any statement runs.
+    #[error(
+        "quarantine would create the {what} '{name}', which is {len} characters; identifiers are \
+         limited to {max} characters (Snowflake and Databricks): {fix}"
+    )]
+    GeneratedNameTooLong {
+        what: &'static str,
+        name: String,
+        len: usize,
+        max: usize,
+        fix: &'static str,
+    },
+
     /// Two tables a mode writes, or one it writes and the source it reads,
     /// resolve to the same name.
     #[error(
@@ -135,7 +182,67 @@ pub struct QuarantinePlan {
     /// The name does not contain the source table's name, so its length is
     /// fixed (51 characters) however long the source's name is.
     pub drop_intermediate: Option<QuarantineStatement>,
+    /// `tag` only: the label columns Rocky owns on the source once
+    /// [`Self::statements`] succeed, to record with
+    /// `StateStore::set_quarantine_owned_labels` under [`Self::source_table`].
+    /// Empty for `split` and `drop`, which do not write their source.
+    ///
+    /// This run's labels, plus earlier owned labels the source still carries
+    /// (an assertion removed from the config leaves its column behind, and it
+    /// is still Rocky's).
+    pub owned_labels_after: Vec<String>,
 }
+
+/// What the source table already holds, read before compiling `split` or
+/// `tag` (#2065).
+///
+/// A label is written as `_error_<name>` after the source's columns. When
+/// the source already has a column under that name (ASCII case ignored,
+/// since labels are emitted unquoted):
+///
+/// ```text
+///   split   refused: split never writes its source, so it owns none of
+///           the source's columns
+///   tag     column in `owned_labels`  -> replaced (excluded from `*`)
+///           otherwise                 -> refused, the column is the user's
+/// ```
+///
+/// Ownership is a state-store record written after a successful `tag`
+/// (`StateStore::set_quarantine_owned_labels`). It travels with remote state
+/// like any other record. If the store is lost, nothing proves ownership, so
+/// the next `tag` refuses and names the column: dropping it (`ALTER TABLE
+/// <table> DROP COLUMN <label>`) lets the following run write it afresh and
+/// record it again. Failing closed there is the point: a column Rocky cannot
+/// prove it wrote may be a user's.
+#[derive(Debug, Clone, Default)]
+pub struct SourceColumns {
+    /// The source's column names as the warehouse reports them, or `None`
+    /// when they were not read. `split` and `tag` refuse `None`.
+    pub columns: Option<Vec<String>>,
+    /// Label columns Rocky recorded writing to this source with `tag`.
+    pub owned_labels: Vec<String>,
+}
+
+impl SourceColumns {
+    /// The source's columns as read, with no ownership record.
+    pub fn read(columns: Vec<String>) -> Self {
+        Self {
+            columns: Some(columns),
+            owned_labels: Vec::new(),
+        }
+    }
+}
+
+/// Whether [`compile_quarantine_sql`] needs [`SourceColumns::columns`] for
+/// this config: every mode that writes label columns.
+pub fn needs_source_columns(config: &QuarantineConfig) -> bool {
+    config.enabled && !matches!(config.mode, QuarantineMode::Drop)
+}
+
+/// The identifier length bound every generated quarantine name is checked
+/// against (#2065). Snowflake and Databricks cap identifiers at 255
+/// characters; BigQuery allows longer, so the bound is conservative there.
+pub const MAX_GENERATED_IDENTIFIER_LEN: usize = 255;
 
 /// A single SQL statement produced by [`compile_quarantine_sql`].
 #[derive(Debug, Clone)]
@@ -185,12 +292,18 @@ pub enum StatementRole {
 /// Not deterministic for `split`: each call draws a new token for the
 /// intermediate table and its label columns. See
 /// [`QuarantinePlan::drop_intermediate`].
+///
+/// `source` is what the source table already holds; see [`SourceColumns`].
+/// `split` and `tag` refuse a label that collides with a source column Rocky
+/// cannot prove it wrote, before any statement runs. Every generated name is
+/// checked against [`MAX_GENERATED_IDENTIFIER_LEN`] here too.
 pub fn compile_quarantine_sql(
     assertions: &[QualityAssertion],
     unqualified_table: &str,
     table_ref: &TableRef,
     dialect: &dyn SqlDialect,
     config: &QuarantineConfig,
+    source: &SourceColumns,
 ) -> Result<Option<QuarantinePlan>, QuarantineError> {
     let token = uuid::Uuid::new_v4().simple().to_string();
     compile_with_token(
@@ -199,6 +312,7 @@ pub fn compile_quarantine_sql(
         table_ref,
         dialect,
         config,
+        source,
         &token[..SPLIT_TOKEN_LEN],
     )
 }
@@ -225,6 +339,7 @@ fn compile_with_token(
     table_ref: &TableRef,
     dialect: &dyn SqlDialect,
     config: &QuarantineConfig,
+    source: &SourceColumns,
     token: &str,
 ) -> Result<Option<QuarantinePlan>, QuarantineError> {
     if !config.enabled {
@@ -233,9 +348,7 @@ fn compile_with_token(
 
     let quarantinable: Vec<&QualityAssertion> = assertions
         .iter()
-        .filter(|a| a.table == unqualified_table)
-        .filter(|a| a.test.severity == TestSeverity::Error)
-        .filter(|a| is_quarantinable(&a.test.test_type))
+        .filter(|a| quarantines(a, unqualified_table))
         .collect();
 
     if quarantinable.is_empty() {
@@ -251,8 +364,16 @@ fn compile_with_token(
     let source_table =
         dialect.format_table_ref(&table_ref.catalog, &table_ref.schema, &table_ref.table)?;
 
-    let valid_name = suffixed_table_name(&table_ref.table, &config.suffix_valid)?;
-    let quarantine_name = suffixed_table_name(&table_ref.table, &config.suffix_quarantine)?;
+    // Only a table the mode writes is held to the length bound: `tag` writes
+    // neither suffixed table and `drop` no quarantine table.
+    let writes_valid = !matches!(config.mode, QuarantineMode::Tag);
+    let writes_quarantine = matches!(config.mode, QuarantineMode::Split);
+    let valid_name = suffixed_table_name(&table_ref.table, &config.suffix_valid, writes_valid)?;
+    let quarantine_name = suffixed_table_name(
+        &table_ref.table,
+        &config.suffix_quarantine,
+        writes_quarantine,
+    )?;
     refuse_colliding_names(config.mode, &table_ref.table, &valid_name, &quarantine_name)?;
     let valid_table =
         dialect.format_table_ref(&table_ref.catalog, &table_ref.schema, &valid_name)?;
@@ -273,8 +394,12 @@ fn compile_with_token(
         labeled.push(LabeledPredicate { label, valid_pred });
     }
 
+    let labels: Vec<&str> = labeled.iter().map(|p| p.label.as_str()).collect();
+    let replaced = resolve_label_collisions(config.mode, &labels, source)?;
+
     let mut statements = Vec::with_capacity(3);
     let mut drop_intermediate = None;
+    let mut owned_labels_after = Vec::new();
     match config.mode {
         QuarantineMode::Split => {
             // In the intermediate table each label sits under a working name,
@@ -289,7 +414,7 @@ fn compile_with_token(
             let working: Vec<String> = (0..labeled.len())
                 .map(|i| {
                     let name = format!("_ql{i}_{token}");
-                    validation::validate_identifier(&name)?;
+                    validate_generated_name("working label column", &name, FIX_INTERNAL)?;
                     Ok::<_, QuarantineError>(name)
                 })
                 .collect::<Result<_, _>>()?;
@@ -301,7 +426,7 @@ fn compile_with_token(
             )?;
 
             let intermediate_name = format!("{SPLIT_TABLE_PREFIX}{token}");
-            validation::validate_identifier(&intermediate_name)?;
+            validate_generated_name("intermediate table", &intermediate_name, FIX_INTERNAL)?;
             let intermediate_table = dialect.format_table_ref(
                 &table_ref.catalog,
                 &table_ref.schema,
@@ -312,6 +437,7 @@ fn compile_with_token(
                 StatementRole::Label,
                 &intermediate_table,
                 &source_table,
+                "*",
                 &labeled,
                 &working,
                 dialect,
@@ -358,15 +484,29 @@ fn compile_with_token(
             ));
         }
         QuarantineMode::Tag => {
-            let names: Vec<&str> = labeled.iter().map(|p| p.label.as_str()).collect();
+            // The label columns an earlier `tag` wrote are left out of `*`
+            // and written afresh, so the rewrite does not carry a stale label
+            // beside the new one (#2065).
+            let star = if replaced.is_empty() {
+                "*".to_string()
+            } else {
+                let replaced: Vec<&str> = replaced.iter().map(String::as_str).collect();
+                dialect
+                    .star_excluding(&replaced)
+                    .ok_or(QuarantineError::TagNeedsStarExclusion {
+                        dialect: dialect.name(),
+                    })?
+            };
             statements.push(build_label_ctas(
                 StatementRole::Tag,
                 &source_table,
                 &source_table,
+                &star,
                 &labeled,
-                &names,
+                &labels,
                 dialect,
             ));
+            owned_labels_after = owned_after_tag(&labels, source);
         }
     }
 
@@ -385,7 +525,142 @@ fn compile_with_token(
         },
         statements,
         drop_intermediate,
+        owned_labels_after,
     }))
+}
+
+/// Shown when a name Rocky builds from fixed parts alone exceeds the bound,
+/// which a change to those parts would have to cause.
+const FIX_INTERNAL: &str = "this name is built by Rocky alone; report it as a bug";
+
+/// Validate a name quarantine generates: identifier characters, and at most
+/// [`MAX_GENERATED_IDENTIFIER_LEN`] characters (#2065).
+fn validate_generated_name(
+    what: &'static str,
+    name: &str,
+    fix: &'static str,
+) -> Result<(), QuarantineError> {
+    validation::validate_identifier(name)?;
+    // Identifier characters are ASCII, so bytes are characters.
+    if name.len() > MAX_GENERATED_IDENTIFIER_LEN {
+        return Err(QuarantineError::GeneratedNameTooLong {
+            what,
+            name: name.to_string(),
+            len: name.len(),
+            max: MAX_GENERATED_IDENTIFIER_LEN,
+            fix,
+        });
+    }
+    Ok(())
+}
+
+fn mode_name(mode: QuarantineMode) -> &'static str {
+    match mode {
+        QuarantineMode::Split => "split",
+        QuarantineMode::Tag => "tag",
+        QuarantineMode::Drop => "drop",
+    }
+}
+
+/// Check each label against the source's columns (#2065) and return the
+/// source columns `tag` replaces. See [`SourceColumns`] for the rule.
+///
+/// Compared with ASCII case ignored. Labels are emitted unquoted, so DuckDB,
+/// Databricks and BigQuery resolve them without case, and Snowflake folds
+/// them to upper case. On Snowflake a quoted lower-case user column
+/// `"_error_x"` is distinct from the label `_ERROR_X`, and this comparison
+/// still refuses it: a refusal in doubt, never an overwrite.
+fn resolve_label_collisions(
+    mode: QuarantineMode,
+    labels: &[&str],
+    source: &SourceColumns,
+) -> Result<Vec<String>, QuarantineError> {
+    if matches!(mode, QuarantineMode::Drop) {
+        // `drop` writes no label column.
+        return Ok(Vec::new());
+    }
+    let columns = source
+        .columns
+        .as_ref()
+        .ok_or(QuarantineError::SourceColumnsUnread {
+            mode: mode_name(mode),
+        })?;
+    let mut replaced = Vec::new();
+    for label in labels {
+        let matching: Vec<&String> = columns
+            .iter()
+            .filter(|c| c.eq_ignore_ascii_case(label))
+            .collect();
+        let Some(first) = matching.first() else {
+            continue;
+        };
+        let refuse = |why| QuarantineError::LabelColumnCollision {
+            mode: mode_name(mode),
+            label: (*label).to_string(),
+            column: (*first).clone(),
+            why,
+        };
+        match mode {
+            QuarantineMode::Split => {
+                return Err(refuse(
+                    "(split writes new tables and never its source, so the column is not \
+                     Rocky's to replace)",
+                ));
+            }
+            QuarantineMode::Tag => {
+                let owned = source
+                    .owned_labels
+                    .iter()
+                    .any(|o| o.eq_ignore_ascii_case(label));
+                if !owned {
+                    return Err(refuse(
+                        "and the state store has no record of an earlier `tag` run writing it",
+                    ));
+                }
+                if matching.len() > 1 {
+                    return Err(refuse(
+                        "more than once under different case, so Rocky cannot tell which \
+                         one it wrote",
+                    ));
+                }
+                // Matched a label ignoring ASCII case, so it is identifier
+                // characters only; checked anyway before it is spliced.
+                validation::validate_identifier(first)?;
+                replaced.push((*first).clone());
+            }
+            QuarantineMode::Drop => {}
+        }
+    }
+    Ok(replaced)
+}
+
+/// The labels Rocky owns on the source after a successful `tag`: this run's,
+/// plus earlier owned labels the source still carries through `*`.
+fn owned_after_tag(labels: &[&str], source: &SourceColumns) -> Vec<String> {
+    let columns = source.columns.as_deref().unwrap_or_default();
+    let mut owned: Vec<String> = labels.iter().map(|l| (*l).to_string()).collect();
+    for prior in &source.owned_labels {
+        let still_there = columns.iter().any(|c| c.eq_ignore_ascii_case(prior));
+        let already = owned.iter().any(|o| o.eq_ignore_ascii_case(prior));
+        if still_there && !already {
+            owned.push(prior.clone());
+        }
+    }
+    owned.sort();
+    owned
+}
+
+/// Whether `assertion` is lowered into `table`'s quarantine.
+fn quarantines(assertion: &QualityAssertion, table: &str) -> bool {
+    assertion.table == table
+        && assertion.test.severity == TestSeverity::Error
+        && is_quarantinable(&assertion.test.test_type)
+}
+
+/// Whether any of `assertions` is lowered into `table`'s quarantine, so a
+/// caller reads [`SourceColumns`] only for a table that will be compiled.
+pub fn has_quarantinable_assertions(assertions: &[QualityAssertion], table: &str) -> bool {
+    assertions.iter().any(|a| quarantines(a, table))
 }
 
 struct LabeledPredicate {
@@ -433,13 +708,15 @@ fn safe_error_label(
         synthesize_label(&assertion.test.test_type, assertion.test.column.as_deref())
     };
 
+    const FIX_LABEL: &str =
+        "give the assertion a shorter `name`, or check a column with a shorter name";
     let mut candidate = format!("_error_{base}");
-    validation::validate_identifier(&candidate)?;
+    validate_generated_name("label column", &candidate, FIX_LABEL)?;
 
     let mut n = 2u32;
     while taken.contains(&candidate) {
         candidate = format!("_error_{base}_{n}");
-        validation::validate_identifier(&candidate)?;
+        validate_generated_name("label column", &candidate, FIX_LABEL)?;
         n += 1;
     }
     taken.insert(candidate.clone());
@@ -670,11 +947,13 @@ fn wrap_filter(
 /// passed that assertion.
 ///
 /// `columns[i]` names the column for `labeled[i]`: the label itself for
-/// `tag`, a working name for `split`.
+/// `tag`, a working name for `split`. `star` is `*`, or for `tag` a `*` that
+/// leaves out the label columns an earlier run wrote.
 fn build_label_ctas(
     role: StatementRole,
     target: &str,
     source: &str,
+    star: &str,
     labeled: &[LabeledPredicate],
     columns: &[&str],
     dialect: &dyn SqlDialect,
@@ -690,7 +969,7 @@ fn build_label_ctas(
         })
         .collect::<Vec<_>>()
         .join(", ");
-    let select = format!("SELECT *, {error_cols} FROM {source}");
+    let select = format!("SELECT {star}, {error_cols} FROM {source}");
     // `split`'s intermediate table must be new: replacing an existing table
     // would destroy something this run does not own, and the drop after it
     // would finish the job. `tag` replaces its source by design.
@@ -819,10 +1098,22 @@ fn refuse_colliding_names(
     Ok(())
 }
 
-fn suffixed_table_name(table: &str, suffix: &str) -> Result<String, QuarantineError> {
+fn suffixed_table_name(
+    table: &str,
+    suffix: &str,
+    written: bool,
+) -> Result<String, QuarantineError> {
     validation::validate_identifier(table)?;
     let candidate = format!("{table}{suffix}");
-    validation::validate_identifier(&candidate)?;
+    if !written {
+        validation::validate_identifier(&candidate)?;
+        return Ok(candidate);
+    }
+    validate_generated_name(
+        "output table",
+        &candidate,
+        "shorten the table name or the quarantine suffix",
+    )?;
     Ok(candidate)
 }
 
@@ -954,8 +1245,15 @@ mod unit_tests {
             Some("customer_id"),
             TestSeverity::Error,
         )];
-        let plan =
-            compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg).unwrap();
+        let plan = compile_quarantine_sql(
+            &assertions,
+            "orders",
+            &table(),
+            &TestDialect,
+            &cfg,
+            &SourceColumns::read(Vec::new()),
+        )
+        .unwrap();
         assert!(plan.is_none());
     }
 
@@ -973,8 +1271,15 @@ mod unit_tests {
                 TestSeverity::Warning,
             ),
         ];
-        let plan =
-            compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg).unwrap();
+        let plan = compile_quarantine_sql(
+            &assertions,
+            "orders",
+            &table(),
+            &TestDialect,
+            &cfg,
+            &SourceColumns::read(Vec::new()),
+        )
+        .unwrap();
         assert!(plan.is_none());
     }
 
@@ -987,9 +1292,17 @@ mod unit_tests {
             Some("customer_id"),
             TestSeverity::Error,
         )];
-        let plan = compile_with_token(&assertions, "orders", &table(), &TestDialect, &cfg, "t0k3n")
-            .unwrap()
-            .unwrap();
+        let plan = compile_with_token(
+            &assertions,
+            "orders",
+            &table(),
+            &TestDialect,
+            &cfg,
+            &SourceColumns::read(Vec::new()),
+            "t0k3n",
+        )
+        .unwrap()
+        .unwrap();
         let roles: Vec<StatementRole> = plan.statements.iter().map(|s| s.role).collect();
         assert_eq!(
             roles,
@@ -1025,9 +1338,17 @@ mod unit_tests {
             Some("customer_id"),
             TestSeverity::Error,
         )];
-        let plan = compile_with_token(&assertions, "orders", &table(), &TestDialect, &cfg, "t0k3n")
-            .unwrap()
-            .unwrap();
+        let plan = compile_with_token(
+            &assertions,
+            "orders",
+            &table(),
+            &TestDialect,
+            &cfg,
+            &SourceColumns::read(Vec::new()),
+            "t0k3n",
+        )
+        .unwrap()
+        .unwrap();
         let sql: Vec<&str> = plan.statements.iter().map(|s| s.sql.as_str()).collect();
         assert_eq!(
             sql,
@@ -1138,9 +1459,16 @@ mod unit_tests {
                 mode,
                 ..split_config()
             };
-            let plan = compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg)
-                .unwrap_or_else(|e| panic!("{mode:?}: {e:?}"))
-                .expect("a plan");
+            let plan = compile_quarantine_sql(
+                &assertions,
+                "orders",
+                &table(),
+                &TestDialect,
+                &cfg,
+                &SourceColumns::read(Vec::new()),
+            )
+            .unwrap_or_else(|e| panic!("{mode:?}: {e:?}"))
+            .expect("a plan");
             for fragment in fragments {
                 let total: usize = plan
                     .statements
@@ -1177,9 +1505,15 @@ mod unit_tests {
         let dialect = StubDialect(LiteralEscape::Standard);
         assert!(dialect.star_excluding(&["x"]).is_none(), "precondition");
 
-        let err =
-            compile_quarantine_sql(&assertions, "orders", &table(), &dialect, &split_config())
-                .unwrap_err();
+        let err = compile_quarantine_sql(
+            &assertions,
+            "orders",
+            &table(),
+            &dialect,
+            &split_config(),
+            &SourceColumns::read(Vec::new()),
+        )
+        .unwrap_err();
         assert!(
             matches!(err, QuarantineError::SplitNeedsStarExclusion { .. }),
             "{err:?}"
@@ -1191,9 +1525,16 @@ mod unit_tests {
                 mode,
                 ..split_config()
             };
-            compile_quarantine_sql(&assertions, "orders", &table(), &dialect, &cfg)
-                .unwrap_or_else(|e| panic!("{mode:?} does not exclude columns: {e:?}"))
-                .expect("a plan");
+            compile_quarantine_sql(
+                &assertions,
+                "orders",
+                &table(),
+                &dialect,
+                &cfg,
+                &SourceColumns::read(Vec::new()),
+            )
+            .unwrap_or_else(|e| panic!("{mode:?} does not exclude columns: {e:?}"))
+            .expect("a plan");
         }
     }
 
@@ -1219,6 +1560,7 @@ mod unit_tests {
                 &table(),
                 &TestDialect,
                 &split_config(),
+                &SourceColumns::read(Vec::new()),
             )
             .unwrap()
             .unwrap()
@@ -1267,10 +1609,16 @@ mod unit_tests {
             TestSeverity::Error,
         );
         a.table = long_table.clone();
-        let plan =
-            compile_quarantine_sql(&[a], &long_table, &table_ref, &TestDialect, &split_config())
-                .unwrap()
-                .unwrap();
+        let plan = compile_quarantine_sql(
+            &[a],
+            &long_table,
+            &table_ref,
+            &TestDialect,
+            &split_config(),
+            &SourceColumns::read(Vec::new()),
+        )
+        .unwrap()
+        .unwrap();
         let intermediate = plan.statements[0]
             .target
             .strip_prefix("poc.staging__orders.")
@@ -1312,7 +1660,14 @@ mod unit_tests {
                 suffix_quarantine: quarantine.into(),
                 ..split_config()
             };
-            compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg)
+            compile_quarantine_sql(
+                &assertions,
+                "orders",
+                &table(),
+                &TestDialect,
+                &cfg,
+                &SourceColumns::read(Vec::new()),
+            )
         };
         let collision = |r: Result<Option<QuarantinePlan>, QuarantineError>| {
             matches!(r, Err(QuarantineError::TableNameCollision { .. }))
@@ -1369,9 +1724,16 @@ mod unit_tests {
             Some("status"),
             TestSeverity::Error,
         )];
-        let plan = compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg)
-            .unwrap()
-            .unwrap();
+        let plan = compile_quarantine_sql(
+            &assertions,
+            "orders",
+            &table(),
+            &TestDialect,
+            &cfg,
+            &SourceColumns::read(Vec::new()),
+        )
+        .unwrap()
+        .unwrap();
         // Valid predicate: NULL or in list.
         assert!(
             plan.statements[0]
@@ -1391,9 +1753,16 @@ mod unit_tests {
             Some("name"),
             TestSeverity::Error,
         )];
-        let plan = compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg)
-            .unwrap()
-            .unwrap();
+        let plan = compile_quarantine_sql(
+            &assertions,
+            "orders",
+            &table(),
+            &TestDialect,
+            &cfg,
+            &SourceColumns::read(Vec::new()),
+        )
+        .unwrap()
+        .unwrap();
         assert!(plan.statements[0].sql.contains("'it''s'"));
     }
 
@@ -1408,9 +1777,16 @@ mod unit_tests {
             None,
             TestSeverity::Error,
         )];
-        let plan = compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg)
-            .unwrap()
-            .unwrap();
+        let plan = compile_quarantine_sql(
+            &assertions,
+            "orders",
+            &table(),
+            &TestDialect,
+            &cfg,
+            &SourceColumns::read(Vec::new()),
+        )
+        .unwrap()
+        .unwrap();
         // COALESCE makes NULL `amount >= 0` resolve to TRUE (preserves
         // existing `WHERE NOT (expr)` semantic that excludes NULL).
         assert!(
@@ -1439,9 +1815,17 @@ mod unit_tests {
                 TestSeverity::Error,
             ),
         ];
-        let plan = compile_with_token(&assertions, "orders", &table(), &TestDialect, &cfg, "t0k3n")
-            .unwrap()
-            .unwrap();
+        let plan = compile_with_token(
+            &assertions,
+            "orders",
+            &table(),
+            &TestDialect,
+            &cfg,
+            &SourceColumns::read(Vec::new()),
+            "t0k3n",
+        )
+        .unwrap()
+        .unwrap();
         // Split combines the labels: any set goes to quarantine, none set to valid.
         let working = "_ql0_t0k3n, _ql1_t0k3n";
         let quarantine_sql = &plan.statements[1].sql;
@@ -1472,9 +1856,16 @@ mod unit_tests {
             mode: QuarantineMode::Drop,
             ..split_config()
         };
-        let plan = compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &drop_cfg)
-            .unwrap()
-            .unwrap();
+        let plan = compile_quarantine_sql(
+            &assertions,
+            "orders",
+            &table(),
+            &TestDialect,
+            &drop_cfg,
+            &SourceColumns::read(Vec::new()),
+        )
+        .unwrap()
+        .unwrap();
         let valid_sql = &plan.statements[0].sql;
         assert!(valid_sql.contains("customer_id IS NOT NULL AND"));
         assert!(valid_sql.contains("status IS NULL OR status IN ('pending')"));
@@ -1538,6 +1929,7 @@ mod unit_tests {
                     &table(),
                     &TestDialect,
                     &cfg,
+                    &SourceColumns::read(Vec::new()),
                 )
                 .unwrap_or_else(|e| panic!("{mode:?} must accept {:?}: {e:?}", case.test))
                 .expect("a quarantinable assertion produces a plan");
@@ -1564,6 +1956,7 @@ mod unit_tests {
             &table(),
             &TestDialect,
             &split_config(),
+            &SourceColumns::read(Vec::new()),
         )
         .unwrap_err();
         assert!(err.to_string().contains("my_udf"), "{err}");
@@ -1581,9 +1974,16 @@ mod unit_tests {
             Some("customer_id"),
             TestSeverity::Error,
         )];
-        let plan = compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg)
-            .unwrap()
-            .unwrap();
+        let plan = compile_quarantine_sql(
+            &assertions,
+            "orders",
+            &table(),
+            &TestDialect,
+            &cfg,
+            &SourceColumns::read(Vec::new()),
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(plan.statements.len(), 1);
         assert_eq!(plan.statements[0].role, StatementRole::Valid);
         assert_eq!(
@@ -1606,9 +2006,16 @@ mod unit_tests {
             Some("customer_id"),
             TestSeverity::Error,
         )];
-        let plan = compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg)
-            .unwrap()
-            .unwrap();
+        let plan = compile_quarantine_sql(
+            &assertions,
+            "orders",
+            &table(),
+            &TestDialect,
+            &cfg,
+            &SourceColumns::read(Vec::new()),
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(plan.statements.len(), 1);
         assert_eq!(plan.statements[0].role, StatementRole::Tag);
         // Target of the tag CTAS is the source table (no suffix).
@@ -1635,9 +2042,16 @@ mod unit_tests {
             Some("customer_id"),
             TestSeverity::Error,
         )];
-        let plan = compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg)
-            .unwrap()
-            .unwrap();
+        let plan = compile_quarantine_sql(
+            &assertions,
+            "orders",
+            &table(),
+            &TestDialect,
+            &cfg,
+            &SourceColumns::read(Vec::new()),
+        )
+        .unwrap()
+        .unwrap();
         assert!(
             plan.statements[0]
                 .sql
@@ -1663,9 +2077,16 @@ mod unit_tests {
                 TestSeverity::Error,
             ),
         ];
-        let plan = compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg)
-            .unwrap()
-            .unwrap();
+        let plan = compile_quarantine_sql(
+            &assertions,
+            "orders",
+            &table(),
+            &TestDialect,
+            &cfg,
+            &SourceColumns::read(Vec::new()),
+        )
+        .unwrap()
+        .unwrap();
         // The quarantine table is where the labels carry their own names.
         let sql = &plan.statements[1].sql;
         assert!(sql.contains("AS _error_not_null_customer_id,"), "{sql}");
@@ -1681,9 +2102,16 @@ mod unit_tests {
             Some("customer_id"),
             TestSeverity::Error,
         )];
-        let plan = compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg)
-            .unwrap()
-            .unwrap();
+        let plan = compile_quarantine_sql(
+            &assertions,
+            "orders",
+            &table(),
+            &TestDialect,
+            &cfg,
+            &SourceColumns::read(Vec::new()),
+        )
+        .unwrap()
+        .unwrap();
         // Quarantine runs before valid so a partial failure leaves a stray
         // quarantine table rather than a stale valid table.
         assert_eq!(plan.statements[1].role, StatementRole::Quarantine);
@@ -1699,7 +2127,15 @@ mod unit_tests {
             Some("col; DROP TABLE"),
             TestSeverity::Error,
         )];
-        let err = compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg).err();
+        let err = compile_quarantine_sql(
+            &assertions,
+            "orders",
+            &table(),
+            &TestDialect,
+            &cfg,
+            &SourceColumns::read(Vec::new()),
+        )
+        .err();
         assert!(err.is_some());
     }
 
@@ -1715,7 +2151,15 @@ mod unit_tests {
             Some("customer_id"),
             TestSeverity::Error,
         )];
-        let err = compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg).err();
+        let err = compile_quarantine_sql(
+            &assertions,
+            "orders",
+            &table(),
+            &TestDialect,
+            &cfg,
+            &SourceColumns::read(Vec::new()),
+        )
+        .err();
         assert!(err.is_some());
     }
 
@@ -1750,9 +2194,16 @@ mod unit_tests {
             Some("amount"),
             TestSeverity::Error,
         )];
-        let plan = compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg)
-            .unwrap()
-            .unwrap();
+        let plan = compile_quarantine_sql(
+            &assertions,
+            "orders",
+            &table(),
+            &TestDialect,
+            &cfg,
+            &SourceColumns::read(Vec::new()),
+        )
+        .unwrap()
+        .unwrap();
         // Label CTAS: (amount IS NULL OR NOT (amount < 0 OR amount > 1000))
         assert!(
             plan.statements[0]
@@ -1772,9 +2223,16 @@ mod unit_tests {
             Some("email"),
             TestSeverity::Error,
         )];
-        let plan = compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg)
-            .unwrap()
-            .unwrap();
+        let plan = compile_quarantine_sql(
+            &assertions,
+            "orders",
+            &table(),
+            &TestDialect,
+            &cfg,
+            &SourceColumns::read(Vec::new()),
+        )
+        .unwrap()
+        .unwrap();
         // Label CTAS: (email IS NULL OR regexp_matches(email, '^[a-z]+$'))
         assert!(
             plan.statements[0]
@@ -1791,9 +2249,16 @@ mod unit_tests {
             Some("customer_id"),
             Some("region = 'US'"),
         )];
-        let plan = compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg)
-            .unwrap()
-            .unwrap();
+        let plan = compile_quarantine_sql(
+            &assertions,
+            "orders",
+            &table(),
+            &TestDialect,
+            &cfg,
+            &SourceColumns::read(Vec::new()),
+        )
+        .unwrap()
+        .unwrap();
         // Out-of-scope rows (filter false/null) pass unconditionally:
         // (CASE WHEN (region = 'US') THEN (customer_id IS NOT NULL) ELSE TRUE END)
         assert!(
@@ -1815,9 +2280,16 @@ mod unit_tests {
             Some("amount"),
             TestSeverity::Error,
         )];
-        let err = compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg)
-            .err()
-            .unwrap();
+        let err = compile_quarantine_sql(
+            &assertions,
+            "orders",
+            &table(),
+            &TestDialect,
+            &cfg,
+            &SourceColumns::read(Vec::new()),
+        )
+        .err()
+        .unwrap();
         assert!(matches!(err, QuarantineError::InvalidInRangeBound { .. }));
     }
 
@@ -1832,9 +2304,16 @@ mod unit_tests {
             Some("email"),
             TestSeverity::Error,
         )];
-        let err = compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg)
-            .err()
-            .unwrap();
+        let err = compile_quarantine_sql(
+            &assertions,
+            "orders",
+            &table(),
+            &TestDialect,
+            &cfg,
+            &SourceColumns::read(Vec::new()),
+        )
+        .err()
+        .unwrap();
         assert!(matches!(err, QuarantineError::UnsafeRegexPattern { .. }));
     }
 
@@ -1897,6 +2376,7 @@ mod unit_tests {
             &table(),
             &StubDialect(LiteralEscape::Standard),
             &cfg,
+            &SourceColumns::read(Vec::new()),
         )
         .unwrap()
         .unwrap();
@@ -1912,6 +2392,7 @@ mod unit_tests {
             &table(),
             &StubDialect(LiteralEscape::Backslash),
             &cfg,
+            &SourceColumns::read(Vec::new()),
         )
         .unwrap()
         .unwrap();
@@ -1935,8 +2416,15 @@ mod unit_tests {
             None,
             TestSeverity::Error,
         )];
-        let err = compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg)
-            .unwrap_err();
+        let err = compile_quarantine_sql(
+            &assertions,
+            "orders",
+            &table(),
+            &TestDialect,
+            &cfg,
+            &SourceColumns::read(Vec::new()),
+        )
+        .unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("statement terminator"), "{msg}");
         assert!(msg.contains("`expression`"), "{msg}");
@@ -1962,8 +2450,15 @@ mod unit_tests {
             None,
             TestSeverity::Error,
         )];
-        let err = compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg)
-            .unwrap_err();
+        let err = compile_quarantine_sql(
+            &assertions,
+            "orders",
+            &table(),
+            &TestDialect,
+            &cfg,
+            &SourceColumns::read(Vec::new()),
+        )
+        .unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("my_udf"),
@@ -1985,8 +2480,15 @@ mod unit_tests {
             None,
             TestSeverity::Error,
         )];
-        let err = compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg)
-            .unwrap_err();
+        let err = compile_quarantine_sql(
+            &assertions,
+            "orders",
+            &table(),
+            &TestDialect,
+            &cfg,
+            &SourceColumns::read(Vec::new()),
+        )
+        .unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.to_lowercase().contains("subquery"),
@@ -2007,8 +2509,15 @@ mod unit_tests {
             None,
             TestSeverity::Error,
         )];
-        compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg)
-            .expect("an ordinary predicate must still compile");
+        compile_quarantine_sql(
+            &assertions,
+            "orders",
+            &table(),
+            &TestDialect,
+            &cfg,
+            &SourceColumns::read(Vec::new()),
+        )
+        .expect("an ordinary predicate must still compile");
     }
 
     /// A dialect identical to `TestDialect` in every respect EXCEPT its
@@ -2116,16 +2625,30 @@ mod unit_tests {
 
         // TestDialect -> name() defaults to "unknown" -> GenericDialect, which
         // parses the operator.
-        compile_quarantine_sql(&assertions(), "orders", &table(), &TestDialect, &cfg)
-            .expect("the generic parser accepts this operator");
+        compile_quarantine_sql(
+            &assertions(),
+            "orders",
+            &table(),
+            &TestDialect,
+            &cfg,
+            &SourceColumns::read(Vec::new()),
+        )
+        .expect("the generic parser accepts this operator");
 
         // The same expression, same call site, a dialect NAMED snowflake.
         // Refused under snowflake, where `->` is the LAMBDA arrow rather than
         // a JSON operator — so the same text parses to a different AST and
         // the walker refuses it. The reason does not matter here; the
         // DIFFERENCE does, and it can only come from the name being threaded.
-        compile_quarantine_sql(&assertions(), "orders", &table(), &SnowflakeNamed, &cfg)
-            .expect_err("the snowflake parser must not accept this operator");
+        compile_quarantine_sql(
+            &assertions(),
+            "orders",
+            &table(),
+            &SnowflakeNamed,
+            &cfg,
+            &SourceColumns::read(Vec::new()),
+        )
+        .expect_err("the snowflake parser must not accept this operator");
     }
 
     /// The same proof for the quarantine FILTER route.
@@ -2144,10 +2667,24 @@ mod unit_tests {
                 Some("(a->'k') IS NOT NULL"),
             )]
         };
-        compile_quarantine_sql(&assertions(), "orders", &table(), &TestDialect, &cfg)
-            .expect("the generic parser accepts this operator");
-        compile_quarantine_sql(&assertions(), "orders", &table(), &SnowflakeNamed, &cfg)
-            .expect_err("the snowflake parser must not accept it");
+        compile_quarantine_sql(
+            &assertions(),
+            "orders",
+            &table(),
+            &TestDialect,
+            &cfg,
+            &SourceColumns::read(Vec::new()),
+        )
+        .expect("the generic parser accepts this operator");
+        compile_quarantine_sql(
+            &assertions(),
+            "orders",
+            &table(),
+            &SnowflakeNamed,
+            &cfg,
+            &SourceColumns::read(Vec::new()),
+        )
+        .expect_err("the snowflake parser must not accept it");
     }
 
     /// The `filter` reaches the same CTAS as the predicate, so it gets the
@@ -2162,8 +2699,15 @@ mod unit_tests {
             Some("customer_id"),
             Some("my_udf(id) IS NOT NULL"),
         )];
-        let err = compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg)
-            .unwrap_err();
+        let err = compile_quarantine_sql(
+            &assertions,
+            "orders",
+            &table(),
+            &TestDialect,
+            &cfg,
+            &SourceColumns::read(Vec::new()),
+        )
+        .unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("my_udf"), "must name the function: {msg}");
         assert!(msg.contains("`filter`"), "must name the field: {msg}");
@@ -2181,8 +2725,15 @@ mod unit_tests {
             Some("customer_id"),
             Some("amount >"),
         )];
-        let err = compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg)
-            .unwrap_err();
+        let err = compile_quarantine_sql(
+            &assertions,
+            "orders",
+            &table(),
+            &TestDialect,
+            &cfg,
+            &SourceColumns::read(Vec::new()),
+        )
+        .unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("A filter is one boolean expression over the row's columns"),
@@ -2200,8 +2751,15 @@ mod unit_tests {
             Some("customer_id"),
             Some("status <> 'void'"),
         )];
-        compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg)
-            .expect("an ordinary filter must still compile");
+        compile_quarantine_sql(
+            &assertions,
+            "orders",
+            &table(),
+            &TestDialect,
+            &cfg,
+            &SourceColumns::read(Vec::new()),
+        )
+        .expect("an ordinary filter must still compile");
     }
 
     #[test]
@@ -2212,8 +2770,15 @@ mod unit_tests {
             Some("customer_id"),
             Some("1=1); SELECT 1; --"),
         )];
-        let err = compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg)
-            .unwrap_err();
+        let err = compile_quarantine_sql(
+            &assertions,
+            "orders",
+            &table(),
+            &TestDialect,
+            &cfg,
+            &SourceColumns::read(Vec::new()),
+        )
+        .unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("statement terminator"), "{msg}");
         assert!(msg.contains("`filter`"), "{msg}");
@@ -2232,8 +2797,15 @@ mod unit_tests {
             None,
             TestSeverity::Error,
         )];
-        let err = compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg)
-            .unwrap_err();
+        let err = compile_quarantine_sql(
+            &assertions,
+            "orders",
+            &table(),
+            &TestDialect,
+            &cfg,
+            &SourceColumns::read(Vec::new()),
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("unterminated"), "{err}");
     }
 
@@ -2245,13 +2817,276 @@ mod unit_tests {
             Some("customer_id"),
             Some("region = 'US;CA'"),
         )];
-        let plan = compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg)
-            .unwrap()
-            .unwrap();
+        let plan = compile_quarantine_sql(
+            &assertions,
+            "orders",
+            &table(),
+            &TestDialect,
+            &cfg,
+            &SourceColumns::read(Vec::new()),
+        )
+        .unwrap()
+        .unwrap();
         assert!(
             plan.statements[0].sql.contains("region = 'US;CA'"),
             "{}",
             plan.statements[0].sql
         );
+    }
+
+    fn mode_config(mode: QuarantineMode) -> QuarantineConfig {
+        QuarantineConfig {
+            mode,
+            ..split_config()
+        }
+    }
+
+    fn not_null_name() -> Vec<QualityAssertion> {
+        vec![assertion(
+            None,
+            TestType::NotNull,
+            Some("name"),
+            TestSeverity::Error,
+        )]
+    }
+
+    fn compile_against(
+        mode: QuarantineMode,
+        source: &SourceColumns,
+    ) -> Result<Option<QuarantinePlan>, QuarantineError> {
+        compile_quarantine_sql(
+            &not_null_name(),
+            "orders",
+            &table(),
+            &TestDialect,
+            &mode_config(mode),
+            source,
+        )
+    }
+
+    fn source(columns: &[&str], owned: &[&str]) -> SourceColumns {
+        SourceColumns {
+            columns: Some(columns.iter().map(|c| (*c).to_string()).collect()),
+            owned_labels: owned.iter().map(|c| (*c).to_string()).collect(),
+        }
+    }
+
+    /// #2065 part 1: a user's own `_error_<label>` column is never
+    /// overwritten. With no ownership record, `tag` and `split` refuse before
+    /// any statement exists, and the error names the column and the label.
+    #[test]
+    fn a_source_column_named_like_a_label_is_refused_without_ownership() {
+        for mode in [QuarantineMode::Tag, QuarantineMode::Split] {
+            let err = compile_against(mode, &source(&["id", "name", "_ERROR_not_null_name"], &[]))
+                .unwrap_err();
+            match &err {
+                QuarantineError::LabelColumnCollision { label, column, .. } => {
+                    assert_eq!(label, "_error_not_null_name");
+                    assert_eq!(column, "_ERROR_not_null_name");
+                }
+                other => panic!("{mode:?}: expected LabelColumnCollision, got {other:?}"),
+            }
+            assert!(err.to_string().contains("RENAME COLUMN"), "{err}");
+        }
+    }
+
+    /// `split` never writes its source, so even a recorded label is not its
+    /// to replace in the quarantine table.
+    #[test]
+    fn split_refuses_a_label_collision_even_with_an_ownership_record() {
+        let err = compile_against(
+            QuarantineMode::Split,
+            &source(&["id", "_error_not_null_name"], &["_error_not_null_name"]),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, QuarantineError::LabelColumnCollision { .. }),
+            "{err:?}"
+        );
+    }
+
+    /// `tag` run two: the column run one wrote is recorded as Rocky's, so it
+    /// is left out of `*` and written afresh, not carried beside the new one.
+    #[test]
+    fn tag_replaces_a_label_column_it_recorded_writing() {
+        let plan = compile_against(
+            QuarantineMode::Tag,
+            &source(
+                &["id", "name", "_error_not_null_name", "_error_old"],
+                &["_error_not_null_name", "_error_old", "_error_gone"],
+            ),
+        )
+        .unwrap()
+        .unwrap();
+        let sql = &plan.statements[0].sql;
+        assert!(
+            sql.contains("SELECT * EXCLUDE (_error_not_null_name), CASE WHEN NOT"),
+            "{sql}"
+        );
+        // This run's label, plus the earlier label the table still carries;
+        // a recorded label the table no longer has is dropped from the record.
+        assert_eq!(
+            plan.owned_labels_after,
+            vec!["_error_not_null_name".to_string(), "_error_old".to_string()]
+        );
+    }
+
+    /// Two source columns that both match a label ignoring case: Rocky cannot
+    /// tell which one it wrote, so it replaces neither.
+    #[test]
+    fn tag_refuses_a_label_matched_by_two_columns() {
+        let err = compile_against(
+            QuarantineMode::Tag,
+            &source(
+                &["_error_not_null_name", "_ERROR_NOT_NULL_NAME"],
+                &["_error_not_null_name"],
+            ),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, QuarantineError::LabelColumnCollision { .. }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn tag_and_split_refuse_unread_source_columns_and_drop_needs_none() {
+        for mode in [QuarantineMode::Tag, QuarantineMode::Split] {
+            let err = compile_against(mode, &SourceColumns::default()).unwrap_err();
+            assert!(
+                matches!(err, QuarantineError::SourceColumnsUnread { .. }),
+                "{mode:?}: {err:?}"
+            );
+        }
+        let plan = compile_against(QuarantineMode::Drop, &SourceColumns::default())
+            .unwrap()
+            .unwrap();
+        assert!(plan.owned_labels_after.is_empty());
+    }
+
+    #[test]
+    fn tag_without_a_collision_writes_plain_star_and_records_its_labels() {
+        let plan = compile_against(QuarantineMode::Tag, &source(&["id", "name"], &[]))
+            .unwrap()
+            .unwrap();
+        assert!(
+            plan.statements[0].sql.contains("SELECT *, CASE WHEN NOT"),
+            "{}",
+            plan.statements[0].sql
+        );
+        assert_eq!(plan.owned_labels_after, vec!["_error_not_null_name"]);
+    }
+
+    /// #2065 part 2: a 250-character table plus `__valid` is 257 characters,
+    /// over the 255 bound. Refused at compile time, before any statement.
+    #[test]
+    fn an_output_table_name_over_the_identifier_limit_is_refused() {
+        let long = "t".repeat(250);
+        let assertions = vec![QualityAssertion {
+            table: long.clone(),
+            ..not_null_name().remove(0)
+        }];
+        let err = compile_quarantine_sql(
+            &assertions,
+            &long,
+            &TableRef {
+                table: long.clone(),
+                ..table()
+            },
+            &TestDialect,
+            &mode_config(QuarantineMode::Drop),
+            &SourceColumns::default(),
+        )
+        .unwrap_err();
+        match err {
+            QuarantineError::GeneratedNameTooLong { what, len, max, .. } => {
+                assert_eq!(what, "output table");
+                assert_eq!(len, 257);
+                assert_eq!(max, 255);
+            }
+            other => panic!("expected GeneratedNameTooLong, got {other:?}"),
+        }
+    }
+
+    /// A 240-character column gives `_error_not_null_<column>` of 256
+    /// characters. Refused at compile time.
+    #[test]
+    fn a_label_name_over_the_identifier_limit_is_refused() {
+        let column = "c".repeat(240);
+        let assertions = vec![assertion(
+            None,
+            TestType::NotNull,
+            Some(&column),
+            TestSeverity::Error,
+        )];
+        let err = compile_quarantine_sql(
+            &assertions,
+            "orders",
+            &table(),
+            &TestDialect,
+            &mode_config(QuarantineMode::Tag),
+            &source(&["id"], &[]),
+        )
+        .unwrap_err();
+        match err {
+            QuarantineError::GeneratedNameTooLong { what, len, .. } => {
+                assert_eq!(what, "label column");
+                assert_eq!(len, 256);
+            }
+            other => panic!("expected GeneratedNameTooLong, got {other:?}"),
+        }
+    }
+
+    /// The bound is inclusive: a 248-character table plus `__valid` is
+    /// exactly 255 characters and compiles.
+    #[test]
+    fn an_output_table_name_at_the_identifier_limit_compiles() {
+        let long = "t".repeat(248);
+        let assertions = vec![QualityAssertion {
+            table: long.clone(),
+            ..not_null_name().remove(0)
+        }];
+        let plan = compile_quarantine_sql(
+            &assertions,
+            &long,
+            &TableRef {
+                table: long.clone(),
+                ..table()
+            },
+            &TestDialect,
+            &mode_config(QuarantineMode::Drop),
+            &SourceColumns::default(),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(plan.valid_table.ends_with(&format!("{long}__valid")));
+        assert!(
+            plan.quarantine_table.is_empty(),
+            "drop writes no quarantine table"
+        );
+    }
+
+    /// `tag` writes neither suffixed table, so a table name that would make
+    /// them too long is not refused for them.
+    #[test]
+    fn tag_is_not_refused_over_suffixed_tables_it_does_not_write() {
+        let long = "t".repeat(250);
+        let assertions = vec![QualityAssertion {
+            table: long.clone(),
+            ..not_null_name().remove(0)
+        }];
+        compile_quarantine_sql(
+            &assertions,
+            &long,
+            &TableRef {
+                table: long.clone(),
+                ..table()
+            },
+            &TestDialect,
+            &mode_config(QuarantineMode::Tag),
+            &source(&["id", "name"], &[]),
+        )
+        .unwrap()
+        .unwrap();
     }
 }

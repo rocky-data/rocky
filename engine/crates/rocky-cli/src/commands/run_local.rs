@@ -605,6 +605,9 @@ pub async fn run_quality(
     let mut tables_checked = 0usize;
     let mut targets_unexpanded = 0usize;
     let mut quarantines_not_applied = 0usize;
+    // Opened only when a quarantine needs it (a `tag` ownership record), then
+    // reused for the run record below: the store takes a writer lock.
+    let mut quarantine_store: Option<StateStore> = None;
 
     if !pipeline.checks.enabled {
         warn!("quality pipeline checks are disabled — nothing to do");
@@ -781,20 +784,79 @@ pub async fn run_quality(
                         schema: table_ref.schema.clone(),
                         table: table_name.clone(),
                     };
-                    match rocky_core::quarantine::compile_quarantine_sql(
-                        &pipeline.checks.assertions,
-                        table_name,
-                        &ir_ref,
-                        dialect,
-                        q_cfg,
-                    ) {
+                    // `split` and `tag` check their label names against the
+                    // source's columns before any statement runs (#2065), so
+                    // the columns (and, for `tag`, the ownership record) are
+                    // read first. A read that fails refuses the quarantine
+                    // like a compile error: nothing has been written yet.
+                    let compiled = if rocky_core::quarantine::needs_source_columns(q_cfg)
+                        && rocky_core::quarantine::has_quarantinable_assertions(
+                            &pipeline.checks.assertions,
+                            table_name,
+                        ) {
+                        read_quarantine_source(
+                            warehouse_adapter.as_ref(),
+                            &ir_ref,
+                            q_cfg,
+                            state_path,
+                            &mut quarantine_store,
+                        )
+                        .await
+                    } else {
+                        Ok(rocky_core::quarantine::SourceColumns::default())
+                    }
+                    .and_then(|source| {
+                        rocky_core::quarantine::compile_quarantine_sql(
+                            &pipeline.checks.assertions,
+                            table_name,
+                            &ir_ref,
+                            dialect,
+                            q_cfg,
+                            &source,
+                        )
+                        .map_err(|e| e.to_string())
+                    });
+                    match compiled {
                         Ok(Some(plan)) => {
-                            let (q_output, write_error) = execute_quarantine_plan(
+                            let ownership =
+                                matches!(plan.mode, rocky_core::config::QuarantineMode::Tag).then(
+                                    || (plan.source_table.clone(), plan.owned_labels_after.clone()),
+                                );
+                            let (q_output, mut write_error) = execute_quarantine_plan(
                                 warehouse_adapter.as_ref(),
                                 asset_key.clone(),
                                 plan,
                             )
                             .await;
+                            // `tag` wrote its label columns: record that Rocky
+                            // owns them, so the next run replaces them rather
+                            // than refusing (#2065). Only after the statement
+                            // succeeded, so a record never claims a column
+                            // that was not written. A record that does not
+                            // land fails the run: the data is right, but the
+                            // next run would refuse these columns as a user's.
+                            if write_error.is_none()
+                                && let Some((table, labels)) = ownership
+                                && let Err(e) =
+                                    open_quarantine_store(&mut quarantine_store, state_path)
+                                        .and_then(|store| {
+                                            store
+                                                .set_quarantine_owned_labels(&table, &labels)
+                                                .map_err(|e| e.to_string())
+                                        })
+                            {
+                                warn!(error = %e, table = %table, "quarantine label ownership not recorded");
+                                write_error = Some(TableErrorOutput {
+                                    asset_key: asset_key.clone(),
+                                    error: format!(
+                                        "quarantine write did not complete: the label columns \
+                                         were written, but recording that Rocky owns them failed, \
+                                         so the next `tag` run will refuse them: {e}"
+                                    ),
+                                    failure_kind: FailureKind::Unknown,
+                                    cooldown_seconds: None,
+                                });
+                            }
                             // A statement that failed is a split that did not
                             // happen, or happened halfway (#2052). `ok: false`
                             // on its own reached the JSON and nothing that
@@ -813,14 +875,16 @@ pub async fn run_quality(
                             if let Some(write_error) = write_error {
                                 output.tables_failed += 1;
                                 quarantines_not_applied += 1;
+                                let reason = q_output
+                                    .error
+                                    .clone()
+                                    .unwrap_or_else(|| write_error.error.clone());
                                 output.errors.push(write_error);
                                 output.check_results.push(TableCheckOutput {
                                     asset_key: asset_key.clone(),
                                     checks: vec![rocky_core::checks::quarantine_not_evaluated(
                                         "quarantine:execute",
-                                        q_output.error.clone().unwrap_or_else(|| {
-                                            "a quarantine statement failed".to_string()
-                                        }),
+                                        reason,
                                     )],
                                 });
                             }
@@ -871,7 +935,7 @@ pub async fn run_quality(
                                 // output multiple times".
                                 checks: vec![rocky_core::checks::quarantine_not_evaluated(
                                     "quarantine:compile",
-                                    e.to_string(),
+                                    e,
                                 )],
                             });
                         }
@@ -930,8 +994,11 @@ pub async fn run_quality(
     // success for the scheduler; the dispatch site abandons the session on the
     // resulting `Err`. Mirrors the transformation call site: submission_id +
     // trigger are read from the environment inside `persist_run_record`.
-    let store = StateStore::open(state_path)
-        .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
+    let store = match quarantine_store.take() {
+        Some(store) => store,
+        None => StateStore::open(state_path)
+            .with_context(|| format!("failed to open state store at {}", state_path.display()))?,
+    };
     // `rocky run --branch` / `--shadow` on a quality pipeline is refused in
     // `run.rs` (`require_shadow_support`) before this function runs (#2161), so
     // there is no `ShadowConfig` here and no Rocky branch to record: a run that
@@ -1257,6 +1324,63 @@ fn classify_assertion(
             Some((n == 0, n))
         }
     }
+}
+
+/// Open the state store for a quarantine, once per run.
+fn open_quarantine_store<'a>(
+    store: &'a mut Option<StateStore>,
+    state_path: &Path,
+) -> std::result::Result<&'a StateStore, String> {
+    if store.is_none() {
+        *store = Some(StateStore::open(state_path).map_err(|e| {
+            format!(
+                "could not open the state store at {}: {e}",
+                state_path.display()
+            )
+        })?);
+    }
+    store
+        .as_ref()
+        .ok_or_else(|| "state store not open".to_string())
+}
+
+/// Read what [`rocky_core::quarantine::compile_quarantine_sql`] checks label
+/// names against (#2065): the source's columns, and for `tag` the labels
+/// Rocky recorded writing there. Keyed by the source's dialect-formatted name,
+/// the same name the `tag` statement writes.
+async fn read_quarantine_source(
+    warehouse: &dyn rocky_core::traits::WarehouseAdapter,
+    table_ref: &rocky_ir::TableRef,
+    config: &rocky_core::config::QuarantineConfig,
+    state_path: &Path,
+    store: &mut Option<StateStore>,
+) -> std::result::Result<rocky_core::quarantine::SourceColumns, String> {
+    let columns = warehouse
+        .describe_table(table_ref)
+        .await
+        .map_err(|e| {
+            format!(
+                "could not read the source table's columns to check the label names against: {e}"
+            )
+        })?
+        .into_iter()
+        .map(|c| c.name)
+        .collect();
+    let owned_labels = if matches!(config.mode, rocky_core::config::QuarantineMode::Tag) {
+        let table = warehouse
+            .dialect()
+            .format_table_ref(&table_ref.catalog, &table_ref.schema, &table_ref.table)
+            .map_err(|e| e.to_string())?;
+        open_quarantine_store(store, state_path)?
+            .get_quarantine_owned_labels(&table)
+            .map_err(|e| format!("could not read the quarantine label ownership record: {e}"))?
+    } else {
+        Vec::new()
+    };
+    Ok(rocky_core::quarantine::SourceColumns {
+        columns: Some(columns),
+        owned_labels,
+    })
 }
 
 /// Execute a compiled [`rocky_core::quarantine::QuarantinePlan`] against
@@ -3820,6 +3944,7 @@ auto_create_schemas = true
                 suffix_valid: "__valid".into(),
                 suffix_quarantine: "__quarantine".into(),
             },
+            &rocky_core::quarantine::SourceColumns::read(vec!["id".into(), "name".into()]),
         )
         .unwrap()
         .unwrap();
@@ -3934,5 +4059,159 @@ auto_create_schemas = true
         let write_error = write_error.expect("a failed write returns its error entry");
         assert_eq!(write_error.failure_kind, super::FailureKind::Unknown);
         assert_eq!(write_error.cooldown_seconds, None);
+    }
+
+    /// A DuckDB quality pipeline running quarantine `tag` on `main.orders`
+    /// with one `not_null(name)` assertion, whose label is
+    /// `_error_not_null_name`.
+    fn tag_fixture(dir: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
+        let db = dir.join("warehouse.duckdb");
+        let config_path = dir.join("rocky.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "[adapter]\ntype = \"duckdb\"\npath = \"{}\"\n\n\
+                 [pipeline.dq]\ntype = \"quality\"\n\n\
+                 [pipeline.dq.target]\nadapter = \"default\"\n\n\
+                 [[pipeline.dq.tables]]\ncatalog = \"warehouse\"\nschema = \"main\"\n\
+                 table = \"orders\"\n\n\
+                 [pipeline.dq.checks]\nenabled = true\nfail_on_error = false\n\n\
+                 [pipeline.dq.checks.quarantine]\nenabled = true\nmode = \"tag\"\n\n\
+                 [[pipeline.dq.checks.assertions]]\ntable = \"orders\"\ntype = \"not_null\"\n\
+                 column = \"name\"\nseverity = \"error\"\n",
+                db.display()
+            ),
+        )
+        .unwrap();
+        (db, config_path)
+    }
+
+    async fn run_tag(config_path: &Path, state_path: &Path) -> anyhow::Result<()> {
+        let cfg = rocky_core::config::load_rocky_config(config_path).unwrap();
+        let rocky_core::config::PipelineConfig::Quality(pipeline) = &cfg.pipelines["dq"] else {
+            panic!("quality fixture");
+        };
+        let pipeline = pipeline.clone();
+        super::run_quality(
+            config_path,
+            &pipeline,
+            &cfg,
+            false,
+            state_path,
+            "test-run",
+            chrono::Utc::now(),
+            "test-hash",
+            "dq",
+        )
+        .await
+    }
+
+    async fn orders_columns(db: &Path) -> Vec<String> {
+        let adapter = DuckDbWarehouseAdapter::open(db).unwrap();
+        adapter
+            .execute_query(
+                "SELECT column_name FROM information_schema.columns \
+                 WHERE table_name = 'orders' ORDER BY ordinal_position",
+            )
+            .await
+            .unwrap()
+            .rows
+            .into_iter()
+            .map(|r| r[0].as_str().unwrap_or_default().to_string())
+            .collect()
+    }
+
+    /// #2065 part 1: `tag` rewrites its own source, so run two reads run
+    /// one's label column. Rocky recorded writing it, so run two replaces it
+    /// rather than leaving a stale label beside a fresh `_error_not_null_name_1`.
+    /// With the state store gone nothing proves ownership, and the run
+    /// refuses instead of guessing.
+    #[tokio::test]
+    async fn tag_twice_replaces_its_own_label_and_refuses_once_ownership_is_lost() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, config_path) = tag_fixture(dir.path());
+        let state_path = dir.path().join("state.redb");
+        let adapter = DuckDbWarehouseAdapter::open(&db).unwrap();
+        adapter
+            .execute_statement(
+                "CREATE TABLE main.orders AS SELECT * FROM (VALUES (1, 'ada'), (2, NULL)) t(id, name)",
+            )
+            .await
+            .unwrap();
+        drop(adapter);
+
+        run_tag(&config_path, &state_path).await.expect("run one");
+        assert_eq!(
+            orders_columns(&db).await,
+            vec!["id", "name", "_error_not_null_name"]
+        );
+        // Between runs the bad row is fixed, so a fresh label is all NULL and
+        // a stale one would still say row 2 failed.
+        let adapter = DuckDbWarehouseAdapter::open(&db).unwrap();
+        adapter
+            .execute_statement("UPDATE main.orders SET name = 'bob' WHERE id = 2")
+            .await
+            .unwrap();
+        drop(adapter);
+
+        run_tag(&config_path, &state_path).await.expect("run two");
+        assert_eq!(
+            orders_columns(&db).await,
+            vec!["id", "name", "_error_not_null_name"],
+            "run one's label is replaced, not carried beside a second one"
+        );
+        let adapter = DuckDbWarehouseAdapter::open(&db).unwrap();
+        let flagged = adapter
+            .execute_query(
+                "SELECT COUNT(*) FROM main.orders WHERE _error_not_null_name IS NOT NULL",
+            )
+            .await
+            .unwrap();
+        assert_eq!(flagged.rows[0][0].as_str(), Some("0"), "the label is fresh");
+        drop(adapter);
+
+        std::fs::remove_file(&state_path).unwrap();
+        let error = run_tag(&config_path, &state_path)
+            .await
+            .expect_err("no record proves the column is Rocky's");
+        assert!(format!("{error:#}").contains("failed"), "{error:#}");
+        assert_eq!(
+            orders_columns(&db).await,
+            vec!["id", "name", "_error_not_null_name"],
+            "nothing was rewritten"
+        );
+    }
+
+    /// #2065 part 1: a user's own `_error_<label>` column on a first run is
+    /// never overwritten. The run fails before any statement, and the column
+    /// keeps its value.
+    #[tokio::test]
+    async fn tag_refuses_a_users_column_named_like_its_label() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, config_path) = tag_fixture(dir.path());
+        let state_path = dir.path().join("state.redb");
+        let adapter = DuckDbWarehouseAdapter::open(&db).unwrap();
+        adapter
+            .execute_statement(
+                "CREATE TABLE main.orders AS SELECT 2 AS id, NULL::VARCHAR AS name, \
+                 'mine' AS _error_not_null_name",
+            )
+            .await
+            .unwrap();
+        drop(adapter);
+
+        run_tag(&config_path, &state_path)
+            .await
+            .expect_err("a user's column is refused");
+        assert_eq!(
+            orders_columns(&db).await,
+            vec!["id", "name", "_error_not_null_name"]
+        );
+        let adapter = DuckDbWarehouseAdapter::open(&db).unwrap();
+        let value = adapter
+            .execute_query("SELECT _error_not_null_name FROM main.orders")
+            .await
+            .unwrap();
+        assert_eq!(value.rows[0][0].as_str(), Some("mine"));
     }
 }
