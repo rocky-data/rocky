@@ -24,6 +24,7 @@ rocky compile [flags]
 | `--models <PATH>` | `PathBuf` | `models` | Directory containing `.sql` and `.toml` model files. |
 | `--contracts <PATH>` | `PathBuf` | | Directory containing data contract definitions. |
 | `--model <NAME>` | `string` | | Restrict the reported result and exit status to one exact model name — whether *that model's own source* is valid, not whether its upstreams can be rebuilt. The full project is still loaded and compile-checked internally for dependency and type context. |
+| `--select <SELECTOR>...`, `-s` / `--exclude <SELECTOR>...` / `--state-ref <REF>` | `string` | | Report and fail on the [selected models](/reference/node-selection/) only. Cannot be combined with `--model`. |
 | `--expand-macros` | `bool` | `false` | Expand macros from `macros/` and include the expanded SQL in the output. |
 | `--target-dialect <DIALECT>` | `dbx` \| `sf` \| `bq` \| `duckdb` | | Run the **P001 dialect-portability lint** against the chosen target. Non-portable constructs emit `error`-severity diagnostics. Precedence: flag > `[portability] target_dialect` in `rocky.toml` > unset. See [Portability linting](/concepts/linters/). |
 | `--with-seed` | `bool` | `false` | Execute `data/seed.sql` against an in-memory DuckDB and use its `information_schema` as the source-of-truth for raw source schemas. Turns leaf `.sql` models from `Unknown` columns into concrete types. Requires the `duckdb` feature (enabled by default in the shipped binary). |
@@ -617,6 +618,7 @@ rocky emit-sql [flags]
 |------|------|---------|-------------|
 | `--models <PATH>` | `PathBuf` | `models` | Directory containing `.sql` and `.toml` model files. |
 | `--model <NAME>` | `string` | | Render a single model by name instead of the whole project. |
+| `--select <SELECTOR>...`, `-s` / `--exclude <SELECTOR>...` / `--state-ref <REF>` | `string` | | Render only the [selected models](/reference/node-selection/). |
 | `--out-dir <PATH>` | `PathBuf` | | Write one `<model>.sql` file per model into this directory, in dependency order. When omitted, the concatenated SQL is printed to stdout (also in dependency order). |
 
 ### Dialect and the runnable guarantee
@@ -710,6 +712,7 @@ rocky test [flags]
 | `--models <PATH>` | `PathBuf` | `models` | Directory containing model files. |
 | `--contracts <PATH>` | `PathBuf` | | Directory containing data contract definitions. |
 | `--model <NAME>` | `string` | | Run tests for a single model only. |
+| `--select <SELECTOR>...`, `-s` / `--exclude <SELECTOR>...` / `--state-ref <REF>` | `string` | | Report only the [selected models](/reference/node-selection/). Every model still runs. Not with `--declarative`. |
 
 ### Examples
 

@@ -707,6 +707,8 @@ rocky list consumers <model> # What depends on this model
 
 Every subcommand supports `--output json` via `-o json`. Rocky finds models in the `models/` directory and in its immediate subdirectories, which covers the common `models/{layer}/` layout.
 
+`rocky list models` takes `--select`, `--exclude`, and `--state-ref` and lists only the selected models. Bare `rocky list` lists models too, so `rocky list --select +fct_orders` works like `dbt ls`. The JSON shape is the same as `rocky list models`. See [Node selection](/reference/node-selection/).
+
 See the [CLI Reference](/reference/cli/#rocky-list) for full examples and JSON output schemas.
 
 ### Related Commands
