@@ -1,4 +1,4 @@
-//! Regression coverage for unsafe raw dbt incremental guards.
+//! Regression coverage for raw dbt incremental guards.
 
 use std::fs;
 use std::path::Path;
@@ -18,7 +18,11 @@ fn write_project_files(dbt_dir: &Path) {
 }
 
 #[test]
-fn no_manifest_refuses_unbounded_append_model() {
+/// WP6: the standard `is_incremental()` watermark filter converts to a Rocky
+/// `incremental` model on the raw path. Before, the model was refused: an
+/// unfiltered append would re-insert every row. The placeholder is `TRUE` on
+/// the first run, so the first load is complete.
+fn no_manifest_converts_standard_incremental_filter() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let dbt_dir = tmp.path().join("dbt");
     let models_dir = dbt_dir.join("models");
@@ -54,17 +58,17 @@ WHERE event_time > (SELECT MAX(event_time) FROM {{ this }})
     );
     let result: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("import-dbt output should be JSON");
-    assert_eq!(result["imported"], 0);
-    assert_eq!(result["failed"], 1);
-    assert_eq!(result["failed_details"][0]["name"], "events");
+    assert_eq!(result["imported"], 1, "{result}");
+    assert_eq!(result["failed"], 0, "{result}");
+    let sql = fs::read_to_string(out_dir.join("models/events.sql")).expect("emitted sql");
+    assert!(sql.contains("WHERE @incremental_filter"), "{sql}");
+    assert!(!sql.contains("is_incremental"), "{sql}");
+    let sidecar = fs::read_to_string(out_dir.join("models/events.toml")).expect("sidecar");
+    assert!(sidecar.contains("type = \"incremental\""), "{sidecar}");
     assert!(
-        result["failed_details"][0]["reason"]
-            .as_str()
-            .is_some_and(|reason| reason.contains("dbt compile --full-refresh"))
+        sidecar.contains("timestamp_column = \"event_time\""),
+        "{sidecar}"
     );
-    assert_eq!(result["emission"]["models_translated_count"], 0);
-    assert!(!out_dir.join("models/events.sql").exists());
-    assert!(!out_dir.join("models/events.toml").exists());
 }
 
 #[test]
