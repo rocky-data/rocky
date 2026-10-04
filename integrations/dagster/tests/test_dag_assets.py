@@ -871,3 +871,59 @@ def test_materializing_the_dag_never_runs_an_ephemeral_model():
     assert result.success
     run_models = sorted(call.args[0] for call in mock_rocky.run_model.call_args_list)
     assert run_models == ["fct"]
+
+
+_CHAIN = ["m1", "m2", "m3", "m4", "m5"]
+
+
+def _chained_transformations_dag() -> DagResult:
+    """``m1 -> m2 -> … -> m5``, all transformations in one group, listed
+    consumer-first so payload order alone would run each before its upstream.
+    Five links make an accidentally ordered set iteration (1 in 120) unlikely
+    enough that the test fails reliably without the fix."""
+    nodes = []
+    for i, name in reversed(list(enumerate(_CHAIN))):
+        node = {
+            "id": f"transformation:{name}",
+            "kind": "transformation",
+            "label": name,
+            "target": {"catalog": "w", "schema": "s", "table": name},
+            "strategy": {"type": "full_refresh"},
+        }
+        if i > 0:
+            node["depends_on"] = [f"transformation:{_CHAIN[i - 1]}"]
+        nodes.append(node)
+    return _make_dag_result(nodes=nodes)
+
+
+def test_chained_transformations_in_one_group_run_upstream_first():
+    """Chained models share one multi_asset. Dagster refuses an output
+    yielded before an in-group dependency, so the group must run and yield
+    in dependency order, not set order."""
+    from unittest.mock import MagicMock
+
+    mock_rocky = MagicMock()
+    mock_rocky.run_model.return_value = _dag_run_result(status="Success")
+    assets = build_dag_multi_assets(
+        _chained_transformations_dag(), rocky=mock_rocky, translator=RockyDagsterTranslator()
+    )
+    assert len(assets) == 1
+    result = dg.materialize(assets, raise_on_error=False)
+    assert result.success
+    assert [call.args[0] for call in mock_rocky.run_model.call_args_list] == _CHAIN
+    materialized = [e.asset_key for e in result.get_asset_materialization_events()]
+    assert materialized == [dg.AssetKey(["w", "s", name]) for name in _CHAIN]
+
+
+def test_topological_order_is_stable_and_tolerates_cycles():
+    from dagster_rocky.dag_assets import _topological_spec_keys
+
+    a, b, c = (dg.AssetKey([n]) for n in "abc")
+    specs = [
+        dg.AssetSpec(key=c, deps=[a]),
+        dg.AssetSpec(key=b),
+        dg.AssetSpec(key=a, deps=[dg.AssetKey(["outside"])]),
+    ]
+    assert _topological_spec_keys(specs) == [b, a, c]
+    cyclic = [dg.AssetSpec(key=a, deps=[b]), dg.AssetSpec(key=b, deps=[a])]
+    assert _topological_spec_keys(cyclic) == [a, b]

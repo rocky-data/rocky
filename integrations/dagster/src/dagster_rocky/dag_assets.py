@@ -574,6 +574,35 @@ def build_dag_multi_assets(
     return assets
 
 
+def _topological_spec_keys(specs: list[dg.AssetSpec]) -> list[dg.AssetKey]:
+    """Order ``specs`` so every spec follows its in-group dependencies.
+
+    Stable: among specs whose in-group dependencies are all placed, the one
+    listed first goes first, so an already-ordered list is unchanged.
+    Dependencies outside the group are ignored. A cycle (a malformed payload)
+    cannot deadlock: its remaining specs are appended in list order.
+    """
+    keys = [spec.key for spec in specs]
+    in_group = set(keys)
+    pending: dict[dg.AssetKey, set[dg.AssetKey]] = {
+        spec.key: {dep.asset_key for dep in spec.deps if dep.asset_key in in_group} - {spec.key}
+        for spec in specs
+    }
+    ordered: list[dg.AssetKey] = []
+    placed: set[dg.AssetKey] = set()
+    while len(placed) < len(keys):
+        ready = next(
+            (k for k in keys if k not in placed and pending[k] <= placed),
+            None,
+        )
+        if ready is None:
+            ordered.extend(k for k in keys if k not in placed)
+            break
+        ordered.append(ready)
+        placed.add(ready)
+    return ordered
+
+
 def _make_dag_group_asset(
     *,
     group: DagAssetGroup,
@@ -589,6 +618,12 @@ def _make_dag_group_asset(
     for spec, node_id in zip(group.specs, group.node_ids, strict=False):
         spec_key_to_node_id[spec.key] = node_id
 
+    # Execution order: upstreams first. Dagster refuses a multi_asset output
+    # yielded before an in-group dependency, and running a downstream model
+    # first would read stale data.
+    execution_order = _topological_spec_keys(group.specs)
+    ordered_key_set = set(execution_order)
+
     @dg.multi_asset(
         name=asset_name,
         specs=group.specs,
@@ -596,7 +631,11 @@ def _make_dag_group_asset(
         partitions_def=group.partitions_def,
     )
     def _asset(context):
-        selected_keys = set(context.selected_asset_keys)
+        selected = set(context.selected_asset_keys)
+        selected_keys = [key for key in execution_order if key in selected]
+        # Defensive: a selected key outside the group's specs keeps its old
+        # placeholder handling below, after every ordered key.
+        selected_keys += [key for key in selected if key not in ordered_key_set]
         partition_kwargs = _partition_kwargs_from_context(context, group.partitions_def)
 
         # Failed / contained models are collected and raised AFTER the loop so

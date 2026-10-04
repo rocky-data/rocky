@@ -147,6 +147,37 @@ def test_build_model_specs_drops_unresolved_deps():
     assert specs[0].deps == []
 
 
+def test_build_model_specs_skips_ephemeral_models_and_passes_deps_through():
+    """An ephemeral model is inlined into its consumers and never runs on its
+    own (``rocky run --model`` on it is E038), so it gets no asset. A consumer
+    depends on the ephemeral model's own upstreams, transitively."""
+    result = _compile_result(
+        _model("raw_orders"),
+        _model("eph_a", strategy={"type": "ephemeral"}, depends_on=["raw_orders"]),
+        _model("eph_b", strategy={"type": "ephemeral"}, depends_on=["eph_a"]),
+        _model("fct", depends_on=["eph_b", "raw_orders"]),
+    )
+    specs = build_model_specs(result, translator=RockyDagsterTranslator())
+
+    raw_key = dg.AssetKey(["warehouse", "marts", "raw_orders"])
+    fct_key = dg.AssetKey(["warehouse", "marts", "fct"])
+    assert [s.key for s in specs] == [raw_key, fct_key]
+    fct = specs[1]
+    assert [dep.asset_key for dep in fct.deps] == [raw_key]
+
+
+def test_build_model_specs_reads_a_typed_ephemeral_strategy():
+    """The generated compile model carries ``strategy.type`` as an attribute,
+    not a dict key; both spellings are recognized."""
+    from types import SimpleNamespace
+
+    from dagster_rocky.derived_models import _is_ephemeral_model
+
+    assert _is_ephemeral_model(SimpleNamespace(strategy=SimpleNamespace(type="ephemeral")))
+    assert not _is_ephemeral_model(SimpleNamespace(strategy=SimpleNamespace(type="merge")))
+    assert not _is_ephemeral_model(SimpleNamespace(strategy=None))
+
+
 def test_build_model_specs_merges_optimize_metadata():
     result = _compile_result(
         _model("fct_orders"),
