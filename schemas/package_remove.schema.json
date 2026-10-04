@@ -1,0 +1,33 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "description": "JSON output of `rocky package remove`.",
+  "properties": {
+    "command": {
+      "type": "string"
+    },
+    "files_deleted": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "lockfile": {
+      "type": "string"
+    },
+    "name": {
+      "type": "string"
+    },
+    "version": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "command",
+    "files_deleted",
+    "lockfile",
+    "name",
+    "version"
+  ],
+  "title": "PackageRemoveOutput",
+  "type": "object"
+}

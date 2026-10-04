@@ -1,0 +1,147 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "PackageListEntry": {
+      "description": "One vendored package, as `rocky package list` reports it.",
+      "properties": {
+        "adapter": {
+          "type": "string"
+        },
+        "compiled_at": {
+          "type": "string"
+        },
+        "dbt_version": {
+          "type": "string"
+        },
+        "files_incoming": {
+          "description": "Pending `<path>.incoming` files from an update.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "files_missing": {
+          "description": "Vendored files that are gone.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "files_modified": {
+          "description": "Vendored files whose content differs from what Rocky wrote.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "hub": {
+          "type": "string"
+        },
+        "includes": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "models": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "name": {
+          "type": "string"
+        },
+        "sources": {
+          "items": {
+            "$ref": "#/definitions/PackageSourceOutput"
+          },
+          "type": "array"
+        },
+        "target_schema": {
+          "type": "string"
+        },
+        "version": {
+          "type": "string"
+        },
+        "version_spec": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "adapter",
+        "compiled_at",
+        "dbt_version",
+        "files_incoming",
+        "files_missing",
+        "files_modified",
+        "hub",
+        "includes",
+        "models",
+        "name",
+        "sources",
+        "target_schema",
+        "version",
+        "version_spec"
+      ],
+      "type": "object"
+    },
+    "PackageSourceOutput": {
+      "description": "A raw source table a vendored package reads.",
+      "properties": {
+        "catalog": {
+          "type": "string"
+        },
+        "name": {
+          "description": "`<source_name>.<table>` as the package declares it.",
+          "type": "string"
+        },
+        "schema": {
+          "type": "string"
+        },
+        "table": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "catalog",
+        "name",
+        "schema",
+        "table"
+      ],
+      "type": "object"
+    }
+  },
+  "description": "JSON output of `rocky package list`.",
+  "properties": {
+    "command": {
+      "type": "string"
+    },
+    "count": {
+      "format": "uint",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "lockfile": {
+      "type": "string"
+    },
+    "packages": {
+      "items": {
+        "$ref": "#/definitions/PackageListEntry"
+      },
+      "type": "array"
+    },
+    "version": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "command",
+    "count",
+    "lockfile",
+    "packages",
+    "version"
+  ],
+  "title": "PackageListOutput",
+  "type": "object"
+}
