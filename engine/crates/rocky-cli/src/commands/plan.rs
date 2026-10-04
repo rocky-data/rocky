@@ -99,6 +99,14 @@ pub async fn plan(
     state_path: &Path,
     output_json: bool,
 ) -> Result<()> {
+    // #2239: an agent-authored run plan is reviewable, and a reviewed approval
+    // does not yet cover the models a `--dag` apply dispatches. Refuse before
+    // any work, so no such plan is persisted.
+    anyhow::ensure!(
+        !(run_options.dag && run_options.principal == Some(PolicyPrincipal::Agent)),
+        "{}",
+        super::review::reviewable_dag_refusal("`rocky plan --dag --principal agent`")
+    );
     if let Some(branch_name) = run_options.branch.as_deref() {
         crate::commands::branch::validate_branch_name_pub(branch_name)?;
     }
@@ -3133,6 +3141,44 @@ mod tests {
         assert!(message.contains("[A-Za-z0-9_]"), "{message}");
         assert!(message.contains("pr_preview_x"), "{message}");
         assert!(!message.contains("failed to load config"), "{message}");
+    }
+
+    /// #2239: an agent-authored `--dag` plan is reviewable, and its approval
+    /// cannot cover the models the DAG dispatches. `rocky plan` refuses it
+    /// before any config IO, so no such plan is persisted. A human `--dag`
+    /// plan is not reviewable and is not refused by this guard.
+    #[tokio::test]
+    async fn plan_refuses_agent_dag_before_config_io() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing_config = temp.path().join("missing.toml");
+        let state = temp.path().join("missing.redb");
+        let run = |principal| {
+            let options = super::PlanRunOptions {
+                dag: true,
+                principal,
+                ..Default::default()
+            };
+            let (config, state) = (missing_config.clone(), state.clone());
+            async move {
+                format!(
+                    "{:#}",
+                    super::plan(
+                        &config, None, None, None, &options, false, "main", &state, false
+                    )
+                    .await
+                    .unwrap_err()
+                )
+            }
+        };
+        let agent = run(Some(rocky_core::config::PolicyPrincipal::Agent)).await;
+        assert_eq!(
+            agent,
+            super::super::review::reviewable_dag_refusal("`rocky plan --dag --principal agent`")
+        );
+        for principal in [None, Some(rocky_core::config::PolicyPrincipal::Human)] {
+            let human = run(principal).await;
+            assert!(human.contains("failed to load config"), "{human}");
+        }
     }
 
     /// The identity must change across a state-schema version bump, because the

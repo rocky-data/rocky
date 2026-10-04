@@ -455,6 +455,9 @@ async fn run_apply_run_plan(
     let run_plan: RunPlan = serde_json::from_value(plan.payload.clone())
         .context("failed to deserialize run plan payload")?;
 
+    // #2239: before any other gate, whoever applies the plan.
+    super::review::refuse_reviewable_dag_plan(&plan, plan_id, &run_plan)?;
+
     if super::review::plan_is_reviewable(&plan) {
         require_reviewable_plan_fingerprint(&plan, plan_id)?;
     }
@@ -3800,6 +3803,9 @@ async fn run_apply_ai_authored_plan(
 
     let run_plan: RunPlan = serde_json::from_value(plan.payload.clone())
         .context("failed to deserialize ai_authored plan payload")?;
+
+    // #2239: before any other gate, whoever applies the plan.
+    super::review::refuse_reviewable_dag_plan(&plan, plan_id, &run_plan)?;
 
     require_reviewable_plan_fingerprint(&plan, plan_id)?;
 
@@ -9338,6 +9344,81 @@ autonomy_budget = { failures = 3, window = "7d" }
             err.to_string().contains("not yet policy-gated"),
             "must refuse the governed dag apply, got: {err}"
         );
+        Ok(())
+    }
+
+    /// #2239: a reviewable `--dag` plan is refused at apply, whoever applies
+    /// it. Its approval covers one models directory, but the DAG runner also
+    /// runs every other pipeline's models. Pre-fix, a HUMAN applying an
+    /// agent-stamped (or approved AI-authored) `--dag` plan had no governed
+    /// context, so the DAG guard did not fire and the DAG ran.
+    #[tokio::test]
+    async fn reviewable_dag_plan_is_refused_whoever_applies_it() -> anyhow::Result<()> {
+        let mut rp = minimal_run_plan();
+        rp.dag = true;
+        rp.models = vec![];
+        rp.execution_layers = vec![];
+        for kind in [PlanKind::Run, PlanKind::AiAuthored] {
+            let dir = tempfile::tempdir()?;
+            let config = dir.path().join("rocky.toml");
+            std::fs::write(
+                &config,
+                format!(
+                    "[adapter]\ntype = \"duckdb\"\npath = \"{}\"\n\n[pipeline.p]\n\
+                     type = \"transformation\"\nmodels = \"models/**\"\n",
+                    dir.path().join("w.duckdb").display()
+                ),
+            )?;
+            let plan_id = crate::plan_store::write_plan_governed(
+                dir.path(),
+                kind.clone(),
+                &rp,
+                PolicyPrincipal::Agent,
+                crate::plan_store::EmbeddedCapabilities {
+                    models_fingerprint: Some("reviewed-fingerprint".to_string()),
+                    config_identity: Some("reviewed-config".to_string()),
+                    fingerprint_version: crate::plan_store::CURRENT_FINGERPRINT_VERSION,
+                    reviewed_source_schemas: Some(BTreeMap::new()),
+                    ..Default::default()
+                },
+            )?;
+            // An approval marker exists, so only the #2239 guard can refuse
+            // the AI-authored plan before dispatch.
+            super::super::review::write_test_review_marker(dir.path(), &plan_id);
+            let state = dir.path().join("state.redb");
+            let apply = if kind == PlanKind::Run {
+                super::run_apply_run_plan(
+                    dir.path(),
+                    &config,
+                    &plan_id,
+                    &state,
+                    PolicyPrincipal::Human,
+                    true,
+                )
+                .await
+            } else {
+                super::run_apply_ai_authored_plan(
+                    dir.path(),
+                    &config,
+                    &plan_id,
+                    &state,
+                    PolicyPrincipal::Human,
+                    true,
+                )
+                .await
+            };
+            let err = apply.expect_err("a reviewable --dag plan must be refused");
+            assert_eq!(
+                err.to_string(),
+                super::super::review::reviewable_dag_refusal(&format!("plan '{plan_id}'")),
+                "{kind}"
+            );
+            assert!(!state.exists(), "{kind}: refused before state is opened");
+            assert!(
+                !dir.path().join("w.duckdb").exists(),
+                "{kind}: refused before the warehouse is opened"
+            );
+        }
         Ok(())
     }
 

@@ -248,6 +248,34 @@ pub fn plan_is_reviewable(plan: &crate::plan_store::PersistedPlan) -> bool {
         && plan.resolved_principal() == rocky_core::config::PolicyPrincipal::Agent)
 }
 
+/// Refuse a reviewable plan that carries `--dag` (#2239).
+///
+/// The approval of a reviewable plan (its conditional DROP disclosure and its
+/// execution fingerprint) covers one models directory. The DAG runner loads
+/// each pipeline's models from that pipeline's own directory, so it can run
+/// models the approval never covered. Until the approval covers every model
+/// the DAG dispatches, `rocky plan`, `rocky review` and `rocky apply` refuse
+/// this shape, whoever applies it.
+pub(crate) fn refuse_reviewable_dag_plan(
+    plan: &crate::plan_store::PersistedPlan,
+    plan_id: &str,
+    run_plan: &RunPlan,
+) -> Result<()> {
+    if run_plan.dag && plan_is_reviewable(plan) {
+        bail!("{}", reviewable_dag_refusal(&format!("plan '{plan_id}'")));
+    }
+    Ok(())
+}
+
+/// The shared refusal text for a reviewable `--dag` plan (#2239).
+pub(crate) fn reviewable_dag_refusal(subject: &str) -> String {
+    format!(
+        "refusing {subject}: a reviewable (agent-authored) plan cannot use --dag. Its approval \
+         covers one models directory, but the DAG runner also runs models from every other \
+         pipeline's directory, which the approval does not cover (#2239). Re-plan without --dag."
+    )
+}
+
 pub async fn compute_review(
     root: &Path,
     config_path: &Path,
@@ -359,6 +387,7 @@ async fn compute_review_with_disclosure_and_seam(
 
     let run_plan: RunPlan = serde_json::from_value(plan.payload.clone())
         .context("failed to deserialize plan payload")?;
+    refuse_reviewable_dag_plan(&plan, plan_id, &run_plan)?;
     let resolved_config_path = root.join(config_path);
 
     // Run plans use apply's execution selection, including the pipeline glob.
@@ -1896,6 +1925,44 @@ mod tests {
             review.conditional_drops[0].drop_sql,
             "DROP TABLE IF EXISTS main.recovery"
         );
+        Ok(())
+    }
+
+    /// #2239: an approval of a `--dag` plan would cover one models directory
+    /// while the DAG runs every pipeline's models, so review refuses it and
+    /// writes no marker.
+    #[tokio::test]
+    async fn review_refuses_a_reviewable_dag_plan_without_a_marker() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let legacy = seed_reviewable_plan(dir.path())?;
+        let mut plan: RunPlan = serde_json::from_value(read_plan(dir.path(), &legacy)?.payload)?;
+        plan.dag = true;
+        let capabilities = super::super::plan::compute_embedded_capabilities(
+            &dir.path().join("rocky.toml"),
+            &dir.path().join("models"),
+            "HEAD",
+            Some(&dir.path().join("state.redb")),
+            None,
+            false,
+        )?;
+        let dag_id = crate::plan_store::write_plan_governed(
+            dir.path(),
+            PlanKind::AiAuthored,
+            &plan,
+            PolicyPrincipal::Agent,
+            capabilities,
+        )?;
+        let err = compute_review(dir.path(), Path::new("rocky.toml"), &dag_id, "HEAD", true)
+            .await
+            .expect_err("a reviewable --dag plan must not be approved");
+        assert_eq!(
+            err.to_string(),
+            reviewable_dag_refusal(&format!("plan '{dag_id}'"))
+        );
+        assert!(matches!(
+            review_marker_state(dir.path(), &dag_id),
+            ReviewMarkerState::Absent
+        ));
         Ok(())
     }
 
