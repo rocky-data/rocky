@@ -41,6 +41,7 @@ use anyhow::{Context, Result, bail};
 use rocky_core::config::{PolicyCapability, PolicyEffect, PolicyPrincipal, StateBackend};
 use rocky_core::policy::{self, ModelAttributes};
 use rocky_core::schema::SchemaPattern;
+use rocky_core::secret_registry::render_placeholders;
 use rocky_core::state::{PolicyDecisionRecord, StateStore};
 use tracing::warn;
 
@@ -455,9 +456,6 @@ async fn run_apply_run_plan(
     let run_plan: RunPlan = serde_json::from_value(plan.payload.clone())
         .context("failed to deserialize run plan payload")?;
 
-    // #2239: before any other gate, whoever applies the plan.
-    super::review::refuse_reviewable_dag_plan(&plan, plan_id, &run_plan)?;
-
     if super::review::plan_is_reviewable(&plan) {
         require_reviewable_plan_fingerprint(&plan, plan_id)?;
     }
@@ -488,6 +486,9 @@ async fn run_apply_run_plan(
         })?,
     );
     preflight_run_plan_shadow_support(&loaded.config, &run_plan)?;
+    // #2239: before the ledger sync, the policy gate, or any decision row.
+    refuse_governed_dag_apply(&plan, plan_id, &run_plan, runtime_principal)?;
+    verify_reviewed_dag_scope(&plan, plan_id, &loaded.config, config_path, &run_plan)?;
     let (models_dir, models_glob) = run_model_selection(&loaded.config, config_path, &run_plan)?;
     // Gate on the models this apply will ACTUALLY execute (fresh compile +
     // `--model` selection), not the plan's informational `models` list.
@@ -938,11 +939,7 @@ async fn execute_run_plan(
         // — including replication — UNGATED. Refuse loudly rather than run
         // ungated until DAG sub-runs thread the governance context.
         if governed_ctx.is_some() {
-            bail!(
-                "refusing to apply plan '{plan_id}' as an agent: a `--dag` apply is not yet \
-                 policy-gated (its sub-runs execute ungated). Re-plan without `--dag`, or have a \
-                 human apply it."
-            );
+            bail!("{}", governed_dag_refusal(plan_id));
         }
         // A stored run plan predates the build-escape-hatch flags (they were
         // never captured into the plan), so the DAG replay uses defaults —
@@ -3883,27 +3880,30 @@ impl VerifyAfterVerdict {
     /// Report the verdict: `Ok` when every required check was confirmed, the
     /// halt-only error otherwise. Call AFTER the custody row is durable.
     fn into_result(self, plan_id: &str, required: &[String]) -> Result<()> {
+        // Check names come from `verify_after` config and may hold a resolved
+        // `${VAR}`. Every message below prints the `${NAME}` form (#1919).
+        let render = rocky_core::secret_registry::render_placeholders;
         if self.failures.is_empty() {
             eprintln!(
                 "verify_after: {} post-apply check(s) passed [{}].",
                 required.len(),
-                required.join(", ")
+                render(&required.join(", "))
             );
             return Ok(());
         }
+        let failures = render(&self.failures.join("; "));
         // Alert: a post-apply verification failure is an operational event, not
         // a routine warning.
         warn!(
             target: "rocky::policy",
             plan_id,
-            failures = %self.failures.join("; "),
+            failures = %failures,
             "verify_after post-apply gate FAILED"
         );
         bail!(
-            "verify_after gate FAILED for plan '{plan_id}': {}. \
+            "verify_after gate FAILED for plan '{plan_id}': {failures}. \
              No rollback substrate is available, so the mutation HAS ALREADY LANDED and remains in \
-             place — it must be reverted manually. The failure is recorded in the policy-decision ledger.",
-            self.failures.join("; ")
+             place — it must be reverted manually. The failure is recorded in the policy-decision ledger."
         )
     }
 }
@@ -3945,14 +3945,18 @@ fn evaluate_verify_after(
     }
     let passed = failures.is_empty();
 
-    let reason = if passed {
+    // The ledger row is read later by processes that never loaded this config
+    // (`rocky audit` reads only the state store), so their registry cannot
+    // render it. Store the `${NAME}` form, not the resolved check names
+    // (#1919).
+    let reason = render_placeholders(&if passed {
         format!("verify_after passed: [{}]", required.join(", "))
     } else {
         format!(
             "verify_after FAILED: {}. No rollback substrate available — the mutation stands; halt-only.",
             failures.join("; ")
         )
-    };
+    });
     let record = PolicyDecisionRecord {
         keys_recorded: false,
         models: Vec::new(),
@@ -3968,7 +3972,7 @@ fn evaluate_verify_after(
         },
         rule_id: None,
         reason,
-        verify_after: required.to_vec(),
+        verify_after: required.iter().map(|n| render_placeholders(n)).collect(),
         auto_apply: None,
     };
     Ok(VerifyAfterVerdict { record, failures })
@@ -4027,9 +4031,6 @@ async fn run_apply_ai_authored_plan(
     let run_plan: RunPlan = serde_json::from_value(plan.payload.clone())
         .context("failed to deserialize ai_authored plan payload")?;
 
-    // #2239: before any other gate, whoever applies the plan.
-    super::review::refuse_reviewable_dag_plan(&plan, plan_id, &run_plan)?;
-
     require_reviewable_plan_fingerprint(&plan, plan_id)?;
 
     validate_run_plan_execution_shape(plan_id, &run_plan)?;
@@ -4054,6 +4055,9 @@ async fn run_apply_ai_authored_plan(
         })?,
     );
     preflight_run_plan_shadow_support(&loaded.config, &run_plan)?;
+    // #2239: before the ledger sync, the policy gate, or any decision row.
+    refuse_governed_dag_apply(&plan, plan_id, &run_plan, runtime_principal)?;
+    verify_reviewed_dag_scope(&plan, plan_id, &loaded.config, config_path, &run_plan)?;
     let (models_dir, models_glob) = run_model_selection(&loaded.config, config_path, &run_plan)?;
     // Gate on the models this apply will ACTUALLY execute (fresh compile +
     // `--model` selection), not the plan's informational `models` list.
@@ -4185,6 +4189,49 @@ async fn run_apply_ai_authored_plan(
     )
     .await?;
     Ok(apply_outcome_for(termination, &apply_run_id))
+}
+
+/// Why an agent (governed) `--dag` apply is refused: the DAG's sub-runs carry
+/// no governance context, so they would execute ungated.
+fn governed_dag_refusal(plan_id: &str) -> String {
+    format!(
+        "refusing to apply plan '{plan_id}' as an agent: a `--dag` apply is not yet \
+         policy-gated (its sub-runs execute ungated). Re-plan without `--dag`, or have a \
+         human apply it."
+    )
+}
+
+/// Refuse a governed `--dag` apply up front, before the remote ledger sync,
+/// the policy gate or a committed rule decision touch any state. The same
+/// refusal in `execute_run_plan` stays as the backstop.
+fn refuse_governed_dag_apply(
+    plan: &PersistedPlan,
+    plan_id: &str,
+    run_plan: &RunPlan,
+    runtime_principal: PolicyPrincipal,
+) -> Result<()> {
+    if run_plan.dag && plan.enforcement_principal(runtime_principal) == PolicyPrincipal::Agent {
+        bail!("{}", governed_dag_refusal(plan_id));
+    }
+    Ok(())
+}
+
+/// #2239: a reviewable `--dag` plan executes only if every model the DAG
+/// runs, in every pipeline's directory, still matches the fingerprint the plan
+/// and its approval recorded. Runs whoever applies the plan, as late as
+/// possible before execution. A plan without `--dag`, or one that is not
+/// review-gated, is unaffected.
+fn verify_reviewed_dag_scope(
+    plan: &PersistedPlan,
+    plan_id: &str,
+    config: &rocky_core::config::RockyConfig,
+    config_path: &Path,
+    run_plan: &RunPlan,
+) -> Result<()> {
+    if !run_plan.dag || !super::review::plan_is_reviewable(plan) {
+        return Ok(());
+    }
+    super::approval_scope::verify_dag_scope_for_apply(plan, plan_id, config, config_path, run_plan)
 }
 
 fn require_reviewable_plan_fingerprint(plan: &PersistedPlan, plan_id: &str) -> Result<()> {
@@ -4339,9 +4386,10 @@ async fn run_apply_backfill_plan(
         backfill_replicate,
     );
     if let Err(e) = session.acquire().await {
-        // Unreachable on a fresh session (`Err` = double-acquire misuse);
-        // consume defensively so no exit path can leak the session.
-        session.abandon("backfill acquire misuse").await;
+        // `Err` = double-acquire misuse, or a #1228 concurrency refusal
+        // (`CasUnsupported` / `CasRequired`); consume defensively so no
+        // exit path can leak the session.
+        session.abandon("backfill acquire failed").await;
         return Err(e.into());
     }
     if let Err(e) = session.require_synced() {
@@ -4660,11 +4708,51 @@ async fn run_apply_replication_plan(
     // Closing (2) needs a credential-free state-authority identity persisted in
     // the plan (backend, host/port/database, key prefix, resolved namespace).
     // That is a payload change, tracked separately rather than bolted on here.
-    let live_config_snapshot = serde_json::to_value(rocky_cfg)
-        .context("failed to serialize the live config for the plan comparison")?;
-    if live_config_snapshot != replication_plan.config_snapshot {
-        let changed =
-            changed_config_sections(&replication_plan.config_snapshot, &live_config_snapshot);
+    //
+    // Since #1919 the snapshot holds each resolved `${VAR}` value as `${NAME}`,
+    // so the comparison has two halves: the printable snapshot (structure and
+    // literal values) and a keyed digest per section (the resolved values).
+    // A plan written before that has no digests and a resolved snapshot, and
+    // is compared the old way.
+    let (differs, changed) = match &replication_plan.config_digests {
+        Some(reviewed_digests) => {
+            let (live_snapshot, live_digests) = crate::commands::plan::config_snapshot_forms(
+                root, rocky_cfg, false,
+            )
+            .with_context(|| {
+                format!(
+                    "cannot verify plan '{plan_id}' against the live config. \
+                             Nothing was written. Re-plan with `rocky plan` and apply the \
+                             new plan_id"
+                )
+            })?;
+            let mut changed =
+                changed_config_sections(&replication_plan.config_snapshot, &live_snapshot);
+            let mut sections: std::collections::BTreeSet<&String> =
+                reviewed_digests.keys().collect();
+            sections.extend(live_digests.keys());
+            for section in sections {
+                if reviewed_digests.get(section) != live_digests.get(section)
+                    && !changed.contains(section)
+                {
+                    changed.push(section.clone());
+                }
+            }
+            changed.sort();
+            let differs = live_snapshot != replication_plan.config_snapshot
+                || live_digests != *reviewed_digests;
+            (differs, changed)
+        }
+        None => {
+            let live_snapshot = serde_json::to_value(rocky_cfg)
+                .context("failed to serialize the live config for the plan comparison")?;
+            let differs = live_snapshot != replication_plan.config_snapshot;
+            let changed =
+                changed_config_sections(&replication_plan.config_snapshot, &live_snapshot);
+            (differs, changed)
+        }
+    };
+    if differs {
         bail!(
             "config has changed since plan '{plan_id}' was created{}.\n\
              The plan is the reviewed artifact, so applying it against a \
@@ -9590,78 +9678,212 @@ autonomy_budget = { failures = 3, window = "7d" }
         Ok(())
     }
 
-    /// #2239: a reviewable `--dag` plan is refused at apply, whoever applies
-    /// it. Its approval covers one models directory, but the DAG runner also
-    /// runs every other pipeline's models. Pre-fix, a HUMAN applying an
-    /// agent-stamped (or approved AI-authored) `--dag` plan had no governed
-    /// context, so the DAG guard did not fire and the DAG ran.
-    #[tokio::test]
-    async fn reviewable_dag_plan_is_refused_whoever_applies_it() -> anyhow::Result<()> {
-        let mut rp = minimal_run_plan();
-        rp.dag = true;
-        rp.models = vec![];
-        rp.execution_layers = vec![];
-        for kind in [PlanKind::Run, PlanKind::AiAuthored] {
-            let dir = tempfile::tempdir()?;
-            let config = dir.path().join("rocky.toml");
+    /// A project with two transformation pipelines, each reading its own
+    /// models directory (`silver/`, `gold/`), on one DuckDB file.
+    fn two_pipeline_dag_project(root: &Path) -> anyhow::Result<PathBuf> {
+        let model = |dir: &str, name: &str, value: u32| -> anyhow::Result<()> {
+            std::fs::create_dir_all(root.join(dir))?;
             std::fs::write(
-                &config,
+                root.join(dir).join(format!("{name}.sql")),
+                format!("SELECT {value} AS v\n"),
+            )?;
+            std::fs::write(
+                root.join(dir).join(format!("{name}.toml")),
                 format!(
-                    "[adapter]\ntype = \"duckdb\"\npath = \"{}\"\n\n[pipeline.p]\n\
-                     type = \"transformation\"\nmodels = \"models/**\"\n",
-                    dir.path().join("w.duckdb").display()
+                    "depends_on = []\n\n[strategy]\ntype = \"full_refresh\"\n\n\
+                     [target]\ncatalog = \"proj\"\nschema = \"marts\"\ntable = \"{name}\"\n"
                 ),
             )?;
-            let plan_id = crate::plan_store::write_plan_governed(
-                dir.path(),
-                kind.clone(),
-                &rp,
-                PolicyPrincipal::Agent,
-                crate::plan_store::EmbeddedCapabilities {
-                    models_fingerprint: Some("reviewed-fingerprint".to_string()),
-                    config_identity: Some("reviewed-config".to_string()),
-                    fingerprint_version: crate::plan_store::CURRENT_FINGERPRINT_VERSION,
-                    reviewed_source_schemas: Some(BTreeMap::new()),
-                    ..Default::default()
-                },
-            )?;
-            // An approval marker exists, so only the #2239 guard can refuse
-            // the AI-authored plan before dispatch.
-            super::super::review::write_test_review_marker(dir.path(), &plan_id);
-            let state = dir.path().join("state.redb");
-            let apply = if kind == PlanKind::Run {
-                super::run_apply_run_plan(
-                    dir.path(),
-                    &config,
-                    &plan_id,
-                    &state,
-                    PolicyPrincipal::Human,
-                    true,
+            Ok(())
+        };
+        model("silver", "orders", 1)?;
+        model("gold", "totals", 2)?;
+        let config = root.join("rocky.toml");
+        let pipeline = |name: &str| {
+            format!(
+                "[pipeline.{name}]\ntype = \"transformation\"\nmodels = \"{name}/**\"\n\n\
+                 [pipeline.{name}.target]\nadapter = \"local\"\n\n\
+                 [pipeline.{name}.target.governance]\nauto_create_catalogs = true\n\
+                 auto_create_schemas = true\n\n"
+            )
+        };
+        std::fs::write(
+            &config,
+            format!(
+                "[adapter.local]\ntype = \"duckdb\"\npath = \"{}\"\n\n{}{}",
+                root.join("proj.duckdb").display(),
+                pipeline("silver"),
+                pipeline("gold"),
+            ),
+        )?;
+        Ok(config)
+    }
+
+    /// Persist a `--dag` run plan through the production capability path,
+    /// stamped with `principal`.
+    fn write_dag_plan(
+        root: &Path,
+        config: &Path,
+        principal: PolicyPrincipal,
+    ) -> anyhow::Result<String> {
+        let rp = RunPlan {
+            dag: true,
+            models: vec![],
+            execution_layers: vec![],
+            ..minimal_run_plan()
+        };
+        let cfg = rocky_core::config::load_optional_project_config(Some(config))?;
+        let scope = super::super::approval_scope::approval_scope(cfg.as_ref(), config, &rp)?;
+        let capabilities = super::super::plan::compute_embedded_capabilities_for_scope(
+            config,
+            Some(&scope),
+            "HEAD",
+            Some(&root.join("state.redb")),
+            None,
+            false,
+        )?;
+        assert!(capabilities.models_fingerprint.is_some());
+        crate::plan_store::write_plan_governed(root, PlanKind::Run, &rp, principal, capabilities)
+    }
+
+    async fn apply_dag_plan_as_human(
+        root: &Path,
+        config: &Path,
+        plan_id: &str,
+    ) -> Result<ApplyOutcome> {
+        super::run_apply_run_plan(
+            root,
+            config,
+            plan_id,
+            &root.join(".rocky-state.redb"),
+            PolicyPrincipal::Human,
+            false,
+        )
+        .await
+    }
+
+    /// #2239: a reviewed `--dag` plan's fingerprint covers every pipeline's
+    /// models, so a model added to, changed in or removed from ANOTHER
+    /// pipeline's directory after the plan refuses the apply before anything
+    /// runs. Pre-fix the fingerprint covered `models/` alone (and the plan was
+    /// refused outright as an interim measure).
+    #[tokio::test]
+    async fn reviewed_dag_plan_refuses_when_another_pipelines_models_change() -> anyhow::Result<()>
+    {
+        type Edit = fn(&Path) -> std::io::Result<()>;
+        let edits: [(&str, Edit); 4] = [
+            // A seed is a DAG node too: its CSV, sidecar and hooks run.
+            ("seed added", |root| {
+                std::fs::create_dir_all(root.join("seeds"))?;
+                std::fs::write(root.join("seeds/s.csv"), "id\n1\n")
+            }),
+            ("changed", |root| {
+                std::fs::write(root.join("gold/totals.sql"), "SELECT 3 AS v\n")
+            }),
+            ("added", |root| {
+                std::fs::write(root.join("gold/extra.sql"), "SELECT 4 AS v\n")?;
+                std::fs::copy(root.join("gold/totals.toml"), root.join("gold/extra.toml"))?;
+                std::fs::write(
+                    root.join("gold/extra.toml"),
+                    std::fs::read_to_string(root.join("gold/extra.toml"))?
+                        .replace("table = \"totals\"", "table = \"extra\""),
                 )
+            }),
+            ("removed", |root| {
+                std::fs::remove_file(root.join("gold/totals.sql"))?;
+                std::fs::remove_file(root.join("gold/totals.toml"))
+            }),
+        ];
+        for (label, edit) in edits {
+            let dir = tempfile::tempdir()?;
+            let root = dir.path();
+            let config = two_pipeline_dag_project(root)?;
+            let plan_id = write_dag_plan(root, &config, PolicyPrincipal::Agent)?;
+            super::super::review::write_test_review_marker(root, &plan_id);
+            edit(root)?;
+
+            let err = apply_dag_plan_as_human(root, &config, &plan_id)
                 .await
-            } else {
-                super::run_apply_ai_authored_plan(
-                    dir.path(),
-                    &config,
-                    &plan_id,
-                    &state,
-                    PolicyPrincipal::Human,
-                    true,
-                )
-                .await
-            };
-            let err = apply.expect_err("a reviewable --dag plan must be refused");
-            assert_eq!(
-                err.to_string(),
-                super::super::review::reviewable_dag_refusal(&format!("plan '{plan_id}'")),
-                "{kind}"
-            );
-            assert!(!state.exists(), "{kind}: refused before state is opened");
+                .expect_err("a reviewed --dag plan must refuse a model change in any pipeline");
+            let msg = format!("{err:#}");
             assert!(
-                !dir.path().join("w.duckdb").exists(),
-                "{kind}: refused before the warehouse is opened"
+                msg.contains("added, removed or changed since the plan was written"),
+                "{label}: {msg}"
+            );
+            assert!(
+                !root.join("proj.duckdb").exists(),
+                "{label}: refused before the warehouse is opened"
             );
         }
+        Ok(())
+    }
+
+    /// #2239: an unchanged reviewed `--dag` plan applies, and builds the
+    /// models of BOTH pipelines.
+    #[tokio::test]
+    async fn unchanged_reviewed_dag_plan_applies_every_pipeline() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path();
+        let config = two_pipeline_dag_project(root)?;
+        let plan_id = write_dag_plan(root, &config, PolicyPrincipal::Agent)?;
+        super::super::review::write_test_review_marker(root, &plan_id);
+
+        apply_dag_plan_as_human(root, &config, &plan_id)
+            .await
+            .expect("an unchanged reviewed --dag plan must apply");
+
+        let adapter =
+            rocky_duckdb::adapter::DuckDbWarehouseAdapter::open(&root.join("proj.duckdb"))?;
+        let conn = adapter.shared_connector();
+        let guard = conn.lock().unwrap();
+        for table in ["orders", "totals"] {
+            let rows = guard.execute_sql(&format!("SELECT v FROM proj.marts.{table}"))?;
+            assert_eq!(rows.rows.len(), 1, "{table} materialized");
+        }
+        Ok(())
+    }
+
+    /// #2239: a human-authored `--dag` plan is not review-gated, so the scope
+    /// check does not run and an edit after planning still applies, exactly as
+    /// before.
+    #[tokio::test]
+    async fn human_authored_dag_plan_is_not_scope_checked() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path();
+        let config = two_pipeline_dag_project(root)?;
+        let plan_id = write_dag_plan(root, &config, PolicyPrincipal::Human)?;
+        std::fs::write(root.join("gold/totals.sql"), "SELECT 3 AS v\n")?;
+
+        apply_dag_plan_as_human(root, &config, &plan_id)
+            .await
+            .expect("a human-authored --dag plan applies the current models");
+        Ok(())
+    }
+
+    /// An agent applying a reviewed `--dag` plan is still refused: the DAG's
+    /// sub-runs carry no governance context, so the governed DAG guard stands.
+    #[tokio::test]
+    async fn agent_apply_of_a_reviewed_dag_plan_is_still_refused() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path();
+        let config = two_pipeline_dag_project(root)?;
+        let plan_id = write_dag_plan(root, &config, PolicyPrincipal::Agent)?;
+        super::super::review::write_test_review_marker(root, &plan_id);
+        let err = super::run_apply_run_plan(
+            root,
+            &config,
+            &plan_id,
+            &root.join(".rocky-state.redb"),
+            PolicyPrincipal::Agent,
+            false,
+        )
+        .await
+        .expect_err("an agent --dag apply is not policy-gated, so it is refused");
+        assert!(
+            format!("{err:#}").contains("a `--dag` apply is not yet policy-gated"),
+            "{err:#}"
+        );
+        assert!(!root.join("proj.duckdb").exists());
         Ok(())
     }
 
@@ -10491,6 +10713,7 @@ schema_template = "s__{source}"
             branch: None,
             governance_override: None,
             config_snapshot: serde_json::json!({"adapter": {"default": {"type": "duckdb"}}}),
+            config_digests: None,
             state_authority: None,
             source_state_snapshot: vec![ReplicationConnectorSnapshot {
                 id: "raw__orders".to_string(),
@@ -10691,6 +10914,122 @@ schema_template = "s__{source}"
                 "an unchanged config must pass the comparison, got: {msg}"
             );
         }
+        Ok(())
+    }
+
+    /// Plan, then apply, with `catalog_template` read from `var`. Returns the
+    /// plan file's text and the apply result. `planned` and `applied` are the
+    /// variable's value at each step.
+    async fn plan_then_apply_with_env_catalog(
+        var: &str,
+        planned: &str,
+        applied: &str,
+        remove_key: bool,
+    ) -> anyhow::Result<(String, anyhow::Result<ApplyOutcome>)> {
+        let dir = tempfile::tempdir()?;
+        let cfg_path = dir.path().join("rocky.toml");
+        std::fs::write(
+            &cfg_path,
+            REPLICATION_TOML.replace(
+                r#"catalog_template = "c""#,
+                &format!(r#"catalog_template = "${{{var}}}""#),
+            ),
+        )?;
+        // SAFETY: test-only; each caller passes a variable name no other test
+        // reads.
+        unsafe { std::env::set_var(var, planned) };
+        let cfg = rocky_core::config::load_rocky_config(&cfg_path)?;
+        let mut rp = minimal_replication_plan();
+        rp.pipeline = Some("p".to_string());
+        rp.filter = None;
+        let (snapshot, digests) =
+            crate::commands::plan::config_snapshot_forms(dir.path(), &cfg, true)?;
+        rp.config_snapshot = snapshot;
+        rp.config_digests = Some(digests);
+        let plan_id = write_plan(dir.path(), PlanKind::Replication, &rp)?;
+        let plan_text = std::fs::read_to_string(
+            dir.path()
+                .join(".rocky")
+                .join("plans")
+                .join(format!("{plan_id}.json")),
+        )?;
+        if remove_key {
+            std::fs::remove_file(crate::plan_store::plan_digest_key_path(dir.path()))?;
+        }
+
+        // SAFETY: as above.
+        unsafe { std::env::set_var(var, applied) };
+        let res = super::run_apply_replication_plan(
+            dir.path(),
+            &cfg_path,
+            &plan_id,
+            &dir.path().join("state.redb"),
+            PolicyPrincipal::Human,
+            true,
+        )
+        .await;
+        // SAFETY: as above.
+        unsafe { std::env::remove_var(var) };
+        Ok((plan_text, res))
+    }
+
+    /// #1919: the plan file holds `${NAME}`, never the resolved value. And
+    /// because both values render as the same `${NAME}`, only the keyed
+    /// digest can see the change: apply must still refuse.
+    #[tokio::test]
+    async fn replication_apply_refuses_an_env_value_changed_behind_a_placeholder()
+    -> anyhow::Result<()> {
+        const PLANNED: &str = "rocky_1919_planned_catalog";
+        const APPLIED: &str = "rocky_1919_applied_catalog";
+        let (plan_text, res) =
+            plan_then_apply_with_env_catalog("ROCKY_T1919_APPLY_CAT", PLANNED, APPLIED, false)
+                .await?;
+        assert!(
+            !plan_text.contains(PLANNED),
+            "plan file leaked: {plan_text}"
+        );
+        assert!(
+            plan_text.contains("${ROCKY_T1919_APPLY_CAT}"),
+            "the plan file must name the variable: {plan_text}"
+        );
+        let msg = format!("{:#}", res.expect_err("a changed env value must refuse"));
+        assert!(msg.contains("config has changed since plan"), "{msg}");
+        assert!(msg.contains("pipeline"), "names the section: {msg}");
+        assert!(
+            !msg.contains(PLANNED) && !msg.contains(APPLIED),
+            "the refusal must not print either value: {msg}"
+        );
+        Ok(())
+    }
+
+    /// The companion: the same env value at apply passes the config check, so
+    /// the refusal above is caused by the change.
+    #[tokio::test]
+    async fn replication_apply_passes_when_the_env_value_behind_a_placeholder_is_unchanged()
+    -> anyhow::Result<()> {
+        const VALUE: &str = "rocky_1919_same_catalog";
+        let (_, res) =
+            plan_then_apply_with_env_catalog("ROCKY_T1919_APPLY_SAME", VALUE, VALUE, false).await?;
+        if let Err(e) = res {
+            let msg = format!("{e:#}");
+            assert!(
+                !msg.contains("config has changed since plan") && !msg.contains("digest key"),
+                "an unchanged env value must pass the comparison, got: {msg}"
+            );
+        }
+        Ok(())
+    }
+
+    /// Fail closed: without the key the digests cannot be checked, so apply
+    /// refuses rather than skip the check.
+    #[tokio::test]
+    async fn replication_apply_refuses_when_the_digest_key_is_missing() -> anyhow::Result<()> {
+        const VALUE: &str = "rocky_1919_nokey_catalog";
+        let (_, res) =
+            plan_then_apply_with_env_catalog("ROCKY_T1919_APPLY_NOKEY", VALUE, VALUE, true).await?;
+        let msg = format!("{:#}", res.expect_err("a missing key must refuse"));
+        assert!(msg.contains("plan digest key"), "{msg}");
+        assert!(msg.contains("Nothing was written"), "{msg}");
         Ok(())
     }
 
@@ -11354,6 +11693,46 @@ schema_template = "s__{source}"
         );
         // The halt-only state (no rollback substrate) must be stated plainly.
         assert!(msg.contains("HAS ALREADY LANDED"), "halt-only state: {msg}");
+    }
+
+    /// #1919: a `verify_after` check name can hold a resolved `${VAR}`. The
+    /// ledger row is read later by `rocky audit`, which never loads the
+    /// config, so the row itself must hold `${NAME}`. So must the gate's
+    /// own error.
+    #[test]
+    fn verify_after_stores_and_prints_a_resolved_check_name_as_its_placeholder() {
+        const SECRET: &str = "rocky_1919_verify_check_c0ffee";
+        rocky_core::secret_registry::register_substitution("ROCKY_T1919_VERIFY", SECRET);
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state.redb");
+        let run_id = record_run_with_checks(&state, &[(SECRET, false)]);
+        let err = super::run_verify_after(
+            "plan-1919",
+            PolicyPrincipal::Agent,
+            &[SECRET.to_string()],
+            &run_id,
+            &state,
+        )
+        .expect_err("a failing named check halts the apply");
+        let msg = format!("{err:#}");
+        assert!(!msg.contains(SECRET), "gate error leaked: {msg}");
+        assert!(msg.contains("${ROCKY_T1919_VERIFY}"), "{msg}");
+
+        let store = StateStore::open_read_only(&state).unwrap();
+        let row = store
+            .list_policy_decisions()
+            .unwrap()
+            .into_iter()
+            .find(|d| d.plan_id == "plan-1919")
+            .expect("the custody row was written");
+        let stored = serde_json::to_string(&row).unwrap();
+        assert!(!stored.contains(SECRET), "ledger row leaked: {stored}");
+        assert_eq!(row.verify_after, vec!["${ROCKY_T1919_VERIFY}".to_string()]);
+        assert!(
+            row.reason.contains("${ROCKY_T1919_VERIFY}"),
+            "{}",
+            row.reason
+        );
     }
 
     #[test]

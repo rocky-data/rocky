@@ -159,12 +159,14 @@ fn validate_inner(config_path: &Path) -> Result<ValidateOutput> {
                     (ok, msgs, String::new(), String::new(), String::new())
                 }
             };
+            // Resolved `${VAR}` values print as `${NAME}` (#1919).
+            let render = rocky_core::secret_registry::render_placeholders;
             out.pipelines.push(ValidatePipelineStatus {
                 name: name.clone(),
                 pipeline_type,
-                strategy,
-                catalog_template,
-                schema_template,
+                strategy: render(&strategy),
+                catalog_template: render(&catalog_template),
+                schema_template: render(&schema_template),
                 ok,
             });
             for msg in msgs {
@@ -1956,6 +1958,43 @@ mod tests {
         let mut f = NamedTempFile::new().unwrap();
         f.write_all(toml_str.as_bytes()).unwrap();
         validate_inner(f.path()).unwrap()
+    }
+
+    /// #1919: `rocky validate --output json` prints a resolved pipeline
+    /// template as `${NAME}`: in the pipeline status and in the V020 message.
+    #[test]
+    fn validate_prints_a_resolved_template_as_its_placeholder() {
+        const SECRET: &str = "rocky1919validatecat";
+        // SAFETY: test-only; the variable name is unique to this test.
+        unsafe { std::env::set_var("ROCKY_T1919_VALIDATE", SECRET) };
+        let out = validate_toml(
+            r#"
+[adapter]
+type = "duckdb"
+path = ":memory:"
+
+[pipeline.p]
+type = "replication"
+strategy = "full_refresh"
+
+[pipeline.p.source.schema_pattern]
+prefix = "raw__"
+separator = "__"
+components = ["source"]
+
+[pipeline.p.target]
+adapter = "default"
+catalog_template = "${ROCKY_T1919_VALIDATE}"
+schema_template = "s__{source}"
+"#,
+        );
+        // SAFETY: as above.
+        unsafe { std::env::remove_var("ROCKY_T1919_VALIDATE") };
+        assert_eq!(out.pipelines.len(), 1, "PRECONDITION: {:?}", out.messages);
+        assert_eq!(out.pipelines[0].catalog_template, "${ROCKY_T1919_VALIDATE}");
+        let json = serde_json::to_string(&out).unwrap();
+        assert!(!json.contains(SECRET), "leaked: {json}");
+        assert!(codes(&out, "V020") == 1, "{:?}", out.messages);
     }
 
     // ----- the products band (V050–V053) -----

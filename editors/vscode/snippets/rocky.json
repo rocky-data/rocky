@@ -12,6 +12,11 @@
     "body": "where ${1:column} ${2|==,!=,>,<,>=,<=|} ${3:value}",
     "description": "Filter rows"
   },
+  "Filter by list (where in)": {
+    "prefix": "where-in",
+    "body": "where ${1:column} ${2|in,not in|} [${3:\"value\"}]",
+    "description": "Filter rows by list membership (not in keeps SQL NULL semantics)"
+  },
   "Aggregate (group)": {
     "prefix": "group",
     "body": [

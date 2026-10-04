@@ -277,7 +277,8 @@ pub struct ChunkChecksum {
     pub chunk_id: u32,
     /// Number of non-null primary-key rows that fell into this chunk.
     pub row_count: u64,
-    /// XOR-aggregated row hashes, widened to `u128` so the largest native
+    /// XOR-aggregated row hashes over the primary key and the value
+    /// columns, widened to `u128` so the largest native
     /// adapter hash output (Snowflake `NUMBER(38,0)`) fits without
     /// truncation. Adapters with smaller native widths (xxhash64,
     /// FARM_FINGERPRINT) zero-extend.
@@ -734,9 +735,11 @@ pub trait WarehouseAdapter: Send + Sync {
     /// drops empty groups on every target warehouse and back-filling
     /// per-adapter is error-prone.
     ///
-    /// `value_columns` are the columns to hash for the chunk checksum
-    /// (typically every non-`pk_column` column the caller cares about).
-    /// `pk_column` identifies the bucketing column. The default impl
+    /// `value_columns` are the non-key columns the caller cares about.
+    /// The row hash covers `pk_column` **and** `value_columns` (see
+    /// [`crate::compare::bisection::checksum_hash_columns`]); a
+    /// value-only hash misses values that swap between keys.
+    /// `pk_column` also identifies the bucketing column. The default impl
     /// supports a single integer/numeric column (`PkRange::IntRange`);
     /// composite and hash-bucket strategies require an adapter override
     /// that knows how to emit the corresponding bucketing SQL.
@@ -823,7 +826,17 @@ async fn default_checksum_chunks(
 
     let dialect = adapter.dialect();
     let table_ref = dialect.format_table_ref(&table.catalog, &table.schema, &table.table)?;
-    let row_hash = dialect.row_hash_expr(value_columns)?;
+    // Hash the key together with the values. With a value-only hash,
+    // rows that swap values between keys hash the same, and two rows
+    // that change to one shared value tuple cancel under `BIT_XOR`
+    // (`h ^ h = 0`). With the key in the hash, rows at different keys
+    // never share a hash input. Rows that repeat the same key AND
+    // values still cancel in pairs; the bisection scope assumes a
+    // unique key.
+    let row_hash = dialect.row_hash_expr(&crate::compare::bisection::checksum_hash_columns(
+        pk_column,
+        value_columns,
+    ))?;
 
     // FLOOR((pk - lo) / step) is the most-portable chunk-id construction —
     // works on Snowflake, Databricks Spark, BigQuery, and DuckDB without
@@ -1732,7 +1745,8 @@ pub trait SqlDialect: Send + Sync {
     /// helpful message at `--algorithm=bisection` time rather than
     /// emitting broken SQL.
     ///
-    /// `columns` are quoted by the caller; the dialect must produce a SQL
+    /// `columns` arrive unquoted (the checksum builders pass the primary
+    /// key first); the dialect validates and quotes them and must produce a SQL
     /// fragment safe to embed under `BIT_XOR(...)` and `GROUP BY
     /// chunk_id`.
     fn row_hash_expr(&self, _columns: &[String]) -> AdapterResult<String> {

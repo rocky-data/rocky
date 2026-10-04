@@ -302,7 +302,7 @@ fn as_u64(v: &serde_json::Value) -> u64 {
 
 /// Read a `serde_json::Value` cell as a display string, mapping SQL NULL to
 /// `None`.
-fn str_cell(v: Option<&serde_json::Value>) -> Option<String> {
+pub(crate) fn str_cell(v: Option<&serde_json::Value>) -> Option<String> {
     match v {
         Some(serde_json::Value::Null) | None => None,
         Some(serde_json::Value::String(s)) => Some(s.clone()),

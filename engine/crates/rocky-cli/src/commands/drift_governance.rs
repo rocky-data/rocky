@@ -544,7 +544,10 @@ pub(crate) fn finalize_drift_verify_after(
         // gate calls, so the two cannot answer "confirmed" differently.
         let failures = rocky_core::state::unverified_required_checks(&outcomes, &required);
         let passed = failures.is_empty();
-        let reason = if passed {
+        // Stored in the `${NAME}` form: `rocky audit` reads this row without
+        // loading the config, so it cannot render it later (#1919).
+        let render = rocky_core::secret_registry::render_placeholders;
+        let reason = render(&if passed {
             format!(
                 "verify_after passed for auto-applied drift on '{}': [{}]",
                 d.model,
@@ -557,7 +560,7 @@ pub(crate) fn finalize_drift_verify_after(
                 d.model,
                 failures.join("; ")
             )
-        };
+        });
         // Filed under the SAME plan id as the decision row (see
         // `decision_plan_id`): a `deny` outcome here + the plain decision row
         // carrying `rule_id` is exactly the pair
@@ -579,7 +582,7 @@ pub(crate) fn finalize_drift_verify_after(
             // budget attribution reads the plain decision row, never this one.
             rule_id: d.rule_id,
             reason: reason.clone(),
-            verify_after: required.clone(),
+            verify_after: required.iter().map(|n| render(n)).collect(),
             auto_apply: d.auto_apply.clone(),
         };
         // Persist the verification-custody row. Fail-closed (C): the row is the
@@ -606,7 +609,7 @@ pub(crate) fn finalize_drift_verify_after(
                 warn!(
                     target: "rocky::policy",
                     model = %d.model,
-                    failures = %failures.join("; "),
+                    failures = %render(&failures.join("; ")),
                     "verify_after post-apply gate FAILED for auto-applied drift"
                 );
                 halted.push(reason);

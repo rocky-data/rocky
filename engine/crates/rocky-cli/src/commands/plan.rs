@@ -99,14 +99,6 @@ pub async fn plan(
     state_path: &Path,
     output_json: bool,
 ) -> Result<()> {
-    // #2239: an agent-authored run plan is reviewable, and a reviewed approval
-    // does not yet cover the models a `--dag` apply dispatches. Refuse before
-    // any work, so no such plan is persisted.
-    anyhow::ensure!(
-        !(run_options.dag && run_options.principal == Some(PolicyPrincipal::Agent)),
-        "{}",
-        super::review::reviewable_dag_refusal("`rocky plan --dag --principal agent`")
-    );
     if let Some(branch_name) = run_options.branch.as_deref() {
         crate::commands::branch::validate_branch_name_pub(branch_name)?;
     }
@@ -550,13 +542,19 @@ pub async fn plan(
                 output
                     .statements
                     .retain(|stmt| stmt.purpose != "conditional_drop");
-                for drop in conditional_drops_for_run_plan(
-                    config_path,
-                    &blueprint_models_dir,
-                    None,
-                    state_path,
-                    &run_plan,
-                )? {
+                let drops = if run_plan.dag {
+                    // #2239: a `--dag` plan discloses every pipeline's DROPs.
+                    conditional_drops_for_dag_plan(config_path, state_path, &run_plan)?
+                } else {
+                    conditional_drops_for_run_plan(
+                        config_path,
+                        &blueprint_models_dir,
+                        None,
+                        state_path,
+                        &run_plan,
+                    )?
+                };
+                for drop in drops {
                     output.statements.push(PlannedStatement {
                         purpose: "conditional_drop".to_string(),
                         target: drop.target.clone(),
@@ -1163,6 +1161,29 @@ pub(crate) fn conditional_drops_for_run_plan(
     conditional_drops_from_models(config_path, &models, models_glob, state_path, run_plan)
 }
 
+/// Conditional DROP disclosure for a `--dag` plan: every transformation
+/// pipeline's models, each through its own directory, glob and target adapter
+/// (#2239).
+pub(crate) fn conditional_drops_for_dag_plan(
+    config_path: &Path,
+    state_path: &Path,
+    run_plan: &RunPlan,
+) -> Result<Vec<ConditionalDrop>> {
+    let cfg = rocky_core::config::load_optional_project_config(Some(config_path))?;
+    let scope = super::approval_scope::approval_scope(cfg.as_ref(), config_path, run_plan)?;
+    let mut drops = Vec::new();
+    for unit in scope.present_units() {
+        drops.extend(conditional_drops_for_run_plan(
+            config_path,
+            &unit.models_dir,
+            unit.models_glob.as_deref(),
+            state_path,
+            &unit.run_plan_for(run_plan),
+        )?);
+    }
+    Ok(drops)
+}
+
 /// Render DROP disclosures from the same compiled models used by approval.
 pub(crate) fn conditional_drops_from_models(
     config_path: &Path,
@@ -1746,17 +1767,39 @@ fn build_and_persist_run_plan(
         // with, so it matches the apply-side literal `reconciles_masks`. A resolution
         // failure ⇒ `false` (fail-safe: apply that doesn't reach the leg never checks
         // the gate, so a wrong-`true` is harmless; a wrong-`false` would false-refuse).
-        let bind_masks = rocky_core::config::load_rocky_config(config_path)
-            .ok()
-            .map(|cfg| {
-                crate::commands::apply::pipeline_is_replication(&cfg, pipeline)
-                    && (run_options.all || run_options.models_dir.is_some())
-                    && run_options.model.is_none()
-            })
-            .unwrap_or(false);
-        let capabilities = compute_embedded_capabilities(
+        // A `--dag` run's model-only sub-runs reconcile no masks.
+        let bind_masks = !run_options.dag
+            && rocky_core::config::load_rocky_config(config_path)
+                .ok()
+                .map(|cfg| {
+                    crate::commands::apply::pipeline_is_replication(&cfg, pipeline)
+                        && (run_options.all || run_options.models_dir.is_some())
+                        && run_options.model.is_none()
+                })
+                .unwrap_or(false);
+        // #2239: fingerprint the scope apply executes, resolved by the same
+        // functions review and apply use: the pipeline's directory and glob,
+        // or every transformation pipeline's for `--dag`. An unresolvable
+        // scope writes no fingerprint, so a review-gated apply refuses.
+        let scope = rocky_core::config::load_optional_project_config(Some(config_path))
+            .map_err(anyhow::Error::from)
+            .and_then(|cfg| {
+                super::approval_scope::approval_scope(cfg.as_ref(), config_path, &run_plan)
+            });
+        let scope = match scope {
+            Ok(scope) => Some(scope),
+            Err(error) => {
+                tracing::warn!(
+                    error = %format!("{error:#}"),
+                    "cannot resolve the models this plan executes; it carries no execution \
+                     fingerprint"
+                );
+                None
+            }
+        };
+        let capabilities = compute_embedded_capabilities_for_scope(
             config_path,
-            models_dir,
+            scope.as_ref(),
             base_ref,
             Some(state_path),
             env,
@@ -1797,6 +1840,38 @@ pub fn compute_embedded_capabilities(
     base_ref: &str,
     state_path: Option<&Path>,
     env: Option<&str>,
+    bind_masks: bool,
+) -> anyhow::Result<EmbeddedCapabilities> {
+    let scope = super::approval_scope::ApprovalScope {
+        dag: false,
+        units: vec![super::approval_scope::ScopeUnit {
+            pipeline: None,
+            models_dir: models_dir.to_path_buf(),
+            models_glob: None,
+        }],
+        seeds_dir: None,
+    };
+    compute_embedded_capabilities_for_scope(
+        config_path,
+        Some(&scope),
+        base_ref,
+        state_path,
+        env,
+        bind_masks,
+    )
+}
+
+/// [`compute_embedded_capabilities`] over the exact model scope apply
+/// executes (#2239): the pipeline's directory and file glob for a plain run
+/// plan, every transformation pipeline's directory and glob for a `--dag`
+/// plan. `None` means the scope could not be resolved, so the plan carries no
+/// fingerprint and a review-gated apply refuses it (fail-closed).
+pub(crate) fn compute_embedded_capabilities_for_scope(
+    config_path: &Path,
+    scope: Option<&super::approval_scope::ApprovalScope>,
+    base_ref: &str,
+    state_path: Option<&Path>,
+    env: Option<&str>,
     // Finding #4: whether the mask enters the fingerprint — `true` iff the apply
     // reaches the mask-reconciling path (a full run of a REPLICATION pipeline that
     // hits the model leg). The CALLER computes this from the resolved pipeline +
@@ -1815,7 +1890,6 @@ pub fn compute_embedded_capabilities(
     // whole" while that call made it false.
 ) -> anyhow::Result<EmbeddedCapabilities> {
     use crate::plan_store::CURRENT_FINGERPRINT_VERSION;
-    use rocky_compiler::compile::{self, CompilerConfig};
 
     // Load the config first — reused for cached source schemas AND the routing
     // config identity. Every path below stamps `fingerprint_version` so a NEW
@@ -1889,9 +1963,9 @@ pub fn compute_embedded_capabilities(
         reviewed_source_schemas: None,
     };
 
-    if !models_dir.is_dir() {
-        return Ok(failed(config_identity)); // fail-closed
-    }
+    let Some(scope) = scope else {
+        return Ok(failed(config_identity)); // fail-closed: scope unresolved
+    };
 
     let identity = config_identity.clone().unwrap_or_default();
 
@@ -1920,16 +1994,12 @@ pub fn compute_embedded_capabilities(
         _ => std::collections::HashMap::new(),
     };
 
-    let head = {
-        let config = CompilerConfig {
-            models_dir: models_dir.to_path_buf(),
-            source_schemas: source_schemas.clone(),
-            ..Default::default()
-        };
-        match compile::compile(&config) {
-            Ok(r) => r,
-            Err(_) => return Ok(failed(config_identity)),
-        }
+    // Compile every unit apply executes: one directory and glob for a plain
+    // run plan, every transformation pipeline's for a `--dag` plan (#2239).
+    // A unit that does not compile (or a plain plan's absent directory) means
+    // no fingerprint, so a review-gated apply refuses (fail-closed).
+    let Ok(heads) = scope.compile(&source_schemas, super::approval_scope::NoModels::Error) else {
+        return Ok(failed(config_identity));
     };
     // Capture the REVIEWED source-schema snapshot (finding #2) — the exact
     // schemas the head compile typed against. `Some` is AUTHORITATIVE even when
@@ -1951,25 +2021,44 @@ pub fn compute_embedded_capabilities(
     // sidecars #1, contract presence/contents #3) are folded in so a post-plan
     // swap of either is refused even though `config`+`sql` are byte-identical —
     // built from the SAME `models_dir` the apply choke-point re-reads.
-    let extras = crate::commands::apply::ExecutionExtras::build(
-        &crate::commands::apply::resolved_surrogate_keys(models_dir, &head.project.models)?,
-        &head.project.models,
-        &resolved_mask,
+    let models_fingerprint = super::approval_scope::scope_fingerprint(
+        scope,
+        &heads,
+        &super::approval_scope::ScopeIdentities {
+            config: &identity,
+            governance: &governance_identity,
+            exec_control: &exec_control_identity,
+            resolved_mask: &resolved_mask,
+        },
     );
-    let models_fingerprint = crate::commands::apply::execution_ir_fingerprint(
-        &head.project.models,
-        &identity,
-        &governance_identity,
-        &exec_control_identity,
-        &extras,
-    );
+    let models_fingerprint = match models_fingerprint {
+        Ok(fingerprint) => fingerprint,
+        // A `--dag` run refuses a seeds directory it cannot discover, so the
+        // plan carries no fingerprint rather than failing to persist; a
+        // review-gated apply then refuses it.
+        Err(error) if scope.dag => {
+            tracing::warn!(error = %format!("{error:#}"), "--dag plan carries no fingerprint");
+            return Ok(failed(config_identity));
+        }
+        Err(error) => return Err(error),
+    };
 
-    let base = match super::ci_diff::extract_base_compile(base_ref, models_dir, source_schemas) {
-        Ok(r) => r,
-        // The head compiled and was fingerprinted; a missing base only costs the
-        // per-model classification (fail-closed to breaking). Keep the
-        // fingerprint so the TOCTOU gate still binds.
-        Err(_) => {
+    // Classify each unit against `base_ref` through the same directory and
+    // glob. Any unit without a base costs the per-model classification for
+    // the whole plan (fail-closed to breaking); the fingerprint is kept so the
+    // TOCTOU gate still binds.
+    let mut changed = std::collections::BTreeMap::new();
+    for unit in &heads {
+        let Some(head) = unit.head.as_ref() else {
+            continue;
+        };
+        let Ok(base) = super::ci_diff::extract_base_compile_in(
+            base_ref,
+            &unit.unit.models_dir,
+            source_schemas.clone(),
+            unit.unit.models_glob.as_deref(),
+            None,
+        ) else {
             return Ok(EmbeddedCapabilities {
                 diff_available: false,
                 changed: std::collections::BTreeMap::new(),
@@ -1978,27 +2067,26 @@ pub fn compute_embedded_capabilities(
                 fingerprint_version: CURRENT_FINGERPRINT_VERSION,
                 reviewed_source_schemas,
             });
-        }
-    };
+        };
 
-    let base_ir = super::ci_diff::project_ir_from_compile(&base);
-    let head_ir = super::ci_diff::project_ir_from_compile(&head);
-    let findings = rocky_core::breaking_change::diff_project_ir(&base_ir, &head_ir);
-    let by_target = rocky_core::policy::classify_findings_by_model(&findings);
+        let base_ir = super::ci_diff::project_ir_from_compile(&base);
+        let head_ir = super::ci_diff::project_ir_from_compile(head);
+        let findings = rocky_core::breaking_change::diff_project_ir(&base_ir, &head_ir);
+        let by_target = rocky_core::policy::classify_findings_by_model(&findings);
 
-    // Findings key on `target.full_name()`; remap to the logical model name
-    // (`ModelIr.name == config.name`) so the map lines up with `RunPlan.models`
-    // and the apply-time `ModelAttributes.name`.
-    let target_to_name: std::collections::HashMap<String, String> = head_ir
-        .models
-        .iter()
-        .map(|m| (m.target.full_name(), m.name.to_string()))
-        .collect();
+        // Findings key on `target.full_name()`; remap to the logical model name
+        // (`ModelIr.name == config.name`) so the map lines up with `RunPlan.models`
+        // and the apply-time `ModelAttributes.name`.
+        let target_to_name: std::collections::HashMap<String, String> = head_ir
+            .models
+            .iter()
+            .map(|m| (m.target.full_name(), m.name.to_string()))
+            .collect();
 
-    let mut changed = std::collections::BTreeMap::new();
-    for (target, cap) in by_target {
-        if let Some(name) = target_to_name.get(&target) {
-            changed.insert(name.clone(), cap);
+        for (target, cap) in by_target {
+            if let Some(name) = target_to_name.get(&target) {
+                changed.insert(name.clone(), cap);
+            }
         }
     }
 
@@ -2149,6 +2237,88 @@ pub(crate) fn state_authority_identity(
     parts.join(" ")
 }
 
+/// The config forms a replication plan persists (#1919).
+///
+/// ```text
+///   snapshot  every resolved ${VAR} value written as ${NAME}   printable
+///   digests   BLAKE3 keyed hash of each top-level section,     comparable
+///             taken over the resolved values
+/// ```
+///
+/// The snapshot alone cannot see an environment value change, because both
+/// values render as the same `${NAME}`. The digests can, and they hold no
+/// value. Credentials serialize as `"***"` in both, as before, so neither
+/// covers a rotated secret.
+pub(crate) fn config_snapshot_forms(
+    root: &std::path::Path,
+    rocky_cfg: &rocky_core::config::RockyConfig,
+    create_key: bool,
+) -> Result<(
+    serde_json::Value,
+    std::collections::BTreeMap<String, String>,
+)> {
+    let resolved =
+        rocky_core::env_string::with_env_values_scope(|| serde_json::to_value(rocky_cfg))
+            .context("failed to serialize RockyConfig for the plan's config snapshot")?;
+    let key = crate::plan_store::plan_digest_key(root, create_key)?;
+    let digests = config_section_digests(&key, &resolved);
+    let snapshot = rocky_core::secret_registry::render_json_placeholders(resolved);
+    Ok((snapshot, digests))
+}
+
+/// One keyed digest per top-level section of a serialized config.
+fn config_section_digests(
+    key: &[u8; 32],
+    resolved: &serde_json::Value,
+) -> std::collections::BTreeMap<String, String> {
+    let mut digests = std::collections::BTreeMap::new();
+    if let Some(sections) = resolved.as_object() {
+        for (name, section) in sections {
+            let mut canonical = String::new();
+            write_canonical_json(section, &mut canonical);
+            digests.insert(
+                name.clone(),
+                blake3::keyed_hash(key, canonical.as_bytes())
+                    .to_hex()
+                    .to_string(),
+            );
+        }
+    }
+    digests
+}
+
+/// JSON with every object's keys sorted, so the digest does not depend on map
+/// iteration order (a `HashMap` field, or `serde_json`'s `preserve_order`).
+fn write_canonical_json(value: &serde_json::Value, out: &mut String) {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut entries: Vec<_> = map.iter().collect();
+            entries.sort_by(|a, b| a.0.cmp(b.0));
+            out.push('{');
+            for (i, (k, v)) in entries.into_iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                out.push_str(&serde_json::Value::String(k.clone()).to_string());
+                out.push(':');
+                write_canonical_json(v, out);
+            }
+            out.push('}');
+        }
+        serde_json::Value::Array(items) => {
+            out.push('[');
+            for (i, v) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                write_canonical_json(v, out);
+            }
+            out.push(']');
+        }
+        other => out.push_str(&other.to_string()),
+    }
+}
+
 fn build_and_persist_replication_plan(
     rocky_cfg: &rocky_core::config::RockyConfig,
     connectors: &[DiscoveredConnector],
@@ -2158,8 +2328,8 @@ fn build_and_persist_replication_plan(
     run_options: &PlanRunOptions,
     state_path: &std::path::Path,
 ) -> Result<(ReplicationPlan, String, chrono::DateTime<Utc>)> {
-    let config_snapshot = serde_json::to_value(rocky_cfg)
-        .context("failed to serialize RockyConfig for replication plan")?;
+    let cwd = std::env::current_dir().context("failed to get current working directory")?;
+    let (config_snapshot, config_digests) = config_snapshot_forms(&cwd, rocky_cfg, true)?;
     let state_authority = state_authority_identity(&rocky_cfg.state, state_path);
     let source_state_snapshot = build_source_state_snapshot(connectors);
 
@@ -2187,11 +2357,11 @@ fn build_and_persist_replication_plan(
         branch: run_options.branch.clone(),
         governance_override: run_options.governance_override.clone(),
         config_snapshot,
+        config_digests: Some(config_digests),
         state_authority: Some(state_authority),
         source_state_snapshot,
     };
 
-    let cwd = std::env::current_dir().context("failed to get current working directory")?;
     let plan_id = write_plan(&cwd, PlanKind::Replication, &replication_plan)
         .context("failed to write replication plan")?;
 
@@ -3213,38 +3383,34 @@ mod tests {
     /// cannot cover the models the DAG dispatches. `rocky plan` refuses it
     /// before any config IO, so no such plan is persisted. A human `--dag`
     /// plan is not reviewable and is not refused by this guard.
+    /// #2239: `rocky plan --dag --principal agent` is no longer refused up
+    /// front; its approval now covers every pipeline's models. It proceeds to
+    /// the config load like any other plan.
     #[tokio::test]
-    async fn plan_refuses_agent_dag_before_config_io() {
+    async fn plan_accepts_agent_dag() {
         let temp = tempfile::tempdir().unwrap();
-        let missing_config = temp.path().join("missing.toml");
-        let state = temp.path().join("missing.redb");
-        let run = |principal| {
-            let options = super::PlanRunOptions {
-                dag: true,
-                principal,
-                ..Default::default()
-            };
-            let (config, state) = (missing_config.clone(), state.clone());
-            async move {
-                format!(
-                    "{:#}",
-                    super::plan(
-                        &config, None, None, None, &options, false, "main", &state, false
-                    )
-                    .await
-                    .unwrap_err()
-                )
-            }
+        let options = super::PlanRunOptions {
+            dag: true,
+            principal: Some(rocky_core::config::PolicyPrincipal::Agent),
+            ..Default::default()
         };
-        let agent = run(Some(rocky_core::config::PolicyPrincipal::Agent)).await;
-        assert_eq!(
-            agent,
-            super::super::review::reviewable_dag_refusal("`rocky plan --dag --principal agent`")
+        let err = super::plan(
+            &temp.path().join("missing.toml"),
+            None,
+            None,
+            None,
+            &options,
+            false,
+            "main",
+            &temp.path().join("missing.redb"),
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("failed to load config"),
+            "{err:#}"
         );
-        for principal in [None, Some(rocky_core::config::PolicyPrincipal::Human)] {
-            let human = run(principal).await;
-            assert!(human.contains("failed to load config"), "{human}");
-        }
     }
 
     /// The identity must change across a state-schema version bump, because the

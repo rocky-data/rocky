@@ -682,34 +682,43 @@ impl std::fmt::Display for StateBackend {
 /// outside the retry), `rocky gc`, `rocky restore`, and `rocky apply`'s
 /// governed rule decision and verify-after custody (#1242). The guarantee
 /// holds only when every writer sharing the `[state]` location runs with
-/// `cas`: one writer left on `off` still uploads unconditionally and can
-/// overwrite the others.
+/// `cas`. To keep one writer left on `off` from overwriting the others, the
+/// first compare-and-swap upload creates a `cas-required` marker beside the
+/// state object, and an unconditional upload that finds the marker refuses
+/// (#1228).
 //
 // Kept free of rustdoc intra-doc links on purpose: `schemars` exports this
 // comment verbatim as the JSON Schema `description`, which surfaces in editor
 // tooltips and the OpenAPI document, where `[text][path]` renders as noise.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+//
+// Deliberately no `Default` impl: the default is per backend (see
+// `StateConfig::concurrency_control`), so a context-free default would be
+// the wrong answer on every backend that supports compare-and-swap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum ConcurrencyControl {
-    /// Unconditional last-writer-wins upload (default) — byte-identical to the
-    /// pre-CAS behaviour. Correct for single-writer-per-prefix deployments
-    /// (one run at a time, orchestrator-serialized).
-    #[default]
+    /// Unconditional last-writer-wins upload — byte-identical to the pre-CAS
+    /// behaviour. The default on `local` and `valkey`, and an explicit opt-out
+    /// elsewhere. Correct for single-writer-per-prefix deployments (one run at
+    /// a time, orchestrator-serialized). An `off` writer refuses to upload
+    /// once a `cas-required` marker exists beside the state object.
     Off,
-    /// Compare-and-swap: the end-of-run upload is conditional on the remote
-    /// object still carrying the generation the run downloaded. A run that lost
-    /// a cross-pod race fail-closes (nonzero exit) instead of erasing the
-    /// winner. Requires a backend with a durable conditional-write object tier
-    /// (`s3`, `gcs`, or `tiered`); auto-downgrades to `off` (with a warn) on
-    /// `local` and `valkey`, which have no such tier.
+    /// Compare-and-swap: every write of the shared state object is conditional
+    /// on the remote object still carrying the generation the writer
+    /// downloaded. A run that lost a cross-pod race fail-closes (nonzero exit)
+    /// instead of erasing the winner; a ledger seam replays its transition onto
+    /// the winner. The default on `s3`, `gcs`, and `tiered`. Requires a backend
+    /// with a durable conditional-write object tier; auto-downgrades to `off`
+    /// (with a warn) on `local` and `valkey`, which have no such tier. When set
+    /// explicitly, a startup probe that finds the store does not honour
+    /// conditional writes is an error rather than a silent downgrade.
     ///
     /// On `tiered` the compare-and-swap runs against the durable S3 leg and the
     /// Valkey tier is kept coherent with it: a cached copy is stored together
     /// with the generation it was committed at, and a read may only use it
     /// after that generation is confirmed to still be the durable object's.
     /// Enabling `cas` also disables the mid-run periodic state uploader, on
-    /// every backend. It protects the end-of-run upload only — see the
-    /// type-level note on the ledger-seam writers that still bypass it.
+    /// every backend.
     Cas,
 }
 
@@ -902,21 +911,24 @@ pub struct StateConfig {
     #[serde(default)]
     pub freeze_marker_writes: bool,
 
-    /// Concurrency control for remote state writes. Default
-    /// [`ConcurrencyControl::Off`] (unconditional last-writer-wins, byte-
-    /// identical to pre-CAS). Set to `"cas"` on live multi-pod deployments with
-    /// a durable object tier (`s3`, `gcs`, `tiered`) so a writer that lost a
-    /// cross-pod race is reconciled by writer class instead of silently
-    /// overwriting the winner: the end-of-run upload fail-closes, and the
-    /// ledger seams — `rocky policy` freeze/unfreeze, `rocky gc`, `rocky
-    /// restore`, and `rocky apply`'s governed rule decision and verify-after
-    /// custody — replay their transition onto the winner (#1242). The
-    /// protection holds only between writers that all run with `cas`: a writer
-    /// on the same state with `off` still uploads unconditionally. On `tiered`
-    /// it additionally makes the Valkey tier coherent with the durable object.
-    /// Auto-downgrades to `off` (with a warn) on `local` and `valkey`.
+    /// Concurrency control for remote state writes: `"cas"` or `"off"`.
+    /// Unset means the backend default, resolved at startup: `cas` on
+    /// backends with a durable conditional-write object tier (`s3`, `gcs`,
+    /// `tiered`), `off` on `local` and `valkey`. On the `cas` backends a cheap
+    /// startup probe confirms the store really honours conditional writes
+    /// (some S3-compatible stores do not); an unset mode falls back to `off`
+    /// with a warning when it does not, and an explicit `"cas"` fails with an
+    /// error. Under `cas` a writer that lost a cross-pod race is reconciled by
+    /// writer class instead of silently overwriting the winner: the end-of-run
+    /// upload fail-closes, and the ledger seams — `rocky policy`
+    /// freeze/unfreeze, `rocky gc`, `rocky restore`, and `rocky apply`'s
+    /// governed rule decision and verify-after custody — replay their
+    /// transition onto the winner (#1242). The first `cas` upload creates a
+    /// `cas-required` marker beside the state object; an `off` writer that
+    /// finds it refuses its unconditional upload (#1228). On `tiered` `cas`
+    /// additionally makes the Valkey tier coherent with the durable object.
     #[serde(default)]
-    pub concurrency_control: ConcurrencyControl,
+    pub concurrency_control: Option<ConcurrencyControl>,
 }
 
 impl Default for StateConfig {
@@ -937,7 +949,7 @@ impl Default for StateConfig {
             namespacing: StateNamespacing::default(),
             on_schema_mismatch: SchemaMismatchPolicy::default(),
             freeze_marker_writes: false,
-            concurrency_control: ConcurrencyControl::default(),
+            concurrency_control: None,
         }
     }
 }
@@ -2578,6 +2590,54 @@ struct EnvExpansion {
     missing: Vec<(String, std::ops::Range<usize>)>,
 }
 
+/// Register an environment value, and every form TOML escape processing can
+/// turn it into.
+///
+/// The value is pasted into the config text before the TOML is parsed. Inside
+/// a basic string (`"..."` or `"""..."""`) the parser then processes escapes,
+/// so a value holding `\u0041` or `\t` is stored in the parsed field as `A`
+/// or a tab. That stored form is what an output struct copies, and it is not
+/// the registered bytes, so it would print as itself (#1919).
+///
+/// So each unescaped form that differs from the raw value is registered too,
+/// under the same name. A value that is not a valid basic-string body (for
+/// example one holding a bare `"`) yields no extra form here; the raw form
+/// is still registered. Escapes that span the boundary between the value and
+/// the text around it are not modelled.
+fn register_env_value(name: &str, value: &str) {
+    crate::secret_registry::register_substitution(name, value);
+    if !value.contains('\\') {
+        return;
+    }
+    for wrapped in [
+        format!("v = \"{value}\""),
+        format!("v = \"\"\"{value}\"\"\""),
+    ] {
+        let Ok(table) = toml::from_str::<toml::Table>(&wrapped) else {
+            continue;
+        };
+        if let Some(toml::Value::String(unescaped)) = table.get("v")
+            && unescaped != value
+        {
+            crate::secret_registry::register_substitution(name, unescaped);
+        }
+    }
+}
+
+/// Register every `${VAR}` value `rocky.toml` at `path` references, without
+/// parsing or validating it.
+///
+/// A command that reads only the state store never loads the config, so its
+/// registry is empty and it cannot render a stored value as `${NAME}`. Calling
+/// this first gives it the same registry a config-loading command has
+/// (#1919). It never fails: an unreadable file or an unset variable registers
+/// nothing more.
+pub fn prime_secret_registry(path: &Path) {
+    if let Ok(text) = std::fs::read_to_string(path) {
+        let _ = substitute_env_vars_inner(&text);
+    }
+}
+
 /// The expansion itself, with no policy attached.
 ///
 /// An unset `${VAR}` is left in the text verbatim either way. Whether that is
@@ -2623,7 +2683,7 @@ fn substitute_env_vars_inner(input: &str) -> EnvExpansion {
             // anyone who can read the file can already read it; redacting it
             // would mangle diagnostics for no secrecy gain (#1897).
             if let Some(value) = &from_env {
-                crate::secret_registry::register_substitution(var_name, value);
+                register_env_value(var_name, value);
             }
             let value = from_env.unwrap_or_else(|| default_value.to_string());
             result.push_str(&value);
@@ -2634,7 +2694,7 @@ fn substitute_env_vars_inner(input: &str) -> EnvExpansion {
         } else {
             match std::env::var(expr) {
                 Ok(value) => {
-                    crate::secret_registry::register_substitution(expr, &value);
+                    register_env_value(expr, &value);
                     result.push_str(&value);
                     substitutions.push(EnvVarSubstitution {
                         name: expr.to_string(),
@@ -10104,6 +10164,46 @@ autonomy_budget = { failures = 2, window = "${ROCKY_T1919_POLICY}" }
             assert!(printed.contains("${ROCKY_T1919_POLICY}"), "{printed}");
         }
         assert!(json.contains("${ROCKY_T1919_POLICY}_*"), "{json}");
+    }
+
+    /// A value the TOML parser unescapes is stored in its unescaped form,
+    /// which is not the registered bytes. It must still print as `${NAME}`.
+    #[test]
+    fn a_value_changed_by_toml_escape_processing_still_prints_as_its_placeholder() {
+        // `A` and `\t` are TOML escapes: the parsed field holds `A` and
+        // a tab, not the six and two bytes the environment held.
+        const RAW: &str = r"ROCKY-1919-ESCA-tab\t-end";
+        const PARSED: &str = "ROCKY-1919-ESCA-tab\t-end";
+        // SAFETY: test-only; the variable name is unique to this test.
+        unsafe { std::env::set_var("ROCKY_T1919_ESCAPE", RAW) };
+        let text = substitute_env_vars(
+            r#"
+[policy]
+version = 1
+
+[[policy.rules]]
+principal = "agent"
+capability = "apply"
+scope = { any = true }
+effect = "allow"
+verify_after = ["${ROCKY_T1919_ESCAPE}"]
+"#,
+        )
+        .unwrap();
+        // SAFETY: as above.
+        unsafe { std::env::remove_var("ROCKY_T1919_ESCAPE") };
+        let cfg = parse(&text);
+        let check = &cfg.policy.as_ref().expect("policy").rules[0].verify_after[0];
+        assert_eq!(
+            check.expose(),
+            PARSED,
+            "PRECONDITION: the parser unescaped it"
+        );
+        let json = serde_json::to_string(&cfg.policy).expect("serialize");
+        for printed in [check.to_string(), format!("{check:?}"), json] {
+            assert!(!printed.contains("ROCKY-1919-ESCA"), "leaked: {printed}");
+            assert!(printed.contains("${ROCKY_T1919_ESCAPE}"), "{printed}");
+        }
     }
 
     /// One of the two `ConfigError` sites #1934 added after the original

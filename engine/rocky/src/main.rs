@@ -1401,6 +1401,19 @@ enum Command {
         /// is reported at error severity and fails the compile.
         #[arg(long = "deny-warnings", value_name = "CODES", value_delimiter = ',')]
         deny_warnings: Vec<String>,
+
+        /// EXPERIMENTAL. Attach to a dbt project instead of reading Rocky
+        /// models: read `<DIR>/target/manifest.json` (and `run_results.json`)
+        /// on every invocation, translate it in memory with the
+        /// `rocky import-dbt` rules, and compile the result. Writes nothing
+        /// under `<DIR>`; ignores `--config`. Refuses what `import-dbt`
+        /// refuses.
+        #[arg(
+            long = "dbt-project",
+            value_name = "DIR",
+            conflicts_with_all = ["models", "with_seed"]
+        )]
+        dbt_project: Option<PathBuf>,
     },
 
     /// Publish a snapshot of this project's compiled IR for consumers to
@@ -1667,6 +1680,13 @@ enum Command {
         /// Profile only this column (default: every column)
         #[arg(long)]
         column: Option<String>,
+        /// Also return up to N distinct non-null values per column
+        /// (`sample_values`, at most 100), chosen pseudo-randomly by a hash of
+        /// each value, so a re-run on unchanged data returns the same values.
+        /// Default 0: no row values beyond min/max and the low-cardinality
+        /// domain.
+        #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u32).range(0..=100))]
+        sample: u32,
         /// Models directory (compiled to obtain the model's inferred schema)
         #[arg(long, default_value = "models")]
         models: String,
@@ -3559,6 +3579,11 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
     // this invocation to its own `<models>/.rocky-state/<key>.redb`. An
     // explicit `--state-path` is a hard override that disables namespacing.
     // The default (neither set) is byte-identical to today.
+    // Every command, including the ones that read only the state store
+    // (`rocky audit`, `rocky history`), renders a resolved `${VAR}` value as
+    // `${NAME}` only if the registry holds it. Prime it from the config text
+    // up front; this never fails (#1919).
+    rocky_core::config::prime_secret_registry(&cli.config);
     let state_namespace: Option<String> = resolve_state_namespace(&cli)?;
     let resolved = rocky_core::state::resolve_state_path_ns(
         cli.state_path.as_deref(),
@@ -4504,26 +4529,43 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             strict_sources,
             var,
             deny_warnings,
+            dbt_project,
         } => {
             let run_vars = rocky_core::run_vars::RunVars::parse_pairs(&var)
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
             let (model, selection) = split_model_and_selection(model, selection)?;
-            rocky_cli::commands::run_compile_with_options(
-                Some(cli.config.as_path()),
-                &state_path,
-                &models,
-                contracts.as_deref(),
-                model.as_deref(),
-                json,
-                expand_macros,
-                target_dialect.map(Into::into),
-                with_seed,
-                cli.cache_ttl,
-                &run_vars,
-                strict_sources,
-                &deny_warnings,
-                selection.as_ref(),
-            )
+            if let Some(dbt_project) = dbt_project {
+                rocky_cli::commands::run_compile_dbt_attach(
+                    &dbt_project,
+                    contracts.as_deref(),
+                    model.as_deref(),
+                    json,
+                    expand_macros,
+                    target_dialect.map(Into::into),
+                    cli.cache_ttl,
+                    &run_vars,
+                    strict_sources,
+                    &deny_warnings,
+                    selection.as_ref(),
+                )
+            } else {
+                rocky_cli::commands::run_compile_with_options(
+                    Some(cli.config.as_path()),
+                    &state_path,
+                    &models,
+                    contracts.as_deref(),
+                    model.as_deref(),
+                    json,
+                    expand_macros,
+                    target_dialect.map(Into::into),
+                    with_seed,
+                    cli.cache_ttl,
+                    &run_vars,
+                    strict_sources,
+                    &deny_warnings,
+                    selection.as_ref(),
+                )
+            }
         }
         Command::PublishIr {
             models,
@@ -4720,6 +4762,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
         Command::Profile {
             model,
             column,
+            sample,
             models,
         } => {
             rocky_cli::commands::run_profile(
@@ -4728,6 +4771,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                 &models,
                 &model,
                 column.as_deref(),
+                sample,
                 json,
                 cli.cache_ttl,
             )

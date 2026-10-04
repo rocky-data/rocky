@@ -902,7 +902,11 @@ dependencies = [
 ]
 
 [package.metadata]
-requires-dist = [{ name = "pydantic", specifier = ">=2.10" }]
+requires-dist = [
+    { name = "laya", marker = "extra == 'classify'", specifier = "==0.3.26" },
+    { name = "pydantic", specifier = ">=2.10" },
+]
+provides-extras = ["classify"]
 
 [package.metadata.requires-dev]
 dev = [

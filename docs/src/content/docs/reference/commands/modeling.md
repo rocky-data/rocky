@@ -30,6 +30,7 @@ rocky compile [flags]
 | `--deny-warnings <CODES>` | `string` (comma-separated, repeatable) | | Report the listed warning codes as errors and exit non-zero, such as `--deny-warnings W042,W043`. Other warnings stay warnings. |
 | `--with-seed` | `bool` | `false` | Execute `data/seed.sql` against an in-memory DuckDB and use its `information_schema` as the source-of-truth for raw source schemas. Turns leaf `.sql` models from `Unknown` columns into concrete types. Requires the `duckdb` feature (enabled by default in the shipped binary). |
 | `--strict-sources` | `bool` | `false` | Treat every known source schema as current. A reference to a column the source lacks is the `E041` error, even when the schema came from a seed or an old cache entry. Without the flag, those schemas give the `W041` warning. Same as `[cache.schemas] strict_sources = true`. See [Missing columns in external sources](/concepts/compiler/#missing-columns-in-external-sources-e041--w041). |
+| `--dbt-project <DIR>` | `PathBuf` | | **Experimental.** Compile a dbt project in place (attach mode). See [Attach to a dbt project](#attach-to-a-dbt-project-experimental). Conflicts with `--models` and `--with-seed`. |
 
 ### Examples
 
@@ -196,6 +197,34 @@ A seed can be out of date. So a reference to a column the seed lacks is the `W04
 ```bash
 rocky compile --with-seed --strict-sources
 ```
+
+#### Attach to a dbt project (experimental)
+
+:::caution
+`--dbt-project` is an experimental spike. Its behavior can change in any release.
+:::
+
+Compile a dbt project without migrating it:
+
+```bash
+dbt compile --full-refresh
+rocky compile --dbt-project path/to/dbt
+```
+
+Each run does these steps:
+
+```
+<DIR>/target/manifest.json ──▶ version check ──▶ import-dbt rules ──▶ temp dir ──▶ compile
+   (+ run_results.json)          (v12 only)       (in memory)         (removed)
+```
+
+- Rocky reads `<DIR>/target/manifest.json` and its sibling `run_results.json` on every run.
+- Rocky writes nothing under `<DIR>`. The translated project lives in a private temp directory. Rocky removes it when the command ends.
+- Rocky refuses the same models that `rocky import-dbt` refuses, with the same reason. The error names each model and its construct, and the command exits non-zero.
+- An incremental model needs a matching `run_results.json` from `dbt compile --full-refresh`. Without it, Rocky refuses the model and names that command.
+- Rocky accepts manifest schema `v12` (dbt 1.8 and later). It refuses any other `dbt_schema_version` by name.
+- `--config` is ignored. The adapter comes from `<DIR>/profiles.yml`, as in `rocky import-dbt`.
+- `--output json` prints the normal `rocky compile` JSON. Attach notes and warnings go to stderr. Diagnostic file paths point into the temp directory.
 
 ### Related Commands
 

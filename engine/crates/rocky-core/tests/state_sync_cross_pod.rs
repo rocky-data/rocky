@@ -435,7 +435,7 @@ async fn schema_cache_crosses_pods_through_the_cas_upload_leg() {
     let harness = CrossPodHarness::new_s3_like();
 
     let cas_cfg = rocky_core::config::StateConfig {
-        concurrency_control: rocky_core::config::ConcurrencyControl::Cas,
+        concurrency_control: Some(rocky_core::config::ConcurrencyControl::Cas),
         ..harness.pod_a.cfg.clone()
     };
     seed_schema_cache(&harness, &harness.pod_a, "orders");
@@ -468,7 +468,7 @@ async fn cas_upload_leg_keeps_the_schema_cache_local_by_default() {
     let harness = CrossPodHarness::new_s3_like();
 
     let cas_cfg = rocky_core::config::StateConfig {
-        concurrency_control: rocky_core::config::ConcurrencyControl::Cas,
+        concurrency_control: Some(rocky_core::config::ConcurrencyControl::Cas),
         ..harness.pod_a.cfg.clone()
     };
     seed_schema_cache(&harness, &harness.pod_a, "orders");
@@ -504,7 +504,10 @@ async fn schema_cache_crosses_pods_through_the_periodic_uploader() {
     use std::time::Duration;
 
     let _serial = remote_testing::serial_guard();
-    let harness = CrossPodHarness::new_s3_like();
+    let mut harness = CrossPodHarness::new_s3_like();
+    // The periodic uploader only runs under `off` (`cas` disables it), and an
+    // unset mode now defaults to `cas` on s3 (#1228).
+    harness.pod_a.cfg.concurrency_control = Some(rocky_core::config::ConcurrencyControl::Off);
 
     let store = Arc::new(rocky_core::state::StateStore::open(&harness.pod_a.state_path).unwrap());
     let key = rocky_core::schema_cache::schema_cache_key("cat", "staging", "orders");

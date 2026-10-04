@@ -12,6 +12,7 @@ use rocky_compiler::source_refs::{SourceProvenance, SourceSchemaOrigin};
 use rocky_compiler::types::TypedColumn;
 use rocky_core::config as rocky_config;
 use rocky_core::macros::{expand_macros, load_macros_from_dir};
+use rocky_core::secret_registry::{render_placeholders, render_placeholders_in};
 use rocky_sql::portability::{self, PortabilityIssue};
 use rocky_sql::pragma;
 use rocky_sql::transpile::Dialect;
@@ -117,6 +118,93 @@ pub fn run_compile_with_options(
     }
 
     Ok(())
+}
+
+/// Execute `rocky compile --dbt-project <DIR>` (experimental "attach mode").
+///
+/// Reads `<DIR>/target/manifest.json` (and its sibling `run_results.json`)
+/// through the same importer `rocky import-dbt` uses, so it refuses the same
+/// constructs with the same reasons. The translated project is written to a
+/// private temp directory, compiled with [`run_compile_with_options`], and removed when
+/// this function returns. Nothing is written under `<DIR>`: the config, the
+/// models and the state path all point into the temp directory.
+///
+/// Attach notes (manifest read, warnings) go to stderr so `--output json`
+/// keeps the unchanged [`CompileOutput`] shape on stdout. Diagnostics name
+/// file paths inside the temp directory.
+#[allow(clippy::too_many_arguments)]
+pub fn run_compile_dbt_attach(
+    dbt_project: &Path,
+    contracts_dir: Option<&Path>,
+    model_filter: Option<&str>,
+    output_json: bool,
+    do_expand_macros: bool,
+    target_dialect: Option<Dialect>,
+    cache_ttl_override: Option<u64>,
+    run_vars: &rocky_core::run_vars::RunVars,
+    strict_sources: bool,
+    deny_warning_codes: &[String],
+    selection: Option<&crate::selection::SelectionArgs>,
+) -> Result<()> {
+    use rocky_compiler::import::dbt_attach;
+    use rocky_compiler::import::emit::{self, EmitInputs, OverwritePolicy};
+
+    if !dbt_project.is_dir() {
+        anyhow::bail!("--dbt-project {} is not a directory", dbt_project.display());
+    }
+
+    let attached = dbt_attach::attach_dbt_project(dbt_project)?;
+
+    eprintln!(
+        "rocky compile (experimental dbt attach): read {} (manifest schema v{}), {} model(s)",
+        attached.manifest_path.display(),
+        attached.schema_version,
+        attached.import.imported.len()
+    );
+    if let Some(reason) = &attached.profile.fallback_reason {
+        eprintln!("  warning: <profiles.yml>: {reason}");
+    }
+    for w in &attached.import.warnings {
+        eprintln!("  warning: {}: {}", w.model, w.message);
+    }
+
+    // `TempDir` removes the directory on drop, including on every early
+    // return below. The project goes one level down so `emit_repo` sees a
+    // fresh, absent directory and never needs `ReplaceContents`.
+    let scratch = tempfile::Builder::new()
+        .prefix("rocky-dbt-attach-")
+        .tempdir()
+        .context("failed to create a temp directory for dbt attach mode")?;
+    let project_dir = scratch.path().join("project");
+
+    emit::emit_repo(&EmitInputs {
+        dbt_project_dir: dbt_project,
+        out_dir: &project_dir,
+        overwrite: OverwritePolicy::Reject,
+        profile: &attached.profile,
+        default_catalog: &attached.default_target.catalog,
+        default_schema: &attached.default_target.schema,
+        import: &attached.import,
+        adapter_override_label: None,
+    })
+    .map_err(|e| anyhow::anyhow!("dbt attach mode could not materialize the project: {e}"))?;
+
+    run_compile_with_options(
+        Some(&project_dir.join("rocky.toml")),
+        &scratch.path().join("state.redb"),
+        &project_dir.join("models"),
+        contracts_dir,
+        model_filter,
+        output_json,
+        do_expand_macros,
+        target_dialect,
+        false,
+        cache_ttl_override,
+        run_vars,
+        strict_sources,
+        deny_warning_codes,
+        selection,
+    )
 }
 
 /// Compile body shared by the JSON core ([`compile_output`]) and the text
@@ -455,11 +543,19 @@ fn compile_inner(
     }
 
     // Re-apply model filter to diagnostics (may now include E027).
+    // A diagnostic can quote a sidecar value (a target collision names the
+    // resolved target), so its text prints each resolved `${VAR}` value as
+    // `${NAME}` (#1919).
     let diagnostics: Vec<_> = result
         .diagnostics
         .iter()
         .filter(|d| in_scope(&d.model))
-        .cloned()
+        .map(|d| Diagnostic {
+            message: render_placeholders(&d.message).into(),
+            model: render_placeholders(&d.model),
+            suggestion: d.suggestion.as_deref().map(render_placeholders),
+            ..d.clone()
+        })
         .collect();
 
     let models_detail: Vec<ModelDetail> = result
@@ -478,18 +574,32 @@ fn compile_inner(
                     rocky_core::cost::Confidence::Low => "low".to_string(),
                 },
             });
-            ModelDetail {
-                name: model.config.name.clone(),
-                strategy: model.config.strategy.clone(),
+            // Sidecar values were `${VAR}`-expanded before parsing. Every
+            // field below except `target` is written with each resolved value
+            // as `${NAME}` (#1919). The copies are for printing only.
+            // `target` prints resolved on purpose: dagster-rocky matches the
+            // asset key it builds from it against `rocky run`'s `asset_key`,
+            // which carries the resolved coordinates.
+            let render = render_placeholders;
+            Ok(ModelDetail {
+                name: render(&model.config.name),
+                strategy: render_placeholders_in(&model.config.strategy)
+                    .context("failed to render the model strategy for output")?,
                 target: model.config.target.clone(),
-                freshness: model.config.freshness.clone(),
+                freshness: render_placeholders_in(&model.config.freshness)
+                    .context("failed to render the model freshness for output")?,
                 contract_source: model.contract_path.as_ref().map(|_| "auto".to_string()),
                 cost_hint,
-                depends_on: model.config.depends_on.clone(),
-                tags: model.config.tags.clone(),
-            }
+                depends_on: model.config.depends_on.iter().map(|d| render(d)).collect(),
+                tags: model
+                    .config
+                    .tags
+                    .iter()
+                    .map(|(k, v)| (render(k), render(v)))
+                    .collect(),
+            })
         })
-        .collect();
+        .collect::<Result<_>>()?;
 
     // Data the text renderer needs from the raw `CompileResult` but which is
     // not carried on `CompileOutput`: execution order, per-model typed-column
@@ -1404,6 +1514,64 @@ schema_template = "s"
             err.to_string().contains("compilation failed"),
             "expected bail, got: {err}"
         );
+    }
+
+    /// #1919: a sidecar value expanded from `${VAR}` prints only as `${NAME}`
+    /// in `rocky compile --output json` (`models_detail`), never as the value.
+    /// The target is the exception: it prints resolved, as `rocky run`'s
+    /// `asset_key` does.
+    #[test]
+    fn compile_output_prints_a_resolved_sidecar_value_as_its_placeholder() {
+        const SECRET: &str = "rocky_1919_compile_secret_d00d";
+        const CATALOG: &str = "rocky_1919_compile_catalog";
+        let dir = TempDir::new().unwrap();
+        let models_dir = dir.path().join("models");
+        fs::create_dir_all(&models_dir).unwrap();
+        fs::write(
+            models_dir.join("m1.sql"),
+            "SELECT 1 AS id, CURRENT_DATE AS ts",
+        )
+        .unwrap();
+        fs::write(
+            models_dir.join("m1.toml"),
+            "name = \"m1\"\n\n\
+             [strategy]\ntype = \"incremental\"\ntimestamp_column = \"${ROCKY_T1919_COMPILE}\"\n\n\
+             [target]\ncatalog = \"${ROCKY_T1919_COMPILE_CATALOG}\"\nschema = \"s\"\ntable = \"m1\"\n\n\
+             [tags]\nowner = \"${ROCKY_T1919_COMPILE}\"\n",
+        )
+        .unwrap();
+        // SAFETY: test-only; the variable name is unique to this test.
+        unsafe {
+            std::env::set_var("ROCKY_T1919_COMPILE", SECRET);
+            std::env::set_var("ROCKY_T1919_COMPILE_CATALOG", CATALOG);
+        }
+        let out = compile_output(
+            None,
+            &dir.path().join(".rocky-state.redb"),
+            &models_dir,
+            None,
+            None,
+            false,
+            None,
+            false,
+            None,
+        );
+        // SAFETY: as above.
+        unsafe {
+            std::env::remove_var("ROCKY_T1919_COMPILE");
+            std::env::remove_var("ROCKY_T1919_COMPILE_CATALOG");
+        }
+        let out = out.expect("compiles");
+        assert_eq!(out.models_detail.len(), 1, "PRECONDITION: the model loaded");
+        let json = serde_json::to_string(&out).unwrap();
+        assert!(!json.contains(SECRET), "leaked: {json}");
+        let detail = serde_json::to_value(&out.models_detail[0]).unwrap();
+        assert_eq!(detail["target"]["catalog"], CATALOG);
+        assert_eq!(
+            detail["strategy"]["timestamp_column"],
+            "${ROCKY_T1919_COMPILE}"
+        );
+        assert_eq!(detail["tags"]["owner"], "${ROCKY_T1919_COMPILE}");
     }
 
     #[test]

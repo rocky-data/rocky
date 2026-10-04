@@ -33,7 +33,15 @@ pub async fn state_reconcile_watermark(
         FinalizeDurability::Durable,
         config.cache.schemas.replicate,
     );
-    let authority = session.acquire().await?;
+    let authority = match session.acquire().await {
+        Ok(authority) => authority,
+        Err(e) => {
+            // A #1228 concurrency refusal (or misuse): consume the session so
+            // the Drop tripwire does not fire on a legitimate error exit.
+            session.abandon("reconcile-watermark acquire failed").await;
+            return Err(e.into());
+        }
+    };
     let result: Result<ReconcileWatermarkOutput> = async {
         anyhow::ensure!(
             authority == StateAuthority::Authoritative,

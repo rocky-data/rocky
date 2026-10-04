@@ -12,7 +12,7 @@
  *
  * **Scope:** `docs/adr/ADR-CONCURRENCY.md` governs. It *requires* every write of the shared state object to compare-and-swap, split by writer class (runs refuse on conflict; single-record ledger seams retry). That requirement covers the shared object only: the sibling objects written under their own keys — freeze markers, idempotency records, the doctor read/write probe — are create-once or self-keyed, cannot lose an update, and stay outside compare-and-swap by design rather than as a gap.
  *
- * `cas` satisfies that requirement for every writer of the shared object: the end-of-run upload, and the ledger seams — `rocky policy` freeze/unfreeze (whose markers are create-once and must never be replayed, so they stay outside the retry), `rocky gc`, `rocky restore`, and `rocky apply`'s governed rule decision and verify-after custody (#1242). The guarantee holds only when every writer sharing the `[state]` location runs with `cas`: one writer left on `off` still uploads unconditionally and can overwrite the others.
+ * `cas` satisfies that requirement for every writer of the shared object: the end-of-run upload, and the ledger seams — `rocky policy` freeze/unfreeze (whose markers are create-once and must never be replayed, so they stay outside the retry), `rocky gc`, `rocky restore`, and `rocky apply`'s governed rule decision and verify-after custody (#1242). The guarantee holds only when every writer sharing the `[state]` location runs with `cas`. To keep one writer left on `off` from overwriting the others, the first compare-and-swap upload creates a `cas-required` marker beside the state object, and an unconditional upload that finds the marker refuses (#1228).
  */
 export type ConcurrencyControl = "off" | "cas";
 /**
@@ -73,7 +73,7 @@ export interface SettingsOutput {
    */
   bind_host: string;
   /**
-   * `[state] concurrency_control`, read at the same moment as `state_backend`. `null` on the same condition.
+   * `[state] concurrency_control`, read at the same moment as `state_backend`: the explicit setting, or the backend default when it is unset (`cas` on `s3`, `gcs` and `tiered`; `off` on `local` and `valkey`). This is the requested mode — the writers' startup conditional-write probe is not run for it, so `rocky doctor` is where a store that falls back to `off` shows up. `null` on the same condition as `state_backend`.
    */
   concurrency_control?: ConcurrencyControl | null;
   /**
