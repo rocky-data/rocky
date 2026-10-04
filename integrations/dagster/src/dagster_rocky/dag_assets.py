@@ -6,7 +6,9 @@ Edges in the DAG become Dagster asset dependencies. Source, Load,
 Transformation, Seed, Quality, and Snapshot nodes are all represented.
 
 Test nodes are mapped to :class:`AssetCheckSpec` on their parent model
-rather than becoming standalone assets.
+rather than becoming standalone assets. Ephemeral transformation nodes get no
+asset at all (the engine inlines them and never runs them on their own); a
+consumer's dependency on one is mapped to the ephemeral model's upstreams.
 
 Usage::
 
@@ -101,32 +103,90 @@ def _shape_key_for_node(node: DagNodeOutput) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _is_ephemeral(node: DagNodeOutput) -> bool:
+    """True for a transformation node whose strategy is ``ephemeral``.
+
+    An ephemeral model is never materialized: the engine inlines its SQL into
+    every consumer, and ``rocky run --model <ephemeral>`` is refused (E038).
+    It therefore gets no asset; its consumers depend on its upstreams instead.
+    """
+    strategy = node.strategy
+    if strategy is None:
+        return False
+    kind = getattr(strategy, "type", None)
+    return str(getattr(kind, "value", kind)) == "ephemeral"
+
+
+def _resolve_through_ephemerals(
+    dep_ids: list[str],
+    node_by_id: dict[str, DagNodeOutput],
+    ephemeral_ids: set[str],
+) -> list[str]:
+    """Replace every ephemeral node id in ``dep_ids`` with its own upstreams.
+
+    Transitive (an ephemeral may read another ephemeral), order-preserving and
+    de-duplicated. The ``seen`` set guards against a malformed cyclic payload.
+    """
+    resolved: list[str] = []
+    seen: set[str] = set()
+    stack = list(reversed(dep_ids))
+    while stack:
+        dep_id = stack.pop()
+        if dep_id in seen:
+            continue
+        seen.add(dep_id)
+        if dep_id in ephemeral_ids:
+            node = node_by_id.get(dep_id)
+            stack.extend(reversed((node.depends_on or []) if node else []))
+            continue
+        resolved.append(dep_id)
+    return resolved
+
+
 def _build_column_lineage_metadata(
     model_edges: list[LineageEdgeRecord],
     node_id_to_key: dict[str, dg.AssetKey],
+    edges_by_target_model: dict[str, list[LineageEdgeRecord]] | None = None,
+    ephemeral_models: set[str] | None = None,
 ) -> dict[str, dg.TableColumnLineage] | None:
     """Build Dagster column lineage metadata from a model's lineage edges.
 
     ``model_edges`` are the edges whose target is this node's model, already
     bucketed by the caller (see ``edges_by_target_model``) so this is not an
     O(nodes × edges) rescan of the full edge list per node.
+
+    An edge whose source is an ephemeral model (which has no asset) is traced
+    through that model's own edges to the materialized columns it reads.
     """
     if not model_edges:
         return None
+    ephemeral_models = ephemeral_models or set()
+    edges_by_target_model = edges_by_target_model or {}
+
+    def _sources(model: str, column: str, seen: set[tuple[str, str]]) -> list[tuple[str, str]]:
+        if model not in ephemeral_models:
+            return [(model, column)]
+        if (model, column) in seen:
+            return []
+        seen.add((model, column))
+        found: list[tuple[str, str]] = []
+        for upstream in edges_by_target_model.get(model, []):
+            if upstream.target.column == column:
+                found.extend(_sources(upstream.source.model, upstream.source.column, seen))
+        return found
 
     deps_by_column: dict[str, list[dg.TableColumnDep]] = {}
     for edge in model_edges:
-        source_node_id = f"transformation:{edge.source.model}"
-        source_key = node_id_to_key.get(source_node_id)
-        if source_key is None:
-            source_key = node_id_to_key.get(f"seed:{edge.source.model}")
-        if source_key is None:
-            continue
-
         col = edge.target.column
-        deps_by_column.setdefault(col, []).append(
-            dg.TableColumnDep(asset_key=source_key, column_name=edge.source.column)
-        )
+        for source_model, source_column in _sources(edge.source.model, edge.source.column, set()):
+            source_key = node_id_to_key.get(f"transformation:{source_model}")
+            if source_key is None:
+                source_key = node_id_to_key.get(f"seed:{source_model}")
+            if source_key is None:
+                continue
+            dep = dg.TableColumnDep(asset_key=source_key, column_name=source_column)
+            if dep not in deps_by_column.setdefault(col, []):
+                deps_by_column[col].append(dep)
 
     if not deps_by_column:
         return None
@@ -150,10 +210,15 @@ def build_dag_specs(
 
     Returns:
         A tuple of (specs, node_id_to_asset_key_map). Test nodes are excluded
-        from specs (they map to asset checks instead).
+        from specs (they map to asset checks instead). Ephemeral transformation
+        nodes are excluded too: nothing materializes them, so a consumer's
+        dependency on one is mapped to the ephemeral model's own upstreams.
     """
     node_id_to_key: dict[str, dg.AssetKey] = {}
     column_lineage_edges = dag_result.column_lineage or []
+    node_by_id: dict[str, DagNodeOutput] = {node.id: node for node in dag_result.nodes}
+    ephemeral_ids = {node.id for node in dag_result.nodes if _is_ephemeral(node)}
+    ephemeral_models = {node_by_id[i].label for i in ephemeral_ids}
 
     # Bucket lineage edges by target model once (O(edges)) so the per-node
     # metadata build below is an O(1) dict lookup rather than a full rescan of
@@ -189,7 +254,7 @@ def build_dag_specs(
     # `get_dag_node_asset_key` is not refused for a collision it does not have.
     key_to_node_ids: dict[dg.AssetKey, list[str]] = defaultdict(list)
     for node in dag_result.nodes:
-        if node.kind == "test":
+        if node.kind == "test" or node.id in ephemeral_ids:
             continue
         key = translator.get_dag_node_asset_key(node)
         node_id_to_key[node.id] = key
@@ -221,12 +286,12 @@ def build_dag_specs(
     # Second pass: build specs with resolved dependencies.
     specs: list[dg.AssetSpec] = []
     for node in dag_result.nodes:
-        if node.kind == "test":
+        if node.kind == "test" or node.id in ephemeral_ids:
             continue
 
         key = node_id_to_key[node.id]
 
-        deps_list = node.depends_on or []
+        deps_list = _resolve_through_ephemerals(node.depends_on or [], node_by_id, ephemeral_ids)
         deps = [node_id_to_key[dep_id] for dep_id in deps_list if dep_id in node_id_to_key]
 
         metadata: dict[str, object] = {
@@ -239,6 +304,8 @@ def build_dag_specs(
         col_lineage_meta = _build_column_lineage_metadata(
             edges_by_target_model.get(node.label, []),
             node_id_to_key,
+            edges_by_target_model,
+            ephemeral_models,
         )
         if col_lineage_meta:
             metadata.update(col_lineage_meta)

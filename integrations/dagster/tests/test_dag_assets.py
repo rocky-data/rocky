@@ -778,3 +778,96 @@ def test_transformation_execution_names_the_nodes_own_pipeline():
         call.args[0]: call.kwargs.get("pipeline") for call in mock_rocky.run_model.call_args_list
     }
     assert by_model == {"one": "alpha", "two": "beta"}, by_model
+
+
+# ---------------------------------------------------------------------------
+# Ephemeral models
+# ---------------------------------------------------------------------------
+
+
+def _ephemeral_chain_dag() -> DagResult:
+    """``raw (seed) -> eph_a (ephemeral) -> eph_b (ephemeral) -> fct``."""
+    return _make_dag_result(
+        nodes=[
+            {
+                "id": "seed:raw",
+                "kind": "seed",
+                "label": "raw",
+                "target": {"catalog": "w", "schema": "s", "table": "raw"},
+            },
+            {
+                "id": "transformation:eph_a",
+                "kind": "transformation",
+                "label": "eph_a",
+                "target": {"catalog": "w", "schema": "s", "table": "eph_a"},
+                "strategy": {"type": "ephemeral"},
+                "depends_on": ["seed:raw"],
+            },
+            {
+                "id": "transformation:eph_b",
+                "kind": "transformation",
+                "label": "eph_b",
+                "target": {"catalog": "w", "schema": "s", "table": "eph_b"},
+                "strategy": {"type": "ephemeral"},
+                "depends_on": ["transformation:eph_a"],
+            },
+            {
+                "id": "transformation:fct",
+                "kind": "transformation",
+                "label": "fct",
+                "target": {"catalog": "w", "schema": "s", "table": "fct"},
+                "strategy": {"type": "full_refresh"},
+                "depends_on": ["transformation:eph_b"],
+            },
+        ],
+        column_lineage=[
+            {
+                "source": {"model": "raw", "column": "amount"},
+                "target": {"model": "eph_a", "column": "amount"},
+                "transform": "direct",
+            },
+            {
+                "source": {"model": "eph_a", "column": "amount"},
+                "target": {"model": "eph_b", "column": "amt"},
+                "transform": "direct",
+            },
+            {
+                "source": {"model": "eph_b", "column": "amt"},
+                "target": {"model": "fct", "column": "total"},
+                "transform": "expression",
+            },
+        ],
+    )
+
+
+def test_ephemeral_nodes_get_no_asset_and_lineage_passes_through_them():
+    """An ephemeral model is never materialized (``rocky run --model`` on it
+    is E038), so it gets no asset. Its consumer depends on, and traces column
+    lineage to, the ephemeral model's own materialized upstream."""
+    specs, node_map = build_dag_specs(_ephemeral_chain_dag(), translator=RockyDagsterTranslator())
+    raw_key = node_map["seed:raw"]
+    fct_key = dg.AssetKey(["w", "s", "fct"])
+    assert {s.key for s in specs} == {raw_key, fct_key}
+    assert "transformation:eph_a" not in node_map
+    assert "transformation:eph_b" not in node_map
+
+    fct = next(s for s in specs if s.key == fct_key)
+    assert {dep.asset_key for dep in fct.deps} == {raw_key}
+    lineage = fct.metadata["dagster/column_lineage"]
+    assert lineage.deps_by_column["total"] == [
+        dg.TableColumnDep(asset_key=raw_key, column_name="amount")
+    ]
+
+
+def test_materializing_the_dag_never_runs_an_ephemeral_model():
+    from unittest.mock import MagicMock
+
+    mock_rocky = MagicMock()
+    mock_rocky.run_model.return_value = _dag_run_result(status="Success")
+    assets = build_dag_multi_assets(
+        _ephemeral_chain_dag(), rocky=mock_rocky, translator=RockyDagsterTranslator()
+    )
+    result = dg.materialize(assets, raise_on_error=False)
+    assert result.success
+    run_models = sorted(call.args[0] for call in mock_rocky.run_model.call_args_list)
+    assert run_models == ["fct"]

@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **DAG assets skip ephemeral models.** `build_dag_specs` / `build_dag_multi_assets` no longer create an asset for a `type = "ephemeral"` transformation node, which `rocky run --model` refuses with `E038`. A consumer's dependency and column lineage on an ephemeral model map to that model's own upstreams.
+
 ## [1.68.0] — 2026-10-03
 
 Pairs with engine 1.76.0 and `rocky-sdk` 0.17.0.
