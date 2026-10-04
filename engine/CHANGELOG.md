@@ -24,6 +24,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **Experimental:** `rocky compile --dbt-project <DIR>` compiles a dbt project in place (attach mode). It reads `<DIR>/target/manifest.json` and `run_results.json` on every run and writes nothing under `<DIR>`. It refuses what `rocky import-dbt` refuses, with the same reasons, and refuses any manifest schema other than `v12` by name.
+- `rocky profile <model> --sample N` returns up to N distinct non-null values per column, as `sample_values`. N is at most 100. Rocky picks the values by a hash of each value, so a re-run on unchanged data returns the same values. Unlike `observed_values`, it covers high-cardinality columns. DuckDB only, like the rest of `rocky profile`. Without `--sample` the output is unchanged.
 
 ## [1.76.0] — 2026-10-03
 

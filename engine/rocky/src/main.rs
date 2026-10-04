@@ -1628,6 +1628,13 @@ enum Command {
         /// Profile only this column (default: every column)
         #[arg(long)]
         column: Option<String>,
+        /// Also return up to N distinct non-null values per column
+        /// (`sample_values`, at most 100), chosen pseudo-randomly by a hash of
+        /// each value, so a re-run on unchanged data returns the same values.
+        /// Default 0: no row values beyond min/max and the low-cardinality
+        /// domain.
+        #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u32).range(0..=100))]
+        sample: u32,
         /// Models directory (compiled to obtain the model's inferred schema)
         #[arg(long, default_value = "models")]
         models: String,
@@ -4498,6 +4505,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
         Command::Profile {
             model,
             column,
+            sample,
             models,
         } => {
             rocky_cli::commands::run_profile(
@@ -4506,6 +4514,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                 &models,
                 &model,
                 column.as_deref(),
+                sample,
                 json,
                 cli.cache_ttl,
             )
