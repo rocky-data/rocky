@@ -478,6 +478,12 @@ pub fn compile_project(
     diagnostics.extend(lakehouse_diagnostics);
     diagnostics.extend(run_var_diagnostics);
     diagnostics.extend(target_collision_diagnostics(&project));
+    diagnostics.extend(crate::governance::governance_diagnostics(
+        &project,
+        &config.models_dir,
+        rocky_core::model_governance::governance_today(),
+    ));
+    crate::governance::drop_latest_alias_star_noise(&project, &mut diagnostics);
     // Dependency-resolution warnings (D011 depends_on mismatch, D012 an edge
     // derived from a name match a warehouse run does not honour). Produced by
     // `resolve::resolve_dependencies` and parked on the project until now;
@@ -716,6 +722,12 @@ pub fn compile_incremental(
     diagnostics.extend(lakehouse_diagnostics);
     diagnostics.extend(run_var_diagnostics);
     diagnostics.extend(target_collision_diagnostics(&project));
+    diagnostics.extend(crate::governance::governance_diagnostics(
+        &project,
+        &config.models_dir,
+        rocky_core::model_governance::governance_today(),
+    ));
+    crate::governance::drop_latest_alias_star_noise(&project, &mut diagnostics);
     // Dependency-resolution warnings (D011 depends_on mismatch, D012 an edge
     // derived from a name match a warehouse run does not honour). Produced by
     // `resolve::resolve_dependencies` and parked on the project until now;

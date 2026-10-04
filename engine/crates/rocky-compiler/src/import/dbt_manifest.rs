@@ -29,6 +29,23 @@ pub struct DbtManifest {
     /// Counts of resource classes the importer does not translate, captured at
     /// parse time so the sweep can report them.
     pub dropped: DbtDroppedCounts,
+    /// dbt `groups`, keyed by group name, with their owners.
+    pub groups: std::collections::BTreeMap<String, rocky_core::model_governance::GroupOwner>,
+}
+
+/// dbt model governance on a manifest node: access, group, and version.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct DbtNodeGovernance {
+    /// `private`, `protected` or `public`, as dbt wrote it.
+    pub access: Option<String>,
+    /// dbt group name.
+    pub group: Option<String>,
+    /// The node's version, as dbt wrote it (`1`, `"2"`, `1.5`, ...).
+    pub version: Option<String>,
+    /// The model's latest version, as dbt wrote it.
+    pub latest_version: Option<String>,
+    /// Deprecation date (`YYYY-MM-DD`, possibly with a time part).
+    pub deprecation_date: Option<String>,
 }
 
 /// Counts of dbt resource classes the importer skips. Surfaced (not silently
@@ -71,6 +88,8 @@ pub struct DbtManifestNode {
     /// the importer matches against it to rewrite compiled upstream refs back
     /// to bare Rocky model names. `None` on manifests that predate the field.
     pub relation_name: Option<String>,
+    /// Access, group and version (dbt model governance).
+    pub governance: DbtNodeGovernance,
 }
 
 /// Dependency information for a manifest node.
@@ -224,6 +243,24 @@ struct RawManifest {
     semantic_models: HashMap<String, serde_json::Value>,
     #[serde(default)]
     exposures: HashMap<String, serde_json::Value>,
+    #[serde(default)]
+    groups: HashMap<String, RawGroup>,
+}
+
+#[derive(Deserialize, Default)]
+struct RawGroup {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    owner: Option<RawGroupOwner>,
+}
+
+#[derive(Deserialize, Default)]
+struct RawGroupOwner {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    email: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -354,6 +391,16 @@ struct RawNode {
     database: Option<String>,
     #[serde(default)]
     relation_name: Option<String>,
+    #[serde(default)]
+    access: Option<String>,
+    #[serde(default)]
+    group: Option<String>,
+    #[serde(default)]
+    version: Option<serde_json::Value>,
+    #[serde(default)]
+    latest_version: Option<serde_json::Value>,
+    #[serde(default)]
+    deprecation_date: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -411,6 +458,10 @@ struct RawNodeConfig {
     /// `contract` — dbt model contract enforcement block.
     #[serde(default)]
     contract: Option<RawContract>,
+    #[serde(default)]
+    access: Option<String>,
+    #[serde(default)]
+    group: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -520,7 +571,24 @@ pub fn parse_manifest(path: &Path) -> Result<DbtManifest, String> {
         .map(|(id, ut)| (id, convert_unit_test(ut)))
         .collect();
 
+    let groups = raw
+        .groups
+        .into_values()
+        .filter(|g| !g.name.is_empty())
+        .map(|g| {
+            let owner = g.owner.unwrap_or_default();
+            (
+                g.name,
+                rocky_core::model_governance::GroupOwner {
+                    name: owner.name.filter(|s| !s.is_empty()),
+                    email: owner.email.filter(|s| !s.is_empty()),
+                },
+            )
+        })
+        .collect();
+
     Ok(DbtManifest {
+        groups,
         metadata,
         full_refresh_compiled,
         successfully_compiled_nodes,
@@ -575,9 +643,32 @@ fn rows_from_json(v: serde_json::Value) -> Vec<serde_json::Value> {
     }
 }
 
+/// A manifest version value (`1`, `"2"`, `1.5`) as text. `None` for null.
+fn json_version(v: Option<serde_json::Value>) -> Option<String> {
+    match v? {
+        serde_json::Value::Null => None,
+        serde_json::Value::String(s) if s.is_empty() => None,
+        serde_json::Value::String(s) => Some(s),
+        other => Some(other.to_string()),
+    }
+}
+
 fn convert_node(raw: RawNode) -> DbtManifestNode {
     let depends_on = raw.depends_on.unwrap_or_default();
     let config = raw.config.unwrap_or_default();
+    let governance = DbtNodeGovernance {
+        access: raw
+            .access
+            .or_else(|| config.access.clone())
+            .filter(|s| !s.is_empty()),
+        group: raw
+            .group
+            .or_else(|| config.group.clone())
+            .filter(|s| !s.is_empty()),
+        version: json_version(raw.version),
+        latest_version: json_version(raw.latest_version),
+        deprecation_date: raw.deprecation_date.filter(|s| !s.is_empty()),
+    };
 
     let unique_key = config.unique_key.and_then(|v| match v {
         serde_json::Value::String(s) => Some(UniqueKeyValue::Single(s)),
@@ -670,6 +761,7 @@ fn convert_node(raw: RawNode) -> DbtManifestNode {
         schema: raw.schema.unwrap_or_default(),
         database: raw.database.unwrap_or_default(),
         relation_name: raw.relation_name.filter(|s| !s.is_empty()),
+        governance,
     }
 }
 

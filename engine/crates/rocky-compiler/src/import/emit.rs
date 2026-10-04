@@ -107,6 +107,8 @@ pub fn emit_repo(inputs: &EmitInputs<'_>) -> Result<EmissionResult, String> {
         }
     }
 
+    write_governance_files(&inputs.import.imported, &models_dir)?;
+
     write_models_defaults(&models_dir, inputs.default_catalog, inputs.default_schema)?;
 
     let rocky_toml_path = inputs.out_dir.join("rocky.toml");
@@ -156,6 +158,99 @@ pub fn emit_repo(inputs: &EmitInputs<'_>) -> Result<EmissionResult, String> {
         rocky_toml_path,
         unknown_materializations,
     })
+}
+
+/// Write the governance files dbt kept outside model files:
+///
+/// - `models/groups/<group>.toml` with an `[owner]` table, for each dbt group
+///   that has an owner and is used by an imported model;
+/// - `models/<name>.toml`, one version declaration per versioned dbt model.
+///   When the latest version already materializes to `<name>` (a dbt `alias`),
+///   the declaration sets `latest_alias = false` so the alias view does not
+///   collide with it.
+fn write_governance_files(models: &[ImportedModel], models_dir: &Path) -> Result<(), String> {
+    use std::collections::BTreeMap;
+
+    let mut owners: BTreeMap<&str, &rocky_core::model_governance::GroupOwner> = BTreeMap::new();
+    // base name -> (latest, [(v, deprecation)], latest target table)
+    // (version, deprecation date) entries of one versioned model.
+    type VersionEntries = Vec<(u32, Option<String>)>;
+    let mut versions: BTreeMap<&str, (u32, VersionEntries)> = BTreeMap::new();
+    let mut latest_tables: BTreeMap<&str, &str> = BTreeMap::new();
+    for m in models {
+        let gov = &m.config.governance;
+        if let (Some(g), Some(owner)) = (gov.access_group.as_deref(), gov.owner.as_ref()) {
+            owners.insert(g, owner);
+        }
+        if let Some(info) = &gov.version
+            && let Some(v) = info.version
+        {
+            let entry = versions
+                .entry(info.model.as_str())
+                .or_insert((info.latest_version, Vec::new()));
+            entry
+                .1
+                .push((v, info.deprecation_date.map(|d| d.to_string())));
+            if v == info.latest_version {
+                latest_tables.insert(info.model.as_str(), m.config.target.table.as_str());
+            }
+        }
+    }
+
+    if !owners.is_empty() {
+        let groups_dir = models_dir.join("groups");
+        std::fs::create_dir_all(&groups_dir)
+            .map_err(|e| format!("failed to create {}: {e}", groups_dir.display()))?;
+        for (group, owner) in owners {
+            if !is_safe_model_file_stem(group) {
+                return Err(format!("dbt group name {group:?} is not a safe file name"));
+            }
+            let mut body = String::from("# Imported from a dbt group definition.\n[owner]\n");
+            if let Some(n) = &owner.name {
+                body.push_str(&format!("name = \"{}\"\n", toml_escape(n)));
+            }
+            if let Some(e) = &owner.email {
+                body.push_str(&format!("email = \"{}\"\n", toml_escape(e)));
+            }
+            let path = groups_dir.join(format!("{group}.toml"));
+            std::fs::write(&path, body)
+                .map_err(|e| format!("failed to write {}: {e}", path.display()))?;
+        }
+    }
+
+    for (base, (latest, mut entries)) in versions {
+        if !is_safe_model_file_stem(base) {
+            return Err(format!("dbt model name {base:?} is not a safe file name"));
+        }
+        // An unversioned model with the same name would make `<base>.toml`
+        // its sidecar, not a declaration.
+        if models.iter().any(|m| m.name == base) {
+            continue;
+        }
+        entries.sort_by_key(|(v, _)| *v);
+        entries.dedup_by_key(|(v, _)| *v);
+        let mut body = format!(
+            "# Version declaration for the versioned dbt model `{base}`. Each version is\n\
+             # the model `{base}_v<N>`; `{base}` itself reads the latest version.\n\
+             latest_version = {latest}\n"
+        );
+        if latest_tables.get(base) == Some(&base) {
+            body.push_str(
+                "# The latest version already materializes to this name (dbt alias).\n\
+                 latest_alias = false\n",
+            );
+        }
+        for (v, deprecation) in entries {
+            body.push_str(&format!("\n[[versions]]\nv = {v}\n"));
+            if let Some(d) = deprecation {
+                body.push_str(&format!("deprecation_date = \"{d}\"\n"));
+            }
+        }
+        let path = models_dir.join(format!("{base}.toml"));
+        std::fs::write(&path, body)
+            .map_err(|e| format!("failed to write {}: {e}", path.display()))?;
+    }
+    Ok(())
 }
 
 fn clone_model(m: &ImportedModel) -> ImportedModel {
@@ -338,6 +433,14 @@ fn render_model_sidecar(config: &ModelConfig) -> String {
     }
     if let Some(intent) = &config.intent {
         out.push_str(&format!("intent = \"{}\"\n", toml_escape(intent)));
+    }
+    // dbt `access` / `group`. A version's access is written per version file;
+    // the shared declaration does not repeat it.
+    if let Some(access) = config.governance.access {
+        out.push_str(&format!("access = \"{access}\"\n"));
+    }
+    if let Some(group) = &config.governance.access_group {
+        out.push_str(&format!("access_group = \"{}\"\n", toml_escape(group)));
     }
     out.push('\n');
 

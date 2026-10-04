@@ -121,6 +121,29 @@ pub struct ModelGovernanceConfig {
     /// strings, used verbatim — no prefix is applied.
     #[serde(default)]
     pub tags: std::collections::BTreeMap<String, String>,
+    /// Resolved access level from the sidecar's top-level `access` key.
+    /// `None` means the key was not set: the model is `protected`. See
+    /// [`crate::model_governance`].
+    #[serde(default, skip_deserializing, skip_serializing_if = "Option::is_none")]
+    pub access: Option<crate::model_governance::ModelAccess>,
+    /// Resolved ownership group: the top-level `access_group` key, else the
+    /// model's config `group`. Consulted only for `private` models.
+    #[serde(default, skip_deserializing, skip_serializing_if = "Option::is_none")]
+    pub access_group: Option<String>,
+    /// Owner of [`Self::access_group`], from that group file's `[owner]`.
+    #[serde(default, skip_deserializing, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<crate::model_governance::GroupOwner>,
+    /// Version metadata, set on the models of a version declaration and on
+    /// the latest alias. See [`crate::model_governance::apply_versions`].
+    #[serde(default, skip_deserializing, skip_serializing_if = "Option::is_none")]
+    pub version: Option<crate::model_governance::ModelVersionInfo>,
+}
+
+impl ModelGovernanceConfig {
+    /// The effective access level (`protected` when unset).
+    pub fn effective_access(&self) -> crate::model_governance::ModelAccess {
+        self.access.unwrap_or_default()
+    }
 }
 
 /// TOML frontmatter in a model SQL file.
@@ -583,6 +606,16 @@ pub struct RawModelConfig {
     /// [`TestDecl`]s and appended to `tests` at load.
     #[serde(default)]
     pub use_test: Vec<TestRef>,
+
+    /// Access level: `private`, `protected` (the default) or `public`. See
+    /// [`crate::model_governance`].
+    #[serde(default)]
+    pub access: Option<crate::model_governance::ModelAccess>,
+
+    /// Ownership group for access checks. Falls back to `group` when unset.
+    /// Unlike `group`, it inherits no config; it names who owns the model.
+    #[serde(default)]
+    pub access_group: Option<String>,
 }
 
 /// The exact existing object kind a model owner permits Rocky to drop.
@@ -798,6 +831,11 @@ pub struct GroupConfig {
     /// overridable defaults unless the author opts in).
     #[serde(default)]
     pub enforce: bool,
+    /// Accountable owner of the group (`[owner] name = "...", email = "..."`).
+    /// Shown for every model whose ownership group is this group, in
+    /// `rocky docs` and `rocky catalog`.
+    #[serde(default)]
+    pub owner: Option<crate::model_governance::GroupOwner>,
 }
 
 /// Load config groups from `<models_dir>/groups/*.toml`. Each file defines one
@@ -1075,8 +1113,17 @@ fn resolve_model_config(
     // the Dagster-only `[tags]` above.
     let mut governance_tags = group.map(|g| g.governance.tags.clone()).unwrap_or_default();
     governance_tags.extend(raw.governance.tags);
+    // Ownership group: an explicit `access_group`, else the config `group`.
+    // Only a `private` model consults it, so the fallback changes nothing for
+    // a project that predates access levels.
+    let access_group = raw.access_group.clone().or_else(|| raw.group.clone());
+    let owner = crate::model_governance::owner_of(access_group.as_deref(), ctx.groups);
     let governance = ModelGovernanceConfig {
         tags: governance_tags,
+        access: raw.access,
+        access_group,
+        owner,
+        version: None,
     };
 
     // Enforcement: when the group sets `enforce = true`, a member model may not
@@ -1707,6 +1754,12 @@ pub fn load_models_from_dir_filtered(
             }
         })
         .collect::<Result<Vec<_>, _>>()?;
+
+    // Model versions: stamp version metadata, rewrite `<name>@v<N>` pins and
+    // add each declaration's latest alias. A directory with no declaration
+    // only has its (rare) `@v` pins rewritten.
+    let version_decls = crate::model_governance::load_version_decls_from_dir(dir)?;
+    crate::model_governance::apply_versions(&mut models, &version_decls, ctx.groups);
 
     models.sort_unstable_by(|a, b| a.config.name.cmp(&b.config.name));
     Ok(models)

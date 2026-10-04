@@ -53,6 +53,10 @@ export interface CatalogAsset {
    */
   fqn: string;
   /**
+   * Access level, ownership and version, when the model declares any of them. Absent for sources and for models with no governance keys.
+   */
+  governance?: CatalogGovernance | null;
+  /**
    * Free-form natural-language description of the asset's purpose, when supplied via the model's sidecar config.
    */
   intent?: string | null;
@@ -96,6 +100,44 @@ export interface CatalogColumn {
    * Whether the column accepts nulls, when known.
    */
   nullable?: boolean | null;
+  [k: string]: unknown;
+}
+/**
+ * Model governance on a [`CatalogAsset`]: access level, ownership group and owner, and model version.
+ */
+export interface CatalogGovernance {
+  /**
+   * `private`, `protected` (the default) or `public`.
+   */
+  access: string;
+  /**
+   * Deprecation date of this version (`YYYY-MM-DD`).
+   */
+  deprecation_date?: string | null;
+  /**
+   * Ownership group (`access_group`, else the config `group`).
+   */
+  group?: string | null;
+  /**
+   * The latest version of [`Self::versioned_model`].
+   */
+  latest_version?: number | null;
+  /**
+   * Group owner's email, from the group file's `[owner]`.
+   */
+  owner_email?: string | null;
+  /**
+   * Group owner's name, from the group file's `[owner]`.
+   */
+  owner_name?: string | null;
+  /**
+   * This model's version. Absent on the latest alias.
+   */
+  version?: number | null;
+  /**
+   * Unversioned model name, for a model version or the latest alias.
+   */
+  versioned_model?: string | null;
   [k: string]: unknown;
 }
 /**

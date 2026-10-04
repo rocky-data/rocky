@@ -56,6 +56,8 @@ The `.toml` file names the model, lists what it depends on, picks a materializat
 | `drop_existing_kind` | `"table"` or `"view"` | No | Standing permission to drop a target of this existing kind when switching between `full_refresh` and `view`. DuckDB only today. |
 | `depends_on` | list of strings | No | Names of upstream models that must run before this one. Defaults to `[]`. |
 | `group` | string | No | Name of a [config group](#config-groups) (`models/groups/<name>.toml`) this model opts into for shared routing and materialization. |
+| `access` | string | No | `private`, `protected` (default) or `public`. Who may reference the model. See [Model governance](/concepts/model-governance/). |
+| `access_group` | string | No | Ownership group for access checks. Falls back to `group`. Inherits no config. See [Model governance](/concepts/model-governance/#ownership-groups-and-owners). |
 | `retention` | string | No | Data retention policy for this model. Grammar `^\d+[dy]$` — e.g. `"90d"` or `"1y"`. See [Retention](#retention). |
 
 `drop_existing_kind` applies only when a `full_refresh` model finds a view, or a `view` model finds a table. Rocky checks the existing kind before using the permission. On DuckDB, the DROP and CREATE run in one transaction. Rocky refuses a `full_refresh` or `view` model carrying this key on every other adapter. The key is a standing permission on the model, not a one-time approval. Rocky keeps no ownership record for the old object; confirm the target belongs to this model before setting the key.
@@ -249,7 +251,7 @@ tier = "gold"
 
 A model's own `[tags]` override the group key by key, without dropping the rest. One model can set `tier = "silver"` and still inherit `domain = "finance"`. See [`[tags]`](#tags) for how the resolved tags surface on `models_detail[].tags` and project onto Dagster assets.
 
-A group file may carry `schema_template`, `strategy`, `tags`, `governance`, and `enforce`. Rocky rejects an unrecognized key at load, so a typo surfaces immediately.
+A group file may carry `schema_template`, `strategy`, `tags`, `governance`, `enforce`, and `[owner]` (`name`, `email`; see [Model governance](/concepts/model-governance/#ownership-groups-and-owners)). Rocky rejects an unrecognized key at load, so a typo surfaces immediately.
 
 ### `[classification]`
 

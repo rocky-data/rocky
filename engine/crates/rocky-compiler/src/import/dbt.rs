@@ -404,6 +404,7 @@ pub fn import_from_manifest(
             manifest.full_refresh_compiled,
             &manifest.successfully_compiled_nodes,
             &model_relations,
+            &manifest.groups,
             &mut result,
         );
     }
@@ -845,12 +846,20 @@ fn resolve_node_coords(
     } else {
         node.database.clone()
     };
+    // dbt's default relation for version N of a versioned model is
+    // `<name>_v<N>`, which is also the Rocky model name.
     let table = node
         .config
         .alias
         .clone()
-        .unwrap_or_else(|| node.name.clone());
+        .unwrap_or_else(|| manifest_rocky_name(node).unwrap_or_else(|_| node.name.clone()));
     (catalog, schema, table)
+}
+
+/// Rocky model name of a manifest node: `<name>_v<N>` for a versioned dbt
+/// model, else the node name. Errors on a version that is not a whole number.
+fn manifest_rocky_name(node: &DbtManifestNode) -> Result<String, String> {
+    super::dbt_governance::rocky_model_name(&node.name, node.governance.version.as_deref())
 }
 
 /// Build the upstream-model lookup keyed by dbt `unique_id`. Only `model.*`
@@ -868,7 +877,7 @@ fn build_model_relation_map(
             (
                 id.clone(),
                 UpstreamModel {
-                    bare_name: node.name.clone(),
+                    bare_name: manifest_rocky_name(node).unwrap_or_else(|_| node.name.clone()),
                     fqn_candidates: relation_candidates(node, default_target),
                 },
             )
@@ -996,6 +1005,7 @@ fn is_relation_ident_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '_'
 }
 
+#[allow(clippy::too_many_arguments)]
 fn import_manifest_node(
     node: &DbtManifestNode,
     default_target: &TargetConfig,
@@ -1003,12 +1013,25 @@ fn import_manifest_node(
     manifest_full_refresh_compiled: bool,
     successfully_compiled_nodes: &std::collections::HashSet<String>,
     model_relations: &HashMap<String, UpstreamModel>,
+    groups: &std::collections::BTreeMap<String, rocky_core::model_governance::GroupOwner>,
     result: &mut ImportResult,
 ) {
+    // A versioned dbt model (`version: N`) becomes the Rocky model
+    // `<name>_v<N>`; the emitter writes the shared version declaration.
+    let rocky_name = match manifest_rocky_name(node) {
+        Ok(name) => name,
+        Err(reason) => {
+            result.failed.push(ImportFailure {
+                name: node.name.clone(),
+                reason,
+            });
+            return;
+        }
+    };
     if node.config.materialized == "incremental" {
         if node.config.full_refresh == Some(false) {
             result.failed.push(ImportFailure {
-                name: node.name.clone(),
+                name: rocky_name.clone(),
                 reason: INCREMENTAL_FULL_REFRESH_DISABLED.to_string(),
             });
             return;
@@ -1018,7 +1041,7 @@ fn import_manifest_node(
             || node.compiled_code.is_none()
         {
             result.failed.push(ImportFailure {
-                name: node.name.clone(),
+                name: rocky_name.clone(),
                 reason: INCREMENTAL_COMPILE_EVIDENCE_REFUSED.to_string(),
             });
             return;
@@ -1123,14 +1146,39 @@ fn import_manifest_node(
     // points at an out-of-tree macro the user needs to hand-port.
     collect_unresolvable_macros(&sql, &node.name, result);
 
-    // Map dependencies
-    let depends_on = dbt_manifest::depends_on_to_rocky(&node.depends_on.nodes);
+    // Map dependencies. Resolve through the relation map first so a versioned
+    // upstream (`model.p.orders.v1`) maps to `orders_v1`, not to `v1`.
+    let depends_on = node
+        .depends_on
+        .nodes
+        .iter()
+        .filter(|id| id.starts_with("model."))
+        .map(|id| match model_relations.get(id) {
+            Some(upstream) => upstream.bare_name.clone(),
+            None => dbt_manifest::extract_model_name(id).to_string(),
+        })
+        .collect();
 
     // Use description as intent
     let intent = node.description.clone();
 
+    // dbt model governance: access, group (+ owner), version.
+    let (governance, governance_warnings) = super::dbt_governance::governance_from_dbt(
+        &super::dbt_governance::DbtGovernanceInput {
+            name: &node.name,
+            rocky_name: &rocky_name,
+            access: node.governance.access.as_deref(),
+            group: node.governance.group.as_deref(),
+            version: node.governance.version.as_deref(),
+            latest_version: node.governance.latest_version.as_deref(),
+            deprecation_date: node.governance.deprecation_date.as_deref(),
+        },
+        groups,
+    );
+    result.warnings.extend(governance_warnings);
+
     let config = ModelConfig {
-        name: node.name.clone(),
+        name: rocky_name.clone(),
         depends_on,
         strategy,
         target: TargetConfig {
@@ -1147,7 +1195,7 @@ fn import_manifest_node(
         format_options: None,
         classification: Default::default(),
         tags: dbt_tags_to_map(&node.tags),
-        governance: Default::default(),
+        governance,
         retention: None,
         budget: None,
         skip: None,
@@ -1156,7 +1204,7 @@ fn import_manifest_node(
     };
 
     result.imported.push(ImportedModel {
-        name: node.name.clone(),
+        name: rocky_name,
         sql: sql.trim().to_string(),
         config,
         unit_tests: Vec::new(),
@@ -1978,6 +2026,23 @@ pub fn import_dbt_project(
         );
         model_yamls.extend(parsed);
     }
+    // dbt governance from YAML: access, group (+ owners), versions. A versioned
+    // model whose versions are plain `<name>_v<N>.sql` files with no
+    // per-version overrides imports as-is; any other versioned model still
+    // needs the manifest and stays refused.
+    let mut yaml_governance = super::dbt_governance::YamlGovernance::default();
+    for dir in &model_dirs {
+        super::dbt_governance::parse_governance_yamls(dir, &mut yaml_governance);
+    }
+    let mut simple_versions: HashMap<String, (String, u32)> = HashMap::new();
+    for (name, gov) in &yaml_governance.models {
+        if let Some(stems) = gov.simple_versions(name) {
+            for (stem, v) in stems {
+                versioned_names.remove(&stem);
+                simple_versions.insert(stem, (name.clone(), v));
+            }
+        }
+    }
     let settings = RawModelSettings {
         project: &project_config,
         model_yamls: &model_yamls,
@@ -1997,6 +2062,8 @@ pub fn import_dbt_project(
             )?;
         }
     }
+
+    apply_yaml_governance(&mut result, &yaml_governance, &simple_versions);
 
     // Phase 2: Scan model YAML files for test definitions and convert them
     // to canonical Rocky `[[tests]]` (`TestDecl`) entries on each imported
@@ -2018,6 +2085,58 @@ pub fn import_dbt_project(
     }
 
     Ok(result)
+}
+
+/// Attach YAML-declared access, group and version metadata to raw-imported
+/// models. `simple_versions` maps a version file stem to `(model, version)`.
+fn apply_yaml_governance(
+    result: &mut ImportResult,
+    yaml: &super::dbt_governance::YamlGovernance,
+    simple_versions: &HashMap<String, (String, u32)>,
+) {
+    for model in &mut result.imported {
+        let (base, version) = match simple_versions.get(&model.name) {
+            Some((base, v)) => (base.as_str(), Some(v.to_string())),
+            None => (model.name.as_str(), None),
+        };
+        let Some(gov) = yaml.models.get(base) else {
+            continue;
+        };
+        let version_entry = version.as_deref().and_then(|v| {
+            gov.versions.iter().find(|e| {
+                super::dbt_governance::parse_version(&e.v)
+                    .map(|n| n.to_string())
+                    .as_deref()
+                    == Some(v)
+            })
+        });
+        let latest = gov.latest_version.clone().or_else(|| {
+            gov.versions
+                .iter()
+                .filter_map(|e| super::dbt_governance::parse_version(&e.v))
+                .max()
+                .map(|n| n.to_string())
+        });
+        let deprecation = version_entry
+            .and_then(|e| e.deprecation_date.clone())
+            .or_else(|| version.as_ref().and(gov.deprecation_date.clone()));
+        let (governance, warnings) = super::dbt_governance::governance_from_dbt(
+            &super::dbt_governance::DbtGovernanceInput {
+                name: base,
+                rocky_name: &model.name,
+                access: gov.access.as_deref(),
+                group: gov.group.as_deref(),
+                version: version.as_deref(),
+                latest_version: latest.as_deref(),
+                deprecation_date: deprecation.as_deref(),
+            },
+            &yaml.groups,
+        );
+        let tags = std::mem::take(&mut model.config.governance.tags);
+        model.config.governance = governance;
+        model.config.governance.tags = tags;
+        result.warnings.extend(warnings);
+    }
 }
 
 struct RawModelSettings<'a> {
@@ -2790,6 +2909,14 @@ fn strip_surrounding_quotes(s: &str) -> &str {
 fn convert_jinja_to_sql(content: &str, this_ref: &str) -> String {
     let mut sql = strip_dbt_config_tags(content);
 
+    // {{ ref('model_name', v=2) }} / version=2 -> model_name_v2 (a pinned
+    // version of a versioned model).
+    let versioned_ref_re = Regex::new(
+        r#"\{\{\s*ref\s*\(\s*['"](\w+)['"]\s*,\s*(?:v|version)\s*=\s*['"]?(\d+)['"]?\s*\)\s*\}\}"#,
+    )
+    .unwrap();
+    sql = versioned_ref_re.replace_all(&sql, "${1}_v${2}").to_string();
+
     // {{ ref('model_name') }} -> model_name
     let ref_re = Regex::new(r#"\{\{\s*ref\s*\(\s*['"](\w+)['"]\s*\)\s*\}\}"#).unwrap();
     sql = ref_re.replace_all(&sql, "$1").to_string();
@@ -3388,6 +3515,153 @@ models:
             StrategyConfig::Merge { .. }
         ));
         assert_eq!(result.imported[0].config.depends_on, vec!["stg"]);
+    }
+
+    /// dbt model governance survives a manifest import and the emitted repo
+    /// loads with the same meaning: versions become `<name>_v<N>` plus a
+    /// declaration, `ref(v=1)` pins `orders_v1`, access/group/owner carry over.
+    #[test]
+    fn manifest_import_carries_access_groups_and_versions() {
+        let node = |id: &str, name: &str, version: Option<i64>, code: &str, deps: Vec<&str>| {
+            let mut n = serde_json::json!({
+                "unique_id": id,
+                "name": name,
+                "resource_type": "model",
+                "compiled_code": code,
+                "raw_code": code,
+                "depends_on": { "nodes": deps, "macros": [] },
+                "config": { "materialized": "table" },
+                "columns": {},
+                "tags": [],
+                "schema": "s",
+                "database": "d",
+                "access": "public",
+                "group": "finance",
+            });
+            if let Some(v) = version {
+                n["version"] = serde_json::json!(v);
+                n["latest_version"] = serde_json::json!(2);
+                n["relation_name"] = serde_json::json!(format!("\"d\".\"s\".\"{name}_v{v}\""));
+                if v == 1 {
+                    n["deprecation_date"] = serde_json::json!("2026-12-31T00:00:00");
+                }
+            } else {
+                n["access"] = serde_json::json!("private");
+            }
+            n
+        };
+        let manifest_json = serde_json::json!({
+            "metadata": { "project_name": "proj" },
+            "nodes": {
+                "model.proj.orders.v1": node("model.proj.orders.v1", "orders", Some(1), "SELECT 1 AS id", vec![]),
+                "model.proj.orders.v2": node("model.proj.orders.v2", "orders", Some(2), "SELECT 1 AS id, 2 AS amount", vec![]),
+                "model.proj.reader": node(
+                    "model.proj.reader", "reader", None,
+                    "SELECT id FROM \"d\".\"s\".\"orders_v1\"",
+                    vec!["model.proj.orders.v1"],
+                ),
+            },
+            "sources": {},
+            "groups": {
+                "group.proj.finance": {
+                    "name": "finance",
+                    "owner": { "name": "Fin", "email": "fin@example.com" }
+                }
+            }
+        });
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("manifest.json");
+        std::fs::write(&path, manifest_json.to_string()).unwrap();
+        let manifest = dbt_manifest::parse_manifest(&path).unwrap();
+        let target = TargetConfig {
+            catalog: "d".to_string(),
+            schema: "s".to_string(),
+            table: String::new(),
+        };
+        let result = import_from_manifest(&manifest, &target, false, MicrobatchMode::Merge);
+        assert!(result.failed.is_empty(), "{:?}", result.failed);
+        let mut names: Vec<&str> = result.imported.iter().map(|m| m.name.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(names, vec!["orders_v1", "orders_v2", "reader"]);
+        let reader = result.imported.iter().find(|m| m.name == "reader").unwrap();
+        assert_eq!(reader.config.depends_on, vec!["orders_v1".to_string()]);
+        assert_eq!(reader.sql, "SELECT id FROM orders_v1");
+
+        let out = tempfile::TempDir::new().unwrap();
+        let profile = super::super::dbt_profiles::resolution_for_kind(
+            super::super::dbt_profiles::AdapterKind::DuckDb,
+            "duckdb",
+        );
+        super::super::emit::emit_repo(&super::super::emit::EmitInputs {
+            dbt_project_dir: dir.path(),
+            out_dir: out.path(),
+            overwrite: super::super::emit::OverwritePolicy::ReplaceContents,
+            profile: &profile,
+            default_catalog: "d",
+            default_schema: "s",
+            import: &result,
+            adapter_override_label: None,
+        })
+        .unwrap();
+        let models_dir = out.path().join("models");
+        let decl = std::fs::read_to_string(models_dir.join("orders.toml")).unwrap();
+        assert!(decl.contains("latest_version = 2"), "{decl}");
+        assert!(decl.contains("deprecation_date = \"2026-12-31\""), "{decl}");
+        let group = std::fs::read_to_string(models_dir.join("groups/finance.toml")).unwrap();
+        assert!(group.contains("email = \"fin@example.com\""), "{group}");
+
+        // The emitted repo loads: versions stamped, alias added, reader pinned.
+        let models = crate::project::Project::load_models(&models_dir, None).unwrap();
+        let project = crate::project::Project::from_models(models).unwrap();
+        let v1 = project.model("orders_v1").unwrap();
+        let info = v1.config.governance.version.as_ref().unwrap();
+        assert_eq!((info.version, info.latest_version), (Some(1), 2));
+        assert_eq!(
+            v1.config.governance.access,
+            Some(rocky_core::model_governance::ModelAccess::Public)
+        );
+        assert_eq!(
+            v1.config.governance.owner.as_ref().unwrap().name.as_deref(),
+            Some("Fin")
+        );
+        assert!(project.model("orders").is_some(), "latest alias");
+        let reader = project.model("reader").unwrap();
+        assert_eq!(
+            reader.config.governance.access,
+            Some(rocky_core::model_governance::ModelAccess::Private)
+        );
+    }
+
+    /// A dbt version that is not a whole number is refused with a reason,
+    /// never silently renamed.
+    #[test]
+    fn manifest_import_refuses_non_integer_version() {
+        let manifest_json = serde_json::json!({
+            "metadata": { "project_name": "proj" },
+            "nodes": {
+                "model.proj.orders.v1.5": {
+                    "unique_id": "model.proj.orders.v1.5",
+                    "name": "orders",
+                    "resource_type": "model",
+                    "compiled_code": "SELECT 1",
+                    "config": { "materialized": "table" },
+                    "version": 1.5
+                }
+            },
+            "sources": {}
+        });
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("manifest.json");
+        std::fs::write(&path, manifest_json.to_string()).unwrap();
+        let manifest = dbt_manifest::parse_manifest(&path).unwrap();
+        let target = TargetConfig {
+            catalog: "d".to_string(),
+            schema: "s".to_string(),
+            table: String::new(),
+        };
+        let result = import_from_manifest(&manifest, &target, false, MicrobatchMode::Merge);
+        assert!(result.imported.is_empty());
+        assert!(result.failed[0].reason.contains("not a whole number"));
     }
 
     #[test]
@@ -4819,6 +5093,47 @@ FROM {{ ref('stg_events') }}
         );
     }
 
+    /// Raw import takes a versioned model whose versions are plain
+    /// `<name>_v<N>.sql` files, and maps `ref(v=N)`, access and group.
+    #[test]
+    fn raw_import_takes_simple_versions_and_governance() {
+        let target = TargetConfig {
+            catalog: "w".into(),
+            schema: "s".into(),
+            table: String::new(),
+        };
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir(dir.path().join("models")).unwrap();
+        std::fs::write(
+            dir.path().join("models/properties.yml"),
+            "groups:\n  - name: finance\n    owner:\n      email: fin@example.com\nmodels:\n  - name: orders\n    access: public\n    group: finance\n    latest_version: 2\n    versions:\n      - v: 1\n        deprecation_date: 2026-12-31\n      - v: 2\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("models/orders_v1.sql"), "select 1 as id").unwrap();
+        std::fs::write(dir.path().join("models/orders_v2.sql"), "select 1 as id").unwrap();
+        std::fs::write(
+            dir.path().join("models/reader.sql"),
+            "select id from {{ ref('orders', v=1) }}",
+        )
+        .unwrap();
+        let result = import_dbt_project(dir.path(), &target).unwrap();
+        assert!(result.failed.is_empty(), "{:?}", result.failed);
+        let v1 = result
+            .imported
+            .iter()
+            .find(|m| m.name == "orders_v1")
+            .unwrap();
+        let info = v1.config.governance.version.as_ref().unwrap();
+        assert_eq!((info.version, info.latest_version), (Some(1), 2));
+        assert!(info.deprecation_date.is_some());
+        assert_eq!(
+            v1.config.governance.access_group.as_deref(),
+            Some("finance")
+        );
+        let reader = result.imported.iter().find(|m| m.name == "reader").unwrap();
+        assert_eq!(reader.sql, "select id from orders_v1");
+    }
+
     #[test]
     fn raw_import_refuses_versioned_properties() {
         let target = TargetConfig {
@@ -5719,6 +6034,7 @@ FROM {{ ref('stg_events') }}
             schema: String::new(),
             database: String::new(),
             relation_name: None,
+            governance: Default::default(),
         }
     }
 

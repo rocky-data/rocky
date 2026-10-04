@@ -3283,6 +3283,65 @@ pub struct CatalogAsset {
     /// triple was captured.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub recipe_identity: Option<RecipeIdentityView>,
+    /// Access level, ownership and version, when the model declares any of
+    /// them. Absent for sources and for models with no governance keys.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub governance: Option<CatalogGovernance>,
+}
+
+/// Model governance on a [`CatalogAsset`]: access level, ownership group and
+/// owner, and model version.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct CatalogGovernance {
+    /// `private`, `protected` (the default) or `public`.
+    pub access: String,
+    /// Ownership group (`access_group`, else the config `group`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+    /// Group owner's name, from the group file's `[owner]`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner_name: Option<String>,
+    /// Group owner's email, from the group file's `[owner]`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner_email: Option<String>,
+    /// Unversioned model name, for a model version or the latest alias.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub versioned_model: Option<String>,
+    /// This model's version. Absent on the latest alias.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<u32>,
+    /// The latest version of [`Self::versioned_model`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latest_version: Option<u32>,
+    /// Deprecation date of this version (`YYYY-MM-DD`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deprecation_date: Option<String>,
+}
+
+impl CatalogGovernance {
+    /// Governance of a model, or `None` when it declares no access, group,
+    /// owner or version.
+    pub fn from_config(config: &rocky_core::models::ModelConfig) -> Option<Self> {
+        let gov = &config.governance;
+        if gov.access.is_none()
+            && gov.access_group.is_none()
+            && gov.owner.is_none()
+            && gov.version.is_none()
+        {
+            return None;
+        }
+        let v = gov.version.as_ref();
+        Some(Self {
+            access: gov.effective_access().to_string(),
+            group: gov.access_group.clone(),
+            owner_name: gov.owner.as_ref().and_then(|o| o.name.clone()),
+            owner_email: gov.owner.as_ref().and_then(|o| o.email.clone()),
+            versioned_model: v.map(|v| v.model.clone()),
+            version: v.and_then(|v| v.version),
+            latest_version: v.map(|v| v.latest_version),
+            deprecation_date: v.and_then(|v| v.deprecation_date).map(|d| d.to_string()),
+        })
+    }
 }
 
 /// A column on a catalog asset.

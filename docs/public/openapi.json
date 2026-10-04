@@ -3987,6 +3987,17 @@
             "description": "Fully-qualified target identifier (`catalog.schema.table`) when resolvable, otherwise the model name.",
             "type": "string"
           },
+          "governance": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/CatalogGovernance"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Access level, ownership and version, when the model declares any of them. Absent for sources and for models with no governance keys."
+          },
           "intent": {
             "description": "Free-form natural-language description of the asset's purpose, when supplied via the model's sidecar config.",
             "type": [
@@ -4117,6 +4128,72 @@
           "target_column",
           "target_model",
           "transform"
+        ],
+        "type": "object"
+      },
+      "CatalogGovernance": {
+        "description": "Model governance on a [`CatalogAsset`]: access level, ownership group and owner, and model version.",
+        "properties": {
+          "access": {
+            "description": "`private`, `protected` (the default) or `public`.",
+            "type": "string"
+          },
+          "deprecation_date": {
+            "description": "Deprecation date of this version (`YYYY-MM-DD`).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "group": {
+            "description": "Ownership group (`access_group`, else the config `group`).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "latest_version": {
+            "description": "The latest version of [`Self::versioned_model`].",
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "owner_email": {
+            "description": "Group owner's email, from the group file's `[owner]`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "owner_name": {
+            "description": "Group owner's name, from the group file's `[owner]`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "version": {
+            "description": "This model's version. Absent on the latest alias.",
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "versioned_model": {
+            "description": "Unversioned model name, for a model version or the latest alias.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "access"
         ],
         "type": "object"
       },
