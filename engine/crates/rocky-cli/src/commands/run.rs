@@ -3368,9 +3368,10 @@ pub async fn run_with_explicit_contracts(
             loaded.config.cache.schemas.replicate,
         );
         if let Err(e) = model_session.acquire().await {
-            // Unreachable on a fresh session (`Err` = double-acquire misuse);
+            // `Err` = double-acquire misuse, or an explicit `cas` the store's
+            // conditional-write probe refuses (#1228);
             // consume defensively so no exit path can leak the session.
-            model_session.abandon("model-only acquire misuse").await;
+            model_session.abandon("model-only acquire failed").await;
             return Err(e.into());
         }
         match model_session.require_synced() {
@@ -3796,10 +3797,10 @@ pub async fn run_with_explicit_contracts(
                     loaded.config.cache.schemas.replicate,
                 );
                 if let Err(e) = session.acquire().await {
-                    // Unreachable on a fresh session (`Err` = double-acquire
-                    // misuse); consume defensively so no exit leaks the
-                    // session.
-                    session.abandon("transformation acquire misuse").await;
+                    // `Err` = double-acquire misuse, or an explicit `cas` the
+                    // store's conditional-write probe refuses (#1228); consume
+                    // defensively so no exit leaks the session.
+                    session.abandon("transformation acquire failed").await;
                     return Err(e.into());
                 }
                 match session.require_synced() {
@@ -4038,7 +4039,7 @@ pub async fn run_with_explicit_contracts(
                 loaded.config.cache.schemas.replicate,
             );
             if let Err(e) = session.acquire().await {
-                session.abandon("quality acquire misuse").await;
+                session.abandon("quality acquire failed").await;
                 return Err(e.into());
             }
             match session.require_synced() {
@@ -4162,7 +4163,7 @@ pub async fn run_with_explicit_contracts(
                 loaded.config.cache.schemas.replicate,
             );
             if let Err(e) = session.acquire().await {
-                session.abandon("snapshot acquire misuse").await;
+                session.abandon("snapshot acquire failed").await;
                 return Err(e.into());
             }
             match session.require_synced() {

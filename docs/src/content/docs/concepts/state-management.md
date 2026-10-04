@@ -216,9 +216,11 @@ The `tiered` backend combines Valkey (fast) with S3 (durable):
 - **Download**: try Valkey first (sub-millisecond reads); on miss or error, fall back to S3.
 - **Upload**: write to both Valkey (best-effort) and S3 (required).
 
-By default Rocky trusts the cached copy as it finds it. A Valkey write that fails while the S3 write succeeds therefore leaves a stale copy in the cache, and the next read serves it.
+With `concurrency_control = "off"`, Rocky trusts the cached copy as it finds it. A Valkey write that fails while the S3 write succeeds therefore leaves a stale copy in the cache, and the next read serves it.
 
-Set `concurrency_control = "cas"` to close that gap. The end-of-run upload commits to S3 first. Rocky then stores the cached copy, stamped with the generation it committed at. A read can therefore check the cache against the durable object before it uses it. The ledger-seam commands (`policy`, `gc`, `restore`, `apply`) commit the same way. See [Concurrent writers](/reference/configuration/#concurrent-writers).
+`concurrency_control = "cas"` closes that gap, and it is the default on `tiered`. The upload commits to S3 first. Rocky then stores the cached copy, stamped with the generation it committed at. A read can therefore check the cache against the durable object before it uses it. The ledger-seam commands (`policy`, `gc`, `restore`, `apply`) commit the same way.
+
+At startup each writer probes the store once to confirm it really enforces conditional writes. The first compare-and-swap upload then creates a `cas-required` marker beside the state object. A writer set to `"off"` that finds the marker refuses to upload, so it cannot overwrite the others. See [Concurrent writers](/reference/configuration/#concurrent-writers).
 
 ### Sync Lifecycle
 

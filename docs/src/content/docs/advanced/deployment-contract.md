@@ -62,8 +62,8 @@ This is why the rule says persistent volume. The state backend does not change i
 
 | `[state] concurrency_control` | Backend | What the loser's run does at the end |
 |---|---|---|
-| `"off"` (default) | any | Uploads unconditionally. Last writer wins, silently: the other run's watermarks are overwritten. |
-| `"cas"` | `s3`, `gcs`, `tiered` | Uploads only if the remote still carries the generation this run downloaded. The loser fails closed: a nonzero exit and an error naming the race, and the winner's state stands. |
+| `"off"` (default on `local`, `valkey`) | any | Uploads unconditionally. Last writer wins, silently: the other run's watermarks are overwritten. On an object store, the upload is refused instead once a `cas` writer has created the `cas-required` marker. |
+| `"cas"` (default on `s3`, `gcs`, `tiered`) | `s3`, `gcs`, `tiered` | Uploads only if the remote still carries the generation this run downloaded. The loser fails closed: a nonzero exit and an error naming the race, and the winner's state stands. |
 | `"cas"` | `valkey` | No generation to compare against; falls back to an unconditional upload and warns once at the start of the run. |
 | `"cas"` | `local` | No remote write at all; the file on the volume is the state. |
 

@@ -82,6 +82,9 @@ struct FaultState {
     armed: HashMap<FaultOp, FaultMode>,
     /// Deterministic conditional conflicts, targeted to an exact object path.
     precondition_failures: HashMap<String, u32>,
+    /// Simulate a store that accepts conditional-write headers and ignores
+    /// them (older S3-compatible stores): every put lands unconditionally.
+    ignore_conditional_writes: bool,
 }
 
 fn lock(state: &Mutex<FaultState>) -> std::sync::MutexGuard<'_, FaultState> {
@@ -156,6 +159,13 @@ impl FaultHandle {
         lock(&self.0)
             .precondition_failures
             .insert(path.into(), count);
+    }
+
+    /// Make the store accept conditional writes and silently ignore their
+    /// preconditions, as some older S3-compatible stores do. Each put is still
+    /// counted by the kind the caller asked for.
+    pub fn ignore_conditional_writes(&self, ignore: bool) {
+        lock(&self.0).ignore_conditional_writes = ignore;
     }
 
     /// Number of `put_opts` calls observed for an exact object path and write
@@ -236,6 +246,14 @@ impl ObjectStore for FaultingStore {
     ) -> object_store::Result<PutResult> {
         self.check(FaultOp::Put)?;
         self.record_put(location, &opts.mode)?;
+        let opts = if lock(&self.state).ignore_conditional_writes {
+            PutOptions {
+                mode: PutMode::Overwrite,
+                ..opts
+            }
+        } else {
+            opts
+        };
         self.inner.put_opts(location, payload, opts).await
     }
 

@@ -4340,9 +4340,10 @@ async fn run_apply_backfill_plan(
         backfill_replicate,
     );
     if let Err(e) = session.acquire().await {
-        // Unreachable on a fresh session (`Err` = double-acquire misuse);
+        // `Err` = double-acquire misuse, or an explicit `cas` the store's
+            // conditional-write probe refuses (#1228);
         // consume defensively so no exit path can leak the session.
-        session.abandon("backfill acquire misuse").await;
+        session.abandon("backfill acquire failed").await;
         return Err(e.into());
     }
     if let Err(e) = session.require_synced() {
