@@ -113,9 +113,10 @@ pub const SECRET_LENGTH_FLOOR: usize = 8;
 /// Value -> the `${NAME}` it is rewritten to.
 ///
 /// Keyed by value because that is what the filter searches for. When two
-/// variables resolve to the same value, the first name registered wins; either
-/// is equally true, and the replacement only has to name *a* variable that
-/// carries it.
+/// variables resolve to the same value, the name that sorts first wins. Either
+/// is equally true, but the choice must not depend on the order the config
+/// mentions them: a plan's config snapshot is compared by its rendered text, so
+/// reordering two sections must not change it.
 static SUBSTITUTED: LazyLock<RwLock<BTreeMap<String, String>>> =
     LazyLock::new(|| RwLock::new(BTreeMap::new()));
 
@@ -139,8 +140,14 @@ pub fn register_substitution(name: &str, value: &str) {
     let mut map = SUBSTITUTED
         .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let replacement = format!("${{{name}}}");
     map.entry(value.to_string())
-        .or_insert_with(|| format!("${{{name}}}"));
+        .and_modify(|current| {
+            if replacement < *current {
+                current.clone_from(&replacement);
+            }
+        })
+        .or_insert(replacement);
 }
 
 /// Every registered `(value, replacement)` pair, **longest value first**.
@@ -499,7 +506,23 @@ mod tests {
         assert_eq!(matches.len(), 1, "one entry per value");
         assert_eq!(
             matches[0].1, "${ROCKY_FIRST_NAME}",
-            "first name wins"
+            "the name that sorts first wins"
+        );
+    }
+
+    /// #1919 follow-up: when two variables share a value, the rendered name
+    /// must not depend on which one the config mentions first. A plan's config
+    /// snapshot is compared by its rendered text, so reordering two sections
+    /// would otherwise make `rocky apply` report a config change.
+    #[test]
+    fn the_shared_value_name_does_not_depend_on_registration_order() {
+        let shared = "ROCKY-SHARED-ORDER-7f1c2d90";
+        register_substitution("ROCKY_ORDER_ZULU", shared);
+        register_substitution("ROCKY_ORDER_ALPHA", shared);
+        assert_eq!(
+            replacement_for(shared).as_deref(),
+            Some("${ROCKY_ORDER_ALPHA}"),
+            "the later-registered name sorts first, so it must win"
         );
     }
 

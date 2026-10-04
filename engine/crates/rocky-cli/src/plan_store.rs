@@ -545,41 +545,23 @@ pub(crate) fn plan_digest_key_path(root: &Path) -> std::path::PathBuf {
 /// skip the check.
 pub(crate) fn plan_digest_key(root: &Path, create: bool) -> Result<[u8; 32]> {
     let path = plan_digest_key_path(root);
-    if create && !path.exists() {
+    if create {
         let rocky_dir = root.join(".rocky");
         rocky_observe::traces::ensure_rocky_gitignore(&rocky_dir);
-        std::fs::create_dir_all(&rocky_dir)
-            .with_context(|| format!("failed to create {}", rocky_dir.display()))?;
-        let mut key = [0u8; 32];
-        key[..16].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
-        key[16..].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
-        let hex: String = key.iter().map(|b| format!("{b:02x}")).collect();
-        // Write a private temp file, then hard-link it into place. The link
-        // either creates the key whole or finds one already there, so a
-        // concurrent `rocky plan` never reads a half-written key.
-        let tmp = rocky_dir.join(format!(
-            ".{PLAN_DIGEST_KEY_FILE}.{}.tmp",
-            uuid::Uuid::new_v4().simple()
-        ));
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
+        // A custom `.rocky/.gitignore` may not cover the key: make sure it does.
+        rocky_observe::traces::ensure_rocky_gitignore_covers(&rocky_dir, PLAN_DIGEST_KEY_FILE);
+        if !path.exists() {
+            std::fs::create_dir_all(&rocky_dir)
+                .with_context(|| format!("failed to create {}", rocky_dir.display()))?;
+            let mut key = [0u8; 32];
+            key[..16].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+            key[16..].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+            let hex: String = key.iter().map(|b| format!("{b:02x}")).collect();
+            install_digest_key(&rocky_dir, &path, &hex, |from, to| {
+                std::fs::hard_link(from, to)
+            })
+            .with_context(|| format!("failed to create {}", path.display()))?;
         }
-        let written = options.open(&tmp).and_then(|mut file| {
-            use std::io::Write;
-            file.write_all(hex.as_bytes())?;
-            file.sync_all()
-        });
-        let linked = written.and_then(|()| match std::fs::hard_link(&tmp, &path) {
-            // Another process created it first. Use theirs.
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
-            other => other,
-        });
-        let _ = std::fs::remove_file(&tmp);
-        linked.with_context(|| format!("failed to create {}", path.display()))?;
     }
     let text = std::fs::read_to_string(&path)
         .with_context(|| format!("failed to read the plan digest key at {}", path.display()))?;
@@ -600,6 +582,75 @@ pub(crate) fn plan_digest_key(root: &Path, create: bool) -> Result<[u8; 32]> {
         })?;
     }
     Ok(key)
+}
+
+/// Open `path` for a new owner-only file (0600 on unix), failing if it exists.
+fn create_private_file(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)
+}
+
+/// Put a new digest key at `path`, whole, unless one is already there.
+///
+/// Writes a private temp file and hard-links it into place: the link either
+/// creates the key complete or finds one already there, so a concurrent
+/// `rocky plan` never reads a half-written key. A filesystem without hard links
+/// (some network and FUSE mounts, FAT) refuses the link. There the key is
+/// created directly with `create_new`, which is still atomic about WHO creates
+/// it (a racing planner gets `AlreadyExists` and uses the winner's key). It is
+/// not atomic about the bytes: a planner that reads in the instant between the
+/// create and the write sees a short key and stops with "malformed", rather
+/// than signing with a wrong one.
+///
+/// `link` is `std::fs::hard_link` in production; tests pass one that fails.
+fn install_digest_key(
+    rocky_dir: &Path,
+    path: &Path,
+    hex: &str,
+    link: impl Fn(&Path, &Path) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    use std::io::Write;
+    let tmp = rocky_dir.join(format!(
+        ".{PLAN_DIGEST_KEY_FILE}.{}.tmp",
+        uuid::Uuid::new_v4().simple()
+    ));
+    let written = create_private_file(&tmp).and_then(|mut file| {
+        file.write_all(hex.as_bytes())?;
+        file.sync_all()
+    });
+    let linked = written.and_then(|()| link(&tmp, path));
+    let _ = std::fs::remove_file(&tmp);
+    match linked {
+        Ok(()) => Ok(()),
+        // Another process created it first. Use theirs.
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(link_err) => match create_private_file(path) {
+            Ok(mut file) => {
+                let written = file
+                    .write_all(hex.as_bytes())
+                    .and_then(|()| file.sync_all());
+                if written.is_err() {
+                    // Leave no partial key behind for every later plan to trip on.
+                    let _ = std::fs::remove_file(path);
+                }
+                written
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+            Err(create_err) => Err(std::io::Error::new(
+                create_err.kind(),
+                format!(
+                    "could not link the key into place ({link_err}) nor create it directly \
+                     ({create_err})"
+                ),
+            )),
+        },
+    }
 }
 
 /// Return the directory where plans are stored, creating it if needed.
@@ -838,6 +889,57 @@ pub fn read_plan(root: &Path, plan_id: &str) -> Result<PersistedPlan> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// #1919 follow-up (P1-5): a filesystem without hard links must not stop
+    /// `rocky plan`. The key is created directly instead, whole, owner-only.
+    #[test]
+    fn digest_key_installs_without_hard_links() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rocky_dir = tmp.path().join(".rocky");
+        std::fs::create_dir_all(&rocky_dir).unwrap();
+        let path = rocky_dir.join(PLAN_DIGEST_KEY_FILE);
+        let hex = "ab".repeat(32);
+        let no_links = |_: &Path, _: &Path| -> std::io::Result<()> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "hard links are not supported on this filesystem",
+            ))
+        };
+        install_digest_key(&rocky_dir, &path, &hex, no_links).expect("falls back");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), hex);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "the key stays owner-only");
+        }
+        // A second installer finds the key there and keeps it.
+        install_digest_key(&rocky_dir, &path, &"cd".repeat(32), no_links).expect("keeps");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), hex);
+        // No temp file is left behind.
+        let leftovers: Vec<_> = std::fs::read_dir(&rocky_dir)
+            .unwrap()
+            .filter_map(std::result::Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
+
+    /// #1919 follow-up (P1-5): a project's own `.rocky/.gitignore` that does
+    /// not cover the key gets a line for it when a plan creates the key.
+    #[test]
+    fn digest_key_is_git_ignored_under_a_custom_gitignore() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rocky_dir = tmp.path().join(".rocky");
+        std::fs::create_dir_all(&rocky_dir).unwrap();
+        std::fs::write(rocky_dir.join(".gitignore"), "traces/\n").unwrap();
+        plan_digest_key(tmp.path(), true).expect("key created");
+        let gitignore = std::fs::read_to_string(rocky_dir.join(".gitignore")).unwrap();
+        assert!(
+            gitignore.lines().any(|l| l == "/plan-digest.key"),
+            "{gitignore}"
+        );
+    }
 
     #[derive(Serialize)]
     struct DummyPayload {
