@@ -758,6 +758,13 @@ A writer on `off` uploads unconditionally, so one such writer could still overwr
 
 A writer whose mode resolves to `off` checks for the marker when it starts, before it does any work, and again before each upload. If the marker exists, the writer stops with an error that names the fix. Reads are not affected. The fix is to set `concurrency_control = "cas"`, or to remove the explicit `"off"`, on that writer. Delete the marker only on purpose, when every writer of that state is deliberately moving to `"off"`. `rocky doctor` warns when the configured mode and the marker disagree.
 
+The marker sits under the schema-version folder (`v9/` above), and a schema bump does not move it. So the check also looks at each older version's folder, down to the oldest one Rocky still carries state forward from. A marker left by the fleet before an upgrade still stops an `off` writer after it. To delete the marker on purpose, delete it in every version folder that has one.
+
+Two limits are worth knowing:
+
+- **The check and the upload are separate steps.** An `off` writer checks for the marker, then uploads. A first CAS upload that creates the marker between those two steps does not stop that one upload. After the marker exists, every later `off` upload is refused.
+- **A marker can exist on a store that ignores conditional writes.** A CAS writer creates the marker even when its probe was inconclusive. If the store in fact ignores conditional headers, the `cas` writers are not protected from each other, yet the marker still blocks every `off` writer. Run `rocky doctor` until the probe passes, or set every writer to `"off"` and delete the marker on purpose.
+
 #### Upgrading to the `cas` default
 
 This release changes the default on `s3`, `gcs`, and `tiered` from `off` to `cas`. Older binaries do not know the marker exists and keep uploading unconditionally. So upgrade every writer that shares a `[state]` prefix together, or keep the interim rule of one writer per prefix until the whole fleet runs this release. To keep the old behaviour, set `concurrency_control = "off"` explicitly before you upgrade. Run `rocky doctor` on each writer afterwards to confirm the resolved mode.
