@@ -26628,6 +26628,7 @@ email = "pii"
             typed_models: &typed_models,
             model_timings: &model_timings,
             surrogate_keys: &surrogate_keys,
+            full_refresh: false,
         };
         super::execute_one_plain_model(
             &model,
