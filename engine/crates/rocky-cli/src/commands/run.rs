@@ -1051,6 +1051,14 @@ pub struct DeferOptions {
     /// production home). When `Some(schema)`, every deferred reference is
     /// pointed at that schema instead (catalog + table preserved).
     pub defer_to: Option<String>,
+    /// Names a model's `depends_on` may list that the caller resolved outside
+    /// this run's models: the seeds and load pipelines of the `rocky run
+    /// --dag` graph, which ordered this sub-run after them (#2138). Passed to
+    /// the compile as [`rocky_compiler::compile::CompilerConfig::external_dependencies`].
+    /// Unrelated to `--defer` (nothing is rewritten); it rides here because
+    /// this is the one options value every sub-run already carries to the
+    /// compile. Empty outside `--dag`.
+    pub external_dependencies: std::collections::BTreeSet<String>,
 }
 
 /// Remove the local-model E039 check only after `--defer` has successfully
@@ -11498,6 +11506,7 @@ pub(crate) async fn execute_models_with_explicit_contracts(
         // This pre-execution compile stays scoped to typecheck +
         // contract diagnostics to avoid broadening its signature.
         run_vars: run_vars.clone(),
+        external_dependencies: defer_opts.external_dependencies.clone(),
         ..Default::default()
     };
 
@@ -33583,6 +33592,7 @@ auto_create_schemas = true
                 &super::DeferOptions {
                     enabled: true,
                     defer_to: None,
+                    ..Default::default()
                 },
                 &rocky_snowflake::dialect::SnowflakeSqlDialect,
             )
@@ -34874,6 +34884,7 @@ auto_create_schemas = true
         let defer_opts = DeferOptions {
             enabled: true,
             defer_to: None,
+            ..Default::default()
         };
         let mut output = RunOutput::new(String::new(), 0, 1);
 
@@ -36604,6 +36615,7 @@ auto_create_schemas = true
                 &DeferOptions {
                     enabled: true,
                     defer_to: Some("prod".to_string()),
+                    ..Default::default()
                 },
                 SkipGateConfig {
                     feature_enabled: false,
@@ -36673,6 +36685,7 @@ auto_create_schemas = true
                     &DeferOptions {
                         enabled: true,
                         defer_to: Some("prod".to_string()),
+                        ..Default::default()
                     },
                     SkipGateConfig {
                         feature_enabled: false,
@@ -36738,6 +36751,7 @@ auto_create_schemas = true
                 &DeferOptions {
                     enabled: true,
                     defer_to: Some("prod".to_string()),
+                    ..Default::default()
                 },
                 SkipGateConfig {
                     feature_enabled: false,

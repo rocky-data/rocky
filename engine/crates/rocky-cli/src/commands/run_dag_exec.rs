@@ -116,16 +116,25 @@ impl StateTurnstile {
 /// `SkipGate::upstream_unchanged`). That is fail-safe — never a stale skip — but
 /// more conservative than a single monolithic run, where the per-layer barrier
 /// makes every upstream verdict visible. Raw-source freshness skips still apply.
-fn default_sub_runner() -> SubRunner {
+///
+/// `external_dependencies` are the names [`dag_external_dependencies`] took
+/// from the graph. Every sub-run compiles with them, so a model whose
+/// `depends_on` names a seed or load pipeline is not refused as naming an
+/// unknown model (#2138): the graph already ordered it after that node.
+fn default_sub_runner(external_dependencies: Arc<std::collections::BTreeSet<String>>) -> SubRunner {
     Arc::new(
-        |config_path: PathBuf,
-         loaded: Arc<rocky_core::config::LoadedConfig>,
-         state_path: PathBuf,
-         pipeline_name: String,
-         model_name: Option<String>,
-         partition_opts,
-         skip_opts,
-         shadow_config: Option<rocky_core::shadow::ShadowConfig>| {
+        move |config_path: PathBuf,
+              loaded: Arc<rocky_core::config::LoadedConfig>,
+              state_path: PathBuf,
+              pipeline_name: String,
+              model_name: Option<String>,
+              partition_opts,
+              skip_opts,
+              shadow_config: Option<rocky_core::shadow::ShadowConfig>| {
+            let defer_opts = super::run::DeferOptions {
+                external_dependencies: (*external_dependencies).clone(),
+                ..super::run::DeferOptions::default()
+            };
             Box::pin(async move {
                 super::run::run(
                     &config_path,
@@ -148,7 +157,9 @@ fn default_sub_runner() -> SubRunner {
                     None,
                     // DAG sub-runs inherit no `--env`.
                     None,
-                    &super::run::DeferOptions::default(),
+                    // No `--defer` under `--dag`; this carries only the
+                    // graph's seed and load names (#2138).
+                    &defer_opts,
                     // The build-escape-hatch overlay (`--force-rebuild` /
                     // `--no-reuse`) threaded from the outer `rocky run --dag`.
                     &skip_opts,
@@ -354,7 +365,7 @@ pub async fn run_with_dag(
         partition_opts: partition_opts.clone(),
         skip_opts: *skip_opts,
         shadow_config: shadow_config.cloned(),
-        sub_runner: default_sub_runner(),
+        sub_runner: default_sub_runner(Arc::new(dag_external_dependencies(&dag))),
         state_turns: StateTurnstile::new(),
     };
     let executor = dag_executor_with_bound(dispatcher, node_concurrency);
@@ -405,6 +416,30 @@ pub async fn run_with_dag(
         anyhow::bail!("DAG execution had {} failed node(s)", result.failed);
     }
     Ok(())
+}
+
+/// The names a model's `depends_on` may give that the graph resolved to a
+/// node other than a model: every seed, and every pipeline with a load node
+/// (a load pipeline, or a replication pipeline's load). A per-model sub-run
+/// compiles models only, so it is told these names are satisfied outside it
+/// (#2138). A name that a model also carries never reaches a sub-run: the
+/// graph refuses a `depends_on` on it as ambiguous.
+fn dag_external_dependencies(
+    dag: &rocky_core::unified_dag::UnifiedDag,
+) -> std::collections::BTreeSet<String> {
+    dag.nodes
+        .iter()
+        .filter_map(|node| match node.kind {
+            NodeKind::Seed => Some(node.label.clone()),
+            NodeKind::Load => node.pipeline.clone(),
+            NodeKind::Source
+            | NodeKind::Replication
+            | NodeKind::Transformation
+            | NodeKind::Quality
+            | NodeKind::Snapshot
+            | NodeKind::Test => None,
+        })
+        .collect()
 }
 
 /// What [`run_with_dag`] schedules from: the graph with every inferred edge,
@@ -1801,7 +1836,7 @@ mod tests {
             partition_opts: PartitionRunOptions::default(),
             skip_opts: SkipRunOptions::default(),
             shadow_config: None,
-            sub_runner: default_sub_runner(),
+            sub_runner: default_sub_runner(Arc::default()),
             state_turns: StateTurnstile::new(),
         };
         let id = NodeId::new("seed", "countries");
@@ -1939,6 +1974,89 @@ mod tests {
             .execute_sql("SELECT COUNT(*) FROM proj.silver.dim_country")
             .unwrap();
         assert_eq!(cell_i64(&model_rows.rows[0][0]), 2, "model rows");
+    }
+
+    /// #2138: a model whose `depends_on` names a seed must not fail its
+    /// `--dag` sub-run.
+    ///
+    /// The graph orders `dim_country` after `seed:countries` from the
+    /// `depends_on` alone — the model's SQL never reads the seed, so no
+    /// physical or label edge exists. Before the fix the model's per-model
+    /// sub-run compiled models only and refused `countries` as an unknown
+    /// model, so the node failed and the DAG exited non-zero.
+    #[tokio::test]
+    async fn a_model_depending_on_a_seed_by_name_runs_under_dag() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("models")).unwrap();
+        std::fs::create_dir_all(root.join("seeds")).unwrap();
+        let db_path = root.join("proj.duckdb");
+        std::fs::write(
+            root.join("rocky.toml"),
+            format!(
+                "[adapter.local]\n\
+                 type = \"duckdb\"\n\
+                 path = \"{}\"\n\n\
+                 [pipeline.silver]\n\
+                 type = \"transformation\"\n\n\
+                 [pipeline.silver.target]\n\
+                 adapter = \"local\"\n\n\
+                 [pipeline.silver.target.governance]\n\
+                 auto_create_catalogs = true\n\
+                 auto_create_schemas = true\n",
+                db_path.display()
+            ),
+        )
+        .unwrap();
+        std::fs::write(root.join("seeds/countries.csv"), "code\nUS\nGB\n").unwrap();
+        std::fs::write(
+            root.join("seeds/countries.toml"),
+            "name = \"countries\"\n\n[target]\ncatalog = \"proj\"\nschema = \"seeds\"\ntable = \"countries\"\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("models/stg.sql"), "SELECT 1 AS id\n").unwrap();
+        std::fs::write(
+            root.join("models/stg.toml"),
+            "name = \"stg\"\ndepends_on = [\"countries\"]\n\n\
+             [target]\ncatalog = \"proj\"\nschema = \"silver\"\ntable = \"stg\"\n",
+        )
+        .unwrap();
+
+        let config_path = root.join("rocky.toml");
+        let cfg = dag_snapshot(&config_path);
+        let planned = plan_runtime_dag(&config_path, &cfg.config).expect("graph builds");
+        assert!(
+            planned.runtime.dag.edges.iter().any(|e| {
+                e.from == NodeId::new("seed", "countries")
+                    && e.to == NodeId::new("transformation", "stg")
+            }),
+            "the declared depends_on orders the model after the seed"
+        );
+        assert_eq!(
+            dag_external_dependencies(&planned.runtime.dag),
+            std::collections::BTreeSet::from(["countries".to_string()])
+        );
+
+        run_with_dag(
+            &config_path,
+            cfg,
+            &root.join(".rocky-state.redb"),
+            false,
+            &PartitionRunOptions::default(),
+            &crate::commands::run::SkipRunOptions::default(),
+            None,
+            None,
+        )
+        .await
+        .expect("a depends_on naming a seed must not fail the model's sub-run");
+
+        let adapter = DuckDbWarehouseAdapter::open(&db_path).unwrap();
+        let conn = adapter.shared_connector();
+        let guard = conn.lock().unwrap();
+        let rows = guard
+            .execute_sql("SELECT COUNT(*) FROM proj.silver.stg")
+            .unwrap();
+        assert_eq!(cell_i64(&rows.rows[0][0]), 1, "the model materialized");
     }
 
     /// #2018: `rocky run --dag` must load a seed on a project with MORE THAN
@@ -2338,7 +2456,7 @@ mod tests {
             partition_opts: PartitionRunOptions::default(),
             skip_opts: SkipRunOptions::default(),
             shadow_config: None,
-            sub_runner: default_sub_runner(),
+            sub_runner: default_sub_runner(Arc::default()),
             state_turns: StateTurnstile::new(),
         };
         let id = NodeId::new("seed", "orders");
@@ -2447,7 +2565,7 @@ mod tests {
             partition_opts: PartitionRunOptions::default(),
             skip_opts: SkipRunOptions::default(),
             shadow_config: None,
-            sub_runner: default_sub_runner(),
+            sub_runner: default_sub_runner(Arc::default()),
             state_turns: StateTurnstile::new(),
         };
         let id = NodeId::new("seed", "orders");

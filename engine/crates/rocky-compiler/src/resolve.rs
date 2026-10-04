@@ -126,6 +126,23 @@ pub fn classify_table_ref(name: &str, model_names: &HashSet<String>) -> TableRef
 /// If a model already has explicit `depends_on` in its config, those are
 /// preserved and merged with auto-resolved dependencies.
 pub fn resolve_dependencies(models: &[Model]) -> Result<ResolveOutput, ResolveError> {
+    resolve_dependencies_with_externals(models, &std::collections::BTreeSet::new())
+}
+
+/// [`resolve_dependencies`], accepting `externals` as satisfied outside the
+/// project.
+///
+/// A `depends_on` entry that names an external and no model of this project
+/// is left out of the model's [`DagNode`], so the topological sort does not
+/// refuse it as unknown. `rocky run --dag` passes the seed names its graph
+/// resolved: the graph already ordered the model after the seed, and the
+/// per-model sub-run compiles models only (#2138). The model's
+/// `config.depends_on` itself is left as declared. A name that IS a model of
+/// this project keeps its edge.
+pub fn resolve_dependencies_with_externals(
+    models: &[Model],
+    externals: &std::collections::BTreeSet<String>,
+) -> Result<ResolveOutput, ResolveError> {
     let model_names: HashSet<String> = models.iter().map(|m| m.config.name.clone()).collect();
     // Models a bare read of their own NAME does not reach on a warehouse run:
     // the target table is spelled differently, so the search path resolves the
@@ -255,8 +272,15 @@ pub fn resolve_dependencies(models: &[Model]) -> Result<ResolveOutput, ResolveEr
             }
         }
 
-        // Merge: explicit depends_on + auto-resolved, deduplicated via HashSet
-        let mut all_deps: Vec<String> = model.config.depends_on.clone();
+        // Merge: explicit depends_on + auto-resolved, deduplicated via HashSet.
+        // An explicit entry satisfied outside the project is not a model edge.
+        let mut all_deps: Vec<String> = model
+            .config
+            .depends_on
+            .iter()
+            .filter(|d| model_names.contains(*d) || !externals.contains(*d))
+            .cloned()
+            .collect();
         let mut seen: HashSet<String> = all_deps.iter().cloned().collect();
         for dep in auto_deps {
             if seen.insert(dep.clone()) {
@@ -570,6 +594,44 @@ mod tests {
         let (dag_nodes, _lineage_cache, _diags) = resolve_dependencies(&models).unwrap();
         let node = dag_nodes.iter().find(|n| n.name == "orders").unwrap();
         assert!(node.depends_on.is_empty());
+    }
+
+    /// #2138: a `depends_on` entry the caller names as external is left out
+    /// of the model DAG, so the topological sort does not refuse it; a model
+    /// of the same name keeps its edge; a name nobody vouched for is still an
+    /// unknown dependency.
+    #[test]
+    fn external_depends_on_names_are_satisfied_outside_the_project() {
+        let externals = std::collections::BTreeSet::from(["countries".to_string()]);
+        let models = vec![make_model_with_deps(
+            "stg",
+            "SELECT 1 AS id",
+            vec!["countries"],
+        )];
+        let (nodes, _, _) = resolve_dependencies_with_externals(&models, &externals).unwrap();
+        assert!(nodes[0].depends_on.is_empty(), "{:?}", nodes[0].depends_on);
+        rocky_ir::dag::topological_sort(&nodes).expect("no unknown dependency left");
+        assert_eq!(
+            models[0].config.depends_on,
+            vec!["countries"],
+            "the declared config is untouched"
+        );
+
+        // Without the external set the same project is refused, as before.
+        let (nodes, _, _) = resolve_dependencies(&models).unwrap();
+        assert!(matches!(
+            rocky_ir::dag::topological_sort(&nodes),
+            Err(rocky_ir::dag::DagError::UnknownDependency { .. })
+        ));
+
+        // A model carrying the external's name keeps its edge.
+        let models = vec![
+            make_model_with_deps("stg", "SELECT 1 AS id", vec!["countries"]),
+            make_model("countries", "SELECT 1 AS code"),
+        ];
+        let (nodes, _, _) = resolve_dependencies_with_externals(&models, &externals).unwrap();
+        let stg = nodes.iter().find(|n| n.name == "stg").unwrap();
+        assert_eq!(stg.depends_on, vec!["countries"]);
     }
 
     fn make_model_with_target(name: &str, sql: &str, schema: &str, table: &str) -> Model {

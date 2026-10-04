@@ -4182,6 +4182,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             let defer_opts = rocky_cli::commands::DeferOptions {
                 enabled: defer,
                 defer_to,
+                ..Default::default()
             };
 
             // CLI overlay for the opt-in model-skip gate. Default-OFF: both

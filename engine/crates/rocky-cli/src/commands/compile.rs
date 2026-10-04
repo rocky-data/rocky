@@ -255,6 +255,7 @@ fn compile_inner(
         allow_unmasked,
         project_freshness,
         run_vars: run_vars.clone(),
+        external_dependencies: Default::default(),
     };
 
     let mut result = compile::compile(&config)?;

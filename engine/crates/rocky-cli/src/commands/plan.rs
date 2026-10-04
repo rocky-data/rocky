@@ -1128,6 +1128,7 @@ pub(crate) fn conditional_drops_for_run_plan(
         allow_unmasked: vec![],
         project_freshness: Default::default(),
         run_vars: rocky_core::run_vars::RunVars::new(),
+        external_dependencies: Default::default(),
     };
     let compiled = match models_glob {
         Some(glob) => compile::compile_matching(&config, glob),
@@ -1355,6 +1356,7 @@ fn plan_preview_output_for_pipeline(
         allow_unmasked: vec![],
         project_freshness: Default::default(),
         run_vars: rocky_core::run_vars::RunVars::new(),
+        external_dependencies: Default::default(),
     };
     let result = match compile::compile(&config) {
         Ok(r) => r,
@@ -1595,6 +1597,7 @@ fn build_and_persist_run_plan(
         allow_unmasked: vec![],
         project_freshness: Default::default(),
         run_vars: rocky_core::run_vars::RunVars::new(),
+        external_dependencies: Default::default(),
     };
 
     let result = compile::compile(&config).context("failed to compile models for run plan")?;
@@ -2409,6 +2412,7 @@ pub fn populate_governance_actions(
         allow_unmasked: cfg.classifications.allow_unmasked.clone(),
         project_freshness: cfg.freshness.clone(),
         run_vars: rocky_core::run_vars::RunVars::new(),
+        external_dependencies: Default::default(),
     })
     .context("failed to compile project for governance preview")?;
 
@@ -2511,6 +2515,7 @@ async fn check_plan_budget(
         allow_unmasked: vec![],
         project_freshness: Default::default(),
         run_vars: rocky_core::run_vars::RunVars::new(),
+        external_dependencies: Default::default(),
     };
     let result = match rocky_compiler::compile::compile(&compile_cfg) {
         Ok(r) => r,
