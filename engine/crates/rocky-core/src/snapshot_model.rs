@@ -241,6 +241,21 @@ fn refuse_invalid(spec: &SnapshotSpec) -> Result<(), SqlGenError> {
     }
 }
 
+/// Refuse a dialect that cannot run the SCD2 snapshot SQL (see
+/// [`SqlDialect::snapshot_unsupported_reason`]): PostgreSQL under
+/// `merge_mode = "on_conflict"`, and Redshift. Every snapshot-model entry
+/// point calls this first, so no DDL is generated for a warehouse that would
+/// reject the steady-state MERGE.
+pub fn refuse_unsupported_dialect(dialect: &dyn SqlDialect) -> Result<(), SqlGenError> {
+    match dialect.snapshot_unsupported_reason() {
+        None => Ok(()),
+        Some(reason) => Err(SqlGenError::InvalidRequest(format!(
+            "snapshot models cannot run on {}: {reason}",
+            dialect.name()
+        ))),
+    }
+}
+
 fn validated(name: &str) -> Result<&str, SqlGenError> {
     validation::validate_identifier(name)?;
     Ok(name)
@@ -309,6 +324,7 @@ pub fn generate_snapshot_bootstrap_select(
     dialect: &dyn SqlDialect,
     now: DateTime<Utc>,
 ) -> Result<String, SqlGenError> {
+    refuse_unsupported_dialect(dialect)?;
     refuse_invalid(spec)?;
     let now = run_timestamp_literal(now);
     let keys = spec
@@ -412,6 +428,7 @@ pub fn add_is_deleted_column_sql(
     target: &str,
     dialect: &dyn SqlDialect,
 ) -> Result<String, SqlGenError> {
+    refuse_unsupported_dialect(dialect)?;
     let name = validated(&spec.meta_columns.is_deleted)?;
     Ok(format!(
         "ALTER TABLE {target} ADD COLUMN {} BOOLEAN",
@@ -464,6 +481,7 @@ pub fn generate_snapshot_model_sql_with(
     now: DateTime<Utc>,
     markers: ExistingMarkers,
 ) -> Result<Vec<String>, SqlGenError> {
+    refuse_unsupported_dialect(dialect)?;
     refuse_invalid(spec)?;
     let now = run_timestamp_literal(now);
     let body = model_sql.trim().trim_end_matches(';');
@@ -676,6 +694,7 @@ pub fn preview_snapshot_model_sql(
     typed_column_names: &[String],
     now: DateTime<Utc>,
 ) -> Result<Vec<String>, SqlGenError> {
+    refuse_unsupported_dialect(dialect)?;
     if typed_column_names.is_empty() {
         return Err(SqlGenError::InvalidRequest(
             "snapshot SQL needs the model's output columns; they were not resolved at compile \

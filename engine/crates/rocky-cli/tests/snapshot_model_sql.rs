@@ -186,3 +186,53 @@ fn duckdb_statement_shapes_match_the_e2e_path() {
         .collect();
     assert_eq!(kinds, vec!["MERGE", "INSERT", "INSERT", "UPDATE"]);
 }
+
+/// Postgres under `merge_mode = "on_conflict"` and Redshift cannot run the
+/// SCD2 MERGE. Every snapshot-model entry point refuses before it emits any
+/// statement: the bootstrap CTAS, the `is_deleted` ALTER, the steady-state
+/// statements and the plan preview.
+#[test]
+fn snapshot_models_refuse_dialects_without_snapshot_support() {
+    use rocky_core::snapshot_model::{
+        ExistingMarkers, add_is_deleted_column_sql, generate_snapshot_model_sql_with,
+        preview_snapshot_model_sql,
+    };
+    let on_conflict =
+        rocky_postgres::PostgresDialect::with_merge_mode(rocky_postgres::MergeMode::OnConflict);
+    let redshift = rocky_postgres::RedshiftDialect::with_late_binding_views(false);
+    let now = Utc.with_ymd_and_hms(2026, 10, 4, 12, 0, 0).unwrap();
+    let s = spec(timestamp(), SnapshotHardDeletes::NewRecord);
+    let cols: Vec<String> = ["id", "region", "name", "updated_at"]
+        .iter()
+        .map(|c| (*c).to_string())
+        .collect();
+    let model = "SELECT id, region, name, updated_at FROM raw.customers";
+    for dialect in [&on_conflict as &dyn SqlDialect, &redshift] {
+        let errors = [
+            generate_snapshot_bootstrap_select(&s, model, dialect, now).unwrap_err(),
+            add_is_deleted_column_sql(&s, "cat.sch.snap", dialect).unwrap_err(),
+            generate_snapshot_model_sql_with(
+                &s,
+                "cat.sch.snap",
+                model,
+                dialect,
+                &cols,
+                now,
+                ExistingMarkers::FromMode,
+            )
+            .unwrap_err(),
+            preview_snapshot_model_sql(&s, "cat.sch.snap", model, dialect, &cols, now).unwrap_err(),
+        ];
+        for err in errors {
+            let msg = err.to_string();
+            assert!(
+                msg.contains("snapshot models cannot run on"),
+                "{}: {msg}",
+                dialect.name()
+            );
+        }
+    }
+    // PostgreSQL 15+ (`merge_mode = "merge"`, the default) still runs them.
+    let pg = rocky_postgres::PostgresDialect::with_merge_mode(rocky_postgres::MergeMode::Merge);
+    assert!(generate_snapshot_bootstrap_select(&s, model, &pg, now).is_ok());
+}
