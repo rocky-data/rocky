@@ -67,6 +67,22 @@ impl UdfSignature {
     pub fn signature(&self) -> String {
         self.def.signature()
     }
+
+    /// Markdown for an editor hover: the signature, then the description.
+    #[must_use]
+    pub fn hover_markdown(&self) -> String {
+        let mut md = format!("**Function:** `{}`", self.signature());
+        if let Some(description) = self
+            .def
+            .config
+            .description
+            .as_deref()
+            .filter(|d| !d.trim().is_empty())
+        {
+            md.push_str(&format!("\n\n> {}", description.trim()));
+        }
+        md
+    }
 }
 
 /// Every function a project declares, keyed case-insensitively by name.
@@ -1054,6 +1070,23 @@ mod tests {
         // An expression over a call is not a direct call: arithmetic result
         // types are dialect-dependent, so it stays Unknown.
         assert_eq!(cols[2].data_type, RockyType::Unknown);
+    }
+
+    #[test]
+    fn hover_shows_the_signature_and_description() {
+        let mut d = def(
+            "cents_to_dollars",
+            &[("cents", "BIGINT")],
+            "DOUBLE",
+            "cents / 100.0",
+        );
+        d.config.description = Some("Integer cents to dollars".to_string());
+        let (reg, _) = registry(vec![d]);
+        assert_eq!(
+            reg.get("CENTS_TO_DOLLARS").unwrap().hover_markdown(),
+            "**Function:** `cents_to_dollars(cents BIGINT) RETURNS DOUBLE`\n\n\
+             > Integer cents to dollars"
+        );
     }
 
     #[test]

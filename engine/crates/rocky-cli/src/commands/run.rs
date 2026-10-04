@@ -11703,7 +11703,17 @@ pub(crate) async fn execute_models_with_explicit_contracts(
     // Opt-in model-skip gate. Inert unless `skip_gate.is_active()`; when
     // inactive the gate below short-circuits and `execute_models` builds every
     // model exactly as before (no extra state reads / warehouse queries).
-    let mut gate = super::skip_gate::SkipGate::new(skip_gate, &compile_result.project);
+    // Models that call a project UDF: never skipped or reused, because their
+    // logic hash does not cover the function bodies they call.
+    let function_callers: std::collections::HashSet<String> = rocky_compiler::udf::function_usage(
+        &compile_result.project.models,
+        compile_result.semantic_graph.functions(),
+    )
+    .into_values()
+    .flatten()
+    .collect();
+    let mut gate = super::skip_gate::SkipGate::new(skip_gate, &compile_result.project)
+        .with_function_callers(function_callers.clone());
 
     // Failure-containment ledger (opt-in via `[resilience] contain_failures`).
     // Tracks the downstream closure of every failed / withheld model so a
@@ -12382,11 +12392,15 @@ pub(crate) async fn execute_models_with_explicit_contracts(
                     );
                     match (model_is_unpartitioned, state_store) {
                         (true, Some(store)) => {
-                            let input_hash = compute_decision_input_hash(
-                                &model_ir,
-                                &reuse_target_by_model,
-                                &reuse_outputs,
-                            );
+                            let input_hash = if function_callers.contains(model_ir.name.as_ref()) {
+                                None
+                            } else {
+                                compute_decision_input_hash(
+                                    &model_ir,
+                                    &reuse_target_by_model,
+                                    &reuse_outputs,
+                                )
+                            };
                             Some(super::run_content_addressed::ReuseDecisionCtx {
                                 input_hash,
                                 state_store: store,

@@ -176,6 +176,10 @@ pub(crate) struct SkipGate<'a> {
     /// This-run verdict per model. Read by clause G's recursion; written by
     /// the caller as each model is built or skipped.
     verdict_map: HashMap<String, Verdict>,
+    /// Models that call a project user-defined function (`functions/`).
+    /// Never eligible: the logic hash covers the model's SQL, not the bodies
+    /// of the functions it calls, so a function-only edit would go unseen.
+    function_callers: std::collections::HashSet<String>,
     /// Marker so the unused-lifetime bound is meaningful even if the borrow
     /// set changes; keeps the struct tied to the compile result's scope.
     _marker: std::marker::PhantomData<&'a ()>,
@@ -208,6 +212,7 @@ impl<'a> SkipGate<'a> {
             model_identities,
             depends_on,
             verdict_map: HashMap::new(),
+            function_callers: std::collections::HashSet::new(),
             _marker: std::marker::PhantomData,
         }
     }
@@ -312,6 +317,17 @@ impl<'a> SkipGate<'a> {
         }
     }
 
+    /// Mark the models that call a project user-defined function as never
+    /// eligible (see [`Self::function_callers`]).
+    #[must_use]
+    pub(crate) fn with_function_callers(
+        mut self,
+        callers: std::collections::HashSet<String>,
+    ) -> Self {
+        self.function_callers = callers;
+        self
+    }
+
     /// Clause (B): is this model eligible to be skipped at all?
     ///
     /// Requires a plain strategy, deterministic SQL (or an explicit
@@ -321,6 +337,12 @@ impl<'a> SkipGate<'a> {
 
         // Explicit opt-out always wins.
         if matches!(skip_cfg.and_then(|s| s.eligible), Some(false)) {
+            return false;
+        }
+
+        // A UDF caller's output can change with no change to its own SQL,
+        // even under `[skip] deterministic = true`.
+        if self.function_callers.contains(&model.config.name) {
             return false;
         }
 
