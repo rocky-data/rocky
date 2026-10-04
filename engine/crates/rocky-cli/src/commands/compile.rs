@@ -39,6 +39,41 @@ pub fn run_compile(
     cache_ttl_override: Option<u64>,
     run_vars: &rocky_core::run_vars::RunVars,
 ) -> Result<()> {
+    run_compile_with_selection(
+        config_path,
+        state_path,
+        models_dir,
+        contracts_dir,
+        model_filter,
+        output_json,
+        do_expand_macros,
+        target_dialect,
+        with_seed,
+        cache_ttl_override,
+        run_vars,
+        None,
+    )
+}
+
+/// [`run_compile`] scoped by `--select` / `--exclude`. The whole project
+/// still compiles (types flow across models); only the selected models'
+/// details and diagnostics are reported, and only their errors fail the
+/// command — the same scoping `--model` applies.
+#[allow(clippy::too_many_arguments)]
+pub fn run_compile_with_selection(
+    config_path: Option<&Path>,
+    state_path: &Path,
+    models_dir: &Path,
+    contracts_dir: Option<&Path>,
+    model_filter: Option<&str>,
+    output_json: bool,
+    do_expand_macros: bool,
+    target_dialect: Option<Dialect>,
+    with_seed: bool,
+    cache_ttl_override: Option<u64>,
+    run_vars: &rocky_core::run_vars::RunVars,
+    selection: Option<&crate::selection::SelectionArgs>,
+) -> Result<()> {
     let (output, text_data) = compile_inner(
         config_path,
         state_path,
@@ -50,6 +85,7 @@ pub fn run_compile(
         with_seed,
         cache_ttl_override,
         run_vars,
+        selection,
     )?;
 
     if output_json {
@@ -85,6 +121,7 @@ fn compile_inner(
     with_seed: bool,
     cache_ttl_override: Option<u64>,
     run_vars: &rocky_core::run_vars::RunVars,
+    selection: Option<&crate::selection::SelectionArgs>,
 ) -> Result<(CompileOutput, CompileTextData)> {
     // Load the project config ONCE, and let a failure fail the command.
     //
@@ -182,7 +219,24 @@ fn compile_inner(
     {
         return Err(anyhow::Error::new(ModelNotFound(filter.to_string())));
     }
-    let in_scope = |name: &str| model_filter.is_none_or(|filter| name == filter);
+    let selected: Option<std::collections::BTreeSet<String>> = match selection {
+        Some(args) if args.is_active() => Some(crate::selection::resolve(
+            args,
+            &result.project,
+            models_dir,
+            &crate::selection::StateContext {
+                config_path: config_path.unwrap_or_else(|| Path::new("rocky.toml")),
+                state_path,
+                cache_ttl_override,
+            },
+        )?),
+        _ => None,
+    };
+    let in_scope = |name: &str| {
+        model_filter.is_none_or(|filter| name == filter)
+            && selected.as_ref().is_none_or(|set| set.contains(name))
+    };
+    let scoped = model_filter.is_some() || selected.is_some();
 
     // Portability lint. Effective target_dialect = CLI flag > [portability]
     // config > unset. Project-wide allow list and per-model `-- rocky-allow:`
@@ -358,7 +412,7 @@ fn compile_inner(
             .collect(),
     };
 
-    let execution_layers = if model_filter.is_some() {
+    let execution_layers = if scoped {
         result
             .project
             .layers
@@ -368,7 +422,7 @@ fn compile_inner(
     } else {
         result.project.layers.len()
     };
-    let has_errors = if model_filter.is_some() {
+    let has_errors = if scoped {
         diagnostics.iter().any(|d| d.severity == Severity::Error)
     } else {
         result.has_errors
@@ -440,6 +494,7 @@ pub fn compile_output(
         // `compile_output` backs commands that don't expose `--var`
         // (ci / dag); an `@var()` model would surface an E028 diagnostic.
         &rocky_core::run_vars::RunVars::new(),
+        None,
     )?;
     Ok(output)
 }

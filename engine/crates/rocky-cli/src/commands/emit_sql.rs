@@ -101,11 +101,27 @@ fn assumes_existing_target(strategy: &rocky_ir::MaterializationStrategy) -> bool
 /// transformation model, applying declared surrogate-key columns so the output
 /// matches what `rocky run` would execute. `model_filter` restricts to a single
 /// model by name.
+#[cfg(test)]
 fn emit_models(
     config_path: Option<&Path>,
     models_dir: &Path,
     model_filter: Option<&str>,
     run_vars: &rocky_core::run_vars::RunVars,
+) -> Result<EmitResult> {
+    emit_models_selected(config_path, models_dir, model_filter, run_vars, None)
+}
+
+/// [`emit_models`], further narrowed by a `--select` / `--exclude`
+/// selection resolved against the compiled project.
+fn emit_models_selected(
+    config_path: Option<&Path>,
+    models_dir: &Path,
+    model_filter: Option<&str>,
+    run_vars: &rocky_core::run_vars::RunVars,
+    selection: Option<(
+        &crate::selection::SelectionArgs,
+        &crate::selection::StateContext<'_>,
+    )>,
 ) -> Result<EmitResult> {
     use rocky_compiler::compile::{self, CompilerConfig};
 
@@ -175,6 +191,17 @@ fn emit_models(
         );
     }
 
+    let selected: Option<std::collections::BTreeSet<String>> = match selection {
+        Some((args, ctx)) if args.is_active() => Some(crate::selection::resolve(
+            args,
+            &result.project,
+            models_dir,
+            ctx,
+        )?),
+        _ => None,
+    };
+    let in_selection = |name: &str| selected.as_ref().is_none_or(|set| set.contains(name));
+
     // Iterate in the project's topological execution order so the emitted files
     // are runnable in sequence (a model never precedes one it reads). Models not
     // listed in `execution_order` (defensive) fall to the end in IR order.
@@ -221,6 +248,7 @@ fn emit_models(
         .models
         .iter()
         .filter(|m| model_filter.is_none_or(|f| m.config.name == f))
+        .filter(|m| in_selection(&m.config.name))
         .map(|m| std::path::PathBuf::from(&m.file_path))
         .collect();
     let surrogate_keys: HashMap<String, Vec<SurrogateKeySpec>> =
@@ -234,6 +262,9 @@ fn emit_models(
     let mut filter_matched = false;
     for model_ir in ordered {
         let model_name = model_ir.name.as_ref();
+        if !in_selection(model_name) {
+            continue;
+        }
         if let Some(f) = model_filter {
             if model_name != f {
                 continue;
@@ -325,10 +356,32 @@ pub fn run_emit_sql(
     out_dir: Option<&Path>,
     run_vars: &rocky_core::run_vars::RunVars,
 ) -> Result<()> {
+    run_emit_sql_with_selection(
+        config_path,
+        models_dir,
+        model_filter,
+        out_dir,
+        run_vars,
+        None,
+    )
+}
+
+/// [`run_emit_sql`] narrowed by `--select` / `--exclude`.
+pub fn run_emit_sql_with_selection(
+    config_path: Option<&Path>,
+    models_dir: &Path,
+    model_filter: Option<&str>,
+    out_dir: Option<&Path>,
+    run_vars: &rocky_core::run_vars::RunVars,
+    selection: Option<(
+        &crate::selection::SelectionArgs,
+        &crate::selection::StateContext<'_>,
+    )>,
+) -> Result<()> {
     let EmitResult {
         models,
         mut skipped,
-    } = emit_models(config_path, models_dir, model_filter, run_vars)?;
+    } = emit_models_selected(config_path, models_dir, model_filter, run_vars, selection)?;
 
     if models.is_empty() {
         println!("emit-sql: no transformation SQL to emit.");

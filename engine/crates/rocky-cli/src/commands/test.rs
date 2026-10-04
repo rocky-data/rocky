@@ -112,13 +112,65 @@ pub fn run_test(
     output_json: bool,
     run_vars: &rocky_core::run_vars::RunVars,
 ) -> Result<()> {
-    let result =
+    run_test_with_selection(
+        models_dir,
+        contracts_dir,
+        model_filter,
+        output_json,
+        run_vars,
+        None,
+    )
+}
+
+/// Narrow a full test run to the selected models. Every model still executes
+/// (a selected model's upstreams must exist in DuckDB); only the reported
+/// results, failures, diagnostics, and unit tests are scoped — the same
+/// contract `--model` has.
+fn retain_selected(
+    result: &mut rocky_engine::test_runner::TestResult,
+    unit_run: &mut rocky_engine::test_runner::UnitTestRun,
+    selected: &std::collections::BTreeSet<String>,
+) {
+    result.failures.retain(|(name, _)| selected.contains(name));
+    result.model_results.retain(|r| selected.contains(&r.model));
+    result.diagnostics.retain(|d| selected.contains(&d.model));
+    result.total = result.model_results.len();
+    result.passed = result
+        .model_results
+        .iter()
+        .filter(|r| r.status == rocky_engine::test_runner::ModelTestStatus::Pass)
+        .count();
+    unit_run.results.retain(|r| selected.contains(&r.model));
+}
+
+/// [`run_test`] scoped by `--select` / `--exclude`.
+pub fn run_test_with_selection(
+    models_dir: &Path,
+    contracts_dir: Option<&Path>,
+    model_filter: Option<&str>,
+    output_json: bool,
+    run_vars: &rocky_core::run_vars::RunVars,
+    selection: Option<(
+        &crate::selection::SelectionArgs,
+        &crate::selection::StateContext<'_>,
+    )>,
+) -> Result<()> {
+    let selected = match selection {
+        Some((args, ctx)) if args.is_active() => Some(crate::selection::resolve_in_dir(
+            args, models_dir, None, ctx,
+        )?),
+        _ => None,
+    };
+    let mut result =
         rocky_engine::test_runner::run_tests(models_dir, contracts_dir, model_filter, run_vars)?;
     // `run_test` deliberately re-runs the engine rather than calling
     // `test_output` (see that function's note), so the check has to be made
     // here too — this is the path the CLI actually takes.
     reject_unknown_model(model_filter, &result.all_models)?;
-    let unit_run = rocky_engine::test_runner::run_unit_tests(models_dir, model_filter)?;
+    let mut unit_run = rocky_engine::test_runner::run_unit_tests(models_dir, model_filter)?;
+    if let Some(set) = &selected {
+        retain_selected(&mut result, &mut unit_run, set);
+    }
     let unit_failed = unit_run.total() - unit_run.passed();
 
     if output_json {

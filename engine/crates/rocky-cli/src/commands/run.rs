@@ -952,6 +952,14 @@ pub struct DeferOptions {
     /// production home). When `Some(schema)`, every deferred reference is
     /// pointed at that schema instead (catalog + table preserved).
     pub defer_to: Option<String>,
+    /// Multi-model graph selection (`--select` / `--exclude`), already
+    /// resolved to model names. `None` (every caller that does not pass a
+    /// selector) keeps today's behavior. When `Some`, `rocky run` takes the
+    /// model-only path and builds exactly these models; with `--defer`, every
+    /// model outside the set is a deferred upstream. Lives here because the
+    /// selection is exactly what `--defer` defers *around*. A selection of one
+    /// model is passed as `--model` instead, so that path stays unchanged.
+    pub selected_models: Option<BTreeSet<String>>,
 }
 
 /// Remove the local-model E039 check only after `--defer` has successfully
@@ -962,16 +970,40 @@ pub struct DeferOptions {
 /// the single-model defer path that binding is necessarily unselected and the
 /// successful rewrite externalizes it. The external target's schema remains
 /// unknown here: an invalid column still fails at warehouse execution.
+///
+/// With a multi-model selection a selected model may read another selected
+/// (locally built) model, so E039 is suppressed only on a selected model whose
+/// edges were all externalized: it has an externalized edge and no declared
+/// input inside the selection.
 fn suppress_deferred_selected_e039(
     compile_result: &mut rocky_compiler::compile::CompileResult,
-    selected: Option<&str>,
+    selected: Option<&BTreeSet<String>>,
+    externalized: &BTreeMap<String, BTreeSet<String>>,
     defer_enabled: bool,
 ) {
     let Some(selected) = selected.filter(|_| defer_enabled) else {
         return;
     };
+    let suppressed_models: BTreeSet<&str> = if selected.len() == 1 {
+        selected.iter().map(String::as_str).collect()
+    } else {
+        selected
+            .iter()
+            .filter(|name| externalized.get(*name).is_some_and(|e| !e.is_empty()))
+            .filter(|name| {
+                compile_result
+                    .project
+                    .dag_nodes
+                    .iter()
+                    .find(|node| node.name == **name)
+                    .is_some_and(|node| node.depends_on.iter().all(|d| !selected.contains(d)))
+            })
+            .map(String::as_str)
+            .collect()
+    };
     let is_suppressed = |diagnostic: &rocky_compiler::diagnostic::Diagnostic| {
-        diagnostic.model == selected && diagnostic.code.as_ref() == rocky_compiler::diagnostic::E039
+        suppressed_models.contains(diagnostic.model.as_str())
+            && diagnostic.code.as_ref() == rocky_compiler::diagnostic::E039
     };
     compile_result
         .type_check
@@ -992,12 +1024,25 @@ fn suppress_deferred_selected_e039(
 /// bare and qualified reads.
 fn deferred_externalized_edges(
     compile_result: &rocky_compiler::compile::CompileResult,
-    selected: Option<&str>,
+    selected: Option<&BTreeSet<String>>,
     defer_enabled: bool,
 ) -> BTreeMap<String, BTreeSet<String>> {
-    let Some(selected) = selected.filter(|_| defer_enabled) else {
+    let Some(selected_set) = selected.filter(|_| defer_enabled) else {
         return BTreeMap::new();
     };
+    selected_set
+        .iter()
+        .flat_map(|name| deferred_externalized_edges_for(compile_result, name, selected_set))
+        .collect()
+}
+
+/// [`deferred_externalized_edges`] for one selected model. A dependency that
+/// is itself selected is built locally, so it is never externalized.
+fn deferred_externalized_edges_for(
+    compile_result: &rocky_compiler::compile::CompileResult,
+    selected: &str,
+    selected_set: &BTreeSet<String>,
+) -> BTreeMap<String, BTreeSet<String>> {
     let Some(model) = compile_result.project.model(selected) else {
         return BTreeMap::new();
     };
@@ -1043,7 +1088,11 @@ fn deferred_externalized_edges(
         }),
     );
     let mut externalized = BTreeSet::new();
-    for dependency in &node.depends_on {
+    for dependency in node
+        .depends_on
+        .iter()
+        .filter(|d| !selected_set.contains(*d))
+    {
         let is_rewritten = |relation: &&ObjectName| {
             relation.0.len() == 1
                 && relation.0[0]
@@ -3000,10 +3049,17 @@ pub async fn run_with_explicit_contracts(
     // pipeline that does not resolve falls through, so the run body reports it
     // as it always did.
     if let Some(shadow) = shadow_config {
+        // A multi-model `--select` takes the model-only arm exactly like
+        // `--model`, so it is gated the same way.
+        let first_selected = defer_opts
+            .selected_models
+            .as_ref()
+            .and_then(|set| set.iter().next())
+            .map(String::as_str);
         require_shadow_support_for_config(
             &loaded.config,
             pipeline_name_arg,
-            model_name_filter,
+            model_name_filter.or(first_selected),
             shadow,
         )?;
     }
@@ -3174,7 +3230,21 @@ pub async fn run_with_explicit_contracts(
     // Model-only execution: skip the entire replication path and execute
     // just the named model. Dagster uses this for per-asset materialization
     // when it controls the DAG scheduling.
-    if let Some(target_model) = model_name_filter {
+    //
+    // A multi-model `--select` (resolved to `defer_opts.selected_models`) takes
+    // the same arm, building exactly the selected set. A one-model selection
+    // arrives as `model_name_filter`, so `target_model` stays the `--model`
+    // path unchanged.
+    let selected_models = defer_opts
+        .selected_models
+        .as_ref()
+        .filter(|_| model_name_filter.is_none());
+    if model_name_filter.is_some() || selected_models.is_some() {
+        let target_model: Option<&str> = model_name_filter;
+        let in_selection = |name: &str| match target_model {
+            Some(target) => name == target,
+            None => selected_models.is_some_and(|set| set.contains(name)),
+        };
         ensure_resume_supported(resume_requested, false, "model-only")?;
         let adapter_registry = AdapterRegistry::from_config(rocky_cfg)?;
         // An explicit `--pipeline` alongside `--model` (also how the unified-DAG
@@ -3341,8 +3411,10 @@ pub async fn run_with_explicit_contracts(
             state_store.as_ref(),
             partition_opts,
             &run_id,
-            Some(target_model),
-            None, // single-model path drives selection via `model_name_filter`
+            target_model,
+            // The single-model path drives selection via `model_name_filter`;
+            // a multi-model `--select` drives it through this set.
+            selected_models,
             &mut output,
             None, // model-only run has no pipeline hooks
             None,
@@ -3407,7 +3479,7 @@ pub async fn run_with_explicit_contracts(
                             .models
                             .iter()
                             .map(|m| m.name.as_str())
-                            .filter(|name| *name == target_model),
+                            .filter(|name| in_selection(name)),
                     )
                     .await
                 {
@@ -3427,12 +3499,27 @@ pub async fn run_with_explicit_contracts(
                     // fingerprint gate, never a fresh disk compile.
                     let governance_adapter =
                         adapter_registry.governance_adapter(&target_adapter_name);
-                    apply_model_governance_tags(
-                        &snapshot,
-                        governance_adapter.as_ref(),
-                        Some(target_model),
-                    )
-                    .await;
+                    match (target_model, selected_models) {
+                        (Some(target), _) => {
+                            apply_model_governance_tags(
+                                &snapshot,
+                                governance_adapter.as_ref(),
+                                Some(target),
+                            )
+                            .await;
+                        }
+                        (None, Some(set)) => {
+                            for model in set {
+                                apply_model_governance_tags(
+                                    &snapshot,
+                                    governance_adapter.as_ref(),
+                                    Some(model),
+                                )
+                                .await;
+                            }
+                        }
+                        (None, None) => {}
+                    }
                     // Write the recipe-identity attestation into the built table's
                     // warehouse metadata (Databricks Delta TBLPROPERTIES; no-op
                     // elsewhere). Reads the triple off the materialization; never
@@ -3452,7 +3539,7 @@ pub async fn run_with_explicit_contracts(
                 // too, instead of hard-coding `Unknown`.
                 let (failure_kind, cooldown_seconds) = classify_anyhow_error_with_cooldown(&e);
                 output.errors.push(crate::output::TableErrorOutput {
-                    asset_key: vec![target_model.to_string()],
+                    asset_key: vec![target_model.unwrap_or("<selection>").to_string()],
                     error: format!("{e:#}"),
                     failure_kind,
                     cooldown_seconds,
@@ -9280,7 +9367,7 @@ pub(super) fn emit_pipes_events(pipes: &crate::pipes::PipesEmitter, output: &Run
 /// reference.
 fn apply_defer_rewrite(
     compile_result: &mut rocky_compiler::compile::CompileResult,
-    model_name_filter: Option<&str>,
+    model_name_filter: Option<&BTreeSet<String>>,
     defer_opts: &DeferOptions,
     dialect: &dyn rocky_core::traits::SqlDialect,
 ) -> Result<()> {
@@ -9309,10 +9396,9 @@ fn apply_defer_rewrite(
             .with_context(|| format!("invalid --defer-to schema '{schema}'"))?;
     }
 
-    // Build the set of selected (built-locally) model names. Today `--model`
-    // selects exactly one model, but treat it as a set so the logic survives
-    // a future multi-select.
-    let selected_set: HashSet<&str> = std::iter::once(selected).collect();
+    // The selected (built-locally) model names: one for `--model`, several
+    // for a `--select` that resolved to more than one model.
+    let selected_set: HashSet<&str> = selected.iter().map(String::as_str).collect();
 
     // The deferred set = every compiled model not in the selection, mapped to
     // its qualified defer target. `--defer-to` overrides the schema part;
@@ -10368,6 +10454,57 @@ pub(crate) fn resolve_model_run_target(
     }
 }
 
+/// Resolve `--select` / `--exclude` for a model run (`rocky run`, `rocky
+/// plan`) against the same models a `--model` run would compile: the
+/// `--models` override, else the owning transformation pipeline's configured
+/// directory and glob, else `./models`.
+pub fn resolve_run_selection(
+    config_path: &Path,
+    state_path: &Path,
+    cache_ttl_override: Option<u64>,
+    pipeline_name_arg: Option<&str>,
+    models_dir: Option<&Path>,
+    selection: &crate::selection::SelectionArgs,
+) -> Result<BTreeSet<String>> {
+    let (mdir, models_glob) = if let Some(dir) = models_dir {
+        (dir.to_path_buf(), None)
+    } else {
+        let config = rocky_core::config::load_rocky_config(config_path)?;
+        let (_, _, configured_glob) = resolve_model_run_target(&config, pipeline_name_arg)?;
+        match configured_glob {
+            Some(glob) => {
+                let dir = match crate::models_loader::locate_models_dir(&glob, config_path)? {
+                    crate::models_loader::ModelsDir::Present(dir)
+                    | crate::models_loader::ModelsDir::Absent(dir) => dir,
+                };
+                (
+                    dir,
+                    Some(crate::models_loader::resolved_models_glob(
+                        &glob,
+                        config_path,
+                    )),
+                )
+            }
+            None => (PathBuf::from("models"), None),
+        }
+    };
+    anyhow::ensure!(
+        mdir.exists(),
+        "models directory '{}' not found (required for --select)",
+        mdir.display()
+    );
+    crate::selection::resolve_in_dir(
+        selection,
+        &mdir,
+        models_glob.as_deref(),
+        &crate::selection::StateContext {
+            config_path,
+            state_path,
+            cache_ttl_override,
+        },
+    )
+}
+
 /// The (catalog, schema) pairs an invocation may pre-create under
 /// `auto_create_schemas` — the models the selection will attempt to build.
 /// (Runtime exclusions decided later — containment poisoning, skip gates —
@@ -11293,17 +11430,32 @@ pub(crate) async fn execute_models_with_explicit_contracts(
     // fingerprint above intentionally covers the pre-rewrite project. This
     // in-memory rewrite must succeed before E039 can be suppressed, and no
     // warehouse write occurs before either step.
-    let externalized_defer_edges =
-        deferred_externalized_edges(&compile_result, model_name_filter, defer_opts.enabled);
+    //
+    // The defer selection is `--model`, else the `--select` set (the
+    // `model_set` the model-only arm passes). A backfill also passes a
+    // `model_set` but never enables `--defer`, so every step below is inert.
+    let defer_selection: Option<BTreeSet<String>> = model_name_filter
+        .map(|name| BTreeSet::from([name.to_string()]))
+        .or_else(|| model_set.cloned());
+    let externalized_defer_edges = deferred_externalized_edges(
+        &compile_result,
+        defer_selection.as_ref(),
+        defer_opts.enabled,
+    );
     if defer_opts.enabled {
         apply_defer_rewrite(
             &mut compile_result,
-            model_name_filter,
+            defer_selection.as_ref(),
             defer_opts,
             warehouse.dialect(),
         )?;
     }
-    suppress_deferred_selected_e039(&mut compile_result, model_name_filter, defer_opts.enabled);
+    suppress_deferred_selected_e039(
+        &mut compile_result,
+        defer_selection.as_ref(),
+        &externalized_defer_edges,
+        defer_opts.enabled,
+    );
 
     let compile_failed_models: BTreeSet<String> = compile_result
         .diagnostics
@@ -31523,6 +31675,79 @@ backend = "local"
         .expect("write model toml");
     }
 
+    /// Multi-model `--defer` (`--select` resolving to several models): an edge
+    /// to another SELECTED model is never externalized or rewritten, an edge
+    /// to an unselected model is, and E039 is kept on a model that still reads
+    /// a selected (locally built) input.
+    #[test]
+    fn multi_model_defer_externalizes_only_unselected_edges() {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir(&models_dir).expect("mkdir models");
+        write_model_with_target(&models_dir, "orders", "SELECT 1 AS id", "main", "orders");
+        write_model_with_target(&models_dir, "stg", "SELECT id FROM orders", "main", "stg");
+        write_model_with_target(&models_dir, "mart", "SELECT id FROM stg", "main", "mart");
+        write_model_with_target(
+            &models_dir,
+            "wide",
+            "SELECT o.id FROM orders o JOIN stg s ON o.id = s.id",
+            "main",
+            "wide",
+        );
+        let mut compiled =
+            rocky_compiler::compile::compile(&rocky_compiler::compile::CompilerConfig {
+                models_dir,
+                ..Default::default()
+            })
+            .expect("compile models");
+        let selected: BTreeSet<String> = ["stg", "mart", "wide"].map(String::from).into();
+
+        let edges = super::deferred_externalized_edges(&compiled, Some(&selected), true);
+        assert_eq!(
+            edges.get("stg"),
+            Some(&BTreeSet::from(["orders".to_string()])),
+            "stg's only input is unselected, so it is externalized"
+        );
+        assert!(
+            !edges.contains_key("mart"),
+            "mart reads selected stg, which is built locally: {edges:?}"
+        );
+        assert!(
+            edges.get("wide").is_none_or(|e| !e.contains("stg")),
+            "a selected input is never externalized: {edges:?}"
+        );
+        assert!(
+            super::deferred_externalized_edges(&compiled, Some(&selected), false).is_empty(),
+            "inert without --defer"
+        );
+
+        super::apply_defer_rewrite(
+            &mut compiled,
+            Some(&selected),
+            &super::DeferOptions {
+                enabled: true,
+                defer_to: Some("prod".to_string()),
+                selected_models: None,
+            },
+            &rocky_databricks::dialect::DatabricksSqlDialect,
+        )
+        .expect("defer rewrite");
+        let sql = |name: &str| {
+            compiled
+                .project
+                .models
+                .iter()
+                .find(|m| m.config.name == name)
+                .expect("model")
+                .sql
+                .clone()
+        };
+        assert!(sql("stg").contains("prod.orders"), "{}", sql("stg"));
+        assert!(!sql("mart").contains("prod."), "{}", sql("mart"));
+        assert!(sql("wide").contains("prod.orders"), "{}", sql("wide"));
+        assert!(!sql("wide").contains("prod.stg"), "{}", sql("wide"));
+    }
+
     /// #1350: the model-only fallback answers identically to naming the
     /// same pipeline explicitly — adapter, governance, and glob. The
     /// hardcoded-false governance was a #1305 fossil.
@@ -32583,10 +32808,11 @@ auto_create_schemas = true
                 .expect("compile models");
             super::apply_defer_rewrite(
                 &mut compiled,
-                Some("mart"),
+                Some(&std::collections::BTreeSet::from(["mart".to_string()])),
                 &super::DeferOptions {
                     enabled: true,
                     defer_to: None,
+                    selected_models: None,
                 },
                 &rocky_snowflake::dialect::SnowflakeSqlDialect,
             )
@@ -33878,6 +34104,7 @@ auto_create_schemas = true
         let defer_opts = DeferOptions {
             enabled: true,
             defer_to: None,
+            selected_models: None,
         };
         let mut output = RunOutput::new(String::new(), 0, 1);
 
@@ -35534,6 +35761,7 @@ auto_create_schemas = true
                 &DeferOptions {
                     enabled: true,
                     defer_to: Some("prod".to_string()),
+                    selected_models: None,
                 },
                 SkipGateConfig {
                     feature_enabled: false,
@@ -35603,6 +35831,7 @@ auto_create_schemas = true
                     &DeferOptions {
                         enabled: true,
                         defer_to: Some("prod".to_string()),
+                        selected_models: None,
                     },
                     SkipGateConfig {
                         feature_enabled: false,
@@ -35668,6 +35897,7 @@ auto_create_schemas = true
                 &DeferOptions {
                     enabled: true,
                     defer_to: Some("prod".to_string()),
+                    selected_models: None,
                 },
                 SkipGateConfig {
                     feature_enabled: false,

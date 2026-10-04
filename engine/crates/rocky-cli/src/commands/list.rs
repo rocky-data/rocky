@@ -128,8 +128,11 @@ pub fn list_models_output(models_dir: &Path) -> Result<ListModelsOutput> {
 /// Build the model-entry rows by loading the models directory (with the
 /// one-level subdirectory scan).
 fn build_model_entries(models_dir: &Path) -> Result<Vec<ListModelEntry>> {
-    let models = load_all_models(models_dir)?;
+    build_model_entries_in(&load_all_models(models_dir)?)
+}
 
+/// Build the model-entry rows from already-loaded models.
+fn build_model_entries_in(models: &[rocky_core::models::Model]) -> Result<Vec<ListModelEntry>> {
     let entries: Vec<ListModelEntry> = models
         .iter()
         .map(|m| {
@@ -137,20 +140,7 @@ fn build_model_entries(models_dir: &Path) -> Result<Vec<ListModelEntry>> {
                 "{}.{}.{}",
                 m.config.target.catalog, m.config.target.schema, m.config.target.table
             );
-            let strategy = match &m.config.strategy {
-                rocky_core::models::StrategyConfig::FullRefresh => "full_refresh",
-                rocky_core::models::StrategyConfig::Incremental { .. } => "incremental",
-                rocky_core::models::StrategyConfig::Merge { .. } => "merge",
-                rocky_core::models::StrategyConfig::TimeInterval { .. } => "time_interval",
-                rocky_core::models::StrategyConfig::DeleteInsert { .. } => "delete_insert",
-                rocky_core::models::StrategyConfig::Ephemeral => "ephemeral",
-                rocky_core::models::StrategyConfig::Microbatch { .. } => "microbatch",
-                rocky_core::models::StrategyConfig::ContentAddressed { .. } => "content_addressed",
-                rocky_core::models::StrategyConfig::View => "view",
-                rocky_core::models::StrategyConfig::MaterializedView => "materialized_view",
-                rocky_core::models::StrategyConfig::DynamicTable { .. } => "dynamic_table",
-            }
-            .to_string();
+            let strategy = rocky_core::selector::strategy_kind(&m.config.strategy).to_string();
             ListModelEntry {
                 name: m.config.name.clone(),
                 target,
@@ -170,7 +160,33 @@ fn build_model_entries(models_dir: &Path) -> Result<Vec<ListModelEntry>> {
 /// is scanned independently so per-directory `_defaults.toml` files work.
 pub fn list_models(models_dir: &Path, json: bool) -> Result<()> {
     let entries = build_model_entries(models_dir)?;
+    render_model_entries(models_dir, entries, json)
+}
 
+/// Execute `rocky list models --select ... --exclude ...`: list only the
+/// models the selection resolves to (dbt `ls --select`). With no selection
+/// flags this is exactly [`list_models`].
+pub fn list_models_selected(
+    models_dir: &Path,
+    json: bool,
+    selection: &crate::selection::SelectionArgs,
+    ctx: &crate::selection::StateContext<'_>,
+) -> Result<()> {
+    if !selection.is_active() {
+        return list_models(models_dir, json);
+    }
+    let models = load_all_models(models_dir)?;
+    let project = rocky_compiler::project::Project::from_models(models.clone())
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let selected = crate::selection::resolve(selection, &project, models_dir, ctx)?;
+    let models: Vec<_> = models
+        .into_iter()
+        .filter(|m| selected.contains(&m.config.name))
+        .collect();
+    render_model_entries(models_dir, build_model_entries_in(&models)?, json)
+}
+
+fn render_model_entries(models_dir: &Path, entries: Vec<ListModelEntry>, json: bool) -> Result<()> {
     if json {
         print_json(&ListModelsOutput::new(entries))?;
     } else {

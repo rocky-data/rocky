@@ -12,7 +12,7 @@ mod brief;
 mod catalog;
 #[cfg(feature = "duckdb")]
 mod ci;
-mod ci_diff;
+pub(crate) mod ci_diff;
 mod column_skip;
 mod compact;
 mod compare;
@@ -125,7 +125,7 @@ pub use ci::run_ci;
 pub use ci_diff::{extract_base_compile, project_ir_from_compile, run_ci_diff};
 pub use compact::{run_compact, run_compact_apply, run_compact_catalog, run_measure_dedup};
 pub use compare::compare;
-pub use compile::{compile_output, run_compile};
+pub use compile::{compile_output, run_compile, run_compile_with_selection};
 pub use completions::run_completions;
 pub use compliance::{compute_compliance, run_compliance};
 pub use cost::{CostGroupBy, compute_cost, run_cost};
@@ -133,7 +133,7 @@ pub use dag::{dag_output, run_dag};
 pub use discover::discover;
 pub use docs::run_docs;
 pub use doctor::doctor;
-pub use emit_sql::run_emit_sql;
+pub use emit_sql::{run_emit_sql, run_emit_sql_with_selection};
 pub use estimate::{EstimateReport, compute_estimate, run_estimate};
 pub use export_openapi::export_openapi;
 pub use export_schemas::{export_schemas, schemas_hash};
@@ -153,7 +153,8 @@ pub use lineage::{column_lineage_output, lineage_output, run_lineage};
 pub use lineage_diff::run_lineage_diff;
 pub use list::{
     list_adapters, list_adapters_output, list_consumers, list_deps, list_models,
-    list_models_output, list_pipelines, list_pipelines_output, list_sources, list_sources_output,
+    list_models_output, list_models_selected, list_pipelines, list_pipelines_output, list_sources,
+    list_sources_output,
 };
 pub use load::run_load;
 pub use lsp::run_lsp;
@@ -201,7 +202,8 @@ pub use schedule_status::{ScheduleStatusError, schedule_status_output};
 pub use rocky_sql::transpile::Dialect;
 pub use run::{
     CheckGateFailure, DeferOptions, Interrupted, PartialFailure, PartitionRunOptions,
-    ShadowComparisonFailure, SkipRunOptions, require_shadow_support_for_config, run,
+    ShadowComparisonFailure, SkipRunOptions, require_shadow_support_for_config,
+    resolve_run_selection, run,
 };
 pub use run_dag_exec::run_with_dag;
 pub use run_watch::run_watch as run_with_watch;
@@ -217,7 +219,7 @@ pub use test::declarative_test_output;
 #[cfg(feature = "duckdb")]
 pub use test::run_declarative_tests;
 #[cfg(feature = "duckdb")]
-pub use test::{run_test, test_output};
+pub use test::{run_test, run_test_with_selection, test_output};
 pub use test_adapter::{run_test_adapter, run_test_adapter_builtin};
 pub use tick::run_tick;
 pub use trace::{compute_trace, run_trace};
