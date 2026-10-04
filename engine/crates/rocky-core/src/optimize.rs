@@ -454,9 +454,9 @@ mod tests {
         assert_eq!(result.recommended_strategy, "view");
     }
 
-    /// No branch recommends `incremental`, which `rocky compile` refuses on a
-    /// transformation model (E037, #1990), or `ephemeral`, which the cost model
-    /// has no evidence for.
+    /// No branch may recommend a strategy `rocky compile` refuses or the cost
+    /// model has no evidence for: `incremental` needs a watermark the optimizer
+    /// cannot pick (E037/E046), and `ephemeral` has no cost evidence.
     #[test]
     fn no_recommendation_names_a_refused_strategy() {
         for (duration, size, refs, runs) in [

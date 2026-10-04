@@ -1,6 +1,7 @@
 use rocky_sql::validation;
 use thiserror::Error;
 
+use crate::incremental_filter;
 use crate::lakehouse::{self, LakehouseError};
 use crate::traits::{AdapterError, SqlDialect};
 use rocky_ir::{
@@ -372,14 +373,13 @@ pub fn generate_transformation_sql_with_warehouse(
             Ok(stmts)
         }
         MaterializationStrategy::Incremental { .. } => {
-            // Refused (#1990). On a transformation model this strategy has
-            // no watermark to apply, so the only SQL it could emit is an
-            // unfiltered `INSERT INTO <target> <model SQL>` that appends the
-            // whole result again on every run. `rocky compile` reports E037;
-            // this arm keeps callers that skip the compile gate (`rocky plan`,
-            // `rocky estimate`) from printing or running that INSERT.
+            // The incremental-run SQL: the model filtered to rows past the
+            // target's own `MAX(<watermark>)`, appended or merged. With no
+            // watermark this refuses (E037, #1990) instead of emitting the
+            // unfiltered INSERT that would append every row again. The first
+            // run goes through `generate_transformation_initial_ddl`.
             // Replication `incremental` goes through `generate_insert_sql`.
-            Err(incremental_transformation_refused(model_ir))
+            generate_incremental_transformation_sql(model_ir, dialect, None)
         }
         MaterializationStrategy::Merge {
             unique_key,
@@ -514,12 +514,17 @@ pub fn generate_time_interval_bootstrap_sql(
         return Err(variant_mismatch(model_ir, "Transformation"));
     }
     // An `incremental` body has no `@start_date`/`@end_date` for the sentinel
-    // window to empty, so this CTAS would load the whole result (#1990).
+    // window to empty; its first run goes through
+    // `generate_transformation_initial_ddl` instead.
     if matches!(
         model_ir.materialization,
         MaterializationStrategy::Incremental { .. }
     ) {
-        return Err(incremental_transformation_refused(model_ir));
+        return Err(SqlGenError::InvalidRequest(format!(
+            "model '{}': an `incremental` model has no time_interval bootstrap; its first \
+             run is generate_transformation_initial_ddl",
+            model_ir.name
+        )));
     }
     // An `ephemeral` model must never get a table (#1996). Refused here too,
     // so a caller that skips the compile gate cannot create one.
@@ -602,15 +607,24 @@ pub fn generate_transformation_initial_ddl(
     if model_ir.variant() != ModelIrVariant::Transformation {
         return Err(variant_mismatch(model_ir, "Transformation"));
     }
-    // The bootstrap CTAS is the first load of an `incremental` model, so it
-    // is refused here too (#1990). Otherwise a caller that skips the compile
-    // gate could still create and load the table before the exec arm refuses.
-    if matches!(
+    // The bootstrap CTAS is the first load of an `incremental` model: every
+    // `@incremental_filter` resolves to `TRUE`. With no watermark it is
+    // refused (E037, #1990), so a caller that skips the compile gate cannot
+    // create and load a table whose later runs would append everything again.
+    let incremental_body;
+    let body: &str = if matches!(
         model_ir.materialization,
         MaterializationStrategy::Incremental { .. }
     ) {
-        return Err(incremental_transformation_refused(model_ir));
-    }
+        incremental_body = incremental_filter::incremental_select(
+            model_ir,
+            dialect,
+            incremental_filter::FilterMode::Unfiltered,
+        )?;
+        &incremental_body
+    } else {
+        &model_ir.sql
+    };
     // Same for `ephemeral` (#1996): this DDL would give a model that must
     // never be materialized a physical table.
     if matches!(model_ir.materialization, MaterializationStrategy::Ephemeral) {
@@ -635,29 +649,74 @@ pub fn generate_transformation_initial_ddl(
             .cloned()
             .unwrap_or_default();
         return Ok(lakehouse::generate_lakehouse_initial_ddl(
-            format,
-            &target,
-            &model_ir.sql,
-            &opts,
-            dialect,
+            format, &target, body, &opts, dialect,
         )?);
     }
 
-    Ok(vec![dialect.create_table_as_new(&target, &model_ir.sql)])
+    Ok(vec![dialect.create_table_as_new(&target, body)])
 }
 
-/// The refusal every transformation generator returns for `incremental` (#1990):
-/// the exec SQL, the first-run CTAS and the time-interval bootstrap.
+/// The incremental-run statement of a transformation `incremental` model.
 ///
-/// A transformation model has no watermark to apply, so every statement this
-/// strategy could produce, the bootstrap CTAS and the INSERT alike, loads the
-/// whole result again. `rocky compile` reports the same thing as E037.
-fn incremental_transformation_refused(model_ir: &ModelIr) -> SqlGenError {
-    SqlGenError::InvalidRequest(format!(
-        "model '{}': `type = \"incremental\"` is not supported on transformation models \
-         (E037); use merge, delete_insert, time_interval or full_refresh",
-        model_ir.name
-    ))
+/// The body is the model filtered to rows past the target's
+/// `MAX(<watermark>)` (see [`incremental_filter`]). With no `unique_key` it is
+/// appended (`INSERT INTO`); with one it is upserted through the dialect's
+/// `MERGE`, updating every typed output column.
+///
+/// `insert_columns` names the target columns of an append explicitly —
+/// `INSERT INTO t (a, b) SELECT a, b FROM (<body>)` — which the runtime passes
+/// when the model's column order no longer matches the target's, so a
+/// positional insert cannot shift values into the wrong column. `None` keeps
+/// the positional form.
+///
+/// # Errors
+///
+/// [`SqlGenError::InvalidRequest`] for a non-transformation IR, a
+/// non-`Incremental` strategy, or a missing watermark (E037);
+/// [`SqlGenError::UnsafeFragment`] / validation errors for a watermark,
+/// key or column that is not a plain identifier.
+pub fn generate_incremental_transformation_sql(
+    model_ir: &ModelIr,
+    dialect: &dyn SqlDialect,
+    insert_columns: Option<&[String]>,
+) -> Result<Vec<String>, SqlGenError> {
+    if model_ir.variant() != ModelIrVariant::Transformation {
+        return Err(variant_mismatch(model_ir, "Transformation"));
+    }
+    let MaterializationStrategy::Incremental { unique_key, .. } = &model_ir.materialization else {
+        return Err(SqlGenError::InvalidRequest(format!(
+            "model '{}': generate_incremental_transformation_sql needs the incremental strategy",
+            model_ir.name
+        )));
+    };
+    let target = dialect.format_table_ref(
+        &model_ir.target.catalog,
+        &model_ir.target.schema,
+        &model_ir.target.table,
+    )?;
+    let body = incremental_filter::incremental_select(
+        model_ir,
+        dialect,
+        incremental_filter::FilterMode::SinceTarget { target: &target },
+    )?;
+    if !unique_key.is_empty() {
+        let resolved = resolve_merge_columns(&ColumnSelection::All, &model_ir.typed_columns);
+        return Ok(vec![
+            dialect.merge_into(&target, &body, unique_key, &resolved)?,
+        ]);
+    }
+    match insert_columns {
+        None => Ok(vec![dialect.insert_into(&target, &body)]),
+        Some(columns) => {
+            for column in columns {
+                validation::validate_identifier(column)?;
+            }
+            let list = columns.join(", ");
+            Ok(vec![format!(
+                "INSERT INTO {target} ({list})\nSELECT {list} FROM (\n{body}\n) AS _rocky_incoming"
+            )])
+        }
+    }
 }
 
 /// Loaded transformation microbatch models become time_interval before IR
@@ -707,9 +766,13 @@ fn substitute_partition_placeholders(sql: &str, window: &PartitionWindow) -> Str
 /// A `time_interval` model's body carries `@start_date` / `@end_date`, which
 /// only `rocky run` used to substitute. Local tests substitute the widest
 /// window the local engine can hold, `0001-01-01 00:00:00` to
-/// `9999-12-31 23:59:59`, so no fixture row is dropped by the window. Every
-/// other strategy runs its compiled SQL unchanged.
+/// `9999-12-31 23:59:59`, so no fixture row is dropped by the window. An
+/// `incremental` model runs as its first load: every `@incremental_filter`
+/// becomes `TRUE`. Every other strategy runs its compiled SQL unchanged.
 pub fn local_test_sql(model: &crate::models::Model) -> std::borrow::Cow<'_, str> {
+    if incremental_filter::has_placeholder(&model.sql) {
+        return std::borrow::Cow::Owned(incremental_filter::unfiltered_sql(&model.sql));
+    }
     if !matches!(
         model.config.strategy,
         crate::models::StrategyConfig::TimeInterval { .. }
@@ -1451,6 +1514,9 @@ mod tests {
             },
             MaterializationStrategy::Incremental {
                 timestamp_column: "_fivetran_synced".into(),
+                unique_key: Vec::new(),
+                lookback: None,
+                filter_column: None,
             },
             SourceRef {
                 catalog: "source_catalog".into(),
@@ -1815,7 +1881,8 @@ mod tests {
 
     /// #1990: a transformation `incremental` model has no watermark to apply,
     /// so the only SQL it could produce is an unfiltered INSERT that appends
-    /// the whole result on every run. The generator refuses it, so callers
+    /// the whole result on every run. Without a watermark the generator
+    /// refuses it (E037), so callers
     /// that skip the compile gate (`rocky plan`, `rocky estimate`) cannot
     /// print or run that statement either.
     #[test]
@@ -1827,7 +1894,11 @@ mod tests {
                 table: "fct_orders".into(),
             },
             MaterializationStrategy::Incremental {
-                timestamp_column: "updated_at".into(),
+                // No watermark declared.
+                timestamp_column: String::new(),
+                unique_key: Vec::new(),
+                lookback: None,
+                filter_column: None,
             },
             vec![],
             "SELECT * FROM cat.sch.raw_orders WHERE updated_at > '2026-01-01'".into(),
@@ -1857,7 +1928,116 @@ mod tests {
         // sentinel window to empty, that CTAS would load the whole result.
         let err = generate_time_interval_bootstrap_sql(&ir, &dialect())
             .expect_err("the time-interval bootstrap must refuse it too");
-        assert!(err.to_string().contains("E037"), "{err}");
+        assert!(matches!(err, SqlGenError::InvalidRequest(_)), "{err}");
+    }
+
+    fn incremental_ir(sql: &str, unique_key: &[&str]) -> ModelIr {
+        let mut ir = ModelIr::transformation(
+            TargetRef {
+                catalog: "cat".into(),
+                schema: "silver".into(),
+                table: "fct_orders".into(),
+            },
+            MaterializationStrategy::Incremental {
+                timestamp_column: "updated_at".into(),
+                unique_key: unique_key
+                    .iter()
+                    .map(|k| std::sync::Arc::from(*k))
+                    .collect(),
+                lookback: None,
+                filter_column: None,
+            },
+            vec![],
+            sql.into(),
+            GovernanceConfig {
+                permissions_file: None,
+                auto_create_catalogs: false,
+                auto_create_schemas: false,
+            },
+            None,
+            None,
+        );
+        ir.typed_columns = ["order_id", "amount", "updated_at"]
+            .into_iter()
+            .map(|name| rocky_ir::TypedColumn {
+                name: name.into(),
+                data_type: rocky_ir::RockyType::Unknown,
+                nullable: true,
+            })
+            .collect();
+        ir
+    }
+
+    const WATERMARK_PREDICATE: &str = "(updated_at > (SELECT MAX(updated_at) FROM \
+        cat.silver.fct_orders) OR NOT EXISTS (SELECT 1 FROM cat.silver.fct_orders))";
+
+    /// WP6: with a watermark, an incremental run appends only rows past the
+    /// target's `MAX(updated_at)`; the first run loads them all.
+    #[test]
+    fn test_transformation_incremental_appends_past_the_target_watermark() {
+        let ir = incremental_ir(
+            "SELECT order_id, amount, updated_at FROM cat.raw.orders WHERE @incremental_filter",
+            &[],
+        );
+        let stmts = generate_transformation_sql(&ir, &dialect()).unwrap();
+        assert_eq!(
+            stmts,
+            vec![format!(
+                "INSERT INTO cat.silver.fct_orders\nSELECT order_id, amount, updated_at FROM \
+                 cat.raw.orders WHERE {WATERMARK_PREDICATE}"
+            )]
+        );
+
+        let first = generate_transformation_initial_ddl(&ir, &dialect()).unwrap();
+        assert_eq!(first.len(), 1);
+        assert!(
+            first[0].ends_with("FROM cat.raw.orders WHERE TRUE"),
+            "the first run loads every row: {}",
+            first[0]
+        );
+
+        // Columns named explicitly when the runtime asks for them.
+        let named = generate_incremental_transformation_sql(
+            &ir,
+            &dialect(),
+            Some(&["amount".to_string(), "order_id".to_string()]),
+        )
+        .unwrap();
+        assert!(
+            named[0].starts_with(
+                "INSERT INTO cat.silver.fct_orders (amount, order_id)\nSELECT amount, order_id FROM ("
+            ),
+            "{}",
+            named[0]
+        );
+        let bad = generate_incremental_transformation_sql(
+            &ir,
+            &dialect(),
+            Some(&["amount; DROP TABLE x".to_string()]),
+        );
+        assert!(bad.is_err(), "column names are validated");
+    }
+
+    /// With a `unique_key`, the filtered body is upserted through MERGE.
+    #[test]
+    fn test_transformation_incremental_with_unique_key_merges() {
+        let ir = incremental_ir(
+            "SELECT order_id, amount, updated_at FROM cat.raw.orders WHERE @incremental_filter",
+            &["order_id"],
+        );
+        let stmts = generate_transformation_sql(&ir, &dialect()).unwrap();
+        assert_eq!(stmts.len(), 1);
+        let merge = &stmts[0];
+        assert!(
+            merge.starts_with("MERGE INTO cat.silver.fct_orders AS t"),
+            "{merge}"
+        );
+        assert!(merge.contains(WATERMARK_PREDICATE), "{merge}");
+        assert!(merge.contains("ON t.order_id = s.order_id"), "{merge}");
+        assert!(
+            merge.contains("UPDATE SET t.order_id = s.order_id, t.amount = s.amount, t.updated_at = s.updated_at"),
+            "every typed column is updated: {merge}"
+        );
     }
 
     #[test]

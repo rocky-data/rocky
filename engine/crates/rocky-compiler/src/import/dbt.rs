@@ -1032,14 +1032,58 @@ fn import_manifest_node(
     let (catalog, schema, table) = resolve_node_coords(node, default_target);
     let this_ref = format!("{catalog}.{schema}.{table}");
 
+    // The standard dbt watermark filter (`{% if is_incremental() %} WHERE
+    // <col> > (SELECT MAX(<wm>) FROM {{ this }}) {% endif %}`) maps to a Rocky
+    // `incremental` model. The compile-evidence gates above still apply.
+    let conversion = if node.config.materialized == "incremental" {
+        find_is_incremental_filter(&node.raw_code).and_then(|recognized| {
+            map_is_incremental_conversion(
+                &node.config,
+                &node.name,
+                Some(&recognized.watermark),
+                recognized.filter_column.as_deref(),
+            )
+            .map(|converted| (recognized, converted))
+        })
+    } else {
+        None
+    };
+
     // Use compiled_code (Jinja resolved) if available, else raw_code. dbt's
     // compiled body carries qualified upstream model refs (`"db"."schema"."up"`);
     // rewrite those back to bare Rocky names so the imported repo compiles and
     // unit-tests. The raw_code fallback already lowers `{{ ref() }}` to a bare
     // name via `convert_jinja_to_sql`, so it needs no rewrite. (FR-046)
-    let mut sql = match &node.compiled_code {
-        Some(code) => rewrite_upstream_refs_to_bare(code, node, model_relations),
-        None => {
+    let placeholder_sql = conversion.as_ref().and_then(|(recognized, _)| {
+        if recognized.other_statement_tags {
+            return None;
+        }
+        let converted = convert_jinja_to_sql(&recognized.rewritten, &this_ref);
+        // An expression the converter cannot lower (a custom macro call)
+        // would be left as a TODO comment; the compiled code is exact.
+        (!converted.contains("TODO: unsupported Jinja")).then_some(converted)
+    });
+    if conversion.is_some() && placeholder_sql.is_none() {
+        result.warnings.push(ImportWarning {
+            model: node.name.clone(),
+            category: WarningCategory::MappedConstruct,
+            message: "raw_code has Jinja beyond the `is_incremental()` filter, so the model SQL \
+                      is the full-refresh compiled_code with no `@incremental_filter` \
+                      placeholder; Rocky filters the output on the watermark column instead, \
+                      which `rocky compile` allows only for a passthrough column (E046)"
+                .to_string(),
+            suggestion: Some(
+                "if `rocky compile` reports E046, add `WHERE @incremental_filter` to the \
+                 imported SQL where dbt applied the filter, and set `filter_column` in the \
+                 sidecar [strategy] block when it compares a qualified or renamed input column"
+                    .to_string(),
+            ),
+        });
+    }
+    let mut sql = match (&placeholder_sql, &node.compiled_code) {
+        (Some(converted), _) => converted.clone(),
+        (None, Some(code)) => rewrite_upstream_refs_to_bare(code, node, model_relations),
+        (None, None) => {
             if node.raw_code.contains("{%") {
                 result.failed.push(ImportFailure {
                     name: node.name.clone(),
@@ -1070,11 +1114,19 @@ fn import_manifest_node(
     // Map strategy from manifest config — covers all dbt materializations
     // (`table`, `view`, `materialized_view`, `incremental`, `ephemeral`,
     // `microbatch`) plus the `incremental_strategy` discriminator.
+    let on_schema_change_mapped = conversion.is_some();
     let StrategyMappingOutput {
         strategy,
         warnings: strategy_warnings,
         structured,
-    } = map_manifest_strategy(&node.config, &node.name, microbatch_mode);
+    } = match conversion {
+        Some((_, converted)) => StrategyMappingOutput {
+            strategy: converted.strategy,
+            warnings: converted.warnings,
+            structured: Vec::new(),
+        },
+        None => map_manifest_strategy(&node.config, &node.name, microbatch_mode),
+    };
 
     // #1990: an incremental dbt model with no Rocky append equivalent falls
     // back to `full_refresh`. That is safe only when the SQL has no dbt
@@ -1111,7 +1163,7 @@ fn import_manifest_node(
     // Surface dbt-databricks specifics that Rocky doesn't auto-translate
     // (databricks_tags, pre/post hooks, on_schema_change). Emitted as
     // structured warnings so the downstream UI can route them.
-    collect_dropped_config_warnings(&node.config, &node.name, result);
+    collect_dropped_config_warnings(&node.config, &node.name, on_schema_change_mapped, result);
 
     // Surface a dropped model contract (`contract: { enforced: true }` +
     // column data_type/constraints). Rocky enforces contracts via a sidecar
@@ -1619,9 +1671,14 @@ fn rewrite_body_for_time_interval(sql: &str, event_time: &str) -> String {
 /// Collect structured warnings for dbt config Rocky can't auto-translate
 /// (databricks_tags, pre/post hooks, on_schema_change). These are
 /// dropped-on-purpose with an explicit pointer at the Rocky equivalent.
+///
+/// `on_schema_change_mapped` is true when the model became a Rocky
+/// `incremental` model, whose sidecar carries `on_schema_change` itself
+/// (see [`map_is_incremental_conversion`]); it is not dropped then.
 fn collect_dropped_config_warnings(
     config: &DbtNodeConfig,
     model_name: &str,
+    on_schema_change_mapped: bool,
     result: &mut ImportResult,
 ) {
     if !config.databricks_tags.is_empty() {
@@ -1680,7 +1737,11 @@ fn collect_dropped_config_warnings(
         });
     }
 
-    if let Some(value) = config.on_schema_change.as_deref() {
+    if let Some(value) = config
+        .on_schema_change
+        .as_deref()
+        .filter(|_| !on_schema_change_mapped)
+    {
         let rocky_equivalent = on_schema_change_to_rocky(value);
         result
             .structured_warnings
@@ -2085,7 +2146,10 @@ fn import_single_model(
 
     // The raw converter keeps the body of statement tags. Even a condition
     // unrelated to is_incremental() can leave a bounded query as full SQL.
-    if content.contains("{%") {
+    // The one exception is an incremental model's `is_incremental()` block,
+    // handled once the materialization is known.
+    let has_statement_tags = content.contains("{%");
+    if has_statement_tags && !contains_unresolved_is_incremental(&content) {
         return Err(RAW_JINJA_CONTROL_REFUSED.to_string());
     }
     if settings.versioned_names.contains(name) {
@@ -2124,19 +2188,79 @@ fn import_single_model(
     {
         return Err(RAW_CONFIG_UNRESOLVED.to_string());
     }
-    if effective_materialization.as_deref() == Some("incremental") {
-        return Err(RAW_INCREMENTAL_EVIDENCE_REFUSED.to_string());
-    }
-
     let mut warnings = Vec::new();
 
-    // Refuse is_incremental() before general Jinja handling. This must catch
-    // compound conditions too: otherwise the generic fallback removes the
-    // control tags and applies the guarded body unconditionally.
-    if contains_unresolved_is_incremental(&content) {
-        return Err(RAW_INCREMENTAL_ERROR.to_string());
-    }
-    let content_processed = content;
+    // An incremental model converts only through its `is_incremental()`
+    // block: the standard watermark filter becomes `@incremental_filter`
+    // (`TRUE` on the first run, so the first run loads every row); any other
+    // use is commented out as a TODO and the watermark is left unset, so
+    // `rocky compile` refuses the model (E037) until a human adds one. An
+    // incremental model with no `is_incremental()` use stays refused.
+    let mut incremental_strategy = None;
+    let mut todo_blocks = Vec::new();
+    let content_processed = if effective_materialization.as_deref() == Some("incremental") {
+        if !contains_unresolved_is_incremental(&content) {
+            return Err(RAW_INCREMENTAL_EVIDENCE_REFUSED.to_string());
+        }
+        let node_config = raw_dbt_node_config(&content, "incremental");
+        if let Some(recognized) = recognize_is_incremental_filter(&content) {
+            let Some(converted) = map_is_incremental_conversion(
+                &node_config,
+                name,
+                Some(&recognized.watermark),
+                recognized.filter_column.as_deref(),
+            ) else {
+                return Err(RAW_JINJA_CONTROL_REFUSED.to_string());
+            };
+            incremental_strategy = Some(converted.strategy);
+            warnings.extend(converted.warnings);
+            recognized.rewritten
+        } else {
+            let Some(converted) = map_is_incremental_conversion(&node_config, name, None, None)
+            else {
+                return Err(RAW_JINJA_CONTROL_REFUSED.to_string());
+            };
+            let (stripped, blocks) = comment_out_is_incremental_blocks(&content);
+            if stripped.contains("{%") {
+                return Err(RAW_JINJA_CONTROL_REFUSED.to_string());
+            }
+            if blocks.is_empty() || contains_unresolved_is_incremental(&stripped) {
+                return Err(RAW_INCREMENTAL_ERROR.to_string());
+            }
+            warnings.push(ImportWarning {
+                model: name.to_string(),
+                category: WarningCategory::JinjaControlFlow,
+                message: format!(
+                    "{} dbt `is_incremental()` block(s) not translated; imported as a \
+                     `-- {IS_INCREMENTAL_TODO}` comment with no watermark, so `rocky compile` \
+                     refuses the model (E037) until one is set",
+                    blocks.len()
+                ),
+                suggestion: Some(
+                    "set `timestamp_column` in the sidecar [strategy] block and put \
+                     `WHERE @incremental_filter` where the commented block was (plus \
+                     `filter_column` when it compares a qualified or renamed input column)"
+                        .to_string(),
+                ),
+            });
+            incremental_strategy = Some(converted.strategy);
+            warnings.extend(converted.warnings);
+            todo_blocks = blocks;
+            stripped
+        }
+    } else {
+        if has_statement_tags {
+            return Err(RAW_JINJA_CONTROL_REFUSED.to_string());
+        }
+        // Refuse is_incremental() before general Jinja handling. This must
+        // catch compound conditions too: otherwise the generic fallback
+        // removes the control tags and applies the guarded body
+        // unconditionally.
+        if contains_unresolved_is_incremental(&content) {
+            return Err(RAW_INCREMENTAL_ERROR.to_string());
+        }
+        content
+    };
 
     // `{{ var('x') }}` is now mapped to Rocky's native per-run variable marker
     // `@var(x)` (with `{{ var('x', 'd') }}` -> `@var(x, d)`) during
@@ -2158,8 +2282,13 @@ fn import_single_model(
     }
 
     // Extract config block
-    let (mut strategy, config_warnings) =
+    let (mut strategy, mut config_warnings) =
         extract_dbt_config(&content_processed, inline_materialization.as_deref());
+    if let Some(converted) = incremental_strategy {
+        // The generic mapping's warnings describe a strategy not applied.
+        strategy = converted;
+        config_warnings.clear();
+    }
     warnings.extend(config_warnings.into_iter().map(|msg| ImportWarning {
         model: name.to_string(),
         category: WarningCategory::UnsupportedMaterialization,
@@ -2200,8 +2329,13 @@ fn import_single_model(
         default_target.catalog, resolved_schema_str, resolved_table
     );
 
-    // Convert Jinja refs to plain SQL.
-    let sql = convert_jinja_to_sql(&content_processed, &this_ref);
+    // Convert Jinja refs to plain SQL. Untranslated `is_incremental()` blocks
+    // sit behind sentinels until now so the converter leaves their quoted
+    // Jinja alone.
+    let mut sql = convert_jinja_to_sql(&content_processed, &this_ref);
+    for (sentinel, comment) in &todo_blocks {
+        sql = sql.replace(sentinel.as_str(), comment);
+    }
 
     // Resolve source references
     let mut model_sources = Vec::new();
@@ -2446,6 +2580,286 @@ fn extract_timestamp_from_where(block: &str) -> Option<String> {
 }
 
 // ---------------------------------------------------------------------------
+// is_incremental() watermark filter -> @incremental_filter
+// ---------------------------------------------------------------------------
+
+/// First line of the comment that replaces an `is_incremental()` block the
+/// importer could not translate.
+const IS_INCREMENTAL_TODO: &str = "TODO: dbt is_incremental() block not translated:";
+
+/// dbt's standard watermark filter:
+///
+/// ```text
+/// {% if is_incremental() %} <WHERE|AND> <lhs> > (SELECT MAX(<wm>) FROM {{ this }}) {% endif %}
+/// ```
+///
+/// Only a strict `>` matches: Rocky's filter is strict, so `>=` would
+/// silently change which rows load. An `{% else %}` branch does not match.
+const IS_INCREMENTAL_FILTER_PATTERN: &str = r"(?is)\{%-?\s*if\s+is_incremental\s*\(\s*\)\s*-?%\}\s*(?P<kw>where|and)\s+(?P<lhs>(?:[a-z_][a-z0-9_]*\.)?[a-z_][a-z0-9_]*)\s*>\s*\(\s*select\s+max\s*\(\s*(?P<wm>[a-z_][a-z0-9_]*)\s*\)\s*from\s*\{\{-?\s*this\s*-?\}\}\s*\)\s*\{%-?\s*endif\s*-?%\}";
+
+/// A recognized dbt watermark filter and the model SQL rewritten to Rocky's
+/// `@incremental_filter` placeholder.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RecognizedIncrementalFilter {
+    /// The `MAX(<wm>)` column: the model's watermark output column.
+    watermark: String,
+    /// The compared input expression (`<ident>` or `<alias>.<ident>`) when
+    /// it is not the watermark column itself. Becomes the sidecar's
+    /// `filter_column`.
+    filter_column: Option<String>,
+    /// The input with the block replaced by `<WHERE|AND> @incremental_filter`.
+    rewritten: String,
+    /// Whether the input holds a `{%` tag besides the recognized block.
+    other_statement_tags: bool,
+}
+
+/// Find exactly one standard `is_incremental()` watermark filter in raw dbt
+/// SQL and rewrite it to the placeholder. Other `{%` tags are allowed here
+/// (and reported); any other reference to `is_incremental` is not.
+fn find_is_incremental_filter(content: &str) -> Option<RecognizedIncrementalFilter> {
+    let filter_re = Regex::new(IS_INCREMENTAL_FILTER_PATTERN).expect("valid regex");
+    let mut found = filter_re.captures_iter(content);
+    let caps = found.next()?;
+    if found.next().is_some() {
+        return None;
+    }
+    let whole = caps.get(0)?;
+    let keyword = &caps["kw"];
+    let lhs = &caps["lhs"];
+    let watermark = caps["wm"].to_string();
+
+    let before = &content[..whole.start()];
+    let after = &content[whole.end()..];
+    let mut replacement = String::new();
+    if before
+        .chars()
+        .next_back()
+        .is_some_and(|c| !c.is_whitespace())
+    {
+        replacement.push(' ');
+    }
+    replacement.push_str(keyword);
+    replacement.push(' ');
+    replacement.push_str(rocky_core::incremental_filter::PLACEHOLDER);
+    if after.chars().next().is_some_and(|c| !c.is_whitespace()) {
+        replacement.push(' ');
+    }
+    let rewritten = format!("{before}{replacement}{after}");
+
+    // A second, unrecognized block, a `{% set %}` alias, or an
+    // `{{ is_incremental() }}` expression means the filter is not the whole
+    // incremental logic.
+    if contains_unresolved_is_incremental(&rewritten) {
+        return None;
+    }
+    let filter_column = (!lhs.eq_ignore_ascii_case(&watermark)).then(|| lhs.to_string());
+    Some(RecognizedIncrementalFilter {
+        watermark,
+        filter_column,
+        other_statement_tags: rewritten.contains("{%"),
+        rewritten,
+    })
+}
+
+/// Recognize the standard `is_incremental()` watermark filter when it is the
+/// only Jinja statement in the file. See [`IS_INCREMENTAL_FILTER_PATTERN`].
+fn recognize_is_incremental_filter(content: &str) -> Option<RecognizedIncrementalFilter> {
+    find_is_incremental_filter(content).filter(|recognized| !recognized.other_statement_tags)
+}
+
+/// Replace every `{% if ... is_incremental ... %} ... {% endif %}` block with
+/// a sentinel on its own line. Returns the new content and, per block, the
+/// sentinel plus the inert `-- ` comment that quotes the block. The caller
+/// swaps the comments in after Jinja conversion, so the converter never sees
+/// the quoted Jinja. An unterminated block is left in place.
+fn comment_out_is_incremental_blocks(content: &str) -> (String, Vec<(String, String)>) {
+    let mut output = String::with_capacity(content.len());
+    let mut blocks = Vec::new();
+    let mut copied_to = 0;
+    let mut cursor = 0;
+    // (block start, nesting depth) while inside an is_incremental() block.
+    let mut open: Option<(usize, usize)> = None;
+
+    while let Some(relative) = content[cursor..].find("{%") {
+        let tag_start = cursor + relative;
+        let body_start = tag_start + 2;
+        let Some(body_len) = find_jinja_tag_end(&content[body_start..], "%}") else {
+            break;
+        };
+        let tag_end = body_start + body_len + 2;
+        let body = content[body_start..body_start + body_len]
+            .trim()
+            .trim_start_matches('-')
+            .trim_end_matches('-')
+            .trim();
+        let keyword = body
+            .split(|c: char| !is_jinja_identifier_char(c))
+            .next()
+            .unwrap_or("");
+        cursor = tag_end;
+
+        match open {
+            None => {
+                if keyword == "if" && contains_unquoted_jinja_identifier(body, "is_incremental") {
+                    open = Some((tag_start, 1));
+                }
+            }
+            Some((start, depth)) => match keyword {
+                "if" => open = Some((start, depth + 1)),
+                "endif" if depth == 1 => {
+                    let sentinel = format!("__rocky_is_incremental_todo_{}__", blocks.len());
+                    let mut comment = format!("-- {IS_INCREMENTAL_TODO}");
+                    for line in content[start..tag_end].lines() {
+                        comment.push_str("\n-- ");
+                        comment.push_str(line.trim_end());
+                    }
+                    output.push_str(&content[copied_to..start]);
+                    if !output.is_empty() && !output.ends_with('\n') {
+                        output.push('\n');
+                    }
+                    output.push_str(&sentinel);
+                    output.push('\n');
+                    copied_to = tag_end;
+                    blocks.push((sentinel, comment));
+                    open = None;
+                }
+                "endif" => open = Some((start, depth - 1)),
+                _ => {}
+            },
+        }
+    }
+    output.push_str(&content[copied_to..]);
+    (output, blocks)
+}
+
+/// The Rocky strategy of a dbt incremental model converted through its
+/// `is_incremental()` block, plus the import warnings that explain it.
+struct IncrementalConversion {
+    strategy: StrategyConfig,
+    warnings: Vec<ImportWarning>,
+}
+
+/// Map a dbt incremental model's config onto [`StrategyConfig::Incremental`].
+///
+/// `watermark` is `None` when the `is_incremental()` block was not
+/// recognized: the sidecar then has no watermark and `rocky compile`
+/// refuses it (E037) until a human adds one. Returns `None` for an
+/// `incremental_strategy` the watermark conversion does not express
+/// (`insert_overwrite`, `microbatch`, anything unrecognized); the caller
+/// keeps its previous behavior for those.
+fn map_is_incremental_conversion(
+    config: &DbtNodeConfig,
+    model_name: &str,
+    watermark: Option<&str>,
+    filter_column: Option<&str>,
+) -> Option<IncrementalConversion> {
+    let keys = || match &config.unique_key {
+        Some(UniqueKeyValue::Single(key)) => vec![key.clone()],
+        Some(UniqueKeyValue::Multiple(keys)) => keys.clone(),
+        None => Vec::new(),
+    };
+    let kind = config
+        .incremental_strategy
+        .as_deref()
+        .map(str::to_ascii_lowercase);
+    // dbt `append` ignores unique_key; `merge` upserts on it, which Rocky's
+    // keyed incremental MERGE expresses. `delete+insert` is NOT converted: it
+    // deletes every target row of a key (often non-unique, such as a date)
+    // before inserting, which a MERGE does not reproduce.
+    let unique_key = match kind.as_deref() {
+        None | Some("merge") => keys(),
+        Some("append") => Vec::new(),
+        Some(_) => return None,
+    };
+
+    let mut warnings = Vec::new();
+    let mut warn = |category: WarningCategory, message: String, suggestion: &str| {
+        warnings.push(ImportWarning {
+            model: model_name.to_string(),
+            category,
+            message,
+            suggestion: Some(suggestion.to_string()),
+        });
+    };
+
+    let on_schema_change = match config
+        .on_schema_change
+        .as_deref()
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        None | Some("fail") => rocky_ir::OnSchemaChange::Fail,
+        Some("append_new_columns") => rocky_ir::OnSchemaChange::AppendNewColumns,
+        Some("sync_all_columns") => {
+            warn(
+                WarningCategory::UnsupportedMaterialization,
+                "on_schema_change='sync_all_columns' mapped to `append_new_columns`: Rocky adds \
+                 new columns but does not remove dropped ones (a column removed from the model \
+                 fails the run)"
+                    .to_string(),
+                "drop removed columns from the target by hand, or rebuild with `rocky run --full-refresh`",
+            );
+            rocky_ir::OnSchemaChange::AppendNewColumns
+        }
+        Some("ignore") => {
+            warn(
+                WarningCategory::UnsupportedMaterialization,
+                "on_schema_change='ignore' mapped to `fail`: Rocky fails the run on a column \
+                 mismatch instead of ignoring it"
+                    .to_string(),
+                "set `on_schema_change = \"append_new_columns\"` in the sidecar [strategy] block \
+                 to add new columns instead",
+            );
+            rocky_ir::OnSchemaChange::Fail
+        }
+        Some(other) => {
+            warn(
+                WarningCategory::UnsupportedMaterialization,
+                format!("on_schema_change='{other}' not recognized; mapped to `fail`"),
+                "set `on_schema_change` in the sidecar [strategy] block to `fail` or `append_new_columns`",
+            );
+            rocky_ir::OnSchemaChange::Fail
+        }
+    };
+
+    if !unique_key.is_empty()
+        && (config.merge_update_columns.is_some() || config.merge_exclude_columns.is_some())
+    {
+        warn(
+            WarningCategory::UnsupportedMaterialization,
+            "merge_update_columns / merge_exclude_columns dropped: Rocky's keyed incremental \
+             MERGE updates every column"
+                .to_string(),
+            "use a `merge` strategy with `update_columns` if only some columns may change",
+        );
+    }
+
+    if let Some(watermark) = watermark {
+        let compared = filter_column.unwrap_or(watermark);
+        warn(
+            WarningCategory::MappedConstruct,
+            format!(
+                "dbt `is_incremental()` filter on `{compared}` mapped to Rocky's \
+                 `@incremental_filter` with `timestamp_column = \"{watermark}\"`"
+            ),
+            "review the emitted SQL and [strategy] block; the first run and \
+             `rocky run --full-refresh` load every row",
+        );
+    }
+
+    Some(IncrementalConversion {
+        strategy: StrategyConfig::Incremental {
+            timestamp_column: watermark.map(str::to_string),
+            unique_key,
+            lookback: None,
+            on_schema_change,
+            filter_column: filter_column.map(str::to_string),
+        },
+        warnings,
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Config extraction
 // ---------------------------------------------------------------------------
 
@@ -2652,13 +3066,30 @@ fn extract_dbt_config(
 ) -> (StrategyConfig, Vec<String>) {
     let mut messages = Vec::new();
 
-    let calls = dbt_config_calls(content);
-    let Some(config_str) = calls.last().copied() else {
+    if dbt_config_calls(content).is_empty() {
         return (StrategyConfig::FullRefresh, messages);
-    };
+    }
+    let synthetic = raw_dbt_node_config(content, inline_materialization.unwrap_or("table"));
 
-    // Parse materialized
-    let materialized = inline_materialization.unwrap_or("table").to_string();
+    // The regex (`--no-manifest`) path always uses the default microbatch
+    // mapping. The `--microbatch-as=time_interval` translation needs the
+    // model's compiled body to rewrite (it injects `@start_date`/`@end_date`),
+    // which only the manifest path reliably provides; opting it in on the
+    // reduced-fidelity regex path would risk corrupting un-compiled Jinja.
+    let mapping = map_manifest_strategy(&synthetic, "<regex-path>", MicrobatchMode::Merge);
+    for w in mapping.warnings {
+        messages.push(w.message);
+    }
+
+    (mapping.strategy, messages)
+}
+
+/// Build a [`DbtNodeConfig`] from the last inline `{{ config(...) }}` call of
+/// a raw model, with `materialized` as given. Without a config call every
+/// other field is unset.
+fn raw_dbt_node_config(content: &str, materialized: &str) -> DbtNodeConfig {
+    let calls = dbt_config_calls(content);
+    let config_str = calls.last().copied().unwrap_or("");
 
     // Parse unique_key — accepts string-form (`unique_key='id'`) or
     // single-line list (`unique_key=['user_id', 'date']`).
@@ -2675,11 +3106,11 @@ fn extract_dbt_config(
     let batch_size = single_string_value(config_str, "batch_size");
     let lookback = single_string_value(config_str, "lookback").and_then(|s| s.parse::<u32>().ok());
 
-    // Build a synthetic DbtNodeConfig — the regex path doesn't recover
-    // databricks_tags / hooks / on_schema_change (they're multi-line in
-    // practice), so they're left empty.
-    let synthetic = DbtNodeConfig {
-        materialized: materialized.clone(),
+    // The regex path doesn't recover databricks_tags / hooks (they're
+    // multi-line in practice), so they're left empty. `on_schema_change` is a
+    // single literal and feeds the incremental conversion.
+    DbtNodeConfig {
+        materialized: materialized.to_string(),
         full_refresh: None,
         schema: None,
         unique_key,
@@ -2691,7 +3122,7 @@ fn extract_dbt_config(
         databricks_tags: BTreeMap::new(),
         pre_hook: Vec::new(),
         post_hook: Vec::new(),
-        on_schema_change: None,
+        on_schema_change: single_string_value(config_str, "on_schema_change"),
         // alias does not affect strategy selection; the regex path threads it
         // to target.table separately via extract_dbt_alias.
         alias: None,
@@ -2701,19 +3132,7 @@ fn extract_dbt_config(
         // not present in the inline `config()` call); contract detection is
         // manifest-only.
         contract: None,
-    };
-
-    // The regex (`--no-manifest`) path always uses the default microbatch
-    // mapping. The `--microbatch-as=time_interval` translation needs the
-    // model's compiled body to rewrite (it injects `@start_date`/`@end_date`),
-    // which only the manifest path reliably provides; opting it in on the
-    // reduced-fidelity regex path would risk corrupting un-compiled Jinja.
-    let mapping = map_manifest_strategy(&synthetic, "<regex-path>", MicrobatchMode::Merge);
-    for w in mapping.warnings {
-        messages.push(w.message);
     }
-
-    (mapping.strategy, messages)
 }
 
 /// Parse `unique_key=...` from a dbt config block. Accepts both
@@ -3508,14 +3927,26 @@ sources:
         assert_eq!(result.imported[0].config.sources[0].schema, "raw_schema");
     }
 
-    #[test]
-    fn raw_append_incremental_guard_is_refused() {
+    fn import_raw_model(sql: &str) -> ImportResult {
         let dir = tempfile::TempDir::new().unwrap();
-
         std::fs::create_dir_all(dir.path().join("models")).unwrap();
+        std::fs::write(dir.path().join("models/fct_events.sql"), sql).unwrap();
+        let target = TargetConfig {
+            catalog: "warehouse".to_string(),
+            schema: "staging".to_string(),
+            table: String::new(),
+        };
+        import_dbt_project(dir.path(), &target).unwrap()
+    }
 
-        std::fs::write(
-            dir.path().join("models/fct_events.sql"),
+    /// An `is_incremental()` use the recognizer does not accept (a compound
+    /// condition here) is imported, not dropped: the block becomes an inert
+    /// TODO comment and the sidecar has no watermark, so `rocky compile`
+    /// refuses the model (E037) until a human finishes it. Before WP6 the
+    /// raw path refused the model outright.
+    #[test]
+    fn raw_unrecognized_incremental_guard_is_kept_as_a_todo() {
+        let result = import_raw_model(
             r#"
 {{ config(materialized='incremental') }}
 
@@ -3525,39 +3956,53 @@ FROM {{ ref('stg_events') }}
   WHERE event_time > (SELECT MAX(event_time) FROM {{ this }})
 {% endif %}
 "#,
-        )
-        .unwrap();
-
-        let target = TargetConfig {
-            catalog: "warehouse".to_string(),
-            schema: "staging".to_string(),
-            table: String::new(),
-        };
-
-        let result = import_dbt_project(dir.path(), &target).unwrap();
-        assert!(result.imported.is_empty());
-        assert_eq!(result.failed.len(), 1);
-        assert_eq!(result.failed[0].name, "fct_events");
+        );
+        assert!(result.failed.is_empty(), "{:?}", result.failed);
+        assert_eq!(result.imported.len(), 1);
+        let model = &result.imported[0];
         assert!(
-            result.failed[0]
-                .reason
-                .contains("raw import cannot evaluate Jinja control flow")
+            model
+                .sql
+                .contains("-- TODO: dbt is_incremental() block not translated:"),
+            "{}",
+            model.sql
         );
         assert!(
-            result.failed[0]
-                .reason
-                .contains("dbt compile --full-refresh")
+            model
+                .sql
+                .contains("--   WHERE event_time > (SELECT MAX(event_time) FROM {{ this }})"),
+            "the original block is quoted as a comment: {}",
+            model.sql
+        );
+        assert!(!model.sql.contains("@incremental_filter"), "{}", model.sql);
+        assert!(
+            matches!(
+                &model.config.strategy,
+                StrategyConfig::Incremental {
+                    timestamp_column: None,
+                    ..
+                }
+            ),
+            "{:?}",
+            model.config.strategy
+        );
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| w.message.contains("not translated") && w.message.contains("E037")),
+            "{:?}",
+            result.warnings
         );
     }
 
+    /// The standard watermark filter converts on the raw path: the block
+    /// becomes the placeholder and the key carries over (MERGE upsert).
     #[test]
-    fn raw_incremental_guard_is_refused_for_keyed_merge() {
-        let dir = tempfile::TempDir::new().unwrap();
-        std::fs::create_dir_all(dir.path().join("models")).unwrap();
-        std::fs::write(
-            dir.path().join("models/fct_events.sql"),
+    fn raw_standard_incremental_filter_converts_to_placeholder() {
+        let result = import_raw_model(
             r#"
-{{ config(materialized='incremental', unique_key='id') }}
+{{ config(materialized='incremental', unique_key='id', on_schema_change='append_new_columns') }}
 
 SELECT *
 FROM {{ ref('stg_events') }}
@@ -3565,24 +4010,109 @@ FROM {{ ref('stg_events') }}
   WHERE event_time > (SELECT MAX(event_time) FROM {{ this }})
 {% endif %}
 "#,
-        )
-        .unwrap();
-
-        let target = TargetConfig {
-            catalog: "warehouse".to_string(),
-            schema: "staging".to_string(),
-            table: String::new(),
-        };
-
-        let result = import_dbt_project(dir.path(), &target).unwrap();
-        assert!(result.imported.is_empty());
-        assert_eq!(result.failed.len(), 1);
-        assert_eq!(result.failed[0].name, "fct_events");
-        assert!(
-            result.failed[0]
-                .reason
-                .contains("dbt compile --full-refresh")
         );
+        assert!(result.failed.is_empty(), "{:?}", result.failed);
+        let model = &result.imported[0];
+        assert!(
+            model.sql.contains("WHERE @incremental_filter"),
+            "{}",
+            model.sql
+        );
+        assert!(!model.sql.contains("is_incremental"), "{}", model.sql);
+        assert!(!model.sql.contains("{%"), "{}", model.sql);
+        match &model.config.strategy {
+            StrategyConfig::Incremental {
+                timestamp_column,
+                unique_key,
+                lookback,
+                on_schema_change,
+                filter_column,
+            } => {
+                assert_eq!(timestamp_column.as_deref(), Some("event_time"));
+                assert_eq!(unique_key, &vec!["id".to_string()]);
+                assert!(lookback.is_none());
+                assert_eq!(
+                    *on_schema_change,
+                    rocky_ir::OnSchemaChange::AppendNewColumns
+                );
+                assert!(filter_column.is_none());
+            }
+            other => panic!("expected incremental, got {other:?}"),
+        }
+    }
+
+    /// `append` drops the key (dbt append ignores it); a qualified left side
+    /// becomes `filter_column`; `AND` keeps its keyword.
+    #[test]
+    fn raw_append_filter_with_qualified_column_converts() {
+        let result = import_raw_model(
+            r#"
+{{ config(materialized='incremental', incremental_strategy='append', unique_key='id') }}
+
+SELECT e.id, e.synced_at AS event_time
+FROM {{ ref('stg_events') }} e
+WHERE e.id > 0
+{%- if is_incremental() -%}
+  AND e.synced_at > (select max(event_time) from {{this}})
+{%- endif %}
+"#,
+        );
+        assert!(result.failed.is_empty(), "{:?}", result.failed);
+        let model = &result.imported[0];
+        assert!(
+            model.sql.contains("AND @incremental_filter"),
+            "{}",
+            model.sql
+        );
+        match &model.config.strategy {
+            StrategyConfig::Incremental {
+                timestamp_column,
+                unique_key,
+                filter_column,
+                ..
+            } => {
+                assert_eq!(timestamp_column.as_deref(), Some("event_time"));
+                assert!(unique_key.is_empty(), "append drops the key");
+                assert_eq!(filter_column.as_deref(), Some("e.synced_at"));
+            }
+            other => panic!("expected incremental, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn recognizer_accepts_only_the_standard_strict_filter() {
+        let ok = recognize_is_incremental_filter(
+            "SELECT * FROM t {% if is_incremental() %} WHERE ts > (SELECT MAX(ts) FROM {{ this }}) {% endif %}",
+        )
+        .expect("standard form");
+        assert_eq!(ok.watermark, "ts");
+        assert_eq!(ok.filter_column, None);
+        assert!(
+            ok.rewritten.contains("WHERE @incremental_filter"),
+            "{}",
+            ok.rewritten
+        );
+
+        for rejected in [
+            // `>=` re-reads rows at the watermark: a different filter.
+            "SELECT * FROM t {% if is_incremental() %} WHERE ts >= (SELECT MAX(ts) FROM {{ this }}) {% endif %}",
+            // An else branch carries first-run logic the placeholder cannot.
+            "SELECT * FROM t {% if is_incremental() %} WHERE ts > (SELECT MAX(ts) FROM {{ this }}) {% else %} WHERE 1=1 {% endif %}",
+            // The bound must come from the model's own table.
+            "SELECT * FROM t {% if is_incremental() %} WHERE ts > (SELECT MAX(ts) FROM other) {% endif %}",
+            // Two blocks.
+            "SELECT * FROM t {% if is_incremental() %} WHERE ts > (SELECT MAX(ts) FROM {{ this }}) {% endif %} \
+             UNION ALL SELECT * FROM u {% if is_incremental() %} WHERE ts > (SELECT MAX(ts) FROM {{ this }}) {% endif %}",
+            // Other statement tags.
+            "{% set x = 1 %} SELECT * FROM t {% if is_incremental() %} WHERE ts > (SELECT MAX(ts) FROM {{ this }}) {% endif %}",
+            // A literal bound.
+            "SELECT * FROM t {% if is_incremental() %} WHERE ts > '2024-01-01' {% endif %}",
+        ] {
+            assert!(
+                recognize_is_incremental_filter(rejected).is_none(),
+                "must not recognize: {rejected}"
+            );
+        }
     }
 
     #[test]
@@ -4328,6 +4858,8 @@ FROM {{ ref('stg_events') }}
     /// `full_refresh` fallback, every run would replace the table with only
     /// the recent rows. The model is refused, not imported, and says why.
     #[test]
+    // `>=` is not the standard filter Rocky converts (its filter is strict),
+    // so this model still takes the #1990 refusal path.
     fn test_append_model_using_is_incremental_is_refused_not_full_refreshed() {
         let manifest = serde_json::json!({
             "metadata": { "project_name": "p" },
@@ -4336,7 +4868,7 @@ FROM {{ ref('stg_events') }}
                     "unique_id": "model.p.events_append",
                     "name": "events_append",
                     "resource_type": "model",
-                    "raw_code": "SELECT * FROM {{ ref('raw_events') }}\n{% if is_incremental() %}\nWHERE updated_at > (SELECT MAX(updated_at) FROM {{ this }})\n{% endif %}",
+                    "raw_code": "SELECT * FROM {{ ref('raw_events') }}\n{% if is_incremental() %}\nWHERE updated_at >= (SELECT MAX(updated_at) FROM {{ this }})\n{% endif %}",
                     "compiled_code": "SELECT * FROM raw_events\nWHERE updated_at > '2026-09-01 00:00:00'",
                     "depends_on": { "nodes": [], "macros": [] },
                     "config": { "materialized": "incremental" },
@@ -4380,6 +4912,55 @@ FROM {{ ref('stg_events') }}
                 && w.message.contains("mapped to full_refresh")),
             "no warning may claim a full_refresh mapping for a refused model: {:?}",
             result.warnings
+        );
+    }
+
+    /// The standard `>` filter converts from a manifest too: the SQL is
+    /// rebuilt from `raw_code` with the placeholder, so the first run (and a
+    /// full refresh) loads every row instead of the compiled delta.
+    #[test]
+    fn manifest_standard_incremental_filter_converts_from_raw_code() {
+        let manifest = serde_json::json!({
+            "metadata": { "project_name": "p" },
+            "nodes": {
+                "model.p.events_append": {
+                    "unique_id": "model.p.events_append",
+                    "name": "events_append",
+                    "resource_type": "model",
+                    "raw_code": "SELECT * FROM {{ ref('raw_events') }}\n{% if is_incremental() %}\nWHERE updated_at > (SELECT MAX(updated_at) FROM {{ this }})\n{% endif %}",
+                    "compiled_code": "SELECT * FROM raw_events\nWHERE updated_at > '2026-09-01 00:00:00'",
+                    "depends_on": { "nodes": [], "macros": [] },
+                    "config": { "materialized": "incremental" },
+                    "columns": {}, "tags": [], "schema": "s", "database": "d"
+                }
+            },
+            "sources": {}
+        });
+        let result = import_from_manifest_json_with_evidence(&manifest, MicrobatchMode::Merge);
+        assert!(result.failed.is_empty(), "{:?}", result.failed);
+        let model = result
+            .imported
+            .iter()
+            .find(|m| m.name == "events_append")
+            .expect("imported");
+        assert!(
+            model.sql.contains("WHERE @incremental_filter"),
+            "{}",
+            model.sql
+        );
+        assert!(
+            !model.sql.contains("2026-09-01"),
+            "not the compiled delta: {}",
+            model.sql
+        );
+        assert!(
+            matches!(
+                &model.config.strategy,
+                StrategyConfig::Incremental { timestamp_column: Some(ts), unique_key, .. }
+                    if ts == "updated_at" && unique_key.is_empty()
+            ),
+            "{:?}",
+            model.config.strategy
         );
     }
 
@@ -4445,16 +5026,29 @@ FROM {{ ref('stg_events') }}
                 name,
                 model.sql
             );
-            if name == "orders_nokey" {
-                assert!(matches!(
+            // The keyed model with the standard `is_incremental()` filter
+            // converts to Rocky `incremental` (WP6); the macro-hidden filter
+            // keeps the keyed merge mapping from the full-refresh SQL.
+            match name {
+                "orders_inc" => assert!(
+                    matches!(
+                        &model.config.strategy,
+                        StrategyConfig::Incremental { timestamp_column: Some(ts), unique_key, .. }
+                            if ts == "updated_at" && unique_key == &vec!["id".to_string()]
+                    ),
+                    "{:?}",
+                    model.config.strategy
+                ),
+                // `delete+insert` keeps its own mapping: a keyed MERGE does
+                // not delete the target rows of a non-unique key.
+                "orders_nokey" => assert!(matches!(
                     model.config.strategy,
                     StrategyConfig::DeleteInsert { .. }
-                ));
-            } else {
-                assert!(matches!(
+                )),
+                _ => assert!(matches!(
                     model.config.strategy,
                     StrategyConfig::Merge { .. }
-                ));
+                )),
             }
         }
         assert_eq!(accepted.imported.len(), 3);

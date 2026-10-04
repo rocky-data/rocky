@@ -391,8 +391,42 @@ pub enum StrategyConfig {
     #[default]
     #[serde(rename = "full_refresh")]
     FullRefresh,
+    /// Load only rows newer than the target's current watermark.
+    ///
+    /// On a transformation model the model SQL marks where the filter goes
+    /// with `@incremental_filter` (`filter_column` names a qualified or
+    /// renamed input column to compare). Each incremental run resolves it
+    /// to `<col> > (SELECT MAX(<watermark>) FROM <target>)`, minus `lookback`;
+    /// the first run and `rocky run --full-refresh` resolve it to `TRUE`. With
+    /// no placeholder, a watermark column that the model passes straight
+    /// through from one input is filtered on the model's output instead;
+    /// anything else is refused (E046). No watermark at all is refused (E037).
     #[serde(rename = "incremental")]
-    Incremental { timestamp_column: String },
+    Incremental {
+        /// The watermark column: an output column of the model whose maximum
+        /// in the target marks what is already loaded. `watermark` is accepted
+        /// as an alias.
+        #[serde(default, alias = "watermark")]
+        timestamp_column: Option<String>,
+        /// Upsert on these columns with `MERGE` instead of appending.
+        #[serde(default)]
+        unique_key: Vec<String>,
+        /// Re-read this far below the watermark, e.g. `"3 days"`, to catch
+        /// late-arriving rows. Pair it with `unique_key`, or the re-read rows
+        /// are appended again (W046).
+        #[serde(default)]
+        lookback: Option<rocky_ir::IncrementalLookback>,
+        /// What a run does when the model's output columns no longer match
+        /// the target: `fail` (default) or `append_new_columns`.
+        #[serde(default)]
+        on_schema_change: rocky_ir::OnSchemaChange,
+        /// The input column `@incremental_filter` compares, when it is not the
+        /// watermark itself: a qualified column in a join (`"o.updated_at"`)
+        /// or a source column the model renames (`"_synced_at"`). The bound
+        /// is still `MAX(<timestamp_column>)` over the target.
+        #[serde(default)]
+        filter_column: Option<String>,
+    },
     #[serde(rename = "merge")]
     Merge {
         unique_key: Vec<String>,
@@ -1348,11 +1382,25 @@ impl Model {
     pub fn to_model_ir(&self) -> ModelIr {
         let strategy = match &self.config.strategy {
             StrategyConfig::FullRefresh => MaterializationStrategy::FullRefresh,
-            StrategyConfig::Incremental { timestamp_column } => {
-                MaterializationStrategy::Incremental {
-                    timestamp_column: timestamp_column.clone(),
-                }
-            }
+            StrategyConfig::Incremental {
+                timestamp_column,
+                unique_key,
+                lookback,
+                // Runtime-only: it decides what a run does on a column
+                // mismatch, not what SQL the model compiles to.
+                on_schema_change: _,
+                filter_column,
+            } => MaterializationStrategy::Incremental {
+                // An absent watermark lowers to "" — every generator refuses
+                // that (E037) rather than emitting an unfiltered INSERT.
+                timestamp_column: timestamp_column.clone().unwrap_or_default(),
+                unique_key: unique_key
+                    .iter()
+                    .map(|k| std::sync::Arc::from(k.as_str()))
+                    .collect(),
+                lookback: *lookback,
+                filter_column: filter_column.clone(),
+            },
             StrategyConfig::Merge {
                 unique_key,
                 update_columns,

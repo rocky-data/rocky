@@ -909,6 +909,11 @@ fn leaf_star_over_a_known_external_source_expands_to_its_columns() {
 
 /// Write a two-model project whose leaf declares `leaf_strategy`.
 fn write_strategy_project(dir: &std::path::Path, leaf_strategy: &str) {
+    write_strategy_project_with_sql(dir, leaf_strategy, "SELECT id, updated_at FROM src");
+}
+
+/// [`write_strategy_project`] with the leaf's SQL given.
+fn write_strategy_project_with_sql(dir: &std::path::Path, leaf_strategy: &str, leaf_sql: &str) {
     use std::fs;
     let models_dir = dir.join("models");
     fs::create_dir_all(&models_dir).unwrap();
@@ -922,11 +927,7 @@ fn write_strategy_project(dir: &std::path::Path, leaf_strategy: &str) {
         "name = \"src\"\n\n[strategy]\ntype = \"full_refresh\"\n\n[target]\ncatalog = \"warehouse\"\nschema = \"s\"\ntable = \"src\"\n",
     )
     .unwrap();
-    fs::write(
-        models_dir.join("leaf.sql"),
-        "SELECT id, updated_at FROM src",
-    )
-    .unwrap();
+    fs::write(models_dir.join("leaf.sql"), leaf_sql).unwrap();
     fs::write(
         models_dir.join("leaf.toml"),
         format!(
@@ -952,10 +953,31 @@ fn compile_strategy_project(leaf_strategy: &str) -> rocky_compiler::compile::Com
 /// `rocky run` excludes a model from execution only for error-severity
 /// diagnostics keyed on its name, and `rocky test` / `emit-sql` refuse on
 /// `has_errors`. A warning would leave the duplicating INSERT running.
+fn compile_leaf(leaf_strategy: &str, leaf_sql: &str) -> rocky_compiler::compile::CompileResult {
+    let dir = tempfile::tempdir().unwrap();
+    write_strategy_project_with_sql(dir.path(), leaf_strategy, leaf_sql);
+    let config = CompilerConfig {
+        models_dir: dir.path().join("models"),
+        contracts_dir: None,
+        source_schemas: HashMap::new(),
+        ..Default::default()
+    };
+    compile(&config).unwrap()
+}
+
+fn codes_on_leaf(result: &rocky_compiler::compile::CompileResult) -> Vec<String> {
+    result
+        .diagnostics
+        .iter()
+        .filter(|d| d.model == "leaf")
+        .map(|d| d.code.to_string())
+        .collect()
+}
+
 #[test]
 fn an_incremental_transformation_model_is_refused_with_e037() {
-    let result =
-        compile_strategy_project("type = \"incremental\"\ntimestamp_column = \"updated_at\"");
+    // No watermark: the only SQL left would be an unfiltered INSERT.
+    let result = compile_strategy_project("type = \"incremental\"");
 
     let e037: Vec<_> = result
         .diagnostics
@@ -988,8 +1010,171 @@ fn an_incremental_transformation_model_is_refused_with_e037() {
         !suggestion.contains("microbatch"),
         "the suggestion uses the canonical time_interval spelling"
     );
+    assert!(
+        suggestion.contains("timestamp_column") && suggestion.contains("@incremental_filter"),
+        "the suggestion points at the watermark config: {suggestion}"
+    );
     assert!(result.has_errors, "an E037 must make the compile fail");
 }
+
+// ---- WP6: incremental transformation models with a watermark ----
+
+const INCREMENTAL_WM: &str = "type = \"incremental\"\ntimestamp_column = \"updated_at\"";
+
+/// Valid controls: a placeholder, a passthrough watermark without one, the
+/// `watermark` alias, and a keyed lookback all compile with no E037/E046/W046.
+#[test]
+fn incremental_models_with_a_safe_watermark_compile_clean() {
+    let cases = [
+        (
+            INCREMENTAL_WM,
+            "SELECT id, updated_at FROM src WHERE @incremental_filter",
+        ),
+        (INCREMENTAL_WM, "SELECT id, updated_at FROM src"),
+        (
+            "type = \"incremental\"\nwatermark = \"updated_at\"",
+            "SELECT s.id, s.updated_at FROM src AS s",
+        ),
+        (
+            "type = \"incremental\"\ntimestamp_column = \"updated_at\"\nunique_key = [\"id\"]\n\
+             lookback = \"3 days\"\nfilter_column = \"s.updated_at\"",
+            "SELECT s.id, s.updated_at FROM src AS s WHERE @incremental_filter AND s.id > 0",
+        ),
+    ];
+    for (strategy, sql) in cases {
+        let result = compile_leaf(strategy, sql);
+        let codes = codes_on_leaf(&result);
+        assert!(
+            !codes
+                .iter()
+                .any(|c| matches!(c.as_str(), "E037" | "E046" | "W046")),
+            "{sql}: unexpected {codes:?} in {:?}",
+            result.diagnostics
+        );
+        assert!(!result.has_errors, "{sql}: {:?}", result.diagnostics);
+    }
+}
+
+/// Without a placeholder, filtering the output is only sound when the
+/// watermark is copied unchanged from one physical input table. An aggregate,
+/// a cast, a column read through a CTE or derived table, or a top-level LIMIT
+/// is refused with E046, also when a placeholder sits only in a comment.
+#[test]
+fn incremental_without_a_provable_filter_place_is_refused_with_e046() {
+    for sql in [
+        "SELECT id, MAX(updated_at) AS updated_at FROM src GROUP BY id",
+        "SELECT id, CAST(updated_at AS TIMESTAMP) AS updated_at FROM src",
+        "SELECT id, updated_at + INTERVAL 1 DAY AS updated_at FROM src -- WHERE @incremental_filter",
+        // Direct at the top, but the CTE body aggregates.
+        "WITH s AS (SELECT id, MAX(updated_at) AS updated_at FROM src GROUP BY id) \
+         SELECT id, updated_at FROM s",
+        // Same through a derived table.
+        "SELECT d.id, d.updated_at FROM (SELECT id, MAX(updated_at) AS updated_at FROM src \
+         GROUP BY id) AS d",
+        // LIMIT picks rows before the output filter would.
+        "SELECT id, updated_at FROM src ORDER BY updated_at LIMIT 10",
+    ] {
+        let result = compile_leaf(INCREMENTAL_WM, sql);
+        let e046: Vec<_> = result
+            .diagnostics
+            .iter()
+            .filter(|d| &*d.code == "E046" && d.model == "leaf")
+            .collect();
+        assert_eq!(e046.len(), 1, "{sql}: {:?}", result.diagnostics);
+        assert!(
+            e046[0].is_error(),
+            "{sql}: E046 must exclude the model from runs"
+        );
+        assert!(
+            e046[0]
+                .suggestion
+                .as_deref()
+                .unwrap_or_default()
+                .contains("@incremental_filter"),
+            "{sql}: the suggestion says where the placeholder goes"
+        );
+        assert!(result.has_errors);
+    }
+}
+
+#[test]
+fn incremental_watermark_must_be_an_output_column() {
+    let result = compile_leaf(
+        INCREMENTAL_WM,
+        "SELECT id FROM src WHERE @incremental_filter",
+    );
+    let e046: Vec<_> = result
+        .diagnostics
+        .iter()
+        .filter(|d| &*d.code == "E046" && d.model == "leaf")
+        .collect();
+    assert_eq!(e046.len(), 1, "{:?}", result.diagnostics);
+    assert!(
+        e046[0].message.contains("not an output column"),
+        "{}",
+        e046[0].message
+    );
+}
+
+#[test]
+fn placeholder_under_another_strategy_is_refused_with_e046() {
+    let result = compile_leaf(
+        "type = \"full_refresh\"",
+        "SELECT id, updated_at FROM src WHERE @incremental_filter",
+    );
+    assert!(
+        codes_on_leaf(&result).contains(&"E046".to_string()),
+        "{:?}",
+        result.diagnostics
+    );
+    // A literal or commented placeholder is not a placeholder.
+    let result = compile_leaf(
+        "type = \"full_refresh\"",
+        "SELECT id, '@incremental_filter' AS note FROM src -- @incremental_filter",
+    );
+    assert!(
+        !codes_on_leaf(&result).contains(&"E046".to_string()),
+        "{:?}",
+        result.diagnostics
+    );
+}
+
+#[test]
+fn incremental_filter_column_must_be_a_column_reference() {
+    let result = compile_leaf(
+        "type = \"incremental\"\ntimestamp_column = \"updated_at\"\nfilter_column = \"a.b.c\"",
+        "SELECT id, updated_at FROM src WHERE @incremental_filter",
+    );
+    assert!(
+        codes_on_leaf(&result).contains(&"E046".to_string()),
+        "{:?}",
+        result.diagnostics
+    );
+}
+
+/// A lookback re-reads rows already in the target; without a key to merge
+/// on, they are appended again. Warning, not error.
+#[test]
+fn lookback_without_unique_key_warns_w046() {
+    let result = compile_leaf(
+        "type = \"incremental\"\ntimestamp_column = \"updated_at\"\nlookback = \"1 day\"",
+        "SELECT id, updated_at FROM src WHERE @incremental_filter",
+    );
+    let w046: Vec<_> = result
+        .diagnostics
+        .iter()
+        .filter(|d| &*d.code == "W046" && d.model == "leaf")
+        .collect();
+    assert_eq!(w046.len(), 1, "{:?}", result.diagnostics);
+    assert!(!w046[0].is_error());
+    assert!(!result.has_errors, "{:?}", result.diagnostics);
+}
+
+/// #1996: an ephemeral model is never materialized and never inlined, so a
+/// consumer reads whatever physical table carries the name. The refusal must
+/// be an ERROR on the model that declares the strategy, for the same reason
+/// E037 must: `rocky run` excludes a model from execution only on an
+/// error-severity diagnostic keyed on its name.
 
 /// #1996: `type = "ephemeral"` used to be refused outright with E038, because
 /// nothing inlined it. Consumers now inline it as a CTE, so a plain ephemeral

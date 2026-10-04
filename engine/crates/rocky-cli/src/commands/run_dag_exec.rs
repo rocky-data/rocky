@@ -1289,6 +1289,7 @@ mod run_opts_threading_tests {
             force_rebuild: true,
             no_reuse: true,
             no_prune: false,
+            full_refresh: false,
         };
         let partition_opts = PartitionRunOptions {
             partition: Some("2020-01-02".into()),

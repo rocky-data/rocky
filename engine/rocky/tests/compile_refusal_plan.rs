@@ -24,8 +24,8 @@ fn model(root: &Path, name: &str, sql: &str, strategy: &str) {
     fs::write(
         dir.join(format!("{name}.toml")),
         format!(
-            "name = \"{name}\"\n[strategy]\ntype = \"{strategy}\"\n{}[target]\ncatalog = \"warehouse\"\nschema = \"main\"\ntable = \"{name}\"\n{}",
-            if strategy == "incremental" { "timestamp_column = \"updated_at\"\n" } else { "" },
+            "name = \"{name}\"\n[strategy]\ntype = \"{strategy}\"\n[target]\ncatalog = \"warehouse\"\nschema = \"main\"\ntable = \"{name}\"\n{}",
+            // No watermark: `incremental` without one is E037.
             // `[[tests]]` on an ephemeral model is an invalid use: E038.
             if strategy == "ephemeral" { "[[tests]]\ntype = \"not_null\"\ncolumn = \"id\"\n" } else { "" }
         ),

@@ -393,7 +393,6 @@ span, and sometimes a suggested fix.
 | `E034` | Imported snapshot declares a format version newer than this build of rocky can read |
 | `E035` | Managed-Iceberg `format_options` declares a combination the warehouse rejects (e.g. `partition_by` + `cluster_by`) |
 | `E036` | Two or more models write the same target table |
-| `E037` | A transformation model declares `type = "incremental"`, which would append every row again on each run. Use `merge`, `delete_insert`, `time_interval` or `full_refresh` |
 | `E038` | An `ephemeral` model is used in a way inlining cannot serve: it declares `[[tests]]`, another model reads its nominal target by a qualified name, a consumer's SQL cannot be rewritten, or `rocky run --model` selects it directly |
 | `E039` | A direct projection names a column absent from a complete in-project upstream model |
 | `E040` | A `.rocky` string literal contains a backslash; use a `.sql` model with the target's own escaping |
@@ -403,6 +402,8 @@ span, and sometimes a suggested fix.
 | `E041` | A direct reference names a column absent from an external source whose schema Rocky trusts. See [Missing columns in external sources](#missing-columns-in-external-sources-e041--w041) |
 | `E051` | A [user-defined function](/concepts/user-defined-functions/) or a call to one is invalid: bad definition, Python language, wrong argument count, a certainly incompatible argument type, or a warehouse that cannot create functions (Trino) |
 | `E050` | A freshness declaration cannot be evaluated: no threshold, a bad duration, `error_after` shorter than `warn_after`, a bad `loaded_at_field` or `filter`, or a model `time_column` absent from a complete output |
+| `E037` | A transformation model declares `type = "incremental"` with no `timestamp_column` (watermark), which would append every row again on each run. Declare the watermark and use `@incremental_filter`, or use `merge`, `delete_insert`, `time_interval` or `full_refresh` |
+| `E046` | An `incremental` model's watermark filter has no safe place: no `@incremental_filter` and the watermark is not a provable passthrough column; or the watermark is not an output column or not a plain name; or `@incremental_filter` appears under another strategy |
 | `W001` | Unused model (no downstream consumers) |
 | `W002` | Duplicate column in model output |
 | `W004` | Classification tag with no matching `[mask]` strategy |
@@ -419,6 +420,7 @@ span, and sometimes a suggested fix.
 | `W043` | Comparison relies on an implicit cast that fails on values that do not convert, such as a `BIGINT` column compared with a `VARCHAR` column on DuckDB (escalate with `--deny-warnings W043`) |
 | `W041` | A direct reference names a column absent from an external source schema that may be out of date (seed or old cache entry) |
 | `W051` | A user-defined function call could not be fully verified: an unknown argument type, or an argument the warehouse must convert implicitly |
+| `W046` | An `incremental` model sets `lookback` without `unique_key`, so the re-read window is appended again on each run |
 | `I001` | Model dependency inferred from SQL |
 | `I002` | Some, but not all, output columns have unknown types — provide source schemas for more type checking |
 | `I003` | A contract declares a type for a column whose type Rocky could not infer, so `E011` did not check it |

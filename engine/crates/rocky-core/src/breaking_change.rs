@@ -434,19 +434,42 @@ fn diff_materialization(
         (
             MaterializationStrategy::Incremental {
                 timestamp_column: o_ts,
+                unique_key: o_uk,
+                ..
             },
             MaterializationStrategy::Incremental {
                 timestamp_column: n_ts,
+                unique_key: n_uk,
+                ..
             },
-        ) if o_ts != n_ts => findings.push(BreakingFinding {
-            change: BreakingChange::MaterializationKeyChanged {
-                model: model.to_string(),
-                key_kind: "timestamp_column".to_string(),
-                old: vec![o_ts.clone()],
-                new: vec![n_ts.clone()],
-            },
-            severity: BreakingSeverity::Breaking,
-        }),
+        ) => {
+            if o_ts != n_ts {
+                findings.push(BreakingFinding {
+                    change: BreakingChange::MaterializationKeyChanged {
+                        model: model.to_string(),
+                        key_kind: "timestamp_column".to_string(),
+                        old: vec![o_ts.clone()],
+                        new: vec![n_ts.clone()],
+                    },
+                    severity: BreakingSeverity::Breaking,
+                });
+            }
+            // A transformation `incremental` key switches append <-> upsert
+            // (or changes which rows an upsert replaces).
+            let o_uk_vec: Vec<String> = o_uk.iter().map(std::string::ToString::to_string).collect();
+            let n_uk_vec: Vec<String> = n_uk.iter().map(std::string::ToString::to_string).collect();
+            if o_uk_vec != n_uk_vec {
+                findings.push(BreakingFinding {
+                    change: BreakingChange::MaterializationKeyChanged {
+                        model: model.to_string(),
+                        key_kind: "unique_key".to_string(),
+                        old: o_uk_vec,
+                        new: n_uk_vec,
+                    },
+                    severity: BreakingSeverity::Breaking,
+                });
+            }
+        }
         (
             MaterializationStrategy::Merge {
                 unique_key: o_uk,
@@ -1078,6 +1101,9 @@ mod tests {
         let mut m = base_model();
         m.materialization = MaterializationStrategy::Incremental {
             timestamp_column: "created_at".to_string(),
+            unique_key: Vec::new(),
+            lookback: None,
+            filter_column: None,
         };
         let new = project(vec![m]);
         let findings = diff_project_ir(&old, &new);

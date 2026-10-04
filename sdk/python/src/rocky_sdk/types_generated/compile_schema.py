@@ -33,30 +33,20 @@ class CostHint(BaseModel):
     """
 
 
-class FunctionDetail(BaseModel):
+class OnSchemaChange1(StrEnum):
     """
-    A user-defined function in `CompileOutput.functions`.
+    Stop the run and name the added and removed columns. The default: nothing is written, and `rocky run --full-refresh` rebuilds the table.
     """
 
-    called_by: list[str]
+    fail = "fail"
+
+
+class OnSchemaChange2(StrEnum):
     """
-    Models that call this function directly. `rocky run` creates the function before any of them is built.
+    Add each new output column to the target with `ALTER TABLE ... ADD COLUMN`, then load. Existing rows hold `NULL` in the new column. A column removed from the model still fails the run.
     """
-    calls: list[str] | None = None
-    """
-    Other project functions this function's body calls (created first).
-    """
-    description: str | None = None
-    deterministic: bool | None = None
-    name: str
-    returns: str
-    """
-    Declared return type, as written.
-    """
-    signature: str
-    """
-    `name(arg TYPE, ...) RETURNS TYPE`, as declared.
-    """
+
+    append_new_columns = "append_new_columns"
 
 
 class PhaseTimings(BaseModel):
@@ -117,11 +107,32 @@ class Type1(StrEnum):
 
 class StrategyConfig2(BaseModel):
     """
-    Materialization strategy for a model, defaulting to full refresh.
+    Load only rows newer than the target's current watermark.
+
+    On a transformation model the model SQL marks where the filter goes with `@incremental_filter` (`filter_column` names a qualified or renamed input column to compare). Each incremental run resolves it to `<col> > (SELECT MAX(<watermark>) FROM <target>)`, minus `lookback`; the first run and `rocky run --full-refresh` resolve it to `TRUE`. With no placeholder, a watermark column that the model passes straight through from one input is filtered on the model's output instead; anything else is refused (E046). No watermark at all is refused (E037).
     """
 
-    timestamp_column: str
+    filter_column: str | None = None
+    """
+    The input column `@incremental_filter` compares, when it is not the watermark itself: a qualified column in a join (`"o.updated_at"`) or a source column the model renames (`"_synced_at"`). The bound is still `MAX(<timestamp_column>)` over the target.
+    """
+    lookback: str | None = None
+    """
+    Re-read this far below the watermark, e.g. `"3 days"`, to catch late-arriving rows. Pair it with `unique_key`, or the re-read rows are appended again (W046).
+    """
+    on_schema_change: OnSchemaChange1 | OnSchemaChange2 | None = "fail"
+    """
+    What a run does when the model's output columns no longer match the target: `fail` (default) or `append_new_columns`.
+    """
+    timestamp_column: str | None = None
+    """
+    The watermark column: an output column of the model whose maximum in the target marks what is already loaded. `watermark` is accepted as an alias.
+    """
     type: Type1
+    unique_key: list[str] | None = []
+    """
+    Upsert on these columns with `MERGE` instead of appending.
+    """
 
 
 class Type2(StrEnum):
@@ -148,7 +159,7 @@ class Type4(StrEnum):
 
 class StrategyConfig5(BaseModel):
     """
-    Ephemeral model — never materialized. `rocky compile` inlines its SQL as a `__rocky_ephemeral__<name>` CTE into every model that reads it, and `rocky run` skips the node. Invalid uses are E038.
+    Ephemeral model — refused at compile time (E038). No table is created and no consumer inlines it, so it is kept only to name the refusal.
     """
 
     type: Type4
@@ -312,7 +323,7 @@ class ModelFreshnessConfig(BaseModel):
 
     Declares the maximum allowed lag between successive materializations of the model plus the optional timestamp column used by the runtime freshness check.
 
-    `rocky freshness` enforces the TTL at run time: it reads `MAX(time_column)` from the model's target table (or, without a `time_column`, the model's last successful build in the state store) and reports `warn`, or `error` when `severity = "error"`. `rocky run` does not gate on it. The compiler checks the `time_column` (E050 when absent from a provably complete output, W050 when not temporal), and soft-warns (W005) when a model has at least one temporal output column but no `freshness` declaration anywhere in scope (per-model or project-level default).
+    The compiler does not enforce the TTL — it's metadata consumed by downstream observability tooling (`dagster-rocky` `FreshnessPolicy`, `rocky doctor --freshness`, etc.). The compiler does however soft-warn (W005) when a model has at least one temporal output column but no `freshness` declaration anywhere in scope (per-model or project-level default).
     """
 
     max_lag_seconds: conint(ge=0)
@@ -449,10 +460,6 @@ class CompileOutput(BaseModel):
     expanded_sql: dict[str, str] | None = None
     """
     Expanded SQL for each model after macro substitution. Only populated when `--expand-macros` is passed. Keys are model names, values are the SQL after all `@macro()` calls have been replaced.
-    """
-    functions: list[FunctionDetail] | None = None
-    """
-    User-defined functions declared under `functions/` that passed validation, with the models that call each one. Under `--model`, only the selected function, or the functions the selected model calls. Empty (and omitted) when the project declares none.
     """
     has_errors: bool
     """

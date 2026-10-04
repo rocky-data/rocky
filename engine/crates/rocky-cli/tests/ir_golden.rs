@@ -524,6 +524,9 @@ fn build_02_replication_incremental() -> ModelIr {
         raw_target("events"),
         MaterializationStrategy::Incremental {
             timestamp_column: "_synced_at".into(),
+            unique_key: Vec::new(),
+            lookback: None,
+            filter_column: None,
         },
         raw_source("events"),
         ColumnSelection::Explicit(vec![

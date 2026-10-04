@@ -346,12 +346,42 @@ fn render_model_sidecar(config: &ModelConfig) -> String {
         StrategyConfig::FullRefresh => {
             out.push_str("type = \"full_refresh\"\n");
         }
-        StrategyConfig::Incremental { timestamp_column } => {
+        StrategyConfig::Incremental {
+            timestamp_column,
+            unique_key,
+            lookback,
+            on_schema_change,
+            filter_column,
+        } => {
             out.push_str("type = \"incremental\"\n");
-            out.push_str(&format!(
-                "timestamp_column = \"{}\"\n",
-                toml_escape(timestamp_column)
-            ));
+            if let Some(timestamp_column) = timestamp_column {
+                out.push_str(&format!(
+                    "timestamp_column = \"{}\"\n",
+                    toml_escape(timestamp_column)
+                ));
+            }
+            if !unique_key.is_empty() {
+                let keys: Vec<String> = unique_key
+                    .iter()
+                    .map(|k| format!("\"{}\"", toml_escape(k)))
+                    .collect();
+                out.push_str(&format!("unique_key = [{}]\n", keys.join(", ")));
+            }
+            if let Some(lookback) = lookback {
+                out.push_str(&format!("lookback = \"{lookback}\"\n"));
+            }
+            if let Some(filter_column) = filter_column {
+                out.push_str(&format!(
+                    "filter_column = \"{}\"\n",
+                    toml_escape(filter_column)
+                ));
+            }
+            if *on_schema_change != rocky_ir::OnSchemaChange::default() {
+                out.push_str(&format!(
+                    "on_schema_change = \"{}\"\n",
+                    on_schema_change.as_str()
+                ));
+            }
         }
         StrategyConfig::Merge {
             unique_key,

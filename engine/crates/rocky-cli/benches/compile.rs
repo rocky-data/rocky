@@ -344,6 +344,9 @@ fn bench_sql_generation(c: &mut Criterion) {
                     } else {
                         MaterializationStrategy::Incremental {
                             timestamp_column: "_fivetran_synced".into(),
+                            unique_key: Vec::new(),
+                            lookback: None,
+                            filter_column: None,
                         }
                     },
                     SourceRef {

@@ -27,6 +27,12 @@ impl SqlDialect for SnowflakeSqlDialect {
         self.snapshot_column_identifier(&name.to_ascii_uppercase())
     }
 
+    fn interval_literal(&self, amount: u32, unit: &str) -> String {
+        // Snowflake interval constants carry the amount and unit in one
+        // string: `INTERVAL '3 DAY'`.
+        format!("INTERVAL '{amount} {unit}'")
+    }
+
     /// Snowflake's `'…'` literal processes backslash escapes; a quote is
     /// `\'` and a backslash is `\\`.
     ///

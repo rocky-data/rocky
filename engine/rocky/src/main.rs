@@ -1224,6 +1224,15 @@ enum Command {
         #[arg(long)]
         no_prune: bool,
 
+        /// Rebuild transformation `incremental` models from scratch with
+        /// `CREATE OR REPLACE TABLE ... AS`, resolving every
+        /// `@incremental_filter` to `TRUE`. Other strategies are unaffected:
+        /// `merge` / `delete_insert` SQL often selects only recent rows, so
+        /// rebuilding from it could drop history. Also turns off the
+        /// `--skip-unchanged` gate. Default OFF.
+        #[arg(long)]
+        full_refresh: bool,
+
         /// Per-run variable substituted into model SQL. Repeatable:
         /// `--var region=us --var since=2024-01-01`.
         ///
@@ -3996,6 +4005,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             force_rebuild,
             no_reuse,
             no_prune,
+            full_refresh,
             var,
             assume_fresh_state,
         } => {
@@ -4229,6 +4239,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                 force_rebuild,
                 no_reuse,
                 no_prune,
+                full_refresh,
             };
 
             if watch {

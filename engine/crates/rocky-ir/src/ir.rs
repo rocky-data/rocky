@@ -47,7 +47,29 @@ pub enum MaterializationStrategy {
     /// execute the runner re-queries `MAX(ts) FROM source` and persists
     /// that as the next watermark. Keeping the field off the strategy
     /// means recipe-hash inputs are runtime-state-free.
-    Incremental { timestamp_column: String },
+    ///
+    /// On a **transformation** model the watermark is read from the target
+    /// instead: the model SQL's `@incremental_filter` placeholder (or, when
+    /// the watermark column is a direct passthrough, a wrap of the whole
+    /// model) resolves to `<col> > (SELECT MAX(<col>) FROM <target>)`, so the
+    /// state store holds nothing for it. An empty `timestamp_column` there
+    /// means no watermark was declared, which is refused (E037).
+    Incremental {
+        timestamp_column: String,
+        /// Transformation only: upsert on these columns with `MERGE` instead
+        /// of appending. Empty means append. Replication leaves it empty.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        unique_key: Vec<Arc<str>>,
+        /// Transformation only: re-read this far below the target's
+        /// `MAX(watermark)` to pick up late-arriving rows.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        lookback: Option<crate::incremental::IncrementalLookback>,
+        /// Transformation only: the input column `@incremental_filter`
+        /// compares (`o.updated_at`, `_synced_at`) when it is not the
+        /// watermark itself. `None` compares the watermark column.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        filter_column: Option<String>,
+    },
     /// Upsert based on unique key columns.
     Merge {
         unique_key: Vec<Arc<str>>,
@@ -1271,6 +1293,9 @@ mod tests {
             MaterializationStrategy::FullRefresh,
             MaterializationStrategy::Incremental {
                 timestamp_column: "_fivetran_synced".into(),
+                unique_key: Vec::new(),
+                lookback: None,
+                filter_column: None,
             },
             MaterializationStrategy::Merge {
                 unique_key: vec!["id".into()],
@@ -1434,6 +1459,9 @@ mod tests {
             lineage_edges: vec![],
             materialization: MaterializationStrategy::Incremental {
                 timestamp_column: "_fivetran_synced".into(),
+                unique_key: Vec::new(),
+                lookback: None,
+                filter_column: None,
             },
             governance: GovernanceConfig {
                 permissions_file: None,

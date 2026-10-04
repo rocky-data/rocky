@@ -1193,6 +1193,10 @@ pub struct SkipRunOptions {
     /// pruning even when the config opts in — e.g. after a manual target-side
     /// mutation. No effect when `prune_unchanged` is off.
     pub no_prune: bool,
+    /// Whether `--full-refresh` was passed. Transformation `incremental`
+    /// models are rebuilt with `CREATE OR REPLACE TABLE ... AS`, every
+    /// `@incremental_filter` resolved to `TRUE`.
+    pub full_refresh: bool,
 }
 
 /// Fully-resolved configuration for the model-skip gate, assembled in
@@ -1221,6 +1225,11 @@ pub(crate) struct SkipGateConfig {
     /// never skip-eligible in v1 — they are verification runs that write to
     /// different targets, so skipping defeats their purpose.
     pub shadow_or_branch: bool,
+    /// `--full-refresh` — rebuild `incremental` transformation models. Rides
+    /// on this struct because it is the run-scoped build decision already
+    /// threaded to `execute_models`; like `--force-rebuild` it turns the skip
+    /// gate off.
+    pub full_refresh: bool,
 }
 
 impl SkipGateConfig {
@@ -1237,6 +1246,7 @@ impl SkipGateConfig {
             rowcount_fallback: run_config.skip_rowcount_fallback,
             lag_tolerance_seconds: run_config.lag_tolerance_seconds,
             shadow_or_branch,
+            full_refresh: skip_opts.full_refresh,
         }
     }
 
@@ -1244,7 +1254,9 @@ impl SkipGateConfig {
     /// is fully inert (default-off, force-rebuild, or a shadow/branch run),
     /// and `execute_models` takes the unchanged build-everything path.
     pub(crate) fn is_active(&self) -> bool {
-        self.feature_enabled && !self.force_rebuild && !self.shadow_or_branch
+        // `--full-refresh` is a forced rebuild too: a skipped model would
+        // report success without the rebuild the operator asked for.
+        self.feature_enabled && !self.force_rebuild && !self.shadow_or_branch && !self.full_refresh
     }
 
     /// The fully-inert gate — the default-off configuration used by tests
@@ -1257,6 +1269,7 @@ impl SkipGateConfig {
             rowcount_fallback: false,
             lag_tolerance_seconds: 0,
             shadow_or_branch: false,
+            full_refresh: false,
         }
     }
 }
@@ -1283,6 +1296,8 @@ pub(crate) struct ExecutionContext<'a> {
     /// resolved into injected metadata columns at materialization time.
     pub surrogate_keys:
         &'a std::collections::HashMap<String, Vec<rocky_core::models::SurrogateKeySpec>>,
+    /// `rocky run --full-refresh`: rebuild table-writing models from scratch.
+    pub full_refresh: bool,
 }
 
 impl<'a> ExecutionContext<'a> {
@@ -11936,6 +11951,7 @@ pub(crate) async fn execute_models_with_explicit_contracts(
         typed_models: &compile_result.type_check.typed_models,
         model_timings: &compile_result.model_timings,
         surrogate_keys: &surrogate_keys,
+        full_refresh: skip_gate.full_refresh,
     };
 
     // Intra-layer concurrency is strictly opt-in via `--parallel N`.
@@ -14131,6 +14147,17 @@ async fn execute_one_plain_model(
     if let Some(specs) = exec_ctx.surrogate_keys.get(model_name) {
         rocky_core::models::apply_surrogate_keys(&mut model_ir, specs, dialect)?;
     }
+    // `--full-refresh`: rebuild an `incremental` model from scratch. The rebuilt
+    // IR is a `FullRefresh` over the model SQL with every
+    // `@incremental_filter` resolved to `TRUE`, so it takes the CTAS path
+    // below; the recipe identity keeps describing the declared strategy.
+    let mut recipe_ir = None;
+    if exec_ctx.full_refresh
+        && super::run_incremental::rebuilds_on_full_refresh(&model_ir.materialization)
+    {
+        let rebuilt = super::run_incremental::full_refresh_ir(&model_ir);
+        recipe_ir = Some(std::mem::replace(&mut model_ir, rebuilt));
+    }
     let target_ref = dialect
         .format_table_ref(
             &model_ir.target.catalog,
@@ -14158,11 +14185,26 @@ async fn execute_one_plain_model(
     // `INSERT`/`MERGE` into it); `MaterializedView`/`DynamicTable` are a
     // third and fourth object kind this binary check does not model.
     // Generate every statement before a permitted destructive change.
-    let exec_stmts = rocky_core::sql_gen::generate_transformation_sql_with_warehouse(
+    let mut exec_stmts = rocky_core::sql_gen::generate_transformation_sql_with_warehouse(
         &model_ir,
         dialect,
         warehouse.warehouse_name(),
     )?;
+    // An `incremental` model against an existing target: check its columns
+    // against the target (`on_schema_change`), pick a positional or named
+    // INSERT, and read the watermark it starts from. `None` leaves the target
+    // to the existence probe below (first run → bootstrap CTAS).
+    let incremental_run = if matches!(
+        model_ir.materialization,
+        rocky_ir::MaterializationStrategy::Incremental { .. }
+    ) {
+        super::run_incremental::prepare(model, &model_ir, warehouse, dialect).await?
+    } else {
+        None
+    };
+    if let Some(run) = &incremental_run {
+        exec_stmts.clone_from(&run.exec_stmts);
+    }
     let mut pending_drop: Option<(String, &'static str, &'static str)> = None;
     let mut kind_probe_note = None;
     if let Some(expected_kind) = strategy_implies_object_kind(&model_ir.materialization) {
@@ -14352,6 +14394,22 @@ async fn execute_one_plain_model(
         }
     }
 
+    // An incremental run against an existing target must have been planned
+    // by `run_incremental::prepare` (column check, named INSERT). If that
+    // describe failed but the existence probe then found the target, refuse
+    // rather than fall back to the unchecked positional INSERT.
+    if !skip_strategy_exec
+        && incremental_run.is_none()
+        && matches!(
+            model_ir.materialization,
+            rocky_ir::MaterializationStrategy::Incremental { .. }
+        )
+    {
+        return Err(anyhow::anyhow!(
+            "model '{model_name}': could not read the columns of {target_ref} to check them \
+             against the model before the incremental load; nothing was written"
+        ));
+    }
     info!(
         model = model_name,
         target = target_ref.as_str(),
@@ -14426,6 +14484,57 @@ async fn execute_one_plain_model(
         }
     }
 
+    // Report the watermark an `incremental` model now stands at, read back
+    // from the target (`MAX(<watermark>)`), and the one this run started from.
+    // The data is already committed, so a failed read is a note, not a
+    // failed model.
+    let mut incremental_notes = Vec::new();
+    let mut watermark = None;
+    let declared_ir = recipe_ir.as_ref().unwrap_or(&model_ir);
+    if let Some(run) = &incremental_run {
+        incremental_notes.extend(run.notes.iter().cloned());
+    }
+    if let rocky_ir::MaterializationStrategy::Incremental {
+        timestamp_column, ..
+    } = &declared_ir.materialization
+    {
+        match super::run_incremental::query_max(warehouse, &target_ref, timestamp_column).await {
+            Ok(after) => {
+                watermark = after.as_deref().and_then(parse_timestamp_cell);
+                let after = after.as_deref().unwrap_or("NULL (empty target)");
+                let note = match &incremental_run {
+                    Some(run) => {
+                        let before = run
+                            .prior_watermark
+                            .as_deref()
+                            .unwrap_or("NULL (empty target)");
+                        format!(
+                            "Incremental load of model '{model_name}': rows with \
+                             {timestamp_column} > {before} (target MAX before this run); \
+                             MAX({timestamp_column}) is now {after}"
+                        )
+                    }
+                    None => format!(
+                        "Full load of model '{model_name}' into {target_ref}; \
+                         MAX({timestamp_column}) is now {after}"
+                    ),
+                };
+                incremental_notes.push(note);
+            }
+            Err(e) => incremental_notes.push(format!(
+                "Model '{model_name}' loaded, but reading MAX({timestamp_column}) back from \
+                 {target_ref} failed: {e:#}"
+            )),
+        }
+    }
+    if let Some(declared) = &recipe_ir {
+        incremental_notes.push(format!(
+            "Full refresh: rebuilt {target_ref} for model '{model_name}' from its full SQL \
+             (declared strategy: {})",
+            transformation_strategy_name(&declared.materialization)
+        ));
+    }
+
     let model_duration_ms = model_start.elapsed().as_millis() as u64;
     let target_table_full_name = format!(
         "{}.{}.{}",
@@ -14445,6 +14554,7 @@ async fn execute_one_plain_model(
             })
             .into_iter()
             .chain(kind_probe_note)
+            .chain(incremental_notes)
             .collect(),
         attempts: Vec::new(),
         rows_copied: None,
@@ -14452,7 +14562,7 @@ async fn execute_one_plain_model(
         started_at: model_started_at,
         metadata: MaterializationMetadata {
             strategy: transformation_strategy_name(&model_ir.materialization).to_string(),
-            watermark: None,
+            watermark,
             target_table_full_name: Some(target_table_full_name),
             sql_hash: Some(crate::output::sql_fingerprint(&exec_stmts)),
             column_count: exec_ctx.column_count_for(model_name),
@@ -14471,7 +14581,7 @@ async fn execute_one_plain_model(
         // behavior byte-identical.
         skip_internal: None,
         recipe_identity: Some(crate::output::recipe_identity_internal(
-            &model_ir,
+            recipe_ir.as_ref().unwrap_or(&model_ir),
             warehouse.dialect().name(),
         )),
         // Not the content-addressed write path — no in-process column bytes.
@@ -15049,6 +15159,9 @@ pub(crate) fn build_replication_strategy_with_override(
     match effective_strategy {
         "incremental" => Ok(MaterializationStrategy::Incremental {
             timestamp_column: effective_timestamp.to_string(),
+            unique_key: Vec::new(),
+            lookback: None,
+            filter_column: None,
         }),
         "merge" => {
             // Resolve merge keys with per-field inheritance.
@@ -22087,7 +22200,11 @@ auto_create_schemas = true
             StrategyConfig::FullRefresh,
             StrategyConfig::MaterializedView,
             StrategyConfig::Incremental {
-                timestamp_column: "ts".into(),
+                timestamp_column: Some("ts".into()),
+                unique_key: Vec::new(),
+                lookback: None,
+                filter_column: None,
+                on_schema_change: Default::default(),
             },
         ] {
             let target = governance_tag_target(&strategy, "warehouse", "marts", "fct_orders");
@@ -22323,6 +22440,7 @@ auto_create_schemas = true
             typed_models: &typed_models,
             model_timings: &model_timings,
             surrogate_keys: &surrogate_keys,
+            full_refresh: false,
         };
 
         assert_eq!(ctx.column_count_for("fct_orders"), Some(3));
@@ -22345,6 +22463,7 @@ auto_create_schemas = true
             typed_models: &typed_models,
             model_timings: &model_timings,
             surrogate_keys: &surrogate_keys,
+            full_refresh: false,
         };
 
         assert_eq!(ctx.column_count_for("raw__shopify__orders"), None);
@@ -24493,7 +24612,9 @@ timestamp_column = "_synced_at"
         );
         let strategy = build_replication_strategy(&pipeline).expect("strategy build");
         match strategy {
-            MaterializationStrategy::Incremental { timestamp_column } => {
+            MaterializationStrategy::Incremental {
+                timestamp_column, ..
+            } => {
                 assert_eq!(timestamp_column, "_synced_at");
             }
             other => panic!("expected Incremental, got {other:?}"),
@@ -24675,6 +24796,9 @@ merge_keys_fallback = ["fallback_only"]
         // carry an `update_columns` field.
         let strategy = MaterializationStrategy::Incremental {
             timestamp_column: "ts".to_string(),
+            unique_key: Vec::new(),
+            lookback: None,
+            filter_column: None,
         };
         let source_cols = vec![ColumnInfo {
             name: "id".to_string(),
@@ -24784,7 +24908,9 @@ merge_keys = ["id"]
         let strategy = build_replication_strategy_with_override(&pipeline, &resolved)
             .expect("strategy build with override");
         match strategy {
-            MaterializationStrategy::Incremental { timestamp_column } => {
+            MaterializationStrategy::Incremental {
+                timestamp_column, ..
+            } => {
                 assert_eq!(timestamp_column, "occurred_at");
             }
             other => panic!("expected Incremental, got {other:?}"),
@@ -25050,6 +25176,9 @@ merge_keys = ["id"]
         // The bootstrap case the bug missed: incremental strategy, first run.
         let strategy = MaterializationStrategy::Incremental {
             timestamp_column: "_fivetran_synced".to_string(),
+            unique_key: Vec::new(),
+            lookback: None,
+            filter_column: None,
         };
         let now = chrono::Utc::now();
 
@@ -25458,6 +25587,7 @@ table = "fct_events"
             typed_models: &typed_models,
             model_timings: &model_timings,
             surrogate_keys: &surrogate_keys,
+            full_refresh: false,
         };
 
         let failing = FailTargetDescribe {
@@ -25561,6 +25691,7 @@ table = "orders_view"
             typed_models: &typed_models,
             model_timings: &model_timings,
             surrogate_keys: &surrogate_keys,
+            full_refresh: false,
         };
 
         let error = match super::execute_one_plain_model(
@@ -25690,6 +25821,7 @@ table = "orders_view"
             typed_models: &typed_models,
             model_timings: &model_timings,
             surrogate_keys: &surrogate_keys,
+            full_refresh: false,
         };
         let output = super::execute_one_plain_model(
             &model,
@@ -25767,6 +25899,7 @@ table = "orders_view"
             typed_models: &typed_models,
             model_timings: &model_timings,
             surrogate_keys: &surrogate_keys,
+            full_refresh: false,
         };
         let error = super::execute_one_plain_model(
             &model,
@@ -25926,6 +26059,7 @@ table = "orders_view"
             typed_models: &typed_models,
             model_timings: &model_timings,
             surrogate_keys: &surrogate_keys,
+            full_refresh: false,
         };
 
         let error = match super::execute_one_plain_model(
@@ -26053,6 +26187,7 @@ table = "fct_daily"
             typed_models: &typed_models,
             model_timings: &model_timings,
             surrogate_keys: &surrogate_keys,
+            full_refresh: false,
         };
         let mut output = RunOutput::new(String::new(), 0, 0);
 
@@ -26153,6 +26288,7 @@ table = "fct_daily"
             typed_models: &typed_models,
             model_timings: &model_timings,
             surrogate_keys: &surrogate_keys,
+            full_refresh: false,
         };
 
         let range = PartitionRunOptions {
@@ -26271,6 +26407,7 @@ table = "fct_events"
             typed_models: &typed_models,
             model_timings: &model_timings,
             surrogate_keys: &surrogate_keys,
+            full_refresh: false,
         };
 
         // A DuckDB lock-contention message → real `classify_failure` →
@@ -26392,6 +26529,7 @@ table = "fct_events"
             typed_models: &typed_models,
             model_timings: &model_timings,
             surrogate_keys: &surrogate_keys,
+            full_refresh: false,
         };
 
         // A non-transient probe failure (not a lock/contention message) →
@@ -26490,6 +26628,7 @@ table = "fct_events"
             typed_models: &typed_models,
             model_timings: &model_timings,
             surrogate_keys: &surrogate_keys,
+            full_refresh: false,
         };
 
         let failing = FailTargetDescribe {
@@ -27705,6 +27844,9 @@ timestamp_column = "ts"
         let dialect = DuckDbSqlDialect;
         let strategy = MaterializationStrategy::Incremental {
             timestamp_column: "ts".to_string(),
+            unique_key: Vec::new(),
+            lookback: None,
+            filter_column: None,
         };
         let target = TableRef {
             catalog: String::new(),
@@ -27845,6 +27987,9 @@ timestamp_column = "ts"
         let resolved = super::resolve_new_watermark(
             &MaterializationStrategy::Incremental {
                 timestamp_column: "ts".into(),
+                unique_key: Vec::new(),
+                lookback: None,
+                filter_column: None,
             },
             &adapter,
             &dialect,
@@ -27948,6 +28093,9 @@ timestamp_column = "ts"
         let dialect = DuckDbSqlDialect;
         let strategy = MaterializationStrategy::Incremental {
             timestamp_column: "_loaded_at".to_string(),
+            unique_key: Vec::new(),
+            lookback: None,
+            filter_column: None,
         };
         let target = TableRef {
             catalog: String::new(),
@@ -34800,6 +34948,7 @@ auto_create_schemas = true
             rowcount_fallback,
             lag_tolerance_seconds,
             shadow_or_branch: false,
+            full_refresh: false,
         }
     }
 
@@ -35399,6 +35548,7 @@ auto_create_schemas = true
             rowcount_fallback: true,
             lag_tolerance_seconds: 0,
             shadow_or_branch: false,
+            full_refresh: false,
         };
         let out2 = run_with_gate(
             &models_dir,
@@ -35683,6 +35833,7 @@ auto_create_schemas = true
                     rowcount_fallback: false,
                     lag_tolerance_seconds: 0,
                     shadow_or_branch: false,
+                    full_refresh: false,
                 },
                 false,
                 false,
@@ -35758,6 +35909,7 @@ auto_create_schemas = true
                     rowcount_fallback: false,
                     lag_tolerance_seconds: 0,
                     shadow_or_branch: false,
+                    full_refresh: false,
                 },
                 false,
                 false,
@@ -35813,6 +35965,7 @@ auto_create_schemas = true
                     rowcount_fallback: false,
                     lag_tolerance_seconds: 0,
                     shadow_or_branch: false,
+                    full_refresh: false,
                 },
                 false,
                 false,
@@ -35939,6 +36092,7 @@ auto_create_schemas = true
                     rowcount_fallback: false,
                     lag_tolerance_seconds: 0,
                     shadow_or_branch: false,
+                    full_refresh: false,
                 },
                 false,
                 false,
@@ -36009,6 +36163,7 @@ auto_create_schemas = true
                         rowcount_fallback: false,
                         lag_tolerance_seconds: 0,
                         shadow_or_branch: false,
+                        full_refresh: false,
                     },
                     false,
                     false,
@@ -36075,6 +36230,7 @@ auto_create_schemas = true
                     rowcount_fallback: false,
                     lag_tolerance_seconds: 0,
                     shadow_or_branch: false,
+                    full_refresh: false,
                 },
                 false,
                 false,
@@ -36142,7 +36298,8 @@ auto_create_schemas = true
             std::fs::write(models_dir.join("up.sql"), "SELECT id, ts FROM main.ev\n").unwrap();
             std::fs::write(
                 models_dir.join("up.toml"),
-                "[strategy]\ntype = \"incremental\"\ntimestamp_column = \"ts\"\n\n\
+                // No watermark: E037.
+                "[strategy]\ntype = \"incremental\"\n\n\
                  [target]\ncatalog = \"\"\nschema = \"main\"\ntable = \"up\"\n",
             )
             .unwrap();
@@ -36162,6 +36319,7 @@ auto_create_schemas = true
                 rowcount_fallback: false,
                 lag_tolerance_seconds: 0,
                 shadow_or_branch: false,
+                full_refresh: false,
             };
             // Both outcomes are asserted below: the exclusion lands in `output`
             // either way, and the Result says whether the dependent could run.
@@ -36326,6 +36484,7 @@ auto_create_schemas = true
                 rowcount_fallback: false,
                 lag_tolerance_seconds: 0,
                 shadow_or_branch: false,
+                full_refresh: false,
             };
             // Both outcomes are asserted below: the exclusion lands in `output`
             // either way, and the Result says whether the dependent could run.
@@ -36490,6 +36649,7 @@ auto_create_schemas = true
             rowcount_fallback: false,
             lag_tolerance_seconds: 0,
             shadow_or_branch: false,
+            full_refresh: false,
         };
         let resilience = rocky_core::config::ResilienceConfig {
             contain_failures: true,
@@ -39379,6 +39539,7 @@ auto_create_schemas = true
             typed_models: &typed_models,
             model_timings: &model_timings,
             surrogate_keys: &surrogate_keys,
+            full_refresh: false,
         };
 
         for run_id in ["first", "second"] {
@@ -39523,6 +39684,7 @@ auto_create_schemas = true
             typed_models: &typed_models,
             model_timings: &model_timings,
             surrogate_keys: &surrogate_keys,
+            full_refresh: false,
         };
 
         // Conservative resilience config with zero backoff so the test is fast;

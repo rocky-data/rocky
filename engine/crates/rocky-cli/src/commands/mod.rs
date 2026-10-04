@@ -72,6 +72,7 @@ mod run;
 mod run_audit;
 mod run_content_addressed;
 mod run_dag_exec;
+mod run_incremental;
 mod run_local;
 mod run_watch;
 pub mod schedule_spool;
