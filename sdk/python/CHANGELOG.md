@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **`RockyClient.package_add(spec, *, vars=None, target_schema=None, compiled=None, no_build_empty=False)`**, `package_update(name=None, ...)`, `package_list()` and `package_remove(name, *, force=False)` wrap the new `rocky package` verbs, which vendor dbt Hub packages as Rocky models. They return `PackageAddOutput`, `PackageUpdateOutput`, `PackageListOutput` and `PackageRemoveOutput`. A refusal (`E055`) raises `RockyCommandError`; findings to review (`W055`) are in `diagnostics`.
+
 ## [0.17.0] — 2026-10-03
 
 Pairs with engine 1.76.0.

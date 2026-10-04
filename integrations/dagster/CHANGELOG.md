@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`RockyResource.package_list()`** returns the dbt packages vendored with `rocky package` (`PackageListOutput`), including locally edited files. The mutating `package` verbs stay on `rocky_sdk.RockyClient`: they rewrite model files, which is a development step, not an orchestration step.
+
 ### Fixed
 
 - **DAG assets skip ephemeral models.** `build_dag_specs` / `build_dag_multi_assets` no longer create an asset for a `type = "ephemeral"` transformation node, which `rocky run --model` refuses with `E038`. A consumer's dependency and column lineage on an ephemeral model map to that model's own upstreams.

@@ -64,6 +64,7 @@ from .types import (
     ModelHistoryResult,
     ModelLineageResult,
     OptimizeResult,
+    PackageListOutput,
     PlanResult,
     ProductApproveOutput,
     ProductCompileOutput,
@@ -902,6 +903,19 @@ class RockyResource(dg.ConfigurableResource):
         one status row each, sorted by name. Read-only."""
         with _translating():
             return self._get_client().product_list()
+
+    def package_list(self) -> PackageListOutput:
+        """Run ``rocky package list`` — the dbt packages vendored under
+        ``models/packages/`` with their versions and any locally edited
+        files. Read-only.
+
+        Only the read-only verb is exposed here: ``rocky package add`` /
+        ``update`` / ``remove`` rewrite model files in the repository, which
+        is a development step, not an orchestration step. Use
+        ``rocky_sdk.RockyClient`` for those.
+        """
+        with _translating():
+            return self._get_client().package_list()
 
     def product_journal(self, product: str) -> ProductJournalOutput:
         """Run ``rocky product journal <name>`` — the product's fulfillment
