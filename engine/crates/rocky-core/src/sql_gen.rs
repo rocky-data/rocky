@@ -738,10 +738,7 @@ pub fn generate_transformation_initial_ddl(
 
     if let Some(opts) = redshift_table_options(model_ir) {
         return Ok(vec![dialect.create_table_as_with_redshift_options(
-            &target,
-            &body,
-            opts,
-            false,
+            &target, &body, opts, false,
         )?]);
     }
     Ok(vec![dialect.create_table_as_new(&target, &body)])
