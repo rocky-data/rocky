@@ -243,6 +243,32 @@ When `backend` is not `local`, Rocky syncs the state file around each run.
 
 If the download fails, Rocky logs a warning and starts fresh from target-table metadata. The [retry + failure policy](#retry-and-failure-policy) below governs what an upload failure does.
 
+### What a Schema Upgrade Does to Remote State
+
+This section says which remote state a new engine reads after a schema upgrade. Rocky stores remote state under a key that names the state schema version (the format version of the state file). The key looks like `<s3_prefix>v30/state.redb` on S3 or GCS and `<valkey_prefix>v30:state.redb` on Valkey. An engine release that changes the schema version therefore looks for a key that does not exist yet.
+
+When the current key is absent, Rocky looks for an older key. It probes older versions newest first, down to `v22`, and restores the first one it finds. The run then opens that state, migrates it in place, and uploads it under the current key. The policy ledger, the run history, and the watermarks all carry over.
+
+```
+   download: v31 key? ── present ──▶ restore v31
+                 │
+               absent
+                 ▼
+             v30 key? ── present ──▶ restore v30, upload writes v31
+                 │
+               absent
+                 ▼
+               ...  down to v22, then start fresh
+```
+
+- Rocky never writes or deletes an older key. It stays in the bucket as your pre-upgrade copy.
+- Rocky never probes a newer key. An older engine never reads state that a newer engine wrote.
+- Under `concurrency_control = "cas"`, the first upload creates the current key. It does not compare against the older object.
+- The Valkey cache of the `tiered` backend reads only the current key. The S3 tier does the lookup for older keys.
+- The download logs `outcome = "carried_forward"` and names the version it restored in `carried_forward_from`.
+
+This assumes that every process that shares the backend runs the same engine version, as the [deployment contract](/advanced/deployment-contract/#mixed-versions-during-an-upgrade) requires. An older engine that keeps writing its own key after the upgrade writes state that the new engine never reads again.
+
 ### Retry and Failure Policy
 
 Every remote transfer runs inside a wall-clock budget, for uploads and downloads alike. Retries back off exponentially, and a three-state circuit breaker stops a failing backend from being hammered. This is the same machinery the Databricks and Snowflake adapters use. Configure it under `[state.retry]` in `rocky.toml`. The [configuration reference](/reference/configuration/#stateretry) lists every field.
@@ -274,6 +300,7 @@ circuit_breaker_threshold = 5
 |---|---|
 | `ok` | Transfer completed successfully. |
 | `absent` | Remote state was empty — first run against this backend. |
+| `carried_forward` | The current schema version had no remote state. Rocky restored the newest older version's state. |
 | `timeout` | Hit `transfer_timeout_seconds` wall-clock cap. |
 | `error_then_fresh` | Existence check failed; Rocky started fresh. |
 | `transient_exhausted` | `max_retries` exhausted on transient errors. |

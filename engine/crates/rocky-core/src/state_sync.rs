@@ -134,25 +134,82 @@ fn remote_state_key(local_path: &Path) -> String {
 /// Qualifying by **schema** version, not binary version or hash, is
 /// deliberate: a patch bump that leaves the redb schema unchanged keeps the
 /// same segment and so keeps sharing state (no fleet-wide watermark reset).
-/// Only a schema-changing bump shifts the segment, after which the new version
-/// finds no state under its key and bootstraps once via the existing
-/// incremental-bootstrap path.
+/// Only a schema-changing bump shifts the segment. The new version then finds
+/// no object under its own key, so the download reads the newest older key
+/// instead and restores it (#1955, see [`carry_forward_versions`]). The first
+/// upload writes the current key; the older key is never written or deleted.
+/// Only when no older key exists down to the floor does the run start fresh.
 fn schema_version_segment() -> String {
     format!("v{}", crate::state::current_schema_version())
+}
+
+/// Oldest schema version a carry-forward will read (#1955).
+///
+/// v22 is the last schema version that added a table, so a store written at
+/// v22 or later carries every table this binary reads, and the normal
+/// read-write open migrates it in place by re-stamping the version. A store
+/// older than that is not carried forward; the key stays absent and the
+/// download is a fresh start, as before. Release 1.74.0 jumped from v23 to
+/// v30, so the floor covers every key a supported upgrade can leave behind.
+const CARRY_FORWARD_FLOOR_SCHEMA_VERSION: u32 = 22;
+
+/// Older schema versions to probe, newest first, when the current-version key
+/// is absent (#1955).
+///
+/// The search runs DOWN from `current - 1` to
+/// [`CARRY_FORWARD_FLOOR_SCHEMA_VERSION`] inclusive and never up: a newer key
+/// was written by a newer binary, and reading it would be a downgrade.
+fn carry_forward_versions() -> Vec<u32> {
+    carry_forward_versions_below(crate::state::current_schema_version())
+}
+
+/// [`carry_forward_versions`] for an explicit `current` version (unit-testable
+/// without changing the compiled-in schema version).
+fn carry_forward_versions_below(current: u32) -> Vec<u32> {
+    (CARRY_FORWARD_FLOOR_SCHEMA_VERSION..current)
+        .rev()
+        .collect()
+}
+
+/// Whether a download leg may restore an older schema version's key when the
+/// current-version key is absent (#1955).
+///
+/// Only the Valkey read takes this flag: `Yes` for the `valkey` backend, `No`
+/// for the Valkey cache leg of `tiered`, where a miss falls through to the
+/// durable S3 leg, which does the carry-forward itself. The object-store read
+/// is always a durable leg (`s3`, `gcs`, the S3 leg of `tiered`), so it always
+/// carries forward.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CarryForward {
+    Yes,
+    No,
 }
 
 /// Schema-qualified object-store key: `v9/state.redb` (under the configured
 /// `<prefix>`). The version segment is a path component so the full object
 /// path reads `<prefix>/v9/state.redb`.
 fn object_store_state_key(remote_key: &str) -> String {
-    format!("{}/{remote_key}", schema_version_segment())
+    object_store_state_key_at(crate::state::current_schema_version(), remote_key)
+}
+
+/// [`object_store_state_key`] for an explicit schema version. Only the
+/// carry-forward READ path passes an older version; every write uses the
+/// current one.
+fn object_store_state_key_at(version: u32, remote_key: &str) -> String {
+    format!("v{version}/{remote_key}")
 }
 
 /// Schema-qualified Valkey key: `<prefix>v9:state.redb` (e.g.
 /// `rocky:state:v9:state.redb`). The version segment is colon-delimited to
 /// match the Valkey prefix convention.
 fn valkey_state_key(prefix: &str, remote_key: &str) -> String {
-    format!("{prefix}{}:{remote_key}", schema_version_segment())
+    valkey_state_key_at(prefix, crate::state::current_schema_version(), remote_key)
+}
+
+/// [`valkey_state_key`] for an explicit schema version. Only the
+/// carry-forward READ path passes an older version.
+fn valkey_state_key_at(prefix: &str, version: u32, remote_key: &str) -> String {
+    format!("{prefix}v{version}:{remote_key}")
 }
 
 /// Build an `ObjectStoreProvider` rooted at `<scheme>://<bucket>/<prefix>`.
@@ -1514,7 +1571,14 @@ impl Drop for RemoteStateSession {
 ///   tables are snapshotted **before** the download and spliced back in
 ///   afterwards, so `jobs` / `schema_cache` survive a download that replaces the
 ///   replicated tables.
-/// - **Absent** — no remote object exists for this key. For a REMOTE backend the
+/// - **Carried forward** (#1955) — the current-version key is absent but an
+///   older schema version's key exists (newest first, down to
+///   [`CARRY_FORWARD_FLOOR_SCHEMA_VERSION`]). The leg restores it and reports
+///   [`DownloadOutcome::Restored`], so it merges exactly like a restore. It
+///   captures no CAS generation: the first upload writes the current key with
+///   create-if-absent. The Valkey cache leg of `tiered` never carries forward.
+/// - **Absent** — no remote object exists for this key, nor for any older
+///   schema version down to the floor. For a REMOTE backend the
 ///   replicated tables must become **fresh** (empty) — a switch to an empty
 ///   prefix must not keep stale watermarks (finding 6) — while the local-only
 ///   tables are preserved. The pre-download snapshot already holds *only* the
@@ -1937,7 +2001,9 @@ async fn download_state_inner(
             )
             .await
         }
-        StateBackend::Valkey => download_from_valkey(config, dest_path, remote_key).await,
+        StateBackend::Valkey => {
+            download_from_valkey(config, dest_path, remote_key, CarryForward::Yes).await
+        }
         // Under `cas` the tiered read is generation-validated against the
         // durable tier — the Valkey copy may only short-circuit when it proves
         // it holds the object's CURRENT generation.
@@ -1977,13 +2043,12 @@ async fn download_state_inner(
             // read captures no base, so nothing can later mistake `None` for
             // "the object was absent" — `cas_enabled()` never routes a base
             // capture through this arm.
-            match Box::pin(download_state_inner(
-                &valkey_config,
-                dest_path,
-                remote_key,
-                None,
-            ))
-            .await
+            //
+            // The cache leg reads ONLY the current key (`CarryForward::No`).
+            // An older Valkey copy is never trusted over the durable tier: a
+            // miss falls through to S3, whose leg does the carry-forward.
+            match download_from_valkey(&valkey_config, dest_path, remote_key, CarryForward::No)
+                .await
             {
                 Ok(DownloadOutcome::Restored) => {
                     debug!("State restored from Valkey");
@@ -3088,12 +3153,32 @@ async fn download_from_object_store(
                     Ok(DownloadOutcome::Restored)
                 }
                 Ok(false) => {
-                    // Clear the sink: there is no object, so there is no base.
-                    // Leaving a stale one would send `finalize` down
-                    // `PutMode::Update` for a key whose only correct write is
-                    // `Create`.
+                    // Clear the sink: there is no object at the CURRENT key, so
+                    // there is no base. Leaving a stale one would send
+                    // `finalize` down `PutMode::Update` for a key whose only
+                    // correct write is `Create`. This holds for a carried-forward
+                    // restore too: the older key's generation belongs to a
+                    // different object, so the first upload must still CAS
+                    // against "current key absent".
                     if let Some(sink) = gen_sink {
                         *sink = None;
+                    }
+                    // An object store is always a durable leg (`s3`, `gcs`, or
+                    // the S3 leg of `tiered`), so it always carries forward.
+                    if let Some(version) =
+                            carry_forward_from_object_store(&provider, remote_key, dest_path)
+                                .await?
+                    {
+                        info!(
+                            size = dest_path.metadata().map(|m| m.len()).unwrap_or(0),
+                            outcome = "carried_forward",
+                            carried_forward_from = format!("v{version}"),
+                            current = %schema_version_segment(),
+                            "no state at the current schema version; restored the newest older \
+                             version's state. The next upload writes the current key; the older \
+                             key is left untouched"
+                        );
+                        return Ok(DownloadOutcome::Restored);
                     }
                     info!(outcome = "absent", "No existing state in object store — starting fresh");
                     Ok(DownloadOutcome::Absent)
@@ -3112,6 +3197,43 @@ async fn download_from_object_store(
     }
     .instrument(span)
     .await
+}
+
+/// Carry-forward read for the object-store path (#1955): probe the older
+/// schema versions' keys newest first and download the first that exists.
+///
+/// Returns the version restored, or `None` when no older key exists down to
+/// [`CARRY_FORWARD_FLOOR_SCHEMA_VERSION`]. Read-only: the older key is never
+/// written or deleted. The download captures no generation, because the
+/// caller's CAS base must stay "current key absent".
+///
+/// A failed probe is propagated (fail-closed), exactly like the current-key
+/// probe: an unreadable older key is not proof of a fresh start.
+async fn carry_forward_from_object_store(
+    provider: &ObjectStoreProvider,
+    remote_key: &str,
+    dest_path: &Path,
+) -> Result<Option<u32>, StateSyncError> {
+    for version in carry_forward_versions() {
+        let key = object_store_state_key_at(version, remote_key);
+        match probe_exists(provider, &key).await {
+            Ok(true) => {
+                provider.download_file(&key, dest_path).await?;
+                return Ok(Some(version));
+            }
+            Ok(false) => debug!(key = %key, "no state at older schema version"),
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    key = %key,
+                    outcome = "error",
+                    "older-version state existence check failed; propagating (fail-closed)"
+                );
+                return Err(e);
+            }
+        }
+    }
+    Ok(None)
 }
 
 /// Upload `STATE_FILE` to an object store rooted at `<scheme>://<bucket>/<prefix>`.
@@ -3308,6 +3430,7 @@ async fn download_from_valkey(
     config: &StateConfig,
     dest_path: &Path,
     remote_key: &str,
+    carry_forward: CarryForward,
 ) -> Result<DownloadOutcome, StateSyncError> {
     // Test seam: force a Valkey MISS without a live Valkey peer, so the tiered
     // fall-through-to-S3 path (and the "stale local file is not a hit" fix) can
@@ -3316,12 +3439,6 @@ async fn download_from_valkey(
     if test_support::take_valkey_miss_fault() {
         return Ok(DownloadOutcome::Absent);
     }
-    let url = config
-        .valkey_url
-        .as_ref()
-        .map(RedactedString::expose)
-        .ok_or_else(|| StateSyncError::MissingConfig("valkey".into(), "state.valkey_url".into()))?
-        .to_string();
     let prefix = config
         .valkey_prefix
         .as_deref()
@@ -3331,59 +3448,110 @@ async fn download_from_valkey(
     // `rocky:state:state.redb`, so a v7 reader and a v9 writer never share a key.
     // `remote_key` is threaded from `download_state` so a staging `dest_path`
     // does not change which key we read.
-    let key = valkey_state_key(&prefix, remote_key);
-    let local_path_owned = dest_path.to_path_buf();
+    //
+    // The current key comes first. Under carry-forward (#1955) the older
+    // versions' keys follow, newest first; the first hit wins. They are only
+    // ever read here, never written or deleted.
+    let current = crate::state::current_schema_version();
+    let mut candidates = vec![(current, valkey_state_key(&prefix, remote_key))];
+    if carry_forward == CarryForward::Yes {
+        candidates.extend(
+            carry_forward_versions()
+                .into_iter()
+                .map(|v| (v, valkey_state_key_at(&prefix, v, remote_key))),
+        );
+    }
     let timeout = transfer_timeout(config);
 
     let span = info_span!("state.download", backend = "valkey");
     async move {
-        info!(key = %key, "downloading state from Valkey");
-        with_transfer_timeout(timeout, async move {
-            let key_for_task = key.clone();
-            let local_for_task = local_path_owned.clone();
-            let join =
-                tokio::task::spawn_blocking(move || -> Result<DownloadOutcome, StateSyncError> {
-                    let client = redis::Client::open(url)
-                        .map_err(|e| StateSyncError::Valkey(e.to_string()))?;
-                    let mut conn = client
-                        .get_connection()
-                        .map_err(|e| StateSyncError::Valkey(e.to_string()))?;
-
-                    let data: Option<Vec<u8>> = redis::cmd("GET")
-                        .arg(&key_for_task)
-                        .query(&mut conn)
-                        .map_err(|e| StateSyncError::Valkey(e.to_string()))?;
-
-                    match data {
-                        Some(bytes) => {
-                            std::fs::write(&local_for_task, bytes)?;
-                            let size = std::fs::metadata(&local_for_task)
-                                .map(|m| m.len())
-                                .unwrap_or(0);
-                            info!(size, outcome = "ok", "state restored from Valkey");
-                            Ok(DownloadOutcome::Restored)
-                        }
-                        None => {
-                            info!(
-                                outcome = "absent",
-                                "No existing state in Valkey — starting fresh"
-                            );
-                            Ok(DownloadOutcome::Absent)
-                        }
-                    }
-                })
-                .await;
-            match join {
-                Ok(inner) => inner,
-                Err(e) => Err(StateSyncError::Valkey(format!(
-                    "valkey worker task failed: {e}"
-                ))),
+        info!(key = %candidates[0].1, "downloading state from Valkey");
+        let hit = with_transfer_timeout(timeout, valkey_get_first(config, candidates)).await?;
+        match hit {
+            Some((version, key, bytes)) => {
+                tokio::fs::write(dest_path, &bytes).await?;
+                if version == current {
+                    info!(
+                        size = bytes.len(),
+                        outcome = "ok",
+                        "state restored from Valkey"
+                    );
+                } else {
+                    info!(
+                        size = bytes.len(),
+                        key = %key,
+                        outcome = "carried_forward",
+                        carried_forward_from = format!("v{version}"),
+                        current = %schema_version_segment(),
+                        "no state at the current schema version; restored the newest older \
+                         version's state from Valkey. The next upload writes the current key; \
+                         the older key is left untouched"
+                    );
+                }
+                Ok(DownloadOutcome::Restored)
             }
-        })
-        .await
+            None => {
+                info!(
+                    outcome = "absent",
+                    "No existing state in Valkey — starting fresh"
+                );
+                Ok(DownloadOutcome::Absent)
+            }
+        }
     }
     .instrument(span)
     .await
+}
+
+/// `GET` each `(version, key)` candidate in order and return the first that
+/// holds a value, or `None` when every key is absent. One connection serves
+/// the whole probe.
+///
+/// The redis sync client blocks its thread, so the work runs on the blocking
+/// pool; the caller caps it with `transfer_timeout_seconds`.
+async fn valkey_get_first(
+    config: &StateConfig,
+    candidates: Vec<(u32, String)>,
+) -> Result<Option<(u32, String, Vec<u8>)>, StateSyncError> {
+    #[cfg(any(test, feature = "test-support"))]
+    if test_support::fake_valkey_installed() {
+        return Ok(candidates.into_iter().find_map(|(version, key)| {
+            test_support::fake_valkey_get(&key).map(|bytes| (version, key, bytes))
+        }));
+    }
+    let url = config
+        .valkey_url
+        .as_ref()
+        .map(RedactedString::expose)
+        .ok_or_else(|| StateSyncError::MissingConfig("valkey".into(), "state.valkey_url".into()))?
+        .to_string();
+    let join = tokio::task::spawn_blocking(
+        move || -> Result<Option<(u32, String, Vec<u8>)>, StateSyncError> {
+            let client =
+                redis::Client::open(url).map_err(|e| StateSyncError::Valkey(e.to_string()))?;
+            let mut conn = client
+                .get_connection()
+                .map_err(|e| StateSyncError::Valkey(e.to_string()))?;
+            for (version, key) in candidates {
+                let data: Option<Vec<u8>> = redis::cmd("GET")
+                    .arg(&key)
+                    .query(&mut conn)
+                    .map_err(|e| StateSyncError::Valkey(e.to_string()))?;
+                if let Some(bytes) = data {
+                    return Ok(Some((version, key, bytes)));
+                }
+                debug!(key = %key, "no state in Valkey at this key");
+            }
+            Ok(None)
+        },
+    )
+    .await;
+    match join {
+        Ok(inner) => inner,
+        Err(e) => Err(StateSyncError::Valkey(format!(
+            "valkey worker task failed: {e}"
+        ))),
+    }
 }
 
 /// Upload state to Valkey/Redis.
@@ -7158,5 +7326,498 @@ mod tests {
             terminal_persisted,
             "the terminal write must persist on the recovered owned store"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // #1955 — carry the newest older schema version's state forward
+    // -----------------------------------------------------------------------
+
+    /// A real redb ledger holding one policy decision, stamped at `version`,
+    /// as an older binary would have uploaded it.
+    fn older_ledger_bytes(dir: &Path, version: u32, plan_id: &str) -> Vec<u8> {
+        let path = dir.join(format!("seed-v{version}-{plan_id}.redb"));
+        {
+            let store = StateStore::open(&path).unwrap();
+            store
+                .record_policy_decision(&seam_policy_record(plan_id))
+                .unwrap();
+        }
+        crate::state::force_schema_version(&path, &version.to_string());
+        std::fs::read(&path).unwrap()
+    }
+
+    fn ledger_plan_ids(local: &Path) -> Vec<String> {
+        let store = StateStore::open(local).unwrap();
+        store
+            .list_policy_decisions()
+            .unwrap()
+            .into_iter()
+            .map(|r| r.plan_id)
+            .collect()
+    }
+
+    fn current_version() -> u32 {
+        crate::state::current_schema_version()
+    }
+
+    #[test]
+    fn carry_forward_probes_newest_first_down_to_the_floor() {
+        assert_eq!(
+            carry_forward_versions_below(30),
+            vec![29, 28, 27, 26, 25, 24, 23, 22],
+            "probe runs from current - 1 DOWN to v22 inclusive"
+        );
+        assert_eq!(carry_forward_versions_below(23), vec![22]);
+        assert!(
+            carry_forward_versions_below(22).is_empty(),
+            "at the floor there is nothing older to probe"
+        );
+        assert!(
+            carry_forward_versions_below(5).is_empty(),
+            "below the floor nothing is ever probed"
+        );
+
+        let live = carry_forward_versions();
+        assert_eq!(live, carry_forward_versions_below(current_version()));
+        assert!(
+            live.iter()
+                .all(|v| (CARRY_FORWARD_FLOOR_SCHEMA_VERSION..current_version()).contains(v)),
+            "never probe the current version, a newer one, or one below v22: {live:?}"
+        );
+        assert!(
+            live.windows(2).all(|w| w[0] > w[1]),
+            "strictly newest first"
+        );
+    }
+
+    #[test]
+    fn versioned_key_builders_match_the_current_key_shape() {
+        let v = current_version();
+        assert_eq!(
+            object_store_state_key_at(v, "state.redb"),
+            object_store_state_key("state.redb")
+        );
+        assert_eq!(object_store_state_key_at(22, "acme.redb"), "v22/acme.redb");
+        assert_eq!(
+            valkey_state_key_at(DEFAULT_VALKEY_PREFIX, v, "state.redb"),
+            valkey_state_key(DEFAULT_VALKEY_PREFIX, "state.redb")
+        );
+        assert_eq!(
+            valkey_state_key_at(DEFAULT_VALKEY_PREFIX, 22, "state.redb"),
+            "rocky:state:v22:state.redb"
+        );
+    }
+
+    /// Absent current key + present older keys: the download restores the
+    /// NEWEST older key (not an even older one), the restored store migrates in
+    /// place on open, the older key is never written, and the next upload
+    /// creates the current key.
+    #[tokio::test]
+    async fn object_store_carry_forward_restores_newest_older_key() {
+        test_support::clear();
+        let faults = install_counting_provider();
+        let provider = test_support::current_override().unwrap();
+        let dir = TempDir::new().unwrap();
+        let local = dir.path().join(".rocky-state.redb");
+        let remote_key = remote_state_key(&local);
+
+        let prev = current_version() - 1;
+        let prev_key = object_store_state_key_at(prev, &remote_key);
+        let older_key = object_store_state_key_at(CARRY_FORWARD_FLOOR_SCHEMA_VERSION, &remote_key);
+        let current_key = object_store_state_key(&remote_key);
+        let prev_bytes = older_ledger_bytes(dir.path(), prev, "kept-decision");
+        provider
+            .put(&prev_key, Bytes::from(prev_bytes.clone()))
+            .await
+            .unwrap();
+        provider
+            .put(
+                &older_key,
+                Bytes::from(older_ledger_bytes(
+                    dir.path(),
+                    CARRY_FORWARD_FLOOR_SCHEMA_VERSION,
+                    "too-old-decision",
+                )),
+            )
+            .await
+            .unwrap();
+        let seeded_puts = faults.count(crate::fault_store::FaultOp::Put);
+
+        let cfg = s3_session_config(StateUploadFailureMode::Fail);
+        let authority = download_state(&cfg, &local, false).await.unwrap();
+        assert_eq!(
+            authority,
+            StateAuthority::Authoritative,
+            "a carried-forward restore is a real restore, not a fresh start"
+        );
+        assert_eq!(
+            ledger_plan_ids(&local),
+            vec!["kept-decision".to_string()],
+            "the ledger must come from the NEWEST older key"
+        );
+        assert_eq!(
+            crate::state::StateStore::peek_schema_version(&local).unwrap(),
+            Some(current_version()),
+            "the read-write open migrates the carried-forward store in place"
+        );
+        assert_eq!(
+            faults.count(crate::fault_store::FaultOp::Put),
+            seeded_puts,
+            "a download never writes to the remote"
+        );
+        assert!(
+            !provider.exists(&current_key).await.unwrap(),
+            "the download alone does not create the current key"
+        );
+
+        upload_state(&cfg, &local, false).await.unwrap();
+        assert!(
+            provider.exists(&current_key).await.unwrap(),
+            "the next upload writes the CURRENT key"
+        );
+        assert_eq!(
+            provider.get(&prev_key).await.unwrap().to_vec(),
+            prev_bytes,
+            "the older key is never written or deleted"
+        );
+        assert_eq!(
+            faults.put_count(&prev_key, crate::fault_store::PutKind::Unconditional)
+                + faults.put_count(&prev_key, crate::fault_store::PutKind::Create)
+                + faults.put_count(&prev_key, crate::fault_store::PutKind::Update),
+            1,
+            "only the test's own seed ever wrote the older key"
+        );
+        test_support::clear();
+    }
+
+    /// The current key wins whenever it exists: no carry-forward probe runs.
+    #[tokio::test]
+    async fn object_store_current_key_wins_over_older_keys() {
+        test_support::clear();
+        let faults = install_counting_provider();
+        let provider = test_support::current_override().unwrap();
+        let dir = TempDir::new().unwrap();
+        let local = dir.path().join(".rocky-state.redb");
+        let remote_key = remote_state_key(&local);
+        provider
+            .put(
+                &object_store_state_key(&remote_key),
+                Bytes::from(older_ledger_bytes(dir.path(), current_version(), "current")),
+            )
+            .await
+            .unwrap();
+        provider
+            .put(
+                &object_store_state_key_at(current_version() - 1, &remote_key),
+                Bytes::from(older_ledger_bytes(
+                    dir.path(),
+                    current_version() - 1,
+                    "older",
+                )),
+            )
+            .await
+            .unwrap();
+        let heads_before = faults.count(crate::fault_store::FaultOp::Head);
+
+        let cfg = s3_session_config(StateUploadFailureMode::Fail);
+        let _ = download_state(&cfg, &local, false).await.unwrap();
+        assert_eq!(ledger_plan_ids(&local), vec!["current".to_string()]);
+        assert_eq!(
+            faults.count(crate::fault_store::FaultOp::Head) - heads_before,
+            1,
+            "a present current key costs exactly one existence probe"
+        );
+        test_support::clear();
+    }
+
+    /// Nothing below v22 is ever read: a key only at v21 leaves the download a
+    /// fresh start, after exactly one probe per version from current down to
+    /// the floor — and no GET at all.
+    #[tokio::test]
+    async fn object_store_carry_forward_never_reads_below_the_floor() {
+        test_support::clear();
+        let faults = install_counting_provider();
+        let provider = test_support::current_override().unwrap();
+        let dir = TempDir::new().unwrap();
+        let local = dir.path().join(".rocky-state.redb");
+        let remote_key = remote_state_key(&local);
+        let below = CARRY_FORWARD_FLOOR_SCHEMA_VERSION - 1;
+        provider
+            .put(
+                &object_store_state_key_at(below, &remote_key),
+                Bytes::from(older_ledger_bytes(dir.path(), below, "below-floor")),
+            )
+            .await
+            .unwrap();
+        let heads_before = faults.count(crate::fault_store::FaultOp::Head);
+        let gets_before = faults.count(crate::fault_store::FaultOp::Get);
+
+        let cfg = s3_session_config(StateUploadFailureMode::Fail);
+        let authority = download_state(&cfg, &local, false).await.unwrap();
+        assert_eq!(authority, StateAuthority::FreshStart);
+        assert!(!local.exists(), "nothing restored, nothing written");
+        assert_eq!(
+            faults.count(crate::fault_store::FaultOp::Head) - heads_before,
+            1 + carry_forward_versions().len() as u64,
+            "one probe for the current key plus one per version down to v22, no more"
+        );
+        assert_eq!(
+            faults.count(crate::fault_store::FaultOp::Get),
+            gets_before,
+            "no object was downloaded"
+        );
+        test_support::clear();
+    }
+
+    /// A failed older-key probe fails closed, exactly like the current-key
+    /// probe: an unreadable older key is not proof of a fresh start.
+    #[tokio::test]
+    async fn object_store_carry_forward_probe_failure_fails_closed() {
+        test_support::clear();
+        let faults = install_counting_provider();
+        let dir = TempDir::new().unwrap();
+        let local = dir.path().join(".rocky-state.redb");
+        // Head #1 is the current key; #2 is the first older key.
+        let nth = faults.count(crate::fault_store::FaultOp::Head) + 2;
+        faults.arm(
+            crate::fault_store::FaultOp::Head,
+            crate::fault_store::FaultMode::FailNth(nth),
+        );
+        let cfg = s3_session_config(StateUploadFailureMode::Fail);
+        let result = download_state(&cfg, &local, false).await;
+        test_support::clear();
+        assert!(
+            result.is_err(),
+            "an older-key probe failure must propagate, got {result:?}"
+        );
+    }
+
+    /// Under CAS a carried-forward restore captures NO base, so the first
+    /// upload CASes against "current key absent" (`PutMode::Create`) — never an
+    /// update against the older object's generation — and never touches the
+    /// older key.
+    #[tokio::test]
+    async fn cas_carry_forward_first_upload_creates_the_current_key() {
+        test_support::clear();
+        let faults = install_counting_provider();
+        let provider = test_support::current_override().unwrap();
+        let dir = TempDir::new().unwrap();
+        let local = dir.path().join(".rocky-state.redb");
+        let remote_key = remote_state_key(&local);
+        let prev_key = object_store_state_key_at(current_version() - 1, &remote_key);
+        let current_key = object_store_state_key(&remote_key);
+        let prev_bytes = older_ledger_bytes(dir.path(), current_version() - 1, "cas-kept");
+        provider
+            .put(&prev_key, Bytes::from(prev_bytes.clone()))
+            .await
+            .unwrap();
+
+        let cfg = StateConfig {
+            concurrency_control: ConcurrencyControl::Cas,
+            ..s3_session_config(StateUploadFailureMode::Fail)
+        };
+        let mut session = RemoteStateSession::new(&cfg, &local, FinalizeDurability::Durable, false);
+        let authority = session.acquire().await.unwrap();
+        // Capture before asserting: a failed assert must not drop an
+        // unfinalized session (its Drop tripwire would abort the test binary).
+        let base_after_acquire = session.base.clone();
+        let plan_ids = ledger_plan_ids(&local);
+        let finalized = session.finalize().await;
+
+        assert_eq!(authority, StateAuthority::Authoritative);
+        assert!(
+            base_after_acquire.is_none(),
+            "a carried-forward restore must not hand the older object's generation to CAS"
+        );
+        assert_eq!(plan_ids, vec!["cas-kept".to_string()]);
+        finalized.expect("first CAS upload commits");
+        assert_eq!(
+            faults.put_count(&current_key, crate::fault_store::PutKind::Create),
+            1,
+            "the first upload after a carry-forward is create-if-absent on the current key"
+        );
+        assert_eq!(
+            faults.put_count(&current_key, crate::fault_store::PutKind::Update),
+            0
+        );
+        assert_eq!(
+            faults.put_count(&prev_key, crate::fault_store::PutKind::Create)
+                + faults.put_count(&prev_key, crate::fault_store::PutKind::Update),
+            0,
+            "no conditional write ever targets the older key"
+        );
+        assert_eq!(
+            provider.get(&prev_key).await.unwrap().to_vec(),
+            prev_bytes,
+            "the older key is untouched"
+        );
+        test_support::clear();
+    }
+
+    /// Tiered `cas`: the durable S3 leg carries forward, with no base.
+    #[tokio::test]
+    async fn tiered_cas_durable_leg_carries_forward_without_a_base() {
+        test_support::clear();
+        let (_faults, provider) = install_tiered_backends();
+        let dir = TempDir::new().unwrap();
+        let local = dir.path().join(".rocky-state.redb");
+        let remote_key = remote_state_key(&local);
+        provider
+            .put(
+                &object_store_state_key_at(current_version() - 1, &remote_key),
+                Bytes::from(older_ledger_bytes(
+                    dir.path(),
+                    current_version() - 1,
+                    "tiered-kept",
+                )),
+            )
+            .await
+            .unwrap();
+
+        let (authority, base) = download_state_with_generation(&tiered_cas_config(), &local, false)
+            .await
+            .unwrap();
+        test_support::clear();
+        assert_eq!(authority, StateAuthority::Authoritative);
+        assert!(base.is_none(), "carry-forward leaves the CAS base empty");
+        assert_eq!(ledger_plan_ids(&local), vec!["tiered-kept".to_string()]);
+    }
+
+    /// Tiered `off`: the Valkey cache leg never carries forward. With an older
+    /// copy ONLY in the cache and nothing durable, the download is a fresh
+    /// start.
+    #[tokio::test]
+    async fn tiered_cache_leg_does_not_carry_forward() {
+        test_support::clear();
+        let _provider = test_support::install(ObjectStoreProvider::in_memory());
+        test_support::install_fake_valkey();
+        let dir = TempDir::new().unwrap();
+        let local = dir.path().join(".rocky-state.redb");
+        let remote_key = remote_state_key(&local);
+        test_support::fake_valkey_set(
+            &valkey_state_key_at(DEFAULT_VALKEY_PREFIX, current_version() - 1, &remote_key),
+            b"OLDER-CACHE-COPY".to_vec(),
+        )
+        .unwrap();
+
+        let cfg = StateConfig {
+            backend: StateBackend::Tiered,
+            s3_bucket: Some("bucket".into()),
+            ..Default::default()
+        };
+        let outcome = download_state_inner(&cfg, &local, &remote_key, None)
+            .await
+            .unwrap();
+        test_support::clear();
+        assert_eq!(
+            outcome,
+            DownloadOutcome::Absent,
+            "an older Valkey cache copy must never be carried forward"
+        );
+        assert!(!local.exists());
+    }
+
+    /// Tiered `off`: a cache miss falls through to S3, and the S3 leg carries
+    /// forward — the durable older copy wins over an older cache copy.
+    #[tokio::test]
+    async fn tiered_off_durable_leg_carries_forward() {
+        test_support::clear();
+        let provider = test_support::install(ObjectStoreProvider::in_memory());
+        test_support::install_fake_valkey();
+        let dir = TempDir::new().unwrap();
+        let local = dir.path().join(".rocky-state.redb");
+        let remote_key = remote_state_key(&local);
+        let prev = current_version() - 1;
+        test_support::fake_valkey_set(
+            &valkey_state_key_at(DEFAULT_VALKEY_PREFIX, prev, &remote_key),
+            b"OLDER-CACHE-COPY".to_vec(),
+        )
+        .unwrap();
+        provider
+            .put(
+                &object_store_state_key_at(prev, &remote_key),
+                Bytes::from_static(b"OLDER-DURABLE-COPY"),
+            )
+            .await
+            .unwrap();
+
+        let cfg = StateConfig {
+            backend: StateBackend::Tiered,
+            s3_bucket: Some("bucket".into()),
+            ..Default::default()
+        };
+        let outcome = download_state_inner(&cfg, &local, &remote_key, None)
+            .await
+            .unwrap();
+        test_support::clear();
+        assert_eq!(outcome, DownloadOutcome::Restored);
+        assert_eq!(std::fs::read(&local).unwrap(), b"OLDER-DURABLE-COPY");
+    }
+
+    /// Valkey backend: absent current key, present older keys → restore the
+    /// newest older one; the older keys are left as they were.
+    #[tokio::test]
+    async fn valkey_carry_forward_restores_newest_older_key() {
+        test_support::clear();
+        test_support::install_fake_valkey();
+        let dir = TempDir::new().unwrap();
+        let local = dir.path().join(".rocky-state.redb");
+        let remote_key = remote_state_key(&local);
+        let prev = current_version() - 1;
+        let prev_key = valkey_state_key_at(DEFAULT_VALKEY_PREFIX, prev, &remote_key);
+        let floor_key = valkey_state_key_at(
+            DEFAULT_VALKEY_PREFIX,
+            CARRY_FORWARD_FLOOR_SCHEMA_VERSION,
+            &remote_key,
+        );
+        let prev_bytes = older_ledger_bytes(dir.path(), prev, "valkey-kept");
+        test_support::fake_valkey_set(&prev_key, prev_bytes.clone()).unwrap();
+        test_support::fake_valkey_set(
+            &floor_key,
+            older_ledger_bytes(dir.path(), CARRY_FORWARD_FLOOR_SCHEMA_VERSION, "too-old"),
+        )
+        .unwrap();
+
+        let cfg = StateConfig {
+            backend: StateBackend::Valkey,
+            ..Default::default()
+        };
+        let authority = download_state(&cfg, &local, false).await.unwrap();
+        let prev_after = test_support::fake_valkey_get(&prev_key);
+        let current_after =
+            test_support::fake_valkey_get(&valkey_state_key(DEFAULT_VALKEY_PREFIX, &remote_key));
+        test_support::clear();
+
+        assert_eq!(authority, StateAuthority::Authoritative);
+        assert_eq!(ledger_plan_ids(&local), vec!["valkey-kept".to_string()]);
+        assert_eq!(prev_after, Some(prev_bytes), "the older key is untouched");
+        assert!(current_after.is_none(), "a download never writes Valkey");
+    }
+
+    /// Valkey backend: nothing below v22 is read.
+    #[tokio::test]
+    async fn valkey_carry_forward_never_reads_below_the_floor() {
+        test_support::clear();
+        test_support::install_fake_valkey();
+        let dir = TempDir::new().unwrap();
+        let local = dir.path().join(".rocky-state.redb");
+        let remote_key = remote_state_key(&local);
+        test_support::fake_valkey_set(
+            &valkey_state_key_at(
+                DEFAULT_VALKEY_PREFIX,
+                CARRY_FORWARD_FLOOR_SCHEMA_VERSION - 1,
+                &remote_key,
+            ),
+            b"BELOW-FLOOR".to_vec(),
+        )
+        .unwrap();
+        let cfg = StateConfig {
+            backend: StateBackend::Valkey,
+            ..Default::default()
+        };
+        let authority = download_state(&cfg, &local, false).await.unwrap();
+        test_support::clear();
+        assert_eq!(authority, StateAuthority::FreshStart);
+        assert!(!local.exists());
     }
 }
