@@ -27,7 +27,7 @@ rocky playground [path]
 
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
-| `--template <TEMPLATE>` | `string` | `quickstart` | Sample project template: `quickstart`, `ecommerce`, or `showcase`. |
+| `--template <TEMPLATE>` | `string` | `quickstart` | Sample project template. `quickstart` is the only one. The removed `ecommerce` and `showcase` templates fail with a message that lists the remaining templates. |
 
 ### Examples
 

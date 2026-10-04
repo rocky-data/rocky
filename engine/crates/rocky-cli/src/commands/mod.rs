@@ -164,7 +164,7 @@ pub use plan::{
     ModelNotFound, PlanRunOptions, compute_embedded_capabilities, plan, plan_preview_output,
     plan_promote, populate_governance_actions,
 };
-pub use playground::{run_playground, run_playground_with_template};
+pub use playground::{PLAYGROUND_TEMPLATES, run_playground, run_playground_with_template};
 pub use policy::{
     PolicyShowLedger, PolicyShowMarkers, assemble_policy_show, compute_policy_check,
     compute_policy_show, compute_policy_test, load_policy_show_markers, policy_show_config,
