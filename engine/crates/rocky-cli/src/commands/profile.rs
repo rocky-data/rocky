@@ -15,10 +15,48 @@ use rocky_core::traits::WarehouseAdapter;
 use crate::output::{ProfileColumnStats, ProfileOutput, print_json};
 
 use super::ai_contract::{
-    FallbackPolicy, PreparedKind, compile_project, prepare_table_query, profile_column,
+    FallbackPolicy, PreparedKind, compile_project, prepare_table_query, profile_column, str_cell,
 };
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Upper bound for `rocky profile --sample N`. The CLI enforces it too; this
+/// guards library callers.
+pub const MAX_SAMPLE_VALUES: u32 = 100;
+
+/// Seed for the reservoir sample, so a re-run on unchanged data returns the
+/// same values.
+const SAMPLE_SEED: u32 = 42;
+
+/// Up to `n` distinct non-null values of `column`, drawn by a seeded
+/// reservoir sample and sorted.
+///
+/// DuckDB syntax: `rocky profile` is DuckDB-only this release (see
+/// `duckdb_only_refusal`). The sample sits on a subquery so it draws from the
+/// non-null distinct values rather than from raw rows (DuckDB applies
+/// `USING SAMPLE` before `WHERE`). SQL is built from the already-validated
+/// `table_ref` and a freshly-validated column identifier.
+async fn sample_column_values(
+    adapter: &dyn WarehouseAdapter,
+    table_ref: &str,
+    column: &str,
+    n: u32,
+) -> Result<Vec<String>> {
+    let col = rocky_sql::validation::validate_identifier(column)
+        .map_err(|e| anyhow::anyhow!("invalid column identifier: {e}"))?;
+    let n = n.min(MAX_SAMPLE_VALUES);
+    let sql = format!(
+        "SELECT v FROM (SELECT DISTINCT CAST({col} AS VARCHAR) AS v FROM {table_ref} \
+         WHERE {col} IS NOT NULL) AS s USING SAMPLE reservoir({n} ROWS) REPEATABLE ({SAMPLE_SEED})"
+    );
+    let qr = adapter
+        .execute_query(&sql)
+        .await
+        .map_err(|e| anyhow::anyhow!("sample query failed for column '{column}': {e}"))?;
+    let mut values: Vec<String> = qr.rows.iter().filter_map(|r| str_cell(r.first())).collect();
+    values.sort();
+    Ok(values)
+}
 
 /// Observed warehouse types for a `schema.table` (or `catalog.schema.table`)
 /// ref, keyed by lowercased column name. Profile reports these instead of the
@@ -56,13 +94,16 @@ async fn observed_column_types(
 
 /// Build the profile payload for `model_name`, optionally narrowed to one
 /// column. Returns a [`ProfileOutput`] carrying either the per-column stats or
-/// an `unavailable` reason (a non-DuckDB target this release).
+/// an `unavailable` reason (a non-DuckDB target this release). `sample > 0`
+/// adds up to that many random distinct values per column
+/// (`sample_values`), capped at [`MAX_SAMPLE_VALUES`].
 pub async fn build_profile_output(
     config_path: &Path,
     state_path: &Path,
     models_dir: &str,
     model_name: &str,
     column: Option<&str>,
+    sample: u32,
     cache_ttl_override: Option<u64>,
 ) -> Result<ProfileOutput> {
     let compile_result = compile_project(config_path, state_path, models_dir, cache_ttl_override)?;
@@ -135,8 +176,20 @@ pub async fn build_profile_output(
         // egress — so it always wants the full per-column values.
         let result =
             profile_column(prepared.adapter.as_ref(), &prepared.table_ref, col, true).await;
+        let result = match result {
+            Ok(p) if sample > 0 => sample_column_values(
+                prepared.adapter.as_ref(),
+                &prepared.table_ref,
+                &p.name,
+                sample,
+            )
+            .await
+            .map(|values| (p, Some(values))),
+            Ok(p) => Ok((p, None)),
+            Err(e) => Err(e),
+        };
         match result {
-            Ok(p) => columns.push(ProfileColumnStats {
+            Ok((p, sample_values)) => columns.push(ProfileColumnStats {
                 // Prefer the observed warehouse type; fall back to the
                 // compiler's inferred name when the column isn't in the
                 // describe (or describe failed).
@@ -152,6 +205,7 @@ pub async fn build_profile_output(
                 observed_values: p.observed_values,
                 min: p.min,
                 max: p.max,
+                sample_values,
             }),
             Err(e) if fell_back => {
                 tracing::debug!(column = %col.name, error = %e, "skipping column in source-fallback profile");
@@ -178,6 +232,7 @@ pub async fn run_profile(
     models_dir: &str,
     model_name: &str,
     column: Option<&str>,
+    sample: u32,
     output_json: bool,
     cache_ttl_override: Option<u64>,
 ) -> Result<()> {
@@ -187,6 +242,7 @@ pub async fn run_profile(
         models_dir,
         model_name,
         column,
+        sample,
         cache_ttl_override,
     )
     .await?;
@@ -207,6 +263,9 @@ pub async fn run_profile(
                 col.null_rate * 100.0,
                 col.distinct,
             );
+            if let Some(values) = &col.sample_values {
+                println!("    sample: {}", values.join(", "));
+            }
         }
     }
     Ok(())
@@ -343,6 +402,7 @@ mod tests {
             models_dir.to_str().unwrap(),
             "raw_orders",
             None,
+            0,
             None,
         )
         .await
@@ -363,6 +423,98 @@ mod tests {
         assert_eq!(order_id.type_name, "BIGINT");
     }
 
+    /// `--sample N` returns N distinct non-null values from the column,
+    /// sorted, the same set on a re-run, and every value in the column's
+    /// domain. Without `--sample` the field is absent.
+    #[tokio::test]
+    async fn sample_returns_seeded_distinct_non_null_values() {
+        let (_tmp, config_path, models_dir) = scaffold_fallback_poc(true).await;
+        let state_path = config_path.parent().unwrap().join(".rocky_state");
+        let run = |sample| {
+            build_profile_output(
+                &config_path,
+                &state_path,
+                models_dir.to_str().unwrap(),
+                "raw_orders",
+                Some("order_id"),
+                sample,
+                None,
+            )
+        };
+
+        let first = run(2).await.expect("profile with --sample 2");
+        let values = first.columns[0]
+            .sample_values
+            .clone()
+            .expect("sample_values set");
+        assert_eq!(values.len(), 2);
+        assert!(
+            values.windows(2).all(|w| w[0] < w[1]),
+            "sorted and distinct: {values:?}"
+        );
+        assert!(values.iter().all(|v| ["1", "2", "3"].contains(&v.as_str())));
+
+        let again = run(2).await.unwrap();
+        assert_eq!(
+            again.columns[0].sample_values.as_ref(),
+            Some(&values),
+            "seeded"
+        );
+
+        // Asking for more than the column holds returns every distinct value.
+        let all = run(10).await.unwrap();
+        assert_eq!(
+            all.columns[0].sample_values.as_deref(),
+            Some(&["1".to_string(), "2".to_string(), "3".to_string()][..])
+        );
+
+        let none = run(0).await.unwrap();
+        assert_eq!(none.columns[0].sample_values, None);
+    }
+
+    /// NULLs never appear in the sample, and a column of only NULLs gives an
+    /// empty sample rather than an error.
+    #[tokio::test]
+    async fn sample_skips_nulls() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("warehouse.duckdb");
+        let config_path = dir.path().join("rocky.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "[adapter.warehouse]\ntype = \"duckdb\"\npath = \"{}\"\n\n\
+                 [pipeline.main]\ntype = \"transformation\"\n\n\
+                 [pipeline.main.target]\nadapter = \"warehouse\"\n",
+                db_path.display()
+            ),
+        )
+        .unwrap();
+        let cfg = rocky_core::config::load_rocky_config(&config_path).unwrap();
+        let registry = crate::registry::AdapterRegistry::from_config(&cfg).unwrap();
+        let adapter = registry.warehouse_adapter("warehouse").unwrap();
+        for stmt in [
+            "CREATE SCHEMA IF NOT EXISTS main",
+            "CREATE TABLE main.t (a VARCHAR, b VARCHAR)",
+            "INSERT INTO main.t VALUES ('x', NULL), (NULL, NULL), ('y', NULL)",
+        ] {
+            adapter.execute_statement(stmt).await.unwrap();
+        }
+        let a = sample_column_values(adapter.as_ref(), "main.t", "a", 5)
+            .await
+            .unwrap();
+        assert_eq!(a, vec!["x".to_string(), "y".to_string()]);
+        let b = sample_column_values(adapter.as_ref(), "main.t", "b", 5)
+            .await
+            .unwrap();
+        assert!(b.is_empty());
+        // A hostile identifier is refused before any SQL is built.
+        assert!(
+            sample_column_values(adapter.as_ref(), "main.t", "a; DROP TABLE main.t", 5)
+                .await
+                .is_err()
+        );
+    }
+
     /// Target table materialized → profile uses it directly, no fallback.
     /// Guards against accidentally falling back when the model is healthy.
     #[tokio::test]
@@ -375,6 +527,7 @@ mod tests {
             models_dir.to_str().unwrap(),
             "raw_orders",
             None,
+            0,
             None,
         )
         .await

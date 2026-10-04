@@ -983,6 +983,7 @@ Report what is actually in a model's data, column by column: row count, null cou
 ```bash
 rocky profile fct_orders                  # Profile every column
 rocky profile fct_orders --column amount  # Profile one column
+rocky profile fct_orders --sample 5       # Add 5 random values per column
 ```
 
 **Arguments and flags:**
@@ -991,11 +992,14 @@ rocky profile fct_orders --column amount  # Profile one column
 |------|---------|-------------|
 | `model` | required | Model to profile. Rocky profiles its target table, or a source table when the target does not exist yet. |
 | `--column <NAME>` | (every column) | Profile only this column. |
+| `--sample <N>` | `0` | Also return up to N distinct non-null values per column, drawn at random, as `sample_values`. N is 1 to 100. The draw is seeded, so a re-run on unchanged data returns the same values. |
 | `--models <PATH>` | `models` | Models directory. Rocky compiles it to obtain the model's inferred schema. |
 
 **Which table Rocky profiles.** Rocky profiles the model's target table when that table is materialized. When it is not, Rocky profiles the first source table it can resolve instead, so you still get observed numbers before the first `rocky run`. On that fallback path Rocky skips any column the source does not have. The JSON output names the table it read under `profiled_table` and the missing target under `fell_back_from`. The text output prints neither field, so read the JSON when you need to know which table the numbers came from.
 
 **Minimum and maximum.** `--output json` carries a `min` and a `max` for every column. The text output prints the row, null, and distinct counts only.
+
+**Sample values.** `--sample` reads real cell values and prints them. Without it, the only cell values are `min`, `max` and `observed_values`, the value list of a column with 25 or fewer distinct values. `--sample` covers every column. The [tag-suggestion aid](/python-sdk/classification-aid/) uses it.
 
 ---
 
