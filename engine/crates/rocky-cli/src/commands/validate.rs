@@ -725,6 +725,28 @@ fn validate_adapter(
                 }
             }
         }
+        "clickhouse" => {
+            // Same parse the registry runs before connecting.
+            match crate::registry::clickhouse_config(name, adapter) {
+                Ok(_) => msgs.push(ValidateMessage {
+                    severity: "ok".into(),
+                    code: "V010".into(),
+                    message: format!("adapter.{name}: clickhouse (beta)"),
+                    file: None,
+                    field: None,
+                }),
+                Err(e) => {
+                    ok = false;
+                    msgs.push(ValidateMessage {
+                        severity: "warn".into(),
+                        code: "V011".into(),
+                        message: format!("{e:#}"),
+                        file: None,
+                        field: Some(format!("adapter.{name}")),
+                    });
+                }
+            }
+        }
         "airbyte" => {
             msgs.push(ValidateMessage {
                 severity: "ok".into(),
@@ -3870,12 +3892,40 @@ schema_template = "demo"
         }
     }
 
+    /// `rocky validate` parses a ClickHouse block the way the registry does:
+    /// a good one is V010, a typo'd `extra` key is V011 naming the key.
+    #[test]
+    fn clickhouse_adapter_block_is_parsed() {
+        let config = |extra: &str| {
+            format!(
+                "[adapter.ch]\ntype = \"clickhouse\"\nhost = \"ch.example.com\"\n{extra}\n\
+                 [pipeline.p]\ntype = \"transformation\"\nmodels = \"models/**\"\n\
+                 target = {{ adapter = \"ch\" }}\n"
+            )
+        };
+        let ok = validate_toml(&config("[adapter.ch.extra]\nsecure = true\n"));
+        assert!(
+            ok.messages
+                .iter()
+                .any(|m| m.code == "V010" && m.message.contains("clickhouse")),
+            "{:?}",
+            ok.messages
+        );
+        let bad = validate_toml(&config("[adapter.ch.extra]\ntls = true\n"));
+        let v011: Vec<_> = bad.messages.iter().filter(|m| m.code == "V011").collect();
+        assert_eq!(v011.len(), 1, "{:?}", bad.messages);
+        assert!(
+            v011[0].message.contains("unknown extra key 'tls'"),
+            "{v011:?}"
+        );
+    }
+
     #[test]
     fn test_unknown_adapter_type() {
         let out = validate_toml(
             r#"
 [adapter.mystery]
-type = "clickhouse"
+type = "singlestore"
 
 [pipeline.poc]
 type = "replication"
@@ -3896,7 +3946,7 @@ schema_template = "demo"
         );
         let unknown: Vec<_> = out.messages.iter().filter(|m| m.code == "V017").collect();
         assert_eq!(unknown.len(), 1);
-        assert!(unknown[0].message.contains("clickhouse"));
+        assert!(unknown[0].message.contains("singlestore"));
         // An unknown adapter type is a hard error: `rocky run` rejects it,
         // so `rocky validate` must report `valid = false` (non-zero exit),
         // not a cosmetic warning.

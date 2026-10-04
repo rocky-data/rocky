@@ -197,6 +197,7 @@ fn incremental_iceberg_model(
             table_properties: vec![],
             comment: Some("incremental iceberg mart".into()),
             redshift: None,
+            clickhouse: None,
         }),
     )
 }

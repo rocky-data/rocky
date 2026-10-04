@@ -689,6 +689,11 @@ pub struct RawModelConfig {
     /// the IR (and the recipe hash) through `format_options`.
     #[serde(default)]
     pub redshift: Option<rocky_ir::RedshiftTableOptions>,
+    /// ClickHouse table attributes from a `[clickhouse]` sidecar block.
+    /// Folded into [`LakehouseOptions::clickhouse`] on resolve, like
+    /// `redshift`.
+    #[serde(default)]
+    pub clickhouse: Option<rocky_ir::ClickHouseTableOptions>,
     /// Column classification tags from the `[classification]` sidecar
     /// block. See [`ModelConfig::classification`].
     #[serde(default)]
@@ -1431,19 +1436,22 @@ fn resolve_model_config(
         format: raw.format,
         // An empty `[redshift]` block sets nothing; it must not make another
         // dialect refuse the model.
-        format_options: match raw
-            .redshift
-            .filter(|r| *r != rocky_ir::RedshiftTableOptions::default())
-        {
-            // `[redshift]` wins over a `[format_options.redshift]` spelling of
-            // the same thing; both land in one place.
-            Some(redshift) => {
-                let mut opts = raw.format_options.unwrap_or_default();
-                opts.redshift = Some(redshift);
-                Some(opts)
-            }
-            None => raw.format_options,
-        },
+        format_options: fold_clickhouse_options(
+            match raw
+                .redshift
+                .filter(|r| *r != rocky_ir::RedshiftTableOptions::default())
+            {
+                // `[redshift]` wins over a `[format_options.redshift]` spelling of
+                // the same thing; both land in one place.
+                Some(redshift) => {
+                    let mut opts = raw.format_options.unwrap_or_default();
+                    opts.redshift = Some(redshift);
+                    Some(opts)
+                }
+                None => raw.format_options,
+            },
+            raw.clickhouse,
+        ),
         classification: raw.classification,
         tags,
         governance,
@@ -1453,6 +1461,23 @@ fn resolve_model_config(
         name_declared,
         target_table_declared,
     })
+}
+
+/// Fold a `[clickhouse]` sidecar block into `format_options`, as `[redshift]`
+/// is above. An empty block sets nothing, so it must not make another
+/// dialect refuse the model.
+fn fold_clickhouse_options(
+    format_options: Option<LakehouseOptions>,
+    clickhouse: Option<rocky_ir::ClickHouseTableOptions>,
+) -> Option<LakehouseOptions> {
+    match clickhouse.filter(|c| *c != rocky_ir::ClickHouseTableOptions::default()) {
+        Some(clickhouse) => {
+            let mut opts = format_options.unwrap_or_default();
+            opts.clickhouse = Some(clickhouse);
+            Some(opts)
+        }
+        None => format_options,
+    }
 }
 
 /// Extract the pre-substitution `name` and `target.table` from raw TOML

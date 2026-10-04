@@ -214,6 +214,14 @@ pub struct LakehouseOptions {
     /// dialect refuses a model that sets it rather than dropping it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub redshift: Option<RedshiftTableOptions>,
+
+    /// ClickHouse table attributes (`ENGINE` / `PARTITION BY` / `ORDER BY`),
+    /// from a model sidecar's `[clickhouse]` block. Like `redshift`, it
+    /// applies without a lakehouse `format` and shapes the plain
+    /// `CREATE TABLE … AS` the ClickHouse dialect emits; any other dialect
+    /// refuses a model that sets it rather than dropping it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clickhouse: Option<ClickHouseTableOptions>,
 }
 
 // ---------------------------------------------------------------------------
@@ -381,6 +389,124 @@ impl RedshiftTableOptions {
 }
 
 // ---------------------------------------------------------------------------
+// ClickHouse table attributes
+// ---------------------------------------------------------------------------
+
+/// ClickHouse table attributes for a model's `CREATE TABLE … AS`.
+///
+/// ```toml
+/// [clickhouse]
+/// engine       = "MergeTree"               # a MergeTree-family engine, no parameters
+/// order_by     = ["customer_id", "order_date"]
+/// partition_by = "toYYYYMM(order_date)"    # a column, or fn(column)
+/// ```
+///
+/// Every field is optional. The default table is
+/// `ENGINE = MergeTree ORDER BY tuple()`: no sorting key, no partitions.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ClickHouseTableOptions {
+    /// Table engine. A MergeTree-family name without parameters
+    /// (`MergeTree`, `ReplacingMergeTree`, `ReplicatedMergeTree`, …).
+    /// Defaults to `MergeTree`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine: Option<String>,
+    /// Sorting key columns (`ORDER BY (a, b)`). Empty means `tuple()`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub order_by: Vec<String>,
+    /// Partition key: a column (`order_date`) or a single-argument function
+    /// of one (`toYYYYMM(order_date)`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partition_by: Option<String>,
+}
+
+/// The engine ClickHouse tables get when `[clickhouse] engine` is unset.
+pub const CLICKHOUSE_DEFAULT_ENGINE: &str = "MergeTree";
+
+fn is_clickhouse_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+impl ClickHouseTableOptions {
+    /// The column a `partition_by` expression reads: the expression itself
+    /// when it is a bare column, the argument of `fn(column)` otherwise.
+    /// `None` when the expression has neither shape.
+    #[must_use]
+    pub fn partition_column(&self) -> Option<&str> {
+        let expr = self.partition_by.as_deref()?.trim();
+        if is_clickhouse_name(expr) {
+            return Some(expr);
+        }
+        let (func, rest) = expr.split_once('(')?;
+        let arg = rest.strip_suffix(')')?.trim();
+        (is_clickhouse_name(func.trim()) && is_clickhouse_name(arg)).then_some(arg)
+    }
+
+    /// Every reason these options cannot render, as messages. Empty when
+    /// they are valid. Shared by `rocky compile` (E053) and the ClickHouse
+    /// dialect, so the compile-time and run-time checks cannot drift.
+    #[must_use]
+    pub fn violations(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if let Some(engine) = &self.engine
+            && !(is_clickhouse_name(engine) && engine.ends_with("MergeTree"))
+        {
+            out.push(format!(
+                "clickhouse.engine '{engine}' is not a MergeTree-family engine name \
+                 (parameters are not accepted)"
+            ));
+        }
+        for col in &self.order_by {
+            if !is_clickhouse_name(col) {
+                out.push(format!(
+                    "clickhouse.order_by entry '{col}' is not a valid column name"
+                ));
+            }
+        }
+        if let Some(expr) = &self.partition_by
+            && self.partition_column().is_none()
+        {
+            out.push(format!(
+                "clickhouse.partition_by '{expr}' must be a column or fn(column)"
+            ));
+        }
+        out
+    }
+
+    /// The table-attribute clause (`ENGINE = MergeTree PARTITION BY
+    /// toYYYYMM(d) ORDER BY (a, b)`), or the violations when the options are
+    /// invalid.
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`Self::violations`] messages joined with `; `.
+    pub fn to_sql(&self) -> Result<String, String> {
+        let violations = self.violations();
+        if !violations.is_empty() {
+            return Err(violations.join("; "));
+        }
+        let engine = self.engine.as_deref().unwrap_or(CLICKHOUSE_DEFAULT_ENGINE);
+        let mut sql = format!("ENGINE = {engine}");
+        if let Some(expr) = &self.partition_by {
+            sql.push_str(&format!(" PARTITION BY {}", expr.trim()));
+        }
+        if self.order_by.is_empty() {
+            sql.push_str(" ORDER BY tuple()");
+        } else if let [col] = self.order_by.as_slice() {
+            // One column renders bare, as ClickHouse itself spells the key.
+            sql.push_str(&format!(" ORDER BY {col}"));
+        } else {
+            sql.push_str(&format!(" ORDER BY ({})", self.order_by.join(", ")));
+        }
+        Ok(sql)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -472,6 +598,77 @@ mod tests {
         .unwrap();
         assert_eq!(opts.sort_style, Some(RedshiftSortStyle::Interleaved));
         assert!(serde_json::from_str::<RedshiftTableOptions>(r#"{"distkey": "c"}"#).is_err());
+    }
+
+    #[test]
+    fn clickhouse_options_render() {
+        assert_eq!(
+            ClickHouseTableOptions::default().to_sql().unwrap(),
+            "ENGINE = MergeTree ORDER BY tuple()"
+        );
+        let opts = ClickHouseTableOptions {
+            engine: Some("ReplacingMergeTree".into()),
+            order_by: vec!["customer_id".into(), "order_date".into()],
+            partition_by: Some("toYYYYMM(order_date)".into()),
+        };
+        assert_eq!(
+            opts.to_sql().unwrap(),
+            "ENGINE = ReplacingMergeTree PARTITION BY toYYYYMM(order_date) \
+             ORDER BY (customer_id, order_date)"
+        );
+        assert_eq!(opts.partition_column(), Some("order_date"));
+        let bare = ClickHouseTableOptions {
+            partition_by: Some("region".into()),
+            ..Default::default()
+        };
+        assert_eq!(bare.partition_column(), Some("region"));
+        let one = ClickHouseTableOptions {
+            order_by: vec!["id".into()],
+            ..Default::default()
+        };
+        assert_eq!(one.to_sql().unwrap(), "ENGINE = MergeTree ORDER BY id");
+    }
+
+    #[test]
+    fn clickhouse_options_violations() {
+        let bad = |o: ClickHouseTableOptions| o.violations().len();
+        // Engine parameters, a non-MergeTree engine, and injection are refused.
+        for engine in ["ReplacingMergeTree(ver)", "Log", "MergeTree; DROP", ""] {
+            assert_eq!(
+                bad(ClickHouseTableOptions {
+                    engine: Some(engine.into()),
+                    ..Default::default()
+                }),
+                1,
+                "{engine}"
+            );
+        }
+        assert_eq!(
+            bad(ClickHouseTableOptions {
+                order_by: vec!["a b".into(), "1a".into(), "ok".into()],
+                ..Default::default()
+            }),
+            2
+        );
+        for expr in ["toYYYYMM(d, 1)", "f(g(d))", "d)", "d + 1", "f()"] {
+            assert_eq!(
+                bad(ClickHouseTableOptions {
+                    partition_by: Some(expr.into()),
+                    ..Default::default()
+                }),
+                1,
+                "{expr}"
+            );
+        }
+        assert_eq!(bad(ClickHouseTableOptions::default()), 0);
+    }
+
+    #[test]
+    fn clickhouse_options_parse_and_refuse_typos() {
+        let opts: ClickHouseTableOptions =
+            serde_json::from_str(r#"{"order_by": ["a"], "partition_by": "toDate(ts)"}"#).unwrap();
+        assert_eq!(opts.order_by, vec!["a".to_string()]);
+        assert!(serde_json::from_str::<ClickHouseTableOptions>(r#"{"orderby": ["a"]}"#).is_err());
     }
 
     #[test]

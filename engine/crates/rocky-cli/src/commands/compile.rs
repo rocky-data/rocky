@@ -289,6 +289,10 @@ fn compile_inner(
         result
             .diagnostics
             .extend(snapshot_adapter_diagnostics(config, &result));
+        // And one with no upsert at all (ClickHouse): E053.
+        result
+            .diagnostics
+            .extend(merge_adapter_diagnostics(config, &result));
     }
 
     // Portability lint. Effective target_dialect = CLI flag > [portability]
@@ -776,6 +780,66 @@ fn snapshot_adapter_diagnostics(
         .collect()
 }
 
+/// E053 for every model that updates rows by key — `merge`, or `incremental`
+/// with a `unique_key` — when every warehouse adapter the project configures
+/// has no upsert to render it with
+/// ([`rocky_core::traits::SqlDialect::merge_unsupported_reason`]):
+/// ClickHouse. Conservative like E049: a project that also configures a
+/// capable warehouse is not refused here; `rocky run` refuses at SQL
+/// generation if the model runs on ClickHouse.
+fn merge_adapter_diagnostics(
+    config: &rocky_config::RockyConfig,
+    result: &compile::CompileResult,
+) -> Vec<Diagnostic> {
+    let mut refusal: Option<(String, &'static str)> = None;
+    for adapter in warehouse_adapters(config) {
+        let reason = match crate::registry::postgres_dialect_for_config(adapter) {
+            Some(dialect) => dialect.merge_unsupported_reason(),
+            None => crate::registry::warehouse_dialect_for_type(&adapter.adapter_type)
+                .and_then(rocky_core::traits::SqlDialect::merge_unsupported_reason),
+        };
+        // One capable (or unknown) warehouse is enough to stay silent.
+        let Some(reason) = reason else {
+            return Vec::new();
+        };
+        refusal.get_or_insert((adapter.adapter_type.clone(), reason));
+    }
+    let Some((adapter_type, reason)) = refusal else {
+        return Vec::new();
+    };
+    result
+        .project
+        .models
+        .iter()
+        .filter_map(|m| {
+            let kind = match &m.config.strategy {
+                rocky_core::models::StrategyConfig::Merge { .. } => "merge",
+                rocky_core::models::StrategyConfig::Incremental { unique_key, .. }
+                    if !unique_key.is_empty() =>
+                {
+                    "incremental with a unique_key"
+                }
+                _ => return None,
+            };
+            Some(
+                Diagnostic::error(
+                    diagnostic::E053,
+                    &m.config.name,
+                    format!(
+                        "model `{}` ({kind}) cannot run on the configured {adapter_type} \
+                         warehouse: {reason}",
+                        m.config.name
+                    ),
+                )
+                .with_suggestion(
+                    "use `delete_insert` (replace rows by partition key), `incremental` without \
+                     a unique_key (append), or `full_refresh`",
+                ),
+            )
+        })
+        .collect()
+}
+
 /// Extra data the `rocky compile` text renderer needs from the raw
 /// `CompileResult` but which is intentionally not carried on the
 /// `JsonSchema`-backed [`CompileOutput`].
@@ -1210,6 +1274,84 @@ schema_template = "s"
         let config = snapshot_project(dir.path(), PG);
         let codes = compile_codes(dir.path(), &config);
         assert!(!codes.iter().any(|(c, _)| c == "E049"), "{codes:?}");
+    }
+
+    const CH: &str = "[adapter.wh]\ntype = \"clickhouse\"\nhost = \"localhost\"\n";
+
+    /// A ClickHouse-only project refuses every model that updates rows by key
+    /// (E053), refuses snapshots (E049) and UDFs (E051), and leaves the
+    /// strategies ClickHouse runs alone.
+    #[test]
+    fn clickhouse_refuses_merge_snapshot_and_udf_only() {
+        let dir = TempDir::new().unwrap();
+        let config = snapshot_project(dir.path(), CH);
+        let models = dir.path().join("models");
+        let model = |name: &str, toml: &str| {
+            fs::write(models.join(format!("{name}.sql")), "SELECT 1 AS id, 2 AS v").unwrap();
+            fs::write(
+                models.join(format!("{name}.toml")),
+                format!("{toml}\n[target]\ncatalog = \"\"\nschema = \"s\"\n"),
+            )
+            .unwrap();
+        };
+        model(
+            "m_merge",
+            "[strategy]\ntype = \"merge\"\nunique_key = [\"id\"]\n",
+        );
+        model(
+            "m_upsert",
+            "[strategy]\ntype = \"incremental\"\ntimestamp_column = \"id\"\n\
+             unique_key = [\"id\"]\n",
+        );
+        model("m_full", "[strategy]\ntype = \"full_refresh\"\n");
+        model(
+            "m_di",
+            "[strategy]\ntype = \"delete_insert\"\npartition_by = [\"id\"]\n",
+        );
+        model("m_view", "[strategy]\ntype = \"view\"\n");
+        let codes = compile_codes(dir.path(), &config);
+        for name in ["m_merge", "m_upsert"] {
+            assert!(
+                codes.contains(&("E053".to_string(), name.to_string())),
+                "{name}: {codes:?}"
+            );
+        }
+        for name in ["m_full", "m_di", "m_view"] {
+            assert!(
+                !codes.iter().any(|(c, m)| c.starts_with('E') && m == name),
+                "{name} must compile clean: {codes:?}"
+            );
+        }
+        assert!(
+            codes.contains(&("E049".to_string(), "snap".to_string())),
+            "{codes:?}"
+        );
+
+        let dir = TempDir::new().unwrap();
+        let config = udf_project(dir.path(), CH);
+        let codes = compile_codes(dir.path(), &config);
+        assert!(
+            codes.contains(&("E051".to_string(), "dbl".to_string())),
+            "{codes:?}"
+        );
+    }
+
+    /// A warehouse with MERGE beside ClickHouse keeps compile quiet; the run
+    /// refuses at SQL generation if the model lands on ClickHouse.
+    #[test]
+    fn clickhouse_merge_with_a_capable_warehouse_is_not_e053() {
+        let dir = TempDir::new().unwrap();
+        let adapters = format!("{CH}\n[adapter.local]\ntype = \"duckdb\"\npath = \":memory:\"\n");
+        let config = adapter_project(dir.path(), &adapters);
+        let models = dir.path().join("models");
+        fs::write(models.join("m.sql"), "SELECT 1 AS id").unwrap();
+        fs::write(
+            models.join("m.toml"),
+            "[strategy]\ntype = \"merge\"\nunique_key = [\"id\"]\n\n[target]\ncatalog = \"\"\nschema = \"s\"\n",
+        )
+        .unwrap();
+        let codes = compile_codes(dir.path(), &config);
+        assert!(!codes.iter().any(|(c, _)| c == "E053"), "{codes:?}");
     }
 
     #[test]

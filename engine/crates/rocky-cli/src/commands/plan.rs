@@ -743,6 +743,7 @@ pub(crate) fn dialect_for_adapter_type(
         "trino" => Box::new(rocky_trino::dialect::TrinoDialect),
         "postgres" => Box::new(rocky_postgres::PostgresDialect::new()),
         "redshift" => Box::new(rocky_postgres::RedshiftDialect::new()),
+        "clickhouse" => Box::new(rocky_clickhouse::ClickHouseDialect::new()),
         #[cfg(feature = "duckdb")]
         "duckdb" => Box::new(rocky_duckdb::dialect::DuckDbSqlDialect),
         other => {

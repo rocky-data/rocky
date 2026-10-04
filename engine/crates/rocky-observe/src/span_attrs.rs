@@ -222,6 +222,7 @@ pub const WAREHOUSE_NAMES: &[&str] = &[
     "trino",
     "postgres",
     "redshift",
+    "clickhouse",
 ];
 
 #[cfg(test)]

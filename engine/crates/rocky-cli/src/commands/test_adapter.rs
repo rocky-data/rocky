@@ -18,7 +18,14 @@ use crate::output::{TestAdapterOutput, TestAdapterTestResult};
 /// the PATH-based `rocky-<name>` process-adapter resolution so the same
 /// `--adapter <name>` flag works for both shipped adapters and installed
 /// process adapters.
-const BUILTIN_ADAPTERS: &[&str] = &["databricks", "snowflake", "duckdb", "postgres", "redshift"];
+const BUILTIN_ADAPTERS: &[&str] = &[
+    "databricks",
+    "snowflake",
+    "duckdb",
+    "postgres",
+    "redshift",
+    "clickhouse",
+];
 
 /// Run the conformance test suite against a process adapter.
 ///
@@ -157,6 +164,19 @@ pub async fn run_test_adapter_builtin(
             create_catalog: false,
             create_schema: true,
             merge: true,
+            tablesample: false,
+            file_load: false,
+        },
+        // ClickHouse: no MERGE (refused, E053), no catalogs (a schema is a
+        // database), no `SAMPLE` without a declared sampling key.
+        "clickhouse" => AdapterCapabilities {
+            warehouse: true,
+            discovery: false,
+            governance: false,
+            batch_checks: false,
+            create_catalog: false,
+            create_schema: true,
+            merge: false,
             tablesample: false,
             file_load: false,
         },

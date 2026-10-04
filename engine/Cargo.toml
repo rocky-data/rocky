@@ -10,6 +10,7 @@ members = [
     "crates/rocky-snowflake",
     "crates/rocky-trino",
     "crates/rocky-postgres",
+    "crates/rocky-clickhouse",
     "crates/rocky-ai",
     "crates/rocky-server",
     "crates/rocky-engine",

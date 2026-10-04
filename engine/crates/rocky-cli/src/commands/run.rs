@@ -9776,7 +9776,7 @@ pub(crate) fn rewrite_quote_style(
 ) -> Result<Option<char>> {
     match dialect.name() {
         // `format_table_ref` renders bare identifiers.
-        "duckdb" | "databricks" | "postgres" | "redshift" => Ok(None),
+        "duckdb" | "databricks" | "postgres" | "redshift" | "clickhouse" => Ok(None),
         // `format_table_ref` renders backticks; its own comment gives the
         // reason (project IDs may contain hyphens).
         "bigquery" => Ok(Some('`')),
@@ -9981,6 +9981,12 @@ pub(crate) fn dialect_case_rules(
         // `apply_shadow_rewrite` answers it with its own always-folding
         // `collision_identity`. Do not reuse this function for it.
         "bigquery" => Ok(uniform(true)),
+        // ClickHouse: database and table names are case-sensitive, quoted or
+        // not, with no session setting that changes it, and
+        // `ClickHouseDialect::format_table_ref` renders them bare — so
+        // `orders` and `Orders` are two tables —
+        // clickhouse.com/docs/sql-reference/syntax#identifiers
+        "clickhouse" => Ok(uniform(true)),
         // Snowflake carries a SECOND identity axis on top of case: it resolves
         // an UNQUOTED identifier by upper-casing it, while
         // `SnowflakeSqlDialect::format_table_ref` renders every component of a
