@@ -1667,6 +1667,7 @@ schema_template = "s"
             true,
             None,
             &rocky_core::run_vars::RunVars::new(),
+            &[],
         )
         .expect("a seed-backed W041 must not fail the compile");
     }
@@ -1693,6 +1694,7 @@ schema_template = "s"
             None,
             &rocky_core::run_vars::RunVars::new(),
             true,
+            &[],
         )
         .unwrap_err();
         assert!(err.to_string().contains("compilation failed"), "{err}");
