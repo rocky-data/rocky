@@ -1239,3 +1239,76 @@ fn defaulted_dsl_microbatch_is_refused_and_defaulted_sql_window_compiles() {
         bounded_only.diagnostics
     );
 }
+
+// ---- DSL `in [...]` / `not in [...]` (plan-15) ----
+
+/// A `.rocky` model using `in` / `not in` parses, lowers, and type-checks to
+/// a Boolean whose nullability follows SQL 3VL: non-null operand and items
+/// give a non-nullable result; a NULL in the list makes it nullable.
+#[test]
+fn dsl_in_list_compiles_to_boolean_with_3vl_nullability() {
+    use rocky_compiler::types::TypedColumn;
+    use rocky_ir::RockyType;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let models = dir.path().join("models");
+    std::fs::create_dir(&models).expect("models dir");
+    std::fs::write(
+        models.join("flags.rocky"),
+        "from warehouse.main.raw_orders\n\
+         derive {\n    hot: status in [\"a\", \"b\"],\n    cold: status not in [\"x\", null]\n}\n",
+    )
+    .expect("rocky");
+    std::fs::write(
+        models.join("flags.toml"),
+        "name = \"flags\"\n\n[strategy]\ntype = \"full_refresh\"\n\n\
+         [target]\ncatalog = \"c\"\nschema = \"s\"\ntable = \"flags\"\n",
+    )
+    .expect("sidecar");
+
+    let mut source_schemas = HashMap::new();
+    source_schemas.insert(
+        "warehouse.main.raw_orders".to_string(),
+        vec![TypedColumn {
+            name: "status".to_string(),
+            data_type: RockyType::String,
+            nullable: false,
+        }],
+    );
+    let result = compile(&CompilerConfig {
+        models_dir: models,
+        contracts_dir: None,
+        source_schemas,
+        ..Default::default()
+    })
+    .unwrap();
+    assert!(
+        !result.has_errors,
+        "in/not in must compile cleanly: {:?}",
+        result.diagnostics
+    );
+    let sql = &result.project.model("flags").expect("model").sql;
+    assert!(
+        sql.contains("status IN ('a', 'b') AS hot")
+            && sql.contains("status NOT IN ('x', NULL) AS cold"),
+        "got: {sql}"
+    );
+    // Expression-level inference over the lowered SQL: the project pass
+    // leaves expression columns `Unknown`, so assert through the same
+    // inference entry point `rocky compile` exposes for model SQL.
+    let mut scope = HashMap::new();
+    scope.insert(
+        "warehouse.main.raw_orders".to_string(),
+        result.type_check.typed_models["warehouse.main.raw_orders"].clone(),
+    );
+    let cols = rocky_compiler::typecheck::infer_select_types(sql, &scope, "flags")
+        .unwrap_or_else(|e| panic!("inference failed: {e}"));
+    let col = |n: &str| cols.iter().find(|c| c.name == n).expect(n).clone();
+    assert_eq!(col("hot").data_type, RockyType::Boolean);
+    assert!(!col("hot").nullable, "non-null operand and items");
+    assert_eq!(col("cold").data_type, RockyType::Boolean);
+    assert!(
+        col("cold").nullable,
+        "a NULL in the list makes NOT IN nullable"
+    );
+}

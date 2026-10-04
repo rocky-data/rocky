@@ -2155,8 +2155,17 @@ fn infer_expr_type(expr: &Expr, scope: &TypeScope) -> (RockyType, bool) {
         // IS NULL / IS NOT NULL → Boolean, non-nullable
         Expr::IsNull(_) | Expr::IsNotNull(_) => (RockyType::Boolean, false),
 
-        // IN list / subquery → Boolean
-        Expr::InList { .. } | Expr::InSubquery { .. } => (RockyType::Boolean, true),
+        // IN list → Boolean. Per SQL 3VL the result is NULL only when the
+        // operand is NULL, or a list item is NULL and nothing matched; so it is
+        // nullable iff the operand or any item is. `NOT IN` is the same.
+        Expr::InList { expr, list, .. } => {
+            let nullable =
+                infer_expr_type(expr, scope).1 || list.iter().any(|e| infer_expr_type(e, scope).1);
+            (RockyType::Boolean, nullable)
+        }
+
+        // IN subquery → Boolean; the subquery's nullability is not modelled.
+        Expr::InSubquery { .. } => (RockyType::Boolean, true),
 
         // EXISTS → Boolean
         Expr::Exists { .. } => (RockyType::Boolean, false),
@@ -4644,6 +4653,36 @@ mod tests {
         let (ty, nullable) = infer_expr_type(&expr, &scope);
         assert_eq!(ty, RockyType::Boolean);
         assert!(!nullable, "IS NULL should be non-nullable");
+    }
+
+    #[test]
+    fn test_infer_expr_in_list_nullability() {
+        let mut scope = TypeScope::new();
+        scope
+            .columns
+            .insert(CiKey::owned("a".to_string()), (RockyType::Int64, false));
+        scope
+            .columns
+            .insert(CiKey::owned("n".to_string()), (RockyType::Int64, true));
+
+        for sql in ["a IN (1, 2)", "a NOT IN (1, 2)"] {
+            let (ty, nullable) = infer_expr_type(&parse_expr(sql), &scope);
+            assert_eq!(ty, RockyType::Boolean, "{sql}");
+            assert!(
+                !nullable,
+                "{sql}: non-null operand and items is non-nullable"
+            );
+        }
+        for sql in [
+            "a NOT IN (1, NULL)",
+            "a IN (1, NULL)",
+            "n IN (1, 2)",
+            "a NOT IN (1, n)",
+        ] {
+            let (ty, nullable) = infer_expr_type(&parse_expr(sql), &scope);
+            assert_eq!(ty, RockyType::Boolean, "{sql}");
+            assert!(nullable, "{sql}: a NULL operand or item makes IN nullable");
+        }
     }
 
     #[test]

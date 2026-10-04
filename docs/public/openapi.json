@@ -652,6 +652,19 @@
           },
           "proposed_source": {
             "type": "string"
+          },
+          "upstream_baseline_found": {
+            "default": false,
+            "description": "Whether a stored upstream-schema baseline existed for this model. `false` on the first sync of a model: the proposal follows declared intent only, and the current upstream schemas become the baseline. Optional on the wire: an engine older than this field never had one.",
+            "type": "boolean"
+          },
+          "upstream_changes": {
+            "default": [],
+            "description": "Upstream column changes since the baseline, one human-readable line each. Empty when there is no baseline or nothing changed.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
           }
         },
         "required": [

@@ -6313,6 +6313,59 @@ impl StateStore {
         Ok(outcome)
     }
 
+    /// Retire one artifact ledger row, but **only** while it is the sole
+    /// reference to its content hash. Returns `true` when the row was removed
+    /// (the hash's refcount is now zero), `false` when nothing changed.
+    ///
+    /// The refcount is re-counted inside the write transaction, so a reference
+    /// recorded after a caller's [`partition_vacuum_candidates`] pass still
+    /// holds the bytes. Returns `false` when the row is absent, its live hash
+    /// differs from `artifact.blake3_hash`, or any other row shares the hash.
+    ///
+    /// Writes no tombstone. This is the ledger half of
+    /// [`crate::cas_vacuum::delete_unreferenced_artifacts`]; `rocky gc`
+    /// eviction uses [`Self::evict_artifact`] instead.
+    pub fn retire_artifact_if_sole_reference(
+        &self,
+        artifact: &ArtifactRecord,
+    ) -> Result<bool, StateError> {
+        let key = artifact_key(&artifact.run_id, &artifact.model_name, &artifact.file_path);
+        let txn = self.db.begin_write()?;
+        let retired;
+        {
+            let mut artifacts = txn.open_table(OUTPUT_ARTIFACTS)?;
+            let live: Option<ArtifactRecord> = match artifacts.get(key.as_str())? {
+                Some(guard) => Some(serde_json::from_slice(guard.value())?),
+                None => None,
+            };
+            retired = match live {
+                Some(row) if row.blake3_hash == artifact.blake3_hash => {
+                    let mut refs: u64 = 0;
+                    for entry in artifacts.iter()? {
+                        let (_key, value) = entry?;
+                        let record: ArtifactRecord = serde_json::from_slice(value.value())?;
+                        if record.blake3_hash == artifact.blake3_hash {
+                            refs += 1;
+                        }
+                    }
+                    if refs == 1 {
+                        artifacts.remove(key.as_str())?;
+                        true
+                    } else {
+                        false
+                    }
+                }
+                _ => false,
+            };
+        }
+        if retired {
+            self.commit_write(txn)?;
+        } else {
+            drop(txn);
+        }
+        Ok(retired)
+    }
+
     /// Upsert a tombstone row (keyed by `evicted_at` + `blake3_hash`).
     ///
     /// A reserved in-place update of an existing tombstone — e.g. flipping

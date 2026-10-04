@@ -2948,6 +2948,16 @@ pub struct AiSyncProposal {
     pub intent: String,
     pub diff: String,
     pub proposed_source: String,
+    /// Whether a stored upstream-schema baseline existed for this model.
+    /// `false` on the first sync of a model: the proposal follows declared
+    /// intent only, and the current upstream schemas become the baseline.
+    /// Optional on the wire: an engine older than this field never had one.
+    #[serde(default)]
+    pub upstream_baseline_found: bool,
+    /// Upstream column changes since the baseline, one human-readable line
+    /// each. Empty when there is no baseline or nothing changed.
+    #[serde(default)]
+    pub upstream_changes: Vec<String>,
 }
 
 /// JSON output for `rocky ai-explain`.
