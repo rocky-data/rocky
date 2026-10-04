@@ -7576,20 +7576,8 @@ mod tests {
         let local = dir.path().join(".rocky-state.redb");
         seed_state_file(&local);
 
-        let mut cas = RemoteStateSession::new(
-            &tiered_cas_config(),
-            &local,
-            FinalizeDurability::ConfigDefault,
-            false,
-        );
-        let _ = cas.acquire().await.unwrap();
-        cas.start_periodic_uploader(Weak::<StateStore>::new(), Duration::from_secs(3600));
-        assert!(
-            cas.periodic.is_none(),
-            "cas on tiered must not start the mid-run uploader"
-        );
-        cas.finalize().await.expect("terminal CAS commit");
-
+        // `off` first: once the CAS commit below creates the cas-required
+        // marker, an `off` session on this state is refused at acquire (#1228).
         let off_cfg = StateConfig {
             concurrency_control: Some(ConcurrencyControl::Off),
             ..tiered_cas_config()
@@ -7604,6 +7592,20 @@ mod tests {
         );
         off.stop_periodic().await;
         off.abandon("test").await;
+
+        let mut cas = RemoteStateSession::new(
+            &tiered_cas_config(),
+            &local,
+            FinalizeDurability::ConfigDefault,
+            false,
+        );
+        let _ = cas.acquire().await.unwrap();
+        cas.start_periodic_uploader(Weak::<StateStore>::new(), Duration::from_secs(3600));
+        assert!(
+            cas.periodic.is_none(),
+            "cas on tiered must not start the mid-run uploader"
+        );
+        cas.finalize().await.expect("terminal CAS commit");
         test_support::clear();
     }
 
