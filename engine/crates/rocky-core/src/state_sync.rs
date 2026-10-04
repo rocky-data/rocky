@@ -7618,14 +7618,19 @@ mod tests {
         };
         let mut session = RemoteStateSession::new(&cfg, &local, FinalizeDurability::Durable, false);
         let authority = session.acquire().await.unwrap();
+        // Capture before asserting: a failed assert must not drop an
+        // unfinalized session (its Drop tripwire would abort the test binary).
+        let base_after_acquire = session.base.clone();
+        let plan_ids = ledger_plan_ids(&local);
+        let finalized = session.finalize().await;
+
         assert_eq!(authority, StateAuthority::Authoritative);
         assert!(
-            session.base.is_none(),
+            base_after_acquire.is_none(),
             "a carried-forward restore must not hand the older object's generation to CAS"
         );
-        assert_eq!(ledger_plan_ids(&local), vec!["cas-kept".to_string()]);
-
-        session.finalize().await.expect("first CAS upload commits");
+        assert_eq!(plan_ids, vec!["cas-kept".to_string()]);
+        finalized.expect("first CAS upload commits");
         assert_eq!(
             faults.put_count(&current_key, crate::fault_store::PutKind::Create),
             1,
