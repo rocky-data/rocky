@@ -436,13 +436,68 @@ fn restore_apply_notes() -> Vec<String> {
     ]
 }
 
+/// [`RestoredOutput::status`] for a restoration that physically wrote the
+/// rebuilt bytes.
+const REBUILT_STATUS: &str =
+    "rebuilt from the recorded recipe, verified hash-exact, and re-materialized";
+
 /// The per-restoration outcome [`execute_restore_apply`] folds into the
 /// output lists.
 enum RestoreOneOutcome {
     Restored(RestoredOutput),
     AlreadyRestored(String),
     Refused(RestoreRefusedOutput),
+    /// The pre-mutation fence refused the object write. Not a per-row
+    /// refusal: a freeze that lands mid-restore revokes the WHOLE remaining
+    /// transition, so [`execute_restore_apply`] stops and returns
+    /// [`RestoreFenced`].
+    Fenced(String),
 }
+
+/// A pre-mutation fence a restoration consults immediately before each
+/// irreversible object-store write (#1242).
+///
+/// Ledger rows are inside the blob the seam publishes, so a refused attempt
+/// discards them. An object write is not: once the bytes land they stay. So
+/// the policy gate is re-checked right before every such write — a freeze
+/// marker or ledger freeze that lands between the attempt's gate and this
+/// write refuses it. The pre-publish recheck alone would see that freeze only
+/// after the bytes were already written.
+#[async_trait::async_trait]
+pub(crate) trait ObjectWriteFence: Send + Sync {
+    /// `Err` refuses the write and aborts the restore transition.
+    async fn check(&self) -> Result<()>;
+}
+
+/// No fence: the Local backend, and tests that drive
+/// [`execute_restore_apply`] directly. The command-level gate already ran.
+pub(crate) struct NoFence;
+
+#[async_trait::async_trait]
+impl ObjectWriteFence for NoFence {
+    async fn check(&self) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// [`execute_restore_apply`] stopped because a pre-mutation fence refused an
+/// object write. Carried as a typed error so the seam can abort the whole
+/// attempt instead of publishing it as a business error.
+#[derive(Debug)]
+pub(crate) struct RestoreFenced(pub(crate) String);
+
+impl std::fmt::Display for RestoreFenced {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "restore refused before an object-store write: {} — nothing more was written, and \
+             no ledger row of this attempt was published",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for RestoreFenced {}
 
 /// Re-execute the recorded recipe on the recording engine and re-encode the
 /// parquet with the table's **discovered** state, returning the deterministic
@@ -516,6 +571,7 @@ async fn discover_table_state(
 /// tombstone → bind recipe to the exact hash → re-derive → **hash-verify before
 /// any write** → materialize (verify-or-create-only) → reinstate the ledger row
 /// atomically.
+#[allow(clippy::too_many_arguments)]
 async fn restore_one(
     store: &StateStore,
     stores: &dyn RestoreStores,
@@ -524,6 +580,7 @@ async fn restore_one(
     plan_id: &str,
     planned: &RestorePlanRestoration,
     now: DateTime<Utc>,
+    fence: &dyn ObjectWriteFence,
 ) -> RestoreOneOutcome {
     let refuse = |reason: String| {
         RestoreOneOutcome::Refused(RestoreRefusedOutput {
@@ -674,9 +731,14 @@ async fn restore_one(
     };
     let obj_path = ObjPath::from(format!("{key_prefix}/{relative}"));
     let bytes_written =
-        match verify_or_create(&obj_store, &obj_path, &parquet, &tomb.blake3_hash).await {
+        match verify_or_create(&obj_store, &obj_path, &parquet, &tomb.blake3_hash, fence).await {
             Ok(wrote) => wrote,
-            Err(e) => return refuse(format!("{e:#}")),
+            Err(e) => {
+                if let Some(fenced) = e.downcast_ref::<RestoreFenced>() {
+                    return RestoreOneOutcome::Fenced(fenced.0.clone());
+                }
+                return refuse(format!("{e:#}"));
+            }
         };
 
     // 6. Atomic, hash-guarded ledger reinstatement. `written_at` is the
@@ -711,8 +773,7 @@ async fn restore_one(
             hash_verified: true,
             bytes_written,
             status: if bytes_written {
-                "rebuilt from the recorded recipe, verified hash-exact, and re-materialized"
-                    .to_string()
+                REBUILT_STATUS.to_string()
             } else {
                 "already present, verified — bytes at the tombstoned path matched the hash; \
                  ledger row reinstated"
@@ -739,8 +800,10 @@ async fn restore_one(
 ///
 /// - bytes present → hash them; a match is success **without writing**, a
 ///   mismatch is a hard error (never overwrite);
-/// - bytes absent → create-only conditional put of the verified `parquet`;
-///   losing the create race re-verifies whatever landed instead of clobbering.
+/// - bytes absent → `fence` check, then a create-only conditional put of the
+///   verified `parquet`; losing the create race re-verifies whatever landed
+///   instead of clobbering. A fence refusal returns [`RestoreFenced`] and
+///   writes nothing.
 ///
 /// Returns whether bytes were physically written.
 async fn verify_or_create(
@@ -748,6 +811,7 @@ async fn verify_or_create(
     obj_path: &ObjPath,
     parquet: &[u8],
     expected_hash: &str,
+    fence: &dyn ObjectWriteFence,
 ) -> Result<bool> {
     use object_store::{ObjectStoreExt, PutMode, PutOptions, PutPayload};
 
@@ -770,6 +834,10 @@ async fn verify_or_create(
             Ok(false)
         }
         Err(object_store::Error::NotFound { .. }) => {
+            // The only irreversible effect of a restoration: fence it.
+            if let Err(e) = fence.check().await {
+                return Err(anyhow::Error::new(RestoreFenced(format!("{e:#}"))));
+            }
             let opts = PutOptions {
                 mode: PutMode::Create,
                 ..Default::default()
@@ -817,6 +885,7 @@ async fn execute_restore_apply(
     plan_id: &str,
     plan: &RestorePlan,
     now: DateTime<Utc>,
+    fence: &dyn ObjectWriteFence,
 ) -> Result<RestoreApplyOutput> {
     let tombstones = store
         .list_tombstones()
@@ -827,10 +896,24 @@ async fn execute_restore_apply(
     let mut already_restored: Vec<String> = Vec::new();
 
     for planned in &plan.restorations {
-        match restore_one(store, stores, warehouse, &tombstones, plan_id, planned, now).await {
+        match restore_one(
+            store,
+            stores,
+            warehouse,
+            &tombstones,
+            plan_id,
+            planned,
+            now,
+            fence,
+        )
+        .await
+        {
             RestoreOneOutcome::Restored(out) => restored.push(out),
             RestoreOneOutcome::AlreadyRestored(hash) => already_restored.push(hash),
             RestoreOneOutcome::Refused(r) => refused.push(r),
+            RestoreOneOutcome::Fenced(reason) => {
+                return Err(anyhow::Error::new(RestoreFenced(reason)));
+            }
         }
     }
 
@@ -899,8 +982,8 @@ pub(crate) async fn run_restore_apply_in(
         state_path,
         runtime_principal,
         json,
-        &S3RestoreStores,
-        warehouse.as_ref(),
+        Arc::new(S3RestoreStores),
+        warehouse,
         // Finding 1: reuse the SAME snapshot the adapter was built from.
         Some(cfg),
     )
@@ -918,14 +1001,79 @@ pub(crate) async fn run_restore_apply_in_with(
     state_path: &Path,
     runtime_principal: PolicyPrincipal,
     json: bool,
-    stores: &dyn RestoreStores,
-    warehouse: &dyn rocky_core::traits::WarehouseAdapter,
+    stores: Arc<dyn RestoreStores>,
+    warehouse: Arc<dyn rocky_core::traits::WarehouseAdapter>,
     // Finding 1: the SAME config snapshot the caller already loaded (the outer
     // `run_restore_apply_in` loaded it to build the recording-warehouse adapter).
     // Threaded in so the freeze/policy gate + `[state]` sync read the config the
     // adapter was built from, not a reload a `rocky.toml` swap could redirect.
     loaded_cfg: Option<rocky_core::config::RockyConfig>,
 ) -> Result<()> {
+    let output = restore_apply_output(
+        root,
+        config_path,
+        plan_id,
+        state_path,
+        runtime_principal,
+        stores,
+        warehouse,
+        loaded_cfg,
+    )
+    .await?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&output)?);
+    } else {
+        print_apply_table(&output);
+    }
+    Ok(())
+}
+
+/// The fence a remote restore seam attempt consults before each object write:
+/// the full policy re-gate over a fresh marker LIST and the attempt's
+/// pre-transition decision snapshot (enforcement-only — no audit row).
+struct RegateFence {
+    cfg: rocky_core::config::RockyConfig,
+    plan_id: String,
+    principal: PolicyPrincipal,
+    touched: BTreeMap<String, PolicyCapability>,
+    models_dir: std::path::PathBuf,
+    models_glob: Option<String>,
+    prior_decisions: Vec<rocky_core::state::PolicyDecisionRecord>,
+}
+
+#[async_trait::async_trait]
+impl ObjectWriteFence for RegateFence {
+    async fn check(&self) -> Result<()> {
+        crate::commands::gc::ledger_seam_regate(
+            "restore",
+            Some(&self.cfg),
+            &self.plan_id,
+            self.principal,
+            &self.touched,
+            &self.models_dir,
+            self.models_glob.as_deref(),
+            &self.prior_decisions,
+            None,
+            "before re-materializing an artifact",
+        )
+        .await
+        .map_err(anyhow::Error::new)
+    }
+}
+
+/// [`run_restore_apply_in_with`] without the printing: gates, executes, and
+/// commits the restoration, and returns the output of record.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn restore_apply_output(
+    root: &Path,
+    config_path: &Path,
+    plan_id: &str,
+    state_path: &Path,
+    runtime_principal: PolicyPrincipal,
+    stores: Arc<dyn RestoreStores>,
+    warehouse: Arc<dyn rocky_core::traits::WarehouseAdapter>,
+    loaded_cfg: Option<rocky_core::config::RockyConfig>,
+) -> Result<RestoreApplyOutput> {
     let plan_record = read_plan(root, plan_id)
         .with_context(|| format!("failed to read restore plan '{plan_id}'"))?;
 
@@ -1014,35 +1162,156 @@ pub(crate) async fn run_restore_apply_in_with(
         );
     }
 
-    let store = StateStore::open(state_path)
-        .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
-    // Finding 5: restore MUTATES the object store + the local artifact/tombstone
-    // ledger as it executes, so a mid-run failure can still have committed state.
-    // CAPTURE the result (don't `?` it), release the store lock, ALWAYS run the
-    // fail-closed upload-after, THEN handle the captured result — a failure must
-    // not skip the durability upload (else the next run's start-download reverts
-    // the partial restoration).
-    let exec_result =
-        execute_restore_apply(&store, stores, warehouse, plan_id, &plan, Utc::now()).await;
-    // Drop the store to release the advisory lock / flush the file before upload.
-    drop(store);
+    let principal = plan_record.enforcement_principal(runtime_principal);
+    let Some(remote_cfg) = crate::commands::apply::remote_ledger_config(loaded_cfg.as_ref()) else {
+        // Local backend (or no config): the on-disk file IS the state.
+        let store = StateStore::open(state_path)
+            .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
+        let exec_result = execute_restore_apply(
+            &store,
+            stores.as_ref(),
+            warehouse.as_ref(),
+            plan_id,
+            &plan,
+            Utc::now(),
+            &NoFence,
+        )
+        .await;
+        drop(store);
+        return exec_result;
+    };
 
-    // Finding 2b + 5 (upload-after, unconditional): push whatever restore wrote to
-    // local state to the remote backend (fail-closed) so it is durable.
-    crate::commands::apply::upload_remote_ledger_fail_closed(
-        loaded_cfg.as_ref(),
+    // Remote ledger seam (#1242; ADR-CONCURRENCY D1 restore rule, normative
+    // since #1542): RETRY with a COMPLETE re-proof, REFUSE on a failed proof.
+    // Every attempt runs the whole restoration against the freshly downloaded
+    // winner — re-resolve the live tombstone at full identity, re-bind the
+    // recipe to the captured hash, re-derive, RE-HASH the bytes already at the
+    // tombstoned path (an earlier attempt may have written them, or something
+    // else may have changed them since), then re-apply the atomic
+    // `restore_artifact`. A row whose proof fails is REFUSED in that attempt's
+    // output, never silently dropped.
+    //
+    // Commit-on-business-error envelope (finding 5): restore mutates the
+    // object store and the ledger as it executes, so a business error is
+    // returned INSIDE the attempt's `Ok` — the rows it did commit are still
+    // published, then the error propagates.
+    //
+    // Fences: the policy gate re-runs at attempt start (recording the
+    // attempt's audit rows), immediately before every object-store write (the
+    // only irreversible effect), and once more before publish. A freeze that
+    // lands mid-restore aborts the attempt; nothing of it is published.
+    let written_paths: Arc<std::sync::Mutex<std::collections::BTreeSet<String>>> =
+        Arc::new(std::sync::Mutex::new(std::collections::BTreeSet::new()));
+    let seam_cfg = remote_cfg.clone();
+    let seam_plan_id = plan_id.to_string();
+    let seam_plan = plan.clone();
+    let seam_touched = touched.clone();
+    let seam_models_dir = models_dir.clone();
+    let seam_models_glob = models_glob.clone();
+    let seam_written = Arc::clone(&written_paths);
+    let exec_result = crate::commands::apply::commit_remote_ledger_seam(
+        remote_cfg,
         state_path,
-        "restore apply",
+        &format!("restore apply '{plan_id}'"),
+        move |fresh_store, _fresh_base| {
+            let cfg = seam_cfg.clone();
+            let plan_id = seam_plan_id.clone();
+            let plan = seam_plan.clone();
+            let touched = seam_touched.clone();
+            let models_dir = seam_models_dir.clone();
+            let models_glob = seam_models_glob.clone();
+            let stores = Arc::clone(&stores);
+            let warehouse = Arc::clone(&warehouse);
+            let written = Arc::clone(&seam_written);
+            Box::pin(async move {
+                // Snapshot BEFORE this attempt records anything: the fences
+                // must not read the attempt's own rows back as history.
+                let prior_decisions = fresh_store.list_policy_decisions().map_err(|e| {
+                    rocky_core::state_sync::StateSyncError::SeamTransition(format!(
+                        "could not snapshot the fresh decision ledger: {e:#}"
+                    ))
+                })?;
+                crate::commands::gc::ledger_seam_regate(
+                    "restore",
+                    Some(&cfg),
+                    &plan_id,
+                    principal,
+                    &touched,
+                    &models_dir,
+                    models_glob.as_deref(),
+                    &prior_decisions,
+                    Some(fresh_store),
+                    "during this restore apply",
+                )
+                .await?;
+                let fence = RegateFence {
+                    cfg: cfg.clone(),
+                    plan_id: plan_id.clone(),
+                    principal,
+                    touched: touched.clone(),
+                    models_dir: models_dir.clone(),
+                    models_glob: models_glob.clone(),
+                    prior_decisions: prior_decisions.clone(),
+                };
+                let exec = execute_restore_apply(
+                    fresh_store,
+                    stores.as_ref(),
+                    warehouse.as_ref(),
+                    &plan_id,
+                    &plan,
+                    Utc::now(),
+                    &fence,
+                )
+                .await;
+                if let Err(e) = &exec
+                    && let Some(fenced) = e.downcast_ref::<RestoreFenced>()
+                {
+                    return Err(rocky_core::state_sync::StateSyncError::SeamTransition(
+                        fenced.to_string(),
+                    ));
+                }
+                // Capture the irreversible effects as they happen: a later
+                // attempt finds these bytes already present and reports
+                // `bytes_written = false`, but THIS command wrote them.
+                if let Ok(out) = &exec {
+                    let mut written = written
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    for r in out.restored.iter().filter(|r| r.bytes_written) {
+                        written.insert(r.file_path.clone());
+                    }
+                }
+                crate::commands::gc::ledger_seam_regate(
+                    "restore",
+                    Some(&cfg),
+                    &plan_id,
+                    principal,
+                    &touched,
+                    &models_dir,
+                    models_glob.as_deref(),
+                    &prior_decisions,
+                    None,
+                    "after restoration, before publish",
+                )
+                .await?;
+                Ok(exec)
+            })
+        },
     )
     .await?;
-
-    let output = exec_result?;
-    if json {
-        println!("{}", serde_json::to_string_pretty(&output)?);
-    } else {
-        print_apply_table(&output);
+    let mut output = exec_result?;
+    // The output of record comes from the CAS-winning attempt; only the
+    // physical-write fact is folded in from the attempts before it.
+    let written = written_paths
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for r in output.restored.iter_mut() {
+        if !r.bytes_written && written.contains(&r.file_path) {
+            r.bytes_written = true;
+            r.status = REBUILT_STATUS.to_string();
+        }
     }
-    Ok(())
+    Ok(output)
 }
 
 fn print_apply_table(output: &RestoreApplyOutput) {
@@ -1576,7 +1845,7 @@ mod tests {
                 .expect("a restore plan file distinct from the gc plan");
             write_review_marker(root, &restore_plan_id);
 
-            let stores = SharedStore(cas.clone());
+            let stores = Arc::new(SharedStore(cas.clone()));
             run_restore_apply_in_with(
                 root,
                 &config,
@@ -1584,8 +1853,8 @@ mod tests {
                 &state_path,
                 PolicyPrincipal::Human,
                 true,
-                &stores,
-                &fresh_duckdb(),
+                stores.clone(),
+                Arc::new(fresh_duckdb()),
                 rocky_core::config::load_rocky_config(&config).ok(),
             )
             .await
@@ -1625,8 +1894,8 @@ mod tests {
                 &state_path,
                 PolicyPrincipal::Human,
                 true,
-                &stores,
-                &fresh_duckdb(),
+                stores.clone(),
+                Arc::new(fresh_duckdb()),
                 rocky_core::config::load_rocky_config(&config).ok(),
             )
             .await
@@ -1897,6 +2166,7 @@ mod tests {
                 "restore-plan",
                 &planned,
                 Utc::now(),
+                &NoFence,
             )
             .await;
 
@@ -1965,8 +2235,8 @@ mod tests {
                 &state_path,
                 PolicyPrincipal::Human,
                 true,
-                &SharedStore(cas.clone()),
-                &fresh_duckdb(),
+                Arc::new(SharedStore(cas.clone())),
+                Arc::new(fresh_duckdb()),
                 rocky_core::config::load_rocky_config(&config).ok(),
             )
             .await
@@ -2078,6 +2348,7 @@ mod tests {
                     }],
                 },
                 Utc::now(),
+                &NoFence,
             )
             .await
             .unwrap();
@@ -2145,6 +2416,7 @@ mod tests {
                     }],
                 },
                 Utc::now(),
+                &NoFence,
             )
             .await
             .unwrap();
@@ -2192,8 +2464,8 @@ mod tests {
                 &state_path,
                 PolicyPrincipal::Human,
                 true,
-                &SharedStore(cas.clone()),
-                &fresh_duckdb(),
+                Arc::new(SharedStore(cas.clone())),
+                Arc::new(fresh_duckdb()),
                 rocky_core::config::load_rocky_config(&config).ok(),
             )
             .await
@@ -2221,8 +2493,8 @@ mod tests {
                 &state_path,
                 PolicyPrincipal::Human,
                 true,
-                &SharedStore(cas.clone()),
-                &fresh_duckdb(),
+                Arc::new(SharedStore(cas.clone())),
+                Arc::new(fresh_duckdb()),
                 rocky_core::config::load_rocky_config(&config).ok(),
             )
             .await
@@ -2560,6 +2832,7 @@ mod tests {
                 "restore-live-plan",
                 &plan,
                 Utc::now(),
+                &NoFence,
             )
             .await
             .expect("restore apply");
@@ -2604,6 +2877,7 @@ mod tests {
                 "restore-live-plan",
                 &plan,
                 Utc::now(),
+                &NoFence,
             )
             .await
             .expect("idempotent re-apply");
@@ -2631,6 +2905,420 @@ mod tests {
                 ))
                 .await
                 .expect("teardown");
+        }
+
+        /// #1242: the restore ledger seam under effective CAS. Every test runs
+        /// the real `LedgerSeamSession` against the two-pod in-memory "S3"
+        /// harness; interleavings are injected from INSIDE the attempt through
+        /// the warehouse re-derivation call (which runs after the attempt's
+        /// download and before its object write and CAS put) or by armed CAS
+        /// precondition failures — no sleeps, no scheduler dependence.
+        mod cas_seam {
+            use super::*;
+
+            use std::future::Future;
+            use std::pin::Pin;
+            use std::sync::atomic::{AtomicUsize, Ordering};
+
+            use rocky_core::fault_store::PutKind;
+            use rocky_core::test_harness::CrossPodHarness;
+
+            const WINNER_KEY: &str = "winner_table";
+
+            type Hook =
+                Box<dyn Fn(usize) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
+
+            /// The recording engine with a per-call hook run BEFORE each
+            /// re-derivation query (1-based call number).
+            struct HookedWarehouse {
+                inner: rocky_duckdb::adapter::DuckDbWarehouseAdapter,
+                calls: AtomicUsize,
+                hook: Hook,
+            }
+
+            impl HookedWarehouse {
+                fn new(hook: Hook) -> Self {
+                    Self {
+                        inner: fresh_duckdb(),
+                        calls: AtomicUsize::new(0),
+                        hook,
+                    }
+                }
+                fn plain() -> Self {
+                    Self::new(Box::new(|_| Box::pin(async {})))
+                }
+            }
+
+            #[async_trait::async_trait]
+            impl rocky_core::traits::WarehouseAdapter for HookedWarehouse {
+                fn dialect(&self) -> &dyn rocky_core::traits::SqlDialect {
+                    self.inner.dialect()
+                }
+                async fn execute_statement(
+                    &self,
+                    sql: &str,
+                ) -> rocky_core::traits::AdapterResult<()> {
+                    self.inner.execute_statement(sql).await
+                }
+                async fn execute_query(
+                    &self,
+                    sql: &str,
+                ) -> rocky_core::traits::AdapterResult<rocky_core::traits::QueryResult>
+                {
+                    let n = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+                    (self.hook)(n).await;
+                    self.inner.execute_query(sql).await
+                }
+                async fn describe_table(
+                    &self,
+                    table: &rocky_ir::TableRef,
+                ) -> rocky_core::traits::AdapterResult<Vec<rocky_ir::ColumnInfo>> {
+                    self.inner.describe_table(table).await
+                }
+            }
+
+            fn state_key() -> String {
+                format!(
+                    "v{}/state.redb",
+                    rocky_core::state::current_schema_version()
+                )
+            }
+
+            fn write_config(root: &Path, with_policy: bool) -> std::path::PathBuf {
+                let path = root.join("rocky.toml");
+                let policy = if with_policy {
+                    "\n[policy]\nversion = 1\n"
+                } else {
+                    ""
+                };
+                std::fs::write(
+                    &path,
+                    format!(
+                        "[state]\nbackend = \"s3\"\ns3_bucket = \"test\"\n\
+                         concurrency_control = \"cas\"\non_upload_failure = \"skip\"\n\n\
+                         [state.retry]\nmax_retries = 0\n{policy}"
+                    ),
+                )
+                .unwrap();
+                path
+            }
+
+            /// Seed pod B with an evicted artifact whose bytes are gone,
+            /// write + approve its restore plan, and publish pod B's ledger
+            /// as the shared blob. Returns `(wr, obj_path, plan_id)`.
+            async fn seed_remote_eviction(
+                harness: &CrossPodHarness,
+                root: &Path,
+                cas: Arc<InMemory>,
+            ) -> (WriteResult, ObjPath, String) {
+                let state_path = &harness.pod_b.state_path;
+                let (wr, obj_path) = seed_evicted(root, state_path, cas.clone()).await;
+                cas.delete(&obj_path).await.unwrap();
+                run_restore_plan_in(root, state_path, "orders", PolicyPrincipal::Human, true)
+                    .unwrap();
+                let plan_id = find_plan_id(&root.join(".rocky").join("plans"));
+                write_review_marker(root, &plan_id);
+                rocky_core::state_sync::upload_state(&harness.pod_b.cfg, state_path, false)
+                    .await
+                    .unwrap();
+                (wr, obj_path, plan_id)
+            }
+
+            async fn apply(
+                harness: &CrossPodHarness,
+                root: &Path,
+                config: &Path,
+                plan_id: &str,
+                cas: Arc<InMemory>,
+                warehouse: Arc<HookedWarehouse>,
+            ) -> Result<RestoreApplyOutput> {
+                restore_apply_output(
+                    root,
+                    config,
+                    plan_id,
+                    &harness.pod_b.state_path,
+                    PolicyPrincipal::Human,
+                    Arc::new(SharedStore(cas)),
+                    warehouse,
+                    rocky_core::config::load_rocky_config(config).ok(),
+                )
+                .await
+            }
+
+            async fn published(harness: &CrossPodHarness) -> StateStore {
+                let _authority = rocky_core::state_sync::download_state(
+                    &harness.pod_a.cfg,
+                    &harness.pod_a.state_path,
+                    false,
+                )
+                .await
+                .unwrap();
+                StateStore::open(&harness.pod_a.state_path).unwrap()
+            }
+
+            /// #1228's loss scenario for restore, plus "the object already
+            /// exists and CAS then conflicts". A run winner commits from pod A
+            /// DURING attempt 1 (inside its re-derivation, after its download,
+            /// before its object write and CAS put), so attempt 1's put loses
+            /// a genuine race. Attempt 2 re-proves completely on the winner:
+            /// it re-derives (second warehouse call) and finds the bytes
+            /// attempt 1 wrote already present, RE-HASHES them, and reinstates
+            /// the row. The published blob holds BOTH effects, and the output
+            /// of record still says the bytes were written by this command.
+            /// The old half-seam uploaded the stale local ledger
+            /// unconditionally and erased the winner's watermark.
+            #[tokio::test]
+            async fn restore_cas_seam_replays_on_the_winner_with_a_full_reproof() {
+                let _serial = rocky_core::state_sync::remote_testing::serial_guard();
+                let harness = CrossPodHarness::new_s3_like();
+                let dir = TempDir::new().unwrap();
+                let root = dir.path();
+                let cas = Arc::new(InMemory::new());
+                let (wr, obj_path, plan_id) =
+                    seed_remote_eviction(&harness, root, cas.clone()).await;
+                let config = write_config(root, false);
+
+                let pod_a_cfg = harness.pod_a.cfg.clone();
+                let pod_a_path = harness.pod_a.state_path.clone();
+                let warehouse = Arc::new(HookedWarehouse::new(Box::new(move |n| {
+                    let cfg = pod_a_cfg.clone();
+                    let path = pod_a_path.clone();
+                    Box::pin(async move {
+                        if n != 1 {
+                            return;
+                        }
+                        let _authority = rocky_core::state_sync::download_state(&cfg, &path, false)
+                            .await
+                            .unwrap();
+                        {
+                            let store = StateStore::open(&path).unwrap();
+                            store
+                                .set_watermark(
+                                    WINNER_KEY,
+                                    &rocky_ir::WatermarkState {
+                                        last_value: Utc::now(),
+                                        updated_at: Utc::now(),
+                                    },
+                                )
+                                .unwrap();
+                        }
+                        rocky_core::state_sync::upload_state(&cfg, &path, false)
+                            .await
+                            .unwrap();
+                    })
+                })));
+
+                let key = state_key();
+                let updates = harness.faults.put_count(&key, PutKind::Update);
+                let unconditional = harness.faults.put_count(&key, PutKind::Unconditional);
+                let out = apply(
+                    &harness,
+                    root,
+                    &config,
+                    &plan_id,
+                    cas.clone(),
+                    warehouse.clone(),
+                )
+                .await
+                .expect("the replay on the winner must commit");
+
+                assert_eq!(
+                    harness.faults.put_count(&key, PutKind::Update) - updates,
+                    2,
+                    "the injected genuine conflict must force exactly two CAS attempts"
+                );
+                // Exactly one unconditional put: the winner's own publish
+                // from pod A inside the hook. The seam adds none.
+                assert_eq!(
+                    harness.faults.put_count(&key, PutKind::Unconditional) - unconditional,
+                    1,
+                    "the seam must never fall back to an unconditional blob put"
+                );
+                assert_eq!(
+                    warehouse.calls.load(Ordering::SeqCst),
+                    2,
+                    "each attempt must re-derive — a complete re-proof, not a replayed row"
+                );
+
+                // Output of record: the winning attempt's, with the physical
+                // write folded in from attempt 1.
+                assert_eq!(out.restored_count, 1, "{out:?}");
+                assert_eq!(out.refused_count, 0, "{out:?}");
+                assert!(
+                    out.restored[0].bytes_written,
+                    "attempt 1 wrote the bytes; the output must say so: {out:?}"
+                );
+
+                let bytes = cas.get(&obj_path).await.unwrap().bytes().await.unwrap();
+                assert_eq!(blake3::hash(&bytes).to_hex().to_string(), wr.blake3_hash);
+                let remote = published(&harness).await;
+                assert!(
+                    remote.get_watermark(WINNER_KEY).unwrap().is_some(),
+                    "the mid-seam run winner's watermark must survive the restore (#1228)"
+                );
+                assert_eq!(remote.refcount_for_hash(&wr.blake3_hash).unwrap(), 1);
+                let tombs = remote.list_tombstones().unwrap();
+                assert_eq!(tombs.len(), 1);
+                assert_eq!(tombs[0].restore_plan_id.as_deref(), Some(plan_id.as_str()));
+            }
+
+            /// RE-HASH on retry: attempt 1 writes the verified bytes, then a
+            /// CAS conflict forces attempt 2 — and between the two the bytes
+            /// at the tombstoned path change. Attempt 2's re-proof hashes the
+            /// bytes now present, finds a mismatch, and REFUSES the row; the
+            /// published ledger does not reinstate it. A replay that trusted
+            /// attempt 1's proof would have reinstated a row over bytes it can
+            /// no longer prove.
+            #[tokio::test]
+            async fn restore_cas_retry_rehashes_and_refuses_bytes_changed_between_attempts() {
+                let _serial = rocky_core::state_sync::remote_testing::serial_guard();
+                let harness = CrossPodHarness::new_s3_like();
+                let dir = TempDir::new().unwrap();
+                let root = dir.path();
+                let cas = Arc::new(InMemory::new());
+                let (wr, obj_path, plan_id) =
+                    seed_remote_eviction(&harness, root, cas.clone()).await;
+                let config = write_config(root, false);
+
+                let hook_cas = cas.clone();
+                let hook_path = obj_path.clone();
+                let warehouse = Arc::new(HookedWarehouse::new(Box::new(move |n| {
+                    let cas = hook_cas.clone();
+                    let path = hook_path.clone();
+                    Box::pin(async move {
+                        if n == 2 {
+                            cas.put(&path, PutPayload::from(b"changed".to_vec()))
+                                .await
+                                .unwrap();
+                        }
+                    })
+                })));
+                harness.faults.arm_precondition_failures(state_key(), 1);
+
+                let out = apply(&harness, root, &config, &plan_id, cas.clone(), warehouse)
+                    .await
+                    .expect("a refused row is an output, not a command failure");
+                assert_eq!(out.restored_count, 0, "{out:?}");
+                assert_eq!(out.refused_count, 1, "{out:?}");
+                assert!(
+                    out.refused[0].reason.contains("DIFFERENT hash"),
+                    "the refusal must be the re-hash mismatch: {}",
+                    out.refused[0].reason
+                );
+                let remote = published(&harness).await;
+                assert_eq!(
+                    remote.refcount_for_hash(&wr.blake3_hash).unwrap(),
+                    0,
+                    "an unprovable row must not be reinstated"
+                );
+                assert!(remote.list_tombstones().unwrap()[0].restored_at.is_none());
+            }
+
+            /// Exhaustion: three straight conflicts fail the command with the
+            /// typed seam-conflict error. The remote winner is preserved (the
+            /// tombstone stays unrestored) and the local file is put back to
+            /// the winner, so a path-opening reader sees no ghost
+            /// reinstatement. The verified bytes stay at the tombstoned path
+            /// (object writes are irreversible); a re-apply completes
+            /// idempotently.
+            #[tokio::test]
+            async fn restore_cas_exhaustion_preserves_the_winner() {
+                let _serial = rocky_core::state_sync::remote_testing::serial_guard();
+                let harness = CrossPodHarness::new_s3_like();
+                let dir = TempDir::new().unwrap();
+                let root = dir.path();
+                let cas = Arc::new(InMemory::new());
+                let (wr, _obj_path, plan_id) =
+                    seed_remote_eviction(&harness, root, cas.clone()).await;
+                let config = write_config(root, false);
+                harness.faults.arm_precondition_failures(state_key(), 3);
+
+                let err = apply(
+                    &harness,
+                    root,
+                    &config,
+                    &plan_id,
+                    cas.clone(),
+                    Arc::new(HookedWarehouse::plain()),
+                )
+                .await
+                .expect_err("exhaustion must fail the command");
+                assert!(
+                    err.chain()
+                        .filter_map(|c| c.downcast_ref::<rocky_core::state_sync::StateSyncError>())
+                        .any(|e| matches!(
+                            e,
+                            rocky_core::state_sync::StateSyncError::LedgerSeamConflict { .. }
+                        )),
+                    "got: {err:#}"
+                );
+                let remote = published(&harness).await;
+                assert_eq!(remote.refcount_for_hash(&wr.blake3_hash).unwrap(), 0);
+                assert!(remote.list_tombstones().unwrap()[0].restored_at.is_none());
+                let local = StateStore::open(&harness.pod_b.state_path).unwrap();
+                assert_eq!(
+                    local.refcount_for_hash(&wr.blake3_hash).unwrap(),
+                    0,
+                    "no ghost reinstatement may stay locally visible"
+                );
+            }
+
+            /// A freeze marker that lands BETWEEN the attempt's gate and its
+            /// object write is caught by the per-mutation fence: nothing is
+            /// written to the object store, nothing is published, and the
+            /// local file is put back to the winner. The pre-publish recheck
+            /// alone would only have seen it after the irreversible write.
+            #[tokio::test]
+            async fn restore_marker_between_gate_and_object_write_is_fenced() {
+                let _serial = rocky_core::state_sync::remote_testing::serial_guard();
+                let harness = CrossPodHarness::new_s3_like();
+                let dir = TempDir::new().unwrap();
+                let root = dir.path();
+                let cas = Arc::new(InMemory::new());
+                let (wr, obj_path, plan_id) =
+                    seed_remote_eviction(&harness, root, cas.clone()).await;
+                let config = write_config(root, true);
+
+                let provider = harness.provider.clone();
+                let warehouse = Arc::new(HookedWarehouse::new(Box::new(move |n| {
+                    let provider = provider.clone();
+                    Box::pin(async move {
+                        if n != 1 {
+                            return;
+                        }
+                        rocky_core::freeze_marker::write_freeze_marker(
+                            &provider,
+                            &rocky_core::freeze_marker::FreezeMarker {
+                                freeze_id: "mid-restore".to_string(),
+                                principal: PolicyPrincipal::Human,
+                                scope: "any".to_string(),
+                                reason: "landed between gate and write".to_string(),
+                                created_at: Utc::now(),
+                            },
+                        )
+                        .await
+                        .unwrap();
+                    })
+                })));
+
+                let err = apply(&harness, root, &config, &plan_id, cas.clone(), warehouse)
+                    .await
+                    .expect_err("the per-mutation fence must refuse");
+                assert!(
+                    format!("{err:#}").contains("before re-materializing an artifact"),
+                    "the deny must come from the PRE-WRITE fence: {err:#}"
+                );
+                assert!(
+                    matches!(
+                        cas.get(&obj_path).await,
+                        Err(object_store::Error::NotFound { .. })
+                    ),
+                    "a fenced restore must write nothing to the object store"
+                );
+                let remote = published(&harness).await;
+                assert_eq!(remote.refcount_for_hash(&wr.blake3_hash).unwrap(), 0);
+                assert!(remote.list_tombstones().unwrap()[0].restored_at.is_none());
+            }
         }
     }
 }

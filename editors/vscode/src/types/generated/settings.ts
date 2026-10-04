@@ -12,7 +12,7 @@
  *
  * **Scope:** `docs/adr/ADR-CONCURRENCY.md` governs. It *requires* every write of the shared state object to compare-and-swap, split by writer class (runs refuse on conflict; single-record ledger seams retry). That requirement covers the shared object only: the sibling objects written under their own keys — freeze markers, idempotency records, the doctor read/write probe — are create-once or self-keyed, cannot lose an update, and stay outside compare-and-swap by design rather than as a gap.
  *
- * `cas` satisfies that requirement today for the end-of-run upload, for the `rocky policy` freeze/unfreeze ledger write (whose markers are create-once and must never be replayed, so they stay outside the retry), and — since #1372 — for `rocky gc`. It does not yet for `rocky restore`, which uploads the shared object unconditionally on every remote backend, nor for `rocky apply`'s verify-after custody rows, which take that path only when `verify_after` is configured. So `cas` does not yet make a deployment fully safe against lost updates. Issue #1228 tracks closing that half; `rocky doctor --check state_concurrency` reports the residual exposure in the meantime.
+ * `cas` satisfies that requirement for every writer of the shared object: the end-of-run upload, and the ledger seams — `rocky policy` freeze/unfreeze (whose markers are create-once and must never be replayed, so they stay outside the retry), `rocky gc`, `rocky restore`, and `rocky apply`'s governed rule decision and verify-after custody (#1242). The guarantee holds only when every writer sharing the `[state]` location runs with `cas`: one writer left on `off` still uploads unconditionally and can overwrite the others.
  */
 export type ConcurrencyControl = "off" | "cas";
 /**

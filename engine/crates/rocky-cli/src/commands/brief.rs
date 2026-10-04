@@ -855,7 +855,7 @@ fn build_autonomy(
                     let Some(budget) = &rule.autonomy_budget else {
                         continue;
                     };
-                    let Some(window) = parse_window_duration(&budget.window) else {
+                    let Some(window) = parse_window_duration(budget.window.expose()) else {
                         continue;
                     };
                     let failures = policy::budget_failures_in_window(decisions, idx, window, now);

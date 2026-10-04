@@ -187,7 +187,11 @@ fn scope_constraints(scope: &PolicyScope, attrs: &ModelAttributes) -> Option<BTr
     let mut set = BTreeSet::new();
 
     if !scope.models.is_empty() {
-        if scope.models.iter().any(|pat| glob_match(pat, &attrs.name)) {
+        if scope
+            .models
+            .iter()
+            .any(|pat| glob_match(pat.expose(), &attrs.name))
+        {
             set.insert(Constraint::Models);
         } else {
             return None;
@@ -197,7 +201,7 @@ fn scope_constraints(scope: &PolicyScope, attrs: &ModelAttributes) -> Option<BTr
         let all = scope
             .tags
             .iter()
-            .all(|(k, v)| attrs.tags.get(k).is_some_and(|got| got == v));
+            .all(|(k, v)| attrs.tags.get(k.expose()).is_some_and(|got| got == v));
         if all {
             set.insert(Constraint::Tags);
         } else {
@@ -208,7 +212,7 @@ fn scope_constraints(scope: &PolicyScope, attrs: &ModelAttributes) -> Option<BTr
         if scope
             .classifications
             .iter()
-            .any(|c| attrs.classifications.contains(c))
+            .any(|c| attrs.classifications.contains(c.expose()))
         {
             set.insert(Constraint::Classifications);
         } else {
@@ -219,7 +223,7 @@ fn scope_constraints(scope: &PolicyScope, attrs: &ModelAttributes) -> Option<BTr
         let clean = !scope
             .exclude_classifications
             .iter()
-            .any(|c| attrs.classifications.contains(c));
+            .any(|c| attrs.classifications.contains(c.expose()));
         if clean {
             set.insert(Constraint::ExcludeClassifications);
         } else {
@@ -234,7 +238,7 @@ fn scope_constraints(scope: &PolicyScope, attrs: &ModelAttributes) -> Option<BTr
         }
     }
     if let Some(want) = &scope.layer {
-        if attrs.layer.as_deref() == Some(want.as_str()) {
+        if attrs.layer.as_deref() == Some(want.expose()) {
             set.insert(Constraint::Layer);
         } else {
             return None;
@@ -536,8 +540,9 @@ pub enum AutonomyDegradation {
         failures: u64,
         /// The rule's configured failure ceiling.
         limit: u64,
-        /// The rule's configured window, verbatim.
-        window: String,
+        /// The rule's configured window. Prints a resolved `${VAR}` as its
+        /// `${NAME}` (#1919).
+        window: crate::env_string::EnvString,
     },
     /// An active policy freeze matched; the effect was forced to `deny`.
     Frozen {
@@ -652,7 +657,7 @@ pub fn budget_is_exhausted(
     rule_idx: usize,
     now: DateTime<Utc>,
 ) -> bool {
-    let Some(window) = parse_window_duration(&budget.window) else {
+    let Some(window) = parse_window_duration(budget.window.expose()) else {
         // An unparseable window fails closed to "not exhausted": config
         // validation already rejects it, so this is belt-and-braces and never
         // fabricates a degrade from a malformed budget.
@@ -881,7 +886,7 @@ pub fn autonomy_degradation(
         && let Some(budget) = &rule.autonomy_budget
         && budget_is_exhausted(budget, decisions, idx, now)
     {
-        let failures = parse_window_duration(&budget.window)
+        let failures = parse_window_duration(budget.window.expose())
             .map(|w| budget_failures_in_window(decisions, idx, w, now))
             .unwrap_or(0);
         return (
@@ -1057,7 +1062,7 @@ mod tests {
                 PolicyPrincipal::Agent,
                 PolicyCapability::Apply,
                 PolicyScope {
-                    layer: Some("silver".to_string()),
+                    layer: Some("silver".to_string().into()),
                     ..Default::default()
                 },
                 PolicyEffect::Allow,
@@ -1066,7 +1071,7 @@ mod tests {
                 PolicyPrincipal::Agent,
                 PolicyCapability::Apply,
                 PolicyScope {
-                    classifications: vec!["pii".to_string()],
+                    classifications: vec!["pii".to_string().into()],
                     ..Default::default()
                 },
                 PolicyEffect::RequireReview,
@@ -1093,7 +1098,7 @@ mod tests {
                 PolicyPrincipal::Agent,
                 PolicyCapability::Apply,
                 PolicyScope {
-                    layer: Some("silver".to_string()),
+                    layer: Some("silver".to_string().into()),
                     ..Default::default()
                 },
                 PolicyEffect::RequireReview,
@@ -1102,7 +1107,7 @@ mod tests {
                 PolicyPrincipal::Agent,
                 PolicyCapability::Apply,
                 PolicyScope {
-                    classifications: vec!["pii".to_string()],
+                    classifications: vec!["pii".to_string().into()],
                     ..Default::default()
                 },
                 PolicyEffect::RequireReview,
@@ -1128,7 +1133,7 @@ mod tests {
                 PolicyPrincipal::Agent,
                 PolicyCapability::Apply,
                 PolicyScope {
-                    layer: Some("bronze".to_string()),
+                    layer: Some("bronze".to_string().into()),
                     ..Default::default()
                 },
                 PolicyEffect::RequireReview,
@@ -1137,7 +1142,7 @@ mod tests {
                 PolicyPrincipal::Agent,
                 PolicyCapability::SchemaChangeAdditive,
                 PolicyScope {
-                    layer: Some("bronze".to_string()),
+                    layer: Some("bronze".to_string().into()),
                     ..Default::default()
                 },
                 PolicyEffect::Allow,
@@ -1247,8 +1252,8 @@ mod tests {
             PolicyPrincipal::Agent,
             PolicyCapability::SchemaChangeAdditive,
             PolicyScope {
-                layer: Some("bronze".to_string()),
-                exclude_classifications: vec!["pii".to_string()],
+                layer: Some("bronze".to_string().into()),
+                exclude_classifications: vec!["pii".to_string().into()],
                 ..Default::default()
             },
             PolicyEffect::Allow,
@@ -1273,7 +1278,7 @@ mod tests {
             PolicyPrincipal::Agent,
             PolicyCapability::Apply,
             PolicyScope {
-                exclude_classifications: vec!["pii".to_string()],
+                exclude_classifications: vec!["pii".to_string().into()],
                 ..Default::default()
             },
             PolicyEffect::Allow,
@@ -1431,7 +1436,7 @@ mod tests {
             PolicyPrincipal::Agent,
             PolicyCapability::SchemaChangeAdditive,
             PolicyScope {
-                layer: Some("bronze".to_string()),
+                layer: Some("bronze".to_string().into()),
                 max_downstreams: Some(5),
                 ..Default::default()
             },
@@ -1491,7 +1496,7 @@ mod tests {
             PolicyPrincipal::Agent,
             PolicyCapability::Apply,
             PolicyScope {
-                layer: Some("bronze".to_string()),
+                layer: Some("bronze".to_string().into()),
                 max_downstreams: Some(5),
                 ..Default::default()
             },
@@ -1517,7 +1522,7 @@ mod tests {
                 PolicyPrincipal::Agent,
                 PolicyCapability::SchemaChangeAdditive,
                 PolicyScope {
-                    layer: Some("bronze".to_string()),
+                    layer: Some("bronze".to_string().into()),
                     ..Default::default()
                 },
                 PolicyEffect::Allow,
@@ -1526,7 +1531,7 @@ mod tests {
                 PolicyPrincipal::Agent,
                 PolicyCapability::SchemaChangeAdditive,
                 PolicyScope {
-                    layer: Some("bronze".to_string()),
+                    layer: Some("bronze".to_string().into()),
                     max_downstreams: Some(5),
                     ..Default::default()
                 },
@@ -1567,7 +1572,7 @@ mod tests {
                 PolicyPrincipal::Agent,
                 PolicyCapability::SchemaChangeAdditive,
                 PolicyScope {
-                    layer: Some("bronze".to_string()),
+                    layer: Some("bronze".to_string().into()),
                     max_downstreams: Some(5),
                     ..Default::default()
                 },
@@ -1577,8 +1582,8 @@ mod tests {
                 PolicyPrincipal::Agent,
                 PolicyCapability::SchemaChangeAdditive,
                 PolicyScope {
-                    layer: Some("bronze".to_string()),
-                    classifications: vec!["public".to_string()],
+                    layer: Some("bronze".to_string().into()),
+                    classifications: vec!["public".to_string().into()],
                     ..Default::default()
                 },
                 PolicyEffect::Allow,
@@ -1622,7 +1627,7 @@ mod tests {
                 PolicyPrincipal::Agent,
                 PolicyCapability::SchemaChangeAdditive,
                 PolicyScope {
-                    layer: Some("bronze".to_string()),
+                    layer: Some("bronze".to_string().into()),
                     max_downstreams: Some(5),
                     ..Default::default()
                 },
@@ -1632,8 +1637,8 @@ mod tests {
                 PolicyPrincipal::Agent,
                 PolicyCapability::SchemaChangeAdditive,
                 PolicyScope {
-                    layer: Some("bronze".to_string()),
-                    classifications: vec!["public".to_string()],
+                    layer: Some("bronze".to_string().into()),
+                    classifications: vec!["public".to_string().into()],
                     ..Default::default()
                 },
                 PolicyEffect::Allow,
@@ -1668,7 +1673,7 @@ mod tests {
             PolicyPrincipal::Agent,
             PolicyCapability::Apply,
             PolicyScope {
-                models: vec!["stg_*".to_string()],
+                models: vec!["stg_*".to_string().into()],
                 ..Default::default()
             },
             PolicyEffect::Deny,
@@ -1785,14 +1790,14 @@ mod tests {
             PolicyPrincipal::Agent,
             PolicyCapability::SchemaChangeAdditive,
             PolicyScope {
-                layer: Some("bronze".to_string()),
+                layer: Some("bronze".to_string().into()),
                 ..Default::default()
             },
             PolicyEffect::Allow,
         );
         rule.autonomy_budget = Some(AutonomyBudget {
             failures,
-            window: window.to_string(),
+            window: window.to_string().into(),
         });
         policy(vec![rule])
     }

@@ -1063,6 +1063,39 @@ fn e037_does_not_fire_for_other_strategies() {
     }
 }
 
+/// #2233: placeholders that sit only in a comment bound nothing. `rocky run`
+/// would copy every source row on each partition run, so compile refuses
+/// the model with E024 before anything runs.
+#[test]
+fn time_interval_with_comment_only_placeholders_is_refused_with_e024() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("fct_events.toml"),
+        "[strategy]\ntype = \"time_interval\"\ntime_column = \"event_at\"\n\
+         granularity = \"day\"\n\n[target]\ncatalog = \"\"\nschema = \"main\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("fct_events.sql"),
+        "SELECT id, event_at FROM raw.events /* @start_date @end_date */",
+    )
+    .unwrap();
+    let result = compile(&CompilerConfig {
+        models_dir: dir.path().to_path_buf(),
+        ..Default::default()
+    })
+    .unwrap();
+    assert!(result.has_errors, "{:?}", result.diagnostics);
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|d| &*d.code == "E024" && d.model == "fct_events" && d.is_error()),
+        "comment-only placeholders must fail with E024: {:?}",
+        result.diagnostics
+    );
+}
+
 #[test]
 fn microbatch_without_window_is_refused_with_e024() {
     let result = compile_strategy_project(

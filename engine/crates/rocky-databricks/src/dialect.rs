@@ -7,8 +7,44 @@
 use std::fmt::Write;
 
 use rocky_core::traits::{AdapterError, AdapterResult, LiteralEscape, SqlDialect};
-use rocky_ir::{ColumnSelection, MetadataColumn};
+use rocky_ir::{ColumnSelection, MetadataColumn, TableRef};
 use rocky_sql::validation;
+
+/// Builds the governance probe for [`SqlDialect::view_governance_probe_sql`].
+///
+/// The catalog goes through the same identifier validation as every target
+/// reference. The schema and view names are string literals, matched
+/// case-insensitively because Unity Catalog stores names lower-cased.
+fn view_governance_probe_sql(
+    dialect: &DatabricksSqlDialect,
+    view: &TableRef,
+) -> AdapterResult<String> {
+    dialect.format_table_ref(&view.catalog, &view.schema, &view.table)?;
+    let info = format!(
+        "{}.information_schema",
+        dialect.quote_identifier(&view.catalog)
+    );
+    let schema = rocky_core::sql_gen::string_literal(dialect, &view.schema);
+    let name = rocky_core::sql_gen::string_literal(dialect, &view.table);
+    let tag_filter =
+        format!("lower(schema_name) = lower({schema}) AND lower(table_name) = lower({name})");
+    let policy_filter =
+        format!("lower(table_schema) = lower({schema}) AND lower(table_name) = lower({name})");
+    Ok(format!(
+        "SELECT 'table_tag' AS kind, CAST(NULL AS STRING) AS column_name, \
+         tag_name AS name, tag_value AS value \
+         FROM {info}.table_tags WHERE {tag_filter}\n\
+         UNION ALL\n\
+         SELECT 'column_tag', column_name, tag_name, tag_value \
+         FROM {info}.column_tags WHERE {tag_filter}\n\
+         UNION ALL\n\
+         SELECT 'row_filter', CAST(NULL AS STRING), filter_name, CAST(NULL AS STRING) \
+         FROM {info}.row_filters WHERE {policy_filter}\n\
+         UNION ALL\n\
+         SELECT 'column_mask', column_name, mask_name, CAST(NULL AS STRING) \
+         FROM {info}.column_masks WHERE {policy_filter}"
+    ))
+}
 
 /// Databricks SQL dialect for Unity Catalog.
 ///
@@ -256,6 +292,17 @@ impl SqlDialect for DatabricksSqlDialect {
         ))
     }
 
+    /// Lists a view's table tags, column tags, row filters and column masks
+    /// from the catalog's `information_schema` (#2234).
+    ///
+    /// Unity Catalog drops all four when `CREATE OR REPLACE VIEW` replaces
+    /// the view. The rows follow the `kind, column_name, name, value` shape
+    /// that [`rocky_core::view_governance::parse_probe_rows`] reads. A view
+    /// that does not exist yet returns no rows.
+    fn view_governance_probe_sql(&self, view: &TableRef) -> Option<AdapterResult<String>> {
+        Some(view_governance_probe_sql(self, view))
+    }
+
     fn row_hash_expr(&self, columns: &[String]) -> AdapterResult<String> {
         if columns.is_empty() {
             return Err(AdapterError::msg(
@@ -265,19 +312,21 @@ impl SqlDialect for DatabricksSqlDialect {
         for col in columns {
             validation::validate_identifier(col).map_err(AdapterError::new)?;
         }
-        // `xxhash64(col_a, col_b, ...)` — Spark's multi-arg form hashes
-        // the binary representation of each column with positional NULL
-        // handling built in: `xxhash64(NULL, 'x')` ≠ `xxhash64('x', NULL)`,
-        // so two rows that swap a NULL across columns hash differently
-        // (a `concat_ws`-based scheme would silently collide them
-        // because `concat_ws` skips NULL arguments). Type-aware as a
-        // bonus: an INT-to-STRING column-type change shows up as a
-        // diff. `xxhash64` returns BIGINT; `BIT_XOR(BIGINT)` returns
-        // BIGINT, which round-trips cleanly to the kernel's `i128`
-        // slot (sign-extended; the parser bit-casts into `u128`).
+        // `xxhash64(a, isnull(a), b, isnull(b), ...)`. Spark's hash
+        // functions SKIP a NULL argument: the running hash passes through
+        // unchanged (`InterpretedHashFunction.hash` returns the seed for
+        // `null`). So bare `xxhash64(NULL, 'x')` equals
+        // `xxhash64('x', NULL)`, and a NULL that moves between columns is
+        // invisible. The `isnull(...)` flag after each column is never
+        // NULL, so it pins which positions held a NULL. The hash stays
+        // type-aware: an INT-to-STRING change still shows up as a diff.
+        //
+        // `xxhash64` returns BIGINT; `BIT_XOR(BIGINT)` returns BIGINT,
+        // which round-trips cleanly to the kernel's `i128` slot
+        // (sign-extended; the parser bit-casts into `u128`).
         let arg_list = columns
             .iter()
-            .map(|c| format!("`{c}`"))
+            .map(|c| format!("`{c}`, isnull(`{c}`)"))
             .collect::<Vec<_>>()
             .join(", ");
         Ok(format!("xxhash64({arg_list})"))
@@ -632,6 +681,48 @@ mod tests {
     }
 
     #[test]
+    fn view_governance_probe_reads_tags_filters_and_masks() {
+        let d = dialect();
+        let view = TableRef {
+            catalog: "cat".into(),
+            schema: "Sch".into(),
+            table: "v".into(),
+        };
+        let sql = d
+            .view_governance_probe_sql(&view)
+            .expect("databricks probes view governance")
+            .unwrap();
+        for source in [
+            "FROM `cat`.information_schema.table_tags WHERE lower(schema_name) = lower('Sch') AND lower(table_name) = lower('v')",
+            "FROM `cat`.information_schema.column_tags WHERE lower(schema_name) = lower('Sch') AND lower(table_name) = lower('v')",
+            "FROM `cat`.information_schema.row_filters WHERE lower(table_schema) = lower('Sch') AND lower(table_name) = lower('v')",
+            "FROM `cat`.information_schema.column_masks WHERE lower(table_schema) = lower('Sch') AND lower(table_name) = lower('v')",
+        ] {
+            assert!(sql.contains(source), "missing {source} in:\n{sql}");
+        }
+        assert_eq!(sql.matches("UNION ALL").count(), 3, "{sql}");
+        for kind in [
+            "'table_tag'",
+            "'column_tag'",
+            "'row_filter'",
+            "'column_mask'",
+        ] {
+            assert!(sql.contains(kind), "missing {kind} in:\n{sql}");
+        }
+    }
+
+    #[test]
+    fn view_governance_probe_refuses_an_invalid_identifier() {
+        let d = dialect();
+        let view = TableRef {
+            catalog: "cat`; DROP".into(),
+            schema: "s".into(),
+            table: "v".into(),
+        };
+        assert!(d.view_governance_probe_sql(&view).unwrap().is_err());
+    }
+
+    #[test]
     fn test_materialized_view_ddl_emits_create_or_replace_mv() {
         let d = dialect();
         let sql = d
@@ -687,14 +778,17 @@ mod tests {
     fn test_row_hash_expr_emits_multi_arg_xxhash64() {
         let d = dialect();
         let sql = d.row_hash_expr(&["name".into(), "value".into()]).unwrap();
-        assert_eq!(sql, "xxhash64(`name`, `value`)");
+        assert_eq!(
+            sql,
+            "xxhash64(`name`, isnull(`name`), `value`, isnull(`value`))"
+        );
     }
 
     #[test]
     fn test_row_hash_expr_single_column() {
         let d = dialect();
         let sql = d.row_hash_expr(&["only".into()]).unwrap();
-        assert_eq!(sql, "xxhash64(`only`)");
+        assert_eq!(sql, "xxhash64(`only`, isnull(`only`))");
     }
 
     #[test]

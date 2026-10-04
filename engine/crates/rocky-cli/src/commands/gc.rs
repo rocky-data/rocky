@@ -1538,6 +1538,40 @@ async fn gc_seam_regate(
     fresh_store: Option<&StateStore>,
     stage: &str,
 ) -> Result<(), rocky_core::state_sync::StateSyncError> {
+    ledger_seam_regate(
+        "gc",
+        cfg,
+        plan_id,
+        principal,
+        touched,
+        models_dir,
+        models_glob,
+        prior_decisions,
+        fresh_store,
+        stage,
+    )
+    .await
+}
+
+/// The per-attempt policy re-gate shared by the review-gated ledger seams
+/// (`gc` and `restore`, #1242). See [`gc_seam_regate`] for the contract;
+/// `verb` names the plan kind in the refusal (`"gc"`, `"restore"`).
+///
+/// Only a `Deny` refuses: both seams sit behind an unconditional review gate
+/// the command already passed, so a `require_review` outcome is satisfied.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn ledger_seam_regate(
+    verb: &str,
+    cfg: Option<&rocky_core::config::RockyConfig>,
+    plan_id: &str,
+    principal: rocky_core::config::PolicyPrincipal,
+    touched: &BTreeMap<String, PolicyCapability>,
+    models_dir: &Path,
+    models_glob: Option<&str>,
+    prior_decisions: &[rocky_core::state::PolicyDecisionRecord],
+    fresh_store: Option<&StateStore>,
+    stage: &str,
+) -> Result<(), rocky_core::state_sync::StateSyncError> {
     use rocky_core::state_sync::StateSyncError;
     let Some(cfg) = cfg else {
         return Ok(());
@@ -1569,7 +1603,7 @@ async fn gc_seam_regate(
         }) => {
             let rule = rule_id.map(|r| format!(" (rule {r})")).unwrap_or_default();
             return Err(StateSyncError::SeamTransition(format!(
-                "policy DENIES gc plan '{plan_id}' {stage}: model '{model}'{rule} — {reason}"
+                "policy DENIES {verb} plan '{plan_id}' {stage}: model '{model}'{rule} — {reason}"
             )));
         }
         Err(_) => return Ok(()),
@@ -1600,7 +1634,7 @@ async fn gc_seam_regate(
     {
         let rule = rule_id.map(|r| format!(" (rule {r})")).unwrap_or_default();
         return Err(StateSyncError::SeamTransition(format!(
-            "policy DENIES gc plan '{plan_id}' {stage}: model '{model}'{rule} — {reason}"
+            "policy DENIES {verb} plan '{plan_id}' {stage}: model '{model}'{rule} — {reason}"
         )));
     }
     Ok(())
@@ -1822,9 +1856,13 @@ pub(crate) async fn run_gc_apply_in_with(
         );
     }
 
-    let seam_cas = remote_state && rocky_core::state_sync::cas_effective(&state_cfg);
-    let output = if seam_cas {
-        // CAS ledger seam (#1242; ADR-CONCURRENCY D1 seam class = RETRY): the
+    let output = if remote_state {
+        // Ledger seam (#1242; ADR-CONCURRENCY D1 seam class = RETRY). Under
+        // effective CAS every attempt is conditional on the generation its own
+        // download captured; without it the session is the legacy half-seam
+        // (one download, one transition, one forced-`Fail` unconditional
+        // upload — #1228's residual exposure, keep one writer per `[state]`
+        // prefix). Either way no other code path publishes this ledger. The
         // whole transition replays per attempt against the freshly downloaded
         // winner. `execute_gc_apply` re-derives candidates, refcounts, and
         // both liveness reads from that fresh store — a winner that re-added
@@ -1919,31 +1957,8 @@ pub(crate) async fn run_gc_apply_in_with(
     } else {
         let store = StateStore::open(state_path)
             .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
-        let output = execute_gc_apply(&store, oracle.as_ref(), plan_id, &plan, Utc::now()).await?;
-        // Drop the store to release the advisory lock / flush the file before upload.
-        drop(store);
-
-        // SEAM-SCOPED SYNC — upload half, FAIL-CLOSED. Durability is the whole
-        // point of the seam: an eviction that commits locally but never reaches
-        // the remote would be silently reverted by the next run's start-download
-        // while this command reported success. So the upload is forced to `Fail`
-        // regardless of the configured `on_upload_failure` (default `skip`) — a
-        // failed upload aborts (finding 5). Without effective CAS this remains
-        // the legacy last-writer-wins half-seam (#1228's residual exposure —
-        // keep one writer per `[state]` prefix).
-        if remote_state {
-            // WP-01 PR-B (2b): the half-seam owns the forced-`Fail` durability
-            // policy (previously a local `StateConfig` clone here).
-            rocky_core::state_sync::RemoteStateSession::upload_only_fail_closed(
-                &state_cfg,
-                state_path,
-                "gc apply",
-                replicate_schema_cache,
-            )
-            .await
-            .with_context(|| "failed to upload remote state after gc apply")?;
-        }
-        output
+        // Local backend: the on-disk file IS the state — no remote publish.
+        execute_gc_apply(&store, oracle.as_ref(), plan_id, &plan, Utc::now()).await?
     };
 
     if json {

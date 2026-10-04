@@ -160,6 +160,70 @@ pub fn substitutions() -> Vec<(String, String)> {
     pairs
 }
 
+/// Rewrite every registered value in `text` to the `${NAME}` that carries it.
+///
+/// This is the in-process form of the `rocky serve` response filter. It works
+/// on plain text, not on a JSON body, so it searches for each value as it is,
+/// with no escaped forms. [`crate::env_string::EnvString`] uses it to build the
+/// form it prints, and error renderers that echo config text use it directly.
+///
+/// Every match of every value is collected as a byte span first. Overlapping
+/// spans are merged and rewritten once. So two values that overlap are both
+/// covered, and no fragment of either one survives. A merged span names every
+/// variable that touched it.
+pub fn render_placeholders(text: &str) -> String {
+    let pairs = substitutions();
+    if pairs.is_empty() {
+        return text.to_string();
+    }
+    // (start, end, replacement)
+    let mut spans: Vec<(usize, usize, &str)> = Vec::new();
+    for (value, replacement) in &pairs {
+        // Advance one CHARACTER past each match, not past its end, so an
+        // overlapping occurrence of the same value is found too. The merge
+        // below collapses the run. Stepping by one byte would land inside a
+        // multi-byte character, and slicing there panics.
+        let mut from = 0;
+        while let Some(found) = text[from..].find(value.as_str()) {
+            let start = from + found;
+            spans.push((start, start + value.len(), replacement.as_str()));
+            from = start + 1;
+            while from < text.len() && !text.is_char_boundary(from) {
+                from += 1;
+            }
+            if from >= text.len() {
+                break;
+            }
+        }
+    }
+    if spans.is_empty() {
+        return text.to_string();
+    }
+    spans.sort_by_key(|&(start, end, _)| (start, std::cmp::Reverse(end)));
+
+    let mut out = String::with_capacity(text.len());
+    let mut cursor = 0usize;
+    let mut i = 0usize;
+    while i < spans.len() {
+        let (start, mut end, first) = spans[i];
+        let mut names: Vec<&str> = vec![first];
+        let mut j = i + 1;
+        while j < spans.len() && spans[j].0 < end {
+            end = end.max(spans[j].1);
+            if !names.contains(&spans[j].2) {
+                names.push(spans[j].2);
+            }
+            j += 1;
+        }
+        out.push_str(&text[cursor..start]);
+        out.push_str(&names.concat());
+        cursor = end;
+        i = j;
+    }
+    out.push_str(&text[cursor..]);
+    out
+}
+
 /// Whether anything has been registered.
 ///
 /// The middleware uses this to skip the scan entirely on a server whose config
@@ -237,6 +301,22 @@ mod tests {
             "the longer value must come first, or replacing the shorter one \
              first leaves `-AND-LONGER` of the longer secret behind"
         );
+    }
+
+    /// Two registered values that overlap in a text are rewritten as one run,
+    /// so no fragment of either survives.
+    #[test]
+    fn render_placeholders_leaves_no_fragment_of_overlapping_values() {
+        let a = "ROCKY-RENDER-ABCDEFGH1234";
+        let b = "12345678-ROCKY-RENDER-XYZ";
+        register_substitution("ROCKY_RENDER_A", a);
+        register_substitution("ROCKY_RENDER_B", b);
+        let text = "x ROCKY-RENDER-ABCDEFGH12345678-ROCKY-RENDER-XYZ y";
+        let out = render_placeholders(text);
+        assert!(!out.contains("ABCDEFGH"), "{out}");
+        assert!(!out.contains("RENDER-XYZ"), "{out}");
+        assert_eq!(out, "x ${ROCKY_RENDER_A}${ROCKY_RENDER_B} y");
+        assert_eq!(render_placeholders("nothing here"), "nothing here");
     }
 
     /// Two variables carrying the same value is not an error, and the map must
