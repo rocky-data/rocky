@@ -866,7 +866,35 @@ const SNAPSHOT_MEMORY_WARN_BYTES: u64 = 128 * 1024 * 1024;
 ///
 ///   **On rollback.** One extra key, ignored by serde; the version check runs
 ///   at OPEN and `[state] on_schema_mismatch` engages there.
-const CURRENT_SCHEMA_VERSION: u32 = 30;
+///
+/// - **v31** — fences the per-target owed-checks list from older binaries: no
+///   new field in this bump. [`RunProgress::owed_check_targets`] (#2235)
+///   shipped serde-additive WITHOUT a bump, and that is unsafe in meaning,
+///   not in parsing. Not a table change — `EXPECTED_TABLES` is untouched; no
+///   blob walk. A v30 blob forward-deserializes with the list `None`, guarded
+///   by `test_v30_run_progress_forward_deserializes_owed_check_targets_none`.
+///
+///   **What it fixes.** An interrupted run writes its `PartialFailure` record
+///   and marks the targets it copied as owing checks. A v30 binary reads that
+///   checkpoint, ignores the unknown key, and applies its own rule: a
+///   recorded run owes nothing. It then prunes those targets as unchanged and
+///   never runs their checks, so a rollback silently drops what this binary
+///   recorded as owed. The bump makes the v30 binary meet the store at OPEN
+///   instead of reaching the checkpoint.
+///
+///   **On upgrade.** A v30 store is stamped v31 in place and every record is
+///   kept. Nothing changes in meaning: a checkpoint written before the list
+///   existed reads back `None`, which is the rule that shipped.
+///
+///   **On rollback.** The version check runs at OPEN.
+///   [`SchemaMismatchPolicy::Fail`] refuses with the version pair.
+///   [`SchemaMismatchPolicy::Recreate`] (the default) logs a warning, starts
+///   from a fresh local store and runs one full refresh, never uploading the
+///   downgraded state. That run re-copies and re-checks every target it
+///   plans, so no owed check is left silently satisfied. The `superseded`
+///   and `watermarks_confirmed` keys, added without a bump earlier, ride
+///   this fence too.
+const CURRENT_SCHEMA_VERSION: u32 = 31;
 
 /// Errors from the embedded redb state store.
 #[derive(Debug, Error)]
@@ -3425,8 +3453,10 @@ pub struct RunProgress {
     /// `None` means the run never recorded a list. A record-less complete
     /// checkpoint then owes its whole plan, which is the rule that shipped
     /// before this field. `Some(list)` is authoritative, with or without a
-    /// run record. Serde-additive like `superseded`: an older blob reads
-    /// back `None`, and an older binary ignores the key.
+    /// run record. Serde-additive: an older blob reads back `None`. An older
+    /// binary would ignore the key and owe nothing for a recorded run, so
+    /// schema v31 keeps it from opening a store that carries one (see the
+    /// v31 stanza on `CURRENT_SCHEMA_VERSION`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owed_check_targets: Option<Vec<String>>,
 }
@@ -11716,6 +11746,61 @@ mod tests {
         );
     }
 
+    /// A v30 `RunProgress` blob (no `owed_check_targets` key) must forward-
+    /// deserialize with the list `None`, and a record that owes nothing must
+    /// serialize without the key. See the v31 stanza on
+    /// `CURRENT_SCHEMA_VERSION`.
+    #[test]
+    fn test_v30_run_progress_forward_deserializes_owed_check_targets_none() {
+        let blob = serde_json::json!({
+            "run_id": "run-v30",
+            "started_at": "2026-09-01T00:00:00Z",
+            "total_tables": 1,
+            "tables": [],
+            "planned_tables": ["cat.schema.a"],
+        });
+        let progress: RunProgress =
+            serde_json::from_value(blob).expect("pre-v31 RunProgress must forward-deserialize");
+        assert!(
+            progress.owed_check_targets.is_none(),
+            "a pre-v31 record never said what it owes"
+        );
+        let bytes = serde_json::to_string(&progress).unwrap();
+        assert!(
+            !bytes.contains("owed_check_targets"),
+            "a record without a list must not grow the key: {bytes}"
+        );
+    }
+
+    /// A store this build wrote an owed-checks list into must be stamped past
+    /// v30, the last version whose binary reads a recorded run as owing
+    /// nothing. Otherwise a rollback opens it, ignores the list, and drops the
+    /// owed checks (#2235 follow-up). The open-time gate refuses a stamp above
+    /// the binary's own (`open_hard_fails_on_forward_incompat_by_default` and
+    /// friends), so the stamp is the whole fence.
+    #[test]
+    fn test_store_with_owed_checks_is_refused_by_a_v30_binary() {
+        const LAST_VERSION_WITHOUT_OWED_CHECKS: u32 = 30;
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("state.redb");
+        {
+            let store = StateStore::open(&path).unwrap();
+            let keys = ["wh.raw.orders".to_string()];
+            store.init_run_progress("r1", &keys, None).unwrap();
+            store.mark_owed_check_targets("r1", &keys).unwrap();
+            let progress = store.get_run_progress("r1").unwrap().unwrap();
+            assert_eq!(progress.owed_check_targets.as_deref(), Some(&keys[..]));
+        }
+        let stamp = StateStore::peek_schema_version(&path)
+            .unwrap()
+            .expect("a read-write open stamps the store");
+        assert!(
+            stamp > LAST_VERSION_WITHOUT_OWED_CHECKS,
+            "a v{LAST_VERSION_WITHOUT_OWED_CHECKS} binary must refuse this store at OPEN, \
+             but it is stamped v{stamp}"
+        );
+    }
+
     /// `init_run_progress` derives the count from the set, so the two cannot
     /// disagree on a checkpoint this build writes (#1674).
     #[test]
@@ -15234,7 +15319,7 @@ mod tests {
         // serde-additive shape. NO table change either — so this stanza moves
         // the version only; guarded by
         // `test_v25_run_record_forward_deserializes_verify_after_failed_false`.
-        const EXPECTED_VERSION: u32 = 30;
+        const EXPECTED_VERSION: u32 = 31;
         // v28 adds `PolicyDecisionRecord::models` (#1766), the graph keys
         // behind a plan-level review escalation's human label. The same
         // serde-additive shape as v25-v27: NO table change — `EXPECTED_TABLES`
@@ -15249,6 +15334,12 @@ mod tests {
         // planned to copy. Same serde-additive shape: NO table change, the
         // version moves only; guarded by
         // `test_v29_run_progress_forward_deserializes_planned_tables_none`.
+        // v31 adds no field: it fences `RunProgress::owed_check_targets`
+        // (#2235), which shipped serde-additive without a bump, from a v30
+        // binary that would read a recorded run as owing nothing. NO table
+        // change, the version moves only; guarded by
+        // `test_v30_run_progress_forward_deserializes_owed_check_targets_none`
+        // and `test_store_with_owed_checks_is_refused_by_a_v30_binary`.
         const EXPECTED_TABLES: &[&str] = &[
             "branches",
             "check_history",
