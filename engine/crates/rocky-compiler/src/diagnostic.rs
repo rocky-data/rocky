@@ -172,6 +172,16 @@ pub const E039: &str = "E039";
 /// by target dialect. Use a `.sql` model with the target's own escaping.
 pub const E040: &str = "E040";
 
+/// An aggregating query reads a column that is neither grouped nor inside an
+/// aggregate, in its SELECT list, HAVING, or ORDER BY.
+///
+/// Emitted by `rocky compile` only when the column provably belongs to a
+/// relation in the same query scope (an upstream model, a known source
+/// schema, a CTE, or a derived table). Unresolved names, `GROUP BY ALL`,
+/// projection aliases, and arguments of unknown functions stay silent. See
+/// `rocky_compiler::group_by` for the full rule set.
+pub const E044: &str = "E044";
+
 // Warnings
 /// Unused model (no downstream consumers).
 pub const W001: &str = "W001";
