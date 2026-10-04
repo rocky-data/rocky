@@ -108,9 +108,22 @@ pub fn check_snapshot_strategy(
         .with_suggestion(format!("Available columns: {}", available()))
     };
 
+    // A key absent from the SELECT is only a warning (like merge's W006): a
+    // `[[surrogate_key]]` column is added at run time, after this check.
     for key in &spec.unique_key {
         if !key.trim().is_empty() && find(key).is_none() {
-            diags.push(absent(format!("unique_key '{key}'")));
+            diags.push(
+                Diagnostic::warning(
+                    W049,
+                    model_name,
+                    format!(
+                        "unique_key '{key}' is not an output column of snapshot model \
+                         '{model_name}' as compiled; the run fails unless it is a \
+                         `[[surrogate_key]]` column"
+                    ),
+                )
+                .with_suggestion(format!("Available columns: {}", available())),
+            );
         }
     }
     match &spec.change {
@@ -147,7 +160,16 @@ pub fn check_snapshot_strategy(
                 }
             }
         }
-        SnapshotChangeStrategy::Check { check_cols } => {
+        SnapshotChangeStrategy::Check {
+            check_cols,
+            updated_at,
+        } => {
+            if let Some(updated_at) = updated_at
+                && !updated_at.trim().is_empty()
+                && find(updated_at).is_none()
+            {
+                diags.push(absent(format!("updated_at '{updated_at}'")));
+            }
             let compared = match check_cols {
                 SnapshotCheckColumns::All => typed_cols
                     .iter()
@@ -186,12 +208,7 @@ pub fn check_snapshot_strategy(
         }
     }
 
-    let written = spec.meta_columns.written(spec.hard_deletes);
-    let reserved = if spec.hard_deletes == SnapshotHardDeletes::NewRecord {
-        written
-    } else {
-        spec.meta_columns.reserved()
-    };
+    let reserved = spec.meta_columns.written(spec.hard_deletes);
     for col in typed_cols {
         if reserved.iter().any(|m| m.eq_ignore_ascii_case(&col.name)) {
             let what = format!(
@@ -212,6 +229,49 @@ pub fn check_snapshot_strategy(
     }
 
     diags
+}
+
+/// Add a snapshot model's metadata columns (`valid_from`, `valid_to`,
+/// `is_current`, ...) to its typed output, so contracts, readers' type
+/// inference and `rocky compile` see the table the run actually builds.
+/// No-op for other strategies, or when a name is already present.
+pub fn append_snapshot_metadata_columns(
+    model: &rocky_core::models::Model,
+    typed_cols: &mut Vec<TypedColumn>,
+) {
+    // Only a resolved output schema gains columns; an empty one stays empty
+    // (unknown), so nothing downstream mistakes it for a complete schema.
+    if typed_cols.is_empty() {
+        return;
+    }
+    let Some(lowered) = model.config.strategy.snapshot_lowered() else {
+        return;
+    };
+    let meta = &lowered.spec.meta_columns;
+    let mut add = |name: &str, data_type: RockyType, nullable: bool| {
+        if !typed_cols.iter().any(|c| c.name.eq_ignore_ascii_case(name)) {
+            typed_cols.push(TypedColumn {
+                name: name.to_string(),
+                data_type,
+                nullable,
+            });
+        }
+    };
+    // CAST(... AS TIMESTAMP) is a timestamp without time zone on every
+    // supported warehouse. `valid_from` is nullable when it comes from a
+    // nullable `updated_at`; `valid_to` is NULL on current versions.
+    add(&meta.valid_from, RockyType::TimestampNtz, true);
+    add(&meta.valid_to, RockyType::TimestampNtz, true);
+    if let Some(flag) = meta.is_current.name() {
+        add(flag, RockyType::Boolean, false);
+    }
+    add(&meta.scd_id, RockyType::String, false);
+    if let Some(updated_at) = &meta.updated_at {
+        add(updated_at, RockyType::TimestampNtz, true);
+    }
+    if lowered.spec.hard_deletes == SnapshotHardDeletes::NewRecord {
+        add(&meta.is_deleted, RockyType::Boolean, true);
+    }
 }
 
 const SNAPSHOT_HELP: &str = "A snapshot sidecar needs `[strategy] type = \"snapshot\"`, \
@@ -451,6 +511,43 @@ mod tests {
         c.push(col("valid_from", RockyType::Timestamp));
         let d = check_snapshot_strategy(&m, &c, true, false);
         assert_eq!(codes(&d), vec![E049]);
+    }
+
+    #[test]
+    fn unique_key_absent_from_select_is_only_w049() {
+        let m = model(
+            "type = \"snapshot\"\nunique_key = \"customer_sk\"\nstrategy = \"check\"\ncheck_cols = [\"name\"]",
+            "SELECT id, name FROM t",
+        );
+        let d = check_snapshot_strategy(&m, &cols(), true, false);
+        assert_eq!(codes(&d), vec![W049]);
+    }
+
+    #[test]
+    fn metadata_columns_join_the_typed_output() {
+        let m = model(
+            "type = \"snapshot\"\nunique_key = \"id\"\nstrategy = \"check\"\ncheck_cols = \"all\"\nhard_deletes = \"new_record\"",
+            "SELECT id, name FROM t",
+        );
+        let mut typed = cols();
+        append_snapshot_metadata_columns(&m, &mut typed);
+        let names: Vec<&str> = typed.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "id",
+                "name",
+                "updated_at",
+                "valid_from",
+                "valid_to",
+                "is_current",
+                "snapshot_id",
+                "is_deleted"
+            ]
+        );
+        let mut unknown = Vec::new();
+        append_snapshot_metadata_columns(&m, &mut unknown);
+        assert!(unknown.is_empty(), "an unknown schema stays unknown");
     }
 
     #[test]

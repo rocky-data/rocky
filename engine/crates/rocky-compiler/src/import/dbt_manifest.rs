@@ -601,10 +601,17 @@ fn convert_node(raw: RawNode) -> DbtManifestNode {
     let mut config = raw.config.unwrap_or_default();
 
     let snapshot = (raw.resource_type == "snapshot").then(|| {
-        // A legacy snapshot names its schema with `target_schema`; route it
-        // to `schema` so the imported target matches dbt's relation.
-        if config.schema.is_none() {
-            config.schema = config.target_schema.clone();
+        // Target dbt's resolved relation, so `rocky run` continues the
+        // history dbt built: the node's `schema` is after
+        // `generate_schema_name` (a YAML snapshot's `schema: snapshots` can
+        // land in `analytics_snapshots`). Fall back to `target_schema`.
+        match raw.schema.as_deref().filter(|s| !s.is_empty()) {
+            Some(resolved) => config.schema = Some(resolved.to_string()),
+            None => {
+                if config.schema.is_none() {
+                    config.schema = config.target_schema.clone();
+                }
+            }
         }
         super::dbt_snapshots::DbtSnapshotConfig {
             unique_key: config.unique_key.clone(),

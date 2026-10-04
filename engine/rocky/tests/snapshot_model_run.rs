@@ -372,3 +372,149 @@ fn invalid_snapshot_config_is_refused_with_e049() {
         "E049 must name the missing updated_at: {stdout}"
     );
 }
+
+/// Edge cases from review: NULL keys must not grow the table on reruns, a
+/// model column named `is_deleted` is data unless the mode writes markers,
+/// dbt-named columns without `is_current` work end to end, and a key stuck on
+/// a deletion marker reopens after the mode leaves `new_record`.
+#[test]
+fn snapshot_edge_cases_rerun_safely() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    fs::write(root.join("rocky.toml"), CONFIG).unwrap();
+    sql(
+        root,
+        "CREATE SCHEMA raw;
+         CREATE TABLE raw.users (id BIGINT, name VARCHAR, is_deleted BOOLEAN, updated_at TIMESTAMP);
+         INSERT INTO raw.users VALUES
+           (1, 'a', false, TIMESTAMP '2026-01-01 00:00:00'),
+           (2, 'b', true,  TIMESTAMP '2026-01-01 00:00:00'),
+           (NULL, 'n', false, TIMESTAMP '2026-01-01 00:00:00');",
+    );
+    write_model(
+        root,
+        "snap_star",
+        "SELECT * FROM raw.users\n",
+        &timestamp_snapshot("ignore"),
+    );
+    write_model(
+        root,
+        "snap_dbt",
+        "SELECT id, name, updated_at FROM raw.users\n",
+        "[strategy]\ntype = \"snapshot\"\nunique_key = \"id\"\nstrategy = \"timestamp\"\n\
+         updated_at = \"updated_at\"\nhard_deletes = \"invalidate\"\n\
+         valid_to_current = \"CAST('9999-12-31' AS TIMESTAMP)\"\n\
+         snapshot_meta_column_names = { valid_from = \"dbt_valid_from\", valid_to = \"dbt_valid_to\", \
+         scd_id = \"dbt_scd_id\", updated_at = \"dbt_updated_at\", is_current = false }\n",
+    );
+    let switch_sql = "SELECT id, name, updated_at FROM raw.users\n";
+    write_model(
+        root,
+        "snap_switch",
+        switch_sql,
+        &timestamp_snapshot("new_record"),
+    );
+
+    run(root, 1);
+    run(root, 2);
+    // NULL key: never snapshotted, so a rerun adds nothing.
+    for t in ["snap_star", "snap_dbt", "snap_switch"] {
+        assert_eq!(
+            count(root, &format!("SELECT count(*) FROM main.{t}")),
+            2,
+            "{t}"
+        );
+    }
+    assert_eq!(
+        count(
+            root,
+            "SELECT count(*) FROM main.snap_dbt \
+             WHERE dbt_valid_to = TIMESTAMP '9999-12-31 00:00:00'"
+        ),
+        2,
+        "valid_to_current marks current versions"
+    );
+
+    // Update 1, delete 2.
+    sql(
+        root,
+        "UPDATE raw.users SET name = 'a2', updated_at = TIMESTAMP '2026-02-01 00:00:00' WHERE id = 1;
+         DELETE FROM raw.users WHERE id = 2;",
+    );
+    run(root, 3);
+    // The user's own `is_deleted` is ordinary data under `ignore`: kept on
+    // the new version, and id 2 stays current.
+    assert_eq!(
+        rows(
+            root,
+            "SELECT id, name, is_deleted, is_current FROM main.snap_star ORDER BY id, valid_from"
+        ),
+        vec![
+            "BigInt(1)|Text(\"a\")|Boolean(false)|Boolean(false)".to_string(),
+            "BigInt(1)|Text(\"a2\")|Boolean(false)|Boolean(true)".to_string(),
+            "BigInt(2)|Text(\"b\")|Boolean(true)|Boolean(true)".to_string(),
+        ]
+    );
+    // Without `is_current`: closing sets dbt_valid_to to a real time.
+    assert_eq!(
+        rows(
+            root,
+            "SELECT id, name, dbt_valid_to = TIMESTAMP '9999-12-31 00:00:00', \
+             dbt_updated_at = dbt_valid_from FROM main.snap_dbt ORDER BY id, dbt_valid_from"
+        ),
+        vec![
+            "BigInt(1)|Text(\"a\")|Boolean(false)|Boolean(true)".to_string(),
+            "BigInt(1)|Text(\"a2\")|Boolean(true)|Boolean(true)".to_string(),
+            "BigInt(2)|Text(\"b\")|Boolean(false)|Boolean(true)".to_string(),
+        ]
+    );
+    assert_eq!(
+        count(
+            root,
+            "SELECT count(*) FROM main.snap_switch WHERE id = 2 AND is_current AND is_deleted"
+        ),
+        1
+    );
+    let before = (
+        rows(root, "SELECT * FROM main.snap_dbt ORDER BY ALL"),
+        rows(root, "SELECT * FROM main.snap_star ORDER BY ALL"),
+    );
+    run(root, 4);
+    assert_eq!(
+        (
+            rows(root, "SELECT * FROM main.snap_dbt ORDER BY ALL"),
+            rows(root, "SELECT * FROM main.snap_star ORDER BY ALL"),
+        ),
+        before,
+        "no-change rerun"
+    );
+
+    // Leave new_record, then bring id 2 back unchanged: it must reopen.
+    write_model(
+        root,
+        "snap_switch",
+        switch_sql,
+        &timestamp_snapshot("invalidate"),
+    );
+    sql(
+        root,
+        "INSERT INTO raw.users VALUES (2, 'b', true, TIMESTAMP '2026-01-01 00:00:00');",
+    );
+    run(root, 5);
+    assert_eq!(
+        count(
+            root,
+            "SELECT count(*) FROM main.snap_switch \
+             WHERE id = 2 AND is_current AND NOT coalesce(is_deleted, false)"
+        ),
+        1,
+        "a key stuck on an old deletion marker reopens"
+    );
+    assert_eq!(
+        count(
+            root,
+            "SELECT count(*) FROM main.snap_switch WHERE id = 2 AND is_current"
+        ),
+        1
+    );
+}

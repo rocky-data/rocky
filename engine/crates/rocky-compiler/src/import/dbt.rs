@@ -4124,7 +4124,7 @@ FROM {{ ref('stg_events') }}
                         "check_cols": "all", "hard_deletes": "invalidate",
                         "snapshot_meta_column_names": { "dbt_valid_from": "start_at", "dbt_scd_id": null }
                     },
-                    "tags": [], "schema": "snapshots", "database": "d"
+                    "tags": [], "schema": "analytics_snapshots", "database": "d"
                 },
                 "model.p.current_orders": model_node("current_orders",
                     serde_json::json!({ "materialized": "table" }), serde_json::json!([]))
@@ -4145,7 +4145,9 @@ FROM {{ ref('stg_events') }}
             .iter()
             .find(|m| m.name == "orders_snap")
             .expect("snapshot imported");
-        assert_eq!(snap.config.target.schema, "snapshots");
+        // dbt's resolved relation (after generate_schema_name), not the
+        // configured `target_schema`, so the run continues dbt's table.
+        assert_eq!(snap.config.target.schema, "analytics_snapshots");
         assert_eq!(snap.sql, "select * from \"d\".\"raw\".\"orders\"");
         let lowered = snap
             .config

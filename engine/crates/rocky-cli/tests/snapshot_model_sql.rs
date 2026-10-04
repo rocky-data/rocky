@@ -38,7 +38,13 @@ fn timestamp() -> SnapshotChangeStrategy {
 }
 
 fn statements(dialect: &dyn SqlDialect, spec: &SnapshotSpec, columns: &[&str]) -> Vec<String> {
-    let target = dialect.format_table_ref("cat", "sch", "snap").unwrap();
+    // BigQuery validates the catalog as a GCP project id.
+    let catalog = if dialect.name() == "bigquery" {
+        "my-project"
+    } else {
+        "cat"
+    };
+    let target = dialect.format_table_ref(catalog, "sch", "snap").unwrap();
     let columns: Vec<String> = columns.iter().map(|c| (*c).to_string()).collect();
     generate_snapshot_model_sql(
         spec,
@@ -75,7 +81,7 @@ fn databricks_uses_backticks_and_aliased_update() {
         stmts[0]
     );
     assert!(
-        stmts[1].contains("md5(cast(coalesce(cast(source.`id` as VARCHAR)"),
+        stmts[1].contains("md5(cast(coalesce(cast(source.`id` as STRING)"),
         "{}",
         stmts[1]
     );
@@ -105,6 +111,7 @@ fn snowflake_folds_metadata_columns_to_upper_case() {
     let s = spec(
         SnapshotChangeStrategy::Check {
             check_cols: SnapshotCheckColumns::All,
+            updated_at: None,
         },
         SnapshotHardDeletes::NewRecord,
     );
@@ -158,8 +165,9 @@ fn bigquery_quotes_with_backticks_and_hashes_with_to_hex() {
     );
     assert!(stmts[1].contains("to_hex(md5("), "{}", stmts[1]);
     assert!(
-        stmts[1].contains("WHERE NOT EXISTS (SELECT 1 FROM `cat`.`sch`.`snap` AS existing")
-            || stmts[1].contains("WHERE NOT EXISTS (SELECT 1 FROM cat.sch.snap AS existing"),
+        stmts[1].contains(
+            "IS NOT NULL AND NOT EXISTS (SELECT 1 FROM `my-project`.`sch`.`snap` AS existing"
+        ),
         "{}",
         stmts[1]
     );

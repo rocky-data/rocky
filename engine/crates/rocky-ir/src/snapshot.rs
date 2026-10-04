@@ -178,8 +178,13 @@ pub enum SnapshotChangeStrategy {
     /// version's. The new version's `valid_from` is that `updated_at`.
     Timestamp { updated_at: Arc<str> },
     /// A row changed when any checked column differs (NULL-safe) from the
-    /// current version. The new version's `valid_from` is the run time.
-    Check { check_cols: SnapshotCheckColumns },
+    /// current version. The new version's `valid_from` is `updated_at` when
+    /// one is named (dbt allows it on a check snapshot), else the run time.
+    Check {
+        check_cols: SnapshotCheckColumns,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        updated_at: Option<Arc<str>>,
+    },
 }
 
 impl SnapshotChangeStrategy {
@@ -188,6 +193,14 @@ impl SnapshotChangeStrategy {
         match self {
             Self::Timestamp { .. } => "timestamp",
             Self::Check { .. } => "check",
+        }
+    }
+
+    /// The column whose value becomes a new version's `valid_from`, if any.
+    pub fn version_column(&self) -> Option<&str> {
+        match self {
+            Self::Timestamp { updated_at } => Some(updated_at),
+            Self::Check { updated_at, .. } => updated_at.as_deref(),
         }
     }
 }
@@ -234,7 +247,7 @@ impl SnapshotSpec {
                     problems.push("`strategy = \"timestamp\"` requires `updated_at`".to_string());
                 }
             }
-            SnapshotChangeStrategy::Check { check_cols } => match check_cols {
+            SnapshotChangeStrategy::Check { check_cols, .. } => match check_cols {
                 SnapshotCheckColumns::All => {}
                 SnapshotCheckColumns::Explicit(cols) => {
                     if cols.is_empty() {
@@ -248,6 +261,28 @@ impl SnapshotSpec {
                     }
                 }
             },
+        }
+        // Key and change columns are spliced into SQL as identifiers. An
+        // expression (dbt's `"id || '-' || region"` key idiom) cannot run.
+        let mut named: Vec<&str> = self.unique_key.iter().map(AsRef::as_ref).collect();
+        if let Some(col) = self.change.version_column() {
+            named.push(col);
+        }
+        if let SnapshotChangeStrategy::Check {
+            check_cols: SnapshotCheckColumns::Explicit(cols),
+            ..
+        } = &self.change
+        {
+            named.extend(cols.iter().map(AsRef::as_ref));
+        }
+        for col in named {
+            let col = col.trim();
+            if !col.is_empty() && validation::validate_identifier(col).is_err() {
+                problems.push(format!(
+                    "'{col}' is not a column name; snapshot keys and change columns must name \
+                     output columns (compute an expression in the model SQL and name it)"
+                ));
+            }
         }
         let meta = &self.meta_columns;
         let mut seen: Vec<String> = Vec::new();
@@ -360,12 +395,21 @@ mod tests {
         let mut s = spec();
         s.change = SnapshotChangeStrategy::Check {
             check_cols: SnapshotCheckColumns::Explicit(vec![]),
+            updated_at: None,
         };
         assert!(!s.problems().is_empty());
         s.change = SnapshotChangeStrategy::Check {
             check_cols: SnapshotCheckColumns::All,
+            updated_at: None,
         };
         assert!(s.problems().is_empty());
+    }
+
+    #[test]
+    fn key_expressions_are_problems() {
+        let mut s = spec();
+        s.unique_key = vec!["id || '-' || region".into()];
+        assert!(s.problems().iter().any(|m| m.contains("not a column name")));
     }
 
     #[test]

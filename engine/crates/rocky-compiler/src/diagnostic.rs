@@ -176,8 +176,9 @@ pub const E040: &str = "E040";
 ///
 /// Emitted by `rocky compile` (`check_snapshot_strategy` in `snapshot.rs`):
 /// a missing `unique_key` or `strategy`, `strategy = "timestamp"` without
-/// `updated_at`, `strategy = "check"` without `check_cols`, a key, `updated_at`
-/// or `check_cols` entry the model's own explicit projection does not output,
+/// `updated_at`, `strategy = "check"` without `check_cols`, a key or change
+/// column that is an expression rather than a column name, an `updated_at` or
+/// `check_cols` entry the model's own explicit projection does not output,
 /// a unique key the projection computes non-deterministically (`random()`,
 /// `uuid()`, `now()`), an output column that collides with a snapshot metadata
 /// column, or an invalid metadata column name or `valid_to_current`.
@@ -289,7 +290,9 @@ pub const W031: &str = "W031";
 /// A `type = "snapshot"` model's config is valid but risky.
 ///
 /// Emitted by `rocky compile` (`check_snapshot_strategy` in `snapshot.rs`):
-/// `strategy = "check"` comparing many columns (every run compares each one
+/// a `unique_key` the compiled SELECT does not output (it may be a
+/// `[[surrogate_key]]` column, added at run time), `strategy = "check"`
+/// comparing many columns (every run compares each one
 /// for every key), `updated_at` whose inferred type is not a timestamp or
 /// date, or a key / change column missing from a `SELECT *` model's
 /// compile-time schema, which may be stale.

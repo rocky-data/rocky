@@ -632,18 +632,35 @@ fn diff_materialization(
                     severity: BreakingSeverity::Breaking,
                 });
             }
-            let o_meta: Vec<String> = o
-                .meta_columns
-                .written(o.hard_deletes)
-                .into_iter()
-                .map(str::to_string)
-                .collect();
-            let n_meta: Vec<String> = n
-                .meta_columns
-                .written(n.hard_deletes)
-                .into_iter()
-                .map(str::to_string)
-                .collect();
+            // What readers depend on: the metadata column names and how a
+            // current version is marked. Adding `is_deleted` (a switch to
+            // `new_record`) only adds a column, so it is compared only when
+            // both sides write it.
+            let reader_shape = |spec: &rocky_ir::SnapshotSpec, other: &rocky_ir::SnapshotSpec| {
+                let meta = &spec.meta_columns;
+                let mut shape = vec![
+                    format!("valid_from={}", meta.valid_from),
+                    format!("valid_to={}", meta.valid_to),
+                    format!("is_current={}", meta.is_current.name().unwrap_or("<none>")),
+                    format!("scd_id={}", meta.scd_id),
+                    format!(
+                        "updated_at={}",
+                        meta.updated_at.as_deref().unwrap_or("<none>")
+                    ),
+                    format!(
+                        "valid_to_current={}",
+                        spec.valid_to_current.as_deref().unwrap_or("NULL")
+                    ),
+                ];
+                if spec.hard_deletes == rocky_ir::SnapshotHardDeletes::NewRecord
+                    && other.hard_deletes == rocky_ir::SnapshotHardDeletes::NewRecord
+                {
+                    shape.push(format!("is_deleted={}", meta.is_deleted));
+                }
+                shape
+            };
+            let o_meta = reader_shape(o, n);
+            let n_meta = reader_shape(n, o);
             if o_meta != n_meta {
                 findings.push(BreakingFinding {
                     change: BreakingChange::MaterializationKeyChanged {

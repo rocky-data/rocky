@@ -626,6 +626,9 @@ fn compute_model_typecheck(
             model_schema.schema_is_complete(),
             model_schema.has_star,
         ));
+        // After the checks above (which judge the SELECT's own columns):
+        // a snapshot's table also holds its metadata columns.
+        crate::snapshot::append_snapshot_metadata_columns(model, &mut typed_cols);
     }
 
     // Step 6: Enrich diagnostics with the model's file path as a SourceSpan

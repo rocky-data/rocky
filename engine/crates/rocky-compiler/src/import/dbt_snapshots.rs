@@ -159,7 +159,7 @@ pub fn snapshot_strategy_from_dbt(cfg: &DbtSnapshotConfig) -> Result<StrategyCon
         check_cols,
         hard_deletes,
         invalidate_hard_deletes: cfg.invalidate_hard_deletes,
-        snapshot_meta_column_names: Some(meta),
+        snapshot_meta_column_names: Some(Box::new(meta)),
         valid_to_current: cfg.dbt_valid_to_current.clone(),
     };
     if let Some(lowered) = strategy.snapshot_lowered()
@@ -205,7 +205,7 @@ fn snapshot_target(name: &str, cfg: &DbtSnapshotConfig, default: &TargetConfig) 
 
 fn imported_snapshot(
     name: &str,
-    sql: String,
+    sql: &str,
     strategy: StrategyConfig,
     target: TargetConfig,
     sources: Vec<rocky_core::models::SourceConfig>,
@@ -246,21 +246,55 @@ fn imported_snapshot(
 /// The project's snapshot directories: `snapshot-paths` from
 /// `dbt_project.yml`, default `snapshots`. Paths escaping the project root
 /// are refused, like model paths.
-fn snapshot_dirs(dbt_dir: &Path) -> Result<Vec<PathBuf>, String> {
+/// Also reports whether `dbt_project.yml` declares project-level snapshot
+/// config (a `snapshots:` block), which the raw path cannot apply.
+fn snapshot_dirs(dbt_dir: &Path) -> Result<(Vec<PathBuf>, bool), String> {
     #[derive(Deserialize, Default)]
-    struct Paths {
+    struct Project {
         #[serde(default, rename = "snapshot-paths")]
         snapshot_paths: Option<Vec<PathBuf>>,
+        #[serde(default)]
+        snapshots: Option<serde_yaml::Value>,
     }
-    let paths = std::fs::read_to_string(dbt_dir.join("dbt_project.yml"))
+    let project = std::fs::read_to_string(dbt_dir.join("dbt_project.yml"))
         .ok()
-        .and_then(|yml| serde_yaml::from_str::<Paths>(&yml).ok())
-        .and_then(|p| p.snapshot_paths)
+        .and_then(|yml| serde_yaml::from_str::<Project>(&yml).ok())
+        .unwrap_or_default();
+    let has_project_config = project
+        .snapshots
+        .as_ref()
+        .is_some_and(|v| !matches!(v, serde_yaml::Value::Null));
+    let paths = project
+        .snapshot_paths
         .unwrap_or_else(|| vec![PathBuf::from("snapshots")]);
-    paths
+    let dirs = paths
         .iter()
         .map(|p| super::dbt::safe_join_under(dbt_dir, p))
-        .collect()
+        .collect::<Result<_, _>>()?;
+    Ok((dirs, has_project_config))
+}
+
+const PROJECT_SNAPSHOT_CONFIG_REFUSED: &str = "dbt_project.yml declares project-level \
+    `snapshots:` config (e.g. `+target_schema`, `+hard_deletes`), which the raw import \
+    cannot apply; import from a compiled manifest.json instead";
+
+/// The raw path cannot see dbt's `generate_schema_name`, so say where the
+/// snapshot will land.
+fn raw_target_note(name: &str, target: &TargetConfig) -> ImportWarning {
+    ImportWarning {
+        model: name.to_string(),
+        category: WarningCategory::MappedConstruct,
+        message: format!(
+            "snapshot targets {}.{}.{} as configured; dbt's `generate_schema_name` may have \
+             built it elsewhere",
+            target.catalog, target.schema, target.table
+        ),
+        suggestion: Some(
+            "check the target before the first `rocky run`: a missing target starts a new \
+             history instead of continuing dbt's"
+                .to_string(),
+        ),
+    }
 }
 
 /// Scan the project's snapshot directories and convert every snapshot found
@@ -272,9 +306,23 @@ pub fn import_raw_snapshots(
     source_map: &HashMap<(String, String), dbt_sources::RockySourceMapping>,
     result: &mut ImportResult,
 ) -> Result<(), String> {
-    for dir in snapshot_dirs(dbt_dir)? {
+    let (dirs, has_project_config) = snapshot_dirs(dbt_dir)?;
+    let before = result.imported.len();
+    for dir in dirs {
         if dir.is_dir() {
             visit(&dir, default_target, source_map, result, 0)?;
+        }
+    }
+    // Project-level snapshot config would change what was just converted
+    // (schema, hard deletes, strategy). Refuse rather than drop it silently.
+    if has_project_config {
+        let converted: Vec<ImportedModel> = result.imported.drain(before..).collect();
+        for model in converted {
+            result.warnings.retain(|w| w.model != model.name);
+            result.failed.push(ImportFailure {
+                name: model.name,
+                reason: PROJECT_SNAPSHOT_CONFIG_REFUSED.to_string(),
+            });
         }
     }
     Ok(())
@@ -470,8 +518,9 @@ fn import_legacy_blocks(
         let sql = convert_jinja_to_sql(block.body, &this_ref);
         let sources = snapshot_sources(name, block.body, source_map, result);
         result.warnings.push(snapshot_import_note(name));
+        result.warnings.push(raw_target_note(name, &target));
         result.imported.push(imported_snapshot(
-            name, sql, strategy, target, sources, None,
+            name, &sql, strategy, target, sources, None,
         ));
     }
 }
@@ -564,9 +613,10 @@ fn import_yaml_snapshots(
         }
         let sources = snapshot_sources(name, relation, source_map, result);
         result.warnings.push(snapshot_import_note(name));
+        result.warnings.push(raw_target_note(name, &target));
         result.imported.push(imported_snapshot(
             name,
-            format!("SELECT * FROM {from}"),
+            &format!("SELECT * FROM {from}"),
             strategy,
             target,
             sources,
@@ -651,7 +701,7 @@ select * from {{ source('jaffle', 'orders') }}
         assert_eq!(spec.hard_deletes, SnapshotHardDeletes::NewRecord);
         assert!(matches!(
             spec.change,
-            rocky_ir::SnapshotChangeStrategy::Check { check_cols: rocky_ir::SnapshotCheckColumns::Explicit(ref c) } if c.len() == 2
+            rocky_ir::SnapshotChangeStrategy::Check { check_cols: rocky_ir::SnapshotCheckColumns::Explicit(ref c), .. } if c.len() == 2
         ));
     }
 
@@ -709,6 +759,55 @@ snapshots:
         assert_eq!(
             spec.valid_to_current.as_deref(),
             Some("to_date('9999-12-31')")
+        );
+    }
+
+    #[test]
+    fn project_level_snapshot_config_refuses_raw_import() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("dbt_project.yml"),
+            "name: p\nsnapshots:\n  p:\n    +hard_deletes: invalidate\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("snapshots")).unwrap();
+        std::fs::write(
+            dir.path().join("snapshots/s.sql"),
+            "{% snapshot s %}{{ config(unique_key='id', strategy='check', check_cols='all') }} select id from raw.t {% endsnapshot %}",
+        )
+        .unwrap();
+        let mut result = empty_result();
+        import_raw_snapshots(dir.path(), &target(), &HashMap::new(), &mut result).unwrap();
+        assert!(result.imported.is_empty());
+        assert_eq!(result.failed.len(), 1);
+        assert!(result.failed[0].reason.contains("project-level"));
+    }
+
+    #[test]
+    fn check_strategy_keeps_updated_at_for_valid_from() {
+        let cfg = DbtSnapshotConfig {
+            unique_key: Some(serde_json::json!("id")),
+            strategy: Some("check".into()),
+            check_cols: Some(serde_json::json!(["name"])),
+            updated_at: Some("changed_at".into()),
+            ..Default::default()
+        };
+        let spec = snapshot_fields(&snapshot_strategy_from_dbt(&cfg).unwrap());
+        assert_eq!(spec.change.version_column(), Some("changed_at"));
+    }
+
+    #[test]
+    fn expression_unique_key_fails_import() {
+        let cfg = DbtSnapshotConfig {
+            unique_key: Some(serde_json::json!("id || '-' || region")),
+            strategy: Some("check".into()),
+            check_cols: Some(serde_json::json!("all")),
+            ..Default::default()
+        };
+        assert!(
+            snapshot_strategy_from_dbt(&cfg)
+                .unwrap_err()
+                .contains("not a column name")
         );
     }
 

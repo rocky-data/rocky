@@ -835,7 +835,7 @@ The model SQL is a plain SELECT, for example `SELECT customer_id, name, email, u
 **How a change is detected:**
 
 - `timestamp`: a row changed when its `updated_at` is later than the current version's. The new version's `valid_from` is that `updated_at`.
-- `check`: a row changed when a column in `check_cols` differs from the current version. NULL counts as a value. `"all"` compares every column except the key. The new version's `valid_from` is the run time.
+- `check`: a row changed when a column in `check_cols` differs from the current version. NULL counts as a value. `"all"` compares every column except the key. The new version's `valid_from` is the run time, or the `updated_at` column when you also set one.
 
 **Columns Rocky adds to each row:**
 
@@ -886,10 +886,15 @@ All statements in one run use one timestamp for "now". A version closed at step 
 
 **Limits:**
 
+- `unique_key`, `updated_at` and `check_cols` must name output columns. To key on an expression, compute it in the model SQL and name it.
+- A row whose key is NULL is not snapshotted. A NULL key never matches its earlier version, so it would be inserted again on every run.
+- `is_deleted` is a metadata column only under `hard_deletes = "new_record"`. Under the other modes a model column with that name is ordinary data. If you leave `new_record`, keys whose current version is a deletion marker still reopen when they return.
 - The target keeps the columns it was created with. A column added to the model later is not captured, and `rocky run` reports it in the model's `notes`. Drop the target to rebuild the history with the new column.
 - The key must be unique in the model's result. Databricks and Snowflake refuse the MERGE when it is not.
 - `rocky plan` and `rocky emit-sql` show the steady-state statements, built from the compile-time column list. `rocky run` reads the column list from the target.
 - A `branch` promotion and a shadow run refuse a snapshot model, like the other strategies that build on rows the target already holds.
+- Each statement reads the model SELECT again, so a source that changes during a run can be seen differently by two statements. The next run reconciles it.
+- Databricks and Snowflake have not run these statements live yet. On Databricks, the run timestamp is a session-time-zone `TIMESTAMP`, and a model whose SELECT contains a subquery may be refused inside the hard-delete `UPDATE`.
 
 `rocky compile` reports an invalid config as `E049` and a risky one as `W049`. See the [diagnostic codes](/concepts/compiler/).
 

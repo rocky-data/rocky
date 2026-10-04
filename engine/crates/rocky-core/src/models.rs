@@ -502,7 +502,7 @@ pub enum StrategyConfig {
         invalidate_hard_deletes: Option<bool>,
         /// Metadata column names (Rocky defaults; dbt keys accepted).
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        snapshot_meta_column_names: Option<rocky_ir::SnapshotMetaColumns>,
+        snapshot_meta_column_names: Option<Box<rocky_ir::SnapshotMetaColumns>>,
         /// SQL expression for `valid_to` on current versions instead of NULL.
         #[serde(
             default,
@@ -538,7 +538,7 @@ impl StrategyConfig {
                 check_cols: check_cols.as_ref(),
                 hard_deletes: *hard_deletes,
                 invalidate_hard_deletes: *invalidate_hard_deletes,
-                meta_columns: snapshot_meta_column_names.as_ref(),
+                meta_columns: snapshot_meta_column_names.as_deref(),
                 valid_to_current: valid_to_current.as_deref(),
             },
         ))
@@ -1485,7 +1485,7 @@ impl Model {
                         check_cols: check_cols.as_ref(),
                         hard_deletes: *hard_deletes,
                         invalidate_hard_deletes: *invalidate_hard_deletes,
-                        meta_columns: snapshot_meta_column_names.as_ref(),
+                        meta_columns: snapshot_meta_column_names.as_deref(),
                         valid_to_current: valid_to_current.as_deref(),
                     },
                 )

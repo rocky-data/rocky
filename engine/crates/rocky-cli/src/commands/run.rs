@@ -13847,6 +13847,12 @@ async fn execute_one_plain_model(
         return execute_snapshot_model(
             &model_ir,
             spec,
+            model
+                .config
+                .strategy
+                .snapshot_lowered()
+                .map(|lowered| lowered.problems)
+                .unwrap_or_default(),
             &target_ref,
             warehouse,
             dialect,
@@ -14212,6 +14218,7 @@ async fn execute_one_plain_model(
 async fn execute_snapshot_model(
     model_ir: &rocky_ir::ModelIr,
     spec: &rocky_ir::SnapshotSpec,
+    lowering_problems: Vec<String>,
     target_ref: &str,
     warehouse: &dyn rocky_core::traits::WarehouseAdapter,
     dialect: &dyn rocky_core::traits::SqlDialect,
@@ -14221,7 +14228,15 @@ async fn execute_snapshot_model(
 ) -> Result<MaterializationOutput> {
     use rocky_core::snapshot_model;
 
-    let problems = spec.problems();
+    // Lowering problems (e.g. conflicting `hard_deletes` spellings) are not
+    // representable in the spec, so re-check them here for callers that
+    // skipped the compile gate.
+    let mut problems = lowering_problems;
+    for problem in spec.problems() {
+        if !problems.contains(&problem) {
+            problems.push(problem);
+        }
+    }
     if !problems.is_empty() {
         anyhow::bail!(
             "model '{model_name}' has an invalid snapshot config (E049): {}",
@@ -14258,31 +14273,79 @@ async fn execute_snapshot_model(
                     spec, target_ref, dialect,
                 )?);
             }
-            let source_columns = snapshot_model::snapshot_source_columns(spec, &names)
-                .with_context(|| format!("snapshot model '{model_name}' failed"))?;
+            // Is the target's `is_deleted` column the deletion marker? Under
+            // `new_record`, yes. Otherwise it is a leftover marker from an
+            // earlier `new_record` run when the model itself does not output
+            // that column (known only when the compiler typed the model).
+            let marker_name = &spec.meta_columns.is_deleted;
+            let marker_column = columns
+                .iter()
+                .find(|c| c.name.eq_ignore_ascii_case(marker_name));
+            // The model's own output columns: a zero-row probe of its SELECT
+            // (the warehouse plans it without scanning), else the compiler's
+            // typed columns minus the metadata it appended.
+            let metadata = spec.meta_columns.written(spec.hard_deletes);
+            let probe = format!(
+                "SELECT * FROM (\n{}\n) AS rocky_snapshot_probe WHERE 1 = 0",
+                model_ir.sql.trim().trim_end_matches(';')
+            );
+            let model_columns: Option<Vec<String>> = match warehouse.execute_query(&probe).await {
+                Ok(result) if !result.columns.is_empty() => Some(result.columns),
+                _ => exec_ctx
+                    .typed_models
+                    .get(model_name)
+                    .filter(|typed| !typed.is_empty())
+                    .map(|typed| {
+                        typed
+                            .iter()
+                            .map(|c| c.name.clone())
+                            .filter(|n| !metadata.iter().any(|m| m.eq_ignore_ascii_case(n)))
+                            .collect()
+                    }),
+            };
+            let model_outputs_marker = model_columns
+                .as_ref()
+                .map(|cols| cols.iter().any(|c| c.eq_ignore_ascii_case(marker_name)));
+            let markers_present = spec.hard_deletes == rocky_ir::SnapshotHardDeletes::NewRecord
+                || (marker_column.is_some() && model_outputs_marker == Some(false));
+            if markers_present
+                && let Some(col) = marker_column
+                && !col.data_type.to_ascii_lowercase().contains("bool")
+            {
+                anyhow::bail!(
+                    "snapshot model '{model_name}': column '{}' of {target_ref} is {}, not \
+                     BOOLEAN, so Rocky cannot read or write it as the deletion marker (a \
+                     dbt-built `new_record` snapshot stores it as a string). Convert the column \
+                     to BOOLEAN, or use `hard_deletes = \"invalidate\"`",
+                    col.name,
+                    col.data_type
+                );
+            }
+            let source_columns =
+                snapshot_model::snapshot_source_columns_with(spec, &names, markers_present)
+                    .with_context(|| format!("snapshot model '{model_name}' failed"))?;
             // The history keeps the columns it was created with. Say so when
             // the model has grown a column the target cannot hold.
-            if let Some(typed) = exec_ctx.typed_models.get(model_name) {
-                for col in typed {
-                    if !source_columns
-                        .iter()
-                        .any(|c| c.eq_ignore_ascii_case(&col.name))
-                    {
-                        notes.push(format!(
-                            "snapshot model '{model_name}': column '{}' is not in {target_ref} \
-                             and is not captured; rebuild the snapshot to add it",
-                            col.name
-                        ));
-                    }
+            for col in model_columns.iter().flatten() {
+                if !source_columns.iter().any(|c| c.eq_ignore_ascii_case(col)) {
+                    notes.push(format!(
+                        "snapshot model '{model_name}': column '{col}' is not in {target_ref} \
+                         and is not captured; rebuild the snapshot to add it"
+                    ));
                 }
             }
-            stmts.extend(snapshot_model::generate_snapshot_model_sql(
+            stmts.extend(snapshot_model::generate_snapshot_model_sql_with(
                 spec,
                 target_ref,
                 &model_ir.sql,
                 dialect,
                 &source_columns,
                 Utc::now(),
+                if markers_present {
+                    snapshot_model::ExistingMarkers::Present
+                } else {
+                    snapshot_model::ExistingMarkers::FromMode
+                },
             )?);
             stmts
         }

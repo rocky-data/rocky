@@ -484,10 +484,14 @@ pub fn generate_transformation_sql_with_warehouse(
             // (`execute_snapshot_model` in rocky-cli) reads the column list
             // from the target itself; this preview path (`rocky plan`,
             // `emit-sql`) uses the compiler's typed output columns.
+            // The compiler adds the metadata columns to a snapshot's typed
+            // output; only the SELECT's own columns are source columns.
+            let metadata = spec.meta_columns.written(spec.hard_deletes);
             let columns: Vec<String> = model_ir
                 .typed_columns
                 .iter()
                 .map(|c| c.name.clone())
+                .filter(|name| !metadata.iter().any(|m| m.eq_ignore_ascii_case(name)))
                 .collect();
             crate::snapshot_model::preview_snapshot_model_sql(
                 spec,

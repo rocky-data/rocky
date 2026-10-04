@@ -177,7 +177,13 @@ pub fn lower_snapshot_config(f: SnapshotConfigFields<'_>) -> LoweredSnapshot {
                         .collect(),
                 ),
             };
-            SnapshotChangeStrategy::Check { check_cols }
+            SnapshotChangeStrategy::Check {
+                check_cols,
+                updated_at: f
+                    .updated_at
+                    .map(|u| std::sync::Arc::from(u.trim()))
+                    .filter(|u: &std::sync::Arc<str>| !u.is_empty()),
+            }
         }
     };
 
@@ -249,17 +255,10 @@ fn current_valid_to(spec: &SnapshotSpec) -> String {
 }
 
 /// `valid_from` of a version built from `alias`'s row.
-fn version_timestamp(
-    spec: &SnapshotSpec,
-    alias: &str,
-    updated_at_ref: Option<&str>,
-    now: &str,
-) -> String {
-    match (&spec.change, updated_at_ref) {
-        (SnapshotChangeStrategy::Timestamp { .. }, Some(u)) => {
-            format!("CAST({alias}.{u} AS TIMESTAMP)")
-        }
-        _ => now.to_string(),
+fn version_timestamp(alias: &str, updated_at_ref: Option<&str>, now: &str) -> String {
+    match updated_at_ref {
+        Some(u) => format!("CAST({alias}.{u} AS TIMESTAMP)"),
+        None => now.to_string(),
     }
 }
 
@@ -317,11 +316,8 @@ pub fn generate_snapshot_bootstrap_select(
         .iter()
         .map(|k| validated(k).map(str::to_string))
         .collect::<Result<Vec<_>, _>>()?;
-    let updated_at = match &spec.change {
-        SnapshotChangeStrategy::Timestamp { updated_at } => Some(validated(updated_at)?),
-        SnapshotChangeStrategy::Check { .. } => None,
-    };
-    let valid_from = version_timestamp(spec, "source", updated_at, &now);
+    let updated_at = spec.change.version_column().map(validated).transpose()?;
+    let valid_from = version_timestamp("source", updated_at, &now);
     let meta = new_version_metadata(spec, dialect, &keys, "source", &valid_from, false)
         .into_iter()
         .map(|(name, value)| {
@@ -333,8 +329,15 @@ pub fn generate_snapshot_bootstrap_select(
         })
         .collect::<Result<Vec<_>, SqlGenError>>()?;
     let body = model_sql.trim().trim_end_matches(';');
+    // A NULL key never matches its own previous version, so a NULL-key row
+    // would be re-inserted on every run. Such rows are not snapshotted.
+    let keys_present = keys
+        .iter()
+        .map(|k| format!("source.{k} IS NOT NULL"))
+        .collect::<Vec<_>>()
+        .join(" AND ");
     Ok(format!(
-        "SELECT source.*, {}\nFROM (\n{body}\n) AS source",
+        "SELECT source.*, {}\nFROM (\n{body}\n) AS source\nWHERE {keys_present}",
         meta.join(", ")
     ))
 }
@@ -349,6 +352,16 @@ pub fn generate_snapshot_bootstrap_select(
 pub fn snapshot_source_columns(
     spec: &SnapshotSpec,
     target_columns: &[String],
+) -> Result<Vec<String>, SqlGenError> {
+    snapshot_source_columns_with(spec, target_columns, false)
+}
+
+/// [`snapshot_source_columns`], also treating the `is_deleted` column as
+/// metadata when `marker_column_is_metadata` (see [`ExistingMarkers`]).
+pub fn snapshot_source_columns_with(
+    spec: &SnapshotSpec,
+    target_columns: &[String],
+    marker_column_is_metadata: bool,
 ) -> Result<Vec<String>, SqlGenError> {
     let meta = &spec.meta_columns;
     let mut required = vec![meta.valid_from.as_str(), meta.valid_to.as_str()];
@@ -368,10 +381,16 @@ pub fn snapshot_source_columns(
             )));
         }
     }
-    let reserved = meta.reserved();
+    // Only the columns this mode writes are metadata. Under `ignore` or
+    // `invalidate` a model column named like `is_deleted` is ordinary data
+    // and must stay in the history.
+    let mut written = meta.written(spec.hard_deletes);
+    if marker_column_is_metadata {
+        written.push(meta.is_deleted.as_str());
+    }
     Ok(target_columns
         .iter()
-        .filter(|c| !reserved.iter().any(|r| c.eq_ignore_ascii_case(r)))
+        .filter(|c| !written.iter().any(|r| c.eq_ignore_ascii_case(r)))
         .cloned()
         .collect())
 }
@@ -411,6 +430,39 @@ pub fn generate_snapshot_model_sql(
     dialect: &dyn SqlDialect,
     source_columns: &[String],
     now: DateTime<Utc>,
+) -> Result<Vec<String>, SqlGenError> {
+    generate_snapshot_model_sql_with(
+        spec,
+        target,
+        model_sql,
+        dialect,
+        source_columns,
+        now,
+        ExistingMarkers::FromMode,
+    )
+}
+
+/// Whether the target may hold deletion markers the current mode did not
+/// write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExistingMarkers {
+    /// Only `hard_deletes = "new_record"` has markers.
+    FromMode,
+    /// The target carries the `is_deleted` metadata column from an earlier
+    /// `new_record` run, though the mode changed since. A key whose current
+    /// version is such a marker must still reopen when it comes back.
+    Present,
+}
+
+/// [`generate_snapshot_model_sql`] with an explicit [`ExistingMarkers`].
+pub fn generate_snapshot_model_sql_with(
+    spec: &SnapshotSpec,
+    target: &str,
+    model_sql: &str,
+    dialect: &dyn SqlDialect,
+    source_columns: &[String],
+    now: DateTime<Utc>,
+    markers: ExistingMarkers,
 ) -> Result<Vec<String>, SqlGenError> {
     refuse_invalid(spec)?;
     let now = run_timestamp_literal(now);
@@ -453,12 +505,11 @@ pub fn generate_snapshot_model_sql(
             .join(" AND ")
     };
 
-    let updated_at_ref = match &spec.change {
-        SnapshotChangeStrategy::Timestamp { updated_at } => {
-            Some(dialect.snapshot_source_reference(updated_at, source_columns)?)
-        }
-        SnapshotChangeStrategy::Check { .. } => None,
-    };
+    let updated_at_ref = spec
+        .change
+        .version_column()
+        .map(|u| dialect.snapshot_source_reference(u, source_columns))
+        .transpose()?;
 
     let new_record = spec.hard_deletes == SnapshotHardDeletes::NewRecord;
     let is_deleted = |alias: &str| format!("COALESCE({alias}.{del}, FALSE)");
@@ -472,7 +523,7 @@ pub fn generate_snapshot_model_sql(
             // `updated_at` was NULL is not stuck forever.
             format!("source.{u} > target.{u} OR (target.{u} IS NULL AND source.{u} IS NOT NULL)")
         }
-        SnapshotChangeStrategy::Check { check_cols } => {
+        SnapshotChangeStrategy::Check { check_cols, .. } => {
             let cols: Vec<String> = match check_cols {
                 SnapshotCheckColumns::All => source_columns
                     .iter()
@@ -502,7 +553,8 @@ pub fn generate_snapshot_model_sql(
                 .join(" OR ")
         }
     };
-    if new_record {
+    let revive_markers = new_record || markers == ExistingMarkers::Present;
+    if revive_markers {
         // A key whose current version is a deletion marker came back.
         changed = format!("{changed} OR {} = TRUE", is_deleted("target"));
     }
@@ -512,8 +564,8 @@ pub fn generate_snapshot_model_sql(
     // 1. Close the current version of every changed key. A revived deletion
     //    marker is closed at the run time, not at the source's updated_at,
     //    which may predate the deletion.
-    let version_from_source = version_timestamp(spec, "source", updated_at_ref.as_deref(), &now);
-    let close_at = if new_record {
+    let version_from_source = version_timestamp("source", updated_at_ref.as_deref(), &now);
+    let close_at = if revive_markers {
         format!(
             "CASE WHEN {} = TRUE THEN {now} ELSE {version_from_source} END",
             is_deleted("target")
@@ -543,10 +595,15 @@ pub fn generate_snapshot_model_sql(
         "INSERT INTO {target} ({names})\n\
          SELECT {values}\n\
          FROM {model} AS source\n\
-         WHERE NOT EXISTS (\
+         WHERE {keys_present} AND NOT EXISTS (\
          SELECT 1 FROM {target} AS existing WHERE {on} AND {is_current})",
         names = names.join(", "),
         values = values.join(", "),
+        keys_present = keys
+            .iter()
+            .map(|k| format!("source.{k} IS NOT NULL"))
+            .collect::<Vec<_>>()
+            .join(" AND "),
         on = join("existing", "source"),
         is_current = current("existing"),
     ));
@@ -773,7 +830,9 @@ mod tests {
         .unwrap();
         assert!(sql.starts_with("SELECT source.*, CAST(source.updated_at AS TIMESTAMP) AS \"valid_from\", CAST(NULL AS TIMESTAMP) AS \"valid_to\", TRUE AS \"is_current\", md5("), "{sql}");
         assert!(
-            sql.ends_with("FROM (\nSELECT id, name, updated_at FROM raw.customers\n) AS source"),
+            sql.ends_with(
+                "FROM (\nSELECT id, name, updated_at FROM raw.customers\n) AS source\nWHERE source.id IS NOT NULL"
+            ),
             "{sql}"
         );
         assert!(!sql.contains("is_deleted"), "{sql}");
@@ -784,6 +843,7 @@ mod tests {
         let mut s = spec(
             SnapshotChangeStrategy::Check {
                 check_cols: SnapshotCheckColumns::All,
+                updated_at: None,
             },
             SnapshotHardDeletes::NewRecord,
         );
@@ -830,7 +890,7 @@ mod tests {
             "{}",
             stmts[1]
         );
-        assert!(stmts[1].contains("WHERE NOT EXISTS (SELECT 1 FROM a.b.snap AS existing WHERE existing.\"id\" = source.\"id\" AND existing.\"is_current\" = TRUE)"), "{}", stmts[1]);
+        assert!(stmts[1].contains("WHERE source.\"id\" IS NOT NULL AND NOT EXISTS (SELECT 1 FROM a.b.snap AS existing WHERE existing.\"id\" = source.\"id\" AND existing.\"is_current\" = TRUE)"), "{}", stmts[1]);
     }
 
     #[test]
@@ -839,6 +899,7 @@ mod tests {
             &spec(
                 SnapshotChangeStrategy::Check {
                     check_cols: SnapshotCheckColumns::All,
+                    updated_at: None,
                 },
                 SnapshotHardDeletes::Ignore,
             ),
@@ -985,6 +1046,47 @@ mod tests {
         let stmts =
             generate_snapshot_model_sql(&s, "a.b.snap", "SELECT 1", &D, &cols(), now()).unwrap();
         assert!(stmts[1].contains("(existing.\"valid_to\" IS NULL OR existing.\"valid_to\" = CAST('9999-12-31' AS TIMESTAMP))"), "{}", stmts[1]);
+    }
+
+    #[test]
+    fn markers_from_an_earlier_new_record_run_still_reopen() {
+        let s = spec(ts(), SnapshotHardDeletes::Invalidate);
+        let stmts = generate_snapshot_model_sql_with(
+            &s,
+            "a.b.snap",
+            "SELECT 1",
+            &D,
+            &cols(),
+            now(),
+            ExistingMarkers::Present,
+        )
+        .unwrap();
+        assert!(
+            stmts[0].contains("OR COALESCE(target.\"is_deleted\", FALSE) = TRUE"),
+            "{}",
+            stmts[0]
+        );
+        // The mode does not write markers, so the new version leaves it NULL.
+        assert!(!stmts[1].contains("is_deleted"), "{}", stmts[1]);
+        let described: Vec<String> = [
+            "id",
+            "valid_from",
+            "valid_to",
+            "is_current",
+            "snapshot_id",
+            "is_deleted",
+        ]
+        .iter()
+        .map(|c| (*c).to_string())
+        .collect();
+        assert_eq!(
+            snapshot_source_columns(&s, &described).unwrap(),
+            vec!["id", "is_deleted"]
+        );
+        assert_eq!(
+            snapshot_source_columns_with(&s, &described, true).unwrap(),
+            vec!["id"]
+        );
     }
 
     #[test]

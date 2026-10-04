@@ -1305,6 +1305,7 @@ mod tests {
                 unique_key: vec!["id".into(), "region".into()],
                 change: crate::snapshot::SnapshotChangeStrategy::Check {
                     check_cols: crate::snapshot::SnapshotCheckColumns::All,
+                    updated_at: Some("changed_at".into()),
                 },
                 hard_deletes: crate::snapshot::SnapshotHardDeletes::NewRecord,
                 meta_columns: crate::snapshot::SnapshotMetaColumns::default(),
