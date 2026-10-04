@@ -458,7 +458,7 @@ pub fn create_function_sql(
                 .join(", ");
             Ok(format!(
                 "CREATE OR REPLACE MACRO {}({params}) AS CAST(({body}\n) AS {returns})",
-                dotted(|s| s.to_string())
+                dotted(ToString::to_string)
             ))
         }
         // Snowflake SQL UDF:
@@ -479,7 +479,7 @@ pub fn create_function_sql(
             }
             let mut sql = format!(
                 "CREATE OR REPLACE FUNCTION {}({})\n  RETURNS {returns}\n  LANGUAGE SQL",
-                dotted(|s| s.to_string()),
+                dotted(ToString::to_string),
                 typed_args()
             );
             match def.config.deterministic {
@@ -502,7 +502,7 @@ pub fn create_function_sql(
             plain_catalog()?;
             let mut sql = format!(
                 "CREATE OR REPLACE FUNCTION {}({})\n  RETURNS {returns}\n  LANGUAGE SQL",
-                dotted(|s| s.to_string()),
+                dotted(ToString::to_string),
                 typed_args()
             );
             match def.config.deterministic {
