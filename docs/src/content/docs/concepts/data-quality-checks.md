@@ -412,10 +412,10 @@ Rocky builds the quarantine predicate from every quarantinable assertion, combin
 Rocky never overwrites a column it cannot prove it wrote. Before any statement runs, it reads the source's columns and compares each label name with them, ignoring case:
 
 - `split` refuses any source column named like a label. It never writes its source, so the column is not Rocky's.
-- `tag` rewrites its own source, so the second run sees the first run's labels. After each successful `tag`, Rocky records the label columns it wrote in the state store. On the next run it replaces a recorded column. It refuses any other column named like a label.
-- If the state store is lost, nothing proves ownership, so `tag` refuses. Drop the column (`ALTER TABLE <target> DROP COLUMN <label>`), and the next run writes and records it again.
+- `tag` rewrites its own source, so the second run sees the first run's labels. After each successful `tag`, Rocky records in the state store the label columns it wrote and the table's full column list. On the next run it replaces a recorded column, but only while the table still has exactly the recorded columns. Appended or updated rows keep that true. A table that was replaced or gained or lost a column does not, and its label columns are refused.
+- If the state store is lost, nothing proves ownership, so `tag` refuses. This includes every existing `tag` table on its first run after upgrading. Remove the column, and the next run writes and records it again.
 
-A refusal names the column and the label. Rename or drop the column, or give the assertion a `name` so its label becomes `_error_<name>`.
+A refusal names the column and the label. Rename or remove the column, or give the assertion a `name` so its label becomes `_error_<name>`. Where the warehouse cannot drop or rename a column (a Databricks table without column mapping, say), rebuild the table without it.
 
 Every name quarantine creates, the suffixed tables and the label columns, must fit in 255 characters, the identifier limit of Snowflake and Databricks. A longer name is refused with a `quarantine:compile` check before any statement runs.
 

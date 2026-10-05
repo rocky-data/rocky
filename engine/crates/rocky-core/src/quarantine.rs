@@ -87,9 +87,9 @@ pub enum QuarantineError {
     #[error(
         "quarantine mode = \"{mode}\" would write the label column '{label}', but the source \
          table already has a column '{column}' {why}. Rocky does not overwrite a column it \
-         cannot prove it wrote. Rename or drop that column (for example `ALTER TABLE <table> \
-         RENAME COLUMN {column} TO <new_name>`), or give the assertion a `name` so its label \
-         is `_error_<name>`"
+         cannot prove it wrote. Rename or remove that column (`ALTER TABLE <table> RENAME \
+         COLUMN {column} TO <new_name>`, or rebuild the table without it where the warehouse \
+         cannot rename), or give the assertion a `name` so its label is `_error_<name>`"
     )]
     LabelColumnCollision {
         mode: &'static str,
@@ -182,15 +182,50 @@ pub struct QuarantinePlan {
     /// The name does not contain the source table's name, so its length is
     /// fixed (51 characters) however long the source's name is.
     pub drop_intermediate: Option<QuarantineStatement>,
-    /// `tag` only: the label columns Rocky owns on the source once
-    /// [`Self::statements`] succeed, to record with
-    /// `StateStore::set_quarantine_owned_labels` under [`Self::source_table`].
-    /// Empty for `split` and `drop`, which do not write their source.
-    ///
-    /// This run's labels, plus earlier owned labels the source still carries
-    /// (an assertion removed from the config leaves its column behind, and it
-    /// is still Rocky's).
-    pub owned_labels_after: Vec<String>,
+    /// `tag` only: what Rocky owns on the source once [`Self::statements`]
+    /// succeed, to record with `StateStore::set_quarantine_ownership` under
+    /// [`Self::source_table`]. `None` for `split` and `drop`, which do not
+    /// write their source.
+    pub ownership_after: Option<QuarantineOwnership>,
+}
+
+/// The record that proves which `_error_*` columns of a source Rocky wrote
+/// with `tag` (#2065).
+///
+/// It names the labels, and binds them to the exact column list the `tag`
+/// statement left the table with. A label is owned only while the table
+/// still has exactly those columns, in that order (ASCII case ignored):
+///
+/// ```text
+///   rows appended or updated since          columns unchanged -> owned
+///   table replaced or reshaped out of band  columns differ    -> not owned
+/// ```
+///
+/// So a table swapped for one carrying a user's own `_error_<label>` column
+/// is refused, not overwritten, unless the new table repeats Rocky's output
+/// shape column for column.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct QuarantineOwnership {
+    /// The label columns Rocky wrote: this run's, plus earlier proven labels
+    /// the table still carries (an assertion removed from the config leaves
+    /// its column behind, and it is still Rocky's).
+    pub labels: Vec<String>,
+    /// The table's columns, in order, right after the `tag` statement.
+    pub columns: Vec<String>,
+}
+
+impl QuarantineOwnership {
+    /// The labels this record proves on a table with `columns`: all of them
+    /// when the table still has exactly the recorded columns, none otherwise.
+    pub fn proven_labels(&self, columns: &[String]) -> &[String] {
+        let unchanged = self.columns.len() == columns.len()
+            && self
+                .columns
+                .iter()
+                .zip(columns)
+                .all(|(a, b)| a.eq_ignore_ascii_case(b));
+        if unchanged { &self.labels } else { &[] }
+    }
 }
 
 /// What the source table already holds, read before compiling `split` or
@@ -203,24 +238,24 @@ pub struct QuarantinePlan {
 /// ```text
 ///   split   refused: split never writes its source, so it owns none of
 ///           the source's columns
-///   tag     column in `owned_labels`  -> replaced (excluded from `*`)
-///           otherwise                 -> refused, the column is the user's
+///   tag     label proven by `ownership` -> replaced (excluded from `*`)
+///           otherwise                   -> refused, the column may be a user's
 /// ```
 ///
 /// Ownership is a state-store record written after a successful `tag`
-/// (`StateStore::set_quarantine_owned_labels`). It travels with remote state
-/// like any other record. If the store is lost, nothing proves ownership, so
-/// the next `tag` refuses and names the column: dropping it (`ALTER TABLE
-/// <table> DROP COLUMN <label>`) lets the following run write it afresh and
-/// record it again. Failing closed there is the point: a column Rocky cannot
-/// prove it wrote may be a user's.
+/// (`StateStore::set_quarantine_ownership`); see [`QuarantineOwnership`]. It
+/// travels with remote state like any other record. If the store is lost,
+/// nothing proves ownership, so the next `tag` refuses and names the column.
+/// Removing the column (or rebuilding the table without it) lets the
+/// following run write it afresh and record it again. Failing closed there is
+/// the point: a column Rocky cannot prove it wrote may be a user's.
 #[derive(Debug, Clone, Default)]
 pub struct SourceColumns {
     /// The source's column names as the warehouse reports them, or `None`
     /// when they were not read. `split` and `tag` refuse `None`.
     pub columns: Option<Vec<String>>,
-    /// Label columns Rocky recorded writing to this source with `tag`.
-    pub owned_labels: Vec<String>,
+    /// Rocky's record of the label columns it wrote here with `tag`.
+    pub ownership: Option<QuarantineOwnership>,
 }
 
 impl SourceColumns {
@@ -228,7 +263,7 @@ impl SourceColumns {
     pub fn read(columns: Vec<String>) -> Self {
         Self {
             columns: Some(columns),
-            owned_labels: Vec::new(),
+            ownership: None,
         }
     }
 }
@@ -399,7 +434,7 @@ fn compile_with_token(
 
     let mut statements = Vec::with_capacity(3);
     let mut drop_intermediate = None;
-    let mut owned_labels_after = Vec::new();
+    let mut ownership_after = None;
     match config.mode {
         QuarantineMode::Split => {
             // In the intermediate table each label sits under a working name,
@@ -506,7 +541,7 @@ fn compile_with_token(
                 &labels,
                 dialect,
             ));
-            owned_labels_after = owned_after_tag(&labels, source);
+            ownership_after = Some(ownership_after_tag(&labels, &replaced, source));
         }
     }
 
@@ -525,7 +560,7 @@ fn compile_with_token(
         },
         statements,
         drop_intermediate,
-        owned_labels_after,
+        ownership_after,
     }))
 }
 
@@ -585,6 +620,11 @@ fn resolve_label_collisions(
         .ok_or(QuarantineError::SourceColumnsUnread {
             mode: mode_name(mode),
         })?;
+    let proven = source
+        .ownership
+        .as_ref()
+        .map(|o| o.proven_labels(columns))
+        .unwrap_or_default();
     let mut replaced = Vec::new();
     for label in labels {
         let matching: Vec<&String> = columns
@@ -608,13 +648,12 @@ fn resolve_label_collisions(
                 ));
             }
             QuarantineMode::Tag => {
-                let owned = source
-                    .owned_labels
-                    .iter()
-                    .any(|o| o.eq_ignore_ascii_case(label));
+                let owned = proven.iter().any(|o| o.eq_ignore_ascii_case(label));
                 if !owned {
                     return Err(refuse(
-                        "and the state store has no record of an earlier `tag` run writing it",
+                        "and Rocky cannot prove an earlier `tag` run wrote it: the state store \
+                         has no record of it, or the table's columns have changed since that \
+                         run",
                     ));
                 }
                 if matching.len() > 1 {
@@ -634,12 +673,23 @@ fn resolve_label_collisions(
     Ok(replaced)
 }
 
-/// The labels Rocky owns on the source after a successful `tag`: this run's,
-/// plus earlier owned labels the source still carries through `*`.
-fn owned_after_tag(labels: &[&str], source: &SourceColumns) -> Vec<String> {
+/// What Rocky owns on the source after a successful `tag`: this run's
+/// labels plus earlier proven labels the source still carries through `*`,
+/// bound to the column list the statement leaves (the source's columns minus
+/// the replaced ones, then the labels).
+fn ownership_after_tag(
+    labels: &[&str],
+    replaced: &[String],
+    source: &SourceColumns,
+) -> QuarantineOwnership {
     let columns = source.columns.as_deref().unwrap_or_default();
+    let proven = source
+        .ownership
+        .as_ref()
+        .map(|o| o.proven_labels(columns))
+        .unwrap_or_default();
     let mut owned: Vec<String> = labels.iter().map(|l| (*l).to_string()).collect();
-    for prior in &source.owned_labels {
+    for prior in proven {
         let still_there = columns.iter().any(|c| c.eq_ignore_ascii_case(prior));
         let already = owned.iter().any(|o| o.eq_ignore_ascii_case(prior));
         if still_there && !already {
@@ -647,7 +697,16 @@ fn owned_after_tag(labels: &[&str], source: &SourceColumns) -> Vec<String> {
         }
     }
     owned.sort();
-    owned
+    let after: Vec<String> = columns
+        .iter()
+        .filter(|c| !replaced.contains(c))
+        .cloned()
+        .chain(labels.iter().map(|l| (*l).to_string()))
+        .collect();
+    QuarantineOwnership {
+        labels: owned,
+        columns: after,
+    }
 }
 
 /// Whether `assertion` is lowered into `table`'s quarantine.
@@ -714,12 +773,14 @@ fn safe_error_label(
     validate_generated_name("label column", &candidate, FIX_LABEL)?;
 
     let mut n = 2u32;
-    while taken.contains(&candidate) {
+    // Compared without ASCII case: labels are emitted unquoted, so `_error_A`
+    // and `_error_a` name one column on a case-insensitive warehouse.
+    while taken.contains(&candidate.to_ascii_lowercase()) {
         candidate = format!("_error_{base}_{n}");
         validate_generated_name("label column", &candidate, FIX_LABEL)?;
         n += 1;
     }
-    taken.insert(candidate.clone());
+    taken.insert(candidate.to_ascii_lowercase());
     Ok(candidate)
 }
 
@@ -2864,10 +2925,19 @@ mod unit_tests {
         )
     }
 
+    fn strings(values: &[&str]) -> Vec<String> {
+        values.iter().map(|c| (*c).to_string()).collect()
+    }
+
+    /// A source with `columns`, and a record owning `owned` that was written
+    /// when the table had exactly those columns.
     fn source(columns: &[&str], owned: &[&str]) -> SourceColumns {
         SourceColumns {
-            columns: Some(columns.iter().map(|c| (*c).to_string()).collect()),
-            owned_labels: owned.iter().map(|c| (*c).to_string()).collect(),
+            columns: Some(strings(columns)),
+            ownership: (!owned.is_empty()).then(|| QuarantineOwnership {
+                labels: strings(owned),
+                columns: strings(columns),
+            }),
         }
     }
 
@@ -2925,9 +2995,69 @@ mod unit_tests {
         );
         // This run's label, plus the earlier label the table still carries;
         // a recorded label the table no longer has is dropped from the record.
+        let after = plan.ownership_after.expect("tag records ownership");
         assert_eq!(
-            plan.owned_labels_after,
-            vec!["_error_not_null_name".to_string(), "_error_old".to_string()]
+            after.labels,
+            strings(&["_error_not_null_name", "_error_old"])
+        );
+        // Bound to the columns the rewrite leaves: replaced label last.
+        assert_eq!(
+            after.columns,
+            strings(&["id", "name", "_error_old", "_error_not_null_name"])
+        );
+    }
+
+    /// The reviewer's case for #2065: run one recorded the label, then the
+    /// table was replaced out of band by one carrying a user's own column of
+    /// that name. Its columns no longer match the record, so nothing is
+    /// proven and the column is refused, not overwritten.
+    #[test]
+    fn tag_refuses_a_recorded_label_once_the_table_was_reshaped() {
+        let reshaped = SourceColumns {
+            columns: Some(strings(&["id", "name", "note", "_error_not_null_name"])),
+            ownership: Some(QuarantineOwnership {
+                labels: strings(&["_error_not_null_name"]),
+                columns: strings(&["id", "name", "_error_not_null_name"]),
+            }),
+        };
+        let err = compile_against(QuarantineMode::Tag, &reshaped).unwrap_err();
+        assert!(
+            matches!(err, QuarantineError::LabelColumnCollision { .. }),
+            "{err:?}"
+        );
+    }
+
+    /// Labels differing only by case name one column on an unquoted,
+    /// case-insensitive warehouse, so the second is suffixed.
+    #[test]
+    fn labels_differing_only_by_case_are_kept_distinct() {
+        let assertions = vec![
+            assertion(
+                Some("Amount_ok"),
+                TestType::NotNull,
+                Some("a"),
+                TestSeverity::Error,
+            ),
+            assertion(
+                Some("amount_OK"),
+                TestType::NotNull,
+                Some("b"),
+                TestSeverity::Error,
+            ),
+        ];
+        let plan = compile_quarantine_sql(
+            &assertions,
+            "orders",
+            &table(),
+            &TestDialect,
+            &mode_config(QuarantineMode::Tag),
+            &source(&["id", "a", "b"], &[]),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            plan.ownership_after.unwrap().labels,
+            strings(&["_error_Amount_ok", "_error_amount_OK_2"])
         );
     }
 
@@ -2961,7 +3091,7 @@ mod unit_tests {
         let plan = compile_against(QuarantineMode::Drop, &SourceColumns::default())
             .unwrap()
             .unwrap();
-        assert!(plan.owned_labels_after.is_empty());
+        assert!(plan.ownership_after.is_none());
     }
 
     #[test]
@@ -2974,7 +3104,13 @@ mod unit_tests {
             "{}",
             plan.statements[0].sql
         );
-        assert_eq!(plan.owned_labels_after, vec!["_error_not_null_name"]);
+        assert_eq!(
+            plan.ownership_after,
+            Some(QuarantineOwnership {
+                labels: strings(&["_error_not_null_name"]),
+                columns: strings(&["id", "name", "_error_not_null_name"]),
+            })
+        );
     }
 
     /// #2065 part 2: a 250-character table plus `__valid` is 257 characters,

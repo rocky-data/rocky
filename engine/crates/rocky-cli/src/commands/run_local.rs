@@ -818,10 +818,10 @@ pub async fn run_quality(
                     });
                     match compiled {
                         Ok(Some(plan)) => {
-                            let ownership =
-                                matches!(plan.mode, rocky_core::config::QuarantineMode::Tag).then(
-                                    || (plan.source_table.clone(), plan.owned_labels_after.clone()),
-                                );
+                            let ownership = plan
+                                .ownership_after
+                                .clone()
+                                .map(|record| (plan.source_table.clone(), record));
                             let (q_output, mut write_error) = execute_quarantine_plan(
                                 warehouse_adapter.as_ref(),
                                 asset_key.clone(),
@@ -836,12 +836,12 @@ pub async fn run_quality(
                             // land fails the run: the data is right, but the
                             // next run would refuse these columns as a user's.
                             if write_error.is_none()
-                                && let Some((table, labels)) = ownership
+                                && let Some((table, record)) = ownership
                                 && let Err(e) =
                                     open_quarantine_store(&mut quarantine_store, state_path)
                                         .and_then(|store| {
                                             store
-                                                .set_quarantine_owned_labels(&table, &labels)
+                                                .set_quarantine_ownership(&table, &record)
                                                 .map_err(|e| e.to_string())
                                         })
                             {
@@ -1366,20 +1366,20 @@ async fn read_quarantine_source(
         .into_iter()
         .map(|c| c.name)
         .collect();
-    let owned_labels = if matches!(config.mode, rocky_core::config::QuarantineMode::Tag) {
+    let ownership = if matches!(config.mode, rocky_core::config::QuarantineMode::Tag) {
         let table = warehouse
             .dialect()
             .format_table_ref(&table_ref.catalog, &table_ref.schema, &table_ref.table)
             .map_err(|e| e.to_string())?;
         open_quarantine_store(store, state_path)?
-            .get_quarantine_owned_labels(&table)
+            .get_quarantine_ownership(&table)
             .map_err(|e| format!("could not read the quarantine label ownership record: {e}"))?
     } else {
-        Vec::new()
+        None
     };
     Ok(rocky_core::quarantine::SourceColumns {
         columns: Some(columns),
-        owned_labels,
+        ownership,
     })
 }
 
@@ -4145,6 +4145,18 @@ auto_create_schemas = true
             orders_columns(&db).await,
             vec!["id", "name", "_error_not_null_name"]
         );
+        let store = StateStore::open(&state_path).unwrap();
+        assert_eq!(
+            store
+                .get_quarantine_ownership("warehouse.main.orders")
+                .unwrap(),
+            Some(rocky_core::quarantine::QuarantineOwnership {
+                labels: vec!["_error_not_null_name".into()],
+                columns: vec!["id".into(), "name".into(), "_error_not_null_name".into()],
+            }),
+            "run one records the label it wrote, bound to the table's columns"
+        );
+        drop(store);
         // Between runs the bad row is fixed, so a fresh label is all NULL and
         // a stale one would still say row 2 failed.
         let adapter = DuckDbWarehouseAdapter::open(&db).unwrap();
@@ -4213,5 +4225,14 @@ auto_create_schemas = true
             .await
             .unwrap();
         assert_eq!(value.rows[0][0].as_str(), Some("mine"));
+        drop(adapter);
+        // Refused before any write, so nothing claims the column either.
+        let store = StateStore::open(&state_path).unwrap();
+        assert_eq!(
+            store
+                .get_quarantine_ownership("warehouse.main.orders")
+                .unwrap(),
+            None
+        );
     }
 }
