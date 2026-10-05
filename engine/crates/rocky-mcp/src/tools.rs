@@ -5299,6 +5299,7 @@ impl RockyMcpServer {
                 model: args.model.clone(),
                 product,
                 idempotency_key: args.idempotency_key.clone(),
+                actor: &self.actor,
             },
         )
         .await;

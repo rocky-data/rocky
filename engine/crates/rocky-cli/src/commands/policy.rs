@@ -1914,6 +1914,7 @@ max_retries = 0
             reason: "remote winner".to_string(),
             verify_after: Vec::new(),
             auto_apply: None,
+            principal_ref: None,
         };
         {
             let store = harness.open_store(&harness.pod_b);

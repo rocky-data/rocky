@@ -1589,7 +1589,8 @@ pub(crate) async fn run_compact_apply_in(
     output_json: bool,
 ) -> Result<()> {
     let (rocky_cfg, statements) =
-        prepare_compact_apply(root, config_path, plan_id, state_path, runtime_principal).await?;
+        prepare_compact_apply(root, config_path, plan_id, state_path, runtime_principal, actor)
+            .await?;
 
     // Build the warehouse adapter from the SAME snapshot the gate cleared, then
     // execute. Only reached once the policy gate has passed.
@@ -1729,7 +1730,8 @@ pub(crate) async fn run_compact_apply_in_with(
     adapter: &dyn WarehouseAdapter,
 ) -> Result<()> {
     let (_rocky_cfg, statements) =
-        prepare_compact_apply(root, config_path, plan_id, state_path, runtime_principal).await?;
+        prepare_compact_apply(root, config_path, plan_id, state_path, runtime_principal, actor)
+            .await?;
     execute_compact_apply(adapter, plan_id, &statements, output_json).await
 }
 

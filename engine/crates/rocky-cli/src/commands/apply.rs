@@ -2454,7 +2454,6 @@ pub(crate) fn evaluate_apply_policy_core(
             decision.matched_rule,
             policy,
             principal,
-            actor,
             attrs,
             prior_decisions,
             marker_freezes,
@@ -4346,7 +4345,6 @@ fn refuse_governed_dag_apply(
     plan_id: &str,
     run_plan: &RunPlan,
     runtime_principal: PolicyPrincipal,
-    actor: &rocky_core::config::PrincipalRef,
 ) -> Result<()> {
     if run_plan.dag && plan.enforcement_principal(runtime_principal) == PolicyPrincipal::Agent {
         bail!("{}", governed_dag_refusal(plan_id));
@@ -7240,6 +7238,7 @@ auto_create_schemas = true
             reason: "policy freeze: agent actions frozen to deny".to_string(),
             verify_after: Vec::new(),
             auto_apply: None,
+            principal_ref: None,
         })?;
         Ok(())
     }
@@ -7388,6 +7387,7 @@ default_agent_effect = "require_review"
             reason: "verify_after passed: [row_count]".to_string(),
             verify_after: vec!["row_count".to_string()],
             auto_apply: None,
+            principal_ref: None,
         };
         assert!(
             super::commit_verify_after_custody(Some(&remote_cfg), &state, &record)
@@ -12198,6 +12198,7 @@ autonomy_budget = { failures = 1, window = "7d" }
             reason: "seeded".to_string(),
             verify_after: verify_after.iter().map(|s| (*s).to_string()).collect(),
             auto_apply: None,
+            principal_ref: None,
         }
     }
 

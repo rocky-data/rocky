@@ -216,6 +216,16 @@ principal at apply time, and uses whichever of the two is more restrictive. An
 AI-authored plan carrying no stamp still counts as agent-authored, which is the
 safe direction.
 
+**A principal id is a name, not a proof.** Every policy decision records a
+principal id beside the class: a name for who acted, such as `alice` or
+`mcp-worker`. Set it with `--principal-id` or `ROCKY_PRINCIPAL_ID`. `rocky mcp`
+uses `mcp-<profile>` when neither is set. Otherwise the id is `unnamed`. Any
+process can claim any id, so `rocky audit` marks every id `verified: false`.
+The gates do not read the id; the class still decides. Ids are verified only
+when signed approvals ship. Rocky never reads `$USER` or a CI variable for the
+id, and the grammar refuses `@`. That keeps personal account names and email
+addresses out of a shared ledger unless you put them there.
+
 **A process-group kill does not hold a process that leaves the group.** The
 fulfillment loop runs its drafting agent in a separate process group, and kills
 the whole group when the task ends. A descendant that puts itself in a new

@@ -2021,7 +2021,6 @@ pub async fn run_branch_promote(
         allow_breaking,
         state_path,
         runtime_principal,
-        actor,
     )
     .await
     {

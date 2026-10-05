@@ -5978,6 +5978,72 @@ mod tests {
         })
     }
 
+    /// `--principal-id` is global (before or after the subcommand), and
+    /// `rocky audit --actor/--since` parse and refuse `--for`/`--scorecard`.
+    #[test]
+    fn principal_id_flag_and_audit_actor_since_parse() {
+        let cli = try_parse_with_big_stack(&[
+            "rocky",
+            "--principal-id",
+            "alice",
+            "audit",
+            "--actor",
+            "bob",
+            "--since",
+            "7d",
+        ]);
+        assert_eq!(cli.principal_id.as_deref(), Some("alice"));
+        let Command::Audit { actor, since, .. } = cli.command else {
+            panic!("expected the audit command");
+        };
+        assert_eq!(actor.as_deref(), Some("bob"));
+        assert_eq!(since.as_deref(), Some("7d"));
+
+        let cli = try_parse_with_big_stack(&[
+            "rocky", "policy", "freeze", "--principal-id", "ops-1",
+        ]);
+        assert_eq!(cli.principal_id.as_deref(), Some("ops-1"));
+
+        for conflicting in [
+            vec!["rocky", "audit", "--actor", "a", "--for", "fct"],
+            vec!["rocky", "audit", "--since", "7d", "--scorecard"],
+        ] {
+            let parsed = std::thread::scope(|s| {
+                let owned: Vec<String> = conflicting.iter().map(ToString::to_string).collect();
+                std::thread::Builder::new()
+                    .stack_size(8 * 1024 * 1024)
+                    .spawn_scoped(s, move || Cli::try_parse_from(&owned).is_ok())
+                    .expect("spawn parser thread")
+                    .join()
+                    .expect("parser thread panicked")
+            });
+            assert!(!parsed, "{conflicting:?} must be a clap conflict");
+        }
+    }
+
+    /// The CLI resolver: a flag wins and is validated; `rocky mcp` falls back
+    /// to `mcp-<profile>`; nothing set is `unnamed`. (The env leg is pinned by
+    /// `PrincipalRef::resolve`'s own tests in rocky-core; this test does not
+    /// touch the process environment, so it only runs its env-independent
+    /// cases when `ROCKY_PRINCIPAL_ID` is unset.)
+    #[test]
+    fn resolve_cli_principal_id_precedence_without_env() {
+        use rocky_core::config::PrincipalIdSource;
+        let r = resolve_cli_principal_id(Some("alice"), Some("worker")).unwrap();
+        assert_eq!((r.id.as_str(), r.source), ("alice", PrincipalIdSource::Flag));
+        assert!(resolve_cli_principal_id(Some("Alice"), None).is_err());
+        assert!(resolve_cli_principal_id(Some("unnamed"), None).is_err());
+        if std::env::var_os("ROCKY_PRINCIPAL_ID").is_none() {
+            let r = resolve_cli_principal_id(None, Some("worker")).unwrap();
+            assert_eq!(
+                (r.id.as_str(), r.source),
+                ("mcp-worker", PrincipalIdSource::McpProfile)
+            );
+            let r = resolve_cli_principal_id(None, None).unwrap();
+            assert_eq!((r.id.as_str(), r.source), ("unnamed", PrincipalIdSource::Default));
+        }
+    }
+
     /// Every `plan`-declared flag must appear in the #1550 guard's list.
     ///
     /// The guard is an explicit array in the dispatch, so a flag added to
