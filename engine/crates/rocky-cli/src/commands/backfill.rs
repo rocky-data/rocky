@@ -950,6 +950,7 @@ mod tests {
             None,
             None,
             true,
+            &rocky_core::config::PrincipalRef::unnamed(),
             true,
         )
         .unwrap();
@@ -1121,6 +1122,7 @@ mod tests {
             None,
             None,
             true,
+            &rocky_core::config::PrincipalRef::unnamed(),
             true,
         )
     }

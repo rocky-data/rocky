@@ -4555,6 +4555,7 @@ mod tests {
                 &state_path,
                 plan_id,
                 PolicyPrincipal::Agent,
+                &rocky_core::config::PrincipalRef::unnamed(),
                 capability,
                 model,
                 // These fixtures model an ORDINARY row, whose `model` is
@@ -4570,6 +4571,7 @@ mod tests {
             &state_path,
             &"0".repeat(64),
             PolicyPrincipal::Agent,
+            &rocky_core::config::PrincipalRef::unnamed(),
             PolicyCapability::Apply,
             "ghost",
             Vec::new(),

@@ -17936,6 +17936,7 @@ max_retries = 0
 
         let ctx = crate::commands::apply::GovernedRunContext {
             principal: rocky_core::config::PolicyPrincipal::Agent,
+            actor: rocky_core::config::PrincipalRef::unnamed(),
             plan_id: "record-not-persisted-transformation-plan",
             root: project,
             config_path: &config_path,
@@ -45762,6 +45763,7 @@ timestamp_column = "ts"
     ) -> anyhow::Result<()> {
         let ctx = crate::commands::apply::GovernedRunContext {
             principal: rocky_core::config::PolicyPrincipal::Agent,
+            actor: rocky_core::config::PrincipalRef::unnamed(),
             plan_id: "checkpoint-ordering-legacy-plan",
             root: config.parent().unwrap(),
             config_path: config,

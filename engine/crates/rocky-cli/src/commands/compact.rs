@@ -1980,6 +1980,7 @@ effect = "deny"
                 &plan_id,
                 &state,
                 PolicyPrincipal::Agent,
+                &rocky_core::config::PrincipalRef::unnamed(),
                 true,
                 &adapter,
             )
@@ -2012,6 +2013,7 @@ effect = "deny"
                 &plan_id,
                 &state,
                 PolicyPrincipal::Human,
+                &rocky_core::config::PrincipalRef::unnamed(),
                 true,
                 &adapter,
             )
@@ -2061,6 +2063,7 @@ effect = "deny"
                 &bound_id,
                 &state,
                 PolicyPrincipal::Human,
+                &rocky_core::config::PrincipalRef::unnamed(),
                 true,
                 &adapter,
             )
@@ -2098,6 +2101,7 @@ effect = "deny"
                 &half_id,
                 &state,
                 PolicyPrincipal::Human,
+                &rocky_core::config::PrincipalRef::unnamed(),
                 true,
                 &adapter,
             )
@@ -2118,6 +2122,7 @@ effect = "deny"
                 &clean_id,
                 &state,
                 PolicyPrincipal::Human,
+                &rocky_core::config::PrincipalRef::unnamed(),
                 true,
                 &adapter,
             )
@@ -2147,6 +2152,7 @@ effect = "deny"
                 &plan_id,
                 &state,
                 PolicyPrincipal::Agent,
+                &rocky_core::config::PrincipalRef::unnamed(),
                 true,
                 &adapter,
             )
@@ -2172,6 +2178,7 @@ effect = "deny"
                 &plan_id,
                 &state,
                 PolicyPrincipal::Agent,
+                &rocky_core::config::PrincipalRef::unnamed(),
                 None,
                 true,
             )
@@ -2203,6 +2210,7 @@ effect = "deny"
                 &plan_id,
                 &state,
                 PolicyPrincipal::Agent,
+                &rocky_core::config::PrincipalRef::unnamed(),
                 true,
                 &adapter,
             )
@@ -2228,6 +2236,7 @@ effect = "deny"
                 &plan_id,
                 &state,
                 PolicyPrincipal::Agent,
+                &rocky_core::config::PrincipalRef::unnamed(),
                 true,
                 &adapter2,
             )
@@ -2980,6 +2989,7 @@ schema_template = "staging__{{source}}"
             &plan_id,
             &dir.path().join("state.redb"),
             rocky_core::config::PolicyPrincipal::Human,
+            &rocky_core::config::PrincipalRef::unnamed(),
             false,
         )
         .await
@@ -3051,6 +3061,7 @@ schema_template = "staging__{{source}}"
             &plan_id,
             &dir.path().join("state.redb"),
             rocky_core::config::PolicyPrincipal::Human,
+            &rocky_core::config::PrincipalRef::unnamed(),
             false,
         )
         .await
@@ -3112,6 +3123,7 @@ schema_template = "staging__{{source}}"
             &fake_id,
             &dir.path().join("state.redb"),
             rocky_core::config::PolicyPrincipal::Human,
+            &rocky_core::config::PrincipalRef::unnamed(),
             false,
         )
         .await

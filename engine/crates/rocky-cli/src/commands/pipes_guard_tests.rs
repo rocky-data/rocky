@@ -169,6 +169,7 @@ async fn direct_apply_guard_refuses_bad_pipes() {
             "missing-plan",
             &dir.path().join("state.redb"),
             rocky_core::config::PolicyPrincipal::Human,
+            &rocky_core::config::PrincipalRef::unnamed(),
             None,
             false,
         )

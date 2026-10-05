@@ -3118,6 +3118,7 @@ auto_create_schemas = true
             &plan_id,
             &state_path,
             PolicyPrincipal::Human,
+            &rocky_core::config::PrincipalRef::unnamed(),
             true,
             oracle.clone(),
         )
@@ -3140,6 +3141,7 @@ auto_create_schemas = true
             &plan_id,
             &state_path,
             PolicyPrincipal::Human,
+            &rocky_core::config::PrincipalRef::unnamed(),
             true,
             oracle.clone(),
         )
@@ -3188,6 +3190,7 @@ auto_create_schemas = true
             &plan_id,
             &state_path,
             PolicyPrincipal::Human,
+            &rocky_core::config::PrincipalRef::unnamed(),
             true,
             oracle.clone(),
         )
@@ -3894,6 +3897,7 @@ auto_create_schemas = true
             &plan_id,
             &state_path,
             PolicyPrincipal::Human,
+            &rocky_core::config::PrincipalRef::unnamed(),
             true,
         )
         .await
@@ -3942,6 +3946,7 @@ auto_create_schemas = true
             &plan_id,
             &state_path,
             PolicyPrincipal::Human,
+            &rocky_core::config::PrincipalRef::unnamed(),
             true,
         )
         .await
@@ -3987,7 +3992,7 @@ auto_create_schemas = true
         let models_dir = root.join("models");
 
         // 1. Create the reclamation plan.
-        run_gc_plan_in(root, &state_path, &config, 7, PolicyPrincipal::Human, true).unwrap();
+        run_gc_plan_in(root, &state_path, &config, 7, PolicyPrincipal::Human, &rocky_core::config::PrincipalRef::unnamed(), true).unwrap();
         let plans_dir = root.join(".rocky").join("plans");
         let plan_id = std::fs::read_dir(&plans_dir)
             .unwrap()
@@ -4064,6 +4069,7 @@ auto_create_schemas = true
             &plan_id,
             &state_path,
             PolicyPrincipal::Human,
+            &rocky_core::config::PrincipalRef::unnamed(),
             true,
         )
         .await
@@ -4262,6 +4268,7 @@ auto_create_schemas = true
             &plan_id,
             &harness.pod_b.state_path,
             PolicyPrincipal::Human,
+            &rocky_core::config::PrincipalRef::unnamed(),
             true,
             oracle.clone(),
         )
@@ -4351,6 +4358,7 @@ auto_create_schemas = true
             &plan_id,
             &harness.pod_b.state_path,
             PolicyPrincipal::Human,
+            &rocky_core::config::PrincipalRef::unnamed(),
             true,
             std::sync::Arc::new(FixedLivenessOracle::reclaimable()),
         )
@@ -4418,6 +4426,7 @@ auto_create_schemas = true
             &plan_id,
             &harness.pod_b.state_path,
             PolicyPrincipal::Human,
+            &rocky_core::config::PrincipalRef::unnamed(),
             true,
             std::sync::Arc::new(FixedLivenessOracle::reclaimable()),
         )
@@ -4477,6 +4486,7 @@ auto_create_schemas = true
             Some(&cfg),
             "plan-x",
             PolicyPrincipal::Human,
+            &rocky_core::config::PrincipalRef::unnamed(),
             &touched,
             &models_dir,
             None,
@@ -4508,6 +4518,7 @@ auto_create_schemas = true
             Some(&cfg),
             "plan-x",
             PolicyPrincipal::Human,
+            &rocky_core::config::PrincipalRef::unnamed(),
             &touched,
             &models_dir,
             None,
@@ -4535,6 +4546,7 @@ auto_create_schemas = true
             Some(&cfg),
             "plan-x",
             PolicyPrincipal::Human,
+            &rocky_core::config::PrincipalRef::unnamed(),
             &touched,
             &models_dir,
             None,
@@ -4560,6 +4572,7 @@ auto_create_schemas = true
             Some(&cfg),
             "plan-x",
             PolicyPrincipal::Human,
+            &rocky_core::config::PrincipalRef::unnamed(),
             &touched,
             &models_dir,
             None,
@@ -4577,6 +4590,7 @@ auto_create_schemas = true
             Some(&cfg),
             "plan-x",
             PolicyPrincipal::Human,
+            &rocky_core::config::PrincipalRef::unnamed(),
             &touched,
             &models_dir,
             None,
@@ -4682,6 +4696,7 @@ auto_create_schemas = true
             &plan_id,
             &harness.pod_b.state_path,
             PolicyPrincipal::Human,
+            &rocky_core::config::PrincipalRef::unnamed(),
             true,
             oracle.clone(),
         )
@@ -4787,6 +4802,7 @@ auto_create_schemas = true
             &plan_id,
             &harness.pod_b.state_path,
             PolicyPrincipal::Human,
+            &rocky_core::config::PrincipalRef::unnamed(),
             true,
             std::sync::Arc::new(OutageOracle {
                 provider: harness.provider.clone(),
@@ -4884,6 +4900,7 @@ auto_create_schemas = true
             &plan_id,
             &harness.pod_b.state_path,
             PolicyPrincipal::Human,
+            &rocky_core::config::PrincipalRef::unnamed(),
             true,
             std::sync::Arc::new(MarkerWritingOracle {
                 provider: harness.provider.clone(),

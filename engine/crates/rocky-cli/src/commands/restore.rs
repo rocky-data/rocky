@@ -1813,7 +1813,7 @@ mod tests {
             }
 
             // --- gc: plan → review → apply (evict + tombstone) ---
-            run_gc_plan_in(root, &state_path, &config, 7, PolicyPrincipal::Human, true).unwrap();
+            run_gc_plan_in(root, &state_path, &config, 7, PolicyPrincipal::Human, &rocky_core::config::PrincipalRef::unnamed(), true).unwrap();
             let plans_dir = root.join(".rocky").join("plans");
             let gc_plan_id = find_plan_id(&plans_dir);
             compute_review(root, &config, &gc_plan_id, "HEAD", true)
@@ -1825,6 +1825,7 @@ mod tests {
                 &gc_plan_id,
                 &state_path,
                 PolicyPrincipal::Human,
+                &rocky_core::config::PrincipalRef::unnamed(),
                 true,
                 std::sync::Arc::new(AlwaysReclaim),
             )
@@ -1852,7 +1853,7 @@ mod tests {
             ));
 
             // --- restore: plan → review → apply (rebuild + verify + reinstate) ---
-            run_restore_plan_in(root, &state_path, "orders", PolicyPrincipal::Human, true).unwrap();
+            run_restore_plan_in(root, &state_path, "orders", PolicyPrincipal::Human, &rocky_core::config::PrincipalRef::unnamed(), true).unwrap();
             let restore_plan_id = std::fs::read_dir(&plans_dir)
                 .unwrap()
                 .filter_map(std::result::Result::ok)
@@ -1874,6 +1875,7 @@ mod tests {
                 &restore_plan_id,
                 &state_path,
                 PolicyPrincipal::Human,
+                &rocky_core::config::PrincipalRef::unnamed(),
                 true,
                 stores.clone(),
                 Arc::new(fresh_duckdb()),
@@ -1915,6 +1917,7 @@ mod tests {
                 &restore_plan_id,
                 &state_path,
                 PolicyPrincipal::Human,
+                &rocky_core::config::PrincipalRef::unnamed(),
                 true,
                 stores.clone(),
                 Arc::new(fresh_duckdb()),
@@ -2256,6 +2259,7 @@ mod tests {
                 &plan_id,
                 &state_path,
                 PolicyPrincipal::Human,
+                &rocky_core::config::PrincipalRef::unnamed(),
                 true,
                 Arc::new(SharedStore(cas.clone())),
                 Arc::new(fresh_duckdb()),
@@ -2342,7 +2346,7 @@ mod tests {
                 .unwrap();
             drop(store);
 
-            run_restore_plan_in(root, &state_path, "orders", PolicyPrincipal::Human, true).unwrap();
+            run_restore_plan_in(root, &state_path, "orders", PolicyPrincipal::Human, &rocky_core::config::PrincipalRef::unnamed(), true).unwrap();
             let plan_id = find_plan_id(&root.join(".rocky").join("plans"));
             write_review_marker(root, &plan_id);
 
@@ -2411,7 +2415,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            run_restore_plan_in(root, &state_path, "orders", PolicyPrincipal::Human, true).unwrap();
+            run_restore_plan_in(root, &state_path, "orders", PolicyPrincipal::Human, &rocky_core::config::PrincipalRef::unnamed(), true).unwrap();
             let plan_id = find_plan_id(&root.join(".rocky").join("plans"));
             write_review_marker(root, &plan_id);
 
@@ -2475,7 +2479,7 @@ mod tests {
             let (wr, obj_path) = seed_evicted(root, &state_path, cas.clone()).await;
             cas.delete(&obj_path).await.unwrap();
 
-            run_restore_plan_in(root, &state_path, "orders", PolicyPrincipal::Human, true).unwrap();
+            run_restore_plan_in(root, &state_path, "orders", PolicyPrincipal::Human, &rocky_core::config::PrincipalRef::unnamed(), true).unwrap();
             let plan_id = find_plan_id(&root.join(".rocky").join("plans"));
 
             // No review marker → apply refuses.
@@ -2485,6 +2489,7 @@ mod tests {
                 &plan_id,
                 &state_path,
                 PolicyPrincipal::Human,
+                &rocky_core::config::PrincipalRef::unnamed(),
                 true,
                 Arc::new(SharedStore(cas.clone())),
                 Arc::new(fresh_duckdb()),
@@ -2514,6 +2519,7 @@ mod tests {
                 &plan_id,
                 &state_path,
                 PolicyPrincipal::Human,
+                &rocky_core::config::PrincipalRef::unnamed(),
                 true,
                 Arc::new(SharedStore(cas.clone())),
                 Arc::new(fresh_duckdb()),
@@ -3036,7 +3042,7 @@ mod tests {
                 let state_path = &harness.pod_b.state_path;
                 let (wr, obj_path) = seed_evicted(root, state_path, cas.clone()).await;
                 cas.delete(&obj_path).await.unwrap();
-                run_restore_plan_in(root, state_path, "orders", PolicyPrincipal::Human, true)
+                run_restore_plan_in(root, state_path, "orders", PolicyPrincipal::Human, &rocky_core::config::PrincipalRef::unnamed(), true)
                     .unwrap();
                 let plan_id = find_plan_id(&root.join(".rocky").join("plans"));
                 write_review_marker(root, &plan_id);
@@ -3060,6 +3066,7 @@ mod tests {
                     plan_id,
                     &harness.pod_b.state_path,
                     PolicyPrincipal::Human,
+                    &rocky_core::config::PrincipalRef::unnamed(),
                     Arc::new(SharedStore(cas)),
                     warehouse,
                     rocky_core::config::load_rocky_config(config).ok(),

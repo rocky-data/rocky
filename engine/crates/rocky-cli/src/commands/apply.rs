@@ -5607,6 +5607,7 @@ mod tests {
             &plan_id,
             &dir.path().join("state.redb"),
             super::PolicyPrincipal::Agent,
+            &rocky_core::config::PrincipalRef::unnamed(),
             true,
         )
         .await
@@ -5756,6 +5757,7 @@ mod tests {
             &cfg,
             "plan-1",
             PolicyPrincipal::Agent,
+            &rocky_core::config::PrincipalRef::unnamed(),
             &BTreeMap::new(),
             dir.path(),
             &dir.path().join("state.redb"),
@@ -5784,6 +5786,7 @@ mod tests {
             &dir.path().join("does-not-exist.toml"),
             "plan-1",
             PolicyPrincipal::Agent,
+            &rocky_core::config::PrincipalRef::unnamed(),
             &BTreeMap::new(),
             dir.path(),
             &dir.path().join("state.redb"),
@@ -5869,6 +5872,7 @@ mod tests {
             &config_path,
             &project.join("state.redb"),
             PolicyPrincipal::Agent,
+            &rocky_core::config::PrincipalRef::unnamed(),
             &touched,
         )
         .await
@@ -6136,6 +6140,7 @@ mod tests {
             &config_path,
             &state,
             PolicyPrincipal::Agent,
+            &rocky_core::config::PrincipalRef::unnamed(),
             &targets,
         )
         .await;
@@ -6187,6 +6192,7 @@ mod tests {
             cfg.policy.as_ref(),
             "plan_m",
             PolicyPrincipal::Agent,
+            &rocky_core::config::PrincipalRef::unnamed(),
             &targets.touched,
             &models,
             None,
@@ -6659,6 +6665,7 @@ mod tests {
             &id,
             &state,
             PolicyPrincipal::Agent,
+            &rocky_core::config::PrincipalRef::unnamed(),
             None,
             false,
         )
@@ -6682,6 +6689,7 @@ mod tests {
             &id,
             &root.join("state.redb"),
             PolicyPrincipal::Human,
+            &rocky_core::config::PrincipalRef::unnamed(),
             None,
             false,
         )
@@ -6729,6 +6737,7 @@ mod tests {
                 &plan_id,
                 &state_path,
                 PolicyPrincipal::Human,
+                &rocky_core::config::PrincipalRef::unnamed(),
                 None,
                 true,
             )
@@ -6765,6 +6774,7 @@ mod tests {
             &plan_id,
             &state_path,
             PolicyPrincipal::Agent,
+            &rocky_core::config::PrincipalRef::unnamed(),
             None,
             true,
         )
@@ -6936,6 +6946,7 @@ mod tests {
             &plan_id,
             std::path::Path::new("models/.rocky-state.redb"),
             PolicyPrincipal::Human,
+            &rocky_core::config::PrincipalRef::unnamed(),
             true,
         )
         .await
@@ -6958,6 +6969,7 @@ mod tests {
             &plan_id,
             std::path::Path::new("models/.rocky-state.redb"),
             PolicyPrincipal::Human,
+            &rocky_core::config::PrincipalRef::unnamed(),
             true,
         )
         .await
@@ -6994,6 +7006,7 @@ mod tests {
             &plan_id,
             std::path::Path::new("models/.rocky-state.redb"),
             PolicyPrincipal::Human,
+            &rocky_core::config::PrincipalRef::unnamed(),
             true,
         )
         .await
@@ -7130,6 +7143,7 @@ auto_create_schemas = true
             &plan_id,
             &state,
             PolicyPrincipal::Human,
+            &rocky_core::config::PrincipalRef::unnamed(),
             true,
         )
         .await
@@ -7176,6 +7190,7 @@ auto_create_schemas = true
             &plan_id,
             &state,
             PolicyPrincipal::Agent,
+            &rocky_core::config::PrincipalRef::unnamed(),
             true,
         )
         .await
@@ -7204,6 +7219,7 @@ auto_create_schemas = true
             &plan_id,
             &state,
             PolicyPrincipal::Human,
+            &rocky_core::config::PrincipalRef::unnamed(),
             true,
         )
         .await
@@ -7435,6 +7451,7 @@ effect = "deny"
             policy.as_ref(),
             "plan_a",
             PolicyPrincipal::Agent,
+            &rocky_core::config::PrincipalRef::unnamed(),
             &touched,
             &models_dir,
             &state,
@@ -7450,6 +7467,7 @@ effect = "deny"
             None,
             "plan_a",
             PolicyPrincipal::Agent,
+            &rocky_core::config::PrincipalRef::unnamed(),
             &touched,
             &models_dir,
             &state,
@@ -7503,6 +7521,7 @@ effect = "deny"
             &config,
             "draft:m",
             PolicyPrincipal::Agent,
+            &rocky_core::config::PrincipalRef::unnamed(),
             &touched,
             &models,
             &state,
@@ -7520,6 +7539,7 @@ effect = "deny"
             &config,
             "draft:m",
             PolicyPrincipal::Agent,
+            &rocky_core::config::PrincipalRef::unnamed(),
             &touched,
             &models,
             &state,
@@ -7575,6 +7595,7 @@ effect = "deny"
             &config,
             "draft:m",
             PolicyPrincipal::Agent,
+            &rocky_core::config::PrincipalRef::unnamed(),
             &touched,
             &models,
             &state,
@@ -7633,6 +7654,7 @@ effect = "deny"
             &config,
             "draft:m",
             PolicyPrincipal::Agent,
+            &rocky_core::config::PrincipalRef::unnamed(),
             &touched,
             &models,
             &state,
@@ -7651,6 +7673,7 @@ effect = "deny"
             &config,
             "draft:m",
             PolicyPrincipal::Agent,
+            &rocky_core::config::PrincipalRef::unnamed(),
             &touched,
             &models,
             &state,
@@ -7708,6 +7731,7 @@ effect = "deny"
             &config,
             "plan_x",
             PolicyPrincipal::Agent,
+            &rocky_core::config::PrincipalRef::unnamed(),
             &touched,
             &models,
             &dir.path().join("state.redb"),
@@ -7739,6 +7763,7 @@ effect = "deny"
             &config,
             "plan_x",
             PolicyPrincipal::Agent,
+            &rocky_core::config::PrincipalRef::unnamed(),
             &touched,
             &dir.path().join("models"),
             &dir.path().join("state.redb"),
@@ -7768,6 +7793,7 @@ effect = "deny"
             &config,
             "plan_x",
             PolicyPrincipal::Human,
+            &rocky_core::config::PrincipalRef::unnamed(),
             &touched,
             &dir.path().join("models"),
             &dir.path().join("state.redb"),
@@ -7907,6 +7933,7 @@ effect = "deny"
                     &plan_a,
                     &state,
                     PolicyPrincipal::Agent,
+                    &rocky_core::config::PrincipalRef::unnamed(),
                     false,
                 )
                 .await,
@@ -7921,6 +7948,7 @@ effect = "deny"
                     None, // pipeline
                     &state,
                     PolicyPrincipal::Agent,
+                    &rocky_core::config::PrincipalRef::unnamed(),
                     false,
                 )
                 .await,
@@ -7944,6 +7972,7 @@ effect = "deny"
                     &plan_b,
                     &state,
                     PolicyPrincipal::Agent,
+                    &rocky_core::config::PrincipalRef::unnamed(),
                     false,
                 )
                 .await,
@@ -7958,6 +7987,7 @@ effect = "deny"
                     None, // pipeline
                     &state,
                     PolicyPrincipal::Agent,
+                    &rocky_core::config::PrincipalRef::unnamed(),
                     false,
                 )
                 .await,
@@ -7980,6 +8010,7 @@ effect = "deny"
             &plan_a,
             &state,
             PolicyPrincipal::Human,
+            &rocky_core::config::PrincipalRef::unnamed(),
             false,
         )
         .await
@@ -7992,6 +8023,7 @@ effect = "deny"
             None, // pipeline
             &state,
             PolicyPrincipal::Human,
+            &rocky_core::config::PrincipalRef::unnamed(),
             false,
         )
         .await
@@ -8010,6 +8042,7 @@ effect = "deny"
             &dir.path().join("rocky.toml"),
             "plan_x",
             PolicyPrincipal::Agent,
+            &rocky_core::config::PrincipalRef::unnamed(),
             &touched,
             &dir.path().join("models"),
             &dir.path().join("state.redb"),
@@ -8044,6 +8077,7 @@ effect = "deny"
             &config,
             "plan_x",
             PolicyPrincipal::Agent,
+            &rocky_core::config::PrincipalRef::unnamed(),
             &BTreeMap::new(),
             &dir.path().join("models"),
             &dir.path().join("state.redb"),
@@ -8092,6 +8126,7 @@ effect = "deny"
             &config,
             "plan_x",
             PolicyPrincipal::Agent,
+            &rocky_core::config::PrincipalRef::unnamed(),
             &touched,
             &dir.path().join("models"),
             &dir.path().join("state.redb"),
@@ -8129,6 +8164,7 @@ effect = "deny"
             &config,
             "plan_x",
             PolicyPrincipal::Agent,
+            &rocky_core::config::PrincipalRef::unnamed(),
             &touched,
             &dir.path().join("models"),
             &state,
@@ -8160,6 +8196,7 @@ effect = "deny"
             &config,
             "plan_x",
             PolicyPrincipal::Human,
+            &rocky_core::config::PrincipalRef::unnamed(),
             &touched,
             &dir.path().join("models"),
             &dir.path().join("state.redb"),
@@ -8265,6 +8302,7 @@ effect = "deny"
             &config,
             &plan_id,
             PolicyPrincipal::Agent,
+            &rocky_core::config::PrincipalRef::unnamed(),
             &touched,
             &models_dir,
             &dir.path().join("state.redb"),
@@ -8314,6 +8352,7 @@ effect = "deny"
             &config,
             &plan_id,
             PolicyPrincipal::Agent,
+            &rocky_core::config::PrincipalRef::unnamed(),
             &touched,
             &models_dir,
             &dir.path().join("state.redb"),
@@ -8371,6 +8410,7 @@ effect = "allow"
             &config,
             "plan_x",
             PolicyPrincipal::Agent,
+            &rocky_core::config::PrincipalRef::unnamed(),
             &touched,
             &dir.path().join("models"),
             &dir.path().join("state.redb"),
@@ -8420,6 +8460,7 @@ effect = "allow"
             &config,
             "plan_x",
             PolicyPrincipal::Agent,
+            &rocky_core::config::PrincipalRef::unnamed(),
             &touched,
             &dir.path().join("models"),
             &state,
@@ -8468,6 +8509,7 @@ effect = "allow"
             &config,
             "plan_x",
             PolicyPrincipal::Agent,
+            &rocky_core::config::PrincipalRef::unnamed(),
             &touched,
             &dir.path().join("models"),
             &state,
@@ -8516,6 +8558,7 @@ effect = "allow"
             &config,
             "plan_x",
             PolicyPrincipal::Agent,
+            &rocky_core::config::PrincipalRef::unnamed(),
             &touched,
             &dir.path().join("models"),
             &state,
@@ -8545,6 +8588,7 @@ effect = "allow"
             &config,
             "plan_x",
             PolicyPrincipal::Human,
+            &rocky_core::config::PrincipalRef::unnamed(),
             &touched,
             &dir.path().join("models"),
             &state,
@@ -8878,6 +8922,7 @@ effect = "allow"
             loaded.policy.as_ref(),
             "plan_p",
             PolicyPrincipal::Agent,
+            &rocky_core::config::PrincipalRef::unnamed(),
             &touched,
             &models_dir,
             None,
@@ -9267,6 +9312,7 @@ auto_create_schemas = true
         let config_path = dir.path().join("rocky.toml");
         let mk = |expected: Option<String>, require: bool| super::GovernedRunContext {
             principal: PolicyPrincipal::Agent,
+            actor: rocky_core::config::PrincipalRef::unnamed(),
             plan_id: "plan_x",
             root: dir.path(),
             config_path: &config_path,
@@ -9372,6 +9418,7 @@ auto_create_schemas = true
             std::collections::BTreeMap<String, Vec<rocky_ir::types::TypedColumn>>,
         >| super::GovernedRunContext {
             principal: PolicyPrincipal::Agent,
+            actor: rocky_core::config::PrincipalRef::unnamed(),
             plan_id: "p",
             root: dir.path(),
             config_path: &config_path,
@@ -9436,6 +9483,7 @@ auto_create_schemas = true
         let ledger = StateStore::open(&state)?;
         let ctx = super::GovernedRunContext {
             principal: PolicyPrincipal::Agent,
+            actor: rocky_core::config::PrincipalRef::unnamed(),
             plan_id: "plan_x",
             root: dir.path(),
             config_path: &config,
@@ -9486,6 +9534,7 @@ effect = "deny"
         let ledger = StateStore::open(&state)?;
         let ctx = super::GovernedRunContext {
             principal: PolicyPrincipal::Agent,
+            actor: rocky_core::config::PrincipalRef::unnamed(),
             plan_id: "plan_x",
             root: dir.path(),
             config_path: &config,
@@ -9535,6 +9584,7 @@ effect = "allow"
         let held = StateStore::open(&state)?;
         let ctx = super::GovernedRunContext {
             principal: PolicyPrincipal::Agent,
+            actor: rocky_core::config::PrincipalRef::unnamed(),
             plan_id: "plan_x",
             root: dir.path(),
             config_path: &config,
@@ -9566,6 +9616,7 @@ effect = "allow"
             &config,
             "plan_x",
             PolicyPrincipal::Agent,
+            &rocky_core::config::PrincipalRef::unnamed(),
             &touched,
             &dir.path().join("models"),
             &state,
@@ -9588,6 +9639,7 @@ effect = "allow"
         let ledger = StateStore::open(&state)?;
         let ctx = super::GovernedRunContext {
             principal: PolicyPrincipal::Agent,
+            actor: rocky_core::config::PrincipalRef::unnamed(),
             plan_id: "plan_x",
             root: dir.path(),
             config_path: &dir.path().join("rocky.toml"),
@@ -9630,6 +9682,7 @@ verify_after = ["row_count"]
         let ledger = StateStore::open(&state)?;
         let ctx = super::GovernedRunContext {
             principal: PolicyPrincipal::Agent,
+            actor: rocky_core::config::PrincipalRef::unnamed(),
             plan_id: "plan_x",
             root: dir.path(),
             config_path: &config,
@@ -9664,6 +9717,7 @@ verify_after = ["row_count"]
         super::finish_apply_verify_after(
             "plan_x",
             PolicyPrincipal::Agent,
+            &rocky_core::config::PrincipalRef::unnamed(),
             Vec::new(),
             apply_run_id,
             &state,
@@ -9717,6 +9771,7 @@ autonomy_budget = { failures = 3, window = "7d" }
             policy.as_ref(),
             "plan_x",
             PolicyPrincipal::Agent,
+            &rocky_core::config::PrincipalRef::unnamed(),
             &touched,
             &dir.path().join("models"),
             &state,
@@ -9775,6 +9830,7 @@ effect = "allow"
             pol_a.as_ref(),
             "p",
             PolicyPrincipal::Agent,
+            &rocky_core::config::PrincipalRef::unnamed(),
             &touched,
             &models,
             &state,
@@ -9804,6 +9860,7 @@ autonomy_budget = { failures = 3, window = "7d" }
             pol_b.as_ref(),
             "p",
             PolicyPrincipal::Agent,
+            &rocky_core::config::PrincipalRef::unnamed(),
             &touched,
             &models,
             &state,
@@ -9840,6 +9897,7 @@ autonomy_budget = { failures = 3, window = "7d" }
             &plan_id,
             &state,
             PolicyPrincipal::Agent,
+            &rocky_core::config::PrincipalRef::unnamed(),
             true,
         )
         .await
@@ -9930,6 +9988,7 @@ autonomy_budget = { failures = 3, window = "7d" }
             plan_id,
             &root.join(".rocky-state.redb"),
             PolicyPrincipal::Human,
+            &rocky_core::config::PrincipalRef::unnamed(),
             false,
         )
         .await
@@ -10048,6 +10107,7 @@ autonomy_budget = { failures = 3, window = "7d" }
             &plan_id,
             &root.join(".rocky-state.redb"),
             PolicyPrincipal::Agent,
+            &rocky_core::config::PrincipalRef::unnamed(),
             false,
         )
         .await
@@ -10082,6 +10142,7 @@ autonomy_budget = { failures = 3, window = "7d" }
             &plan_id,
             &state,
             PolicyPrincipal::Human,
+            &rocky_core::config::PrincipalRef::unnamed(),
             true,
         )
         .await
@@ -10127,6 +10188,7 @@ autonomy_budget = { failures = 3, window = "7d" }
                 &plan_id,
                 &state,
                 PolicyPrincipal::Human,
+                &rocky_core::config::PrincipalRef::unnamed(),
                 true,
             )
             .await
@@ -10168,6 +10230,7 @@ autonomy_budget = { failures = 3, window = "7d" }
             &plan_id,
             &state,
             PolicyPrincipal::Human,
+            &rocky_core::config::PrincipalRef::unnamed(),
             true,
         )
         .await
@@ -10241,6 +10304,7 @@ schema_template = "s__{source}"
             &plan_id,
             &state,
             PolicyPrincipal::Agent,
+            &rocky_core::config::PrincipalRef::unnamed(),
             true,
         )
         .await
@@ -10285,6 +10349,7 @@ schema_template = "s__{source}"
             &plan_id,
             &state,
             PolicyPrincipal::Agent,
+            &rocky_core::config::PrincipalRef::unnamed(),
             true,
         )
         .await
@@ -10457,6 +10522,7 @@ schema_template = "s__{source}"
             &bound_id,
             &state,
             PolicyPrincipal::Human,
+            &rocky_core::config::PrincipalRef::unnamed(),
             None,
             false,
         )
@@ -10475,6 +10541,7 @@ schema_template = "s__{source}"
             &unbound_id,
             &state,
             PolicyPrincipal::Human,
+            &rocky_core::config::PrincipalRef::unnamed(),
             Some("sha256:abc"),
             false,
         )
@@ -10492,6 +10559,7 @@ schema_template = "s__{source}"
             &bound_id,
             &state,
             PolicyPrincipal::Human,
+            &rocky_core::config::PrincipalRef::unnamed(),
             Some("sha256:other"),
             false,
         )
@@ -10512,6 +10580,7 @@ schema_template = "s__{source}"
             &bound_id,
             &state,
             PolicyPrincipal::Human,
+            &rocky_core::config::PrincipalRef::unnamed(),
             Some("sha256:abc"),
             false,
         )
@@ -10554,6 +10623,7 @@ schema_template = "s__{source}"
             &plan_id,
             &root.join("state.redb"),
             PolicyPrincipal::Human,
+            &rocky_core::config::PrincipalRef::unnamed(),
             None,
             false,
         )
@@ -10646,6 +10716,7 @@ schema_template = "s__{source}"
                 &plan_id,
                 &state,
                 PolicyPrincipal::Human,
+                &rocky_core::config::PrincipalRef::unnamed(),
                 flag,
                 false,
             )
@@ -10936,6 +11007,7 @@ schema_template = "s__{source}"
             &plan_id,
             &other_state,
             PolicyPrincipal::Human,
+            &rocky_core::config::PrincipalRef::unnamed(),
             true,
         )
         .await
@@ -10971,6 +11043,7 @@ schema_template = "s__{source}"
             &plan_id,
             &dir.path().join("anywhere.redb"),
             PolicyPrincipal::Human,
+            &rocky_core::config::PrincipalRef::unnamed(),
             true,
         )
         .await;
@@ -11037,6 +11110,7 @@ schema_template = "s__{source}"
             &plan_id,
             &state,
             PolicyPrincipal::Human,
+            &rocky_core::config::PrincipalRef::unnamed(),
             true,
         )
         .await
@@ -11076,6 +11150,7 @@ schema_template = "s__{source}"
             &plan_id,
             &state,
             PolicyPrincipal::Human,
+            &rocky_core::config::PrincipalRef::unnamed(),
             true,
         )
         .await;
@@ -11140,6 +11215,7 @@ schema_template = "s__{source}"
             &plan_id,
             &dir.path().join("state.redb"),
             PolicyPrincipal::Human,
+            &rocky_core::config::PrincipalRef::unnamed(),
             true,
         )
         .await;
@@ -11837,6 +11913,7 @@ schema_template = "s__{source}"
         let r = super::run_verify_after(
             "plan-x",
             PolicyPrincipal::Agent,
+            &rocky_core::config::PrincipalRef::unnamed(),
             &["row_count".to_string(), "not_null_keys".to_string()],
             &run_id,
             &state,
@@ -11856,6 +11933,7 @@ schema_template = "s__{source}"
         let err = super::run_verify_after(
             "plan-x",
             PolicyPrincipal::Agent,
+            &rocky_core::config::PrincipalRef::unnamed(),
             &["not_null_keys".to_string()],
             &run_id,
             &state,
@@ -11884,6 +11962,7 @@ schema_template = "s__{source}"
         let err = super::run_verify_after(
             "plan-1919",
             PolicyPrincipal::Agent,
+            &rocky_core::config::PrincipalRef::unnamed(),
             &[SECRET.to_string()],
             &run_id,
             &state,
@@ -11921,6 +12000,7 @@ schema_template = "s__{source}"
         let err = super::run_verify_after(
             "plan-x",
             PolicyPrincipal::Agent,
+            &rocky_core::config::PrincipalRef::unnamed(),
             &["freshness".to_string()],
             &run_id,
             &state,
@@ -11968,6 +12048,7 @@ schema_template = "s__{source}"
         let err = super::run_verify_after(
             "plan-x",
             PolicyPrincipal::Agent,
+            &rocky_core::config::PrincipalRef::unnamed(),
             &["cross_source_overlap:duckdb.orders".to_string()],
             &run_id,
             &state,
@@ -11994,6 +12075,7 @@ schema_template = "s__{source}"
             super::run_verify_after(
                 "plan-x",
                 PolicyPrincipal::Agent,
+                &rocky_core::config::PrincipalRef::unnamed(),
                 &["row_count".to_string()],
                 &run_id,
                 &state,
@@ -12022,6 +12104,7 @@ schema_template = "s__{source}"
             super::run_verify_after(
                 "plan-x",
                 PolicyPrincipal::Agent,
+                &rocky_core::config::PrincipalRef::unnamed(),
                 &checks,
                 "run-lost",
                 &state,
@@ -12053,7 +12136,7 @@ schema_template = "s__{source}"
         let state = dir.path().join("state.redb");
         // No required checks → the gate is a no-op and never touches state.
         assert!(
-            super::run_verify_after("plan-x", PolicyPrincipal::Agent, &[], "unused-id", &state)
+            super::run_verify_after("plan-x", PolicyPrincipal::Agent, &rocky_core::config::PrincipalRef::unnamed(), &[], "unused-id", &state)
                 .is_ok()
         );
     }
@@ -12078,6 +12161,7 @@ schema_template = "s__{source}"
         let err = super::run_verify_after(
             "plan-x",
             PolicyPrincipal::Agent,
+            &rocky_core::config::PrincipalRef::unnamed(),
             &["row_count".to_string()],
             "run-A",
             &state,
@@ -12113,6 +12197,7 @@ schema_template = "s__{source}"
         let err = super::run_verify_after(
             "plan-x",
             PolicyPrincipal::Agent,
+            &rocky_core::config::PrincipalRef::unnamed(),
             &["row_count".to_string()],
             "run-dup",
             &state,
@@ -12258,6 +12343,7 @@ autonomy_budget = { failures = 1, window = "7d" }
             root,
             "plan-x",
             PolicyPrincipal::Agent,
+            &rocky_core::config::PrincipalRef::unnamed(),
             &touched(),
             &root.join("models"),
             None,
