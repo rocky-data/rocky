@@ -88,6 +88,7 @@ pub fn run_compile_with_options(
     deny_warning_codes: &[String],
     selection: Option<&crate::selection::SelectionArgs>,
 ) -> Result<()> {
+    validate_deny_warning_codes(deny_warning_codes)?;
     let (mut output, text_data) = compile_inner(
         config_path,
         state_path,
@@ -367,20 +368,37 @@ fn compile_inner(
     };
     let scoped = model_filter.is_some() || selected.is_some();
 
-    // A warehouse that cannot create functions refuses them here (E051), at
-    // compile time, rather than mid-run.
-    if let Some(config) = &project_config {
+    // The warehouses each model runs on, from the pipelines that target
+    // them (not every configured adapter). The adapter gates below judge
+    // each model against these, and refuse when any one refuses.
+    let config_file_path = config_path.unwrap_or_else(|| Path::new("rocky.toml"));
+    let model_targets = project_config
+        .as_ref()
+        .map(|config| ModelTargets::resolve(config, config_file_path));
+
+    if let Some(targets) = &model_targets {
+        // PostgreSQL accepts a column functionally dependent on a grouped
+        // primary key, which Rocky cannot see: E044 is a warning (W044)
+        // there. Redshift keeps E044.
+        if rocky_compiler::group_by::downgrade_for_postgres(&mut result.diagnostics, |m| {
+            runs_only_on_postgres(targets, m)
+        }) > 0
+        {
+            result.has_errors = result.diagnostics.iter().any(Diagnostic::is_error);
+        }
+        // A warehouse that cannot create functions refuses them here (E051), at
+        // compile time, rather than mid-run.
         result
             .diagnostics
-            .extend(function_adapter_diagnostics(config, &result));
+            .extend(function_adapter_diagnostics(targets, &result));
         // Likewise a warehouse that cannot run the SCD2 snapshot MERGE.
         result
             .diagnostics
-            .extend(snapshot_adapter_diagnostics(config, &result));
+            .extend(snapshot_adapter_diagnostics(targets, &result));
         // And one with no upsert at all (ClickHouse): E053.
         result
             .diagnostics
-            .extend(merge_adapter_diagnostics(config, &result));
+            .extend(merge_adapter_diagnostics(targets, &result));
     }
 
     // Portability lint. Effective target_dialect = CLI flag > [portability]
@@ -423,13 +441,19 @@ fn compile_inner(
     // Aggregate-argument and comparison-operand checks (E042/W042,
     // E043/W043). These judge against the warehouse that will run the SQL,
     // so they need a dialect the compiler core does not carry; see
-    // `resolve_operand_dialect` for the precedence.
-    let operand_dialect = resolve_operand_dialect(target_dialect, project_config.as_ref());
-    let operand_diags = rocky_compiler::operand_check::check_operand_types(
+    // `operand_target_for` for the precedence.
+    let operand_diags = rocky_compiler::operand_check::check_operand_types_per_model(
         &result.project.models,
         &result.semantic_graph,
         &result.type_check.typed_models,
-        operand_dialect,
+        &|model| {
+            operand_target_for(
+                target_dialect,
+                project_config.as_ref(),
+                model_targets.as_ref(),
+                model,
+            )
+        },
     );
     if operand_diags.iter().any(|d| d.severity == Severity::Error) {
         result.has_errors = true;
@@ -503,10 +527,10 @@ fn compile_inner(
     let _already_reported = rocky_compiler::ephemeral::apply_ephemerals(&mut result.project, true);
     // SQL Server lifts every CTE to the head of the statement; check that
     // on the inlined SQL, the text `rocky run` sends (E054).
-    if let Some(config) = &project_config {
+    if let Some(targets) = &model_targets {
         result
             .diagnostics
-            .extend(sqlserver_cte_diagnostics(config, &result));
+            .extend(sqlserver_cte_diagnostics(targets, &result));
     }
 
     // Load macros and expand model SQL when --expand-macros is set.
@@ -662,46 +686,73 @@ fn compile_inner(
     Ok((output, text_data))
 }
 
-/// The warehouse dialect the E042/E043 operand checks judge against.
+/// The warehouse dialects the E042/E043 operand checks judge `model` against.
 ///
-/// Precedence: an explicit `--target-dialect` flag, then the adapter type of
-/// the pipelines' target adapter (only when every pipeline targets the same
-/// dialect, or — with no pipelines — when every warehouse adapter does), then
-/// `[portability] target_dialect`. `None` when nothing resolves; the checks
-/// then report the least severe verdict across all dialects (warnings only).
-fn resolve_operand_dialect(
+/// Precedence: an explicit `--target-dialect` flag (every model), then the
+/// adapter types of the warehouses the model runs on ([`ModelTargets`]; the
+/// most severe verdict across them wins), then `[portability]
+/// target_dialect`. With none of these the checks report the least severe
+/// verdict across all dialects (warnings only).
+fn operand_target_for(
     target_dialect: Option<Dialect>,
     config: Option<&rocky_config::RockyConfig>,
-) -> Option<rocky_compiler::operand_check::OperandDialect> {
-    use rocky_compiler::operand_check::OperandDialect;
+    targets: Option<&ModelTargets<'_>>,
+    model: &str,
+) -> rocky_compiler::operand_check::OperandTarget {
+    use rocky_compiler::operand_check::{OperandDialect, OperandTarget};
 
     if let Some(dialect) = target_dialect {
-        return Some(dialect.into());
+        return Some(OperandDialect::from(dialect)).into();
     }
-    let config = config?;
-    let adapter_dialect = |name: &str| {
-        config
-            .adapters
-            .get(name)
-            .and_then(|a| OperandDialect::from_adapter_type(&a.adapter_type))
-    };
-    let dialects: std::collections::HashSet<OperandDialect> = if config.pipelines.is_empty() {
-        config
-            .adapters
-            .values()
-            .filter_map(|a| OperandDialect::from_adapter_type(&a.adapter_type))
-            .collect()
-    } else {
-        config
-            .pipelines
-            .values()
-            .filter_map(|p| adapter_dialect(p.target_adapter()))
-            .collect()
-    };
-    if dialects.len() == 1 {
-        return dialects.into_iter().next();
+    if let Some(targets) = targets {
+        let adapters = targets.for_model(model);
+        if !adapters.is_empty() {
+            let mut dialects = Vec::new();
+            let mut unruled = Vec::new();
+            for adapter in adapters {
+                match OperandDialect::from_adapter_type(&adapter.adapter_type) {
+                    Some(d) if !dialects.contains(&d) => dialects.push(d),
+                    Some(_) => {}
+                    None if !unruled.contains(&adapter.adapter_type) => {
+                        unruled.push(adapter.adapter_type.clone());
+                    }
+                    None => {}
+                }
+            }
+            if dialects.is_empty()
+                && let Some(d) = config.and_then(|c| c.portability.target_dialect)
+            {
+                return Some(OperandDialect::from(d)).into();
+            }
+            return OperandTarget::Targets { dialects, unruled };
+        }
     }
-    config.portability.target_dialect.map(Into::into)
+    config
+        .and_then(|c| c.portability.target_dialect)
+        .map(OperandDialect::from)
+        .into()
+}
+
+/// Refuse `--deny-warnings` codes that name no warning Rocky emits — an
+/// unknown code (`W999`), a malformed one (`W42`, `W 042`), or an error code.
+/// A typo there would otherwise escalate nothing and pass in silence.
+fn validate_deny_warning_codes(codes: &[String]) -> Result<()> {
+    let bad: Vec<&str> = codes
+        .iter()
+        .map(String::as_str)
+        .filter(|c| !diagnostic::is_warning_code(c))
+        .collect();
+    if bad.is_empty() {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "--deny-warnings: unknown or malformed warning code(s): {}. Valid codes: {}",
+        bad.iter()
+            .map(|c| format!("`{c}`"))
+            .collect::<Vec<_>>()
+            .join(", "),
+        diagnostic::WARNING_CODES.join(", ")
+    )
 }
 
 /// Escalate warning diagnostics whose code is listed in `--deny-warnings` to
@@ -772,48 +823,162 @@ fn function_details(
         .collect()
 }
 
-/// The adapter blocks that act as warehouses (the data role): every block
-/// except a discovery-only type (`fivetran`, `airbyte`, …) or one declared
-/// `kind = "discovery"`. An adapter type Rocky does not know counts as a
-/// warehouse, so the checks below treat it as unable to run the feature.
-fn warehouse_adapters(
-    config: &rocky_config::RockyConfig,
-) -> impl Iterator<Item = &rocky_config::AdapterConfig> {
-    config.adapters.values().filter(|a| {
-        a.kind != Some(rocky_config::AdapterKind::Discovery)
-            && rocky_core::adapter_capability::capability_for(&a.adapter_type)
-                .is_none_or(|cap| cap.supports_data)
-    })
+/// Whether an adapter block acts as a warehouse (the data role): every
+/// block except a discovery-only type (`fivetran`, `airbyte`, …) or one
+/// declared `kind = "discovery"`. An adapter type Rocky does not know counts
+/// as a warehouse.
+fn is_warehouse(adapter: &rocky_config::AdapterConfig) -> bool {
+    adapter.kind != Some(rocky_config::AdapterKind::Discovery)
+        && rocky_core::adapter_capability::capability_for(&adapter.adapter_type)
+            .is_none_or(|cap| cap.supports_data)
 }
 
-/// E051 for every valid function a model calls when every warehouse adapter
-/// the project configures cannot create it: Trino, every adapter with no
-/// function DDL (ClickHouse, SQL Server, an unknown type), and PostgreSQL /
-/// Redshift when their `CREATE FUNCTION` rendering
+/// The warehouse adapters each model runs on, resolved from the pipelines
+/// that actually target them — not from every configured adapter.
+///
+/// ```text
+///   model ──(matches pipeline.<p>.models glob)──▶ transformation pipeline
+///         ──(pipeline.<p>.target.adapter)──────▶ warehouse adapter
+/// ```
+///
+/// - A model that a transformation pipeline's `models` glob loads runs on
+///   that pipeline's target. Several pipelines can load one model; it then
+///   has several targets.
+/// - A model no transformation pipeline loads can still run through
+///   `rocky run --models` on any pipeline, so it gets every pipeline's
+///   target. With no pipeline at all, it gets every warehouse adapter.
+/// - A pipeline whose model set cannot be read adds its target to every
+///   model (fail closed).
+///
+/// The compile-time refusals (E049, E051, E053, E054, E042/E043) refuse a
+/// model when ANY of its targets refuses it. An adapter that no pipeline
+/// targets no longer hides a refusal.
+struct ModelTargets<'c> {
+    by_model: HashMap<String, Vec<&'c rocky_config::AdapterConfig>>,
+    unclaimed: Vec<&'c rocky_config::AdapterConfig>,
+    everywhere: Vec<&'c rocky_config::AdapterConfig>,
+}
+
+impl<'c> ModelTargets<'c> {
+    fn resolve(config: &'c rocky_config::RockyConfig, config_path: &Path) -> Self {
+        let warehouse = |name: &str| config.adapters.get(name).filter(|a| is_warehouse(a));
+        let mut pipelines: Vec<(&String, &rocky_config::PipelineConfig)> =
+            config.pipelines.iter().collect();
+        pipelines.sort_by(|a, b| a.0.cmp(b.0));
+
+        let mut by_model: HashMap<String, Vec<&'c rocky_config::AdapterConfig>> = HashMap::new();
+        let mut everywhere = Vec::new();
+        let mut unclaimed = Vec::new();
+        for (_, pipeline) in &pipelines {
+            let Some(adapter) = warehouse(pipeline.target_adapter()) else {
+                continue;
+            };
+            push_unique(&mut unclaimed, adapter);
+            let Some(tx) = pipeline.as_transformation() else {
+                continue;
+            };
+            match pipeline_model_names(tx, config_path) {
+                Some(names) => {
+                    for name in names {
+                        push_unique(by_model.entry(name).or_default(), adapter);
+                    }
+                }
+                None => push_unique(&mut everywhere, adapter),
+            }
+        }
+        if pipelines.is_empty() {
+            let mut names: Vec<&String> = config.adapters.keys().collect();
+            names.sort();
+            for name in names {
+                if let Some(adapter) = warehouse(name) {
+                    push_unique(&mut unclaimed, adapter);
+                }
+            }
+        }
+        Self {
+            by_model,
+            unclaimed,
+            everywhere,
+        }
+    }
+
+    /// The warehouses `model` can run on. Empty when nothing is configured.
+    fn for_model(&self, model: &str) -> Vec<&'c rocky_config::AdapterConfig> {
+        let mut out = self
+            .by_model
+            .get(model)
+            .cloned()
+            .unwrap_or_else(|| self.unclaimed.clone());
+        for adapter in &self.everywhere {
+            push_unique(&mut out, adapter);
+        }
+        out
+    }
+}
+
+fn push_unique<'c>(
+    list: &mut Vec<&'c rocky_config::AdapterConfig>,
+    adapter: &'c rocky_config::AdapterConfig,
+) {
+    if !list.iter().any(|a| std::ptr::eq(*a, adapter)) {
+        list.push(adapter);
+    }
+}
+
+/// The names of the models a transformation pipeline loads, through the
+/// same glob resolution `rocky run` uses. `None` when the set cannot be read.
+fn pipeline_model_names(
+    tx: &rocky_config::TransformationPipelineConfig,
+    config_path: &Path,
+) -> Option<Vec<String>> {
+    match crate::models_loader::locate_models_dir(&tx.models, config_path).ok()? {
+        crate::models_loader::ModelsDir::Absent(_) => Some(Vec::new()),
+        crate::models_loader::ModelsDir::Present(dir) => {
+            let glob = crate::models_loader::resolved_models_glob(&tx.models, config_path);
+            let models =
+                crate::models_loader::load_project_models_matching(&dir, &glob, None).ok()?;
+            Some(models.into_iter().map(|m| m.config.name).collect())
+        }
+    }
+}
+
+/// The SCD2 snapshot refusal of one warehouse, if it has one.
+fn snapshot_refusal(adapter: &rocky_config::AdapterConfig) -> Option<&'static str> {
+    match crate::registry::postgres_dialect_for_config(adapter) {
+        Some(dialect) => dialect.snapshot_unsupported_reason(),
+        None => crate::registry::warehouse_dialect_for_type(&adapter.adapter_type)
+            .and_then(rocky_core::traits::SqlDialect::snapshot_unsupported_reason),
+    }
+}
+
+/// The upsert refusal of one warehouse, if it has one.
+fn merge_refusal(adapter: &rocky_config::AdapterConfig) -> Option<&'static str> {
+    match crate::registry::postgres_dialect_for_config(adapter) {
+        Some(dialect) => dialect.merge_unsupported_reason(),
+        None => crate::registry::warehouse_dialect_for_type(&adapter.adapter_type)
+            .and_then(rocky_core::traits::SqlDialect::merge_unsupported_reason),
+    }
+}
+
+/// E051 for every valid function a model calls when a warehouse that a
+/// calling model runs on ([`ModelTargets`]) cannot create it: Trino, every
+/// adapter with no function DDL (ClickHouse, SQL Server, an unknown type),
+/// and PostgreSQL / Redshift when their `CREATE FUNCTION` rendering
 /// ([`rocky_core::functions::create_function_sql`]) refuses this function —
 /// a `[target] catalog` on Redshift, a body holding the dollar-quote
 /// delimiter, an argument used in a qualified reference with no positional
 /// spelling. Those refusals would otherwise surface only at `rocky run`.
 /// SQL Server is refused, not rendered: a T-SQL scalar UDF takes
 /// `@`-prefixed parameters and must be called schema-qualified
-/// (`dbo.f(x)`), so a model's bare `f(x)` call would not resolve to it. A project
-/// that also configures a capable warehouse is not refused here —
-/// `rocky run` refuses at the boundary if the model runs on the other one.
+/// (`dbo.f(x)`), so a model's bare `f(x)` call would not resolve to it.
+/// Fail closed: one refusing target is enough.
 fn function_adapter_diagnostics(
-    config: &rocky_config::RockyConfig,
+    targets: &ModelTargets<'_>,
     result: &compile::CompileResult,
 ) -> Vec<Diagnostic> {
     use rocky_core::functions::{FunctionDialect, create_function_sql};
     let registry = result.semantic_graph.functions();
-    let warehouses: Vec<(&str, Option<FunctionDialect>)> = warehouse_adapters(config)
-        .map(|a| {
-            (
-                a.adapter_type.as_str(),
-                FunctionDialect::from_dialect_name(&a.adapter_type),
-            )
-        })
-        .collect();
-    if registry.is_empty() || warehouses.is_empty() {
+    if registry.is_empty() {
         return Vec::new();
     }
     // Why `name` cannot be created on warehouse `w`, or `None` when it can.
@@ -840,19 +1005,40 @@ fn function_adapter_diagnostics(
             }
         }
     };
-    let mut types: Vec<&str> = warehouses.iter().map(|(t, _)| *t).collect();
-    types.sort_unstable();
-    types.dedup();
-    let types = types.join(", ");
     let usage = rocky_compiler::udf::function_usage(&result.project.models, registry);
-    usage
-        .keys()
+    let mut names: Vec<&String> = usage.keys().collect();
+    names.sort();
+    names
+        .into_iter()
         .filter_map(|name| {
-            let reasons: Vec<Result<String, ()>> = warehouses
-                .iter()
-                .map(|(_, w)| refusal(name, w))
-                .collect::<Option<_>>()?;
-            let rendered: Vec<String> = reasons.into_iter().filter_map(Result::ok).collect();
+            let mut warehouses: Vec<&rocky_config::AdapterConfig> = Vec::new();
+            for caller in &usage[name] {
+                for adapter in targets.for_model(caller) {
+                    push_unique(&mut warehouses, adapter);
+                }
+            }
+            let mut types: Vec<&str> = Vec::new();
+            let mut rendered: Vec<String> = Vec::new();
+            for adapter in warehouses {
+                let dialect = FunctionDialect::from_dialect_name(&adapter.adapter_type);
+                match refusal(name, &dialect) {
+                    None => {}
+                    Some(reason) => {
+                        types.push(adapter.adapter_type.as_str());
+                        if let Ok(reason) = reason
+                            && !rendered.contains(&reason)
+                        {
+                            rendered.push(reason);
+                        }
+                    }
+                }
+            }
+            if types.is_empty() {
+                return None;
+            }
+            types.sort_unstable();
+            types.dedup();
+            let types = types.join(", ");
             let diagnostic = if rendered.is_empty() {
                 Diagnostic::error(
                     diagnostic::E051,
@@ -883,32 +1069,15 @@ fn function_adapter_diagnostics(
         .collect()
 }
 
-/// E049 for every snapshot model when every warehouse adapter the project
-/// configures cannot run the SCD2 snapshot SQL
+/// E049 for every snapshot model when a warehouse it runs on
+/// ([`ModelTargets`]) cannot run the SCD2 snapshot SQL
 /// ([`rocky_core::traits::SqlDialect::snapshot_unsupported_reason`]):
-/// PostgreSQL under `merge_mode = "on_conflict"`, and Redshift. Conservative
-/// like E051: a project that also configures a capable warehouse is not
-/// refused here; `rocky run` refuses at the boundary instead.
+/// PostgreSQL under `merge_mode = "on_conflict"`, Redshift, SQL Server.
+/// Fail closed: one refusing target is enough.
 fn snapshot_adapter_diagnostics(
-    config: &rocky_config::RockyConfig,
+    targets: &ModelTargets<'_>,
     result: &compile::CompileResult,
 ) -> Vec<Diagnostic> {
-    let mut reasons: Vec<(String, &'static str)> = Vec::new();
-    for adapter in warehouse_adapters(config) {
-        let reason = match crate::registry::postgres_dialect_for_config(adapter) {
-            Some(dialect) => dialect.snapshot_unsupported_reason(),
-            None => crate::registry::warehouse_dialect_for_type(&adapter.adapter_type)
-                .and_then(rocky_core::traits::SqlDialect::snapshot_unsupported_reason),
-        };
-        // One capable (or unknown) warehouse is enough to stay silent.
-        let Some(reason) = reason else {
-            return Vec::new();
-        };
-        reasons.push((adapter.adapter_type.clone(), reason));
-    }
-    let Some((adapter_type, reason)) = reasons.first() else {
-        return Vec::new();
-    };
     result
         .project
         .models
@@ -919,51 +1088,39 @@ fn snapshot_adapter_diagnostics(
                 rocky_core::models::StrategyConfig::Snapshot { .. }
             )
         })
-        .map(|m| {
-            Diagnostic::error(
-                diagnostic::E049,
-                &m.config.name,
-                format!(
-                    "snapshot model `{}` cannot run on the configured {adapter_type} warehouse: \
-                     {reason}",
-                    m.config.name
+        .filter_map(|m| {
+            let (adapter_type, reason) = targets
+                .for_model(&m.config.name)
+                .into_iter()
+                .find_map(|a| snapshot_refusal(a).map(|r| (a.adapter_type.clone(), r)))?;
+            Some(
+                Diagnostic::error(
+                    diagnostic::E049,
+                    &m.config.name,
+                    format!(
+                        "snapshot model `{}` cannot run on the configured {adapter_type} \
+                         warehouse: {reason}",
+                        m.config.name
+                    ),
+                )
+                .with_suggestion(
+                    "use a warehouse that supports MERGE (PostgreSQL 15+ with merge_mode = \
+                     \"merge\"), or change the model's strategy",
                 ),
-            )
-            .with_suggestion(
-                "use a warehouse that supports MERGE (PostgreSQL 15+ with merge_mode = \"merge\"), \
-                 or change the model's strategy",
             )
         })
         .collect()
 }
 
 /// E053 for every model that updates rows by key — `merge`, or `incremental`
-/// with a `unique_key` — when every warehouse adapter the project configures
-/// has no upsert to render it with
+/// with a `unique_key` — when a warehouse it runs on ([`ModelTargets`]) has
+/// no upsert to render it with
 /// ([`rocky_core::traits::SqlDialect::merge_unsupported_reason`]):
-/// ClickHouse. Conservative like E049: a project that also configures a
-/// capable warehouse is not refused here; `rocky run` refuses at SQL
-/// generation if the model runs on ClickHouse.
+/// ClickHouse. Fail closed: one refusing target is enough.
 fn merge_adapter_diagnostics(
-    config: &rocky_config::RockyConfig,
+    targets: &ModelTargets<'_>,
     result: &compile::CompileResult,
 ) -> Vec<Diagnostic> {
-    let mut refusal: Option<(String, &'static str)> = None;
-    for adapter in warehouse_adapters(config) {
-        let reason = match crate::registry::postgres_dialect_for_config(adapter) {
-            Some(dialect) => dialect.merge_unsupported_reason(),
-            None => crate::registry::warehouse_dialect_for_type(&adapter.adapter_type)
-                .and_then(rocky_core::traits::SqlDialect::merge_unsupported_reason),
-        };
-        // One capable (or unknown) warehouse is enough to stay silent.
-        let Some(reason) = reason else {
-            return Vec::new();
-        };
-        refusal.get_or_insert((adapter.adapter_type.clone(), reason));
-    }
-    let Some((adapter_type, reason)) = refusal else {
-        return Vec::new();
-    };
     result
         .project
         .models
@@ -978,6 +1135,10 @@ fn merge_adapter_diagnostics(
                 }
                 _ => return None,
             };
+            let (adapter_type, reason) = targets
+                .for_model(&m.config.name)
+                .into_iter()
+                .find_map(|a| merge_refusal(a).map(|r| (a.adapter_type.clone(), r)))?;
             Some(
                 Diagnostic::error(
                     diagnostic::E053,
@@ -999,17 +1160,12 @@ fn merge_adapter_diagnostics(
 
 /// E054 for every model whose SQL (ephemeral upstreams already inlined)
 /// SQL Server cannot run because its CTEs cannot be lifted to one leading
-/// `WITH` ([`rocky_sqlserver::tsql::hoist_ctes`]), when every warehouse
-/// adapter the project configures is SQL Server. Conservative like E053: a
-/// project that also configures another warehouse is not refused here.
+/// `WITH` ([`rocky_sqlserver::tsql::hoist_ctes`]), when a warehouse the model
+/// runs on ([`ModelTargets`]) is SQL Server. Fail closed.
 fn sqlserver_cte_diagnostics(
-    config: &rocky_config::RockyConfig,
+    targets: &ModelTargets<'_>,
     result: &compile::CompileResult,
 ) -> Vec<Diagnostic> {
-    let mut warehouses = warehouse_adapters(config).peekable();
-    if warehouses.peek().is_none() || !warehouses.all(|a| a.adapter_type == "sqlserver") {
-        return Vec::new();
-    }
     result
         .project
         .models
@@ -1019,6 +1175,12 @@ fn sqlserver_cte_diagnostics(
                 m.config.strategy,
                 rocky_core::models::StrategyConfig::Ephemeral
             )
+        })
+        .filter(|m| {
+            targets
+                .for_model(&m.config.name)
+                .iter()
+                .any(|a| a.adapter_type == "sqlserver")
         })
         .filter(|m| rocky_sqlserver::tsql::hoist_ctes(&m.sql).is_none())
         .map(|m| {
@@ -1038,6 +1200,13 @@ fn sqlserver_cte_diagnostics(
             )
         })
         .collect()
+}
+
+/// Whether every warehouse `model` runs on is PostgreSQL (and there is at
+/// least one). Redshift does not count: it has no functional-dependence rule.
+fn runs_only_on_postgres(targets: &ModelTargets<'_>, model: &str) -> bool {
+    let adapters = targets.for_model(model);
+    !adapters.is_empty() && adapters.iter().all(|a| a.adapter_type == "postgres")
 }
 
 /// Extra data the `rocky compile` text renderer needs from the raw
@@ -1428,8 +1597,8 @@ schema_template = "s"
     /// PostgreSQL / Redshift render the function's DDL at compile time, so a
     /// definition their rendering refuses is E051 now rather than at run:
     /// a Redshift `[target] catalog`, a body with the dollar-quote
-    /// delimiter, an argument in a qualified reference. A capable warehouse
-    /// beside them keeps compile quiet.
+    /// delimiter, an argument in a qualified reference. A capable adapter
+    /// beside them that no pipeline targets does not hide the refusal.
     #[test]
     fn udf_refused_by_postgres_or_redshift_rendering_is_e051() {
         let rs = PG.replace("postgres", "redshift");
@@ -1479,27 +1648,41 @@ schema_template = "s"
                 e051[0].message
             );
 
-            // DuckDB beside it can create the function: no compile refusal.
+            // A DuckDB adapter that no pipeline targets does not hide the
+            // refusal: the calling model still runs on the refusing target.
             let dir = TempDir::new().unwrap();
             let both =
                 format!("{adapters}\n[adapter.local]\ntype = \"duckdb\"\npath = \":memory:\"\n");
             let config = udf_project(dir.path(), &both);
+            fs::write(
+                dir.path().join("functions/dbl.toml"),
+                format!(
+                    "returns = \"DOUBLE\"\n\n[[arguments]]\nname = \"x\"\ntype = \"DOUBLE\"\n\n{target}"
+                ),
+            )
+            .unwrap();
             fs::write(dir.path().join("functions/dbl.sql"), body).unwrap();
             let codes = compile_codes(dir.path(), &config);
-            assert!(!codes.iter().any(|(c, _)| c == "E051"), "{body}: {codes:?}");
+            assert!(
+                codes.contains(&("E051".to_string(), "dbl".to_string())),
+                "{body}: {codes:?}"
+            );
         }
     }
 
-    /// A capable warehouse beside Trino keeps compile quiet: the run
-    /// refuses at the boundary if the model lands on Trino.
+    /// A capable adapter that no pipeline targets does not hide the
+    /// refusal: the pipeline runs the model on Trino.
     #[test]
-    fn udf_with_a_capable_warehouse_configured_is_not_e051() {
+    fn udf_with_an_unused_capable_adapter_is_still_e051() {
         let dir = TempDir::new().unwrap();
         let adapters =
             format!("{TRINO}\n[adapter.local]\ntype = \"duckdb\"\npath = \":memory:\"\n");
         let config = udf_project(dir.path(), &adapters);
         let codes = compile_codes(dir.path(), &config);
-        assert!(!codes.iter().any(|(c, _)| c == "E051"), "{codes:?}");
+        assert!(
+            codes.contains(&("E051".to_string(), "dbl".to_string())),
+            "{codes:?}"
+        );
     }
 
     fn snapshot_project(root: &Path, adapters: &str) -> std::path::PathBuf {
@@ -1609,8 +1792,8 @@ schema_template = "s"
     /// Two ephemeral upstreams that each end in `WITH final AS …`, read by a
     /// consumer with its own `final`, lift on SQL Server (the nested names
     /// are renamed in scope). A nested CTE named like a column the outer
-    /// query reads cannot be lifted: E054 on a SQL Server-only project, and
-    /// silence when another warehouse is configured.
+    /// query reads cannot be lifted: E054 when the pipeline targets SQL Server,
+    /// even with an unused DuckDB adapter configured beside it.
     #[test]
     fn sqlserver_cte_lifting_is_checked_at_compile() {
         let write = |models: &Path, name: &str, sql: &str, strategy: &str| {
@@ -1681,13 +1864,19 @@ schema_template = "s"
         let adapters = format!("{SS}\n[adapter.local]\ntype = \"duckdb\"\npath = \":memory:\"\n");
         let config = project(dir.path(), &adapters);
         let codes = compile_codes(dir.path(), &config);
-        assert!(!codes.iter().any(|(c, _)| c == "E054"), "{codes:?}");
+        let e054: Vec<&str> = codes
+            .iter()
+            .filter(|(c, _)| c == "E054")
+            .map(|(_, m)| m.as_str())
+            .collect();
+        assert_eq!(e054, vec!["bad"], "{codes:?}");
     }
 
-    /// A warehouse with MERGE beside ClickHouse keeps compile quiet; the run
-    /// refuses at SQL generation if the model lands on ClickHouse.
+    /// The red-team repro: the pipeline targets ClickHouse and a DuckDB
+    /// adapter sits unused beside it. The DuckDB adapter used to silence
+    /// E053, and `rocky run` then failed with "ClickHouse has no MERGE".
     #[test]
-    fn clickhouse_merge_with_a_capable_warehouse_is_not_e053() {
+    fn clickhouse_merge_with_an_unused_capable_adapter_is_still_e053() {
         let dir = TempDir::new().unwrap();
         let adapters = format!("{CH}\n[adapter.local]\ntype = \"duckdb\"\npath = \":memory:\"\n");
         let config = adapter_project(dir.path(), &adapters);
@@ -1699,7 +1888,220 @@ schema_template = "s"
         )
         .unwrap();
         let codes = compile_codes(dir.path(), &config);
-        assert!(!codes.iter().any(|(c, _)| c == "E053"), "{codes:?}");
+        assert!(
+            codes.contains(&("E053".to_string(), "m".to_string())),
+            "{codes:?}"
+        );
+    }
+
+    /// A project with two transformation pipelines: `models/duck/**` runs on
+    /// DuckDB (`[adapter.local]`), `models/other/**` on the `wh` adapter.
+    fn split_project(root: &Path, wh: &str) -> std::path::PathBuf {
+        fs::create_dir_all(root.join("models/duck")).unwrap();
+        fs::create_dir_all(root.join("models/other")).unwrap();
+        let path = root.join("rocky.toml");
+        fs::write(
+            &path,
+            format!(
+                "{wh}\n[adapter.local]\ntype = \"duckdb\"\npath = \":memory:\"\n\n\
+                 [pipeline.duck]\ntype = \"transformation\"\nmodels = \"models/duck/**\"\n\
+                 target = {{ adapter = \"local\" }}\n\n\
+                 [pipeline.other]\ntype = \"transformation\"\nmodels = \"models/other/**\"\n\
+                 target = {{ adapter = \"wh\" }}\n"
+            ),
+        )
+        .unwrap();
+        path
+    }
+
+    fn write_strategy_model(dir: &Path, name: &str, sql: &str, strategy: &str) {
+        fs::write(dir.join(format!("{name}.sql")), sql).unwrap();
+        fs::write(
+            dir.join(format!("{name}.toml")),
+            format!("{strategy}\n[target]\ncatalog = \"\"\nschema = \"s\"\n"),
+        )
+        .unwrap();
+    }
+
+    fn codes_of<'a>(codes: &'a [(String, String)], code: &str) -> Vec<&'a str> {
+        codes
+            .iter()
+            .filter(|(c, _)| c == code)
+            .map(|(_, m)| m.as_str())
+            .collect()
+    }
+
+    /// Each model is judged against the warehouse its own pipeline targets:
+    /// the model in the DuckDB pipeline is not refused, the same shape in
+    /// the SQL Server / ClickHouse pipeline is.
+    #[test]
+    fn adapter_gates_follow_each_models_pipeline_target() {
+        // SQL Server: E054 (CTE lifting) and E049 (snapshot) only on its side.
+        let dir = TempDir::new().unwrap();
+        let config = split_project(dir.path(), SS);
+        let bad_cte = "SELECT v FROM (WITH v AS (SELECT 1 AS v) SELECT v FROM v) AS s";
+        let snap = "SELECT 1 AS id, CAST('2024-01-01' AS TIMESTAMP) AS updated_at";
+        let snap_strategy = "[strategy]\ntype = \"snapshot\"\nunique_key = \"id\"\n\
+                             strategy = \"timestamp\"\nupdated_at = \"updated_at\"\n";
+        let fr = "[strategy]\ntype = \"full_refresh\"\n";
+        let duck = dir.path().join("models/duck");
+        let other = dir.path().join("models/other");
+        write_strategy_model(&duck, "cte_duck", bad_cte, fr);
+        write_strategy_model(&other, "cte_ss", bad_cte, fr);
+        write_strategy_model(&duck, "snap_duck", snap, snap_strategy);
+        write_strategy_model(&other, "snap_ss", snap, snap_strategy);
+        let codes = compile_codes(dir.path(), &config);
+        assert_eq!(codes_of(&codes, "E054"), vec!["cte_ss"], "{codes:?}");
+        assert_eq!(codes_of(&codes, "E049"), vec!["snap_ss"], "{codes:?}");
+
+        // ClickHouse: E053 only on its side.
+        let dir = TempDir::new().unwrap();
+        let config = split_project(dir.path(), CH);
+        let merge = "[strategy]\ntype = \"merge\"\nunique_key = [\"id\"]\n";
+        let duck = dir.path().join("models/duck");
+        let other = dir.path().join("models/other");
+        write_strategy_model(&duck, "m_duck", "SELECT 1 AS id", merge);
+        write_strategy_model(&other, "m_ch", "SELECT 1 AS id", merge);
+        let codes = compile_codes(dir.path(), &config);
+        assert_eq!(codes_of(&codes, "E053"), vec!["m_ch"], "{codes:?}");
+    }
+
+    /// A model that two pipelines load runs on both targets; one refusing
+    /// target refuses it (fail closed).
+    #[test]
+    fn a_model_on_two_targets_is_refused_when_either_refuses() {
+        let dir = TempDir::new().unwrap();
+        fs::create_dir_all(dir.path().join("models")).unwrap();
+        let config = dir.path().join("rocky.toml");
+        fs::write(
+            &config,
+            format!(
+                "{CH}\n[adapter.local]\ntype = \"duckdb\"\npath = \":memory:\"\n\n\
+                 [pipeline.a]\ntype = \"transformation\"\nmodels = \"models/**\"\n\
+                 target = {{ adapter = \"local\" }}\n\n\
+                 [pipeline.b]\ntype = \"transformation\"\nmodels = \"models/**\"\n\
+                 target = {{ adapter = \"wh\" }}\n"
+            ),
+        )
+        .unwrap();
+        write_strategy_model(
+            &dir.path().join("models"),
+            "m",
+            "SELECT 1 AS id",
+            "[strategy]\ntype = \"merge\"\nunique_key = [\"id\"]\n",
+        );
+        let codes = compile_codes(dir.path(), &config);
+        assert_eq!(codes_of(&codes, "E053"), vec!["m"], "{codes:?}");
+    }
+
+    fn compile_in(root: &Path, config: &Path) -> CompileOutput {
+        compile_output(
+            Some(config),
+            &root.join("state.redb"),
+            &root.join("models"),
+            None,
+            None,
+            false,
+            None,
+            false,
+            None,
+        )
+        .unwrap()
+    }
+
+    /// A GROUP BY that reads a non-grouped column: E044 everywhere but
+    /// PostgreSQL, which accepts it when the column depends on a grouped
+    /// primary key (W044). Redshift has no such rule and keeps E044.
+    #[test]
+    fn group_by_on_postgres_is_w044_and_on_redshift_stays_e044() {
+        let group = |adapters: &str| {
+            let dir = TempDir::new().unwrap();
+            let config = adapter_project(dir.path(), adapters);
+            let models = dir.path().join("models");
+            write_model(&models, "raw", "SELECT 1 AS id, 'x' AS status, 2 AS amount");
+            write_model(
+                &models,
+                "agg",
+                "SELECT id, status, SUM(amount) AS total FROM raw GROUP BY id",
+            );
+            let out = compile_in(dir.path(), &config);
+            let found: Vec<(String, Severity)> = out
+                .diagnostics
+                .iter()
+                .filter(|d| d.model == "agg" && (&*d.code == "E044" || &*d.code == "W044"))
+                .map(|d| (d.code.to_string(), d.severity))
+                .collect();
+            (found, out.has_errors)
+        };
+        let (pg, pg_errors) = group(PG);
+        assert_eq!(pg, vec![("W044".to_string(), Severity::Warning)]);
+        assert!(!pg_errors, "W044 alone must not fail the compile");
+        let (rs, rs_errors) = group(&PG.replace("postgres", "redshift"));
+        assert_eq!(rs, vec![("E044".to_string(), Severity::Error)]);
+        assert!(rs_errors);
+        let (duck, _) = group("[adapter.wh]\ntype = \"duckdb\"\npath = \":memory:\"\n");
+        assert_eq!(duck, vec![("E044".to_string(), Severity::Error)]);
+    }
+
+    /// The operand checks judge each model against its pipeline's target:
+    /// `SUM(text)` is E042 on PostgreSQL (no implicit text cast), and a
+    /// ClickHouse target says it has no rules rather than "no target
+    /// dialect configured".
+    #[test]
+    fn operand_checks_use_the_models_target_dialect() {
+        let sum_text = |adapters: &str| {
+            let dir = TempDir::new().unwrap();
+            let config = adapter_project(dir.path(), adapters);
+            fs::create_dir_all(dir.path().join("data")).unwrap();
+            fs::write(
+                dir.path().join("data/seed.sql"),
+                "CREATE SCHEMA raw; CREATE TABLE raw.t (id INTEGER, status VARCHAR);",
+            )
+            .unwrap();
+            write_model(
+                &dir.path().join("models"),
+                "agg",
+                "SELECT SUM(status) AS s FROM raw.t",
+            );
+            compile_output(
+                Some(&config),
+                &dir.path().join("state.redb"),
+                &dir.path().join("models"),
+                None,
+                None,
+                false,
+                None,
+                true,
+                None,
+            )
+            .unwrap()
+            .diagnostics
+            .into_iter()
+            .filter(|d| &*d.code == "E042" || &*d.code == "W042")
+            .map(|d| (d.code.to_string(), d.message.to_string()))
+            .collect::<Vec<_>>()
+        };
+        let pg = sum_text(PG);
+        assert_eq!(pg.len(), 1, "{pg:?}");
+        assert_eq!(pg[0].0, "E042", "{pg:?}");
+        assert!(pg[0].1.contains("PostgreSQL"), "{pg:?}");
+        let ch = sum_text(CH);
+        assert_eq!(ch.len(), 1, "{ch:?}");
+        assert_eq!(ch[0].0, "W042", "{ch:?}");
+        assert!(ch[0].1.contains("no operand rules"), "{ch:?}");
+        assert!(!ch[0].1.contains("no target dialect configured"), "{ch:?}");
+    }
+
+    /// `--deny-warnings` refuses codes that name no warning.
+    #[test]
+    fn deny_warnings_refuses_unknown_and_malformed_codes() {
+        validate_deny_warning_codes(&["W042".into(), " w043 ".into(), "P002".into()]).unwrap();
+        for bad in ["W999", "W42", "W 042", "E042", ""] {
+            let err = validate_deny_warning_codes(&[bad.to_string()]).unwrap_err();
+            let msg = err.to_string();
+            assert!(msg.contains("unknown or malformed"), "{bad}: {msg}");
+            assert!(msg.contains("W042"), "the valid list: {msg}");
+        }
     }
 
     #[test]
