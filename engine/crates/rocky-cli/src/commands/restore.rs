@@ -626,6 +626,7 @@ async fn restore_one(
     planned: &RestorePlanRestoration,
     now: DateTime<Utc>,
     fence: &dyn ObjectWriteFence,
+    written: &WrittenObjects,
 ) -> RestoreOneOutcome {
     let refuse = |reason: String| {
         RestoreOneOutcome::Refused(RestoreRefusedOutput {
@@ -777,7 +778,17 @@ async fn restore_one(
     let obj_path = ObjPath::from(format!("{key_prefix}/{relative}"));
     let bytes_written =
         match verify_or_create(&obj_store, &obj_path, &parquet, &tomb.blake3_hash, fence).await {
-            Ok(wrote) => wrote,
+            Ok(wrote) => {
+                // Recorded the moment the bytes land: a later refusal of this
+                // row (a failed ledger reinstatement) cannot take them back.
+                if wrote {
+                    written
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .insert(tomb.file_path.clone());
+                }
+                wrote
+            }
             Err(e) => {
                 if let Some(fenced) = e.downcast_ref::<RestoreFenced>() {
                     return RestoreOneOutcome::Fenced(fenced.reason.clone());
@@ -919,6 +930,9 @@ async fn verify_or_create(
     }
 }
 
+/// The objects a restore physically wrote, recorded as each write lands.
+type WrittenObjects = std::sync::Mutex<std::collections::BTreeSet<String>>;
+
 /// The restoration engine: re-resolve each planned tombstone against the live
 /// custody ledger and restore it fail-closed. Pure over its inputs (`store`,
 /// `stores`, `now`) so tests drive it directly; the review + policy gates live
@@ -931,6 +945,26 @@ async fn execute_restore_apply(
     plan: &RestorePlan,
     now: DateTime<Utc>,
     fence: &dyn ObjectWriteFence,
+) -> Result<RestoreApplyOutput> {
+    let written = WrittenObjects::default();
+    execute_restore_apply_recording(
+        store, stores, warehouse, plan_id, plan, now, fence, &written,
+    )
+    .await
+}
+
+/// [`execute_restore_apply`], recording every object it writes into `written`
+/// as the write lands, including one whose row is then refused.
+#[allow(clippy::too_many_arguments)]
+async fn execute_restore_apply_recording(
+    store: &StateStore,
+    stores: &dyn RestoreStores,
+    warehouse: &dyn rocky_core::traits::WarehouseAdapter,
+    plan_id: &str,
+    plan: &RestorePlan,
+    now: DateTime<Utc>,
+    fence: &dyn ObjectWriteFence,
+    written: &WrittenObjects,
 ) -> Result<RestoreApplyOutput> {
     let tombstones = store
         .list_tombstones()
@@ -950,6 +984,7 @@ async fn execute_restore_apply(
             planned,
             now,
             fence,
+            written,
         )
         .await
         {
@@ -959,10 +994,11 @@ async fn execute_restore_apply(
             RestoreOneOutcome::Fenced(reason) => {
                 return Err(anyhow::Error::new(RestoreFenced {
                     reason,
-                    written: restored
+                    written: written
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .iter()
-                        .filter(|r| r.bytes_written)
-                        .map(|r| r.file_path.clone())
+                        .cloned()
                         .collect(),
                 }));
             }
@@ -1305,7 +1341,11 @@ pub(crate) async fn restore_apply_output(
                     models_glob: models_glob.clone(),
                     prior_decisions: prior_decisions.clone(),
                 };
-                let exec = execute_restore_apply(
+                // Every object write lands in the command-wide `written`
+                // set as it happens, so an attempt that stops later (a
+                // fence, a refused row, the pre-publish regate) cannot lose
+                // one; the command's error names them all.
+                let exec = execute_restore_apply_recording(
                     fresh_store,
                     stores.as_ref(),
                     warehouse.as_ref(),
@@ -1313,19 +1353,16 @@ pub(crate) async fn restore_apply_output(
                     &plan,
                     Utc::now(),
                     &fence,
+                    &written,
                 )
                 .await;
                 if let Err(e) = &exec
                     && let Some(fenced) = e.downcast_ref::<RestoreFenced>()
                 {
-                    // The bytes written before the fence stay: record them
-                    // so the command's error names them.
-                    written
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .extend(fenced.written.iter().cloned());
+                    // The written objects are named once, by the command's
+                    // error context, not again in this message.
                     return Err(rocky_core::state_sync::StateSyncError::SeamTransition(
-                        fenced.to_string(),
+                        RestoreFenced::new(fenced.reason.clone()).to_string(),
                     ));
                 }
                 // Capture the irreversible effects as they happen: a later
@@ -2236,6 +2273,7 @@ mod tests {
                 &planned,
                 Utc::now(),
                 &NoFence,
+                &WrittenObjects::default(),
             )
             .await;
 
@@ -2447,6 +2485,18 @@ mod tests {
         /// The error used to say only "nothing more was written".
         #[tokio::test]
         async fn a_fence_refusal_mid_loop_names_the_objects_already_written() {
+            fence_refusal_after_one_write(false).await;
+        }
+
+        /// Review follow-up: the same when the first row is REFUSED after its
+        /// bytes were written (here its ledger reinstatement finds a
+        /// conflicting row). The object is on the store all the same.
+        #[tokio::test]
+        async fn a_fence_refusal_names_an_object_whose_row_was_refused_after_writing() {
+            fence_refusal_after_one_write(true).await;
+        }
+
+        async fn fence_refusal_after_one_write(refuse_first_row_after_write: bool) {
             use std::sync::atomic::{AtomicUsize, Ordering};
 
             let dir = TempDir::new().unwrap();
@@ -2484,6 +2534,21 @@ mod tests {
                 ));
                 cas.delete(&obj_path).await.unwrap();
                 paths.push(obj_path);
+                if refuse_first_row_after_write && run == "r1" {
+                    // A live ledger row at the same location with another
+                    // hash: the reinstatement after the write is refused.
+                    store
+                        .record_artifact(&ArtifactRecord {
+                            blake3_hash: "c".repeat(64),
+                            run_id: run.to_string(),
+                            model_name: "orders".to_string(),
+                            file_path: wr.file_path.clone(),
+                            commit_version: wr.commit_version,
+                            size_bytes: wr.size_bytes,
+                            written_at: Utc::now(),
+                        })
+                        .unwrap();
+                }
                 restorations.push(RestorePlanRestoration {
                     model_name: "orders".to_string(),
                     run_id: run.to_string(),
