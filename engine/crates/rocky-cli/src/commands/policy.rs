@@ -1627,11 +1627,23 @@ expect = \"deny\"
             None,
             None,
             false,
-            &rocky_core::config::PrincipalRef::unnamed(),
+            &rocky_core::config::PrincipalRef {
+                id: rocky_core::config::PrincipalId::parse_asserted("ops-1").unwrap(),
+                source: rocky_core::config::PrincipalIdSource::Flag,
+            },
             true,
         )
         .expect("freeze must record and exit 0 even with no [policy] block");
         let store = StateStore::open(&state).unwrap();
+        // RV4-P1: the row names the OPERATOR who froze; `principal` stays the
+        // frozen class.
+        let rows = store.list_policy_decisions().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].principal_ref.as_ref().map(|r| r.id.as_str()),
+            Some("ops-1")
+        );
+        assert_eq!(rows[0].principal, PolicyPrincipal::Agent);
         let freezes = policy::active_freezes(&store.list_policy_decisions().unwrap());
         assert_eq!(
             freezes.len(),

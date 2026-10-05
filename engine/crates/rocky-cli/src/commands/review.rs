@@ -3302,11 +3302,15 @@ mod tests {
         );
         // gc_bbb evicts from `b`, which `c` reads from.
         touch_plan_file(root, "gc_bbb");
+        let queue_actor = rocky_core::config::PrincipalRef {
+            id: rocky_core::config::PrincipalId::parse_asserted("queue-actor").unwrap(),
+            source: rocky_core::config::PrincipalIdSource::Flag,
+        };
         record_plan_review_escalation(
             &state_path,
             "gc_bbb",
             PolicyPrincipal::Human,
-            &rocky_core::config::PrincipalRef::unnamed(),
+            &queue_actor,
             PolicyCapability::Gc,
             "gc: 1 artifact(s) across 1 model(s)",
             vec!["b".to_string()],
@@ -3322,6 +3326,9 @@ mod tests {
              it does not sort first on id, so only the blast radius can put it there"
         );
         assert_eq!(out.pending[0].blast_radius, Some(1));
+        // RV4-P1: the escalation row carries the actor, and the queue shows it.
+        assert_eq!(out.pending[0].principal_id.as_deref(), Some("queue-actor"));
+        assert_eq!(out.pending[1].principal_id.as_deref(), Some("unnamed"));
         assert_eq!(out.pending[1].plan_id, "gc_aaa");
         assert_eq!(
             out.pending[1].blast_radius,

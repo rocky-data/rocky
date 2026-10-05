@@ -8918,11 +8918,12 @@ effect = "allow"
         assert!(resolved.contains("orders") && !resolved.contains("corp.prod.orders"));
 
         let loaded = rocky_core::config::load_rocky_config(&config)?;
+        let actor = test_actor("gate-actor");
         let _gate = super::evaluate_apply_policy_with_policy_matching(
             loaded.policy.as_ref(),
             "plan_p",
             PolicyPrincipal::Agent,
-            &rocky_core::config::PrincipalRef::unnamed(),
+            &actor,
             &touched,
             &models_dir,
             None,
@@ -8945,7 +8946,21 @@ effect = "allow"
             row("corp.prod.orders").models.is_empty(),
             "verbatim: no key, whatever a model happens to be named"
         );
+        // RV4-P1: the gate core stamps the acting principal id on every row
+        // it records, beside the class it enforced.
+        for model in ["orders", "corp.prod.orders"] {
+            assert_eq!(row(model).principal_ref.as_ref(), Some(&actor), "{model}");
+            assert_eq!(row(model).principal, PolicyPrincipal::Agent, "{model}");
+        }
         Ok(())
+    }
+
+    /// A named actor for the RV4-P1 writer tests.
+    fn test_actor(id: &str) -> rocky_core::config::PrincipalRef {
+        rocky_core::config::PrincipalRef {
+            id: rocky_core::config::PrincipalId::parse_asserted(id).unwrap(),
+            source: rocky_core::config::PrincipalIdSource::Flag,
+        }
     }
 
     /// `resolve_config_models_dir` reads the transformation pipeline's `models`
@@ -11946,6 +11961,38 @@ schema_template = "s__{source}"
         );
         // The halt-only state (no rollback substrate) must be stated plainly.
         assert!(msg.contains("HAS ALREADY LANDED"), "halt-only state: {msg}");
+    }
+
+    /// RV4-P1: the `verify_after` custody row carries the applier's principal
+    /// id, on the passing and the failing path alike.
+    #[test]
+    fn verify_after_custody_row_carries_the_actor() {
+        let actor = rocky_core::config::PrincipalRef {
+            id: rocky_core::config::PrincipalId::parse_asserted("verify-actor").unwrap(),
+            source: rocky_core::config::PrincipalIdSource::Env,
+        };
+        for (plan, passed) in [("plan-va-pass", true), ("plan-va-fail", false)] {
+            let dir = tempfile::tempdir().unwrap();
+            let state = dir.path().join("state.redb");
+            let run_id = record_run_with_checks(&state, &[("row_count", passed)]);
+            let result = super::run_verify_after(
+                plan,
+                PolicyPrincipal::Agent,
+                &actor,
+                &["row_count".to_string()],
+                &run_id,
+                &state,
+            );
+            assert_eq!(result.is_ok(), passed, "{plan}");
+            let row = StateStore::open_read_only(&state)
+                .unwrap()
+                .list_policy_decisions()
+                .unwrap()
+                .into_iter()
+                .find(|d| d.plan_id == plan)
+                .expect("the custody row was written");
+            assert_eq!(row.principal_ref.as_ref(), Some(&actor), "{plan}");
+        }
     }
 
     /// #1919: a `verify_after` check name can hold a resolved `${VAR}`. The

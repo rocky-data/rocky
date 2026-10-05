@@ -988,6 +988,18 @@ effect = "deny"
             .any(|d| d.model == "orders" && d.effect == rocky_core::config::PolicyEffect::Deny),
         "the propose-time deny is recorded in the ledger: {decisions:?}"
     );
+    // RV4-P1: with no `--principal-id`, a default-profile server records its
+    // decisions as `mcp-default`, source `mcp_profile`.
+    let row = decisions
+        .iter()
+        .find(|d| d.model == "orders")
+        .expect("the orders row");
+    let actor = row.principal_ref.as_ref().expect("the row names its actor");
+    assert_eq!(actor.id.as_str(), "mcp-default");
+    assert_eq!(
+        actor.source,
+        rocky_core::config::PrincipalIdSource::McpProfile
+    );
 }
 
 /// A `require_review` verdict at propose time still **persists** the plan (it is

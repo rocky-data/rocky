@@ -26,6 +26,8 @@ const CHAIN: AuditForOutput = {
         effect: "require_review",
         rule_id: 1,
         reason: "<script>alert(1)</script> hostile reason",
+        principal_id: null,
+        principal_id_verified: false,
       },
     ],
   },

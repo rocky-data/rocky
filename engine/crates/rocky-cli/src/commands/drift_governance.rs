@@ -789,6 +789,47 @@ mod tests {
         );
     }
 
+    /// RV4-P1: the governed custody row and its verification row both carry
+    /// the run's principal id; the class stays `agent`.
+    #[tokio::test]
+    async fn drift_custody_rows_carry_the_run_actor() {
+        let actor = PrincipalRef {
+            id: rocky_core::config::PrincipalId::parse_asserted("drift-actor").unwrap(),
+            source: rocky_core::config::PrincipalIdSource::Flag,
+        };
+        let cfg = cfg_opt_in_no_policy();
+        let gov = DriftGovernor::build(&cfg, "run-act", "wh.raw.orders", true, &[], &actor)
+            .expect("governor present");
+        let (store, _d) = temp_store();
+        let state = Arc::new(store);
+        let _ = gov
+            .govern(&additive_add_drift(), "wh.raw.orders", &state)
+            .await;
+        let rows = state.list_policy_decisions().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].principal_ref.as_ref(), Some(&actor));
+        assert_eq!(rows[0].principal, PolicyPrincipal::Agent);
+
+        // The verification row `finalize_drift_verify_after` writes.
+        let (store, _d) = temp_store();
+        let policy = granting_policy(&["row_count"], None);
+        store
+            .record_policy_decision(&applied_decision("run-v", "wh.raw.orders"))
+            .unwrap();
+        store
+            .record_run(&run_with_checks("run-v", &[("row_count", true)]))
+            .unwrap();
+        finalize_drift_verify_after(Some(&store), "run-v", Some(&policy), &actor).unwrap();
+        let verify_rows: Vec<_> = store
+            .list_policy_decisions()
+            .unwrap()
+            .into_iter()
+            .filter(|r| !r.verify_after.is_empty())
+            .collect();
+        assert_eq!(verify_rows.len(), 1);
+        assert_eq!(verify_rows[0].principal_ref.as_ref(), Some(&actor));
+    }
+
     /// A `[policy]` block whose rule 0 grants `schema_change.additive` on any
     /// scope with the given `verify_after` checks and optional budget — the
     /// shape the finalize gate resolves required checks from.

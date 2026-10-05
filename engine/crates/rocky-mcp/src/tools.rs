@@ -8068,6 +8068,29 @@ type = "duckdb"
 database = ":memory:"
 "#;
 
+    /// RV4-P1: every profile has a valid default actor `mcp-<profile>`, and
+    /// `with_actor` (what `rocky mcp --principal-id` uses) replaces it.
+    #[test]
+    fn mcp_profiles_default_to_a_named_actor_and_can_be_overridden() {
+        for (profile, id) in [
+            (McpProfile::Default, "mcp-default"),
+            (McpProfile::Approver, "mcp-approver"),
+            (McpProfile::Worker, "mcp-worker"),
+        ] {
+            let actor = profile.default_actor();
+            assert_eq!(actor.id.as_str(), id);
+            assert_eq!(
+                actor.source,
+                rocky_core::config::PrincipalIdSource::McpProfile
+            );
+        }
+        let (_tmp, server) = write_mcp_project(Some(VALID_MCP_TOML));
+        assert_eq!(server.actor().id.as_str(), "mcp-default");
+        let named = rocky_core::config::PrincipalRef::resolve(Some("agent-7"), None, None).unwrap();
+        let server = server.with_actor(named.clone());
+        assert_eq!(server.actor(), &named);
+    }
+
     /// The single config read behind every compile-backed MCP tool. A present
     /// but unloadable `rocky.toml` must refuse; it used to return the same
     /// empty map a project with no config returns.
