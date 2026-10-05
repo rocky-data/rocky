@@ -27,10 +27,10 @@ use rocky_core::state::{PolicyDecisionRecord, RunRecord, StateStore};
 
 use crate::output::{
     AuditChainBlastRadius, AuditChainDecisions, AuditChainPlan, AuditChainRuns, AuditChainVerify,
-    AuditDecisionEntry, AuditFilter, AuditForOutput, AuditOutput, AuditPlanChange, AuditProductScope,
-    AuditRunEntry, AuditScorecardOutput, AuditSubjectKind, AuditVerifyEntry, ScorecardDimension,
-    ScorecardGroup, ScorecardUnavailableMetric, ScorecardVerifyAfter, SectionAvailability,
-    print_json,
+    AuditDecisionEntry, AuditFilter, AuditForOutput, AuditOutput, AuditPlanChange,
+    AuditProductScope, AuditRunEntry, AuditScorecardOutput, AuditSubjectKind, AuditVerifyEntry,
+    ScorecardDimension, ScorecardGroup, ScorecardUnavailableMetric, ScorecardVerifyAfter,
+    SectionAvailability, print_json,
 };
 use crate::plan_store::read_plan;
 
@@ -112,11 +112,7 @@ impl AuditQuery {
     ///
     /// An `--actor` value outside the id grammar (no row can carry it), or a
     /// `--since` value in none of the accepted shapes.
-    pub fn parse(
-        actor: Option<&str>,
-        since: Option<&str>,
-        now: DateTime<Utc>,
-    ) -> Result<Self> {
+    pub fn parse(actor: Option<&str>, since: Option<&str>, now: DateTime<Utc>) -> Result<Self> {
         let actor = actor
             .map(|raw| {
                 // Grammar only: `unnamed` and `unrecorded` are valid filters
@@ -1591,8 +1587,12 @@ mod tests {
     }
 
     fn query(actor: Option<&str>, since: Option<&str>) -> AuditQuery {
-        AuditQuery::parse(actor, since, Utc.with_ymd_and_hms(2026, 10, 5, 12, 0, 0).unwrap())
-            .unwrap()
+        AuditQuery::parse(
+            actor,
+            since,
+            Utc.with_ymd_and_hms(2026, 10, 5, 12, 0, 0).unwrap(),
+        )
+        .unwrap()
     }
 
     fn plans(out: &AuditOutput) -> Vec<&str> {
@@ -1605,7 +1605,11 @@ mod tests {
     fn audit_since_boundary_is_inclusive() {
         let bound = Utc.with_ymd_and_hms(2026, 10, 1, 0, 0, 0).unwrap();
         let rows = vec![
-            row_at(bound - chrono::Duration::nanoseconds(1), "early", Some("alice")),
+            row_at(
+                bound - chrono::Duration::nanoseconds(1),
+                "early",
+                Some("alice"),
+            ),
             row_at(bound, "equal", Some("alice")),
             row_at(bound + chrono::Duration::seconds(1), "later", Some("alice")),
         ];
@@ -1625,10 +1629,21 @@ mod tests {
     fn audit_since_offset_is_normalized_to_utc() {
         // 09:00 at +02:00 is 07:00 UTC.
         let q = query(None, Some("2026-10-01T09:00:00+02:00"));
-        assert_eq!(q.since, Some(Utc.with_ymd_and_hms(2026, 10, 1, 7, 0, 0).unwrap()));
+        assert_eq!(
+            q.since,
+            Some(Utc.with_ymd_and_hms(2026, 10, 1, 7, 0, 0).unwrap())
+        );
         let rows = vec![
-            row_at(Utc.with_ymd_and_hms(2026, 10, 1, 6, 59, 59).unwrap(), "before", None),
-            row_at(Utc.with_ymd_and_hms(2026, 10, 1, 7, 0, 0).unwrap(), "at", None),
+            row_at(
+                Utc.with_ymd_and_hms(2026, 10, 1, 6, 59, 59).unwrap(),
+                "before",
+                None,
+            ),
+            row_at(
+                Utc.with_ymd_and_hms(2026, 10, 1, 7, 0, 0).unwrap(),
+                "at",
+                None,
+            ),
         ];
         let out = audit_output_from(rows, None, &q);
         assert_eq!(plans(&out), vec!["at"]);
@@ -1652,7 +1667,14 @@ mod tests {
             Utc.with_ymd_and_hms(2026, 10, 5, 6, 0, 0).unwrap()
         );
         assert!(parse_since("2099-01-01", now).is_ok());
-        for bad in ["all", "yesterday", "2026-10-01T09:00:00", "2026-13-01", "", "7w"] {
+        for bad in [
+            "all",
+            "yesterday",
+            "2026-10-01T09:00:00",
+            "2026-13-01",
+            "",
+            "7w",
+        ] {
             let err = parse_since(bad, now).expect_err(bad).to_string();
             assert!(err.contains("invalid --since"), "{bad}: {err}");
         }
@@ -1673,7 +1695,11 @@ mod tests {
             row_at(t, "old2", None),
             row_at(t, "a2", Some("alice")),
             // Out of range: neither listed nor counted.
-            row_at(Utc.with_ymd_and_hms(2026, 9, 1, 0, 0, 0).unwrap(), "old0", None),
+            row_at(
+                Utc.with_ymd_and_hms(2026, 9, 1, 0, 0, 0).unwrap(),
+                "old0",
+                None,
+            ),
         ];
         let out = audit_output_from(rows, None, &query(Some("alice"), Some("2026-10-01")));
         assert_eq!(plans(&out), vec!["a1", "a2"]);
@@ -1699,12 +1725,7 @@ mod tests {
     #[test]
     fn audit_actor_unrecorded_lists_rows_without_an_id() {
         let t = Utc.with_ymd_and_hms(2026, 10, 2, 0, 0, 0).unwrap();
-        let rows = || {
-            vec![
-                row_at(t, "a1", Some("alice")),
-                row_at(t, "old1", None),
-            ]
-        };
+        let rows = || vec![row_at(t, "a1", Some("alice")), row_at(t, "old1", None)];
         let out = audit_output_from(rows(), None, &query(Some("unrecorded"), None));
         assert_eq!(plans(&out), vec!["old1"]);
         assert_eq!(out.unattributed_skipped, 0);
@@ -1740,7 +1761,11 @@ mod tests {
         let t = Utc.with_ymd_and_hms(2026, 10, 2, 0, 0, 0).unwrap();
         let mut other = row_at(t, "other-model", Some("alice"));
         other.model = "dim_customers".to_string();
-        let rows = vec![row_at(t, "mine", Some("alice")), other, row_at(t, "bob", Some("bob"))];
+        let rows = vec![
+            row_at(t, "mine", Some("alice")),
+            other,
+            row_at(t, "bob", Some("bob")),
+        ];
         let scope = AuditProductScope {
             name: "orders".to_string(),
             output_model: "fct_orders".to_string(),
@@ -2040,7 +2065,8 @@ mod tests {
                 output_model: "revenue_daily".to_string(),
             }
         );
-        let scoped = compute_audit(&state_path, Some(scope.clone()), &AuditQuery::default()).unwrap();
+        let scoped =
+            compute_audit(&state_path, Some(scope.clone()), &AuditQuery::default()).unwrap();
         assert_eq!(scoped.product, Some(scope));
         assert_eq!(plan_ids(&scoped), ["plan-a", "plan-c"]);
 
@@ -2057,7 +2083,8 @@ mod tests {
         );
 
         // An absent store is an empty ledger, scoped or not.
-        let empty = compute_audit(&root.join("missing.redb"), None, &AuditQuery::default()).unwrap();
+        let empty =
+            compute_audit(&root.join("missing.redb"), None, &AuditQuery::default()).unwrap();
         assert!(empty.decisions.is_empty());
     }
 

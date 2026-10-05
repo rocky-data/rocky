@@ -99,6 +99,7 @@ pub async fn run_apply(
 /// most-restrictively with the plan's kind-forced principal (see
 /// [`PersistedPlan::enforcement_principal`]); the plan's stored `principal`
 /// field is never trusted for a gate decision.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_apply_in(
     root: &Path,
     config_path: &Path,
@@ -129,6 +130,7 @@ pub(crate) async fn run_apply_in(
 /// façade consumes it, because a resumed apply deflected as
 /// `skipped_in_flight` returns `Ok` here and would otherwise be
 /// mis-journaled as `applied`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_apply_core_in(
     root: &Path,
     config_path: &Path,
@@ -709,6 +711,7 @@ fn validate_run_plan_execution_shape(plan_id: &str, run_plan: &RunPlan) -> Resul
 /// joined here with any checks resolved before execution. Keeping that join,
 /// custody decision, and remote upload in one helper prevents a plan-kind arm
 /// from accepting replication requirements without actually enforcing them.
+#[allow(clippy::too_many_arguments)]
 async fn finish_apply_verify_after(
     plan_id: &str,
     principal: PolicyPrincipal,
@@ -747,7 +750,14 @@ async fn finish_apply_verify_after(
     let verdict = {
         let store = open_ledger_with_retry(state_path)
             .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
-        evaluate_verify_after(&store, plan_id, principal, actor, &verify_checks, apply_run_id)?
+        evaluate_verify_after(
+            &store,
+            plan_id,
+            principal,
+            actor,
+            &verify_checks,
+            apply_run_id,
+        )?
     };
     commit_verify_after_custody(Some(cfg), state_path, &verdict.record).await?;
     verdict.into_result(plan_id, &verify_checks)
@@ -1796,6 +1806,7 @@ async fn commit_verify_after_custody(
 /// synthesizes a bare-`apply` entry per planned model, so its execution stays
 /// governed (do not pass an empty map for an executing plan or the gate is
 /// bypassed).
+#[allow(clippy::too_many_arguments)]
 pub fn evaluate_apply_policy(
     config_path: &Path,
     plan_id: &str,
@@ -12183,8 +12194,15 @@ schema_template = "s__{source}"
         let state = dir.path().join("state.redb");
         // No required checks → the gate is a no-op and never touches state.
         assert!(
-            super::run_verify_after("plan-x", PolicyPrincipal::Agent, &rocky_core::config::PrincipalRef::unnamed(), &[], "unused-id", &state)
-                .is_ok()
+            super::run_verify_after(
+                "plan-x",
+                PolicyPrincipal::Agent,
+                &rocky_core::config::PrincipalRef::unnamed(),
+                &[],
+                "unused-id",
+                &state
+            )
+            .is_ok()
         );
     }
 

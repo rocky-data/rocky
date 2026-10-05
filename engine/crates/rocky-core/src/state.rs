@@ -11936,7 +11936,10 @@ mod tests {
         });
         let row: PolicyDecisionRecord = serde_json::from_value(blob)
             .expect("a pre-RV4-P1 decision row must forward-deserialize");
-        assert!(row.principal_ref.is_none(), "an old row never named its actor");
+        assert!(
+            row.principal_ref.is_none(),
+            "an old row never named its actor"
+        );
         let bytes = serde_json::to_string(&row).unwrap();
         assert!(
             !bytes.contains("principal_ref"),

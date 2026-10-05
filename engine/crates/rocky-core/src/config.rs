@@ -3299,9 +3299,9 @@ impl PrincipalId {
         }
         let bytes = s.as_bytes();
         let lead_ok = bytes[0].is_ascii_lowercase() || bytes[0].is_ascii_digit();
-        let rest_ok = bytes[1..]
-            .iter()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'_' | b'-'));
+        let rest_ok = bytes[1..].iter().all(|b| {
+            b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'_' | b'-')
+        });
         if !lead_ok || !rest_ok {
             return Err(PrincipalIdError::Grammar { id: s.to_string() });
         }
@@ -3494,7 +3494,8 @@ mod principal_id_tests {
             assert_eq!(id.as_str(), s);
         }
 
-        let refused: [(&str, fn(&PrincipalIdError) -> bool); 13] = [
+        type Expect = fn(&PrincipalIdError) -> bool;
+        let refused: [(&str, Expect); 13] = [
             ("", |e| matches!(e, PrincipalIdError::Empty)),
             (too_long_64.as_str(), |e| {
                 matches!(e, PrincipalIdError::TooLong { len: 64, .. })
@@ -3503,21 +3504,27 @@ mod principal_id_tests {
             ("alice@example.com", |e| {
                 matches!(e, PrincipalIdError::Grammar { .. })
             }),
-            ("team:alice", |e| matches!(e, PrincipalIdError::Grammar { .. })),
-            ("team/alice", |e| matches!(e, PrincipalIdError::Grammar { .. })),
+            ("team:alice", |e| {
+                matches!(e, PrincipalIdError::Grammar { .. })
+            }),
+            ("team/alice", |e| {
+                matches!(e, PrincipalIdError::Grammar { .. })
+            }),
             ("a|b", |e| matches!(e, PrincipalIdError::Grammar { .. })),
             ("-alice", |e| matches!(e, PrincipalIdError::Grammar { .. })),
             (".alice", |e| matches!(e, PrincipalIdError::Grammar { .. })),
             ("al ice", |e| matches!(e, PrincipalIdError::Grammar { .. })),
             ("ålice", |e| matches!(e, PrincipalIdError::Grammar { .. })),
-            ("unnamed", |e| matches!(e, PrincipalIdError::Reserved { .. })),
+            ("unnamed", |e| {
+                matches!(e, PrincipalIdError::Reserved { .. })
+            }),
             ("unrecorded", |e| {
                 matches!(e, PrincipalIdError::Reserved { .. })
             }),
         ];
         for (s, expect) in refused {
-            let err = PrincipalId::parse_asserted(s)
-                .expect_err(&format!("'{s}' should be refused"));
+            let err =
+                PrincipalId::parse_asserted(s).expect_err(&format!("'{s}' should be refused"));
             assert!(expect(&err), "'{s}' refused with the wrong reason: {err:?}");
         }
     }
@@ -3565,7 +3572,9 @@ mod principal_id_tests {
     fn principal_ref_invalid_inputs_fail_closed() {
         assert!(matches!(
             PrincipalRef::resolve(None, Some("Bob"), Some("worker")),
-            Err(ResolvePrincipalIdError::Env(PrincipalIdError::Grammar { .. }))
+            Err(ResolvePrincipalIdError::Env(
+                PrincipalIdError::Grammar { .. }
+            ))
         ));
         assert!(matches!(
             PrincipalRef::resolve(None, Some(""), None),
@@ -3573,11 +3582,15 @@ mod principal_id_tests {
         ));
         assert!(matches!(
             PrincipalRef::resolve(None, Some("unnamed"), None),
-            Err(ResolvePrincipalIdError::Env(PrincipalIdError::Reserved { .. }))
+            Err(ResolvePrincipalIdError::Env(
+                PrincipalIdError::Reserved { .. }
+            ))
         ));
         assert!(matches!(
             PrincipalRef::resolve(Some("x@y"), Some("bob"), None),
-            Err(ResolvePrincipalIdError::Flag(PrincipalIdError::Grammar { .. }))
+            Err(ResolvePrincipalIdError::Flag(
+                PrincipalIdError::Grammar { .. }
+            ))
         ));
     }
 

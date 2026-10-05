@@ -1683,6 +1683,7 @@ pub(crate) async fn run_gc_apply_in(
 
 /// [`run_gc_apply_in`] with an injectable [`LivenessOracle`] — the real path
 /// passes [`ManifestLivenessOracle`]; tests pass a deterministic oracle.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_gc_apply_in_with(
     root: &Path,
     config_path: &Path,
@@ -3992,7 +3993,16 @@ auto_create_schemas = true
         let models_dir = root.join("models");
 
         // 1. Create the reclamation plan.
-        run_gc_plan_in(root, &state_path, &config, 7, PolicyPrincipal::Human, &rocky_core::config::PrincipalRef::unnamed(), true).unwrap();
+        run_gc_plan_in(
+            root,
+            &state_path,
+            &config,
+            7,
+            PolicyPrincipal::Human,
+            &rocky_core::config::PrincipalRef::unnamed(),
+            true,
+        )
+        .unwrap();
         let plans_dir = root.join(".rocky").join("plans");
         let plan_id = std::fs::read_dir(&plans_dir)
             .unwrap()

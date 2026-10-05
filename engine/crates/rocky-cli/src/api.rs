@@ -5471,7 +5471,14 @@ mod tests {
         let text = resp.text().await.unwrap();
         assert_eq!(
             text,
-            reference_bytes(&compute_audit(&state_path, None, &crate::commands::audit::AuditQuery::default()).unwrap())
+            reference_bytes(
+                &compute_audit(
+                    &state_path,
+                    None,
+                    &crate::commands::audit::AuditQuery::default()
+                )
+                .unwrap()
+            )
         );
         let whole: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert!(whole.get("product").is_none(), "{text}");
@@ -5485,7 +5492,14 @@ mod tests {
         let scope = resolve_product_scope(&root, "revenue_daily").unwrap();
         assert_eq!(
             text,
-            reference_bytes(&compute_audit(&state_path, Some(scope), &crate::commands::audit::AuditQuery::default()).unwrap())
+            reference_bytes(
+                &compute_audit(
+                    &state_path,
+                    Some(scope),
+                    &crate::commands::audit::AuditQuery::default()
+                )
+                .unwrap()
+            )
         );
         let scoped: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(scoped["product"]["output_model"], "revenue_daily");
@@ -5601,7 +5615,14 @@ mod tests {
         assert_eq!(resp.status(), 200);
         assert_eq!(
             resp.text().await.unwrap(),
-            reference_bytes(&compute_audit(&state_path, None, &crate::commands::audit::AuditQuery::default()).unwrap())
+            reference_bytes(
+                &compute_audit(
+                    &state_path,
+                    None,
+                    &crate::commands::audit::AuditQuery::default()
+                )
+                .unwrap()
+            )
         );
 
         let resp = reqwest::get(format!("{base}/api/v1/audit?product=revenue_daily"))

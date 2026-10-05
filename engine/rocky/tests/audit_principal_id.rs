@@ -30,7 +30,7 @@ fn global_args<'a>(dir: &'a Path, state: &'a str) -> Vec<String> {
     ]
 }
 
-fn ok(out: Output, what: &str) -> serde_json::Value {
+fn ok(out: &Output, what: &str) -> serde_json::Value {
     assert!(
         out.status.success(),
         "{what} must exit 0, got {:?}; stderr: {}",
@@ -51,16 +51,38 @@ fn principal_id_reaches_the_ledger_and_audit_filters_on_it() {
     // 1. The flag.
     let mut args = global_args(dir.path(), state);
     args.extend(
-        ["--principal-id", "alice", "policy", "freeze", "--principal", "agent", "--scope", "any"]
-            .map(String::from),
+        [
+            "--principal-id",
+            "alice",
+            "policy",
+            "freeze",
+            "--principal",
+            "agent",
+            "--scope",
+            "any",
+        ]
+        .map(String::from),
     );
-    ok(rocky(dir.path()).args(&args).output().unwrap(), "freeze --principal-id alice");
+    ok(
+        &rocky(dir.path()).args(&args).output().unwrap(),
+        "freeze --principal-id alice",
+    );
 
     // 2. The env var, when the flag is absent.
     let mut args = global_args(dir.path(), state);
-    args.extend(["policy", "unfreeze", "--principal", "agent", "--scope", "any"].map(String::from));
+    args.extend(
+        [
+            "policy",
+            "unfreeze",
+            "--principal",
+            "agent",
+            "--scope",
+            "any",
+        ]
+        .map(String::from),
+    );
     ok(
-        rocky(dir.path())
+        &rocky(dir.path())
             .env("ROCKY_PRINCIPAL_ID", "carol")
             .args(&args)
             .output()
@@ -71,19 +93,28 @@ fn principal_id_reaches_the_ledger_and_audit_filters_on_it() {
     // 3. Neither: the default.
     let mut args = global_args(dir.path(), state);
     args.extend(["policy", "freeze", "--principal", "human", "--scope", "any"].map(String::from));
-    ok(rocky(dir.path()).args(&args).output().unwrap(), "freeze with no id");
+    ok(
+        &rocky(dir.path()).args(&args).output().unwrap(),
+        "freeze with no id",
+    );
 
     // `rocky audit --actor alice --since <today>`: alice's row only.
     let mut args = global_args(dir.path(), state);
     args.extend(["audit", "--actor", "alice", "--since"].map(String::from));
     args.push(today.clone());
-    let audit = ok(rocky(dir.path()).args(&args).output().unwrap(), "audit --actor alice");
+    let audit = ok(
+        &rocky(dir.path()).args(&args).output().unwrap(),
+        "audit --actor alice",
+    );
     let decisions = audit["decisions"].as_array().expect("decisions");
     assert_eq!(decisions.len(), 1, "only alice's row: {audit:#}");
     assert_eq!(decisions[0]["principal_id"], "alice");
     assert_eq!(decisions[0]["principal_id_source"], "flag");
     assert_eq!(decisions[0]["principal_id_verified"], false);
-    assert_eq!(decisions[0]["principal"], "agent", "the frozen class stays the class");
+    assert_eq!(
+        decisions[0]["principal"], "agent",
+        "the frozen class stays the class"
+    );
     assert_eq!(audit["filter"]["actor"], "alice");
     assert_eq!(audit["filter"]["since"], format!("{today}T00:00:00Z"));
     assert_eq!(audit["unattributed_skipped"], 0);
@@ -91,7 +122,7 @@ fn principal_id_reaches_the_ledger_and_audit_filters_on_it() {
     // The whole ledger: one row per source, oldest first.
     let mut args = global_args(dir.path(), state);
     args.push("audit".to_string());
-    let audit = ok(rocky(dir.path()).args(&args).output().unwrap(), "audit");
+    let audit = ok(&rocky(dir.path()).args(&args).output().unwrap(), "audit");
     let got: Vec<(String, String)> = audit["decisions"]
         .as_array()
         .unwrap()
@@ -111,12 +142,18 @@ fn principal_id_reaches_the_ledger_and_audit_filters_on_it() {
             ("unnamed".to_string(), "default".to_string()),
         ]
     );
-    assert!(audit.get("filter").is_none(), "no filter, no key: {audit:#}");
+    assert!(
+        audit.get("filter").is_none(),
+        "no filter, no key: {audit:#}"
+    );
 
     // A future `--since` lists nothing and is not an error.
     let mut args = global_args(dir.path(), state);
     args.extend(["audit", "--since", "2999-01-01"].map(String::from));
-    let audit = ok(rocky(dir.path()).args(&args).output().unwrap(), "audit --since future");
+    let audit = ok(
+        &rocky(dir.path()).args(&args).output().unwrap(),
+        "audit --since future",
+    );
     assert_eq!(audit["decisions"].as_array().unwrap().len(), 0);
 }
 
@@ -148,7 +185,7 @@ fn invalid_principal_ids_fail_closed() {
     // Nothing was recorded by either refusal.
     let mut args = global_args(dir.path(), state);
     args.push("audit".to_string());
-    let audit = ok(rocky(dir.path()).args(&args).output().unwrap(), "audit");
+    let audit = ok(&rocky(dir.path()).args(&args).output().unwrap(), "audit");
     assert_eq!(audit["decisions"].as_array().unwrap().len(), 0);
 
     // A malformed `--actor` or `--since` is a usage error.
@@ -158,6 +195,9 @@ fn invalid_principal_ids_fail_closed() {
         args.extend(bad.map(String::from));
         let out = rocky(dir.path()).args(&args).output().unwrap();
         assert_eq!(out.status.code(), Some(1), "{bad:?}: {out:?}");
-        assert!(String::from_utf8_lossy(&out.stderr).contains("invalid --"), "{bad:?}");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("invalid --"),
+            "{bad:?}"
+        );
     }
 }

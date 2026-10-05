@@ -324,8 +324,8 @@ fn policy_freeze_download_failure_fails_closed() {
         None,  // scope — any
         None,  // reason — synthesized
         false, // lift
-        false, &rocky_core::config::PrincipalRef::unnamed(),
-// json
+        &rocky_core::config::PrincipalRef::unnamed(),
+        false, // json
     )
     .expect_err("a remote-backend freeze must fail closed when the download fails");
 

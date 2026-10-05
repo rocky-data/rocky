@@ -927,6 +927,7 @@ fn marker_error_to_sync(e: FreezeMarkerError) -> StateSyncError {
 /// always on wherever a durable object tier exists. These marker keys never
 /// bump the shared blob generation, so blob CAS does not serialize them or
 /// close a marker-LIST-to-mutation window.
+#[allow(clippy::too_many_arguments)]
 pub fn run_policy_freeze(
     config_path: &Path,
     state_path: &Path,

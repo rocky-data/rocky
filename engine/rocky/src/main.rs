@@ -3776,7 +3776,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                         &resolve_cli_principal_id(cli.principal_id.as_deref(), None)?,
                         json,
                     )
-                        .await
+                    .await
                 }
                 None => anyhow::bail!(
                     "usage: rocky fulfill <product> [--retry] | rocky fulfill approve-spec \
@@ -5525,7 +5525,8 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             let profile: rocky_mcp::McpProfile = profile.into();
             // `--principal-id` / `ROCKY_PRINCIPAL_ID` on the server process
             // win; otherwise the server acts as `mcp-<profile>`.
-            let actor = resolve_cli_principal_id(cli.principal_id.as_deref(), Some(profile.name()))?;
+            let actor =
+                resolve_cli_principal_id(cli.principal_id.as_deref(), Some(profile.name()))?;
             rocky_mcp::serve_stdio(config, profile, actor).await
         }
     };
@@ -5981,6 +5982,10 @@ mod tests {
     /// `--principal-id` is global (before or after the subcommand), and
     /// `rocky audit --actor/--since` parse and refuse `--for`/`--scorecard`.
     #[test]
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "a conflict check needs the parse error, which the wrapper turns into a panic"
+    )]
     fn principal_id_flag_and_audit_actor_since_parse() {
         let cli = try_parse_with_big_stack(&[
             "rocky",
@@ -5999,9 +6004,8 @@ mod tests {
         assert_eq!(actor.as_deref(), Some("bob"));
         assert_eq!(since.as_deref(), Some("7d"));
 
-        let cli = try_parse_with_big_stack(&[
-            "rocky", "policy", "freeze", "--principal-id", "ops-1",
-        ]);
+        let cli =
+            try_parse_with_big_stack(&["rocky", "policy", "freeze", "--principal-id", "ops-1"]);
         assert_eq!(cli.principal_id.as_deref(), Some("ops-1"));
 
         for conflicting in [
@@ -6030,7 +6034,10 @@ mod tests {
     fn resolve_cli_principal_id_precedence_without_env() {
         use rocky_core::config::PrincipalIdSource;
         let r = resolve_cli_principal_id(Some("alice"), Some("worker")).unwrap();
-        assert_eq!((r.id.as_str(), r.source), ("alice", PrincipalIdSource::Flag));
+        assert_eq!(
+            (r.id.as_str(), r.source),
+            ("alice", PrincipalIdSource::Flag)
+        );
         assert!(resolve_cli_principal_id(Some("Alice"), None).is_err());
         assert!(resolve_cli_principal_id(Some("unnamed"), None).is_err());
         if std::env::var_os("ROCKY_PRINCIPAL_ID").is_none() {
@@ -6040,7 +6047,10 @@ mod tests {
                 ("mcp-worker", PrincipalIdSource::McpProfile)
             );
             let r = resolve_cli_principal_id(None, None).unwrap();
-            assert_eq!((r.id.as_str(), r.source), ("unnamed", PrincipalIdSource::Default));
+            assert_eq!(
+                (r.id.as_str(), r.source),
+                ("unnamed", PrincipalIdSource::Default)
+            );
         }
     }
 

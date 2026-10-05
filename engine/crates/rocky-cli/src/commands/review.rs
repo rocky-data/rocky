@@ -1421,6 +1421,7 @@ fn queue_graph_keys(
 /// Best-effort like every other ledger write: the review-marker gate at apply
 /// is the safety boundary, the ledger is the trail — a locked or unreadable
 /// state store must not fail plan creation.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn record_plan_review_escalation(
     state_path: &Path,
     plan_id: &str,

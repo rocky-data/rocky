@@ -119,13 +119,13 @@ impl StateTurnstile {
 fn default_sub_runner(actor: rocky_core::config::PrincipalRef) -> SubRunner {
     Arc::new(
         move |config_path: PathBuf,
-         loaded: Arc<rocky_core::config::LoadedConfig>,
-         state_path: PathBuf,
-         pipeline_name: String,
-         model_name: Option<String>,
-         partition_opts,
-         skip_opts,
-         shadow_config: Option<rocky_core::shadow::ShadowConfig>| {
+              loaded: Arc<rocky_core::config::LoadedConfig>,
+              state_path: PathBuf,
+              pipeline_name: String,
+              model_name: Option<String>,
+              partition_opts,
+              skip_opts,
+              shadow_config: Option<rocky_core::shadow::ShadowConfig>| {
             let actor = actor.clone();
             Box::pin(async move {
                 super::run::run(

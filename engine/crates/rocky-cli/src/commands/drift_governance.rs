@@ -692,8 +692,15 @@ mod tests {
         // a breaking change ungoverned. Pre-fix, `build` returned `None` and the
         // `.expect` below panics; post-fix it governs and refuses.
         let cfg = cfg_opt_in_no_policy();
-        let gov = DriftGovernor::build(&cfg, "run-x", "wh.raw.orders", true, &[], &PrincipalRef::unnamed())
-            .expect("opt-in on ⇒ a governor must exist even without a [policy] block");
+        let gov = DriftGovernor::build(
+            &cfg,
+            "run-x",
+            "wh.raw.orders",
+            true,
+            &[],
+            &PrincipalRef::unnamed(),
+        )
+        .expect("opt-in on ⇒ a governor must exist even without a [policy] block");
         assert_eq!(
             gov.effect,
             PolicyEffect::RequireReview,
@@ -748,8 +755,15 @@ mod tests {
         // grant ⇒ nothing auto-applies) — recording a require-review custody
         // row and never authorising a mutation.
         let cfg = cfg_opt_in_no_policy();
-        let gov = DriftGovernor::build(&cfg, "run-x", "wh.raw.orders", true, &[], &PrincipalRef::unnamed())
-            .expect("governor present");
+        let gov = DriftGovernor::build(
+            &cfg,
+            "run-x",
+            "wh.raw.orders",
+            true,
+            &[],
+            &PrincipalRef::unnamed(),
+        )
+        .expect("governor present");
         let (store, _d) = temp_store();
         let state = Arc::new(store);
 
@@ -938,7 +952,15 @@ mod tests {
     fn no_auto_heals_is_ok() {
         let (store, _d) = temp_store();
         let policy = granting_policy(&["row_count"], None);
-        assert!(finalize_drift_verify_after(Some(&store), "run-1", Some(&policy), &PrincipalRef::unnamed()).is_ok());
+        assert!(
+            finalize_drift_verify_after(
+                Some(&store),
+                "run-1",
+                Some(&policy),
+                &PrincipalRef::unnamed()
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -951,7 +973,15 @@ mod tests {
         store
             .record_run(&run_with_checks("run-1", &[("row_count", true)]))
             .unwrap();
-        assert!(finalize_drift_verify_after(Some(&store), "run-1", Some(&policy), &PrincipalRef::unnamed()).is_ok());
+        assert!(
+            finalize_drift_verify_after(
+                Some(&store),
+                "run-1",
+                Some(&policy),
+                &PrincipalRef::unnamed()
+            )
+            .is_ok()
+        );
         // A verification custody row was written with effect=allow, under the
         // same plan id as the decision row.
         let rows = verify_rows(&store, "run-1");
@@ -984,8 +1014,13 @@ mod tests {
         );
         store.record_run(&record).unwrap();
 
-        let err = finalize_drift_verify_after(Some(&store), "run-1", Some(&policy), &PrincipalRef::unnamed())
-            .expect_err("an absent required check must fail the gate closed");
+        let err = finalize_drift_verify_after(
+            Some(&store),
+            "run-1",
+            Some(&policy),
+            &PrincipalRef::unnamed(),
+        )
+        .expect_err("an absent required check must fail the gate closed");
         assert!(
             err.to_string().contains("absent — did not run"),
             "the refusal names the absence rather than a failure: {err}"
@@ -1006,7 +1041,13 @@ mod tests {
         store
             .record_run(&run_with_checks("run-2", &[("row_count", false)]))
             .unwrap();
-        let err = finalize_drift_verify_after(Some(&store), "run-2", Some(&policy), &PrincipalRef::unnamed()).unwrap_err();
+        let err = finalize_drift_verify_after(
+            Some(&store),
+            "run-2",
+            Some(&policy),
+            &PrincipalRef::unnamed(),
+        )
+        .unwrap_err();
         assert!(
             err.to_string().contains("verify_after gate FAILED"),
             "{err}"
@@ -1027,7 +1068,15 @@ mod tests {
             .record_policy_decision(&applied_decision("run-3", "wh.raw.orders"))
             .unwrap();
         store.record_run(&run_with_checks("run-3", &[])).unwrap();
-        assert!(finalize_drift_verify_after(Some(&store), "run-3", Some(&policy), &PrincipalRef::unnamed()).is_err());
+        assert!(
+            finalize_drift_verify_after(
+                Some(&store),
+                "run-3",
+                Some(&policy),
+                &PrincipalRef::unnamed()
+            )
+            .is_err()
+        );
     }
 
     /// 🔴 #1715, the drift-governance half. A required check that ran,
@@ -1062,8 +1111,13 @@ mod tests {
         );
         store.record_run(&record).unwrap();
 
-        let err = finalize_drift_verify_after(Some(&store), "run-1715", Some(&policy), &PrincipalRef::unnamed())
-            .expect_err("a check that measured nothing cannot confirm the migration");
+        let err = finalize_drift_verify_after(
+            Some(&store),
+            "run-1715",
+            Some(&policy),
+            &PrincipalRef::unnamed(),
+        )
+        .expect_err("a check that measured nothing cannot confirm the migration");
         assert!(
             err.to_string().contains("not evaluated")
                 && err.to_string().contains("only one contributing table"),
@@ -1089,7 +1143,13 @@ mod tests {
             .record_run(&run_with_checks("run-ok", &[("row_count", true)]))
             .unwrap();
         assert!(
-            finalize_drift_verify_after(Some(&store), "run-ok", Some(&policy), &PrincipalRef::unnamed()).is_ok(),
+            finalize_drift_verify_after(
+                Some(&store),
+                "run-ok",
+                Some(&policy),
+                &PrincipalRef::unnamed()
+            )
+            .is_ok(),
             "a measured pass still confirms the migration"
         );
         assert_eq!(verify_rows(&store, "run-ok")[0].effect, PolicyEffect::Allow);
@@ -1109,7 +1169,15 @@ mod tests {
                 &[("row_count", true), ("row_count", false)],
             ))
             .unwrap();
-        assert!(finalize_drift_verify_after(Some(&store), "run-4", Some(&policy), &PrincipalRef::unnamed()).is_err());
+        assert!(
+            finalize_drift_verify_after(
+                Some(&store),
+                "run-4",
+                Some(&policy),
+                &PrincipalRef::unnamed()
+            )
+            .is_err()
+        );
     }
 
     /// A freeze-decision row exactly as `rocky policy freeze` records it.
@@ -1144,8 +1212,15 @@ mod tests {
     #[tokio::test]
     async fn active_freeze_blocks_auto_apply_even_with_a_granting_rule() {
         let cfg = cfg_opt_in_with_policy(granting_policy(&[], None));
-        let gov = DriftGovernor::build(&cfg, "run-fz", "wh.raw.orders", true, &[], &PrincipalRef::unnamed())
-            .expect("governor present");
+        let gov = DriftGovernor::build(
+            &cfg,
+            "run-fz",
+            "wh.raw.orders",
+            true,
+            &[],
+            &PrincipalRef::unnamed(),
+        )
+        .expect("governor present");
         assert_eq!(
             gov.effect,
             PolicyEffect::Allow,
@@ -1184,8 +1259,15 @@ mod tests {
     #[tokio::test]
     async fn human_scoped_freeze_does_not_block_agent_auto_apply() {
         let cfg = cfg_opt_in_with_policy(granting_policy(&[], None));
-        let gov =
-            DriftGovernor::build(&cfg, "run-hfz", "wh.raw.orders", true, &[], &PrincipalRef::unnamed()).expect("governor");
+        let gov = DriftGovernor::build(
+            &cfg,
+            "run-hfz",
+            "wh.raw.orders",
+            true,
+            &[],
+            &PrincipalRef::unnamed(),
+        )
+        .expect("governor");
         let (store, _d) = temp_store();
         store
             .record_policy_decision(&freeze_record(PolicyPrincipal::Human, "any"))
@@ -1211,8 +1293,15 @@ mod tests {
             window: "7d".to_string().into(),
         };
         let cfg = cfg_opt_in_with_policy(granting_policy(&["row_count"], Some(budget)));
-        let gov =
-            DriftGovernor::build(&cfg, "run-b2", "wh.raw.orders", true, &[], &PrincipalRef::unnamed()).expect("governor");
+        let gov = DriftGovernor::build(
+            &cfg,
+            "run-b2",
+            "wh.raw.orders",
+            true,
+            &[],
+            &PrincipalRef::unnamed(),
+        )
+        .expect("governor");
         assert_eq!(gov.effect, PolicyEffect::Allow);
 
         let (store, _d) = temp_store();
@@ -1265,8 +1354,15 @@ mod tests {
     async fn auto_heal_verify_failure_burns_the_granting_rules_budget() {
         let policy = granting_policy(&["row_count"], None);
         let cfg = cfg_opt_in_with_policy(policy.clone());
-        let gov =
-            DriftGovernor::build(&cfg, "run-burn", "wh.raw.orders", true, &[], &PrincipalRef::unnamed()).expect("governor");
+        let gov = DriftGovernor::build(
+            &cfg,
+            "run-burn",
+            "wh.raw.orders",
+            true,
+            &[],
+            &PrincipalRef::unnamed(),
+        )
+        .expect("governor");
 
         let (store, _d) = temp_store();
         let state = Arc::new(store);
@@ -1302,7 +1398,13 @@ mod tests {
         store
             .record_run(&run_with_checks("run-burn", &[("row_count", false)]))
             .unwrap();
-        let err = finalize_drift_verify_after(Some(&store), "run-burn", Some(&policy), &PrincipalRef::unnamed()).unwrap_err();
+        let err = finalize_drift_verify_after(
+            Some(&store),
+            "run-burn",
+            Some(&policy),
+            &PrincipalRef::unnamed(),
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("verify_after gate FAILED"));
 
         // The pair now counts against rule 0's budget.
@@ -1354,8 +1456,15 @@ mod tests {
         );
         // Sanity: the SAME governor with an authoritative ledger applies — proves
         // the refusal is authority-driven, not policy-driven (non-vacuous).
-        let gov_ok =
-            DriftGovernor::build(&cfg, "run-ok", "wh.raw.orders", true, &[], &PrincipalRef::unnamed()).expect("governor");
+        let gov_ok = DriftGovernor::build(
+            &cfg,
+            "run-ok",
+            "wh.raw.orders",
+            true,
+            &[],
+            &PrincipalRef::unnamed(),
+        )
+        .expect("governor");
         let (store2, _d2) = temp_store();
         let d2 = gov_ok
             .govern(&additive_add_drift(), "wh.raw.orders", &Arc::new(store2))
@@ -1383,9 +1492,15 @@ mod tests {
         // false: authority alone decides.
         let ledger_authoritative = authority.is_usable();
         assert!(!ledger_authoritative);
-        let gov_dl =
-            DriftGovernor::build(&cfg, "run-dl", "wh.raw.orders", ledger_authoritative, &[], &PrincipalRef::unnamed())
-                .expect("governor");
+        let gov_dl = DriftGovernor::build(
+            &cfg,
+            "run-dl",
+            "wh.raw.orders",
+            ledger_authoritative,
+            &[],
+            &PrincipalRef::unnamed(),
+        )
+        .expect("governor");
         let (store3, _d3) = temp_store();
         let d3 = gov_dl
             .govern(&additive_add_drift(), "wh.raw.orders", &Arc::new(store3))
@@ -1409,8 +1524,15 @@ mod tests {
     #[tokio::test]
     async fn freeze_plus_non_additive_records_deny_not_require_review() {
         let cfg = cfg_opt_in_with_policy(granting_policy(&[], None));
-        let gov =
-            DriftGovernor::build(&cfg, "run-d6", "wh.raw.orders", true, &[], &PrincipalRef::unnamed()).expect("governor");
+        let gov = DriftGovernor::build(
+            &cfg,
+            "run-d6",
+            "wh.raw.orders",
+            true,
+            &[],
+            &PrincipalRef::unnamed(),
+        )
+        .expect("governor");
         let (store, _d) = temp_store();
         store
             .record_policy_decision(&freeze_record(PolicyPrincipal::Agent, "any"))

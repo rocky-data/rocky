@@ -1588,9 +1588,15 @@ pub(crate) async fn run_compact_apply_in(
     actor: &rocky_core::config::PrincipalRef,
     output_json: bool,
 ) -> Result<()> {
-    let (rocky_cfg, statements) =
-        prepare_compact_apply(root, config_path, plan_id, state_path, runtime_principal, actor)
-            .await?;
+    let (rocky_cfg, statements) = prepare_compact_apply(
+        root,
+        config_path,
+        plan_id,
+        state_path,
+        runtime_principal,
+        actor,
+    )
+    .await?;
 
     // Build the warehouse adapter from the SAME snapshot the gate cleared, then
     // execute. Only reached once the policy gate has passed.
@@ -1719,6 +1725,7 @@ async fn execute_compact_apply(
 /// any `execute_statement` reaches the adapter (zero recorded statements),
 /// while an allowed apply reaches it.
 #[cfg(test)]
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_compact_apply_in_with(
     root: &Path,
     config_path: &Path,
@@ -1729,9 +1736,15 @@ pub(crate) async fn run_compact_apply_in_with(
     output_json: bool,
     adapter: &dyn WarehouseAdapter,
 ) -> Result<()> {
-    let (_rocky_cfg, statements) =
-        prepare_compact_apply(root, config_path, plan_id, state_path, runtime_principal, actor)
-            .await?;
+    let (_rocky_cfg, statements) = prepare_compact_apply(
+        root,
+        config_path,
+        plan_id,
+        state_path,
+        runtime_principal,
+        actor,
+    )
+    .await?;
     execute_compact_apply(adapter, plan_id, &statements, output_json).await
 }
 
@@ -1742,6 +1755,7 @@ pub(crate) async fn run_compact_apply_in_with(
 /// BEFORE any `execute_statement` reaches the adapter (zero recorded
 /// statements).
 #[cfg(test)]
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_compact_apply_alias_in_with(
     root: &Path,
     config_path: &Path,

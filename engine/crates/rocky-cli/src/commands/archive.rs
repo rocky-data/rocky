@@ -626,9 +626,15 @@ pub(crate) async fn run_archive_apply_in(
     actor: &rocky_core::config::PrincipalRef,
     output_json: bool,
 ) -> Result<()> {
-    let (rocky_cfg, statements) =
-        prepare_archive_apply(root, config_path, plan_id, state_path, runtime_principal, actor)
-            .await?;
+    let (rocky_cfg, statements) = prepare_archive_apply(
+        root,
+        config_path,
+        plan_id,
+        state_path,
+        runtime_principal,
+        actor,
+    )
+    .await?;
 
     // Build the warehouse adapter from the SAME snapshot the gate cleared, then
     // execute. Only reached once the policy gate has passed.
@@ -755,6 +761,7 @@ async fn execute_archive_apply(
 /// to prove a policy DENY refuses BEFORE any `execute_statement` reaches the
 /// adapter (zero recorded statements), while an allowed apply reaches it.
 #[cfg(test)]
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_archive_apply_in_with(
     root: &Path,
     config_path: &Path,
@@ -765,9 +772,15 @@ pub(crate) async fn run_archive_apply_in_with(
     output_json: bool,
     adapter: &dyn rocky_core::traits::WarehouseAdapter,
 ) -> Result<()> {
-    let (_rocky_cfg, statements) =
-        prepare_archive_apply(root, config_path, plan_id, state_path, runtime_principal, actor)
-            .await?;
+    let (_rocky_cfg, statements) = prepare_archive_apply(
+        root,
+        config_path,
+        plan_id,
+        state_path,
+        runtime_principal,
+        actor,
+    )
+    .await?;
     execute_archive_apply(adapter, plan_id, &statements, output_json).await
 }
 
@@ -778,6 +791,7 @@ pub(crate) async fn run_archive_apply_in_with(
 /// BEFORE any `execute_statement` reaches the adapter (zero recorded
 /// statements).
 #[cfg(test)]
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_archive_apply_alias_in_with(
     root: &Path,
     config_path: &Path,
