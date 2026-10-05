@@ -42,6 +42,12 @@ export type PolicyEffect = "allow" | "require_review" | "deny";
  */
 export type PolicyPrincipal = "human" | "agent";
 /**
+ * Where a [`PrincipalId`] came from.
+ *
+ * P1 knows four sources, and every one is self-asserted. RV4-P2 adds signed sources (a local key, CI OIDC). C2 adds `serve_token` for the HTTP API. A new variant is a change in meaning for an older binary, so the phase that adds one bumps the state schema.
+ */
+export type PrincipalIdSource = "flag" | "env" | "mcp_profile" | "default";
+/**
  * What `rocky audit --for <selector>` resolved its selector to.
  *
  * The selector is resolved in priority order: a 64-char hex string with a plan file on disk is a [`AuditSubjectKind::Plan`]; a string matching a `run_id` in the run ledger is a [`AuditSubjectKind::Run`]; a string the decision ledger keys rows by is likewise a [`AuditSubjectKind::Plan`] (the plan file may be gone, or the id may be a decision-only custody key that never had one); anything else is treated as a [`AuditSubjectKind::Model`] name.
@@ -153,6 +159,18 @@ export interface AuditDecisionEntry {
    * Who was acting (`human` / `agent`).
    */
   principal: PolicyPrincipal;
+  /**
+   * The id of the actor behind the decision (RV4-P1). `null` means unrecorded: the row was written before ids existed. `unnamed` means nobody named the actor.
+   */
+  principal_id?: string | null;
+  /**
+   * Where the id came from (`flag`, `env`, `mcp_profile`, `default`). `null` when the id is unrecorded.
+   */
+  principal_id_source?: PrincipalIdSource | null;
+  /**
+   * Whether anything verified the id. Always `false` today: ids are self-asserted until signed approvals exist.
+   */
+  principal_id_verified: boolean;
   /**
    * Human-readable explanation of how the effect was reached. A resolved `${VAR}` value prints as `${NAME}` (#1919).
    */

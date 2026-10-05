@@ -35,6 +35,12 @@ export type PolicyEffect = "allow" | "require_review" | "deny";
  * `agent` is a non-human caller (an AI harness authoring, applying, or remediating). `human` is a person. In v0 the principal is supplied explicitly (`rocky policy check --principal …`); auto-detection is a later phase.
  */
 export type PolicyPrincipal = "human" | "agent";
+/**
+ * Where a [`PrincipalId`] came from.
+ *
+ * P1 knows four sources, and every one is self-asserted. RV4-P2 adds signed sources (a local key, CI OIDC). C2 adds `serve_token` for the HTTP API. A new variant is a change in meaning for an older binary, so the phase that adds one bumps the state schema.
+ */
+export type PrincipalIdSource = "flag" | "env" | "mcp_profile" | "default";
 
 /**
  * JSON output for `rocky audit` — the agent-policy decision ledger.
@@ -44,13 +50,21 @@ export type PolicyPrincipal = "human" | "agent";
 export interface AuditOutput {
   command: string;
   /**
-   * Every recorded policy decision, oldest first. Under `product`, only the rows whose `model` is that product's output model.
+   * Every recorded policy decision, oldest first. Under `product`, only the rows whose `model` is that product's output model. Under `filter`, only the rows that match it.
    */
   decisions: AuditDecisionEntry[];
+  /**
+   * The `--actor` / `--since` filter applied, absent when neither was given.
+   */
+  filter?: AuditFilter | null;
   /**
    * The product the ledger was filtered to (`--product <name>`), absent when the whole ledger is listed.
    */
   product?: AuditProductScope | null;
+  /**
+   * How many rows in range carry no principal id (written before ids existed) and so an `--actor <id>` filter dropped them. `0` without an `--actor` filter, and under `--actor unrecorded`, which lists them.
+   */
+  unattributed_skipped: number;
   version: string;
   [k: string]: unknown;
 }
@@ -79,6 +93,18 @@ export interface AuditDecisionEntry {
    */
   principal: PolicyPrincipal;
   /**
+   * The id of the actor behind the decision (RV4-P1). `null` means unrecorded: the row was written before ids existed. `unnamed` means nobody named the actor.
+   */
+  principal_id?: string | null;
+  /**
+   * Where the id came from (`flag`, `env`, `mcp_profile`, `default`). `null` when the id is unrecorded.
+   */
+  principal_id_source?: PrincipalIdSource | null;
+  /**
+   * Whether anything verified the id. Always `false` today: ids are self-asserted until signed approvals exist.
+   */
+  principal_id_verified: boolean;
+  /**
    * Human-readable explanation of how the effect was reached. A resolved `${VAR}` value prints as `${NAME}` (#1919).
    */
   reason: string;
@@ -90,6 +116,20 @@ export interface AuditDecisionEntry {
    * RFC 3339 timestamp when the decision was recorded.
    */
   timestamp: string;
+  [k: string]: unknown;
+}
+/**
+ * The `--actor` / `--since` filter of `rocky audit` (RV4-P1).
+ */
+export interface AuditFilter {
+  /**
+   * The principal id the rows were filtered to. `unrecorded` selects the rows with no id.
+   */
+  actor?: string | null;
+  /**
+   * The inclusive lower bound, as an RFC 3339 UTC timestamp. A row is kept when its timestamp is at or after this.
+   */
+  since?: string | null;
   [k: string]: unknown;
 }
 /**
