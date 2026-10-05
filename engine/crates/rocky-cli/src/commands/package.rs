@@ -499,6 +499,18 @@ fn vendor(
             "package name `{pkg_name}` is not a safe directory name"
         )));
     }
+    if previous.is_none()
+        && let Some(other) = PackagesLock::read(lock_path)
+            .map_err(e055)?
+            .get(&pkg_name)
+            .filter(|o| !o.hub.eq_ignore_ascii_case(&request.hub))
+    {
+        bail!(e055(format!(
+            "`{}` is dbt project `{pkg_name}`, the same name as the vendored `{}`; both would \
+             write models/packages/{pkg_name}/. Remove `{pkg_name}` first",
+            request.hub, other.hub
+        )));
+    }
     if let Some(prev) = previous
         && prev.name != pkg_name
     {
@@ -551,6 +563,34 @@ fn vendor(
                 String::new()
             }
         )));
+    }
+
+    // Never leave a project `rocky compile` rejects: a vendored model must not
+    // read something that was not vendored, and its SQL must parse.
+    if !import.blocking.is_empty() {
+        bail!(e055(format!(
+            "package `{pkg_name}` cannot be vendored as compiled; nothing was written:\n  {}",
+            import.blocking.join("\n  ")
+        )));
+    }
+    // A model vendored before that fails now would look "removed upstream"
+    // and its files would be deleted. Refuse instead.
+    if let Some(prev) = previous {
+        let locked = dbt_package::locked_model_names(prev);
+        let lost: Vec<String> = import
+            .failed
+            .iter()
+            .filter(|f| locked.contains(&f.name))
+            .map(|f| format!("`{}`: {}", f.name, f.reason))
+            .collect();
+        if !lost.is_empty() {
+            bail!(e055(format!(
+                "{} vendored model(s) of `{pkg_name}` no longer import, so updating would delete \
+                 them; nothing was written:\n  {}",
+                lost.len(),
+                lost.join("\n  ")
+            )));
+        }
     }
 
     let planned = dbt_package::render_package_files(&import).map_err(e055)?;

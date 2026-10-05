@@ -227,6 +227,11 @@ pub struct PackageImport {
     /// column-introspecting macro reads did not exist (also in `failed`).
     /// Outside [`BuildMode::BuildEmpty`] any entry refuses the whole package.
     pub introspection_refused: Vec<String>,
+    /// Reasons the import as a whole cannot be vendored without leaving a
+    /// project `rocky compile` rejects: a vendored model reads a model that
+    /// was not vendored, or a dbt seed, or its SQL does not parse. Any entry
+    /// refuses the package (E055) before anything is written.
+    pub blocking: Vec<String>,
 }
 
 /// Import one package's models from a compiled manifest.
@@ -350,8 +355,10 @@ pub fn import_package(
     incremental_fallbacks.dedup();
 
     let (tests_mapped, tests_dropped) = map_generic_tests(info, &selected, &mut models);
+    let blocking = integrity_problems(info, &by_rocky_name, &filtered, &models, &result.failed);
 
     Ok(PackageImport {
+        blocking,
         introspection_refused,
         package: package.to_string(),
         models,
@@ -363,6 +370,78 @@ pub fn import_package(
         incremental_fallbacks,
         dbt_version: result.dbt_version,
     })
+}
+
+/// Why the vendored set would not compile on its own. Every dependency of a
+/// vendored model must itself be vendored (a model or snapshot) or be a dbt
+/// source; a seed, or a model that failed to import, would leave a dangling
+/// read. Every vendored SQL body must parse the way `rocky compile` parses it.
+fn integrity_problems(
+    info: &PackageManifestInfo,
+    by_rocky_name: &HashMap<String, String>,
+    filtered: &DbtManifest,
+    models: &[VendoredModel],
+    failed: &[ImportFailure],
+) -> Vec<String> {
+    let vendored_ids: BTreeSet<&str> = models
+        .iter()
+        .filter_map(|vm| by_rocky_name.get(&vm.model.name).map(String::as_str))
+        .collect();
+    let failure_of = |name: &str| -> Option<&str> {
+        failed
+            .iter()
+            .find(|f| f.name == name)
+            .map(|f| f.reason.as_str())
+    };
+    let mut problems = Vec::new();
+    for vm in models {
+        let name = &vm.model.name;
+        let rendered = super::emit::annotate_unsupported_jinja(&vm.model.sql);
+        if let Err(reason) = rocky_sql::lineage::extract_lineage(&rendered) {
+            problems.push(format!(
+                "model `{name}`: its compiled SQL does not parse, so `rocky compile` would \
+                 reject it: {reason}"
+            ));
+        }
+        let Some(node) = by_rocky_name
+            .get(name)
+            .and_then(|id| filtered.nodes.get(id))
+        else {
+            continue;
+        };
+        for dep in &node.depends_on.nodes {
+            let Some(up) = info.nodes.get(dep) else {
+                continue;
+            };
+            match up.resource_type.as_str() {
+                "model" | "snapshot" => {
+                    if vendored_ids.contains(dep.as_str()) || up.config.enabled == Some(false) {
+                        continue;
+                    }
+                    let why = match failure_of(&up.name) {
+                        Some(reason) => format!("it failed to import: {reason}"),
+                        None if up.package_name == info.project_name => {
+                            "it belongs to the build project, not a package".to_string()
+                        }
+                        None => "it was not selected".to_string(),
+                    };
+                    problems.push(format!(
+                        "model `{name}` reads `{}`, which was not vendored ({why})",
+                        up.name
+                    ));
+                }
+                "seed" => problems.push(format!(
+                    "model `{name}` reads dbt seed `{}` ({}); Rocky does not vendor seeds, so \
+                     the read would point at a table nothing builds",
+                    up.name, up.package_name
+                )),
+                _ => {}
+            }
+        }
+    }
+    problems.sort();
+    problems.dedup();
+    problems
 }
 
 /// Select `package`'s model nodes plus their upstream closure, mapped to the
@@ -1651,6 +1730,82 @@ mod tests {
             schema: "main".into(),
             table: String::new(),
         }
+    }
+
+    fn import_json(json: &serde_json::Value) -> PackageImport {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("manifest.json");
+        std::fs::write(&path, json.to_string()).unwrap();
+        let manifest = parse_manifest(&path).unwrap();
+        let info = parse_package_info(&path).unwrap();
+        import_package(&manifest, &info, "stripe", &target()).unwrap()
+    }
+
+    #[test]
+    fn a_clean_import_has_no_blocking_problems() {
+        assert_eq!(
+            import_json(&fixture_manifest()).blocking,
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn a_model_reading_a_refused_upstream_blocks_the_package() {
+        let mut json = fixture_manifest();
+        json["nodes"]["model.stripe_source.stg_stripe__charge"]["compiled_code"] =
+            serde_json::Value::String(format!(
+                "select\n*\n/* {INTROSPECTION_PLACEHOLDER} */\nfrom \"dev\".\"raw_stripe\".\"charge\""
+            ));
+        let import = import_json(&json);
+        assert!(
+            import.blocking.iter().any(|p| p
+                .contains("`stripe__charges` reads `stg_stripe__charge`")
+                && p.contains("failed to import")),
+            "{:?}",
+            import.blocking
+        );
+    }
+
+    #[test]
+    fn a_model_reading_a_dbt_seed_blocks_the_package() {
+        let mut json = fixture_manifest();
+        json["nodes"]["seed.stripe.country_codes"] = serde_json::json!({
+            "unique_id": "seed.stripe.country_codes",
+            "name": "country_codes",
+            "resource_type": "seed",
+            "package_name": "stripe",
+            "depends_on": {"nodes": []},
+            "config": {}
+        });
+        json["nodes"]["model.stripe.stripe__charges"]["depends_on"]["nodes"]
+            .as_array_mut()
+            .unwrap()
+            .push("seed.stripe.country_codes".into());
+        let import = import_json(&json);
+        assert!(
+            import
+                .blocking
+                .iter()
+                .any(|p| p.contains("dbt seed `country_codes`")),
+            "{:?}",
+            import.blocking
+        );
+    }
+
+    #[test]
+    fn unparseable_vendored_sql_blocks_the_package() {
+        let mut json = fixture_manifest();
+        json["nodes"]["model.stripe.stripe__charges"]["compiled_code"] =
+            serde_json::Value::String("select a,, from (((".to_string());
+        let import = import_json(&json);
+        assert!(
+            import
+                .blocking
+                .iter()
+                .any(|p| p.contains("`stripe__charges`") && p.contains("does not parse")),
+            "{:?}",
+            import.blocking
+        );
     }
 
     #[test]

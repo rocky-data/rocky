@@ -102,6 +102,34 @@ fn add_recorded(root: &Path) -> serde_json::Value {
     ))
 }
 
+/// A copy of the recorded compile with `edit` applied to its manifest.
+fn compiled_variant(edit: impl FnOnce(&mut serde_json::Value)) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir.path().join("target")).unwrap();
+    fs::copy(
+        fixture().join("compiled/package-lock.yml"),
+        dir.path().join("package-lock.yml"),
+    )
+    .unwrap();
+    let text = fs::read_to_string(fixture().join("compiled/target/manifest.json")).unwrap();
+    let mut manifest: serde_json::Value = serde_json::from_str(&text).unwrap();
+    edit(&mut manifest);
+    fs::write(
+        dir.path().join("target/manifest.json"),
+        manifest.to_string(),
+    )
+    .unwrap();
+    dir
+}
+
+/// Make `model` fail import: no compiled SQL, and Jinja control flow the
+/// importer refuses to translate.
+fn break_model(manifest: &mut serde_json::Value, unique_id: &str) {
+    let node = &mut manifest["nodes"][unique_id];
+    node["compiled_code"] = serde_json::Value::Null;
+    node["raw_code"] = "{% if true %}select 1 as id{% endif %}".into();
+}
+
 const SIDECAR: &str = "[target]\ncatalog = \"dev\"\nschema = \"main\"\n";
 
 #[test]
@@ -448,6 +476,79 @@ fn a_compile_without_built_upstreams_is_refused_with_both_options() {
     assert!(err.contains("Nothing was written"), "{err}");
     assert!(!root.join("models/packages").exists());
     assert!(!root.join("rocky-packages.lock").exists());
+}
+
+#[test]
+fn a_model_reading_a_model_that_failed_to_import_refuses_add() {
+    let tmp = project();
+    let root = tmp.path();
+    let compiled = compiled_variant(|m| break_model(m, "model.stripe.stg_stripe__customer"));
+    let dir = compiled.path().display().to_string();
+    let err = refused(&rocky(
+        root,
+        &["package", "add", "fivetran/stripe", "--compiled", &dir],
+    ));
+    assert!(err.contains("reads `stg_stripe__customer`"), "{err}");
+    assert!(err.contains("nothing was written"), "{err}");
+    assert!(!root.join("models/packages").exists());
+    assert!(!root.join("rocky-packages.lock").exists());
+}
+
+#[test]
+fn update_refuses_instead_of_deleting_a_model_that_no_longer_imports() {
+    let tmp = project();
+    let root = tmp.path();
+    add_recorded(root);
+    let kept = root.join("models/packages/stripe/stripe__customer_overview.sql");
+    assert!(kept.exists());
+    let lock_before = fs::read_to_string(root.join("rocky-packages.lock")).unwrap();
+    let compiled = compiled_variant(|m| break_model(m, "model.stripe.stripe__customer_overview"));
+    let dir = compiled.path().display().to_string();
+    let err = refused(&rocky(
+        root,
+        &["package", "update", "stripe", "--compiled", &dir],
+    ));
+    assert!(err.contains("`stripe__customer_overview`"), "{err}");
+    assert!(err.contains("no longer import"), "{err}");
+    assert!(
+        kept.exists(),
+        "a model that fails to re-import is never deleted"
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("rocky-packages.lock")).unwrap(),
+        lock_before
+    );
+}
+
+#[test]
+fn a_second_hub_with_the_same_dbt_project_name_is_refused() {
+    let tmp = project();
+    let root = tmp.path();
+    add_recorded(root);
+    let lock_path = root.join("rocky-packages.lock");
+    let text = fs::read_to_string(&lock_path).unwrap();
+    fs::write(
+        &lock_path,
+        text.replace("hub = \"fivetran/stripe\"", "hub = \"acme/stripe\""),
+    )
+    .unwrap();
+    let err = refused(&rocky(
+        root,
+        &[
+            "package",
+            "add",
+            "fivetran/stripe",
+            "--compiled",
+            &compiled_flag(),
+        ],
+    ));
+    assert!(err.contains("acme/stripe"), "{err}");
+    assert!(
+        fs::read_to_string(&lock_path)
+            .unwrap()
+            .contains("acme/stripe"),
+        "the existing entry is not replaced"
+    );
 }
 
 #[test]
