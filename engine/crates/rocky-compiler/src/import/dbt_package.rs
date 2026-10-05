@@ -312,7 +312,7 @@ pub fn import_package(
     let mut failed = std::mem::take(&mut result.failed);
     let mut introspection_refused = Vec::new();
     models.retain(|vm| {
-        let reason = if vm.model.sql.contains(INTROSPECTION_PLACEHOLDER) {
+        let reason = if has_introspection_placeholder(&vm.model.sql) {
             "a column-introspecting macro (dbt_utils.star) emitted a placeholder `*`"
         } else if projects_only_nulls(&vm.model.sql) {
             "a column-filling macro (Fivetran's fill_staging_columns) found no columns and \
@@ -1259,55 +1259,270 @@ pub fn resolve_from_package_lock(text: &str, hub: &str) -> Result<(String, Strin
 pub const INTROSPECTION_PLACEHOLDER: &str =
     "No columns were returned. Maybe the relation doesn't exist yet";
 
-/// True when some SELECT in `sql` reads a relation but projects only `NULL`
-/// literals (`NULL`, `CAST(NULL AS t)`), two or more of them. That is what
-/// column-filling macros such as Fivetran's `fill_staging_columns` compile to
-/// when the relation they introspect does not exist: every staging column
-/// becomes `cast(null as ...)`, which runs fine and silently loads nothing.
-/// A branch of a set operation is not checked, since a NULL-filler branch can
-/// be deliberate. SQL that does not parse is not flagged.
-pub fn projects_only_nulls(sql: &str) -> bool {
-    use sqlparser::ast::{Expr, Query, SelectItem, SetExpr, Value, Visit, Visitor};
-    use std::ops::ControlFlow;
+/// Marker dbt-utils' `star()` writes instead of a column list when it runs
+/// (`dbt run`, `dbt build`) and the relation it introspects has no columns.
+/// `dbt compile` writes [`INTROSPECTION_PLACEHOLDER`] instead.
+pub const INTROSPECTION_RUN_MARKER: &str = "no columns returned from star() macro";
 
-    fn is_null(e: &Expr) -> bool {
-        match e {
-            Expr::Value(v) => matches!(v.value, Value::Null),
-            Expr::Cast { expr, .. } | Expr::Nested(expr) => is_null(expr),
-            _ => false,
-        }
-    }
-    fn all_null(body: &SetExpr) -> bool {
-        match body {
-            SetExpr::Select(s) => {
-                !s.from.is_empty()
-                    && s.projection.len() >= 2
-                    && s.projection.iter().all(|item| match item {
-                        SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => {
-                            is_null(e)
-                        }
-                        _ => false,
-                    })
-            }
-            SetExpr::Query(q) => all_null(&q.body),
-            _ => false,
-        }
-    }
-    struct Finder;
-    impl Visitor for Finder {
-        type Break = ();
-        fn pre_visit_query(&mut self, q: &Query) -> ControlFlow<()> {
-            if all_null(&q.body) {
-                ControlFlow::Break(())
-            } else {
-                ControlFlow::Continue(())
-            }
-        }
-    }
+/// True when `sql` carries either dbt-utils `star()` placeholder.
+pub fn has_introspection_placeholder(sql: &str) -> bool {
+    let lower = sql.to_lowercase();
+    lower.contains(&INTROSPECTION_PLACEHOLDER.to_lowercase())
+        || lower.contains(INTROSPECTION_RUN_MARKER)
+}
+
+/// True when the model's output reads a relation yet every output column
+/// that carries data is a NULL literal: at least two columns trace, through
+/// CTEs and subqueries, to `NULL` / `CAST(NULL AS t)`, and the rest are
+/// constants. That is what column-filling macros such as Fivetran's
+/// `fill_staging_columns` compile to when the relation they introspect does
+/// not exist: each staging column becomes `cast(null as ...)` in a `fields`
+/// CTE (beside a constant `source_relation`), and the final SELECT renames
+/// them. The SQL runs and loads only NULLs.
+///
+/// Only the model's OUTPUT is judged, so an all-NULL padding CTE joined to
+/// real columns is not flagged. A column the analysis cannot follow (a
+/// function call, a physical table's column, a `*` over a physical table)
+/// counts as data, so uncertainty never refuses a model. SQL that does not
+/// parse is not flagged.
+pub fn projects_only_nulls(sql: &str) -> bool {
+    use sqlparser::ast::Statement;
     let Ok(statements) = rocky_sql::parser::parse_sql(sql) else {
         return false;
     };
-    statements.iter().any(|st| st.visit(&mut Finder).is_break())
+    let Some(Statement::Query(query)) = statements.last() else {
+        return false;
+    };
+    let (columns, reads) = null_flow::query_columns(query, &null_flow::Scope::default());
+    let nulls = columns
+        .iter()
+        .filter(|c| c.state == null_flow::State::Null)
+        .count();
+    reads && nulls >= 2 && columns.iter().all(|c| c.state != null_flow::State::Data)
+}
+
+/// The dataflow behind [`projects_only_nulls`].
+mod null_flow {
+    use std::collections::HashMap;
+
+    use sqlparser::ast::{
+        Expr, Query, Select, SelectItem, SelectItemQualifiedWildcardKind, SetExpr, TableFactor,
+        Value,
+    };
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum State {
+        /// Always NULL.
+        Null,
+        /// A constant (a non-NULL literal).
+        Const,
+        /// Anything else, including what the analysis cannot follow.
+        Data,
+    }
+
+    #[derive(Debug, Clone)]
+    pub struct Column {
+        /// Lowercased output name; empty when the warehouse names it.
+        pub name: String,
+        pub state: State,
+    }
+
+    /// CTEs in scope, by lowercased name.
+    #[derive(Debug, Clone, Default)]
+    pub struct Scope {
+        ctes: HashMap<String, Vec<Column>>,
+    }
+
+    /// One FROM relation: its alias (or name) and its columns when known.
+    struct Relation {
+        name: String,
+        columns: Option<Vec<Column>>,
+    }
+
+    fn last_ident(name: &sqlparser::ast::ObjectName) -> String {
+        name.0
+            .last()
+            .and_then(|p| p.as_ident())
+            .map(|i| i.value.to_lowercase())
+            .unwrap_or_default()
+    }
+
+    /// Output columns of `query`, and whether it reads any relation.
+    pub fn query_columns(query: &Query, outer: &Scope) -> (Vec<Column>, bool) {
+        let mut scope = outer.clone();
+        if let Some(with) = &query.with {
+            for cte in &with.cte_tables {
+                let (mut cols, _) = query_columns(&cte.query, &scope);
+                for (col, renamed) in cols.iter_mut().zip(&cte.alias.columns) {
+                    col.name = renamed.name.value.to_lowercase();
+                }
+                scope.ctes.insert(cte.alias.name.value.to_lowercase(), cols);
+            }
+        }
+        body_columns(&query.body, &scope)
+    }
+
+    fn body_columns(body: &SetExpr, scope: &Scope) -> (Vec<Column>, bool) {
+        match body {
+            SetExpr::Select(select) => select_columns(select, scope),
+            SetExpr::Query(q) => query_columns(q, scope),
+            SetExpr::SetOperation { left, right, .. } => {
+                let (l, lr) = body_columns(left, scope);
+                let (r, rr) = body_columns(right, scope);
+                let cols = l
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, c)| {
+                        let other = r.get(i).map_or(State::Data, |c| c.state);
+                        let state = match (c.state, other) {
+                            (State::Null, State::Null) => State::Null,
+                            (State::Data, _) | (_, State::Data) => State::Data,
+                            _ => State::Const,
+                        };
+                        Column {
+                            name: c.name,
+                            state,
+                        }
+                    })
+                    .collect();
+                (cols, lr || rr)
+            }
+            _ => (
+                vec![Column {
+                    name: String::new(),
+                    state: State::Data,
+                }],
+                false,
+            ),
+        }
+    }
+
+    fn relation(factor: &TableFactor, scope: &Scope) -> Relation {
+        match factor {
+            TableFactor::Table { name, alias, .. } => {
+                let table = last_ident(name);
+                let columns = (name.0.len() == 1)
+                    .then(|| scope.ctes.get(&table).cloned())
+                    .flatten();
+                Relation {
+                    name: alias
+                        .as_ref()
+                        .map_or(table, |a| a.name.value.to_lowercase()),
+                    columns,
+                }
+            }
+            TableFactor::Derived {
+                subquery, alias, ..
+            } => Relation {
+                name: alias
+                    .as_ref()
+                    .map(|a| a.name.value.to_lowercase())
+                    .unwrap_or_default(),
+                columns: Some(query_columns(subquery, scope).0),
+            },
+            _ => Relation {
+                name: String::new(),
+                columns: None,
+            },
+        }
+    }
+
+    fn select_columns(select: &Select, scope: &Scope) -> (Vec<Column>, bool) {
+        let mut relations = Vec::new();
+        for twj in &select.from {
+            relations.push(relation(&twj.relation, scope));
+            for join in &twj.joins {
+                relations.push(relation(&join.relation, scope));
+            }
+        }
+        let data = |name: String| Column {
+            name,
+            state: State::Data,
+        };
+        let mut out = Vec::new();
+        for item in &select.projection {
+            match item {
+                SelectItem::UnnamedExpr(e) => {
+                    let name = match e {
+                        Expr::Identifier(i) => i.value.to_lowercase(),
+                        Expr::CompoundIdentifier(parts) => parts
+                            .last()
+                            .map(|i| i.value.to_lowercase())
+                            .unwrap_or_default(),
+                        _ => String::new(),
+                    };
+                    out.push(Column {
+                        name,
+                        state: classify(e, &relations),
+                    });
+                }
+                SelectItem::ExprWithAlias { expr, alias } => out.push(Column {
+                    name: alias.value.to_lowercase(),
+                    state: classify(expr, &relations),
+                }),
+                SelectItem::Wildcard(_) => {
+                    if relations.iter().all(|r| r.columns.is_some()) && !relations.is_empty() {
+                        for r in &relations {
+                            out.extend(r.columns.iter().flatten().cloned());
+                        }
+                    } else {
+                        out.push(data(String::new()));
+                    }
+                }
+                SelectItem::QualifiedWildcard(
+                    SelectItemQualifiedWildcardKind::ObjectName(n),
+                    _,
+                ) => {
+                    let q = last_ident(n);
+                    match relations
+                        .iter()
+                        .find(|r| r.name == q)
+                        .and_then(|r| r.columns.as_ref())
+                    {
+                        Some(cols) => out.extend(cols.iter().cloned()),
+                        None => out.push(data(String::new())),
+                    }
+                }
+                _ => out.push(data(String::new())),
+            }
+        }
+        (out, !relations.is_empty())
+    }
+
+    fn classify(expr: &Expr, relations: &[Relation]) -> State {
+        match expr {
+            Expr::Value(v) if matches!(v.value, Value::Null) => State::Null,
+            Expr::Value(_) => State::Const,
+            Expr::Cast { expr, .. } | Expr::Nested(expr) => classify(expr, relations),
+            Expr::Identifier(i) => lookup(None, &i.value, relations),
+            Expr::CompoundIdentifier(parts) if parts.len() == 2 => {
+                lookup(Some(&parts[0].value), &parts[1].value, relations)
+            }
+            _ => State::Data,
+        }
+    }
+
+    fn lookup(qualifier: Option<&str>, column: &str, relations: &[Relation]) -> State {
+        let column = column.to_lowercase();
+        let qualifier = qualifier.map(str::to_lowercase);
+        let mut found = None;
+        for r in relations {
+            if qualifier.as_ref().is_some_and(|q| *q != r.name) {
+                continue;
+            }
+            // A relation whose columns are unknown may hold the column.
+            let Some(cols) = &r.columns else {
+                return State::Data;
+            };
+            if let Some(c) = cols.iter().find(|c| c.name == column) {
+                if found.is_some() {
+                    return State::Data;
+                }
+                found = Some(c.state);
+            }
+        }
+        found.unwrap_or(State::Data)
+    }
 }
 
 /// How `rocky package` got the package's compiled SQL. Recorded in the
@@ -2412,6 +2627,45 @@ mod tests {
             "select a, b from t union all select null as a, null as b from u"
         ));
         assert!(!projects_only_nulls("not sql at all ((("));
+    }
+
+    /// The shape fivetran/stripe 1.10.1 really compiles to without
+    /// `dbt run --empty`: an all-NULL `fields` CTE beside a constant
+    /// `source_relation`, renamed by `final`, read by `select * from final`.
+    #[test]
+    fn the_fivetran_staging_shape_is_detected_through_the_cte_chain() {
+        let compiled = "with base as (select * from \"dev\".\"s\".\"stg_stripe__charge_tmp\"), \
+             fields as (select cast(null as integer) as amount, cast(null as TEXT) as id, \
+             cast(null as timestamp) as created, cast('dev.stripe' as TEXT) as source_relation \
+             from base), \
+             final as (select id as charge_id, amount as amount, cast(created as timestamp) \
+             as created_at, source_relation from fields where cast(livemode as boolean) = True) \
+             select * from final";
+        assert!(projects_only_nulls(compiled));
+    }
+
+    /// Red-team case: an all-NULL padding CTE is fine when the output also
+    /// carries real columns.
+    #[test]
+    fn an_all_null_padding_cte_beside_real_columns_is_not_flagged() {
+        let sql = "with base as (select id, name from raw.t), \
+                   pad as (select cast(null as varchar) a, cast(null as varchar) b from base) \
+                   select base.id, base.name, pad.a, pad.b from base cross join pad";
+        assert!(!projects_only_nulls(sql));
+        let unioned = "with pad as (select cast(null as varchar) a, cast(null as varchar) b \
+                       from raw.t) select a, b from raw.u union all select a, b from pad";
+        assert!(!projects_only_nulls(unioned));
+    }
+
+    #[test]
+    fn both_star_placeholders_are_detected() {
+        assert!(has_introspection_placeholder(
+            "select /* no columns returned from star() macro */ from x"
+        ));
+        assert!(has_introspection_placeholder(&format!(
+            "select * /* {INTROSPECTION_PLACEHOLDER} */ from x"
+        )));
+        assert!(!has_introspection_placeholder("select * from x"));
     }
 
     #[test]
