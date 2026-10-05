@@ -927,6 +927,7 @@ fn marker_error_to_sync(e: FreezeMarkerError) -> StateSyncError {
 /// always on wherever a durable object tier exists. These marker keys never
 /// bump the shared blob generation, so blob CAS does not serialize them or
 /// close a marker-LIST-to-mutation window.
+#[allow(clippy::too_many_arguments)]
 pub fn run_policy_freeze(
     config_path: &Path,
     state_path: &Path,
@@ -934,6 +935,7 @@ pub fn run_policy_freeze(
     scope: Option<String>,
     reason: Option<String>,
     lift: bool,
+    actor: &rocky_core::config::PrincipalRef,
     json: bool,
 ) -> Result<()> {
     let scope = scope.unwrap_or_else(|| "any".to_string());
@@ -1083,6 +1085,8 @@ pub fn run_policy_freeze(
             // A freeze/unfreeze is a policy-change decision, not a drift
             // auto-apply, so it carries no auto-apply custody.
             auto_apply: None,
+            // The OPERATOR who froze, not the frozen class above (RV4-P1).
+            principal_ref: Some(actor.clone()),
         };
         if let Some(store) = &local_store {
             store
@@ -1624,10 +1628,23 @@ expect = \"deny\"
             None,
             None,
             false,
+            &rocky_core::config::PrincipalRef {
+                id: rocky_core::config::PrincipalId::parse_asserted("ops-1").unwrap(),
+                source: rocky_core::config::PrincipalIdSource::Flag,
+            },
             true,
         )
         .expect("freeze must record and exit 0 even with no [policy] block");
         let store = StateStore::open(&state).unwrap();
+        // RV4-P1: the row names the OPERATOR who froze; `principal` stays the
+        // frozen class.
+        let rows = store.list_policy_decisions().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].principal_ref.as_ref().map(|r| r.id.as_str()),
+            Some("ops-1")
+        );
+        assert_eq!(rows[0].principal, PolicyPrincipal::Agent);
         let freezes = policy::active_freezes(&store.list_policy_decisions().unwrap());
         assert_eq!(
             freezes.len(),
@@ -1655,6 +1672,7 @@ expect = \"deny\"
             None,
             None,
             false,
+            &rocky_core::config::PrincipalRef::unnamed(),
             true,
         )
         .expect_err("a malformed config must abort the freeze, not record it local-only");
@@ -1770,6 +1788,7 @@ expcet = \"deny\"
             None,
             None,
             false,
+            &rocky_core::config::PrincipalRef::unnamed(),
             true,
         )
         .expect_err("a remote-backend freeze must abort when the backend is unreachable");
@@ -1805,6 +1824,7 @@ expcet = \"deny\"
             None,
             None,
             false,
+            &rocky_core::config::PrincipalRef::unnamed(),
             true,
         )
         .expect("a local-backend freeze must record without any remote round-trip");
@@ -1850,6 +1870,7 @@ max_retries = 0
             Some("any".to_string()),
             Some("two-conflict freeze".to_string()),
             false,
+            &rocky_core::config::PrincipalRef::unnamed(),
             true,
         )
         .expect("the third full transition attempt must commit");
@@ -1906,6 +1927,7 @@ max_retries = 0
             reason: "remote winner".to_string(),
             verify_after: Vec::new(),
             auto_apply: None,
+            principal_ref: None,
         };
         {
             let store = harness.open_store(&harness.pod_b);
@@ -1940,6 +1962,7 @@ max_retries = 0
             Some("any".to_string()),
             Some("exhausted freeze".to_string()),
             false,
+            &rocky_core::config::PrincipalRef::unnamed(),
             true,
         )
         .expect_err("three conflicts must make the command fail nonzero");
@@ -2036,6 +2059,7 @@ max_retries = 0
             Some("any".to_string()),
             Some("freeze before failed lift".to_string()),
             false,
+            &rocky_core::config::PrincipalRef::unnamed(),
             true,
         )
         .unwrap();
@@ -2052,6 +2076,7 @@ max_retries = 0
             Some("any".to_string()),
             Some("must not lift early".to_string()),
             true,
+            &rocky_core::config::PrincipalRef::unnamed(),
             true,
         )
         .expect_err("the unfreeze ledger transition must exhaust before marker creation");
@@ -2178,6 +2203,7 @@ expect = \"allow\"
             Some("model=fct_*".to_string()),
             Some("incident 42".to_string()),
             false,
+            &rocky_core::config::PrincipalRef::unnamed(),
             true,
         )
         .unwrap();
@@ -2226,6 +2252,7 @@ expect = \"allow\"
             Some("model=fct_*".to_string()),
             None,
             true,
+            &rocky_core::config::PrincipalRef::unnamed(),
             true,
         )
         .unwrap();
@@ -2478,6 +2505,7 @@ expect = \"allow\"
             Some("model=fct_*".to_string()),
             Some("incident 42".to_string()),
             false,
+            &rocky_core::config::PrincipalRef::unnamed(),
             true,
         )
         .unwrap();
@@ -2639,6 +2667,7 @@ expect = \"allow\"
             Some("model=fct_*".to_string()),
             Some("incident 42".to_string()),
             false,
+            &rocky_core::config::PrincipalRef::unnamed(),
             true,
         )
         .unwrap();

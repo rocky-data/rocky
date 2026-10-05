@@ -96,6 +96,7 @@ async fn direct_run_guard_refuses_bad_pipes() {
             None,
             false,
             None,
+            &rocky_core::config::PrincipalRef::unnamed(),
         )
         .await,
     );
@@ -145,6 +146,7 @@ async fn contracts_refusal_does_not_send_pipes_opened() {
         false,
         None,
         Some(&dir.path().join("contracts")),
+        &rocky_core::config::PrincipalRef::unnamed(),
     )
     .await;
     assert!(
@@ -167,6 +169,7 @@ async fn direct_apply_guard_refuses_bad_pipes() {
             "missing-plan",
             &dir.path().join("state.redb"),
             rocky_core::config::PolicyPrincipal::Human,
+            &rocky_core::config::PrincipalRef::unnamed(),
             None,
             false,
         )
@@ -190,6 +193,7 @@ async fn direct_dag_guard_refuses_bad_pipes() {
             &SkipRunOptions::default(),
             None,
             None,
+            &rocky_core::config::PrincipalRef::unnamed(),
         )
         .await,
     );
@@ -216,6 +220,7 @@ async fn direct_watch_guard_refuses_bad_pipes() {
             None,
             None,
             &SkipRunOptions::default(),
+            &rocky_core::config::PrincipalRef::unnamed(),
         )
         .await,
     );

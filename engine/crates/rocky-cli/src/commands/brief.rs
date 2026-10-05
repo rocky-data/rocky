@@ -1733,6 +1733,7 @@ mod tests {
             reason: "test".to_string(),
             verify_after: Vec::new(),
             auto_apply: None,
+            principal_ref: None,
         }
     }
 

@@ -379,6 +379,7 @@ async fn drive_run(
         None,  // governed_ctx
         false, // assume_fresh_state
         None,  // #1460
+        &rocky_core::config::PrincipalRef::unnamed(),
     )
     .await
     .map(|_| ())
@@ -404,6 +405,7 @@ fn policy_freeze_writes_one_marker_per_principal_when_enabled() {
         None, // scope — any
         Some("stop everything".to_string()),
         false, // lift
+        &rocky_core::config::PrincipalRef::unnamed(),
         false, // json
     )
     .expect("a marker-writing freeze succeeds");
@@ -461,6 +463,7 @@ fn policy_freeze_writes_no_markers_by_default() {
         None,
         None,
         false,
+        &rocky_core::config::PrincipalRef::unnamed(),
         false,
     )
     .expect("a default-config freeze succeeds");
@@ -504,6 +507,7 @@ fn policy_unfreeze_writes_marker_referencing_lifted_ids() {
         None,
         None,
         false,
+        &rocky_core::config::PrincipalRef::unnamed(),
         false,
     )
     .expect("freeze succeeds");
@@ -532,6 +536,7 @@ fn policy_unfreeze_writes_marker_referencing_lifted_ids() {
         None,
         Some("all clear".to_string()),
         true, // lift
+        &rocky_core::config::PrincipalRef::unnamed(),
         false,
     )
     .expect("unfreeze succeeds");
@@ -599,6 +604,7 @@ async fn reader_enforces_marker_with_writes_flag_off() {
         cfg.policy.as_ref(),
         "plan-reader",
         PolicyPrincipal::Agent,
+        &rocky_core::config::PrincipalRef::unnamed(),
         &touched,
         &project.dir.path().join("no-models"),
         &project.state_path,
@@ -647,6 +653,7 @@ async fn marker_only_freeze_denies_gate_with_empty_ledger() {
         cfg.policy.as_ref(),
         "plan-marker-only",
         PolicyPrincipal::Agent,
+        &rocky_core::config::PrincipalRef::unnamed(),
         &touched,
         &project.dir.path().join("no-models"),
         &project.state_path,
@@ -690,6 +697,7 @@ async fn pre_reader_pod_ignores_marker_documented() {
         cfg.policy.as_ref(),
         "plan-pre-reader",
         PolicyPrincipal::Human,
+        &rocky_core::config::PrincipalRef::unnamed(),
         &touched,
         &project.dir.path().join("no-models"),
         &project.state_path,

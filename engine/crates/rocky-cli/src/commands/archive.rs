@@ -444,6 +444,7 @@ pub async fn run_archive_apply(
     plan_id: &str,
     state_path: &Path,
     runtime_principal: rocky_core::config::PolicyPrincipal,
+    actor: &rocky_core::config::PrincipalRef,
     output_json: bool,
 ) -> Result<()> {
     let cwd = std::env::current_dir().context("failed to get current working directory")?;
@@ -453,6 +454,7 @@ pub async fn run_archive_apply(
         plan_id,
         state_path,
         runtime_principal,
+        actor,
         output_json,
     )
     .await
@@ -482,6 +484,7 @@ pub(crate) async fn run_archive_apply_alias_in(
     plan_id: &str,
     state_path: &Path,
     runtime_principal: rocky_core::config::PolicyPrincipal,
+    actor: &rocky_core::config::PrincipalRef,
     output_json: bool,
 ) -> Result<()> {
     refuse_product_bound_archive_alias(root, plan_id)?;
@@ -491,6 +494,7 @@ pub(crate) async fn run_archive_apply_alias_in(
         plan_id,
         state_path,
         runtime_principal,
+        actor,
         output_json,
     )
     .await
@@ -515,6 +519,7 @@ async fn prepare_archive_apply(
     plan_id: &str,
     state_path: &Path,
     runtime_principal: rocky_core::config::PolicyPrincipal,
+    actor: &rocky_core::config::PrincipalRef,
 ) -> Result<(rocky_core::config::RockyConfig, Vec<NamedStatement>)> {
     let plan = read_plan(root, plan_id)
         .with_context(|| format!("failed to read archive plan '{plan_id}'"))?;
@@ -595,6 +600,7 @@ async fn prepare_archive_apply(
         config_path,
         state_path,
         runtime_principal,
+        actor,
         &touched,
     )
     .await?;
@@ -617,10 +623,18 @@ pub(crate) async fn run_archive_apply_in(
     plan_id: &str,
     state_path: &Path,
     runtime_principal: rocky_core::config::PolicyPrincipal,
+    actor: &rocky_core::config::PrincipalRef,
     output_json: bool,
 ) -> Result<()> {
-    let (rocky_cfg, statements) =
-        prepare_archive_apply(root, config_path, plan_id, state_path, runtime_principal).await?;
+    let (rocky_cfg, statements) = prepare_archive_apply(
+        root,
+        config_path,
+        plan_id,
+        state_path,
+        runtime_principal,
+        actor,
+    )
+    .await?;
 
     // Build the warehouse adapter from the SAME snapshot the gate cleared, then
     // execute. Only reached once the policy gate has passed.
@@ -747,17 +761,26 @@ async fn execute_archive_apply(
 /// to prove a policy DENY refuses BEFORE any `execute_statement` reaches the
 /// adapter (zero recorded statements), while an allowed apply reaches it.
 #[cfg(test)]
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_archive_apply_in_with(
     root: &Path,
     config_path: &Path,
     plan_id: &str,
     state_path: &Path,
     runtime_principal: rocky_core::config::PolicyPrincipal,
+    actor: &rocky_core::config::PrincipalRef,
     output_json: bool,
     adapter: &dyn rocky_core::traits::WarehouseAdapter,
 ) -> Result<()> {
-    let (_rocky_cfg, statements) =
-        prepare_archive_apply(root, config_path, plan_id, state_path, runtime_principal).await?;
+    let (_rocky_cfg, statements) = prepare_archive_apply(
+        root,
+        config_path,
+        plan_id,
+        state_path,
+        runtime_principal,
+        actor,
+    )
+    .await?;
     execute_archive_apply(adapter, plan_id, &statements, output_json).await
 }
 
@@ -768,12 +791,14 @@ pub(crate) async fn run_archive_apply_in_with(
 /// BEFORE any `execute_statement` reaches the adapter (zero recorded
 /// statements).
 #[cfg(test)]
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_archive_apply_alias_in_with(
     root: &Path,
     config_path: &Path,
     plan_id: &str,
     state_path: &Path,
     runtime_principal: rocky_core::config::PolicyPrincipal,
+    actor: &rocky_core::config::PrincipalRef,
     output_json: bool,
     adapter: &dyn rocky_core::traits::WarehouseAdapter,
 ) -> Result<()> {
@@ -784,6 +809,7 @@ pub(crate) async fn run_archive_apply_alias_in_with(
         plan_id,
         state_path,
         runtime_principal,
+        actor,
         output_json,
         adapter,
     )
@@ -1055,6 +1081,7 @@ effect = "deny"
                 &plan_id,
                 &state,
                 PolicyPrincipal::Agent,
+                &rocky_core::config::PrincipalRef::unnamed(),
                 true,
                 &adapter,
             )
@@ -1087,6 +1114,7 @@ effect = "deny"
                 &plan_id,
                 &state,
                 PolicyPrincipal::Human,
+                &rocky_core::config::PrincipalRef::unnamed(),
                 true,
                 &adapter,
             )
@@ -1132,6 +1160,7 @@ effect = "deny"
                 &bound_id,
                 &state,
                 PolicyPrincipal::Human,
+                &rocky_core::config::PrincipalRef::unnamed(),
                 true,
                 &adapter,
             )
@@ -1158,6 +1187,7 @@ effect = "deny"
                 &clean_id,
                 &state,
                 PolicyPrincipal::Human,
+                &rocky_core::config::PrincipalRef::unnamed(),
                 true,
                 &adapter,
             )
@@ -1186,6 +1216,7 @@ effect = "deny"
                 &plan_id,
                 &state,
                 PolicyPrincipal::Agent,
+                &rocky_core::config::PrincipalRef::unnamed(),
                 true,
                 &adapter,
             )
@@ -1211,6 +1242,7 @@ effect = "deny"
                 &plan_id,
                 &state,
                 PolicyPrincipal::Agent,
+                &rocky_core::config::PrincipalRef::unnamed(),
                 None,
                 true,
             )
@@ -1238,6 +1270,7 @@ effect = "deny"
                 &plan_id,
                 &state,
                 PolicyPrincipal::Human,
+                &rocky_core::config::PrincipalRef::unnamed(),
                 true,
                 &adapter,
             )
@@ -1271,6 +1304,7 @@ effect = "deny"
                 &plan_id,
                 &state,
                 PolicyPrincipal::Human,
+                &rocky_core::config::PrincipalRef::unnamed(),
                 true,
                 &adapter,
             )
@@ -1305,6 +1339,7 @@ effect = "deny"
                 &plan_id,
                 &state,
                 PolicyPrincipal::Agent,
+                &rocky_core::config::PrincipalRef::unnamed(),
                 true,
                 &adapter,
             )
@@ -1330,6 +1365,7 @@ effect = "deny"
                 &plan_id,
                 &state,
                 PolicyPrincipal::Agent,
+                &rocky_core::config::PrincipalRef::unnamed(),
                 true,
                 &adapter2,
             )
@@ -1497,6 +1533,7 @@ schema_template = "staging__{{source}}"
             &plan_id,
             &dir.path().join("state.redb"),
             rocky_core::config::PolicyPrincipal::Human,
+            &rocky_core::config::PrincipalRef::unnamed(),
             false,
         )
         .await
@@ -1569,6 +1606,7 @@ schema_template = "staging__{{source}}"
             &plan_id,
             &dir.path().join("state.redb"),
             rocky_core::config::PolicyPrincipal::Human,
+            &rocky_core::config::PrincipalRef::unnamed(),
             false,
         )
         .await

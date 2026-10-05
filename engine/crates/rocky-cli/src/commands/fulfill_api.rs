@@ -225,6 +225,9 @@ pub struct ProposeRequest<'a> {
     /// present, the documented `<product_id>@<spec_digest>` fallback is
     /// derived so a product propose never bypasses dedup.
     pub idempotency_key: Option<String>,
+    /// Who is proposing (RV4-P1), stamped on the gate's decision rows. The
+    /// gate still evaluates the `agent` class.
+    pub actor: &'a rocky_core::config::PrincipalRef,
 }
 
 /// Compile the project the way the MCP server's propose always has:
@@ -364,6 +367,7 @@ pub async fn propose_governed_run_plan(
         model,
         product,
         idempotency_key,
+        actor,
     } = request;
 
     let result = compile_for_propose(config_path, models_dir, state_path)
@@ -498,6 +502,7 @@ pub async fn propose_governed_run_plan(
         cfg.as_ref().and_then(|c| c.policy.as_ref()),
         &plan_id,
         PolicyPrincipal::Agent,
+        actor,
         &touched,
         models_dir,
         state_path,
@@ -592,6 +597,7 @@ pub async fn apply_plan(
     plan_id: &str,
     state_path: &Path,
     runtime_principal: PolicyPrincipal,
+    actor: &rocky_core::config::PrincipalRef,
     expect_spec_digest: Option<&str>,
     output_json: bool,
 ) -> Result<ApplyOutcome> {
@@ -601,6 +607,7 @@ pub async fn apply_plan(
         plan_id,
         state_path,
         runtime_principal,
+        actor,
         expect_spec_digest,
         output_json,
     )
@@ -1148,6 +1155,7 @@ mod tests {
                 model,
                 product: None,
                 idempotency_key: None,
+                actor: &rocky_core::config::PrincipalRef::unnamed(),
             })
             .await;
             assert!(
@@ -1197,6 +1205,7 @@ mod tests {
             model: Some("orders".to_string()),
             product: None,
             idempotency_key: None,
+            actor: &rocky_core::config::PrincipalRef::unnamed(),
         })
         .await;
 

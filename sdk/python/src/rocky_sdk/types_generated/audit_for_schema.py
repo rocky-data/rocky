@@ -212,6 +212,38 @@ class PolicyPrincipal4(StrEnum):
     agent = "agent"
 
 
+class PrincipalIdSource5(StrEnum):
+    """
+    The global `--principal-id` flag.
+    """
+
+    flag = "flag"
+
+
+class PrincipalIdSource6(StrEnum):
+    """
+    The `ROCKY_PRINCIPAL_ID` environment variable.
+    """
+
+    env = "env"
+
+
+class PrincipalIdSource7(StrEnum):
+    """
+    Derived from the `rocky mcp --profile` the server runs under (`mcp-default`, `mcp-approver`, `mcp-worker`).
+    """
+
+    mcp_profile = "mcp_profile"
+
+
+class PrincipalIdSource8(StrEnum):
+    """
+    Nobody named the actor; the id is [`PRINCIPAL_ID_UNNAMED`].
+    """
+
+    default = "default"
+
+
 class SectionAvailability1(StrEnum):
     """
     The query ran and the section carries data for the window.
@@ -346,6 +378,24 @@ class AuditDecisionEntry(BaseModel):
     principal: PolicyPrincipal3 | PolicyPrincipal4
     """
     Who was acting (`human` / `agent`).
+    """
+    principal_id: str | None = None
+    """
+    The id of the actor behind the decision (RV4-P1). `null` means unrecorded: the row was written before ids existed. `unnamed` means nobody named the actor.
+    """
+    principal_id_source: (
+        PrincipalIdSource5
+        | PrincipalIdSource6
+        | PrincipalIdSource7
+        | PrincipalIdSource8
+        | None
+    ) = None
+    """
+    Where the id came from (`flag`, `env`, `mcp_profile`, `default`). `null` when the id is unrecorded.
+    """
+    principal_id_verified: bool | None = False
+    """
+    Whether anything verified the id. Always `false` today: ids are self-asserted until signed approvals exist. Defaulted, so a consumer reading an older binary's output sees `false`.
     """
     reason: str
     """

@@ -142,6 +142,7 @@ async fn run_executes_the_loaded_snapshot() {
         None, // governed_ctx
         false,
         None, // #1460
+        &rocky_core::config::PrincipalRef::unnamed(),
     )
     .await
     .expect("the run must execute the loaded snapshot A");

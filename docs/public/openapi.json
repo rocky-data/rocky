@@ -1443,6 +1443,29 @@
             ],
             "description": "Who was acting (`human` / `agent`)."
           },
+          "principal_id": {
+            "description": "The id of the actor behind the decision (RV4-P1). `null` means unrecorded: the row was written before ids existed. `unnamed` means nobody named the actor.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "principal_id_source": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PrincipalIdSource"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Where the id came from (`flag`, `env`, `mcp_profile`, `default`). `null` when the id is unrecorded."
+          },
+          "principal_id_verified": {
+            "default": false,
+            "description": "Whether anything verified the id. Always `false` today: ids are self-asserted until signed approvals exist. Defaulted, so a consumer reading an older binary's output sees `false`.",
+            "type": "boolean"
+          },
           "reason": {
             "description": "Human-readable explanation of how the effect was reached. A resolved `${VAR}` value prints as `${NAME}` (#1919).",
             "type": "string"
@@ -1566,6 +1589,26 @@
           }
         ]
       },
+      "AuditFilter": {
+        "description": "The `--actor` / `--since` filter of `rocky audit` (RV4-P1).",
+        "properties": {
+          "actor": {
+            "description": "The principal id the rows were filtered to. `unrecorded` selects the rows with no id.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "since": {
+            "description": "The inclusive lower bound, as an RFC 3339 UTC timestamp. A row is kept when its timestamp is at or after this.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
       "AuditForOutput": {
         "description": "JSON output for `rocky audit --for <table|run|plan>` — the custody chain.\n\nA one-query drill-down assembled link by link from the data Rocky already records: who proposed the change and what the policy plane decided ([`Self::decisions`]), what the plan changed ([`Self::plan`]), which runs materialized it ([`Self::runs`]), what a post-apply verification found ([`Self::verify_after`]), and what sits downstream in its blast radius ([`Self::blast_radius`]).\n\nEvery link fails closed the same way the estate brief does: a link whose signal is genuinely not recorded renders [`SectionAvailability::Unavailable`] with a note, never a fabricated or assumed value. Post-apply verification outcomes are persisted as decision-ledger custody rows (non-empty `verify_after`), so [`Self::verify_after`] renders them when they exist and says \"not recorded\" when none exist for the subject. The run ledger is not keyed to policy decisions, so a `run` selector cannot join back to a decision. The blast radius is recomputed from the current compiled graph (a live query, not a stored snapshot).",
         "properties": {
@@ -1653,11 +1696,22 @@
             "type": "string"
           },
           "decisions": {
-            "description": "Every recorded policy decision, oldest first. Under `product`, only the rows whose `model` is that product's output model.",
+            "description": "Every recorded policy decision, oldest first. Under `product`, only the rows whose `model` is that product's output model. Under `filter`, only the rows that match it.",
             "items": {
               "$ref": "#/components/schemas/AuditDecisionEntry"
             },
             "type": "array"
+          },
+          "filter": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/AuditFilter"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The `--actor` / `--since` filter applied, absent when neither was given."
           },
           "product": {
             "anyOf": [
@@ -1669,6 +1723,13 @@
               }
             ],
             "description": "The product the ledger was filtered to (`--product <name>`), absent when the whole ledger is listed."
+          },
+          "unattributed_skipped": {
+            "default": 0,
+            "description": "How many rows in range carry no principal id (written before ids existed) and so an `--actor <id>` filter dropped them. `0` without an `--actor` filter, and under `--actor unrecorded`, which lists them. Defaulted, so a consumer reading an older binary's output sees `0`.",
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
           },
           "version": {
             "type": "string"
@@ -14853,6 +14914,39 @@
         },
         "type": "object"
       },
+      "PrincipalIdSource": {
+        "description": "Where a [`PrincipalId`] came from.\n\nP1 knows four sources, and every one is self-asserted. RV4-P2 adds signed sources (a local key, CI OIDC). C2 adds `serve_token` for the HTTP API. A new variant is a change in meaning for an older binary, so the phase that adds one bumps the state schema.",
+        "oneOf": [
+          {
+            "description": "The global `--principal-id` flag.",
+            "enum": [
+              "flag"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "The `ROCKY_PRINCIPAL_ID` environment variable.",
+            "enum": [
+              "env"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "Derived from the `rocky mcp --profile` the server runs under (`mcp-default`, `mcp-approver`, `mcp-worker`).",
+            "enum": [
+              "mcp_profile"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "Nobody named the actor; the id is [`PRINCIPAL_ID_UNNAMED`].",
+            "enum": [
+              "default"
+            ],
+            "type": "string"
+          }
+        ]
+      },
       "ProductApprovalOutput": {
         "description": "The approval record, as echoed by compile/status output.",
         "properties": {
@@ -18097,6 +18191,13 @@
               }
             ],
             "description": "Who authored the change (`human` / `agent`)."
+          },
+          "principal_id": {
+            "description": "The id of the actor behind the escalation (RV4-P1). `null` when the row was written before ids existed. Self-asserted and unverified.",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "reason": {
             "description": "Human-readable explanation of how `require_review` was reached.",
@@ -23090,13 +23191,31 @@
   "paths": {
     "/api/v1/audit": {
       "get": {
-        "description": "Every policy decision recorded at a mutating enforcement seam, oldest first: the same bytes as `rocky audit --output json`. With `product=<name>`, only the rows about that product's output model (`product.output.model`, default the product name), resolved from `products/<name>.toml`: the same bytes as `rocky audit --product <name> --output json`. Unfiltered it reads the state store only and needs no bound config. The ledger is returned whole, as the CLI prints it. Reads only.",
+        "description": "Every policy decision recorded at a mutating enforcement seam, oldest first: the same bytes as `rocky audit --output json`. With `product=<name>`, only the rows about that product's output model (`product.output.model`, default the product name), resolved from `products/<name>.toml`: the same bytes as `rocky audit --product <name> --output json`. With `actor=<id>` and `since=<when>`, the same bytes as `rocky audit --actor <id> --since <when> --output json`; they compose with `product`. Principal ids are self-asserted and unverified. Unfiltered it reads the state store only and needs no bound config. The ledger is returned whole, as the CLI prints it. Reads only.",
         "operationId": "getAuditLedger",
         "parameters": [
           {
             "description": "A product name. Lists only the rows whose model is that product's output model.",
             "in": "query",
             "name": "product",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "A principal id. Lists only the rows that actor recorded. `unrecorded` lists the rows with no id.",
+            "in": "query",
+            "name": "actor",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "An inclusive lower bound: `YYYY-MM-DD` (00:00 UTC), an RFC 3339 timestamp with an offset, or a `<N>d` / `<N>h` duration.",
+            "in": "query",
+            "name": "since",
             "required": false,
             "schema": {
               "type": "string"
@@ -23112,7 +23231,17 @@
                 }
               }
             },
-            "description": "The ledger, whole or scoped to the product."
+            "description": "The ledger, whole or filtered."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "A query parameter is not one of its documented values, or the subject is longer than 512 bytes."
           },
           "404": {
             "content": {

@@ -116,16 +116,17 @@ impl StateTurnstile {
 /// `SkipGate::upstream_unchanged`). That is fail-safe — never a stale skip — but
 /// more conservative than a single monolithic run, where the per-layer barrier
 /// makes every upstream verdict visible. Raw-source freshness skips still apply.
-fn default_sub_runner() -> SubRunner {
+fn default_sub_runner(actor: rocky_core::config::PrincipalRef) -> SubRunner {
     Arc::new(
-        |config_path: PathBuf,
-         loaded: Arc<rocky_core::config::LoadedConfig>,
-         state_path: PathBuf,
-         pipeline_name: String,
-         model_name: Option<String>,
-         partition_opts,
-         skip_opts,
-         shadow_config: Option<rocky_core::shadow::ShadowConfig>| {
+        move |config_path: PathBuf,
+              loaded: Arc<rocky_core::config::LoadedConfig>,
+              state_path: PathBuf,
+              pipeline_name: String,
+              model_name: Option<String>,
+              partition_opts,
+              skip_opts,
+              shadow_config: Option<rocky_core::shadow::ShadowConfig>| {
+            let actor = actor.clone();
             Box::pin(async move {
                 super::run::run(
                     &config_path,
@@ -161,6 +162,7 @@ fn default_sub_runner() -> SubRunner {
                     // `--assume-fresh-state` is not surfaced on the DAG path.
                     false,
                     None, // #1460: DAG sub-run, no persisted plan
+                    &actor,
                 )
                 .await
                 .map(|_| ())
@@ -228,6 +230,8 @@ pub async fn run_with_dag(
     // split out of #1290 rather than ridden along with it. Unset therefore
     // keeps the historical unbounded fan-out.
     node_concurrency: Option<u32>,
+    // Who is running (RV4-P1), handed to every sub-run.
+    actor: &rocky_core::config::PrincipalRef,
 ) -> Result<()> {
     // Seed nodes do not pass through run(), so reject broken Pipes before
     // the DAG can execute any node.
@@ -354,7 +358,7 @@ pub async fn run_with_dag(
         partition_opts: partition_opts.clone(),
         skip_opts: *skip_opts,
         shadow_config: shadow_config.cloned(),
-        sub_runner: default_sub_runner(),
+        sub_runner: default_sub_runner(actor.clone()),
         state_turns: StateTurnstile::new(),
     };
     let executor = dag_executor_with_bound(dispatcher, node_concurrency);
@@ -1801,7 +1805,7 @@ mod tests {
             partition_opts: PartitionRunOptions::default(),
             skip_opts: SkipRunOptions::default(),
             shadow_config: None,
-            sub_runner: default_sub_runner(),
+            sub_runner: default_sub_runner(rocky_core::config::PrincipalRef::unnamed()),
             state_turns: StateTurnstile::new(),
         };
         let id = NodeId::new("seed", "countries");
@@ -1907,6 +1911,7 @@ mod tests {
             // Unbounded node fan-out: these tests predate `--parallel`
             // bounding it and do not exercise concurrency (#1288).
             None,
+            &rocky_core::config::PrincipalRef::unnamed(),
         )
         .await
         .expect("run --dag should succeed");
@@ -2064,6 +2069,7 @@ mod tests {
             &crate::commands::run::SkipRunOptions::default(),
             None,
             None,
+            &rocky_core::config::PrincipalRef::unnamed(),
         )
         .await
         .expect("run --dag must complete the seed node on a multi-pipeline project");
@@ -2222,6 +2228,7 @@ mod tests {
             &crate::commands::run::SkipRunOptions::default(),
             None,
             None,
+            &rocky_core::config::PrincipalRef::unnamed(),
         )
         .await
         .expect("run --dag should complete the seed and its downstream model");
@@ -2338,7 +2345,7 @@ mod tests {
             partition_opts: PartitionRunOptions::default(),
             skip_opts: SkipRunOptions::default(),
             shadow_config: None,
-            sub_runner: default_sub_runner(),
+            sub_runner: default_sub_runner(rocky_core::config::PrincipalRef::unnamed()),
             state_turns: StateTurnstile::new(),
         };
         let id = NodeId::new("seed", "orders");
@@ -2447,7 +2454,7 @@ mod tests {
             partition_opts: PartitionRunOptions::default(),
             skip_opts: SkipRunOptions::default(),
             shadow_config: None,
-            sub_runner: default_sub_runner(),
+            sub_runner: default_sub_runner(rocky_core::config::PrincipalRef::unnamed()),
             state_turns: StateTurnstile::new(),
         };
         let id = NodeId::new("seed", "orders");
@@ -2534,6 +2541,7 @@ mod tests {
             &crate::commands::run::SkipRunOptions::default(),
             None,
             None,
+            &rocky_core::config::PrincipalRef::unnamed(),
         )
         .await
         .expect("run --dag should resolve the replication pipeline's catalog");
@@ -2621,6 +2629,7 @@ mod tests {
             // Unbounded node fan-out: these tests predate `--parallel`
             // bounding it and do not exercise concurrency (#1288).
             None,
+            &rocky_core::config::PrincipalRef::unnamed(),
         )
         .await
         .expect("the non-shadow DAG seeds production");
@@ -2649,6 +2658,7 @@ mod tests {
             // Unbounded node fan-out: these tests predate `--parallel`
             // bounding it and do not exercise concurrency (#1288).
             None,
+            &rocky_core::config::PrincipalRef::unnamed(),
         )
         .await
         .expect_err("a shadow DAG containing a seed must be refused");
@@ -2737,6 +2747,7 @@ mod tests {
             // Unbounded node fan-out: these tests predate `--parallel`
             // bounding it and do not exercise concurrency (#1288).
             None,
+            &rocky_core::config::PrincipalRef::unnamed(),
         )
         .await
         .expect("the non-shadow DAG builds production");
@@ -2762,6 +2773,7 @@ mod tests {
             // Unbounded node fan-out: these tests predate `--parallel`
             // bounding it and do not exercise concurrency (#1288).
             None,
+            &rocky_core::config::PrincipalRef::unnamed(),
         )
         .await
         .expect_err("a shadow DAG must be refused, not silently mis-isolated");
@@ -2856,6 +2868,7 @@ mod tests {
             // Unbounded node fan-out: these tests predate `--parallel`
             // bounding it and do not exercise concurrency (#1288).
             None,
+            &rocky_core::config::PrincipalRef::unnamed(),
         )
         .await
         .expect("historical DAG partition run should succeed");
@@ -3042,6 +3055,7 @@ mod tests {
             // Unbounded node fan-out: these tests predate `--parallel`
             // bounding it and do not exercise concurrency (#1288).
             None,
+            &rocky_core::config::PrincipalRef::unnamed(),
         )
         .await
         .expect("a two-transformation-pipeline DAG must build and run");
@@ -3137,6 +3151,7 @@ mod tests {
             // Unbounded node fan-out: these tests predate `--parallel`
             // bounding it and do not exercise concurrency (#1288).
             None,
+            &rocky_core::config::PrincipalRef::unnamed(),
         )
         .await
         .expect("run --dag should succeed");
@@ -3535,6 +3550,7 @@ mod tests {
             &crate::commands::run::SkipRunOptions::default(),
             None,
             None,
+            &rocky_core::config::PrincipalRef::unnamed(),
         )
         .await
         .expect_err("an ambiguous label must refuse the run");
@@ -3592,6 +3608,7 @@ mod tests {
             None,
             // `--parallel 1`: one node at a time, in dispatch order.
             Some(1),
+            &rocky_core::config::PrincipalRef::unnamed(),
         )
         .await
         .expect("run --dag should succeed");
@@ -3698,6 +3715,7 @@ mod tests {
             &crate::commands::run::SkipRunOptions::default(),
             None,
             Some(1),
+            &rocky_core::config::PrincipalRef::unnamed(),
         )
         .await
         .expect("the read waits for the in-run producer");

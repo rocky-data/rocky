@@ -161,8 +161,52 @@ struct Cli {
     #[arg(long, global = true, value_enum)]
     principal: Option<PolicyPrincipalArg>,
 
+    /// A name for who is acting, recorded on every policy decision.
+    ///
+    /// Lowercase letters, digits, `.`, `_` and `-`, at most 63 bytes. No `@`,
+    /// so an email address is refused. `unnamed`, `unrecorded` and every id
+    /// starting `mcp-` (the MCP server's own) are reserved. The id is self-asserted: Rocky does not verify it, and
+    /// `rocky audit` shows it as `verified: false`. It is a label, not an
+    /// enforcement input — `--principal` (the class) still decides the gate.
+    ///
+    /// Precedence: this flag, then `ROCKY_PRINCIPAL_ID`, then (for `rocky
+    /// mcp` only) `mcp-<profile>`, then `unnamed`. An invalid value is an
+    /// error; an empty `ROCKY_PRINCIPAL_ID` counts as unset. Rocky never reads `$USER` or a CI variable for it.
+    #[arg(long = "principal-id", global = true, value_name = "ID")]
+    principal_id: Option<String>,
+
     #[command(subcommand)]
     command: Command,
+}
+
+/// Resolve who is acting, for the `principal_ref` every decision row carries
+/// (RV4-P1).
+///
+/// Precedence: `--principal-id`, then `ROCKY_PRINCIPAL_ID`, then
+/// `mcp-<profile>` when `mcp_profile` is set (only `rocky mcp` passes it),
+/// then `unnamed`. An invalid flag or env value is a hard error, the same
+/// fail-closed rule as `ROCKY_PRINCIPAL`. A `ROCKY_PRINCIPAL_ID` that is not
+/// valid Unicode is an error too, never a silent fall-through.
+///
+/// Deliberately reads no `$USER`, `$USERNAME` or CI variable: a personal
+/// account name does not belong in a shared remote ledger by default, and CI
+/// identity is the signed OIDC work of RV4-P2.
+fn resolve_cli_principal_id(
+    flag: Option<&str>,
+    mcp_profile: Option<&str>,
+) -> Result<rocky_core::config::PrincipalRef> {
+    let env = match std::env::var("ROCKY_PRINCIPAL_ID") {
+        Ok(v) => Some(v),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            anyhow::bail!("invalid ROCKY_PRINCIPAL_ID: the value is not valid Unicode")
+        }
+    };
+    Ok(rocky_core::config::PrincipalRef::resolve(
+        flag,
+        env.as_deref(),
+        mcp_profile,
+    )?)
 }
 
 /// Resolve the effective CLI authoring principal per the frozen §3 precedence.
@@ -596,6 +640,17 @@ enum Command {
         /// the product name), read from `products/<NAME>.toml`.
         #[arg(long, conflicts_with_all = ["for_subject", "scorecard"])]
         product: Option<String>,
+        /// List only the decisions one actor made: the rows whose principal
+        /// id is `<ID>` (see the global `--principal-id`). `unrecorded` lists
+        /// the rows written before ids existed. Ids are self-asserted and
+        /// unverified. This filter reads no environment variable.
+        #[arg(long, value_name = "ID", conflicts_with_all = ["for_subject", "scorecard"])]
+        actor: Option<String>,
+        /// List only the decisions recorded at or after this time.
+        /// `YYYY-MM-DD` (00:00 UTC), an RFC 3339 timestamp with an offset, or
+        /// a `<N>d` / `<N>h` duration back from now (e.g. `7d`).
+        #[arg(long, value_name = "WHEN", conflicts_with_all = ["for_subject", "scorecard"])]
+        since: Option<String>,
         /// Models directory used to compute the downstream blast radius.
         #[arg(long, default_value = "models")]
         models: PathBuf,
@@ -3636,11 +3691,13 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             // (tamperable) plan file. Combined most-restrictively with the
             // plan's kind-forced principal inside each seam.
             let runtime_principal = resolve_cli_principal(cli.principal)?;
+            let actor = resolve_cli_principal_id(cli.principal_id.as_deref(), None)?;
             rocky_cli::commands::run_apply(
                 &cli.config,
                 &plan_id,
                 &state_path,
                 runtime_principal,
+                &actor,
                 expect_spec_digest.as_deref(),
                 json,
             )
@@ -3696,6 +3753,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                 from.as_deref(),
                 to.as_deref(),
                 !no_downstream,
+                &resolve_cli_principal_id(cli.principal_id.as_deref(), None)?,
                 json,
             )
             .await
@@ -3710,8 +3768,15 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             }
             None => match product {
                 Some(product) => {
-                    rocky_fulfill::run_fulfill(&cli.config, &state_path, &product, retry, json)
-                        .await
+                    rocky_fulfill::run_fulfill(
+                        &cli.config,
+                        &state_path,
+                        &product,
+                        retry,
+                        &resolve_cli_principal_id(cli.principal_id.as_deref(), None)?,
+                        json,
+                    )
+                    .await
                 }
                 None => anyhow::bail!(
                     "usage: rocky fulfill <product> [--retry] | rocky fulfill approve-spec \
@@ -3768,6 +3833,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                 scope,
                 reason,
                 false,
+                &resolve_cli_principal_id(cli.principal_id.as_deref(), None)?,
                 json,
             ),
             PolicySubcommand::Unfreeze {
@@ -3781,6 +3847,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                 scope,
                 reason,
                 true,
+                &resolve_cli_principal_id(cli.principal_id.as_deref(), None)?,
                 json,
             ),
         },
@@ -3790,6 +3857,8 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             by,
             window,
             product,
+            actor,
+            since,
             models,
         } => {
             if scorecard {
@@ -3808,7 +3877,13 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                         &selector,
                         json,
                     ),
-                    None => rocky_cli::commands::run_audit(&state_path, product.as_deref(), json),
+                    None => rocky_cli::commands::run_audit(
+                        &state_path,
+                        product.as_deref(),
+                        actor.as_deref(),
+                        since.as_deref(),
+                        json,
+                    ),
                 }
             }
         }
@@ -4211,6 +4286,9 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                 no_reuse,
                 no_prune,
             };
+            // Who is running (RV4-P1): stamped on the drift auto-apply
+            // custody rows. Resolved here, once, for all three run shapes.
+            let actor = resolve_cli_principal_id(cli.principal_id.as_deref(), None)?;
 
             if watch {
                 // `--watch` wraps the standard run path in a filesystem
@@ -4232,6 +4310,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                     cli.cache_ttl,
                     env.as_deref(),
                     &skip_opts,
+                    &actor,
                 )
                 .await
             } else if dag {
@@ -4256,6 +4335,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                     // has the default folded in and can no longer say whether
                     // the caller asked for a bound (#1288).
                     parallel,
+                    &actor,
                 );
                 tokio::select! {
                     result = run_future => result,
@@ -4300,6 +4380,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                     &run_vars,
                     assume_fresh_state,
                     contracts.as_deref(),
+                    &actor,
                 )
                 .await
             }
@@ -4971,11 +5052,13 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                 // arm uses, so the sink gates under `PolicyCapability::Apply`
                 // regardless of which route reached it.
                 let runtime_principal = resolve_cli_principal(cli.principal)?;
+                let actor = resolve_cli_principal_id(cli.principal_id.as_deref(), None)?;
                 rocky_cli::commands::run_compact_apply(
                     &cli.config,
                     &plan_id,
                     &state_path,
                     runtime_principal,
+                    &actor,
                     json,
                 )
                 .await
@@ -5083,6 +5166,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                     // keyed on the promote-time runtime principal, NOT the
                     // plan's stored stamp.
                     let runtime_principal = resolve_cli_principal(cli.principal)?;
+                    let actor = resolve_cli_principal_id(cli.principal_id.as_deref(), None)?;
                     let cwd = std::env::current_dir()
                         .context("failed to get current working directory")?;
                     rocky_cli::commands::run_branch_promote_from_plan(
@@ -5093,6 +5177,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                         pipeline.as_deref(),
                         &state_path,
                         runtime_principal,
+                        &actor,
                         json,
                     )
                     .await
@@ -5114,6 +5199,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                         )
                     })?;
                     let runtime_principal = resolve_cli_principal(cli.principal)?;
+                    let actor = resolve_cli_principal_id(cli.principal_id.as_deref(), None)?;
                     let cwd = std::env::current_dir()
                         .context("failed to get current working directory")?;
                     rocky_cli::commands::run_branch_promote(
@@ -5128,6 +5214,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                         skip_approval,
                         allow_breaking,
                         runtime_principal,
+                        &actor,
                         json,
                     )
                     .await
@@ -5216,11 +5303,13 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                 // what a deny rule catches. The review gate is unconditional
                 // either way. Never deletes.
                 let principal = resolve_cli_principal(cli.principal)?;
+                let actor = resolve_cli_principal_id(cli.principal_id.as_deref(), None)?;
                 rocky_cli::commands::run_gc_plan(
                     &state_path,
                     &cli.config,
                     min_age_days,
                     principal,
+                    &actor,
                     json,
                 )
             }
@@ -5234,7 +5323,8 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             // stored stamp — is what a deny rule catches. The review gate is
             // unconditional either way. Writes no bytes.
             let principal = resolve_cli_principal(cli.principal)?;
-            rocky_cli::commands::run_restore_plan(&state_path, &target, principal, json)
+            let actor = resolve_cli_principal_id(cli.principal_id.as_deref(), None)?;
+            rocky_cli::commands::run_restore_plan(&state_path, &target, principal, &actor, json)
         }
         Command::Preview { action } => match action {
             PreviewAction::Create { base, name, models } => {
@@ -5378,11 +5468,13 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                 // arm uses, so the destructive DELETE + VACUUM gates under
                 // `PolicyCapability::Apply` regardless of which route reached it.
                 let runtime_principal = resolve_cli_principal(cli.principal)?;
+                let actor = resolve_cli_principal_id(cli.principal_id.as_deref(), None)?;
                 rocky_cli::commands::run_archive_apply(
                     &cli.config,
                     &plan_id,
                     &state_path,
                     runtime_principal,
+                    &actor,
                     json,
                 )
                 .await
@@ -5429,7 +5521,14 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             rocky_cli::commands::run_completions::<Cli>(shell, &mut std::io::stdout());
             Ok(())
         }
-        Command::Mcp { config, profile } => rocky_mcp::serve_stdio(config, profile.into()).await,
+        Command::Mcp { config, profile } => {
+            let profile: rocky_mcp::McpProfile = profile.into();
+            // `--principal-id` / `ROCKY_PRINCIPAL_ID` on the server process
+            // win; otherwise the server acts as `mcp-<profile>`.
+            let actor =
+                resolve_cli_principal_id(cli.principal_id.as_deref(), Some(profile.name()))?;
+            rocky_mcp::serve_stdio(config, profile, actor).await
+        }
     };
 
     // SIGINT: map `commands::Interrupted` to the conventional shell exit
@@ -5878,6 +5977,81 @@ mod tests {
                 .join()
                 .expect("command-builder thread panicked")
         })
+    }
+
+    /// `--principal-id` is global (before or after the subcommand), and
+    /// `rocky audit --actor/--since` parse and refuse `--for`/`--scorecard`.
+    #[test]
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "a conflict check needs the parse error, which the wrapper turns into a panic"
+    )]
+    fn principal_id_flag_and_audit_actor_since_parse() {
+        let cli = try_parse_with_big_stack(&[
+            "rocky",
+            "--principal-id",
+            "alice",
+            "audit",
+            "--actor",
+            "bob",
+            "--since",
+            "7d",
+        ]);
+        assert_eq!(cli.principal_id.as_deref(), Some("alice"));
+        let Command::Audit { actor, since, .. } = cli.command else {
+            panic!("expected the audit command");
+        };
+        assert_eq!(actor.as_deref(), Some("bob"));
+        assert_eq!(since.as_deref(), Some("7d"));
+
+        let cli =
+            try_parse_with_big_stack(&["rocky", "policy", "freeze", "--principal-id", "ops-1"]);
+        assert_eq!(cli.principal_id.as_deref(), Some("ops-1"));
+
+        for conflicting in [
+            vec!["rocky", "audit", "--actor", "a", "--for", "fct"],
+            vec!["rocky", "audit", "--since", "7d", "--scorecard"],
+        ] {
+            let parsed = std::thread::scope(|s| {
+                let owned: Vec<String> = conflicting.iter().map(ToString::to_string).collect();
+                std::thread::Builder::new()
+                    .stack_size(8 * 1024 * 1024)
+                    .spawn_scoped(s, move || Cli::try_parse_from(&owned).is_ok())
+                    .expect("spawn parser thread")
+                    .join()
+                    .expect("parser thread panicked")
+            });
+            assert!(!parsed, "{conflicting:?} must be a clap conflict");
+        }
+    }
+
+    /// The CLI resolver: a flag wins and is validated; `rocky mcp` falls back
+    /// to `mcp-<profile>`; nothing set is `unnamed`. (The env leg is pinned by
+    /// `PrincipalRef::resolve`'s own tests in rocky-core; this test does not
+    /// touch the process environment, so it only runs its env-independent
+    /// cases when `ROCKY_PRINCIPAL_ID` is unset.)
+    #[test]
+    fn resolve_cli_principal_id_precedence_without_env() {
+        use rocky_core::config::PrincipalIdSource;
+        let r = resolve_cli_principal_id(Some("alice"), Some("worker")).unwrap();
+        assert_eq!(
+            (r.id.as_str(), r.source),
+            ("alice", PrincipalIdSource::Flag)
+        );
+        assert!(resolve_cli_principal_id(Some("Alice"), None).is_err());
+        assert!(resolve_cli_principal_id(Some("unnamed"), None).is_err());
+        if std::env::var_os("ROCKY_PRINCIPAL_ID").is_none() {
+            let r = resolve_cli_principal_id(None, Some("worker")).unwrap();
+            assert_eq!(
+                (r.id.as_str(), r.source),
+                ("mcp-worker", PrincipalIdSource::McpProfile)
+            );
+            let r = resolve_cli_principal_id(None, None).unwrap();
+            assert_eq!(
+                (r.id.as_str(), r.source),
+                ("unnamed", PrincipalIdSource::Default)
+            );
+        }
     }
 
     /// Every `plan`-declared flag must appear in the #1550 guard's list.

@@ -222,6 +222,7 @@ async fn drive_run(
         None,  // governed_ctx
         false, // assume_fresh_state
         None,  // #1460
+        &rocky_core::config::PrincipalRef::unnamed(),
     )
     .await
     .map(|_| ())
@@ -242,6 +243,7 @@ async fn drive_run_governed(
     let root = config_path.parent().expect("project root").to_path_buf();
     let ctx = rocky_cli::commands::apply::GovernedRunContext {
         principal: rocky_core::config::PolicyPrincipal::Agent,
+        actor: rocky_core::config::PrincipalRef::unnamed(),
         plan_id: "plan-durability-redteam",
         root: &root,
         config_path,
@@ -280,6 +282,7 @@ async fn drive_run_governed(
         Some(&ctx),
         false, // assume_fresh_state
         None,  // #1460
+        &rocky_core::config::PrincipalRef::unnamed(),
     )
     .await
     .map(|_| ())
@@ -966,6 +969,7 @@ async fn backfill_fixture_with(model_sql: &str, with_policy: bool) -> (ModelProj
         None,
         None,
         true,
+        &rocky_core::config::PrincipalRef::unnamed(),
         false,
     )
     .await;
@@ -1023,6 +1027,7 @@ async fn drive_backfill_apply(project: &ModelProject, plan_id: &str) -> anyhow::
         plan_id,
         &project.state_path,
         rocky_core::config::PolicyPrincipal::Human, // kind-forces Agent anyway
+        &rocky_core::config::PrincipalRef::unnamed(),
         None,
         false,
     )

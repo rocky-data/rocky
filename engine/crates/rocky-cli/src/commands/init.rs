@@ -761,6 +761,7 @@ mod tests {
             None,  // no governance ctx (test)
             false, // assume_fresh_state (test)
             None,  // #1460
+            &rocky_core::config::PrincipalRef::unnamed(),
         )
         .await
         .expect("the scaffolded duckdb project must run end to end");

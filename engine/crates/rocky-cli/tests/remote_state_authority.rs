@@ -143,6 +143,7 @@ async fn drive_run(
         None, // governed_ctx
         assume_fresh_state,
         None, // #1460
+        &rocky_core::config::PrincipalRef::unnamed(),
     )
     .await
     .map(|_| ())
@@ -323,6 +324,7 @@ fn policy_freeze_download_failure_fails_closed() {
         None,  // scope — any
         None,  // reason — synthesized
         false, // lift
+        &rocky_core::config::PrincipalRef::unnamed(),
         false, // json
     )
     .expect_err("a remote-backend freeze must fail closed when the download fails");

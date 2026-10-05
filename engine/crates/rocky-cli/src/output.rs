@@ -8507,6 +8507,9 @@ pub struct ReviewQueueEntry {
     pub timestamp: String,
     /// Who authored the change (`human` / `agent`).
     pub principal: rocky_core::config::PolicyPrincipal,
+    /// The id of the actor behind the escalation (RV4-P1). `null` when the
+    /// row was written before ids existed. Self-asserted and unverified.
+    pub principal_id: Option<String>,
     /// The capability that was evaluated (its `schema_change.*` refinement is
     /// the change class the ranking weighs).
     pub capability: rocky_core::config::PolicyCapability,
@@ -8910,9 +8913,33 @@ pub struct AuditOutput {
     /// when the whole ledger is listed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub product: Option<AuditProductScope>,
+    /// The `--actor` / `--since` filter applied, absent when neither was
+    /// given.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub filter: Option<AuditFilter>,
+    /// How many rows in range carry no principal id (written before ids
+    /// existed) and so an `--actor <id>` filter dropped them. `0` without an
+    /// `--actor` filter, and under `--actor unrecorded`, which lists them.
+    /// Defaulted, so a consumer reading an older binary's output sees `0`.
+    #[serde(default)]
+    pub unattributed_skipped: u64,
     /// Every recorded policy decision, oldest first. Under `product`, only
-    /// the rows whose `model` is that product's output model.
+    /// the rows whose `model` is that product's output model. Under `filter`,
+    /// only the rows that match it.
     pub decisions: Vec<AuditDecisionEntry>,
+}
+
+/// The `--actor` / `--since` filter of `rocky audit` (RV4-P1).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+pub struct AuditFilter {
+    /// The principal id the rows were filtered to. `unrecorded` selects the
+    /// rows with no id.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub actor: Option<String>,
+    /// The inclusive lower bound, as an RFC 3339 UTC timestamp. A row is kept
+    /// when its timestamp is at or after this.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub since: Option<String>,
 }
 
 /// The product filter of `rocky audit --product <name>`, resolved from the
@@ -8953,6 +8980,18 @@ pub struct AuditDecisionEntry {
     /// Human-readable explanation of how the effect was reached. A resolved
     /// `${VAR}` value prints as `${NAME}` (#1919).
     pub reason: EnvString,
+    /// The id of the actor behind the decision (RV4-P1). `null` means
+    /// unrecorded: the row was written before ids existed. `unnamed` means
+    /// nobody named the actor.
+    pub principal_id: Option<String>,
+    /// Where the id came from (`flag`, `env`, `mcp_profile`, `default`).
+    /// `null` when the id is unrecorded.
+    pub principal_id_source: Option<rocky_core::config::PrincipalIdSource>,
+    /// Whether anything verified the id. Always `false` today: ids are
+    /// self-asserted until signed approvals exist. Defaulted, so a consumer
+    /// reading an older binary's output sees `false`.
+    #[serde(default)]
+    pub principal_id_verified: bool,
 }
 
 // ---------------------------------------------------------------------------

@@ -1795,6 +1795,7 @@ mod tests {
             None,  // no governance ctx (test)
             false, // assume_fresh_state (test)
             None,  // #1460
+            &rocky_core::config::PrincipalRef::unnamed(),
         )
         .await
         .map(|_| ())
@@ -1940,6 +1941,7 @@ auto_create_schemas = true
             None,
             false,
             None, // #1460
+            &rocky_core::config::PrincipalRef::unnamed(),
         )
         .await
         .expect("--model with --pipeline must resolve that pipeline's models dir");
@@ -2020,6 +2022,7 @@ auto_create_schemas = true
             None,
             false,
             None, // #1460
+            &rocky_core::config::PrincipalRef::unnamed(),
         )
         .await
         .map(|_| ())
@@ -2410,6 +2413,7 @@ auto_create_schemas = true
             None,  // no governance ctx (test)
             false, // assume_fresh_state (test)
             None,  // #1460
+            &rocky_core::config::PrincipalRef::unnamed(),
         )
         .await
         .expect("full-DAG transformation run with idempotency key should succeed");
@@ -2734,6 +2738,7 @@ auto_create_schemas = true
             None,  // no governance ctx (test)
             false, // assume_fresh_state (test)
             None,  // #1460
+            &rocky_core::config::PrincipalRef::unnamed(),
         )
         .await
         .expect("model-only run must reach the governance.tags apply path and succeed");
@@ -2815,6 +2820,7 @@ auto_create_schemas = true
             None,  // no governance ctx (test)
             false, // assume_fresh_state (test)
             None,  // #1460
+            &rocky_core::config::PrincipalRef::unnamed(),
         )
         .await;
 

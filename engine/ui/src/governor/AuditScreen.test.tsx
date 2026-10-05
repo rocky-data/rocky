@@ -11,6 +11,7 @@ const PLAN = "c".repeat(64);
 const LEDGER: AuditOutput = {
   version: "1.74.0",
   command: "audit",
+  unattributed_skipped: 0,
   decisions: [
     {
       timestamp: "2026-09-04T09:00:00Z",
@@ -21,6 +22,9 @@ const LEDGER: AuditOutput = {
       effect: "allow",
       rule_id: 0,
       reason: "propose is allowed",
+      principal_id: "alice",
+      principal_id_source: "flag",
+      principal_id_verified: false,
     },
     {
       timestamp: "2026-09-04T10:00:00Z",
@@ -31,6 +35,8 @@ const LEDGER: AuditOutput = {
       effect: "deny",
       rule_id: null,
       reason: "<i>frozen</i> by the governor",
+      principal_id: null,
+      principal_id_verified: false,
     },
   ],
 };
@@ -75,6 +81,9 @@ describe("AuditScreen", () => {
     expect(within(rows[0]).getByRole("link", { name: PLAN })).toBeInTheDocument();
     expect(within(rows[1]).getByRole("link", { name: "freeze:global" })).toBeInTheDocument();
     expect(screen.getByText("<i>frozen</i> by the governor")).toBeInTheDocument();
+    // `class(id)`: a named actor, and a row from before ids existed.
+    expect(screen.getByText("agent(alice)")).toBeInTheDocument();
+    expect(screen.getByText("human(unrecorded)")).toBeInTheDocument();
     expect(container.querySelector("i")).toBeNull();
     expect(screen.getByText("2 decision(s), oldest first, the whole ledger")).toBeInTheDocument();
   });

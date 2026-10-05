@@ -1262,6 +1262,7 @@ fn build_queue(
                 decision_ref: format!("{}|{}|{}", d.timestamp.to_rfc3339(), d.plan_id, d.model),
                 timestamp: d.timestamp.to_rfc3339(),
                 principal: d.principal,
+                principal_id: d.principal_ref.as_ref().map(|r| r.id.to_string()),
                 capability: d.capability,
                 model: d.model.clone(),
                 models,
@@ -1420,10 +1421,12 @@ fn queue_graph_keys(
 /// Best-effort like every other ledger write: the review-marker gate at apply
 /// is the safety boundary, the ledger is the trail — a locked or unreadable
 /// state store must not fail plan creation.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn record_plan_review_escalation(
     state_path: &Path,
     plan_id: &str,
     principal: PolicyPrincipal,
+    actor: &rocky_core::config::PrincipalRef,
     capability: PolicyCapability,
     model_summary: &str,
     models: Vec<String>,
@@ -1443,6 +1446,7 @@ pub(crate) fn record_plan_review_escalation(
         reason: reason.to_string(),
         verify_after: Vec::new(),
         auto_apply: None,
+        principal_ref: Some(actor.clone()),
     };
     let written = StateStore::open(state_path).and_then(|s| s.record_policy_decision(&record));
     if let Err(e) = written {
@@ -1506,6 +1510,14 @@ fn render_queue_text(out: &ReviewQueueOutput) {
             .ok()
             .and_then(|v| v.as_str().map(str::to_string))
             .unwrap_or_default();
+        // `class(id)`, e.g. `agent(mcp-worker)`; a row from before ids
+        // existed reads `human(unrecorded)`.
+        let principal = format!(
+            "{principal}({})",
+            e.principal_id
+                .as_deref()
+                .unwrap_or(rocky_core::config::PRINCIPAL_ID_UNRECORDED)
+        );
         println!(
             "  {}. {} ({}) — {}, waited {}s [score {:.1}]",
             i + 1,
@@ -2610,6 +2622,7 @@ mod tests {
             reason: "test".to_string(),
             verify_after: Vec::new(),
             auto_apply: None,
+            principal_ref: None,
         }
     }
 
@@ -3282,6 +3295,7 @@ mod tests {
             &state_path,
             "gc_aaa",
             PolicyPrincipal::Human,
+            &rocky_core::config::PrincipalRef::unnamed(),
             PolicyCapability::Gc,
             "gc: 1 artifact(s) across 1 model(s)",
             vec!["c".to_string()],
@@ -3289,10 +3303,15 @@ mod tests {
         );
         // gc_bbb evicts from `b`, which `c` reads from.
         touch_plan_file(root, "gc_bbb");
+        let queue_actor = rocky_core::config::PrincipalRef {
+            id: rocky_core::config::PrincipalId::parse_asserted("queue-actor").unwrap(),
+            source: rocky_core::config::PrincipalIdSource::Flag,
+        };
         record_plan_review_escalation(
             &state_path,
             "gc_bbb",
             PolicyPrincipal::Human,
+            &queue_actor,
             PolicyCapability::Gc,
             "gc: 1 artifact(s) across 1 model(s)",
             vec!["b".to_string()],
@@ -3308,6 +3327,9 @@ mod tests {
              it does not sort first on id, so only the blast radius can put it there"
         );
         assert_eq!(out.pending[0].blast_radius, Some(1));
+        // RV4-P1: the escalation row carries the actor, and the queue shows it.
+        assert_eq!(out.pending[0].principal_id.as_deref(), Some("queue-actor"));
+        assert_eq!(out.pending[1].principal_id.as_deref(), Some("unnamed"));
         assert_eq!(out.pending[1].plan_id, "gc_aaa");
         assert_eq!(
             out.pending[1].blast_radius,
@@ -3348,6 +3370,7 @@ mod tests {
                 &state_path,
                 plan_id,
                 PolicyPrincipal::Agent,
+                &rocky_core::config::PrincipalRef::unnamed(),
                 PolicyCapability::Backfill,
                 "backfill: 3 model(s)",
                 models.into_iter().map(str::to_string).collect(),
@@ -3417,6 +3440,7 @@ mod tests {
             &state_path,
             "bf_one",
             PolicyPrincipal::Agent,
+            &rocky_core::config::PrincipalRef::unnamed(),
             PolicyCapability::Backfill,
             "backfill: 1 model(s)",
             vec!["a".to_string()],
@@ -3427,6 +3451,7 @@ mod tests {
             &state_path,
             "bf_two",
             PolicyPrincipal::Agent,
+            &rocky_core::config::PrincipalRef::unnamed(),
             PolicyCapability::Backfill,
             "backfill: 2 model(s)",
             vec!["a".to_string(), "x".to_string()],
@@ -3474,6 +3499,7 @@ mod tests {
             &state_path,
             "bf_overlap",
             PolicyPrincipal::Agent,
+            &rocky_core::config::PrincipalRef::unnamed(),
             PolicyCapability::Backfill,
             "backfill: 2 model(s)",
             vec!["a".to_string(), "b".to_string()],
@@ -3517,6 +3543,7 @@ mod tests {
             &state_path,
             "gc_partial",
             PolicyPrincipal::Human,
+            &rocky_core::config::PrincipalRef::unnamed(),
             PolicyCapability::Gc,
             "gc: 2 artifact(s) across 2 model(s)",
             vec!["c".to_string(), "deleted_since".to_string()],
@@ -3528,6 +3555,7 @@ mod tests {
             &state_path,
             "gc_leaf_only",
             PolicyPrincipal::Human,
+            &rocky_core::config::PrincipalRef::unnamed(),
             PolicyCapability::Gc,
             "gc: 1 artifact(s) across 1 model(s)",
             vec!["c".to_string()],
@@ -3579,6 +3607,7 @@ mod tests {
             &state_path,
             "p_empty",
             PolicyPrincipal::Agent,
+            &rocky_core::config::PrincipalRef::unnamed(),
             PolicyCapability::Backfill,
             "backfill: 2 model(s)",
             Vec::new(),
@@ -3590,6 +3619,7 @@ mod tests {
             &state_path,
             "p_gone",
             PolicyPrincipal::Agent,
+            &rocky_core::config::PrincipalRef::unnamed(),
             PolicyCapability::Backfill,
             "backfill: 1 model(s)",
             vec!["deleted_since".to_string()],
@@ -3730,6 +3760,7 @@ mod tests {
             &state_path,
             "bf",
             PolicyPrincipal::Agent,
+            &rocky_core::config::PrincipalRef::unnamed(),
             PolicyCapability::Backfill,
             "backfill_2_models",
             vec!["b".to_string(), "d".to_string()],
@@ -3822,6 +3853,7 @@ mod tests {
             &state_path,
             "restore_gone",
             PolicyPrincipal::Human,
+            &rocky_core::config::PrincipalRef::unnamed(),
             PolicyCapability::Restore,
             "restore: gone (abc123…)",
             vec!["gone".to_string()],
@@ -3992,6 +4024,7 @@ mod tests {
             &config_path,
             "plan_e2e",
             PolicyPrincipal::Agent,
+            &rocky_core::config::PrincipalRef::unnamed(),
             &touched,
             &models_dir,
             &state_path,
@@ -4088,6 +4121,7 @@ mod tests {
                 cfg.policy.as_ref(),
                 "repl",
                 PolicyPrincipal::Agent,
+                &rocky_core::config::PrincipalRef::unnamed(),
                 &touched,
                 &models_dir,
                 None,
@@ -4165,6 +4199,7 @@ mod tests {
             &state_path,
             "recorded",
             PolicyPrincipal::Agent,
+            &rocky_core::config::PrincipalRef::unnamed(),
             PolicyCapability::Backfill,
             "backfill: 2 model(s)",
             vec!["a".to_string(), "b".to_string()],
