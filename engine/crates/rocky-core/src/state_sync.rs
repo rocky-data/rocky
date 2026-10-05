@@ -1008,9 +1008,10 @@ fn cas_probe_cache_key(cfg: &StateConfig) -> String {
                 env(&[
                     "AWS_ENDPOINT_URL",
                     "AWS_ENDPOINT",
-                    "AWS_ENDPOINT_URL_S3",
                     "AWS_REGION",
                     "AWS_DEFAULT_REGION",
+                    // Changes how a conditional put is sent, so the verdict.
+                    "AWS_CONDITIONAL_PUT",
                 ])
             )
         }
@@ -1376,19 +1377,21 @@ fn cas_required_marker_keys(remote_key: &str) -> Vec<String> {
         .collect()
 }
 
-/// The first `cas-required` marker that exists among
-/// [`cas_required_marker_keys`], or `None`. Stops at the first hit; any
-/// existence check that fails is an error (fail-closed, as before).
+/// The newest `cas-required` marker that exists among
+/// [`cas_required_marker_keys`], or `None`. The existence checks run
+/// concurrently, so the scan costs one round trip of the shared transfer
+/// timeout rather than one per schema version. Any check that fails is an
+/// error (fail-closed, as before).
 async fn find_cas_required_marker(
     provider: &ObjectStoreProvider,
     remote_key: &str,
 ) -> Result<Option<String>, StateSyncError> {
-    for key in cas_required_marker_keys(remote_key) {
-        if provider.exists(&key).await? {
-            return Ok(Some(key));
-        }
-    }
-    Ok(None)
+    let keys = cas_required_marker_keys(remote_key);
+    let found = futures::future::try_join_all(keys.iter().map(|key| provider.exists(key))).await?;
+    Ok(keys
+        .into_iter()
+        .zip(found)
+        .find_map(|(key, exists)| exists.then_some(key)))
 }
 
 /// Startup half of the marker rule: a writer whose resolved mode is `off`
