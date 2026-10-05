@@ -116,6 +116,7 @@ fn recorded_stripe_add_compile_run_extend_update_remove() {
     assert_eq!(pkg["hub"], "fivetran/stripe");
     assert_eq!(pkg["version"], "1.10.1");
     assert_eq!(pkg["dbt_version"], "1.12.5");
+    assert_eq!(pkg["mode"], "compiled");
     assert_eq!(pkg["models"].as_array().unwrap().len(), MODELS, "{pkg}");
     assert_eq!(pkg["failed_models"].as_array().unwrap().len(), 0, "{pkg}");
     assert_eq!(pkg["tests_mapped"], 15, "the package's not_null tests map");
@@ -245,6 +246,13 @@ fn recorded_stripe_add_compile_run_extend_update_remove() {
     // lock recorded for it, as a new package version would.
     let lock_path = root.join("rocky-packages.lock");
     let lock_text = fs::read_to_string(&lock_path).unwrap();
+    assert!(lock_text.contains("mode = \"compiled\""), "{lock_text}");
+    // A package vendored from --compiled has no dbt run to replay.
+    let err = refused(&rocky(root, &["package", "update"]));
+    assert!(
+        err.contains("--compiled") && err.contains("--build-empty"),
+        "{err}"
+    );
     let mut lock: toml::Value = toml::from_str(&lock_text).unwrap();
     lock["package"][0]["files"][edited_rel] = toml::Value::String("blake3:00".into());
     fs::write(&lock_path, toml::to_string(&lock).unwrap()).unwrap();
@@ -369,6 +377,97 @@ fn a_project_model_collision_refuses_add_and_writes_nothing() {
 }
 
 #[test]
+fn collisions_use_the_resolved_name_and_ignore_case() {
+    let tmp = project();
+    let root = tmp.path();
+    // The file stem differs; the sidecar's `name =` resolves to the package
+    // model's name, in another case.
+    fs::write(root.join("models/my_charges.sql"), "SELECT 1 AS id\n").unwrap();
+    fs::write(
+        root.join("models/my_charges.toml"),
+        format!("name = \"Stripe__Customer_Overview\"\n{SIDECAR}"),
+    )
+    .unwrap();
+    let err = refused(&rocky(
+        root,
+        &[
+            "package",
+            "add",
+            "fivetran/stripe",
+            "--compiled",
+            &compiled_flag(),
+        ],
+    ));
+    assert!(
+        err.contains("stripe__customer_overview") && err.contains("Stripe__Customer_Overview"),
+        "{err}"
+    );
+    assert!(!root.join("models/packages").exists());
+}
+
+/// What `dbt compile` without `dbt run --empty` produces for a Fivetran
+/// staging model: every column cast to NULL. Such a project is refused with
+/// both ways out, and nothing is written.
+#[test]
+fn a_compile_without_built_upstreams_is_refused_with_both_options() {
+    let tmp = project();
+    let root = tmp.path();
+    let compiled = tempfile::tempdir().unwrap();
+    fs::create_dir_all(compiled.path().join("target")).unwrap();
+    fs::copy(
+        fixture().join("compiled/package-lock.yml"),
+        compiled.path().join("package-lock.yml"),
+    )
+    .unwrap();
+    let manifest_text =
+        fs::read_to_string(fixture().join("compiled/target/manifest.json")).unwrap();
+    let mut manifest: serde_json::Value = serde_json::from_str(&manifest_text).unwrap();
+    manifest["nodes"]["model.stripe.stg_stripe__charge"]["compiled_code"] =
+        serde_json::Value::String(
+            "with base as (select * from \"dev\".\"rocky_package_build_stg_stripe\".\
+             \"stg_stripe__charge_tmp\"),\nfields as (select cast(null as timestamp) as \
+             _fivetran_synced, cast(null as integer) as amount, cast(null as TEXT) as id \
+             from base)\nselect * from fields"
+                .to_string(),
+        );
+    fs::write(
+        compiled.path().join("target/manifest.json"),
+        manifest.to_string(),
+    )
+    .unwrap();
+    let dir = compiled.path().display().to_string();
+    let err = refused(&rocky(
+        root,
+        &["package", "add", "fivetran/stripe", "--compiled", &dir],
+    ));
+    assert!(err.contains("stg_stripe__charge"), "{err}");
+    assert!(
+        err.contains("--build-empty") && err.contains("--compiled"),
+        "{err}"
+    );
+    assert!(err.contains("Nothing was written"), "{err}");
+    assert!(!root.join("models/packages").exists());
+    assert!(!root.join("rocky-packages.lock").exists());
+}
+
+#[test]
+fn build_empty_and_compiled_conflict() {
+    let tmp = project();
+    let err = refused(&rocky(
+        tmp.path(),
+        &[
+            "package",
+            "add",
+            "fivetran/stripe",
+            "--build-empty",
+            "--compiled",
+            &compiled_flag(),
+        ],
+    ));
+    assert!(err.contains("conflict"), "{err}");
+}
+
+#[test]
 fn missing_dbt_is_refused_with_install_guidance() {
     let tmp = project();
     let out = Command::new(env!("CARGO_BIN_EXE_rocky"))
@@ -435,16 +534,35 @@ fn live_dbt_add_compile_run() {
     if let Some(bin) = &bin {
         args.extend(["--dbt", bin.as_str()]);
     }
+    // Default: compile only. Fivetran staging introspects upstream models,
+    // so the compile is wrong and the package is refused, writing nothing.
+    let err = refused(&rocky(root, &args));
+    assert!(
+        err.contains("--build-empty") && err.contains("--compiled"),
+        "{err}"
+    );
+    assert!(!root.join("models/packages").exists());
+    assert!(!root.join("rocky-packages.lock").exists());
+
+    args.push("--build-empty");
     let added = ok(&rocky(root, &args));
     let pkg = &added["package"];
     assert_eq!(pkg["models"].as_array().unwrap().len(), MODELS, "{pkg}");
     assert_eq!(pkg["failed_models"].as_array().unwrap().len(), 0, "{pkg}");
-    assert_eq!(pkg["build_empty"], true);
+    assert_eq!(pkg["mode"], "build-empty");
     let compiled = ok(&rocky(root, &["compile"]));
     assert_eq!(compiled["has_errors"], false, "{}", compiled["diagnostics"]);
     let run = ok(&rocky(root, &["run", "--dag"]));
     assert_eq!(run["failed"], 0, "{run}");
-    let updated = ok(&rocky(root, &["package", "update"]));
+    let mut update = vec!["package", "update"];
+    if let Some(bin) = &bin {
+        update.extend(["--dbt", bin.as_str()]);
+    }
+    let updated = ok(&rocky(root, &update));
+    assert_eq!(
+        updated["packages"][0]["mode"], "build-empty",
+        "the lock's mode is replayed"
+    );
     assert_eq!(
         updated["packages"][0]["files_unchanged"],
         MODELS * 2,

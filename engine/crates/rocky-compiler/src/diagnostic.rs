@@ -338,8 +338,12 @@ pub const E054: &str = "E054";
 /// malformed `<namespace>/<name>[@<version>]` spec, `dbt` missing from `PATH`,
 /// a Rocky adapter with no dbt profile mapping (supported: duckdb, snowflake,
 /// databricks, bigquery, postgres), a failed `dbt deps` / `dbt compile`, a
-/// package model whose name an existing project or package model already
-/// owns (package models keep their dbt names; Rocky never prefixes them), or
+/// compile without `--build-empty` (or from `--compiled`) where an
+/// introspecting macro found no upstream columns (a model selecting only
+/// NULLs from a table, or the `dbt_utils.star` placeholder), a package model
+/// whose resolved name an existing project or package model already owns,
+/// compared case-insensitively (package models keep their dbt names; Rocky
+/// never prefixes them), two package models differing only by case, or
 /// a `remove` that would delete locally edited vendored files without
 /// `--force`. Nothing is written when it fires.
 pub const E055: &str = "E055";

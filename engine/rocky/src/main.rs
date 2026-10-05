@@ -3050,11 +3050,14 @@ struct PackageBuildArgs {
     /// `<dir>/target/manifest.json` and `<dir>/package-lock.yml`.
     #[arg(long)]
     compiled: Option<PathBuf>,
-    /// Skip `dbt run --empty`. Without it, macros that introspect upstream
-    /// models at compile time (e.g. Fivetran staging columns,
-    /// `dbt_utils.star`) see no columns.
-    #[arg(long = "no-build-empty")]
-    no_build_empty: bool,
+    /// Run `dbt run --empty --full-refresh` before compiling, so macros that
+    /// introspect upstream models (Fivetran staging columns, `dbt_utils.star`)
+    /// see real columns. Writes empty `rocky_package_build*` schemas to the
+    /// warehouse and runs the package's hooks. Off by default (compile only;
+    /// such a package is then refused with E055). `update` reuses the mode in
+    /// rocky-packages.lock; `--build-empty=false` switches back.
+    #[arg(long = "build-empty", num_args = 0..=1, default_missing_value = "true", require_equals = true)]
+    build_empty: Option<bool>,
 }
 
 impl PackageBuildArgs {
@@ -3065,7 +3068,7 @@ impl PackageBuildArgs {
             target_schema: self.target_schema,
             dbt: self.dbt,
             compiled: self.compiled,
-            no_build_empty: self.no_build_empty,
+            build_empty: self.build_empty,
         }
     }
 }

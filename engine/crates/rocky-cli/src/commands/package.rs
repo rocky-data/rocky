@@ -8,9 +8,13 @@
 //! ```
 //!
 //! `add` and `update` run dbt once, in a throwaway project under a temp
-//! directory: `dbt deps`, then `dbt run --empty --full-refresh` (empty
-//! relations, so compile-time introspection macros see real columns; skip
-//! with `--no-build-empty`), then `dbt compile --full-refresh`. The compiled
+//! directory: `dbt deps`, then `dbt compile --full-refresh`. Nothing is
+//! written to the warehouse by default. With the opt-in `--build-empty`, dbt
+//! first runs `dbt run --empty --full-refresh` so compile-time introspection
+//! macros see real columns; without it, a package whose compiled SQL shows
+//! such a macro found nothing (all-NULL columns, a placeholder `*`) is
+//! refused with E055 rather than vendored wrong. The mode is recorded in the
+//! lockfile and replayed by `update`. The compiled
 //! manifest is imported for that one package and written to
 //! `models/packages/<package>/`, with `rocky-packages.lock` recording what was
 //! written. From then on Rocky owns the models; dbt is not needed to compile,
@@ -30,7 +34,7 @@ use serde::{Deserialize, Serialize};
 
 use rocky_compiler::import::dbt_manifest;
 use rocky_compiler::import::dbt_package::{
-    self, INCOMING_SUFFIX, LOCKFILE_NAME, LockedPackage, PackageImport, PackagesLock,
+    self, BuildMode, INCOMING_SUFFIX, LOCKFILE_NAME, LockedPackage, PackageImport, PackagesLock,
 };
 use rocky_core::config::{AdapterConfig, RockyConfig};
 use rocky_core::models::TargetConfig;
@@ -110,8 +114,10 @@ pub struct PackageVendorReport {
     /// Schema the vendored models build into.
     pub target_schema: String,
     pub vars_hash: String,
-    /// Whether dbt built empty upstream relations before compiling.
-    pub build_empty: bool,
+    /// How the SQL was compiled: `compile-only` (`dbt compile` alone; nothing
+    /// written to the warehouse), `build-empty` (`dbt run --empty` first) or
+    /// `compiled` (`--compiled <dir>`).
+    pub mode: String,
     /// Dependency packages whose models were vendored alongside.
     pub includes: Vec<String>,
     /// Every vendored model, sorted.
@@ -170,6 +176,8 @@ pub struct PackageListEntry {
     pub dbt_version: String,
     pub adapter: String,
     pub target_schema: String,
+    /// `compile-only`, `build-empty` or `compiled`; replayed by `update`.
+    pub mode: String,
     pub compiled_at: String,
     pub includes: Vec<String>,
     pub models: Vec<String>,
@@ -220,8 +228,36 @@ pub struct PackageBuildOptions {
     /// `--compiled <dir>`: import an already-compiled dbt project instead of
     /// running dbt (`<dir>/target/manifest.json` + `<dir>/package-lock.yml`).
     pub compiled: Option<PathBuf>,
-    /// `--no-build-empty`: skip `dbt run --empty`.
-    pub no_build_empty: bool,
+    /// `--build-empty[=BOOL]`: run `dbt run --empty` before compiling. Unset
+    /// means compile-only on `add` and the recorded mode on `update`.
+    pub build_empty: Option<bool>,
+}
+
+/// Pick the build mode from the flags and, on `update`, the lock entry.
+fn resolve_mode(
+    opts: &PackageBuildOptions,
+    previous: Option<&LockedPackage>,
+    hub: &str,
+) -> Result<BuildMode> {
+    if opts.compiled.is_some() {
+        if opts.build_empty == Some(true) {
+            bail!(e055(
+                "--build-empty and --compiled conflict: --compiled imports SQL dbt already \
+                 compiled elsewhere"
+            ));
+        }
+        return Ok(BuildMode::Compiled);
+    }
+    Ok(match (opts.build_empty, previous.map(|p| p.mode)) {
+        (Some(true), _) => BuildMode::BuildEmpty,
+        (Some(false), _) => BuildMode::CompileOnly,
+        (None, Some(BuildMode::Compiled)) => bail!(e055(format!(
+            "`{hub}` was vendored from --compiled; pass --compiled <dir> with a fresh compile, \
+             or --build-empty to let rocky package run dbt"
+        ))),
+        (None, Some(mode)) => mode,
+        (None, None) => BuildMode::CompileOnly,
+    })
 }
 
 /// A refusal carrying `E055`.
@@ -428,7 +464,8 @@ fn vendor(
     }
 
     let mut diagnostics = Vec::new();
-    let build_empty = !opts.no_build_empty && opts.compiled.is_none();
+    let mode = resolve_mode(opts, previous, &request.hub)?;
+    let build_empty = mode == BuildMode::BuildEmpty;
     let _tmp; // keeps the throwaway project alive until the import is done
     let project_dir = match &opts.compiled {
         Some(dir) => dir.clone(),
@@ -481,6 +518,40 @@ fn vendor(
     };
     let import =
         dbt_package::import_package(&manifest, &info, &pkg_name, &default_target).map_err(e055)?;
+    // Without empty upstream relations, an introspecting macro compiles to
+    // wrong SQL (all-NULL columns, a placeholder `*`). Never vendor that.
+    if mode != BuildMode::BuildEmpty && !import.introspection_refused.is_empty() {
+        let shown: Vec<&str> = import
+            .introspection_refused
+            .iter()
+            .take(5)
+            .map(String::as_str)
+            .collect();
+        let more = import
+            .introspection_refused
+            .len()
+            .saturating_sub(shown.len());
+        let source = if mode == BuildMode::Compiled {
+            "The project in --compiled was compiled"
+        } else {
+            "dbt compiled the package"
+        };
+        bail!(e055(format!(
+            "{source} before the relations its macros read existed, so {} model(s) came out \
+             wrong (all-NULL columns or a placeholder `*`): {}{}. Nothing was written. Choose \
+             one:\n  --build-empty     run `dbt run --empty` first; this writes empty \
+             `rocky_package_build*` schemas to the warehouse and runs the package's \
+             on-run-start/on-run-end hooks\n  --compiled <dir>  import a dbt project compiled \
+             elsewhere after `dbt run --empty --full-refresh`",
+            import.introspection_refused.len(),
+            shown.join(", "),
+            if more > 0 {
+                format!(" and {more} more")
+            } else {
+                String::new()
+            }
+        )));
+    }
 
     let planned = dbt_package::render_package_files(&import).map_err(e055)?;
 
@@ -488,11 +559,30 @@ fn vendor(
     let lock = PackagesLock::read(lock_path).map_err(e055)?;
     let existing = existing_models(root, &lock, &planned)?;
     let replacing: BTreeSet<String> = std::iter::once(pkg_name.clone()).collect();
+    let twins = dbt_package::case_duplicates(&import);
+    if !twins.is_empty() {
+        let list: Vec<String> = twins
+            .iter()
+            .map(|(a, b)| format!("`{a}` and `{b}`"))
+            .collect();
+        bail!(e055(format!(
+            "package `{pkg_name}` has models whose names differ only by case: {}. Warehouses \
+             fold unquoted names and case-insensitive file systems cannot hold both, so Rocky \
+             cannot vendor them",
+            list.join(", ")
+        )));
+    }
     let collisions = dbt_package::find_collisions(&import, &existing, &replacing);
     if !collisions.is_empty() {
         let list: Vec<String> = collisions
             .iter()
-            .map(|c| format!("`{}` (owned by {})", c.model, c.owner))
+            .map(|c| {
+                if c.existing == c.model {
+                    format!("`{}` (owned by {})", c.model, c.owner)
+                } else {
+                    format!("`{}` (as `{}`, owned by {})", c.model, c.existing, c.owner)
+                }
+            })
             .collect();
         bail!(e055(format!(
             "package `{pkg_name}` would define model names that already exist: {}. Rocky \
@@ -562,6 +652,7 @@ fn vendor(
         compiled_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
         vars_hash: vars_hash.clone(),
         vars: request.vars.clone(),
+        mode,
         includes: includes.clone(),
         sources: import.sources.clone(),
         files: plan.lock_files.clone(),
@@ -577,7 +668,7 @@ fn vendor(
         adapter: adapter.adapter_type.clone(),
         target_schema,
         vars_hash,
-        build_empty,
+        mode: mode.as_str().to_string(),
         includes,
         models,
         models_added,
@@ -695,7 +786,8 @@ fn select_adapter<'a>(
     }
 }
 
-/// Every model name already in the project, mapped to its owners: the lock
+/// Every model already in the project, keyed by lowercased resolved name
+/// (sidecar `name =` override, else the file stem), with its owner: the lock
 /// entry that vendored it, or `project`.
 ///
 /// A file at a path this run is about to write, with exactly the content it
@@ -705,7 +797,7 @@ fn existing_models(
     root: &Path,
     lock: &PackagesLock,
     planned: &BTreeMap<String, String>,
-) -> Result<BTreeMap<String, BTreeSet<String>>> {
+) -> Result<BTreeMap<String, BTreeSet<dbt_package::ExistingModel>>> {
     let models_dir = root.join("models");
     let mut out = BTreeMap::new();
     let (dirs, errors) = rocky_core::model_walk::walk_model_dirs(&models_dir);
@@ -722,7 +814,7 @@ fn existing_models(
             if !matches!(ext, Some("sql" | "rocky")) {
                 continue;
             }
-            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            let Some(name) = dbt_package::resolved_model_name(&path) else {
                 continue;
             };
             let rel = relative_slash(root, &path);
@@ -735,9 +827,9 @@ fn existing_models(
             {
                 continue;
             }
-            out.entry(stem.to_string())
+            out.entry(name.to_lowercase())
                 .or_insert_with(BTreeSet::new)
-                .insert(owner);
+                .insert(dbt_package::ExistingModel { name, owner });
         }
     }
     Ok(out)
@@ -951,6 +1043,7 @@ pub fn run_package_list(config_path: &Path, output_json: bool) -> Result<()> {
             dbt_version: p.dbt_version.clone(),
             adapter: p.adapter.clone(),
             target_schema: p.target_schema.clone(),
+            mode: p.mode.as_str().to_string(),
             compiled_at: p.compiled_at.clone(),
             includes: p.includes.clone(),
             models: dbt_package::locked_model_names(p).into_iter().collect(),

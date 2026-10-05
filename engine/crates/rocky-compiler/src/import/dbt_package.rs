@@ -223,6 +223,10 @@ pub struct PackageImport {
     /// strategy (imported as full refresh, or failed).
     pub incremental_fallbacks: Vec<String>,
     pub dbt_version: Option<String>,
+    /// Models refused because dbt compiled them while the relation a
+    /// column-introspecting macro reads did not exist (also in `failed`).
+    /// Outside [`BuildMode::BuildEmpty`] any entry refuses the whole package.
+    pub introspection_refused: Vec<String>,
 }
 
 /// Import one package's models from a compiled manifest.
@@ -298,21 +302,29 @@ pub fn import_package(
     models.sort_by(|a, b| a.model.name.cmp(&b.model.name));
 
     // A model dbt compiled before its upstream existed carries an
-    // introspection placeholder instead of a column list. Refuse it.
+    // introspection placeholder or all-NULL columns instead of real ones.
+    // Refuse it.
     let mut failed = std::mem::take(&mut result.failed);
+    let mut introspection_refused = Vec::new();
     models.retain(|vm| {
-        if vm.model.sql.contains(INTROSPECTION_PLACEHOLDER) {
-            failed.push(ImportFailure {
-                name: vm.model.name.clone(),
-                reason: "dbt compiled this model before an upstream relation existed, so a \
-                         column-introspecting macro (dbt_utils.star) emitted a placeholder `*`; \
-                         re-run without --no-build-empty so dbt builds empty upstreams first"
-                    .to_string(),
-            });
-            false
+        let reason = if vm.model.sql.contains(INTROSPECTION_PLACEHOLDER) {
+            "a column-introspecting macro (dbt_utils.star) emitted a placeholder `*`"
+        } else if projects_only_nulls(&vm.model.sql) {
+            "a column-filling macro (Fivetran's fill_staging_columns) found no columns and \
+             cast every column to NULL"
         } else {
-            true
-        }
+            return true;
+        };
+        failed.push(ImportFailure {
+            name: vm.model.name.clone(),
+            reason: format!(
+                "dbt compiled this model before the relation it introspects existed, so {reason}. \
+                 Re-run with --build-empty, or import a project compiled after `dbt run --empty` \
+                 with --compiled <dir>"
+            ),
+        });
+        introspection_refused.push(vm.model.name.clone());
+        false
     });
     result.failed = failed;
 
@@ -340,6 +352,7 @@ pub fn import_package(
     let (tests_mapped, tests_dropped) = map_generic_tests(info, &selected, &mut models);
 
     Ok(PackageImport {
+        introspection_refused,
         package: package.to_string(),
         models,
         failed: result.failed,
@@ -670,36 +683,93 @@ pub fn render_package_files(import: &PackageImport) -> Result<BTreeMap<String, S
     Ok(files)
 }
 
-/// A model name that is already taken.
+/// A package model whose name an existing model already uses.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Collision {
+    /// The package model's name.
     pub model: String,
+    /// The existing model's resolved name (differs from `model` only by case,
+    /// or not at all).
+    pub existing: String,
     /// `project` or the name of the package that owns the existing model.
     pub owner: String,
 }
 
+/// A model already in the project, keyed in the map [`find_collisions`] takes
+/// by its lowercased name.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ExistingModel {
+    /// Resolved name: the sidecar's `name =` override, else the file stem.
+    pub name: String,
+    /// `project` or the lock entry name that vendored it.
+    pub owner: String,
+}
+
 /// Names the new package's models would collide with. `existing` maps every
-/// model name already in the project to each of its owners (`project` or a
-/// lock entry name); an owner in `replacing` (the package being re-vendored)
-/// is expected to be replaced and never collides.
+/// model already in the project, by lowercased resolved name, to its
+/// definitions. Names compare case-insensitively: warehouses fold unquoted
+/// identifiers, and case-insensitive file systems cannot hold both files.
+/// An owner in `replacing` (the package being re-vendored) is expected to be
+/// replaced and never collides.
 pub fn find_collisions(
     import: &PackageImport,
-    existing: &BTreeMap<String, BTreeSet<String>>,
+    existing: &BTreeMap<String, BTreeSet<ExistingModel>>,
     replacing: &BTreeSet<String>,
 ) -> Vec<Collision> {
     let mut out = Vec::new();
     for vm in &import.models {
-        let Some(owners) = existing.get(&vm.model.name) else {
+        let Some(defs) = existing.get(&vm.model.name.to_lowercase()) else {
             continue;
         };
-        for owner in owners.difference(replacing) {
+        for def in defs.iter().filter(|d| !replacing.contains(&d.owner)) {
             out.push(Collision {
                 model: vm.model.name.clone(),
-                owner: owner.clone(),
+                existing: def.name.clone(),
+                owner: def.owner.clone(),
             });
         }
     }
     out
+}
+
+/// Package models whose names differ only by case (or match exactly, from two
+/// owner packages). Such a pair cannot be vendored side by side.
+pub fn case_duplicates(import: &PackageImport) -> Vec<(String, String)> {
+    let mut seen: BTreeMap<String, &str> = BTreeMap::new();
+    let mut out = Vec::new();
+    for vm in &import.models {
+        let name = vm.model.name.as_str();
+        match seen.get(&name.to_lowercase()) {
+            Some(first) => out.push(((*first).to_string(), name.to_string())),
+            None => {
+                seen.insert(name.to_lowercase(), name);
+            }
+        }
+    }
+    out
+}
+
+/// The name a model file resolves to: `name =` in its `<stem>.toml` sidecar
+/// or its `---toml` frontmatter, else the file stem. Mirrors the model
+/// loader's precedence without its env-var substitution, which a model name
+/// does not use in practice.
+pub fn resolved_model_name(model_path: &Path) -> Option<String> {
+    let stem = model_path.file_stem()?.to_str()?.to_string();
+    let declared = |toml_src: &str| -> Option<String> {
+        let value: toml::Value = toml::from_str(toml_src).ok()?;
+        value.get("name")?.as_str().map(str::to_string)
+    };
+    let sidecar = model_path.with_extension("toml");
+    if let Ok(text) = std::fs::read_to_string(&sidecar) {
+        return Some(declared(&text).unwrap_or(stem));
+    }
+    if let Ok(text) = std::fs::read_to_string(model_path)
+        && let Some(rest) = text.trim_start().strip_prefix("---toml")
+        && let Some((front, _)) = rest.split_once("\n---")
+    {
+        return Some(declared(front).unwrap_or(stem));
+    }
+    Some(stem)
 }
 
 /// Content hash recorded in the lockfile (`blake3:<hex>`).
@@ -786,6 +856,9 @@ pub struct LockedPackage {
     /// dbt vars (`key = "yaml value"`) replayed by `rocky package update`.
     #[serde(default)]
     pub vars: BTreeMap<String, String>,
+    /// How the SQL was compiled; replayed by `rocky package update`.
+    #[serde(default)]
+    pub mode: BuildMode,
     /// Dependency packages whose models were vendored alongside.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub includes: Vec<String>,
@@ -1042,6 +1115,83 @@ pub fn resolve_from_package_lock(text: &str, hub: &str) -> Result<(String, Strin
 /// refused rather than vendored.
 pub const INTROSPECTION_PLACEHOLDER: &str =
     "No columns were returned. Maybe the relation doesn't exist yet";
+
+/// True when some SELECT in `sql` reads a relation but projects only `NULL`
+/// literals (`NULL`, `CAST(NULL AS t)`), two or more of them. That is what
+/// column-filling macros such as Fivetran's `fill_staging_columns` compile to
+/// when the relation they introspect does not exist: every staging column
+/// becomes `cast(null as ...)`, which runs fine and silently loads nothing.
+/// A branch of a set operation is not checked, since a NULL-filler branch can
+/// be deliberate. SQL that does not parse is not flagged.
+pub fn projects_only_nulls(sql: &str) -> bool {
+    use sqlparser::ast::{Expr, Query, SelectItem, SetExpr, Value, Visit, Visitor};
+    use std::ops::ControlFlow;
+
+    fn is_null(e: &Expr) -> bool {
+        match e {
+            Expr::Value(v) => matches!(v.value, Value::Null),
+            Expr::Cast { expr, .. } | Expr::Nested(expr) => is_null(expr),
+            _ => false,
+        }
+    }
+    fn all_null(body: &SetExpr) -> bool {
+        match body {
+            SetExpr::Select(s) => {
+                !s.from.is_empty()
+                    && s.projection.len() >= 2
+                    && s.projection.iter().all(|item| match item {
+                        SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => {
+                            is_null(e)
+                        }
+                        _ => false,
+                    })
+            }
+            SetExpr::Query(q) => all_null(&q.body),
+            _ => false,
+        }
+    }
+    struct Finder;
+    impl Visitor for Finder {
+        type Break = ();
+        fn pre_visit_query(&mut self, q: &Query) -> ControlFlow<()> {
+            if all_null(&q.body) {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        }
+    }
+    let Ok(statements) = rocky_sql::parser::parse_sql(sql) else {
+        return false;
+    };
+    statements.iter().any(|st| st.visit(&mut Finder).is_break())
+}
+
+/// How `rocky package` got the package's compiled SQL. Recorded in the
+/// lockfile so `rocky package update` replays it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum BuildMode {
+    /// `dbt compile` only. Nothing is written to the warehouse. A package
+    /// whose macros introspect upstream models is refused (E055).
+    #[default]
+    CompileOnly,
+    /// `dbt run --empty` first (opt-in `--build-empty`): writes empty
+    /// `rocky_package_build*` relations and runs package hooks.
+    BuildEmpty,
+    /// `--compiled <dir>`: a dbt project compiled elsewhere.
+    Compiled,
+}
+
+impl BuildMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BuildMode::CompileOnly => "compile-only",
+            BuildMode::BuildEmpty => "build-empty",
+            BuildMode::Compiled => "compiled",
+        }
+    }
+}
 
 /// Split `<namespace>/<name>[@<version-spec>]`. The spec is a comma-separated
 /// requirement list (`>=1.0.0,<2.0.0`) or one exact version; empty means
@@ -1641,32 +1791,77 @@ mod tests {
     fn collisions_with_project_and_other_packages_are_found() {
         let (manifest, info, _d) = load_fixture();
         let import = import_package(&manifest, &info, "stripe", &target()).unwrap();
-        let owners = |names: &[&str]| -> BTreeSet<String> {
-            names.iter().map(ToString::to_string).collect()
+        let def = |name: &str, owner: &str| ExistingModel {
+            name: name.into(),
+            owner: owner.into(),
         };
-        let mut existing = BTreeMap::new();
+        let mut existing: BTreeMap<String, BTreeSet<ExistingModel>> = BTreeMap::new();
         // The package's own copy AND a project model: still a collision.
         existing.insert(
             "stripe__charges".to_string(),
-            owners(&["stripe", "project"]),
+            [
+                def("stripe__charges", "stripe"),
+                def("stripe__charges", "project"),
+            ]
+            .into(),
         );
-        existing.insert("stg_stripe__customer".to_string(), owners(&["hubspot"]));
-        existing.insert("stg_stripe__charge".to_string(), owners(&["stripe"]));
-        let replacing: BTreeSet<String> = owners(&["stripe"]);
+        // Differs only by case: a collision.
+        existing.insert(
+            "stg_stripe__customer".to_string(),
+            [def("STG_Stripe__Customer", "hubspot")].into(),
+        );
+        existing.insert(
+            "stg_stripe__charge".to_string(),
+            [def("stg_stripe__charge", "stripe")].into(),
+        );
+        let replacing: BTreeSet<String> = ["stripe".to_string()].into();
         let collisions = find_collisions(&import, &existing, &replacing);
         assert_eq!(
             collisions,
             vec![
                 Collision {
                     model: "stg_stripe__customer".into(),
+                    existing: "STG_Stripe__Customer".into(),
                     owner: "hubspot".into()
                 },
                 Collision {
                     model: "stripe__charges".into(),
+                    existing: "stripe__charges".into(),
                     owner: "project".into()
                 },
             ]
         );
+    }
+
+    #[test]
+    fn package_models_differing_only_by_case_are_found() {
+        let (manifest, info, _d) = load_fixture();
+        let mut import = import_package(&manifest, &info, "stripe", &target()).unwrap();
+        assert!(case_duplicates(&import).is_empty());
+        import.models[1].model.name = import.models[0].model.name.to_uppercase();
+        let dups = case_duplicates(&import);
+        assert_eq!(dups.len(), 1);
+        assert!(dups[0].0.eq_ignore_ascii_case(&dups[0].1));
+    }
+
+    #[test]
+    fn resolved_model_names_follow_the_sidecar_then_the_stem() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        std::fs::write(p.join("a.sql"), "select 1").unwrap();
+        std::fs::write(p.join("a.toml"), "name = \"orders\"\n").unwrap();
+        std::fs::write(
+            p.join("b.sql"),
+            "---toml\nname = \"Customers\"\n---\nselect 1",
+        )
+        .unwrap();
+        std::fs::write(p.join("c.sql"), "select 1").unwrap();
+        std::fs::write(p.join("d.rocky"), "from x").unwrap();
+        std::fs::write(p.join("d.toml"), "[strategy]\ntype = \"full_refresh\"\n").unwrap();
+        assert_eq!(resolved_model_name(&p.join("a.sql")).unwrap(), "orders");
+        assert_eq!(resolved_model_name(&p.join("b.sql")).unwrap(), "Customers");
+        assert_eq!(resolved_model_name(&p.join("c.sql")).unwrap(), "c");
+        assert_eq!(resolved_model_name(&p.join("d.rocky")).unwrap(), "d");
     }
 
     #[test]
@@ -1812,6 +2007,7 @@ mod tests {
             compiled_at: "2026-10-04T00:00:00Z".into(),
             vars_hash: vars_hash(&vars),
             vars,
+            mode: BuildMode::BuildEmpty,
             includes: vec![],
             sources: vec![PackageSource {
                 name: "stripe.charge".into(),
@@ -1928,9 +2124,35 @@ mod tests {
             import
                 .failed
                 .iter()
-                .any(|f| f.name == "stripe__charges" && f.reason.contains("--no-build-empty"))
+                .any(|f| f.name == "stripe__charges" && f.reason.contains("--build-empty"))
+        );
+        assert_eq!(
+            import.introspection_refused,
+            vec!["stripe__charges".to_string()]
         );
         assert_eq!(import.models.len(), 2, "the clean upstreams still vendor");
+    }
+
+    #[test]
+    fn all_null_projections_are_detected() {
+        // fivetran/stripe 1.10.1 `stg_stripe__charge`, compiled without
+        // `dbt run --empty`.
+        let compiled = "with base as (select * from \"dev\".\"s\".\"stg_stripe__charge_tmp\"), \
+                        fields as (select cast(null as timestamp) as _fivetran_synced, \
+                        cast(null as integer) as amount, cast(null as TEXT) as id from base) \
+                        select id, amount from fields";
+        assert!(projects_only_nulls(compiled));
+        assert!(projects_only_nulls("select null as a, (null) as b from t"));
+        // Real columns, a single NULL, no FROM, and a filler UNION branch stay clean.
+        assert!(!projects_only_nulls(
+            "select cast(null as int) as a, id from t"
+        ));
+        assert!(!projects_only_nulls("select cast(null as int) as a from t"));
+        assert!(!projects_only_nulls("select null as a, null as b"));
+        assert!(!projects_only_nulls(
+            "select a, b from t union all select null as a, null as b from u"
+        ));
+        assert!(!projects_only_nulls("not sql at all ((("));
     }
 
     #[test]
