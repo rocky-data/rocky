@@ -205,8 +205,11 @@ fn supported_strategies_and_valid_options_stay_clean() {
     }
 }
 
+/// The red-team repro: the pipeline targets ClickHouse, and a DuckDB adapter
+/// that no pipeline targets sits beside it. That unused adapter used to hide
+/// E053, and `rocky run` then failed with "ClickHouse has no MERGE".
 #[test]
-fn merge_with_a_capable_warehouse_configured_is_not_refused_at_compile() {
+fn merge_on_a_clickhouse_target_is_refused_even_with_an_unused_capable_adapter() {
     let tmp = project(&format!(
         "{CLICKHOUSE}\n[adapter.local]\ntype = \"duckdb\"\npath = \":memory:\"\n"
     ));
@@ -219,7 +222,7 @@ fn merge_with_a_capable_warehouse_configured_is_not_refused_at_compile() {
     );
     let parsed = compile_json(root);
     assert!(
-        !codes_for(&parsed, "dim_customers")
+        codes_for(&parsed, "dim_customers")
             .iter()
             .any(|(c, _)| *c == "E053"),
         "{parsed}"

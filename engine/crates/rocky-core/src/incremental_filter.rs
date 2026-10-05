@@ -244,16 +244,55 @@ pub(crate) fn no_watermark_refused(model_ir: &ModelIr) -> SqlGenError {
 /// (SELECT 1 FROM <target>)`, parenthesised so it composes with any
 /// surrounding `AND` / `OR`.
 fn predicate(lhs: &str, wm: &Watermark<'_>, target: &str, dialect: &dyn SqlDialect) -> String {
+    let bound = bound_expr(wm, dialect);
+    format!("({lhs} > (SELECT {bound} FROM {target}) OR NOT EXISTS (SELECT 1 FROM {target}))")
+}
+
+/// `MAX(<wm>)`, minus the lookback interval when there is one.
+fn bound_expr(wm: &Watermark<'_>, dialect: &dyn SqlDialect) -> String {
     let column = wm.column;
-    let bound = match wm.lookback {
+    match wm.lookback {
         Some(lb) if lb.amount > 0 => dialect.subtract_interval_expr(
             &format!("MAX({column})"),
             lb.amount,
             lb.unit.sql_keyword(),
         ),
         _ => format!("MAX({column})"),
+    }
+}
+
+/// The two sides of the comparison an incremental run applies, taken from
+/// the same resolution [`incremental_select`] uses. `rocky run` renders its
+/// run note from this, so the note cannot drift from the SQL.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PredicateSummary {
+    /// What is compared: `filter_column` (or the watermark column) at an
+    /// `@incremental_filter` placeholder, else the model's output watermark
+    /// column.
+    pub compared: String,
+    /// The bound over the target: `MAX(<wm>)`, minus the lookback interval.
+    pub bound: String,
+}
+
+/// [`PredicateSummary`] for an incremental run of `model_ir` on `dialect`.
+///
+/// # Errors
+///
+/// The same refusals as [`incremental_select`].
+pub fn predicate_summary(
+    model_ir: &ModelIr,
+    dialect: &dyn SqlDialect,
+) -> Result<PredicateSummary, SqlGenError> {
+    let wm = watermark_of(model_ir)?;
+    let compared = if has_placeholder(&model_ir.sql) {
+        wm.filter
+    } else {
+        wm.column
     };
-    format!("({lhs} > (SELECT {bound} FROM {target}) OR NOT EXISTS (SELECT 1 FROM {target}))")
+    Ok(PredicateSummary {
+        compared: compared.to_string(),
+        bound: bound_expr(&wm, dialect),
+    })
 }
 
 /// The `SELECT` an `incremental` transformation model loads in `mode`.
@@ -530,6 +569,40 @@ mod tests {
         assert!(
             sql.contains("OR NOT EXISTS (SELECT 1 FROM main.fct)"),
             "{sql}"
+        );
+    }
+
+    /// The summary names exactly what the SQL compares: `filter_column` at
+    /// the placeholder, and the lookback-adjusted bound.
+    #[test]
+    fn predicate_summary_matches_the_generated_sql() {
+        let m = ir_filtering(
+            "SELECT * FROM raw.orders o WHERE @incremental_filter",
+            "updated_at",
+            Some(IncrementalLookback {
+                amount: 3,
+                unit: LookbackUnit::Day,
+            }),
+            Some("o.loaded_at"),
+        );
+        let p = predicate_summary(&m, &Ansi).unwrap();
+        assert_eq!(p.compared, "o.loaded_at");
+        assert_eq!(p.bound, "MAX(updated_at) - INTERVAL '3' DAY");
+        let sql =
+            incremental_select(&m, &Ansi, FilterMode::SinceTarget { target: "main.fct" }).unwrap();
+        assert!(
+            sql.contains(&format!(
+                "({} > (SELECT {} FROM main.fct)",
+                p.compared, p.bound
+            )),
+            "{sql}"
+        );
+        // No placeholder: the output watermark column, no lookback.
+        let wrapped = ir("SELECT id, updated_at FROM raw.orders", "updated_at", None);
+        let p = predicate_summary(&wrapped, &Ansi).unwrap();
+        assert_eq!(
+            (p.compared.as_str(), p.bound.as_str()),
+            ("updated_at", "MAX(updated_at)")
         );
     }
 

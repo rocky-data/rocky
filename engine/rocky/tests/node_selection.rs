@@ -462,8 +462,10 @@ fn run_builds_only_the_selection_and_reads_unselected_upstreams_as_is() {
     ok(&out, "run --select one model");
     assert!(tables(root).contains("stg_payments"));
 
-    // Nothing selected: nothing to do, exit 0, no table written.
-    let out = rocky(root, &["run", "--select", "tag:nope", "--output", "json"]);
+    // Nothing selected (a glob that matches nothing): nothing to do, exit 0,
+    // no table written. A named term that matches nothing is an error; see
+    // `a_named_selector_that_matches_nothing_is_refused`.
+    let out = rocky(root, &["run", "--select", "nope_*", "--output", "json"]);
     ok(&out, "run with an empty selection");
     let v = json(&out);
     assert_eq!(v["tables_failed"], 0, "{v}");
@@ -570,4 +572,106 @@ fn state_selectors_diff_against_a_git_ref() {
         ],
     );
     assert!(!out.status.success());
+}
+
+/// A selector term that names one model, tag, path or source that does not
+/// exist is a typo. Every selecting command refuses it with a non-zero exit
+/// instead of building nothing and reporting success. A glob or a computed
+/// set that matches nothing stays a warning.
+#[test]
+fn a_named_selector_that_matches_nothing_is_refused() {
+    let tmp = project();
+    let root = tmp.path();
+    {
+        let conn = duckdb::Connection::open(root.join("probe.duckdb")).unwrap();
+        conn.execute_batch(SEED).unwrap();
+    }
+    for args in [
+        &["run", "--select", "nonexistent", "--output", "json"][..],
+        &["list", "--select", "nonexistent", "--output", "json"],
+        &["compile", "--models", "models", "--select", "nonexistent"],
+        &["test", "--models", "models", "--select", "tag:nope"],
+        &[
+            "emit-sql",
+            "--models",
+            "models",
+            "--select",
+            "path:models/nowhere",
+        ],
+        &["list", "--select", "fct_revenue", "source:raw.nothing"],
+        &["docs", "--models", "models", "--select", "nonexistent"],
+    ] {
+        let out = rocky(root, args);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !out.status.success(),
+            "{args:?} must fail\nstdout:\n{}\nstderr:\n{stderr}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        assert!(
+            stderr.contains("match nothing in this project"),
+            "{args:?}: {stderr}"
+        );
+    }
+    // Nothing was built by the refused run.
+    assert!(
+        !tables(root).contains("fct_revenue"),
+        "a refused selection builds nothing"
+    );
+    // A glob that matches nothing is still a warning and exit 0.
+    let out = rocky(root, &["run", "--select", "nope_*", "--output", "json"]);
+    ok(&out, "an unmatched glob");
+}
+
+/// `state:modified` compares committed changes. A model edited but not
+/// committed is left out, and the run says so; `--state-working-tree`
+/// selects it.
+#[test]
+fn state_selection_warns_about_uncommitted_model_edits() {
+    let tmp = project();
+    let root = tmp.path();
+    git(root, &["init", "-q", "-b", "trunk"]);
+    git(root, &["add", "-A"]);
+    git(root, &["commit", "-qm", "base"]);
+    git(root, &["checkout", "-qb", "feature"]);
+    fs::write(
+        root.join("models/marts/dim_customers.sql"),
+        "SELECT customer_id, upper(customer_name) AS customer_name FROM stg_customers\n",
+    )
+    .unwrap();
+
+    let out = rocky(
+        root,
+        &[
+            "list",
+            "--select",
+            "state:modified",
+            "--state-ref",
+            "trunk",
+            "--output",
+            "json",
+        ],
+    );
+    ok(&out, "an empty state selection");
+    assert_eq!(json(&out)["models"].as_array().unwrap().len(), 0);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("uncommitted edits") && stderr.contains("dim_customers"),
+        "stderr:\n{stderr}"
+    );
+    assert!(stderr.contains("--state-working-tree"), "stderr:\n{stderr}");
+
+    assert_eq!(
+        list(
+            root,
+            &[
+                "--select",
+                "state:modified",
+                "--state-ref",
+                "trunk",
+                "--state-working-tree"
+            ]
+        ),
+        set(&["dim_customers"])
+    );
 }

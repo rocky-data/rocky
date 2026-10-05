@@ -507,8 +507,11 @@ fn grade(
             result.age_seconds = age;
             result.status = status;
             result.message = message.or_else(|| {
-                age.filter(|a| *a < 0)
-                    .map(|_| "the newest load time is in the future (clock skew?)".to_string())
+                age.filter(|a| *a < 0).map(|_| {
+                    "the newest load time is in the future: clock skew, a future-dated row, or a \
+                         local-time column read as UTC"
+                        .to_string()
+                })
             });
         }
         Err(message) => {

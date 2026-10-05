@@ -244,7 +244,11 @@ pub enum FreshnessStatus {
 ///   `loaded_at_field` value is NULL (after `filter`). Nothing was ever
 ///   loaded, so the source is as stale as it can be: the worst configured
 ///   threshold trips. Age is `None`.
-/// - A future `max_loaded_at` (clock skew) yields a negative age and `pass`.
+/// - A `max_loaded_at` more than [`FUTURE_SKEW_TOLERANCE_SECONDS`] in the
+///   future yields a negative age and at least `warn`: the clocks disagree
+///   (or a row is future-dated), so the age cannot be trusted. It never
+///   reads as `pass`. A smaller skew passes, so ordinary clock drift
+///   between the warehouse and the runner is not reported.
 pub fn evaluate(
     max_loaded_at: Option<DateTime<Utc>>,
     now: DateTime<Utc>,
@@ -263,13 +267,18 @@ pub fn evaluate(
         |limit: Option<u64>| limit.is_some_and(|l| age > i64::try_from(l).unwrap_or(i64::MAX));
     let status = if exceeds(thresholds.error_after_seconds) {
         FreshnessStatus::Error
-    } else if exceeds(thresholds.warn_after_seconds) {
+    } else if exceeds(thresholds.warn_after_seconds) || age < -FUTURE_SKEW_TOLERANCE_SECONDS {
         FreshnessStatus::Warn
     } else {
         FreshnessStatus::Pass
     };
     (status, Some(age))
 }
+
+/// How far in the future the newest load time may be before [`evaluate`]
+/// stops passing it: one minute of clock drift between the warehouse and
+/// the runner.
+pub const FUTURE_SKEW_TOLERANCE_SECONDS: i64 = 60;
 
 /// Build `SELECT COUNT(*), MAX(<field>) FROM <table> [WHERE (<filter>)]`.
 ///
@@ -308,6 +317,13 @@ pub fn generate_max_loaded_at_sql(
 /// `YYYY-MM-DD HH:MM:SS[.fff][±hh[:mm]]` shape other warehouses use, a naive
 /// `YYYY-MM-DDTHH:MM:SS[.fff]`, and a bare `YYYY-MM-DD` DATE (read as
 /// midnight UTC). A naive value is taken as UTC. Anything else is `None`.
+///
+/// A naive value is taken as UTC because it carries no zone. A column stored
+/// in local time — a SQL Server `DATETIME` / `DATETIME2` filled with
+/// `GETDATE()`, a `TIMESTAMP WITHOUT TIME ZONE` written in a session zone
+/// other than UTC — is therefore off by the zone's offset: ahead of UTC it
+/// reads as older, behind UTC as newer (and, past one minute, as clock skew).
+/// Store load times in UTC (`SYSUTCDATETIME()`), or in a zoned type.
 pub fn parse_loaded_at_cell(s: &str) -> Option<DateTime<Utc>> {
     let s = s.trim();
     if let Ok(dt) = s.parse::<DateTime<Utc>>() {
@@ -481,12 +497,25 @@ mod tests {
         );
     }
 
+    /// A load time an hour in the future is clock skew or a future-dated
+    /// row: the age cannot be trusted, so it warns instead of passing. A
+    /// few seconds of drift still passes.
     #[test]
-    fn evaluate_future_timestamp_passes_with_negative_age() {
+    fn evaluate_future_timestamp_warns_with_negative_age() {
         let t = cfg(Some("12h"), None).validate().unwrap();
         assert_eq!(
             evaluate(hours_ago(-1), now(), &t),
-            (FreshnessStatus::Pass, Some(-3_600))
+            (FreshnessStatus::Warn, Some(-3_600))
+        );
+        let both = cfg(Some("12h"), Some("24h")).validate().unwrap();
+        assert_eq!(
+            evaluate(hours_ago(-1), now(), &both).0,
+            FreshnessStatus::Warn
+        );
+        let drift = now() + chrono::Duration::seconds(30);
+        assert_eq!(
+            evaluate(Some(drift), now(), &t),
+            (FreshnessStatus::Pass, Some(-30))
         );
     }
 

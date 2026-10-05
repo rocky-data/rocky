@@ -849,7 +849,7 @@ The age is the check time minus the newest load time. Rocky grades it:
 | Status | When |
 |--------|------|
 | `pass` | The age is within every threshold. |
-| `warn` | The age is greater than `warn_after`. |
+| `warn` | The age is greater than `warn_after`. Also when the newest load time is more than 60 seconds in the future: the age cannot be trusted. |
 | `error` | The age is greater than `error_after`. |
 | `runtime_error` | Rocky could not measure: invalid config, a failed query, or a value that does not read as a timestamp. |
 
@@ -866,6 +866,7 @@ A model can inherit `time_column` from `_defaults.toml` or the project `[freshne
 - Run history records a model build under its bare target table name. Two models whose targets share a table name in different schemas share that history. For a model without a `time_column`, the newer build of the two can hide a stale one. Set a `time_column` to measure the table itself.
 - With `[state] namespacing = "pipeline"`, the state-store fallback reads the global state file, so it may find no build.
 - Exit `1` covers both a stale check and a command failure (for example a config that does not load). A command failure prints no JSON report.
+- A load time with no time zone is read as UTC. A column filled in local time is off by the zone's offset. A SQL Server `DATETIME` filled with `GETDATE()` is the common case. Fill it with `SYSUTCDATETIME()`, or use a zoned type such as `DATETIMEOFFSET`.
 - Snowflake temporal cells arrive as epoch numbers and are decoded as such. That decoding follows the documented SQL API format and is not yet verified against a live account.
 
 ### Flags

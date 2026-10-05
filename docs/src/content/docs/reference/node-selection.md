@@ -30,6 +30,7 @@ Every flag on this page is optional. Without `--select` or `--exclude`, a comman
 | `--select <SELECTOR>...`, `-s` | Models to include. Repeat the flag or pass several values. |
 | `--exclude <SELECTOR>...` | Models to remove from the selection. Without `--select`, Rocky removes them from every model. |
 | `--state-ref <REF>` | Git ref that `state:` methods compare against. Default: `main`. |
+| `--state-working-tree` | `state:` methods compare the working tree (staged, unstaged and untracked files) with the merge base of `--state-ref`, as `rocky ci-diff --working-tree` does. Not on `rocky plan`. |
 
 ## Selector syntax
 
@@ -108,7 +109,7 @@ Both `tag:finance` and `tag:domain=finance` select this model. `tag:tier` select
 
 ### How `state:` finds changed models
 
-`state:modified` and `state:new` use the change detection of `rocky ci-diff`. Rocky runs `git diff <ref>...HEAD` and maps the changed files to models. Only committed changes count. Commit your work before you select on state.
+`state:modified` and `state:new` use the change detection of `rocky ci-diff`. Rocky runs `git diff <ref>...HEAD` and maps the changed files to models. Only committed changes count. Commit your work before you select on state, or pass `--state-working-tree`. When a model has uncommitted edits that the committed diff leaves out, Rocky logs a warning that names it.
 
 ```sh
 rocky list --select state:modified+ --state-ref origin/main
@@ -121,7 +122,8 @@ These rules decide what happens at the edges of the syntax.
 - An unknown method, such as `owner:x`, is an error. The message lists the supported methods.
 - `test_type:` is not supported. Rocky tests are not separate nodes in the DAG.
 - `@` with `+` (such as `@+m`) is an error, as in dbt.
-- A criterion that matches no model logs a warning: `The selection criterion 'x' does not match any enabled nodes`.
+- A `--select` term that names one model, tag, path, file or source with no glob, and matches nothing, is an error. Every selecting command exits non-zero and does nothing. The term is almost always a typo.
+- A glob (`stg_*`), a `config.` term, or a `state:` term that matches no model logs a warning: `The selection criterion 'x' does not match any enabled nodes`. An `--exclude` term that matches nothing also only warns.
 - A selection that matches no model logs `Nothing to do`. `list`, `compile`, `test`, `emit-sql`, and `run` then exit 0 with nothing done. With `--output json`, `rocky run` prints an empty, successful run result. `plan` and `docs` refuse, because they cannot write an empty plan or catalog.
 
 ## How `--select` works with `--model`

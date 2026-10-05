@@ -134,7 +134,7 @@ WHEN NOT MATCHED BY TARGET THEN INSERT ([order_id], [amount]) VALUES (rocky_s.[o
 
 One list cannot hold two CTEs with the same name. This happens when an inlined `ephemeral` model and its consumer both define `final`. Rocky then renames the nested CTE (`final` → `final__2`) through the parsed SQL. Only the references that read that CTE, in its own scope, change. A renamed table reference keeps the old name as its alias, so `final.id` still binds.
 
-Some models still cannot be lifted: a nested CTE named like a column the outer query also reads, or SQL the parser cannot read. When every configured warehouse is SQL Server, `rocky compile` reports `E054` on such a model. Otherwise `rocky run` sends the SQL as written, and the server reports its own error.
+Some models still cannot be lifted: a nested CTE named like a column the outer query also reads, or SQL the parser cannot read. When a pipeline that loads such a model targets SQL Server, `rocky compile` reports `E054` on it.
 
 **IDENTITY columns.** `SELECT … INTO` copies a source column's `IDENTITY` property, which would make every later insert of that column fail. Rocky adds an empty `UNION ALL SELECT TOP (0) …` branch to each `SELECT … INTO`; a `UNION` is the documented way to drop the property.
 

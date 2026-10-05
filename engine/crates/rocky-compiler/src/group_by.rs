@@ -16,8 +16,11 @@
 //!   (seed or cache), a CTE, or a derived table. A name Rocky cannot place —
 //!   an unknown relation, a session variable, an outer-scope reference — is
 //!   left alone. Postgres-style functional dependence on a primary key is not
-//!   assumed by DuckDB, Databricks, Snowflake, or BigQuery, so it is not
-//!   modelled; it never matters because only grouped names are accepted.
+//!   assumed by DuckDB, Databricks, Snowflake, BigQuery, or Redshift, so it is
+//!   not modelled here. PostgreSQL does allow it, and Rocky cannot see primary
+//!   keys, so a model whose every target is PostgreSQL gets the warning
+//!   [`W044`](crate::diagnostic::W044) instead
+//!   ([`downgrade_for_postgres`], called by `rocky compile` and `rocky run`).
 //! - "Grouped" is decided by *name*. Every identifier that appears anywhere in
 //!   the GROUP BY clause (after expanding ordinals and projection aliases)
 //!   covers every reference with that column name, whatever its qualifier.
@@ -58,7 +61,36 @@ use sqlparser::ast::{
 };
 use sqlparser::parser::Parser;
 
-use crate::diagnostic::{Diagnostic, E044};
+use crate::diagnostic::{Diagnostic, E044, Severity, W044};
+
+/// Turn every error-severity [`E044`] on a model for which `on_postgres`
+/// answers true into the warning [`W044`]. Returns how many it changed.
+///
+/// PostgreSQL accepts a column outside `GROUP BY` when the column is
+/// functionally dependent on a grouped primary key
+/// (<https://www.postgresql.org/docs/current/sql-select.html#SQL-GROUPBY>).
+/// Rocky cannot see primary keys, so on PostgreSQL the finding may be a
+/// false refusal. Redshift has no such rule; pass `false` for it.
+pub fn downgrade_for_postgres(
+    diagnostics: &mut [Diagnostic],
+    on_postgres: impl Fn(&str) -> bool,
+) -> usize {
+    let mut changed = 0;
+    for diag in diagnostics {
+        if diag.severity == Severity::Error && &*diag.code == E044 && on_postgres(&diag.model) {
+            diag.severity = Severity::Warning;
+            diag.code = W044.into();
+            diag.message = format!(
+                "{} PostgreSQL accepts this when the column is functionally dependent on a \
+                 grouped primary key, which Rocky cannot check, so this is a warning",
+                diag.message
+            )
+            .into();
+            changed += 1;
+        }
+    }
+    changed
+}
 
 /// Check every query scope in `sql` for E044.
 ///
@@ -1067,6 +1099,30 @@ mod tests {
         let suggestion = diag.suggestion.as_deref().unwrap_or_default();
         assert!(suggestion.contains("GROUP BY"), "{suggestion}");
         assert!(suggestion.contains("ANY_VALUE(status)"), "{suggestion}");
+    }
+
+    /// On PostgreSQL the finding becomes the warning W044 (functional
+    /// dependence on a primary key is legal there); elsewhere it stays E044.
+    #[test]
+    fn postgres_downgrades_e044_to_w044_and_others_keep_it() {
+        let sql =
+            "SELECT customer_id, status, SUM(amount) AS t FROM raw.orders GROUP BY customer_id";
+        let mut diags = check(sql);
+        assert_eq!(downgrade_for_postgres(&mut diags, |_| false), 0);
+        assert_eq!(&*diags[0].code, E044);
+        assert_eq!(diags[0].severity, Severity::Error);
+        assert_eq!(downgrade_for_postgres(&mut diags, |m| m == "m"), 1);
+        assert_eq!(&*diags[0].code, W044);
+        assert_eq!(diags[0].severity, Severity::Warning);
+        assert!(
+            diags[0].message.contains("primary key"),
+            "{}",
+            diags[0].message
+        );
+        // Another model's E044 is untouched.
+        let mut other = check_group_by("n", sql, &lookup);
+        downgrade_for_postgres(&mut other, |m| m == "m");
+        assert_eq!(&*other[0].code, E044);
     }
 
     const VALID: &[&str] = &[

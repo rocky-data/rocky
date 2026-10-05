@@ -477,6 +477,17 @@ pub const W042: &str = "W042";
 /// string literal that parses as a number is not reported. Escalate with
 /// `rocky compile --deny-warnings W043`.
 pub const W043: &str = "W043";
+/// [`E044`]'s finding on a model whose every target warehouse is
+/// PostgreSQL.
+///
+/// PostgreSQL accepts a column outside `GROUP BY` when it is functionally
+/// dependent on a grouped primary key
+/// (<https://www.postgresql.org/docs/current/sql-select.html#SQL-GROUPBY>).
+/// Rocky cannot see primary keys, so it cannot tell a valid query from an
+/// invalid one there, and warns instead of refusing. Emitted by
+/// `rocky compile`. Redshift does not allow this and keeps [`E044`].
+/// Escalate with `rocky compile --deny-warnings W044`.
+pub const W044: &str = "W044";
 /// A direct column reference names a column absent from an external source
 /// schema that may be out of date.
 ///
@@ -546,6 +557,21 @@ pub const W053: &str = "W053";
 /// `accepted_values` and `relationships` (dropped, counted); and a
 /// `dbt run --empty` that did not build every model.
 pub const W055: &str = "W055";
+
+/// Every warning code the compile pipeline can emit: the `W###` codes above
+/// plus [`P002`]. `rocky compile --deny-warnings` accepts only these.
+/// A unit test checks this list against the constants in this file.
+pub const WARNING_CODES: &[&str] = &[
+    W001, W002, W004, W005, W006, W010, W011, W012, W013, W030, W031, W041, W042, W043, W044, W046,
+    W048, W049, W050, W051, W052, W053, P002,
+];
+
+/// Whether `code` (case-insensitive, surrounding spaces ignored) is a
+/// warning code in [`WARNING_CODES`].
+pub fn is_warning_code(code: &str) -> bool {
+    let code = code.trim();
+    WARNING_CODES.iter().any(|c| c.eq_ignore_ascii_case(code))
+}
 
 // Info
 /// Model dependency inferred from SQL.
@@ -969,6 +995,32 @@ pub fn render_diagnostics(
 
 #[cfg(test)]
 mod tests {
+
+    /// `WARNING_CODES` lists every `W###` constant in this file, and only
+    /// codes that exist.
+    #[test]
+    fn warning_codes_registry_is_complete() {
+        let src = include_str!("diagnostic.rs");
+        let mut declared: Vec<&str> = src
+            .lines()
+            .filter_map(|l| l.strip_prefix("pub const W"))
+            .filter_map(|rest| rest.split(':').next())
+            .filter(|code| code.chars().all(|c| c.is_ascii_digit()))
+            .collect();
+        declared.sort_unstable();
+        let mut listed: Vec<&str> = WARNING_CODES
+            .iter()
+            .filter_map(|c| c.strip_prefix('W'))
+            .collect();
+        listed.sort_unstable();
+        assert_eq!(declared, listed);
+        assert!(is_warning_code(" w042 "));
+        assert!(is_warning_code("P002"));
+        for bad in ["W999", "W42", "W 042", "E042", "", "P001"] {
+            assert!(!is_warning_code(bad), "{bad}");
+        }
+    }
+
     use super::*;
 
     #[test]

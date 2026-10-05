@@ -37,6 +37,12 @@
 //! Every statement in one run uses one timestamp literal for "now", so a
 //! check-strategy version closed in step 1 and its successor inserted in step
 //! 2 meet exactly (`valid_to` = next `valid_from`).
+//!
+//! A version opened in step 2 never starts before the key's latest
+//! `valid_to`. So the versions of one key never overlap, even when a deleted
+//! key comes back with the `updated_at` it had before the delete. Under
+//! `invalidate` the revived version starts where the closed one ended; only
+//! `new_record` records the time the key was absent (its marker).
 
 use chrono::{DateTime, Utc};
 use rocky_ir::{
@@ -284,6 +290,7 @@ fn new_version_metadata(
     key_refs: &[String],
     alias: &str,
     valid_from: &str,
+    source_version: &str,
     is_deleted: bool,
 ) -> Vec<(String, String)> {
     let meta = &spec.meta_columns;
@@ -299,7 +306,7 @@ fn new_version_metadata(
     }
     pairs.push((meta.scd_id.clone(), dialect.surrogate_key_expr(&hash_refs)));
     if let Some(updated_at) = &meta.updated_at {
-        pairs.push((updated_at.clone(), valid_from.to_string()));
+        pairs.push((updated_at.clone(), source_version.to_string()));
     }
     if spec.hard_deletes == SnapshotHardDeletes::NewRecord {
         pairs.push((
@@ -334,16 +341,24 @@ pub fn generate_snapshot_bootstrap_select(
         .collect::<Result<Vec<_>, _>>()?;
     let updated_at = spec.change.version_column().map(validated).transpose()?;
     let valid_from = version_timestamp("source", updated_at, &now);
-    let meta = new_version_metadata(spec, dialect, &keys, "source", &valid_from, false)
-        .into_iter()
-        .map(|(name, value)| {
-            validated(&name)?;
-            Ok(format!(
-                "{value} AS {}",
-                dialect.snapshot_metadata_identifier(&name)
-            ))
-        })
-        .collect::<Result<Vec<_>, SqlGenError>>()?;
+    let meta = new_version_metadata(
+        spec,
+        dialect,
+        &keys,
+        "source",
+        &valid_from,
+        &valid_from,
+        false,
+    )
+    .into_iter()
+    .map(|(name, value)| {
+        validated(&name)?;
+        Ok(format!(
+            "{value} AS {}",
+            dialect.snapshot_metadata_identifier(&name)
+        ))
+    })
+    .collect::<Result<Vec<_>, SqlGenError>>()?;
     let body = model_sql.trim().trim_end_matches(';');
     // A NULL key never matches its own previous version, so a NULL-key row
     // would be re-inserted on every run. Such rows are not snapshotted.
@@ -601,9 +616,30 @@ pub fn generate_snapshot_model_sql_with(
         set = close(&close_at),
     ));
 
-    // 2. Open a current version for every key that has none.
-    let metadata =
-        new_version_metadata(spec, dialect, &keys, "source", &version_from_source, false);
+    // 2. Open a current version for every key that has none. A key with
+    //    history (closed by step 1, by an earlier delete, or by a deletion
+    //    marker) starts no earlier than its latest `valid_to`: the source's
+    //    timestamp can predate that close (a key deleted, then re-inserted
+    //    with the same `updated_at`), and a new version starting before it
+    //    would overlap the history, so a point-in-time read returned two
+    //    rows. `CASE` rather than `GREATEST`: SQL Server has `GREATEST` only
+    //    from 2022. With no history the `CASE` falls to the source value.
+    let prior = "rocky_prior";
+    let prior_vt = "rocky_prior_valid_to";
+    let key_list = keys.join(", ");
+    let valid_from_new = format!(
+        "CASE WHEN {prior}.{prior_vt} > {version_from_source} THEN {prior}.{prior_vt} \
+         ELSE {version_from_source} END"
+    );
+    let metadata = new_version_metadata(
+        spec,
+        dialect,
+        &keys,
+        "source",
+        &valid_from_new,
+        &version_from_source,
+        false,
+    );
     let metadata_refs: Vec<(&str, &str)> = metadata
         .iter()
         .map(|(n, v)| (n.as_str(), v.as_str()))
@@ -613,10 +649,13 @@ pub fn generate_snapshot_model_sql_with(
         "INSERT INTO {target} ({names})\n\
          SELECT {values}\n\
          FROM {model} AS source\n\
+         LEFT JOIN (SELECT {key_list}, MAX({vt}) AS {prior_vt} FROM {target} \
+         GROUP BY {key_list}) AS {prior} ON {prior_on}\n\
          WHERE {keys_present} AND NOT EXISTS (\
          SELECT 1 FROM {target} AS existing WHERE {on} AND {is_current})",
         names = names.join(", "),
         values = values.join(", "),
+        prior_on = join(prior, "source"),
         keys_present = keys
             .iter()
             .map(|k| format!("source.{k} IS NOT NULL"))
@@ -646,7 +685,8 @@ pub fn generate_snapshot_model_sql_with(
             // 3a. A deletion marker copies the vanished key's last values.
             //     The target is aliased `source` so the dialect's insert
             //     column list (`source.<col>`) reads from it.
-            let marker_meta = new_version_metadata(spec, dialect, &keys, "source", &now, true);
+            let marker_meta =
+                new_version_metadata(spec, dialect, &keys, "source", &now, &now, true);
             let marker_refs: Vec<(&str, &str)> = marker_meta
                 .iter()
                 .map(|(n, v)| (n.as_str(), v.as_str()))

@@ -81,6 +81,33 @@
 //!   category" only: `SUM(varchar)` is "Operand data type varchar is invalid
 //!   for sum operator"). `STRING_AGG` converts non-string input to
 //!   `NVARCHAR`, so numbers are clean.
+//! - PostgreSQL — <https://www.postgresql.org/docs/current/typeconv-overview.html>
+//!   (no implicit cast from `text` to a numeric or date/time type; only an
+//!   untyped literal is resolved to the other side's type) and
+//!   <https://www.postgresql.org/docs/current/functions-aggregate.html>
+//!   (`sum` / `avg` / `stddev` / `variance` take numeric and interval inputs,
+//!   `bool_and` / `bool_or` take `boolean`, `string_agg` takes `text` or
+//!   `bytea`). Verified against PostgreSQL 16: `sum(text)`, `bool_and(text)`
+//!   and `string_agg(integer, unknown)` fail with "function … does not
+//!   exist"; `integer = text` and `date = text` fail with "operator does not
+//!   exist".
+//! - Amazon Redshift —
+//!   <https://docs.aws.amazon.com/redshift/latest/dg/r_SUM.html>,
+//!   <https://docs.aws.amazon.com/redshift/latest/dg/r_AVG.html>,
+//!   <https://docs.aws.amazon.com/redshift/latest/dg/r_STDDEV_functions.html>,
+//!   <https://docs.aws.amazon.com/redshift/latest/dg/r_VARIANCE_functions.html>
+//!   (numeric argument types only) and
+//!   <https://docs.aws.amazon.com/redshift/latest/dg/r_BOOL_AND.html> (Boolean or
+//!   integer only), so text into these aggregates is refused. Comparisons
+//!   follow <https://docs.aws.amazon.com/redshift/latest/dg/c_Supported_data_types.html>
+//!   ("Type compatibility and conversion"): a character string is converted
+//!   implicitly to a numeric or date/time value when it is a valid literal,
+//!   so a text column compared with a number or a date is value-dependent,
+//!   not refused. Redshift has no `STRING_AGG`; its `LISTAGG` rule is not
+//!   modelled.
+//! - ClickHouse has no table here yet. A model that targets only ClickHouse
+//!   gets the least severe verdict across the dialects above, and the
+//!   message says ClickHouse has no rules, not that no dialect is configured.
 
 use std::collections::HashSet;
 
@@ -104,16 +131,20 @@ pub enum OperandDialect {
     BigQuery,
     Trino,
     SqlServer,
+    Postgres,
+    Redshift,
 }
 
 impl OperandDialect {
-    const ALL: [OperandDialect; 6] = [
+    const ALL: [OperandDialect; 8] = [
         OperandDialect::DuckDb,
         OperandDialect::Snowflake,
         OperandDialect::Databricks,
         OperandDialect::BigQuery,
         OperandDialect::Trino,
         OperandDialect::SqlServer,
+        OperandDialect::Postgres,
+        OperandDialect::Redshift,
     ];
 
     /// Map a `rocky.toml` adapter `type` to a dialect. Returns `None` for
@@ -126,11 +157,14 @@ impl OperandDialect {
             "bigquery" => Some(Self::BigQuery),
             "trino" => Some(Self::Trino),
             "sqlserver" => Some(Self::SqlServer),
+            "postgres" | "postgresql" => Some(Self::Postgres),
+            "redshift" => Some(Self::Redshift),
             _ => None,
         }
     }
 
-    fn name(self) -> &'static str {
+    /// The display name used in diagnostics.
+    pub fn name(self) -> &'static str {
         match self {
             Self::DuckDb => "DuckDB",
             Self::Snowflake => "Snowflake",
@@ -138,6 +172,8 @@ impl OperandDialect {
             Self::BigQuery => "BigQuery",
             Self::Trino => "Trino",
             Self::SqlServer => "SQL Server",
+            Self::Postgres => "PostgreSQL",
+            Self::Redshift => "Redshift",
         }
     }
 }
@@ -223,19 +259,23 @@ fn aggregate_verdict(dialect: OperandDialect, kind: AggregateKind, arg: Family) 
         // time (its boolean-aggregate names do not exist at all, so a call is
         // refused either way).
         (AggregateKind::Numeric | AggregateKind::Boolean, Family::Text) => match dialect {
-            DuckDb | BigQuery | Trino | SqlServer => Verdict::Refused,
+            DuckDb | BigQuery | Trino | SqlServer | Postgres | Redshift => Verdict::Refused,
             Snowflake | Databricks => Verdict::ValueDependent,
         },
         // BigQuery `STRING_AGG` takes STRING or BYTES only.
+        // PostgreSQL `string_agg` takes `text` or `bytea` and does not cast
+        // a number to text implicitly.
         (AggregateKind::StringAgg, Family::Numeric) => match dialect {
-            BigQuery => Verdict::Refused,
-            DuckDb | Snowflake | Databricks | Trino | SqlServer => Verdict::Clean,
+            BigQuery | Postgres => Verdict::Refused,
+            DuckDb | Snowflake | Databricks | Trino | SqlServer | Redshift => Verdict::Clean,
         },
         // Trino `LISTAGG` takes VARCHAR only, and Trino never converts
         // numbers to text implicitly.
         (AggregateKind::ListAgg, Family::Numeric) => match dialect {
             Trino => Verdict::Refused,
-            DuckDb | Snowflake | Databricks | BigQuery | SqlServer => Verdict::Clean,
+            DuckDb | Snowflake | Databricks | BigQuery | SqlServer | Postgres | Redshift => {
+                Verdict::Clean
+            }
         },
         _ => Verdict::Clean,
     }
@@ -261,8 +301,8 @@ fn comparison_verdict(dialect: OperandDialect, a: &Operand<'_>, b: &Operand<'_>)
             // only as a warning, because literal coercion rules vary.
             Some(_) => Verdict::ValueDependent,
             None => match dialect {
-                DuckDb | Snowflake | Databricks | SqlServer => Verdict::ValueDependent,
-                BigQuery | Trino => Verdict::Refused,
+                DuckDb | Snowflake | Databricks | SqlServer | Redshift => Verdict::ValueDependent,
+                BigQuery | Trino | Postgres => Verdict::Refused,
             },
         },
         (Some(Family::Temporal), Some(Family::Text)) => match b.literal {
@@ -270,24 +310,82 @@ fn comparison_verdict(dialect: OperandDialect, a: &Operand<'_>, b: &Operand<'_>)
             None => match dialect {
                 // Trino's rule for date-vs-varchar columns is not stated in
                 // its conversion docs; warn rather than refuse.
-                DuckDb | Snowflake | Databricks | Trino | SqlServer => Verdict::ValueDependent,
-                BigQuery => Verdict::Refused,
+                DuckDb | Snowflake | Databricks | Trino | SqlServer | Redshift => {
+                    Verdict::ValueDependent
+                }
+                BigQuery | Postgres => Verdict::Refused,
             },
         },
         _ => Verdict::Clean,
     }
 }
 
-/// Resolve the verdict for a known dialect, or the least severe one across
-/// every dialect when the target is unknown.
-fn resolve(dialect: Option<OperandDialect>, f: impl Fn(OperandDialect) -> Verdict) -> Verdict {
-    match dialect {
-        Some(d) => f(d),
-        None => OperandDialect::ALL
+/// What one model's operands are judged against.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum OperandTarget {
+    /// No target is known. The verdict is the least severe one across every
+    /// dialect, so an unconfigured project only ever gets warnings.
+    #[default]
+    Unconfigured,
+    /// The model can run on each of `dialects`. The verdict is the most
+    /// severe one across them (fail closed): a model that one target refuses
+    /// is refused. `unruled` names target adapter types this pass has no
+    /// table for (ClickHouse); with no ruled dialect left, the verdict falls
+    /// back to the unconfigured one and the message names them.
+    Targets {
+        dialects: Vec<OperandDialect>,
+        unruled: Vec<String>,
+    },
+}
+
+impl From<Option<OperandDialect>> for OperandTarget {
+    fn from(value: Option<OperandDialect>) -> Self {
+        match value {
+            Some(d) => Self::Targets {
+                dialects: vec![d],
+                unruled: Vec::new(),
+            },
+            None => Self::Unconfigured,
+        }
+    }
+}
+
+/// Resolve the verdict, and the dialect that gives it when the target is
+/// known: the most severe verdict across the target dialects, or the least
+/// severe one across every dialect when no ruled target is known.
+fn resolve(
+    target: &OperandTarget,
+    f: impl Fn(OperandDialect) -> Verdict,
+) -> (Verdict, Option<OperandDialect>) {
+    match target {
+        OperandTarget::Targets { dialects, .. } if !dialects.is_empty() => dialects
             .iter()
-            .map(|d| f(*d))
-            .min()
-            .unwrap_or(Verdict::Clean),
+            .map(|d| (f(*d), Some(*d)))
+            // `max_by_key` keeps the last maximum; reverse so the first
+            // configured dialect with the worst verdict names the message.
+            .rev()
+            .max_by_key(|(v, _)| *v)
+            .unwrap_or((Verdict::Clean, None)),
+        _ => (
+            OperandDialect::ALL
+                .iter()
+                .map(|d| f(*d))
+                .min()
+                .unwrap_or(Verdict::Clean),
+            None,
+        ),
+    }
+}
+
+/// The opening of the message when no ruled target dialect is known.
+fn no_dialect_clause(target: &OperandTarget) -> String {
+    match target {
+        OperandTarget::Targets { unruled, .. } if !unruled.is_empty() => format!(
+            "Rocky has no operand rules for the target warehouse ({}) yet; across the dialects \
+             it does know",
+            unruled.join(", ")
+        ),
+        _ => "With no target dialect configured".to_string(),
     }
 }
 
@@ -316,9 +414,22 @@ pub fn check_operand_types(
     typed_models: &IndexMap<String, Vec<TypedColumn>>,
     dialect: Option<OperandDialect>,
 ) -> Vec<Diagnostic> {
+    let target = OperandTarget::from(dialect);
+    check_operand_types_per_model(models, graph, typed_models, &|_| target.clone())
+}
+
+/// [`check_operand_types`] with a target per model: `target_for` maps a model
+/// name to the dialects that model runs on.
+pub fn check_operand_types_per_model(
+    models: &[rocky_core::models::Model],
+    graph: &SemanticGraph,
+    typed_models: &IndexMap<String, Vec<TypedColumn>>,
+    target_for: &dyn Fn(&str) -> OperandTarget,
+) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
     for model in models {
-        diagnostics.extend(check_model(model, graph, typed_models, dialect));
+        let target = target_for(&model.config.name);
+        diagnostics.extend(check_model(model, graph, typed_models, target));
     }
     diagnostics
 }
@@ -327,7 +438,7 @@ fn check_model(
     model: &rocky_core::models::Model,
     graph: &SemanticGraph,
     typed_models: &IndexMap<String, Vec<TypedColumn>>,
-    dialect: Option<OperandDialect>,
+    target: OperandTarget,
 ) -> Vec<Diagnostic> {
     let Ok(statements) = Parser::parse_sql(&rocky_sql::dialect::DatabricksDialect, &model.sql)
     else {
@@ -347,7 +458,7 @@ fn check_model(
         model: &model.config.name,
         file,
         precise_spans,
-        dialect,
+        target,
         join_key_columns: join_key_checked_columns(&model.config.name, graph, typed_models),
         seen: HashSet::new(),
         out: Vec::new(),
@@ -397,7 +508,7 @@ struct Ctx<'m> {
     model: &'m str,
     file: String,
     precise_spans: bool,
-    dialect: Option<OperandDialect>,
+    target: OperandTarget,
     join_key_columns: HashSet<String>,
     /// `(code, line, col, message)` already emitted — CTE bodies are typed
     /// twice by construction, never reported twice.
@@ -732,7 +843,7 @@ fn check_comparison(at: &Expr, left: &Expr, right: &Expr, scope: &TypeScope, ctx
     };
     let judge =
         |d: OperandDialect| comparison_verdict(d, &l, &r).max(comparison_verdict(d, &r, &l));
-    let verdict = resolve(ctx.dialect, judge);
+    let (verdict, dialect) = resolve(&ctx.target, judge);
     if verdict == Verdict::Clean {
         return;
     }
@@ -756,7 +867,7 @@ fn check_comparison(at: &Expr, left: &Expr, right: &Expr, scope: &TypeScope, ctx
     };
     let pair = format!("`{left}` ({left_ty}) vs `{right}` ({right_ty})");
     let refused = verdict == Verdict::Refused;
-    let message = match (ctx.dialect, refused) {
+    let message = match (dialect, refused) {
         (Some(d), true) => format!(
             "comparison of incompatible types: {pair}. {} has no comparison between these types \
              and does not cast implicitly, so the query fails before reading any rows",
@@ -769,9 +880,10 @@ fn check_comparison(at: &Expr, left: &Expr, right: &Expr, scope: &TypeScope, ctx
             d.name()
         ),
         (None, _) => format!(
-            "value-dependent implicit cast in comparison: {pair}. With no target dialect \
-             configured: {} refuse this outright; {} cast `{text_side}` to {target} at run time \
-             and fail on the first value that does not convert",
+            "value-dependent implicit cast in comparison: {pair}. {}: {} refuse this \
+             outright; {} cast `{text_side}` to {target} at run time and fail on the first value \
+             that does not convert",
+            no_dialect_clause(&ctx.target),
             dialects_with(judge, Verdict::Refused),
             dialects_with(judge, Verdict::ValueDependent),
         ),
@@ -812,7 +924,7 @@ fn check_aggregate(at: &Expr, func: &ast::Function, scope: &TypeScope, ctx: &mut
         return;
     };
     let judge = |d: OperandDialect| aggregate_verdict(d, kind, arg_family);
-    let verdict = resolve(ctx.dialect, judge);
+    let (verdict, dialect) = resolve(&ctx.target, judge);
     if verdict == Verdict::Clean {
         return;
     }
@@ -823,7 +935,7 @@ fn check_aggregate(at: &Expr, func: &ast::Function, scope: &TypeScope, ctx: &mut
         AggregateKind::Boolean => "a boolean",
         AggregateKind::StringAgg | AggregateKind::ListAgg => "text",
     };
-    let message = match (ctx.dialect, refused) {
+    let message = match (dialect, refused) {
         (Some(d), true) => format!(
             "{call} has no overload on {}: argument `{arg}` is {arg_ty}, and {} does not cast \
              it to {expected} implicitly",
@@ -836,9 +948,9 @@ fn check_aggregate(at: &Expr, func: &ast::Function, scope: &TypeScope, ctx: &mut
             d.name()
         ),
         (None, _) => format!(
-            "{call}: argument `{arg}` is {arg_ty}. With no target dialect configured: {} have \
-             no such overload; {} cast it to {expected} at run time and fail on the first value \
-             that does not convert",
+            "{call}: argument `{arg}` is {arg_ty}. {}: {} have no such overload; {} cast it \
+             to {expected} at run time and fail on the first value that does not convert",
+            no_dialect_clause(&ctx.target),
             dialects_with(judge, Verdict::Refused),
             dialects_with(judge, Verdict::ValueDependent),
         ),
@@ -1143,6 +1255,108 @@ mod tests {
                 assert!(diags.is_empty(), "{dialect:?} {project:?}: {diags:?}");
             }
         }
+    }
+
+    fn run_target(models: &[(&str, &str)], target: &OperandTarget) -> Vec<Diagnostic> {
+        let models: Vec<Model> = models.iter().map(|(n, s)| model(n, s)).collect();
+        let config = crate::compile::CompilerConfig {
+            source_schemas: sources(),
+            ..Default::default()
+        };
+        let result = crate::compile::compile_preloaded_models(models, &config).expect("compile");
+        check_operand_types_per_model(
+            &result.project.models,
+            &result.semantic_graph,
+            &result.type_check.typed_models,
+            &|_| target.clone(),
+        )
+    }
+
+    const DATE_VS_TEXT: &str =
+        "SELECT o.order_id FROM raw.orders o JOIN raw.customers c ON o.order_date = c.email";
+    const STRING_AGG_NUM: &str = "SELECT STRING_AGG(order_id, ',') AS s FROM raw.orders";
+
+    /// PostgreSQL has no implicit cast from `text` (verified on PostgreSQL
+    /// 16): `sum(text)`, `bool_and(text)`, `string_agg(integer, …)`,
+    /// `integer = text` and `date = text` all fail before reading a row.
+    #[test]
+    fn postgres_refuses_text_aggregates_and_text_comparisons() {
+        let pg = Some(OperandDialect::Postgres);
+        for (sql, code) in [
+            (D2, "E042"),
+            ("SELECT BOOL_AND(status) AS b FROM raw.orders", "E042"),
+            ("SELECT AVG(status) AS b FROM raw.orders", "E042"),
+            (STRING_AGG_NUM, "E042"),
+            (D5, "E043"),
+            (DATE_VS_TEXT, "E043"),
+        ] {
+            let diags = run(&[("m", sql)], pg);
+            assert_eq!(codes(&diags), vec![code], "{sql}: {diags:?}");
+            assert!(diags[0].message.contains("PostgreSQL"), "{diags:?}");
+        }
+        // Valid controls: a numeric literal, a numeric aggregate, text into
+        // STRING_AGG.
+        for sql in [
+            "SELECT order_id FROM raw.orders WHERE customer_id = '10'",
+            "SELECT SUM(amount) AS s, STRING_AGG(status, ',') AS t FROM raw.orders",
+            "SELECT order_id FROM raw.orders WHERE order_date >= '2024-01-01'",
+        ] {
+            assert!(run(&[("m", sql)], pg).is_empty(), "{sql}");
+        }
+    }
+
+    /// Redshift's numeric aggregates take numeric arguments only, but it
+    /// converts a character string implicitly in a comparison, so a text
+    /// column against a number or a date is value-dependent.
+    #[test]
+    fn redshift_refuses_text_aggregates_and_warns_on_text_comparisons() {
+        let rs = Some(OperandDialect::Redshift);
+        for (sql, code) in [
+            (D2, "E042"),
+            ("SELECT STDDEV(status) AS b FROM raw.orders", "E042"),
+            (D5, "W043"),
+            (DATE_VS_TEXT, "W043"),
+        ] {
+            let diags = run(&[("m", sql)], rs);
+            assert_eq!(codes(&diags), vec![code], "{sql}: {diags:?}");
+            assert!(diags[0].message.contains("Redshift"), "{diags:?}");
+        }
+        assert!(run(&[("m", STRING_AGG_NUM)], rs).is_empty());
+        assert!(run(&[("m", "SELECT SUM(amount) AS s FROM raw.orders")], rs).is_empty());
+    }
+
+    /// A model that runs on several warehouses is judged against the
+    /// strictest one: DuckDB refuses `SUM(VARCHAR)` even though Snowflake
+    /// only warns.
+    #[test]
+    fn several_targets_take_the_most_severe_verdict() {
+        let target = OperandTarget::Targets {
+            dialects: vec![OperandDialect::Snowflake, OperandDialect::DuckDb],
+            unruled: Vec::new(),
+        };
+        let diags = run_target(&[("m", D2)], &target);
+        assert_eq!(codes(&diags), vec!["E042"], "{diags:?}");
+        assert!(diags[0].message.contains("DuckDB"), "{diags:?}");
+    }
+
+    /// A ClickHouse target has no table yet. The verdict stays the
+    /// unconfigured one, and the message says so instead of claiming no
+    /// dialect is configured.
+    #[test]
+    fn unruled_target_says_it_has_no_rules() {
+        let target = OperandTarget::Targets {
+            dialects: Vec::new(),
+            unruled: vec!["clickhouse".to_string()],
+        };
+        let diags = run_target(&[("m", D2)], &target);
+        assert_eq!(codes(&diags), vec!["W042"], "{diags:?}");
+        assert!(
+            diags[0]
+                .message
+                .contains("no operand rules for the target warehouse (clickhouse)"),
+            "{diags:?}"
+        );
+        assert!(!diags[0].message.contains("no target dialect configured"));
     }
 
     #[test]
