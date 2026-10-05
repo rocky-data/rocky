@@ -1443,6 +1443,29 @@
             ],
             "description": "Who was acting (`human` / `agent`)."
           },
+          "principal_id": {
+            "description": "The id of the actor behind the decision (RV4-P1). `null` means unrecorded: the row was written before ids existed. `unnamed` means nobody named the actor.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "principal_id_source": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PrincipalIdSource"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Where the id came from (`flag`, `env`, `mcp_profile`, `default`). `null` when the id is unrecorded."
+          },
+          "principal_id_verified": {
+            "default": false,
+            "description": "Whether anything verified the id. Always `false` today: ids are self-asserted until signed approvals exist. Defaulted, so a consumer reading an older binary's output sees `false`.",
+            "type": "boolean"
+          },
           "reason": {
             "description": "Human-readable explanation of how the effect was reached. A resolved `${VAR}` value prints as `${NAME}` (#1919).",
             "type": "string"
@@ -1566,6 +1589,26 @@
           }
         ]
       },
+      "AuditFilter": {
+        "description": "The `--actor` / `--since` filter of `rocky audit` (RV4-P1).",
+        "properties": {
+          "actor": {
+            "description": "The principal id the rows were filtered to. `unrecorded` selects the rows with no id.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "since": {
+            "description": "The inclusive lower bound, as an RFC 3339 UTC timestamp. A row is kept when its timestamp is at or after this.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
       "AuditForOutput": {
         "description": "JSON output for `rocky audit --for <table|run|plan>` — the custody chain.\n\nA one-query drill-down assembled link by link from the data Rocky already records: who proposed the change and what the policy plane decided ([`Self::decisions`]), what the plan changed ([`Self::plan`]), which runs materialized it ([`Self::runs`]), what a post-apply verification found ([`Self::verify_after`]), and what sits downstream in its blast radius ([`Self::blast_radius`]).\n\nEvery link fails closed the same way the estate brief does: a link whose signal is genuinely not recorded renders [`SectionAvailability::Unavailable`] with a note, never a fabricated or assumed value. Post-apply verification outcomes are persisted as decision-ledger custody rows (non-empty `verify_after`), so [`Self::verify_after`] renders them when they exist and says \"not recorded\" when none exist for the subject. The run ledger is not keyed to policy decisions, so a `run` selector cannot join back to a decision. The blast radius is recomputed from the current compiled graph (a live query, not a stored snapshot).",
         "properties": {
@@ -1653,11 +1696,22 @@
             "type": "string"
           },
           "decisions": {
-            "description": "Every recorded policy decision, oldest first. Under `product`, only the rows whose `model` is that product's output model.",
+            "description": "Every recorded policy decision, oldest first. Under `product`, only the rows whose `model` is that product's output model. Under `filter`, only the rows that match it.",
             "items": {
               "$ref": "#/components/schemas/AuditDecisionEntry"
             },
             "type": "array"
+          },
+          "filter": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/AuditFilter"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The `--actor` / `--since` filter applied, absent when neither was given."
           },
           "product": {
             "anyOf": [
@@ -1669,6 +1723,13 @@
               }
             ],
             "description": "The product the ledger was filtered to (`--product <name>`), absent when the whole ledger is listed."
+          },
+          "unattributed_skipped": {
+            "default": 0,
+            "description": "How many rows in range carry no principal id (written before ids existed) and so an `--actor <id>` filter dropped them. `0` without an `--actor` filter, and under `--actor unrecorded`, which lists them. Defaulted, so a consumer reading an older binary's output sees `0`.",
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
           },
           "version": {
             "type": "string"
@@ -3974,7 +4035,6 @@
             "default": {
               "enabled": true,
               "replicate": false,
-              "strict_sources": false,
               "ttl_seconds": 86400
             },
             "description": "Schema cache. Stores `DESCRIBE TABLE` results in `state.redb` so leaf models typecheck against real warehouse types without a live round-trip on every compile."
@@ -4000,17 +4060,6 @@
           "fqn": {
             "description": "Fully-qualified target identifier (`catalog.schema.table`) when resolvable, otherwise the model name.",
             "type": "string"
-          },
-          "governance": {
-            "anyOf": [
-              {
-                "$ref": "#/components/schemas/CatalogGovernance"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "description": "Access level, ownership and version, when the model declares any of them. Absent for sources and for models with no governance keys."
           },
           "intent": {
             "description": "Free-form natural-language description of the asset's purpose, when supplied via the model's sidecar config.",
@@ -4142,72 +4191,6 @@
           "target_column",
           "target_model",
           "transform"
-        ],
-        "type": "object"
-      },
-      "CatalogGovernance": {
-        "description": "Model governance on a [`CatalogAsset`]: access level, ownership group and owner, and model version.",
-        "properties": {
-          "access": {
-            "description": "`private`, `protected` (the default) or `public`.",
-            "type": "string"
-          },
-          "deprecation_date": {
-            "description": "Deprecation date of this version (`YYYY-MM-DD`).",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "group": {
-            "description": "Ownership group (`access_group`, else the config `group`).",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "latest_version": {
-            "description": "The latest version of [`Self::versioned_model`].",
-            "format": "uint32",
-            "minimum": 0.0,
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "owner_email": {
-            "description": "Group owner's email, from the group file's `[owner]`.",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "owner_name": {
-            "description": "Group owner's name, from the group file's `[owner]`.",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "version": {
-            "description": "This model's version. Absent on the latest alias.",
-            "format": "uint32",
-            "minimum": 0.0,
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "versioned_model": {
-            "description": "Unversioned model name, for a model version or the latest alias.",
-            "type": [
-              "string",
-              "null"
-            ]
-          }
-        },
-        "required": [
-          "access"
         ],
         "type": "object"
       },
@@ -4637,35 +4620,9 @@
         },
         "type": "object"
       },
-      "CiDiffMode": {
-        "description": "Which code snapshot `rocky ci-diff` / `rocky lineage-diff` compares against the base.\n\nSelection (which files changed) and compilation (what those files contain) always read the same snapshot, so the report never mixes a committed file list with uncommitted contents.",
-        "oneOf": [
-          {
-            "description": "Compare the HEAD commit, read from git objects. The default.",
-            "enum": [
-              "head"
-            ],
-            "type": "string"
-          },
-          {
-            "description": "Compare the working tree: staged, unstaged, untracked, renamed and deleted files on disk (`--working-tree`).",
-            "enum": [
-              "working_tree"
-            ],
-            "type": "string"
-          }
-        ]
-      },
       "CiDiffOutput": {
         "description": "JSON output for `rocky ci-diff`.\n\nReports which models changed between two git refs, with optional column-level structural diffs when compilation succeeds on both sides.",
         "properties": {
-          "base_commit": {
-            "description": "Commit the base side was read from: the merge base of `base_ref` and HEAD. Omitted when git could not compute one and `base_ref` itself was used (e.g. a shallow clone).",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
           "base_ref": {
             "description": "Git ref used as the comparison base (e.g. `main`).",
             "type": "string"
@@ -4687,14 +4644,6 @@
           "markdown": {
             "description": "Pre-rendered Markdown suitable for posting as a GitHub PR comment.",
             "type": "string"
-          },
-          "mode": {
-            "allOf": [
-              {
-                "$ref": "#/components/schemas/CiDiffMode"
-              }
-            ],
-            "description": "Which snapshot was compared against the base: `head` (the HEAD commit; uncommitted edits ignored) or `working_tree` (files on disk, including staged, unstaged and untracked changes)."
           },
           "models": {
             "description": "Per-model diff results.",
@@ -4720,7 +4669,6 @@
           "command",
           "head_ref",
           "markdown",
-          "mode",
           "models",
           "summary",
           "version"
@@ -4990,13 +4938,6 @@
           },
           "model": {
             "type": "string"
-          },
-          "row_selection": {
-            "description": "Row-selection edges along the trace: columns that decide which rows or groups exist (join keys, filters, group keys, window keys) rather than feeding a value. `trace` stays value-derivation only.\n\nUpstream: the row-selection inputs of every model on the value trace, for the traced column. Downstream: the models whose rows the traced column (or a column derived from it) filters, joins, groups or partitions. Omitted when empty.",
-            "items": {
-              "$ref": "#/components/schemas/RowSelectionEdgeRecord"
-            },
-            "type": "array"
           },
           "trace": {
             "items": {
@@ -5426,13 +5367,6 @@
             "description": "Expanded SQL for each model after macro substitution. Only populated when `--expand-macros` is passed. Keys are model names, values are the SQL after all `@macro()` calls have been replaced.",
             "type": "object"
           },
-          "functions": {
-            "description": "User-defined functions declared under `functions/` that passed validation, with the models that call each one. Under `--model`, only the selected function, or the functions the selected model calls. Empty (and omitted) when the project declares none.",
-            "items": {
-              "$ref": "#/components/schemas/FunctionDetail"
-            },
-            "type": "array"
-          },
           "has_errors": {
             "description": "Whether the diagnostics this result describes include error-severity entries — and, for the CLI, whether the command exits non-zero.\n\nUnder `--model` this is computed from the exact-attribution filter above, so it says nothing about whether the selected model's upstreams compile: an error attributed to another model is filtered out and leaves this `false`, even though `rocky run` would classify that model as a compile error and exclude it from execution. A failure that aborts compilation outright rather than emitting a diagnostic — an unparseable model, a semantic-graph or contract-load failure — fails the command before any scoping applies. To learn whether a model can be built, compile without a selector.",
             "type": "boolean"
@@ -5653,39 +5587,6 @@
             "description": "Present, but could not be read or parsed. The server still started — `rocky serve` does not require a config — but the scheduler will skip every tick until it parses.",
             "enum": [
               "unreadable"
-            ],
-            "type": "string"
-          }
-        ]
-      },
-      "ConsumerImpactStatus": {
-        "description": "What happened to a consumer of a removed column.",
-        "oneOf": [
-          {
-            "description": "HEAD still reads (or newly reads) the removed column. This consumer breaks.",
-            "enum": [
-              "newly_broken"
-            ],
-            "type": "string"
-          },
-          {
-            "description": "Lineage could not decide: HEAD did not compile, or the consumer mentions the column in a place lineage cannot attribute.",
-            "enum": [
-              "unknown"
-            ],
-            "type": "string"
-          },
-          {
-            "description": "The consumer model no longer exists on HEAD.",
-            "enum": [
-              "deleted"
-            ],
-            "type": "string"
-          },
-          {
-            "description": "The consumer still exists on HEAD and provably no longer reads the column.",
-            "enum": [
-              "repaired"
             ],
             "type": "string"
           }
@@ -8145,89 +8046,6 @@
         },
         "type": "object"
       },
-      "FreshnessCheckResult": {
-        "description": "One freshness check.",
-        "properties": {
-          "age_seconds": {
-            "description": "`checked_at - max_loaded_at`, in seconds. Negative when the newest load time is in the future (clock skew).",
-            "format": "int64",
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "error_after_seconds": {
-            "format": "uint64",
-            "minimum": 0.0,
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "loaded_at_field": {
-            "description": "The column read with `MAX(..)`. `None` when the measurement is the model's last successful build from the state store.",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "max_loaded_at": {
-            "description": "The newest load time seen. `None` when the table is empty, every value is NULL, the model was never built, or the check could not run.",
-            "format": "date-time",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "measured_from": {
-            "description": "Where `max_loaded_at` came from: `warehouse` or `state_store`.",
-            "type": "string"
-          },
-          "message": {
-            "description": "Why the status is what it is, when that is not just the age.",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "name": {
-            "description": "Source `schema.table` (or `catalog.schema.table`), or the model name.",
-            "type": "string"
-          },
-          "pipeline": {
-            "description": "The pipeline that declares the source or loads the model.",
-            "type": "string"
-          },
-          "status": {
-            "allOf": [
-              {
-                "$ref": "#/components/schemas/FreshnessStatus"
-              }
-            ],
-            "description": "`pass`, `warn`, `error`, or `runtime_error`."
-          },
-          "table": {
-            "description": "The table the measurement was taken from (`catalog.schema.table`).",
-            "type": "string"
-          },
-          "warn_after_seconds": {
-            "format": "uint64",
-            "minimum": 0.0,
-            "type": [
-              "integer",
-              "null"
-            ]
-          }
-        },
-        "required": [
-          "measured_from",
-          "name",
-          "pipeline",
-          "status",
-          "table"
-        ],
-        "type": "object"
-      },
       "FreshnessConfig": {
         "additionalProperties": false,
         "description": "Freshness check configuration.\n\nA single scalar `threshold_seconds` applies to every checked table. There used to be an `overrides` key for per-schema thresholds; it parsed and validated but nothing on the check path ever read it, so it is now refused with a message naming the remedy (#1620).",
@@ -8263,48 +8081,6 @@
         },
         "required": [
           "threshold_seconds"
-        ],
-        "type": "object"
-      },
-      "FreshnessOutput": {
-        "description": "JSON output for `rocky freshness`.",
-        "properties": {
-          "checked_at": {
-            "description": "The instant every age was measured against.",
-            "format": "date-time",
-            "type": "string"
-          },
-          "command": {
-            "type": "string"
-          },
-          "models": {
-            "description": "One entry per model `[freshness]` block.",
-            "items": {
-              "$ref": "#/components/schemas/FreshnessCheckResult"
-            },
-            "type": "array"
-          },
-          "sources": {
-            "description": "One entry per declared source freshness block.",
-            "items": {
-              "$ref": "#/components/schemas/FreshnessCheckResult"
-            },
-            "type": "array"
-          },
-          "summary": {
-            "$ref": "#/components/schemas/FreshnessSummary"
-          },
-          "version": {
-            "type": "string"
-          }
-        },
-        "required": [
-          "checked_at",
-          "command",
-          "models",
-          "sources",
-          "summary",
-          "version"
         ],
         "type": "object"
       },
@@ -8354,48 +8130,6 @@
         "required": [
           "max_lag",
           "time_column"
-        ],
-        "type": "object"
-      },
-      "FreshnessStatus": {
-        "description": "Outcome of one freshness check. Serialized `pass` / `warn` / `error` / `runtime_error`, matching dbt's `source freshness` statuses.\n\n- `pass`: within every threshold. - `warn`: older than `warn_after`, not older than `error_after`. - `error`: older than `error_after`. - `runtime_error`: the check could not be evaluated (invalid config, a failed query, or a value that does not read as a timestamp).",
-        "enum": [
-          "pass",
-          "warn",
-          "error",
-          "runtime_error"
-        ],
-        "type": "string"
-      },
-      "FreshnessSummary": {
-        "description": "Counts per status across `sources` and `models`.",
-        "properties": {
-          "error": {
-            "format": "uint",
-            "minimum": 0.0,
-            "type": "integer"
-          },
-          "pass": {
-            "format": "uint",
-            "minimum": 0.0,
-            "type": "integer"
-          },
-          "runtime_error": {
-            "format": "uint",
-            "minimum": 0.0,
-            "type": "integer"
-          },
-          "warn": {
-            "format": "uint",
-            "minimum": 0.0,
-            "type": "integer"
-          }
-        },
-        "required": [
-          "error",
-          "pass",
-          "runtime_error",
-          "warn"
         ],
         "type": "object"
       },
@@ -8551,55 +8285,6 @@
           "product_id",
           "state",
           "version"
-        ],
-        "type": "object"
-      },
-      "FunctionDetail": {
-        "description": "A user-defined function in `CompileOutput.functions`.",
-        "properties": {
-          "called_by": {
-            "description": "Models that call this function directly. `rocky run` creates the function before any of them is built.",
-            "items": {
-              "type": "string"
-            },
-            "type": "array"
-          },
-          "calls": {
-            "description": "Other project functions this function's body calls (created first).",
-            "items": {
-              "type": "string"
-            },
-            "type": "array"
-          },
-          "description": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "deterministic": {
-            "type": [
-              "boolean",
-              "null"
-            ]
-          },
-          "name": {
-            "type": "string"
-          },
-          "returns": {
-            "description": "Declared return type, as written.",
-            "type": "string"
-          },
-          "signature": {
-            "description": "`name(arg TYPE, ...) RETURNS TYPE`, as declared.",
-            "type": "string"
-          }
-        },
-        "required": [
-          "called_by",
-          "name",
-          "returns",
-          "signature"
         ],
         "type": "object"
       },
@@ -10053,8 +9738,192 @@
         ],
         "type": "object"
       },
-      "IncrementalLookback": {
-        "type": "string"
+      "IntentCheckOutput": {
+        "description": "Result of `rocky plan --intent <intent>`. **Experimental. Report-only.**\n\nRocky builds each changed model twice, once from the SQL at `base_ref` and once from the working tree, in one DuckDB transaction, and compares the two outputs exactly. See [`INTENT_CHECK_CAVEAT`] for what a `match` does and does not mean.",
+        "properties": {
+          "adapter": {
+            "description": "The target adapter type (for example `\"duckdb\"`).",
+            "type": "string"
+          },
+          "base_ref": {
+            "description": "The git ref the working tree was compared against (`--base`).",
+            "type": "string"
+          },
+          "caveat": {
+            "description": "What a verdict means and what it does not check. Always set.",
+            "type": "string"
+          },
+          "intent": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/PlanIntent"
+              }
+            ],
+            "description": "The intent that was checked."
+          },
+          "models": {
+            "description": "One verdict per changed model, sorted by model name.",
+            "items": {
+              "$ref": "#/components/schemas/ModelIntentVerdict"
+            },
+            "type": "array"
+          },
+          "probes": {
+            "description": "Extra builds of the base SQL used to detect nondeterminism.",
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "summary": {
+            "$ref": "#/components/schemas/IntentCheckSummary"
+          }
+        },
+        "required": [
+          "adapter",
+          "base_ref",
+          "caveat",
+          "intent",
+          "models",
+          "probes",
+          "summary"
+        ],
+        "type": "object"
+      },
+      "IntentCheckReason": {
+        "description": "Why a model got `mismatch` or `unverified`. A closed list.",
+        "oneOf": [
+          {
+            "description": "Mismatch: the column names, types or order differ.",
+            "enum": [
+              "schema_differs"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "Mismatch: the outputs are different multisets of rows.",
+            "enum": [
+              "rows_differ"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "Mismatch: the model exists at the base ref and not in the working tree.",
+            "enum": [
+              "model_removed"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "Unverified: the target adapter is not DuckDB.",
+            "enum": [
+              "adapter_unsupported"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "Unverified: the model does not exist at the base ref.",
+            "enum": [
+              "no_base"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "Unverified: the models at the base ref could not be read or compiled.",
+            "enum": [
+              "base_unavailable"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "Unverified: the SQL calls a volatile builtin, or two builds of the same SQL disagree.",
+            "enum": [
+              "nondeterministic"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "Unverified: the materialization strategy is not supported.",
+            "enum": [
+              "unsupported_strategy"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "Unverified: a build or a comparison query failed.",
+            "enum": [
+              "build_failed"
+            ],
+            "type": "string"
+          }
+        ]
+      },
+      "IntentCheckSummary": {
+        "description": "Counts of each verdict in [`IntentCheckOutput::models`].",
+        "properties": {
+          "match": {
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "mismatch": {
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "unverified": {
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "match",
+          "mismatch",
+          "unverified"
+        ],
+        "type": "object"
+      },
+      "IntentColumn": {
+        "description": "One column of a built output: its name and its warehouse type.",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "type": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "type"
+        ],
+        "type": "object"
+      },
+      "IntentVerdict": {
+        "description": "The verdict for one changed model.",
+        "oneOf": [
+          {
+            "description": "The effect satisfies the intent on the recorded inputs.",
+            "enum": [
+              "match"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "The effect breaks the intent. `reason` says how.",
+            "enum": [
+              "mismatch"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "The check could not decide. `reason` says why.",
+            "enum": [
+              "unverified"
+            ],
+            "type": "string"
+          }
+        ]
       },
       "IsolationConfig": {
         "additionalProperties": false,
@@ -10255,13 +10124,6 @@
           "column_name": {
             "type": "string"
           },
-          "consumer_impact": {
-            "description": "For a removed (or renamed-away) column: what happened to each model that read it directly, found by comparing the base and HEAD lineage graphs. Includes reads through value lineage and through row selection (join keys, filters, group keys, window keys). Omitted for other change types and when no consumer was found.",
-            "items": {
-              "$ref": "#/components/schemas/LineageConsumerImpact"
-            },
-            "type": "array"
-          },
           "downstream_consumers": {
             "description": "Columns reached by walking the lineage graph downstream from `(model_name, column_name)` on HEAD's compile. Empty when the column no longer exists on HEAD (e.g. for removed columns) or when the trace finds no consumers.",
             "items": {
@@ -10306,52 +10168,9 @@
         ],
         "type": "object"
       },
-      "LineageConsumerImpact": {
-        "description": "One direct consumer of a removed column, classified.",
-        "properties": {
-          "columns": {
-            "description": "Consumer output columns involved: the HEAD-side columns for `newly_broken`, the base-side columns otherwise. Empty when the read affects every column (a filter or join key).",
-            "items": {
-              "type": "string"
-            },
-            "type": "array"
-          },
-          "model": {
-            "description": "The consumer model.",
-            "type": "string"
-          },
-          "reason": {
-            "description": "One-line, human-readable explanation of the classification.",
-            "type": "string"
-          },
-          "status": {
-            "$ref": "#/components/schemas/ConsumerImpactStatus"
-          },
-          "via": {
-            "description": "How the consumer reads the column: `value`, or a row-selection kind (`join_key`, `filter`, `group_by`, `having`, `qualify`, `window_partition`, `window_order`).",
-            "items": {
-              "type": "string"
-            },
-            "type": "array"
-          }
-        },
-        "required": [
-          "model",
-          "reason",
-          "status"
-        ],
-        "type": "object"
-      },
       "LineageDiffOutput": {
-        "description": "JSON output for `rocky lineage-diff <base_ref>`.\n\nCombines the structural per-column diff produced by `rocky ci-diff` (added/removed/type-changed columns between two git refs) with the downstream blast-radius from `rocky lineage --downstream` (consumers of each changed column, traced through HEAD's semantic graph).\n\nThe markdown payload is rendered server-side and ready to drop into a PR comment — answers \"what does this PR change downstream?\" in one command.\n\n`downstream_consumers` is traced **downstream from HEAD**, so a removed column reports an empty set there. Removed columns instead carry `consumer_impact`: each direct consumer on the base side (or HEAD side), classified by comparing the base and HEAD lineage graphs.",
+        "description": "JSON output for `rocky lineage-diff <base_ref>`.\n\nCombines the structural per-column diff produced by `rocky ci-diff` (added/removed/type-changed columns between two git refs) with the downstream blast-radius from `rocky lineage --downstream` (consumers of each changed column, traced through HEAD's semantic graph).\n\nThe markdown payload is rendered server-side and ready to drop into a PR comment — answers \"what does this PR change downstream?\" in one command.\n\nTrace direction is fixed to **downstream from HEAD only** in v1. Removed columns therefore report an empty consumer set (the column no longer exists on HEAD's compile, so its downstream reach can't be walked); the structural diff still surfaces the removal.",
         "properties": {
-          "base_commit": {
-            "description": "Commit the base side was read from (merge base of `base_ref` and HEAD). Omitted when it could not be computed.",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
           "base_ref": {
             "description": "Git ref used as the comparison base (e.g. `main`).",
             "type": "string"
@@ -10366,14 +10185,6 @@
           "markdown": {
             "description": "Pre-rendered Markdown suitable for posting as a GitHub PR comment.",
             "type": "string"
-          },
-          "mode": {
-            "allOf": [
-              {
-                "$ref": "#/components/schemas/CiDiffMode"
-              }
-            ],
-            "description": "Which snapshot was compared against the base. See [`CiDiffMode`]."
           },
           "results": {
             "description": "Per-changed-model entries, each with per-column downstream traces.",
@@ -10394,7 +10205,6 @@
           "command",
           "head_ref",
           "markdown",
-          "mode",
           "results",
           "summary",
           "version"
@@ -11982,7 +11792,7 @@
         "type": "object"
       },
       "ModelFreshnessConfig": {
-        "description": "Per-model freshness configuration.\n\nDeclares the maximum allowed lag between successive materializations of the model plus the optional timestamp column used by the runtime freshness check.\n\n`rocky freshness` enforces the TTL at run time: it reads `MAX(time_column)` from the model's target table (or, without a `time_column`, the model's last successful build in the state store) and reports `warn`, or `error` when `severity = \"error\"`. `rocky run` does not gate on it. The compiler checks the `time_column` (E050 when absent from a provably complete output, W050 when not temporal), and soft-warns (W005) when a model has at least one temporal output column but no `freshness` declaration anywhere in scope (per-model or project-level default).",
+        "description": "Per-model freshness configuration.\n\nDeclares the maximum allowed lag between successive materializations of the model plus the optional timestamp column used by the runtime freshness check.\n\nThe compiler does not enforce the TTL — it's metadata consumed by downstream observability tooling (`dagster-rocky` `FreshnessPolicy`, `rocky doctor --freshness`, etc.). The compiler does however soft-warn (W005) when a model has at least one temporal output column but no `freshness` declaration anywhere in scope (per-model or project-level default).",
         "properties": {
           "max_lag_seconds": {
             "description": "Maximum lag in seconds before the model is considered stale.\n\nAccepts both `max_lag_seconds` (legacy field name, preserved for existing sidecar fixtures + dagster Pydantic + VS Code bindings) and `expected_lag_seconds` (the documented public-facing name matching dbt freshness + SQLMesh defaults). Both deserialize to the same field; the serialized name stays `max_lag_seconds` so existing JSON/codegen consumers keep working unchanged.",
@@ -12055,6 +11865,104 @@
           "executions",
           "model",
           "version"
+        ],
+        "type": "object"
+      },
+      "ModelIntentVerdict": {
+        "description": "The intent verdict for one changed model.",
+        "properties": {
+          "detail": {
+            "description": "Plain-text detail, such as the error text of a failed build.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "model": {
+            "description": "The model name, as declared in its sidecar.",
+            "type": "string"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/IntentCheckReason"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Set for every `mismatch` and every `unverified`. Unset for `match`."
+          },
+          "rows_base": {
+            "description": "Row count of the base build.",
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "rows_head": {
+            "description": "Row count of the head build.",
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "rows_only_in_base": {
+            "description": "Rows in the base output and not in the head output (multiset).",
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "rows_only_in_head": {
+            "description": "Rows in the head output and not in the base output (multiset).",
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "schema_base": {
+            "description": "The base output columns. Set only when `reason` is `schema_differs`.",
+            "items": {
+              "$ref": "#/components/schemas/IntentColumn"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "schema_head": {
+            "description": "The head output columns. Set only when `reason` is `schema_differs`.",
+            "items": {
+              "$ref": "#/components/schemas/IntentColumn"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "upstream_changed": {
+            "description": "Changed models upstream of this one. Both builds read the materialized upstream tables, so this model's verdict does not cover the upstream change. Empty when no upstream model changed.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "verdict": {
+            "$ref": "#/components/schemas/IntentVerdict"
+          }
+        },
+        "required": [
+          "model",
+          "verdict"
         ],
         "type": "object"
       },
@@ -12306,25 +12214,6 @@
             "description": "Report collisions and fail the discover, so a colliding onboard cannot silently create a catalog/table.",
             "enum": [
               "error"
-            ],
-            "type": "string"
-          }
-        ]
-      },
-      "OnSchemaChange": {
-        "description": "What an incremental run does when the model's output columns differ from the existing target's columns.",
-        "oneOf": [
-          {
-            "description": "Stop the run and name the added and removed columns. The default: nothing is written, and `rocky run --full-refresh` rebuilds the table.",
-            "enum": [
-              "fail"
-            ],
-            "type": "string"
-          },
-          {
-            "description": "Add each new output column to the target with `ALTER TABLE ... ADD COLUMN`, then load. Existing rows hold `NULL` in the new column. A column removed from the model still fails the run.",
-            "enum": [
-              "append_new_columns"
             ],
             "type": "string"
           }
@@ -12956,41 +12845,6 @@
         ],
         "type": "object"
       },
-      "PipelineSourceConfig2": {
-        "additionalProperties": false,
-        "description": "One external source a transformation pipeline reads.\n\n`catalog` may be omitted (DuckDB and other two-part warehouses); it then defaults to the empty string, which the dialects render as `schema.table`.",
-        "properties": {
-          "catalog": {
-            "default": "",
-            "description": "Catalog (database) holding the table. Empty for two-part names.",
-            "type": "string"
-          },
-          "freshness": {
-            "anyOf": [
-              {
-                "$ref": "#/components/schemas/SourceFreshnessConfig"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "description": "Optional freshness expectation. A source without one is declared but never checked."
-          },
-          "schema": {
-            "description": "Schema holding the table.",
-            "type": "string"
-          },
-          "table": {
-            "description": "Table name.",
-            "type": "string"
-          }
-        },
-        "required": [
-          "schema",
-          "table"
-        ],
-        "type": "object"
-      },
       "PipelineTargetConfig": {
         "additionalProperties": false,
         "description": "Pipeline target configuration.",
@@ -13060,6 +12914,18 @@
         ],
         "description": "Schema-only helper mirroring [`AdaptersFieldSchema`] for `[pipeline.*]`.\n\nThe flat-pipeline shorthand exists in [`normalize_toml_shorthands`] but is unused across all committed POCs; including it in the schema is defensive — a user typing `[pipeline] source = ...` shouldn't see a false IDE error. The pipeline payload references [`PipelineConfig`] directly, whose hand-written `JsonSchema` impl emits an `anyOf` of the five pipeline variants."
       },
+      "PlanIntent": {
+        "description": "The closed list of intents `rocky plan --intent` accepts.\n\nVersion 1 has one intent. Each intent has a written predicate that the check measures on the data. clap rejects any other value.",
+        "oneOf": [
+          {
+            "description": "Same schema. The base and head outputs are equal multisets of rows.",
+            "enum": [
+              "refactor"
+            ],
+            "type": "string"
+          }
+        ]
+      },
       "PlanOutput": {
         "properties": {
           "breaking_verdict": {
@@ -13122,6 +12988,17 @@
             "description": "`true` when at least one entry in `budget_diagnostics` has error-level severity (`on_breach = \"error\"`). Callers can use this flag to fail a pipeline-as-code check without inspecting individual diagnostic severities.",
             "type": "boolean"
           },
+          "intent_check": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/IntentCheckOutput"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Result of `rocky plan --intent <intent>`: one verdict per changed model. **Experimental.** Present only when `--intent` is set. REPORT-ONLY: it relaxes no gate and never changes the exit code. It lives on the output, not in the persisted plan, so it does not enter `plan_id`. See [`IntentCheckOutput`] and its `caveat`."
+          },
           "mask_actions": {
             "description": "Masking-policy applications the governance reconciler would issue via `apply_masking_policy`. One row per `(model, column, tag)` where the tag resolves to a strategy for the active env. Unresolved tags are intentionally omitted — `rocky compliance` is the diagnostic surface for that gap.",
             "items": {
@@ -13158,7 +13035,7 @@
             "type": "array"
           },
           "skipped": {
-            "description": "Models excluded from the SQL preview or refused by compilation, with the reason for each. This includes SQL that needs a live warehouse to render, compiler errors, and `ephemeral` models, which are inlined into their consumers and render no statement of their own.",
+            "description": "Models excluded from the SQL preview or refused by compilation, with the reason for each. This includes SQL that needs a live warehouse to render and compiler errors such as E038 for an `ephemeral` model.",
             "items": {
               "$ref": "#/components/schemas/SkippedModel"
             },
@@ -15037,6 +14914,39 @@
         },
         "type": "object"
       },
+      "PrincipalIdSource": {
+        "description": "Where a [`PrincipalId`] came from.\n\nP1 knows four sources, and every one is self-asserted. RV4-P2 adds signed sources (a local key, CI OIDC). C2 adds `serve_token` for the HTTP API. A new variant is a change in meaning for an older binary, so the phase that adds one bumps the state schema.",
+        "oneOf": [
+          {
+            "description": "The global `--principal-id` flag.",
+            "enum": [
+              "flag"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "The `ROCKY_PRINCIPAL_ID` environment variable.",
+            "enum": [
+              "env"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "Derived from the `rocky mcp --profile` the server runs under (`mcp-default`, `mcp-approver`, `mcp-worker`).",
+            "enum": [
+              "mcp_profile"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "Nobody named the actor; the id is [`PRINCIPAL_ID_UNNAMED`].",
+            "enum": [
+              "default"
+            ],
+            "type": "string"
+          }
+        ]
+      },
       "ProductApprovalOutput": {
         "description": "The approval record, as echoed by compile/status output.",
         "properties": {
@@ -15903,10 +15813,10 @@
                 "type": "null"
               }
             ],
-            "description": "Default severity reported when the freshness check trips. Inherited on the same terms as `time_column`. Under `error`, a stale model makes `rocky freshness` exit 1."
+            "description": "Default severity reported when the freshness check trips. Inherited on the same terms as `time_column`. No runtime check reads it yet."
           },
           "time_column": {
-            "description": "Default timestamp column used to evaluate freshness at runtime. Carried into a model that declares no `[freshness]` block of its own; a model that declares one keeps its own value, or none. Only inherited alongside an `expected_lag_seconds`. `rocky freshness` reads `MAX(time_column)` from each inheriting model's target; when a model does not have the column it measures the last successful build instead.",
+            "description": "Default timestamp column used to evaluate freshness at runtime. Carried into a model that declares no `[freshness]` block of its own; a model that declares one keeps its own value, or none. Only inherited alongside an `expected_lag_seconds`. No runtime check reads it yet.",
             "type": [
               "string",
               "null"
@@ -18282,6 +18192,13 @@
             ],
             "description": "Who authored the change (`human` / `agent`)."
           },
+          "principal_id": {
+            "description": "The id of the actor behind the escalation (RV4-P1). `null` when the row was written before ids existed. Self-asserted and unverified.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "reason": {
             "description": "Human-readable explanation of how `require_review` was reached.",
             "type": "string"
@@ -18507,7 +18424,6 @@
               "schemas": {
                 "enabled": true,
                 "replicate": false,
-                "strict_sources": false,
                 "ttl_seconds": 86400
               }
             },
@@ -18989,40 +18905,6 @@
           "expected",
           "kind",
           "row_index"
-        ],
-        "type": "object"
-      },
-      "RowSelectionEdgeRecord": {
-        "description": "One row-selection lineage edge. See `ColumnLineageOutput::row_selection`.",
-        "properties": {
-          "kind": {
-            "description": "`join_key`, `filter`, `group_by`, `having`, `qualify`, `window_partition` or `window_order`.",
-            "type": "string"
-          },
-          "source": {
-            "allOf": [
-              {
-                "$ref": "#/components/schemas/LineageQualifiedColumn"
-              }
-            ],
-            "description": "The column that influences row selection."
-          },
-          "target_column": {
-            "description": "The single output column affected (window keys). Omitted when the edge affects every output column of `target_model`.",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "target_model": {
-            "description": "The model whose rows it influences.",
-            "type": "string"
-          }
-        },
-        "required": [
-          "kind",
-          "source",
-          "target_model"
         ],
         "type": "object"
       },
@@ -20058,20 +19940,6 @@
             "description": "Replicate the schema cache via `state_sync` to the remote backend. Defaults to `false`: a dev on a fresh clone should not inherit another machine's stale type stamps. Opt in to `true` for teams that want cross-machine cache warm-up via a shared state backend.",
             "type": "boolean"
           },
-          "strict_sources": {
-            "default": false,
-            "description": "Treat every source schema the compiler knows as authoritative for missing-column checks. Defaults to `false`.\n\nA direct reference to a column a known source schema lacks is a `W041` warning when that schema came from a seed file (`rocky compile --with-seed`) or from a cache entry older than `trusted_max_age_seconds`: a stale schema must not fail a valid build. Set this to `true` to escalate those warnings to the `E041` error, matching a strict \"refuse what you cannot prove\" posture. `rocky compile --strict-sources` sets it for one invocation.",
-            "type": "boolean"
-          },
-          "trusted_max_age_seconds": {
-            "description": "Age, in seconds, under which a cached source schema is trusted as current. Defaults to unset: no cache entry is trusted, so a missing source column found against the cache is a `W041` warning.\n\nWhen set, a missing source column found against a cache entry younger than this is the `E041` error instead. Only entries that survive `ttl_seconds` are read at all, so a value above the TTL trusts every cached entry.",
-            "format": "uint64",
-            "minimum": 0.0,
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
           "ttl_seconds": {
             "default": 86400,
             "description": "TTL for cache entries in seconds. Defaults to 86400 (24 hours). Lower it for high-DDL-churn teams; raise it for projects whose sources change on a weekly or slower cadence.",
@@ -20590,101 +20458,6 @@
         ],
         "type": "object"
       },
-      "SnapshotCheckColsConfig": {
-        "anyOf": [
-          {
-            "type": "string"
-          },
-          {
-            "items": {
-              "type": "string"
-            },
-            "type": "array"
-          }
-        ],
-        "description": "`check_cols` accepts a list of columns or the string `\"all\"`."
-      },
-      "SnapshotFlagColumn": {
-        "anyOf": [
-          {
-            "description": "Write the flag under this column name.",
-            "type": "string"
-          },
-          {
-            "description": "`false`: write no flag column. `true` means the default name.",
-            "type": "boolean"
-          }
-        ],
-        "description": "The `is_current` metadata column: a name, or `false` for none.\n\nA snapshot table built by dbt has no `is_current` column. Setting `is_current = false` lets Rocky continue such a table: a version is then current when its `valid_to` is NULL (or equals `valid_to_current`)."
-      },
-      "SnapshotHardDeletes": {
-        "description": "What a snapshot does with a key that disappears from the model's result.",
-        "oneOf": [
-          {
-            "description": "Keep the last version current. The default, as in dbt.",
-            "enum": [
-              "ignore"
-            ],
-            "type": "string"
-          },
-          {
-            "description": "Close the current version: set `valid_to` and clear `is_current`.",
-            "enum": [
-              "invalidate"
-            ],
-            "type": "string"
-          },
-          {
-            "description": "Close the current version and insert a deletion-marker version with `is_deleted = TRUE`.",
-            "enum": [
-              "new_record"
-            ],
-            "type": "string"
-          }
-        ]
-      },
-      "SnapshotMetaColumns": {
-        "description": "Names of the metadata columns a snapshot model adds to its rows.\n\nThe defaults match the `snapshot` pipeline. Each key also accepts the dbt spelling (`dbt_valid_from`, `dbt_valid_to`, `dbt_scd_id`, `dbt_updated_at`, `dbt_is_deleted`) so an imported `snapshot_meta_column_names` block reads unchanged.",
-        "properties": {
-          "is_current": {
-            "allOf": [
-              {
-                "$ref": "#/components/schemas/SnapshotFlagColumn"
-              }
-            ],
-            "default": "is_current",
-            "description": "`TRUE` on the current version of each key. Default `is_current`; `false` writes no flag (dbt has no such column)."
-          },
-          "is_deleted": {
-            "default": "is_deleted",
-            "description": "Deletion marker, written only under `hard_deletes = \"new_record\"`. Default `is_deleted`.",
-            "type": "string"
-          },
-          "scd_id": {
-            "default": "snapshot_id",
-            "description": "Deterministic per-version id: a hash of the key and `valid_from`. Default `snapshot_id`.",
-            "type": "string"
-          },
-          "updated_at": {
-            "description": "Optional copy of the version's change timestamp (dbt's `dbt_updated_at`). Not written unless named.",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "valid_from": {
-            "default": "valid_from",
-            "description": "When this version became current. Default `valid_from`.",
-            "type": "string"
-          },
-          "valid_to": {
-            "default": "valid_to",
-            "description": "When this version stopped being current. Default `valid_to`.",
-            "type": "string"
-          }
-        },
-        "type": "object"
-      },
       "SnapshotOutput": {
         "description": "Output for `rocky snapshot --output json`.",
         "properties": {
@@ -20897,14 +20670,6 @@
         ],
         "type": "object"
       },
-      "SnapshotStrategyKind": {
-        "description": "The `strategy` key inside a snapshot `[strategy]` block.",
-        "enum": [
-          "timestamp",
-          "check"
-        ],
-        "type": "string"
-      },
       "SnapshotTargetConfig": {
         "additionalProperties": false,
         "description": "Target table for a snapshot pipeline (explicit single-table reference + governance).",
@@ -20947,20 +20712,6 @@
         ],
         "type": "object"
       },
-      "SnapshotUniqueKey": {
-        "anyOf": [
-          {
-            "type": "string"
-          },
-          {
-            "items": {
-              "type": "string"
-            },
-            "type": "array"
-          }
-        ],
-        "description": "`unique_key` accepts one column name or a list (dbt parity)."
-      },
       "SourceEvaluation": {
         "description": "One demand source's outcome within a pipeline's evaluation.",
         "properties": {
@@ -20993,41 +20744,6 @@
         "required": [
           "reason",
           "source"
-        ],
-        "type": "object"
-      },
-      "SourceFreshnessConfig": {
-        "additionalProperties": false,
-        "description": "Freshness expectation for one source (dbt `freshness:` parity).",
-        "properties": {
-          "error_after": {
-            "description": "Age above which the source reports `error` and `rocky freshness` exits non-zero. Must not be shorter than `warn_after`.",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "filter": {
-            "description": "Optional SQL predicate limiting the rows the maximum is taken over, spliced as `WHERE (<filter>)`. A statement terminator is refused.",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "loaded_at_field": {
-            "description": "Column holding the load time of each row. Should be a TIMESTAMP or DATE column; `rocky freshness` reads `MAX(loaded_at_field)`.",
-            "type": "string"
-          },
-          "warn_after": {
-            "description": "Age above which the source reports `warn` (`\"12h\"`, `\"3600s\"`, `\"7d\"`).",
-            "type": [
-              "string",
-              "null"
-            ]
-          }
-        },
-        "required": [
-          "loaded_at_field"
         ],
         "type": "object"
       },
@@ -21638,61 +21354,19 @@
             "type": "object"
           },
           {
-            "description": "Load only rows newer than the target's current watermark.\n\nOn a transformation model the model SQL marks where the filter goes with `@incremental_filter` (`filter_column` names a qualified or renamed input column to compare). Each incremental run resolves it to `<col> > (SELECT MAX(<watermark>) FROM <target>)`, minus `lookback`; the first run and `rocky run --full-refresh` resolve it to `TRUE`. With no placeholder, a watermark column that the model passes straight through from one input is filtered on the model's output instead; anything else is refused (E046). No watermark at all is refused (E037).",
             "properties": {
-              "filter_column": {
-                "default": null,
-                "description": "The input column `@incremental_filter` compares, when it is not the watermark itself: a qualified column in a join (`\"o.updated_at\"`) or a source column the model renames (`\"_synced_at\"`). The bound is still `MAX(<timestamp_column>)` over the target.",
-                "type": [
-                  "string",
-                  "null"
-                ]
-              },
-              "lookback": {
-                "anyOf": [
-                  {
-                    "$ref": "#/components/schemas/IncrementalLookback"
-                  },
-                  {
-                    "type": "null"
-                  }
-                ],
-                "default": null,
-                "description": "Re-read this far below the watermark, e.g. `\"3 days\"`, to catch late-arriving rows. Pair it with `unique_key`, or the re-read rows are appended again (W046)."
-              },
-              "on_schema_change": {
-                "allOf": [
-                  {
-                    "$ref": "#/components/schemas/OnSchemaChange"
-                  }
-                ],
-                "default": "fail",
-                "description": "What a run does when the model's output columns no longer match the target: `fail` (default) or `append_new_columns`."
-              },
               "timestamp_column": {
-                "default": null,
-                "description": "The watermark column: an output column of the model whose maximum in the target marks what is already loaded. `watermark` is accepted as an alias.",
-                "type": [
-                  "string",
-                  "null"
-                ]
+                "type": "string"
               },
               "type": {
                 "enum": [
                   "incremental"
                 ],
                 "type": "string"
-              },
-              "unique_key": {
-                "default": [],
-                "description": "Upsert on these columns with `MERGE` instead of appending.",
-                "items": {
-                  "type": "string"
-                },
-                "type": "array"
               }
             },
             "required": [
+              "timestamp_column",
               "type"
             ],
             "type": "object"
@@ -21780,7 +21454,7 @@
             "type": "object"
           },
           {
-            "description": "Ephemeral model — never materialized. `rocky compile` inlines its SQL as a `__rocky_ephemeral__<name>` CTE into every model that reads it, and `rocky run` skips the node. Invalid uses are E038.",
+            "description": "Ephemeral model — refused at compile time (E038). No table is created and no consumer inlines it, so it is kept only to name the refusal.",
             "properties": {
               "type": {
                 "enum": [
@@ -21920,97 +21594,6 @@
             },
             "required": [
               "storage_prefix",
-              "type"
-            ],
-            "type": "object"
-          },
-          {
-            "description": "SCD Type 2 snapshot of the model's SELECT (dbt `snapshot` parity). Each run closes changed versions and opens new ones; see [`crate::snapshot_model`]. Every field is optional here so a missing one is reported as E049 by `rocky compile` rather than as a TOML parse error.",
-            "properties": {
-              "check_cols": {
-                "anyOf": [
-                  {
-                    "$ref": "#/components/schemas/SnapshotCheckColsConfig"
-                  },
-                  {
-                    "type": "null"
-                  }
-                ],
-                "description": "Check-strategy columns: a list, or `\"all\"`."
-              },
-              "hard_deletes": {
-                "anyOf": [
-                  {
-                    "$ref": "#/components/schemas/SnapshotHardDeletes"
-                  },
-                  {
-                    "type": "null"
-                  }
-                ],
-                "description": "`\"ignore\"` (default), `\"invalidate\"` or `\"new_record\"`."
-              },
-              "invalidate_hard_deletes": {
-                "description": "dbt's legacy spelling of `hard_deletes = \"invalidate\"`.",
-                "type": [
-                  "boolean",
-                  "null"
-                ]
-              },
-              "snapshot_meta_column_names": {
-                "anyOf": [
-                  {
-                    "$ref": "#/components/schemas/SnapshotMetaColumns"
-                  },
-                  {
-                    "type": "null"
-                  }
-                ],
-                "description": "Metadata column names (Rocky defaults; dbt keys accepted)."
-              },
-              "strategy": {
-                "anyOf": [
-                  {
-                    "$ref": "#/components/schemas/SnapshotStrategyKind"
-                  },
-                  {
-                    "type": "null"
-                  }
-                ],
-                "description": "`\"timestamp\"` or `\"check\"`."
-              },
-              "type": {
-                "enum": [
-                  "snapshot"
-                ],
-                "type": "string"
-              },
-              "unique_key": {
-                "anyOf": [
-                  {
-                    "$ref": "#/components/schemas/SnapshotUniqueKey"
-                  },
-                  {
-                    "type": "null"
-                  }
-                ],
-                "description": "Column, or list of columns, identifying a row of the output."
-              },
-              "updated_at": {
-                "description": "Timestamp-strategy change column.",
-                "type": [
-                  "string",
-                  "null"
-                ]
-              },
-              "valid_to_current": {
-                "description": "SQL expression for `valid_to` on current versions instead of NULL.",
-                "type": [
-                  "string",
-                  "null"
-                ]
-              }
-            },
-            "required": [
               "type"
             ],
             "type": "object"
@@ -22938,13 +22521,6 @@
             ],
             "description": "Optional native-schedule declaration. See [`ScheduleConfig`]."
           },
-          "sources": {
-            "description": "External sources the pipeline's models read, with optional freshness expectations checked by `rocky freshness`. Declared as `[[pipeline.<name>.sources]]`. See [`crate::source_freshness::PipelineSourceConfig`].",
-            "items": {
-              "$ref": "#/components/schemas/PipelineSourceConfig2"
-            },
-            "type": "array"
-          },
           "target": {
             "allOf": [
               {
@@ -23615,13 +23191,31 @@
   "paths": {
     "/api/v1/audit": {
       "get": {
-        "description": "Every policy decision recorded at a mutating enforcement seam, oldest first: the same bytes as `rocky audit --output json`. With `product=<name>`, only the rows about that product's output model (`product.output.model`, default the product name), resolved from `products/<name>.toml`: the same bytes as `rocky audit --product <name> --output json`. Unfiltered it reads the state store only and needs no bound config. The ledger is returned whole, as the CLI prints it. Reads only.",
+        "description": "Every policy decision recorded at a mutating enforcement seam, oldest first: the same bytes as `rocky audit --output json`. With `product=<name>`, only the rows about that product's output model (`product.output.model`, default the product name), resolved from `products/<name>.toml`: the same bytes as `rocky audit --product <name> --output json`. With `actor=<id>` and `since=<when>`, the same bytes as `rocky audit --actor <id> --since <when> --output json`; they compose with `product`. Principal ids are self-asserted and unverified. Unfiltered it reads the state store only and needs no bound config. The ledger is returned whole, as the CLI prints it. Reads only.",
         "operationId": "getAuditLedger",
         "parameters": [
           {
             "description": "A product name. Lists only the rows whose model is that product's output model.",
             "in": "query",
             "name": "product",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "A principal id. Lists only the rows that actor recorded. `unrecorded` lists the rows with no id.",
+            "in": "query",
+            "name": "actor",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "An inclusive lower bound: `YYYY-MM-DD` (00:00 UTC), an RFC 3339 timestamp with an offset, or a `<N>d` / `<N>h` duration.",
+            "in": "query",
+            "name": "since",
             "required": false,
             "schema": {
               "type": "string"
@@ -23637,7 +23231,17 @@
                 }
               }
             },
-            "description": "The ledger, whole or scoped to the product."
+            "description": "The ledger, whole or filtered."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "A query parameter is not one of its documented values, or the subject is longer than 512 bytes."
           },
           "404": {
             "content": {

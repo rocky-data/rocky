@@ -21,16 +21,16 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Duration, Utc};
 use rocky_compiler::compile::{self, CompilerConfig};
-use rocky_core::config::PolicyEffect;
+use rocky_core::config::{PRINCIPAL_ID_UNRECORDED, PolicyEffect, PrincipalId};
 use rocky_core::env_string::EnvString;
 use rocky_core::state::{PolicyDecisionRecord, RunRecord, StateStore};
 
 use crate::output::{
     AuditChainBlastRadius, AuditChainDecisions, AuditChainPlan, AuditChainRuns, AuditChainVerify,
-    AuditDecisionEntry, AuditForOutput, AuditOutput, AuditPlanChange, AuditProductScope,
-    AuditRunEntry, AuditScorecardOutput, AuditSubjectKind, AuditVerifyEntry, ScorecardDimension,
-    ScorecardGroup, ScorecardUnavailableMetric, ScorecardVerifyAfter, SectionAvailability,
-    print_json,
+    AuditDecisionEntry, AuditFilter, AuditForOutput, AuditOutput, AuditPlanChange,
+    AuditProductScope, AuditRunEntry, AuditScorecardOutput, AuditSubjectKind, AuditVerifyEntry,
+    ScorecardDimension, ScorecardGroup, ScorecardUnavailableMetric, ScorecardVerifyAfter,
+    SectionAvailability, print_json,
 };
 use crate::plan_store::read_plan;
 
@@ -44,7 +44,16 @@ const MAX_HISTORY_SCAN: usize = 10_000;
 /// Opens the state store read-only and lists the policy-decision ledger. An
 /// absent state file is not an error — it renders an empty ledger (no plan has
 /// been applied against a `[policy]` block yet).
-pub fn run_audit(state_path: &Path, product: Option<&str>, output_json: bool) -> Result<()> {
+pub fn run_audit(
+    state_path: &Path,
+    product: Option<&str>,
+    actor: Option<&str>,
+    since: Option<&str>,
+    output_json: bool,
+) -> Result<()> {
+    // Parse the filter before touching the product spec or the store, so a
+    // malformed flag is a usage error even on an empty ledger.
+    let query = AuditQuery::parse(actor, since, Utc::now())?;
     let scope = match product {
         Some(name) => {
             let root =
@@ -53,7 +62,7 @@ pub fn run_audit(state_path: &Path, product: Option<&str>, output_json: bool) ->
         }
         None => None,
     };
-    let output = compute_audit(state_path, scope)?;
+    let output = compute_audit(state_path, scope, &query)?;
 
     if output_json {
         print_json(&output)?;
@@ -82,12 +91,106 @@ pub fn resolve_product_scope(
     })
 }
 
+/// The `--actor` / `--since` filter of `rocky audit` (RV4-P1), parsed.
+///
+/// `Default` is "no filter": every row passes.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AuditQuery {
+    /// Keep only the rows whose principal id equals this. The reserved word
+    /// [`PRINCIPAL_ID_UNRECORDED`] keeps the rows with no id instead.
+    pub actor: Option<PrincipalId>,
+    /// Keep only the rows recorded at or after this instant (inclusive).
+    pub since: Option<DateTime<Utc>>,
+}
+
+impl AuditQuery {
+    /// Parse the raw `--actor` / `--since` values. `now` anchors a `<N>d` /
+    /// `<N>h` duration. Reads no environment variable: the filter names whom
+    /// to look for, it is not the caller's own identity.
+    ///
+    /// # Errors
+    ///
+    /// An `--actor` value outside the id grammar (no row can carry it), or a
+    /// `--since` value in none of the accepted shapes.
+    pub fn parse(actor: Option<&str>, since: Option<&str>, now: DateTime<Utc>) -> Result<Self> {
+        let actor = actor
+            .map(|raw| {
+                // Grammar only: `unnamed` and `unrecorded` are valid filters
+                // even though nobody may assert them.
+                PrincipalId::try_from(raw.to_string())
+                    .map_err(|e| anyhow::anyhow!("invalid --actor: {e}"))
+            })
+            .transpose()?;
+        let since = since.map(|raw| parse_since(raw, now)).transpose()?;
+        Ok(Self { actor, since })
+    }
+
+    /// Whether neither filter is set.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.actor.is_none() && self.since.is_none()
+    }
+
+    /// The serializable echo of this filter, `None` when it is empty.
+    fn echo(&self) -> Option<AuditFilter> {
+        (!self.is_empty()).then(|| AuditFilter {
+            actor: self.actor.as_ref().map(|a| a.as_str().to_string()),
+            since: self
+                .since
+                .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true)),
+        })
+    }
+
+    /// Whether `d` is in the time range (`timestamp >= since`, inclusive).
+    fn in_range(&self, d: &PolicyDecisionRecord) -> bool {
+        self.since.is_none_or(|since| d.timestamp >= since)
+    }
+
+    /// Whether `d` matches the actor filter.
+    fn actor_matches(&self, d: &PolicyDecisionRecord) -> bool {
+        match &self.actor {
+            None => true,
+            Some(want) if want.as_str() == PRINCIPAL_ID_UNRECORDED => d.principal_ref.is_none(),
+            Some(want) => d.principal_ref.as_ref().is_some_and(|r| &r.id == want),
+        }
+    }
+}
+
+/// Parse `rocky audit --since`: `YYYY-MM-DD` (00:00 UTC that day), an RFC 3339
+/// timestamp with an offset (normalized to UTC), or a `<N>d` / `<N>h` duration
+/// back from `now` (the same grammar as `--window`). A date in the future is
+/// valid and simply matches nothing.
+pub(crate) fn parse_since(raw: &str, now: DateTime<Utc>) -> Result<DateTime<Utc>> {
+    let trimmed = raw.trim();
+    if let Ok(date) = chrono::NaiveDate::parse_from_str(trimmed, "%Y-%m-%d") {
+        return Ok(date.and_time(chrono::NaiveTime::MIN).and_utc());
+    }
+    if let Ok(ts) = DateTime::parse_from_rfc3339(trimmed) {
+        return Ok(ts.with_timezone(&Utc));
+    }
+    // `parse_window` treats `all` as "no bound"; that is not a time.
+    if !trimmed.eq_ignore_ascii_case("all")
+        && let Ok(Some(bound)) = parse_window(Some(trimmed), now)
+    {
+        return Ok(bound);
+    }
+    bail!(
+        "invalid --since '{raw}': expected YYYY-MM-DD (00:00 UTC), an RFC 3339 timestamp with \
+         an offset (e.g. 2026-10-01T09:00:00+01:00), or a '<N>d' / '<N>h' duration (e.g. 7d)"
+    )
+}
+
 /// Compose the ledger without rendering it: every recorded decision, oldest
-/// first, or under `product` only the rows about that product's output model.
+/// first, or under `product` only the rows about that product's output model,
+/// and under `query` only the rows that match its actor and time range.
 ///
 /// The reusable core behind `rocky audit` and `GET /api/v1/audit`. Opens the
 /// store read-only; an absent store is an empty ledger, not an error.
-pub fn compute_audit(state_path: &Path, product: Option<AuditProductScope>) -> Result<AuditOutput> {
+pub fn compute_audit(
+    state_path: &Path,
+    product: Option<AuditProductScope>,
+    query: &AuditQuery,
+) -> Result<AuditOutput> {
     let decisions = if state_path.exists() {
         let store = StateStore::open_read_only_or_empty(state_path)
             .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
@@ -97,32 +200,60 @@ pub fn compute_audit(state_path: &Path, product: Option<AuditProductScope>) -> R
     } else {
         Vec::new()
     };
+    Ok(audit_output_from(decisions, product, query))
+}
 
-    let entries: Vec<AuditDecisionEntry> = decisions
-        .into_iter()
-        .filter(|d| {
-            // `graph_keys`, not `d.model`, for the same reason the `--for`
-            // matcher uses it: a plan-level escalation's `model` is a summary,
-            // so a backfill or gc that touches the product's OUTPUT MODEL was
-            // filtered out of the product's own custody chain (#1766). It now
-            // matches on the models it recorded, and still on the summary.
-            product
-                .as_ref()
-                .is_none_or(|scope| d.graph_keys().any(|m| m == scope.output_model))
-        })
-        .map(to_decision_entry)
-        .collect();
+/// The pure half of [`compute_audit`]: filter and project rows already read.
+fn audit_output_from(
+    decisions: Vec<PolicyDecisionRecord>,
+    product: Option<AuditProductScope>,
+    query: &AuditQuery,
+) -> AuditOutput {
+    // Only a filter for a NAMED actor can drop a row for having no id; the
+    // count tells the reader what that filter could not see.
+    let counts_unattributed = query
+        .actor
+        .as_ref()
+        .is_some_and(|a| a.as_str() != PRINCIPAL_ID_UNRECORDED);
+    let mut unattributed_skipped: u64 = 0;
+    let mut entries: Vec<AuditDecisionEntry> = Vec::new();
+    for d in decisions {
+        // `graph_keys`, not `d.model`, for the same reason the `--for`
+        // matcher uses it: a plan-level escalation's `model` is a summary,
+        // so a backfill or gc that touches the product's OUTPUT MODEL was
+        // filtered out of the product's own custody chain (#1766). It now
+        // matches on the models it recorded, and still on the summary.
+        let in_product = product
+            .as_ref()
+            .is_none_or(|scope| d.graph_keys().any(|m| m == scope.output_model));
+        if !in_product || !query.in_range(&d) {
+            continue;
+        }
+        if !query.actor_matches(&d) {
+            if counts_unattributed && d.principal_ref.is_none() {
+                unattributed_skipped += 1;
+            }
+            continue;
+        }
+        entries.push(to_decision_entry(d));
+    }
 
-    Ok(AuditOutput {
+    AuditOutput {
         version: VERSION.to_string(),
         command: "audit".to_string(),
         product,
+        filter: query.echo(),
+        unattributed_skipped,
         decisions: entries,
-    })
+    }
 }
 
 /// Map a ledger record to its serializable entry.
 fn to_decision_entry(d: PolicyDecisionRecord) -> AuditDecisionEntry {
+    let (principal_id, principal_id_source) = match d.principal_ref {
+        Some(r) => (Some(r.id.to_string()), Some(r.source)),
+        None => (None, None),
+    };
     AuditDecisionEntry {
         timestamp: d.timestamp.to_rfc3339(),
         plan_id: d.plan_id,
@@ -132,18 +263,49 @@ fn to_decision_entry(d: PolicyDecisionRecord) -> AuditDecisionEntry {
         effect: d.effect,
         rule_id: d.rule_id,
         reason: d.reason.into(),
+        principal_id,
+        principal_id_source,
+        // Self-asserted in P1: nothing verifies an id until signed approvals
+        // exist (RV4-P2).
+        principal_id_verified: false,
     }
+}
+
+/// `class(id)` for text output, e.g. `agent(mcp-worker)` or
+/// `human(unrecorded)` for a row written before ids existed.
+fn principal_label(d: &AuditDecisionEntry) -> String {
+    format!(
+        "{}({})",
+        serde_plain(&d.principal),
+        d.principal_id.as_deref().unwrap_or(PRINCIPAL_ID_UNRECORDED)
+    )
+}
+
+/// The note for rows an `--actor` filter could not attribute.
+fn unattributed_note(skipped: u64) -> Option<String> {
+    (skipped > 0).then(|| {
+        format!(
+            "{skipped} decision(s) in range carry no principal id (recorded before ids); \
+             --actor unrecorded lists them"
+        )
+    })
 }
 
 /// Render the ledger as a compact human-readable table.
 fn render_text(out: &AuditOutput) {
     if out.decisions.is_empty() {
         println!("policy audit: no decisions recorded");
+        if let Some(note) = unattributed_note(out.unattributed_skipped) {
+            println!("  {note}");
+        }
         return;
     }
     println!("policy audit: {} decision(s)", out.decisions.len());
+    if let Some(note) = unattributed_note(out.unattributed_skipped) {
+        println!("  {note}");
+    }
     for d in &out.decisions {
-        let principal = serde_plain(&d.principal);
+        let principal = principal_label(d);
         let capability = serde_plain(&d.capability);
         let effect = serde_plain(&d.effect);
         let rule = d
@@ -833,7 +995,7 @@ fn render_chain_text(out: &AuditForOutput) {
                 println!(
                     "  {} {}/{} {} → {} via {} — {}",
                     d.timestamp,
-                    serde_plain(&d.principal),
+                    principal_label(d),
                     serde_plain(&d.capability),
                     d.model,
                     serde_plain(&d.effect).to_uppercase(),
@@ -1401,7 +1563,225 @@ mod tests {
             reason: "test".to_string(),
             verify_after: Vec::new(),
             auto_apply: None,
+            principal_ref: None,
         }
+    }
+
+    // -----------------------------------------------------------------
+    // RV4-P1: `--actor` / `--since`
+    // -----------------------------------------------------------------
+
+    fn actor(id: &str) -> rocky_core::config::PrincipalRef {
+        rocky_core::config::PrincipalRef {
+            id: rocky_core::config::PrincipalId::parse_asserted(id).unwrap(),
+            source: rocky_core::config::PrincipalIdSource::Flag,
+        }
+    }
+
+    fn row_at(ts: DateTime<Utc>, plan: &str, who: Option<&str>) -> PolicyDecisionRecord {
+        PolicyDecisionRecord {
+            timestamp: ts,
+            principal_ref: who.map(actor),
+            ..decision(0, plan, "fct_orders", PolicyEffect::Allow)
+        }
+    }
+
+    fn query(actor: Option<&str>, since: Option<&str>) -> AuditQuery {
+        AuditQuery::parse(
+            actor,
+            since,
+            Utc.with_ymd_and_hms(2026, 10, 5, 12, 0, 0).unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn plans(out: &AuditOutput) -> Vec<&str> {
+        out.decisions.iter().map(|d| d.plan_id.as_str()).collect()
+    }
+
+    /// `--since` is inclusive: a row stamped exactly at the bound is kept,
+    /// one nanosecond earlier is dropped.
+    #[test]
+    fn audit_since_boundary_is_inclusive() {
+        let bound = Utc.with_ymd_and_hms(2026, 10, 1, 0, 0, 0).unwrap();
+        let rows = vec![
+            row_at(
+                bound - chrono::Duration::nanoseconds(1),
+                "early",
+                Some("alice"),
+            ),
+            row_at(bound, "equal", Some("alice")),
+            row_at(bound + chrono::Duration::seconds(1), "later", Some("alice")),
+        ];
+        let out = audit_output_from(rows, None, &query(None, Some("2026-10-01")));
+        assert_eq!(plans(&out), vec!["equal", "later"]);
+        assert_eq!(
+            out.filter,
+            Some(AuditFilter {
+                actor: None,
+                since: Some("2026-10-01T00:00:00Z".to_string()),
+            })
+        );
+    }
+
+    /// An offset timestamp is normalized to UTC before the comparison.
+    #[test]
+    fn audit_since_offset_is_normalized_to_utc() {
+        // 09:00 at +02:00 is 07:00 UTC.
+        let q = query(None, Some("2026-10-01T09:00:00+02:00"));
+        assert_eq!(
+            q.since,
+            Some(Utc.with_ymd_and_hms(2026, 10, 1, 7, 0, 0).unwrap())
+        );
+        let rows = vec![
+            row_at(
+                Utc.with_ymd_and_hms(2026, 10, 1, 6, 59, 59).unwrap(),
+                "before",
+                None,
+            ),
+            row_at(
+                Utc.with_ymd_and_hms(2026, 10, 1, 7, 0, 0).unwrap(),
+                "at",
+                None,
+            ),
+        ];
+        let out = audit_output_from(rows, None, &q);
+        assert_eq!(plans(&out), vec!["at"]);
+        assert_eq!(
+            out.filter.and_then(|f| f.since).as_deref(),
+            Some("2026-10-01T07:00:00Z")
+        );
+    }
+
+    /// The `--since` shapes: a date, RFC 3339, a duration; a future date is
+    /// valid and matches nothing; garbage and `all` are usage errors.
+    #[test]
+    fn audit_since_accepted_shapes() {
+        let now = Utc.with_ymd_and_hms(2026, 10, 5, 12, 0, 0).unwrap();
+        assert_eq!(
+            parse_since("7d", now).unwrap(),
+            Utc.with_ymd_and_hms(2026, 9, 28, 12, 0, 0).unwrap()
+        );
+        assert_eq!(
+            parse_since("6h", now).unwrap(),
+            Utc.with_ymd_and_hms(2026, 10, 5, 6, 0, 0).unwrap()
+        );
+        assert!(parse_since("2099-01-01", now).is_ok());
+        for bad in [
+            "all",
+            "yesterday",
+            "2026-10-01T09:00:00",
+            "2026-13-01",
+            "",
+            "7w",
+        ] {
+            let err = parse_since(bad, now).expect_err(bad).to_string();
+            assert!(err.contains("invalid --since"), "{bad}: {err}");
+        }
+        let rows = vec![row_at(now, "today", Some("alice"))];
+        let out = audit_output_from(rows, None, &query(None, Some("2099-01-01")));
+        assert!(out.decisions.is_empty(), "a future bound lists nothing");
+    }
+
+    /// `--actor` keeps exactly that id's rows, counts the id-less rows it had
+    /// to drop, and does not count rows of other named actors.
+    #[test]
+    fn audit_actor_filter_matches_and_counts_unattributed() {
+        let t = Utc.with_ymd_and_hms(2026, 10, 2, 0, 0, 0).unwrap();
+        let rows = vec![
+            row_at(t, "a1", Some("alice")),
+            row_at(t, "b1", Some("bob")),
+            row_at(t, "old1", None),
+            row_at(t, "old2", None),
+            row_at(t, "a2", Some("alice")),
+            // Out of range: neither listed nor counted.
+            row_at(
+                Utc.with_ymd_and_hms(2026, 9, 1, 0, 0, 0).unwrap(),
+                "old0",
+                None,
+            ),
+        ];
+        let out = audit_output_from(rows, None, &query(Some("alice"), Some("2026-10-01")));
+        assert_eq!(plans(&out), vec!["a1", "a2"]);
+        assert_eq!(out.unattributed_skipped, 2);
+        let entry = &out.decisions[0];
+        assert_eq!(entry.principal_id.as_deref(), Some("alice"));
+        assert_eq!(
+            entry.principal_id_source,
+            Some(rocky_core::config::PrincipalIdSource::Flag)
+        );
+        assert!(!entry.principal_id_verified);
+        assert_eq!(
+            unattributed_note(out.unattributed_skipped).as_deref(),
+            Some(
+                "2 decision(s) in range carry no principal id (recorded before ids); \
+                 --actor unrecorded lists them"
+            )
+        );
+    }
+
+    /// `--actor unrecorded` lists the id-less rows and counts nothing; no
+    /// filter lists everything and counts nothing.
+    #[test]
+    fn audit_actor_unrecorded_lists_rows_without_an_id() {
+        let t = Utc.with_ymd_and_hms(2026, 10, 2, 0, 0, 0).unwrap();
+        let rows = || vec![row_at(t, "a1", Some("alice")), row_at(t, "old1", None)];
+        let out = audit_output_from(rows(), None, &query(Some("unrecorded"), None));
+        assert_eq!(plans(&out), vec!["old1"]);
+        assert_eq!(out.unattributed_skipped, 0);
+        assert_eq!(out.decisions[0].principal_id, None);
+        assert_eq!(out.decisions[0].principal_id_source, None);
+
+        let all = audit_output_from(rows(), None, &AuditQuery::default());
+        assert_eq!(plans(&all), vec!["a1", "old1"]);
+        assert_eq!(all.unattributed_skipped, 0);
+        assert_eq!(all.filter, None);
+        let json = serde_json::to_value(&all).unwrap();
+        assert!(json.get("filter").is_none(), "no filter, no key: {json}");
+        assert_eq!(json["unattributed_skipped"], 0);
+    }
+
+    /// `--actor` rejects a value no row can carry, rather than listing
+    /// nothing; the reserved words are valid filters.
+    #[test]
+    fn audit_actor_value_is_checked() {
+        let now = Utc::now();
+        for bad in ["Alice", "a@b.c", "a:b", ""] {
+            let err = AuditQuery::parse(Some(bad), None, now).expect_err(bad);
+            assert!(err.to_string().contains("invalid --actor"), "{bad}: {err}");
+        }
+        for ok in ["unnamed", "unrecorded", "mcp-worker"] {
+            assert!(AuditQuery::parse(Some(ok), None, now).is_ok(), "{ok}");
+        }
+    }
+
+    /// `--actor` composes with `--product`: a row must match both.
+    #[test]
+    fn audit_actor_composes_with_product() {
+        let t = Utc.with_ymd_and_hms(2026, 10, 2, 0, 0, 0).unwrap();
+        let mut other = row_at(t, "other-model", Some("alice"));
+        other.model = "dim_customers".to_string();
+        let rows = vec![
+            row_at(t, "mine", Some("alice")),
+            other,
+            row_at(t, "bob", Some("bob")),
+        ];
+        let scope = AuditProductScope {
+            name: "orders".to_string(),
+            output_model: "fct_orders".to_string(),
+        };
+        let out = audit_output_from(rows, Some(scope), &query(Some("alice"), None));
+        assert_eq!(plans(&out), vec!["mine"]);
+    }
+
+    /// Text output shows `class(id)`, with `unrecorded` for an id-less row.
+    #[test]
+    fn audit_principal_label_shows_class_and_id() {
+        let t = Utc.with_ymd_and_hms(2026, 10, 2, 0, 0, 0).unwrap();
+        let named = to_decision_entry(row_at(t, "p", Some("alice")));
+        let old = to_decision_entry(row_at(t, "p", None));
+        assert_eq!(principal_label(&named), "agent(alice)");
+        assert_eq!(principal_label(&old), "agent(unrecorded)");
     }
 
     fn write_model(dir: &Path, name: &str, sql: &str) {
@@ -1446,6 +1826,7 @@ mod tests {
             reason: "backfill plan awaits review".to_string(),
             verify_after: Vec::new(),
             auto_apply: None,
+            principal_ref: None,
         };
         let decisions = vec![plan_level];
 
@@ -1500,6 +1881,7 @@ mod tests {
             reason: "allow by rule 0".to_string(),
             verify_after: Vec::new(),
             auto_apply: None,
+            principal_ref: None,
         }];
 
         let link = build_decisions_link(AuditSubjectKind::Model, "dim_customer", &decisions);
@@ -1541,6 +1923,7 @@ mod tests {
             reason: "gc plan awaits review".to_string(),
             verify_after: Vec::new(),
             auto_apply: None,
+            principal_ref: None,
         };
 
         {
@@ -1582,7 +1965,7 @@ mod tests {
         let scope = resolve_product_scope(root, "daily_revenue").unwrap();
         assert_eq!(scope.output_model, "revenue_daily");
 
-        let scoped = compute_audit(&state_path, Some(scope)).unwrap();
+        let scoped = compute_audit(&state_path, Some(scope), &AuditQuery::default()).unwrap();
         let plans: Vec<&str> = scoped
             .decisions
             .iter()
@@ -1663,7 +2046,7 @@ mod tests {
             out.decisions.iter().map(|d| d.plan_id.clone()).collect()
         };
 
-        let whole = compute_audit(&state_path, None).unwrap();
+        let whole = compute_audit(&state_path, None, &AuditQuery::default()).unwrap();
         assert!(whole.product.is_none());
         assert_eq!(plan_ids(&whole), ["plan-a", "plan-b", "plan-c"]);
 
@@ -1682,7 +2065,8 @@ mod tests {
                 output_model: "revenue_daily".to_string(),
             }
         );
-        let scoped = compute_audit(&state_path, Some(scope.clone())).unwrap();
+        let scoped =
+            compute_audit(&state_path, Some(scope.clone()), &AuditQuery::default()).unwrap();
         assert_eq!(scoped.product, Some(scope));
         assert_eq!(plan_ids(&scoped), ["plan-a", "plan-c"]);
 
@@ -1699,7 +2083,8 @@ mod tests {
         );
 
         // An absent store is an empty ledger, scoped or not.
-        let empty = compute_audit(&root.join("missing.redb"), None).unwrap();
+        let empty =
+            compute_audit(&root.join("missing.redb"), None, &AuditQuery::default()).unwrap();
         assert!(empty.decisions.is_empty());
     }
 
@@ -1830,6 +2215,7 @@ mod tests {
             reason: reason.to_string(),
             verify_after: checks.iter().map(ToString::to_string).collect(),
             auto_apply: None,
+            principal_ref: None,
         }
     }
 
@@ -2263,6 +2649,7 @@ mod tests {
             reason: "test".to_string(),
             verify_after: Vec::new(),
             auto_apply: None,
+            principal_ref: None,
         }
     }
 

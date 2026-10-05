@@ -2015,6 +2015,7 @@ pub async fn run_branch_promote(
     skip_approval_flag: bool,
     allow_breaking: bool,
     runtime_principal: rocky_core::config::PolicyPrincipal,
+    actor: &rocky_core::config::PrincipalRef,
     json: bool,
 ) -> Result<()> {
     use crate::plan_store::read_plan;
@@ -2095,6 +2096,7 @@ pub async fn run_branch_promote(
         config_path,
         &plan_id,
         persisted.enforcement_principal(runtime_principal),
+        actor,
         &promote_plan,
         state_path,
     )?;
@@ -2416,6 +2418,7 @@ pub async fn run_branch_promote_from_plan(
     pipeline_name: Option<&str>,
     state_path: &Path,
     runtime_principal: rocky_core::config::PolicyPrincipal,
+    actor: &rocky_core::config::PrincipalRef,
     json: bool,
 ) -> Result<()> {
     use crate::output::{AuditEvent, AuditEventKind, PromotePlan, print_json};
@@ -2498,6 +2501,7 @@ pub async fn run_branch_promote_from_plan(
         config_path,
         plan_id,
         plan.enforcement_principal(runtime_principal),
+        actor,
         &promote_plan,
         state_path,
     )?;
@@ -4242,6 +4246,7 @@ mod tests {
             None,
             &state_path,
             rocky_core::config::PolicyPrincipal::Human,
+            &rocky_core::config::PrincipalRef::unnamed(),
             false,
         )
         .await
@@ -4270,6 +4275,7 @@ mod tests {
             None,
             &state_path,
             rocky_core::config::PolicyPrincipal::Human,
+            &rocky_core::config::PrincipalRef::unnamed(),
             false,
         )
         .await
@@ -4502,6 +4508,7 @@ adapter = "default"
             &config_path,
             "plan-swap-drill",
             rocky_core::config::PolicyPrincipal::Human,
+            &rocky_core::config::PrincipalRef::unnamed(),
             &promote_plan,
             &state_path,
         )
@@ -4958,6 +4965,7 @@ adapter = "default"
             None,
             false,
             None,
+            &rocky_core::config::PrincipalRef::unnamed(),
         )
         .await?;
         Ok(())
@@ -5057,6 +5065,7 @@ adapter = "default"
             false,
             false,
             rocky_core::config::PolicyPrincipal::Human,
+            &rocky_core::config::PrincipalRef::unnamed(),
             false,
         )
         .await;
@@ -5708,6 +5717,7 @@ auto_create_schemas = true
             &plan_id,
             &state_path,
             rocky_core::config::PolicyPrincipal::Human,
+            &rocky_core::config::PrincipalRef::unnamed(),
             None,
             false,
         )
@@ -5734,6 +5744,7 @@ auto_create_schemas = true
             None,
             &state_path,
             rocky_core::config::PolicyPrincipal::Human,
+            &rocky_core::config::PrincipalRef::unnamed(),
             false,
         )
         .await
@@ -5746,6 +5757,7 @@ auto_create_schemas = true
             None,
             &state_path,
             rocky_core::config::PolicyPrincipal::Human,
+            &rocky_core::config::PrincipalRef::unnamed(),
             false,
         )
         .await
@@ -5771,6 +5783,7 @@ auto_create_schemas = true
             None,
             &state_path,
             rocky_core::config::PolicyPrincipal::Human,
+            &rocky_core::config::PrincipalRef::unnamed(),
             false,
         )
         .await
@@ -5787,6 +5800,7 @@ auto_create_schemas = true
             false, // skip_approval_flag
             true,  // allow_breaking — irrelevant here; gate skips fail-open anyway
             rocky_core::config::PolicyPrincipal::Human, // human runtime — no [policy], ungated
+            &rocky_core::config::PrincipalRef::unnamed(),
             false, // json — suppress pretty stdout in tests
         )
         .await;
@@ -6046,6 +6060,7 @@ effect = "deny"
             None, // pipeline
             &state_path,
             rocky_core::config::PolicyPrincipal::Agent,
+            &rocky_core::config::PrincipalRef::unnamed(),
             false,
         )
         .await;
@@ -6202,6 +6217,7 @@ effect = "deny"
             &shared_plan_id,
             &state_path,
             PolicyPrincipal::Agent,
+            &rocky_core::config::PrincipalRef::unnamed(),
             None,
             false,
         )
@@ -6214,6 +6230,7 @@ effect = "deny"
             None, // pipeline
             &state_path,
             PolicyPrincipal::Agent,
+            &rocky_core::config::PrincipalRef::unnamed(),
             false,
         )
         .await;
@@ -6229,6 +6246,7 @@ effect = "deny"
             false, // skip_approval_flag
             true,  // allow_breaking
             PolicyPrincipal::Agent,
+            &rocky_core::config::PrincipalRef::unnamed(),
             false,
         )
         .await;
@@ -6267,6 +6285,7 @@ effect = "deny"
             &shared_plan_id,
             &state_path,
             PolicyPrincipal::Human,
+            &rocky_core::config::PrincipalRef::unnamed(),
             None,
             false,
         )
@@ -6280,6 +6299,7 @@ effect = "deny"
             None, // pipeline
             &state_path,
             PolicyPrincipal::Human,
+            &rocky_core::config::PrincipalRef::unnamed(),
             false,
         )
         .await
@@ -6296,6 +6316,7 @@ effect = "deny"
             false,
             true,
             PolicyPrincipal::Human,
+            &rocky_core::config::PrincipalRef::unnamed(),
             false,
         )
         .await
@@ -6428,6 +6449,7 @@ adapter = "default"
             false,
             true,
             PolicyPrincipal::Human,
+            &rocky_core::config::PrincipalRef::unnamed(),
             false,
         )
         .await;
@@ -6445,6 +6467,7 @@ adapter = "default"
             false,
             true,
             PolicyPrincipal::Human,
+            &rocky_core::config::PrincipalRef::unnamed(),
             false,
         )
         .await;
@@ -6634,6 +6657,7 @@ adapter = "default"
             &plan_id,
             &state_path,
             PolicyPrincipal::Human,
+            &rocky_core::config::PrincipalRef::unnamed(),
             None,
             false,
         )
@@ -6795,6 +6819,7 @@ adapter = "default"
             Some("staging"),
             &state_path,
             PolicyPrincipal::Human,
+            &rocky_core::config::PrincipalRef::unnamed(),
             false,
         )
         .await;
@@ -6809,6 +6834,7 @@ adapter = "default"
             None,
             &state_path,
             PolicyPrincipal::Human,
+            &rocky_core::config::PrincipalRef::unnamed(),
             false,
         )
         .await;
@@ -7001,6 +7027,7 @@ auto_create_schemas = true
             false,
             false, // allow_breaking — the gate must fire
             PolicyPrincipal::Human,
+            &rocky_core::config::PrincipalRef::unnamed(),
             true, // json — the block JSON is emitted to stdout
         )
         .await;

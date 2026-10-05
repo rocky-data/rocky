@@ -105,6 +105,10 @@ export interface ReviewQueueEntry {
    */
   principal: PolicyPrincipal;
   /**
+   * The id of the actor behind the escalation (RV4-P1). `null` when the row was written before ids existed. Self-asserted and unverified.
+   */
+  principal_id?: string | null;
+  /**
    * Human-readable explanation of how `require_review` was reached.
    */
   reason: string;

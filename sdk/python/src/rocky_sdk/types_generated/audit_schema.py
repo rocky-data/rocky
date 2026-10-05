@@ -8,6 +8,21 @@ from enum import StrEnum
 from pydantic import BaseModel, conint
 
 
+class AuditFilter(BaseModel):
+    """
+    The `--actor` / `--since` filter of `rocky audit` (RV4-P1).
+    """
+
+    actor: str | None = None
+    """
+    The principal id the rows were filtered to. `unrecorded` selects the rows with no id.
+    """
+    since: str | None = None
+    """
+    The inclusive lower bound, as an RFC 3339 UTC timestamp. A row is kept when its timestamp is at or after this.
+    """
+
+
 class AuditProductScope(BaseModel):
     """
     The product filter of `rocky audit --product <name>`, resolved from the product's spec before the ledger is read.
@@ -161,6 +176,38 @@ class PolicyPrincipal2(StrEnum):
     agent = "agent"
 
 
+class PrincipalIdSource1(StrEnum):
+    """
+    The global `--principal-id` flag.
+    """
+
+    flag = "flag"
+
+
+class PrincipalIdSource2(StrEnum):
+    """
+    The `ROCKY_PRINCIPAL_ID` environment variable.
+    """
+
+    env = "env"
+
+
+class PrincipalIdSource3(StrEnum):
+    """
+    Derived from the `rocky mcp --profile` the server runs under (`mcp-default`, `mcp-approver`, `mcp-worker`).
+    """
+
+    mcp_profile = "mcp_profile"
+
+
+class PrincipalIdSource4(StrEnum):
+    """
+    Nobody named the actor; the id is [`PRINCIPAL_ID_UNNAMED`].
+    """
+
+    default = "default"
+
+
 class AuditDecisionEntry(BaseModel):
     """
     One recorded policy decision in the [`AuditOutput`] ledger.
@@ -199,6 +246,24 @@ class AuditDecisionEntry(BaseModel):
     """
     Who was acting (`human` / `agent`).
     """
+    principal_id: str | None = None
+    """
+    The id of the actor behind the decision (RV4-P1). `null` means unrecorded: the row was written before ids existed. `unnamed` means nobody named the actor.
+    """
+    principal_id_source: (
+        PrincipalIdSource1
+        | PrincipalIdSource2
+        | PrincipalIdSource3
+        | PrincipalIdSource4
+        | None
+    ) = None
+    """
+    Where the id came from (`flag`, `env`, `mcp_profile`, `default`). `null` when the id is unrecorded.
+    """
+    principal_id_verified: bool | None = False
+    """
+    Whether anything verified the id. Always `false` today: ids are self-asserted until signed approvals exist. Defaulted, so a consumer reading an older binary's output sees `false`.
+    """
     reason: str
     """
     Human-readable explanation of how the effect was reached. A resolved `${VAR}` value prints as `${NAME}` (#1919).
@@ -223,10 +288,18 @@ class AuditOutput(BaseModel):
     command: str
     decisions: list[AuditDecisionEntry]
     """
-    Every recorded policy decision, oldest first. Under `product`, only the rows whose `model` is that product's output model.
+    Every recorded policy decision, oldest first. Under `product`, only the rows whose `model` is that product's output model. Under `filter`, only the rows that match it.
+    """
+    filter: AuditFilter | None = None
+    """
+    The `--actor` / `--since` filter applied, absent when neither was given.
     """
     product: AuditProductScope | None = None
     """
     The product the ledger was filtered to (`--product <name>`), absent when the whole ledger is listed.
+    """
+    unattributed_skipped: conint(ge=0) | None = 0
+    """
+    How many rows in range carry no principal id (written before ids existed) and so an `--actor <id>` filter dropped them. `0` without an `--actor` filter, and under `--actor unrecorded`, which lists them. Defaulted, so a consumer reading an older binary's output sees `0`.
     """
     version: str

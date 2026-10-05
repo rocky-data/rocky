@@ -136,7 +136,9 @@ function LedgerBody({ ledger, now }: { ledger: AuditOutput; now?: number }) {
         columns={["when", "principal", "capability", "model", "effect", "rule", "plan", "reason"]}
         rows={ledger.decisions.map((entry) => [
           formatInstant(entry.timestamp, now),
-          entry.principal,
+          // `class(id)`: the id is self-asserted (`principal_id_verified` is
+          // false), and a row from before ids existed reads `unrecorded`.
+          `${entry.principal}(${entry.principal_id ?? "unrecorded"})`,
           entry.capability,
           <CustodyLink key={`m-${entry.plan_id}-${entry.model}`} subject={entry.model} />,
           entry.effect,

@@ -173,6 +173,13 @@
           ],
           "description": "Who authored the change (`human` / `agent`)."
         },
+        "principal_id": {
+          "description": "The id of the actor behind the escalation (RV4-P1). `null` when the row was written before ids existed. Self-asserted and unverified.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "reason": {
           "description": "Human-readable explanation of how `require_review` was reached.",
           "type": "string"

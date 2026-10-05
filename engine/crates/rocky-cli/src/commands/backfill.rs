@@ -67,6 +67,7 @@ pub async fn run_backfill(
     partition_from: Option<&str>,
     partition_to: Option<&str>,
     include_downstream: bool,
+    actor: &rocky_core::config::PrincipalRef,
     output_json: bool,
 ) -> Result<()> {
     let cwd = std::env::current_dir().context("failed to get current working directory")?;
@@ -80,6 +81,7 @@ pub async fn run_backfill(
         partition_from,
         partition_to,
         include_downstream,
+        actor,
         output_json,
     )
 }
@@ -97,6 +99,7 @@ pub(crate) fn run_backfill_in(
     partition_from: Option<&str>,
     partition_to: Option<&str>,
     include_downstream: bool,
+    actor: &rocky_core::config::PrincipalRef,
     output_json: bool,
 ) -> Result<()> {
     if from_last_run && !seed_models.is_empty() {
@@ -344,6 +347,7 @@ pub(crate) fn run_backfill_in(
         state_path,
         &plan_id,
         PolicyPrincipal::Agent,
+        actor,
         PolicyCapability::Backfill,
         &format!("backfill: {} model(s)", ordered.len()),
         // The label above is a summary, not a graph key. These are the keys:
@@ -619,6 +623,7 @@ fn build_run_plan(
         // A backfill re-runs existing recipes; it is never product-bound.
         product_id: None,
         spec_digest: None,
+        intent: None,
     }
 }
 
@@ -945,6 +950,7 @@ mod tests {
             None,
             None,
             true,
+            &rocky_core::config::PrincipalRef::unnamed(),
             true,
         )
         .unwrap();
@@ -1116,6 +1122,7 @@ mod tests {
             None,
             None,
             true,
+            &rocky_core::config::PrincipalRef::unnamed(),
             true,
         )
     }

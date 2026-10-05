@@ -85,6 +85,7 @@ auto_create_schemas = true
             None,
             false,
             None,
+            &rocky_core::config::PrincipalRef::unnamed(),
         )
         .await
         .expect("rocky run should complete the snapshot");

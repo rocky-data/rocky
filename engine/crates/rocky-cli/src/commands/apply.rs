@@ -38,7 +38,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use anyhow::{Context, Result, bail};
-use rocky_core::config::{PolicyCapability, PolicyEffect, PolicyPrincipal, StateBackend};
+use rocky_core::config::{
+    PolicyCapability, PolicyEffect, PolicyPrincipal, PrincipalRef, StateBackend,
+};
 use rocky_core::policy::{self, ModelAttributes};
 use rocky_core::schema::SchemaPattern;
 use rocky_core::secret_registry::render_placeholders;
@@ -71,6 +73,7 @@ pub async fn run_apply(
     plan_id: &str,
     state_path: &Path,
     runtime_principal: PolicyPrincipal,
+    actor: &PrincipalRef,
     expect_spec_digest: Option<&str>,
     output_json: bool,
 ) -> Result<()> {
@@ -81,6 +84,7 @@ pub async fn run_apply(
         plan_id,
         state_path,
         runtime_principal,
+        actor,
         expect_spec_digest,
         output_json,
     )
@@ -95,12 +99,14 @@ pub async fn run_apply(
 /// most-restrictively with the plan's kind-forced principal (see
 /// [`PersistedPlan::enforcement_principal`]); the plan's stored `principal`
 /// field is never trusted for a gate decision.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_apply_in(
     root: &Path,
     config_path: &Path,
     plan_id: &str,
     state_path: &Path,
     runtime_principal: PolicyPrincipal,
+    actor: &PrincipalRef,
     expect_spec_digest: Option<&str>,
     output_json: bool,
 ) -> Result<()> {
@@ -110,6 +116,7 @@ pub(crate) async fn run_apply_in(
         plan_id,
         state_path,
         runtime_principal,
+        actor,
         expect_spec_digest,
         output_json,
     )
@@ -123,12 +130,14 @@ pub(crate) async fn run_apply_in(
 /// façade consumes it, because a resumed apply deflected as
 /// `skipped_in_flight` returns `Ok` here and would otherwise be
 /// mis-journaled as `applied`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_apply_core_in(
     root: &Path,
     config_path: &Path,
     plan_id: &str,
     state_path: &Path,
     runtime_principal: PolicyPrincipal,
+    actor: &PrincipalRef,
     expect_spec_digest: Option<&str>,
     output_json: bool,
 ) -> Result<ApplyOutcome> {
@@ -155,6 +164,7 @@ pub(crate) async fn run_apply_core_in(
                 plan_id,
                 state_path,
                 runtime_principal,
+                actor,
                 output_json,
             )
             .await
@@ -169,6 +179,7 @@ pub(crate) async fn run_apply_core_in(
                 plan_id,
                 state_path,
                 runtime_principal,
+                actor,
                 output_json,
             )
             .await
@@ -181,6 +192,7 @@ pub(crate) async fn run_apply_core_in(
                 plan_id,
                 state_path,
                 runtime_principal,
+                actor,
                 output_json,
             )
             .await
@@ -192,6 +204,7 @@ pub(crate) async fn run_apply_core_in(
                 plan_id,
                 state_path,
                 runtime_principal,
+                actor,
                 output_json,
             )
             .await
@@ -202,6 +215,7 @@ pub(crate) async fn run_apply_core_in(
             plan_id,
             state_path,
             runtime_principal,
+            actor,
             output_json,
         )
         .await
@@ -213,6 +227,7 @@ pub(crate) async fn run_apply_core_in(
                 plan_id,
                 state_path,
                 runtime_principal,
+                actor,
                 output_json,
             )
             .await
@@ -224,6 +239,7 @@ pub(crate) async fn run_apply_core_in(
                 plan_id,
                 state_path,
                 runtime_principal,
+                actor,
                 output_json,
             )
             .await
@@ -234,6 +250,7 @@ pub(crate) async fn run_apply_core_in(
             plan_id,
             state_path,
             runtime_principal,
+            actor,
             output_json,
         )
         .await
@@ -244,6 +261,7 @@ pub(crate) async fn run_apply_core_in(
             plan_id,
             state_path,
             runtime_principal,
+            actor,
             output_json,
         )
         .await
@@ -439,6 +457,7 @@ async fn run_apply_run_plan(
     plan_id: &str,
     state_path: &Path,
     runtime_principal: PolicyPrincipal,
+    actor: &rocky_core::config::PrincipalRef,
     output_json: bool,
 ) -> Result<ApplyOutcome> {
     let plan =
@@ -512,6 +531,7 @@ async fn run_apply_run_plan(
         loaded.config.policy.as_ref(),
         plan_id,
         principal,
+        actor,
         &touched,
         &models_dir,
         models_glob.as_deref(),
@@ -544,6 +564,7 @@ async fn run_apply_run_plan(
             root,
             plan_id,
             principal,
+            actor,
             &touched,
             &models_dir,
             models_glob.as_deref(),
@@ -562,6 +583,7 @@ async fn run_apply_run_plan(
     let governed = governed_run_context(
         &plan,
         principal,
+        actor,
         plan_id,
         root,
         config_path,
@@ -576,11 +598,32 @@ async fn run_apply_run_plan(
         output_json,
         &apply_run_id,
         governed.as_ref(),
+        actor,
     )
-    .await?;
+    .await;
+    let termination = match termination {
+        Err(e) if is_lost_run_record(&e) => {
+            return Err(verify_after_despite_lost_record(
+                e,
+                finish_apply_verify_after(
+                    plan_id,
+                    principal,
+                    actor,
+                    verify_checks,
+                    &apply_run_id,
+                    state_path,
+                    &loaded.config,
+                    governed.as_ref(),
+                ),
+            )
+            .await);
+        }
+        other => other?,
+    };
     finish_apply_verify_after(
         plan_id,
         principal,
+        actor,
         verify_checks,
         &apply_run_id,
         state_path,
@@ -668,9 +711,11 @@ fn validate_run_plan_execution_shape(plan_id: &str, run_plan: &RunPlan) -> Resul
 /// joined here with any checks resolved before execution. Keeping that join,
 /// custody decision, and remote upload in one helper prevents a plan-kind arm
 /// from accepting replication requirements without actually enforcing them.
+#[allow(clippy::too_many_arguments)]
 async fn finish_apply_verify_after(
     plan_id: &str,
     principal: PolicyPrincipal,
+    actor: &PrincipalRef,
     mut verify_checks: Vec<String>,
     apply_run_id: &str,
     state_path: &Path,
@@ -685,7 +730,14 @@ async fn finish_apply_verify_after(
 
     if remote_ledger_config(Some(cfg)).is_none() {
         // Local backend: the on-disk file IS the state.
-        return run_verify_after(plan_id, principal, &verify_checks, apply_run_id, state_path);
+        return run_verify_after(
+            plan_id,
+            principal,
+            actor,
+            &verify_checks,
+            apply_run_id,
+            state_path,
+        );
     }
     if verify_checks.is_empty() {
         return Ok(());
@@ -698,10 +750,41 @@ async fn finish_apply_verify_after(
     let verdict = {
         let store = open_ledger_with_retry(state_path)
             .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
-        evaluate_verify_after(&store, plan_id, principal, &verify_checks, apply_run_id)?
+        evaluate_verify_after(
+            &store,
+            plan_id,
+            principal,
+            actor,
+            &verify_checks,
+            apply_run_id,
+        )?
     };
     commit_verify_after_custody(Some(cfg), state_path, &verdict.record).await?;
     verdict.into_result(plan_id, &verify_checks)
+}
+
+/// Whether `e` is a run that succeeded but whose record did not land (#1884).
+fn is_lost_run_record(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<crate::commands::run::RunRecordNotPersisted>()
+        .is_some()
+}
+
+/// Run the `verify_after` custody step for a run that succeeded but lost its
+/// record (#1884), then return the run's error.
+///
+/// The run fails non-zero, but its custody row must still land. With no run
+/// record the gate fails closed and writes a `Deny` row, and that row is what
+/// burns the agent's autonomy budget. Skipping it would let repeated
+/// lost-record applies never use up the budget. The returned error stays a
+/// [`crate::commands::run::RunRecordNotPersisted`] for `downcast_ref`.
+async fn verify_after_despite_lost_record(
+    e: anyhow::Error,
+    finish: impl std::future::Future<Output = Result<()>>,
+) -> anyhow::Error {
+    match finish.await {
+        Ok(()) => e,
+        Err(verify) => e.context(format!("{verify:#}")),
+    }
 }
 
 /// Build the [`GovernedRunContext`] for a two-step apply — `Some` only for an
@@ -709,6 +792,7 @@ async fn finish_apply_verify_after(
 fn governed_run_context<'a>(
     plan: &PersistedPlan,
     principal: PolicyPrincipal,
+    actor: &PrincipalRef,
     plan_id: &'a str,
     root: &'a Path,
     config_path: &'a Path,
@@ -722,6 +806,7 @@ fn governed_run_context<'a>(
     let embedded = plan.embedded_capabilities();
     Some(GovernedRunContext {
         principal,
+        actor: actor.clone(),
         plan_id,
         root,
         config_path,
@@ -857,6 +942,8 @@ async fn execute_run_plan(
     // Governance context (agent apply): the in-run TOCTOU models-drift reject +
     // post-discovery replication gate. `None` for a human apply.
     governed_ctx: Option<&GovernedRunContext<'_>>,
+    // Who is applying (RV4-P1), handed to `run()` for its custody rows.
+    actor: &PrincipalRef,
 ) -> Result<crate::commands::run::RunTermination> {
     // ‼️ Finding #2/#1: preflight the reviewed source-schema snapshot BEFORE any
     // warehouse mutation — this path executes models (and, for a replication
@@ -980,6 +1067,7 @@ async fn execute_run_plan(
             // explicit — that changes the plan's contract and its `plan_id`
             // hash, so it is tracked separately rather than done here.
             crate::commands::run_dag_exec::replayed_node_concurrency(run_plan.parallel),
+            actor,
         )
         .await
         .with_context(|| format!("rocky apply run plan '{plan_id}' failed (dag path)"))
@@ -1083,6 +1171,7 @@ async fn execute_run_plan(
         // a persisted plan — the two-step apply path always runs without it.
         false,
         None, // #1460: not a replication plan
+        actor,
     )
     .await
     .with_context(|| format!("rocky apply run plan '{plan_id}' failed"))
@@ -1606,6 +1695,7 @@ async fn commit_governed_rule_decision(
     root: &Path,
     plan_id: &str,
     principal: PolicyPrincipal,
+    actor: &PrincipalRef,
     touched: &BTreeMap<String, PolicyCapability>,
     models_dir: &Path,
     models_glob: Option<&str>,
@@ -1623,6 +1713,7 @@ async fn commit_governed_rule_decision(
     let seam_touched = touched.clone();
     let seam_models_dir = models_dir.to_path_buf();
     let seam_models_glob = models_glob.map(str::to_string);
+    let seam_actor = actor.clone();
     commit_remote_ledger_seam(
         cfg,
         state_path,
@@ -1634,6 +1725,7 @@ async fn commit_governed_rule_decision(
             let touched = seam_touched.clone();
             let models_dir = seam_models_dir.clone();
             let models_glob = seam_models_glob.clone();
+            let actor = seam_actor.clone();
             Box::pin(async move {
                 let marker_freezes = marker_freezes_before_gate(&cfg, &touched)
                     .await
@@ -1642,6 +1734,7 @@ async fn commit_governed_rule_decision(
                     cfg.policy.as_ref(),
                     &plan_id,
                     principal,
+                    &actor,
                     &touched,
                     &models_dir,
                     models_glob.as_deref(),
@@ -1713,10 +1806,12 @@ async fn commit_verify_after_custody(
 /// synthesizes a bare-`apply` entry per planned model, so its execution stays
 /// governed (do not pass an empty map for an executing plan or the gate is
 /// bypassed).
+#[allow(clippy::too_many_arguments)]
 pub fn evaluate_apply_policy(
     config_path: &Path,
     plan_id: &str,
     principal: PolicyPrincipal,
+    actor: &PrincipalRef,
     touched: &BTreeMap<String, PolicyCapability>,
     models_dir: &Path,
     state_path: &Path,
@@ -1736,6 +1831,7 @@ pub fn evaluate_apply_policy(
         policy.as_ref(),
         plan_id,
         principal,
+        actor,
         touched,
         models_dir,
         state_path,
@@ -1761,6 +1857,7 @@ pub fn evaluate_apply_policy_with_policy(
     policy: Option<&rocky_core::config::PolicyConfig>,
     plan_id: &str,
     principal: PolicyPrincipal,
+    actor: &PrincipalRef,
     touched: &BTreeMap<String, PolicyCapability>,
     models_dir: &Path,
     state_path: &Path,
@@ -1770,6 +1867,7 @@ pub fn evaluate_apply_policy_with_policy(
         policy,
         plan_id,
         principal,
+        actor,
         touched,
         models_dir,
         None,
@@ -1784,6 +1882,7 @@ pub(crate) fn evaluate_apply_policy_with_policy_matching(
     policy: Option<&rocky_core::config::PolicyConfig>,
     plan_id: &str,
     principal: PolicyPrincipal,
+    actor: &PrincipalRef,
     touched: &BTreeMap<String, PolicyCapability>,
     models_dir: &Path,
     models_glob: Option<&str>,
@@ -1795,6 +1894,7 @@ pub(crate) fn evaluate_apply_policy_with_policy_matching(
         policy,
         plan_id,
         principal,
+        actor,
         touched,
         models_dir,
         models_glob,
@@ -1854,6 +1954,7 @@ pub fn evaluate_apply_policy_with_extra_classifications(
     config_path: &Path,
     plan_id: &str,
     principal: PolicyPrincipal,
+    actor: &PrincipalRef,
     touched: &BTreeMap<String, PolicyCapability>,
     models_dir: &Path,
     state_path: &Path,
@@ -1868,6 +1969,7 @@ pub fn evaluate_apply_policy_with_extra_classifications(
         policy.as_ref(),
         plan_id,
         principal,
+        actor,
         touched,
         models_dir,
         None,
@@ -1911,6 +2013,7 @@ fn evaluate_apply_policy_with_policy_matching_dual(
     policy: Option<&rocky_core::config::PolicyConfig>,
     plan_id: &str,
     principal: PolicyPrincipal,
+    actor: &PrincipalRef,
     touched: &BTreeMap<String, PolicyCapability>,
     models_dir: &Path,
     models_glob: Option<&str>,
@@ -2005,6 +2108,7 @@ fn evaluate_apply_policy_with_policy_matching_dual(
                     &policy,
                     plan_id,
                     principal,
+                    actor,
                     touched,
                     attrs,
                     subjects,
@@ -2032,6 +2136,7 @@ fn evaluate_apply_policy_with_policy_matching_dual(
         &policy,
         plan_id,
         principal,
+        actor,
         touched,
         eval_attrs,
         subjects,
@@ -2183,6 +2288,7 @@ pub(crate) fn evaluate_apply_policy_with_store(
     policy: Option<&rocky_core::config::PolicyConfig>,
     plan_id: &str,
     principal: PolicyPrincipal,
+    actor: &PrincipalRef,
     touched: &BTreeMap<String, PolicyCapability>,
     models_dir: &Path,
     models_glob: Option<&str>,
@@ -2209,6 +2315,7 @@ pub(crate) fn evaluate_apply_policy_with_store(
         &policy,
         plan_id,
         principal,
+        actor,
         touched,
         &attrs_map,
         subjects,
@@ -2299,6 +2406,7 @@ pub(crate) fn evaluate_apply_policy_core(
     policy: &rocky_core::config::PolicyConfig,
     plan_id: &str,
     principal: PolicyPrincipal,
+    actor: &PrincipalRef,
     touched: &BTreeMap<String, PolicyCapability>,
     attrs_map: &BTreeMap<String, ModelAttributes>,
     subjects: GateSubjects<'_>,
@@ -2400,6 +2508,8 @@ pub(crate) fn evaluate_apply_policy_core(
             verify_after: Vec::new(),
             // Ordinary apply/promote evaluation — no auto-apply custody.
             auto_apply: None,
+            // Who acted (RV4-P1). A label, not an enforcement input.
+            principal_ref: Some(actor.clone()),
         });
 
         let gate = match effect {
@@ -3037,6 +3147,9 @@ pub struct GovernedRunContext<'a> {
     /// The enforcement principal for this apply (see
     /// [`PersistedPlan::enforcement_principal`]).
     pub principal: PolicyPrincipal,
+    /// Who is applying (RV4-P1): stamped on the decision rows the in-run
+    /// replication gate writes. Never an enforcement input.
+    pub actor: PrincipalRef,
     /// The plan id the decision rows are recorded against, and the review
     /// marker the replication gate consults.
     pub plan_id: &'a str,
@@ -3196,6 +3309,7 @@ impl GovernedRunContext<'_> {
             cfg.policy.as_ref(),
             self.plan_id,
             self.principal,
+            &self.actor,
             &touched,
             &models_dir,
             models_glob.as_deref(),
@@ -3255,6 +3369,7 @@ pub(crate) fn gate_promote_plan(
     config_path: &Path,
     plan_id: &str,
     principal: PolicyPrincipal,
+    actor: &PrincipalRef,
     promote_plan: &PromotePlan,
     state_path: &Path,
 ) -> Result<std::sync::Arc<rocky_core::config::LoadedConfig>> {
@@ -3298,6 +3413,7 @@ pub(crate) fn gate_promote_plan(
         loaded.config.policy.as_ref(),
         plan_id,
         principal,
+        actor,
         &touched,
         &promote_models_dir,
         promote_models_glob.as_deref(),
@@ -3684,6 +3800,7 @@ pub(crate) async fn gate_maintenance_apply(
     config_path: &Path,
     state_path: &Path,
     runtime_principal: PolicyPrincipal,
+    actor: &rocky_core::config::PrincipalRef,
     targets: &TouchedTargets,
 ) -> Result<()> {
     let touched = &targets.touched;
@@ -3700,6 +3817,7 @@ pub(crate) async fn gate_maintenance_apply(
         config.policy.as_ref(),
         plan_id,
         plan.enforcement_principal(runtime_principal),
+        actor,
         touched,
         &models_dir,
         models_glob.as_deref(),
@@ -3846,6 +3964,7 @@ fn required_verify_after(
 fn run_verify_after(
     plan_id: &str,
     principal: PolicyPrincipal,
+    actor: &PrincipalRef,
     required: &[String],
     run_id: &str,
     state_path: &Path,
@@ -3860,7 +3979,7 @@ fn run_verify_after(
     // best-effort open) so the custody half of the budget-burn pair is durable.
     let store = open_ledger_with_retry(state_path)
         .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
-    let verdict = evaluate_verify_after(&store, plan_id, principal, required, run_id)?;
+    let verdict = evaluate_verify_after(&store, plan_id, principal, actor, required, run_id)?;
     record_verify_after_custody(&store, &verdict.record)?;
     drop(store);
     verdict.into_result(plan_id, required)
@@ -3914,6 +4033,7 @@ fn evaluate_verify_after(
     store: &StateStore,
     plan_id: &str,
     principal: PolicyPrincipal,
+    actor: &PrincipalRef,
     required: &[String],
     run_id: &str,
 ) -> Result<VerifyAfterVerdict> {
@@ -3974,6 +4094,7 @@ fn evaluate_verify_after(
         reason,
         verify_after: required.iter().map(|n| render_placeholders(n)).collect(),
         auto_apply: None,
+        principal_ref: Some(actor.clone()),
     };
     Ok(VerifyAfterVerdict { record, failures })
 }
@@ -4015,6 +4136,7 @@ async fn run_apply_ai_authored_plan(
     plan_id: &str,
     state_path: &Path,
     runtime_principal: PolicyPrincipal,
+    actor: &rocky_core::config::PrincipalRef,
     output_json: bool,
 ) -> Result<ApplyOutcome> {
     let plan = read_plan(root, plan_id)
@@ -4080,6 +4202,7 @@ async fn run_apply_ai_authored_plan(
         loaded.config.policy.as_ref(),
         plan_id,
         principal,
+        actor,
         &touched,
         &models_dir,
         models_glob.as_deref(),
@@ -4148,6 +4271,7 @@ async fn run_apply_ai_authored_plan(
             root,
             plan_id,
             principal,
+            actor,
             &touched,
             &models_dir,
             models_glob.as_deref(),
@@ -4162,6 +4286,7 @@ async fn run_apply_ai_authored_plan(
     let governed = governed_run_context(
         &plan,
         principal,
+        actor,
         plan_id,
         root,
         config_path,
@@ -4176,11 +4301,32 @@ async fn run_apply_ai_authored_plan(
         output_json,
         &apply_run_id,
         governed.as_ref(),
+        actor,
     )
-    .await?;
+    .await;
+    let termination = match termination {
+        Err(e) if is_lost_run_record(&e) => {
+            return Err(verify_after_despite_lost_record(
+                e,
+                finish_apply_verify_after(
+                    plan_id,
+                    principal,
+                    actor,
+                    verify_checks,
+                    &apply_run_id,
+                    state_path,
+                    &loaded.config,
+                    governed.as_ref(),
+                ),
+            )
+            .await);
+        }
+        other => other?,
+    };
     finish_apply_verify_after(
         plan_id,
         principal,
+        actor,
         verify_checks,
         &apply_run_id,
         state_path,
@@ -4296,6 +4442,7 @@ async fn run_apply_backfill_plan(
     plan_id: &str,
     state_path: &Path,
     runtime_principal: PolicyPrincipal,
+    actor: &rocky_core::config::PrincipalRef,
     output_json: bool,
 ) -> Result<ApplyOutcome> {
     let plan = read_plan(root, plan_id)
@@ -4437,6 +4584,7 @@ async fn run_apply_backfill_plan(
             cfg.as_ref().and_then(|l| l.config.policy.as_ref()),
             plan_id,
             plan.enforcement_principal(runtime_principal),
+            actor,
             &touched,
             models_dir,
             state_path,
@@ -4495,6 +4643,7 @@ async fn run_apply_backfill_plan(
         let governed = governed_run_context(
             &plan,
             plan.enforcement_principal(runtime_principal),
+            actor,
             plan_id,
             root,
             config_path,
@@ -4654,6 +4803,7 @@ async fn run_apply_replication_plan(
     plan_id: &str,
     state_path: &Path,
     runtime_principal: PolicyPrincipal,
+    actor: &rocky_core::config::PrincipalRef,
     output_json: bool,
 ) -> Result<ApplyOutcome> {
     let plan = read_plan(root, plan_id)
@@ -4897,6 +5047,7 @@ async fn run_apply_replication_plan(
     let governed = governed_run_context(
         &plan,
         principal,
+        actor,
         plan_id,
         root,
         config_path,
@@ -4952,9 +5103,29 @@ async fn run_apply_replication_plan(
         // a persisted plan — the replication apply path always runs without it.
         false,
         Some((plan_id, replication_plan.source_state_snapshot.as_slice())), // #1460
+        actor,
     )
     .await
-    .with_context(|| format!("rocky apply replication plan '{plan_id}' failed"))?;
+    .with_context(|| format!("rocky apply replication plan '{plan_id}' failed"));
+    let termination = match termination {
+        Err(e) if is_lost_run_record(&e) => {
+            return Err(verify_after_despite_lost_record(
+                e,
+                finish_apply_verify_after(
+                    plan_id,
+                    principal,
+                    actor,
+                    Vec::new(),
+                    &apply_run_id,
+                    state_path,
+                    &loaded.config,
+                    governed.as_ref(),
+                ),
+            )
+            .await);
+        }
+        other => other?,
+    };
 
     // Replication targets and their winning rules are discovered inside `run`.
     // Enforce the captured requirements after the run and persist/upload the
@@ -4962,6 +5133,7 @@ async fn run_apply_replication_plan(
     finish_apply_verify_after(
         plan_id,
         principal,
+        actor,
         Vec::new(),
         &apply_run_id,
         state_path,
@@ -5229,6 +5401,7 @@ async fn run_apply_promote_plan(
     plan_id: &str,
     state_path: &Path,
     runtime_principal: PolicyPrincipal,
+    actor: &rocky_core::config::PrincipalRef,
     output_json: bool,
 ) -> Result<()> {
     use crate::output::print_json;
@@ -5255,6 +5428,7 @@ async fn run_apply_promote_plan(
         config_path,
         plan_id,
         plan.enforcement_principal(runtime_principal),
+        actor,
         &promote_plan,
         state_path,
     )?;
@@ -5377,6 +5551,8 @@ pub async fn run_apply_inline_for_run(
     run_vars: &rocky_core::run_vars::RunVars,
     assume_fresh_state: bool,
     contracts_dir: Option<&Path>,
+    // Who is running (RV4-P1). Stamped on the drift auto-apply custody rows.
+    actor: &PrincipalRef,
 ) -> Result<()> {
     // THE single fingerprinted config load for a bare `rocky run` (#1120):
     // this entry point loaded nothing before this change (run() re-read the
@@ -5418,6 +5594,7 @@ pub async fn run_apply_inline_for_run(
         assume_fresh_state,
         None, // #1460: inline `rocky run`, not a persisted plan
         contracts_dir,
+        actor,
     )
     .await
     .map(|_| ())
@@ -5440,6 +5617,7 @@ mod tests {
             &plan_id,
             &dir.path().join("state.redb"),
             super::PolicyPrincipal::Agent,
+            &rocky_core::config::PrincipalRef::unnamed(),
             true,
         )
         .await
@@ -5589,6 +5767,7 @@ mod tests {
             &cfg,
             "plan-1",
             PolicyPrincipal::Agent,
+            &rocky_core::config::PrincipalRef::unnamed(),
             &BTreeMap::new(),
             dir.path(),
             &dir.path().join("state.redb"),
@@ -5617,6 +5796,7 @@ mod tests {
             &dir.path().join("does-not-exist.toml"),
             "plan-1",
             PolicyPrincipal::Agent,
+            &rocky_core::config::PrincipalRef::unnamed(),
             &BTreeMap::new(),
             dir.path(),
             &dir.path().join("state.redb"),
@@ -5702,6 +5882,7 @@ mod tests {
             &config_path,
             &project.join("state.redb"),
             PolicyPrincipal::Agent,
+            &rocky_core::config::PrincipalRef::unnamed(),
             &touched,
         )
         .await
@@ -5969,6 +6150,7 @@ mod tests {
             &config_path,
             &state,
             PolicyPrincipal::Agent,
+            &rocky_core::config::PrincipalRef::unnamed(),
             &targets,
         )
         .await;
@@ -6020,6 +6202,7 @@ mod tests {
             cfg.policy.as_ref(),
             "plan_m",
             PolicyPrincipal::Agent,
+            &rocky_core::config::PrincipalRef::unnamed(),
             &targets.touched,
             &models,
             None,
@@ -6151,6 +6334,7 @@ mod tests {
             "apply-run-id",
             // A human apply: the governed `--dag` refusal above does not apply.
             None,
+            &rocky_core::config::PrincipalRef::unnamed(),
         )
         .await
         .expect_err("a stored --dag --shadow plan must reach the shadow-aware DAG path");
@@ -6277,6 +6461,7 @@ mod tests {
             "apply-run-id",
             // A human apply: the governed `--dag` refusal does not apply.
             None,
+            &rocky_core::config::PrincipalRef::unnamed(),
         )
         .await
         .expect("a stored --dag partition plan must apply cleanly");
@@ -6384,6 +6569,7 @@ mod tests {
             "apply-run-id",
             // A human apply: the governed `--dag` refusal does not apply.
             None,
+            &rocky_core::config::PrincipalRef::unnamed(),
         )
         .await
         .expect("a stored --dag plan must apply cleanly");
@@ -6430,6 +6616,7 @@ mod tests {
             execution_layers: vec![vec!["schema.orders".to_string()]],
             product_id: None,
             spec_digest: None,
+            intent: None,
         }
     }
 
@@ -6488,6 +6675,7 @@ mod tests {
             &id,
             &state,
             PolicyPrincipal::Agent,
+            &rocky_core::config::PrincipalRef::unnamed(),
             None,
             false,
         )
@@ -6511,6 +6699,7 @@ mod tests {
             &id,
             &root.join("state.redb"),
             PolicyPrincipal::Human,
+            &rocky_core::config::PrincipalRef::unnamed(),
             None,
             false,
         )
@@ -6558,6 +6747,7 @@ mod tests {
                 &plan_id,
                 &state_path,
                 PolicyPrincipal::Human,
+                &rocky_core::config::PrincipalRef::unnamed(),
                 None,
                 true,
             )
@@ -6594,6 +6784,7 @@ mod tests {
             &plan_id,
             &state_path,
             PolicyPrincipal::Agent,
+            &rocky_core::config::PrincipalRef::unnamed(),
             None,
             true,
         )
@@ -6765,6 +6956,7 @@ mod tests {
             &plan_id,
             std::path::Path::new("models/.rocky-state.redb"),
             PolicyPrincipal::Human,
+            &rocky_core::config::PrincipalRef::unnamed(),
             true,
         )
         .await
@@ -6787,6 +6979,7 @@ mod tests {
             &plan_id,
             std::path::Path::new("models/.rocky-state.redb"),
             PolicyPrincipal::Human,
+            &rocky_core::config::PrincipalRef::unnamed(),
             true,
         )
         .await
@@ -6823,6 +7016,7 @@ mod tests {
             &plan_id,
             std::path::Path::new("models/.rocky-state.redb"),
             PolicyPrincipal::Human,
+            &rocky_core::config::PrincipalRef::unnamed(),
             true,
         )
         .await
@@ -6959,6 +7153,7 @@ auto_create_schemas = true
             &plan_id,
             &state,
             PolicyPrincipal::Human,
+            &rocky_core::config::PrincipalRef::unnamed(),
             true,
         )
         .await
@@ -7005,6 +7200,7 @@ auto_create_schemas = true
             &plan_id,
             &state,
             PolicyPrincipal::Agent,
+            &rocky_core::config::PrincipalRef::unnamed(),
             true,
         )
         .await
@@ -7033,6 +7229,7 @@ auto_create_schemas = true
             &plan_id,
             &state,
             PolicyPrincipal::Human,
+            &rocky_core::config::PrincipalRef::unnamed(),
             true,
         )
         .await
@@ -7067,6 +7264,7 @@ auto_create_schemas = true
             reason: "policy freeze: agent actions frozen to deny".to_string(),
             verify_after: Vec::new(),
             auto_apply: None,
+            principal_ref: None,
         })?;
         Ok(())
     }
@@ -7215,6 +7413,7 @@ default_agent_effect = "require_review"
             reason: "verify_after passed: [row_count]".to_string(),
             verify_after: vec!["row_count".to_string()],
             auto_apply: None,
+            principal_ref: None,
         };
         assert!(
             super::commit_verify_after_custody(Some(&remote_cfg), &state, &record)
@@ -7262,6 +7461,7 @@ effect = "deny"
             policy.as_ref(),
             "plan_a",
             PolicyPrincipal::Agent,
+            &rocky_core::config::PrincipalRef::unnamed(),
             &touched,
             &models_dir,
             &state,
@@ -7277,6 +7477,7 @@ effect = "deny"
             None,
             "plan_a",
             PolicyPrincipal::Agent,
+            &rocky_core::config::PrincipalRef::unnamed(),
             &touched,
             &models_dir,
             &state,
@@ -7330,6 +7531,7 @@ effect = "deny"
             &config,
             "draft:m",
             PolicyPrincipal::Agent,
+            &rocky_core::config::PrincipalRef::unnamed(),
             &touched,
             &models,
             &state,
@@ -7347,6 +7549,7 @@ effect = "deny"
             &config,
             "draft:m",
             PolicyPrincipal::Agent,
+            &rocky_core::config::PrincipalRef::unnamed(),
             &touched,
             &models,
             &state,
@@ -7402,6 +7605,7 @@ effect = "deny"
             &config,
             "draft:m",
             PolicyPrincipal::Agent,
+            &rocky_core::config::PrincipalRef::unnamed(),
             &touched,
             &models,
             &state,
@@ -7460,6 +7664,7 @@ effect = "deny"
             &config,
             "draft:m",
             PolicyPrincipal::Agent,
+            &rocky_core::config::PrincipalRef::unnamed(),
             &touched,
             &models,
             &state,
@@ -7478,6 +7683,7 @@ effect = "deny"
             &config,
             "draft:m",
             PolicyPrincipal::Agent,
+            &rocky_core::config::PrincipalRef::unnamed(),
             &touched,
             &models,
             &state,
@@ -7535,6 +7741,7 @@ effect = "deny"
             &config,
             "plan_x",
             PolicyPrincipal::Agent,
+            &rocky_core::config::PrincipalRef::unnamed(),
             &touched,
             &models,
             &dir.path().join("state.redb"),
@@ -7566,6 +7773,7 @@ effect = "deny"
             &config,
             "plan_x",
             PolicyPrincipal::Agent,
+            &rocky_core::config::PrincipalRef::unnamed(),
             &touched,
             &dir.path().join("models"),
             &dir.path().join("state.redb"),
@@ -7595,6 +7803,7 @@ effect = "deny"
             &config,
             "plan_x",
             PolicyPrincipal::Human,
+            &rocky_core::config::PrincipalRef::unnamed(),
             &touched,
             &dir.path().join("models"),
             &dir.path().join("state.redb"),
@@ -7734,6 +7943,7 @@ effect = "deny"
                     &plan_a,
                     &state,
                     PolicyPrincipal::Agent,
+                    &rocky_core::config::PrincipalRef::unnamed(),
                     false,
                 )
                 .await,
@@ -7748,6 +7958,7 @@ effect = "deny"
                     None, // pipeline
                     &state,
                     PolicyPrincipal::Agent,
+                    &rocky_core::config::PrincipalRef::unnamed(),
                     false,
                 )
                 .await,
@@ -7771,6 +7982,7 @@ effect = "deny"
                     &plan_b,
                     &state,
                     PolicyPrincipal::Agent,
+                    &rocky_core::config::PrincipalRef::unnamed(),
                     false,
                 )
                 .await,
@@ -7785,6 +7997,7 @@ effect = "deny"
                     None, // pipeline
                     &state,
                     PolicyPrincipal::Agent,
+                    &rocky_core::config::PrincipalRef::unnamed(),
                     false,
                 )
                 .await,
@@ -7807,6 +8020,7 @@ effect = "deny"
             &plan_a,
             &state,
             PolicyPrincipal::Human,
+            &rocky_core::config::PrincipalRef::unnamed(),
             false,
         )
         .await
@@ -7819,6 +8033,7 @@ effect = "deny"
             None, // pipeline
             &state,
             PolicyPrincipal::Human,
+            &rocky_core::config::PrincipalRef::unnamed(),
             false,
         )
         .await
@@ -7837,6 +8052,7 @@ effect = "deny"
             &dir.path().join("rocky.toml"),
             "plan_x",
             PolicyPrincipal::Agent,
+            &rocky_core::config::PrincipalRef::unnamed(),
             &touched,
             &dir.path().join("models"),
             &dir.path().join("state.redb"),
@@ -7871,6 +8087,7 @@ effect = "deny"
             &config,
             "plan_x",
             PolicyPrincipal::Agent,
+            &rocky_core::config::PrincipalRef::unnamed(),
             &BTreeMap::new(),
             &dir.path().join("models"),
             &dir.path().join("state.redb"),
@@ -7919,6 +8136,7 @@ effect = "deny"
             &config,
             "plan_x",
             PolicyPrincipal::Agent,
+            &rocky_core::config::PrincipalRef::unnamed(),
             &touched,
             &dir.path().join("models"),
             &dir.path().join("state.redb"),
@@ -7956,6 +8174,7 @@ effect = "deny"
             &config,
             "plan_x",
             PolicyPrincipal::Agent,
+            &rocky_core::config::PrincipalRef::unnamed(),
             &touched,
             &dir.path().join("models"),
             &state,
@@ -7987,6 +8206,7 @@ effect = "deny"
             &config,
             "plan_x",
             PolicyPrincipal::Human,
+            &rocky_core::config::PrincipalRef::unnamed(),
             &touched,
             &dir.path().join("models"),
             &dir.path().join("state.redb"),
@@ -8092,6 +8312,7 @@ effect = "deny"
             &config,
             &plan_id,
             PolicyPrincipal::Agent,
+            &rocky_core::config::PrincipalRef::unnamed(),
             &touched,
             &models_dir,
             &dir.path().join("state.redb"),
@@ -8141,6 +8362,7 @@ effect = "deny"
             &config,
             &plan_id,
             PolicyPrincipal::Agent,
+            &rocky_core::config::PrincipalRef::unnamed(),
             &touched,
             &models_dir,
             &dir.path().join("state.redb"),
@@ -8198,6 +8420,7 @@ effect = "allow"
             &config,
             "plan_x",
             PolicyPrincipal::Agent,
+            &rocky_core::config::PrincipalRef::unnamed(),
             &touched,
             &dir.path().join("models"),
             &dir.path().join("state.redb"),
@@ -8247,6 +8470,7 @@ effect = "allow"
             &config,
             "plan_x",
             PolicyPrincipal::Agent,
+            &rocky_core::config::PrincipalRef::unnamed(),
             &touched,
             &dir.path().join("models"),
             &state,
@@ -8295,6 +8519,7 @@ effect = "allow"
             &config,
             "plan_x",
             PolicyPrincipal::Agent,
+            &rocky_core::config::PrincipalRef::unnamed(),
             &touched,
             &dir.path().join("models"),
             &state,
@@ -8343,6 +8568,7 @@ effect = "allow"
             &config,
             "plan_x",
             PolicyPrincipal::Agent,
+            &rocky_core::config::PrincipalRef::unnamed(),
             &touched,
             &dir.path().join("models"),
             &state,
@@ -8372,6 +8598,7 @@ effect = "allow"
             &config,
             "plan_x",
             PolicyPrincipal::Human,
+            &rocky_core::config::PrincipalRef::unnamed(),
             &touched,
             &dir.path().join("models"),
             &state,
@@ -8701,10 +8928,12 @@ effect = "allow"
         assert!(resolved.contains("orders") && !resolved.contains("corp.prod.orders"));
 
         let loaded = rocky_core::config::load_rocky_config(&config)?;
+        let actor = test_actor("gate-actor");
         let _gate = super::evaluate_apply_policy_with_policy_matching(
             loaded.policy.as_ref(),
             "plan_p",
             PolicyPrincipal::Agent,
+            &actor,
             &touched,
             &models_dir,
             None,
@@ -8727,7 +8956,21 @@ effect = "allow"
             row("corp.prod.orders").models.is_empty(),
             "verbatim: no key, whatever a model happens to be named"
         );
+        // RV4-P1: the gate core stamps the acting principal id on every row
+        // it records, beside the class it enforced.
+        for model in ["orders", "corp.prod.orders"] {
+            assert_eq!(row(model).principal_ref.as_ref(), Some(&actor), "{model}");
+            assert_eq!(row(model).principal, PolicyPrincipal::Agent, "{model}");
+        }
         Ok(())
+    }
+
+    /// A named actor for the RV4-P1 writer tests.
+    fn test_actor(id: &str) -> rocky_core::config::PrincipalRef {
+        rocky_core::config::PrincipalRef {
+            id: rocky_core::config::PrincipalId::parse_asserted(id).unwrap(),
+            source: rocky_core::config::PrincipalIdSource::Flag,
+        }
     }
 
     /// `resolve_config_models_dir` reads the transformation pipeline's `models`
@@ -9094,6 +9337,7 @@ auto_create_schemas = true
         let config_path = dir.path().join("rocky.toml");
         let mk = |expected: Option<String>, require: bool| super::GovernedRunContext {
             principal: PolicyPrincipal::Agent,
+            actor: rocky_core::config::PrincipalRef::unnamed(),
             plan_id: "plan_x",
             root: dir.path(),
             config_path: &config_path,
@@ -9199,6 +9443,7 @@ auto_create_schemas = true
             std::collections::BTreeMap<String, Vec<rocky_ir::types::TypedColumn>>,
         >| super::GovernedRunContext {
             principal: PolicyPrincipal::Agent,
+            actor: rocky_core::config::PrincipalRef::unnamed(),
             plan_id: "p",
             root: dir.path(),
             config_path: &config_path,
@@ -9263,6 +9508,7 @@ auto_create_schemas = true
         let ledger = StateStore::open(&state)?;
         let ctx = super::GovernedRunContext {
             principal: PolicyPrincipal::Agent,
+            actor: rocky_core::config::PrincipalRef::unnamed(),
             plan_id: "plan_x",
             root: dir.path(),
             config_path: &config,
@@ -9313,6 +9559,7 @@ effect = "deny"
         let ledger = StateStore::open(&state)?;
         let ctx = super::GovernedRunContext {
             principal: PolicyPrincipal::Agent,
+            actor: rocky_core::config::PrincipalRef::unnamed(),
             plan_id: "plan_x",
             root: dir.path(),
             config_path: &config,
@@ -9362,6 +9609,7 @@ effect = "allow"
         let held = StateStore::open(&state)?;
         let ctx = super::GovernedRunContext {
             principal: PolicyPrincipal::Agent,
+            actor: rocky_core::config::PrincipalRef::unnamed(),
             plan_id: "plan_x",
             root: dir.path(),
             config_path: &config,
@@ -9393,6 +9641,7 @@ effect = "allow"
             &config,
             "plan_x",
             PolicyPrincipal::Agent,
+            &rocky_core::config::PrincipalRef::unnamed(),
             &touched,
             &dir.path().join("models"),
             &state,
@@ -9415,6 +9664,7 @@ effect = "allow"
         let ledger = StateStore::open(&state)?;
         let ctx = super::GovernedRunContext {
             principal: PolicyPrincipal::Agent,
+            actor: rocky_core::config::PrincipalRef::unnamed(),
             plan_id: "plan_x",
             root: dir.path(),
             config_path: &dir.path().join("rocky.toml"),
@@ -9457,6 +9707,7 @@ verify_after = ["row_count"]
         let ledger = StateStore::open(&state)?;
         let ctx = super::GovernedRunContext {
             principal: PolicyPrincipal::Agent,
+            actor: rocky_core::config::PrincipalRef::unnamed(),
             plan_id: "plan_x",
             root: dir.path(),
             config_path: &config,
@@ -9491,6 +9742,7 @@ verify_after = ["row_count"]
         super::finish_apply_verify_after(
             "plan_x",
             PolicyPrincipal::Agent,
+            &rocky_core::config::PrincipalRef::unnamed(),
             Vec::new(),
             apply_run_id,
             &state,
@@ -9544,6 +9796,7 @@ autonomy_budget = { failures = 3, window = "7d" }
             policy.as_ref(),
             "plan_x",
             PolicyPrincipal::Agent,
+            &rocky_core::config::PrincipalRef::unnamed(),
             &touched,
             &dir.path().join("models"),
             &state,
@@ -9602,6 +9855,7 @@ effect = "allow"
             pol_a.as_ref(),
             "p",
             PolicyPrincipal::Agent,
+            &rocky_core::config::PrincipalRef::unnamed(),
             &touched,
             &models,
             &state,
@@ -9631,6 +9885,7 @@ autonomy_budget = { failures = 3, window = "7d" }
             pol_b.as_ref(),
             "p",
             PolicyPrincipal::Agent,
+            &rocky_core::config::PrincipalRef::unnamed(),
             &touched,
             &models,
             &state,
@@ -9667,6 +9922,7 @@ autonomy_budget = { failures = 3, window = "7d" }
             &plan_id,
             &state,
             PolicyPrincipal::Agent,
+            &rocky_core::config::PrincipalRef::unnamed(),
             true,
         )
         .await
@@ -9757,6 +10013,7 @@ autonomy_budget = { failures = 3, window = "7d" }
             plan_id,
             &root.join(".rocky-state.redb"),
             PolicyPrincipal::Human,
+            &rocky_core::config::PrincipalRef::unnamed(),
             false,
         )
         .await
@@ -9875,6 +10132,7 @@ autonomy_budget = { failures = 3, window = "7d" }
             &plan_id,
             &root.join(".rocky-state.redb"),
             PolicyPrincipal::Agent,
+            &rocky_core::config::PrincipalRef::unnamed(),
             false,
         )
         .await
@@ -9909,6 +10167,7 @@ autonomy_budget = { failures = 3, window = "7d" }
             &plan_id,
             &state,
             PolicyPrincipal::Human,
+            &rocky_core::config::PrincipalRef::unnamed(),
             true,
         )
         .await
@@ -9954,6 +10213,7 @@ autonomy_budget = { failures = 3, window = "7d" }
                 &plan_id,
                 &state,
                 PolicyPrincipal::Human,
+                &rocky_core::config::PrincipalRef::unnamed(),
                 true,
             )
             .await
@@ -9995,6 +10255,7 @@ autonomy_budget = { failures = 3, window = "7d" }
             &plan_id,
             &state,
             PolicyPrincipal::Human,
+            &rocky_core::config::PrincipalRef::unnamed(),
             true,
         )
         .await
@@ -10068,6 +10329,7 @@ schema_template = "s__{source}"
             &plan_id,
             &state,
             PolicyPrincipal::Agent,
+            &rocky_core::config::PrincipalRef::unnamed(),
             true,
         )
         .await
@@ -10112,6 +10374,7 @@ schema_template = "s__{source}"
             &plan_id,
             &state,
             PolicyPrincipal::Agent,
+            &rocky_core::config::PrincipalRef::unnamed(),
             true,
         )
         .await
@@ -10236,6 +10499,7 @@ schema_template = "s__{source}"
             execution_layers: vec![vec!["db.s.orders".to_string()]],
             product_id: Some("product:revenue_daily".to_string()),
             spec_digest: Some("sha256:abc123".to_string()),
+            intent: None,
         };
         let plan_id = write_plan(dir.path(), PlanKind::Run, &rp)?;
         let persisted = read_plan(dir.path(), &plan_id)?;
@@ -10283,6 +10547,7 @@ schema_template = "s__{source}"
             &bound_id,
             &state,
             PolicyPrincipal::Human,
+            &rocky_core::config::PrincipalRef::unnamed(),
             None,
             false,
         )
@@ -10301,6 +10566,7 @@ schema_template = "s__{source}"
             &unbound_id,
             &state,
             PolicyPrincipal::Human,
+            &rocky_core::config::PrincipalRef::unnamed(),
             Some("sha256:abc"),
             false,
         )
@@ -10318,6 +10584,7 @@ schema_template = "s__{source}"
             &bound_id,
             &state,
             PolicyPrincipal::Human,
+            &rocky_core::config::PrincipalRef::unnamed(),
             Some("sha256:other"),
             false,
         )
@@ -10338,6 +10605,7 @@ schema_template = "s__{source}"
             &bound_id,
             &state,
             PolicyPrincipal::Human,
+            &rocky_core::config::PrincipalRef::unnamed(),
             Some("sha256:abc"),
             false,
         )
@@ -10380,6 +10648,7 @@ schema_template = "s__{source}"
             &plan_id,
             &root.join("state.redb"),
             PolicyPrincipal::Human,
+            &rocky_core::config::PrincipalRef::unnamed(),
             None,
             false,
         )
@@ -10472,6 +10741,7 @@ schema_template = "s__{source}"
                 &plan_id,
                 &state,
                 PolicyPrincipal::Human,
+                &rocky_core::config::PrincipalRef::unnamed(),
                 flag,
                 false,
             )
@@ -10566,6 +10836,7 @@ schema_template = "s__{source}"
             ],
             product_id: None,
             spec_digest: None,
+            intent: None,
         };
         let plan_id = write_plan(dir.path(), PlanKind::Run, &rp)?;
         let persisted = read_plan(dir.path(), &plan_id)?;
@@ -10761,6 +11032,7 @@ schema_template = "s__{source}"
             &plan_id,
             &other_state,
             PolicyPrincipal::Human,
+            &rocky_core::config::PrincipalRef::unnamed(),
             true,
         )
         .await
@@ -10796,6 +11068,7 @@ schema_template = "s__{source}"
             &plan_id,
             &dir.path().join("anywhere.redb"),
             PolicyPrincipal::Human,
+            &rocky_core::config::PrincipalRef::unnamed(),
             true,
         )
         .await;
@@ -10862,6 +11135,7 @@ schema_template = "s__{source}"
             &plan_id,
             &state,
             PolicyPrincipal::Human,
+            &rocky_core::config::PrincipalRef::unnamed(),
             true,
         )
         .await
@@ -10901,6 +11175,7 @@ schema_template = "s__{source}"
             &plan_id,
             &state,
             PolicyPrincipal::Human,
+            &rocky_core::config::PrincipalRef::unnamed(),
             true,
         )
         .await;
@@ -10965,6 +11240,7 @@ schema_template = "s__{source}"
             &plan_id,
             &dir.path().join("state.redb"),
             PolicyPrincipal::Human,
+            &rocky_core::config::PrincipalRef::unnamed(),
             true,
         )
         .await;
@@ -11662,6 +11938,7 @@ schema_template = "s__{source}"
         let r = super::run_verify_after(
             "plan-x",
             PolicyPrincipal::Agent,
+            &rocky_core::config::PrincipalRef::unnamed(),
             &["row_count".to_string(), "not_null_keys".to_string()],
             &run_id,
             &state,
@@ -11681,6 +11958,7 @@ schema_template = "s__{source}"
         let err = super::run_verify_after(
             "plan-x",
             PolicyPrincipal::Agent,
+            &rocky_core::config::PrincipalRef::unnamed(),
             &["not_null_keys".to_string()],
             &run_id,
             &state,
@@ -11693,6 +11971,38 @@ schema_template = "s__{source}"
         );
         // The halt-only state (no rollback substrate) must be stated plainly.
         assert!(msg.contains("HAS ALREADY LANDED"), "halt-only state: {msg}");
+    }
+
+    /// RV4-P1: the `verify_after` custody row carries the applier's principal
+    /// id, on the passing and the failing path alike.
+    #[test]
+    fn verify_after_custody_row_carries_the_actor() {
+        let actor = rocky_core::config::PrincipalRef {
+            id: rocky_core::config::PrincipalId::parse_asserted("verify-actor").unwrap(),
+            source: rocky_core::config::PrincipalIdSource::Env,
+        };
+        for (plan, passed) in [("plan-va-pass", true), ("plan-va-fail", false)] {
+            let dir = tempfile::tempdir().unwrap();
+            let state = dir.path().join("state.redb");
+            let run_id = record_run_with_checks(&state, &[("row_count", passed)]);
+            let result = super::run_verify_after(
+                plan,
+                PolicyPrincipal::Agent,
+                &actor,
+                &["row_count".to_string()],
+                &run_id,
+                &state,
+            );
+            assert_eq!(result.is_ok(), passed, "{plan}");
+            let row = StateStore::open_read_only(&state)
+                .unwrap()
+                .list_policy_decisions()
+                .unwrap()
+                .into_iter()
+                .find(|d| d.plan_id == plan)
+                .expect("the custody row was written");
+            assert_eq!(row.principal_ref.as_ref(), Some(&actor), "{plan}");
+        }
     }
 
     /// #1919: a `verify_after` check name can hold a resolved `${VAR}`. The
@@ -11709,6 +12019,7 @@ schema_template = "s__{source}"
         let err = super::run_verify_after(
             "plan-1919",
             PolicyPrincipal::Agent,
+            &rocky_core::config::PrincipalRef::unnamed(),
             &[SECRET.to_string()],
             &run_id,
             &state,
@@ -11746,6 +12057,7 @@ schema_template = "s__{source}"
         let err = super::run_verify_after(
             "plan-x",
             PolicyPrincipal::Agent,
+            &rocky_core::config::PrincipalRef::unnamed(),
             &["freshness".to_string()],
             &run_id,
             &state,
@@ -11793,6 +12105,7 @@ schema_template = "s__{source}"
         let err = super::run_verify_after(
             "plan-x",
             PolicyPrincipal::Agent,
+            &rocky_core::config::PrincipalRef::unnamed(),
             &["cross_source_overlap:duckdb.orders".to_string()],
             &run_id,
             &state,
@@ -11819,6 +12132,7 @@ schema_template = "s__{source}"
             super::run_verify_after(
                 "plan-x",
                 PolicyPrincipal::Agent,
+                &rocky_core::config::PrincipalRef::unnamed(),
                 &["row_count".to_string()],
                 &run_id,
                 &state,
@@ -11828,14 +12142,66 @@ schema_template = "s__{source}"
         );
     }
 
+    /// #1884: a governed run that succeeded but lost its record still gets
+    /// its `verify_after` custody row. The gate finds no record, fails closed,
+    /// and writes a `Deny` row — the row that burns the autonomy budget. The
+    /// run's own error is what comes back.
+    #[tokio::test]
+    async fn a_lost_run_record_still_writes_the_verify_after_custody_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state.redb");
+        let checks = vec!["row_count".to_string()];
+        let lost: anyhow::Error = crate::commands::run::RunRecordNotPersisted {
+            run_id: "run-lost".into(),
+        }
+        .into();
+        assert!(super::is_lost_run_record(&lost));
+
+        let err = super::verify_after_despite_lost_record(lost, async {
+            super::run_verify_after(
+                "plan-x",
+                PolicyPrincipal::Agent,
+                &rocky_core::config::PrincipalRef::unnamed(),
+                &checks,
+                "run-lost",
+                &state,
+            )
+        })
+        .await;
+        assert!(
+            super::is_lost_run_record(&err),
+            "the run's error must survive: {err:#}"
+        );
+        let decisions = rocky_core::state::StateStore::open(&state)
+            .unwrap()
+            .list_policy_decisions()
+            .unwrap();
+        assert!(
+            decisions.iter().any(
+                |d| d.plan_id == "plan-x" && d.effect == rocky_core::config::PolicyEffect::Deny
+            ),
+            "the fail-closed custody row must land: {decisions:?}"
+        );
+        assert!(!super::is_lost_run_record(&anyhow::anyhow!(
+            "other failure"
+        )));
+    }
+
     #[test]
     fn verify_after_empty_is_noop_even_without_a_run() {
         let dir = tempfile::tempdir().unwrap();
         let state = dir.path().join("state.redb");
         // No required checks → the gate is a no-op and never touches state.
         assert!(
-            super::run_verify_after("plan-x", PolicyPrincipal::Agent, &[], "unused-id", &state)
-                .is_ok()
+            super::run_verify_after(
+                "plan-x",
+                PolicyPrincipal::Agent,
+                &rocky_core::config::PrincipalRef::unnamed(),
+                &[],
+                "unused-id",
+                &state
+            )
+            .is_ok()
         );
     }
 
@@ -11859,6 +12225,7 @@ schema_template = "s__{source}"
         let err = super::run_verify_after(
             "plan-x",
             PolicyPrincipal::Agent,
+            &rocky_core::config::PrincipalRef::unnamed(),
             &["row_count".to_string()],
             "run-A",
             &state,
@@ -11894,6 +12261,7 @@ schema_template = "s__{source}"
         let err = super::run_verify_after(
             "plan-x",
             PolicyPrincipal::Agent,
+            &rocky_core::config::PrincipalRef::unnamed(),
             &["row_count".to_string()],
             "run-dup",
             &state,
@@ -11979,6 +12347,7 @@ autonomy_budget = { failures = 1, window = "7d" }
             reason: "seeded".to_string(),
             verify_after: verify_after.iter().map(|s| (*s).to_string()).collect(),
             auto_apply: None,
+            principal_ref: None,
         }
     }
 
@@ -12038,6 +12407,7 @@ autonomy_budget = { failures = 1, window = "7d" }
             root,
             "plan-x",
             PolicyPrincipal::Agent,
+            &rocky_core::config::PrincipalRef::unnamed(),
             &touched(),
             &root.join("models"),
             None,
