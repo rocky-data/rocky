@@ -2353,10 +2353,11 @@ async fn breaker_trip_without_recovery_timeout_emits_none_cooldown() {
 /// guard is reverted inside `execute_batch_row_counts`. This one does not.
 ///
 /// Three tables, one readable count each — except `bad`, whose count cell is
-/// a JSON null. `bad` must be ABSENT from the results, not present with 0,
-/// and the other two must be unaffected by its removal.
+/// a JSON null. `bad` must come back UNREADABLE with the reason (#1928), not
+/// measured with 0, and the other two must be unaffected by it.
 #[tokio::test]
-async fn an_unreadable_batched_row_count_cell_is_omitted_from_the_results() {
+async fn an_unreadable_batched_row_count_cell_is_unreadable_with_its_reason() {
+    use rocky_core::traits::BatchReading;
     use rocky_databricks::batch::{BatchTableRef, execute_batch_row_counts};
 
     let server = MockServer::start().await;
@@ -2398,24 +2399,34 @@ async fn an_unreadable_batched_row_count_cell_is_omitted_from_the_results() {
         .await
         .expect("a readable response is not an error");
 
-    let named: Vec<(&str, u64)> = results
+    let named: Vec<(&str, BatchReading<u64>)> = results
         .iter()
-        .map(|r| (r.table.as_str(), r.count))
+        .map(|r| (r.table.as_str(), r.count.clone()))
         .collect();
 
-    assert!(
-        !named.iter().any(|(t, _)| *t == "bad"),
-        "an unreadable count must not reach the caller as a measured row: {named:?}"
+    // In row order, so the unreadable row neither truncates nor shifts the
+    // ones that follow it.
+    assert_eq!(
+        named,
+        vec![
+            ("before", BatchReading::Readable(11)),
+            (
+                "bad",
+                BatchReading::Unreadable(
+                    "the row count cell was not a non-negative integer (got null)".to_string()
+                )
+            ),
+            ("after", BatchReading::Readable(22)),
+        ],
+        "{named:?}"
     );
-    // The rows on either side are untouched, so the omission is not a
-    // truncation and does not shift the ones that follow it.
-    assert_eq!(named, vec![("before", 11), ("after", 22)], "{named:?}");
 }
 
-/// #1929. An unreadable freshness timestamp must become an ABSENT result, so
-/// `run.rs` reports the table not evaluated and the gate trips. It used to
-/// become `max_timestamp: None`, which the consumer read as "empty table,
-/// emit no check" — so the check silently vanished.
+/// #1929. An unreadable freshness timestamp must become an UNREADABLE result
+/// carrying the reason (#1928), so `run.rs` reports the table not evaluated
+/// and the gate trips. It used to become `max_timestamp: None`, which the
+/// consumer read as "empty table, emit no check" — so the check silently
+/// vanished.
 ///
 /// A genuine SQL NULL is the control: it must STILL be returned with `None`,
 /// now beside the `COUNT(*)` that tells the consumer whether the table is
@@ -2430,10 +2441,10 @@ async fn an_unreadable_batched_row_count_cell_is_omitted_from_the_results() {
 /// with that shape, so a reorder of the SELECT list fails here and not only
 /// on the generator's string.
 #[tokio::test]
-async fn an_unreadable_freshness_timestamp_is_omitted_and_a_null_is_kept() {
+async fn an_unreadable_freshness_timestamp_is_unreadable_and_a_null_is_kept() {
     use std::sync::Arc;
 
-    use rocky_core::traits::BatchCheckAdapter;
+    use rocky_core::traits::{BatchCheckAdapter, BatchReading};
     use rocky_databricks::adapter::DatabricksBatchCheckAdapter;
     use rocky_ir::TableRef;
 
@@ -2496,12 +2507,20 @@ async fn an_unreadable_freshness_timestamp_is_omitted_and_a_null_is_kept() {
 
     let named: Vec<(&str, bool, Option<u64>)> = results
         .iter()
-        .map(|r| {
-            (
+        .filter_map(|r| match &r.reading {
+            BatchReading::Readable(f) => Some((
                 r.table.table.as_str(),
-                r.max_timestamp.is_some(),
-                r.row_count,
-            )
+                f.max_timestamp.is_some(),
+                f.row_count,
+            )),
+            BatchReading::Unreadable(_) => None,
+        })
+        .collect();
+    let unreadable: Vec<(&str, &str)> = results
+        .iter()
+        .filter_map(|r| match &r.reading {
+            BatchReading::Unreadable(reason) => Some((r.table.table.as_str(), reason.as_str())),
+            BatchReading::Readable(_) => None,
         })
         .collect();
 
@@ -2523,15 +2542,28 @@ async fn an_unreadable_freshness_timestamp_is_omitted_and_a_null_is_kept() {
         named.contains(&("good", true, Some(2))),
         "a readable timestamp must still be measured: {named:?}"
     );
+    assert_eq!(named.len(), 3, "only three rows are readable: {named:?}");
 
-    // These four must be ABSENT, so run.rs reports them not evaluated
-    // instead of silently emitting nothing. `badcount` is the new one: a
-    // count that does not read as a number leaves its NULL unclassifiable.
-    for table in ["unparsable", "nonstring", "badcount", "shortrow"] {
-        assert!(
-            !named.iter().any(|(t, _, _)| *t == table),
-            "{table}: an unreadable cell must not be returned as None, \
-             which reads as an empty table: {named:?}"
-        );
-    }
+    // These four come back UNREADABLE with the cause, so run.rs reports them
+    // not evaluated and says why (#1928). `badcount` is a count that does not
+    // read as a number, which leaves its NULL unclassifiable.
+    assert_eq!(
+        unreadable,
+        vec![
+            (
+                "unparsable",
+                "the freshness timestamp \"yesterday\" would not parse"
+            ),
+            (
+                "nonstring",
+                "the freshness timestamp cell was not a string (got 12345)"
+            ),
+            (
+                "badcount",
+                "the freshness row count cell was not a non-negative integer (got \"many\")"
+            ),
+            ("shortrow", "the freshness row carried no timestamp cell"),
+        ],
+        "{unreadable:?}"
+    );
 }

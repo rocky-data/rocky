@@ -50,6 +50,10 @@
 //!   beside `MAX`, which tells an empty table from rows with no value).
 //!   Nothing bridges the SDK's batch results into the core check runner
 //!   yet, so the field has no consumer here; add it when that bridge lands.
+//! - `RowCountResult` / `FreshnessResult` here are flat, while
+//!   `rocky_core::traits` returns one `BatchTableResult` per table whose
+//!   reading is `Readable(T)` or `Unreadable(reason)` (#1928). Same reason
+//!   as above: align them when the bridge lands.
 
 use std::collections::BTreeMap;
 

@@ -22,8 +22,9 @@ use rocky_core::hooks::{HookContext, HookRegistry};
 use rocky_core::sql_gen;
 use rocky_core::state::{ResumeScope, RunProgress, StateError, StateStore, WatermarkRecoveryTable};
 use rocky_core::traits::{
-    AdapterResult, BatchCheckAdapter, FreshnessResult as BatchFreshnessResult, GovernanceAdapter,
-    MaskingPolicy, RowCountResult as BatchRowCountResult, TagTarget, WarehouseAdapter,
+    AdapterResult, BatchCheckAdapter, BatchReading, Freshness as BatchFreshness,
+    FreshnessResult as BatchFreshnessResult, GovernanceAdapter, MaskingPolicy,
+    RowCountResult as BatchRowCountResult, TagTarget, WarehouseAdapter,
 };
 use rocky_ir::*;
 use sqlparser::ast::{ObjectName, SetExpr, Statement, TableFactor};
@@ -8154,9 +8155,11 @@ async fn run_batched_checks(
     // for a table that is missing from the measured results, so a measured
     // table never reads a stale reason. BOTH paths record here: the per-table
     // path names the one table whose own query failed, the batch path names
-    // every table the failed leg was handed (#1655). A table that a leg
-    // answered WITHOUT leaving a row for is not recorded — there is no reason
-    // to give, and it is reported as "returned no readable count for this table".
+    // every table the failed leg was handed (#1655), and a leg that answered
+    // but could not read one table records the adapter's reason for it
+    // (#1928). A table that a leg answered WITHOUT leaving a row for is not
+    // recorded — there is no reason to give, and it is reported as "returned
+    // no readable count for this table".
     let mut source_count_failures: HashMap<String, String> = HashMap::new();
     let mut target_count_failures: HashMap<String, String> = HashMap::new();
     // In table order, so the emitted results are deterministic.
@@ -8184,7 +8187,9 @@ async fn run_batched_checks(
 
     // A failed row-count leg contributes no measurements, and every table
     // it covered gets the reason. Reported by the same code that reports
-    // a per-table failure, so the two paths emit the same check shape.
+    // a per-table failure, so the two paths emit the same check shape. A
+    // leg that answered but could not read one table's count names that
+    // table with the adapter's own reason (#1928).
     fn fold_row_count_leg(
         leg: AdapterResult<Vec<BatchRowCountResult>>,
         refs: &[TableRef],
@@ -8192,7 +8197,20 @@ async fn run_batched_checks(
         failures: &mut HashMap<String, String>,
     ) -> Vec<BatchRowCountResult> {
         match leg {
-            Ok(rows) => rows,
+            Ok(rows) => {
+                for row in &rows {
+                    if let BatchReading::Unreadable(reason) = &row.reading {
+                        warn!(
+                            side,
+                            table = row.table.full_name(),
+                            reason = reason.as_str(),
+                            "the batch row count query could not read this table's count"
+                        );
+                        failures.insert(row.table.full_name(), reason.clone());
+                    }
+                }
+                rows
+            }
             Err(e) => {
                 warn!(
                     side,
@@ -8232,7 +8250,7 @@ async fn run_batched_checks(
                     match checks::cell_as_u64(result.rows.first().and_then(|r| r.first())) {
                         Some(count) => counts.push(BatchRowCountResult {
                             table: br.clone(),
-                            count,
+                            reading: BatchReading::Readable(count),
                         }),
                         None => {
                             warn!(
@@ -8295,16 +8313,20 @@ async fn run_batched_checks(
                         (Some(rows), Some(cell)) if cell.is_null() => {
                             fresh_results.push(BatchFreshnessResult {
                                 table: br.clone(),
-                                max_timestamp: None,
-                                row_count: Some(rows),
+                                reading: BatchReading::Readable(BatchFreshness {
+                                    max_timestamp: None,
+                                    row_count: Some(rows),
+                                }),
                             });
                         }
                         (Some(rows), Some(cell)) => {
                             match cell.as_str().and_then(parse_timestamp_cell) {
                                 Some(ts) => fresh_results.push(BatchFreshnessResult {
                                     table: br.clone(),
-                                    max_timestamp: Some(ts),
-                                    row_count: Some(rows),
+                                    reading: BatchReading::Readable(BatchFreshness {
+                                        max_timestamp: Some(ts),
+                                        row_count: Some(rows),
+                                    }),
                                 }),
                                 None => {
                                     warn!(table = br.table.as_str(), cell = %cell, "per-table freshness check returned an unreadable timestamp");
@@ -8397,7 +8419,29 @@ async fn run_batched_checks(
     };
 
     let freshness_results: Vec<BatchFreshnessResult> = match batched_freshness {
-        Some(Ok(rows)) => rows,
+        // A table the leg answered for but could not read is recorded with
+        // the adapter's own reason, in the order the adapter returned it
+        // (#1928). A table that ALSO has a readable row is measured, so it
+        // records no failure and is not reported twice.
+        Some(Ok(rows)) => {
+            for row in &rows {
+                if let BatchReading::Unreadable(reason) = &row.reading {
+                    let readable_twin = rows.iter().any(|other| {
+                        other.table == row.table
+                            && matches!(other.reading, BatchReading::Readable(_))
+                    });
+                    if !readable_twin {
+                        warn!(
+                            table = row.table.full_name(),
+                            reason = reason.as_str(),
+                            "the batch freshness query could not read this table — reporting it as not evaluated"
+                        );
+                        freshness_failures.push((row.table.full_name(), reason.clone()));
+                    }
+                }
+            }
+            rows
+        }
         Some(Err(e)) => {
             warn!(
                 tables = freshness_batch_refs.len(),
@@ -8425,14 +8469,14 @@ async fn run_batched_checks(
     // Measured counts by full table name. A table absent from a map has no
     // measurement: its query failed, returned no readable count, or the batch
     // query left it out.
-    let source_map: HashMap<String, u64> = source_counts
-        .iter()
-        .map(|r| (r.table.full_name(), r.count))
-        .collect();
-    let target_map: HashMap<String, u64> = target_counts
-        .iter()
-        .map(|r| (r.table.full_name(), r.count))
-        .collect();
+    let measured_count = |r: &BatchRowCountResult| match r.reading {
+        BatchReading::Readable(count) => Some((r.table.full_name(), count)),
+        BatchReading::Unreadable(_) => None,
+    };
+    let source_map: HashMap<String, u64> =
+        source_counts.iter().filter_map(measured_count).collect();
+    let target_map: HashMap<String, u64> =
+        target_counts.iter().filter_map(measured_count).collect();
 
     // Process row count results
     if row_count_enabled {
@@ -8653,7 +8697,11 @@ async fn run_batched_checks(
         // before the count existed.
         let measured = freshness_batch_refs.iter().filter_map(|tref| {
             let key = tref.full_name();
-            match freshness_results.iter().find(|fr| fr.table == *tref) {
+            let readable = freshness_results.iter().find_map(|fr| match &fr.reading {
+                BatchReading::Readable(f) if fr.table == *tref => Some(f),
+                _ => None,
+            });
+            match readable {
                 Some(fr) => match (fr.max_timestamp, fr.row_count) {
                     (Some(ts), _) => {
                         let lag = (now - ts).num_seconds().unsigned_abs();
@@ -8670,8 +8718,8 @@ async fn run_batched_checks(
                     )),
                     (None, _) => None,
                 },
-                // Absent from the results and with no recorded reason: the
-                // batch query left this table out.
+                // No readable row and no recorded reason: the batch query
+                // left this table out.
                 None if !freshness_failures.iter().any(|(k, _)| *k == key) => {
                     warn!(
                         table = key.as_str(),
@@ -8685,7 +8733,9 @@ async fn run_batched_checks(
                         ),
                     ))
                 }
-                // Absent, but the per-table path already recorded why.
+                // No readable row, and a reason is already recorded: the
+                // leg failed, the adapter said why it could not read the
+                // table, or the per-table path did.
                 None => None,
             }
         });
@@ -40725,7 +40775,7 @@ threshold = 0
                 .iter()
                 .map(|t| BatchRowCountResult {
                     table: t.clone(),
-                    count: self.count,
+                    reading: BatchReading::Readable(self.count),
                 })
                 .collect())
         }
@@ -40744,8 +40794,10 @@ threshold = 0
                 .iter()
                 .map(|t| BatchFreshnessResult {
                     table: t.clone(),
-                    max_timestamp: self.max_timestamp,
-                    row_count: self.freshness_row_count,
+                    reading: BatchReading::Readable(BatchFreshness {
+                        max_timestamp: self.max_timestamp,
+                        row_count: self.freshness_row_count,
+                    }),
                 })
                 .collect())
         }
@@ -40776,6 +40828,100 @@ threshold = 0
                 "source: the batch row count query returned no readable count for this table; \
                  target: the batch row count query returned no readable count for this table"
             ),
+            "{result:?}"
+        );
+    }
+
+    /// A `BatchCheckAdapter` that answers for every table but cannot read
+    /// any of them, and says why (#1928).
+    #[cfg(feature = "duckdb")]
+    struct UnreadableBatchCheck;
+
+    #[cfg(feature = "duckdb")]
+    const UNREADABLE_COUNT: &str = "the row count cell was not a non-negative integer (got null)";
+    #[cfg(feature = "duckdb")]
+    const UNREADABLE_TIMESTAMP: &str = "the freshness timestamp \"yesterday\" would not parse";
+
+    #[cfg(feature = "duckdb")]
+    #[async_trait::async_trait]
+    impl BatchCheckAdapter for UnreadableBatchCheck {
+        async fn batch_row_counts(
+            &self,
+            tables: &[TableRef],
+        ) -> rocky_core::traits::AdapterResult<Vec<BatchRowCountResult>> {
+            Ok(tables
+                .iter()
+                .map(|t| BatchRowCountResult {
+                    table: t.clone(),
+                    reading: BatchReading::Unreadable(UNREADABLE_COUNT.to_string()),
+                })
+                .collect())
+        }
+
+        async fn batch_freshness(
+            &self,
+            tables: &[TableRef],
+            _timestamp_col: &str,
+        ) -> rocky_core::traits::AdapterResult<Vec<BatchFreshnessResult>> {
+            Ok(tables
+                .iter()
+                .map(|t| BatchFreshnessResult {
+                    table: t.clone(),
+                    reading: BatchReading::Unreadable(UNREADABLE_TIMESTAMP.to_string()),
+                })
+                .collect())
+        }
+
+        async fn batch_describe_schema(
+            &self,
+            _catalog: &str,
+            _schema: &str,
+        ) -> rocky_core::traits::AdapterResult<HashMap<String, Vec<ColumnInfo>>> {
+            Ok(HashMap::new())
+        }
+    }
+
+    /// #1928: the check result carries the adapter's reason for an
+    /// unreadable count, not the generic "no readable count" text, and the
+    /// check still gates.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn an_unreadable_batch_row_count_carries_the_adapters_reason() {
+        let inner = seeded_duckdb().await;
+        let fx = BatchedCheckFixture::new("row_count = true");
+
+        let (pending, _, _) = fx.run(&inner, Some(&UnreadableBatchCheck), None).await;
+        let result = the_result(&pending, &fx.target_key(), "row_count");
+        assert!(!result.passed, "{result:?}");
+        assert_eq!(
+            result.severity,
+            rocky_core::tests::TestSeverity::Error,
+            "{result:?}"
+        );
+        assert_eq!(
+            result.not_evaluated.as_deref(),
+            Some(format!("source: {UNREADABLE_COUNT}; target: {UNREADABLE_COUNT}").as_str()),
+            "{result:?}"
+        );
+    }
+
+    /// #1928, freshness: an unreadable row is reported once, with the
+    /// adapter's reason, and gates.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn an_unreadable_batch_freshness_carries_the_adapters_reason() {
+        let inner = seeded_duckdb().await;
+        let fx = BatchedCheckFixture::new(
+            "[pipeline.bronze.checks.freshness]\nthreshold_seconds = 3600",
+        );
+
+        let (pending, _, _) = fx.run(&inner, Some(&UnreadableBatchCheck), None).await;
+        // `the_result` also asserts the table is reported exactly once.
+        let result = the_result(&pending, &fx.target_key(), "freshness");
+        assert!(!result.passed, "{result:?}");
+        assert_eq!(
+            result.not_evaluated.as_deref(),
+            Some(UNREADABLE_TIMESTAMP),
             "{result:?}"
         );
     }
@@ -41610,7 +41756,7 @@ threshold = 0
                 .iter()
                 .map(|t| BatchRowCountResult {
                     table: t.clone(),
-                    count: BATCHED_COUNT,
+                    reading: BatchReading::Readable(BATCHED_COUNT),
                 })
                 .collect())
         }
@@ -41631,8 +41777,10 @@ threshold = 0
                 .iter()
                 .map(|t| BatchFreshnessResult {
                     table: t.clone(),
-                    max_timestamp: Some(Utc::now()),
-                    row_count: Some(1),
+                    reading: BatchReading::Readable(BatchFreshness {
+                        max_timestamp: Some(Utc::now()),
+                        row_count: Some(1),
+                    }),
                 })
                 .collect())
         }
