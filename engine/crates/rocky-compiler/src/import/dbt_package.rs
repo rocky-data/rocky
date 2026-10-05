@@ -828,6 +828,70 @@ pub fn case_duplicates(import: &PackageImport) -> Vec<(String, String)> {
     out
 }
 
+/// The lowercased `catalog.schema.table` a target writes; an empty table
+/// defaults to the model name, as the model loader does.
+pub fn target_key(target: &TargetConfig, model_name: &str) -> String {
+    let table = if target.table.is_empty() {
+        model_name
+    } else {
+        target.table.as_str()
+    };
+    format!("{}.{}.{}", target.catalog, target.schema, table).to_lowercase()
+}
+
+/// A package model whose `[target]` table another model already writes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TargetCollision {
+    /// The package model.
+    pub model: String,
+    /// The lowercased `catalog.schema.table` both write.
+    pub target: String,
+    /// The other model's name.
+    pub existing: String,
+    /// `project`, a lock entry name, or `this package` for two models of the
+    /// package being vendored.
+    pub owner: String,
+}
+
+/// Target tables written twice: by two models of `import`, or by a model of
+/// `import` and an existing model in `existing` (keyed by [`target_key`]),
+/// except one owned by a package in `replacing`.
+pub fn find_target_collisions(
+    import: &PackageImport,
+    existing: &BTreeMap<String, BTreeSet<ExistingModel>>,
+    replacing: &BTreeSet<String>,
+) -> Vec<TargetCollision> {
+    let mut out = Vec::new();
+    let mut seen: BTreeMap<String, &str> = BTreeMap::new();
+    for vm in &import.models {
+        let key = target_key(&vm.model.config.target, &vm.model.name);
+        if let Some(first) = seen.get(&key) {
+            out.push(TargetCollision {
+                model: vm.model.name.clone(),
+                target: key.clone(),
+                existing: (*first).to_string(),
+                owner: "this package".to_string(),
+            });
+        } else {
+            seen.insert(key.clone(), &vm.model.name);
+        }
+        for def in existing
+            .get(&key)
+            .into_iter()
+            .flatten()
+            .filter(|d| !replacing.contains(&d.owner))
+        {
+            out.push(TargetCollision {
+                model: vm.model.name.clone(),
+                target: key.clone(),
+                existing: def.name.clone(),
+                owner: def.owner.clone(),
+            });
+        }
+    }
+    out
+}
+
 /// The name a model file resolves to: `name =` in its `<stem>.toml` sidecar
 /// or its `---toml` frontmatter, else the file stem. Mirrors the model
 /// loader's precedence without its env-var substitution, which a model name
@@ -1985,6 +2049,46 @@ mod tests {
                     owner: "project".into()
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn target_collisions_within_the_package_and_with_existing_models_are_found() {
+        let (manifest, info, _d) = load_fixture();
+        let mut import = import_package(&manifest, &info, "stripe", &target()).unwrap();
+        assert!(find_target_collisions(&import, &BTreeMap::new(), &BTreeSet::new()).is_empty());
+        // Two package models aliased onto one table.
+        import.models[1].model.config.target.table = "Stg_Stripe__Charge".into();
+        let mut existing: BTreeMap<String, BTreeSet<ExistingModel>> = BTreeMap::new();
+        existing.insert(
+            "dev.main.stripe__charges".into(),
+            [ExistingModel {
+                name: "my_charges".into(),
+                owner: "project".into(),
+            }]
+            .into(),
+        );
+        let found = find_target_collisions(&import, &existing, &BTreeSet::new());
+        let pairs: Vec<(&str, &str, &str)> = found
+            .iter()
+            .map(|c| (c.model.as_str(), c.existing.as_str(), c.owner.as_str()))
+            .collect();
+        assert!(
+            pairs.contains(&("stripe__charges", "my_charges", "project")),
+            "{found:?}"
+        );
+        assert!(
+            found
+                .iter()
+                .any(|c| c.owner == "this package" && c.target == "dev.main.stg_stripe__charge"),
+            "{found:?}"
+        );
+        // An existing model of the package being re-vendored does not collide.
+        let replacing: BTreeSet<String> = ["project".to_string()].into();
+        assert!(
+            find_target_collisions(&import, &existing, &replacing)
+                .iter()
+                .all(|c| c.owner == "this package")
         );
     }
 

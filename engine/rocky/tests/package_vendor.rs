@@ -552,6 +552,62 @@ fn a_second_hub_with_the_same_dbt_project_name_is_refused() {
 }
 
 #[test]
+fn a_project_model_writing_a_package_table_is_refused() {
+    let tmp = project();
+    let root = tmp.path();
+    // Different name, same [target] table.
+    fs::write(root.join("models/my_overview.sql"), "SELECT 1 AS id\n").unwrap();
+    fs::write(
+        root.join("models/my_overview.toml"),
+        "[target]\ncatalog = \"dev\"\nschema = \"main\"\ntable = \"Stripe__Customer_Overview\"\n",
+    )
+    .unwrap();
+    let err = refused(&rocky(
+        root,
+        &[
+            "package",
+            "add",
+            "fivetran/stripe",
+            "--compiled",
+            &compiled_flag(),
+        ],
+    ));
+    assert!(
+        err.contains("`stripe__customer_overview` and `my_overview`")
+            && err.contains("dev.main.stripe__customer_overview"),
+        "{err}"
+    );
+    assert!(!root.join("models/packages").exists());
+}
+
+#[test]
+fn collisions_are_checked_in_every_configured_models_directory() {
+    let tmp = project();
+    let root = tmp.path();
+    let mut config = fs::read_to_string(root.join("rocky.toml")).unwrap();
+    config.push_str("\n[pipeline.extra]\ntype = \"transformation\"\nmodels = \"extra/**\"\n\n[pipeline.extra.target.governance]\nauto_create_schemas = true\n");
+    fs::write(root.join("rocky.toml"), config).unwrap();
+    fs::create_dir_all(root.join("extra")).unwrap();
+    fs::write(
+        root.join("extra/stg_stripe__charge.sql"),
+        "SELECT 1 AS id\n",
+    )
+    .unwrap();
+    fs::write(root.join("extra/stg_stripe__charge.toml"), SIDECAR).unwrap();
+    let err = refused(&rocky(
+        root,
+        &[
+            "package",
+            "add",
+            "fivetran/stripe",
+            "--compiled",
+            &compiled_flag(),
+        ],
+    ));
+    assert!(err.contains("stg_stripe__charge"), "{err}");
+}
+
+#[test]
 fn build_empty_and_compiled_conflict() {
     let tmp = project();
     let err = refused(&rocky(

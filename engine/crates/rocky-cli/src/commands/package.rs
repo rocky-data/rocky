@@ -597,7 +597,7 @@ fn vendor(
 
     // Namespacing: refuse a model name the project or another package owns.
     let lock = PackagesLock::read(lock_path).map_err(e055)?;
-    let existing = existing_models(root, &lock, &planned)?;
+    let existing = existing_models(&config, config_path, root, &lock, &planned)?;
     let replacing: BTreeSet<String> = std::iter::once(pkg_name.clone()).collect();
     let twins = dbt_package::case_duplicates(&import);
     if !twins.is_empty() {
@@ -612,7 +612,7 @@ fn vendor(
             list.join(", ")
         )));
     }
-    let collisions = dbt_package::find_collisions(&import, &existing, &replacing);
+    let collisions = dbt_package::find_collisions(&import, &existing.names, &replacing);
     if !collisions.is_empty() {
         let list: Vec<String> = collisions
             .iter()
@@ -630,6 +630,35 @@ fn vendor(
              remove the existing model first",
             list.join(", ")
         )));
+    }
+
+    let target_collisions =
+        dbt_package::find_target_collisions(&import, &existing.targets, &replacing);
+    if !target_collisions.is_empty() {
+        let list: Vec<String> = target_collisions
+            .iter()
+            .map(|c| {
+                format!(
+                    "`{}` and `{}` ({}) both write `{}`",
+                    c.model, c.existing, c.owner, c.target
+                )
+            })
+            .collect();
+        bail!(e055(format!(
+            "package `{pkg_name}` would write tables another model already writes: {}. Change \
+             one model's [target] (or --target-schema) first; nothing was written",
+            list.join("; ")
+        )));
+    }
+    for e in &existing.load_errors {
+        diagnostics.push(w055(
+            format!(
+                "could not load every project model, so target-table collisions with it were \
+                 not checked: {e}"
+            ),
+            None,
+            None,
+        ));
     }
 
     let locked_files = previous.map(|p| p.files.clone()).unwrap_or_default();
@@ -826,50 +855,113 @@ fn select_adapter<'a>(
     }
 }
 
-/// Every model already in the project, keyed by lowercased resolved name
-/// (sidecar `name =` override, else the file stem), with its owner: the lock
-/// entry that vendored it, or `project`.
+/// The models already in the project, from every transformation pipeline's
+/// models directory (`models/` when no pipeline declares one).
+struct ProjectModels {
+    /// Lowercased resolved name (sidecar `name =` override, else the file
+    /// stem) → definitions, each with its owner: the lock entry that vendored
+    /// it, or `project`.
+    names: BTreeMap<String, BTreeSet<dbt_package::ExistingModel>>,
+    /// [`dbt_package::target_key`] → the models writing that table.
+    targets: BTreeMap<String, BTreeSet<dbt_package::ExistingModel>>,
+    /// Directories whose models could not all be loaded, so the target check
+    /// is incomplete there.
+    load_errors: Vec<String>,
+}
+
+/// The directories `rocky compile` reads models from.
+fn project_model_dirs(config: &RockyConfig, config_path: &Path, root: &Path) -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    for pipeline in config.pipelines.values() {
+        let Some(tx) = pipeline.as_transformation() else {
+            continue;
+        };
+        if let Ok(crate::models_loader::ModelsDir::Present(dir)) =
+            crate::models_loader::locate_models_dir(&tx.models, config_path)
+            && !dirs.contains(&dir)
+        {
+            dirs.push(dir);
+        }
+    }
+    if dirs.is_empty() {
+        dirs.push(root.join("models"));
+    }
+    dirs
+}
+
+/// Scan the project's models.
 ///
 /// A file at a path this run is about to write, with exactly the content it
 /// would write, is skipped: it is the leftover of an earlier run that wrote
 /// files but failed before recording them, not a competing model.
 fn existing_models(
+    config: &RockyConfig,
+    config_path: &Path,
     root: &Path,
     lock: &PackagesLock,
     planned: &BTreeMap<String, String>,
-) -> Result<BTreeMap<String, BTreeSet<dbt_package::ExistingModel>>> {
-    let models_dir = root.join("models");
-    let mut out = BTreeMap::new();
-    let (dirs, errors) = rocky_core::model_walk::walk_model_dirs(&models_dir);
-    if let Some(e) = errors.into_iter().next() {
-        return Err(anyhow!("{e}"));
-    }
-    for dir in dirs {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let ext = path.extension().and_then(|e| e.to_str());
-            if !matches!(ext, Some("sql" | "rocky")) {
-                continue;
-            }
-            let Some(name) = dbt_package::resolved_model_name(&path) else {
+) -> Result<ProjectModels> {
+    let owner_of = |path: &Path| -> Option<String> {
+        let rel = relative_slash(root, path);
+        let owner = lock.owner_of(&rel).unwrap_or("project").to_string();
+        let leftover = owner == "project"
+            && planned.get(&rel).is_some_and(|content| {
+                dbt_package::read_disk(path)
+                    == dbt_package::DiskFile::Hash(dbt_package::content_hash(content))
+            });
+        (!leftover).then_some(owner)
+    };
+    let mut out = ProjectModels {
+        names: BTreeMap::new(),
+        targets: BTreeMap::new(),
+        load_errors: Vec::new(),
+    };
+    for models_dir in project_model_dirs(config, config_path, root) {
+        let (dirs, errors) = rocky_core::model_walk::walk_model_dirs(&models_dir);
+        if let Some(e) = errors.into_iter().next() {
+            return Err(anyhow!("{e}"));
+        }
+        for dir in dirs {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
                 continue;
             };
-            let rel = relative_slash(root, &path);
-            let owner = lock.owner_of(&rel).unwrap_or("project").to_string();
-            if owner == "project"
-                && planned.get(&rel).is_some_and(|content| {
-                    dbt_package::read_disk(&path)
-                        == dbt_package::DiskFile::Hash(dbt_package::content_hash(content))
-                })
-            {
-                continue;
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let ext = path.extension().and_then(|e| e.to_str());
+                if !matches!(ext, Some("sql" | "rocky")) {
+                    continue;
+                }
+                let Some(name) = dbt_package::resolved_model_name(&path) else {
+                    continue;
+                };
+                let Some(owner) = owner_of(&path) else {
+                    continue;
+                };
+                out.names
+                    .entry(name.to_lowercase())
+                    .or_insert_with(BTreeSet::new)
+                    .insert(dbt_package::ExistingModel { name, owner });
             }
-            out.entry(name.to_lowercase())
+        }
+        let (models, errors) = crate::models_loader::load_project_models_partial(&models_dir, None);
+        for e in errors {
+            out.load_errors
+                .push(format!("{}: {e}", models_dir.display()));
+        }
+        for model in models {
+            let Some(owner) = owner_of(&model.file_path) else {
+                continue;
+            };
+            out.targets
+                .entry(dbt_package::target_key(
+                    &model.config.target,
+                    &model.config.name,
+                ))
                 .or_insert_with(BTreeSet::new)
-                .insert(dbt_package::ExistingModel { name, owner });
+                .insert(dbt_package::ExistingModel {
+                    name: model.config.name.clone(),
+                    owner,
+                });
         }
     }
     Ok(out)
