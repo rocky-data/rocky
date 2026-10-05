@@ -168,9 +168,9 @@ export interface AuditDecisionEntry {
    */
   principal_id_source?: PrincipalIdSource | null;
   /**
-   * Whether anything verified the id. Always `false` today: ids are self-asserted until signed approvals exist.
+   * Whether anything verified the id. Always `false` today: ids are self-asserted until signed approvals exist. Defaulted, so a consumer reading an older binary's output sees `false`.
    */
-  principal_id_verified: boolean;
+  principal_id_verified?: boolean;
   /**
    * Human-readable explanation of how the effect was reached. A resolved `${VAR}` value prints as `${NAME}` (#1919).
    */

@@ -393,9 +393,9 @@ class AuditDecisionEntry(BaseModel):
     """
     Where the id came from (`flag`, `env`, `mcp_profile`, `default`). `null` when the id is unrecorded.
     """
-    principal_id_verified: bool
+    principal_id_verified: bool | None = False
     """
-    Whether anything verified the id. Always `false` today: ids are self-asserted until signed approvals exist.
+    Whether anything verified the id. Always `false` today: ids are self-asserted until signed approvals exist. Defaulted, so a consumer reading an older binary's output sees `false`.
     """
     reason: str
     """

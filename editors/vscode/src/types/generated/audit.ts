@@ -62,9 +62,9 @@ export interface AuditOutput {
    */
   product?: AuditProductScope | null;
   /**
-   * How many rows in range carry no principal id (written before ids existed) and so an `--actor <id>` filter dropped them. `0` without an `--actor` filter, and under `--actor unrecorded`, which lists them.
+   * How many rows in range carry no principal id (written before ids existed) and so an `--actor <id>` filter dropped them. `0` without an `--actor` filter, and under `--actor unrecorded`, which lists them. Defaulted, so a consumer reading an older binary's output sees `0`.
    */
-  unattributed_skipped: number;
+  unattributed_skipped?: number;
   version: string;
   [k: string]: unknown;
 }
@@ -101,9 +101,9 @@ export interface AuditDecisionEntry {
    */
   principal_id_source?: PrincipalIdSource | null;
   /**
-   * Whether anything verified the id. Always `false` today: ids are self-asserted until signed approvals exist.
+   * Whether anything verified the id. Always `false` today: ids are self-asserted until signed approvals exist. Defaulted, so a consumer reading an older binary's output sees `false`.
    */
-  principal_id_verified: boolean;
+  principal_id_verified?: boolean;
   /**
    * Human-readable explanation of how the effect was reached. A resolved `${VAR}` value prints as `${NAME}` (#1919).
    */

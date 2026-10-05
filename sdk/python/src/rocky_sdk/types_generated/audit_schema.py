@@ -260,9 +260,9 @@ class AuditDecisionEntry(BaseModel):
     """
     Where the id came from (`flag`, `env`, `mcp_profile`, `default`). `null` when the id is unrecorded.
     """
-    principal_id_verified: bool
+    principal_id_verified: bool | None = False
     """
-    Whether anything verified the id. Always `false` today: ids are self-asserted until signed approvals exist.
+    Whether anything verified the id. Always `false` today: ids are self-asserted until signed approvals exist. Defaulted, so a consumer reading an older binary's output sees `false`.
     """
     reason: str
     """
@@ -298,8 +298,8 @@ class AuditOutput(BaseModel):
     """
     The product the ledger was filtered to (`--product <name>`), absent when the whole ledger is listed.
     """
-    unattributed_skipped: conint(ge=0)
+    unattributed_skipped: conint(ge=0) | None = 0
     """
-    How many rows in range carry no principal id (written before ids existed) and so an `--actor <id>` filter dropped them. `0` without an `--actor` filter, and under `--actor unrecorded`, which lists them.
+    How many rows in range carry no principal id (written before ids existed) and so an `--actor <id>` filter dropped them. `0` without an `--actor` filter, and under `--actor unrecorded`, which lists them. Defaulted, so a consumer reading an older binary's output sees `0`.
     """
     version: str

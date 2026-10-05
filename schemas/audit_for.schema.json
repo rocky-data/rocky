@@ -256,7 +256,8 @@
           "description": "Where the id came from (`flag`, `env`, `mcp_profile`, `default`). `null` when the id is unrecorded."
         },
         "principal_id_verified": {
-          "description": "Whether anything verified the id. Always `false` today: ids are self-asserted until signed approvals exist.",
+          "default": false,
+          "description": "Whether anything verified the id. Always `false` today: ids are self-asserted until signed approvals exist. Defaulted, so a consumer reading an older binary's output sees `false`.",
           "type": "boolean"
         },
         "reason": {
@@ -283,7 +284,6 @@
         "model",
         "plan_id",
         "principal",
-        "principal_id_verified",
         "reason",
         "timestamp"
       ],
