@@ -6113,6 +6113,7 @@ mod tests {
                     reason: "plain rule decision".into(),
                     verify_after: vec![],
                     auto_apply: None,
+                    principal_ref: None,
                 })
                 .unwrap();
             store
@@ -6129,6 +6130,7 @@ mod tests {
                     reason: "verify_after FAILED".into(),
                     verify_after: vec!["row_count".into()],
                     auto_apply: None,
+                    principal_ref: None,
                 })
                 .unwrap();
             drop(store);
@@ -6896,6 +6898,7 @@ mod tests {
             reason: plan_id.to_string(),
             verify_after: Vec::new(),
             auto_apply: None,
+            principal_ref: None,
         }
     }
 

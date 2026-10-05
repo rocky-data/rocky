@@ -894,6 +894,23 @@ const SNAPSHOT_MEMORY_WARN_BYTES: u64 = 128 * 1024 * 1024;
 ///   plans, so no owed check is left silently satisfied. The `superseded`
 ///   and `watermarks_confirmed` keys, added without a bump earlier, ride
 ///   this fence too.
+///
+/// # Fields added without a bump
+///
+/// A serde-additive field needs no bump when an older binary that ignores it
+/// still means the same thing. Each such field is listed here with its reason.
+///
+/// - **[`PolicyDecisionRecord::principal_ref`]** (RV4-P1, at v31). The actor
+///   id behind a decision. No gate reads it in P1, and the ledger is
+///   append-only, so a v31 binary without the field drops nothing it would act
+///   on. A row from an older binary reads back `None`, which means
+///   "unrecorded". Guarded by
+///   `test_v31_policy_decision_forward_deserializes_principal_ref_none` and
+///   `test_v31_rollback_mirror_reads_a_row_with_principal_ref`.
+///
+///   **The phase that makes a gate read the id (RV4-P2, signatures) MUST bump.**
+///   From then on an older binary that ignores the id would decide
+///   differently, which is the v31 lesson above.
 const CURRENT_SCHEMA_VERSION: u32 = 31;
 
 /// Errors from the embedded redb state store.
@@ -7413,6 +7430,18 @@ pub struct PolicyDecisionRecord {
     /// forward-deserializes with it absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_apply: Option<AutoApplyCustody>,
+    /// The actor behind the decision: a self-asserted id and its source
+    /// (RV4-P1). The class above stays the enforcement axis; no gate reads
+    /// this.
+    ///
+    /// `None` means "unrecorded": the row was written before ids existed.
+    /// `rocky audit --actor unrecorded` lists those rows. Every production
+    /// writer sets `Some`, with `unnamed` when nobody named the actor.
+    ///
+    /// Added WITHOUT a schema bump; see the note above
+    /// [`CURRENT_SCHEMA_VERSION`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub principal_ref: Option<crate::config::PrincipalRef>,
 }
 
 /// What kind of event a [`PolicyDecisionRecord`] row records.
@@ -7434,23 +7463,21 @@ pub struct PolicyDecisionRecord {
 /// # Why this is derived rather than stored
 ///
 /// A persisted tag would be stronger: an unclassified row would be
-/// unrepresentable rather than merely unusual. It is not worth its price here.
-/// Adding a field to this record means a schema-version bump, and a bump shifts
-/// the remote state key segment, after which the download path finds no object
-/// and empties every replicated table — including this one (#1955). Fixing how
-/// the ledger is *counted* is not worth making the ledger unreachable on every
-/// remote deployment.
+/// unrepresentable rather than merely unusual. When this was written, a
+/// schema-version bump shifted the remote state key segment, and the download
+/// then found no object and emptied every replicated table — including this
+/// one (#1955). #2248 fixed that: the download now carries the newest older
+/// key forward. So the original reason is gone.
 ///
-/// So the kind is computed from evidence the row already carries. That is
+/// The kind is still computed from evidence the row already carries. That is
 /// weaker in one specific way, stated plainly: a future event kind that this
 /// function does not know about is classified `Evaluation` and counted as one.
 /// The mitigation is that there is now exactly ONE place to teach, instead of
 /// the three separate ad-hoc predicates that let this reach three kinds
-/// unnoticed. When a schema bump happens for some other reason, or #1955 is
-/// resolved, this should become a stored tag.
+/// unnoticed. A stored tag is now possible. It changes meaning for an older
+/// binary that counts rows, so it needs a schema bump when it lands.
 // Not serialized, by construction: this is derived from the row on read and
-// never written, which is the whole point (#1955). No serde, no schema, no
-// binding to regenerate.
+// never written. No serde, no schema, no binding to regenerate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DecisionKind {
     /// A policy gate evaluated a plan. The only kind whose `effect` is a
@@ -11890,6 +11917,103 @@ mod tests {
         );
     }
 
+    /// A v31 decision row written before RV4-P1 (no `principal_ref` key) must
+    /// forward-deserialize with the actor `None` ("unrecorded"), and a row
+    /// without an actor must not grow the key on re-serialization. See the
+    /// "Fields added without a bump" note on `CURRENT_SCHEMA_VERSION`.
+    #[test]
+    fn test_v31_policy_decision_forward_deserializes_principal_ref_none() {
+        let blob = serde_json::json!({
+            "timestamp": "2026-09-01T00:00:00Z",
+            "plan_id": "plan-old",
+            "principal": "agent",
+            "capability": "apply",
+            "model": "fct_orders",
+            "models": ["fct_orders"],
+            "keys_recorded": true,
+            "effect": "allow",
+            "reason": "allowed by rule 0",
+        });
+        let row: PolicyDecisionRecord = serde_json::from_value(blob)
+            .expect("a pre-RV4-P1 decision row must forward-deserialize");
+        assert!(row.principal_ref.is_none(), "an old row never named its actor");
+        let bytes = serde_json::to_string(&row).unwrap();
+        assert!(
+            !bytes.contains("principal_ref"),
+            "a row without an actor must not grow the key: {bytes}"
+        );
+    }
+
+    /// Rollback: a v31 binary from before RV4-P1 must read a row this build
+    /// writes. The mirror below is the exact pre-P1 field set (no
+    /// `principal_ref`), with serde's default unknown-field handling — the
+    /// shape that binary has. If someone adds `deny_unknown_fields` to the
+    /// record, the real struct would refuse new rows on rollback; the mirror
+    /// pins the posture this release relies on.
+    #[test]
+    fn test_v31_rollback_mirror_reads_a_row_with_principal_ref() {
+        use crate::config::{
+            PolicyCapability, PolicyEffect, PolicyPrincipal, PrincipalId, PrincipalIdSource,
+            PrincipalRef,
+        };
+
+        #[derive(serde::Deserialize)]
+        #[allow(dead_code)]
+        struct PreP1PolicyDecisionRecord {
+            timestamp: chrono::DateTime<chrono::Utc>,
+            plan_id: String,
+            principal: PolicyPrincipal,
+            capability: PolicyCapability,
+            model: String,
+            #[serde(default)]
+            models: Vec<String>,
+            #[serde(default)]
+            keys_recorded: bool,
+            effect: PolicyEffect,
+            #[serde(default)]
+            rule_id: Option<usize>,
+            #[serde(default)]
+            reason: String,
+            #[serde(default)]
+            verify_after: Vec<String>,
+            #[serde(default)]
+            auto_apply: Option<AutoApplyCustody>,
+        }
+
+        let (store, _dir) = temp_store();
+        let row = PolicyDecisionRecord {
+            timestamp: Utc::now(),
+            plan_id: "plan-new".to_string(),
+            principal: PolicyPrincipal::Human,
+            capability: PolicyCapability::Apply,
+            model: "fct_orders".to_string(),
+            models: vec!["fct_orders".to_string()],
+            keys_recorded: true,
+            effect: PolicyEffect::Allow,
+            rule_id: None,
+            reason: "default posture".to_string(),
+            verify_after: Vec::new(),
+            auto_apply: None,
+            principal_ref: Some(PrincipalRef {
+                id: PrincipalId::parse_asserted("alice").unwrap(),
+                source: PrincipalIdSource::Flag,
+            }),
+        };
+        store.record_policy_decision(&row).unwrap();
+
+        // This build reads its own row back with the actor intact.
+        let back = store.list_policy_decisions().unwrap();
+        assert_eq!(back, vec![row.clone()]);
+
+        // The pre-P1 shape reads the same bytes and ignores the actor.
+        let bytes = serde_json::to_vec(&row).unwrap();
+        assert!(String::from_utf8_lossy(&bytes).contains("\"principal_ref\""));
+        let old: PreP1PolicyDecisionRecord = serde_json::from_slice(&bytes)
+            .expect("a pre-P1 v31 binary must read a row that carries principal_ref");
+        assert_eq!(old.plan_id, "plan-new");
+        assert_eq!(old.effect, PolicyEffect::Allow);
+    }
+
     /// A store this build wrote an owed-checks list into must be stamped past
     /// v30, the last version whose binary reads a recorded run as owing
     /// nothing. Otherwise a rollback opens it, ignores the list, and drops the
@@ -14372,6 +14496,7 @@ mod tests {
             reason: "allow by rule 1".to_string(),
             verify_after: Vec::new(),
             auto_apply: None,
+            principal_ref: None,
         };
         let later = PolicyDecisionRecord {
             keys_recorded: false,
@@ -14388,6 +14513,7 @@ mod tests {
             reason: "denied by rule 0 (deny overrides)".to_string(),
             verify_after: Vec::new(),
             auto_apply: None,
+            principal_ref: None,
         };
         // Insert out of order; the ledger must return them chronologically.
         store.record_policy_decision(&later).unwrap();
@@ -14428,6 +14554,7 @@ mod tests {
             reason: "backfill plan awaits review".to_string(),
             verify_after: Vec::new(),
             auto_apply: None,
+            principal_ref: None,
         };
         let mut value = serde_json::to_value(&record).expect("serialize record");
         value
@@ -14474,6 +14601,7 @@ mod tests {
             reason: "replication target awaits review".to_string(),
             verify_after: Vec::new(),
             auto_apply: None,
+            principal_ref: None,
         };
         let mut value = serde_json::to_value(&record).expect("serialize record");
         value
@@ -14516,6 +14644,7 @@ mod tests {
             reason: String::new(),
             verify_after: Vec::new(),
             auto_apply: None,
+            principal_ref: None,
         };
 
         // No set: the label is the only candidate. It will not resolve in any
@@ -14573,6 +14702,7 @@ mod tests {
             reason: "allow by rule 1".to_string(),
             verify_after: Vec::new(),
             auto_apply: None,
+            principal_ref: None,
         };
         let mut value = serde_json::to_value(&record).expect("serialize record");
         value
@@ -15366,6 +15496,7 @@ mod tests {
                     reason: "backfill plan awaits review".to_string(),
                     verify_after: Vec::new(),
                     auto_apply: None,
+                    principal_ref: None,
                 })
                 .unwrap();
         }

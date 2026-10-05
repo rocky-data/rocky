@@ -3216,6 +3216,386 @@ pub enum PolicyPrincipal {
     Agent,
 }
 
+// ---------------------------------------------------------------------------
+// Principal ids (RV4-P1)
+// ---------------------------------------------------------------------------
+
+/// The longest principal id, in bytes. The grammar is ASCII-only, so bytes
+/// and characters agree.
+pub const PRINCIPAL_ID_MAX_LEN: usize = 63;
+
+/// The id every decision carries when nobody named the actor.
+///
+/// It is reserved: an operator cannot assert it with `--principal-id` or
+/// `ROCKY_PRINCIPAL_ID`, so a row that says `unnamed` always means "the
+/// default applied", never "someone chose this name".
+pub const PRINCIPAL_ID_UNNAMED: &str = "unnamed";
+
+/// The word `rocky audit --actor` uses for a row that carries no id at all — a
+/// row written before ids existed. Reserved so that no real actor can share
+/// it.
+pub const PRINCIPAL_ID_UNRECORDED: &str = "unrecorded";
+
+/// Why a string is not a valid [`PrincipalId`].
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum PrincipalIdError {
+    /// The string is empty.
+    #[error("a principal id cannot be empty")]
+    Empty,
+    /// The string is longer than [`PRINCIPAL_ID_MAX_LEN`] bytes.
+    #[error("principal id '{id}' is {len} bytes; the limit is {PRINCIPAL_ID_MAX_LEN}")]
+    TooLong {
+        /// The rejected id.
+        id: String,
+        /// Its length in bytes.
+        len: usize,
+    },
+    /// The string breaks the grammar `^[a-z0-9][a-z0-9._-]{0,62}$`.
+    #[error(
+        "principal id '{id}' is not valid: use lowercase letters, digits, '.', '_' and '-', \
+         starting with a letter or a digit (no '@', ':', '/', '|' or uppercase)"
+    )]
+    Grammar {
+        /// The rejected id.
+        id: String,
+    },
+    /// The string is a reserved word.
+    #[error("principal id '{id}' is reserved and cannot be asserted")]
+    Reserved {
+        /// The rejected id.
+        id: String,
+    },
+}
+
+/// A stable, self-asserted name for the actor behind a policy decision.
+///
+/// The grammar is `^[a-z0-9][a-z0-9._-]{0,62}$`. Uppercase is refused, not
+/// lowercased, so one actor has one spelling. `@` is refused, so an email
+/// cannot be stored by accident. `:`, `/` and `|` are refused, so the id never
+/// collides with the separators that state keys and plan ids use.
+///
+/// The class ([`PolicyPrincipal`]) stays the enforcement axis. The id is a
+/// label in P1: no gate reads it, and nothing verifies it. Every output that
+/// shows it says `verified: false`.
+///
+/// Deserialization checks the grammar only. The reserved-word check applies
+/// when an operator asserts an id ([`Self::parse_asserted`]), because the
+/// default [`PRINCIPAL_ID_UNNAMED`] must round-trip through the ledger.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct PrincipalId(String);
+
+impl PrincipalId {
+    /// Check the grammar only. The reserved words pass.
+    fn parse_grammar(s: &str) -> Result<Self, PrincipalIdError> {
+        if s.is_empty() {
+            return Err(PrincipalIdError::Empty);
+        }
+        if s.len() > PRINCIPAL_ID_MAX_LEN {
+            return Err(PrincipalIdError::TooLong {
+                id: s.to_string(),
+                len: s.len(),
+            });
+        }
+        let bytes = s.as_bytes();
+        let lead_ok = bytes[0].is_ascii_lowercase() || bytes[0].is_ascii_digit();
+        let rest_ok = bytes[1..]
+            .iter()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'_' | b'-'));
+        if !lead_ok || !rest_ok {
+            return Err(PrincipalIdError::Grammar { id: s.to_string() });
+        }
+        Ok(Self(s.to_string()))
+    }
+
+    /// Parse an id that an operator asserts (a flag or an env var).
+    ///
+    /// Refuses a grammar violation and the reserved words
+    /// [`PRINCIPAL_ID_UNNAMED`] and [`PRINCIPAL_ID_UNRECORDED`].
+    pub fn parse_asserted(s: &str) -> Result<Self, PrincipalIdError> {
+        let id = Self::parse_grammar(s)?;
+        if is_reserved_principal_id(&id.0) {
+            return Err(PrincipalIdError::Reserved { id: id.0 });
+        }
+        Ok(id)
+    }
+
+    /// The default id, [`PRINCIPAL_ID_UNNAMED`].
+    #[must_use]
+    pub fn unnamed() -> Self {
+        Self(PRINCIPAL_ID_UNNAMED.to_string())
+    }
+
+    /// The id as a string.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Whether `s` is a reserved principal id that no operator may assert.
+#[must_use]
+pub fn is_reserved_principal_id(s: &str) -> bool {
+    s == PRINCIPAL_ID_UNNAMED || s == PRINCIPAL_ID_UNRECORDED
+}
+
+impl TryFrom<String> for PrincipalId {
+    type Error = PrincipalIdError;
+    fn try_from(s: String) -> Result<Self, Self::Error> {
+        Self::parse_grammar(&s)
+    }
+}
+
+impl From<PrincipalId> for String {
+    fn from(id: PrincipalId) -> Self {
+        id.0
+    }
+}
+
+impl std::fmt::Display for PrincipalId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Where a [`PrincipalId`] came from.
+///
+/// P1 knows four sources, and every one is self-asserted. RV4-P2 adds signed
+/// sources (a local key, CI OIDC). C2 adds `serve_token` for the HTTP API.
+/// A new variant is a change in meaning for an older binary, so the phase that
+/// adds one bumps the state schema.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PrincipalIdSource {
+    /// The global `--principal-id` flag.
+    Flag,
+    /// The `ROCKY_PRINCIPAL_ID` environment variable.
+    Env,
+    /// Derived from the `rocky mcp --profile` the server runs under
+    /// (`mcp-default`, `mcp-approver`, `mcp-worker`).
+    McpProfile,
+    /// Nobody named the actor; the id is [`PRINCIPAL_ID_UNNAMED`].
+    Default,
+}
+
+/// The actor behind a decision: its id and where the id came from.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrincipalRef {
+    /// The actor's id.
+    pub id: PrincipalId,
+    /// Where the id came from.
+    pub source: PrincipalIdSource,
+}
+
+impl PrincipalRef {
+    /// The default actor: `unnamed`, source `default`.
+    #[must_use]
+    pub fn unnamed() -> Self {
+        Self {
+            id: PrincipalId::unnamed(),
+            source: PrincipalIdSource::Default,
+        }
+    }
+
+    /// The actor for an MCP server running `profile` (`default`, `approver`,
+    /// `worker`): `mcp-<profile>`, source `mcp_profile`.
+    ///
+    /// # Errors
+    ///
+    /// Refuses a profile name that does not make a valid id. The three real
+    /// profile names always do.
+    pub fn for_mcp_profile(profile: &str) -> Result<Self, PrincipalIdError> {
+        Ok(Self {
+            id: PrincipalId::parse_grammar(&format!("mcp-{profile}"))?,
+            source: PrincipalIdSource::McpProfile,
+        })
+    }
+
+    /// Resolve the acting principal id from its inputs, highest first:
+    ///
+    /// 1. `flag` — the `--principal-id` value;
+    /// 2. `env` — the `ROCKY_PRINCIPAL_ID` value, when set;
+    /// 3. `mcp_profile` — only `rocky mcp` passes it;
+    /// 4. the default, `unnamed`.
+    ///
+    /// The function reads no environment itself, so it is pure and testable.
+    /// It never consults `$USER`, `$USERNAME` or a CI variable: a personal
+    /// account name does not belong in a shared ledger by default.
+    ///
+    /// # Errors
+    ///
+    /// An invalid or reserved `flag` or `env` value is an error, never a
+    /// silent fallback to a lower source. This fails closed, as
+    /// `ROCKY_PRINCIPAL` does.
+    pub fn resolve(
+        flag: Option<&str>,
+        env: Option<&str>,
+        mcp_profile: Option<&str>,
+    ) -> Result<Self, ResolvePrincipalIdError> {
+        if let Some(flag) = flag {
+            let id = PrincipalId::parse_asserted(flag).map_err(ResolvePrincipalIdError::Flag)?;
+            return Ok(Self {
+                id,
+                source: PrincipalIdSource::Flag,
+            });
+        }
+        if let Some(env) = env {
+            let id = PrincipalId::parse_asserted(env).map_err(ResolvePrincipalIdError::Env)?;
+            return Ok(Self {
+                id,
+                source: PrincipalIdSource::Env,
+            });
+        }
+        if let Some(profile) = mcp_profile {
+            return Self::for_mcp_profile(profile).map_err(ResolvePrincipalIdError::McpProfile);
+        }
+        Ok(Self::unnamed())
+    }
+}
+
+/// Why [`PrincipalRef::resolve`] refused.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum ResolvePrincipalIdError {
+    /// The `--principal-id` value is invalid.
+    #[error("invalid --principal-id: {0}")]
+    Flag(PrincipalIdError),
+    /// The `ROCKY_PRINCIPAL_ID` value is invalid.
+    #[error("invalid ROCKY_PRINCIPAL_ID: {0}")]
+    Env(PrincipalIdError),
+    /// The MCP profile name does not make a valid id.
+    #[error("invalid MCP profile id: {0}")]
+    McpProfile(PrincipalIdError),
+}
+
+#[cfg(test)]
+mod principal_id_tests {
+    use super::*;
+
+    /// The grammar table: what an operator may assert, and what is refused.
+    #[test]
+    fn principal_id_grammar_table() {
+        let ok_63 = format!("a{}", "b".repeat(62));
+        let too_long_64 = format!("a{}", "b".repeat(63));
+        assert_eq!(ok_63.len(), 63);
+        assert_eq!(too_long_64.len(), 64);
+
+        let accepted = [
+            "alice",
+            "a",
+            "0",
+            "ci-bot.v2",
+            "svc_ingest-01",
+            "9lives",
+            ok_63.as_str(),
+        ];
+        for s in accepted {
+            let id = PrincipalId::parse_asserted(s)
+                .unwrap_or_else(|e| panic!("'{s}' should be accepted: {e}"));
+            assert_eq!(id.as_str(), s);
+        }
+
+        let refused: [(&str, fn(&PrincipalIdError) -> bool); 13] = [
+            ("", |e| matches!(e, PrincipalIdError::Empty)),
+            (too_long_64.as_str(), |e| {
+                matches!(e, PrincipalIdError::TooLong { len: 64, .. })
+            }),
+            ("Alice", |e| matches!(e, PrincipalIdError::Grammar { .. })),
+            ("alice@example.com", |e| {
+                matches!(e, PrincipalIdError::Grammar { .. })
+            }),
+            ("team:alice", |e| matches!(e, PrincipalIdError::Grammar { .. })),
+            ("team/alice", |e| matches!(e, PrincipalIdError::Grammar { .. })),
+            ("a|b", |e| matches!(e, PrincipalIdError::Grammar { .. })),
+            ("-alice", |e| matches!(e, PrincipalIdError::Grammar { .. })),
+            (".alice", |e| matches!(e, PrincipalIdError::Grammar { .. })),
+            ("al ice", |e| matches!(e, PrincipalIdError::Grammar { .. })),
+            ("ålice", |e| matches!(e, PrincipalIdError::Grammar { .. })),
+            ("unnamed", |e| matches!(e, PrincipalIdError::Reserved { .. })),
+            ("unrecorded", |e| {
+                matches!(e, PrincipalIdError::Reserved { .. })
+            }),
+        ];
+        for (s, expect) in refused {
+            let err = PrincipalId::parse_asserted(s)
+                .expect_err(&format!("'{s}' should be refused"));
+            assert!(expect(&err), "'{s}' refused with the wrong reason: {err:?}");
+        }
+    }
+
+    /// The reserved default round-trips through serde (the ledger stores it),
+    /// but a grammar violation does not deserialize.
+    #[test]
+    fn principal_id_serde_checks_grammar_but_allows_the_default() {
+        let unnamed: PrincipalId = serde_json::from_str("\"unnamed\"").unwrap();
+        assert_eq!(unnamed, PrincipalId::unnamed());
+        assert_eq!(serde_json::to_string(&unnamed).unwrap(), "\"unnamed\"");
+        assert!(serde_json::from_str::<PrincipalId>("\"Bob@x\"").is_err());
+        assert!(serde_json::from_str::<PrincipalId>("\"\"").is_err());
+    }
+
+    /// Precedence: flag > env > mcp profile > default.
+    #[test]
+    fn principal_ref_resolution_precedence() {
+        let r = PrincipalRef::resolve(Some("alice"), Some("bob"), Some("worker")).unwrap();
+        assert_eq!(r.id.as_str(), "alice");
+        assert_eq!(r.source, PrincipalIdSource::Flag);
+
+        let r = PrincipalRef::resolve(None, Some("bob"), Some("worker")).unwrap();
+        assert_eq!(r.id.as_str(), "bob");
+        assert_eq!(r.source, PrincipalIdSource::Env);
+
+        let r = PrincipalRef::resolve(None, None, Some("worker")).unwrap();
+        assert_eq!(r.id.as_str(), "mcp-worker");
+        assert_eq!(r.source, PrincipalIdSource::McpProfile);
+
+        let r = PrincipalRef::resolve(None, None, None).unwrap();
+        assert_eq!(r, PrincipalRef::unnamed());
+        assert_eq!(r.id.as_str(), "unnamed");
+        assert_eq!(r.source, PrincipalIdSource::Default);
+
+        for profile in ["default", "approver", "worker"] {
+            let r = PrincipalRef::for_mcp_profile(profile).unwrap();
+            assert_eq!(r.id.as_str(), format!("mcp-{profile}"));
+        }
+    }
+
+    /// An invalid env value is an error, never a fall-through to the MCP
+    /// profile or the default. Same for the flag, even when env is valid.
+    #[test]
+    fn principal_ref_invalid_inputs_fail_closed() {
+        assert!(matches!(
+            PrincipalRef::resolve(None, Some("Bob"), Some("worker")),
+            Err(ResolvePrincipalIdError::Env(PrincipalIdError::Grammar { .. }))
+        ));
+        assert!(matches!(
+            PrincipalRef::resolve(None, Some(""), None),
+            Err(ResolvePrincipalIdError::Env(PrincipalIdError::Empty))
+        ));
+        assert!(matches!(
+            PrincipalRef::resolve(None, Some("unnamed"), None),
+            Err(ResolvePrincipalIdError::Env(PrincipalIdError::Reserved { .. }))
+        ));
+        assert!(matches!(
+            PrincipalRef::resolve(Some("x@y"), Some("bob"), None),
+            Err(ResolvePrincipalIdError::Flag(PrincipalIdError::Grammar { .. }))
+        ));
+    }
+
+    /// The source enum's wire spelling is snake_case.
+    #[test]
+    fn principal_id_source_wire_spelling() {
+        let all = [
+            (PrincipalIdSource::Flag, "\"flag\""),
+            (PrincipalIdSource::Env, "\"env\""),
+            (PrincipalIdSource::McpProfile, "\"mcp_profile\""),
+            (PrincipalIdSource::Default, "\"default\""),
+        ];
+        for (src, wire) in all {
+            assert_eq!(serde_json::to_string(&src).unwrap(), wire);
+        }
+    }
+}
+
 /// The class of action a policy rule governs.
 ///
 /// `read` is always allowed (short-circuit). The mutating verbs (`propose`
