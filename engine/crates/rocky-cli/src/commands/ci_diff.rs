@@ -198,6 +198,31 @@ pub(crate) fn changed_paths(base_ref: &str) -> Result<Vec<(char, String)>> {
         .collect())
 }
 
+/// [`changed_paths`] for the working tree: files that differ between the
+/// merge base of `base_ref` and the files on disk (staged, unstaged,
+/// untracked), the set `rocky ci-diff --working-tree` diffs.
+pub(crate) fn changed_paths_worktree(base_ref: &str) -> Result<Vec<(char, String)>> {
+    validate_base_ref(base_ref)?;
+    let base = resolve_merge_base(base_ref, None).unwrap_or_else(|| base_ref.to_string());
+    Ok(flatten_changed(git_changed_files_worktree(&base, None)?))
+}
+
+/// Files with uncommitted edits: the working tree against `HEAD`, plus
+/// untracked files.
+pub(crate) fn uncommitted_paths() -> Result<Vec<(char, String)>> {
+    Ok(flatten_changed(git_changed_files_worktree("HEAD", None)?))
+}
+
+fn flatten_changed(files: Vec<ChangedFile>) -> Vec<(char, String)> {
+    files
+        .into_iter()
+        .flat_map(|file| {
+            let old = file.old_path.map(|path| (file.status, path));
+            std::iter::once((file.status, file.path)).chain(old)
+        })
+        .collect()
+}
+
 /// The [`CiDiffMode`] selected by the `--working-tree` flag.
 #[must_use]
 pub fn ci_diff_mode(working_tree: bool) -> CiDiffMode {

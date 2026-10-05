@@ -251,6 +251,25 @@ pub struct Resolution {
     pub selected: BTreeSet<String>,
     /// Atoms (as written) whose method matched no model.
     pub unmatched: Vec<String>,
+    /// The subset of [`Self::unmatched`] that names one specific thing in
+    /// the project — a model name, tag, path, file or source written without
+    /// a glob — rather than a pattern or a computed set (`state:`,
+    /// `config.`). Matching nothing there means the named thing does not
+    /// exist: almost always a typo.
+    pub unmatched_named: Vec<String>,
+}
+
+impl Method {
+    /// Whether this method names one specific thing in the project, with no
+    /// glob (see [`Resolution::unmatched_named`]).
+    pub fn names_project_entity(&self) -> bool {
+        match self {
+            Self::Name(p) | Self::Tag(p) | Self::Path(p) | Self::File(p) | Self::Source(p) => {
+                !p.contains(['*', '?', '['])
+            }
+            Self::Config(..) | Self::State(_) => false,
+        }
+    }
 }
 
 /// Map a strategy to the name `config.materialized` matches against. These
@@ -445,6 +464,9 @@ impl Selector {
                 let matched = match_method(atom, graph, state)?;
                 if matched.is_empty() {
                     out.unmatched.push(atom.raw.clone());
+                    if atom.method.names_project_entity() {
+                        out.unmatched_named.push(atom.raw.clone());
+                    }
                 }
                 let expanded = apply_graph_ops(atom, graph, matched);
                 acc = Some(match acc {
@@ -604,6 +626,9 @@ pub struct Selection {
     pub models: BTreeSet<String>,
     /// Human-readable warnings (unmatched criteria), dbt-worded.
     pub warnings: Vec<String>,
+    /// `--select` atoms that name a model, tag, path, file or source that
+    /// matches nothing in the project. The CLI refuses these.
+    pub unmatched_named: Vec<String>,
 }
 
 /// Resolve `select` (all models when empty) minus `exclude`.
@@ -614,6 +639,7 @@ pub fn select(
     state: Option<&StateSets>,
 ) -> Result<Selection, SelectorError> {
     let mut warnings = Vec::new();
+    let mut unmatched_named = Vec::new();
     let mut models = if select.is_empty() {
         graph.names()
     } else {
@@ -621,6 +647,7 @@ pub fn select(
         warnings.extend(r.unmatched.iter().map(|raw| {
             format!("The selection criterion '{raw}' does not match any enabled nodes")
         }));
+        unmatched_named = r.unmatched_named;
         r.selected
     };
     if !exclude.is_empty() {
@@ -630,7 +657,11 @@ pub fn select(
         }));
         models.retain(|m| !r.selected.contains(m));
     }
-    Ok(Selection { models, warnings })
+    Ok(Selection {
+        models,
+        warnings,
+        unmatched_named,
+    })
 }
 
 #[cfg(test)]
@@ -814,6 +845,39 @@ mod tests {
         assert_eq!(r.models.len(), 1);
         assert_eq!(r.warnings.len(), 1);
         assert!(r.warnings[0].contains("'nope'"));
+    }
+
+    /// A name, tag, path or source that matches nothing is reported as
+    /// named-but-missing; a computed set (`config.`, `state:`) is not.
+    #[test]
+    fn unmatched_named_atoms_are_separated_from_computed_sets() {
+        let g = diamond();
+        for raw in [
+            "nope",
+            "tag:nope",
+            "path:nowhere",
+            "source:no.such",
+            "file:nope",
+            "nope+",
+        ] {
+            let s = parse(&[raw.into()]).unwrap();
+            let r = select(&g, &s, &Selector::default(), None).unwrap();
+            assert_eq!(r.unmatched_named, vec![raw.to_string()], "{raw}");
+        }
+        for raw in ["config.materialized:view", "nope_*", "tag:no?e"] {
+            let s = parse(&[raw.into()]).unwrap();
+            let r = select(&g, &s, &Selector::default(), None).unwrap();
+            assert!(r.models.is_empty(), "{raw}");
+            assert!(r.unmatched_named.is_empty(), "{raw}");
+        }
+        let s = parse(&["state:modified".into()]).unwrap();
+        let r = select(&g, &s, &Selector::default(), Some(&StateSets::default())).unwrap();
+        assert!(r.models.is_empty());
+        assert!(r.unmatched_named.is_empty());
+        // An excluded name never counts.
+        let x = parse(&["nope".into()]).unwrap();
+        let r = select(&g, &Selector::default(), &x, None).unwrap();
+        assert!(r.unmatched_named.is_empty());
     }
 
     #[test]

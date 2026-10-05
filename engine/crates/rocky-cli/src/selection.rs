@@ -27,6 +27,11 @@ pub struct SelectionArgs {
     /// `--state-ref`: base git ref for `state:modified` / `state:new`.
     /// `None` = [`DEFAULT_STATE_REF`].
     pub state_ref: Option<String>,
+    /// `--state-working-tree`: `state:` selectors compare the working tree
+    /// (staged, unstaged and untracked files) with the merge base of
+    /// `state_ref`, as `rocky ci-diff --working-tree` does. Default: the
+    /// committed `state_ref...HEAD` diff only.
+    pub state_working_tree: bool,
     /// A legacy `--model <name>` folded in by [`Self::with_model`]. It must
     /// name a real model, as `--model` alone requires.
     pub required_model: Option<String>,
@@ -142,7 +147,8 @@ pub fn build_graph(project: &Project, models_dir: &Path) -> SelectorGraph {
 }
 
 /// Compute `state:` sets by diffing `state_ref...HEAD` exactly as
-/// `rocky ci-diff` does (committed changes only).
+/// `rocky ci-diff` does (committed changes only), or the working tree when
+/// `working_tree` (`--state-working-tree`, as `rocky ci-diff --working-tree`).
 ///
 /// `ci-diff` classifies only files directly inside the models directory, but
 /// models also load one directory down (`models/staging/*.sql`). So the git
@@ -152,21 +158,81 @@ pub fn build_graph(project: &Project, models_dir: &Path) -> SelectorGraph {
 /// never missed.
 fn compute_state(
     state_ref: &str,
+    working_tree: bool,
     project: &Project,
     models_dir: &Path,
     ctx: &StateContext<'_>,
 ) -> Result<StateSets> {
-    let mut state = compute_ci_diff_state(state_ref, models_dir, ctx)?;
-    let changed = crate::commands::ci_diff::changed_paths(state_ref)?;
+    let mut state = compute_ci_diff_state(state_ref, working_tree, models_dir, ctx)?;
+    let changed = if working_tree {
+        crate::commands::ci_diff::changed_paths_worktree(state_ref)?
+    } else {
+        crate::commands::ci_diff::changed_paths(state_ref)?
+    };
+    mark_changed_models(&changed, project, models_dir, &mut state);
+    if !working_tree {
+        warn_uncommitted(project, models_dir, &state);
+    }
+    Ok(state)
+}
+
+/// Warn about models whose files have uncommitted edits that the committed
+/// `state:` diff leaves out. Best effort: a git failure here only skips the
+/// warning.
+fn warn_uncommitted(project: &Project, models_dir: &Path, state: &StateSets) {
+    let Ok(uncommitted) = crate::commands::ci_diff::uncommitted_paths() else {
+        return;
+    };
+    let mut touched = StateSets::default();
+    mark_changed_models(&uncommitted, project, models_dir, &mut touched);
+    let excluded: BTreeSet<&String> = touched
+        .modified
+        .iter()
+        .chain(&touched.new)
+        .filter(|m| !state.modified.contains(*m) && !state.new.contains(*m))
+        .collect();
+    if let Some(message) = uncommitted_warning(&excluded) {
+        warn!("{message}");
+    }
+}
+
+/// The warning text for models with uncommitted edits that `state:` left out.
+fn uncommitted_warning(excluded: &BTreeSet<&String>) -> Option<String> {
+    if excluded.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "state: selectors compare committed changes only (<ref>...HEAD); {} model(s) with \
+         uncommitted edits are not selected by them: {}. Commit the edits, or pass \
+         --state-working-tree to compare the working tree",
+        excluded.len(),
+        excluded
+            .iter()
+            .map(|s| s.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    ))
+}
+
+/// Map git's changed paths (repo-root-relative) onto each model's own files —
+/// its source, `.toml` sidecar, `.contract.toml`, and any `_defaults.toml`
+/// in its directory or the models root — and record the model as new or
+/// modified in `state`.
+fn mark_changed_models(
+    changed: &[(char, String)],
+    project: &Project,
+    models_dir: &Path,
+    state: &mut StateSets,
+) {
     if changed.is_empty() {
-        return Ok(state);
+        return;
     }
     let Some(repo_root) = git_toplevel() else {
-        return Ok(state);
+        return;
     };
     let changed: Vec<(char, PathBuf)> = changed
-        .into_iter()
-        .map(|(status, path)| (status, repo_root.join(path)))
+        .iter()
+        .map(|(status, path)| (*status, repo_root.join(path)))
         .collect();
     let models_root = std::fs::canonicalize(models_dir).ok();
     for model in &project.models {
@@ -194,7 +260,6 @@ fn compute_state(
             }
         }
     }
-    Ok(state)
 }
 
 /// The repository root, canonicalized, or `None` outside a git work tree.
@@ -213,6 +278,7 @@ fn git_toplevel() -> Option<PathBuf> {
 /// The `rocky ci-diff` classification of `state_ref...HEAD`.
 fn compute_ci_diff_state(
     state_ref: &str,
+    working_tree: bool,
     models_dir: &Path,
     ctx: &StateContext<'_>,
 ) -> Result<StateSets> {
@@ -223,8 +289,9 @@ fn compute_ci_diff_state(
         models_dir,
         ctx.cache_ttl_override,
         // Committed `HEAD`, the same snapshot `changed_paths` diffs, so the
-        // file selection and the compiled models agree (G7).
-        crate::output::CiDiffMode::Head,
+        // file selection and the compiled models agree (G7). With
+        // `--state-working-tree`, the working tree for both.
+        crate::commands::ci_diff_mode(working_tree),
     )
     .with_context(|| format!("failed to compute `state:` selection against '{state_ref}'"))?;
     let mut state = StateSets::default();
@@ -256,7 +323,13 @@ pub fn resolve(
     let exclude = selector::parse(&args.exclude)?;
     let state = if select.uses_state() || exclude.uses_state() {
         let state_ref = args.state_ref.as_deref().unwrap_or(DEFAULT_STATE_REF);
-        Some(compute_state(state_ref, project, models_dir, ctx)?)
+        Some(compute_state(
+            state_ref,
+            args.state_working_tree,
+            project,
+            models_dir,
+            ctx,
+        )?)
     } else {
         None
     };
@@ -268,6 +341,23 @@ pub fn resolve(
         );
     }
     let selection = selector::select(&graph, &select, &exclude, state.as_ref())?;
+    // A term that names one model, tag, path, file or source that does not
+    // exist is a typo, not an empty selection: refuse it rather than run
+    // nothing and report success. Globs and computed sets (`state:`,
+    // `config.`) that match nothing stay a warning.
+    if !selection.unmatched_named.is_empty() {
+        anyhow::bail!(
+            "--select: selector term(s) that match nothing in this project: {}. Each names a \
+             model, tag, path, file or source that does not exist. Check the spelling; \
+             `rocky list models` shows the model names",
+            selection
+                .unmatched_named
+                .iter()
+                .map(|t| format!("'{t}'"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
     for w in &selection.warnings {
         warn!("{w}");
     }

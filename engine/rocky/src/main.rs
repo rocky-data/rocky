@@ -3178,6 +3178,11 @@ struct SelectArgs {
     /// changes `<ref>...HEAD`, as `rocky ci-diff` does). Default: main.
     #[arg(long, value_name = "REF")]
     state_ref: Option<String>,
+    /// `state:` selectors compare the working tree (staged, unstaged and
+    /// untracked files) instead of committed changes, as
+    /// `rocky ci-diff --working-tree` does.
+    #[arg(long)]
+    state_working_tree: bool,
 }
 
 impl SelectArgs {
@@ -3186,6 +3191,7 @@ impl SelectArgs {
             select: self.select,
             exclude: self.exclude,
             state_ref: self.state_ref,
+            state_working_tree: self.state_working_tree,
             required_model: None,
         }
     }
@@ -3901,6 +3907,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                         select,
                         exclude,
                         state_ref,
+                        state_working_tree: false,
                         required_model: None,
                     };
                     let model = if selection.is_active() {
