@@ -123,6 +123,10 @@ const CONSUMED_ENGINE_PATHS: &[&str] = &[
     // Config vocabulary (the [fulfill] block + the apply principal).
     "rocky_core::config::FulfillDriverConfig",
     "rocky_core::config::PolicyPrincipal",
+    // RV4-P1 — the acting principal's id, threaded into the façade so the
+    // decisions the loop causes name who acted. DELIBERATE addition: a
+    // label only, unverified, read by no gate.
+    "rocky_core::config::PrincipalRef",
     "rocky_core::config::RockyConfig",
     "rocky_core::config::load_rocky_config",
     // The state vocabulary + the CAS store (WP-E1's tables).
