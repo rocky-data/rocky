@@ -140,9 +140,19 @@ fn create_state_store_parent(state_path: &Path) -> Result<()> {
 /// `path` as the filesystem resolves it: the longest prefix that exists
 /// is canonicalized (symlinks and `..` resolved by the OS, so `link/..`
 /// means the link target's parent), and the missing tail is appended with
-/// `.` and `..` folded lexically — a directory that does not exist cannot
-/// be a symlink.
+/// `.` and `..` folded lexically.
+///
+/// A symlink whose target does not exist yet does not canonicalize, but
+/// opening the store through it creates the file at the target. So the
+/// first missing component that is itself a link is followed by hand and
+/// resolved again — `.rocky/state.redb -> ../models/x.redb` resolves into
+/// `models/`. A loop of links stops after a bounded number of hops and
+/// returns the path as written.
 fn resolve_existing_prefix(path: &Path) -> PathBuf {
+    resolve_existing_prefix_hops(path, 40)
+}
+
+fn resolve_existing_prefix_hops(path: &Path, hops: u32) -> PathBuf {
     use std::path::Component;
     let components: Vec<Component<'_>> = path.components().collect();
     for split in (0..=components.len()).rev() {
@@ -152,7 +162,25 @@ fn resolve_existing_prefix(path: &Path) -> PathBuf {
         } else {
             prefix.canonicalize().ok()
         };
-        let Some(mut resolved) = base else { continue };
+        let Some(mut resolved) = base else {
+            let dangling = std::fs::symlink_metadata(&prefix)
+                .map(|m| m.file_type().is_symlink())
+                .unwrap_or(false);
+            if dangling
+                && hops > 0
+                && let Ok(target) = std::fs::read_link(&prefix)
+            {
+                let mut next = match prefix.parent() {
+                    Some(parent) => parent.join(target),
+                    None => target,
+                };
+                for component in &components[split..] {
+                    next.push(component);
+                }
+                return resolve_existing_prefix_hops(&next, hops - 1);
+            }
+            continue;
+        };
         for component in &components[split..] {
             match component {
                 Component::CurDir => {}
@@ -178,6 +206,21 @@ fn with_state_path(command: &str, state_path: &Path) -> String {
         ),
         None => command.to_string(),
     }
+}
+
+/// A stop message with this invocation's `--state-path` added to every
+/// `rocky <verb>` command it quotes, so a human who copies a command out of
+/// the prose reaches the same store as one who runs `next_command` (#2169).
+fn message_with_state_path(message: &str, state_path: &Path) -> String {
+    let flag = format!(
+        "rocky --state-path {} ",
+        shell_quote(&state_path.display().to_string())
+    );
+    ["fulfill ", "review ", "product ", "apply "]
+        .iter()
+        .fold(message.to_string(), |text, verb| {
+            text.replace(&format!("rocky {verb}"), &format!("{flag}{verb}"))
+        })
 }
 
 /// Single-quote `s` for a POSIX shell unless every character is plainly safe.
@@ -263,6 +306,7 @@ pub async fn run_fulfill(
         .next_command
         .as_deref()
         .map(|next| with_state_path(next, state_path));
+    let message = message_with_state_path(&stop.message, state_path);
 
     let output = fulfill_api::FulfillOutput {
         version: VERSION.to_string(),
@@ -270,7 +314,7 @@ pub async fn run_fulfill(
         product: product.to_string(),
         product_id: released.product_id.clone(),
         state: released.state.tag().to_string(),
-        message: stop.message.clone(),
+        message: message.clone(),
         next_command: next_command.clone(),
         spec_digest: released.spec_digest.clone(),
         plan_id: released.plan_id.clone(),
@@ -279,7 +323,7 @@ pub async fn run_fulfill(
         fulfill_api::print_json(&output)?;
     } else {
         println!("product {product}: {}", released.state.tag());
-        println!("{}", stop.message);
+        println!("{message}");
         if let Some(next) = &next_command {
             println!("next: {next}");
         }
@@ -2250,6 +2294,38 @@ mod state_store_placement {
         std::fs::create_dir(root.path().join("models")).unwrap();
         std::os::unix::fs::symlink(root.path().join("models"), root.path().join("state")).unwrap();
         assert!(refuse_state_store_in_models(root.path(), Path::new("state/x.redb")).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_symlink_into_models_is_refused() {
+        // The target does not exist yet, so the link does not canonicalize,
+        // but opening the store through it would create the file in models/.
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("models")).unwrap();
+        std::fs::create_dir(root.path().join(".rocky")).unwrap();
+        std::os::unix::fs::symlink(
+            "../models/state.redb",
+            root.path().join(".rocky/state.redb"),
+        )
+        .unwrap();
+        assert!(refuse_state_store_in_models(root.path(), Path::new(".rocky/state.redb")).is_err());
+        // A dangling link that points outside models/ is still accepted.
+        std::os::unix::fs::symlink("../elsewhere.redb", root.path().join(".rocky/other.redb"))
+            .unwrap();
+        refuse_state_store_in_models(root.path(), Path::new(".rocky/other.redb")).unwrap();
+    }
+
+    #[test]
+    fn the_stop_message_quotes_commands_with_the_state_path() {
+        assert_eq!(
+            super::message_with_state_path(
+                "plan p awaits human review; after approving, re-run: rocky fulfill x",
+                Path::new(".rocky/state.redb")
+            ),
+            "plan p awaits human review; after approving, re-run: \
+             rocky --state-path .rocky/state.redb fulfill x"
+        );
     }
 
     #[test]

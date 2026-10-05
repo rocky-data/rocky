@@ -139,7 +139,7 @@ The state store must sit outside every directory the worker can write. The defau
 rocky --state-path .rocky/state.redb fulfill revenue_daily
 ```
 
-Pass the same `--state-path` to every `rocky fulfill`, `rocky fulfill approve-spec` and `rocky review` call for the project. Every next step the loop prints carries it, so a command run as printed reaches the store the loop reads. `rocky fulfill approve-spec` without it refuses, like the loop. `rocky review` without it reads the default store instead.
+Pass the same `--state-path` to every `rocky fulfill`, `rocky fulfill approve-spec` and `rocky review` call for the project. Every next step the loop prints carries it, so a command run as printed reaches the store the loop reads. Commands quoted in a stop's message carry it too. `rocky fulfill approve-spec` without it refuses, like the loop. `rocky review` and `rocky product approve` do not check where the store is. Without the flag they use the default store, and an approval recorded there never reaches the loop.
 
 `.rocky/state.redb` is only safe if the worker cannot write `.rocky/`. Pick a path that fits how you deploy.
 
