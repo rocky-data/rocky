@@ -115,10 +115,12 @@ column and is joined to the rest of the clause by `AND`:
   placeholder may be cast or shifted by a constant, such as
   `@start_date - INTERVAL 1 DAY`.
 - `<col> IN (SELECT ...)` counts when that subquery's rows are bounded.
+- An `OR` counts when every branch is bounded by these same rules, for example
+  `(a >= @start_date AND a < @end_date) OR (b >= @start_date AND b < @end_date)`.
 
-Anything that can let rows outside the window through does not count: a
-comparison under `OR` or `NOT` (`ts >= @start_date OR 1 = 1`,
-`@start_date IS NULL OR ...`), a bound that faces the wrong way
+Anything that can let rows outside the window through does not count: an
+`OR` with an unbounded branch, a comparison under `NOT`
+(`ts >= @start_date OR 1 = 1`, `@start_date IS NULL OR ...`), a bound that faces the wrong way
 (`ts <= @start_date`), `NOT BETWEEN`, `NOT IN` and `EXISTS`. A placeholder
 inside a subquery bounds that subquery's rows, not the clause around it.
 

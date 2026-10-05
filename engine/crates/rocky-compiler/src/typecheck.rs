@@ -1513,9 +1513,13 @@ fn table_factor_window_bound(relation: &TableFactor, scope: &mut CteScope) -> Wi
 /// whole-literal quoted form `'@start_date'` count alike, because the runtime
 /// substitutes both.
 ///
+/// An `OR` bounds its rows only where every branch does, by this same rule:
+/// `(a >= @start_date AND a < @end_date) OR (b >= @start_date AND b < @end_date)`
+/// is bounded.
+///
 /// Anything else bounds nothing, because it can let rows outside the window
-/// through: a conjunct under `OR` or `NOT` (`ts >= @start_date OR 1=1`,
-/// `@start_date IS NULL OR ...`), a comparison facing the wrong way
+/// through: an `OR` with an unbounded branch or a conjunct under `NOT`
+/// (`ts >= @start_date OR 1=1`, `@start_date IS NULL OR ...`), a comparison facing the wrong way
 /// (`ts <= @start_date`), `NOT IN`, and `EXISTS`. A subquery is never
 /// searched for placeholders: its filter bounds its own rows, not this one's.
 fn filter_window_bound(filter: &Expr, scope: &mut CteScope) -> WindowBound {
@@ -1554,6 +1558,13 @@ enum WindowEdge {
 fn conjunct_window_bound(conjunct: &Expr, scope: &mut CteScope) -> WindowBound {
     let mut bound = WindowBound::default();
     match conjunct {
+        // Every row satisfies at least one branch, so the branches together
+        // bound the rows only where each branch does.
+        Expr::BinaryOp {
+            left,
+            op: ast::BinaryOperator::Or,
+            right,
+        } => bound = filter_window_bound(left, scope).and(filter_window_bound(right, scope)),
         Expr::BinaryOp { left, op, right } => {
             // Normalise to `<column> <op> <placeholder>`.
             let (op, edge) = if is_column_term(left) {
@@ -1586,10 +1597,10 @@ fn conjunct_window_bound(conjunct: &Expr, scope: &mut CteScope) -> WindowBound {
             bound.end = placeholder_term(high) == Some(WindowEdge::End);
         }
         Expr::InSubquery {
+            expr,
             subquery,
             negated: false,
-            ..
-        } => bound = query_window_bound(subquery, scope),
+        } if is_column_term(expr) => bound = query_window_bound(subquery, scope),
         _ => {}
     }
     bound
@@ -5632,6 +5643,14 @@ mod tests {
             // NOT BETWEEN keeps the rows outside the window.
             "SELECT order_date FROM upstream \
              WHERE order_date NOT BETWEEN @start_date AND @end_date",
+            // One OR branch bounds only one end.
+            "SELECT order_date FROM upstream \
+             WHERE (order_date >= @start_date AND order_date < @end_date) \
+             OR ship_date >= @start_date",
+            // IN on a constant, not a column, restricts no row.
+            "WITH w AS (SELECT order_date FROM upstream \
+             WHERE order_date >= @start_date AND order_date < @end_date) \
+             SELECT order_date FROM other WHERE 1 IN (SELECT 1 FROM w)",
             // A comparison between the placeholders bounds no column.
             "SELECT order_date FROM upstream WHERE @start_date < @end_date",
             // A CASE that only sometimes uses the window.
@@ -5662,6 +5681,10 @@ mod tests {
             // A lookback shift by a constant.
             "SELECT order_date FROM upstream \
              WHERE order_date >= @start_date - INTERVAL 1 DAY AND order_date < @end_date",
+            // Every OR branch bounds both ends.
+            "SELECT order_date FROM upstream \
+             WHERE (order_date >= @start_date AND order_date < @end_date) \
+             OR (ship_date >= @start_date AND ship_date < @end_date)",
             // A qualified column.
             "SELECT u.order_date FROM upstream u \
              WHERE u.order_date >= @start_date AND u.order_date < @end_date",
