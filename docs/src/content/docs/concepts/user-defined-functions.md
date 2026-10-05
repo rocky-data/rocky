@@ -217,12 +217,12 @@ Redshift requires a volatility clause. `deterministic = true` gives
 Rocky does not set a description on Redshift either.
 
 `rocky compile` renders each called function for PostgreSQL and Redshift
-and reports these refusals as `E051` when every configured warehouse refuses
-the function. Otherwise the plan preview and `rocky run` refuse it with
-`E051` on the warehouse that cannot create it.
+and reports these refusals as `E051` when a warehouse that a calling model
+runs on refuses the function. A model runs on the target of each
+transformation pipeline that loads it.
 
 Rocky's Trino adapter cannot create persistent functions. `rocky compile`
-reports `E051` when Trino is the only warehouse adapter in `rocky.toml`.
+reports `E051` when a calling model runs on a Trino target.
 `rocky run` and the plan preview refuse with `E051` on a Trino target.
 ClickHouse and SQL Server are refused the same way. On SQL Server a
 scalar function takes `@`-prefixed parameters and must be called with its

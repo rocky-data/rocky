@@ -79,7 +79,7 @@ This table lists every strategy and how Rocky runs it on ClickHouse:
 | `materialized_view` | Refused. A ClickHouse materialized view is an insert trigger over new rows. It is not a refreshed query result. |
 | User-defined functions | Refused, `E051`. |
 
-Rocky reports `E053` at compile time only when every warehouse in the project is ClickHouse. If the project also has a warehouse with `MERGE`, `rocky run` refuses the model when it targets ClickHouse.
+Rocky reports `E053` at compile time when a pipeline that loads the model targets ClickHouse. Another adapter in `rocky.toml` that no pipeline targets does not change this. A model that no pipeline loads is judged against every pipeline's target.
 
 ### Why Rocky refuses `merge`
 

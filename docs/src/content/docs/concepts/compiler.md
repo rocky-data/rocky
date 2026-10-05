@@ -132,19 +132,22 @@ For `USING` and `NATURAL` joins, Rocky distinguishes merged join keys from quali
 `rocky compile` also checks two kinds of operands against the target warehouse:
 
 - **Aggregate arguments.** `SUM(customer_name)` over a `VARCHAR` column has no
-  overload on DuckDB, BigQuery, Trino or SQL Server. Rocky reports `E042`.
-  Snowflake and Databricks cast the text at run time instead, so there it is
-  `W042`.
+  overload on DuckDB, BigQuery, Trino, SQL Server, PostgreSQL or Redshift.
+  Rocky reports `E042`. Snowflake and Databricks cast the text at run time
+  instead, so there it is `W042`.
 - **Comparison operands.** This covers `=`, `<>`, `<`, `>`, `<=`, `>=`, `IN`,
   `BETWEEN` and join `ON` predicates. A `BIGINT` column compared with a
   `VARCHAR` column casts the text on every row on DuckDB, Snowflake,
-  Databricks and SQL Server. The query fails on the first value that does not parse, so Rocky
-  reports `W043`. BigQuery and Trino refuse the pair outright: `E043`.
+  Databricks, SQL Server and Redshift. The query fails on the first value that does not parse, so Rocky
+  reports `W043`. BigQuery, Trino and PostgreSQL refuse the pair outright: `E043`.
 
 The warehouse comes from, in order: `--target-dialect`, the adapter `type` of
-the pipelines' target adapter, then `[portability] target_dialect`. With none
-of these, Rocky reports the mildest verdict across all warehouses. That is
-always a warning.
+the warehouse each model runs on, then `[portability] target_dialect`. A model
+runs on the target adapter of each transformation pipeline whose `models` glob
+loads it. A model no pipeline loads runs on every pipeline's target. When a
+model has several targets, the strictest verdict wins. With none of these,
+Rocky reports the mildest verdict across all warehouses. That is always a
+warning. ClickHouse has no operand rules yet; the message says so.
 
 These stay clean, so valid SQL is never refused:
 
@@ -283,6 +286,11 @@ GROUP BY customer_id
 Fix it by adding the column to `GROUP BY`, or by wrapping it in an aggregate
 such as `ANY_VALUE(status)`.
 
+PostgreSQL accepts a column outside `GROUP BY` when it depends on a grouped
+primary key. Rocky cannot see primary keys. So when every warehouse a model
+runs on is PostgreSQL, the finding is the warning `W044`, not `E044`.
+Redshift has no such rule and keeps `E044`.
+
 `E044` fires only when Rocky is certain. The column must belong to a relation
 in the same query whose columns Rocky knows: an upstream model, a source
 schema from `--with-seed` or the schema cache, a CTE, or a subquery in `FROM`.
@@ -409,8 +417,8 @@ span, and sometimes a suggested fix.
 | `E047` | A model reads a `private` model outside its ownership group, or a producer model that is not `public` (see [Model governance](/concepts/model-governance/)) |
 | `E048` | A model-version problem: undeclared latest version, missing version file, or a reference to an undeclared version |
 | `E052` | A model's `[redshift]` table options cannot render (an invalid or contradictory `dist_key` / `sort_key`), or sit on a strategy that builds no table. See [Redshift](/reference/adapters/redshift/#table-distribution-and-sort-keys) |
-| `E053` | ClickHouse cannot run the model as configured: its `[clickhouse]` table options cannot render or sit on a strategy that builds no table, or it is a `merge` model (or `incremental` with `unique_key`) and every configured warehouse is ClickHouse, which has no `MERGE`. See [ClickHouse](/reference/adapters/clickhouse/#strategies) |
-| `E054` | SQL Server cannot run the model's SQL: its CTEs cannot be lifted to the start of the statement, even after Rocky renames colliding nested CTEs. Emitted when every configured warehouse is SQL Server. See [SQL Server](/reference/adapters/sqlserver/) |
+| `E053` | ClickHouse cannot run the model as configured: its `[clickhouse]` table options cannot render or sit on a strategy that builds no table, or it is a `merge` model (or `incremental` with `unique_key`) and a warehouse the model runs on is ClickHouse, which has no `MERGE`. See [ClickHouse](/reference/adapters/clickhouse/#strategies) |
+| `E054` | SQL Server cannot run the model's SQL: its CTEs cannot be lifted to the start of the statement, even after Rocky renames colliding nested CTEs. Emitted when a warehouse the model runs on is SQL Server. See [SQL Server](/reference/adapters/sqlserver/) |
 | `W001` | Unused model (no downstream consumers) |
 | `W002` | Duplicate column in model output |
 | `W004` | Classification tag with no matching `[mask]` strategy |
@@ -425,6 +433,7 @@ span, and sometimes a suggested fix.
 | `W031` | Imported producer widened the type of a column this project reads (cross-team contract) |
 | `W042` | Aggregate argument is cast implicitly at run time and fails on values that do not convert (escalate with `--deny-warnings W042`) |
 | `W043` | Comparison relies on an implicit cast that fails on values that do not convert, such as a `BIGINT` column compared with a `VARCHAR` column on DuckDB (escalate with `--deny-warnings W043`) |
+| `W044` | `E044`'s finding on a model that runs only on PostgreSQL, which accepts a column that depends on a grouped primary key (escalate with `--deny-warnings W044`) |
 | `W041` | A direct reference names a column absent from an external source schema that may be out of date (seed or old cache entry) |
 | `W051` | A user-defined function call could not be fully verified: an unknown argument type, or an argument the warehouse must convert implicitly |
 | `W046` | An `incremental` model sets `lookback` without `unique_key`, so the re-read window is appended again on each run |
