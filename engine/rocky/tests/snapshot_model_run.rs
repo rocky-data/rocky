@@ -518,3 +518,121 @@ fn snapshot_edge_cases_rerun_safely() {
         1
     );
 }
+
+/// Pairs of versions of one key whose `[valid_from, valid_to)` intervals
+/// overlap. A point-in-time read returns more than one row for such a key.
+fn overlapping_versions(root: &Path, table: &str) -> i64 {
+    count(
+        root,
+        &format!(
+            "SELECT count(*) FROM main.{table} a JOIN main.{table} b \
+             ON a.id = b.id AND a.rowid < b.rowid \
+             WHERE a.valid_from < coalesce(b.valid_to, TIMESTAMP '9999-12-31') \
+             AND b.valid_from < coalesce(a.valid_to, TIMESTAMP '9999-12-31')"
+        ),
+    )
+}
+
+/// B2: a key deleted and then re-inserted with the SAME `updated_at` used to
+/// get a new current version whose `valid_from` (the source timestamp)
+/// preceded the deletion, so its interval overlapped the closed history and
+/// a point-in-time read returned two rows. Every snapshot mode must keep the
+/// versions of one key disjoint after every step.
+#[test]
+fn revived_keys_never_overlap_their_history() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    fs::write(root.join("rocky.toml"), CONFIG).unwrap();
+    sql(
+        root,
+        "CREATE SCHEMA raw;
+         CREATE TABLE raw.users (id BIGINT, name VARCHAR, updated_at TIMESTAMP);
+         INSERT INTO raw.users VALUES
+           (1, 'a', TIMESTAMP '2026-01-01 00:00:00'),
+           (2, 'b', TIMESTAMP '2026-01-01 00:00:00');",
+    );
+    let source = "SELECT id, name, updated_at FROM raw.users\n";
+    let check = |hard_deletes: &str| {
+        format!(
+            "[strategy]\ntype = \"snapshot\"\nunique_key = \"id\"\nstrategy = \"check\"\n\
+             check_cols = [\"name\"]\nhard_deletes = \"{hard_deletes}\"\n"
+        )
+    };
+    let tables = [
+        ("ts_new_record", timestamp_snapshot("new_record")),
+        ("ts_invalidate", timestamp_snapshot("invalidate")),
+        ("check_new_record", check("new_record")),
+        ("check_invalidate", check("invalidate")),
+    ];
+    for (name, strategy) in &tables {
+        write_model(root, name, source, strategy);
+    }
+    let assert_disjoint = |step: &str| {
+        for (t, _) in &tables {
+            assert_eq!(
+                overlapping_versions(root, t),
+                0,
+                "{t} after {step}: {:?}",
+                rows(
+                    root,
+                    &format!("SELECT * FROM main.{t} ORDER BY id, valid_from, valid_to")
+                )
+            );
+        }
+    };
+
+    run(root, 1);
+    assert_disjoint("the first run");
+
+    sql(root, "DELETE FROM raw.users WHERE id = 1;");
+    run(root, 2);
+    assert_disjoint("the delete");
+
+    // The key comes back with the updated_at it had before the delete.
+    sql(
+        root,
+        "INSERT INTO raw.users VALUES (1, 'a', TIMESTAMP '2026-01-01 00:00:00');",
+    );
+    run(root, 3);
+    assert_disjoint("the revival");
+    for (t, _) in &tables {
+        assert_eq!(
+            count(
+                root,
+                &format!("SELECT count(*) FROM main.{t} WHERE id = 1 AND is_current")
+            ),
+            1,
+            "{t}: one current version"
+        );
+        // The revived version starts no earlier than the latest close.
+        assert_eq!(
+            count(
+                root,
+                &format!(
+                    "SELECT count(*) FROM main.{t} c WHERE c.id = 1 AND c.is_current \
+                     AND c.valid_from < (SELECT max(valid_to) FROM main.{t} h WHERE h.id = 1)"
+                )
+            ),
+            0,
+            "{t}: revived valid_from precedes the history"
+        );
+    }
+    // The timestamp strategy still records the source's updated_at.
+    assert_eq!(
+        count(
+            root,
+            "SELECT count(*) FROM main.ts_invalidate WHERE id = 2 \
+             AND valid_from = TIMESTAMP '2026-01-01 00:00:00'"
+        ),
+        1
+    );
+
+    // A rerun with no source change writes nothing.
+    let before = rows(root, "SELECT * FROM main.ts_new_record ORDER BY ALL");
+    run(root, 4);
+    assert_disjoint("a no-change rerun");
+    assert_eq!(
+        rows(root, "SELECT * FROM main.ts_new_record ORDER BY ALL"),
+        before
+    );
+}
