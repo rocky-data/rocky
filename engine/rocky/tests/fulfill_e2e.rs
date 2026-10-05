@@ -212,6 +212,9 @@ fn write_project(dir: &Path, session: &str) -> PathBuf {
     dir.join("rocky.toml")
 }
 
+/// The drills' state store, relative to the project root.
+const STATE_PATH: &str = ".rocky/state.redb";
+
 /// Run the real binary from `dir`, JSON output, returning (exit_code,
 /// parsed stdout JSON when it parses, raw stdout, raw stderr).
 fn rocky(dir: &Path, args: &[&str]) -> (i32, Option<serde_json::Value>, String, String) {
@@ -224,7 +227,9 @@ fn rocky_env(
     env: &[(&str, &str)],
 ) -> (i32, Option<serde_json::Value>, String, String) {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_rocky"));
-    cmd.args(["--output", "json"])
+    // Outside `models/`: `rocky fulfill` refuses a store the drafting worker
+    // may write (#2169). Every command in a drill shares this one store.
+    cmd.args(["--output", "json", "--state-path", STATE_PATH])
         .args(args)
         .current_dir(dir)
         .env("RUST_LOG", "error");
@@ -254,7 +259,9 @@ fn materialize_target(dir: &Path) {
 }
 
 fn state_store(dir: &Path) -> rocky_core::state::StateStore {
-    rocky_core::state::StateStore::open(&dir.join("models/.rocky-state.redb")).expect("store")
+    let path = dir.join(STATE_PATH);
+    std::fs::create_dir_all(path.parent().expect("parent")).expect("state dir");
+    rocky_core::state::StateStore::open(&path).expect("store")
 }
 
 /// Count the declared data checks in the MERGED sidecar, independently
@@ -319,10 +326,9 @@ fn drive_to_plan_review(dir: &Path) -> String {
     assert_eq!(json["state"], "needs_input", "{json}");
     let plan_id = json["plan_id"].as_str().expect("plan pinned").to_string();
     assert!(
-        json["next_command"]
-            .as_str()
-            .unwrap()
-            .contains(&format!("rocky review {plan_id} --approve")),
+        json["next_command"].as_str().unwrap().contains(&format!(
+            "rocky --state-path {STATE_PATH} review {plan_id} --approve"
+        )),
         "{json}"
     );
     // The spec-owned Phase-A artifact exists.
@@ -354,6 +360,54 @@ fn approve_and_apply(dir: &Path, plan_id: &str) {
         .query_row("SELECT COUNT(*) FROM out.revenue_daily", [], |r| r.get(0))
         .expect("target table");
     assert_eq!(count, 1);
+}
+
+/// #2169: the default store sits in `models/`, which the drafting worker
+/// may write, so both `rocky fulfill` spellings refuse it before touching
+/// anything, naming `--state-path`. With the store moved out, the printed
+/// next step carries the same `--state-path`, so the human's approval lands
+/// in the store the loop reads.
+#[test]
+fn a_state_store_inside_models_is_refused_and_the_next_step_names_the_store() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dir = tmp.path();
+    write_project(dir, &session_json(&[]));
+
+    for args in [
+        &["fulfill", PRODUCT][..],
+        &["fulfill", "approve-spec", PRODUCT][..],
+    ] {
+        let out = Command::new(env!("CARGO_BIN_EXE_rocky"))
+            .args(["--output", "json"])
+            .args(args)
+            .current_dir(dir)
+            .env("RUST_LOG", "error")
+            .output()
+            .expect("spawn rocky");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_ne!(out.status.code(), Some(0), "{args:?} must refuse: {stderr}");
+        assert!(
+            stderr.contains("inside the models directory") && stderr.contains("--state-path"),
+            "{args:?}: {stderr}"
+        );
+        assert!(
+            !dir.join("models/.rocky-state.redb").exists(),
+            "{args:?}: the refusal must come before the store is created"
+        );
+        assert!(
+            !dir.join(format!("products/{PRODUCT}.toml")).exists(),
+            "{args:?}: the refusal must come before elicitation"
+        );
+    }
+
+    let (code, json, _out, err) = rocky(dir, &["fulfill", PRODUCT]);
+    assert_eq!(code, 0, "{err}");
+    let json = json.expect("fulfill json");
+    assert_eq!(
+        json["next_command"],
+        format!("rocky --state-path {STATE_PATH} fulfill approve-spec {PRODUCT}"),
+        "{json}"
+    );
 }
 
 #[test]
@@ -2160,7 +2214,7 @@ fn a_reroute_to_an_unresolvable_adapter_reports_routing_not_custody() {
     );
     assert_eq!(
         json["next_command"].as_str(),
-        Some(format!("rocky fulfill {PRODUCT}").as_str()),
+        Some(format!("rocky --state-path {STATE_PATH} fulfill {PRODUCT}").as_str()),
         "re-running after fixing the config IS the remedy here: {json}"
     );
 
@@ -2495,7 +2549,7 @@ fn a_digest_from_an_older_scheme_blocks_with_a_remedy_that_works() {
     );
     assert_eq!(
         json["next_command"].as_str(),
-        Some(format!("rocky fulfill {PRODUCT} --retry").as_str()),
+        Some(format!("rocky --state-path {STATE_PATH} fulfill {PRODUCT} --retry").as_str()),
         "and the printed command is the one that starts a generation this build can pin: \
          {json}"
     );
