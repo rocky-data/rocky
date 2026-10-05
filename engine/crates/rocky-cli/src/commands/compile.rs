@@ -12,6 +12,7 @@ use rocky_compiler::source_refs::{SourceProvenance, SourceSchemaOrigin};
 use rocky_compiler::types::TypedColumn;
 use rocky_core::config as rocky_config;
 use rocky_core::macros::{expand_macros, load_macros_from_dir};
+use rocky_core::secret_registry::{render_placeholders, render_placeholders_in};
 use rocky_sql::portability::{self, PortabilityIssue};
 use rocky_sql::pragma;
 use rocky_sql::transpile::Dialect;
@@ -117,6 +118,93 @@ pub fn run_compile_with_options(
     }
 
     Ok(())
+}
+
+/// Execute `rocky compile --dbt-project <DIR>` (experimental "attach mode").
+///
+/// Reads `<DIR>/target/manifest.json` (and its sibling `run_results.json`)
+/// through the same importer `rocky import-dbt` uses, so it refuses the same
+/// constructs with the same reasons. The translated project is written to a
+/// private temp directory, compiled with [`run_compile_with_options`], and removed when
+/// this function returns. Nothing is written under `<DIR>`: the config, the
+/// models and the state path all point into the temp directory.
+///
+/// Attach notes (manifest read, warnings) go to stderr so `--output json`
+/// keeps the unchanged [`CompileOutput`] shape on stdout. Diagnostics name
+/// file paths inside the temp directory.
+#[allow(clippy::too_many_arguments)]
+pub fn run_compile_dbt_attach(
+    dbt_project: &Path,
+    contracts_dir: Option<&Path>,
+    model_filter: Option<&str>,
+    output_json: bool,
+    do_expand_macros: bool,
+    target_dialect: Option<Dialect>,
+    cache_ttl_override: Option<u64>,
+    run_vars: &rocky_core::run_vars::RunVars,
+    strict_sources: bool,
+    deny_warning_codes: &[String],
+    selection: Option<&crate::selection::SelectionArgs>,
+) -> Result<()> {
+    use rocky_compiler::import::dbt_attach;
+    use rocky_compiler::import::emit::{self, EmitInputs, OverwritePolicy};
+
+    if !dbt_project.is_dir() {
+        anyhow::bail!("--dbt-project {} is not a directory", dbt_project.display());
+    }
+
+    let attached = dbt_attach::attach_dbt_project(dbt_project)?;
+
+    eprintln!(
+        "rocky compile (experimental dbt attach): read {} (manifest schema v{}), {} model(s)",
+        attached.manifest_path.display(),
+        attached.schema_version,
+        attached.import.imported.len()
+    );
+    if let Some(reason) = &attached.profile.fallback_reason {
+        eprintln!("  warning: <profiles.yml>: {reason}");
+    }
+    for w in &attached.import.warnings {
+        eprintln!("  warning: {}: {}", w.model, w.message);
+    }
+
+    // `TempDir` removes the directory on drop, including on every early
+    // return below. The project goes one level down so `emit_repo` sees a
+    // fresh, absent directory and never needs `ReplaceContents`.
+    let scratch = tempfile::Builder::new()
+        .prefix("rocky-dbt-attach-")
+        .tempdir()
+        .context("failed to create a temp directory for dbt attach mode")?;
+    let project_dir = scratch.path().join("project");
+
+    emit::emit_repo(&EmitInputs {
+        dbt_project_dir: dbt_project,
+        out_dir: &project_dir,
+        overwrite: OverwritePolicy::Reject,
+        profile: &attached.profile,
+        default_catalog: &attached.default_target.catalog,
+        default_schema: &attached.default_target.schema,
+        import: &attached.import,
+        adapter_override_label: None,
+    })
+    .map_err(|e| anyhow::anyhow!("dbt attach mode could not materialize the project: {e}"))?;
+
+    run_compile_with_options(
+        Some(&project_dir.join("rocky.toml")),
+        &scratch.path().join("state.redb"),
+        &project_dir.join("models"),
+        contracts_dir,
+        model_filter,
+        output_json,
+        do_expand_macros,
+        target_dialect,
+        false,
+        cache_ttl_override,
+        run_vars,
+        strict_sources,
+        deny_warning_codes,
+        selection,
+    )
 }
 
 /// Compile body shared by the JSON core ([`compile_output`]) and the text
@@ -289,6 +377,10 @@ fn compile_inner(
         result
             .diagnostics
             .extend(snapshot_adapter_diagnostics(config, &result));
+        // And one with no upsert at all (ClickHouse): E053.
+        result
+            .diagnostics
+            .extend(merge_adapter_diagnostics(config, &result));
     }
 
     // Portability lint. Effective target_dialect = CLI flag > [portability]
@@ -409,6 +501,13 @@ fn compile_inner(
         .map(|m| (m.file_path.display().to_string(), m.sql.clone()))
         .collect();
     let _already_reported = rocky_compiler::ephemeral::apply_ephemerals(&mut result.project, true);
+    // SQL Server lifts every CTE to the head of the statement; check that
+    // on the inlined SQL, the text `rocky run` sends (E054).
+    if let Some(config) = &project_config {
+        result
+            .diagnostics
+            .extend(sqlserver_cte_diagnostics(config, &result));
+    }
 
     // Load macros and expand model SQL when --expand-macros is set.
     let expanded_sql = if do_expand_macros {
@@ -451,11 +550,19 @@ fn compile_inner(
     }
 
     // Re-apply model filter to diagnostics (may now include E027).
+    // A diagnostic can quote a sidecar value (a target collision names the
+    // resolved target), so its text prints each resolved `${VAR}` value as
+    // `${NAME}` (#1919).
     let diagnostics: Vec<_> = result
         .diagnostics
         .iter()
         .filter(|d| in_scope(&d.model))
-        .cloned()
+        .map(|d| Diagnostic {
+            message: render_placeholders(&d.message).into(),
+            model: render_placeholders(&d.model),
+            suggestion: d.suggestion.as_deref().map(render_placeholders),
+            ..d.clone()
+        })
         .collect();
 
     let models_detail: Vec<ModelDetail> = result
@@ -474,18 +581,32 @@ fn compile_inner(
                     rocky_core::cost::Confidence::Low => "low".to_string(),
                 },
             });
-            ModelDetail {
-                name: model.config.name.clone(),
-                strategy: model.config.strategy.clone(),
+            // Sidecar values were `${VAR}`-expanded before parsing. Every
+            // field below except `target` is written with each resolved value
+            // as `${NAME}` (#1919). The copies are for printing only.
+            // `target` prints resolved on purpose: dagster-rocky matches the
+            // asset key it builds from it against `rocky run`'s `asset_key`,
+            // which carries the resolved coordinates.
+            let render = render_placeholders;
+            Ok(ModelDetail {
+                name: render(&model.config.name),
+                strategy: render_placeholders_in(&model.config.strategy)
+                    .context("failed to render the model strategy for output")?,
                 target: model.config.target.clone(),
-                freshness: model.config.freshness.clone(),
+                freshness: render_placeholders_in(&model.config.freshness)
+                    .context("failed to render the model freshness for output")?,
                 contract_source: model.contract_path.as_ref().map(|_| "auto".to_string()),
                 cost_hint,
-                depends_on: model.config.depends_on.clone(),
-                tags: model.config.tags.clone(),
-            }
+                depends_on: model.config.depends_on.iter().map(|d| render(d)).collect(),
+                tags: model
+                    .config
+                    .tags
+                    .iter()
+                    .map(|(k, v)| (render(k), render(v)))
+                    .collect(),
+            })
         })
-        .collect();
+        .collect::<Result<_>>()?;
 
     // Data the text renderer needs from the raw `CompileResult` but which is
     // not carried on `CompileOutput`: execution order, per-model typed-column
@@ -666,15 +787,23 @@ fn warehouse_adapters(
 }
 
 /// E051 for every valid function a model calls when every warehouse adapter
-/// the project configures cannot create functions: Trino, and every adapter
-/// with no function DDL (PostgreSQL, Redshift, an unknown type). A project
+/// the project configures cannot create it: Trino, every adapter with no
+/// function DDL (ClickHouse, SQL Server, an unknown type), and PostgreSQL /
+/// Redshift when their `CREATE FUNCTION` rendering
+/// ([`rocky_core::functions::create_function_sql`]) refuses this function —
+/// a `[target] catalog` on Redshift, a body holding the dollar-quote
+/// delimiter, an argument used in a qualified reference with no positional
+/// spelling. Those refusals would otherwise surface only at `rocky run`.
+/// SQL Server is refused, not rendered: a T-SQL scalar UDF takes
+/// `@`-prefixed parameters and must be called schema-qualified
+/// (`dbo.f(x)`), so a model's bare `f(x)` call would not resolve to it. A project
 /// that also configures a capable warehouse is not refused here —
 /// `rocky run` refuses at the boundary if the model runs on the other one.
 fn function_adapter_diagnostics(
     config: &rocky_config::RockyConfig,
     result: &compile::CompileResult,
 ) -> Vec<Diagnostic> {
-    use rocky_core::functions::FunctionDialect;
+    use rocky_core::functions::{FunctionDialect, create_function_sql};
     let registry = result.semantic_graph.functions();
     let warehouses: Vec<(&str, Option<FunctionDialect>)> = warehouse_adapters(config)
         .map(|a| {
@@ -684,19 +813,33 @@ fn function_adapter_diagnostics(
             )
         })
         .collect();
-    let can_create = |w: &Option<FunctionDialect>| match w {
-        Some(FunctionDialect::Trino) | None => false,
-        Some(
-            FunctionDialect::DuckDb
-            | FunctionDialect::Snowflake
-            | FunctionDialect::Databricks
-            | FunctionDialect::BigQuery,
-        ) => true,
-    };
-    if registry.is_empty() || warehouses.is_empty() || warehouses.iter().any(|(_, w)| can_create(w))
-    {
+    if registry.is_empty() || warehouses.is_empty() {
         return Vec::new();
     }
+    // Why `name` cannot be created on warehouse `w`, or `None` when it can.
+    // `Err(())` is "no function DDL at all"; `Ok(reason)` is the rendering's
+    // own refusal.
+    let refusal = |name: &str, w: &Option<FunctionDialect>| -> Option<Result<String, ()>> {
+        match w {
+            Some(FunctionDialect::Trino) | None => Some(Err(())),
+            Some(
+                FunctionDialect::DuckDb
+                | FunctionDialect::Snowflake
+                | FunctionDialect::Databricks
+                | FunctionDialect::BigQuery,
+            ) => None,
+            Some(dialect @ (FunctionDialect::Postgres | FunctionDialect::Redshift)) => {
+                let def = &registry.get(name)?.def;
+                // An invalid definition already has its own E051.
+                if !def.validation_problems().is_empty() {
+                    return None;
+                }
+                create_function_sql(def, *dialect)
+                    .err()
+                    .map(|e| Ok(e.to_string()))
+            }
+        }
+    };
     let mut types: Vec<&str> = warehouses.iter().map(|(t, _)| *t).collect();
     types.sort_unstable();
     types.dedup();
@@ -704,18 +847,38 @@ fn function_adapter_diagnostics(
     let usage = rocky_compiler::udf::function_usage(&result.project.models, registry);
     usage
         .keys()
-        .map(|name| {
-            Diagnostic::error(
-                diagnostic::E051,
-                name,
-                format!(
-                    "function `{name}` cannot be created: Rocky cannot create persistent \
-                     user-defined functions on the configured warehouse ({types})"
-                ),
-            )
-            .with_suggestion(
-                "inline the expression in the calling models, or create the routine outside Rocky",
-            )
+        .filter_map(|name| {
+            let reasons: Vec<Result<String, ()>> = warehouses
+                .iter()
+                .map(|(_, w)| refusal(name, w))
+                .collect::<Option<_>>()?;
+            let rendered: Vec<String> = reasons.into_iter().filter_map(Result::ok).collect();
+            let diagnostic = if rendered.is_empty() {
+                Diagnostic::error(
+                    diagnostic::E051,
+                    name,
+                    format!(
+                        "function `{name}` cannot be created: Rocky cannot create persistent \
+                         user-defined functions on the configured warehouse ({types})"
+                    ),
+                )
+                .with_suggestion(
+                    "inline the expression in the calling models, or create the routine \
+                     outside Rocky",
+                )
+            } else {
+                Diagnostic::error(
+                    diagnostic::E051,
+                    name,
+                    format!(
+                        "function `{name}` cannot be created on the configured warehouse \
+                         ({types}): {}",
+                        rendered.join("; ")
+                    ),
+                )
+                .with_suggestion("change the function definition as the message says")
+            };
+            Some(diagnostic)
         })
         .collect()
 }
@@ -769,6 +932,109 @@ fn snapshot_adapter_diagnostics(
             .with_suggestion(
                 "use a warehouse that supports MERGE (PostgreSQL 15+ with merge_mode = \"merge\"), \
                  or change the model's strategy",
+            )
+        })
+        .collect()
+}
+
+/// E053 for every model that updates rows by key — `merge`, or `incremental`
+/// with a `unique_key` — when every warehouse adapter the project configures
+/// has no upsert to render it with
+/// ([`rocky_core::traits::SqlDialect::merge_unsupported_reason`]):
+/// ClickHouse. Conservative like E049: a project that also configures a
+/// capable warehouse is not refused here; `rocky run` refuses at SQL
+/// generation if the model runs on ClickHouse.
+fn merge_adapter_diagnostics(
+    config: &rocky_config::RockyConfig,
+    result: &compile::CompileResult,
+) -> Vec<Diagnostic> {
+    let mut refusal: Option<(String, &'static str)> = None;
+    for adapter in warehouse_adapters(config) {
+        let reason = match crate::registry::postgres_dialect_for_config(adapter) {
+            Some(dialect) => dialect.merge_unsupported_reason(),
+            None => crate::registry::warehouse_dialect_for_type(&adapter.adapter_type)
+                .and_then(rocky_core::traits::SqlDialect::merge_unsupported_reason),
+        };
+        // One capable (or unknown) warehouse is enough to stay silent.
+        let Some(reason) = reason else {
+            return Vec::new();
+        };
+        refusal.get_or_insert((adapter.adapter_type.clone(), reason));
+    }
+    let Some((adapter_type, reason)) = refusal else {
+        return Vec::new();
+    };
+    result
+        .project
+        .models
+        .iter()
+        .filter_map(|m| {
+            let kind = match &m.config.strategy {
+                rocky_core::models::StrategyConfig::Merge { .. } => "merge",
+                rocky_core::models::StrategyConfig::Incremental { unique_key, .. }
+                    if !unique_key.is_empty() =>
+                {
+                    "incremental with a unique_key"
+                }
+                _ => return None,
+            };
+            Some(
+                Diagnostic::error(
+                    diagnostic::E053,
+                    &m.config.name,
+                    format!(
+                        "model `{}` ({kind}) cannot run on the configured {adapter_type} \
+                         warehouse: {reason}",
+                        m.config.name
+                    ),
+                )
+                .with_suggestion(
+                    "use `delete_insert` (replace rows by partition key), `incremental` without \
+                     a unique_key (append), or `full_refresh`",
+                ),
+            )
+        })
+        .collect()
+}
+
+/// E054 for every model whose SQL (ephemeral upstreams already inlined)
+/// SQL Server cannot run because its CTEs cannot be lifted to one leading
+/// `WITH` ([`rocky_sqlserver::tsql::hoist_ctes`]), when every warehouse
+/// adapter the project configures is SQL Server. Conservative like E053: a
+/// project that also configures another warehouse is not refused here.
+fn sqlserver_cte_diagnostics(
+    config: &rocky_config::RockyConfig,
+    result: &compile::CompileResult,
+) -> Vec<Diagnostic> {
+    let mut warehouses = warehouse_adapters(config).peekable();
+    if warehouses.peek().is_none() || !warehouses.all(|a| a.adapter_type == "sqlserver") {
+        return Vec::new();
+    }
+    result
+        .project
+        .models
+        .iter()
+        .filter(|m| {
+            !matches!(
+                m.config.strategy,
+                rocky_core::models::StrategyConfig::Ephemeral
+            )
+        })
+        .filter(|m| rocky_sqlserver::tsql::hoist_ctes(&m.sql).is_none())
+        .map(|m| {
+            Diagnostic::error(
+                diagnostic::E054,
+                &m.config.name,
+                format!(
+                    "model `{}` cannot run on SQL Server: T-SQL accepts `WITH` only at the \
+                     start of a statement, and Rocky cannot lift this model's CTEs there \
+                     without changing what a name refers to",
+                    m.config.name
+                ),
+            )
+            .with_suggestion(
+                "give each CTE a distinct name that no table, column or alias in the model \
+                 also uses, or move nested `WITH` clauses to the top of the model",
             )
         })
         .collect()
@@ -1118,17 +1384,19 @@ schema_template = "s"
         config
     }
 
-    /// Postgres and Redshift have no function DDL. With no other
-    /// warehouse configured, a UDF is refused at compile time (E051)
-    /// instead of failing mid-run.
+    const TRINO: &str = "[adapter.wh]\ntype = \"trino\"\nhost = \"localhost\"\n";
+
+    /// Trino cannot create persistent functions. With no other warehouse
+    /// configured, a UDF is refused at compile time (E051) instead of
+    /// failing mid-run.
     #[test]
     fn udf_on_warehouse_without_function_ddl_is_e051() {
         for adapters in [
-            PG.to_string(),
-            PG.replace("postgres", "redshift"),
+            TRINO.to_string(),
+            PG.replace("postgres", "sqlserver"),
             // A discovery-only adapter is not a warehouse.
             format!(
-                "{PG}\n[adapter.src]\ntype = \"fivetran\"\nkind = \"discovery\"\n\
+                "{TRINO}\n[adapter.src]\ntype = \"fivetran\"\nkind = \"discovery\"\n\
                      destination_id = \"d\"\napi_key = \"k\"\napi_secret = \"s\"\n"
             ),
         ] {
@@ -1142,12 +1410,93 @@ schema_template = "s"
         }
     }
 
-    /// A capable warehouse beside Postgres keeps compile quiet: the run
-    /// refuses at the boundary if the model lands on Postgres.
+    /// PostgreSQL and Redshift create SQL functions, so a project whose
+    /// only warehouse is one of them compiles clean.
+    #[test]
+    fn udf_on_postgres_or_redshift_is_not_e051() {
+        for adapters in [PG.to_string(), PG.replace("postgres", "redshift")] {
+            let dir = TempDir::new().unwrap();
+            let config = udf_project(dir.path(), &adapters);
+            let codes = compile_codes(dir.path(), &config);
+            assert!(
+                !codes.iter().any(|(c, _)| c == "E051"),
+                "{adapters}: {codes:?}"
+            );
+        }
+    }
+
+    /// PostgreSQL / Redshift render the function's DDL at compile time, so a
+    /// definition their rendering refuses is E051 now rather than at run:
+    /// a Redshift `[target] catalog`, a body with the dollar-quote
+    /// delimiter, an argument in a qualified reference. A capable warehouse
+    /// beside them keeps compile quiet.
+    #[test]
+    fn udf_refused_by_postgres_or_redshift_rendering_is_e051() {
+        let rs = PG.replace("postgres", "redshift");
+        let cases: [(&str, &str, &str, &str); 4] = [
+            (
+                rs.as_str(),
+                "[target]\ncatalog = \"c\"\nschema = \"s\"\n",
+                "x * 2",
+                "catalog",
+            ),
+            (rs.as_str(), "", "x || '$$'", "$$"),
+            (rs.as_str(), "", "x.field", "qualified"),
+            (PG, "", "x || '$rocky$'", "$rocky$"),
+        ];
+        for (adapters, target, body, needle) in cases {
+            let dir = TempDir::new().unwrap();
+            let config = udf_project(dir.path(), adapters);
+            fs::write(
+                dir.path().join("functions/dbl.toml"),
+                format!(
+                    "returns = \"DOUBLE\"\n\n[[arguments]]\nname = \"x\"\ntype = \"DOUBLE\"\n\n{target}"
+                ),
+            )
+            .unwrap();
+            fs::write(dir.path().join("functions/dbl.sql"), body).unwrap();
+            let out = compile_output(
+                Some(&config),
+                &dir.path().join("state.redb"),
+                &dir.path().join("models"),
+                None,
+                None,
+                false,
+                None,
+                false,
+                None,
+            )
+            .unwrap();
+            let e051: Vec<_> = out
+                .diagnostics
+                .iter()
+                .filter(|d| &*d.code == "E051" && d.model == "dbl")
+                .collect();
+            assert_eq!(e051.len(), 1, "{body}: {:?}", out.diagnostics);
+            assert!(
+                e051[0].message.contains(needle),
+                "{body}: {}",
+                e051[0].message
+            );
+
+            // DuckDB beside it can create the function: no compile refusal.
+            let dir = TempDir::new().unwrap();
+            let both =
+                format!("{adapters}\n[adapter.local]\ntype = \"duckdb\"\npath = \":memory:\"\n");
+            let config = udf_project(dir.path(), &both);
+            fs::write(dir.path().join("functions/dbl.sql"), body).unwrap();
+            let codes = compile_codes(dir.path(), &config);
+            assert!(!codes.iter().any(|(c, _)| c == "E051"), "{body}: {codes:?}");
+        }
+    }
+
+    /// A capable warehouse beside Trino keeps compile quiet: the run
+    /// refuses at the boundary if the model lands on Trino.
     #[test]
     fn udf_with_a_capable_warehouse_configured_is_not_e051() {
         let dir = TempDir::new().unwrap();
-        let adapters = format!("{PG}\n[adapter.local]\ntype = \"duckdb\"\npath = \":memory:\"\n");
+        let adapters =
+            format!("{TRINO}\n[adapter.local]\ntype = \"duckdb\"\npath = \":memory:\"\n");
         let config = udf_project(dir.path(), &adapters);
         let codes = compile_codes(dir.path(), &config);
         assert!(!codes.iter().any(|(c, _)| c == "E051"), "{codes:?}");
@@ -1177,6 +1526,7 @@ schema_template = "s"
         for adapters in [
             format!("{PG}\n[adapter.wh.extra]\nmerge_mode = \"on_conflict\"\n"),
             PG.replace("postgres", "redshift"),
+            PG.replace("postgres", "sqlserver"),
         ] {
             let dir = TempDir::new().unwrap();
             let config = snapshot_project(dir.path(), &adapters);
@@ -1191,6 +1541,165 @@ schema_template = "s"
         let config = snapshot_project(dir.path(), PG);
         let codes = compile_codes(dir.path(), &config);
         assert!(!codes.iter().any(|(c, _)| c == "E049"), "{codes:?}");
+    }
+
+    const CH: &str = "[adapter.wh]\ntype = \"clickhouse\"\nhost = \"localhost\"\n";
+
+    /// A ClickHouse-only project refuses every model that updates rows by key
+    /// (E053), refuses snapshots (E049) and UDFs (E051), and leaves the
+    /// strategies ClickHouse runs alone.
+    #[test]
+    fn clickhouse_refuses_merge_snapshot_and_udf_only() {
+        let dir = TempDir::new().unwrap();
+        let config = snapshot_project(dir.path(), CH);
+        let models = dir.path().join("models");
+        let model = |name: &str, toml: &str| {
+            fs::write(models.join(format!("{name}.sql")), "SELECT 1 AS id, 2 AS v").unwrap();
+            fs::write(
+                models.join(format!("{name}.toml")),
+                format!("{toml}\n[target]\ncatalog = \"\"\nschema = \"s\"\n"),
+            )
+            .unwrap();
+        };
+        model(
+            "m_merge",
+            "[strategy]\ntype = \"merge\"\nunique_key = [\"id\"]\n",
+        );
+        model(
+            "m_upsert",
+            "[strategy]\ntype = \"incremental\"\ntimestamp_column = \"id\"\n\
+             unique_key = [\"id\"]\n",
+        );
+        model("m_full", "[strategy]\ntype = \"full_refresh\"\n");
+        model(
+            "m_di",
+            "[strategy]\ntype = \"delete_insert\"\npartition_by = [\"id\"]\n",
+        );
+        model("m_view", "[strategy]\ntype = \"view\"\n");
+        let codes = compile_codes(dir.path(), &config);
+        for name in ["m_merge", "m_upsert"] {
+            assert!(
+                codes.contains(&("E053".to_string(), name.to_string())),
+                "{name}: {codes:?}"
+            );
+        }
+        for name in ["m_full", "m_di", "m_view"] {
+            assert!(
+                !codes.iter().any(|(c, m)| c.starts_with('E') && m == name),
+                "{name} must compile clean: {codes:?}"
+            );
+        }
+        assert!(
+            codes.contains(&("E049".to_string(), "snap".to_string())),
+            "{codes:?}"
+        );
+
+        let dir = TempDir::new().unwrap();
+        let config = udf_project(dir.path(), CH);
+        let codes = compile_codes(dir.path(), &config);
+        assert!(
+            codes.contains(&("E051".to_string(), "dbl".to_string())),
+            "{codes:?}"
+        );
+    }
+
+    const SS: &str = "[adapter.wh]\ntype = \"sqlserver\"\nhost = \"localhost\"\n\
+                      database = \"an\"\nusername = \"u\"\npassword = \"x\"\n";
+
+    /// Two ephemeral upstreams that each end in `WITH final AS …`, read by a
+    /// consumer with its own `final`, lift on SQL Server (the nested names
+    /// are renamed in scope). A nested CTE named like a column the outer
+    /// query reads cannot be lifted: E054 on a SQL Server-only project, and
+    /// silence when another warehouse is configured.
+    #[test]
+    fn sqlserver_cte_lifting_is_checked_at_compile() {
+        let write = |models: &Path, name: &str, sql: &str, strategy: &str| {
+            fs::write(models.join(format!("{name}.sql")), sql).unwrap();
+            fs::write(
+                models.join(format!("{name}.toml")),
+                format!(
+                    "{strategy}\n[strategy]\ntype = \"{}\"\n\n[target]\ncatalog = \"an\"\nschema = \"marts\"\n",
+                    if strategy.is_empty() { "full_refresh" } else { "ephemeral" }
+                ),
+            )
+            .unwrap();
+        };
+        let project = |root: &Path, adapters: &str| {
+            let config = adapter_project(root, adapters);
+            let models = root.join("models");
+            write(&models, "raw", "SELECT 1 AS id, 2 AS v", "");
+            let eph = "depends_on = [\"raw\"]";
+            write(
+                &models,
+                "stg_a",
+                "WITH final AS (SELECT id, v FROM raw) SELECT * FROM final",
+                eph,
+            );
+            write(
+                &models,
+                "stg_b",
+                "WITH final AS (SELECT id, v + 1 AS w FROM raw) SELECT * FROM final",
+                eph,
+            );
+            fs::write(
+                models.join("fct.sql"),
+                "WITH final AS (SELECT a.id, a.v, b.w FROM stg_a AS a JOIN stg_b AS b ON a.id = b.id) \
+                 SELECT * FROM final",
+            )
+            .unwrap();
+            fs::write(
+                models.join("fct.toml"),
+                "depends_on = [\"stg_a\", \"stg_b\"]\n[strategy]\ntype = \"full_refresh\"\n\n\
+                 [target]\ncatalog = \"an\"\nschema = \"marts\"\n",
+            )
+            .unwrap();
+            fs::write(
+                models.join("bad.sql"),
+                "SELECT v FROM (WITH v AS (SELECT id AS v FROM raw) SELECT v FROM v) AS s",
+            )
+            .unwrap();
+            fs::write(
+                models.join("bad.toml"),
+                "depends_on = [\"raw\"]\n[strategy]\ntype = \"full_refresh\"\n\n\
+                 [target]\ncatalog = \"an\"\nschema = \"marts\"\n",
+            )
+            .unwrap();
+            config
+        };
+
+        let dir = TempDir::new().unwrap();
+        let config = project(dir.path(), SS);
+        let codes = compile_codes(dir.path(), &config);
+        let e054: Vec<&str> = codes
+            .iter()
+            .filter(|(c, _)| c == "E054")
+            .map(|(_, m)| m.as_str())
+            .collect();
+        assert_eq!(e054, vec!["bad"], "{codes:?}");
+
+        let dir = TempDir::new().unwrap();
+        let adapters = format!("{SS}\n[adapter.local]\ntype = \"duckdb\"\npath = \":memory:\"\n");
+        let config = project(dir.path(), &adapters);
+        let codes = compile_codes(dir.path(), &config);
+        assert!(!codes.iter().any(|(c, _)| c == "E054"), "{codes:?}");
+    }
+
+    /// A warehouse with MERGE beside ClickHouse keeps compile quiet; the run
+    /// refuses at SQL generation if the model lands on ClickHouse.
+    #[test]
+    fn clickhouse_merge_with_a_capable_warehouse_is_not_e053() {
+        let dir = TempDir::new().unwrap();
+        let adapters = format!("{CH}\n[adapter.local]\ntype = \"duckdb\"\npath = \":memory:\"\n");
+        let config = adapter_project(dir.path(), &adapters);
+        let models = dir.path().join("models");
+        fs::write(models.join("m.sql"), "SELECT 1 AS id").unwrap();
+        fs::write(
+            models.join("m.toml"),
+            "[strategy]\ntype = \"merge\"\nunique_key = [\"id\"]\n\n[target]\ncatalog = \"\"\nschema = \"s\"\n",
+        )
+        .unwrap();
+        let codes = compile_codes(dir.path(), &config);
+        assert!(!codes.iter().any(|(c, _)| c == "E053"), "{codes:?}");
     }
 
     #[test]
@@ -1238,6 +1747,64 @@ schema_template = "s"
             err.to_string().contains("compilation failed"),
             "expected bail, got: {err}"
         );
+    }
+
+    /// #1919: a sidecar value expanded from `${VAR}` prints only as `${NAME}`
+    /// in `rocky compile --output json` (`models_detail`), never as the value.
+    /// The target is the exception: it prints resolved, as `rocky run`'s
+    /// `asset_key` does.
+    #[test]
+    fn compile_output_prints_a_resolved_sidecar_value_as_its_placeholder() {
+        const SECRET: &str = "rocky_1919_compile_secret_d00d";
+        const CATALOG: &str = "rocky_1919_compile_catalog";
+        let dir = TempDir::new().unwrap();
+        let models_dir = dir.path().join("models");
+        fs::create_dir_all(&models_dir).unwrap();
+        fs::write(
+            models_dir.join("m1.sql"),
+            "SELECT 1 AS id, CURRENT_DATE AS ts",
+        )
+        .unwrap();
+        fs::write(
+            models_dir.join("m1.toml"),
+            "name = \"m1\"\n\n\
+             [strategy]\ntype = \"incremental\"\ntimestamp_column = \"${ROCKY_T1919_COMPILE}\"\n\n\
+             [target]\ncatalog = \"${ROCKY_T1919_COMPILE_CATALOG}\"\nschema = \"s\"\ntable = \"m1\"\n\n\
+             [tags]\nowner = \"${ROCKY_T1919_COMPILE}\"\n",
+        )
+        .unwrap();
+        // SAFETY: test-only; the variable name is unique to this test.
+        unsafe {
+            std::env::set_var("ROCKY_T1919_COMPILE", SECRET);
+            std::env::set_var("ROCKY_T1919_COMPILE_CATALOG", CATALOG);
+        }
+        let out = compile_output(
+            None,
+            &dir.path().join(".rocky-state.redb"),
+            &models_dir,
+            None,
+            None,
+            false,
+            None,
+            false,
+            None,
+        );
+        // SAFETY: as above.
+        unsafe {
+            std::env::remove_var("ROCKY_T1919_COMPILE");
+            std::env::remove_var("ROCKY_T1919_COMPILE_CATALOG");
+        }
+        let out = out.expect("compiles");
+        assert_eq!(out.models_detail.len(), 1, "PRECONDITION: the model loaded");
+        let json = serde_json::to_string(&out).unwrap();
+        assert!(!json.contains(SECRET), "leaked: {json}");
+        let detail = serde_json::to_value(&out.models_detail[0]).unwrap();
+        assert_eq!(detail["target"]["catalog"], CATALOG);
+        assert_eq!(
+            detail["strategy"]["timestamp_column"],
+            "${ROCKY_T1919_COMPILE}"
+        );
+        assert_eq!(detail["tags"]["owner"], "${ROCKY_T1919_COMPILE}");
     }
 
     #[test]

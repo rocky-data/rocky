@@ -132,12 +132,13 @@ For `USING` and `NATURAL` joins, Rocky distinguishes merged join keys from quali
 `rocky compile` also checks two kinds of operands against the target warehouse:
 
 - **Aggregate arguments.** `SUM(customer_name)` over a `VARCHAR` column has no
-  overload on DuckDB, BigQuery or Trino. Rocky reports `E042`. Snowflake and
-  Databricks cast the text at run time instead, so there it is `W042`.
+  overload on DuckDB, BigQuery, Trino or SQL Server. Rocky reports `E042`.
+  Snowflake and Databricks cast the text at run time instead, so there it is
+  `W042`.
 - **Comparison operands.** This covers `=`, `<>`, `<`, `>`, `<=`, `>=`, `IN`,
   `BETWEEN` and join `ON` predicates. A `BIGINT` column compared with a
-  `VARCHAR` column casts the text on every row on DuckDB, Snowflake and
-  Databricks. The query fails on the first value that does not parse, so Rocky
+  `VARCHAR` column casts the text on every row on DuckDB, Snowflake,
+  Databricks and SQL Server. The query fails on the first value that does not parse, so Rocky
   reports `W043`. BigQuery and Trino refuse the pair outright: `E043`.
 
 The warehouse comes from, in order: `--target-dialect`, the adapter `type` of
@@ -400,7 +401,7 @@ span, and sometimes a suggested fix.
 | `E042` | Aggregate argument type has no overload on the target warehouse, such as `SUM(VARCHAR)` on DuckDB |
 | `E043` | Comparison between types the target warehouse refuses, such as `INT64 = STRING` on BigQuery |
 | `E041` | A direct reference names a column absent from an external source whose schema Rocky trusts. See [Missing columns in external sources](#missing-columns-in-external-sources-e041--w041) |
-| `E051` | A [user-defined function](/concepts/user-defined-functions/) or a call to one is invalid: bad definition, Python language, wrong argument count, a certainly incompatible argument type, or a warehouse that cannot create functions (Trino) |
+| `E051` | A [user-defined function](/concepts/user-defined-functions/) or a call to one is invalid: bad definition, Python language, wrong argument count, a certainly incompatible argument type, or a warehouse that cannot create functions (Trino, ClickHouse, SQL Server) |
 | `E050` | A freshness declaration cannot be evaluated: no threshold, a bad duration, `error_after` shorter than `warn_after`, a bad `loaded_at_field` or `filter`, or a model `time_column` absent from a complete output |
 | `E037` | A transformation model declares `type = "incremental"` with no `timestamp_column` (watermark), which would append every row again on each run. Declare the watermark and use `@incremental_filter`, or use `merge`, `delete_insert`, `time_interval` or `full_refresh` |
 | `E046` | An `incremental` model's watermark filter has no safe place: no `@incremental_filter` and the watermark is not a provable passthrough column; or the watermark is not an output column or not a plain name; or `@incremental_filter` appears under another strategy |
@@ -408,6 +409,8 @@ span, and sometimes a suggested fix.
 | `E047` | A model reads a `private` model outside its ownership group, or a producer model that is not `public` (see [Model governance](/concepts/model-governance/)) |
 | `E048` | A model-version problem: undeclared latest version, missing version file, or a reference to an undeclared version |
 | `E052` | A model's `[redshift]` table options cannot render (an invalid or contradictory `dist_key` / `sort_key`), or sit on a strategy that builds no table. See [Redshift](/reference/adapters/redshift/#table-distribution-and-sort-keys) |
+| `E053` | ClickHouse cannot run the model as configured: its `[clickhouse]` table options cannot render or sit on a strategy that builds no table, or it is a `merge` model (or `incremental` with `unique_key`) and every configured warehouse is ClickHouse, which has no `MERGE`. See [ClickHouse](/reference/adapters/clickhouse/#strategies) |
+| `E054` | SQL Server cannot run the model's SQL: its CTEs cannot be lifted to the start of the statement, even after Rocky renames colliding nested CTEs. Emitted when every configured warehouse is SQL Server. See [SQL Server](/reference/adapters/sqlserver/) |
 | `E055` | `rocky package` refused to vendor a dbt package: a bad spec, `dbt` not on `PATH`, an adapter with no dbt profile mapping, a failed `dbt deps` or `dbt compile`, a package model name the project already uses, or a `remove` that would delete edited files without `--force`. See [Use dbt packages](/guides/dbt-packages/) |
 | `W001` | Unused model (no downstream consumers) |
 | `W002` | Duplicate column in model output |
@@ -429,6 +432,7 @@ span, and sometimes a suggested fix.
 | `W049` | A `type = "snapshot"` model is valid but risky: a `unique_key` the SELECT does not output (it may be a `[[surrogate_key]]` column), `check` over more than 20 columns, an `updated_at` that is not a timestamp or date, or a key or change column missing from a `SELECT *` model's compile-time schema (which may be stale) |
 | `W048` | A model reads a model version whose `deprecation_date` has passed or is less than 30 days away |
 | `W052` | A `[redshift]` `dist_key` or `sort_key` column is not in the model's output |
+| `W053` | A `[clickhouse]` `order_by` or `partition_by` column is not in the model's output |
 | `W055` | `rocky package` vendored a package with something to review: an edited file the new version changed (written beside it as `.incoming`), a package model it could not vendor, an incremental model that fell back to full refresh, or dbt tests it did not map |
 | `I001` | Model dependency inferred from SQL |
 | `I002` | Some, but not all, output columns have unknown types — provide source schemas for more type checking |

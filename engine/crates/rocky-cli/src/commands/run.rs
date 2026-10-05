@@ -3453,9 +3453,10 @@ pub async fn run_with_explicit_contracts(
             loaded.config.cache.schemas.replicate,
         );
         if let Err(e) = model_session.acquire().await {
-            // Unreachable on a fresh session (`Err` = double-acquire misuse);
-            // consume defensively so no exit path can leak the session.
-            model_session.abandon("model-only acquire misuse").await;
+            // `Err` = double-acquire misuse, or a #1228 concurrency refusal
+            // (`CasUnsupported` / `CasRequired`); consume defensively so no
+            // exit path can leak the session.
+            model_session.abandon("model-only acquire failed").await;
             return Err(e.into());
         }
         match model_session.require_synced() {
@@ -3898,10 +3899,10 @@ pub async fn run_with_explicit_contracts(
                     loaded.config.cache.schemas.replicate,
                 );
                 if let Err(e) = session.acquire().await {
-                    // Unreachable on a fresh session (`Err` = double-acquire
-                    // misuse); consume defensively so no exit leaks the
-                    // session.
-                    session.abandon("transformation acquire misuse").await;
+                    // `Err` = double-acquire misuse, or a #1228 concurrency
+                    // refusal (`CasUnsupported` / `CasRequired`); consume
+                    // defensively so no exit leaks the session.
+                    session.abandon("transformation acquire failed").await;
                     return Err(e.into());
                 }
                 match session.require_synced() {
@@ -4140,7 +4141,7 @@ pub async fn run_with_explicit_contracts(
                 loaded.config.cache.schemas.replicate,
             );
             if let Err(e) = session.acquire().await {
-                session.abandon("quality acquire misuse").await;
+                session.abandon("quality acquire failed").await;
                 return Err(e.into());
             }
             match session.require_synced() {
@@ -4264,7 +4265,7 @@ pub async fn run_with_explicit_contracts(
                 loaded.config.cache.schemas.replicate,
             );
             if let Err(e) = session.acquire().await {
-                session.abandon("snapshot acquire misuse").await;
+                session.abandon("snapshot acquire failed").await;
                 return Err(e.into());
             }
             match session.require_synced() {
@@ -8291,7 +8292,10 @@ async fn run_batched_checks(
             let table_ref = dialect
                 .format_table_ref(&br.catalog, &br.schema, &br.table)
                 .map_err(anyhow::Error::from)?;
-            let sql = format!("SELECT COUNT(*), MAX({timestamp_column}) FROM {table_ref}");
+            let sql = format!(
+                "SELECT COUNT(*), {} FROM {table_ref}",
+                dialect.max_aggregate(timestamp_column)
+            );
             match warehouse.execute_query(&sql).await {
                 Ok(result) => {
                     // One row, two cells: the count, then the maximum. A
@@ -9776,12 +9780,15 @@ pub(crate) fn rewrite_quote_style(
 ) -> Result<Option<char>> {
     match dialect.name() {
         // `format_table_ref` renders bare identifiers.
-        "duckdb" | "databricks" | "postgres" | "redshift" => Ok(None),
+        "duckdb" | "databricks" | "postgres" | "redshift" | "clickhouse" => Ok(None),
         // `format_table_ref` renders backticks; its own comment gives the
         // reason (project IDs may contain hyphens).
         "bigquery" => Ok(Some('`')),
         // `format_table_ref` renders double quotes on both.
         "snowflake" | "trino" => Ok(Some('"')),
+        // `format_table_ref` renders `[brackets]`; sqlparser's `Ident` renders
+        // a `[` quote style as `[name]`.
+        "sqlserver" => Ok(Some('[')),
         other => anyhow::bail!(
             "cannot rewrite upstream references for dialect '{other}': its identifier quoting \
              is unknown, so a rewritten reference could name a different object than the one \
@@ -9981,6 +9988,21 @@ pub(crate) fn dialect_case_rules(
         // `apply_shadow_rewrite` answers it with its own always-folding
         // `collision_identity`. Do not reuse this function for it.
         "bigquery" => Ok(uniform(true)),
+        // ClickHouse: database and table names are case-sensitive, quoted or
+        // not, with no session setting that changes it, and
+        // `ClickHouseDialect::format_table_ref` renders them bare — so
+        // `orders` and `Orders` are two tables —
+        // clickhouse.com/docs/sql-reference/syntax#identifiers
+        "clickhouse" => Ok(uniform(true)),
+        // SQL Server: identifier case follows the database COLLATION, quoted or
+        // not — the default `SQL_Latin1_General_CP1_CI_AS` folds case, a `_CS_`
+        // or `_BIN2` collation does not —
+        // learn.microsoft.com/sql/relational-databases/collations/collation-and-unicode-support
+        // The collation is database state Rocky does not read here, so this
+        // assumes case-sensitive, the fail-closed answer for the redirect
+        // question (same narrow reading as the BigQuery / Snowflake note
+        // above).
+        "sqlserver" => Ok(uniform(true)),
         // Snowflake carries a SECOND identity axis on top of case: it resolves
         // an UNQUOTED identifier by upper-casing it, while
         // `SnowflakeSqlDialect::format_table_ref` renders every component of a
@@ -14413,7 +14435,7 @@ async fn execute_one_plain_model(
     if exec_ctx.full_refresh
         && super::run_incremental::rebuilds_on_full_refresh(&model_ir.materialization)
     {
-        let rebuilt = super::run_incremental::full_refresh_ir(&model_ir);
+        let rebuilt = super::run_incremental::full_refresh_ir(&model_ir, dialect);
         recipe_ir = Some(std::mem::replace(&mut model_ir, rebuilt));
     }
     let target_ref = dialect
@@ -15785,7 +15807,10 @@ pub(crate) async fn query_target_max_timestamp(
                 target.full_name()
             )
         })?;
-    let sql = format!("SELECT MAX({timestamp_column}) FROM {target_ref}");
+    let sql = format!(
+        "SELECT {} FROM {target_ref}",
+        dialect.max_aggregate(timestamp_column)
+    );
 
     let result = warehouse
         .execute_query(&sql)

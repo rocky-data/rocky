@@ -299,6 +299,39 @@ pub const E048: &str = "E048";
 /// `ephemeral`) or alongside a lakehouse `format`. The option rules are shared
 /// with the Redshift dialect's SQL-generation guard, so the two cannot drift.
 pub const E052: &str = "E052";
+/// ClickHouse cannot run a model as configured.
+///
+/// Emitted by `rocky compile` in two places:
+///
+/// - `clickhouse_options::check_clickhouse_table_options`, for a model's
+///   `[clickhouse]` block that cannot render (an engine that is not a
+///   parameterless MergeTree-family name, an invalid `order_by` column, a
+///   `partition_by` that is not a column or `fn(column)`), or that sits on a
+///   strategy that builds no table (`view`, `materialized_view`,
+///   `dynamic_table`, `content_addressed`, `ephemeral`) or alongside a
+///   lakehouse `format`. The option rules are shared with the ClickHouse
+///   dialect's SQL-generation guard.
+/// - the CLI's adapter check, for a `merge` model or an `incremental` model
+///   with a `unique_key` when every configured warehouse is ClickHouse:
+///   ClickHouse has no `MERGE` statement, so Rocky cannot update rows by key.
+///   A project that also configures a warehouse with `MERGE` is not refused at
+///   compile time; `rocky run` refuses at SQL generation if the model runs on
+///   ClickHouse.
+pub const E053: &str = "E053";
+/// SQL Server cannot run a model's SQL as written: its CTEs cannot be lifted
+/// to the head of the statement.
+///
+/// T-SQL accepts `WITH` only at the start of a statement, so Rocky lifts
+/// every CTE — nested ones included, such as those an inlined `ephemeral`
+/// model brings — into one leading list
+/// (`rocky_sqlserver::tsql::hoist_ctes`). Nested CTEs whose names collide are
+/// renamed in their own scope first (`final` → `final__2`). Emitted by the
+/// CLI's adapter check when every configured warehouse is SQL Server and the
+/// lift is still impossible: the SQL does not parse for the rename, or a
+/// nested CTE's name is also used unqualified elsewhere in the statement
+/// (for example as a column). A project that also configures another
+/// warehouse is not refused at compile time.
+pub const E054: &str = "E054";
 /// `rocky package` refused to vendor a dbt Hub package.
 ///
 /// Emitted by `rocky package add|update|remove` (`commands/package.rs`) for a
@@ -491,6 +524,13 @@ pub const W048: &str = "W048";
 /// lineage extraction; Redshift rejects the `CREATE TABLE` at run time if the
 /// column really is missing.
 pub const W052: &str = "W052";
+/// A `[clickhouse]` `order_by` / `partition_by` names a column the model does
+/// not output.
+///
+/// Emitted only when the model's output columns are provably complete (the
+/// W006 guard), as W052 is. ClickHouse rejects the `CREATE TABLE` at run time
+/// if the column really is missing.
+pub const W053: &str = "W053";
 /// `rocky package` vendored a dbt package with something to review.
 ///
 /// Emitted by `rocky package add|update` for: a locally edited vendored file

@@ -330,8 +330,8 @@ pub fn generate_transformation_sql_with_warehouse(
     // `[redshift]` table attributes shape a table's first CREATE. A view, a
     // materialized view or a dynamic table has no such CREATE here, and the
     // lakehouse DDL has its own grammar — refuse rather than drop them.
-    let redshift_options = redshift_table_options(model_ir);
-    if let Some(_opts) = redshift_options
+    // `[clickhouse]` likewise.
+    if has_table_options(model_ir)
         && (model_ir.format.is_some()
             || matches!(
                 model_ir.materialization,
@@ -340,7 +340,7 @@ pub fn generate_transformation_sql_with_warehouse(
                     | MaterializationStrategy::DynamicTable { .. }
             ))
     {
-        return Err(redshift_options_refused(model_ir));
+        return Err(table_options_refused(model_ir));
     }
 
     // `FullRefresh` rebuilds the whole table every run, so it always emits a
@@ -385,13 +385,8 @@ pub fn generate_transformation_sql_with_warehouse(
             if dialect.full_refresh_needs_predrop() {
                 stmts.push(dialect.drop_table_sql(&target));
             }
-            match redshift_options {
-                Some(opts) => stmts.push(dialect.create_table_as_with_redshift_options(
-                    &target,
-                    &model_ir.sql,
-                    opts,
-                    true,
-                )?),
+            match ctas_with_table_options(model_ir, dialect, &target, &model_ir.sql, true)? {
+                Some(stmt) => stmts.push(stmt),
                 None => stmts.push(dialect.create_table_as(&target, &model_ir.sql)),
             }
             Ok(stmts)
@@ -458,16 +453,18 @@ pub fn generate_transformation_sql_with_warehouse(
             })?;
 
             // Build the partition filter. Timestamps are formatted by chrono
-            // from a fixed format string — never user input. Single-quoted
-            // literals match the existing pattern in the rest of sql_gen.
+            // from a fixed format string — never user input — into the
+            // dialect's literal (`'YYYY-MM-DD HH:MM:SS'` unless overridden).
             let filter = format!(
-                "{tc} >= '{start}' AND {tc} < '{end}'",
+                "{tc} >= {start} AND {tc} < {end}",
                 tc = time_column,
-                start = window.start.format("%Y-%m-%d %H:%M:%S"),
-                end = window.end.format("%Y-%m-%d %H:%M:%S"),
+                start = dialect.timestamp_literal(&window.start),
+                end = dialect.timestamp_literal(&window.end),
             );
 
-            let substituted = substitute_partition_placeholders(&model_ir.sql, window);
+            let substituted = substitute_partition_placeholders_for(&model_ir.sql, window, &|ts| {
+                dialect.timestamp_literal(ts)
+            });
 
             Ok(dialect.insert_overwrite_partition(&target, &filter, &substituted)?)
         }
@@ -478,14 +475,9 @@ pub fn generate_transformation_sql_with_warehouse(
                 validation::validate_identifier(col)?;
             }
 
-            // Build the subquery to identify partition values
-            let partition_cols = partition_by.join(", ");
-            let delete_sql = format!(
-                "DELETE FROM {target} WHERE ({partition_cols}) IN (\
-                 SELECT DISTINCT {partition_cols} FROM ({source_sql}) AS _rocky_incoming\
-                 )",
-                source_sql = model_ir.sql,
-            );
+            // The DELETE that clears the incoming partitions (dialect-shaped:
+            // T-SQL has no row-value IN).
+            let delete_sql = dialect.delete_partitions_sql(&target, partition_by, &model_ir.sql);
             let insert_sql = dialect.insert_into(&target, &model_ir.sql);
             Ok(dialect.delete_insert_statements(delete_sql, insert_sql))
         }
@@ -612,11 +604,13 @@ pub fn generate_time_interval_bootstrap_sql(
     // compile gate, so the bootstrap also wraps the body in `WHERE 1 = 0`:
     // it is empty by its shape, not only by its window (#2233). The newline
     // before `)` closes a trailing `--` comment in the body.
-    let rendered = substitute_partition_placeholders(&model_ir.sql, &bootstrap_window);
+    let rendered = substitute_partition_placeholders_for(&model_ir.sql, &bootstrap_window, &|ts| {
+        dialect.timestamp_literal(ts)
+    });
     let rendered = rendered.trim().trim_end_matches(';');
     let body = format!("SELECT * FROM (\n{rendered}\n) AS __rocky_bootstrap WHERE 1 = 0");
-    if redshift_table_options(model_ir).is_some() && model_ir.format.is_some() {
-        return Err(redshift_options_refused(model_ir));
+    if has_table_options(model_ir) && model_ir.format.is_some() {
+        return Err(table_options_refused(model_ir));
     }
 
     // When a lakehouse format is specified, the bootstrap table must be
@@ -636,8 +630,8 @@ pub fn generate_time_interval_bootstrap_sql(
         return Ok(stmts.join(";\n"));
     }
 
-    if let Some(opts) = redshift_table_options(model_ir) {
-        return Ok(dialect.create_table_as_with_redshift_options(&target, &body, opts, false)?);
+    if let Some(stmt) = ctas_with_table_options(model_ir, dialect, &target, &body, false)? {
+        return Ok(stmt);
     }
     Ok(dialect.create_table_as_new(&target, &body))
 }
@@ -731,8 +725,8 @@ pub fn generate_transformation_initial_ddl(
         | MaterializationStrategy::ContentAddressed { .. } => body.to_string(),
     };
 
-    if redshift_table_options(model_ir).is_some() && model_ir.format.is_some() {
-        return Err(redshift_options_refused(model_ir));
+    if has_table_options(model_ir) && model_ir.format.is_some() {
+        return Err(table_options_refused(model_ir));
     }
     if let Some(ref format) = model_ir.format {
         let opts = model_ir
@@ -745,10 +739,8 @@ pub fn generate_transformation_initial_ddl(
         )?);
     }
 
-    if let Some(opts) = redshift_table_options(model_ir) {
-        return Ok(vec![dialect.create_table_as_with_redshift_options(
-            &target, &body, opts, false,
-        )?]);
+    if let Some(stmt) = ctas_with_table_options(model_ir, dialect, &target, &body, false)? {
+        return Ok(vec![stmt]);
     }
     Ok(vec![dialect.create_table_as_new(&target, &body)])
 }
@@ -759,6 +751,65 @@ fn redshift_table_options(model_ir: &ModelIr) -> Option<&rocky_ir::RedshiftTable
         .format_options
         .as_ref()
         .and_then(|o| o.redshift.as_ref())
+}
+
+/// The model's `[clickhouse]` table attributes, when it declares any.
+fn clickhouse_table_options(model_ir: &ModelIr) -> Option<&rocky_ir::ClickHouseTableOptions> {
+    model_ir
+        .format_options
+        .as_ref()
+        .and_then(|o| o.clickhouse.as_ref())
+}
+
+/// Whether the model declares warehouse table attributes (`[redshift]` or
+/// `[clickhouse]`) that shape its table's `CREATE TABLE … AS`.
+fn has_table_options(model_ir: &ModelIr) -> bool {
+    redshift_table_options(model_ir).is_some() || clickhouse_table_options(model_ir).is_some()
+}
+
+/// The `CREATE TABLE … AS` carrying the model's warehouse table attributes,
+/// through the dialect hook for each, or `None` when it declares neither.
+/// A dialect without the hook refuses rather than dropping the attributes;
+/// a model declaring both kinds is refused, since no warehouse takes both.
+fn ctas_with_table_options(
+    model_ir: &ModelIr,
+    dialect: &dyn SqlDialect,
+    target: &str,
+    body: &str,
+    replace: bool,
+) -> Result<Option<String>, SqlGenError> {
+    match (
+        redshift_table_options(model_ir),
+        clickhouse_table_options(model_ir),
+    ) {
+        (Some(_), Some(_)) => Err(SqlGenError::InvalidRequest(format!(
+            "model '{}': sets both `[redshift]` and `[clickhouse]` table options; a model \
+             targets one warehouse, so keep only its block",
+            model_ir.name
+        ))),
+        (Some(opts), None) => Ok(Some(
+            dialect.create_table_as_with_redshift_options(target, body, opts, replace)?,
+        )),
+        (None, Some(opts)) => Ok(Some(
+            dialect.create_table_as_with_clickhouse_options(target, body, opts, replace)?,
+        )),
+        (None, None) => Ok(None),
+    }
+}
+
+/// The refusal for warehouse table attributes on a model with no plain
+/// table CREATE to carry them.
+fn table_options_refused(model_ir: &ModelIr) -> SqlGenError {
+    if clickhouse_table_options(model_ir).is_some() {
+        SqlGenError::InvalidRequest(format!(
+            "model '{}': `[clickhouse]` table options (engine / order_by / partition_by) apply \
+             only to a table created with CREATE TABLE AS — not to a view, materialized view, \
+             dynamic table or a lakehouse `format` (E053)",
+            model_ir.name
+        ))
+    } else {
+        redshift_options_refused(model_ir)
+    }
 }
 
 /// `[redshift]` table attributes on a model with no plain table CREATE to
@@ -828,10 +879,7 @@ pub fn generate_incremental_transformation_sql(
             for column in columns {
                 validation::validate_identifier(column)?;
             }
-            let list = columns.join(", ");
-            Ok(vec![format!(
-                "INSERT INTO {target} ({list})\nSELECT {list} FROM (\n{body}\n) AS _rocky_incoming"
-            )])
+            Ok(vec![dialect.insert_into_columns(&target, columns, &body)])
         }
     }
 }
@@ -869,8 +917,20 @@ fn ephemeral_refused(model_ir: &ModelIr) -> SqlGenError {
 /// The documented form is bare, but tolerate an already single-quoted
 /// placeholder without adding a second pair of quotes.
 fn substitute_partition_placeholders(sql: &str, window: &PartitionWindow) -> String {
-    let start = format!("'{}'", window.start.format("%Y-%m-%d %H:%M:%S"));
-    let end = format!("'{}'", window.end.format("%Y-%m-%d %H:%M:%S"));
+    substitute_partition_placeholders_for(sql, window, &|ts| {
+        format!("'{}'", ts.format("%Y-%m-%d %H:%M:%S"))
+    })
+}
+
+/// [`substitute_partition_placeholders`] with each bound rendered by
+/// `literal` (a dialect's [`SqlDialect::timestamp_literal`]).
+fn substitute_partition_placeholders_for(
+    sql: &str,
+    window: &PartitionWindow,
+    literal: &dyn Fn(&chrono::DateTime<chrono::Utc>) -> String,
+) -> String {
+    let start = literal(&window.start);
+    let end = literal(&window.end);
 
     sql.replace("'@start_date'", &start)
         .replace("@start_date", &start)
@@ -2315,6 +2375,37 @@ FROM source_catalog.src__acme__us_west__shopify.orders";
         assert!(generate_transformation_sql(&sample_transformation_ir(), &dialect()).is_ok());
     }
 
+    fn with_clickhouse_options(mut ir: ModelIr) -> ModelIr {
+        let mut opts = ir.format_options.take().unwrap_or_default();
+        opts.clickhouse = Some(rocky_ir::ClickHouseTableOptions {
+            order_by: vec!["id".into()],
+            ..Default::default()
+        });
+        ir.format_options = Some(opts);
+        ir
+    }
+
+    /// `[clickhouse]` reaches the dialect hook on the table-creating paths;
+    /// a dialect without the hook refuses, a view refuses with E053, and a
+    /// model carrying both warehouse blocks is refused.
+    #[test]
+    fn clickhouse_options_route_to_the_dialect_hook_or_refuse() {
+        let full = with_clickhouse_options(sample_transformation_ir());
+        let err = generate_transformation_sql(&full, &dialect()).unwrap_err();
+        assert!(err.to_string().contains("only the clickhouse"), "{err}");
+        let err = generate_transformation_initial_ddl(&full, &dialect()).unwrap_err();
+        assert!(err.to_string().contains("only the clickhouse"), "{err}");
+
+        let mut view = with_clickhouse_options(sample_transformation_ir());
+        view.materialization = MaterializationStrategy::View;
+        let err = generate_transformation_sql(&view, &dialect()).unwrap_err();
+        assert!(err.to_string().contains("E053"), "{err}");
+
+        let both = with_clickhouse_options(with_redshift_options(sample_transformation_ir()));
+        let err = generate_transformation_sql(&both, &dialect()).unwrap_err();
+        assert!(err.to_string().contains("both"), "{err}");
+    }
+
     #[test]
     fn redshift_options_on_a_view_or_with_a_format_are_refused() {
         let mut view = with_redshift_options(sample_transformation_ir());
@@ -2614,6 +2705,7 @@ SELECT id, name, email FROM cat.sch.src WHERE active = true";
                 table_properties: vec![("delta.enableChangeDataFeed".into(), "true".into())],
                 comment: Some("Orders fact table".into()),
                 redshift: None,
+                clickhouse: None,
             },
             MaterializationStrategy::FullRefresh,
         );

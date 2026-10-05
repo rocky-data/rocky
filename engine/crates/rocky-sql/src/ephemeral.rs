@@ -489,7 +489,7 @@ impl VisitorMut for RefVisitor<'_> {
 }
 
 /// Collect every CTE alias and every relation-name part in `query`, folded.
-fn collect_names(query: &Query, out: &mut HashSet<String>) {
+pub(crate) fn collect_names(query: &Query, out: &mut HashSet<String>) {
     struct Names<'a>(&'a mut HashSet<String>);
     impl Visitor for Names<'_> {
         type Break = ();

@@ -27,6 +27,11 @@ use rocky_core::test_harness::CrossPodHarness;
 use rocky_core::traits::WarehouseAdapter;
 use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
 
+/// The startup conditional-write probe writes (and deletes) a throwaway object
+/// under this prefix (#1228). It is not a state upload, so "nothing was
+/// uploaded" assertions count puts outside it.
+const STARTUP_PROBE_PREFIX: &str = "cas-probe/";
+
 /// Seed `raw__acme.orders` in the persistent DuckDB file, dropping the
 /// connection before returning so `rocky run` can reopen the file.
 async fn seed_source(db: &Path) {
@@ -171,7 +176,7 @@ async fn ungoverned_download_failure_suppresses_all_uploads() {
 
     harness.faults.clear();
     assert_eq!(
-        harness.faults.count(FaultOp::Put),
+        harness.faults.put_count_outside(STARTUP_PROBE_PREFIX),
         0,
         "an Indeterminate-authority run must suppress BOTH the periodic and the terminal \
          state upload — never a blind last-writer-wins over an unread remote"
@@ -263,7 +268,7 @@ async fn resume_refuses_indeterminate_remote_state() {
         "unexpected error: {message}"
     );
     assert_eq!(
-        harness.faults.count(FaultOp::Put),
+        harness.faults.put_count_outside(STARTUP_PROBE_PREFIX),
         0,
         "a refused resume must not upload local state"
     );
@@ -333,7 +338,7 @@ fn policy_freeze_download_failure_fails_closed() {
         "the freeze seam must fail closed with the seam context; got: {err:#}"
     );
     assert_eq!(
-        harness.faults.count(FaultOp::Put),
+        harness.faults.put_count_outside(STARTUP_PROBE_PREFIX),
         0,
         "a refused freeze must not upload anything"
     );

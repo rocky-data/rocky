@@ -340,6 +340,16 @@ pub fn warehouse_type_to_rocky(warehouse_type: &str) -> RockyType {
         // BigQuery `DATETIME` is a timezone-naive timestamp.
         "TIMESTAMP_NTZ" | "DATETIME" => RockyType::TimestampNtz,
         "VARIANT" => RockyType::Variant,
+        // ClickHouse `DateTime64(p)`, reported with its precision by the
+        // ClickHouse adapter: an instant, whatever the precision.
+        _ if upper
+            .strip_prefix("DATETIME64(")
+            .and_then(|rest| rest.strip_suffix(')'))
+            .and_then(|p| p.trim().parse::<u8>().ok())
+            .is_some_and(|p| p <= 9) =>
+        {
+            RockyType::Timestamp
+        }
         // DECIMAL / NUMERIC (ANSI, Databricks, BigQuery) and NUMBER
         // (Snowflake's fixed-point name). Snowflake's `DESCRIBE` returns
         // `NUMBER(38,0)`, so it must normalize to the same RockyType as a
@@ -672,6 +682,15 @@ mod tests {
         assert_eq!(warehouse_type_to_rocky("FLOAT64"), RockyType::Float64);
         assert_eq!(warehouse_type_to_rocky("BYTES"), RockyType::Binary);
         assert_eq!(warehouse_type_to_rocky("DATETIME"), RockyType::TimestampNtz);
+        // ClickHouse `DateTime64(p)` is an instant at any precision.
+        assert_eq!(
+            warehouse_type_to_rocky("DateTime64(3)"),
+            RockyType::Timestamp
+        );
+        assert_eq!(
+            warehouse_type_to_rocky("DateTime64(10)"),
+            RockyType::Unknown
+        );
         assert!(matches!(
             warehouse_type_to_rocky("BIGNUMERIC(76,38)"),
             RockyType::Decimal { .. }

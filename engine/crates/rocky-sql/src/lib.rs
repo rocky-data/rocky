@@ -1,5 +1,6 @@
 pub mod check_expression;
 pub mod consumed_columns;
+pub mod cte_names;
 pub mod defer;
 pub mod determinism;
 pub mod dialect;
@@ -12,4 +13,5 @@ pub mod parser;
 pub mod portability;
 pub mod pragma;
 pub mod transpile;
+pub mod udf_body;
 pub mod validation;

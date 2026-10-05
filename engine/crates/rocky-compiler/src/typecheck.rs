@@ -14,7 +14,7 @@ use std::time::Instant;
 
 use indexmap::IndexMap;
 use rayon::prelude::*;
-use sqlparser::ast::{self, Expr, SelectItem, SetExpr, Statement, TableFactor, Visit, Visitor};
+use sqlparser::ast::{self, Expr, SelectItem, SetExpr, Statement, TableFactor};
 use sqlparser::parser::Parser;
 
 use crate::compile::default_type_mapper;
@@ -1467,6 +1467,10 @@ fn watermark_is_direct_passthrough(sql: &str, watermark: &str) -> bool {
 /// row on each partition run. The quoted form `'@start_date'` counts, because
 /// the runtime substitutes it like the bare form.
 ///
+/// The filter must reach every row the model emits: each `UNION` branch, and
+/// only CTEs and subqueries the output reads. See
+/// [`emitted_rows_window_bound`].
+///
 /// When the SQL does not parse, the check cannot see where the placeholders
 /// are, so it fails closed with E024.
 fn check_time_interval_placeholders(model_name: &str, sql: &str) -> Vec<Diagnostic> {
@@ -1484,20 +1488,20 @@ fn check_time_interval_placeholders(model_name: &str, sql: &str) -> Vec<Diagnost
             ),
         ];
     };
-    let mut scan = WindowFilterScan::default();
-    // `pre_visit_query` never breaks, so the visit always runs to the end.
-    let _ = statements.visit(&mut scan);
+    let bound = emitted_rows_window_bound(&statements);
     let mut diags = Vec::new();
-    match (scan.start, scan.end) {
+    match (bound.start, bound.end) {
         (true, true) => {}
         (false, false) => {
             diags.push(
                 Diagnostic::error(
                     E024,
                     model_name,
-                    "time_interval model must filter its rows on both `@start_date` and \
-                     `@end_date` (in a WHERE, HAVING, QUALIFY or inner JOIN ON clause; a \
-                     comment, a string literal or the SELECT list does not count)",
+                    "time_interval model must filter every row it emits on both \
+                     `@start_date` and `@end_date` (in a WHERE, HAVING, QUALIFY or inner \
+                     JOIN ON clause of each UNION branch, or of a CTE or subquery the output \
+                     reads; a comment, a string literal, an unused CTE or the SELECT list \
+                     does not count)",
                 )
                 .with_suggestion(
                     "Add `WHERE <ts_col> >= @start_date AND <ts_col> < @end_date` to the model SQL",
@@ -1528,107 +1532,227 @@ fn check_time_interval_placeholders(model_name: &str, sql: &str) -> Vec<Diagnost
     diags
 }
 
-/// Records whether `@start_date` / `@end_date` appear in a row filter of any
-/// `SELECT` in a statement. The visitor reaches every nested query (CTEs,
-/// derived tables, subqueries); each query's own `SELECT`s are scanned here.
-///
-/// The scan does not prove that a filter dominates the output: a `UNION ALL`
-/// branch or an unused CTE can still carry the only filter.
-#[derive(Default)]
-struct WindowFilterScan {
+/// Which window placeholders bound a row set. `start` is set when every row
+/// in the set passed a row filter on `@start_date`; `end` likewise for
+/// `@end_date`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct WindowBound {
     start: bool,
     end: bool,
 }
 
-impl Visitor for WindowFilterScan {
-    type Break = ();
+impl WindowBound {
+    /// Rows that one of two bounded inputs restricts (an inner join, an
+    /// `INTERSECT`, a filter on top of a source).
+    fn or(self, other: Self) -> Self {
+        Self {
+            start: self.start || other.start,
+            end: self.end || other.end,
+        }
+    }
 
-    fn pre_visit_query(&mut self, query: &ast::Query) -> ControlFlow<Self::Break> {
-        self.scan_set_expr(&query.body);
-        ControlFlow::Continue(())
+    /// Rows that both inputs contribute unfiltered (each `UNION` branch, each
+    /// side of a `FULL OUTER JOIN`).
+    fn and(self, other: Self) -> Self {
+        Self {
+            start: self.start && other.start,
+            end: self.end && other.end,
+        }
     }
 }
 
-impl WindowFilterScan {
-    fn scan_set_expr(&mut self, body: &SetExpr) {
-        match body {
-            SetExpr::Select(select) => self.scan_select(select),
-            SetExpr::SetOperation { left, right, .. } => {
-                self.scan_set_expr(left);
-                self.scan_set_expr(right);
+/// The CTEs visible at a point in the query, innermost last: lowercased name
+/// and the bound of the rows it holds.
+type CteScope = Vec<(String, WindowBound)>;
+
+/// The window bound of every row the model emits (#2233 follow-up).
+///
+/// A placeholder bounds the output only when each row source that reaches
+/// the final `SELECT` passes it:
+///
+/// - each `UNION` branch must be bounded; `INTERSECT` needs one side,
+///   `EXCEPT` the left side;
+/// - a CTE counts only where the output reads it, so a filter in an unused
+///   CTE bounds nothing;
+/// - a `SELECT` is bounded by its own row filters (`WHERE`, `HAVING`,
+///   `QUALIFY`, `PREWHERE`) or by its `FROM` tree;
+/// - an inner or semi join is bounded when either side or its `ON` is; an
+///   outer or anti join only by the side it keeps every row of;
+/// - a scalar subquery in the `SELECT` list is not a row source, so a filter
+///   inside it bounds nothing;
+/// - a base table, a table function (including a date spine such as
+///   `GENERATE_SERIES(@start_date, @end_date)`), `UNNEST` and `VALUES` are
+///   unbounded. A spine's end is inclusive in most warehouses, so its rows
+///   spill into the next partition; filter it with a `WHERE` instead.
+///
+/// Anything but a single query statement is unbounded (fail closed).
+fn emitted_rows_window_bound(statements: &[Statement]) -> WindowBound {
+    match statements {
+        [Statement::Query(query)] => query_window_bound(query, &mut CteScope::new()),
+        _ => WindowBound::default(),
+    }
+}
+
+fn query_window_bound(query: &ast::Query, scope: &mut CteScope) -> WindowBound {
+    let outer = scope.len();
+    if let Some(with) = &query.with {
+        for cte in &with.cte_tables {
+            // A CTE sees the CTEs declared before it. A recursive CTE's
+            // reference to itself resolves to whatever was in scope before
+            // it (usually a base table), so its recursive branch is
+            // unbounded unless filtered.
+            let bound = query_window_bound(&cte.query, scope);
+            scope.push((cte.alias.name.value.to_lowercase(), bound));
+        }
+    }
+    let bound = set_expr_window_bound(&query.body, scope);
+    scope.truncate(outer);
+    bound
+}
+
+fn set_expr_window_bound(body: &SetExpr, scope: &mut CteScope) -> WindowBound {
+    match body {
+        SetExpr::Select(select) => select_window_bound(select, scope),
+        SetExpr::Query(query) => query_window_bound(query, scope),
+        SetExpr::SetOperation {
+            op, left, right, ..
+        } => {
+            let left = set_expr_window_bound(left, scope);
+            let right = set_expr_window_bound(right, scope);
+            match op {
+                ast::SetOperator::Union => left.and(right),
+                ast::SetOperator::Intersect => left.or(right),
+                ast::SetOperator::Except | ast::SetOperator::Minus => left,
             }
-            // A nested `Query` is reached by the visitor itself. The other
-            // sqlparser bodies (VALUES, TABLE, DML, ...) carry no row filter.
-            _ => {}
         }
+        // VALUES, TABLE and DML bodies carry no row filter.
+        _ => WindowBound::default(),
     }
+}
 
-    fn scan_select(&mut self, select: &ast::Select) {
-        for filter in [
-            &select.selection,
-            &select.having,
-            &select.qualify,
-            &select.prewhere,
-        ]
-        .into_iter()
-        .flatten()
-        {
-            self.scan_filter(filter);
-        }
-        for table in &select.from {
-            self.scan_table_with_joins(table);
-        }
+fn select_window_bound(select: &ast::Select, scope: &mut CteScope) -> WindowBound {
+    let mut bound = WindowBound::default();
+    for filter in [
+        &select.selection,
+        &select.having,
+        &select.qualify,
+        &select.prewhere,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        bound = bound.or(filter_window_bound(filter, scope));
     }
+    // Comma-separated `FROM` items are a cross join: one bounded item bounds
+    // the product.
+    for table in &select.from {
+        bound = bound.or(table_with_joins_window_bound(table, scope));
+    }
+    bound
+}
 
-    fn scan_table_with_joins(&mut self, table: &ast::TableWithJoins) {
-        self.scan_nested_join(&table.relation);
-        for join in &table.joins {
-            self.scan_nested_join(&join.relation);
-            // Only an `ON` that drops non-matching rows bounds the output.
-            // An outer or anti join keeps rows the `ON` does not match.
-            let constraint = match &join.join_operator {
-                ast::JoinOperator::Join(c)
-                | ast::JoinOperator::Inner(c)
-                | ast::JoinOperator::StraightJoin(c)
-                | ast::JoinOperator::Semi(c)
-                | ast::JoinOperator::LeftSemi(c)
-                | ast::JoinOperator::RightSemi(c) => c,
-                _ => continue,
-            };
-            if let ast::JoinConstraint::On(on) = constraint {
-                self.scan_filter(on);
+fn table_with_joins_window_bound(table: &ast::TableWithJoins, scope: &mut CteScope) -> WindowBound {
+    use ast::JoinOperator as J;
+    let mut acc = table_factor_window_bound(&table.relation, scope);
+    for join in &table.joins {
+        let right = table_factor_window_bound(&join.relation, scope);
+        acc = match &join.join_operator {
+            // Every output row matches a row on both sides and the `ON`.
+            J::Join(c)
+            | J::Inner(c)
+            | J::StraightJoin(c)
+            | J::CrossJoin(c)
+            | J::Semi(c)
+            | J::LeftSemi(c)
+            | J::RightSemi(c) => acc.or(right).or(join_on_window_bound(c, scope)),
+            J::CrossApply => acc.or(right),
+            // These keep every row of the left side.
+            J::Left(_)
+            | J::LeftOuter(_)
+            | J::Anti(_)
+            | J::LeftAnti(_)
+            | J::OuterApply
+            | J::ArrayJoin
+            | J::LeftArrayJoin
+            | J::InnerArrayJoin => acc,
+            // These keep every row of the right side.
+            J::Right(_) | J::RightOuter(_) | J::RightAnti(_) => right,
+            // FULL OUTER keeps both sides; any other join must be bounded
+            // on both sides (fail closed).
+            _ => acc.and(right),
+        };
+    }
+    acc
+}
+
+fn join_on_window_bound(constraint: &ast::JoinConstraint, scope: &mut CteScope) -> WindowBound {
+    match constraint {
+        ast::JoinConstraint::On(on) => filter_window_bound(on, scope),
+        _ => WindowBound::default(),
+    }
+}
+
+fn table_factor_window_bound(relation: &TableFactor, scope: &mut CteScope) -> WindowBound {
+    match relation {
+        // A one-part name may be a CTE in scope; anything else is a base
+        // table. `args` marks a table function, which is never a CTE.
+        TableFactor::Table {
+            name, args: None, ..
+        } => match name.0.as_slice() {
+            [ast::ObjectNamePart::Identifier(ident)] => {
+                let key = ident.value.to_lowercase();
+                scope
+                    .iter()
+                    .rev()
+                    .find(|(name, _)| *name == key)
+                    .map(|(_, bound)| *bound)
+                    .unwrap_or_default()
             }
-        }
-    }
-
-    fn scan_nested_join(&mut self, relation: &TableFactor) {
-        if let TableFactor::NestedJoin {
+            _ => WindowBound::default(),
+        },
+        TableFactor::Derived { subquery, .. } => query_window_bound(subquery, scope),
+        TableFactor::NestedJoin {
             table_with_joins, ..
-        } = relation
-        {
-            self.scan_table_with_joins(table_with_joins);
+        } => table_with_joins_window_bound(table_with_joins, scope),
+        TableFactor::Pivot { table, .. } | TableFactor::Unpivot { table, .. } => {
+            table_factor_window_bound(table, scope)
         }
+        // Table functions (date spines included), UNNEST, JSON_TABLE, ...:
+        // the window does not filter their rows.
+        _ => WindowBound::default(),
     }
+}
 
-    fn scan_filter(&mut self, filter: &Expr) {
-        let _ = ast::visit_expressions(filter, |expr| {
-            if let Expr::Value(v) = expr {
-                // The runtime substitutes the bare placeholder and the
-                // whole-literal quoted form `'@start_date'` alike.
+/// The placeholders a row filter mentions. The bare placeholder and the
+/// whole-literal quoted form `'@start_date'` count alike, because the
+/// runtime substitutes both. An `x IN (subquery)` also counts when the
+/// subquery's rows are bounded, so it can read a bounded CTE.
+fn filter_window_bound(filter: &Expr, scope: &mut CteScope) -> WindowBound {
+    let mut bound = WindowBound::default();
+    let _ = ast::visit_expressions(filter, |expr| {
+        match expr {
+            Expr::Value(v) => {
                 let token = match &v.value {
                     ast::Value::Placeholder(p) => p.as_str(),
                     ast::Value::SingleQuotedString(s) => s.as_str(),
                     _ => "",
                 };
                 match token {
-                    "@start_date" => self.start = true,
-                    "@end_date" => self.end = true,
+                    "@start_date" => bound.start = true,
+                    "@end_date" => bound.end = true,
                     _ => {}
                 }
             }
-            ControlFlow::<()>::Continue(())
-        });
-    }
+            Expr::InSubquery {
+                subquery,
+                negated: false,
+                ..
+            } => bound = bound.or(query_window_bound(subquery, scope)),
+            _ => {}
+        }
+        ControlFlow::<()>::Continue(())
+    });
+    bound
 }
 
 /// E026 — `first_partition`, if present, must parse to a canonical key for
@@ -2257,8 +2381,17 @@ pub(crate) fn infer_expr_type(expr: &Expr, scope: &TypeScope) -> (RockyType, boo
         // IS NULL / IS NOT NULL → Boolean, non-nullable
         Expr::IsNull(_) | Expr::IsNotNull(_) => (RockyType::Boolean, false),
 
-        // IN list / subquery → Boolean
-        Expr::InList { .. } | Expr::InSubquery { .. } => (RockyType::Boolean, true),
+        // IN list → Boolean. Per SQL 3VL the result is NULL only when the
+        // operand is NULL, or a list item is NULL and nothing matched; so it is
+        // nullable iff the operand or any item is. `NOT IN` is the same.
+        Expr::InList { expr, list, .. } => {
+            let nullable =
+                infer_expr_type(expr, scope).1 || list.iter().any(|e| infer_expr_type(e, scope).1);
+            (RockyType::Boolean, nullable)
+        }
+
+        // IN subquery → Boolean; the subquery's nullability is not modelled.
+        Expr::InSubquery { .. } => (RockyType::Boolean, true),
 
         // EXISTS → Boolean
         Expr::Exists { .. } => (RockyType::Boolean, false),
@@ -4802,6 +4935,36 @@ mod tests {
     }
 
     #[test]
+    fn test_infer_expr_in_list_nullability() {
+        let mut scope = TypeScope::new();
+        scope
+            .columns
+            .insert(CiKey::owned("a".to_string()), (RockyType::Int64, false));
+        scope
+            .columns
+            .insert(CiKey::owned("n".to_string()), (RockyType::Int64, true));
+
+        for sql in ["a IN (1, 2)", "a NOT IN (1, 2)"] {
+            let (ty, nullable) = infer_expr_type(&parse_expr(sql), &scope);
+            assert_eq!(ty, RockyType::Boolean, "{sql}");
+            assert!(
+                !nullable,
+                "{sql}: non-null operand and items is non-nullable"
+            );
+        }
+        for sql in [
+            "a NOT IN (1, NULL)",
+            "a IN (1, NULL)",
+            "n IN (1, 2)",
+            "a NOT IN (1, n)",
+        ] {
+            let (ty, nullable) = infer_expr_type(&parse_expr(sql), &scope);
+            assert_eq!(ty, RockyType::Boolean, "{sql}");
+            assert!(nullable, "{sql}: a NULL operand or item makes IN nullable");
+        }
+    }
+
+    #[test]
     fn test_infer_expr_case_when() {
         let mut scope = TypeScope::new();
         scope.columns.insert(
@@ -5435,6 +5598,128 @@ mod tests {
         assert!(e024_fires(
             "SELECT order_date FROM upstream WHERE order_date >= @start_date \
              AND order_date < @end_date AND ((("
+        ));
+    }
+
+    /// A filter must reach every row the model emits, not just some (#2233
+    /// follow-up). Each of these bodies holds a correct filter somewhere,
+    /// yet copies unbounded rows on every partition run.
+    #[test]
+    fn test_e024_filter_that_misses_some_rows() {
+        for sql in [
+            // One UNION ALL branch is unfiltered.
+            "SELECT order_date FROM upstream \
+             WHERE order_date >= @start_date AND order_date < @end_date \
+             UNION ALL SELECT order_date FROM other",
+            // Same with the unfiltered branch first, and plain UNION.
+            "SELECT order_date FROM other UNION SELECT order_date FROM upstream \
+             WHERE order_date >= @start_date AND order_date < @end_date",
+            // Each branch bounds one end only.
+            "SELECT order_date FROM upstream WHERE order_date >= @start_date \
+             UNION ALL SELECT order_date FROM upstream WHERE order_date < @end_date",
+            // EXCEPT keeps the left rows; a filter on the right bounds nothing.
+            "SELECT order_date FROM upstream EXCEPT SELECT order_date FROM upstream \
+             WHERE order_date >= @start_date AND order_date < @end_date",
+            // The only filter sits in a CTE that is never read.
+            "WITH w AS (SELECT order_date FROM upstream \
+             WHERE order_date >= @start_date AND order_date < @end_date) \
+             SELECT order_date FROM upstream",
+            // The filtered CTE is read only by another unused CTE.
+            "WITH w AS (SELECT order_date FROM upstream \
+             WHERE order_date >= @start_date AND order_date < @end_date), \
+             v AS (SELECT * FROM w) SELECT order_date FROM upstream",
+            // The only filter is in a scalar subquery in the SELECT list.
+            "SELECT order_date, (SELECT COUNT(*) FROM upstream \
+             WHERE order_date >= @start_date AND order_date < @end_date) AS n FROM other",
+            // A scalar subquery with no FROM on the outer query.
+            "SELECT (SELECT MAX(order_date) FROM upstream \
+             WHERE order_date >= @start_date AND order_date < @end_date) AS order_date",
+            // A bounded CTE on the dropped side of a LEFT JOIN.
+            "WITH w AS (SELECT order_date FROM upstream \
+             WHERE order_date >= @start_date AND order_date < @end_date) \
+             SELECT o.order_date FROM other o LEFT JOIN w ON o.order_date = w.order_date",
+            // A FULL OUTER JOIN keeps the unbounded side's rows.
+            "SELECT o.order_date FROM other o FULL OUTER JOIN (SELECT order_date FROM upstream \
+             WHERE order_date >= @start_date AND order_date < @end_date) w \
+             ON o.order_date = w.order_date",
+            // NOT IN a bounded set keeps rows outside the window.
+            "WITH w AS (SELECT order_date FROM upstream \
+             WHERE order_date >= @start_date AND order_date < @end_date) \
+             SELECT order_date FROM other WHERE order_date NOT IN (SELECT order_date FROM w)",
+            // A bare date spine: its end is inclusive in most warehouses, so
+            // it emits a row in the next partition.
+            "SELECT d AS order_date FROM GENERATE_SERIES(@start_date, @end_date, INTERVAL 1 DAY) AS s(d)",
+            // A shadowing inner CTE hides the bounded outer one.
+            "WITH w AS (SELECT order_date FROM upstream \
+             WHERE order_date >= @start_date AND order_date < @end_date) \
+             SELECT * FROM (WITH w AS (SELECT order_date FROM other) SELECT order_date FROM w) x",
+            // VALUES rows are not filtered by the window.
+            "SELECT order_date FROM upstream \
+             WHERE order_date >= @start_date AND order_date < @end_date \
+             UNION ALL VALUES (DATE '2020-01-01')",
+        ] {
+            assert!(e024_fires(sql), "E024 must fire for: {sql}");
+        }
+    }
+
+    /// Shapes where the filter does reach every emitted row keep passing.
+    #[test]
+    fn test_e024_filter_reaching_every_row_passes() {
+        for sql in [
+            // Every UNION ALL branch is filtered.
+            "SELECT order_date FROM upstream \
+             WHERE order_date >= @start_date AND order_date < @end_date \
+             UNION ALL SELECT order_date FROM other \
+             WHERE order_date >= @start_date AND order_date < @end_date",
+            // A filter on top of the union bounds both branches.
+            "SELECT order_date FROM (SELECT order_date FROM upstream \
+             UNION ALL SELECT order_date FROM other) u \
+             WHERE order_date >= @start_date AND order_date < @end_date",
+            // INTERSECT needs one filtered side.
+            "SELECT order_date FROM upstream INTERSECT SELECT order_date FROM other \
+             WHERE order_date >= @start_date AND order_date < @end_date",
+            // A filtered CTE read through a chain of CTEs.
+            "WITH w AS (SELECT order_date FROM upstream \
+             WHERE order_date >= @start_date AND order_date < @end_date), \
+             v AS (SELECT order_date FROM w) SELECT order_date FROM v",
+            // CTE names match case-insensitively.
+            "WITH W AS (SELECT order_date FROM upstream \
+             WHERE order_date >= @start_date AND order_date < @end_date) \
+             SELECT order_date FROM w",
+            // A bounded CTE inner-joined to a dimension.
+            "WITH w AS (SELECT order_date, k FROM upstream \
+             WHERE order_date >= @start_date AND order_date < @end_date) \
+             SELECT w.order_date FROM w JOIN dim d ON w.k = d.k",
+            // A bounded CTE on the kept side of a LEFT JOIN.
+            "WITH w AS (SELECT order_date, k FROM upstream \
+             WHERE order_date >= @start_date AND order_date < @end_date) \
+             SELECT w.order_date FROM w LEFT JOIN dim d ON w.k = d.k",
+            // A bounded CTE on the kept side of a RIGHT JOIN.
+            "WITH w AS (SELECT order_date, k FROM upstream \
+             WHERE order_date >= @start_date AND order_date < @end_date) \
+             SELECT w.order_date FROM dim d RIGHT JOIN w ON w.k = d.k",
+            // A semi-join through IN on a bounded CTE.
+            "WITH w AS (SELECT order_date FROM upstream \
+             WHERE order_date >= @start_date AND order_date < @end_date) \
+             SELECT order_date FROM other WHERE order_date IN (SELECT order_date FROM w)",
+            // A date spine filtered by a WHERE.
+            "SELECT d AS order_date FROM GENERATE_SERIES(@start_date, @end_date, INTERVAL 1 DAY) AS s(d) \
+             WHERE d >= @start_date AND d < @end_date",
+            // A SELECT-list scalar subquery beside a real filter is harmless.
+            "SELECT order_date, (SELECT 1) AS one FROM upstream \
+             WHERE order_date >= @start_date AND order_date < @end_date",
+        ] {
+            assert!(!e024_fires(sql), "E024 must not fire for: {sql}");
+        }
+    }
+
+    /// Only a single query statement is checked; anything else fails closed.
+    #[test]
+    fn test_e024_non_query_statement_fails_closed() {
+        assert!(e024_fires(
+            "SELECT order_date FROM upstream \
+             WHERE order_date >= @start_date AND order_date < @end_date; \
+             SELECT order_date FROM other"
         ));
     }
 

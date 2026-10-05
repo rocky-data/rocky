@@ -340,6 +340,8 @@ pub fn lineage_output(result: &compile::CompileResult, model_name: &str) -> Resu
             if let Some(model) = result.project.model(&id) {
                 LineageNodeDef {
                     model: id,
+                    // A target prints resolved, as `rocky run`'s
+                    // `asset_key` does (#1919).
                     target_schema: Some(model.config.target.schema.clone()),
                     source_id: None,
                 }

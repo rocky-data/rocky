@@ -10,7 +10,7 @@ from pydantic import BaseModel
 
 class ConcurrencyControl3(StrEnum):
     """
-    Unconditional last-writer-wins upload (default) — byte-identical to the pre-CAS behaviour. Correct for single-writer-per-prefix deployments (one run at a time, orchestrator-serialized).
+    Unconditional last-writer-wins upload — byte-identical to the pre-CAS behaviour. The default on `local` and `valkey`, and an explicit opt-out elsewhere. Correct for single-writer-per-prefix deployments (one run at a time, orchestrator-serialized). An `off` writer refuses to upload once a `cas-required` marker exists beside the state object.
     """
 
     off = "off"
@@ -18,9 +18,9 @@ class ConcurrencyControl3(StrEnum):
 
 class ConcurrencyControl4(StrEnum):
     """
-    Compare-and-swap: the end-of-run upload is conditional on the remote object still carrying the generation the run downloaded. A run that lost a cross-pod race fail-closes (nonzero exit) instead of erasing the winner. Requires a backend with a durable conditional-write object tier (`s3`, `gcs`, or `tiered`); auto-downgrades to `off` (with a warn) on `local` and `valkey`, which have no such tier.
+    Compare-and-swap: every write of the shared state object is conditional on the remote object still carrying the generation the writer downloaded. A run that lost a cross-pod race fail-closes (nonzero exit) instead of erasing the winner; a ledger seam replays its transition onto the winner. The default on `s3`, `gcs`, and `tiered`. Requires a backend with a durable conditional-write object tier; auto-downgrades to `off` (with a warn) on `local` and `valkey`, which have no such tier. When set explicitly, a startup probe that finds the store does not honour conditional writes is an error rather than a silent downgrade.
 
-    On `tiered` the compare-and-swap runs against the durable S3 leg and the Valkey tier is kept coherent with it: a cached copy is stored together with the generation it was committed at, and a read may only use it after that generation is confirmed to still be the durable object's. Enabling `cas` also disables the mid-run periodic state uploader, on every backend. It protects the end-of-run upload only — see the type-level note on the ledger-seam writers that still bypass it.
+    On `tiered` the compare-and-swap runs against the durable S3 leg and the Valkey tier is kept coherent with it: a cached copy is stored together with the generation it was committed at, and a read may only use it after that generation is confirmed to still be the durable object's. Enabling `cas` also disables the mid-run periodic state uploader, on every backend.
     """
 
     cas = "cas"
@@ -186,7 +186,7 @@ class SettingsOutput(BaseModel):
     """
     concurrency_control: ConcurrencyControl3 | ConcurrencyControl4 | None = None
     """
-    `[state] concurrency_control`, read at the same moment as `state_backend`. `null` on the same condition.
+    `[state] concurrency_control`, read at the same moment as `state_backend`: the explicit setting, or the backend default when it is unset (`cas` on `s3`, `gcs` and `tiered`; `off` on `local` and `valkey`). This is the requested mode — the writers' startup conditional-write probe is not run for it, so `rocky doctor` is where a store that falls back to `off` shows up. `null` on the same condition as `state_backend`.
     """
     config_status: ConfigStatus1 | ConfigStatus2 | ConfigStatus3
     """

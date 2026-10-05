@@ -1424,6 +1424,8 @@ from .types_generated import (  # noqa: E402, F401
     ProductListOutput,
     ProductStatusOutput,
     ProductVerifyOutput,
+    ProfileColumnStats,
+    ProfileOutput,
     PromotePlan,
     PromoteTarget,
     PromoteTargetPlan,
@@ -1564,6 +1566,7 @@ RockyOutput = (
     | AiExplainResult
     | AiTestResult
     | AiContractOutput
+    | ProfileOutput
     | ValidateMigrationResult
     | ConformanceResult
     | DoctorResult
@@ -1619,6 +1622,7 @@ _SIMPLE_DISPATCH: dict[str, type[BaseModel]] = {
     "ai_explain": AiExplainResult,
     "ai_test": AiTestResult,
     "ai_contract": AiContractOutput,
+    "profile": ProfileOutput,
     "validate-migration": ValidateMigrationResult,
     "doctor": DoctorResult,
     "dag": DagResult,

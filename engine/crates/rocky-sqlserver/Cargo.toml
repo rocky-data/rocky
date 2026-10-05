@@ -1,0 +1,32 @@
+[package]
+name = "rocky-sqlserver"
+version = "1.76.0"
+description = "Microsoft SQL Server, Azure SQL and Fabric Warehouse adapter for Rocky"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rocky-core = { path = "../rocky-core" }
+rocky-ir = { path = "../rocky-ir" }
+rocky-sql = { path = "../rocky-sql" }
+async-trait = { workspace = true }
+chrono = { workspace = true }
+futures = { workspace = true }
+reqwest = { workspace = true }
+serde_json = { workspace = true }
+sqlparser = { workspace = true }
+thiserror = { workspace = true }
+tiberius = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+# `test-support` exposes `MetadataColumn::new_unchecked`, which the dialect
+# tests use to build the hostile metadata columns `select_clause` must refuse.
+rocky-ir = { path = "../rocky-ir", features = ["test-support"] }
+tokio = { workspace = true }
+
+[lints]
+workspace = true

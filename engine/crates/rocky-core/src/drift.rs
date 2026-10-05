@@ -217,8 +217,9 @@ pub fn generate_alter_column_sql(
 /// Generates `ALTER TABLE ... ADD COLUMN` SQL for columns present in
 /// the source but missing from the target.
 ///
-/// Standard SQL across BigQuery / Snowflake / Databricks / DuckDB; no
-/// dialect override needed today. Each new column is added as
+/// The statement shape comes from [`SqlDialect::add_column_sql`]: ANSI
+/// `ADD COLUMN` everywhere but SQL Server (`ADD <name> <type>`). Each new
+/// column is added as
 /// nullable (the syntax `<name> <type>` defaults to nullable on every
 /// supported dialect), which matches the runtime's
 /// `INSERT INTO target SELECT * FROM source` semantic — backfill is
@@ -234,10 +235,7 @@ pub fn generate_add_column_sql(
     for col in added_columns {
         rocky_sql::validation::validate_identifier(&col.name)?;
         crate::sql_gen::validate_sql_type(&col.data_type)?;
-        statements.push(format!(
-            "ALTER TABLE {} ADD COLUMN {} {}",
-            table_ref, col.name, col.data_type
-        ));
+        statements.push(dialect.add_column_sql(&table_ref, &col.name, &col.data_type));
     }
     Ok(statements)
 }

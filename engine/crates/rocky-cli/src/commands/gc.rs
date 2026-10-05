@@ -4168,10 +4168,16 @@ auto_create_schemas = true
                 // 2's first read — after ITS download, before ITS put: the
                 // winner published here makes that put a genuine conflict.
                 if n == 3 {
-                    let _authority =
-                        rocky_core::state_sync::download_state(&self.cfg, &self.path, false)
-                            .await
-                            .unwrap();
+                    // The winner is a real CAS run writer: it acquires a base
+                    // and commits by compare-and-swap (an unconditional upload
+                    // is refused once the cas-required marker exists, #1228).
+                    let mut winner = rocky_core::state_sync::RemoteStateSession::new(
+                        &self.cfg,
+                        &self.path,
+                        rocky_core::state_sync::FinalizeDurability::Durable,
+                        false,
+                    );
+                    let _authority = winner.acquire().await.unwrap();
                     {
                         let store = StateStore::open(&self.path).unwrap();
                         seed(
@@ -4186,9 +4192,7 @@ auto_create_schemas = true
                         );
                         record_run(&store, "r-winner", "winner_model");
                     }
-                    rocky_core::state_sync::upload_state(&self.cfg, &self.path, false)
-                        .await
-                        .unwrap();
+                    winner.finalize().await.unwrap();
                 }
                 ReclaimVerdict::Reclaimable { head_version: 0 }
             }
@@ -4252,7 +4256,10 @@ auto_create_schemas = true
                 .faults
                 .put_count(&object_key, rocky_core::fault_store::PutKind::Update)
                 - baseline_updates,
-            3,
+            // Three seam attempts + the injected winner's own CAS commit (the
+            // winner is a real CAS run writer since #1228, so its publish is
+            // an `Update` on the same object).
+            4,
             "armed + injected genuine conflict must force exactly three CAS attempts"
         );
         assert_eq!(
@@ -4579,10 +4586,16 @@ auto_create_schemas = true
             async fn reclaim_verdict(&self, _sp: &str, _fp: &str, _cv: u64) -> ReclaimVerdict {
                 let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
                 if n == 3 {
-                    let _authority =
-                        rocky_core::state_sync::download_state(&self.cfg, &self.path, false)
-                            .await
-                            .unwrap();
+                    // The winner is a real CAS run writer: it acquires a base
+                    // and commits by compare-and-swap (an unconditional upload
+                    // is refused once the cas-required marker exists, #1228).
+                    let mut winner = rocky_core::state_sync::RemoteStateSession::new(
+                        &self.cfg,
+                        &self.path,
+                        rocky_core::state_sync::FinalizeDurability::Durable,
+                        false,
+                    );
+                    let _authority = winner.acquire().await.unwrap();
                     {
                         let store = StateStore::open(&self.path).unwrap();
                         store
@@ -4602,9 +4615,7 @@ auto_create_schemas = true
                             })
                             .unwrap();
                     }
-                    rocky_core::state_sync::upload_state(&self.cfg, &self.path, false)
-                        .await
-                        .unwrap();
+                    winner.finalize().await.unwrap();
                 }
                 ReclaimVerdict::Reclaimable { head_version: 0 }
             }

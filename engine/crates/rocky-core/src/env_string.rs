@@ -49,7 +49,41 @@ use schemars::r#gen::SchemaGenerator;
 use schemars::schema::Schema;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+use std::cell::Cell;
+
 use crate::redacted::unredacted_scope_active;
+
+thread_local! {
+    /// Depth of [`with_env_values_scope`]. A counter so nested scopes compose.
+    static ENV_VALUES_DEPTH: Cell<u32> = const { Cell::new(0) };
+}
+
+/// Run `f` with [`EnvString`] serializing its value instead of `${NAME}`.
+///
+/// Narrower than [`crate::redacted::with_unredacted_scope`]: a
+/// [`crate::redacted::RedactedString`] credential still writes `"***"`. The
+/// one use is a keyed digest of the resolved config, which must change when
+/// an environment value changes but must not hold or depend on credentials
+/// (#1919). Never print what this produces.
+pub fn with_env_values_scope<F, R>(f: F) -> R
+where
+    F: FnOnce() -> R,
+{
+    ENV_VALUES_DEPTH.with(|d| d.set(d.get().saturating_add(1)));
+    // Decrement on panic too, so the thread never stays in this mode.
+    struct Guard;
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            ENV_VALUES_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+        }
+    }
+    let _guard = Guard;
+    f()
+}
+
+fn env_values_scope_active() -> bool {
+    ENV_VALUES_DEPTH.with(|d| d.get() > 0)
+}
 
 /// A config string whose printed form never holds a resolved `${VAR}` value.
 ///
@@ -60,7 +94,8 @@ use crate::redacted::unredacted_scope_active;
 ///
 /// let token = EnvString::substituted("DEPLOY_TOKEN", "dapi_abc123_secret");
 /// assert_eq!(token.to_string(), "${DEPLOY_TOKEN}");
-/// assert_eq!(format!("{token:?}"), "${DEPLOY_TOKEN}");
+/// // `Debug` quotes the placeholder, as it quotes any string.
+/// assert_eq!(format!("{token:?}"), "\"${DEPLOY_TOKEN}\"");
 /// assert_eq!(serde_json::to_string(&token).unwrap(), "\"${DEPLOY_TOKEN}\"");
 /// assert_eq!(token.expose(), "dapi_abc123_secret");
 /// ```
@@ -145,7 +180,7 @@ impl Serialize for EnvString {
     /// [`crate::redacted::with_unredacted_scope`]. Same boundary as
     /// [`crate::redacted::RedactedString`].
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        if unredacted_scope_active() {
+        if unredacted_scope_active() || env_values_scope_active() {
             self.0.value.serialize(serializer)
         } else {
             self.0.rendered.serialize(serializer)
@@ -315,6 +350,19 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&s).unwrap(),
             "\"${ROCKY_ENVSTRING_SCOPE}\"",
+            "the scope ends with the closure"
+        );
+    }
+
+    #[test]
+    fn the_env_values_scope_writes_the_value_but_not_a_credential() {
+        let s = EnvString::substituted("ROCKY_ENVSTRING_ENVSCOPE", SECRET);
+        let cred = crate::redacted::RedactedString::new("ROCKY-CRED-9d1f22aa".to_string());
+        let json = with_env_values_scope(|| serde_json::to_string(&(&s, &cred)).unwrap());
+        assert_eq!(json, format!("[\"{SECRET}\",\"***\"]"));
+        assert_eq!(
+            serde_json::to_string(&s).unwrap(),
+            "\"${ROCKY_ENVSTRING_ENVSCOPE}\"",
             "the scope ends with the closure"
         );
     }

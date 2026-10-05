@@ -246,9 +246,10 @@ pub(crate) fn no_watermark_refused(model_ir: &ModelIr) -> SqlGenError {
 fn predicate(lhs: &str, wm: &Watermark<'_>, target: &str, dialect: &dyn SqlDialect) -> String {
     let column = wm.column;
     let bound = match wm.lookback {
-        Some(lb) if lb.amount > 0 => format!(
-            "MAX({column}) - {}",
-            dialect.interval_literal(lb.amount, lb.unit.sql_keyword())
+        Some(lb) if lb.amount > 0 => dialect.subtract_interval_expr(
+            &format!("MAX({column})"),
+            lb.amount,
+            lb.unit.sql_keyword(),
         ),
         _ => format!("MAX({column})"),
     };
@@ -275,7 +276,7 @@ pub fn incremental_select(
     let sql = model_ir.sql.as_str();
     if has_placeholder(sql) {
         return Ok(match mode {
-            FilterMode::Unfiltered => replace_placeholders(sql, "TRUE"),
+            FilterMode::Unfiltered => replace_placeholders(sql, dialect.true_predicate()),
             FilterMode::SinceTarget { target } => {
                 replace_placeholders(sql, &predicate(wm.filter, &wm, target, dialect))
             }
@@ -300,6 +301,14 @@ pub fn incremental_select(
 #[must_use]
 pub fn unfiltered_sql(sql: &str) -> String {
     replace_placeholders(sql, "TRUE")
+}
+
+/// [`unfiltered_sql`] with the dialect's always-true predicate
+/// ([`SqlDialect::true_predicate`]) — `(1 = 1)` on SQL Server, which has no
+/// `TRUE` literal.
+#[must_use]
+pub fn unfiltered_sql_for(sql: &str, dialect: &dyn SqlDialect) -> String {
+    replace_placeholders(sql, dialect.true_predicate())
 }
 
 #[cfg(test)]

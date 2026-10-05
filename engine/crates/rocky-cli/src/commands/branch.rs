@@ -1607,7 +1607,8 @@ fn quote_fqn(dialect: &dyn rocky_core::traits::SqlDialect, target: &TargetRef) -
     // table `rocky run` created as `marts.orders`. Promote must name the
     // same object, so it uses the dialect's own rendering (which also drops
     // an empty catalog instead of emitting `""`).
-    if matches!(dialect.name(), "postgres" | "redshift") {
+    // ClickHouse renders `database.table` bare and has no catalog level.
+    if matches!(dialect.name(), "postgres" | "redshift" | "clickhouse") {
         return Ok(dialect.format_table_ref(&target.catalog, &target.schema, &target.table)?);
     }
     Ok(format!(

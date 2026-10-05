@@ -859,8 +859,12 @@ async fn pk_window(
         .format_table_ref(&branch.catalog, &branch.schema, &branch.table)
         .map_err(|e| anyhow::anyhow!(e.to_string()))?;
 
-    let (base_lo, base_hi) = single_pk_window(adapter, &base_ref, pk_column).await?;
-    let (branch_lo, branch_hi) = single_pk_window(adapter, &branch_ref, pk_column).await?;
+    // Quote through the dialect. A literal `"id"` is a STRING literal on
+    // Databricks and BigQuery, so `MIN("id")` there returns the text `id`
+    // instead of the smallest key.
+    let pk_quoted = dialect.quote_identifier(pk_column);
+    let (base_lo, base_hi) = single_pk_window(adapter, &base_ref, &pk_quoted).await?;
+    let (branch_lo, branch_hi) = single_pk_window(adapter, &branch_ref, &pk_quoted).await?;
 
     let lo = match (base_lo, branch_lo) {
         (Some(a), Some(b)) => Some(a.min(b)),
@@ -875,15 +879,13 @@ async fn pk_window(
     Ok((lo.unwrap_or(0), hi.map(|h| h + 1).unwrap_or(0)))
 }
 
+/// `pk_quoted` is the key column already quoted by the adapter's dialect.
 async fn single_pk_window(
     adapter: &dyn rocky_core::traits::WarehouseAdapter,
     table_ref: &str,
-    pk_column: &str,
+    pk_quoted: &str,
 ) -> Result<(Option<i128>, Option<i128>)> {
-    let sql = format!(
-        "SELECT MIN(\"{pk_column}\"), MAX(\"{pk_column}\") FROM {table_ref} \
-         WHERE \"{pk_column}\" IS NOT NULL"
-    );
+    let sql = pk_window_sql(table_ref, pk_quoted);
     let result = adapter
         .execute_query(&sql)
         .await
@@ -894,6 +896,13 @@ async fn single_pk_window(
     let lo = parse_optional_i128(row.first());
     let hi = parse_optional_i128(row.get(1));
     Ok((lo, hi))
+}
+
+fn pk_window_sql(table_ref: &str, pk_quoted: &str) -> String {
+    format!(
+        "SELECT MIN({pk_quoted}), MAX({pk_quoted}) FROM {table_ref} \
+         WHERE {pk_quoted} IS NOT NULL"
+    )
 }
 
 fn parse_optional_i128(cell: Option<&serde_json::Value>) -> Option<i128> {
@@ -2270,6 +2279,64 @@ mod tests {
         branch: true,
         base: true,
     };
+
+    /// `pk_window` must quote the key through the adapter's dialect. On
+    /// Databricks a double-quoted `"id"` is a STRING literal, so
+    /// `MIN("id")` returns the text `id` and the window is wrong.
+    #[tokio::test]
+    async fn pk_window_quotes_the_key_through_the_dialect() {
+        use rocky_core::traits::{AdapterResult, QueryResult, SqlDialect, WarehouseAdapter};
+        use std::sync::Mutex;
+
+        struct CapturingAdapter {
+            dialect: rocky_databricks::dialect::DatabricksSqlDialect,
+            seen: Mutex<Vec<String>>,
+        }
+        #[async_trait::async_trait]
+        impl WarehouseAdapter for CapturingAdapter {
+            fn dialect(&self) -> &dyn SqlDialect {
+                &self.dialect
+            }
+            async fn execute_statement(&self, _sql: &str) -> AdapterResult<()> {
+                unimplemented!("pk_window only queries")
+            }
+            async fn execute_query(&self, sql: &str) -> AdapterResult<QueryResult> {
+                self.seen.lock().unwrap().push(sql.to_string());
+                Ok(QueryResult {
+                    columns: vec!["lo".into(), "hi".into()],
+                    rows: vec![vec![serde_json::json!(3), serde_json::json!(9)]],
+                })
+            }
+            async fn describe_table(
+                &self,
+                _t: &rocky_ir::TableRef,
+            ) -> AdapterResult<Vec<rocky_ir::ColumnInfo>> {
+                unimplemented!("pk_window never describes")
+            }
+        }
+
+        let adapter = CapturingAdapter {
+            dialect: rocky_databricks::dialect::DatabricksSqlDialect,
+            seen: Mutex::new(Vec::new()),
+        };
+        let table = |schema: &str| rocky_ir::TableRef {
+            catalog: "cat".into(),
+            schema: schema.into(),
+            table: "orders".into(),
+        };
+
+        let window = pk_window(&adapter, &table("base"), &table("branch"), "id")
+            .await
+            .expect("pk window");
+        assert_eq!(window, (3, 10));
+
+        let seen = adapter.seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 2);
+        for sql in &seen {
+            assert!(sql.contains("MIN(`id`)"), "dialect quoting expected: {sql}");
+            assert!(!sql.contains("\"id\""), "string-literal key leaked: {sql}");
+        }
+    }
 
     #[tokio::test]
     async fn preview_name_entry_points_refuse_hyphens_before_io() {

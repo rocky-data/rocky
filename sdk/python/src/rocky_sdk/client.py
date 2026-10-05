@@ -85,6 +85,7 @@ from rocky_sdk.types import (
     ProductListOutput,
     ProductStatusOutput,
     ProductVerifyOutput,
+    ProfileOutput,
     PromotePlan,
     ReconcileWatermarkOutput,
     RestoreApplyOutput,
@@ -1923,6 +1924,19 @@ class RockyClient:
         if save:
             args.append("--save")
         return _parse_rocky_json(self.run_cli(args), AiTestResult, command="ai-test")
+
+    def profile(self, model: str, *, column: str | None = None, sample: int = 0) -> ProfileOutput:
+        """Profile a model's target table per column (DuckDB only).
+
+        ``sample > 0`` adds up to that many random distinct non-null values per
+        column (``sample_values``, at most 100). Needs engine 1.77.0 or later.
+        """
+        args: list[str] = ["profile", model, "--models", self.models_dir]
+        if column is not None:
+            args.extend(["--column", column])
+        if sample:
+            args.extend(["--sample", str(sample)])
+        return _parse_rocky_json(self.run_cli(args), ProfileOutput, command="profile")
 
     def ai_contract(self, model: str, *, save: bool = False) -> AiContractOutput:
         """AI-draft a data contract from a model's observed data (DuckDB only)."""

@@ -11,6 +11,14 @@ class AiSyncProposal(BaseModel):
     intent: str
     model: str
     proposed_source: str
+    upstream_baseline_found: bool | None = False
+    """
+    Whether a stored upstream-schema baseline existed for this model. `false` on the first sync of a model: the proposal follows declared intent only, and the current upstream schemas become the baseline. Optional on the wire: an engine older than this field never had one.
+    """
+    upstream_changes: list[str] | None = []
+    """
+    Upstream column changes since the baseline, one human-readable line each. Empty when there is no baseline or nothing changed.
+    """
 
 
 class AiSyncOutput(BaseModel):

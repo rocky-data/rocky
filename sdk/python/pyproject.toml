@@ -26,6 +26,12 @@ dependencies = [
     "pydantic>=2.10",
 ]
 
+[project.optional-dependencies]
+# The local model behind `rocky_sdk.classify.suggest(..., use_model=True)`.
+# Heavy (PyTorch + transformers); the rules-only path needs none of it.
+# Pinned: the aid's error rate was measured on this exact version.
+classify = ["laya==0.3.26"]
+
 [project.urls]
 Homepage = "https://rocky-data.dev/"
 Repository = "https://github.com/rocky-data/rocky"

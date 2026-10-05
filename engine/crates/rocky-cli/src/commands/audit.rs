@@ -22,6 +22,7 @@ use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Duration, Utc};
 use rocky_compiler::compile::{self, CompilerConfig};
 use rocky_core::config::PolicyEffect;
+use rocky_core::env_string::EnvString;
 use rocky_core::state::{PolicyDecisionRecord, RunRecord, StateStore};
 
 use crate::output::{
@@ -127,10 +128,10 @@ fn to_decision_entry(d: PolicyDecisionRecord) -> AuditDecisionEntry {
         plan_id: d.plan_id,
         principal: d.principal,
         capability: d.capability,
-        model: d.model,
+        model: d.model.into(),
         effect: d.effect,
         rule_id: d.rule_id,
-        reason: d.reason,
+        reason: d.reason.into(),
     }
 }
 
@@ -585,9 +586,9 @@ fn build_verify_link(
         .map(|d| AuditVerifyEntry {
             timestamp: d.timestamp.to_rfc3339(),
             plan_id: d.plan_id.clone(),
-            checks: d.verify_after.clone(),
+            checks: d.verify_after.iter().map(EnvString::from).collect(),
             passed: d.effect == PolicyEffect::Allow,
-            reason: d.reason.clone(),
+            reason: EnvString::from(&d.reason),
         })
         .collect();
 
@@ -902,7 +903,7 @@ fn render_chain_text(out: &AuditForOutput) {
                     "  {} {} [{}] — {}",
                     v.timestamp,
                     verdict,
-                    v.checks.join(", "),
+                    rocky_core::env_string::join_rendered(&v.checks, ", "),
                     v.reason,
                 );
             }
@@ -1876,7 +1877,7 @@ mod tests {
         assert_eq!(link.total, 2);
         // Newest first: the failed verification (secs=3) leads.
         assert!(!link.entries[0].passed);
-        assert!(link.entries[0].reason.contains("FAILED"));
+        assert!(link.entries[0].reason.rendered().contains("FAILED"));
         assert_eq!(link.entries[0].checks, vec!["row_count".to_string()]);
         assert!(link.entries[1].passed);
         assert_eq!(link.entries[1].checks.len(), 2);
@@ -1974,6 +1975,48 @@ mod tests {
     /// The two that matter most are the last two: a governed auto-apply row is
     /// a GENUINE evaluation that happens to carry custody detail, and removing
     /// it from the rates would be the same defect in the opposite direction.
+    /// #1919: a ledger row written before the fix holds resolved values.
+    /// `rocky audit` renders them through the registry on the way out, both
+    /// in the decision list and in the custody chain's verify entries.
+    #[test]
+    fn audit_prints_a_resolved_value_in_an_old_ledger_row_as_its_placeholder() {
+        const SECRET: &str = "rocky_1919_audit_check_5a5a5a";
+        rocky_core::secret_registry::register_substitution("ROCKY_T1919_AUDIT", SECRET);
+        let mut row = sc_decision(
+            1,
+            "plan-a",
+            SECRET,
+            PolicyPrincipal::Agent,
+            Some(0),
+            PolicyEffect::Deny,
+        );
+        row.verify_after = vec![SECRET.to_string()];
+        row.reason = format!("verify_after FAILED: {SECRET} (absent — did not run)");
+
+        let entry = serde_json::to_string(&to_decision_entry(row.clone())).unwrap();
+        let plan_link = AuditChainPlan {
+            availability: SectionAvailability::Unavailable,
+            note: None,
+            plan_id: None,
+            principal: None,
+            kind: None,
+            diff_available: false,
+            changes: Vec::new(),
+        };
+        let link = build_verify_link(
+            AuditSubjectKind::Plan,
+            "plan-a",
+            &plan_link,
+            std::slice::from_ref(&row),
+        );
+        assert_eq!(link.entries.len(), 1, "PRECONDITION: the row joined");
+        let verify = serde_json::to_string(&link).unwrap();
+        for printed in [entry, verify] {
+            assert!(!printed.contains(SECRET), "leaked: {printed}");
+            assert!(printed.contains("${ROCKY_T1919_AUDIT}"), "{printed}");
+        }
+    }
+
     #[test]
     fn every_ledger_row_kind_is_classified() {
         use rocky_core::state::DecisionKind;

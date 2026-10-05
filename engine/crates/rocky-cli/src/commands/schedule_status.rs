@@ -88,7 +88,8 @@ pub fn schedule_status_output(
 
     Ok(ScheduleStatusOutput {
         now,
-        timezone: config.schedule.timezone.clone(),
+        // Resolved `${VAR}` values print as `${NAME}` (#1919).
+        timezone: rocky_core::secret_registry::render_placeholders(&config.schedule.timezone),
         tick_lock,
         pipelines,
         counts,
@@ -214,8 +215,15 @@ fn build_pipelines(
                 common(
                     None,
                     schedule.enabled,
-                    schedule.cron.as_ref().map(|(expr, _)| expr.clone()),
-                    schedule.after.clone(),
+                    schedule
+                        .cron
+                        .as_ref()
+                        .map(|(expr, _)| rocky_core::secret_registry::render_placeholders(expr)),
+                    schedule
+                        .after
+                        .iter()
+                        .map(|a| rocky_core::secret_registry::render_placeholders(a))
+                        .collect(),
                     schedule
                         .freshness_budget
                         .map(|d| d.num_seconds().max(0) as u64),
@@ -229,7 +237,9 @@ fn build_pipelines(
             // the pipeline IS configured, it just cannot fire, and silence is
             // the least actionable way to say so.
             Err(e) => common(
-                Some(e.to_string()),
+                Some(rocky_core::secret_registry::render_placeholders(
+                    &e.to_string(),
+                )),
                 false,
                 None,
                 Vec::new(),

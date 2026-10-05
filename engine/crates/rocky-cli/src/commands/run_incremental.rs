@@ -58,10 +58,10 @@ pub(super) fn rebuilds_on_full_refresh(strategy: &MaterializationStrategy) -> bo
 
 /// The IR a `--full-refresh` run executes: the same model rebuilt with
 /// `CREATE OR REPLACE TABLE ... AS`, every `@incremental_filter` resolved to
-/// `TRUE`.
-pub(super) fn full_refresh_ir(model_ir: &ModelIr) -> ModelIr {
+/// the dialect's always-true predicate (`TRUE`; `(1 = 1)` on SQL Server).
+pub(super) fn full_refresh_ir(model_ir: &ModelIr, dialect: &dyn SqlDialect) -> ModelIr {
     let mut rebuilt = model_ir.clone();
-    rebuilt.sql = rocky_core::incremental_filter::unfiltered_sql(&model_ir.sql);
+    rebuilt.sql = rocky_core::incremental_filter::unfiltered_sql_for(&model_ir.sql, dialect);
     rebuilt.materialization = MaterializationStrategy::FullRefresh;
     rebuilt
 }
@@ -117,7 +117,7 @@ pub(super) async fn prepare(
         .format_table_ref(&table.catalog, &table.schema, &table.table)
         .map_err(anyhow::Error::from)?;
 
-    let model_columns = probe_output_columns(model_ir, warehouse, &target_ref).await?;
+    let model_columns = probe_output_columns(model_ir, warehouse, dialect, &target_ref).await?;
     let mut notes = Vec::new();
     let mut insert_columns = None;
     if !model_columns.is_empty() {
@@ -203,7 +203,10 @@ pub(super) async fn query_max(
     rocky_sql::validation::validate_identifier(column)
         .with_context(|| format!("invalid watermark column '{column}'"))?;
     let result = warehouse
-        .execute_query(&format!("SELECT MAX({column}) FROM {target_ref}"))
+        .execute_query(&format!(
+            "SELECT {} FROM {target_ref}",
+            warehouse.dialect().max_aggregate(column)
+        ))
         .await
         .map_err(anyhow::Error::from)
         .with_context(|| format!("reading MAX({column}) from {target_ref} failed"))?;
@@ -225,13 +228,12 @@ pub(super) async fn query_max(
 async fn probe_output_columns(
     model_ir: &ModelIr,
     warehouse: &dyn WarehouseAdapter,
+    dialect: &dyn SqlDialect,
     target_ref: &str,
 ) -> Result<Vec<String>> {
-    let body = rocky_core::incremental_filter::unfiltered_sql(&model_ir.sql);
+    let body = rocky_core::incremental_filter::unfiltered_sql_for(&model_ir.sql, dialect);
     let result = warehouse
-        .execute_query(&format!(
-            "SELECT * FROM (\n{body}\n) AS _rocky_probe LIMIT 0"
-        ))
+        .execute_query(&dialect.wrap_select_limited(&format!("\n{body}\n"), "_rocky_probe", "*", 0))
         .await
         .map_err(anyhow::Error::from)
         .with_context(|| {
@@ -269,12 +271,12 @@ async fn typed_added_columns(
     let probe_ref = dialect
         .format_table_ref(&probe.catalog, &probe.schema, &probe.table)
         .map_err(anyhow::Error::from)?;
-    let body = rocky_core::incremental_filter::unfiltered_sql(&model_ir.sql);
+    let body = rocky_core::incremental_filter::unfiltered_sql_for(&model_ir.sql, dialect);
     let drop_sql = dialect.drop_table_sql(&probe_ref);
     warehouse
         .execute_statement(&dialect.create_table_as_new(
             &probe_ref,
-            &format!("SELECT * FROM (\n{body}\n) AS _rocky_probe LIMIT 0"),
+            &dialect.wrap_select_limited(&format!("\n{body}\n"), "_rocky_probe", "*", 0),
         ))
         .await
         .map_err(anyhow::Error::from)

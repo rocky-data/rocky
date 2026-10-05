@@ -299,9 +299,6 @@ pub async fn run_ai_sync(
     let client = make_client(config_path)?;
     let result = compile_project(config_path, state_path, models_dir, cache_ttl_override)?;
 
-    // For now, use the current compilation as both "previous" and "current".
-    // In practice, the previous would come from the state store.
-    // Detect changes against models that have intent and upstream changes.
     let models_with_intent: Vec<&rocky_core::models::Model> = result
         .project
         .models
@@ -333,20 +330,31 @@ pub async fn run_ai_sync(
         return Ok(());
     }
 
+    // Diff each model's upstream schemas against the baseline stored next to
+    // the state store. A model with no baseline (first sync) proceeds on
+    // intent alone, and its current upstream schemas become the baseline.
+    let snapshot_path = ai_sync_snapshot_path(state_path);
+    let mut snapshot = load_ai_sync_snapshot(&snapshot_path)?.unwrap_or_default();
+    let mut diffs = Vec::with_capacity(models_with_intent.len());
+    let mut first_seen = 0usize;
+    for model in &models_with_intent {
+        let diff = upstream_diff(&snapshot, &result, &model.config.name);
+        if !diff.baseline_found {
+            snapshot
+                .models
+                .insert(model.config.name.clone(), diff.current.clone());
+            first_seen += 1;
+        }
+        diffs.push(diff);
+    }
+    if first_seen > 0 {
+        save_ai_sync_snapshot(&snapshot_path, &snapshot)?;
+    }
+
     let mut proposals = Vec::new();
 
-    for model in &models_with_intent {
-        // Upstream schema-change detection is not wired yet: it would
-        // require diffing the current compilation against a *persisted
-        // previous* one (see `rocky_ai::sync::detect_schema_changes`), but
-        // the state store does not yet snapshot prior `CompileResult`s.
-        // Until that snapshot store exists, sync proposals are driven by
-        // the model's declared intent alone, with no upstream diff. This
-        // is surfaced to the user below (TODO: persist compile snapshots
-        // so `detect_schema_changes` can feed this).
-        let upstream_changes = Vec::new();
-
-        let proposal = rocky_ai::sync::sync_model(model, &upstream_changes, &client, &result)
+    for (model, diff) in models_with_intent.iter().zip(&diffs) {
+        let proposal = rocky_ai::sync::sync_model(model, &diff.changes, &client, &result)
             .await
             .map_err(|e| anyhow::anyhow!("{e}"))?;
 
@@ -356,11 +364,18 @@ pub async fn run_ai_sync(
     if output_json {
         let typed_proposals: Vec<AiSyncProposal> = proposals
             .iter()
-            .map(|p| AiSyncProposal {
+            .zip(&diffs)
+            .map(|(p, d)| AiSyncProposal {
                 model: p.model.clone(),
                 intent: p.intent.clone(),
                 diff: p.diff.clone(),
                 proposed_source: p.proposed_source.clone(),
+                upstream_baseline_found: d.baseline_found,
+                upstream_changes: p
+                    .upstream_changes
+                    .iter()
+                    .map(|c| c.details.clone())
+                    .collect(),
             })
             .collect();
         let output = AiSyncOutput {
@@ -370,16 +385,29 @@ pub async fn run_ai_sync(
         };
         print_json(&output)?;
     } else {
-        println!(
-            "Note: proposals are based on declared model intent only — \
-             upstream schema-change detection is not yet wired."
-        );
-        println!();
-        for proposal in &proposals {
+        if first_seen > 0 {
+            println!(
+                "Note: no upstream schema snapshot existed for {first_seen} model(s) (first sync). \
+                 Their proposals follow declared intent only. Saved a baseline to {}.",
+                snapshot_path.display()
+            );
+            println!();
+        }
+        for (proposal, diff) in proposals.iter().zip(&diffs) {
             println!(
                 "Model: {} (intent: \"{}\")",
                 proposal.model, proposal.intent
             );
+            if diff.baseline_found {
+                if diff.changes.is_empty() {
+                    println!("Upstream changes: none since the baseline");
+                } else {
+                    println!("Upstream changes since the baseline:");
+                    for change in &diff.changes {
+                        println!("  - {}", change.details);
+                    }
+                }
+            }
             println!("{}", proposal.diff);
             println!();
         }
@@ -416,14 +444,163 @@ pub async fn run_ai_sync(
                     }
                     std::fs::write(&model.file_path, &proposal.proposed_source)?;
                     println!("Updated: {}", model.file_path.display());
+                    // The model is now synced against today's upstreams:
+                    // advance its baseline. Saved per model so a later
+                    // refusal in this loop keeps the ones already written.
+                    if let Some(diff) = diffs.iter().find(|d| d.model == proposal.model) {
+                        snapshot
+                            .models
+                            .insert(proposal.model.clone(), diff.current.clone());
+                        save_ai_sync_snapshot(&snapshot_path, &snapshot)?;
+                    }
                 }
             }
         } else if !proposals.is_empty() {
-            println!("Run with --apply to update models.");
+            println!(
+                "Run with --apply to update models. A model's upstream baseline advances \
+                 only when --apply writes its proposal."
+            );
         }
     }
 
     Ok(())
+}
+
+/// Stored upstream schemas `rocky ai-sync` diffs against, per synced model.
+///
+/// Lives in a JSON file next to the state store (see
+/// [`ai_sync_snapshot_path`]): `model -> upstream name -> typed columns`, as
+/// of the model's first sync or its last applied proposal. Keyed per model,
+/// not globally, so applying one model's proposal cannot hide an upstream
+/// change from another model that has not synced yet.
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+struct AiSyncSnapshot {
+    version: u32,
+    models:
+        std::collections::BTreeMap<String, std::collections::BTreeMap<String, Vec<TypedColumn>>>,
+}
+
+const AI_SYNC_SNAPSHOT_VERSION: u32 = 1;
+
+/// `<state file>.ai-sync.json`, e.g. `models/.rocky-state.ai-sync.json`.
+fn ai_sync_snapshot_path(state_path: &Path) -> PathBuf {
+    state_path.with_extension("ai-sync.json")
+}
+
+/// Read the snapshot. `Ok(None)` only when the file does not exist; an
+/// unreadable or malformed file is an error, never an empty baseline.
+fn load_ai_sync_snapshot(path: &Path) -> Result<Option<AiSyncSnapshot>> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(e).with_context(|| {
+                format!("failed to read ai-sync schema snapshot {}", path.display())
+            });
+        }
+    };
+    let snapshot: AiSyncSnapshot = serde_json::from_slice(&bytes).with_context(|| {
+        format!(
+            "ai-sync schema snapshot {} is malformed; delete it to re-baseline",
+            path.display()
+        )
+    })?;
+    if snapshot.version != AI_SYNC_SNAPSHOT_VERSION {
+        anyhow::bail!(
+            "ai-sync schema snapshot {} has version {}, expected {}; delete it to re-baseline",
+            path.display(),
+            snapshot.version,
+            AI_SYNC_SNAPSHOT_VERSION
+        );
+    }
+    Ok(Some(snapshot))
+}
+
+/// Write the snapshot atomically (temp file + rename).
+fn save_ai_sync_snapshot(path: &Path, snapshot: &AiSyncSnapshot) -> Result<()> {
+    let snapshot = AiSyncSnapshot {
+        version: AI_SYNC_SNAPSHOT_VERSION,
+        models: snapshot.models.clone(),
+    };
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, serde_json::to_vec_pretty(&snapshot)?)
+        .with_context(|| format!("failed to write {}", tmp.display()))?;
+    std::fs::rename(&tmp, path)
+        .with_context(|| format!("failed to write ai-sync schema snapshot {}", path.display()))?;
+    Ok(())
+}
+
+/// One model's upstream diff for `rocky ai-sync`.
+#[derive(Debug)]
+struct UpstreamDiff {
+    model: String,
+    /// A baseline existed for this model.
+    baseline_found: bool,
+    /// Column changes on upstreams present in both the baseline and the
+    /// current compile. Empty without a baseline.
+    changes: Vec<rocky_ai::sync::SchemaChange>,
+    /// The model's current upstream schemas (the next baseline).
+    current: std::collections::BTreeMap<String, Vec<TypedColumn>>,
+}
+
+/// The typed schemas of `model`'s direct upstreams in this compile. An
+/// upstream with no known schema (e.g. a cold source-schema cache) is left
+/// out rather than recorded as empty.
+fn current_upstream_schemas(
+    result: &CompileResult,
+    model: &str,
+) -> std::collections::BTreeMap<String, Vec<TypedColumn>> {
+    let Some(schema) = result.semantic_graph.model_schema(model) else {
+        return std::collections::BTreeMap::new();
+    };
+    schema
+        .upstream
+        .iter()
+        .filter_map(|up| {
+            result
+                .type_check
+                .typed_models
+                .get(up)
+                .map(|cols| (up.clone(), cols.clone()))
+        })
+        .collect()
+}
+
+/// Diff `model`'s current upstream schemas against its stored baseline.
+///
+/// Only upstreams known on both sides are compared, so a newly added
+/// dependency or a schema that is merely unknown this run is not reported
+/// as an upstream change.
+fn upstream_diff(snapshot: &AiSyncSnapshot, result: &CompileResult, model: &str) -> UpstreamDiff {
+    let current = current_upstream_schemas(result, model);
+    let Some(baseline) = snapshot.models.get(model) else {
+        return UpstreamDiff {
+            model: model.to_string(),
+            baseline_found: false,
+            changes: Vec::new(),
+            current,
+        };
+    };
+    let previous: indexmap::IndexMap<String, Vec<TypedColumn>> = baseline
+        .iter()
+        .filter(|(name, _)| current.contains_key(*name))
+        .map(|(name, cols)| (name.clone(), cols.clone()))
+        .collect();
+    let now: indexmap::IndexMap<String, Vec<TypedColumn>> = current
+        .iter()
+        .filter(|(name, _)| baseline.contains_key(*name))
+        .map(|(name, cols)| (name.clone(), cols.clone()))
+        .collect();
+    UpstreamDiff {
+        model: model.to_string(),
+        baseline_found: true,
+        changes: rocky_ai::sync::detect_schema_changes_between(&previous, &now),
+        current,
+    }
 }
 
 /// Execute `rocky ai-explain` — generate intent descriptions from code.
@@ -628,6 +805,143 @@ mod tests {
             on_disk, original,
             "an invalid proposal must not overwrite the model file"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // ai-sync upstream schema snapshot (defect 2). No API key needed: these
+    // cover everything `run_ai_sync` does around the LLM call.
+    // ------------------------------------------------------------------
+
+    /// A two-model project: `stg` (SQL over literals) feeds `report`, which
+    /// declares intent. `stg_sql` controls the upstream's columns.
+    fn ai_sync_project(dir: &Path, stg_sql: &str) -> PathBuf {
+        let models = dir.join("models");
+        std::fs::create_dir_all(&models).unwrap();
+        std::fs::write(models.join("stg.sql"), stg_sql).unwrap();
+        std::fs::write(
+            models.join("stg.toml"),
+            "name = \"stg\"\n\n[strategy]\ntype = \"full_refresh\"\n\n\
+             [target]\ncatalog = \"c\"\nschema = \"s\"\ntable = \"stg\"\n",
+        )
+        .unwrap();
+        std::fs::write(models.join("report.sql"), "SELECT id FROM stg").unwrap();
+        std::fs::write(
+            models.join("report.toml"),
+            "name = \"report\"\nintent = \"one row per id\"\ndepends_on = [\"stg\"]\n\n\
+             [strategy]\ntype = \"full_refresh\"\n\n\
+             [target]\ncatalog = \"c\"\nschema = \"s\"\ntable = \"report\"\n",
+        )
+        .unwrap();
+        models
+    }
+
+    fn ai_sync_compile(dir: &Path) -> CompileResult {
+        compile_project(
+            &dir.join("rocky.toml"),
+            &dir.join("state.redb"),
+            dir.join("models").to_str().unwrap(),
+            None,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn ai_sync_first_run_has_no_baseline_and_records_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        ai_sync_project(tmp.path(), "SELECT 1 AS id, 'a' AS name");
+        let result = ai_sync_compile(tmp.path());
+        let path = ai_sync_snapshot_path(&tmp.path().join("state.redb"));
+        assert_eq!(path, tmp.path().join("state.ai-sync.json"));
+
+        assert!(load_ai_sync_snapshot(&path).unwrap().is_none());
+        let diff = upstream_diff(&AiSyncSnapshot::default(), &result, "report");
+        assert!(!diff.baseline_found, "first run: no baseline");
+        assert!(diff.changes.is_empty(), "first run proceeds on intent only");
+        assert!(
+            diff.current.contains_key("stg"),
+            "the baseline must capture the upstream: {:?}",
+            diff.current
+        );
+
+        let mut snapshot = AiSyncSnapshot::default();
+        snapshot.models.insert("report".into(), diff.current);
+        save_ai_sync_snapshot(&path, &snapshot).unwrap();
+        let reloaded = load_ai_sync_snapshot(&path).unwrap().expect("saved");
+        assert_eq!(reloaded.version, AI_SYNC_SNAPSHOT_VERSION);
+        assert_eq!(reloaded.models["report"], snapshot.models["report"]);
+    }
+
+    #[test]
+    fn ai_sync_diffs_upstream_columns_against_the_stored_baseline() {
+        let tmp = tempfile::tempdir().unwrap();
+        let models = ai_sync_project(tmp.path(), "SELECT 1 AS id, 'a' AS name");
+        let before = ai_sync_compile(tmp.path());
+        let mut snapshot = AiSyncSnapshot::default();
+        snapshot
+            .models
+            .insert("report".into(), current_upstream_schemas(&before, "report"));
+
+        // The upstream gains `amount` (kept apart from a removal so the
+        // rename heuristic cannot pair them).
+        std::fs::write(
+            models.join("stg.sql"),
+            "SELECT 1 AS id, 'a' AS name, 2.5 AS amount",
+        )
+        .unwrap();
+        let after = ai_sync_compile(tmp.path());
+        let diff = upstream_diff(&snapshot, &after, "report");
+        assert!(diff.baseline_found);
+        let details: Vec<&str> = diff.changes.iter().map(|c| c.details.as_str()).collect();
+        assert!(
+            diff.changes.iter().any(|c| matches!(
+                &c.change_type,
+                rocky_ai::sync::SchemaChangeType::ColumnAdded { name, .. } if name == "amount"
+            )),
+            "added column must be reported: {details:?}"
+        );
+        assert!(diff.changes.iter().all(|c| c.model == "stg"), "{details:?}");
+
+        // The upstream drops `name`.
+        std::fs::write(models.join("stg.sql"), "SELECT 1 AS id").unwrap();
+        let dropped = ai_sync_compile(tmp.path());
+        let removed = upstream_diff(&snapshot, &dropped, "report");
+        let removed_details: Vec<&str> =
+            removed.changes.iter().map(|c| c.details.as_str()).collect();
+        assert!(
+            removed.changes.iter().any(|c| matches!(
+                &c.change_type,
+                rocky_ai::sync::SchemaChangeType::ColumnRemoved { name } if name == "name"
+            )),
+            "removed column must be reported: {removed_details:?}"
+        );
+
+        // The changes reach the LLM prompt that `sync_model` sends.
+        let report = after.project.model("report").unwrap();
+        let (system, _user) = rocky_ai::sync::sync_prompts(report, &diff.changes, &after);
+        for change in &diff.changes {
+            assert!(system.contains(&change.details), "prompt: {system}");
+        }
+
+        // No upstream change since the baseline: nothing reported.
+        let same = upstream_diff(&snapshot, &before, "report");
+        assert!(
+            same.baseline_found && same.changes.is_empty(),
+            "{:?}",
+            same.changes
+        );
+    }
+
+    #[test]
+    fn ai_sync_malformed_snapshot_is_an_error_not_an_empty_baseline() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("state.ai-sync.json");
+        std::fs::write(&path, "{ not json").unwrap();
+        let err = load_ai_sync_snapshot(&path).unwrap_err();
+        assert!(format!("{err:#}").contains("malformed"), "{err:#}");
+
+        std::fs::write(&path, r#"{"version": 99, "models": {}}"#).unwrap();
+        let err = load_ai_sync_snapshot(&path).unwrap_err();
+        assert!(format!("{err:#}").contains("version 99"), "{err:#}");
     }
 
     // ------------------------------------------------------------------

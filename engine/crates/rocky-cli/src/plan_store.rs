@@ -527,6 +527,81 @@ fn compute_plan_id(kind: &PlanKind, payload: &serde_json::Value) -> String {
     hash.to_hex().to_string()
 }
 
+/// The key file for the keyed digests a replication plan stores in place of
+/// resolved `${VAR}` values (#1919). Lives beside `plans/`, under the same
+/// git-ignored `.rocky/`.
+pub(crate) const PLAN_DIGEST_KEY_FILE: &str = "plan-digest.key";
+
+/// Path of [`PLAN_DIGEST_KEY_FILE`] under `root`.
+pub(crate) fn plan_digest_key_path(root: &Path) -> std::path::PathBuf {
+    root.join(".rocky").join(PLAN_DIGEST_KEY_FILE)
+}
+
+/// The 32-byte key for plan config digests.
+///
+/// With `create`, a missing key is generated (two v4 UUIDs, 244 random bits)
+/// and written owner-only. Without it, a missing or malformed key is an error:
+/// apply cannot verify a digest it has no key for, and it refuses rather than
+/// skip the check.
+pub(crate) fn plan_digest_key(root: &Path, create: bool) -> Result<[u8; 32]> {
+    let path = plan_digest_key_path(root);
+    if create && !path.exists() {
+        let rocky_dir = root.join(".rocky");
+        rocky_observe::traces::ensure_rocky_gitignore(&rocky_dir);
+        std::fs::create_dir_all(&rocky_dir)
+            .with_context(|| format!("failed to create {}", rocky_dir.display()))?;
+        let mut key = [0u8; 32];
+        key[..16].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+        key[16..].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+        let hex: String = key.iter().map(|b| format!("{b:02x}")).collect();
+        // Write a private temp file, then hard-link it into place. The link
+        // either creates the key whole or finds one already there, so a
+        // concurrent `rocky plan` never reads a half-written key.
+        let tmp = rocky_dir.join(format!(
+            ".{PLAN_DIGEST_KEY_FILE}.{}.tmp",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let written = options.open(&tmp).and_then(|mut file| {
+            use std::io::Write;
+            file.write_all(hex.as_bytes())?;
+            file.sync_all()
+        });
+        let linked = written.and_then(|()| match std::fs::hard_link(&tmp, &path) {
+            // Another process created it first. Use theirs.
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+            other => other,
+        });
+        let _ = std::fs::remove_file(&tmp);
+        linked.with_context(|| format!("failed to create {}", path.display()))?;
+    }
+    let text = std::fs::read_to_string(&path)
+        .with_context(|| format!("failed to read the plan digest key at {}", path.display()))?;
+    let text = text.trim();
+    let mut key = [0u8; 32];
+    if text.len() != 64 || !text.is_ascii() {
+        bail!(
+            "the plan digest key at {} is malformed (expected 64 hex characters)",
+            path.display()
+        );
+    }
+    for (i, byte) in key.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&text[i * 2..i * 2 + 2], 16).with_context(|| {
+            format!(
+                "the plan digest key at {} is malformed (expected 64 hex characters)",
+                path.display()
+            )
+        })?;
+    }
+    Ok(key)
+}
+
 /// Return the directory where plans are stored, creating it if needed.
 fn plans_dir(root: &Path) -> Result<std::path::PathBuf> {
     let rocky_dir = root.join(".rocky");

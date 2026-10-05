@@ -1,6 +1,7 @@
 //! Import from external project formats (dbt, etc.).
 
 pub mod dbt;
+pub mod dbt_attach;
 pub mod dbt_governance;
 pub mod dbt_macros;
 pub mod dbt_manifest;

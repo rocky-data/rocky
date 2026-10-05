@@ -385,7 +385,7 @@ rocky doctor
 | Pipelines | `pipelines` | Validates schema patterns, templates, and governance config |
 | State Sync | `state_sync` | Inspects the configured remote state backend (type only) |
 | State RW | `state_rw` | Round-trips a marker object against the configured backend (put → get → delete). Surfaces IAM and reachability problems at cold start instead of end-of-run upload. No-op for `local`; tiered probes both legs. |
-| State Concurrency | `state_concurrency` | Reports lost-update exposure of a remote `[state]` backend. `"cas"` on a backend that performs compare-and-swap writes (`s3`, `gcs`, `tiered`) is healthy: the end-of-run upload and every ledger seam (`rocky policy`, `rocky gc`, `rocky restore`, `rocky apply`) commit by compare-and-swap. The message still notes that the guarantee needs every writer on the same state to run with `"cas"`. It warns, with a distinct message each, for `concurrency_control = "off"` (not enabled) and for `"cas"` on a backend that performs no compare-and-swap write (enabled but silently downgraded to an unconditional upload). Silent for `local`. |
+| State Concurrency | `state_concurrency` | Reports lost-update exposure of a remote `[state]` backend. Resolves the mode as a writer does at startup: an unset `concurrency_control` takes the backend default, and `"cas"` runs the conditional-write probe. The message names the resolved mode, whether it was explicit or the default, and the probe result. Resolved `"cas"` with a supporting store is healthy: the end-of-run upload and every ledger seam (`rocky policy`, `rocky gc`, `rocky restore`, `rocky apply`) commit by compare-and-swap. It is critical when `"cas"` is explicit and the probe shows the store ignores conditional writes. It warns, with a distinct message each, when the mode resolves to `"off"` but the `cas-required` marker exists (the two disagree, and uploads will be refused), when an unset mode fell back to `"off"`, when the probe was inconclusive, for an explicit `"off"`, and for `"cas"` on a backend that performs no compare-and-swap write. `--verbose` adds `resolved`, `cas_probe`, and `cas_required_marker` details. Silent for `local`. |
 | Auth | `auth`, `auth/<adapter>` | Pings each warehouse and discovery adapter to verify credentials and connectivity |
 
 **JSON output:**
@@ -986,6 +986,7 @@ Report what is actually in a model's data, column by column: row count, null cou
 ```bash
 rocky profile fct_orders                  # Profile every column
 rocky profile fct_orders --column amount  # Profile one column
+rocky profile fct_orders --sample 5       # Add 5 random values per column
 ```
 
 **Arguments and flags:**
@@ -994,11 +995,14 @@ rocky profile fct_orders --column amount  # Profile one column
 |------|---------|-------------|
 | `model` | required | Model to profile. Rocky profiles its target table, or a source table when the target does not exist yet. |
 | `--column <NAME>` | (every column) | Profile only this column. |
+| `--sample <N>` | `0` (off) | Also return up to N distinct non-null values per column as `sample_values`. N is at most 100. Rocky picks the values by a hash of each value, so the choice looks random but a re-run on unchanged data returns the same values. |
 | `--models <PATH>` | `models` | Models directory. Rocky compiles it to obtain the model's inferred schema. |
 
 **Which table Rocky profiles.** Rocky profiles the model's target table when that table is materialized. When it is not, Rocky profiles the first source table it can resolve instead, so you still get observed numbers before the first `rocky run`. On that fallback path Rocky skips any column the source does not have. The JSON output names the table it read under `profiled_table` and the missing target under `fell_back_from`. The text output prints neither field, so read the JSON when you need to know which table the numbers came from.
 
 **Minimum and maximum.** `--output json` carries a `min` and a `max` for every column. The text output prints the row, null, and distinct counts only.
+
+**Sample values.** `--sample` reads real cell values and prints them. Without it, the only cell values are `min`, `max` and `observed_values`, the value list of a column with 25 or fewer distinct values. `--sample` covers every column. It reads every distinct value of each column, so it costs more on a large table. The [tag-suggestion aid](/python-sdk/classification-aid/) uses it.
 
 ---
 

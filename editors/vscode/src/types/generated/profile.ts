@@ -50,6 +50,10 @@ export interface ProfileColumnStats {
   observed_values: string[];
   rows: number;
   /**
+   * Up to N distinct non-null values, sorted. Chosen pseudo-randomly by a hash of each value, so a re-run on unchanged data returns the same set whatever the scan order. Present only when `rocky profile --sample N` asked for them; unlike `observed_values` it covers high-cardinality columns too.
+   */
+  sample_values?: string[] | null;
+  /**
    * Inferred Rocky type name.
    */
   type: string;

@@ -263,7 +263,7 @@ type = "databricks"
 
     #[test]
     fn did_you_mean_returns_none_for_distant() {
-        assert_eq!(did_you_mean("clickhouse", KNOWN_ADAPTER_TYPES), None);
+        assert_eq!(did_you_mean("singlestore", KNOWN_ADAPTER_TYPES), None);
         assert_eq!(did_you_mean("zzzzzzz", KNOWN_ADAPTER_TYPES), None);
     }
 

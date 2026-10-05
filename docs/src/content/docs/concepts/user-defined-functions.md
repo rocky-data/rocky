@@ -175,7 +175,10 @@ so a second run replaces the function in place.
 | Snowflake | `CREATE OR REPLACE FUNCTION name(cents NUMBER(38,0)) RETURNS FLOAT LANGUAGE SQL [IMMUTABLE \| VOLATILE] [COMMENT = '…'] AS $$ … $$` |
 | Databricks | `CREATE OR REPLACE FUNCTION name(cents BIGINT) RETURNS DOUBLE LANGUAGE SQL [[NOT] DETERMINISTIC] [COMMENT '…'] RETURN …` |
 | BigQuery | ``CREATE OR REPLACE FUNCTION `project`.`dataset`.`name`(cents INT64) RETURNS FLOAT64 AS (…) [OPTIONS (description = '…')]`` |
+| PostgreSQL | `CREATE OR REPLACE FUNCTION name(cents BIGINT) RETURNS NUMERIC LANGUAGE sql [IMMUTABLE \| VOLATILE] AS $rocky$ SELECT … $rocky$` |
+| Redshift | `CREATE OR REPLACE FUNCTION name(BIGINT) RETURNS FLOAT8 { IMMUTABLE \| VOLATILE } AS $$ SELECT … $$ LANGUAGE sql` |
 | Trino | Refused with `E051` |
+| ClickHouse, SQL Server | Refused with `E051` |
 
 The table shows each statement on one line. In the real statement, the
 parenthesis that closes the body starts a new line, so a trailing
@@ -189,9 +192,41 @@ BigQuery needs a dataset for a persistent function. Set `[target] schema`.
 Rocky refuses a BigQuery function without one. BigQuery SQL functions take no
 determinism clause, so Rocky ignores `deterministic` there.
 
+PostgreSQL quotes the body with the `$rocky$` tag, so a body may contain
+`$$`. Rocky refuses a body that contains `$rocky$`. Without `deterministic`,
+the warehouse default (`VOLATILE`) applies. PostgreSQL keeps a description
+in a separate `COMMENT ON FUNCTION` statement, so Rocky does not set one.
+
+Redshift SQL functions take no argument names. The body refers to arguments
+as `$1`, `$2`, and so on, in declaration order. Rocky writes the body with
+names and rewrites each argument reference for you. It parses the body
+first, so a string literal or function name that spells an argument stays
+as it is. So does the date part of `DATEADD`, `DATEDIFF` and `DATE_PART`:
+in `DATEADD(day, n, day)` with arguments `day` and `n`, the first `day` is
+the date-part keyword and becomes nothing else. The rewritten body is printed back from the parsed SQL, so
+comments in it are dropped. Rocky refuses a Redshift function when:
+
+- the body does not parse as one expression,
+- the body uses an argument in a dotted reference such as `arg.field`,
+- the rewritten body contains `$$`, or
+- the function sets `[target] catalog`. Redshift creates a function in the
+  connected database, so set only `schema`.
+
+Redshift requires a volatility clause. `deterministic = true` gives
+`IMMUTABLE`. Otherwise Rocky writes `VOLATILE`, which promises nothing.
+Rocky does not set a description on Redshift either.
+
+`rocky compile` renders each called function for PostgreSQL and Redshift
+and reports these refusals as `E051` when every configured warehouse refuses
+the function. Otherwise the plan preview and `rocky run` refuse it with
+`E051` on the warehouse that cannot create it.
+
 Rocky's Trino adapter cannot create persistent functions. `rocky compile`
 reports `E051` when Trino is the only warehouse adapter in `rocky.toml`.
 `rocky run` and the plan preview refuse with `E051` on a Trino target.
+ClickHouse and SQL Server are refused the same way. On SQL Server a
+scalar function takes `@`-prefixed parameters and must be called with its
+schema (`dbo.f(x)`), so a model's bare `f(x)` call would not reach it.
 
 ## How to select a function
 
@@ -228,7 +263,8 @@ In VS Code, hover over a function name to see its signature and description.
 - `rocky run --dag` runs each model as its own sub-run. Each sub-run creates
   the functions its model needs, so a function can be replaced more than
   once in one run.
-- A function body is passed to the warehouse unchanged. Rocky parses it only
-  to find calls to other project functions. When it cannot parse a body, it
+- A function body is passed to the warehouse unchanged, except on Redshift
+  (see above). Otherwise Rocky parses it only to find calls to other project
+  functions. When it cannot parse a body, it
   reports `W051` and does not track calls inside it.
 - The governed-apply fingerprint covers models, not functions.

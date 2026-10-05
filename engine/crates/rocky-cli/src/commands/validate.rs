@@ -159,12 +159,14 @@ fn validate_inner(config_path: &Path) -> Result<ValidateOutput> {
                     (ok, msgs, String::new(), String::new(), String::new())
                 }
             };
+            // Resolved `${VAR}` values print as `${NAME}` (#1919).
+            let render = rocky_core::secret_registry::render_placeholders;
             out.pipelines.push(ValidatePipelineStatus {
                 name: name.clone(),
                 pipeline_type,
-                strategy,
-                catalog_template,
-                schema_template,
+                strategy: render(&strategy),
+                catalog_template: render(&catalog_template),
+                schema_template: render(&schema_template),
                 ok,
             });
             for msg in msgs {
@@ -715,6 +717,52 @@ fn validate_adapter(
                     ok = false;
                     // `warn`, like the Databricks missing-host check: the
                     // same problem fails `rocky run` with this message.
+                    msgs.push(ValidateMessage {
+                        severity: "warn".into(),
+                        code: "V011".into(),
+                        message: format!("{e:#}"),
+                        file: None,
+                        field: Some(format!("adapter.{name}")),
+                    });
+                }
+            }
+        }
+        "clickhouse" => {
+            // Same parse the registry runs before connecting.
+            match crate::registry::clickhouse_config(name, adapter) {
+                Ok(_) => msgs.push(ValidateMessage {
+                    severity: "ok".into(),
+                    code: "V010".into(),
+                    message: format!("adapter.{name}: clickhouse (beta)"),
+                    file: None,
+                    field: None,
+                }),
+                Err(e) => {
+                    ok = false;
+                    msgs.push(ValidateMessage {
+                        severity: "warn".into(),
+                        code: "V011".into(),
+                        message: format!("{e:#}"),
+                        file: None,
+                        field: Some(format!("adapter.{name}")),
+                    });
+                }
+            }
+        }
+        "sqlserver" => {
+            // Same parse the registry runs before connecting: a missing
+            // host / database, no or several auth methods, or an unknown
+            // `extra` key is reported here rather than at `rocky run`.
+            match crate::registry::sqlserver_config(name, adapter) {
+                Ok(_) => msgs.push(ValidateMessage {
+                    severity: "ok".into(),
+                    code: "V010".into(),
+                    message: format!("adapter.{name}: sqlserver"),
+                    file: None,
+                    field: None,
+                }),
+                Err(e) => {
+                    ok = false;
                     msgs.push(ValidateMessage {
                         severity: "warn".into(),
                         code: "V011".into(),
@@ -1910,6 +1958,43 @@ mod tests {
         let mut f = NamedTempFile::new().unwrap();
         f.write_all(toml_str.as_bytes()).unwrap();
         validate_inner(f.path()).unwrap()
+    }
+
+    /// #1919: `rocky validate --output json` prints a resolved pipeline
+    /// template as `${NAME}`: in the pipeline status and in the V020 message.
+    #[test]
+    fn validate_prints_a_resolved_template_as_its_placeholder() {
+        const SECRET: &str = "rocky1919validatecat";
+        // SAFETY: test-only; the variable name is unique to this test.
+        unsafe { std::env::set_var("ROCKY_T1919_VALIDATE", SECRET) };
+        let out = validate_toml(
+            r#"
+[adapter]
+type = "duckdb"
+path = ":memory:"
+
+[pipeline.p]
+type = "replication"
+strategy = "full_refresh"
+
+[pipeline.p.source.schema_pattern]
+prefix = "raw__"
+separator = "__"
+components = ["source"]
+
+[pipeline.p.target]
+adapter = "default"
+catalog_template = "${ROCKY_T1919_VALIDATE}"
+schema_template = "s__{source}"
+"#,
+        );
+        // SAFETY: as above.
+        unsafe { std::env::remove_var("ROCKY_T1919_VALIDATE") };
+        assert_eq!(out.pipelines.len(), 1, "PRECONDITION: {:?}", out.messages);
+        assert_eq!(out.pipelines[0].catalog_template, "${ROCKY_T1919_VALIDATE}");
+        let json = serde_json::to_string(&out).unwrap();
+        assert!(!json.contains(SECRET), "leaked: {json}");
+        assert!(codes(&out, "V020") == 1, "{:?}", out.messages);
     }
 
     // ----- the products band (V050–V053) -----
@@ -3870,12 +3955,40 @@ schema_template = "demo"
         }
     }
 
+    /// `rocky validate` parses a ClickHouse block the way the registry does:
+    /// a good one is V010, a typo'd `extra` key is V011 naming the key.
+    #[test]
+    fn clickhouse_adapter_block_is_parsed() {
+        let config = |extra: &str| {
+            format!(
+                "[adapter.ch]\ntype = \"clickhouse\"\nhost = \"ch.example.com\"\n{extra}\n\
+                 [pipeline.p]\ntype = \"transformation\"\nmodels = \"models/**\"\n\
+                 target = {{ adapter = \"ch\" }}\n"
+            )
+        };
+        let ok = validate_toml(&config("[adapter.ch.extra]\nsecure = true\n"));
+        assert!(
+            ok.messages
+                .iter()
+                .any(|m| m.code == "V010" && m.message.contains("clickhouse")),
+            "{:?}",
+            ok.messages
+        );
+        let bad = validate_toml(&config("[adapter.ch.extra]\ntls = true\n"));
+        let v011: Vec<_> = bad.messages.iter().filter(|m| m.code == "V011").collect();
+        assert_eq!(v011.len(), 1, "{:?}", bad.messages);
+        assert!(
+            v011[0].message.contains("unknown extra key 'tls'"),
+            "{v011:?}"
+        );
+    }
+
     #[test]
     fn test_unknown_adapter_type() {
         let out = validate_toml(
             r#"
 [adapter.mystery]
-type = "clickhouse"
+type = "singlestore"
 
 [pipeline.poc]
 type = "replication"
@@ -3896,7 +4009,7 @@ schema_template = "demo"
         );
         let unknown: Vec<_> = out.messages.iter().filter(|m| m.code == "V017").collect();
         assert_eq!(unknown.len(), 1);
-        assert!(unknown[0].message.contains("clickhouse"));
+        assert!(unknown[0].message.contains("singlestore"));
         // An unknown adapter type is a hard error: `rocky run` rejects it,
         // so `rocky validate` must report `valid = false` (non-zero exit),
         // not a cosmetic warning.

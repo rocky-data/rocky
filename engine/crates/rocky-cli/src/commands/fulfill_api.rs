@@ -806,7 +806,10 @@ pub async fn observe_max_time_column(
     let target_ref = dialect
         .format_table_ref(&target.catalog, &target.schema, &target.table)
         .map_err(|e| anyhow::anyhow!("could not format target table: {e}"))?;
-    let sql = format!("SELECT MAX({time_column}) FROM {target_ref}");
+    let sql = format!(
+        "SELECT {} FROM {target_ref}",
+        dialect.max_aggregate(time_column)
+    );
     let query = warehouse
         .execute_query(&sql)
         .await

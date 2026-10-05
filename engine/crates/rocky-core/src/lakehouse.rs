@@ -479,6 +479,7 @@ mod tests {
             table_properties: vec![("delta.autoOptimize.optimizeWrite".into(), "true".into())],
             comment: Some("Sales fact table".into()),
             redshift: None,
+            clickhouse: None,
         };
         let json = serde_json::to_string(&opts).unwrap();
         let deserialized: LakehouseOptions = serde_json::from_str(&json).unwrap();
@@ -596,6 +597,7 @@ mod tests {
             table_properties: vec![("delta.enableChangeDataFeed".into(), "true".into())],
             comment: Some("Full options test".into()),
             redshift: None,
+            clickhouse: None,
         };
         let stmts = generate_lakehouse_ddl(
             &LakehouseFormat::DeltaTable,
@@ -851,6 +853,7 @@ mod tests {
             comment: Some("Raw clickstream".into()),
             table_properties: vec![("pipelines.reset.allowed".into(), "true".into())],
             redshift: None,
+            clickhouse: None,
         };
         let stmts = generate_lakehouse_ddl(
             &LakehouseFormat::StreamingTable,
@@ -1212,6 +1215,7 @@ mod tests {
             comment: Some("Test".into()),
             table_properties: vec![("delta.cdf".into(), "true".into())],
             redshift: None,
+            clickhouse: None,
         };
         let stmts = generate_lakehouse_ddl(
             &LakehouseFormat::DeltaTable,
