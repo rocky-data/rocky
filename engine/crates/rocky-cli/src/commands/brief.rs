@@ -232,26 +232,27 @@ pub fn compute_brief(
     let decisions = store
         .list_policy_decisions()
         .context("failed to read the policy-decision ledger")?;
-    let runs = store
-        .list_runs(MAX_HISTORY_SCAN)
-        .context("failed to read the run ledger")?;
-
     // A brief reports on production (#2201): shadow and branch runs wrote
     // elsewhere and are left out. Runs recorded before runs carried a scope
     // ARE counted — the brief exists to surface what happened, and dropping
     // them could hide a production failure. `run_scope` in the output says
-    // how many of each the window held.
-    let (windowed_runs, run_scope) = ProductionRunScope::select(
-        runs.iter().filter(|r| in_window(r.started_at, since_ts)),
-        UnrecordedScope::Count,
-    );
+    // how many of each the window held. The filter runs inside the scan, so a
+    // burst of shadow runs cannot push production runs past the cap.
+    let (counted_runs, run_scope) =
+        ProductionRunScope::read(&store, MAX_HISTORY_SCAN, UnrecordedScope::Count, |r| {
+            in_window(r.started_at, since_ts)
+        })
+        .context("failed to read the run ledger")?;
+    let windowed_runs: Vec<&RunRecord> = counted_runs.iter().collect();
     // Quality snapshots carry the run that wrote them; one from a shadow or
     // branch run measured a non-production table.
-    let non_production_runs: BTreeSet<&str> = runs
-        .iter()
-        .filter(|r| !r.counts_as_production(UnrecordedScope::Count))
-        .map(|r| r.run_id.as_str())
-        .collect();
+    let non_production = store
+        .list_runs_matching(MAX_HISTORY_SCAN, |r| {
+            !r.counts_as_production(UnrecordedScope::Count)
+        })
+        .context("failed to read the run ledger")?;
+    let non_production_runs: BTreeSet<&str> =
+        non_production.iter().map(|r| r.run_id.as_str()).collect();
     let mut windowed_decisions: Vec<&PolicyDecisionRecord> = decisions
         .iter()
         .filter(|d| in_window(d.timestamp, since_ts))
@@ -2660,6 +2661,48 @@ mod tests {
             !note.contains("no rocky.toml"),
             "a present-but-broken config must not be reported as an absent one: {note}"
         );
+    }
+
+    /// #2201: the quality section reports the newest snapshot a PRODUCTION
+    /// run wrote, not a newer one a shadow run wrote against its own table.
+    #[test]
+    fn brief_quality_reads_production_snapshots_only() {
+        use rocky_core::state::RunScope;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let state_path = root.join("state.redb");
+        let store = rocky_core::state::StateStore::open(&state_path).unwrap();
+        let prod = run("prod", RunStatus::Success, vec![exec("m", "success")]);
+        store.record_run(&prod).unwrap();
+        let mut shadow = run("shadow", RunStatus::Success, vec![exec("m", "success")]);
+        shadow.run_scope = Some(RunScope::Shadow { schema: None });
+        store.record_run(&shadow).unwrap();
+        for (run_id, hour, rows) in [("prod", 2, 10u64), ("shadow", 3, 99)] {
+            store
+                .record_quality(
+                    &serde_json::from_value(serde_json::json!({
+                        "timestamp": ts(hour).to_rfc3339(),
+                        "run_id": run_id,
+                        "model_name": "m",
+                        "metrics": {"row_count": rows, "null_rates": {}},
+                    }))
+                    .unwrap(),
+                )
+                .unwrap();
+        }
+        drop(store);
+
+        let out = compute_brief(
+            root,
+            &state_path,
+            &root.join("rocky.toml"),
+            BriefSince::Days7,
+            ts(10),
+        )
+        .unwrap();
+        assert_eq!(out.quality.models.len(), 1, "{:?}", out.quality);
+        assert_eq!(out.quality.models[0].run_id, "prod");
+        assert_eq!(out.quality.models[0].row_count, 10);
     }
 
     /// #2201: the digest reports on production. A failed shadow run and a

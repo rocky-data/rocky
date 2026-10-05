@@ -421,10 +421,11 @@ fn enrich_with_state_store(
     let Ok(store) = StateStore::open_read_only_or_empty(state_path) else {
         return (None, None);
     };
-    let Ok(all_runs) = store.list_runs(STATE_RUN_LIMIT) else {
+    let Ok((runs, run_scope)) =
+        ProductionRunScope::read(&store, STATE_RUN_LIMIT, UnrecordedScope::Count, |_| true)
+    else {
         return (None, None);
     };
-    let (runs, run_scope) = ProductionRunScope::select(&all_runs, UnrecordedScope::Count);
 
     // Project-level: first successful run, newest-first.
     let project_last_run_id = runs
@@ -1246,6 +1247,23 @@ mod tests {
         let scope = scope.expect("readable store reports a tally");
         assert_eq!(scope.excluded_runs, 1);
         assert_eq!(scope.production_runs, 3);
+
+        // 5. A burst of newer shadow runs larger than the read cap must not
+        //    push the production runs out of the page (red-team finding on
+        //    #2201: the cap used to apply before the scope filter).
+        let store = StateStore::open(&state_path).unwrap();
+        for i in 0..=STATE_RUN_LIMIT {
+            let mut burst = shadow.clone();
+            burst.run_id = format!("run-burst-{i:03}");
+            burst.started_at = shadow_started + ChronoDuration::minutes(i as i64 + 1);
+            burst.finished_at = burst.started_at;
+            store.record_run(&burst).unwrap();
+        }
+        drop(store);
+        let mut assets = vec![sample_asset("raw_orders")];
+        let (project_run, _) = enrich_with_state_store(&state_path, &mut assets);
+        assert_eq!(project_run.as_deref(), Some("run-003-failed"));
+        assert_eq!(assets[0].last_run_id.as_deref(), Some("run-001"));
 
         fn sample_asset(name: &str) -> CatalogAsset {
             CatalogAsset {

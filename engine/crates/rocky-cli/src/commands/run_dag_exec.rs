@@ -2059,6 +2059,57 @@ mod tests {
         assert_eq!(cell_i64(&rows.rows[0][0]), 1, "the model materialized");
     }
 
+    /// #2138 negative control: only names the graph resolved to a seed or
+    /// load are accepted. A misspelled `depends_on` is still an unknown
+    /// dependency — the model's node fails and the DAG run fails.
+    #[tokio::test]
+    async fn a_misspelled_depends_on_still_fails_under_dag() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("models")).unwrap();
+        std::fs::create_dir_all(root.join("seeds")).unwrap();
+        let db_path = root.join("proj.duckdb");
+        std::fs::write(
+            root.join("rocky.toml"),
+            format!(
+                "[adapter.local]\ntype = \"duckdb\"\npath = \"{}\"\n\n\
+                 [pipeline.silver]\ntype = \"transformation\"\n\n\
+                 [pipeline.silver.target]\nadapter = \"local\"\n\n\
+                 [pipeline.silver.target.governance]\nauto_create_catalogs = true\n\
+                 auto_create_schemas = true\n",
+                db_path.display()
+            ),
+        )
+        .unwrap();
+        std::fs::write(root.join("seeds/countries.csv"), "code\nUS\n").unwrap();
+        std::fs::write(
+            root.join("seeds/countries.toml"),
+            "name = \"countries\"\n\n[target]\ncatalog = \"proj\"\nschema = \"seeds\"\ntable = \"countries\"\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("models/stg.sql"), "SELECT 1 AS id\n").unwrap();
+        std::fs::write(
+            root.join("models/stg.toml"),
+            "name = \"stg\"\ndepends_on = [\"countires\"]\n\n\
+             [target]\ncatalog = \"proj\"\nschema = \"silver\"\ntable = \"stg\"\n",
+        )
+        .unwrap();
+        let config_path = root.join("rocky.toml");
+        let err = run_with_dag(
+            &config_path,
+            dag_snapshot(&config_path),
+            &root.join(".rocky-state.redb"),
+            false,
+            &PartitionRunOptions::default(),
+            &crate::commands::run::SkipRunOptions::default(),
+            None,
+            None,
+        )
+        .await
+        .expect_err("a misspelled depends_on must still fail");
+        assert!(format!("{err:#}").contains("failed node"), "{err:#}");
+    }
+
     /// #2018: `rocky run --dag` must load a seed on a project with MORE THAN
     /// ONE pipeline, not refuse with "multiple pipelines defined".
     ///

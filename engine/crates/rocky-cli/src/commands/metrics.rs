@@ -29,7 +29,26 @@ pub fn metrics_output(
 ) -> Result<MetricsOutput> {
     let store = StateStore::open_read_only_or_empty(state_path)?;
 
-    let snapshots = store.get_quality_trend(model_name, if trend { 20 } else { 1 })?;
+    // Production snapshots only (#2201). A snapshot carries the run that
+    // wrote it; one written by a shadow or branch run measured another table.
+    // The limit applies after the filter, so newer shadow snapshots cannot
+    // push the production ones out.
+    let limit = if trend { 20 } else { 1 };
+    let mut snapshots = Vec::with_capacity(limit);
+    let mut excluded_non_production_snapshots = 0usize;
+    for snapshot in store.get_quality_trend(model_name, usize::MAX)? {
+        if snapshots.len() == limit {
+            break;
+        }
+        let production = store
+            .get_run(&snapshot.run_id)?
+            .is_none_or(|run| run.counts_as_production(rocky_core::state::UnrecordedScope::Count));
+        if production {
+            snapshots.push(snapshot);
+        } else {
+            excluded_non_production_snapshots += 1;
+        }
+    }
 
     if snapshots.is_empty() {
         return Ok(MetricsOutput {
@@ -42,6 +61,7 @@ pub fn metrics_output(
             column: None,
             column_trend: vec![],
             message: Some("no quality metrics available".to_string()),
+            excluded_non_production_snapshots,
         });
     }
 
@@ -125,6 +145,7 @@ pub fn metrics_output(
         column: column.map(std::string::ToString::to_string),
         column_trend,
         message: None,
+        excluded_non_production_snapshots,
     })
 }
 
@@ -212,4 +233,60 @@ pub fn run_metrics(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// #2201: a newer snapshot written by a shadow run is not the model's
+    /// production quality. The latest production snapshot is reported, and
+    /// the output counts what was left out.
+    #[test]
+    fn metrics_report_production_snapshots_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("state.redb");
+        let store = StateStore::open(&state_path).unwrap();
+        for (id, hour, scope, rows) in [
+            ("prod", 1, serde_json::json!("production"), 10u64),
+            (
+                "shadow",
+                2,
+                serde_json::json!({"shadow": {"schema": null}}),
+                99,
+            ),
+        ] {
+            let at = format!("2026-05-01T{hour:02}:00:00Z");
+            let run: rocky_core::state::RunRecord = serde_json::from_value(serde_json::json!({
+                "run_id": id,
+                "started_at": at,
+                "finished_at": at,
+                "status": "Success",
+                "models_executed": [],
+                "trigger": "Manual",
+                "config_hash": "c",
+                "run_scope": scope,
+            }))
+            .unwrap();
+            store.record_run(&run).unwrap();
+            store
+                .record_quality(
+                    &serde_json::from_value(serde_json::json!({
+                        "timestamp": at,
+                        "run_id": id,
+                        "model_name": "m",
+                        "metrics": {"row_count": rows, "null_rates": {}},
+                    }))
+                    .unwrap(),
+                )
+                .unwrap();
+        }
+        drop(store);
+
+        let out = metrics_output(&state_path, "m", false, None, false).unwrap();
+        assert_eq!(out.snapshots.len(), 1);
+        assert_eq!(out.snapshots[0].run_id, "prod");
+        assert_eq!(out.snapshots[0].row_count, 10);
+        assert_eq!(out.excluded_non_production_snapshots, 1);
+    }
 }

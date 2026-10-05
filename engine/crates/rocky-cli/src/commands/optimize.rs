@@ -56,8 +56,8 @@ pub fn optimize_output(
     // they are most of the history right after an upgrade, and dropping them
     // would leave nothing to recommend from. `run_scope` in the output says
     // how many of each were read.
-    let all_runs = store.list_runs(100)?;
-    let (runs, run_scope) = ProductionRunScope::select(&all_runs, UnrecordedScope::Count);
+    let (runs, run_scope) =
+        ProductionRunScope::read(&store, 100, UnrecordedScope::Count, |_| true)?;
 
     if runs.is_empty() {
         let mut out = OptimizeOutput::empty("no production run history available");

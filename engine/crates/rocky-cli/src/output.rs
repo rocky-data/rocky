@@ -2458,30 +2458,36 @@ pub struct ProductionRunScope {
 }
 
 impl ProductionRunScope {
-    /// Split `runs` into the ones a production report counts, and the tally
-    /// that says what was counted and left out.
-    #[must_use]
-    pub fn select<'a>(
-        runs: impl IntoIterator<Item = &'a rocky_core::state::RunRecord>,
+    /// Read up to `cap` runs a production report counts, newest first, with
+    /// the tally — the scope filter runs INSIDE the scan, before the cap.
+    ///
+    /// Filtering a capped page afterwards would let a burst of shadow or
+    /// branch runs push every production run out of the page, and the report
+    /// would show nothing. `keep` narrows both sides (a time window, say).
+    /// `excluded_runs` counts at most `cap` left-out runs.
+    pub fn read(
+        store: &rocky_core::state::StateStore,
+        cap: usize,
         unrecorded: rocky_core::state::UnrecordedScope,
-    ) -> (Vec<&'a rocky_core::state::RunRecord>, Self) {
-        use rocky_core::state::{ProductionScope, UnrecordedScope};
+        keep: impl Fn(&rocky_core::state::RunRecord) -> bool,
+    ) -> Result<(Vec<rocky_core::state::RunRecord>, Self), rocky_core::state::StateError> {
+        use rocky_core::state::ProductionScope;
+        let counted =
+            store.list_runs_matching(cap, |r| keep(r) && r.counts_as_production(unrecorded))?;
+        let left_out =
+            store.list_runs_matching(cap, |r| keep(r) && !r.counts_as_production(unrecorded))?;
         let mut tally = Self {
-            unrecorded_runs_counted: unrecorded == UnrecordedScope::Count,
+            unrecorded_runs_counted: unrecorded == rocky_core::state::UnrecordedScope::Count,
             ..Self::default()
         };
-        let mut kept = Vec::new();
-        for run in runs {
+        for run in counted.iter().chain(&left_out) {
             match run.production_scope() {
                 ProductionScope::Production => tally.production_runs += 1,
                 ProductionScope::Unrecorded => tally.unrecorded_runs += 1,
                 ProductionScope::NotProduction => tally.excluded_runs += 1,
             }
-            if run.counts_as_production(unrecorded) {
-                kept.push(run);
-            }
         }
-        (kept, tally)
+        Ok((counted, tally))
     }
 
     /// One plain sentence for table output, or `None` when every run read
@@ -3008,6 +3014,12 @@ pub struct MetricsOutput {
     pub column_trend: Vec<ColumnTrendPoint>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+    /// Quality snapshots skipped, while reading the newest ones, because a
+    /// shadow or branch run wrote them (#2201): they measured a
+    /// non-production table. A snapshot whose run carries no recorded scope,
+    /// or whose run record is gone, is kept. Omitted when zero.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub excluded_non_production_snapshots: usize,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -11510,6 +11522,11 @@ pub struct ProjectRunOutput {
     pub models_executed: u64,
     /// What started it (`Manual`, `Schedule`, `Webhook`, …).
     pub trigger: String,
+    /// Where it wrote (#2201). The last run reported here is the newest
+    /// production run, or one recorded before runs carried a scope
+    /// (`unrecorded`); shadow and branch runs are never reported here.
+    #[serde(default)]
+    pub run_scope: RunScopeKind,
 }
 
 /// The compiled model list for `GET /api/v1/models`.

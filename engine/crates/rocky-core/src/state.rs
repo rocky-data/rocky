@@ -6044,10 +6044,12 @@ impl StateStore {
     /// Only production runs count (#2201). A `--shadow` or `--branch` run of
     /// the pipeline built somewhere else, so it must neither satisfy a
     /// downstream's `after` demand nor reset its own `freshness` budget. A run
-    /// recorded before `run_scope` existed is counted
-    /// ([`UnrecordedScope::Count`]): excluding it would fire every `freshness`
-    /// pipeline at the first tick after an upgrade. Its influence ends at the
-    /// pipeline's first production success, which is newer.
+    /// recorded before `run_scope` existed is NOT counted
+    /// ([`UnrecordedScope::Exclude`]): it may have been a `--shadow` run, and
+    /// counting it could silently skip a due production run. The cost of
+    /// excluding it is bounded and visible: right after an upgrade a
+    /// `freshness` pipeline reads as never run and fires once, and an `after`
+    /// downstream waits for its upstream's next production success.
     pub fn latest_successful_run(&self, pipeline: &str) -> Result<Option<RunRecord>, StateError> {
         let txn = self.db.begin_read()?;
         let table = txn.open_table(RUN_HISTORY)?;
@@ -6057,7 +6059,7 @@ impl StateStore {
             let run: RunRecord = serde_json::from_slice(value.value())?;
             if run.pipeline.as_deref() == Some(pipeline)
                 && run.status == RunStatus::Success
-                && run.counts_as_production(UnrecordedScope::Count)
+                && run.counts_as_production(UnrecordedScope::Exclude)
                 && best
                     .as_ref()
                     .is_none_or(|b| run.finished_at > b.finished_at)
@@ -9522,7 +9524,8 @@ mod tests {
         let latest = store.latest_successful_run("raw").unwrap().unwrap();
         assert_eq!(latest.run_id, "prod");
 
-        // A pre-#2200 record (no scope) still counts, per the documented policy.
+        // A newer pre-#2200 record (no scope) does not count either: it may
+        // have been a shadow run.
         let mut legacy = minimal_run_record("legacy", vec![]);
         legacy.pipeline = Some("raw".into());
         legacy.run_scope = None;
@@ -9530,7 +9533,7 @@ mod tests {
         legacy.finished_at = legacy.started_at;
         store.record_run(&legacy).unwrap();
         let latest = store.latest_successful_run("raw").unwrap().unwrap();
-        assert_eq!(latest.run_id, "legacy");
+        assert_eq!(latest.run_id, "prod");
     }
 
     /// #2201: the scoped model history skips executions from runs the

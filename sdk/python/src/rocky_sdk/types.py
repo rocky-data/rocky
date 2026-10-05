@@ -973,6 +973,8 @@ class MetricsResult(BaseModel):
     #: Human-readable status message (e.g. "no snapshots yet"). ``None`` when
     #: the command has data to report.
     message: str | None = None
+    #: Snapshots skipped because a shadow or branch run wrote them (#2201).
+    excluded_non_production_snapshots: int = 0
 
 
 # ---------------------------------------------------------------------------

@@ -1051,28 +1051,34 @@ async fn project(
     drop(failure_guard);
 
     let state_path = state_path_for(&state);
-    let last_run =
-        store_read(
-            &state,
-            move || -> anyhow::Result<Option<crate::output::ProjectRunOutput>> {
-                if !state_path.exists() {
-                    return Ok(None);
-                }
-                let store = rocky_core::state::StateStore::open_read_only_or_empty(&state_path)?;
-                Ok(store.list_runs(1)?.into_iter().next().map(|run| {
-                    crate::output::ProjectRunOutput {
-                        run_id: run.run_id,
-                        started_at: run.started_at.to_rfc3339(),
-                        finished_at: run.finished_at.to_rfc3339(),
-                        status: format!("{:?}", run.status),
-                        models_executed: run.models_executed.len() as u64,
-                        trigger: format!("{:?}", run.trigger),
-                    }
+    let last_run = store_read(
+        &state,
+        move || -> anyhow::Result<Option<crate::output::ProjectRunOutput>> {
+            if !state_path.exists() {
+                return Ok(None);
+            }
+            let store = rocky_core::state::StateStore::open_read_only_or_empty(&state_path)?;
+            // The project's last PRODUCTION run (#2201); a run recorded
+            // before runs carried a scope is eligible and says so.
+            let latest = store.list_runs_matching(1, |r| {
+                r.counts_as_production(rocky_core::state::UnrecordedScope::Count)
+            })?;
+            Ok(latest
+                .into_iter()
+                .next()
+                .map(|run| crate::output::ProjectRunOutput {
+                    run_scope: crate::output::RunScopeKind::of(&run),
+                    run_id: run.run_id,
+                    started_at: run.started_at.to_rfc3339(),
+                    finished_at: run.finished_at.to_rfc3339(),
+                    status: format!("{:?}", run.status),
+                    models_executed: run.models_executed.len() as u64,
+                    trigger: format!("{:?}", run.trigger),
                 }))
-            },
-        )
-        .await?
-        .map_err(|e| map_state_err(e, state.mutation_permit.running_job()))?;
+        },
+    )
+    .await?
+    .map_err(|e| map_state_err(e, state.mutation_permit.running_job()))?;
 
     Ok(PrettyJson(ProjectOutput {
         name,
@@ -5896,6 +5902,16 @@ mod tests {
     async fn project_route_reads_the_config_the_compile_and_the_resolved_store() {
         let dir = tempfile::tempdir().unwrap();
         let (root, config, state_path, _) = governor_fixture(dir.path());
+        // #2201: a newer shadow run is not the project's last run.
+        {
+            let store = rocky_core::state::StateStore::open(&state_path).unwrap();
+            let mut shadow = store.get_run("run-orders-1").unwrap().expect("fixture run");
+            shadow.run_id = "run-shadow-later".to_string();
+            shadow.started_at += chrono::Duration::hours(1);
+            shadow.finished_at += chrono::Duration::hours(1);
+            shadow.run_scope = Some(rocky_core::state::RunScope::Shadow { schema: None });
+            store.record_run(&shadow).unwrap();
+        }
         let base = spawn_router(pinned_server(
             root.join("models"),
             Some(config.clone()),
@@ -5927,6 +5943,7 @@ mod tests {
         assert_eq!(project["last_run"]["run_id"], "run-orders-1", "{text}");
         assert_eq!(project["last_run"]["status"], "Success");
         assert_eq!(project["last_run"]["models_executed"], 1);
+        assert_eq!(project["last_run"]["run_scope"], "production");
         assert!(project["diagnostics"]["total"].is_number());
 
         // No config bound: still 200, with nothing config-derived.
