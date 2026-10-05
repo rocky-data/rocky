@@ -231,7 +231,14 @@ pub struct PackageBuildOptions {
     /// `--build-empty[=BOOL]`: run `dbt run --empty` before compiling. Unset
     /// means compile-only on `add` and the recorded mode on `update`.
     pub build_empty: Option<bool>,
+    /// `--allow-secret-var`: accept `--vars` names that look like credentials.
+    pub allow_secret_var: bool,
+    /// `--dbt-timeout <seconds>`: kill a dbt step that runs longer.
+    pub dbt_timeout: Option<u64>,
 }
+
+/// Default limit for one dbt step (`deps`, `run --empty`, `compile`).
+const DEFAULT_DBT_TIMEOUT_SECS: u64 = 30 * 60;
 
 /// Pick the build mode from the flags and, on `update`, the lock entry.
 fn resolve_mode(
@@ -308,7 +315,7 @@ pub fn run_package_add(
             existing.name, existing.version, existing.name
         )));
     }
-    let vars = dbt_package::parse_vars(&opts.vars).map_err(e055)?;
+    let vars = dbt_package::parse_vars(&opts.vars, opts.allow_secret_var).map_err(e055)?;
     let request = BuildRequest {
         hub,
         version_spec,
@@ -362,7 +369,7 @@ pub fn run_package_update(
             "`--compiled` imports one compiled project; name the package to update"
         ));
     }
-    let flag_vars = dbt_package::parse_vars(&opts.vars).map_err(e055)?;
+    let flag_vars = dbt_package::parse_vars(&opts.vars, opts.allow_secret_var).map_err(e055)?;
 
     let mut reports = Vec::new();
     let mut diagnostics = Vec::new();
@@ -382,6 +389,8 @@ pub fn run_package_update(
                 .clone()
                 .or_else(|| Some(previous.target_schema.clone()).filter(|s| !s.is_empty())),
         };
+        // Stop at the first failure, and say which packages were already
+        // updated (their files and lock entries are written).
         let (report, diags) = vendor(
             config_path,
             &root,
@@ -389,7 +398,22 @@ pub fn run_package_update(
             &request,
             opts,
             Some(&previous),
-        )?;
+        )
+        .map_err(|e| {
+            let done: Vec<&str> = reports
+                .iter()
+                .map(|r: &PackageVendorReport| r.name.as_str())
+                .collect();
+            if done.is_empty() {
+                e
+            } else {
+                e.context(format!(
+                    "updating `{}` failed; already updated: {}; not attempted after it",
+                    previous.name,
+                    done.join(", ")
+                ))
+            }
+        })?;
         reports.push(report);
         diagnostics.extend(diags);
     }
@@ -463,6 +487,9 @@ fn vendor(
         )));
     }
 
+    // Validate the vars before any temp dir or dbt process exists, whether
+    // they came from flags or from the lockfile.
+    dbt_package::render_dbt_project_yml(BUILD_PROJECT, &request.vars).map_err(e055)?;
     let mut diagnostics = Vec::new();
     let mode = resolve_mode(opts, previous, &request.hub)?;
     let build_empty = mode == BuildMode::BuildEmpty;
@@ -481,6 +508,9 @@ fn vendor(
                 adapter,
                 build_empty,
                 opts.dbt.as_deref(),
+                std::time::Duration::from_secs(
+                    opts.dbt_timeout.unwrap_or(DEFAULT_DBT_TIMEOUT_SECS),
+                ),
                 &mut diagnostics,
             )?;
             _tmp.path().to_path_buf()
@@ -977,14 +1007,31 @@ fn relative_slash(root: &Path, path: &Path) -> String {
 
 /// Write, stage `.incoming`, and delete per the plan; prune emptied dirs.
 fn apply_plan(root: &Path, plan: &dbt_package::UpdatePlan) -> Result<()> {
+    // Check every path before touching any, so a refusal writes nothing.
+    for rel in plan
+        .write
+        .keys()
+        .chain(plan.incoming.keys())
+        .chain(plan.delete.iter())
+    {
+        refuse_symlinks(root, rel)?;
+        refuse_symlinks(root, &format!("{rel}{INCOMING_SUFFIX}"))?;
+    }
     let write = |rel: &str, content: &str| -> Result<()> {
         let path = root.join(rel);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("failed to create {}", parent.display()))?;
         }
-        std::fs::write(&path, content)
-            .with_context(|| format!("failed to write {}", path.display()))
+        // Temp file + rename: an interrupted run never leaves half a model.
+        let tmp = path.with_extension(format!(
+            "{}.rocky-tmp",
+            path.extension().and_then(|e| e.to_str()).unwrap_or("")
+        ));
+        std::fs::write(&tmp, content)
+            .with_context(|| format!("failed to write {}", tmp.display()))?;
+        std::fs::rename(&tmp, &path)
+            .with_context(|| format!("failed to replace {}", path.display()))
     };
     for (rel, content) in &plan.write {
         write(rel, content)?;
@@ -1004,6 +1051,27 @@ fn apply_plan(root: &Path, plan: &dbt_package::UpdatePlan) -> Result<()> {
     Ok(())
 }
 
+/// Refuse when any existing component of `rel` (a vendored path under
+/// `models/packages/`), from `models/` down to the file, is a symlink:
+/// writing or deleting through it would reach outside the vendored tree.
+fn refuse_symlinks(root: &Path, rel: &str) -> Result<()> {
+    let mut path = root.to_path_buf();
+    for part in rel.split('/') {
+        path.push(part);
+        match std::fs::symlink_metadata(&path) {
+            Ok(meta) if meta.file_type().is_symlink() => bail!(e055(format!(
+                "`{}` is a symlink; rocky package does not write or delete through symlinks \
+                 under {}",
+                path.display(),
+                dbt_package::PACKAGES_DIR
+            ))),
+            Ok(_) => {}
+            Err(_) => break,
+        }
+    }
+    Ok(())
+}
+
 /// Remove now-empty directories up to (not including) `models/packages`.
 fn prune_empty_dirs(root: &Path, mut dir: Option<&Path>) {
     let stop = root.join(dbt_package::PACKAGES_DIR);
@@ -1019,11 +1087,117 @@ fn prune_empty_dirs(root: &Path, mut dir: Option<&Path>) {
 // dbt process
 // ---------------------------------------------------------------------------
 
+/// The variables passed through to dbt from Rocky's environment: the
+/// process basics, locale, temp dirs, TLS and proxy settings (`dbt deps`
+/// downloads), Google ADC for the BigQuery `oauth` method, and
+/// `DBT_PACKAGE_HUB_URL` for Hub mirrors. Credentials the generated profile
+/// needs are added separately, as `DBT_ENV_SECRET_*` so dbt scrubs them from
+/// its logs.
+fn dbt_environment() -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+    // Compared upper-cased: Windows names are case-insensitive (`Path`), and
+    // proxies are spelled both ways on Unix.
+    const EXACT: &[&str] = &[
+        "PATH",
+        "HOME",
+        "USER",
+        "LOGNAME",
+        "SHELL",
+        "LANG",
+        "TZ",
+        "TMPDIR",
+        "TMP",
+        "TEMP",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+        "REQUESTS_CA_BUNDLE",
+        "CURL_CA_BUNDLE",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "NO_PROXY",
+        "ALL_PROXY",
+        "GOOGLE_APPLICATION_CREDENTIALS",
+        "CLOUDSDK_CONFIG",
+        "DBT_PACKAGE_HUB_URL",
+        // Windows process basics.
+        "SYSTEMROOT",
+        "WINDIR",
+        "COMSPEC",
+        "PATHEXT",
+        "USERPROFILE",
+        "APPDATA",
+        "LOCALAPPDATA",
+        "PROGRAMDATA",
+    ];
+    std::env::vars_os()
+        .filter(|(k, _)| {
+            k.to_str().is_some_and(|k| {
+                let upper = k.to_ascii_uppercase();
+                EXACT.contains(&upper.as_str()) || upper.starts_with("LC_")
+            })
+        })
+        .collect()
+}
+
+/// Run `cmd` to completion, killing it after `timeout`. Returns success and
+/// the combined stdout + stderr.
+fn run_with_timeout(mut cmd: Command, timeout: std::time::Duration) -> Result<(bool, String)> {
+    use std::io::Read;
+    let mut child = cmd
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+    let drain = |pipe: Option<Box<dyn Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut p) = pipe {
+                let _ = p.read_to_end(&mut buf);
+            }
+            buf
+        })
+    };
+    let out = drain(
+        child
+            .stdout
+            .take()
+            .map(|p| Box::new(p) as Box<dyn Read + Send>),
+    );
+    let err = drain(
+        child
+            .stderr
+            .take()
+            .map(|p| Box::new(p) as Box<dyn Read + Send>),
+    );
+    let deadline = std::time::Instant::now() + timeout;
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!(e055(format!(
+                "dbt did not finish within {}s and was stopped; raise --dbt-timeout if the \
+                 package needs longer",
+                timeout.as_secs()
+            )));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    };
+    let mut text = String::from_utf8_lossy(&out.join().unwrap_or_default()).into_owned();
+    text.push_str(&String::from_utf8_lossy(&err.join().unwrap_or_default()));
+    Ok((status.success(), text))
+}
+
 /// Locate `dbt`: `--dbt`, else the first `dbt` on `PATH`.
 fn locate_dbt(flag: Option<&Path>) -> Result<PathBuf> {
     if let Some(p) = flag {
+        // dbt runs with the temp project as its working directory, so a
+        // relative --dbt must be resolved against ours first.
+        let p = std::path::absolute(p)
+            .with_context(|| format!("cannot resolve --dbt {}", p.display()))?;
         if p.is_file() {
-            return Ok(p.to_path_buf());
+            return Ok(p);
         }
         bail!(e055(format!("--dbt {} is not a file", p.display())));
     }
@@ -1059,6 +1233,7 @@ fn run_dbt(
     adapter: &AdapterConfig,
     build_empty: bool,
     dbt_flag: Option<&Path>,
+    timeout: std::time::Duration,
     diagnostics: &mut Vec<PackageDiagnostic>,
 ) -> Result<()> {
     let dbt = locate_dbt(dbt_flag)?;
@@ -1088,20 +1263,22 @@ fn run_dbt(
 
     let run = |args: &[&str]| -> Result<(bool, String)> {
         tracing::info!(dbt = %dbt.display(), ?args, "running dbt");
-        let out = Command::new(&dbt)
-            .args(args)
+        let mut cmd = Command::new(&dbt);
+        cmd.args(args)
             .arg("--project-dir")
             .arg(dir)
             .arg("--profiles-dir")
             .arg(dir)
             .current_dir(dir)
-            .envs(profile.env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
-            .output()
-            .with_context(|| format!("failed to start {}", dbt.display()))?;
-        let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
-        text.push_str(&String::from_utf8_lossy(&out.stderr));
+            // Only what dbt needs: the package code dbt runs is third-party,
+            // so it never sees the rest of Rocky's environment.
+            .env_clear()
+            .envs(dbt_environment())
+            .envs(profile.env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+        let (ok, text) = run_with_timeout(cmd, timeout)
+            .with_context(|| format!("failed to run {} {}", dbt.display(), args.join(" ")))?;
         tracing::debug!(output = %text, "dbt output");
-        Ok((out.status.success(), text))
+        Ok((ok, text))
     };
     let tail = |text: &str| -> String {
         let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
@@ -1254,6 +1431,10 @@ pub fn run_package_remove(
                 .collect::<Vec<_>>()
                 .join(", ")
         )));
+    }
+    for rel in pkg.files.keys() {
+        refuse_symlinks(&root, rel)?;
+        refuse_symlinks(&root, &format!("{rel}{INCOMING_SUFFIX}"))?;
     }
     let mut deleted = Vec::new();
     for rel in pkg.files.keys() {

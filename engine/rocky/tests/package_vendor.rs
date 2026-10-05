@@ -624,6 +624,182 @@ fn build_empty_and_compiled_conflict() {
     assert!(err.contains("conflict"), "{err}");
 }
 
+/// A stand-in `dbt` (POSIX sh): `deps` copies the recorded package-lock,
+/// `compile` copies the recorded manifest, `run` does nothing. It writes the
+/// environment it was given to `<root>/dbt-env.txt` and sleeps `sleep`
+/// seconds per step. Paths are baked in because dbt gets a cleared
+/// environment.
+#[cfg(unix)]
+fn fake_dbt(root: &Path, sleep: u32) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let script = root.join("fake-dbt");
+    let compiled = fixture().join("compiled");
+    fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nset -e\nenv > '{env}'\nsleep {sleep}\ncmd=$1; shift\n\
+             while [ $# -gt 0 ]; do case \"$1\" in --project-dir) dir=$2; shift;; esac; shift; done\n\
+             case \"$cmd\" in\n\
+             deps) cp '{c}/package-lock.yml' \"$dir/package-lock.yml\";;\n\
+             compile) mkdir -p \"$dir/target\"; cp '{c}/target/manifest.json' \"$dir/target/manifest.json\";;\n\
+             esac\n",
+            env = root.join("dbt-env.txt").display(),
+            c = compiled.display(),
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+    script
+}
+
+#[cfg(unix)]
+#[test]
+fn dbt_runs_with_a_cleared_environment_and_a_relative_dbt_path() {
+    let tmp = project();
+    let root = tmp.path();
+    fake_dbt(root, 0);
+    let out = Command::new(env!("CARGO_BIN_EXE_rocky"))
+        .args(["--config", "rocky.toml", "--output", "json"])
+        .args(["package", "add", "fivetran/stripe", "--dbt", "./fake-dbt"])
+        .current_dir(root)
+        .env("RUST_LOG", "error")
+        .env("ROCKY_TEST_CANARY", "must-not-leak")
+        .env("AWS_SECRET_ACCESS_KEY", "must-not-leak")
+        .env("DBT_PACKAGE_HUB_URL", "http://mirror.invalid/")
+        .output()
+        .unwrap();
+    let added = ok(&out);
+    assert_eq!(added["package"]["mode"], "compile-only");
+    let env = fs::read_to_string(root.join("dbt-env.txt")).unwrap();
+    assert!(!env.contains("must-not-leak"), "{env}");
+    assert!(
+        env.contains("DBT_PACKAGE_HUB_URL=http://mirror.invalid/"),
+        "{env}"
+    );
+    assert!(env.lines().any(|l| l.starts_with("PATH=")), "{env}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_dbt_step_past_the_timeout_is_stopped() {
+    let tmp = project();
+    let root = tmp.path();
+    let dbt = fake_dbt(root, 30).display().to_string();
+    let started = std::time::Instant::now();
+    let err = refused(&rocky(
+        root,
+        &[
+            "package",
+            "add",
+            "fivetran/stripe",
+            "--dbt",
+            &dbt,
+            "--dbt-timeout",
+            "1",
+        ],
+    ));
+    assert!(err.contains("did not finish within 1s"), "{err}");
+    assert!(started.elapsed() < std::time::Duration::from_secs(20));
+    assert!(!root.join("rocky-packages.lock").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn update_stops_at_the_first_failing_package_and_names_those_done() {
+    let tmp = project();
+    let root = tmp.path();
+    let dbt = fake_dbt(root, 0).display().to_string();
+    ok(&rocky(
+        root,
+        &["package", "add", "fivetran/stripe", "--dbt", &dbt],
+    ));
+    // A second entry that cannot resolve: the fake dbt only knows stripe.
+    let lock_path = root.join("rocky-packages.lock");
+    let mut lock = fs::read_to_string(&lock_path).unwrap();
+    lock.push_str(
+        "\n[[package]]\nname = \"zzz\"\nhub = \"acme/zzz\"\nversion = \"1\"\n\
+         dbt_version = \"1\"\nadapter = \"duckdb\"\ncompiled_at = \"\"\nvars_hash = \"\"\n",
+    );
+    fs::write(&lock_path, lock).unwrap();
+    let err = refused(&rocky(root, &["package", "update", "--dbt", &dbt]));
+    assert!(err.contains("already updated: stripe"), "{err}");
+    assert!(err.contains("`zzz`"), "{err}");
+}
+
+#[test]
+fn jinja_and_credential_like_vars_are_refused_before_anything_runs() {
+    let tmp = project();
+    let root = tmp.path();
+    let dir = compiled_flag();
+    let err = refused(&rocky(
+        root,
+        &[
+            "package",
+            "add",
+            "fivetran/stripe",
+            "--compiled",
+            &dir,
+            "--vars",
+            "x={{ env_var('HOME') }}",
+        ],
+    ));
+    assert!(err.contains("Jinja"), "{err}");
+    let err = refused(&rocky(
+        root,
+        &[
+            "package",
+            "add",
+            "fivetran/stripe",
+            "--compiled",
+            &dir,
+            "--vars",
+            "api_key=abc",
+        ],
+    ));
+    assert!(err.contains("--allow-secret-var"), "{err}");
+    assert!(!root.join("rocky-packages.lock").exists());
+    ok(&rocky(
+        root,
+        &[
+            "package",
+            "add",
+            "fivetran/stripe",
+            "--compiled",
+            &dir,
+            "--vars",
+            "api_key=abc",
+            "--allow-secret-var",
+        ],
+    ));
+    // A lockfile that carries a template (e.g. from someone else's commit)
+    // is refused before dbt could render it.
+    let lock_path = root.join("rocky-packages.lock");
+    let lock = fs::read_to_string(&lock_path)
+        .unwrap()
+        .replace("api_key = \"abc\"", "api_key = \"{{ env_var('HOME') }}\"");
+    fs::write(&lock_path, lock).unwrap();
+    let err = refused(&rocky(root, &["package", "update", "--compiled", &dir]));
+    assert!(err.contains("Jinja"), "{err}");
+}
+
+#[cfg(unix)]
+#[test]
+fn remove_refuses_to_delete_through_a_symlink() {
+    let tmp = project();
+    let root = tmp.path();
+    add_recorded(root);
+    let outside = tempfile::tempdir().unwrap();
+    let real = outside.path().join("stripe");
+    fs::rename(root.join("models/packages/stripe"), &real).unwrap();
+    std::os::unix::fs::symlink(&real, root.join("models/packages/stripe")).unwrap();
+    let err = refused(&rocky(root, &["package", "remove", "stripe", "--force"]));
+    assert!(err.contains("symlink"), "{err}");
+    assert!(
+        real.join("stripe__customer_overview.sql").exists(),
+        "nothing behind the symlink is deleted"
+    );
+}
+
 #[test]
 fn missing_dbt_is_refused_with_install_guidance() {
     let tmp = project();

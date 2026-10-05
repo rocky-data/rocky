@@ -649,6 +649,20 @@ fn test_decl(test: &InfoNode, target_of: &HashMap<String, String>) -> Result<Tes
         .where_clause
         .clone()
         .filter(|w| !w.trim().is_empty());
+    if let Some(w) = &filter {
+        // The same gates Rocky applies when the test runs, applied now so a
+        // filter it would refuse is reported as dropped instead.
+        let context = format!("`where` of dbt test `{}`", test.name);
+        rocky_sql::validation::reject_statement_terminator(&context, w)
+            .map_err(|e| e.to_string())?;
+        rocky_sql::check_expression::validate_check_expression(
+            &context,
+            w,
+            rocky_sql::check_expression::dialect_for("generic").as_ref(),
+            rocky_sql::check_expression::ExpressionUse::Filter,
+        )
+        .map_err(|e| e.to_string())?;
+    }
     let test_type = match meta.name.as_str() {
         "not_null" => TestType::NotNull,
         "unique" => TestType::Unique,
@@ -656,6 +670,30 @@ fn test_decl(test: &InfoNode, target_of: &HashMap<String, String>) -> Result<Tes
             let values = kwarg("values")
                 .and_then(|v| v.as_array())
                 .ok_or_else(|| "accepted_values without a literal `values` list".to_string())?;
+            // Rocky's accepted_values compares string literals. Numeric (and
+            // boolean) values become an expression test with bare literals,
+            // so a numeric column is not compared to strings.
+            if !values.is_empty() && values.iter().all(|v| v.is_number() || v.is_boolean()) {
+                let col = column
+                    .clone()
+                    .ok_or_else(|| "`accepted_values` test without a column".to_string())?;
+                rocky_sql::validation::validate_identifier(&col).map_err(|e| e.to_string())?;
+                let list: Vec<String> = values.iter().map(ToString::to_string).collect();
+                let expression = format!("{col} IS NULL OR {col} IN ({})", list.join(", "));
+                rocky_sql::check_expression::validate_check_expression(
+                    "accepted_values",
+                    &expression,
+                    rocky_sql::check_expression::dialect_for("generic").as_ref(),
+                    rocky_sql::check_expression::ExpressionUse::SinglePredicate,
+                )
+                .map_err(|e| e.to_string())?;
+                return Ok(TestDecl {
+                    test_type: TestType::Expression { expression },
+                    column: Some(col),
+                    severity,
+                    filter,
+                });
+            }
             let values: Vec<String> = values
                 .iter()
                 .map(|v| match v {
@@ -1028,6 +1066,8 @@ impl PackagesLock {
                             pkg.name
                         ));
                     }
+                    validate_vars(&pkg.vars)
+                        .map_err(|e| format!("{}: package `{}`: {e}", path.display(), pkg.name))?;
                     if let Some(bad) = pkg.files.keys().find(|f| !is_vendored_path(f)) {
                         return Err(format!(
                             "{}: `{bad}` is not a path under {PACKAGES_DIR}/; refusing to \
@@ -1597,22 +1637,73 @@ pub fn render_packages_yml(hub: &str, version_spec: &str) -> String {
     serde_yaml::to_string(&root).unwrap_or_default()
 }
 
+/// True when `s` carries Jinja template syntax.
+pub fn has_jinja(s: &str) -> bool {
+    s.contains("{{") || s.contains("{%") || s.contains("{#")
+}
+
+/// True when a var name looks like it holds a credential. Vars are stored in
+/// clear text in `rocky-packages.lock`, which is committed.
+pub fn secret_like_var(name: &str) -> bool {
+    const WORDS: &[&str] = &[
+        "token",
+        "secret",
+        "password",
+        "passwd",
+        "pwd",
+        "key",
+        "apikey",
+        "credential",
+        "credentials",
+        "private",
+    ];
+    name.to_ascii_lowercase()
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|word| WORDS.contains(&word))
+}
+
+/// Refuse vars dbt would execute: dbt renders `dbt_project.yml`, and the
+/// vars in it, through Jinja, so `{{ env_var('AWS_SECRET_ACCESS_KEY') }}` in
+/// a value (from a flag or a lockfile someone else committed) would run.
+pub fn validate_vars(vars: &BTreeMap<String, String>) -> Result<(), String> {
+    for (k, v) in vars {
+        if k.is_empty() || !k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            return Err(format!("var key `{k}` must be letters, digits and `_`"));
+        }
+        if has_jinja(v) {
+            return Err(format!(
+                "var `{k}` contains Jinja template syntax (`{{{{`, `{{%` or `{{#`), which dbt \
+                 would execute; pass a plain value"
+            ));
+        }
+        serde_yaml::from_str::<serde_yaml::Value>(v)
+            .map_err(|e| format!("var `{k}`: value is not valid YAML: {e}"))?;
+    }
+    Ok(())
+}
+
 /// Parse `--vars key=value` flags. Keys are identifiers; values keep their
-/// text and are read as YAML when dbt sees them (`false`, `5`, `[a, b]`).
-pub fn parse_vars(flags: &[String]) -> Result<BTreeMap<String, String>, String> {
+/// text and are read as YAML when dbt sees them (`false`, `5`, `[a, b]`). A
+/// name that looks like a credential is refused unless `allow_secret`.
+pub fn parse_vars(
+    flags: &[String],
+    allow_secret: bool,
+) -> Result<BTreeMap<String, String>, String> {
     let mut vars = BTreeMap::new();
     for flag in flags {
         let (k, v) = flag
             .split_once('=')
             .ok_or_else(|| format!("--vars `{flag}` is not `key=value`"))?;
         let k = k.trim();
-        if k.is_empty() || !k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
-            return Err(format!("--vars key `{k}` must be letters, digits and `_`"));
+        if !allow_secret && secret_like_var(k) {
+            return Err(format!(
+                "--vars `{k}` looks like a credential. Vars are stored in clear text in \
+                 rocky-packages.lock; pass --allow-secret-var if it is not a secret"
+            ));
         }
-        serde_yaml::from_str::<serde_yaml::Value>(v)
-            .map_err(|e| format!("--vars `{k}`: value is not valid YAML: {e}"))?;
         vars.insert(k.to_string(), v.trim().to_string());
     }
+    validate_vars(&vars).map_err(|e| format!("--vars: {e}"))?;
     Ok(vars)
 }
 
@@ -1627,6 +1718,7 @@ pub fn render_dbt_project_yml(
     root.insert("version".into(), "1.0.0".into());
     root.insert("config-version".into(), 2.into());
     root.insert("profile".into(), name.into());
+    validate_vars(vars)?;
     if !vars.is_empty() {
         let mut map = serde_yaml::Mapping::new();
         for (k, v) in vars {
@@ -1680,7 +1772,14 @@ pub fn render_profiles_yml(
     use serde_yaml::{Mapping, Value};
     let mut out = Mapping::new();
     let mut env: Vec<(String, String)> = Vec::new();
+    let mut secret_keys: BTreeSet<String> = BTreeSet::new();
+    let absolute = |p: &str| -> Result<String, String> {
+        std::path::absolute(p)
+            .map(|a| a.display().to_string())
+            .map_err(|e| format!("cannot resolve path `{p}`: {e}"))
+    };
     let mut secret = |out: &mut Mapping, key: &str, value: &str, var: &str| {
+        secret_keys.insert(key.to_string());
         env.push((var.to_string(), value.to_string()));
         out.insert(key.into(), format!("{{{{ env_var(\"{var}\") }}}}").into());
     };
@@ -1727,15 +1826,22 @@ pub fn render_profiles_yml(
             out.insert("schema".into(), dbt_schema.into());
             if let Some(t) = &adapter.oauth_token {
                 out.insert("authenticator".into(), "oauth".into());
-                secret(&mut out, "token", t.expose(), "ROCKY_DBT_SNOWFLAKE_TOKEN");
+                secret(
+                    &mut out,
+                    "token",
+                    t.expose(),
+                    "DBT_ENV_SECRET_ROCKY_SNOWFLAKE_TOKEN",
+                );
             } else if let Some(k) = &adapter.private_key_path {
-                out.insert("private_key_path".into(), k.as_str().into());
+                // dbt runs in a temp directory; a relative path must stay
+                // relative to where `rocky` was started.
+                out.insert("private_key_path".into(), absolute(k)?.into());
             } else if let Some(p) = adapter.password.as_ref().or(adapter.pat.as_ref()) {
                 secret(
                     &mut out,
                     "password",
                     p.expose(),
-                    "ROCKY_DBT_SNOWFLAKE_PASSWORD",
+                    "DBT_ENV_SECRET_ROCKY_SNOWFLAKE_PASSWORD",
                 );
             } else {
                 return Err(
@@ -1761,7 +1867,12 @@ pub fn render_profiles_yml(
             }
             out.insert("schema".into(), dbt_schema.into());
             if let Some(t) = &adapter.token {
-                secret(&mut out, "token", t.expose(), "ROCKY_DBT_DATABRICKS_TOKEN");
+                secret(
+                    &mut out,
+                    "token",
+                    t.expose(),
+                    "DBT_ENV_SECRET_ROCKY_DATABRICKS_TOKEN",
+                );
             } else if let (Some(id), Some(cs)) = (&adapter.client_id, &adapter.client_secret) {
                 out.insert("auth_type".into(), "oauth".into());
                 out.insert("client_id".into(), id.as_str().into());
@@ -1769,7 +1880,7 @@ pub fn render_profiles_yml(
                     &mut out,
                     "client_secret",
                     cs.expose(),
-                    "ROCKY_DBT_DATABRICKS_CLIENT_SECRET",
+                    "DBT_ENV_SECRET_ROCKY_DATABRICKS_CLIENT_SECRET",
                 );
             } else {
                 return Err(
@@ -1789,7 +1900,7 @@ pub fn render_profiles_yml(
             match adapter.extra.get("keyfile").and_then(|v| v.as_str()) {
                 Some(keyfile) => {
                     out.insert("method".into(), "service-account".into());
-                    out.insert("keyfile".into(), keyfile.into());
+                    out.insert("keyfile".into(), absolute(keyfile)?.into());
                 }
                 None => {
                     // Application Default Credentials, the same chain the
@@ -1820,7 +1931,7 @@ pub fn render_profiles_yml(
                     &mut out,
                     "password",
                     p.expose(),
-                    "ROCKY_DBT_POSTGRES_PASSWORD",
+                    "DBT_ENV_SECRET_ROCKY_POSTGRES_PASSWORD",
                 );
             } else {
                 out.insert("password".into(), "".into());
@@ -1831,6 +1942,20 @@ pub fn render_profiles_yml(
                 "no dbt profile mapping for adapter type `{other}`; `rocky package` supports {}. \
                  Compile the package yourself and pass `--compiled <dbt project dir>`",
                 PROFILE_ADAPTERS.join(", ")
+            ));
+        }
+    }
+    // dbt renders profiles.yml through Jinja. Only the `env_var()` lookups
+    // generated above may carry template syntax; a config value that does
+    // would run as a template inside dbt.
+    for (key, value) in &out {
+        if let (Some(k), Some(v)) = (key.as_str(), value.as_str())
+            && !secret_keys.contains(k)
+            && has_jinja(v)
+        {
+            return Err(format!(
+                "adapter field `{k}` contains Jinja template syntax, which dbt would execute; \
+                 remove it"
             ));
         }
     }
@@ -2158,6 +2283,47 @@ mod tests {
         );
         let names: Vec<&str> = import.sources.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(names, vec!["stripe.charge", "stripe.customer"]);
+    }
+
+    #[test]
+    fn numeric_accepted_values_become_a_numeric_expression() {
+        let mut json = fixture_manifest();
+        let t = &mut json["nodes"]["test.stripe.accepted_values_stripe__charges_status.def"];
+        t["test_metadata"]["kwargs"]["column_name"] = "amount".into();
+        t["test_metadata"]["kwargs"]["values"] = serde_json::json!([1, 2.5]);
+        let import = import_json(&json);
+        let charges = import
+            .models
+            .iter()
+            .find(|m| m.model.name == "stripe__charges")
+            .unwrap();
+        let expr = charges
+            .model
+            .config
+            .tests
+            .iter()
+            .find_map(|t| match &t.test_type {
+                TestType::Expression { expression } => Some(expression.clone()),
+                _ => None,
+            })
+            .expect("an expression test");
+        assert_eq!(expr, "amount IS NULL OR amount IN (1, 2.5)");
+    }
+
+    #[test]
+    fn a_test_filter_that_is_not_one_predicate_is_dropped() {
+        let mut json = fixture_manifest();
+        json["nodes"]["test.stripe.accepted_values_stripe__charges_status.def"]["config"]["where"] =
+            "amount > 0; drop table x".into();
+        let import = import_json(&json);
+        assert!(
+            import
+                .tests_dropped
+                .iter()
+                .any(|d| d.test == "accepted_values_stripe__charges_status"),
+            "{:?}",
+            import.tests_dropped
+        );
     }
 
     #[test]
@@ -2692,11 +2858,14 @@ mod tests {
 
     #[test]
     fn vars_are_typed_as_yaml_in_dbt_project() {
-        let vars = parse_vars(&[
-            "stripe_schema=raw_stripe".to_string(),
-            "stripe__using_invoices=false".to_string(),
-            "stripe_sources=[a, b]".to_string(),
-        ])
+        let vars = parse_vars(
+            &[
+                "stripe_schema=raw_stripe".to_string(),
+                "stripe__using_invoices=false".to_string(),
+                "stripe_sources=[a, b]".to_string(),
+            ],
+            false,
+        )
         .unwrap();
         let yml = render_dbt_project_yml("rocky_package_build", &vars).unwrap();
         let v: serde_yaml::Value = serde_yaml::from_str(&yml).unwrap();
@@ -2704,8 +2873,78 @@ mod tests {
         assert_eq!(v["vars"]["stripe__using_invoices"], false);
         assert_eq!(v["vars"]["stripe_sources"][1], "b");
         assert_eq!(v["profile"], "rocky_package_build");
-        assert!(parse_vars(&["noequals".to_string()]).is_err());
-        assert!(parse_vars(&["bad key=1".to_string()]).is_err());
+        assert!(parse_vars(&["noequals".to_string()], false).is_err());
+        assert!(parse_vars(&["bad key=1".to_string()], false).is_err());
+    }
+
+    #[test]
+    fn jinja_in_vars_is_refused_from_flags_the_lockfile_and_the_render() {
+        let injected = "x={{ env_var('AWS_SECRET_ACCESS_KEY') }}".to_string();
+        let err = parse_vars(&[injected], false).unwrap_err();
+        assert!(err.contains("Jinja"), "{err}");
+        for v in ["{% raw %}", "{# c #}", "\"{{ 1 }}\""] {
+            assert!(parse_vars(&[format!("x={v}")], false).is_err(), "{v}");
+        }
+        let mut vars = BTreeMap::new();
+        vars.insert("x".to_string(), "{{ env_var('HOME') }}".to_string());
+        assert!(render_dbt_project_yml("p", &vars).is_err());
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(LOCKFILE_NAME);
+        std::fs::write(
+            &path,
+            "version = 1\n[[package]]\nname = \"stripe\"\nhub = \"fivetran/stripe\"\n\
+             version = \"1\"\ndbt_version = \"1\"\nadapter = \"duckdb\"\ncompiled_at = \"\"\n\
+             vars_hash = \"\"\n[package.vars]\nx = \"{{ env_var('HOME') }}\"\n",
+        )
+        .unwrap();
+        let err = PackagesLock::read(&path).unwrap_err();
+        assert!(err.contains("Jinja"), "{err}");
+    }
+
+    #[test]
+    fn credential_like_var_names_need_an_explicit_opt_in() {
+        for name in [
+            "api_key",
+            "stripe_token",
+            "db_password",
+            "SECRET",
+            "private_key_path",
+        ] {
+            let flag = format!("{name}=x");
+            assert!(
+                parse_vars(std::slice::from_ref(&flag), false).is_err(),
+                "{name}"
+            );
+            assert!(parse_vars(&[flag], true).is_ok(), "{name}");
+        }
+        for name in [
+            "stripe_schema",
+            "stripe__using_invoices",
+            "monkey",
+            "tokens_table",
+        ] {
+            assert!(parse_vars(&[format!("{name}=x")], false).is_ok(), "{name}");
+        }
+    }
+
+    #[test]
+    fn jinja_in_an_adapter_field_is_refused_and_key_paths_are_absolute() {
+        let a = adapter(
+            "type = \"snowflake\"\naccount = \"{{ env_var('X') }}\"\nusername = \"u\"\ndatabase = \"DB\"\npassword = \"p\"\n",
+        );
+        let err = render_profiles_yml("p", &a, "S", None).unwrap_err();
+        assert!(err.contains("account"), "{err}");
+        let k = adapter(
+            "type = \"snowflake\"\naccount = \"a\"\nusername = \"u\"\ndatabase = \"DB\"\nprivate_key_path = \"keys/rsa.p8\"\n",
+        );
+        let p = render_profiles_yml("p", &k, "S", None).unwrap();
+        let v: serde_yaml::Value = serde_yaml::from_str(&p.yaml).unwrap();
+        let path = v["p"]["outputs"]["rocky"]["private_key_path"]
+            .as_str()
+            .unwrap();
+        assert!(Path::new(path).is_absolute(), "{path}");
+        assert!(path.ends_with("keys/rsa.p8"), "{path}");
     }
 
     fn adapter(toml_text: &str) -> rocky_core::config::AdapterConfig {
@@ -2744,14 +2983,15 @@ mod tests {
         let p = render_profiles_yml("p", &a, "S", None).unwrap();
         assert!(!p.yaml.contains("hunter2"), "{}", p.yaml);
         assert!(
-            p.yaml.contains("env_var(\"ROCKY_DBT_SNOWFLAKE_PASSWORD\")"),
+            p.yaml
+                .contains("env_var(\"DBT_ENV_SECRET_ROCKY_SNOWFLAKE_PASSWORD\")"),
             "{}",
             p.yaml
         );
         assert_eq!(
             p.env,
             vec![(
-                "ROCKY_DBT_SNOWFLAKE_PASSWORD".to_string(),
+                "DBT_ENV_SECRET_ROCKY_SNOWFLAKE_PASSWORD".to_string(),
                 "hunter2".to_string()
             )]
         );

@@ -3058,6 +3058,15 @@ struct PackageBuildArgs {
     /// rocky-packages.lock; `--build-empty=false` switches back.
     #[arg(long = "build-empty", num_args = 0..=1, default_missing_value = "true", require_equals = true)]
     build_empty: Option<bool>,
+    /// Accept `--vars` names that look like credentials (`*_token`,
+    /// `*_password`, `*_key`, ...). Vars are stored in clear text in
+    /// rocky-packages.lock.
+    #[arg(long = "allow-secret-var")]
+    allow_secret_var: bool,
+    /// Stop a dbt step (`deps`, `run --empty`, `compile`) that runs longer
+    /// than this many seconds (default 1800).
+    #[arg(long = "dbt-timeout", value_name = "SECONDS")]
+    dbt_timeout: Option<u64>,
 }
 
 impl PackageBuildArgs {
@@ -3069,6 +3078,8 @@ impl PackageBuildArgs {
             dbt: self.dbt,
             compiled: self.compiled,
             build_empty: self.build_empty,
+            allow_secret_var: self.allow_secret_var,
+            dbt_timeout: self.dbt_timeout,
         }
     }
 }
