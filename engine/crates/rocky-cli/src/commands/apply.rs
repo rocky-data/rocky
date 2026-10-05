@@ -4807,28 +4807,31 @@ async fn run_apply_replication_plan(
         None => {
             let live_snapshot = serde_json::to_value(rocky_cfg)
                 .context("failed to serialize the live config for the plan comparison")?;
-            if live_snapshot != replication_plan.config_snapshot {
-                // A plan without digests predates #1919: its snapshot holds
-                // resolved `${VAR}` values, and the live snapshot holds
-                // `${NAME}`. The two cannot be compared, so this is not
-                // evidence that the config changed. Refuse either way
-                // (fail-closed), but say what is actually wrong.
+            if live_snapshot == replication_plan.config_snapshot {
+                (false, Vec::new())
+            } else {
+                // A plan without digests predates #1919: its snapshot may hold
+                // resolved `${VAR}` values where this engine prints `${NAME}`.
+                // If it matches the resolved form, nothing changed but the
+                // form: refuse anyway (fail-closed) and say what is wrong.
+                let live_resolved = rocky_core::env_string::with_env_values_scope(|| {
+                    serde_json::to_value(rocky_cfg)
+                })
+                .context("failed to serialize the live config for the plan comparison")?;
+                if live_resolved == replication_plan.config_snapshot {
+                    bail!(
+                        "re-plan: this plan was written by an older engine. Plan \
+                         '{plan_id}' has no config digests, and its config snapshot holds \
+                         values this engine prints as `${{NAME}}`, so the two cannot be \
+                         compared.\n\
+                         Nothing was written. Re-plan with `rocky plan` and apply the new \
+                         plan_id."
+                    );
+                }
                 let changed =
                     changed_config_sections(&replication_plan.config_snapshot, &live_snapshot);
-                bail!(
-                    "re-plan: this plan was written by an older engine. Plan \
-                     '{plan_id}' has no config digests, so its config snapshot cannot be \
-                     compared with this engine's{}.\n\
-                     Nothing was written. Re-plan with `rocky plan` and apply the new \
-                     plan_id.",
-                    if changed.is_empty() {
-                        String::new()
-                    } else {
-                        format!(" (sections that differ in form: {})", changed.join(", "))
-                    }
-                );
+                (true, changed)
             }
-            (false, Vec::new())
         }
     };
     if differs {
