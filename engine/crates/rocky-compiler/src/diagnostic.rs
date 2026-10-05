@@ -343,7 +343,14 @@ pub const E054: &str = "E054";
 /// NULLs from a table, or the `dbt_utils.star` placeholder), a package model
 /// whose resolved name an existing project or package model already owns,
 /// compared case-insensitively (package models keep their dbt names; Rocky
-/// never prefixes them), two package models differing only by case, or
+/// never prefixes them), two package models differing only by case, a
+/// `[target]` table another model already writes, a vendored model that
+/// reads a model that was not vendored or a dbt seed, vendored SQL that does
+/// not parse, a previously vendored model that no longer imports (`update`),
+/// a dbt project name already vendored from another Hub package, Jinja in a
+/// var (from flags or the lockfile), a credential-like var name without
+/// `--allow-secret-var`, a dbt step past `--dbt-timeout`, a symlink under
+/// `models/packages/`, or
 /// a `remove` that would delete locally edited vendored files without
 /// `--force`. Nothing is written when it fires.
 pub const E055: &str = "E055";
@@ -565,6 +572,12 @@ pub const WARNING_CODES: &[&str] = &[
     W001, W002, W004, W005, W006, W010, W011, W012, W013, W030, W031, W041, W042, W043, W044, W046,
     W048, W049, W050, W051, W052, W053, P002,
 ];
+
+/// Warning codes other commands emit, never `rocky compile`, so
+/// `--deny-warnings` does not accept them: [`W055`] (`rocky package`).
+/// The registry test requires every `W###` constant in exactly one of this
+/// list and [`WARNING_CODES`].
+pub const NON_COMPILE_WARNING_CODES: &[&str] = &[W055];
 
 /// Whether `code` (case-insensitive, surrounding spaces ignored) is a
 /// warning code in [`WARNING_CODES`].
@@ -1010,13 +1023,14 @@ mod tests {
         declared.sort_unstable();
         let mut listed: Vec<&str> = WARNING_CODES
             .iter()
+            .chain(NON_COMPILE_WARNING_CODES)
             .filter_map(|c| c.strip_prefix('W'))
             .collect();
         listed.sort_unstable();
         assert_eq!(declared, listed);
         assert!(is_warning_code(" w042 "));
         assert!(is_warning_code("P002"));
-        for bad in ["W999", "W42", "W 042", "E042", "", "P001"] {
+        for bad in ["W999", "W42", "W 042", "E042", "", "P001", "W055"] {
             assert!(!is_warning_code(bad), "{bad}");
         }
     }

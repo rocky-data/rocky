@@ -507,10 +507,7 @@ fn vendor(
                 &adapter_name,
                 adapter,
                 build_empty,
-                opts.dbt.as_deref(),
-                std::time::Duration::from_secs(
-                    opts.dbt_timeout.unwrap_or(DEFAULT_DBT_TIMEOUT_SECS),
-                ),
+                opts,
                 &mut diagnostics,
             )?;
             _tmp.path().to_path_buf()
@@ -969,7 +966,7 @@ fn existing_models(
                 };
                 out.names
                     .entry(name.to_lowercase())
-                    .or_insert_with(BTreeSet::new)
+                    .or_default()
                     .insert(dbt_package::ExistingModel { name, owner });
             }
         }
@@ -987,7 +984,7 @@ fn existing_models(
                     &model.config.target,
                     &model.config.name,
                 ))
-                .or_insert_with(BTreeSet::new)
+                .or_default()
                 .insert(dbt_package::ExistingModel {
                     name: model.config.name.clone(),
                     owner,
@@ -1232,11 +1229,12 @@ fn run_dbt(
     adapter_name: &str,
     adapter: &AdapterConfig,
     build_empty: bool,
-    dbt_flag: Option<&Path>,
-    timeout: std::time::Duration,
+    opts: &PackageBuildOptions,
     diagnostics: &mut Vec<PackageDiagnostic>,
 ) -> Result<()> {
-    let dbt = locate_dbt(dbt_flag)?;
+    let dbt = locate_dbt(opts.dbt.as_deref())?;
+    let timeout =
+        std::time::Duration::from_secs(opts.dbt_timeout.unwrap_or(DEFAULT_DBT_TIMEOUT_SECS));
     let duckdb_path = match (adapter.adapter_type.as_str(), adapter.path.as_deref()) {
         ("duckdb", Some(p)) => Some(
             std::path::absolute(p).with_context(|| format!("cannot resolve DuckDB path {p}"))?,
