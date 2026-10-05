@@ -334,6 +334,8 @@ fn unsupported_strategy(ir: &ModelIr) -> Option<&'static str> {
         MaterializationStrategy::TimeInterval { .. } => Some("time_interval"),
         MaterializationStrategy::Microbatch { .. } => Some("microbatch"),
         MaterializationStrategy::Ephemeral => Some("ephemeral"),
+        // The applied SQL is an SCD2 MERGE over history, not the SELECT.
+        MaterializationStrategy::Snapshot(_) => Some("snapshot"),
     }
 }
 
@@ -1235,6 +1237,37 @@ mod tests {
         }
         let v = check_one(&adapter, "duckdb", c).await;
         assert_eq!(v.reason, Some(IntentCheckReason::UnsupportedStrategy));
+    }
+
+    #[test]
+    fn snapshot_models_are_an_unsupported_strategy() {
+        let ir = ModelIr::transformation(
+            rocky_ir::TargetRef {
+                catalog: "c".into(),
+                schema: "s".into(),
+                table: "snap".into(),
+            },
+            MaterializationStrategy::Snapshot(Box::new(rocky_ir::snapshot::SnapshotSpec {
+                unique_key: vec!["id".into()],
+                change: rocky_ir::snapshot::SnapshotChangeStrategy::Check {
+                    check_cols: rocky_ir::snapshot::SnapshotCheckColumns::All,
+                    updated_at: None,
+                },
+                hard_deletes: rocky_ir::snapshot::SnapshotHardDeletes::Ignore,
+                meta_columns: rocky_ir::snapshot::SnapshotMetaColumns::default(),
+                valid_to_current: None,
+            })),
+            Vec::new(),
+            "SELECT id FROM t".into(),
+            rocky_ir::GovernanceConfig {
+                permissions_file: None,
+                auto_create_catalogs: false,
+                auto_create_schemas: false,
+            },
+            None,
+            None,
+        );
+        assert_eq!(unsupported_strategy(&ir), Some("snapshot"));
     }
 
     #[test]
