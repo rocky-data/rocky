@@ -1002,6 +1002,71 @@ effect = "deny"
     );
 }
 
+/// RV4-P1: the propose gate stamps the server's actor. An approver server
+/// with no override records `mcp-approver`; a server built with
+/// `with_actor` (what `rocky mcp --principal-id` does) records that id.
+#[tokio::test]
+async fn propose_records_the_profile_actor_or_the_override() {
+    let policy = r#"[policy]
+version = 1
+default_agent_effect = "require_review"
+
+[[policy.rules]]
+principal = "agent"
+capability = "apply"
+scope = { any = true }
+effect = "deny"
+"#;
+    let override_actor =
+        rocky_core::config::PrincipalRef::resolve(Some("agent-7"), None, None).unwrap();
+    let cases: Vec<(
+        Option<rocky_core::config::PrincipalRef>,
+        &str,
+        rocky_core::config::PrincipalIdSource,
+    )> = vec![
+        (
+            None,
+            "mcp-approver",
+            rocky_core::config::PrincipalIdSource::McpProfile,
+        ),
+        (
+            Some(override_actor),
+            "agent-7",
+            rocky_core::config::PrincipalIdSource::Flag,
+        ),
+    ];
+    for (actor, want_id, want_source) in cases {
+        let dir = TempDir::new().unwrap();
+        write_project_with_policy(dir.path(), &dir.path().join("test.duckdb"), policy);
+        let mut server = RockyMcpServer::new_with_profile(
+            dir.path().join("rocky.toml"),
+            rocky_mcp::McpProfile::Approver,
+        );
+        if let Some(actor) = actor {
+            server = server.with_actor(actor);
+        }
+        let client = connect(server).await;
+        let result = client
+            .call_tool(CallToolRequestParams::new("propose"))
+            .await
+            .expect("propose returns a result");
+        assert_eq!(result.is_error, Some(true), "the policy denies");
+        client.cancel().await.unwrap();
+
+        let state_path =
+            rocky_core::state::resolve_state_path(None, &dir.path().join("models")).path;
+        let store = rocky_core::state::StateStore::open(&state_path).expect("open ledger");
+        let rows = store.list_policy_decisions().expect("list decisions");
+        assert!(!rows.is_empty(), "{want_id}: the gate recorded a row");
+        for row in &rows {
+            let actor = row.principal_ref.as_ref().expect("the row names its actor");
+            assert_eq!(actor.id.as_str(), want_id);
+            assert_eq!(actor.source, want_source);
+            assert_eq!(row.principal, rocky_core::config::PolicyPrincipal::Agent);
+        }
+    }
+}
+
 /// A `require_review` verdict at propose time still **persists** the plan (it is
 /// headed to human review) and returns a structured `policy_review_required`
 /// signal naming the rule and the recorded plan_id, so the agent surfaces the

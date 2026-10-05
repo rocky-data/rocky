@@ -1732,7 +1732,7 @@ mod tests {
         .unwrap();
     }
 
-    /// Drive `super::super::run::run(&rocky_core::config::PrincipalRef::unnamed())` end-to-end against the given config +
+    /// Drive `super::super::run::run()` end-to-end against the given config +
     /// canonical `state_path`, exercising both the full transformation
     /// dispatch and its model-only entry point.
     async fn run_full_dag(

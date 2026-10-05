@@ -201,3 +201,72 @@ fn invalid_principal_ids_fail_closed() {
         );
     }
 }
+
+/// The freeze row names the operator (`--principal-id ops-1`) and keeps the
+/// frozen class (`--principal agent`); a blank `ROCKY_PRINCIPAL_ID` counts as
+/// unset; the `mcp-` namespace is refused from the flag and the env var.
+#[test]
+fn freeze_records_operator_id_beside_the_frozen_class() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let state = dir.path().join("state.redb");
+    let state = state.to_str().unwrap();
+
+    let mut args = global_args(dir.path(), state);
+    args.extend(
+        [
+            "--principal-id",
+            "ops-1",
+            "policy",
+            "freeze",
+            "--principal",
+            "agent",
+        ]
+        .map(String::from),
+    );
+    ok(
+        &rocky(dir.path()).args(&args).output().unwrap(),
+        "freeze as ops-1",
+    );
+
+    // A blank env value is unset: the command runs and records `unnamed`.
+    let mut args = global_args(dir.path(), state);
+    args.extend(["policy", "unfreeze", "--principal", "agent"].map(String::from));
+    ok(
+        &rocky(dir.path())
+            .env("ROCKY_PRINCIPAL_ID", "  ")
+            .args(&args)
+            .output()
+            .unwrap(),
+        "unfreeze with a blank ROCKY_PRINCIPAL_ID",
+    );
+
+    let mut args = global_args(dir.path(), state);
+    args.push("audit".to_string());
+    let audit = ok(&rocky(dir.path()).args(&args).output().unwrap(), "audit");
+    let rows = audit["decisions"].as_array().unwrap();
+    assert_eq!(rows.len(), 2, "{audit:#}");
+    assert_eq!(rows[0]["principal"], "agent");
+    assert_eq!(rows[0]["principal_id"], "ops-1");
+    assert_eq!(rows[0]["principal_id_source"], "flag");
+    assert_eq!(rows[1]["principal_id"], "unnamed");
+    assert_eq!(rows[1]["principal_id_source"], "default");
+
+    // Nobody may claim the MCP server's namespace.
+    for env in [None, Some("mcp-worker")] {
+        let mut args = global_args(dir.path(), state);
+        if env.is_none() {
+            args.extend(["--principal-id", "mcp-worker"].map(String::from));
+        }
+        args.extend(["policy", "freeze", "--principal", "agent"].map(String::from));
+        let mut cmd = rocky(dir.path());
+        if let Some(v) = env {
+            cmd.env("ROCKY_PRINCIPAL_ID", v);
+        }
+        let out = cmd.args(&args).output().unwrap();
+        assert_eq!(out.status.code(), Some(1), "{env:?}: {out:?}");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("reserved"),
+            "{env:?}"
+        );
+    }
+}

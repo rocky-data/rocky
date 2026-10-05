@@ -197,15 +197,19 @@ rocky audit --actor unrecorded               # rows written before principal ids
 | `--actor <ID>` | `string` | | List only the decisions one actor made: the rows whose principal id is `<ID>`. `unrecorded` lists the rows with no id. Composes with `--product` and `--since`. Conflicts with `--for` and `--scorecard`. Reads no environment variable. |
 | `--since <WHEN>` | `string` | | List only the decisions recorded at or after `<WHEN>`. Accepts `YYYY-MM-DD` (00:00 UTC), an RFC 3339 timestamp with an offset (Rocky converts it to UTC), or a `<N>d` / `<N>h` duration back from now. A future time lists nothing. Conflicts with `--for` and `--scorecard`. |
 
-Read-only. Only mutating enforcement seams record decisions — reads are never logged — so the ledger is the audit trail of governed mutations.
+Read-only. Only mutating enforcement seams record decisions — reads are never logged — so the ledger is the audit trail of governed mutations. A signal the ledger does not persist is reported as *not recorded* rather than inferred, and the scorecard is wired to no automatic policy change.
 
 ### Principal ids
 
 Each decision records two things about the actor. The class (`human` or `agent`) is what the policy gates enforce. The principal id is a name for who acted. Set it with the global `--principal-id` flag or `ROCKY_PRINCIPAL_ID`. When neither is set, the id is `unnamed`. The text output shows both as `class(id)`, for example `agent(mcp-worker)`.
 
-Each JSON entry carries `principal_id`, `principal_id_source` (`flag`, `env`, `mcp_profile` or `default`) and `principal_id_verified`. The id is self-asserted, so `principal_id_verified` is always `false`. A row written before ids existed has `principal_id: null`, and the text output shows `unrecorded`. An `--actor <ID>` filter cannot match those rows. The output counts them in `unattributed_skipped`, and the text output prints a note. A signal the ledger does not persist is reported as *not recorded* rather than inferred, and the scorecard is wired to no automatic policy change.
+Each JSON entry carries `principal_id`, `principal_id_source` (`flag`, `env`, `mcp_profile` or `default`) and `principal_id_verified`. The id is self-asserted, so `principal_id_verified` is always `false`. A row written before ids existed has `principal_id: null`, and the text output shows `unrecorded`. An `--actor <ID>` filter cannot match those rows. The output counts them in `unattributed_skipped`, and the text output prints a note.
 
-`rocky serve` answers the ledger at `GET /api/v1/audit`, or one product's rows at `GET /api/v1/audit?product=<name>`, byte for byte. The same route takes `actor=<id>` and `since=<when>`; the scorecard at `GET /api/v1/audit/scorecard?by=<dim>&window=<w>`, except `window_start` for a duration window; and the custody chain at `GET /api/v1/custody/{subject}`, byte for byte.
+`rocky serve` answers the same data over HTTP:
+
+- the ledger at `GET /api/v1/audit`, byte for byte. The route takes `product=<name>`, `actor=<id>` and `since=<when>`, which filter as the CLI flags do. A malformed `actor` or `since` is a `400`.
+- the scorecard at `GET /api/v1/audit/scorecard?by=<dim>&window=<w>`, byte for byte except `window_start` for a duration window.
+- the custody chain at `GET /api/v1/custody/{subject}`, byte for byte.
 
 ---
 

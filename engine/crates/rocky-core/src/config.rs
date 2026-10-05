@@ -3310,8 +3310,10 @@ impl PrincipalId {
 
     /// Parse an id that an operator asserts (a flag or an env var).
     ///
-    /// Refuses a grammar violation and the reserved words
-    /// [`PRINCIPAL_ID_UNNAMED`] and [`PRINCIPAL_ID_UNRECORDED`].
+    /// Refuses a grammar violation, the reserved words
+    /// [`PRINCIPAL_ID_UNNAMED`] and [`PRINCIPAL_ID_UNRECORDED`], and any id
+    /// starting with [`PRINCIPAL_ID_MCP_PREFIX`], which only the MCP server's
+    /// own profile default may carry.
     pub fn parse_asserted(s: &str) -> Result<Self, PrincipalIdError> {
         let id = Self::parse_grammar(s)?;
         if is_reserved_principal_id(&id.0) {
@@ -3333,10 +3335,18 @@ impl PrincipalId {
     }
 }
 
-/// Whether `s` is a reserved principal id that no operator may assert.
+/// The prefix of the ids `rocky mcp` derives from its profile
+/// (`mcp-default`, `mcp-approver`, `mcp-worker`). Reserved for source
+/// `mcp_profile`, so a person cannot record decisions as the MCP server.
+pub const PRINCIPAL_ID_MCP_PREFIX: &str = "mcp-";
+
+/// Whether `s` is a reserved principal id that no operator may assert: the
+/// two reserved words, or any id in the `mcp-` namespace.
 #[must_use]
 pub fn is_reserved_principal_id(s: &str) -> bool {
-    s == PRINCIPAL_ID_UNNAMED || s == PRINCIPAL_ID_UNRECORDED
+    s == PRINCIPAL_ID_UNNAMED
+        || s == PRINCIPAL_ID_UNRECORDED
+        || s.starts_with(PRINCIPAL_ID_MCP_PREFIX)
 }
 
 impl TryFrom<String> for PrincipalId {
@@ -3414,7 +3424,9 @@ impl PrincipalRef {
     /// Resolve the acting principal id from its inputs, highest first:
     ///
     /// 1. `flag` — the `--principal-id` value;
-    /// 2. `env` — the `ROCKY_PRINCIPAL_ID` value, when set;
+    /// 2. `env` — the `ROCKY_PRINCIPAL_ID` value, when set and not blank (an
+    ///    empty or whitespace-only value counts as unset, so a CI variable
+    ///    that expands to nothing does not abort every command);
     /// 3. `mcp_profile` — only `rocky mcp` passes it;
     /// 4. the default, `unnamed`.
     ///
@@ -3439,7 +3451,7 @@ impl PrincipalRef {
                 source: PrincipalIdSource::Flag,
             });
         }
-        if let Some(env) = env {
+        if let Some(env) = env.filter(|v| !v.trim().is_empty()) {
             let id = PrincipalId::parse_asserted(env).map_err(ResolvePrincipalIdError::Env)?;
             return Ok(Self {
                 id,
@@ -3486,6 +3498,7 @@ mod principal_id_tests {
             "ci-bot.v2",
             "svc_ingest-01",
             "9lives",
+            "mcpbot",
             ok_63.as_str(),
         ];
         for s in accepted {
@@ -3495,7 +3508,11 @@ mod principal_id_tests {
         }
 
         type Expect = fn(&PrincipalIdError) -> bool;
-        let refused: [(&str, Expect); 13] = [
+        let refused: [(&str, Expect); 15] = [
+            ("mcp-worker", |e| {
+                matches!(e, PrincipalIdError::Reserved { .. })
+            }),
+            ("mcp-", |e| matches!(e, PrincipalIdError::Reserved { .. })),
             ("", |e| matches!(e, PrincipalIdError::Empty)),
             (too_long_64.as_str(), |e| {
                 matches!(e, PrincipalIdError::TooLong { len: 64, .. })
@@ -3576,9 +3593,46 @@ mod principal_id_tests {
                 PrincipalIdError::Grammar { .. }
             ))
         ));
+        // A blank env value counts as unset and falls through.
+        for blank in ["", "   ", "\t"] {
+            assert_eq!(
+                PrincipalRef::resolve(None, Some(blank), Some("worker"))
+                    .unwrap()
+                    .id
+                    .as_str(),
+                "mcp-worker",
+                "{blank:?}"
+            );
+            assert_eq!(
+                PrincipalRef::resolve(None, Some(blank), None).unwrap(),
+                PrincipalRef::unnamed(),
+                "{blank:?}"
+            );
+        }
+        // A blank FLAG is still an error: the operator typed it.
         assert!(matches!(
-            PrincipalRef::resolve(None, Some(""), None),
-            Err(ResolvePrincipalIdError::Env(PrincipalIdError::Empty))
+            PrincipalRef::resolve(Some(""), None, None),
+            Err(ResolvePrincipalIdError::Flag(PrincipalIdError::Empty))
+        ));
+        // A non-blank invalid env value is still an error.
+        assert!(matches!(
+            PrincipalRef::resolve(None, Some(" bob "), None),
+            Err(ResolvePrincipalIdError::Env(
+                PrincipalIdError::Grammar { .. }
+            ))
+        ));
+        // The `mcp-` namespace is the MCP server's: refused from flag and env.
+        assert!(matches!(
+            PrincipalRef::resolve(Some("mcp-worker"), None, None),
+            Err(ResolvePrincipalIdError::Flag(
+                PrincipalIdError::Reserved { .. }
+            ))
+        ));
+        assert!(matches!(
+            PrincipalRef::resolve(None, Some("mcp-default"), Some("worker")),
+            Err(ResolvePrincipalIdError::Env(
+                PrincipalIdError::Reserved { .. }
+            ))
         ));
         assert!(matches!(
             PrincipalRef::resolve(None, Some("unnamed"), None),

@@ -5525,6 +5525,95 @@ mod tests {
         assert!(err.message.contains("broken"), "{}", err.message);
     }
 
+    /// RV4-P1 serve parity: `/audit?actor=&since=` answers with the bytes
+    /// `rocky audit --actor --since` prints for the same query, and a
+    /// malformed `actor` or `since` is a 400.
+    #[tokio::test]
+    async fn audit_ledger_actor_since_match_the_cli_bytes_and_refuse_bad_values() {
+        use chrono::TimeZone;
+        use rocky_core::config::{
+            PolicyCapability, PolicyEffect, PolicyPrincipal, PrincipalIdSource, PrincipalRef,
+        };
+        use rocky_core::state::{PolicyDecisionRecord, StateStore};
+
+        let dir = tempfile::tempdir().unwrap();
+        let (root, config, state_path, _) = governor_fixture(dir.path());
+        let row = |plan: &str, day: u32, month: u32, who: Option<&str>| PolicyDecisionRecord {
+            keys_recorded: false,
+            models: Vec::new(),
+            timestamp: chrono::Utc
+                .with_ymd_and_hms(2026, month, day, 9, 0, 0)
+                .unwrap(),
+            plan_id: plan.to_string(),
+            principal: PolicyPrincipal::Agent,
+            capability: PolicyCapability::Apply,
+            model: "revenue_daily".to_string(),
+            effect: PolicyEffect::Allow,
+            rule_id: None,
+            reason: "test".to_string(),
+            verify_after: Vec::new(),
+            auto_apply: None,
+            principal_ref: who.map(|id| PrincipalRef {
+                id: rocky_core::config::PrincipalId::parse_asserted(id).unwrap(),
+                source: PrincipalIdSource::Flag,
+            }),
+        };
+        {
+            let store = StateStore::open(&state_path).unwrap();
+            for r in [
+                row("p-alice-old", 1, 9, Some("alice")),
+                row("p-alice", 2, 10, Some("alice")),
+                row("p-bob", 2, 10, Some("bob")),
+                row("p-unrecorded", 2, 10, None),
+            ] {
+                store.record_policy_decision(&r).unwrap();
+            }
+        }
+        let base = spawn_router(pinned_server(
+            root.join("models"),
+            Some(config),
+            &state_path,
+        ))
+        .await;
+
+        let resp = reqwest::get(format!("{base}/api/v1/audit?actor=alice&since=2026-10-01"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let text = resp.text().await.unwrap();
+        let query = crate::commands::audit::AuditQuery::parse(
+            Some("alice"),
+            Some("2026-10-01"),
+            chrono::Utc::now(),
+        )
+        .unwrap();
+        assert_eq!(
+            text,
+            reference_bytes(&compute_audit(&state_path, None, &query).unwrap())
+        );
+        let out: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let plans: Vec<&str> = out["decisions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| d["plan_id"].as_str().unwrap())
+            .collect();
+        assert_eq!(plans, vec!["p-alice"], "{text}");
+        // The fixture's own id-less rows are recent too, so at least ours.
+        assert!(out["unattributed_skipped"].as_u64().unwrap() >= 1, "{text}");
+        assert_eq!(out["filter"]["actor"], "alice");
+        assert_eq!(out["filter"]["since"], "2026-10-01T00:00:00Z");
+
+        for bad in ["actor=Bad", "actor=a%40b", "since=garbage", "since=all"] {
+            let resp = reqwest::get(format!("{base}/api/v1/audit?{bad}"))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 400, "{bad}");
+            let err: ErrorEnvelope = resp.json().await.unwrap();
+            assert_eq!(err.code, "bad_request", "{bad}");
+        }
+    }
+
     /// `/products/{name}/journal` answers with the CLI's bytes: empty for a
     /// product known by its spec alone, one row after an approval; an
     /// unknown or traversal-shaped name is 404.

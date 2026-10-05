@@ -8920,6 +8920,8 @@ pub struct AuditOutput {
     /// How many rows in range carry no principal id (written before ids
     /// existed) and so an `--actor <id>` filter dropped them. `0` without an
     /// `--actor` filter, and under `--actor unrecorded`, which lists them.
+    /// Defaulted, so a consumer reading an older binary's output sees `0`.
+    #[serde(default)]
     pub unattributed_skipped: u64,
     /// Every recorded policy decision, oldest first. Under `product`, only
     /// the rows whose `model` is that product's output model. Under `filter`,
@@ -8986,7 +8988,9 @@ pub struct AuditDecisionEntry {
     /// `null` when the id is unrecorded.
     pub principal_id_source: Option<rocky_core::config::PrincipalIdSource>,
     /// Whether anything verified the id. Always `false` today: ids are
-    /// self-asserted until signed approvals exist.
+    /// self-asserted until signed approvals exist. Defaulted, so a consumer
+    /// reading an older binary's output sees `false`.
+    #[serde(default)]
     pub principal_id_verified: bool,
 }
 

@@ -164,14 +164,14 @@ struct Cli {
     /// A name for who is acting, recorded on every policy decision.
     ///
     /// Lowercase letters, digits, `.`, `_` and `-`, at most 63 bytes. No `@`,
-    /// so an email address is refused. `unnamed` and `unrecorded` are
-    /// reserved. The id is self-asserted: Rocky does not verify it, and
+    /// so an email address is refused. `unnamed`, `unrecorded` and every id
+    /// starting `mcp-` (the MCP server's own) are reserved. The id is self-asserted: Rocky does not verify it, and
     /// `rocky audit` shows it as `verified: false`. It is a label, not an
     /// enforcement input — `--principal` (the class) still decides the gate.
     ///
     /// Precedence: this flag, then `ROCKY_PRINCIPAL_ID`, then (for `rocky
     /// mcp` only) `mcp-<profile>`, then `unnamed`. An invalid value is an
-    /// error. Rocky never reads `$USER` or a CI variable for it.
+    /// error; an empty `ROCKY_PRINCIPAL_ID` counts as unset. Rocky never reads `$USER` or a CI variable for it.
     #[arg(long = "principal-id", global = true, value_name = "ID")]
     principal_id: Option<String>,
 

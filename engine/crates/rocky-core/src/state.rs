@@ -7440,8 +7440,31 @@ pub struct PolicyDecisionRecord {
     ///
     /// Added WITHOUT a schema bump; see the note above
     /// [`CURRENT_SCHEMA_VERSION`].
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ///
+    /// Written strictly, read leniently: a value this binary cannot parse — a
+    /// later binary's new source variant or looser id grammar, or a corrupt
+    /// row — reads as `None` (unrecorded) instead of failing the whole ledger
+    /// read, which would make the gate deny every agent as "ledger unreadable".
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_principal_ref_lenient"
+    )]
     pub principal_ref: Option<crate::config::PrincipalRef>,
+}
+
+/// Lenient reader for [`PolicyDecisionRecord::principal_ref`]: any value that
+/// does not parse as a [`crate::config::PrincipalRef`] reads as `None`. The id
+/// is a label no gate reads, so losing an unparseable one is safe; failing the
+/// row (and with it every ledger read) is not.
+fn deserialize_principal_ref_lenient<'de, D>(
+    deserializer: D,
+) -> Result<Option<crate::config::PrincipalRef>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = <Option<serde_json::Value> as serde::Deserialize>::deserialize(deserializer)?;
+    Ok(raw.and_then(|v| serde_json::from_value(v).ok()))
 }
 
 /// What kind of event a [`PolicyDecisionRecord`] row records.
@@ -11945,6 +11968,64 @@ mod tests {
             !bytes.contains("principal_ref"),
             "a row without an actor must not grow the key: {bytes}"
         );
+    }
+
+    /// Version skew: a row whose `principal_ref` this binary cannot parse — a
+    /// source variant from a later binary, an id outside today's grammar —
+    /// still lists, and reads as unrecorded. A strict read would fail the whole
+    /// ledger and the gate would deny every agent.
+    #[test]
+    fn test_v31_unparseable_principal_ref_reads_as_unrecorded() {
+        let (store, _dir) = temp_store();
+        let blob = serde_json::json!({
+            "timestamp": "2026-09-01T00:00:00Z",
+            "plan_id": "plan-skew",
+            "principal": "agent",
+            "capability": "apply",
+            "model": "fct_orders",
+            "effect": "allow",
+            "principal_ref": {"id": "Bad@x", "source": "zzz"},
+        });
+        // Write the raw bytes the way a later binary would.
+        let key = policy_decision_key(
+            &"2026-09-01T00:00:00Z"
+                .parse::<chrono::DateTime<Utc>>()
+                .unwrap(),
+            "plan-skew",
+            "fct_orders",
+        );
+        let bytes = serde_json::to_vec(&blob).unwrap();
+        let txn = store.db.begin_write().unwrap();
+        {
+            let mut table = txn.open_table(POLICY_DECISIONS).unwrap();
+            table.insert(key.as_str(), bytes.as_slice()).unwrap();
+        }
+        txn.commit().unwrap();
+
+        let rows = store
+            .list_policy_decisions()
+            .expect("an unparseable principal_ref must not fail the ledger read");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].plan_id, "plan-skew");
+        assert!(rows[0].principal_ref.is_none(), "reads as unrecorded");
+
+        // Each half on its own, and a non-object value, also degrade to None.
+        for bad in [
+            serde_json::json!({"id": "alice", "source": "oidc"}),
+            serde_json::json!({"id": "Alice", "source": "flag"}),
+            serde_json::json!("alice"),
+            serde_json::Value::Null,
+        ] {
+            let mut row = blob.clone();
+            row["principal_ref"] = bad.clone();
+            let back: PolicyDecisionRecord = serde_json::from_value(row).unwrap();
+            assert!(back.principal_ref.is_none(), "{bad}");
+        }
+        // A valid one still reads.
+        let mut row = blob.clone();
+        row["principal_ref"] = serde_json::json!({"id": "alice", "source": "flag"});
+        let back: PolicyDecisionRecord = serde_json::from_value(row).unwrap();
+        assert_eq!(back.principal_ref.unwrap().id.as_str(), "alice");
     }
 
     /// Rollback: a v31 binary from before RV4-P1 must read a row this build
