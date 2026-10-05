@@ -1264,6 +1264,8 @@ class RockyClient:
         target_schema: str | None = None,
         compiled: str | None = None,
         build_empty: bool | None = None,
+        allow_secret_var: bool = False,
+        dbt_timeout: int | None = None,
         timeout_seconds: int | None = None,
     ) -> PackageAddOutput:
         """Run ``rocky package add <namespace>/<name>[@<version>]``.
@@ -1276,6 +1278,9 @@ class RockyClient:
         ``rocky_package_build*`` schemas to the warehouse and runs package
         hooks; packages whose macros read upstream columns (Fivetran staging)
         need it or ``compiled``, and are refused (E055) without either.
+        ``allow_secret_var`` accepts credential-like var names (vars are
+        stored in clear text in the lockfile); ``dbt_timeout`` limits each dbt
+        step, in seconds (engine default 1800).
         A refusal raises ``RockyCommandError``; findings to review (W055) come
         back in ``diagnostics``.
 
@@ -1298,6 +1303,7 @@ class RockyClient:
         """
         args = ["package", "add", spec, *_package_build_args(vars, target_schema, compiled)]
         args.extend(_build_empty_args(build_empty))
+        args.extend(_dbt_run_args(allow_secret_var, dbt_timeout))
         return _parse_rocky_json(
             self.run_cli(args, timeout_seconds=timeout_seconds),
             PackageAddOutput,
@@ -1311,6 +1317,8 @@ class RockyClient:
         vars: dict[str, str] | None = None,
         compiled: str | None = None,
         build_empty: bool | None = None,
+        allow_secret_var: bool = False,
+        dbt_timeout: int | None = None,
         timeout_seconds: int | None = None,
     ) -> PackageUpdateOutput:
         """Run ``rocky package update [<name>]``.
@@ -1338,6 +1346,7 @@ class RockyClient:
             args.append(name)
         args.extend(_package_build_args(vars, None, compiled))
         args.extend(_build_empty_args(build_empty))
+        args.extend(_dbt_run_args(allow_secret_var, dbt_timeout))
         return _parse_rocky_json(
             self.run_cli(args, timeout_seconds=timeout_seconds),
             PackageUpdateOutput,
@@ -2071,3 +2080,12 @@ def _build_empty_args(build_empty: bool | None) -> list[str]:
     if build_empty is None:
         return []
     return ["--build-empty"] if build_empty else ["--build-empty=false"]
+
+
+def _dbt_run_args(allow_secret_var: bool, dbt_timeout: int | None) -> list[str]:
+    """``--allow-secret-var`` and ``--dbt-timeout`` for ``rocky package add`` /
+    ``update``."""
+    args = ["--allow-secret-var"] if allow_secret_var else []
+    if dbt_timeout is not None:
+        args.extend(["--dbt-timeout", str(dbt_timeout)])
+    return args

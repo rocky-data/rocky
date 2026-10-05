@@ -251,7 +251,7 @@ rocky package list
 rocky package remove <name> [--force]
 ```
 
-`add` and `update` run `dbt deps` and `dbt compile --full-refresh` in a temporary dbt project. With `--build-empty`, `dbt run --empty --full-refresh` runs between them. The profile comes from the `rocky.toml` adapter (`duckdb`, `snowflake`, `databricks`, `bigquery` or `postgres`). Rocky writes the package's models to `models/packages/<package>/` and records them in `rocky-packages.lock` at the project root.
+`add` and `update` run `dbt deps` and `dbt compile --full-refresh` in a temporary dbt project, with a cleared environment plus an allowlist. Credentials reach dbt as `DBT_ENV_SECRET_ROCKY_*` variables. With `--build-empty`, `dbt run --empty --full-refresh` runs between them. The profile comes from the `rocky.toml` adapter (`duckdb`, `snowflake`, `databricks`, `bigquery` or `postgres`). Rocky writes the package's models to `models/packages/<package>/` and records them in `rocky-packages.lock` at the project root.
 
 ### Flags (`add` and `update`)
 
@@ -260,7 +260,9 @@ rocky package remove <name> [--force]
 | `--vars <KEY=VALUE>` | `string` (repeatable) | lockfile vars on `update` | A dbt var for the package. The value is read as YAML. Recorded in the lockfile and reused by `update`. |
 | `--adapter <NAME>` | `string` | the only warehouse adapter | The `rocky.toml` adapter dbt compiles against. |
 | `--target-schema <NAME>` | `string` | the warehouse default schema (`main` on DuckDB, `public` on Postgres, `PUBLIC` on Snowflake, `default` on Databricks) | Schema the vendored models build into. Required on BigQuery. |
-| `--dbt <PATH>` | `PathBuf` | `dbt` on `PATH` | The dbt executable. |
+| `--dbt <PATH>` | `PathBuf` | `dbt` on `PATH` | The dbt executable. A relative path is resolved against the current directory. |
+| `--dbt-timeout <SECONDS>` | `u64` | `1800` | Stop a dbt step (`deps`, `run --empty`, `compile`) that runs longer. |
+| `--allow-secret-var` | `bool` | `false` | Accept `--vars` names that look like credentials (`*_key`, `*_token`, `*_password`, ...). Vars are stored in clear text in the lockfile. |
 | `--compiled <DIR>` | `PathBuf` | | Import an already-compiled dbt project (`<DIR>/target/manifest.json` + `<DIR>/package-lock.yml`) instead of running dbt. |
 | `--build-empty[=BOOL]` | `bool` | `false` on `add`; the lockfile's mode on `update` | Run `dbt run --empty --full-refresh` before compiling, so macros that read upstream columns see them. Writes empty `rocky_package_build*` schemas to the warehouse and runs the package's hooks. Without it, a package whose compile came out with all-NULL columns or a placeholder `*` is refused with `E055`. Conflicts with `--compiled`. |
 
@@ -274,7 +276,7 @@ The lockfile records the build mode: `compile-only`, `build-empty` or `compiled`
 
 ### Codes
 
-- `E055`: refused. A bad spec, `dbt` not found, an adapter with no profile mapping, a failed `dbt deps` or `dbt compile`, a compile that came out wrong because upstream relations did not exist (all-NULL columns or a placeholder `*`, without `--build-empty`), a model name the project or another package already owns (by resolved name, ignoring case), or `remove` of edited files without `--force`. Nothing is written.
+- `E055`: refused. A bad spec, `dbt` not found, an adapter with no profile mapping, a failed `dbt deps` or `dbt compile`, a compile that came out wrong because upstream relations did not exist (all-NULL columns or a placeholder `*`, without `--build-empty`), a model name or `[target]` table the project or another package already owns (ignoring case), a vendored model that reads a model that was not vendored or a dbt seed, vendored SQL that does not parse, a previously vendored model that no longer imports (on `update`), a dbt project name already vendored from another Hub package, Jinja in a var, a credential-like var name without `--allow-secret-var`, a dbt step past `--dbt-timeout`, a symlink under `models/packages/`, or `remove` of edited files without `--force`. Nothing is written.
 - `W055`: vendored, with something to review. An `.incoming` file, an edited file upstream removed, a model that could not be vendored, an incremental model that fell back to full refresh, dropped dbt tests, or a `dbt run --empty` failure.
 
 ### JSON output

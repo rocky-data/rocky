@@ -1113,6 +1113,8 @@ def test_package_add_argv_and_typed_parse():
             target_schema="analytics",
             compiled="/tmp/dbt",
             build_empty=True,
+            allow_secret_var=True,
+            dbt_timeout=60,
         )
     assert run_cli.call_args[0][0] == [
         "package",
@@ -1125,6 +1127,9 @@ def test_package_add_argv_and_typed_parse():
         "--compiled",
         "/tmp/dbt",
         "--build-empty",
+        "--allow-secret-var",
+        "--dbt-timeout",
+        "60",
     ]
     assert isinstance(added, PackageAddOutput)
     assert added.package.models == ["stg_stripe__charge"]

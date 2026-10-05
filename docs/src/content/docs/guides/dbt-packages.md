@@ -131,7 +131,7 @@ with balance_transaction_joined as (
 - **Model names stay as the package names them.** References between package models are bare names, so Rocky sees them as DAG edges.
 - **Every package model builds into one schema**, `main` on DuckDB. Rocky resolves a bare model name through the connection's current schema, so a model in another schema would be out of reach. Change it with `--target-schema`. dbt's per-folder schemas (`stg_stripe`, `stripe`) are not kept.
 - **Source tables stay fully qualified**, as dbt resolved them: `"dev"."stripe"."charge"`. Each model's sidecar lists them as `[[sources]]`.
-- **Tests:** dbt's `not_null`, `unique`, `accepted_values` and `relationships` tests become `[[tests]]`, with their `severity` and `where`. Rocky reports any other test as dropped (`W055`).
+- **Tests:** dbt's `not_null`, `unique`, `accepted_values` and `relationships` tests become `[[tests]]`, with their `severity` and `where`. An `accepted_values` test with numeric values becomes an `expression` test (`col IS NULL OR col IN (1, 2)`), so the column is not compared with strings. A `where` filter must be one boolean expression that Rocky's filter rules accept; otherwise the test is dropped. Rocky reports any dropped test (`W055`).
 - **Materializations:** `table` becomes `full_refresh`, `view` stays a view, and `ephemeral` stays ephemeral. An `incremental` model goes through the same conversion as [`rocky import-dbt`](/guides/migrate-from-dbt/). Rocky reports one that does not stay incremental (`W055`).
 
 **rocky-packages.lock** records, for each package: the Hub name, the version requirement, the resolved version, the dbt version, the adapter, the target schema, the vars and their hash, the build mode, the compile time, the source tables, and a hash of every file Rocky wrote. Commit it with the models.
@@ -186,6 +186,8 @@ rocky package update stripe     # one package
 | Edited | Removed | Kept (`W055`) |
 | Deleted | Any | Written again |
 
+If a model Rocky vendored before no longer imports, `update` refuses (`E055`) and writes nothing, instead of deleting that model's files. `rocky package update` with no name updates packages in name order and stops at the first failure; the message names the packages it already updated.
+
 Merge an `.incoming` file by hand, then delete it. Rocky does not load `.incoming` files as models. The JSON output lists the models the update added and removed.
 
 ## List and remove
@@ -201,7 +203,29 @@ rocky package remove stripe
 
 Package models keep their dbt names. Rocky does not prefix or rename them, because your models read them by bare name. When a package model has the name of a project model or of another package's model, `add` and `update` refuse with `E055` and write nothing. Rename or remove the existing model, then try again.
 
+Rocky also refuses a package model that writes the same table as another model: the same `[target]` `catalog.schema.table`, ignoring case. That covers a project model with another name, and two models of the package itself.
+
 Rocky compares the name each model resolves to: the `name =` in its sidecar or frontmatter, else its file name. Names that differ only by case collide too, because warehouses fold unquoted names and some file systems ignore case. A package with two such models of its own is refused as well.
+
+## What Rocky refuses
+
+Before it writes anything, `add` and `update` check that the vendored models make a project `rocky compile` accepts. Each problem below refuses the package with `E055`:
+
+- A package model reads a model that was not vendored, for example one that failed to import.
+- A package model reads a dbt seed. Rocky does not vendor seeds.
+- A package model's SQL does not parse the way `rocky compile` parses it.
+
+A model that fails to import but that nothing reads is skipped with `W055`, and the rest are vendored.
+
+## How Rocky runs dbt
+
+The package's macros are third-party code, and dbt runs them. Rocky limits what they can reach:
+
+- **Environment.** dbt starts with an empty environment plus an allowlist: `PATH`, `HOME`, user and locale variables, temp directories, TLS and proxy settings, `GOOGLE_APPLICATION_CREDENTIALS`, `CLOUDSDK_CONFIG` and `DBT_PACKAGE_HUB_URL`. The credentials the generated profile needs are passed as `DBT_ENV_SECRET_ROCKY_*` variables, which dbt scrubs from its logs.
+- **Vars.** dbt renders vars through Jinja. Rocky refuses `{{`, `{%` and `{#` in a var, from `--vars` or from the lockfile. A var whose name looks like a credential (`api_key`, `stripe_token`, `db_password`) is refused unless you pass `--allow-secret-var`, because vars are stored in clear text in `rocky-packages.lock`.
+- **Timeout.** Each dbt step stops after 30 minutes. Change it with `--dbt-timeout <seconds>`.
+- **Files.** Rocky writes each vendored file to a temp file and renames it. It refuses to write or delete through a symlink under `models/packages/`.
+- **Paths.** A relative `--dbt`, Snowflake `private_key_path` or BigQuery `keyfile` is resolved against the directory you ran `rocky` in.
 
 ## Without dbt on the machine
 
@@ -213,7 +237,7 @@ rocky package add fivetran/stripe --compiled path/to/dbt-project
 
 `--compiled` reads `<dir>/target/manifest.json` and `<dir>/package-lock.yml`. Compile that project with `dbt run --empty --full-refresh` and then `dbt compile --full-refresh`. Use a warehouse with the same source table names. Rocky applies the same NULL-column check, so a project compiled without `dbt run --empty` is refused.
 
-To use a private dbt Hub mirror, set `DBT_PACKAGE_HUB_URL`. Rocky passes the environment through to dbt.
+To use a private dbt Hub mirror, set `DBT_PACKAGE_HUB_URL`. Rocky passes it through to dbt.
 
 ## Limits
 
@@ -224,6 +248,7 @@ To use a private dbt Hub mirror, set `DBT_PACKAGE_HUB_URL`. Rocky passes the env
 - **Two packages that share a model-carrying dependency** collide on that dependency's model names. Rocky refuses the second package.
 - **`--build-empty` writes to the warehouse.** It uses the adapter's real credentials, creates the `rocky_package_build*` schemas with empty relations, and runs the package's hooks. Rocky does not drop these schemas. Where that is not allowed, use `--compiled`.
 - **Vars are stored in plain text** in `rocky-packages.lock`. Do not pass secrets as `--vars`.
+- **Seeds are not vendored.** A package whose models read a dbt seed is refused.
 
 ## Reference
 
