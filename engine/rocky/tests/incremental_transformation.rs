@@ -153,7 +153,13 @@ fn append_loads_only_rows_past_the_target_watermark() {
     let m = materialization(&second);
     assert_eq!(m["metadata"]["watermark"], "2026-01-06T00:00:00Z");
     let notes = m["notes"].to_string();
-    assert!(notes.contains("updated_at > 2026-01-03"), "{notes}");
+    // The note names the comparison the SQL applied, and the watermark it
+    // started from.
+    assert!(
+        notes.contains("rows with updated_at > MAX(updated_at)"),
+        "{notes}"
+    );
+    assert!(notes.contains("was 2026-01-03"), "{notes}");
     // Appended: the two new rows and the new version of order 2. Orders 1
     // and 3 are not appended again.
     assert_eq!(
@@ -238,7 +244,14 @@ fn lookback_with_unique_key_catches_late_rows() {
         dir.path(),
         "INSERT INTO raw.orders VALUES (9, 19, 1.0, 'late', TIMESTAMP '2026-01-02 12:00:00');",
     );
-    run_ok(dir.path(), &[]);
+    let second = run_ok(dir.path(), &[]);
+    // B3: the note reports the lookback-adjusted bound the SQL applied, not
+    // a bare `updated_at > <prior MAX>`.
+    let notes = materialization(&second)["notes"].to_string();
+    assert!(
+        notes.contains("rows with updated_at > MAX(updated_at) - INTERVAL"),
+        "{notes}"
+    );
     assert!(
         target_rows(dir.path()).contains(&(9, "late".to_string())),
         "{:?}",

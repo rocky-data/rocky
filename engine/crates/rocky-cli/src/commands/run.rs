@@ -11645,6 +11645,20 @@ pub(crate) async fn execute_models_with_explicit_contracts(
         }
     };
 
+    // PostgreSQL accepts a column functionally dependent on a grouped primary
+    // key, which Rocky cannot see, so E044 is the warning W044 there — the
+    // same downgrade `rocky compile` applies. Redshift keeps E044.
+    if warehouse.dialect().name() == "postgres"
+        && rocky_compiler::group_by::downgrade_for_postgres(&mut compile_result.diagnostics, |_| {
+            true
+        }) > 0
+    {
+        compile_result.has_errors = compile_result
+            .diagnostics
+            .iter()
+            .any(rocky_compiler::diagnostic::Diagnostic::is_error);
+    }
+
     // `--model <function>` selects a user-defined function (`functions/`):
     // create it and the functions it calls, and build no model.
     if let Some(name) = model_name_filter
@@ -14826,17 +14840,13 @@ async fn execute_one_plain_model(
                 watermark = after.as_deref().and_then(parse_timestamp_cell);
                 let after = after.as_deref().unwrap_or("NULL (empty target)");
                 let note = match &incremental_run {
-                    Some(run) => {
-                        let before = run
-                            .prior_watermark
-                            .as_deref()
-                            .unwrap_or("NULL (empty target)");
-                        format!(
-                            "Incremental load of model '{model_name}': rows with \
-                             {timestamp_column} > {before} (target MAX before this run); \
-                             MAX({timestamp_column}) is now {after}"
-                        )
-                    }
+                    Some(run) => incremental_load_note(
+                        model_name,
+                        &model_ir,
+                        warehouse.dialect(),
+                        run.prior_watermark.as_deref(),
+                        after,
+                    ),
                     None => format!(
                         "Full load of model '{model_name}' into {target_ref}; \
                          MAX({timestamp_column}) is now {after}"
@@ -14912,6 +14922,38 @@ async fn execute_one_plain_model(
         // Consumer baseline is content-addressed-path only.
         consumed_column_baseline: None,
     })
+}
+
+/// The run note for an incremental load against an existing target. The
+/// comparison comes from [`rocky_core::incremental_filter::predicate_summary`],
+/// the same resolution the SQL uses, so `filter_column` and `lookback` show
+/// as they were applied.
+fn incremental_load_note(
+    model_name: &str,
+    model_ir: &rocky_ir::ModelIr,
+    dialect: &dyn rocky_core::traits::SqlDialect,
+    prior_watermark: Option<&str>,
+    after: &str,
+) -> String {
+    let before = prior_watermark.unwrap_or("NULL (empty target)");
+    let timestamp_column = match &model_ir.materialization {
+        rocky_ir::MaterializationStrategy::Incremental {
+            timestamp_column, ..
+        } => timestamp_column.as_str(),
+        _ => "",
+    };
+    match rocky_core::incremental_filter::predicate_summary(model_ir, dialect) {
+        Ok(p) => format!(
+            "Incremental load of model '{model_name}': rows with {} > {} over the target, \
+             where MAX({timestamp_column}) was {before} before this run; \
+             MAX({timestamp_column}) is now {after}",
+            p.compared, p.bound
+        ),
+        Err(e) => format!(
+            "Incremental load of model '{model_name}' (filter could not be described: {e}); \
+             MAX({timestamp_column}) was {before} before this run and is now {after}"
+        ),
+    }
 }
 
 /// Execute one `type = "snapshot"` model (SCD Type 2 over the model SELECT).
@@ -17894,6 +17936,78 @@ fn post_copy_column_match(
 
 #[cfg(test)]
 mod tests {
+
+    /// B3: the run note reports the predicate the SQL applied — the
+    /// `filter_column` and the lookback-adjusted bound — not a bare
+    /// `<timestamp_column> > <prior MAX>`.
+    #[cfg(feature = "duckdb")]
+    #[test]
+    fn incremental_note_reports_filter_column_and_lookback() {
+        use rocky_ir::{
+            GovernanceConfig, IncrementalLookback, LookbackUnit, MaterializationStrategy, ModelIr,
+            TargetRef,
+        };
+        let model_ir = ModelIr::transformation(
+            TargetRef {
+                catalog: String::new(),
+                schema: "main".into(),
+                table: "fct".into(),
+            },
+            MaterializationStrategy::Incremental {
+                timestamp_column: "updated_at".into(),
+                unique_key: Vec::new(),
+                lookback: Some(IncrementalLookback {
+                    amount: 2,
+                    unit: LookbackUnit::Day,
+                }),
+                filter_column: Some("o.loaded_at".into()),
+            },
+            vec![],
+            "SELECT o.id, o.updated_at FROM raw.orders o WHERE @incremental_filter".into(),
+            GovernanceConfig {
+                permissions_file: None,
+                auto_create_catalogs: false,
+                auto_create_schemas: false,
+            },
+            None,
+            None,
+        );
+        let dialect = rocky_duckdb::dialect::DuckDbSqlDialect;
+        let note = super::incremental_load_note(
+            "fct",
+            &model_ir,
+            &dialect,
+            Some("2026-01-05 00:00:00"),
+            "2026-01-06 00:00:00",
+        );
+        let summary =
+            rocky_core::incremental_filter::predicate_summary(&model_ir, &dialect).unwrap();
+        assert!(
+            note.contains(&format!("rows with o.loaded_at > {}", summary.bound)),
+            "{note}"
+        );
+        assert!(
+            summary.bound.contains('2'),
+            "lookback in the bound: {}",
+            summary.bound
+        );
+        assert!(!note.contains("rows with updated_at > 2026"), "{note}");
+        assert!(note.contains("2026-01-05 00:00:00"), "{note}");
+        // The note's comparison is the one the SQL applies.
+        let sql = rocky_core::incremental_filter::incremental_select(
+            &model_ir,
+            &dialect,
+            rocky_core::incremental_filter::FilterMode::SinceTarget { target: "main.fct" },
+        )
+        .unwrap();
+        assert!(
+            sql.contains(&format!(
+                "o.loaded_at > (SELECT {} FROM main.fct)",
+                summary.bound
+            )),
+            "{sql}"
+        );
+    }
 
     #[test]
     fn timestamp_column_match_accepts_folded_snowflake_names_and_rejects_absence() {
