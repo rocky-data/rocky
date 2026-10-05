@@ -2098,6 +2098,11 @@ async fn custody_chain(
 struct AuditQuery {
     /// A product name: list only the rows about its output model.
     product: Option<String>,
+    /// A principal id: list only that actor's rows (`unrecorded` lists the
+    /// rows with no id). Same grammar as `rocky audit --actor`.
+    actor: Option<String>,
+    /// An inclusive lower bound, in any shape `rocky audit --since` accepts.
+    since: Option<String>,
 }
 
 /// The three ways a ledger lookup can end, decided on the blocking side so
@@ -2122,10 +2127,19 @@ enum AuditLookup {
 /// only and needs no bound config. A name that is not a bare identifier, or
 /// has no spec file, is `404 product_not_found`; a spec the loader rejects is
 /// `409 product_spec_invalid` with the loader's code and reason.
+///
+/// `?actor=<id>&since=<when>` filter exactly as `rocky audit --actor --since`
+/// do, and compose with `?product`. A malformed value is `400 bad_request`.
 async fn audit_ledger(
     State(state): State<Arc<ServerState>>,
     ApiQuery(query): ApiQuery<AuditQuery>,
 ) -> Result<PrettyJson<AuditOutput>, ApiError> {
+    let filter = crate::commands::audit::AuditQuery::parse(
+        query.actor.as_deref(),
+        query.since.as_deref(),
+        chrono::Utc::now(),
+    )
+    .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
     let product_name = query.product.clone().unwrap_or_default();
     let scope = match query.product {
         None => None,
@@ -2155,7 +2169,8 @@ async fn audit_ledger(
                 }
             },
         };
-        compute_audit(&state_path, product).map(|output| AuditLookup::Found(Box::new(output)))
+        compute_audit(&state_path, product, &filter)
+            .map(|output| AuditLookup::Found(Box::new(output)))
     })
     .await?
     .map_err(|e| map_state_err(e, state.mutation_permit.running_job()))?;
@@ -5452,7 +5467,7 @@ mod tests {
         let text = resp.text().await.unwrap();
         assert_eq!(
             text,
-            reference_bytes(&compute_audit(&state_path, None).unwrap())
+            reference_bytes(&compute_audit(&state_path, None, &crate::commands::audit::AuditQuery::default()).unwrap())
         );
         let whole: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert!(whole.get("product").is_none(), "{text}");
@@ -5466,7 +5481,7 @@ mod tests {
         let scope = resolve_product_scope(&root, "revenue_daily").unwrap();
         assert_eq!(
             text,
-            reference_bytes(&compute_audit(&state_path, Some(scope)).unwrap())
+            reference_bytes(&compute_audit(&state_path, Some(scope), &crate::commands::audit::AuditQuery::default()).unwrap())
         );
         let scoped: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(scoped["product"]["output_model"], "revenue_daily");
@@ -5582,7 +5597,7 @@ mod tests {
         assert_eq!(resp.status(), 200);
         assert_eq!(
             resp.text().await.unwrap(),
-            reference_bytes(&compute_audit(&state_path, None).unwrap())
+            reference_bytes(&compute_audit(&state_path, None, &crate::commands::audit::AuditQuery::default()).unwrap())
         );
 
         let resp = reqwest::get(format!("{base}/api/v1/audit?product=revenue_daily"))
@@ -8029,6 +8044,7 @@ mod tests {
             Some("model=fct_*".to_string()),
             Some("incident 42".to_string()),
             false,
+            &rocky_core::config::PrincipalRef::unnamed(),
             true,
         )
         .unwrap();

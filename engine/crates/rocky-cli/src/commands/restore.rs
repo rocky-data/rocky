@@ -256,10 +256,11 @@ pub fn run_restore_plan(
     state_path: &Path,
     target: &str,
     principal: PolicyPrincipal,
+    actor: &rocky_core::config::PrincipalRef,
     json: bool,
 ) -> Result<()> {
     let cwd = std::env::current_dir().context("failed to get current working directory")?;
-    run_restore_plan_in(&cwd, state_path, target, principal, json)
+    run_restore_plan_in(&cwd, state_path, target, principal, actor, json)
 }
 
 /// Inner implementation — takes an explicit `root` for the plans directory so
@@ -269,6 +270,7 @@ pub(crate) fn run_restore_plan_in(
     state_path: &Path,
     target: &str,
     principal: PolicyPrincipal,
+    actor: &rocky_core::config::PrincipalRef,
     json: bool,
 ) -> Result<()> {
     let (tombstones, live_artifacts) = {
@@ -316,6 +318,7 @@ pub(crate) fn run_restore_plan_in(
         state_path,
         &plan_id,
         principal,
+        actor,
         PolicyCapability::Restore,
         &format!(
             "restore: {} ({}…)",
@@ -951,6 +954,7 @@ pub(crate) async fn run_restore_apply_in(
     plan_id: &str,
     state_path: &Path,
     runtime_principal: PolicyPrincipal,
+    actor: &rocky_core::config::PrincipalRef,
     json: bool,
 ) -> Result<()> {
     // Re-derivation runs on the RECORDING engine — the project's configured
@@ -987,6 +991,7 @@ pub(crate) async fn run_restore_apply_in(
         plan_id,
         state_path,
         runtime_principal,
+        actor,
         json,
         Arc::new(S3RestoreStores),
         warehouse,
@@ -1006,6 +1011,7 @@ pub(crate) async fn run_restore_apply_in_with(
     plan_id: &str,
     state_path: &Path,
     runtime_principal: PolicyPrincipal,
+    actor: &rocky_core::config::PrincipalRef,
     json: bool,
     stores: Arc<dyn RestoreStores>,
     warehouse: Arc<dyn rocky_core::traits::WarehouseAdapter>,
@@ -1021,6 +1027,7 @@ pub(crate) async fn run_restore_apply_in_with(
         plan_id,
         state_path,
         runtime_principal,
+        actor,
         stores,
         warehouse,
         loaded_cfg,
@@ -1041,6 +1048,7 @@ struct RegateFence {
     cfg: rocky_core::config::RockyConfig,
     plan_id: String,
     principal: PolicyPrincipal,
+    actor: rocky_core::config::PrincipalRef,
     touched: BTreeMap<String, PolicyCapability>,
     models_dir: std::path::PathBuf,
     models_glob: Option<String>,
@@ -1055,6 +1063,7 @@ impl ObjectWriteFence for RegateFence {
             Some(&self.cfg),
             &self.plan_id,
             self.principal,
+            &self.actor,
             &self.touched,
             &self.models_dir,
             self.models_glob.as_deref(),
@@ -1076,6 +1085,7 @@ pub(crate) async fn restore_apply_output(
     plan_id: &str,
     state_path: &Path,
     runtime_principal: PolicyPrincipal,
+    actor: &rocky_core::config::PrincipalRef,
     stores: Arc<dyn RestoreStores>,
     warehouse: Arc<dyn rocky_core::traits::WarehouseAdapter>,
     loaded_cfg: Option<rocky_core::config::RockyConfig>,
@@ -1147,6 +1157,7 @@ pub(crate) async fn restore_apply_output(
         loaded_cfg.as_ref().and_then(|c| c.policy.as_ref()),
         plan_id,
         plan_record.enforcement_principal(runtime_principal),
+        actor,
         &touched,
         &models_dir,
         models_glob.as_deref(),
@@ -1214,6 +1225,7 @@ pub(crate) async fn restore_apply_output(
     let seam_touched = touched.clone();
     let seam_models_dir = models_dir.clone();
     let seam_models_glob = models_glob.clone();
+    let seam_actor = actor.clone();
     let seam_written = Arc::clone(&written_paths);
     let exec_result = crate::commands::apply::commit_remote_ledger_seam(
         remote_cfg,
@@ -1226,6 +1238,7 @@ pub(crate) async fn restore_apply_output(
             let touched = seam_touched.clone();
             let models_dir = seam_models_dir.clone();
             let models_glob = seam_models_glob.clone();
+            let actor = seam_actor.clone();
             let stores = Arc::clone(&stores);
             let warehouse = Arc::clone(&warehouse);
             let written = Arc::clone(&seam_written);
@@ -1242,6 +1255,7 @@ pub(crate) async fn restore_apply_output(
                     Some(&cfg),
                     &plan_id,
                     principal,
+                    &actor,
                     &touched,
                     &models_dir,
                     models_glob.as_deref(),
@@ -1254,6 +1268,7 @@ pub(crate) async fn restore_apply_output(
                     cfg: cfg.clone(),
                     plan_id: plan_id.clone(),
                     principal,
+                    actor: actor.clone(),
                     touched: touched.clone(),
                     models_dir: models_dir.clone(),
                     models_glob: models_glob.clone(),
@@ -1292,6 +1307,7 @@ pub(crate) async fn restore_apply_output(
                     Some(&cfg),
                     &plan_id,
                     principal,
+                    &actor,
                     &touched,
                     &models_dir,
                     models_glob.as_deref(),

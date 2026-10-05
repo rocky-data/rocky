@@ -1262,6 +1262,7 @@ fn build_queue(
                 decision_ref: format!("{}|{}|{}", d.timestamp.to_rfc3339(), d.plan_id, d.model),
                 timestamp: d.timestamp.to_rfc3339(),
                 principal: d.principal,
+                principal_id: d.principal_ref.as_ref().map(|r| r.id.to_string()),
                 capability: d.capability,
                 model: d.model.clone(),
                 models,
@@ -1424,6 +1425,7 @@ pub(crate) fn record_plan_review_escalation(
     state_path: &Path,
     plan_id: &str,
     principal: PolicyPrincipal,
+    actor: &rocky_core::config::PrincipalRef,
     capability: PolicyCapability,
     model_summary: &str,
     models: Vec<String>,
@@ -1443,6 +1445,7 @@ pub(crate) fn record_plan_review_escalation(
         reason: reason.to_string(),
         verify_after: Vec::new(),
         auto_apply: None,
+        principal_ref: Some(actor.clone()),
     };
     let written = StateStore::open(state_path).and_then(|s| s.record_policy_decision(&record));
     if let Err(e) = written {
@@ -1506,6 +1509,14 @@ fn render_queue_text(out: &ReviewQueueOutput) {
             .ok()
             .and_then(|v| v.as_str().map(str::to_string))
             .unwrap_or_default();
+        // `class(id)`, e.g. `agent(mcp-worker)`; a row from before ids
+        // existed reads `human(unrecorded)`.
+        let principal = format!(
+            "{principal}({})",
+            e.principal_id
+                .as_deref()
+                .unwrap_or(rocky_core::config::PRINCIPAL_ID_UNRECORDED)
+        );
         println!(
             "  {}. {} ({}) — {}, waited {}s [score {:.1}]",
             i + 1,

@@ -1421,6 +1421,7 @@ pub async fn run_compact_apply(
     plan_id: &str,
     state_path: &Path,
     runtime_principal: rocky_core::config::PolicyPrincipal,
+    actor: &rocky_core::config::PrincipalRef,
     output_json: bool,
 ) -> Result<()> {
     let cwd = std::env::current_dir().context("failed to get current working directory")?;
@@ -1430,6 +1431,7 @@ pub async fn run_compact_apply(
         plan_id,
         state_path,
         runtime_principal,
+        actor,
         output_json,
     )
     .await
@@ -1459,6 +1461,7 @@ pub(crate) async fn run_compact_apply_alias_in(
     plan_id: &str,
     state_path: &Path,
     runtime_principal: rocky_core::config::PolicyPrincipal,
+    actor: &rocky_core::config::PrincipalRef,
     output_json: bool,
 ) -> Result<()> {
     refuse_product_bound_compact_alias(root, plan_id)?;
@@ -1468,6 +1471,7 @@ pub(crate) async fn run_compact_apply_alias_in(
         plan_id,
         state_path,
         runtime_principal,
+        actor,
         output_json,
     )
     .await
@@ -1488,6 +1492,7 @@ async fn prepare_compact_apply(
     plan_id: &str,
     state_path: &Path,
     runtime_principal: rocky_core::config::PolicyPrincipal,
+    actor: &rocky_core::config::PrincipalRef,
 ) -> Result<(rocky_core::config::RockyConfig, Vec<NamedStatement>)> {
     let plan = read_plan(root, plan_id)
         .with_context(|| format!("failed to read compact plan '{plan_id}'"))?;
@@ -1557,6 +1562,7 @@ async fn prepare_compact_apply(
         config_path,
         state_path,
         runtime_principal,
+        actor,
         &touched,
     )
     .await?;
@@ -1579,6 +1585,7 @@ pub(crate) async fn run_compact_apply_in(
     plan_id: &str,
     state_path: &Path,
     runtime_principal: rocky_core::config::PolicyPrincipal,
+    actor: &rocky_core::config::PrincipalRef,
     output_json: bool,
 ) -> Result<()> {
     let (rocky_cfg, statements) =
@@ -1717,6 +1724,7 @@ pub(crate) async fn run_compact_apply_in_with(
     plan_id: &str,
     state_path: &Path,
     runtime_principal: rocky_core::config::PolicyPrincipal,
+    actor: &rocky_core::config::PrincipalRef,
     output_json: bool,
     adapter: &dyn WarehouseAdapter,
 ) -> Result<()> {
@@ -1738,6 +1746,7 @@ pub(crate) async fn run_compact_apply_alias_in_with(
     plan_id: &str,
     state_path: &Path,
     runtime_principal: rocky_core::config::PolicyPrincipal,
+    actor: &rocky_core::config::PrincipalRef,
     output_json: bool,
     adapter: &dyn WarehouseAdapter,
 ) -> Result<()> {
@@ -1748,6 +1757,7 @@ pub(crate) async fn run_compact_apply_alias_in_with(
         plan_id,
         state_path,
         runtime_principal,
+        actor,
         output_json,
         adapter,
     )

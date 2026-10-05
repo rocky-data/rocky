@@ -98,6 +98,7 @@ pub async fn run_fulfill(
     state_path: &Path,
     product: &str,
     retry: bool,
+    actor: &rocky_core::config::PrincipalRef,
     output_json: bool,
 ) -> Result<()> {
     let root = std::env::current_dir().context("failed to get current working directory")?;
@@ -111,6 +112,7 @@ pub async fn run_fulfill(
         product: product.to_string(),
         store: StoreDriver::open(state_path, product)?,
         cfg,
+        actor: actor.clone(),
     };
 
     let me = crate::store::self_identity()?;
@@ -196,6 +198,9 @@ struct Runner {
     product: String,
     store: StoreDriver,
     cfg: RockyConfig,
+    /// Who drives the loop (RV4-P1), stamped on the decision rows its
+    /// propose and apply write. They are still gated as `agent`.
+    actor: rocky_core::config::PrincipalRef,
 }
 
 impl Runner {
@@ -720,6 +725,7 @@ impl Runner {
                 spec_digest: spec.digest.clone(),
             }),
             idempotency_key: Some(idempotency_key.clone()),
+            actor: &self.actor,
         };
         let outcome = match fulfill_api::propose_governed_run_plan(request).await {
             Ok(outcome) => outcome,
@@ -839,6 +845,7 @@ impl Runner {
             plan_id,
             &self.state_path,
             PolicyPrincipal::Agent,
+            &self.actor,
             Some(&expect),
             false,
         )

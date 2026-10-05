@@ -2955,6 +2955,8 @@ pub async fn run(
     governed_ctx: Option<&crate::commands::apply::GovernedRunContext<'_>>,
     assume_fresh_state: bool,
     reviewed_source_state: Option<(&str, &[crate::output::ReplicationConnectorSnapshot])>,
+    // Who is running (RV4-P1). Stamped on the drift auto-apply custody rows.
+    actor: &rocky_core::config::PrincipalRef,
 ) -> Result<RunTermination> {
     run_with_explicit_contracts(
         config_path,
@@ -2982,6 +2984,7 @@ pub async fn run(
         assume_fresh_state,
         reviewed_source_state,
         None,
+        actor,
     )
     .await
 }
@@ -3077,6 +3080,10 @@ pub async fn run_with_explicit_contracts(
     // which keeps the filter-scope tolerance identical.
     reviewed_source_state: Option<(&str, &[crate::output::ReplicationConnectorSnapshot])>,
     contracts_dir: Option<&Path>,
+    // Who is running (RV4-P1). Stamped on the drift auto-apply custody rows
+    // (`DriftGovernor`, `finalize_drift_verify_after`). A label only: the
+    // custody rows are still evaluated as the `agent` class.
+    actor: &rocky_core::config::PrincipalRef,
 ) -> Result<RunTermination> {
     // Refuse a broken Dagster Pipes launch before an idempotency claim, state
     // session, hook, or warehouse statement can run.
@@ -5601,6 +5608,7 @@ pub async fn run_with_explicit_contracts(
                         // The run-entry durable freeze-marker projection — a
                         // marker-only freeze must refuse auto-apply too.
                         &entry_marker_freezes,
+                        actor,
                     ),
                 });
             }
@@ -7445,6 +7453,7 @@ pub async fn run_with_explicit_contracts(
         state_store.as_ref(),
         &run_id,
         rocky_cfg.policy.as_ref(),
+        actor,
     );
     if let Err(custody_err) = &verify_after_result {
         output.tables_failed += 1;
@@ -17580,6 +17589,7 @@ max_retries = 0
                 None,
                 false,
                 None,
+                &rocky_core::config::PrincipalRef::unnamed(),
             )
             .await
         })
@@ -17751,6 +17761,7 @@ max_retries = 0
                 None,
                 false,
                 None,
+                &rocky_core::config::PrincipalRef::unnamed(),
             )
             .await
         })
@@ -17964,6 +17975,7 @@ max_retries = 0
                 if governed { Some(&ctx) } else { None },
                 false,
                 None,
+                &rocky_core::config::PrincipalRef::unnamed(),
             )
             .await
         })
@@ -20913,6 +20925,7 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
             None,
             false,
             None,
+            &rocky_core::config::PrincipalRef::unnamed(),
         )
         .await
         .map(|_| ())
@@ -21154,6 +21167,7 @@ auto_create_schemas = true
                 None,
                 false,
                 None,
+                &rocky_core::config::PrincipalRef::unnamed(),
             )
             .await
             .expect_err(label);
@@ -21244,6 +21258,7 @@ auto_create_schemas = true
                 None,
                 false,
                 None,
+                &rocky_core::config::PrincipalRef::unnamed(),
             )
             .await
             .expect_err(label);
@@ -21295,6 +21310,7 @@ auto_create_schemas = true
             None,
             false,
             None,
+            &rocky_core::config::PrincipalRef::unnamed(),
         )
         .await
         .expect_err("replication shadow must not claim a model production target");
@@ -21355,6 +21371,7 @@ auto_create_schemas = true
             None,
             false,
             None,
+            &rocky_core::config::PrincipalRef::unnamed(),
         )
         .await
         .expect_err("catalogless replication shadow aliases the model's production target");
@@ -23657,6 +23674,7 @@ auto_create_schemas = true
             None,
             false,
             Some(("plan-under-test", reviewed.as_slice())),
+            &rocky_core::config::PrincipalRef::unnamed(),
         )
         .await
         .expect_err("a reviewed state that does not match discovery must refuse");
@@ -23811,6 +23829,7 @@ threshold = 0
             None,
             false,
             None,
+            &rocky_core::config::PrincipalRef::unnamed(),
         )
         .await
         .expect_err("a check-name collision must refuse the run before copying anything");
@@ -23933,6 +23952,7 @@ adapter = "default"
             None,  // no governance ctx (test)
             false, // assume_fresh_state (test)
             None,  // #1460
+            &rocky_core::config::PrincipalRef::unnamed(),
         )
         .await
         .expect("transformation run should succeed");
@@ -24131,6 +24151,7 @@ adapter = "default"
                     None,
                     false,
                     None,
+                    &rocky_core::config::PrincipalRef::unnamed(),
                 )
                 .await;
                 let commit_path =
@@ -24309,6 +24330,7 @@ adapter = "default"
             None,
             false,
             None,
+            &rocky_core::config::PrincipalRef::unnamed(),
         )
         .await;
         assert!(result.is_err(), "the model write must fail: {failure}");
@@ -24548,6 +24570,7 @@ schema_template = "staging__{{source}}"
             None,
             false,
             None,
+            &rocky_core::config::PrincipalRef::unnamed(),
         )
         .await;
         assert!(result.is_err(), "the model write must fail: {failure}");
@@ -24682,6 +24705,7 @@ adapter = "default"
                 None,
                 false,
                 None, // #1460
+                &rocky_core::config::PrincipalRef::unnamed(),
             ))
             .expect("the run must succeed regardless of the trace context");
         }
@@ -24832,6 +24856,7 @@ schema = "mart"
             None,  // no governance ctx (test)
             false, // assume_fresh_state (test)
             None,  // #1460
+            &rocky_core::config::PrincipalRef::unnamed(),
         )
         .await
         .expect(
@@ -28755,6 +28780,7 @@ timestamp_column = "ts"
                 None,
                 false,
                 None, // #1460
+                &rocky_core::config::PrincipalRef::unnamed(),
             )
             .await
         }
@@ -28890,6 +28916,7 @@ backend = "local"
                 None,
                 false,
                 None, // #1460
+                &rocky_core::config::PrincipalRef::unnamed(),
             )
             .await
             .map(|_| ())
@@ -42218,6 +42245,7 @@ value = "'{source}'"
                 None,
                 false,
                 None,
+                &rocky_core::config::PrincipalRef::unnamed(),
             )
             .await
         }
@@ -43831,6 +43859,7 @@ auto_create_schemas = true
             None,
             false,
             None,
+            &rocky_core::config::PrincipalRef::unnamed(),
         )
         .await
         .map(|_| ());
@@ -45770,6 +45799,7 @@ timestamp_column = "ts"
             if governed { Some(&ctx) } else { None },
             false,
             None,
+            &rocky_core::config::PrincipalRef::unnamed(),
         )
         .await
         .map(|_| ())

@@ -1987,6 +1987,7 @@ pub async fn run_branch_promote(
     skip_approval_flag: bool,
     allow_breaking: bool,
     runtime_principal: rocky_core::config::PolicyPrincipal,
+    actor: &rocky_core::config::PrincipalRef,
     json: bool,
 ) -> Result<()> {
     use crate::plan_store::read_plan;
@@ -2020,6 +2021,7 @@ pub async fn run_branch_promote(
         allow_breaking,
         state_path,
         runtime_principal,
+        actor,
     )
     .await
     {
@@ -2067,6 +2069,7 @@ pub async fn run_branch_promote(
         config_path,
         &plan_id,
         persisted.enforcement_principal(runtime_principal),
+        actor,
         &promote_plan,
         state_path,
     )?;
@@ -2388,6 +2391,7 @@ pub async fn run_branch_promote_from_plan(
     pipeline_name: Option<&str>,
     state_path: &Path,
     runtime_principal: rocky_core::config::PolicyPrincipal,
+    actor: &rocky_core::config::PrincipalRef,
     json: bool,
 ) -> Result<()> {
     use crate::output::{AuditEvent, AuditEventKind, PromotePlan, print_json};
@@ -2470,6 +2474,7 @@ pub async fn run_branch_promote_from_plan(
         config_path,
         plan_id,
         plan.enforcement_principal(runtime_principal),
+        actor,
         &promote_plan,
         state_path,
     )?;
@@ -4856,6 +4861,7 @@ adapter = "default"
             None,
             false,
             None,
+            &rocky_core::config::PrincipalRef::unnamed(),
         )
         .await?;
         Ok(())

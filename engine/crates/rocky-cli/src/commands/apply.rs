@@ -38,7 +38,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use anyhow::{Context, Result, bail};
-use rocky_core::config::{PolicyCapability, PolicyEffect, PolicyPrincipal, StateBackend};
+use rocky_core::config::{
+    PolicyCapability, PolicyEffect, PolicyPrincipal, PrincipalRef, StateBackend,
+};
 use rocky_core::policy::{self, ModelAttributes};
 use rocky_core::schema::SchemaPattern;
 use rocky_core::secret_registry::render_placeholders;
@@ -71,6 +73,7 @@ pub async fn run_apply(
     plan_id: &str,
     state_path: &Path,
     runtime_principal: PolicyPrincipal,
+    actor: &PrincipalRef,
     expect_spec_digest: Option<&str>,
     output_json: bool,
 ) -> Result<()> {
@@ -81,6 +84,7 @@ pub async fn run_apply(
         plan_id,
         state_path,
         runtime_principal,
+        actor,
         expect_spec_digest,
         output_json,
     )
@@ -101,6 +105,7 @@ pub(crate) async fn run_apply_in(
     plan_id: &str,
     state_path: &Path,
     runtime_principal: PolicyPrincipal,
+    actor: &PrincipalRef,
     expect_spec_digest: Option<&str>,
     output_json: bool,
 ) -> Result<()> {
@@ -110,6 +115,7 @@ pub(crate) async fn run_apply_in(
         plan_id,
         state_path,
         runtime_principal,
+        actor,
         expect_spec_digest,
         output_json,
     )
@@ -129,6 +135,7 @@ pub(crate) async fn run_apply_core_in(
     plan_id: &str,
     state_path: &Path,
     runtime_principal: PolicyPrincipal,
+    actor: &PrincipalRef,
     expect_spec_digest: Option<&str>,
     output_json: bool,
 ) -> Result<ApplyOutcome> {
@@ -155,6 +162,7 @@ pub(crate) async fn run_apply_core_in(
                 plan_id,
                 state_path,
                 runtime_principal,
+                actor,
                 output_json,
             )
             .await
@@ -169,6 +177,7 @@ pub(crate) async fn run_apply_core_in(
                 plan_id,
                 state_path,
                 runtime_principal,
+                actor,
                 output_json,
             )
             .await
@@ -181,6 +190,7 @@ pub(crate) async fn run_apply_core_in(
                 plan_id,
                 state_path,
                 runtime_principal,
+                actor,
                 output_json,
             )
             .await
@@ -192,6 +202,7 @@ pub(crate) async fn run_apply_core_in(
                 plan_id,
                 state_path,
                 runtime_principal,
+                actor,
                 output_json,
             )
             .await
@@ -202,6 +213,7 @@ pub(crate) async fn run_apply_core_in(
             plan_id,
             state_path,
             runtime_principal,
+            actor,
             output_json,
         )
         .await
@@ -213,6 +225,7 @@ pub(crate) async fn run_apply_core_in(
                 plan_id,
                 state_path,
                 runtime_principal,
+                actor,
                 output_json,
             )
             .await
@@ -224,6 +237,7 @@ pub(crate) async fn run_apply_core_in(
                 plan_id,
                 state_path,
                 runtime_principal,
+                actor,
                 output_json,
             )
             .await
@@ -234,6 +248,7 @@ pub(crate) async fn run_apply_core_in(
             plan_id,
             state_path,
             runtime_principal,
+            actor,
             output_json,
         )
         .await
@@ -244,6 +259,7 @@ pub(crate) async fn run_apply_core_in(
             plan_id,
             state_path,
             runtime_principal,
+            actor,
             output_json,
         )
         .await
@@ -439,6 +455,7 @@ async fn run_apply_run_plan(
     plan_id: &str,
     state_path: &Path,
     runtime_principal: PolicyPrincipal,
+    actor: &rocky_core::config::PrincipalRef,
     output_json: bool,
 ) -> Result<ApplyOutcome> {
     let plan =
@@ -512,6 +529,7 @@ async fn run_apply_run_plan(
         loaded.config.policy.as_ref(),
         plan_id,
         principal,
+        actor,
         &touched,
         &models_dir,
         models_glob.as_deref(),
@@ -544,6 +562,7 @@ async fn run_apply_run_plan(
             root,
             plan_id,
             principal,
+            actor,
             &touched,
             &models_dir,
             models_glob.as_deref(),
@@ -562,6 +581,7 @@ async fn run_apply_run_plan(
     let governed = governed_run_context(
         &plan,
         principal,
+        actor,
         plan_id,
         root,
         config_path,
@@ -576,6 +596,7 @@ async fn run_apply_run_plan(
         output_json,
         &apply_run_id,
         governed.as_ref(),
+        actor,
     )
     .await;
     let termination = match termination {
@@ -585,6 +606,7 @@ async fn run_apply_run_plan(
                 finish_apply_verify_after(
                     plan_id,
                     principal,
+                    actor,
                     verify_checks,
                     &apply_run_id,
                     state_path,
@@ -599,6 +621,7 @@ async fn run_apply_run_plan(
     finish_apply_verify_after(
         plan_id,
         principal,
+        actor,
         verify_checks,
         &apply_run_id,
         state_path,
@@ -689,6 +712,7 @@ fn validate_run_plan_execution_shape(plan_id: &str, run_plan: &RunPlan) -> Resul
 async fn finish_apply_verify_after(
     plan_id: &str,
     principal: PolicyPrincipal,
+    actor: &PrincipalRef,
     mut verify_checks: Vec<String>,
     apply_run_id: &str,
     state_path: &Path,
@@ -703,7 +727,14 @@ async fn finish_apply_verify_after(
 
     if remote_ledger_config(Some(cfg)).is_none() {
         // Local backend: the on-disk file IS the state.
-        return run_verify_after(plan_id, principal, &verify_checks, apply_run_id, state_path);
+        return run_verify_after(
+            plan_id,
+            principal,
+            actor,
+            &verify_checks,
+            apply_run_id,
+            state_path,
+        );
     }
     if verify_checks.is_empty() {
         return Ok(());
@@ -716,7 +747,7 @@ async fn finish_apply_verify_after(
     let verdict = {
         let store = open_ledger_with_retry(state_path)
             .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
-        evaluate_verify_after(&store, plan_id, principal, &verify_checks, apply_run_id)?
+        evaluate_verify_after(&store, plan_id, principal, actor, &verify_checks, apply_run_id)?
     };
     commit_verify_after_custody(Some(cfg), state_path, &verdict.record).await?;
     verdict.into_result(plan_id, &verify_checks)
@@ -751,6 +782,7 @@ async fn verify_after_despite_lost_record(
 fn governed_run_context<'a>(
     plan: &PersistedPlan,
     principal: PolicyPrincipal,
+    actor: &PrincipalRef,
     plan_id: &'a str,
     root: &'a Path,
     config_path: &'a Path,
@@ -764,6 +796,7 @@ fn governed_run_context<'a>(
     let embedded = plan.embedded_capabilities();
     Some(GovernedRunContext {
         principal,
+        actor: actor.clone(),
         plan_id,
         root,
         config_path,
@@ -899,6 +932,8 @@ async fn execute_run_plan(
     // Governance context (agent apply): the in-run TOCTOU models-drift reject +
     // post-discovery replication gate. `None` for a human apply.
     governed_ctx: Option<&GovernedRunContext<'_>>,
+    // Who is applying (RV4-P1), handed to `run()` for its custody rows.
+    actor: &PrincipalRef,
 ) -> Result<crate::commands::run::RunTermination> {
     // ‼️ Finding #2/#1: preflight the reviewed source-schema snapshot BEFORE any
     // warehouse mutation — this path executes models (and, for a replication
@@ -1022,6 +1057,7 @@ async fn execute_run_plan(
             // explicit — that changes the plan's contract and its `plan_id`
             // hash, so it is tracked separately rather than done here.
             crate::commands::run_dag_exec::replayed_node_concurrency(run_plan.parallel),
+            actor,
         )
         .await
         .with_context(|| format!("rocky apply run plan '{plan_id}' failed (dag path)"))
@@ -1125,6 +1161,7 @@ async fn execute_run_plan(
         // a persisted plan — the two-step apply path always runs without it.
         false,
         None, // #1460: not a replication plan
+        actor,
     )
     .await
     .with_context(|| format!("rocky apply run plan '{plan_id}' failed"))
@@ -1648,6 +1685,7 @@ async fn commit_governed_rule_decision(
     root: &Path,
     plan_id: &str,
     principal: PolicyPrincipal,
+    actor: &PrincipalRef,
     touched: &BTreeMap<String, PolicyCapability>,
     models_dir: &Path,
     models_glob: Option<&str>,
@@ -1665,6 +1703,7 @@ async fn commit_governed_rule_decision(
     let seam_touched = touched.clone();
     let seam_models_dir = models_dir.to_path_buf();
     let seam_models_glob = models_glob.map(str::to_string);
+    let seam_actor = actor.clone();
     commit_remote_ledger_seam(
         cfg,
         state_path,
@@ -1676,6 +1715,7 @@ async fn commit_governed_rule_decision(
             let touched = seam_touched.clone();
             let models_dir = seam_models_dir.clone();
             let models_glob = seam_models_glob.clone();
+            let actor = seam_actor.clone();
             Box::pin(async move {
                 let marker_freezes = marker_freezes_before_gate(&cfg, &touched)
                     .await
@@ -1684,6 +1724,7 @@ async fn commit_governed_rule_decision(
                     cfg.policy.as_ref(),
                     &plan_id,
                     principal,
+                    &actor,
                     &touched,
                     &models_dir,
                     models_glob.as_deref(),
@@ -1759,6 +1800,7 @@ pub fn evaluate_apply_policy(
     config_path: &Path,
     plan_id: &str,
     principal: PolicyPrincipal,
+    actor: &PrincipalRef,
     touched: &BTreeMap<String, PolicyCapability>,
     models_dir: &Path,
     state_path: &Path,
@@ -1778,6 +1820,7 @@ pub fn evaluate_apply_policy(
         policy.as_ref(),
         plan_id,
         principal,
+        actor,
         touched,
         models_dir,
         state_path,
@@ -1803,6 +1846,7 @@ pub fn evaluate_apply_policy_with_policy(
     policy: Option<&rocky_core::config::PolicyConfig>,
     plan_id: &str,
     principal: PolicyPrincipal,
+    actor: &PrincipalRef,
     touched: &BTreeMap<String, PolicyCapability>,
     models_dir: &Path,
     state_path: &Path,
@@ -1812,6 +1856,7 @@ pub fn evaluate_apply_policy_with_policy(
         policy,
         plan_id,
         principal,
+        actor,
         touched,
         models_dir,
         None,
@@ -1826,6 +1871,7 @@ pub(crate) fn evaluate_apply_policy_with_policy_matching(
     policy: Option<&rocky_core::config::PolicyConfig>,
     plan_id: &str,
     principal: PolicyPrincipal,
+    actor: &PrincipalRef,
     touched: &BTreeMap<String, PolicyCapability>,
     models_dir: &Path,
     models_glob: Option<&str>,
@@ -1837,6 +1883,7 @@ pub(crate) fn evaluate_apply_policy_with_policy_matching(
         policy,
         plan_id,
         principal,
+        actor,
         touched,
         models_dir,
         models_glob,
@@ -1896,6 +1943,7 @@ pub fn evaluate_apply_policy_with_extra_classifications(
     config_path: &Path,
     plan_id: &str,
     principal: PolicyPrincipal,
+    actor: &PrincipalRef,
     touched: &BTreeMap<String, PolicyCapability>,
     models_dir: &Path,
     state_path: &Path,
@@ -1910,6 +1958,7 @@ pub fn evaluate_apply_policy_with_extra_classifications(
         policy.as_ref(),
         plan_id,
         principal,
+        actor,
         touched,
         models_dir,
         None,
@@ -1953,6 +2002,7 @@ fn evaluate_apply_policy_with_policy_matching_dual(
     policy: Option<&rocky_core::config::PolicyConfig>,
     plan_id: &str,
     principal: PolicyPrincipal,
+    actor: &PrincipalRef,
     touched: &BTreeMap<String, PolicyCapability>,
     models_dir: &Path,
     models_glob: Option<&str>,
@@ -2047,6 +2097,7 @@ fn evaluate_apply_policy_with_policy_matching_dual(
                     &policy,
                     plan_id,
                     principal,
+                    actor,
                     touched,
                     attrs,
                     subjects,
@@ -2074,6 +2125,7 @@ fn evaluate_apply_policy_with_policy_matching_dual(
         &policy,
         plan_id,
         principal,
+        actor,
         touched,
         eval_attrs,
         subjects,
@@ -2225,6 +2277,7 @@ pub(crate) fn evaluate_apply_policy_with_store(
     policy: Option<&rocky_core::config::PolicyConfig>,
     plan_id: &str,
     principal: PolicyPrincipal,
+    actor: &PrincipalRef,
     touched: &BTreeMap<String, PolicyCapability>,
     models_dir: &Path,
     models_glob: Option<&str>,
@@ -2251,6 +2304,7 @@ pub(crate) fn evaluate_apply_policy_with_store(
         &policy,
         plan_id,
         principal,
+        actor,
         touched,
         &attrs_map,
         subjects,
@@ -2341,6 +2395,7 @@ pub(crate) fn evaluate_apply_policy_core(
     policy: &rocky_core::config::PolicyConfig,
     plan_id: &str,
     principal: PolicyPrincipal,
+    actor: &PrincipalRef,
     touched: &BTreeMap<String, PolicyCapability>,
     attrs_map: &BTreeMap<String, ModelAttributes>,
     subjects: GateSubjects<'_>,
@@ -2399,6 +2454,7 @@ pub(crate) fn evaluate_apply_policy_core(
             decision.matched_rule,
             policy,
             principal,
+            actor,
             attrs,
             prior_decisions,
             marker_freezes,
@@ -2442,6 +2498,8 @@ pub(crate) fn evaluate_apply_policy_core(
             verify_after: Vec::new(),
             // Ordinary apply/promote evaluation — no auto-apply custody.
             auto_apply: None,
+            // Who acted (RV4-P1). A label, not an enforcement input.
+            principal_ref: Some(actor.clone()),
         });
 
         let gate = match effect {
@@ -3079,6 +3137,9 @@ pub struct GovernedRunContext<'a> {
     /// The enforcement principal for this apply (see
     /// [`PersistedPlan::enforcement_principal`]).
     pub principal: PolicyPrincipal,
+    /// Who is applying (RV4-P1): stamped on the decision rows the in-run
+    /// replication gate writes. Never an enforcement input.
+    pub actor: PrincipalRef,
     /// The plan id the decision rows are recorded against, and the review
     /// marker the replication gate consults.
     pub plan_id: &'a str,
@@ -3238,6 +3299,7 @@ impl GovernedRunContext<'_> {
             cfg.policy.as_ref(),
             self.plan_id,
             self.principal,
+            &self.actor,
             &touched,
             &models_dir,
             models_glob.as_deref(),
@@ -3297,6 +3359,7 @@ pub(crate) fn gate_promote_plan(
     config_path: &Path,
     plan_id: &str,
     principal: PolicyPrincipal,
+    actor: &PrincipalRef,
     promote_plan: &PromotePlan,
     state_path: &Path,
 ) -> Result<std::sync::Arc<rocky_core::config::LoadedConfig>> {
@@ -3340,6 +3403,7 @@ pub(crate) fn gate_promote_plan(
         loaded.config.policy.as_ref(),
         plan_id,
         principal,
+        actor,
         &touched,
         &promote_models_dir,
         promote_models_glob.as_deref(),
@@ -3727,6 +3791,7 @@ pub(crate) async fn gate_maintenance_apply(
     config_path: &Path,
     state_path: &Path,
     runtime_principal: PolicyPrincipal,
+    actor: &rocky_core::config::PrincipalRef,
     targets: &TouchedTargets,
 ) -> Result<()> {
     let touched = &targets.touched;
@@ -3743,6 +3808,7 @@ pub(crate) async fn gate_maintenance_apply(
         config.policy.as_ref(),
         plan_id,
         plan.enforcement_principal(runtime_principal),
+        actor,
         touched,
         &models_dir,
         models_glob.as_deref(),
@@ -3889,6 +3955,7 @@ fn required_verify_after(
 fn run_verify_after(
     plan_id: &str,
     principal: PolicyPrincipal,
+    actor: &PrincipalRef,
     required: &[String],
     run_id: &str,
     state_path: &Path,
@@ -3903,7 +3970,7 @@ fn run_verify_after(
     // best-effort open) so the custody half of the budget-burn pair is durable.
     let store = open_ledger_with_retry(state_path)
         .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
-    let verdict = evaluate_verify_after(&store, plan_id, principal, required, run_id)?;
+    let verdict = evaluate_verify_after(&store, plan_id, principal, actor, required, run_id)?;
     record_verify_after_custody(&store, &verdict.record)?;
     drop(store);
     verdict.into_result(plan_id, required)
@@ -3957,6 +4024,7 @@ fn evaluate_verify_after(
     store: &StateStore,
     plan_id: &str,
     principal: PolicyPrincipal,
+    actor: &PrincipalRef,
     required: &[String],
     run_id: &str,
 ) -> Result<VerifyAfterVerdict> {
@@ -4017,6 +4085,7 @@ fn evaluate_verify_after(
         reason,
         verify_after: required.iter().map(|n| render_placeholders(n)).collect(),
         auto_apply: None,
+        principal_ref: Some(actor.clone()),
     };
     Ok(VerifyAfterVerdict { record, failures })
 }
@@ -4058,6 +4127,7 @@ async fn run_apply_ai_authored_plan(
     plan_id: &str,
     state_path: &Path,
     runtime_principal: PolicyPrincipal,
+    actor: &rocky_core::config::PrincipalRef,
     output_json: bool,
 ) -> Result<ApplyOutcome> {
     let plan = read_plan(root, plan_id)
@@ -4123,6 +4193,7 @@ async fn run_apply_ai_authored_plan(
         loaded.config.policy.as_ref(),
         plan_id,
         principal,
+        actor,
         &touched,
         &models_dir,
         models_glob.as_deref(),
@@ -4191,6 +4262,7 @@ async fn run_apply_ai_authored_plan(
             root,
             plan_id,
             principal,
+            actor,
             &touched,
             &models_dir,
             models_glob.as_deref(),
@@ -4205,6 +4277,7 @@ async fn run_apply_ai_authored_plan(
     let governed = governed_run_context(
         &plan,
         principal,
+        actor,
         plan_id,
         root,
         config_path,
@@ -4219,6 +4292,7 @@ async fn run_apply_ai_authored_plan(
         output_json,
         &apply_run_id,
         governed.as_ref(),
+        actor,
     )
     .await;
     let termination = match termination {
@@ -4228,6 +4302,7 @@ async fn run_apply_ai_authored_plan(
                 finish_apply_verify_after(
                     plan_id,
                     principal,
+                    actor,
                     verify_checks,
                     &apply_run_id,
                     state_path,
@@ -4242,6 +4317,7 @@ async fn run_apply_ai_authored_plan(
     finish_apply_verify_after(
         plan_id,
         principal,
+        actor,
         verify_checks,
         &apply_run_id,
         state_path,
@@ -4270,6 +4346,7 @@ fn refuse_governed_dag_apply(
     plan_id: &str,
     run_plan: &RunPlan,
     runtime_principal: PolicyPrincipal,
+    actor: &rocky_core::config::PrincipalRef,
 ) -> Result<()> {
     if run_plan.dag && plan.enforcement_principal(runtime_principal) == PolicyPrincipal::Agent {
         bail!("{}", governed_dag_refusal(plan_id));
@@ -4357,6 +4434,7 @@ async fn run_apply_backfill_plan(
     plan_id: &str,
     state_path: &Path,
     runtime_principal: PolicyPrincipal,
+    actor: &rocky_core::config::PrincipalRef,
     output_json: bool,
 ) -> Result<ApplyOutcome> {
     let plan = read_plan(root, plan_id)
@@ -4498,6 +4576,7 @@ async fn run_apply_backfill_plan(
             cfg.as_ref().and_then(|l| l.config.policy.as_ref()),
             plan_id,
             plan.enforcement_principal(runtime_principal),
+            actor,
             &touched,
             models_dir,
             state_path,
@@ -4556,6 +4635,7 @@ async fn run_apply_backfill_plan(
         let governed = governed_run_context(
             &plan,
             plan.enforcement_principal(runtime_principal),
+            actor,
             plan_id,
             root,
             config_path,
@@ -4715,6 +4795,7 @@ async fn run_apply_replication_plan(
     plan_id: &str,
     state_path: &Path,
     runtime_principal: PolicyPrincipal,
+    actor: &rocky_core::config::PrincipalRef,
     output_json: bool,
 ) -> Result<ApplyOutcome> {
     let plan = read_plan(root, plan_id)
@@ -4958,6 +5039,7 @@ async fn run_apply_replication_plan(
     let governed = governed_run_context(
         &plan,
         principal,
+        actor,
         plan_id,
         root,
         config_path,
@@ -5013,6 +5095,7 @@ async fn run_apply_replication_plan(
         // a persisted plan — the replication apply path always runs without it.
         false,
         Some((plan_id, replication_plan.source_state_snapshot.as_slice())), // #1460
+        actor,
     )
     .await
     .with_context(|| format!("rocky apply replication plan '{plan_id}' failed"));
@@ -5023,6 +5106,7 @@ async fn run_apply_replication_plan(
                 finish_apply_verify_after(
                     plan_id,
                     principal,
+                    actor,
                     Vec::new(),
                     &apply_run_id,
                     state_path,
@@ -5041,6 +5125,7 @@ async fn run_apply_replication_plan(
     finish_apply_verify_after(
         plan_id,
         principal,
+        actor,
         Vec::new(),
         &apply_run_id,
         state_path,
@@ -5308,6 +5393,7 @@ async fn run_apply_promote_plan(
     plan_id: &str,
     state_path: &Path,
     runtime_principal: PolicyPrincipal,
+    actor: &rocky_core::config::PrincipalRef,
     output_json: bool,
 ) -> Result<()> {
     use crate::output::print_json;
@@ -5334,6 +5420,7 @@ async fn run_apply_promote_plan(
         config_path,
         plan_id,
         plan.enforcement_principal(runtime_principal),
+        actor,
         &promote_plan,
         state_path,
     )?;
@@ -5456,6 +5543,8 @@ pub async fn run_apply_inline_for_run(
     run_vars: &rocky_core::run_vars::RunVars,
     assume_fresh_state: bool,
     contracts_dir: Option<&Path>,
+    // Who is running (RV4-P1). Stamped on the drift auto-apply custody rows.
+    actor: &PrincipalRef,
 ) -> Result<()> {
     // THE single fingerprinted config load for a bare `rocky run` (#1120):
     // this entry point loaded nothing before this change (run() re-read the
@@ -5497,6 +5586,7 @@ pub async fn run_apply_inline_for_run(
         assume_fresh_state,
         None, // #1460: inline `rocky run`, not a persisted plan
         contracts_dir,
+        actor,
     )
     .await
     .map(|_| ())
@@ -6230,6 +6320,7 @@ mod tests {
             "apply-run-id",
             // A human apply: the governed `--dag` refusal above does not apply.
             None,
+            &rocky_core::config::PrincipalRef::unnamed(),
         )
         .await
         .expect_err("a stored --dag --shadow plan must reach the shadow-aware DAG path");
@@ -6356,6 +6447,7 @@ mod tests {
             "apply-run-id",
             // A human apply: the governed `--dag` refusal does not apply.
             None,
+            &rocky_core::config::PrincipalRef::unnamed(),
         )
         .await
         .expect("a stored --dag partition plan must apply cleanly");
@@ -6463,6 +6555,7 @@ mod tests {
             "apply-run-id",
             // A human apply: the governed `--dag` refusal does not apply.
             None,
+            &rocky_core::config::PrincipalRef::unnamed(),
         )
         .await
         .expect("a stored --dag plan must apply cleanly");

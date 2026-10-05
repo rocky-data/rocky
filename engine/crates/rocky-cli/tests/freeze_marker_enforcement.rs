@@ -379,6 +379,7 @@ async fn drive_run(
         None,  // governed_ctx
         false, // assume_fresh_state
         None,  // #1460
+        &rocky_core::config::PrincipalRef::unnamed(),
     )
     .await
     .map(|_| ())
@@ -404,7 +405,8 @@ fn policy_freeze_writes_one_marker_per_principal_when_enabled() {
         None, // scope — any
         Some("stop everything".to_string()),
         false, // lift
-        false, // json
+        false, &rocky_core::config::PrincipalRef::unnamed(),
+// json
     )
     .expect("a marker-writing freeze succeeds");
 
@@ -461,6 +463,7 @@ fn policy_freeze_writes_no_markers_by_default() {
         None,
         None,
         false,
+        &rocky_core::config::PrincipalRef::unnamed(),
         false,
     )
     .expect("a default-config freeze succeeds");
@@ -504,6 +507,7 @@ fn policy_unfreeze_writes_marker_referencing_lifted_ids() {
         None,
         None,
         false,
+        &rocky_core::config::PrincipalRef::unnamed(),
         false,
     )
     .expect("freeze succeeds");
@@ -531,7 +535,8 @@ fn policy_unfreeze_writes_marker_referencing_lifted_ids() {
         None,
         None,
         Some("all clear".to_string()),
-        true, // lift
+        true, &rocky_core::config::PrincipalRef::unnamed(),
+// lift
         false,
     )
     .expect("unfreeze succeeds");

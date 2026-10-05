@@ -1085,24 +1085,41 @@ fn route_table() -> Vec<Route> {
                  `product=<name>`, only the rows about that product's output model \
                  (`product.output.model`, default the product name), resolved from \
                  `products/<name>.toml`: the same bytes as `rocky audit --product <name> \
-                 --output json`. Unfiltered it reads the state store only and needs no \
-                 bound config. The ledger is returned whole, as the CLI prints it. Reads \
-                 only.",
+                 --output json`. With `actor=<id>` and `since=<when>`, the same bytes as \
+                 `rocky audit --actor <id> --since <when> --output json`; they compose \
+                 with `product`. Principal ids are self-asserted and unverified. \
+                 Unfiltered it reads the state store only and needs no bound config. The \
+                 ledger is returned whole, as the CLI prints it. Reads only.",
             path_params: &[],
-            query_params: &[QueryParam {
-                name: "product",
-                description: "A product name. Lists only the rows whose model is that \
-                     product's output model.",
-                allowed: &[],
-            }],
+            query_params: &[
+                QueryParam {
+                    name: "product",
+                    description: "A product name. Lists only the rows whose model is that \
+                         product's output model.",
+                    allowed: &[],
+                },
+                QueryParam {
+                    name: "actor",
+                    description: "A principal id. Lists only the rows that actor recorded. \
+                         `unrecorded` lists the rows with no id.",
+                    allowed: &[],
+                },
+                QueryParam {
+                    name: "since",
+                    description: "An inclusive lower bound: `YYYY-MM-DD` (00:00 UTC), an \
+                         RFC 3339 timestamp with an offset, or a `<N>d` / `<N>h` duration.",
+                    allowed: &[],
+                },
+            ],
             header_params: &[],
             request_body: None,
             responses: &[
                 Resp {
                     status: "200",
-                    description: "The ledger, whole or scoped to the product.",
+                    description: "The ledger, whole or filtered.",
                     body: Body::Component("AuditOutput"),
                 },
+                BAD_QUERY,
                 PRODUCT_NOT_FOUND,
                 PRODUCT_SPEC_INVALID,
                 ENGINE_BUSY_OR_NOT_READY,
