@@ -251,7 +251,7 @@ rocky package list
 rocky package remove <name> [--force]
 ```
 
-`add` and `update` run `dbt deps`, `dbt run --empty --full-refresh` and `dbt compile --full-refresh` in a temporary dbt project. The profile comes from the `rocky.toml` adapter (`duckdb`, `snowflake`, `databricks`, `bigquery` or `postgres`). Rocky writes the package's models to `models/packages/<package>/` and records them in `rocky-packages.lock` at the project root.
+`add` and `update` run `dbt deps` and `dbt compile --full-refresh` in a temporary dbt project. With `--build-empty`, `dbt run --empty --full-refresh` runs between them. The profile comes from the `rocky.toml` adapter (`duckdb`, `snowflake`, `databricks`, `bigquery` or `postgres`). Rocky writes the package's models to `models/packages/<package>/` and records them in `rocky-packages.lock` at the project root.
 
 ### Flags (`add` and `update`)
 
@@ -262,9 +262,11 @@ rocky package remove <name> [--force]
 | `--target-schema <NAME>` | `string` | the warehouse default schema (`main` on DuckDB, `public` on Postgres, `PUBLIC` on Snowflake, `default` on Databricks) | Schema the vendored models build into. Required on BigQuery. |
 | `--dbt <PATH>` | `PathBuf` | `dbt` on `PATH` | The dbt executable. |
 | `--compiled <DIR>` | `PathBuf` | | Import an already-compiled dbt project (`<DIR>/target/manifest.json` + `<DIR>/package-lock.yml`) instead of running dbt. |
-| `--no-build-empty` | `bool` | `false` | Skip `dbt run --empty`. Macros that read upstream columns at compile time then see none; Rocky refuses models compiled with a placeholder. |
+| `--build-empty[=BOOL]` | `bool` | `false` on `add`; the lockfile's mode on `update` | Run `dbt run --empty --full-refresh` before compiling, so macros that read upstream columns see them. Writes empty `rocky_package_build*` schemas to the warehouse and runs the package's hooks. Without it, a package whose compile came out with all-NULL columns or a placeholder `*` is refused with `E055`. Conflicts with `--compiled`. |
 
 `remove --force` also deletes vendored files you edited.
+
+The lockfile records the build mode: `compile-only`, `build-empty` or `compiled`. `update` reuses it. A `compiled` package needs `--compiled <dir>` or `--build-empty` on `update`.
 
 ### Update rules
 
@@ -272,7 +274,7 @@ rocky package remove <name> [--force]
 
 ### Codes
 
-- `E055`: refused. A bad spec, `dbt` not found, an adapter with no profile mapping, a failed `dbt deps` or `dbt compile`, a model name the project or another package already owns, or `remove` of edited files without `--force`. Nothing is written.
+- `E055`: refused. A bad spec, `dbt` not found, an adapter with no profile mapping, a failed `dbt deps` or `dbt compile`, a compile that came out wrong because upstream relations did not exist (all-NULL columns or a placeholder `*`, without `--build-empty`), a model name the project or another package already owns (by resolved name, ignoring case), or `remove` of edited files without `--force`. Nothing is written.
 - `W055`: vendored, with something to review. An `.incoming` file, an edited file upstream removed, a model that could not be vendored, an incremental model that fell back to full refresh, dropped dbt tests, or a `dbt run --empty` failure.
 
 ### JSON output
@@ -293,7 +295,7 @@ rocky package remove <name> [--force]
     "adapter": "duckdb",
     "target_schema": "main",
     "vars_hash": "blake3:af13…",
-    "build_empty": true,
+    "mode": "build-empty",
     "includes": [],
     "models": ["int_stripe__account_daily", "..."],
     "models_added": ["int_stripe__account_daily", "..."],

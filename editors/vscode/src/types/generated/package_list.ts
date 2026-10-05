@@ -37,6 +37,10 @@ export interface PackageListEntry {
   files_modified: string[];
   hub: string;
   includes: string[];
+  /**
+   * `compile-only`, `build-empty` or `compiled`; replayed by `update`.
+   */
+  mode: string;
   models: string[];
   name: string;
   sources: PackageSourceOutput[];

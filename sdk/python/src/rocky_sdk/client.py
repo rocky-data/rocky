@@ -1263,17 +1263,21 @@ class RockyClient:
         vars: dict[str, str] | None = None,
         target_schema: str | None = None,
         compiled: str | None = None,
-        no_build_empty: bool = False,
+        build_empty: bool | None = None,
         timeout_seconds: int | None = None,
     ) -> PackageAddOutput:
         """Run ``rocky package add <namespace>/<name>[@<version>]``.
 
         Vendors a dbt Hub package (e.g. ``fivetran/stripe@>=1.0.0,<2.0.0``)
         as Rocky models under ``models/packages/<package>/`` and records it in
-        ``rocky-packages.lock``. Runs dbt once (``deps``, ``run --empty``,
-        ``compile``) unless ``compiled`` names an already-compiled dbt project.
-        A refusal (E055) raises ``RockyCommandError``; findings to review
-        (W055) come back in ``diagnostics``.
+        ``rocky-packages.lock``. Runs dbt once (``deps``, ``compile``) unless
+        ``compiled`` names an already-compiled dbt project. ``build_empty=True``
+        first runs ``dbt run --empty``, which writes empty
+        ``rocky_package_build*`` schemas to the warehouse and runs package
+        hooks; packages whose macros read upstream columns (Fivetran staging)
+        need it or ``compiled``, and are refused (E055) without either.
+        A refusal raises ``RockyCommandError``; findings to review (W055) come
+        back in ``diagnostics``.
 
         Example:
 
@@ -1285,6 +1289,7 @@ class RockyClient:
                 result = client.package_add(
                     "fivetran/stripe@>=1.0.0,<2.0.0",
                     vars={"stripe_schema": "raw_stripe"},
+                    build_empty=True,
                 )
 
                 print(len(result.package.models), "models vendored")
@@ -1292,8 +1297,7 @@ class RockyClient:
                     print(d.code, d.message)
         """
         args = ["package", "add", spec, *_package_build_args(vars, target_schema, compiled)]
-        if no_build_empty:
-            args.append("--no-build-empty")
+        args.extend(_build_empty_args(build_empty))
         return _parse_rocky_json(
             self.run_cli(args, timeout_seconds=timeout_seconds),
             PackageAddOutput,
@@ -1306,12 +1310,13 @@ class RockyClient:
         *,
         vars: dict[str, str] | None = None,
         compiled: str | None = None,
-        no_build_empty: bool = False,
+        build_empty: bool | None = None,
         timeout_seconds: int | None = None,
     ) -> PackageUpdateOutput:
         """Run ``rocky package update [<name>]``.
 
-        Recompiles vendored packages (all of them when ``name`` is ``None``).
+        Recompiles vendored packages (all of them when ``name`` is ``None``)
+        in the mode recorded in the lockfile; ``build_empty`` overrides it.
         Files you edited are never overwritten: when upstream also changed
         one, the new version is written beside it as ``<file>.incoming``.
 
@@ -1332,8 +1337,7 @@ class RockyClient:
         if name is not None:
             args.append(name)
         args.extend(_package_build_args(vars, None, compiled))
-        if no_build_empty:
-            args.append("--no-build-empty")
+        args.extend(_build_empty_args(build_empty))
         return _parse_rocky_json(
             self.run_cli(args, timeout_seconds=timeout_seconds),
             PackageUpdateOutput,
@@ -2058,3 +2062,12 @@ def _package_build_args(
     if compiled is not None:
         args.extend(["--compiled", compiled])
     return args
+
+
+def _build_empty_args(build_empty: bool | None) -> list[str]:
+    """``--build-empty[=false]`` for ``rocky package add`` / ``update``; ``None``
+    leaves the engine default (compile only on ``add``, the lockfile's mode on
+    ``update``)."""
+    if build_empty is None:
+        return []
+    return ["--build-empty"] if build_empty else ["--build-empty=false"]

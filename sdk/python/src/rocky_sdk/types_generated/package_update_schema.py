@@ -69,10 +69,6 @@ class PackageVendorReport(BaseModel):
     """
     Rocky adapter type the package was compiled against.
     """
-    build_empty: bool
-    """
-    Whether dbt built empty upstream relations before compiling.
-    """
     dbt_version: str
     failed_models: list[PackageFailedModel]
     files_deleted: list[str]
@@ -103,6 +99,10 @@ class PackageVendorReport(BaseModel):
     incremental_fallbacks: list[str]
     """
     dbt `incremental` models that did not stay incremental.
+    """
+    mode: str
+    """
+    How the SQL was compiled: `compile-only` (`dbt compile` alone; nothing written to the warehouse), `build-empty` (`dbt run --empty` first) or `compiled` (`--compiled <dir>`).
     """
     models: list[str]
     """

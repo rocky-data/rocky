@@ -1071,7 +1071,7 @@ def _package_report(name: str = "stripe") -> dict:
         "adapter": "duckdb",
         "target_schema": "main",
         "vars_hash": "blake3:00",
-        "build_empty": True,
+        "mode": "build-empty",
         "includes": [],
         "models": ["stg_stripe__charge"],
         "models_added": ["stg_stripe__charge"],
@@ -1112,7 +1112,7 @@ def test_package_add_argv_and_typed_parse():
             vars={"stripe_schema": "raw_stripe"},
             target_schema="analytics",
             compiled="/tmp/dbt",
-            no_build_empty=True,
+            build_empty=True,
         )
     assert run_cli.call_args[0][0] == [
         "package",
@@ -1124,7 +1124,7 @@ def test_package_add_argv_and_typed_parse():
         "analytics",
         "--compiled",
         "/tmp/dbt",
-        "--no-build-empty",
+        "--build-empty",
     ]
     assert isinstance(added, PackageAddOutput)
     assert added.package.models == ["stg_stripe__charge"]
@@ -1153,6 +1153,9 @@ def test_package_update_list_remove_argv_and_typed_parse():
     with patch.object(client, "run_cli", return_value=update_json) as run_cli:
         client.package_update()
     assert run_cli.call_args[0][0] == ["package", "update"]
+    with patch.object(client, "run_cli", return_value=update_json) as run_cli:
+        client.package_update("stripe", build_empty=False)
+    assert run_cli.call_args[0][0] == ["package", "update", "stripe", "--build-empty=false"]
 
     list_json = json.dumps(
         {

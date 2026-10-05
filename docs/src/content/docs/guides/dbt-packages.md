@@ -14,13 +14,13 @@ If you prefer to keep a package in dbt and only read its tables, see [Using Rock
 ## How it works
 
 ```
-rocky package add fivetran/stripe
+rocky package add fivetran/stripe [--build-empty]
         │
         ▼  throwaway dbt project in a temp directory
-   dbt deps ─▶ dbt run --empty ─▶ dbt compile --full-refresh
-        │                              │
-        │                              ▼
-        │                    target/manifest.json
+   dbt deps ─▶ [dbt run --empty] ─▶ dbt compile --full-refresh
+        │       only with                    │
+        │       --build-empty                ▼
+        │                          target/manifest.json
         ▼
 models/packages/stripe/*.sql + *.toml   (plain SQL, no Jinja)
 rocky-packages.lock                     (versions + file hashes)
@@ -30,8 +30,21 @@ rocky compile ─▶ rocky run ─▶ rocky test --declarative
 ```
 
 - **`dbt deps`** downloads the package and its dependencies from the dbt Hub.
-- **`dbt run --empty`** builds every package model with zero rows in a scratch schema, `rocky_package_build` (and `rocky_package_build_<custom schema>`). Many package macros read the columns of an upstream relation while they compile. Fivetran staging models and `dbt_utils.star` do this. Without built upstreams, they see no columns and compile to wrong SQL. The scratch relations are empty. Rocky never builds there, and you can drop them.
+- **`dbt run --empty`** runs only when you pass `--build-empty`. It builds every package model with zero rows in a scratch schema, `rocky_package_build` (and `rocky_package_build_<custom schema>`).
 - **`dbt compile --full-refresh`** writes the final SQL. Rocky imports the models of the package you asked for, plus any model the package reads from another package.
+
+### Why some packages need `--build-empty`
+
+Many package macros read the columns of an upstream relation while they compile. Fivetran staging models and `dbt_utils.star` do this. When the upstream does not exist yet, the macro sees no columns. Fivetran's macro then turns every column into `cast(null as ...)`. That SQL runs and loads nothing but NULLs.
+
+Rocky never vendors that SQL. It looks for a model that selects only NULL columns from a table, or the `dbt_utils.star` placeholder `*`. Without `--build-empty`, such a model refuses the whole package with `E055`, and nothing is written. The message offers two ways out:
+
+| Option | What happens |
+|---|---|
+| `--build-empty` | dbt runs `dbt run --empty` first. This writes empty `rocky_package_build*` schemas to the warehouse with your adapter's credentials, and runs the package's `on-run-start` / `on-run-end` hooks. Rocky never builds there; you can drop the schemas. |
+| `--compiled <dir>` | Compile the package elsewhere, for example against a scratch warehouse, and import the result. Nothing runs against your warehouse. |
+
+`fivetran/stripe` needs one of them. Rocky records the mode in `rocky-packages.lock` as `compile-only`, `build-empty` or `compiled`, and `rocky package update` reuses it.
 
 ## Before you start
 
@@ -67,8 +80,10 @@ Fivetran writes the Stripe connector tables to the `stripe` schema: `stripe.char
 ### 2. Add the package
 
 ```bash
-rocky package add "fivetran/stripe@>=1.0.0,<2.0.0"
+rocky package add "fivetran/stripe@>=1.0.0,<2.0.0" --build-empty
 ```
+
+Without `--build-empty`, this package is refused with `E055`. See [Why some packages need `--build-empty`](#why-some-packages-need---build-empty).
 
 The argument is `<namespace>/<name>`, then optionally `@` and a version requirement. A requirement is one version (`1.10.1`) or a comma-separated range. Without one, dbt takes the latest version.
 
@@ -83,7 +98,7 @@ fivetran/stripe 1.10.1 (stripe) → models/packages/stripe/
 If your connector writes to another schema, pass the package's own variable:
 
 ```bash
-rocky package add fivetran/stripe --vars stripe_schema=raw_stripe
+rocky package add fivetran/stripe --build-empty --vars stripe_schema=raw_stripe
 ```
 
 `--vars` takes `key=value` and can repeat. Rocky reads the value as YAML, so `false`, `5` and `[a, b]` keep their types. The lockfile records the vars, and `rocky package update` uses them again.
@@ -119,7 +134,7 @@ with balance_transaction_joined as (
 - **Tests:** dbt's `not_null`, `unique`, `accepted_values` and `relationships` tests become `[[tests]]`, with their `severity` and `where`. Rocky reports any other test as dropped (`W055`).
 - **Materializations:** `table` becomes `full_refresh`, `view` stays a view, and `ephemeral` stays ephemeral. An `incremental` model goes through the same conversion as [`rocky import-dbt`](/guides/migrate-from-dbt/). Rocky reports one that does not stay incremental (`W055`).
 
-**rocky-packages.lock** records, for each package: the Hub name, the version requirement, the resolved version, the dbt version, the adapter, the target schema, the vars and their hash, the compile time, the source tables, and a hash of every file Rocky wrote. Commit it with the models.
+**rocky-packages.lock** records, for each package: the Hub name, the version requirement, the resolved version, the dbt version, the adapter, the target schema, the vars and their hash, the build mode, the compile time, the source tables, and a hash of every file Rocky wrote. Commit it with the models.
 
 ## Extend a package
 
@@ -160,7 +175,7 @@ rocky package update            # every package
 rocky package update stripe     # one package
 ```
 
-`update` recompiles the package within its version requirement, with the vars in the lockfile. `--vars` adds or replaces vars. Then Rocky compares three versions of each file: what it wrote last time (the hash in the lockfile), the file on disk, and the new upstream file.
+`update` recompiles the package within its version requirement, with the vars and the build mode in the lockfile. `--vars` adds or replaces vars. `--build-empty` or `--build-empty=false` changes the mode. A package added with `--compiled` needs `--compiled <dir>` again, or `--build-empty`. Then Rocky compares three versions of each file: what it wrote last time (the hash in the lockfile), the file on disk, and the new upstream file.
 
 | Your file | Upstream | Result |
 |---|---|---|
@@ -186,6 +201,8 @@ rocky package remove stripe
 
 Package models keep their dbt names. Rocky does not prefix or rename them, because your models read them by bare name. When a package model has the name of a project model or of another package's model, `add` and `update` refuse with `E055` and write nothing. Rename or remove the existing model, then try again.
 
+Rocky compares the name each model resolves to: the `name =` in its sidecar or frontmatter, else its file name. Names that differ only by case collide too, because warehouses fold unquoted names and some file systems ignore case. A package with two such models of its own is refused as well.
+
 ## Without dbt on the machine
 
 In CI, or with no network, compile the package where dbt is available and import the result:
@@ -194,7 +211,7 @@ In CI, or with no network, compile the package where dbt is available and import
 rocky package add fivetran/stripe --compiled path/to/dbt-project
 ```
 
-`--compiled` reads `<dir>/target/manifest.json` and `<dir>/package-lock.yml`. Compile that project with `dbt run --empty --full-refresh` and then `dbt compile --full-refresh`, against the same warehouse.
+`--compiled` reads `<dir>/target/manifest.json` and `<dir>/package-lock.yml`. Compile that project with `dbt run --empty --full-refresh` and then `dbt compile --full-refresh`. Use a warehouse with the same source table names. Rocky applies the same NULL-column check, so a project compiled without `dbt run --empty` is refused.
 
 To use a private dbt Hub mirror, set `DBT_PACKAGE_HUB_URL`. Rocky passes the environment through to dbt.
 
@@ -202,10 +219,10 @@ To use a private dbt Hub mirror, set `DBT_PACKAGE_HUB_URL`. Rocky passes the env
 
 - **The compiled SQL is fixed at add time.** dbt resolved its macros against your warehouse and vars on that day. Run `rocky package update` when the connector adds columns, or when you change vars.
 - **One schema.** All package models build into `--target-schema`.
-- **Introspection placeholders.** When dbt compiled a model before an upstream existed, `dbt_utils.star` writes a placeholder `*`. Rocky refuses that model and reports it (`W055`). This happens with `--no-build-empty`, or when `dbt run --empty` fails for an upstream.
+- **Introspection is detected by its output.** Rocky catches all-NULL columns and the `dbt_utils.star` placeholder. A macro that degrades another way without built upstreams is not caught. Use `--build-empty` for packages that introspect. With `--build-empty`, a model whose upstream failed in `dbt run --empty` is refused on its own (`W055`) and the rest are vendored.
 - **dbt-only features are dropped.** Hooks, `on_schema_change` and other config that the [migration importer](/guides/migrate-from-dbt/) does not translate are not translated here either. Tests on sources are not mapped.
 - **Two packages that share a model-carrying dependency** collide on that dependency's model names. Rocky refuses the second package.
-- **`dbt run --empty` writes to the warehouse.** It uses the adapter's real credentials and creates the `rocky_package_build*` schemas with empty relations. It also runs any `on-run-start` / `on-run-end` hooks the package declares. Rocky does not drop these schemas. Use `--no-build-empty` on a warehouse where that is not allowed, and check the refused models it reports.
+- **`--build-empty` writes to the warehouse.** It uses the adapter's real credentials, creates the `rocky_package_build*` schemas with empty relations, and runs the package's hooks. Rocky does not drop these schemas. Where that is not allowed, use `--compiled`.
 - **Vars are stored in plain text** in `rocky-packages.lock`. Do not pass secrets as `--vars`.
 
 ## Reference

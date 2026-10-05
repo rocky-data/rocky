@@ -42,6 +42,10 @@ class PackageListEntry(BaseModel):
     """
     hub: str
     includes: list[str]
+    mode: str
+    """
+    `compile-only`, `build-empty` or `compiled`; replayed by `update`.
+    """
     models: list[str]
     name: str
     sources: list[PackageSourceOutput]

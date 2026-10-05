@@ -44,10 +44,6 @@ export interface PackageVendorReport {
    * Rocky adapter type the package was compiled against.
    */
   adapter: string;
-  /**
-   * Whether dbt built empty upstream relations before compiling.
-   */
-  build_empty: boolean;
   dbt_version: string;
   failed_models: PackageFailedModel[];
   /**
@@ -79,6 +75,10 @@ export interface PackageVendorReport {
    * dbt `incremental` models that did not stay incremental.
    */
   incremental_fallbacks: string[];
+  /**
+   * How the SQL was compiled: `compile-only` (`dbt compile` alone; nothing written to the warehouse), `build-empty` (`dbt run --empty` first) or `compiled` (`--compiled <dir>`).
+   */
+  mode: string;
   /**
    * Every vendored model, sorted.
    */

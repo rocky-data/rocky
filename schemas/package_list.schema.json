@@ -43,6 +43,10 @@
           },
           "type": "array"
         },
+        "mode": {
+          "description": "`compile-only`, `build-empty` or `compiled`; replayed by `update`.",
+          "type": "string"
+        },
         "models": {
           "items": {
             "type": "string"
@@ -77,6 +81,7 @@
         "files_modified",
         "hub",
         "includes",
+        "mode",
         "models",
         "name",
         "sources",
