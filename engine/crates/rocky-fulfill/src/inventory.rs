@@ -552,8 +552,9 @@ fn apply_is_invoked_from_exactly_one_module() {
     );
 }
 
-/// Every FOLLOWING file read in this crate's production code, by file, with
-/// the reason it is allowed to follow (#1633).
+/// Every FOLLOWING file read, and every pathname publication (`fs::rename`,
+/// a raw `OpenOptions`), in this crate's production code, by file, with the
+/// reason it is allowed (#1633).
 ///
 /// The custody rule is one rule, not a per-call-site decision: bytes this
 /// crate takes from a file a worker (or anyone below the operator) could
@@ -573,41 +574,88 @@ const FOLLOWING_READS: &[(&str, usize, &str)] = &[
          driver's session file (an operator's CLI argument, not a worker output)",
     ),
     (
+        "handoff.rs",
+        1,
+        "publication rename of the drafting hand-off: the source is a tmp this \
+         process just created O_EXCL and wrote the vetted bytes into, never a name \
+         a worker placed",
+    ),
+    (
         "step.rs",
-        4,
-        "the approved spec snapshot: every read is digest-compared against the \
-         approval record in the state store, a value the file's writer does not \
-         control, before the bytes are used",
+        5,
+        "one publication rename of the candidate spec (same shape as handoff.rs: an \
+         O_EXCL tmp holding the bytes the outbox reader vetted), plus four reads of \
+         the approved spec snapshot, at the path the approval record in the state \
+         store names (the store is in the closed set fulfill.md lists). Three reads \
+         compare the bytes' digest against the approval record before use; the \
+         fourth (`apply`) hands its recomputed digest to the engine as \
+         `expect_spec_digest`, which apply compares against the digest the governed \
+         plan pinned at propose",
     ),
 ];
 
-/// The production half of a source file: everything before its first
-/// top-level `#[cfg(test)]` / `#[cfg(all(test, …))]` module.
-fn production_code(text: &str) -> &str {
-    let mut offset = 0;
-    for line in text.split_inclusive('\n') {
-        if line.starts_with("#[cfg(test)]") || line.starts_with("#[cfg(all(test") {
-            return &text[..offset];
+/// The production code of a source file, with comments and strings already
+/// stripped: every top-level item gated `#[cfg(test)]` or
+/// `#[cfg(all(test, …))]` is cut out — wherever it sits, so production code
+/// AFTER a test module is still scanned. An item ends at the `;` or the
+/// balanced `}` that closes the first block after the attribute.
+fn production_code(code: &str) -> String {
+    let bytes = code.as_bytes();
+    let mut out = String::with_capacity(code.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let at_line_start = i == 0 || bytes[i - 1] == b'\n';
+        let rest = &code[i..];
+        if at_line_start && (rest.starts_with("#[cfg(test)]") || rest.starts_with("#[cfg(all(test"))
+        {
+            let mut j = i + rest.find(']').unwrap_or(0) + 1;
+            while j < bytes.len() && bytes[j] != b'{' && bytes[j] != b';' {
+                j += 1;
+            }
+            if j < bytes.len() && bytes[j] == b'{' {
+                let mut depth = 0usize;
+                while j < bytes.len() {
+                    match bytes[j] {
+                        b'{' => depth += 1,
+                        b'}' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                    j += 1;
+                }
+            }
+            i = (j + 1).min(bytes.len());
+            continue;
         }
-        offset += line.len();
+        let next = rest.find('\n').map_or(bytes.len(), |n| i + n + 1);
+        out.push_str(&code[i..next]);
+        i = next;
     }
-    text
+    out
 }
 
 #[test]
 fn every_following_read_is_inventoried() {
+    // A count per file, not per site, on purpose: the pin is a
+    // reviewer-visible number, and any change to it is a diff here.
     const SHAPES: &[&str] = &[
         "fs::read(",
         "fs::read_to_string(",
         "File::open(",
         "fs::copy(",
+        "fs::rename(",
+        "OpenOptions::new(",
     ];
     let mut found: BTreeSet<(String, usize)> = BTreeSet::new();
     for (path, text) in crate_sources() {
         if path.ends_with("inventory.rs") {
             continue;
         }
-        let code = strip_comments_and_strings(production_code(&text));
+        let code = production_code(&strip_comments_and_strings(&text));
         let count: usize = SHAPES.iter().map(|shape| code.matches(shape).count()).sum();
         if count > 0 {
             let name = path

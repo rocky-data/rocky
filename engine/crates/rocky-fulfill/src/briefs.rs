@@ -214,7 +214,12 @@ pub fn load_template(
                 }
                 Err(err) => {
                     return Err(err).with_context(|| {
-                        format!("failed to read brief override {}", candidate.display())
+                        format!(
+                            "failed to read brief override {} — a `briefs_dir` override must \
+                             be a regular file with exactly one name (not a symlink, not a \
+                             hard link)",
+                            candidate.display()
+                        )
                     });
                 }
             }
