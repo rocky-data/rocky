@@ -790,6 +790,11 @@ pub struct RockyMcpServer {
     /// rewrites: one place where every profile's guidance is decided, and
     /// `get_info` stays a plain read.
     instructions: String,
+    /// Who this server acts as (RV4-P1): stamped on every policy decision row
+    /// a tool writes. Defaults to `mcp-<profile>`; `rocky mcp` overrides it
+    /// with `--principal-id` / `ROCKY_PRINCIPAL_ID` via [`Self::with_actor`].
+    /// A self-asserted label: the gate still evaluates the `agent` class.
+    actor: rocky_core::config::PrincipalRef,
     tool_router: ToolRouter<Self>,
     prompt_router: PromptRouter<Self>,
 }
@@ -820,6 +825,26 @@ pub enum McpProfile {
     /// explicitly allowlisted — is absent from the listing and returns
     /// tool-not-found when called.
     Worker,
+}
+
+impl McpProfile {
+    /// The profile's name as `rocky mcp --profile` spells it.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::Approver => "approver",
+            Self::Worker => "worker",
+        }
+    }
+
+    /// The actor a server running this profile stamps on decision rows when
+    /// nobody named one: `mcp-<profile>`, source `mcp_profile` (RV4-P1).
+    #[must_use]
+    pub fn default_actor(self) -> rocky_core::config::PrincipalRef {
+        rocky_core::config::PrincipalRef::for_mcp_profile(self.name())
+            .expect("the MCP profile names are valid principal ids")
+    }
 }
 
 /// The worker-profile tool ALLOWLIST — exhaustively enumerated, never derived
@@ -2260,9 +2285,22 @@ impl RockyMcpServer {
                 key
             },
             instructions,
+            actor: profile.default_actor(),
             tool_router,
             prompt_router,
         })
+    }
+
+    /// Replace the actor this server stamps on decision rows (RV4-P1).
+    #[must_use]
+    pub fn with_actor(mut self, actor: rocky_core::config::PrincipalRef) -> Self {
+        self.actor = actor;
+        self
+    }
+
+    /// The actor this server stamps on decision rows.
+    pub fn actor(&self) -> &rocky_core::config::PrincipalRef {
+        &self.actor
     }
 
     fn state_path(&self) -> PathBuf {
@@ -4276,6 +4314,7 @@ impl RockyMcpServer {
             &self.config_path,
             decision_id,
             rocky_core::config::PolicyPrincipal::Agent,
+            &self.actor,
             &touched,
             &self.models_dir,
             &self.state_path(),
@@ -4539,6 +4578,7 @@ impl RockyMcpServer {
             &self.config_path,
             &decision_id,
             rocky_core::config::PolicyPrincipal::Agent,
+            &self.actor,
             &touched,
             &self.models_dir,
             &state_path,
@@ -5264,6 +5304,7 @@ impl RockyMcpServer {
                 model: args.model.clone(),
                 product,
                 idempotency_key: args.idempotency_key.clone(),
+                actor: &self.actor,
             },
         )
         .await;
@@ -8031,6 +8072,29 @@ api_secret = "s"
 type = "duckdb"
 database = ":memory:"
 "#;
+
+    /// RV4-P1: every profile has a valid default actor `mcp-<profile>`, and
+    /// `with_actor` (what `rocky mcp --principal-id` uses) replaces it.
+    #[test]
+    fn mcp_profiles_default_to_a_named_actor_and_can_be_overridden() {
+        for (profile, id) in [
+            (McpProfile::Default, "mcp-default"),
+            (McpProfile::Approver, "mcp-approver"),
+            (McpProfile::Worker, "mcp-worker"),
+        ] {
+            let actor = profile.default_actor();
+            assert_eq!(actor.id.as_str(), id);
+            assert_eq!(
+                actor.source,
+                rocky_core::config::PrincipalIdSource::McpProfile
+            );
+        }
+        let (_tmp, server) = write_mcp_project(Some(VALID_MCP_TOML));
+        assert_eq!(server.actor().id.as_str(), "mcp-default");
+        let named = rocky_core::config::PrincipalRef::resolve(Some("agent-7"), None, None).unwrap();
+        let server = server.with_actor(named.clone());
+        assert_eq!(server.actor(), &named);
+    }
 
     /// The single config read behind every compile-backed MCP tool. A present
     /// but unloadable `rocky.toml` must refuse; it used to return the same

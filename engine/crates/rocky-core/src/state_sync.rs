@@ -1414,7 +1414,9 @@ pub type LedgerSeamAttempt<'a, T> =
 /// When CAS is not effective this is deliberately the legacy half-seam shape:
 /// Local performs one transition and no remote I/O; a remote backend downloads
 /// once, performs one transition, and unconditionally uploads with
-/// `on_upload_failure = "fail"`.
+/// `on_upload_failure = "fail"`. On either path a failed transition or upload
+/// puts the local file back to the remote copy, so rows that never committed
+/// are not left readable locally.
 #[derive(Debug, Clone)]
 pub struct LedgerSeamSession {
     cfg: StateConfig,
@@ -1491,12 +1493,28 @@ impl LedgerSeamSession {
             let store = StateStore::open(&self.state_path)?;
             let result = attempt(&store, None).await;
             drop(store);
-            let output = result?;
+            // The same local-visibility rule as the CAS loop below: a
+            // transition that never reached the remote must not stay readable
+            // in the local file.
+            let output = match result {
+                Ok(output) => output,
+                Err(e) => {
+                    self.restore_remote_winner("failed ledger-seam transition")
+                        .await;
+                    return Err(e);
+                }
+            };
             let upload_cfg = StateConfig {
                 on_upload_failure: StateUploadFailureMode::Fail,
                 ..self.cfg.clone()
             };
-            upload_state(&upload_cfg, &self.state_path, self.replicate_schema_cache).await?;
+            if let Err(e) =
+                upload_state(&upload_cfg, &self.state_path, self.replicate_schema_cache).await
+            {
+                self.restore_remote_winner("failed ledger-seam upload")
+                    .await;
+                return Err(e);
+            }
             return Ok(output);
         }
 
@@ -6095,6 +6113,7 @@ mod tests {
                     reason: "plain rule decision".into(),
                     verify_after: vec![],
                     auto_apply: None,
+                    principal_ref: None,
                 })
                 .unwrap();
             store
@@ -6111,6 +6130,7 @@ mod tests {
                     reason: "verify_after FAILED".into(),
                     verify_after: vec!["row_count".into()],
                     auto_apply: None,
+                    principal_ref: None,
                 })
                 .unwrap();
             drop(store);
@@ -6878,6 +6898,7 @@ mod tests {
             reason: plan_id.to_string(),
             verify_after: Vec::new(),
             auto_apply: None,
+            principal_ref: None,
         }
     }
 
@@ -7134,6 +7155,50 @@ mod tests {
             .unwrap();
         assert!(decisions.iter().any(|row| row.plan_id == "off-winner"));
         assert!(decisions.iter().any(|row| row.plan_id == "off-seam"));
+        test_support::clear();
+    }
+
+    /// `concurrency_control = "off"`: a transition that fails after writing
+    /// rows must not leave them readable in the local file. The rows never
+    /// reached the remote, so the local file is put back to the remote copy,
+    /// exactly as the CAS path does.
+    #[tokio::test]
+    async fn ledger_seam_off_failed_transition_restores_the_remote_copy() {
+        let _serial = test_support::serial_guard();
+        test_support::clear();
+        let mut harness = crate::test_harness::CrossPodHarness::new_s3_like();
+        // Explicit `off`: an unset mode defaults to `cas` on s3 (#1228).
+        harness.pod_a.cfg.concurrency_control = Some(ConcurrencyControl::Off);
+        harness.pod_b.cfg.concurrency_control = Some(ConcurrencyControl::Off);
+        {
+            let store = harness.open_store(&harness.pod_a);
+            store
+                .record_policy_decision(&seam_policy_record("off-remote"))
+                .unwrap();
+        }
+        harness.upload(&harness.pod_a).await.unwrap();
+
+        let session = LedgerSeamSession::new(&harness.pod_b.cfg, &harness.pod_b.state_path, false);
+        let err = session
+            .execute(|store, _| {
+                Box::pin(async move {
+                    store.record_policy_decision(&seam_policy_record("off-unpublished"))?;
+                    Err::<(), _>(StateSyncError::SeamTransition("refused".into()))
+                })
+            })
+            .await
+            .expect_err("the failed transition must propagate");
+        assert!(matches!(err, StateSyncError::SeamTransition(_)), "{err:?}");
+
+        let decisions = StateStore::open(&harness.pod_b.state_path)
+            .unwrap()
+            .list_policy_decisions()
+            .unwrap();
+        assert!(decisions.iter().any(|row| row.plan_id == "off-remote"));
+        assert!(
+            !decisions.iter().any(|row| row.plan_id == "off-unpublished"),
+            "a row that never reached the remote must not stay in the local file"
+        );
         test_support::clear();
     }
 

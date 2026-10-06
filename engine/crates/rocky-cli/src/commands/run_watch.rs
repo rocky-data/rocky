@@ -71,6 +71,8 @@ pub async fn run_watch(
     // `--skip-unchanged` / `--force-rebuild` overlay; threaded into each
     // watch iteration's `run()`. Default OFF ⇒ unchanged watch behavior.
     skip_opts: &super::run::SkipRunOptions,
+    // Who is running (RV4-P1), handed to each iteration's `run()`.
+    actor: &rocky_core::config::PrincipalRef,
 ) -> Result<()> {
     // The watch loop logs iteration errors and keeps running. Refuse an
     // unusable Pipes channel before entering that loop.
@@ -244,6 +246,7 @@ pub async fn run_watch(
             cache_ttl_override,
             env,
             skip_opts,
+            actor,
         );
         tokio::pin!(first_run);
         let interrupted = tokio::select! {
@@ -364,6 +367,7 @@ pub async fn run_watch(
                     cache_ttl_override,
                     env,
                     skip_opts,
+                    actor,
                 );
                 tokio::pin!(rerun);
                 let interrupted = tokio::select! {
@@ -457,6 +461,7 @@ async fn iter_once(
     cache_ttl_override: Option<u64>,
     env: Option<&str>,
     skip_opts: &super::run::SkipRunOptions,
+    actor: &rocky_core::config::PrincipalRef,
 ) -> IterOutcome {
     let started = std::time::Instant::now();
     // Load the config FRESH for THIS iteration — deliberately NEVER hoisted
@@ -518,6 +523,7 @@ async fn iter_once(
         // rejects the combination at parse time).
         false,
         None, // #1460: dev watch loop, no persisted plan
+        actor,
     )
     .await;
     let elapsed_ms = started.elapsed().as_millis();
@@ -734,6 +740,7 @@ mod tests {
             None,
             None,
             &super::super::run::SkipRunOptions::default(),
+            &rocky_core::config::PrincipalRef::unnamed(),
         )
         .await
         .fingerprint

@@ -356,8 +356,8 @@ impl RecordCustody {
 /// after its terminal upload; see [`take_record_not_persisted`].
 #[derive(Debug, thiserror::Error)]
 #[error(
-    "refusing to exit 0: run {run_id} succeeded and its state was uploaded, but its run record \
-     could not be written to the state store — `rocky history`, `rocky replay`, `rocky trace`, \
+    "refusing to exit 0: run {run_id} succeeded, but its run record could not be written to \
+     the state store — `rocky history`, `rocky replay`, `rocky trace`, \
      `rocky cost` and the schedule reconciler's `after`/`freshness` demands will not see this \
      run. Retry once the state store is writable"
 )]
@@ -385,17 +385,45 @@ pub(crate) fn record_custody_exit_result(
     governed: bool,
     mode: rocky_core::config::StateUploadFailureMode,
 ) -> Result<()> {
-    match custody {
-        RecordCustody::Persisted => Ok(()),
-        RecordCustody::Lost
-            if !governed && mode == rocky_core::config::StateUploadFailureMode::Skip =>
-        {
-            Ok(())
-        }
-        RecordCustody::Lost => Err(RunRecordNotPersisted {
+    if lost_record_fails_run(custody, governed, mode) {
+        Err(RunRecordNotPersisted {
             run_id: run_id.to_string(),
         }
-        .into()),
+        .into())
+    } else {
+        Ok(())
+    }
+}
+
+/// Whether [`record_custody_exit_result`] will fail this run.
+///
+/// The idempotency stamp reads it too: a run that will exit non-zero for a
+/// lost record is stamped `Failed`, so the retry its error asks for is not
+/// skipped as already completed.
+pub(crate) fn lost_record_fails_run(
+    custody: RecordCustody,
+    governed: bool,
+    mode: rocky_core::config::StateUploadFailureMode,
+) -> bool {
+    custody == RecordCustody::Lost
+        && (governed || mode != rocky_core::config::StateUploadFailureMode::Skip)
+}
+
+/// Stamp the idempotency key of a dispatch arm that returned success.
+///
+/// A success whose lost record will still fail the run (#1884) is stamped
+/// `Failed` instead of `Succeeded`, so a retry with the same key runs again
+/// and can write the record.
+async fn finalize_idempotency_after_success(
+    ctx_slot: &mut Option<IdempotencyCtx>,
+    state_path: &Path,
+    run_id: &str,
+    record_fails_run: bool,
+) {
+    if record_fails_run {
+        finalize_idempotency_on_error(ctx_slot, state_path, run_id).await;
+    } else {
+        finalize_idempotency_on_success(ctx_slot, state_path, run_id).await;
     }
 }
 
@@ -1802,11 +1830,17 @@ async fn finalize_idempotency(
     state_store: Option<&StateStore>,
     run_id: &str,
     output: &RunOutput,
+    // A successful run whose lost record will still fail it (#1884, see
+    // [`lost_record_fails_run`]) is stamped `Failed`, so its retry runs.
+    record_fails_run: bool,
 ) {
     let Some(ctx) = ctx_slot.take() else {
         return;
     };
     let outcome = match output.derive_run_status() {
+        rocky_core::state::RunStatus::Success if record_fails_run => {
+            rocky_core::idempotency::FinalOutcome::Failed
+        }
         rocky_core::state::RunStatus::Success => rocky_core::idempotency::FinalOutcome::Succeeded,
         rocky_core::state::RunStatus::PartialFailure | rocky_core::state::RunStatus::Failure => {
             rocky_core::idempotency::FinalOutcome::Failed
@@ -2985,6 +3019,8 @@ pub async fn run(
     governed_ctx: Option<&crate::commands::apply::GovernedRunContext<'_>>,
     assume_fresh_state: bool,
     reviewed_source_state: Option<(&str, &[crate::output::ReplicationConnectorSnapshot])>,
+    // Who is running (RV4-P1). Stamped on the drift auto-apply custody rows.
+    actor: &rocky_core::config::PrincipalRef,
 ) -> Result<RunTermination> {
     run_with_explicit_contracts(
         config_path,
@@ -3012,6 +3048,7 @@ pub async fn run(
         assume_fresh_state,
         reviewed_source_state,
         None,
+        actor,
     )
     .await
 }
@@ -3107,6 +3144,10 @@ pub async fn run_with_explicit_contracts(
     // which keeps the filter-scope tolerance identical.
     reviewed_source_state: Option<(&str, &[crate::output::ReplicationConnectorSnapshot])>,
     contracts_dir: Option<&Path>,
+    // Who is running (RV4-P1). Stamped on the drift auto-apply custody rows
+    // (`DriftGovernor`, `finalize_drift_verify_after`). A label only: the
+    // custody rows are still evaluated as the `agent` class.
+    actor: &rocky_core::config::PrincipalRef,
 ) -> Result<RunTermination> {
     // Refuse a broken Dagster Pipes launch before an idempotency claim, state
     // session, hook, or warehouse statement can run.
@@ -3711,6 +3752,7 @@ pub async fn run_with_explicit_contracts(
             state_store.as_ref(),
             &run_id,
             &output,
+            lost_record_fails_run(custody, governed, loaded.config.state.on_upload_failure),
         )
         .await;
 
@@ -4054,8 +4096,17 @@ pub async fn run_with_explicit_contracts(
             let (dispatch_result, record_custody) = take_record_not_persisted(dispatch_result);
             match dispatch_result {
                 Ok(()) => {
-                    finalize_idempotency_on_success(&mut idempotency_ctx, state_path, &run_id)
-                        .await;
+                    finalize_idempotency_after_success(
+                        &mut idempotency_ctx,
+                        state_path,
+                        &run_id,
+                        lost_record_fails_run(
+                            record_custody,
+                            governed,
+                            loaded.config.state.on_upload_failure,
+                        ),
+                    )
+                    .await;
                     // Terminal upload AFTER the idempotency stamp so it rides
                     // the upload — the same reposition as the replication
                     // seam. Consumes the session (`None` = the lazy no-op
@@ -4206,8 +4257,17 @@ pub async fn run_with_explicit_contracts(
             let (dispatch_result, record_custody) = take_record_not_persisted(dispatch_result);
             match dispatch_result {
                 Ok(()) => {
-                    finalize_idempotency_on_success(&mut idempotency_ctx, state_path, &run_id)
-                        .await;
+                    finalize_idempotency_after_success(
+                        &mut idempotency_ctx,
+                        state_path,
+                        &run_id,
+                        lost_record_fails_run(
+                            record_custody,
+                            governed,
+                            loaded.config.state.on_upload_failure,
+                        ),
+                    )
+                    .await;
                     session.finalize().await.context(
                         "refusing to exit 0: the state ledger mutation could not be \
                          persisted to the remote [state] backend",
@@ -4324,8 +4384,17 @@ pub async fn run_with_explicit_contracts(
             let (dispatch_result, record_custody) = take_record_not_persisted(dispatch_result);
             match dispatch_result {
                 Ok(()) => {
-                    finalize_idempotency_on_success(&mut idempotency_ctx, state_path, &run_id)
-                        .await;
+                    finalize_idempotency_after_success(
+                        &mut idempotency_ctx,
+                        state_path,
+                        &run_id,
+                        lost_record_fails_run(
+                            record_custody,
+                            governed,
+                            loaded.config.state.on_upload_failure,
+                        ),
+                    )
+                    .await;
                     session.finalize().await.context(
                         "refusing to exit 0: the state ledger mutation could not be \
                          persisted to the remote [state] backend",
@@ -5641,6 +5710,7 @@ pub async fn run_with_explicit_contracts(
                         // The run-entry durable freeze-marker projection — a
                         // marker-only freeze must refuse auto-apply too.
                         &entry_marker_freezes,
+                        actor,
                     ),
                 });
             }
@@ -6643,7 +6713,14 @@ pub async fn run_with_explicit_contracts(
                     Some(pipeline_name),
                 );
             }
-            finalize_idempotency(&mut idempotency_ctx, Some(state), &shared_run_id, &output).await;
+            finalize_idempotency(
+                &mut idempotency_ctx,
+                Some(state),
+                &shared_run_id,
+                &output,
+                false,
+            )
+            .await;
         }
 
         // Preserve the available ledger even when the interrupted flush or
@@ -7478,6 +7555,7 @@ pub async fn run_with_explicit_contracts(
         state_store.as_ref(),
         &run_id,
         rocky_cfg.policy.as_ref(),
+        actor,
     );
     if let Err(custody_err) = &verify_after_result {
         output.tables_failed += 1;
@@ -7523,6 +7601,7 @@ pub async fn run_with_explicit_contracts(
             state_store.as_ref(),
             &run_id,
             &output,
+            false,
         )
         .await;
         // WP-01 PR-C: drop the owned state store BEFORE finalize so its copy is
@@ -7573,6 +7652,7 @@ pub async fn run_with_explicit_contracts(
         state_store.as_ref(),
         &run_id,
         &output,
+        lost_record_fails_run(record_custody, governed, rocky_cfg.state.on_upload_failure),
     )
     .await;
 
@@ -7800,16 +7880,39 @@ pub async fn run_with_explicit_contracts(
         .into());
     }
 
+    // A successful run whose record did not land (#1884). The session already
+    // finalized above, so the watermarks and the `run_progress` header — the
+    // ledger's own evidence of the missing record — reached the remote. Only
+    // the exit code follows the rule. Decided before the hooks fire, so a run
+    // that will exit non-zero reports `pipeline_error`, not
+    // `pipeline_complete`.
+    let record_result = record_custody_exit_result(
+        record_custody,
+        &run_id,
+        governed,
+        rocky_cfg.state.on_upload_failure,
+    );
+
     // §P2.6 emit: pipeline_complete on happy-path exit. Drain async
     // webhooks before returning.
-    let _ = hook_registry
-        .fire(&HookContext::pipeline_complete(
-            &run_id,
-            pipeline_name,
-            output.duration_ms,
-            output.tables_copied,
-        ))
-        .await;
+    if let Err(error) = &record_result {
+        let _ = hook_registry
+            .fire(&HookContext::pipeline_error(
+                &run_id,
+                pipeline_name,
+                &error.to_string(),
+            ))
+            .await;
+    } else {
+        let _ = hook_registry
+            .fire(&HookContext::pipeline_complete(
+                &run_id,
+                pipeline_name,
+                output.duration_ms,
+                output.tables_copied,
+            ))
+            .await;
+    }
     let _ = hook_registry.wait_async_webhooks().await;
 
     // Propagate budget breach error (if any) after the hooks have
@@ -7821,16 +7924,7 @@ pub async fn run_with_explicit_contracts(
     // terminal-success handling — so it never reaches this happy-path exit.
     let _ = &verify_after_result;
 
-    // A successful run whose record did not land (#1884). The session already
-    // finalized above, so the watermarks and the `run_progress` header — the
-    // ledger's own evidence of the missing record — reached the remote. Only
-    // the exit code follows the rule.
-    record_custody_exit_result(
-        record_custody,
-        &run_id,
-        governed,
-        rocky_cfg.state.on_upload_failure,
-    )?;
+    record_result?;
 
         Ok(())
     }
@@ -18314,6 +18408,7 @@ max_retries = 0
                 None,
                 false,
                 None,
+                &rocky_core::config::PrincipalRef::unnamed(),
             )
             .await
         })
@@ -18485,6 +18580,7 @@ max_retries = 0
                 None,
                 false,
                 None,
+                &rocky_core::config::PrincipalRef::unnamed(),
             )
             .await
         })
@@ -18659,6 +18755,7 @@ max_retries = 0
 
         let ctx = crate::commands::apply::GovernedRunContext {
             principal: rocky_core::config::PolicyPrincipal::Agent,
+            actor: rocky_core::config::PrincipalRef::unnamed(),
             plan_id: "record-not-persisted-transformation-plan",
             root: project,
             config_path: &config_path,
@@ -18698,6 +18795,7 @@ max_retries = 0
                 if governed { Some(&ctx) } else { None },
                 false,
                 None,
+                &rocky_core::config::PrincipalRef::unnamed(),
             )
             .await
         })
@@ -21647,6 +21745,7 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
             None,
             false,
             None,
+            &rocky_core::config::PrincipalRef::unnamed(),
         )
         .await
         .map(|_| ())
@@ -21888,6 +21987,7 @@ auto_create_schemas = true
                 None,
                 false,
                 None,
+                &rocky_core::config::PrincipalRef::unnamed(),
             )
             .await
             .expect_err(label);
@@ -21978,6 +22078,7 @@ auto_create_schemas = true
                 None,
                 false,
                 None,
+                &rocky_core::config::PrincipalRef::unnamed(),
             )
             .await
             .expect_err(label);
@@ -22029,6 +22130,7 @@ auto_create_schemas = true
             None,
             false,
             None,
+            &rocky_core::config::PrincipalRef::unnamed(),
         )
         .await
         .expect_err("replication shadow must not claim a model production target");
@@ -22089,6 +22191,7 @@ auto_create_schemas = true
             None,
             false,
             None,
+            &rocky_core::config::PrincipalRef::unnamed(),
         )
         .await
         .expect_err("catalogless replication shadow aliases the model's production target");
@@ -24140,6 +24243,72 @@ auto_create_schemas = true
     }
 
     #[tokio::test]
+    async fn a_lost_record_that_fails_the_run_does_not_mark_the_key_succeeded() {
+        // #1884: a successful run whose lost record still fails it exits
+        // non-zero and asks the operator to retry. Its key must be stamped
+        // `Failed`, or the retry with the same key is skipped as completed and
+        // the record is never written.
+        use rocky_core::config::{DedupPolicy, IdempotencyConfig, StateUploadFailureMode};
+        use rocky_core::idempotency::{IdempotencyBackend, IdempotencyCheck};
+        use rocky_core::state::StateStore;
+
+        assert!(lost_record_fails_run(
+            RecordCustody::Lost,
+            false,
+            StateUploadFailureMode::Fail
+        ));
+        assert!(lost_record_fails_run(
+            RecordCustody::Lost,
+            true,
+            StateUploadFailureMode::Skip
+        ));
+        assert!(!lost_record_fails_run(
+            RecordCustody::Lost,
+            false,
+            StateUploadFailureMode::Skip
+        ));
+        assert!(!lost_record_fails_run(
+            RecordCustody::Persisted,
+            true,
+            StateUploadFailureMode::Fail
+        ));
+
+        let config = IdempotencyConfig {
+            retention_days: 30,
+            dedup_on: DedupPolicy::Success,
+            in_flight_ttl_hours: 24,
+        };
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let state_path = tmp.path().join("state.redb");
+        let store = StateStore::open(&state_path).expect("open");
+        let backend = IdempotencyBackend::Local;
+        assert!(matches!(
+            backend
+                .check_and_claim(Some(&store), "lost-key", "run-1", &config)
+                .await
+                .unwrap(),
+            IdempotencyCheck::Proceed
+        ));
+        let mut ctx_slot = Some(IdempotencyCtx {
+            key: "lost-key".into(),
+            backend: IdempotencyBackend::Local,
+            config: config.clone(),
+            _claim_backend_label: "local",
+        });
+        let output = RunOutput::new(String::new(), 0, 1);
+        finalize_idempotency(&mut ctx_slot, Some(&store), "run-1", &output, true).await;
+
+        let retry = backend
+            .check_and_claim(Some(&store), "lost-key", "run-2", &config)
+            .await
+            .unwrap();
+        assert!(
+            !retry.is_skip(),
+            "the retry the error asks for must run, got {retry:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn finalize_idempotency_is_one_shot_take() {
         // Guards the contract that `finalize_idempotency` takes the ctx
         // out of its `Option<_>` so the outer error-path wrapper in
@@ -24166,7 +24335,7 @@ auto_create_schemas = true
 
         // Synthetic successful output.
         let output = RunOutput::new(String::new(), 0, 1);
-        finalize_idempotency(&mut ctx_slot, Some(&store), "run-ok", &output).await;
+        finalize_idempotency(&mut ctx_slot, Some(&store), "run-ok", &output, false).await;
         assert!(
             ctx_slot.is_none(),
             "first finalize must drain the Option; the outer wrapper relies on this \
@@ -24174,7 +24343,7 @@ auto_create_schemas = true
         );
 
         // Second call is a no-op — no panic, ctx remains None.
-        finalize_idempotency(&mut ctx_slot, Some(&store), "run-ok", &output).await;
+        finalize_idempotency(&mut ctx_slot, Some(&store), "run-ok", &output, false).await;
         assert!(ctx_slot.is_none());
     }
 
@@ -24331,6 +24500,7 @@ auto_create_schemas = true
             None,
             false,
             Some(("plan-under-test", reviewed.as_slice())),
+            &rocky_core::config::PrincipalRef::unnamed(),
         )
         .await
         .expect_err("a reviewed state that does not match discovery must refuse");
@@ -24485,6 +24655,7 @@ threshold = 0
             None,
             false,
             None,
+            &rocky_core::config::PrincipalRef::unnamed(),
         )
         .await
         .expect_err("a check-name collision must refuse the run before copying anything");
@@ -24607,6 +24778,7 @@ adapter = "default"
             None,  // no governance ctx (test)
             false, // assume_fresh_state (test)
             None,  // #1460
+            &rocky_core::config::PrincipalRef::unnamed(),
         )
         .await
         .expect("transformation run should succeed");
@@ -24805,6 +24977,7 @@ adapter = "default"
                     None,
                     false,
                     None,
+                    &rocky_core::config::PrincipalRef::unnamed(),
                 )
                 .await;
                 let commit_path =
@@ -24983,6 +25156,7 @@ adapter = "default"
             None,
             false,
             None,
+            &rocky_core::config::PrincipalRef::unnamed(),
         )
         .await;
         assert!(result.is_err(), "the model write must fail: {failure}");
@@ -25222,6 +25396,7 @@ schema_template = "staging__{{source}}"
             None,
             false,
             None,
+            &rocky_core::config::PrincipalRef::unnamed(),
         )
         .await;
         assert!(result.is_err(), "the model write must fail: {failure}");
@@ -25356,6 +25531,7 @@ adapter = "default"
                 None,
                 false,
                 None, // #1460
+                &rocky_core::config::PrincipalRef::unnamed(),
             ))
             .expect("the run must succeed regardless of the trace context");
         }
@@ -25506,6 +25682,7 @@ schema = "mart"
             None,  // no governance ctx (test)
             false, // assume_fresh_state (test)
             None,  // #1460
+            &rocky_core::config::PrincipalRef::unnamed(),
         )
         .await
         .expect(
@@ -29459,6 +29636,7 @@ timestamp_column = "ts"
                 None,
                 false,
                 None, // #1460
+                &rocky_core::config::PrincipalRef::unnamed(),
             )
             .await
         }
@@ -29594,6 +29772,7 @@ backend = "local"
                 None,
                 false,
                 None, // #1460
+                &rocky_core::config::PrincipalRef::unnamed(),
             )
             .await
             .map(|_| ())
@@ -43033,6 +43212,7 @@ value = "'{source}'"
                 None,
                 false,
                 None,
+                &rocky_core::config::PrincipalRef::unnamed(),
             )
             .await
         }
@@ -44646,6 +44826,7 @@ auto_create_schemas = true
             None,
             false,
             None,
+            &rocky_core::config::PrincipalRef::unnamed(),
         )
         .await
         .map(|_| ());
@@ -46548,6 +46729,7 @@ timestamp_column = "ts"
     ) -> anyhow::Result<()> {
         let ctx = crate::commands::apply::GovernedRunContext {
             principal: rocky_core::config::PolicyPrincipal::Agent,
+            actor: rocky_core::config::PrincipalRef::unnamed(),
             plan_id: "checkpoint-ordering-legacy-plan",
             root: config.parent().unwrap(),
             config_path: config,
@@ -46585,6 +46767,7 @@ timestamp_column = "ts"
             if governed { Some(&ctx) } else { None },
             false,
             None,
+            &rocky_core::config::PrincipalRef::unnamed(),
         )
         .await
         .map(|_| ())

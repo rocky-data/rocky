@@ -1443,6 +1443,29 @@
             ],
             "description": "Who was acting (`human` / `agent`)."
           },
+          "principal_id": {
+            "description": "The id of the actor behind the decision (RV4-P1). `null` means unrecorded: the row was written before ids existed. `unnamed` means nobody named the actor.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "principal_id_source": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PrincipalIdSource"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Where the id came from (`flag`, `env`, `mcp_profile`, `default`). `null` when the id is unrecorded."
+          },
+          "principal_id_verified": {
+            "default": false,
+            "description": "Whether anything verified the id. Always `false` today: ids are self-asserted until signed approvals exist. Defaulted, so a consumer reading an older binary's output sees `false`.",
+            "type": "boolean"
+          },
           "reason": {
             "description": "Human-readable explanation of how the effect was reached. A resolved `${VAR}` value prints as `${NAME}` (#1919).",
             "type": "string"
@@ -1566,6 +1589,26 @@
           }
         ]
       },
+      "AuditFilter": {
+        "description": "The `--actor` / `--since` filter of `rocky audit` (RV4-P1).",
+        "properties": {
+          "actor": {
+            "description": "The principal id the rows were filtered to. `unrecorded` selects the rows with no id.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "since": {
+            "description": "The inclusive lower bound, as an RFC 3339 UTC timestamp. A row is kept when its timestamp is at or after this.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
       "AuditForOutput": {
         "description": "JSON output for `rocky audit --for <table|run|plan>` — the custody chain.\n\nA one-query drill-down assembled link by link from the data Rocky already records: who proposed the change and what the policy plane decided ([`Self::decisions`]), what the plan changed ([`Self::plan`]), which runs materialized it ([`Self::runs`]), what a post-apply verification found ([`Self::verify_after`]), and what sits downstream in its blast radius ([`Self::blast_radius`]).\n\nEvery link fails closed the same way the estate brief does: a link whose signal is genuinely not recorded renders [`SectionAvailability::Unavailable`] with a note, never a fabricated or assumed value. Post-apply verification outcomes are persisted as decision-ledger custody rows (non-empty `verify_after`), so [`Self::verify_after`] renders them when they exist and says \"not recorded\" when none exist for the subject. The run ledger is not keyed to policy decisions, so a `run` selector cannot join back to a decision. The blast radius is recomputed from the current compiled graph (a live query, not a stored snapshot).",
         "properties": {
@@ -1653,11 +1696,22 @@
             "type": "string"
           },
           "decisions": {
-            "description": "Every recorded policy decision, oldest first. Under `product`, only the rows whose `model` is that product's output model.",
+            "description": "Every recorded policy decision, oldest first. Under `product`, only the rows whose `model` is that product's output model. Under `filter`, only the rows that match it.",
             "items": {
               "$ref": "#/components/schemas/AuditDecisionEntry"
             },
             "type": "array"
+          },
+          "filter": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/AuditFilter"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The `--actor` / `--since` filter applied, absent when neither was given."
           },
           "product": {
             "anyOf": [
@@ -1669,6 +1723,13 @@
               }
             ],
             "description": "The product the ledger was filtered to (`--product <name>`), absent when the whole ledger is listed."
+          },
+          "unattributed_skipped": {
+            "default": 0,
+            "description": "How many rows in range carry no principal id (written before ids existed) and so an `--actor <id>` filter dropped them. `0` without an `--actor` filter, and under `--actor unrecorded`, which lists them. Defaulted, so a consumer reading an older binary's output sees `0`.",
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
           },
           "version": {
             "type": "string"
@@ -10056,6 +10117,193 @@
       "IncrementalLookback": {
         "type": "string"
       },
+      "IntentCheckOutput": {
+        "description": "Result of `rocky plan --intent <intent>`. **Experimental. Report-only.**\n\nRocky builds each changed model twice, once from the SQL at `base_ref` and once from the working tree, in one DuckDB transaction, and compares the two outputs exactly. See [`INTENT_CHECK_CAVEAT`] for what a `match` does and does not mean.",
+        "properties": {
+          "adapter": {
+            "description": "The target adapter type (for example `\"duckdb\"`).",
+            "type": "string"
+          },
+          "base_ref": {
+            "description": "The git ref the working tree was compared against (`--base`).",
+            "type": "string"
+          },
+          "caveat": {
+            "description": "What a verdict means and what it does not check. Always set.",
+            "type": "string"
+          },
+          "intent": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/PlanIntent"
+              }
+            ],
+            "description": "The intent that was checked."
+          },
+          "models": {
+            "description": "One verdict per changed model, sorted by model name.",
+            "items": {
+              "$ref": "#/components/schemas/ModelIntentVerdict"
+            },
+            "type": "array"
+          },
+          "probes": {
+            "description": "Extra builds of the base SQL used to detect nondeterminism.",
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "summary": {
+            "$ref": "#/components/schemas/IntentCheckSummary"
+          }
+        },
+        "required": [
+          "adapter",
+          "base_ref",
+          "caveat",
+          "intent",
+          "models",
+          "probes",
+          "summary"
+        ],
+        "type": "object"
+      },
+      "IntentCheckReason": {
+        "description": "Why a model got `mismatch` or `unverified`. A closed list.",
+        "oneOf": [
+          {
+            "description": "Mismatch: the column names, types or order differ.",
+            "enum": [
+              "schema_differs"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "Mismatch: the outputs are different multisets of rows.",
+            "enum": [
+              "rows_differ"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "Mismatch: the model exists at the base ref and not in the working tree.",
+            "enum": [
+              "model_removed"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "Unverified: the target adapter is not DuckDB.",
+            "enum": [
+              "adapter_unsupported"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "Unverified: the model does not exist at the base ref.",
+            "enum": [
+              "no_base"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "Unverified: the models at the base ref could not be read or compiled.",
+            "enum": [
+              "base_unavailable"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "Unverified: the SQL calls a volatile builtin, or two builds of the same SQL disagree.",
+            "enum": [
+              "nondeterministic"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "Unverified: the materialization strategy is not supported.",
+            "enum": [
+              "unsupported_strategy"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "Unverified: a build or a comparison query failed.",
+            "enum": [
+              "build_failed"
+            ],
+            "type": "string"
+          }
+        ]
+      },
+      "IntentCheckSummary": {
+        "description": "Counts of each verdict in [`IntentCheckOutput::models`].",
+        "properties": {
+          "match": {
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "mismatch": {
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "unverified": {
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "match",
+          "mismatch",
+          "unverified"
+        ],
+        "type": "object"
+      },
+      "IntentColumn": {
+        "description": "One column of a built output: its name and its warehouse type.",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "type": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "type"
+        ],
+        "type": "object"
+      },
+      "IntentVerdict": {
+        "description": "The verdict for one changed model.",
+        "oneOf": [
+          {
+            "description": "The effect satisfies the intent on the recorded inputs.",
+            "enum": [
+              "match"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "The effect breaks the intent. `reason` says how.",
+            "enum": [
+              "mismatch"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "The check could not decide. `reason` says why.",
+            "enum": [
+              "unverified"
+            ],
+            "type": "string"
+          }
+        ]
+      },
       "IsolationConfig": {
         "additionalProperties": false,
         "description": "Workspace isolation configuration (Databricks-specific).\n\n```toml [governance.isolation] enabled = true\n\n[[governance.isolation.workspace_ids]] id = 7474656540609532 binding_type = \"READ_WRITE\"\n\n[[governance.isolation.workspace_ids]] id = 7474647537929812 binding_type = \"READ_ONLY\" ```",
@@ -12058,6 +12306,104 @@
         ],
         "type": "object"
       },
+      "ModelIntentVerdict": {
+        "description": "The intent verdict for one changed model.",
+        "properties": {
+          "detail": {
+            "description": "Plain-text detail, such as the error text of a failed build.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "model": {
+            "description": "The model name, as declared in its sidecar.",
+            "type": "string"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/IntentCheckReason"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Set for every `mismatch` and every `unverified`. Unset for `match`."
+          },
+          "rows_base": {
+            "description": "Row count of the base build.",
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "rows_head": {
+            "description": "Row count of the head build.",
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "rows_only_in_base": {
+            "description": "Rows in the base output and not in the head output (multiset).",
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "rows_only_in_head": {
+            "description": "Rows in the head output and not in the base output (multiset).",
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "schema_base": {
+            "description": "The base output columns. Set only when `reason` is `schema_differs`.",
+            "items": {
+              "$ref": "#/components/schemas/IntentColumn"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "schema_head": {
+            "description": "The head output columns. Set only when `reason` is `schema_differs`.",
+            "items": {
+              "$ref": "#/components/schemas/IntentColumn"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "upstream_changed": {
+            "description": "Changed models upstream of this one. Both builds read the materialized upstream tables, so this model's verdict does not cover the upstream change. Empty when no upstream model changed.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "verdict": {
+            "$ref": "#/components/schemas/IntentVerdict"
+          }
+        },
+        "required": [
+          "model",
+          "verdict"
+        ],
+        "type": "object"
+      },
       "ModelListEntry": {
         "description": "One row of [`ModelListOutput`].",
         "properties": {
@@ -13535,6 +13881,18 @@
         ],
         "description": "Schema-only helper mirroring [`AdaptersFieldSchema`] for `[pipeline.*]`.\n\nThe flat-pipeline shorthand exists in [`normalize_toml_shorthands`] but is unused across all committed POCs; including it in the schema is defensive — a user typing `[pipeline] source = ...` shouldn't see a false IDE error. The pipeline payload references [`PipelineConfig`] directly, whose hand-written `JsonSchema` impl emits an `anyOf` of the five pipeline variants."
       },
+      "PlanIntent": {
+        "description": "The closed list of intents `rocky plan --intent` accepts.\n\nVersion 1 has one intent. Each intent has a written predicate that the check measures on the data. clap rejects any other value.",
+        "oneOf": [
+          {
+            "description": "Same schema. The base and head outputs are equal multisets of rows.",
+            "enum": [
+              "refactor"
+            ],
+            "type": "string"
+          }
+        ]
+      },
       "PlanOutput": {
         "properties": {
           "breaking_verdict": {
@@ -13596,6 +13954,17 @@
           "has_budget_errors": {
             "description": "`true` when at least one entry in `budget_diagnostics` has error-level severity (`on_breach = \"error\"`). Callers can use this flag to fail a pipeline-as-code check without inspecting individual diagnostic severities.",
             "type": "boolean"
+          },
+          "intent_check": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/IntentCheckOutput"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Result of `rocky plan --intent <intent>`: one verdict per changed model. **Experimental.** Present only when `--intent` is set. REPORT-ONLY: it relaxes no gate and never changes the exit code. It lives on the output, not in the persisted plan, so it does not enter `plan_id`. See [`IntentCheckOutput`] and its `caveat`."
           },
           "mask_actions": {
             "description": "Masking-policy applications the governance reconciler would issue via `apply_masking_policy`. One row per `(model, column, tag)` where the tag resolves to a strategy for the active env. Unresolved tags are intentionally omitted — `rocky compliance` is the diagnostic surface for that gap.",
@@ -15511,6 +15880,39 @@
           }
         },
         "type": "object"
+      },
+      "PrincipalIdSource": {
+        "description": "Where a [`PrincipalId`] came from.\n\nP1 knows four sources, and every one is self-asserted. RV4-P2 adds signed sources (a local key, CI OIDC). C2 adds `serve_token` for the HTTP API. A new variant is a change in meaning for an older binary, so the phase that adds one bumps the state schema.",
+        "oneOf": [
+          {
+            "description": "The global `--principal-id` flag.",
+            "enum": [
+              "flag"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "The `ROCKY_PRINCIPAL_ID` environment variable.",
+            "enum": [
+              "env"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "Derived from the `rocky mcp --profile` the server runs under (`mcp-default`, `mcp-approver`, `mcp-worker`).",
+            "enum": [
+              "mcp_profile"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "Nobody named the actor; the id is [`PRINCIPAL_ID_UNNAMED`].",
+            "enum": [
+              "default"
+            ],
+            "type": "string"
+          }
+        ]
       },
       "ProductApprovalOutput": {
         "description": "The approval record, as echoed by compile/status output.",
@@ -18756,6 +19158,13 @@
               }
             ],
             "description": "Who authored the change (`human` / `agent`)."
+          },
+          "principal_id": {
+            "description": "The id of the actor behind the escalation (RV4-P1). `null` when the row was written before ids existed. Self-asserted and unverified.",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "reason": {
             "description": "Human-readable explanation of how `require_review` was reached.",
@@ -24090,13 +24499,31 @@
   "paths": {
     "/api/v1/audit": {
       "get": {
-        "description": "Every policy decision recorded at a mutating enforcement seam, oldest first: the same bytes as `rocky audit --output json`. With `product=<name>`, only the rows about that product's output model (`product.output.model`, default the product name), resolved from `products/<name>.toml`: the same bytes as `rocky audit --product <name> --output json`. Unfiltered it reads the state store only and needs no bound config. The ledger is returned whole, as the CLI prints it. Reads only.",
+        "description": "Every policy decision recorded at a mutating enforcement seam, oldest first: the same bytes as `rocky audit --output json`. With `product=<name>`, only the rows about that product's output model (`product.output.model`, default the product name), resolved from `products/<name>.toml`: the same bytes as `rocky audit --product <name> --output json`. With `actor=<id>` and `since=<when>`, the same bytes as `rocky audit --actor <id> --since <when> --output json`; they compose with `product`. Principal ids are self-asserted and unverified. Unfiltered it reads the state store only and needs no bound config. The ledger is returned whole, as the CLI prints it. Reads only.",
         "operationId": "getAuditLedger",
         "parameters": [
           {
             "description": "A product name. Lists only the rows whose model is that product's output model.",
             "in": "query",
             "name": "product",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "A principal id. Lists only the rows that actor recorded. `unrecorded` lists the rows with no id.",
+            "in": "query",
+            "name": "actor",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "An inclusive lower bound: `YYYY-MM-DD` (00:00 UTC), an RFC 3339 timestamp with an offset, or a `<N>d` / `<N>h` duration.",
+            "in": "query",
+            "name": "since",
             "required": false,
             "schema": {
               "type": "string"
@@ -24112,7 +24539,17 @@
                 }
               }
             },
-            "description": "The ledger, whole or scoped to the product."
+            "description": "The ledger, whole or filtered."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "A query parameter is not one of its documented values, or the subject is longer than 512 bytes."
           },
           "404": {
             "content": {

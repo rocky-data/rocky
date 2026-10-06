@@ -237,6 +237,29 @@
           ],
           "description": "Who was acting (`human` / `agent`)."
         },
+        "principal_id": {
+          "description": "The id of the actor behind the decision (RV4-P1). `null` means unrecorded: the row was written before ids existed. `unnamed` means nobody named the actor.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "principal_id_source": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/PrincipalIdSource"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Where the id came from (`flag`, `env`, `mcp_profile`, `default`). `null` when the id is unrecorded."
+        },
+        "principal_id_verified": {
+          "default": false,
+          "description": "Whether anything verified the id. Always `false` today: ids are self-asserted until signed approvals exist. Defaulted, so a consumer reading an older binary's output sees `false`.",
+          "type": "boolean"
+        },
         "reason": {
           "description": "Human-readable explanation of how the effect was reached. A resolved `${VAR}` value prints as `${NAME}` (#1919).",
           "type": "string"
@@ -509,6 +532,39 @@
           "description": "A non-human caller (AI agent / automation).",
           "enum": [
             "agent"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "PrincipalIdSource": {
+      "description": "Where a [`PrincipalId`] came from.\n\nP1 knows four sources, and every one is self-asserted. RV4-P2 adds signed sources (a local key, CI OIDC). C2 adds `serve_token` for the HTTP API. A new variant is a change in meaning for an older binary, so the phase that adds one bumps the state schema.",
+      "oneOf": [
+        {
+          "description": "The global `--principal-id` flag.",
+          "enum": [
+            "flag"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "The `ROCKY_PRINCIPAL_ID` environment variable.",
+          "enum": [
+            "env"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Derived from the `rocky mcp --profile` the server runs under (`mcp-default`, `mcp-approver`, `mcp-worker`).",
+          "enum": [
+            "mcp_profile"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Nobody named the actor; the id is [`PRINCIPAL_ID_UNNAMED`].",
+          "enum": [
+            "default"
           ],
           "type": "string"
         }

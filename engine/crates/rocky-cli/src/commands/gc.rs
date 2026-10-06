@@ -884,10 +884,19 @@ pub fn run_gc_plan(
     config_path: &Path,
     min_age_days: i64,
     principal: PolicyPrincipal,
+    actor: &rocky_core::config::PrincipalRef,
     json: bool,
 ) -> Result<()> {
     let cwd = std::env::current_dir().context("failed to get current working directory")?;
-    run_gc_plan_in(&cwd, state_path, config_path, min_age_days, principal, json)
+    run_gc_plan_in(
+        &cwd,
+        state_path,
+        config_path,
+        min_age_days,
+        principal,
+        actor,
+        json,
+    )
 }
 
 /// Inner implementation — takes an explicit `root` for the plans directory so
@@ -898,6 +907,7 @@ pub(crate) fn run_gc_plan_in(
     config_path: &Path,
     min_age_days: i64,
     principal: PolicyPrincipal,
+    actor: &rocky_core::config::PrincipalRef,
     json: bool,
 ) -> Result<()> {
     let adapter = load_adapter_cost(config_path);
@@ -940,6 +950,7 @@ pub(crate) fn run_gc_plan_in(
         state_path,
         &plan_id,
         principal,
+        actor,
         PolicyCapability::Gc,
         &gc_plan_scope_summary(&plan),
         // The summary above counts models; these name them, so two pending gc
@@ -1531,6 +1542,7 @@ async fn gc_seam_regate(
     cfg: Option<&rocky_core::config::RockyConfig>,
     plan_id: &str,
     principal: rocky_core::config::PolicyPrincipal,
+    actor: &rocky_core::config::PrincipalRef,
     touched: &BTreeMap<String, PolicyCapability>,
     models_dir: &Path,
     models_glob: Option<&str>,
@@ -1543,6 +1555,7 @@ async fn gc_seam_regate(
         cfg,
         plan_id,
         principal,
+        actor,
         touched,
         models_dir,
         models_glob,
@@ -1565,6 +1578,7 @@ pub(crate) async fn ledger_seam_regate(
     cfg: Option<&rocky_core::config::RockyConfig>,
     plan_id: &str,
     principal: rocky_core::config::PolicyPrincipal,
+    actor: &rocky_core::config::PrincipalRef,
     touched: &BTreeMap<String, PolicyCapability>,
     models_dir: &Path,
     models_glob: Option<&str>,
@@ -1612,6 +1626,7 @@ pub(crate) async fn ledger_seam_regate(
         &policy,
         plan_id,
         principal,
+        actor,
         touched,
         &attrs_map,
         crate::commands::apply::GateSubjects::CompiledModels,
@@ -1646,6 +1661,7 @@ pub(crate) async fn run_gc_apply_in(
     plan_id: &str,
     state_path: &Path,
     runtime_principal: rocky_core::config::PolicyPrincipal,
+    actor: &rocky_core::config::PrincipalRef,
     json: bool,
 ) -> Result<()> {
     // The authoritative manifest-truth liveness oracle. Split out so tests can
@@ -1658,6 +1674,7 @@ pub(crate) async fn run_gc_apply_in(
         plan_id,
         state_path,
         runtime_principal,
+        actor,
         json,
         std::sync::Arc::new(ManifestLivenessOracle),
     )
@@ -1666,12 +1683,14 @@ pub(crate) async fn run_gc_apply_in(
 
 /// [`run_gc_apply_in`] with an injectable [`LivenessOracle`] — the real path
 /// passes [`ManifestLivenessOracle`]; tests pass a deterministic oracle.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_gc_apply_in_with(
     root: &Path,
     config_path: &Path,
     plan_id: &str,
     state_path: &Path,
     runtime_principal: rocky_core::config::PolicyPrincipal,
+    actor: &rocky_core::config::PrincipalRef,
     json: bool,
     oracle: std::sync::Arc<dyn LivenessOracle>,
 ) -> Result<()> {
@@ -1801,6 +1820,7 @@ pub(crate) async fn run_gc_apply_in_with(
         loaded_cfg.as_ref().and_then(|c| c.policy.as_ref()),
         plan_id,
         plan_record.enforcement_principal(runtime_principal),
+        actor,
         &touched,
         &models_dir,
         models_glob.as_deref(),
@@ -1890,6 +1910,7 @@ pub(crate) async fn run_gc_apply_in_with(
         let seam_models_dir = models_dir.clone();
         let seam_models_glob = models_glob.clone();
         let seam_principal = plan_record.enforcement_principal(runtime_principal);
+        let seam_actor = actor.clone();
         let seam_plan = plan.clone();
         let seam_plan_id = plan_id.to_string();
         let seam_oracle = std::sync::Arc::clone(&oracle);
@@ -1900,6 +1921,7 @@ pub(crate) async fn run_gc_apply_in_with(
                 let models_dir = seam_models_dir.clone();
                 let models_glob = seam_models_glob.clone();
                 let principal = seam_principal;
+                let actor = seam_actor.clone();
                 let plan = seam_plan.clone();
                 let plan_id = seam_plan_id.clone();
                 let oracle = std::sync::Arc::clone(&seam_oracle);
@@ -1916,6 +1938,7 @@ pub(crate) async fn run_gc_apply_in_with(
                         cfg.as_ref(),
                         &plan_id,
                         principal,
+                        &actor,
                         &touched,
                         &models_dir,
                         models_glob.as_deref(),
@@ -1939,6 +1962,7 @@ pub(crate) async fn run_gc_apply_in_with(
                         cfg.as_ref(),
                         &plan_id,
                         principal,
+                        &actor,
                         &touched,
                         &models_dir,
                         models_glob.as_deref(),
@@ -3095,6 +3119,7 @@ auto_create_schemas = true
             &plan_id,
             &state_path,
             PolicyPrincipal::Human,
+            &rocky_core::config::PrincipalRef::unnamed(),
             true,
             oracle.clone(),
         )
@@ -3117,6 +3142,7 @@ auto_create_schemas = true
             &plan_id,
             &state_path,
             PolicyPrincipal::Human,
+            &rocky_core::config::PrincipalRef::unnamed(),
             true,
             oracle.clone(),
         )
@@ -3165,6 +3191,7 @@ auto_create_schemas = true
             &plan_id,
             &state_path,
             PolicyPrincipal::Human,
+            &rocky_core::config::PrincipalRef::unnamed(),
             true,
             oracle.clone(),
         )
@@ -3871,6 +3898,7 @@ auto_create_schemas = true
             &plan_id,
             &state_path,
             PolicyPrincipal::Human,
+            &rocky_core::config::PrincipalRef::unnamed(),
             true,
         )
         .await
@@ -3919,6 +3947,7 @@ auto_create_schemas = true
             &plan_id,
             &state_path,
             PolicyPrincipal::Human,
+            &rocky_core::config::PrincipalRef::unnamed(),
             true,
         )
         .await
@@ -3964,7 +3993,16 @@ auto_create_schemas = true
         let models_dir = root.join("models");
 
         // 1. Create the reclamation plan.
-        run_gc_plan_in(root, &state_path, &config, 7, PolicyPrincipal::Human, true).unwrap();
+        run_gc_plan_in(
+            root,
+            &state_path,
+            &config,
+            7,
+            PolicyPrincipal::Human,
+            &rocky_core::config::PrincipalRef::unnamed(),
+            true,
+        )
+        .unwrap();
         let plans_dir = root.join(".rocky").join("plans");
         let plan_id = std::fs::read_dir(&plans_dir)
             .unwrap()
@@ -4041,6 +4079,7 @@ auto_create_schemas = true
             &plan_id,
             &state_path,
             PolicyPrincipal::Human,
+            &rocky_core::config::PrincipalRef::unnamed(),
             true,
         )
         .await
@@ -4239,6 +4278,7 @@ auto_create_schemas = true
             &plan_id,
             &harness.pod_b.state_path,
             PolicyPrincipal::Human,
+            &rocky_core::config::PrincipalRef::unnamed(),
             true,
             oracle.clone(),
         )
@@ -4328,6 +4368,7 @@ auto_create_schemas = true
             &plan_id,
             &harness.pod_b.state_path,
             PolicyPrincipal::Human,
+            &rocky_core::config::PrincipalRef::unnamed(),
             true,
             std::sync::Arc::new(FixedLivenessOracle::reclaimable()),
         )
@@ -4395,6 +4436,7 @@ auto_create_schemas = true
             &plan_id,
             &harness.pod_b.state_path,
             PolicyPrincipal::Human,
+            &rocky_core::config::PrincipalRef::unnamed(),
             true,
             std::sync::Arc::new(FixedLivenessOracle::reclaimable()),
         )
@@ -4454,6 +4496,7 @@ auto_create_schemas = true
             Some(&cfg),
             "plan-x",
             PolicyPrincipal::Human,
+            &rocky_core::config::PrincipalRef::unnamed(),
             &touched,
             &models_dir,
             None,
@@ -4479,11 +4522,13 @@ auto_create_schemas = true
             reason: "unit ledger-only freeze".to_string(),
             verify_after: Vec::new(),
             auto_apply: None,
+            principal_ref: None,
         };
         let err = gc_seam_regate(
             Some(&cfg),
             "plan-x",
             PolicyPrincipal::Human,
+            &rocky_core::config::PrincipalRef::unnamed(),
             &touched,
             &models_dir,
             None,
@@ -4511,6 +4556,7 @@ auto_create_schemas = true
             Some(&cfg),
             "plan-x",
             PolicyPrincipal::Human,
+            &rocky_core::config::PrincipalRef::unnamed(),
             &touched,
             &models_dir,
             None,
@@ -4536,6 +4582,7 @@ auto_create_schemas = true
             Some(&cfg),
             "plan-x",
             PolicyPrincipal::Human,
+            &rocky_core::config::PrincipalRef::unnamed(),
             &touched,
             &models_dir,
             None,
@@ -4553,6 +4600,7 @@ auto_create_schemas = true
             Some(&cfg),
             "plan-x",
             PolicyPrincipal::Human,
+            &rocky_core::config::PrincipalRef::unnamed(),
             &touched,
             &models_dir,
             None,
@@ -4612,6 +4660,7 @@ auto_create_schemas = true
                                 reason: "kill switch engaged mid-seam".to_string(),
                                 verify_after: Vec::new(),
                                 auto_apply: None,
+                                principal_ref: None,
                             })
                             .unwrap();
                     }
@@ -4657,6 +4706,7 @@ auto_create_schemas = true
             &plan_id,
             &harness.pod_b.state_path,
             PolicyPrincipal::Human,
+            &rocky_core::config::PrincipalRef::unnamed(),
             true,
             oracle.clone(),
         )
@@ -4762,6 +4812,7 @@ auto_create_schemas = true
             &plan_id,
             &harness.pod_b.state_path,
             PolicyPrincipal::Human,
+            &rocky_core::config::PrincipalRef::unnamed(),
             true,
             std::sync::Arc::new(OutageOracle {
                 provider: harness.provider.clone(),
@@ -4859,6 +4910,7 @@ auto_create_schemas = true
             &plan_id,
             &harness.pod_b.state_path,
             PolicyPrincipal::Human,
+            &rocky_core::config::PrincipalRef::unnamed(),
             true,
             std::sync::Arc::new(MarkerWritingOracle {
                 provider: harness.provider.clone(),

@@ -256,10 +256,11 @@ pub fn run_restore_plan(
     state_path: &Path,
     target: &str,
     principal: PolicyPrincipal,
+    actor: &rocky_core::config::PrincipalRef,
     json: bool,
 ) -> Result<()> {
     let cwd = std::env::current_dir().context("failed to get current working directory")?;
-    run_restore_plan_in(&cwd, state_path, target, principal, json)
+    run_restore_plan_in(&cwd, state_path, target, principal, actor, json)
 }
 
 /// Inner implementation — takes an explicit `root` for the plans directory so
@@ -269,6 +270,7 @@ pub(crate) fn run_restore_plan_in(
     state_path: &Path,
     target: &str,
     principal: PolicyPrincipal,
+    actor: &rocky_core::config::PrincipalRef,
     json: bool,
 ) -> Result<()> {
     let (tombstones, live_artifacts) = {
@@ -316,6 +318,7 @@ pub(crate) fn run_restore_plan_in(
         state_path,
         &plan_id,
         principal,
+        actor,
         PolicyCapability::Restore,
         &format!(
             "restore: {} ({}…)",
@@ -459,10 +462,16 @@ enum RestoreOneOutcome {
 ///
 /// Ledger rows are inside the blob the seam publishes, so a refused attempt
 /// discards them. An object write is not: once the bytes land they stay. So
-/// the policy gate is re-checked right before every such write — a freeze
-/// marker or ledger freeze that lands between the attempt's gate and this
-/// write refuses it. The pre-publish recheck alone would see that freeze only
-/// after the bytes were already written.
+/// the policy gate is re-checked right before every such write, over a fresh
+/// LIST of freeze markers — a freeze marker that lands between the attempt's
+/// gate and this write refuses it. The pre-publish recheck alone would see
+/// that freeze only after the bytes were already written.
+///
+/// Ledger rows are read from the attempt's own download, so a freeze recorded
+/// only as a ledger row on another pod mid-attempt is not seen here. It is
+/// caught at publish (the CAS conflict replays the attempt, whose gate then
+/// refuses), after the write. Only freeze markers fence the write itself,
+/// which is why `rocky policy freeze` writes them.
 #[async_trait::async_trait]
 pub(crate) trait ObjectWriteFence: Send + Sync {
     /// `Err` refuses the write and aborts the restore transition.
@@ -945,6 +954,7 @@ pub(crate) async fn run_restore_apply_in(
     plan_id: &str,
     state_path: &Path,
     runtime_principal: PolicyPrincipal,
+    actor: &rocky_core::config::PrincipalRef,
     json: bool,
 ) -> Result<()> {
     // Re-derivation runs on the RECORDING engine — the project's configured
@@ -981,6 +991,7 @@ pub(crate) async fn run_restore_apply_in(
         plan_id,
         state_path,
         runtime_principal,
+        actor,
         json,
         Arc::new(S3RestoreStores),
         warehouse,
@@ -1000,6 +1011,7 @@ pub(crate) async fn run_restore_apply_in_with(
     plan_id: &str,
     state_path: &Path,
     runtime_principal: PolicyPrincipal,
+    actor: &rocky_core::config::PrincipalRef,
     json: bool,
     stores: Arc<dyn RestoreStores>,
     warehouse: Arc<dyn rocky_core::traits::WarehouseAdapter>,
@@ -1015,6 +1027,7 @@ pub(crate) async fn run_restore_apply_in_with(
         plan_id,
         state_path,
         runtime_principal,
+        actor,
         stores,
         warehouse,
         loaded_cfg,
@@ -1035,6 +1048,7 @@ struct RegateFence {
     cfg: rocky_core::config::RockyConfig,
     plan_id: String,
     principal: PolicyPrincipal,
+    actor: rocky_core::config::PrincipalRef,
     touched: BTreeMap<String, PolicyCapability>,
     models_dir: std::path::PathBuf,
     models_glob: Option<String>,
@@ -1049,6 +1063,7 @@ impl ObjectWriteFence for RegateFence {
             Some(&self.cfg),
             &self.plan_id,
             self.principal,
+            &self.actor,
             &self.touched,
             &self.models_dir,
             self.models_glob.as_deref(),
@@ -1070,6 +1085,7 @@ pub(crate) async fn restore_apply_output(
     plan_id: &str,
     state_path: &Path,
     runtime_principal: PolicyPrincipal,
+    actor: &rocky_core::config::PrincipalRef,
     stores: Arc<dyn RestoreStores>,
     warehouse: Arc<dyn rocky_core::traits::WarehouseAdapter>,
     loaded_cfg: Option<rocky_core::config::RockyConfig>,
@@ -1141,6 +1157,7 @@ pub(crate) async fn restore_apply_output(
         loaded_cfg.as_ref().and_then(|c| c.policy.as_ref()),
         plan_id,
         plan_record.enforcement_principal(runtime_principal),
+        actor,
         &touched,
         &models_dir,
         models_glob.as_deref(),
@@ -1208,6 +1225,7 @@ pub(crate) async fn restore_apply_output(
     let seam_touched = touched.clone();
     let seam_models_dir = models_dir.clone();
     let seam_models_glob = models_glob.clone();
+    let seam_actor = actor.clone();
     let seam_written = Arc::clone(&written_paths);
     let exec_result = crate::commands::apply::commit_remote_ledger_seam(
         remote_cfg,
@@ -1220,6 +1238,7 @@ pub(crate) async fn restore_apply_output(
             let touched = seam_touched.clone();
             let models_dir = seam_models_dir.clone();
             let models_glob = seam_models_glob.clone();
+            let actor = seam_actor.clone();
             let stores = Arc::clone(&stores);
             let warehouse = Arc::clone(&warehouse);
             let written = Arc::clone(&seam_written);
@@ -1236,6 +1255,7 @@ pub(crate) async fn restore_apply_output(
                     Some(&cfg),
                     &plan_id,
                     principal,
+                    &actor,
                     &touched,
                     &models_dir,
                     models_glob.as_deref(),
@@ -1248,6 +1268,7 @@ pub(crate) async fn restore_apply_output(
                     cfg: cfg.clone(),
                     plan_id: plan_id.clone(),
                     principal,
+                    actor: actor.clone(),
                     touched: touched.clone(),
                     models_dir: models_dir.clone(),
                     models_glob: models_glob.clone(),
@@ -1286,6 +1307,7 @@ pub(crate) async fn restore_apply_output(
                     Some(&cfg),
                     &plan_id,
                     principal,
+                    &actor,
                     &touched,
                     &models_dir,
                     models_glob.as_deref(),
@@ -1791,7 +1813,16 @@ mod tests {
             }
 
             // --- gc: plan → review → apply (evict + tombstone) ---
-            run_gc_plan_in(root, &state_path, &config, 7, PolicyPrincipal::Human, true).unwrap();
+            run_gc_plan_in(
+                root,
+                &state_path,
+                &config,
+                7,
+                PolicyPrincipal::Human,
+                &rocky_core::config::PrincipalRef::unnamed(),
+                true,
+            )
+            .unwrap();
             let plans_dir = root.join(".rocky").join("plans");
             let gc_plan_id = find_plan_id(&plans_dir);
             compute_review(root, &config, &gc_plan_id, "HEAD", true)
@@ -1803,6 +1834,7 @@ mod tests {
                 &gc_plan_id,
                 &state_path,
                 PolicyPrincipal::Human,
+                &rocky_core::config::PrincipalRef::unnamed(),
                 true,
                 std::sync::Arc::new(AlwaysReclaim),
             )
@@ -1830,7 +1862,15 @@ mod tests {
             ));
 
             // --- restore: plan → review → apply (rebuild + verify + reinstate) ---
-            run_restore_plan_in(root, &state_path, "orders", PolicyPrincipal::Human, true).unwrap();
+            run_restore_plan_in(
+                root,
+                &state_path,
+                "orders",
+                PolicyPrincipal::Human,
+                &rocky_core::config::PrincipalRef::unnamed(),
+                true,
+            )
+            .unwrap();
             let restore_plan_id = std::fs::read_dir(&plans_dir)
                 .unwrap()
                 .filter_map(std::result::Result::ok)
@@ -1852,6 +1892,7 @@ mod tests {
                 &restore_plan_id,
                 &state_path,
                 PolicyPrincipal::Human,
+                &rocky_core::config::PrincipalRef::unnamed(),
                 true,
                 stores.clone(),
                 Arc::new(fresh_duckdb()),
@@ -1893,6 +1934,7 @@ mod tests {
                 &restore_plan_id,
                 &state_path,
                 PolicyPrincipal::Human,
+                &rocky_core::config::PrincipalRef::unnamed(),
                 true,
                 stores.clone(),
                 Arc::new(fresh_duckdb()),
@@ -2234,6 +2276,7 @@ mod tests {
                 &plan_id,
                 &state_path,
                 PolicyPrincipal::Human,
+                &rocky_core::config::PrincipalRef::unnamed(),
                 true,
                 Arc::new(SharedStore(cas.clone())),
                 Arc::new(fresh_duckdb()),
@@ -2320,7 +2363,15 @@ mod tests {
                 .unwrap();
             drop(store);
 
-            run_restore_plan_in(root, &state_path, "orders", PolicyPrincipal::Human, true).unwrap();
+            run_restore_plan_in(
+                root,
+                &state_path,
+                "orders",
+                PolicyPrincipal::Human,
+                &rocky_core::config::PrincipalRef::unnamed(),
+                true,
+            )
+            .unwrap();
             let plan_id = find_plan_id(&root.join(".rocky").join("plans"));
             write_review_marker(root, &plan_id);
 
@@ -2389,7 +2440,15 @@ mod tests {
                 .await
                 .unwrap();
 
-            run_restore_plan_in(root, &state_path, "orders", PolicyPrincipal::Human, true).unwrap();
+            run_restore_plan_in(
+                root,
+                &state_path,
+                "orders",
+                PolicyPrincipal::Human,
+                &rocky_core::config::PrincipalRef::unnamed(),
+                true,
+            )
+            .unwrap();
             let plan_id = find_plan_id(&root.join(".rocky").join("plans"));
             write_review_marker(root, &plan_id);
 
@@ -2453,7 +2512,15 @@ mod tests {
             let (wr, obj_path) = seed_evicted(root, &state_path, cas.clone()).await;
             cas.delete(&obj_path).await.unwrap();
 
-            run_restore_plan_in(root, &state_path, "orders", PolicyPrincipal::Human, true).unwrap();
+            run_restore_plan_in(
+                root,
+                &state_path,
+                "orders",
+                PolicyPrincipal::Human,
+                &rocky_core::config::PrincipalRef::unnamed(),
+                true,
+            )
+            .unwrap();
             let plan_id = find_plan_id(&root.join(".rocky").join("plans"));
 
             // No review marker → apply refuses.
@@ -2463,6 +2530,7 @@ mod tests {
                 &plan_id,
                 &state_path,
                 PolicyPrincipal::Human,
+                &rocky_core::config::PrincipalRef::unnamed(),
                 true,
                 Arc::new(SharedStore(cas.clone())),
                 Arc::new(fresh_duckdb()),
@@ -2492,6 +2560,7 @@ mod tests {
                 &plan_id,
                 &state_path,
                 PolicyPrincipal::Human,
+                &rocky_core::config::PrincipalRef::unnamed(),
                 true,
                 Arc::new(SharedStore(cas.clone())),
                 Arc::new(fresh_duckdb()),
@@ -3014,8 +3083,15 @@ mod tests {
                 let state_path = &harness.pod_b.state_path;
                 let (wr, obj_path) = seed_evicted(root, state_path, cas.clone()).await;
                 cas.delete(&obj_path).await.unwrap();
-                run_restore_plan_in(root, state_path, "orders", PolicyPrincipal::Human, true)
-                    .unwrap();
+                run_restore_plan_in(
+                    root,
+                    state_path,
+                    "orders",
+                    PolicyPrincipal::Human,
+                    &rocky_core::config::PrincipalRef::unnamed(),
+                    true,
+                )
+                .unwrap();
                 let plan_id = find_plan_id(&root.join(".rocky").join("plans"));
                 write_review_marker(root, &plan_id);
                 rocky_core::state_sync::upload_state(&harness.pod_b.cfg, state_path, false)
@@ -3038,6 +3114,7 @@ mod tests {
                     plan_id,
                     &harness.pod_b.state_path,
                     PolicyPrincipal::Human,
+                    &rocky_core::config::PrincipalRef::unnamed(),
                     Arc::new(SharedStore(cas)),
                     warehouse,
                     rocky_core::config::load_rocky_config(config).ok(),

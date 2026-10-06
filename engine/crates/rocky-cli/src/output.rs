@@ -1858,7 +1858,161 @@ pub struct PlanOutput {
     /// OUTPUT SCHEMA only and is blind to schema-stable value changes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub breaking_verdict: Option<SemanticPlanVerdict>,
+
+    // ---- Intent check (RV2-P1, experimental, report-only) ---------------
+    /// Result of `rocky plan --intent <intent>`: one verdict per changed
+    /// model. **Experimental.** Present only when `--intent` is set.
+    /// REPORT-ONLY: it relaxes no gate and never changes the exit code. It
+    /// lives on the output, not in the persisted plan, so it does not enter
+    /// `plan_id`. See [`IntentCheckOutput`] and its `caveat`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intent_check: Option<IntentCheckOutput>,
 }
+
+/// The closed list of intents `rocky plan --intent` accepts.
+///
+/// Version 1 has one intent. Each intent has a written predicate that the
+/// check measures on the data. clap rejects any other value.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, clap::ValueEnum,
+)]
+#[serde(rename_all = "kebab-case")]
+#[value(rename_all = "kebab-case")]
+pub enum PlanIntent {
+    /// Same schema. The base and head outputs are equal multisets of rows.
+    Refactor,
+}
+
+impl PlanIntent {
+    /// The wire name (`"refactor"`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PlanIntent::Refactor => "refactor",
+        }
+    }
+}
+
+/// The verdict for one changed model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum IntentVerdict {
+    /// The effect satisfies the intent on the recorded inputs.
+    Match,
+    /// The effect breaks the intent. `reason` says how.
+    Mismatch,
+    /// The check could not decide. `reason` says why.
+    Unverified,
+}
+
+/// Why a model got `mismatch` or `unverified`. A closed list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum IntentCheckReason {
+    /// Mismatch: the column names, types or order differ.
+    SchemaDiffers,
+    /// Mismatch: the outputs are different multisets of rows.
+    RowsDiffer,
+    /// Mismatch: the model exists at the base ref and not in the working tree.
+    ModelRemoved,
+    /// Unverified: the target adapter is not DuckDB.
+    AdapterUnsupported,
+    /// Unverified: the model does not exist at the base ref.
+    NoBase,
+    /// Unverified: the models at the base ref could not be read or compiled.
+    BaseUnavailable,
+    /// Unverified: the SQL calls a volatile builtin, or two builds of the
+    /// same SQL disagree.
+    Nondeterministic,
+    /// Unverified: the materialization strategy is not supported.
+    UnsupportedStrategy,
+    /// Unverified: a build or a comparison query failed.
+    BuildFailed,
+}
+
+/// One column of a built output: its name and its warehouse type.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+pub struct IntentColumn {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub data_type: String,
+}
+
+/// The intent verdict for one changed model.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct ModelIntentVerdict {
+    /// The model name, as declared in its sidecar.
+    pub model: String,
+    pub verdict: IntentVerdict,
+    /// Set for every `mismatch` and every `unverified`. Unset for `match`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<IntentCheckReason>,
+    /// Plain-text detail, such as the error text of a failed build.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    /// Row count of the base build.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rows_base: Option<u64>,
+    /// Row count of the head build.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rows_head: Option<u64>,
+    /// Rows in the base output and not in the head output (multiset).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rows_only_in_base: Option<u64>,
+    /// Rows in the head output and not in the base output (multiset).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rows_only_in_head: Option<u64>,
+    /// The base output columns. Set only when `reason` is `schema_differs`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema_base: Option<Vec<IntentColumn>>,
+    /// The head output columns. Set only when `reason` is `schema_differs`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema_head: Option<Vec<IntentColumn>>,
+    /// Changed models upstream of this one. Both builds read the
+    /// materialized upstream tables, so this model's verdict does not cover
+    /// the upstream change. Empty when no upstream model changed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub upstream_changed: Vec<String>,
+}
+
+/// Counts of each verdict in [`IntentCheckOutput::models`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, JsonSchema)]
+pub struct IntentCheckSummary {
+    #[serde(rename = "match")]
+    pub matched: u64,
+    pub mismatch: u64,
+    pub unverified: u64,
+}
+
+/// Result of `rocky plan --intent <intent>`. **Experimental. Report-only.**
+///
+/// Rocky builds each changed model twice, once from the SQL at `base_ref`
+/// and once from the working tree, in one DuckDB transaction, and compares
+/// the two outputs exactly. See [`INTENT_CHECK_CAVEAT`] for what a `match`
+/// does and does not mean.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct IntentCheckOutput {
+    /// The intent that was checked.
+    pub intent: PlanIntent,
+    /// The git ref the working tree was compared against (`--base`).
+    pub base_ref: String,
+    /// The target adapter type (for example `"duckdb"`).
+    pub adapter: String,
+    /// Extra builds of the base SQL used to detect nondeterminism.
+    pub probes: u32,
+    /// What a verdict means and what it does not check. Always set.
+    pub caveat: String,
+    /// One verdict per changed model, sorted by model name.
+    pub models: Vec<ModelIntentVerdict>,
+    pub summary: IntentCheckSummary,
+}
+
+/// Verbatim caveat carried by every [`IntentCheckOutput`].
+pub const INTENT_CHECK_CAVEAT: &str = "A match means no difference on the recorded inputs. \
+It is not a proof for other inputs. The check compares the SELECT output only. It does not \
+check masks, classifications, targets, strategies or any other model config. Each model is \
+built against the materialized upstream tables, so per-model matches do not add up to an \
+end-to-end match. The verdict is report-only: it relaxes no gate and never changes the exit \
+code.";
 
 /// Decision-support verdict from the typed-IR breaking-change classifier,
 /// attached to `PlanOutput` when `rocky plan --semantic` runs against a
@@ -4235,6 +4389,15 @@ pub struct RunPlan {
     /// all.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spec_digest: Option<String>,
+    /// The stated intent of the change this plan carries (`rocky plan
+    /// --intent <intent>`). **Experimental.** Recorded so the plan says what
+    /// its author claimed. The verdict that checks the claim is NOT
+    /// persisted: plan files are a trusted input (#1943), so an unsigned
+    /// verdict here would be forgeable. When unset the serialized payload is
+    /// byte-identical to the pre-intent shape, so every legacy plan_id stays
+    /// stable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intent: Option<PlanIntent>,
 }
 
 fn default_parallel() -> u32 {
@@ -6006,6 +6169,7 @@ impl PlanOutput {
             models: vec![],
             execution_layers: vec![],
             breaking_verdict: None,
+            intent_check: None,
         }
     }
 }
@@ -8603,6 +8767,9 @@ pub struct ReviewQueueEntry {
     pub timestamp: String,
     /// Who authored the change (`human` / `agent`).
     pub principal: rocky_core::config::PolicyPrincipal,
+    /// The id of the actor behind the escalation (RV4-P1). `null` when the
+    /// row was written before ids existed. Self-asserted and unverified.
+    pub principal_id: Option<String>,
     /// The capability that was evaluated (its `schema_change.*` refinement is
     /// the change class the ranking weighs).
     pub capability: rocky_core::config::PolicyCapability,
@@ -9006,9 +9173,33 @@ pub struct AuditOutput {
     /// when the whole ledger is listed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub product: Option<AuditProductScope>,
+    /// The `--actor` / `--since` filter applied, absent when neither was
+    /// given.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub filter: Option<AuditFilter>,
+    /// How many rows in range carry no principal id (written before ids
+    /// existed) and so an `--actor <id>` filter dropped them. `0` without an
+    /// `--actor` filter, and under `--actor unrecorded`, which lists them.
+    /// Defaulted, so a consumer reading an older binary's output sees `0`.
+    #[serde(default)]
+    pub unattributed_skipped: u64,
     /// Every recorded policy decision, oldest first. Under `product`, only
-    /// the rows whose `model` is that product's output model.
+    /// the rows whose `model` is that product's output model. Under `filter`,
+    /// only the rows that match it.
     pub decisions: Vec<AuditDecisionEntry>,
+}
+
+/// The `--actor` / `--since` filter of `rocky audit` (RV4-P1).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+pub struct AuditFilter {
+    /// The principal id the rows were filtered to. `unrecorded` selects the
+    /// rows with no id.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub actor: Option<String>,
+    /// The inclusive lower bound, as an RFC 3339 UTC timestamp. A row is kept
+    /// when its timestamp is at or after this.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub since: Option<String>,
 }
 
 /// The product filter of `rocky audit --product <name>`, resolved from the
@@ -9049,6 +9240,18 @@ pub struct AuditDecisionEntry {
     /// Human-readable explanation of how the effect was reached. A resolved
     /// `${VAR}` value prints as `${NAME}` (#1919).
     pub reason: EnvString,
+    /// The id of the actor behind the decision (RV4-P1). `null` means
+    /// unrecorded: the row was written before ids existed. `unnamed` means
+    /// nobody named the actor.
+    pub principal_id: Option<String>,
+    /// Where the id came from (`flag`, `env`, `mcp_profile`, `default`).
+    /// `null` when the id is unrecorded.
+    pub principal_id_source: Option<rocky_core::config::PrincipalIdSource>,
+    /// Whether anything verified the id. Always `false` today: ids are
+    /// self-asserted until signed approvals exist. Defaulted, so a consumer
+    /// reading an older binary's output sees `false`.
+    #[serde(default)]
+    pub principal_id_verified: bool,
 }
 
 // ---------------------------------------------------------------------------

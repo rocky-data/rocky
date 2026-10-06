@@ -182,6 +182,10 @@ class ReviewQueueEntry(BaseModel):
     """
     Who authored the change (`human` / `agent`).
     """
+    principal_id: str | None = None
+    """
+    The id of the actor behind the escalation (RV4-P1). `null` when the row was written before ids existed. Self-asserted and unverified.
+    """
     reason: str
     """
     Human-readable explanation of how `require_review` was reached.

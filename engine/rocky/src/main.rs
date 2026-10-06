@@ -161,8 +161,52 @@ struct Cli {
     #[arg(long, global = true, value_enum)]
     principal: Option<PolicyPrincipalArg>,
 
+    /// A name for who is acting, recorded on every policy decision.
+    ///
+    /// Lowercase letters, digits, `.`, `_` and `-`, at most 63 bytes. No `@`,
+    /// so an email address is refused. `unnamed`, `unrecorded` and every id
+    /// starting `mcp-` (the MCP server's own) are reserved. The id is self-asserted: Rocky does not verify it, and
+    /// `rocky audit` shows it as `verified: false`. It is a label, not an
+    /// enforcement input — `--principal` (the class) still decides the gate.
+    ///
+    /// Precedence: this flag, then `ROCKY_PRINCIPAL_ID`, then (for `rocky
+    /// mcp` only) `mcp-<profile>`, then `unnamed`. An invalid value is an
+    /// error; an empty `ROCKY_PRINCIPAL_ID` counts as unset. Rocky never reads `$USER` or a CI variable for it.
+    #[arg(long = "principal-id", global = true, value_name = "ID")]
+    principal_id: Option<String>,
+
     #[command(subcommand)]
     command: Command,
+}
+
+/// Resolve who is acting, for the `principal_ref` every decision row carries
+/// (RV4-P1).
+///
+/// Precedence: `--principal-id`, then `ROCKY_PRINCIPAL_ID`, then
+/// `mcp-<profile>` when `mcp_profile` is set (only `rocky mcp` passes it),
+/// then `unnamed`. An invalid flag or env value is a hard error, the same
+/// fail-closed rule as `ROCKY_PRINCIPAL`. A `ROCKY_PRINCIPAL_ID` that is not
+/// valid Unicode is an error too, never a silent fall-through.
+///
+/// Deliberately reads no `$USER`, `$USERNAME` or CI variable: a personal
+/// account name does not belong in a shared remote ledger by default, and CI
+/// identity is the signed OIDC work of RV4-P2.
+fn resolve_cli_principal_id(
+    flag: Option<&str>,
+    mcp_profile: Option<&str>,
+) -> Result<rocky_core::config::PrincipalRef> {
+    let env = match std::env::var("ROCKY_PRINCIPAL_ID") {
+        Ok(v) => Some(v),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            anyhow::bail!("invalid ROCKY_PRINCIPAL_ID: the value is not valid Unicode")
+        }
+    };
+    Ok(rocky_core::config::PrincipalRef::resolve(
+        flag,
+        env.as_deref(),
+        mcp_profile,
+    )?)
 }
 
 /// Resolve the effective CLI authoring principal per the frozen §3 precedence.
@@ -391,32 +435,8 @@ impl From<PolicyCapabilityArg> for rocky_core::config::PolicyCapability {
     }
 }
 
-/// Command groups (Plan 22 design)
-///
-/// These commands will be reorganized into nested subcommand trees in a
-/// follow-up phase. Top-level aliases will be preserved for backward compat.
-///
-/// ## Pipeline — core pipeline operations
-/// `run`, `plan`, `discover`, `compare`, `state`, `history`
-///
-/// ## Model — model development and analysis
-/// `compile`, `test`, `lineage`, `metrics`, `optimize`, `ci`
-///
-/// ## Infra — infrastructure and maintenance
-/// `doctor`, `hooks`, `archive`, `compact`, `profile-storage`, `watch`
-///
-/// ## Dev — development and tooling
-/// `init`, `playground`, `serve`, `lsp`, `list`, `shell`, `validate`,
-/// `bench`, `export-schemas`
-///
-/// ## Migrate — migration tooling
-/// `import-dbt`, `validate-migration`, `init-adapter`, `test-adapter`
-///
-/// ## Data — data operations
-/// `load`, `seed`, `snapshot`, `docs`
-///
-/// ## AI — AI-powered features
-/// `ai`, `ai-sync`, `ai-explain`, `ai-test`
+/// Every top-level `rocky` verb. `rocky --help` lists them in the groups in
+/// [`HELP_GROUPS`], with the core verbs first (RV5-P3).
 #[derive(Subcommand)]
 #[allow(clippy::large_enum_variant)]
 enum Command {
@@ -620,6 +640,17 @@ enum Command {
         /// the product name), read from `products/<NAME>.toml`.
         #[arg(long, conflicts_with_all = ["for_subject", "scorecard"])]
         product: Option<String>,
+        /// List only the decisions one actor made: the rows whose principal
+        /// id is `<ID>` (see the global `--principal-id`). `unrecorded` lists
+        /// the rows written before ids existed. Ids are self-asserted and
+        /// unverified. This filter reads no environment variable.
+        #[arg(long, value_name = "ID", conflicts_with_all = ["for_subject", "scorecard"])]
+        actor: Option<String>,
+        /// List only the decisions recorded at or after this time.
+        /// `YYYY-MM-DD` (00:00 UTC), an RFC 3339 timestamp with an offset, or
+        /// a `<N>d` / `<N>h` duration back from now (e.g. `7d`).
+        #[arg(long, value_name = "WHEN", conflicts_with_all = ["for_subject", "scorecard"])]
+        since: Option<String>,
         /// Models directory used to compute the downstream blast radius.
         #[arg(long, default_value = "models")]
         models: PathBuf,
@@ -957,8 +988,23 @@ enum Command {
         /// Applies to the default plan subcommand only.
         #[arg(long, global = false)]
         semantic: bool,
-        /// Git ref the working tree is diffed against for `--semantic`
-        /// (default: main). Ignored unless `--semantic` is set.
+        /// State the intent of this change, and check it on the data.
+        /// **Experimental.** The only value is `refactor`: the change must
+        /// keep each changed model's output schema and rows. Rocky builds
+        /// each changed model from `--base` and from the working tree, in
+        /// one DuckDB transaction, and compares the outputs exactly. The
+        /// result goes under `intent_check` in the JSON output.
+        ///
+        /// Report-only: the verdict relaxes no gate and never changes the
+        /// exit code. The intent is recorded in the persisted plan; the
+        /// verdict is not. DuckDB targets only; other adapters report
+        /// `unverified`. Works where `rocky plan --model` works.
+        /// Applies to the default plan subcommand only.
+        #[arg(long, value_enum, global = false)]
+        intent: Option<rocky_cli::output::PlanIntent>,
+        /// Git ref the working tree is compared against (default: main).
+        /// Used by `--semantic`, by `--intent`, and by the change
+        /// classification embedded in every persisted run plan.
         /// Applies to the default plan subcommand only.
         #[arg(long, default_value = "main", global = false)]
         base: String,
@@ -3431,12 +3477,185 @@ fn offending_default_plan_flag(flags: &[(&'static str, bool)]) -> Option<&'stati
 /// to stop.
 const RUNTIME_SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// The groups `rocky --help` shows, in order (RV5-P3, ruled 2026-10-04).
+///
+/// The first group is the core verb set. Clap cannot group subcommands under
+/// headings, so [`with_grouped_help`] renders this table into the root help
+/// template. Grouping changes only the help text: every verb, alias and
+/// output schema stays as it is. A visible verb missing from this table is
+/// listed under "Other commands", so a new verb never drops out of help.
+const HELP_GROUPS: &[(&str, &[&str])] = &[
+    (
+        "Core commands",
+        &[
+            "compile", "run", "test", "plan", "review", "apply", "policy",
+        ],
+    ),
+    ("Getting started", &["init", "playground"]),
+    (
+        "Model development",
+        &[
+            "validate",
+            "discover",
+            "dag",
+            "catalog",
+            "lineage",
+            "lineage-diff",
+            "ci",
+            "ci-diff",
+            "preview",
+            "compare",
+            "branch",
+            "list",
+            "emit-sql",
+            "imports",
+            "publish-ir",
+        ],
+    ),
+    ("Data loading", &["load", "seed", "snapshot", "backfill"]),
+    (
+        "Governance",
+        &[
+            "audit",
+            "brief",
+            "compliance",
+            "product",
+            "fulfill",
+            "gc",
+            "restore",
+        ],
+    ),
+    (
+        "Operations",
+        &[
+            "doctor",
+            "state",
+            "history",
+            "replay",
+            "trace",
+            "cost",
+            "metrics",
+            "optimize",
+            "profile",
+            "profile-storage",
+            "compact",
+            "archive",
+            "retention-status",
+            "hooks",
+            "tick",
+        ],
+    ),
+    ("dbt migration", &["import-dbt", "validate-migration"]),
+    (
+        "AI",
+        &[
+            "ai",
+            "ai-sync",
+            "ai-explain",
+            "ai-test",
+            "ai-contract",
+            "mcp",
+        ],
+    ),
+    (
+        "Integrations and tooling",
+        &[
+            "serve",
+            "lsp",
+            "export-schemas",
+            "export-openapi",
+            "completions",
+            "test-adapter",
+            "init-adapter",
+            "adapter",
+        ],
+    ),
+    (
+        "Other tools",
+        &["docs", "shell", "estimate", "bench", "watch", "fmt"],
+    ),
+];
+
+/// Parse the command line with the grouped root help.
+///
+/// Behaves like `Cli::parse()`: a parse error or `--help` prints and exits.
+fn parse_cli() -> Cli {
+    use clap::{CommandFactory, FromArgMatches};
+    let mut cmd = with_grouped_help(Cli::command());
+    let mut matches = cmd.get_matches_mut();
+    Cli::from_arg_matches_mut(&mut matches)
+        .map_err(|e| e.format(&mut cmd))
+        .unwrap_or_else(|e| e.exit())
+}
+
+/// Replace the flat "Commands:" list in the root help with [`HELP_GROUPS`].
+fn with_grouped_help(cmd: clap::Command) -> clap::Command {
+    let listing = grouped_subcommand_listing(&cmd);
+    let header = cmd.get_styles().get_header();
+    let template = format!(
+        "{{before-help}}{{about-with-newline}}\n{{usage-heading}} {{usage}}\n\n{listing}\
+         {}Options:{}\n{{options}}{{after-help}}",
+        header.render(),
+        header.render_reset()
+    );
+    cmd.help_template(template)
+}
+
+/// Render the visible subcommands of `cmd`, grouped by [`HELP_GROUPS`].
+fn grouped_subcommand_listing(cmd: &clap::Command) -> String {
+    use std::fmt::Write as _;
+    let styles = cmd.get_styles();
+    let (header, literal) = (styles.get_header(), styles.get_literal());
+    let visible: Vec<&clap::Command> = cmd.get_subcommands().filter(|c| !c.is_hide_set()).collect();
+    let width = visible
+        .iter()
+        .map(|c| c.get_name().len())
+        .max()
+        .unwrap_or(0);
+
+    let mut out = String::new();
+    let mut section = |title: &str, cmds: &[&clap::Command]| {
+        if cmds.is_empty() {
+            return;
+        }
+        let _ = writeln!(out, "{}{title}:{}", header.render(), header.render_reset());
+        for c in cmds {
+            let about = c.get_about().map(ToString::to_string).unwrap_or_default();
+            let _ = writeln!(
+                out,
+                "  {}{:width$}{}  {about}",
+                literal.render(),
+                c.get_name(),
+                literal.render_reset(),
+            );
+        }
+        out.push('\n');
+    };
+
+    let mut placed = std::collections::HashSet::new();
+    for (title, names) in HELP_GROUPS {
+        let cmds: Vec<&clap::Command> = names
+            .iter()
+            .filter_map(|n| visible.iter().copied().find(|c| c.get_name() == *n))
+            .collect();
+        placed.extend(names.iter().copied());
+        section(title, &cmds);
+    }
+    let rest: Vec<&clap::Command> = visible
+        .iter()
+        .copied()
+        .filter(|c| !placed.contains(c.get_name()))
+        .collect();
+    section("Other commands", &rest);
+    out
+}
+
 fn main() -> Result<()> {
     // Must run before `Cli::parse()`: clap emits `--help` / `--version`
     // through `println!`, which panics on EPIPE if SIGPIPE is ignored.
     reset_sigpipe();
 
-    let cli = Cli::parse();
+    let cli = parse_cli();
     // A Pipes writer must receive EPIPE as a Rust error. With SIG_DFL,
     // Dagster closing its stream would kill this process before the run
     // releases its idempotency claim. Keep the ordinary CLI pipe behavior
@@ -3707,11 +3926,13 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             // (tamperable) plan file. Combined most-restrictively with the
             // plan's kind-forced principal inside each seam.
             let runtime_principal = resolve_cli_principal(cli.principal)?;
+            let actor = resolve_cli_principal_id(cli.principal_id.as_deref(), None)?;
             rocky_cli::commands::run_apply(
                 &cli.config,
                 &plan_id,
                 &state_path,
                 runtime_principal,
+                &actor,
                 expect_spec_digest.as_deref(),
                 json,
             )
@@ -3767,6 +3988,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                 from.as_deref(),
                 to.as_deref(),
                 !no_downstream,
+                &resolve_cli_principal_id(cli.principal_id.as_deref(), None)?,
                 json,
             )
             .await
@@ -3781,8 +4003,15 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             }
             None => match product {
                 Some(product) => {
-                    rocky_fulfill::run_fulfill(&cli.config, &state_path, &product, retry, json)
-                        .await
+                    rocky_fulfill::run_fulfill(
+                        &cli.config,
+                        &state_path,
+                        &product,
+                        retry,
+                        &resolve_cli_principal_id(cli.principal_id.as_deref(), None)?,
+                        json,
+                    )
+                    .await
                 }
                 None => anyhow::bail!(
                     "usage: rocky fulfill <product> [--retry] | rocky fulfill approve-spec \
@@ -3839,6 +4068,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                 scope,
                 reason,
                 false,
+                &resolve_cli_principal_id(cli.principal_id.as_deref(), None)?,
                 json,
             ),
             PolicySubcommand::Unfreeze {
@@ -3852,6 +4082,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                 scope,
                 reason,
                 true,
+                &resolve_cli_principal_id(cli.principal_id.as_deref(), None)?,
                 json,
             ),
         },
@@ -3861,6 +4092,8 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             by,
             window,
             product,
+            actor,
+            since,
             models,
         } => {
             if scorecard {
@@ -3879,7 +4112,13 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                         &selector,
                         json,
                     ),
-                    None => rocky_cli::commands::run_audit(&state_path, product.as_deref(), json),
+                    None => rocky_cli::commands::run_audit(
+                        &state_path,
+                        product.as_deref(),
+                        actor.as_deref(),
+                        since.as_deref(),
+                        json,
+                    ),
                 }
             }
         }
@@ -3940,6 +4179,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             idempotency_key,
             env,
             semantic,
+            intent,
             base,
         } => {
             // #1550: a default-plan flag alongside a plan subcommand used to be
@@ -3977,6 +4217,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                     ("--idempotency-key", idempotency_key.is_some()),
                     ("--env", env.is_some()),
                     ("--semantic", semantic),
+                    ("--intent", intent.is_some()),
                     ("--base", base != "main"),
                 ])
             {
@@ -4067,6 +4308,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                         models_dir,
                         partition_opts,
                         principal: Some(resolve_cli_principal(cli.principal)?),
+                        intent,
                     };
                     rocky_cli::commands::plan(
                         &cli.config,
@@ -4377,6 +4619,9 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                 no_prune,
                 full_refresh,
             };
+            // Who is running (RV4-P1): stamped on the drift auto-apply
+            // custody rows. Resolved here, once, for all three run shapes.
+            let actor = resolve_cli_principal_id(cli.principal_id.as_deref(), None)?;
 
             if watch {
                 // `--watch` wraps the standard run path in a filesystem
@@ -4398,6 +4643,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                     cli.cache_ttl,
                     env.as_deref(),
                     &skip_opts,
+                    &actor,
                 )
                 .await
             } else if dag {
@@ -4422,6 +4668,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                     // has the default folded in and can no longer say whether
                     // the caller asked for a bound (#1288).
                     parallel,
+                    &actor,
                 );
                 tokio::select! {
                     result = run_future => result,
@@ -4466,6 +4713,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                     &run_vars,
                     assume_fresh_state,
                     contracts.as_deref(),
+                    &actor,
                 )
                 .await
             }
@@ -5195,11 +5443,13 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                 // arm uses, so the sink gates under `PolicyCapability::Apply`
                 // regardless of which route reached it.
                 let runtime_principal = resolve_cli_principal(cli.principal)?;
+                let actor = resolve_cli_principal_id(cli.principal_id.as_deref(), None)?;
                 rocky_cli::commands::run_compact_apply(
                     &cli.config,
                     &plan_id,
                     &state_path,
                     runtime_principal,
+                    &actor,
                     json,
                 )
                 .await
@@ -5307,6 +5557,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                     // keyed on the promote-time runtime principal, NOT the
                     // plan's stored stamp.
                     let runtime_principal = resolve_cli_principal(cli.principal)?;
+                    let actor = resolve_cli_principal_id(cli.principal_id.as_deref(), None)?;
                     let cwd = std::env::current_dir()
                         .context("failed to get current working directory")?;
                     rocky_cli::commands::run_branch_promote_from_plan(
@@ -5317,6 +5568,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                         pipeline.as_deref(),
                         &state_path,
                         runtime_principal,
+                        &actor,
                         json,
                     )
                     .await
@@ -5338,6 +5590,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                         )
                     })?;
                     let runtime_principal = resolve_cli_principal(cli.principal)?;
+                    let actor = resolve_cli_principal_id(cli.principal_id.as_deref(), None)?;
                     let cwd = std::env::current_dir()
                         .context("failed to get current working directory")?;
                     rocky_cli::commands::run_branch_promote(
@@ -5352,6 +5605,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                         skip_approval,
                         allow_breaking,
                         runtime_principal,
+                        &actor,
                         json,
                     )
                     .await
@@ -5440,11 +5694,13 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                 // what a deny rule catches. The review gate is unconditional
                 // either way. Never deletes.
                 let principal = resolve_cli_principal(cli.principal)?;
+                let actor = resolve_cli_principal_id(cli.principal_id.as_deref(), None)?;
                 rocky_cli::commands::run_gc_plan(
                     &state_path,
                     &cli.config,
                     min_age_days,
                     principal,
+                    &actor,
                     json,
                 )
             }
@@ -5458,7 +5714,8 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             // stored stamp — is what a deny rule catches. The review gate is
             // unconditional either way. Writes no bytes.
             let principal = resolve_cli_principal(cli.principal)?;
-            rocky_cli::commands::run_restore_plan(&state_path, &target, principal, json)
+            let actor = resolve_cli_principal_id(cli.principal_id.as_deref(), None)?;
+            rocky_cli::commands::run_restore_plan(&state_path, &target, principal, &actor, json)
         }
         Command::Preview { action } => match action {
             PreviewAction::Create { base, name, models } => {
@@ -5637,11 +5894,13 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                 // arm uses, so the destructive DELETE + VACUUM gates under
                 // `PolicyCapability::Apply` regardless of which route reached it.
                 let runtime_principal = resolve_cli_principal(cli.principal)?;
+                let actor = resolve_cli_principal_id(cli.principal_id.as_deref(), None)?;
                 rocky_cli::commands::run_archive_apply(
                     &cli.config,
                     &plan_id,
                     &state_path,
                     runtime_principal,
+                    &actor,
                     json,
                 )
                 .await
@@ -5688,7 +5947,14 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             rocky_cli::commands::run_completions::<Cli>(shell, &mut std::io::stdout());
             Ok(())
         }
-        Command::Mcp { config, profile } => rocky_mcp::serve_stdio(config, profile.into()).await,
+        Command::Mcp { config, profile } => {
+            let profile: rocky_mcp::McpProfile = profile.into();
+            // `--principal-id` / `ROCKY_PRINCIPAL_ID` on the server process
+            // win; otherwise the server acts as `mcp-<profile>`.
+            let actor =
+                resolve_cli_principal_id(cli.principal_id.as_deref(), Some(profile.name()))?;
+            rocky_mcp::serve_stdio(config, profile, actor).await
+        }
     };
 
     // SIGINT: map `commands::Interrupted` to the conventional shell exit
@@ -6019,6 +6285,82 @@ mod tests {
         }
     }
 
+    /// The grouped root help, rendered on a big stack (see
+    /// [`command_with_big_stack`]).
+    fn grouped_root_help_with_big_stack() -> (Vec<String>, String) {
+        std::thread::scope(|s| {
+            std::thread::Builder::new()
+                .stack_size(8 * 1024 * 1024)
+                .spawn_scoped(s, || {
+                    let cmd = Cli::command();
+                    let visible = cmd
+                        .get_subcommands()
+                        .filter(|c| !c.is_hide_set())
+                        .map(|c| c.get_name().to_string())
+                        .collect();
+                    let help = with_grouped_help(cmd).render_help().to_string();
+                    (visible, help)
+                })
+                .expect("spawn help thread")
+                .join()
+                .expect("help thread panicked")
+        })
+    }
+
+    /// RV5-P3: every verb in `HELP_GROUPS` exists, and none is listed twice.
+    /// A renamed or removed verb fails here instead of silently vanishing
+    /// from its group.
+    #[test]
+    fn help_groups_name_only_real_verbs_once() {
+        let (visible, _) = grouped_root_help_with_big_stack();
+        let mut seen = std::collections::HashSet::new();
+        for (title, names) in HELP_GROUPS {
+            for name in *names {
+                assert!(
+                    visible.iter().any(|v| v == name),
+                    "`{name}` in help group `{title}` is not a visible rocky verb"
+                );
+                assert!(seen.insert(*name), "`{name}` is listed in two help groups");
+            }
+        }
+    }
+
+    /// RV5-P3: the root help lists every visible verb exactly once, leads
+    /// with the core verbs, and still lists the options.
+    #[test]
+    fn root_help_groups_every_verb_with_core_first() {
+        let (visible, help) = grouped_root_help_with_big_stack();
+        let listed: Vec<&str> = help
+            .lines()
+            .filter_map(|l| l.strip_prefix("  "))
+            .filter(|l| !l.starts_with(' ') && !l.starts_with('-'))
+            .filter_map(|l| l.split_whitespace().next())
+            .collect();
+        for verb in &visible {
+            let n = listed.iter().filter(|l| **l == verb.as_str()).count();
+            assert_eq!(
+                n, 1,
+                "`{verb}` must appear exactly once in rocky --help:\n{help}"
+            );
+        }
+        let core = help.find("Core commands:").expect("core heading");
+        for heading in ["Getting started:", "Other tools:", "Options:"] {
+            assert!(
+                help.find(heading).expect(heading) > core,
+                "`{heading}` must come after the core verbs"
+            );
+        }
+        assert_eq!(
+            &listed[..7],
+            &[
+                "compile", "run", "test", "plan", "review", "apply", "policy"
+            ],
+            "the core verbs lead the help"
+        );
+        assert!(help.contains("--config"), "the root options stay listed");
+        assert!(!help.contains("\nCommands:"), "the flat list is replaced");
+    }
+
     /// Spawn the clap parser on a scoped thread with an 8 MB stack.
     ///
     /// `Cli`/`Command` is intentionally large — `Command` carries every
@@ -6061,6 +6403,81 @@ mod tests {
                 .join()
                 .expect("command-builder thread panicked")
         })
+    }
+
+    /// `--principal-id` is global (before or after the subcommand), and
+    /// `rocky audit --actor/--since` parse and refuse `--for`/`--scorecard`.
+    #[test]
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "a conflict check needs the parse error, which the wrapper turns into a panic"
+    )]
+    fn principal_id_flag_and_audit_actor_since_parse() {
+        let cli = try_parse_with_big_stack(&[
+            "rocky",
+            "--principal-id",
+            "alice",
+            "audit",
+            "--actor",
+            "bob",
+            "--since",
+            "7d",
+        ]);
+        assert_eq!(cli.principal_id.as_deref(), Some("alice"));
+        let Command::Audit { actor, since, .. } = cli.command else {
+            panic!("expected the audit command");
+        };
+        assert_eq!(actor.as_deref(), Some("bob"));
+        assert_eq!(since.as_deref(), Some("7d"));
+
+        let cli =
+            try_parse_with_big_stack(&["rocky", "policy", "freeze", "--principal-id", "ops-1"]);
+        assert_eq!(cli.principal_id.as_deref(), Some("ops-1"));
+
+        for conflicting in [
+            vec!["rocky", "audit", "--actor", "a", "--for", "fct"],
+            vec!["rocky", "audit", "--since", "7d", "--scorecard"],
+        ] {
+            let parsed = std::thread::scope(|s| {
+                let owned: Vec<String> = conflicting.iter().map(ToString::to_string).collect();
+                std::thread::Builder::new()
+                    .stack_size(8 * 1024 * 1024)
+                    .spawn_scoped(s, move || Cli::try_parse_from(&owned).is_ok())
+                    .expect("spawn parser thread")
+                    .join()
+                    .expect("parser thread panicked")
+            });
+            assert!(!parsed, "{conflicting:?} must be a clap conflict");
+        }
+    }
+
+    /// The CLI resolver: a flag wins and is validated; `rocky mcp` falls back
+    /// to `mcp-<profile>`; nothing set is `unnamed`. (The env leg is pinned by
+    /// `PrincipalRef::resolve`'s own tests in rocky-core; this test does not
+    /// touch the process environment, so it only runs its env-independent
+    /// cases when `ROCKY_PRINCIPAL_ID` is unset.)
+    #[test]
+    fn resolve_cli_principal_id_precedence_without_env() {
+        use rocky_core::config::PrincipalIdSource;
+        let r = resolve_cli_principal_id(Some("alice"), Some("worker")).unwrap();
+        assert_eq!(
+            (r.id.as_str(), r.source),
+            ("alice", PrincipalIdSource::Flag)
+        );
+        assert!(resolve_cli_principal_id(Some("Alice"), None).is_err());
+        assert!(resolve_cli_principal_id(Some("unnamed"), None).is_err());
+        if std::env::var_os("ROCKY_PRINCIPAL_ID").is_none() {
+            let r = resolve_cli_principal_id(None, Some("worker")).unwrap();
+            assert_eq!(
+                (r.id.as_str(), r.source),
+                ("mcp-worker", PrincipalIdSource::McpProfile)
+            );
+            let r = resolve_cli_principal_id(None, None).unwrap();
+            assert_eq!(
+                (r.id.as_str(), r.source),
+                ("unnamed", PrincipalIdSource::Default)
+            );
+        }
     }
 
     /// Every `plan`-declared flag must appear in the #1550 guard's list.
@@ -6577,6 +6994,7 @@ mod tests {
                 // `crates/rocky-cli/src/commands/plan.rs`; this run/plan
                 // flag-parity helper does not thread them.
                 semantic: _,
+                intent: _,
                 base: _,
                 // Node selection resolves to `--model` before the plan is
                 // built; covered by `rocky/tests/node_selection.rs`.

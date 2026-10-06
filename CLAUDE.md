@@ -6,7 +6,13 @@ Canonical agent guidance lives in [`AGENTS.md`](AGENTS.md) (shared across agent 
 
 ## Red team in Claude Code
 
-The independent red team that [`AGENTS.md`](AGENTS.md) requires for substantive analyses and plans is the **Codex plugin** here (the `codex:codex-rescue` agent). `/code-review` is same-model Claude: strong for code diffs, but it does not satisfy the independence requirement.
+The independent red team that [`AGENTS.md`](AGENTS.md) requires for substantive analyses and plans is chosen in this order. Take the first one that is available:
+
+1. **Codex**, if the plugin is installed (the `codex:codex-rescue` agent). It is not installed as of 2026-10-04.
+2. **Claude Sonnet**, as a separate read-only agent (`Agent` with `model: "sonnet"`), when Opus authored the change.
+3. **Claude Opus**, as a fresh read-only agent that did not author the change (`model: "opus"`), when Sonnet authored it or Sonnet is unavailable.
+
+Give the reviewer the diff, the two `AGENTS.md` answers and `AGENT_REVIEW.md`, never the author's reasoning. Name the reviewer and its model in the PR or report. `/code-review` run by the authoring agent does not count as the red team.
 
 ## Claude Code skills
 

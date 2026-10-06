@@ -894,6 +894,23 @@ const SNAPSHOT_MEMORY_WARN_BYTES: u64 = 128 * 1024 * 1024;
 ///   plans, so no owed check is left silently satisfied. The `superseded`
 ///   and `watermarks_confirmed` keys, added without a bump earlier, ride
 ///   this fence too.
+///
+/// # Fields added without a bump
+///
+/// A serde-additive field needs no bump when an older binary that ignores it
+/// still means the same thing. Each such field is listed here with its reason.
+///
+/// - **[`PolicyDecisionRecord::principal_ref`]** (RV4-P1, at v31). The actor
+///   id behind a decision. No gate reads it in P1, and the ledger is
+///   append-only, so a v31 binary without the field drops nothing it would act
+///   on. A row from an older binary reads back `None`, which means
+///   "unrecorded". Guarded by
+///   `test_v31_policy_decision_forward_deserializes_principal_ref_none` and
+///   `test_v31_rollback_mirror_reads_a_row_with_principal_ref`.
+///
+///   **The phase that makes a gate read the id (RV4-P2, signatures) MUST bump.**
+///   From then on an older binary that ignores the id would decide
+///   differently, which is the v31 lesson above.
 const CURRENT_SCHEMA_VERSION: u32 = 31;
 
 /// Errors from the embedded redb state store.
@@ -3754,7 +3771,19 @@ impl StateStore {
             if !key.value().starts_with(RUN_STARTED_KEY_PREFIX) {
                 break;
             }
-            let marker: RunStartedMarker = serde_json::from_str(value.value())?;
+            // A row that cannot be read is skipped, not fatal: this listing
+            // feeds `rocky history`, which must still show the recorded runs.
+            let marker: RunStartedMarker = match serde_json::from_str(value.value()) {
+                Ok(marker) => marker,
+                Err(error) => {
+                    tracing::warn!(
+                        key = key.value(),
+                        error = %error,
+                        "skipping an unreadable run-started marker"
+                    );
+                    continue;
+                }
+            };
             if runs.get(marker.run_id.as_str())?.is_none() {
                 found.push(marker);
             }
@@ -4308,8 +4337,19 @@ impl StateStore {
         let runs = txn.open_table(RUN_HISTORY)?;
         let mut found = Vec::new();
         for row in headers.iter()? {
-            let (_, value) = row?;
-            let progress: RunProgress = serde_json::from_slice(value.value())?;
+            let (key, value) = row?;
+            // Skipped, not fatal, for the same reason as the marker listing.
+            let progress: RunProgress = match serde_json::from_slice(value.value()) {
+                Ok(progress) => progress,
+                Err(error) => {
+                    tracing::warn!(
+                        key = key.value(),
+                        error = %error,
+                        "skipping an unreadable run_progress header"
+                    );
+                    continue;
+                }
+            };
             if runs.get(progress.run_id.as_str())?.is_none() {
                 found.push(progress);
             }
@@ -4756,6 +4796,7 @@ impl StateStore {
             let (deleted, kept) = self.sweep_run_history(cutoff, min_keep)?;
             report.runs_deleted = deleted;
             report.runs_kept = kept;
+            self.sweep_stale_run_started_markers(cutoff)?;
         } else {
             report.runs_kept = self.count_run_history()?;
         }
@@ -4867,6 +4908,47 @@ impl StateStore {
         }
 
         Ok((deleted, total.saturating_sub(deleted)))
+    }
+
+    /// Drop run-started markers (#1884) whose run started before `cutoff`.
+    ///
+    /// `record_run` removes a marker with its record, so a marker that
+    /// survives is a run that crashed or lost its record. Past the history
+    /// retention window it would only keep `rocky history` reporting an
+    /// incomplete history forever, so it ages out with the records. Returns
+    /// how many markers were removed. An unreadable marker is left in place.
+    fn sweep_stale_run_started_markers(
+        &self,
+        cutoff: chrono::DateTime<chrono::Utc>,
+    ) -> Result<u64, StateError> {
+        let stale: Vec<String> = {
+            let txn = self.db.begin_read()?;
+            let metadata = txn.open_table(METADATA)?;
+            let mut stale = Vec::new();
+            for row in metadata.range(RUN_STARTED_KEY_PREFIX..)? {
+                let (key, value) = row?;
+                if !key.value().starts_with(RUN_STARTED_KEY_PREFIX) {
+                    break;
+                }
+                if let Ok(marker) = serde_json::from_str::<RunStartedMarker>(value.value())
+                    && marker.started_at < cutoff
+                {
+                    stale.push(key.value().to_string());
+                }
+            }
+            stale
+        };
+        if !stale.is_empty() {
+            let txn = self.db.begin_write()?;
+            {
+                let mut metadata = txn.open_table(METADATA)?;
+                for key in &stale {
+                    metadata.remove(key.as_str())?;
+                }
+            }
+            self.commit_write(txn)?;
+        }
+        Ok(stale.len() as u64)
     }
 
     /// Plan-only counterpart: returns `(would_delete, would_keep)` without
@@ -7348,6 +7430,41 @@ pub struct PolicyDecisionRecord {
     /// forward-deserializes with it absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_apply: Option<AutoApplyCustody>,
+    /// The actor behind the decision: a self-asserted id and its source
+    /// (RV4-P1). The class above stays the enforcement axis; no gate reads
+    /// this.
+    ///
+    /// `None` means "unrecorded": the row was written before ids existed.
+    /// `rocky audit --actor unrecorded` lists those rows. Every production
+    /// writer sets `Some`, with `unnamed` when nobody named the actor.
+    ///
+    /// Added WITHOUT a schema bump; see the note above
+    /// [`CURRENT_SCHEMA_VERSION`].
+    ///
+    /// Written strictly, read leniently: a value this binary cannot parse — a
+    /// later binary's new source variant or looser id grammar, or a corrupt
+    /// row — reads as `None` (unrecorded) instead of failing the whole ledger
+    /// read, which would make the gate deny every agent as "ledger unreadable".
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_principal_ref_lenient"
+    )]
+    pub principal_ref: Option<crate::config::PrincipalRef>,
+}
+
+/// Lenient reader for [`PolicyDecisionRecord::principal_ref`]: any value that
+/// does not parse as a [`crate::config::PrincipalRef`] reads as `None`. The id
+/// is a label no gate reads, so losing an unparseable one is safe; failing the
+/// row (and with it every ledger read) is not.
+fn deserialize_principal_ref_lenient<'de, D>(
+    deserializer: D,
+) -> Result<Option<crate::config::PrincipalRef>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = <Option<serde_json::Value> as serde::Deserialize>::deserialize(deserializer)?;
+    Ok(raw.and_then(|v| serde_json::from_value(v).ok()))
 }
 
 /// What kind of event a [`PolicyDecisionRecord`] row records.
@@ -7369,23 +7486,21 @@ pub struct PolicyDecisionRecord {
 /// # Why this is derived rather than stored
 ///
 /// A persisted tag would be stronger: an unclassified row would be
-/// unrepresentable rather than merely unusual. It is not worth its price here.
-/// Adding a field to this record means a schema-version bump, and a bump shifts
-/// the remote state key segment, after which the download path finds no object
-/// and empties every replicated table — including this one (#1955). Fixing how
-/// the ledger is *counted* is not worth making the ledger unreachable on every
-/// remote deployment.
+/// unrepresentable rather than merely unusual. When this was written, a
+/// schema-version bump shifted the remote state key segment, and the download
+/// then found no object and emptied every replicated table — including this
+/// one (#1955). #2248 fixed that: the download now carries the newest older
+/// key forward. So the original reason is gone.
 ///
-/// So the kind is computed from evidence the row already carries. That is
+/// The kind is still computed from evidence the row already carries. That is
 /// weaker in one specific way, stated plainly: a future event kind that this
 /// function does not know about is classified `Evaluation` and counted as one.
 /// The mitigation is that there is now exactly ONE place to teach, instead of
 /// the three separate ad-hoc predicates that let this reach three kinds
-/// unnoticed. When a schema bump happens for some other reason, or #1955 is
-/// resolved, this should become a stored tag.
+/// unnoticed. A stored tag is now possible. It changes meaning for an older
+/// binary that counts rows, so it needs a schema bump when it lands.
 // Not serialized, by construction: this is derived from the row on read and
-// never written, which is the whole point (#1955). No serde, no schema, no
-// binding to regenerate.
+// never written. No serde, no schema, no binding to regenerate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DecisionKind {
     /// A policy gate evaluated a plan. The only kind whose `effect` is a
@@ -11825,6 +11940,164 @@ mod tests {
         );
     }
 
+    /// A v31 decision row written before RV4-P1 (no `principal_ref` key) must
+    /// forward-deserialize with the actor `None` ("unrecorded"), and a row
+    /// without an actor must not grow the key on re-serialization. See the
+    /// "Fields added without a bump" note on `CURRENT_SCHEMA_VERSION`.
+    #[test]
+    fn test_v31_policy_decision_forward_deserializes_principal_ref_none() {
+        let blob = serde_json::json!({
+            "timestamp": "2026-09-01T00:00:00Z",
+            "plan_id": "plan-old",
+            "principal": "agent",
+            "capability": "apply",
+            "model": "fct_orders",
+            "models": ["fct_orders"],
+            "keys_recorded": true,
+            "effect": "allow",
+            "reason": "allowed by rule 0",
+        });
+        let row: PolicyDecisionRecord = serde_json::from_value(blob)
+            .expect("a pre-RV4-P1 decision row must forward-deserialize");
+        assert!(
+            row.principal_ref.is_none(),
+            "an old row never named its actor"
+        );
+        let bytes = serde_json::to_string(&row).unwrap();
+        assert!(
+            !bytes.contains("principal_ref"),
+            "a row without an actor must not grow the key: {bytes}"
+        );
+    }
+
+    /// Version skew: a row whose `principal_ref` this binary cannot parse — a
+    /// source variant from a later binary, an id outside today's grammar —
+    /// still lists, and reads as unrecorded. A strict read would fail the whole
+    /// ledger and the gate would deny every agent.
+    #[test]
+    fn test_v31_unparseable_principal_ref_reads_as_unrecorded() {
+        let (store, _dir) = temp_store();
+        let blob = serde_json::json!({
+            "timestamp": "2026-09-01T00:00:00Z",
+            "plan_id": "plan-skew",
+            "principal": "agent",
+            "capability": "apply",
+            "model": "fct_orders",
+            "effect": "allow",
+            "principal_ref": {"id": "Bad@x", "source": "zzz"},
+        });
+        // Write the raw bytes the way a later binary would.
+        let key = policy_decision_key(
+            &"2026-09-01T00:00:00Z"
+                .parse::<chrono::DateTime<Utc>>()
+                .unwrap(),
+            "plan-skew",
+            "fct_orders",
+        );
+        let bytes = serde_json::to_vec(&blob).unwrap();
+        let txn = store.db.begin_write().unwrap();
+        {
+            let mut table = txn.open_table(POLICY_DECISIONS).unwrap();
+            table.insert(key.as_str(), bytes.as_slice()).unwrap();
+        }
+        txn.commit().unwrap();
+
+        let rows = store
+            .list_policy_decisions()
+            .expect("an unparseable principal_ref must not fail the ledger read");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].plan_id, "plan-skew");
+        assert!(rows[0].principal_ref.is_none(), "reads as unrecorded");
+
+        // Each half on its own, and a non-object value, also degrade to None.
+        for bad in [
+            serde_json::json!({"id": "alice", "source": "oidc"}),
+            serde_json::json!({"id": "Alice", "source": "flag"}),
+            serde_json::json!("alice"),
+            serde_json::Value::Null,
+        ] {
+            let mut row = blob.clone();
+            row["principal_ref"] = bad.clone();
+            let back: PolicyDecisionRecord = serde_json::from_value(row).unwrap();
+            assert!(back.principal_ref.is_none(), "{bad}");
+        }
+        // A valid one still reads.
+        let mut row = blob.clone();
+        row["principal_ref"] = serde_json::json!({"id": "alice", "source": "flag"});
+        let back: PolicyDecisionRecord = serde_json::from_value(row).unwrap();
+        assert_eq!(back.principal_ref.unwrap().id.as_str(), "alice");
+    }
+
+    /// Rollback: a v31 binary from before RV4-P1 must read a row this build
+    /// writes. The mirror below is the exact pre-P1 field set (no
+    /// `principal_ref`), with serde's default unknown-field handling — the
+    /// shape that binary has. If someone adds `deny_unknown_fields` to the
+    /// record, the real struct would refuse new rows on rollback; the mirror
+    /// pins the posture this release relies on.
+    #[test]
+    fn test_v31_rollback_mirror_reads_a_row_with_principal_ref() {
+        use crate::config::{
+            PolicyCapability, PolicyEffect, PolicyPrincipal, PrincipalId, PrincipalIdSource,
+            PrincipalRef,
+        };
+
+        #[derive(serde::Deserialize)]
+        #[allow(dead_code)]
+        struct PreP1PolicyDecisionRecord {
+            timestamp: chrono::DateTime<chrono::Utc>,
+            plan_id: String,
+            principal: PolicyPrincipal,
+            capability: PolicyCapability,
+            model: String,
+            #[serde(default)]
+            models: Vec<String>,
+            #[serde(default)]
+            keys_recorded: bool,
+            effect: PolicyEffect,
+            #[serde(default)]
+            rule_id: Option<usize>,
+            #[serde(default)]
+            reason: String,
+            #[serde(default)]
+            verify_after: Vec<String>,
+            #[serde(default)]
+            auto_apply: Option<AutoApplyCustody>,
+        }
+
+        let (store, _dir) = temp_store();
+        let row = PolicyDecisionRecord {
+            timestamp: Utc::now(),
+            plan_id: "plan-new".to_string(),
+            principal: PolicyPrincipal::Human,
+            capability: PolicyCapability::Apply,
+            model: "fct_orders".to_string(),
+            models: vec!["fct_orders".to_string()],
+            keys_recorded: true,
+            effect: PolicyEffect::Allow,
+            rule_id: None,
+            reason: "default posture".to_string(),
+            verify_after: Vec::new(),
+            auto_apply: None,
+            principal_ref: Some(PrincipalRef {
+                id: PrincipalId::parse_asserted("alice").unwrap(),
+                source: PrincipalIdSource::Flag,
+            }),
+        };
+        store.record_policy_decision(&row).unwrap();
+
+        // This build reads its own row back with the actor intact.
+        let back = store.list_policy_decisions().unwrap();
+        assert_eq!(back, vec![row.clone()]);
+
+        // The pre-P1 shape reads the same bytes and ignores the actor.
+        let bytes = serde_json::to_vec(&row).unwrap();
+        assert!(String::from_utf8_lossy(&bytes).contains("\"principal_ref\""));
+        let old: PreP1PolicyDecisionRecord = serde_json::from_slice(&bytes)
+            .expect("a pre-P1 v31 binary must read a row that carries principal_ref");
+        assert_eq!(old.plan_id, "plan-new");
+        assert_eq!(old.effect, PolicyEffect::Allow);
+    }
+
     /// A store this build wrote an owed-checks list into must be stamped past
     /// v30, the last version whose binary reads a recorded run as owing
     /// nothing. Otherwise a rollback opens it, ignores the list, and drops the
@@ -13828,10 +14101,6 @@ mod tests {
         assert!(store.get_watermark("wh.raw.orders").unwrap().is_some());
     }
 
-    /// A swept run record takes its checkpoint with it — the `run_progress`
-    /// header and its per-table entries — while the checkpoints of kept
-    /// runs, of a run whose id shares a prefix, and of a record-less
-    /// (crashed) run stay put.
     /// #1884: a checkpoint header whose run has no record is listed, newest
     /// first; a header beside its record is not.
     #[test]
@@ -13908,6 +14177,77 @@ mod tests {
         assert!(store.list_recordless_run_progress(10).unwrap().is_empty());
     }
 
+    /// #1884: a marker that outlives the history retention window is swept
+    /// with the records; a recent one is kept.
+    #[test]
+    fn sweep_retention_drops_stale_run_started_markers() {
+        let (store, _dir) = temp_store();
+        let now = Utc::now();
+        for (run_id, age) in [
+            ("crashed-long-ago", chrono::Duration::days(700)),
+            ("crashed-recently", chrono::Duration::hours(1)),
+        ] {
+            store
+                .mark_run_started(&RunStartedMarker {
+                    run_id: run_id.to_string(),
+                    started_at: now - age,
+                    pipeline: None,
+                })
+                .unwrap();
+        }
+        let policy = StateRetentionConfig {
+            max_age_days: 30,
+            min_runs_kept: 0,
+            applies_to: vec![StateRetentionDomain::History],
+            ..StateRetentionConfig::default()
+        };
+        store.sweep_retention_dry_run(&policy).unwrap();
+        assert_eq!(
+            store.list_recordless_run_markers(10).unwrap().len(),
+            2,
+            "a dry run deletes nothing"
+        );
+        store.sweep_retention(&policy).unwrap();
+        let left: Vec<String> = store
+            .list_recordless_run_markers(10)
+            .unwrap()
+            .into_iter()
+            .map(|m| m.run_id)
+            .collect();
+        assert_eq!(left, vec!["crashed-recently".to_string()]);
+    }
+
+    /// #1884: one unreadable marker is skipped; the readable ones are still
+    /// listed, so `rocky history` does not fail on a bad row.
+    #[test]
+    fn an_unreadable_run_started_marker_is_skipped_not_fatal() {
+        let (store, _dir) = temp_store();
+        store
+            .mark_run_started(&RunStartedMarker {
+                run_id: "readable".to_string(),
+                started_at: Utc::now(),
+                pipeline: None,
+            })
+            .unwrap();
+        {
+            let txn = store.db.begin_write().unwrap();
+            {
+                let mut metadata = txn.open_table(METADATA).unwrap();
+                metadata
+                    .insert(run_started_key("garbled").as_str(), "{not json")
+                    .unwrap();
+            }
+            txn.commit().unwrap();
+        }
+        let found = store.list_recordless_run_markers(10).unwrap();
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].run_id, "readable");
+    }
+
+    /// A swept run record takes its checkpoint with it — the `run_progress`
+    /// header and its per-table entries — while the checkpoints of kept
+    /// runs, of a run whose id shares a prefix, and of a record-less
+    /// (crashed) run stay put.
     #[test]
     fn sweep_retention_drops_the_checkpoint_with_its_run_record() {
         let (store, _dir) = temp_store();
@@ -14240,6 +14580,7 @@ mod tests {
             reason: "allow by rule 1".to_string(),
             verify_after: Vec::new(),
             auto_apply: None,
+            principal_ref: None,
         };
         let later = PolicyDecisionRecord {
             keys_recorded: false,
@@ -14256,6 +14597,7 @@ mod tests {
             reason: "denied by rule 0 (deny overrides)".to_string(),
             verify_after: Vec::new(),
             auto_apply: None,
+            principal_ref: None,
         };
         // Insert out of order; the ledger must return them chronologically.
         store.record_policy_decision(&later).unwrap();
@@ -14296,6 +14638,7 @@ mod tests {
             reason: "backfill plan awaits review".to_string(),
             verify_after: Vec::new(),
             auto_apply: None,
+            principal_ref: None,
         };
         let mut value = serde_json::to_value(&record).expect("serialize record");
         value
@@ -14342,6 +14685,7 @@ mod tests {
             reason: "replication target awaits review".to_string(),
             verify_after: Vec::new(),
             auto_apply: None,
+            principal_ref: None,
         };
         let mut value = serde_json::to_value(&record).expect("serialize record");
         value
@@ -14384,6 +14728,7 @@ mod tests {
             reason: String::new(),
             verify_after: Vec::new(),
             auto_apply: None,
+            principal_ref: None,
         };
 
         // No set: the label is the only candidate. It will not resolve in any
@@ -14441,6 +14786,7 @@ mod tests {
             reason: "allow by rule 1".to_string(),
             verify_after: Vec::new(),
             auto_apply: None,
+            principal_ref: None,
         };
         let mut value = serde_json::to_value(&record).expect("serialize record");
         value
@@ -15234,6 +15580,7 @@ mod tests {
                     reason: "backfill plan awaits review".to_string(),
                     verify_after: Vec::new(),
                     auto_apply: None,
+                    principal_ref: None,
                 })
                 .unwrap();
         }

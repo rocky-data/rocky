@@ -173,7 +173,7 @@ export type {
 export type { OptimizeOutput, OptimizeRecommendation } from "./optimize";
 
 // Plan
-export type { PlanOutput, PlannedStatement } from "./plan";
+export type { IntentCheckOutput, PlanOutput, PlannedStatement } from "./plan";
 
 // Run (canonical source for all run-only nested types)
 export type {
