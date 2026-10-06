@@ -5945,6 +5945,7 @@ impl RunOutput {
                 // never inside them, so a retried-then-succeeded build stays
                 // byte-indistinguishable downstream from a first-try success.
                 attempts: mat.attempts.clone(),
+                output_version: None,
             });
         }
 
@@ -5984,6 +5985,7 @@ impl RunOutput {
                 // when the retry layer produced them, ride on its
                 // `MaterializationOutput` instead.
                 attempts: Vec::new(),
+                output_version: None,
             });
         }
 

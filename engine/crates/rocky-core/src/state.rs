@@ -911,6 +911,18 @@ const SNAPSHOT_MEMORY_WARN_BYTES: u64 = 128 * 1024 * 1024;
 ///   **The phase that makes a gate read the id (RV4-P2, signatures) MUST bump.**
 ///   From then on an older binary that ignores the id would decide
 ///   differently, which is the v31 lesson above.
+///
+/// - **[`ModelExecution::output_version`]** (RV1-P1b, at v31). The version
+///   identity of each model output. Nothing reads it in P1b; it is recorded
+///   only. A v31 binary without the field ignores it and drops nothing it
+///   would act on. A row from an older binary reads back `None`, which means
+///   "not recorded". The field is omitted when `None` and read leniently.
+///   Guarded by `test_v31_model_execution_forward_deserializes_output_version_none`
+///   and `test_v31_rollback_mirror_reads_a_row_with_output_version`.
+///
+///   **RV1-P2 MUST bump to v32 when publish starts reading `output_version`.**
+///   From then on an older binary that ignores the version would publish
+///   differently, which is the v31 lesson above.
 const CURRENT_SCHEMA_VERSION: u32 = 31;
 
 /// Errors from the embedded redb state store.
@@ -2711,6 +2723,168 @@ pub struct ModelExecution {
     /// and the `ledger_record_serialization_pinned` golden.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attempts: Vec<AttemptRecord>,
+
+    // --- Output version (RV1-P1b, no schema bump) ------------------------
+    /// The version identity of the output this execution wrote, as the
+    /// warehouse reports it. See [`OutputVersion`] for what each variant
+    /// proves and what it does not.
+    ///
+    /// `None` means "not recorded": a failed execution, or a record written
+    /// by a binary that predates this field. A successful execution on this
+    /// binary always records `Some`, and an adapter that has no version
+    /// records [`OutputVersion::Unversioned`] with a reason.
+    ///
+    /// Added WITHOUT a schema bump; see the note above
+    /// [`CURRENT_SCHEMA_VERSION`]. Omitted when `None`, so the
+    /// `ledger_record_serialization_pinned` golden stays byte-identical.
+    ///
+    /// Written strictly, read leniently: a value this binary cannot parse (a
+    /// later binary's new variant or reason, or a corrupt value) reads as
+    /// `None` instead of failing the whole run-history read.
+    /// State-internal: not part of any `*Output` JSON schema, so no codegen.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_output_version_lenient"
+    )]
+    pub output_version: Option<OutputVersion>,
+}
+
+/// Lenient reader for [`ModelExecution::output_version`]: any value that does
+/// not parse as an [`OutputVersion`] reads as `None` ("not recorded"). No gate
+/// reads the version yet, so losing an unparseable one is safe; failing the
+/// row (and with it every run-history read) is not.
+fn deserialize_output_version_lenient<'de, D>(
+    deserializer: D,
+) -> Result<Option<OutputVersion>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = <Option<serde_json::Value> as serde::Deserialize>::deserialize(deserializer)?;
+    Ok(raw.and_then(|v| serde_json::from_value(v).ok()))
+}
+
+/// The version identity of one model output, recorded per execution (RV1-P1b).
+///
+/// Each variant says how strong its claim is. Only
+/// [`OutputVersion::ContentAddressed`] is a proof that Rocky made the commit
+/// it names, because Rocky owns that write.
+///
+/// ```text
+///   content_addressed  Rocky wrote the files and the Delta commit   proof
+///   delta_observed     DESCRIBE HISTORY read after the write       observation
+///   warehouse_job      the warehouse job id of the last statement  job identity
+///   unversioned        no version available, with a closed reason  none
+/// ```
+///
+/// Serialized with a `kind` tag in snake_case, for example
+/// `{"kind":"delta_observed","table":"c.s.t","version":7}`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum OutputVersion {
+    /// Rocky wrote this output itself through the content-addressed writer.
+    ///
+    /// `delta_version` is the Delta commit version of the last commit this
+    /// execution made (a partitioned write makes one commit per partition
+    /// group today, so it is the last group's commit). On a point-to reuse it
+    /// is the pointer commit.
+    ///
+    /// `files` holds the blake3 (hex) of every parquet file the execution
+    /// committed, sorted. `blake3` is the identity of the whole output: the
+    /// single file's hash for an unpartitioned write, or
+    /// [`partitioned_output_blake3`] over `files` for a partitioned write.
+    /// Build it with [`OutputVersion::content_addressed`].
+    ContentAddressed {
+        table: String,
+        delta_version: u64,
+        blake3: String,
+        files: Vec<String>,
+    },
+    /// The Delta table version Rocky read with `DESCRIBE HISTORY` **after**
+    /// its write finished.
+    ///
+    /// This is an observation, not a proof. Another writer can commit between
+    /// Rocky's write and the read, so `version` can name a later commit than
+    /// the one Rocky made. It is never an earlier one.
+    DeltaObserved { table: String, version: u64 },
+    /// The warehouse job id of the last statement Rocky ran for this output
+    /// (BigQuery `jobReference.jobId`). `ended_at` is Rocky's clock when the
+    /// output's statements had returned, not the warehouse's job end time.
+    WarehouseJob {
+        table: String,
+        job_id: String,
+        ended_at: chrono::DateTime<chrono::Utc>,
+    },
+    /// No version identity is available. The reason is a closed set, so a
+    /// reader can tell "the adapter cannot say" from "the read failed".
+    Unversioned { reason: UnversionedReason },
+}
+
+/// Why an execution recorded [`OutputVersion::Unversioned`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UnversionedReason {
+    /// The adapter exposes no table version (DuckDB, Trino, Postgres,
+    /// Redshift, ClickHouse, SQL Server, and Snowflake until its query id is
+    /// wired).
+    AdapterHasNoVersion,
+    /// A view stores no data, so there is no data version to record.
+    ViewHasNoStoredData,
+    /// The warehouse refreshes the output on its own schedule
+    /// (`materialized_view`, `dynamic_table`), so no write of Rocky's names
+    /// a version.
+    WarehouseManagedRefresh,
+    /// The model writes nothing (`ephemeral`).
+    NoOutput,
+    /// The adapter supports a version read, but the read failed. The run
+    /// itself still succeeded.
+    ObserveFailed,
+}
+
+/// The whole-output blake3 (hex) of a partitioned content-addressed write.
+///
+/// Recipe: sort the per-file blake3 hex strings, then hash the domain tag
+/// `rocky.partitioned-output.v1\n` followed by each sorted hash and a `\n`.
+/// Sorting makes the result independent of the order the groups were written.
+pub fn partitioned_output_blake3(file_hashes: &[String]) -> String {
+    let mut sorted: Vec<&str> = file_hashes.iter().map(String::as_str).collect();
+    sorted.sort_unstable();
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"rocky.partitioned-output.v1\n");
+    for hash in sorted {
+        hasher.update(hash.as_bytes());
+        hasher.update(b"\n");
+    }
+    hasher.finalize().to_hex().to_string()
+}
+
+impl OutputVersion {
+    /// Build [`OutputVersion::ContentAddressed`] from the per-file hashes of
+    /// one execution. `partitioned` selects the whole-output identity: the
+    /// single file's hash, or [`partitioned_output_blake3`] over all files.
+    ///
+    /// An unpartitioned write commits exactly one file. If `partitioned` is
+    /// false but the list does not hold exactly one hash, the fold is used
+    /// anyway, so the identity never silently covers only one file.
+    pub fn content_addressed(
+        table: String,
+        delta_version: u64,
+        file_hashes: Vec<String>,
+        partitioned: bool,
+    ) -> Self {
+        let mut files = file_hashes;
+        files.sort_unstable();
+        let blake3 = match files.as_slice() {
+            [only] if !partitioned => only.clone(),
+            _ => partitioned_output_blake3(&files),
+        };
+        OutputVersion::ContentAddressed {
+            table,
+            delta_version,
+            blake3,
+            files,
+        }
+    }
 }
 
 /// Where a run wrote its results. Missing on records written before #2172.
@@ -9887,6 +10061,7 @@ mod tests {
                 hash_scheme: None,
                 output_column_hashes: None,
                 attempts: Vec::new(),
+                output_version: None,
             }],
         );
         store.record_run(&run).unwrap();
@@ -10085,6 +10260,7 @@ mod tests {
                 hash_scheme: None,
                 output_column_hashes: None,
                 attempts: Vec::new(),
+                output_version: None,
             })
             .collect();
         for i in 0..1440u32 {
@@ -10382,6 +10558,7 @@ mod tests {
             hash_scheme: None,
             output_column_hashes: None,
             attempts: Vec::new(),
+            output_version: None,
         }
     }
 
@@ -10473,6 +10650,7 @@ mod tests {
                     hash_scheme: None,
                     output_column_hashes: None,
                     attempts: Vec::new(),
+                    output_version: None,
                 },
                 ModelExecution {
                     model_name: "customers".to_string(),
@@ -10494,6 +10672,7 @@ mod tests {
                     hash_scheme: None,
                     output_column_hashes: None,
                     attempts: Vec::new(),
+                    output_version: None,
                 },
             ],
         );
@@ -10530,6 +10709,7 @@ mod tests {
                     hash_scheme: None,
                     output_column_hashes: None,
                     attempts: Vec::new(),
+                    output_version: None,
                 }],
             );
             store.record_run(&run).unwrap();
@@ -10859,6 +11039,7 @@ mod tests {
                 hash: "col-hash".to_string(),
             }]),
             attempts: Vec::new(),
+            output_version: None,
         };
         let json = serde_json::to_string(&exec).unwrap();
         let back: ModelExecution = serde_json::from_str(&json).unwrap();
@@ -10911,6 +11092,7 @@ mod tests {
             hash_scheme: Some("v1".to_string()),
             output_column_hashes: None,
             attempts: Vec::new(),
+            output_version: None,
         };
         let exec_json = serde_json::to_string(&exec).unwrap();
 

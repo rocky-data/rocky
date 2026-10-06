@@ -36867,6 +36867,7 @@ auto_create_schemas = true
                 hash_scheme: None,
                 output_column_hashes: None,
                 attempts: Vec::new(),
+                output_version: None,
             }],
             trigger: rocky_core::state::RunTrigger::Manual,
             config_hash: "cfg".to_string(),
@@ -39149,6 +39150,7 @@ auto_create_schemas = true
             // content-addressed consumer sees fct's current output == its prior.
             output_column_hashes: Some(vec![ch("amount", "H_FCT_OUT")]),
             attempts: Vec::new(),
+            output_version: None,
         };
         let run = rocky_core::state::RunRecord {
             run_id: "run-1".to_string(),
@@ -39349,6 +39351,7 @@ auto_create_schemas = true
             hash_scheme: Some(identity.hash_scheme.clone()),
             output_column_hashes: Some(vec![ch("amount", "H_FCT_OUT")]),
             attempts: Vec::new(),
+            output_version: None,
         };
         let base_run = rocky_core::state::RunRecord {
             run_id: "run-prior".to_string(),
@@ -39486,6 +39489,7 @@ auto_create_schemas = true
                 hash_scheme: Some(identity.hash_scheme.clone()),
                 output_column_hashes: Some(vec![ch("amount", "H_FCT_OUT")]),
                 attempts: Vec::new(),
+                output_version: None,
             }],
             trigger: rocky_core::state::RunTrigger::Manual,
             config_hash: "cfg".to_string(),
@@ -40468,6 +40472,7 @@ auto_create_schemas = true
                 hash_scheme: Some(identity.hash_scheme.clone()),
                 output_column_hashes: Some(fct_out.clone()),
                 attempts: Vec::new(),
+                output_version: None,
             };
             let run = rocky_core::state::RunRecord {
                 run_id: "run-1".to_string(),
@@ -40773,6 +40778,7 @@ auto_create_schemas = true
                 hash_scheme: Some(identity.hash_scheme.clone()),
                 output_column_hashes: None,
                 attempts: Vec::new(),
+                output_version: None,
             };
             store
                 .record_run(&rocky_core::state::RunRecord {
