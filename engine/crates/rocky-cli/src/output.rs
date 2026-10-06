@@ -6511,6 +6511,25 @@ pub struct DagNodeOutput {
     /// Upstream node IDs (derived from DAG edges).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub depends_on: Vec<String>,
+    /// Whether the serving process's current compile covers this node, i.e.
+    /// whether `GET /api/v1/models/{label}` can serve it (#2011).
+    ///
+    /// Set only by `GET /api/v1/dag`, and only on `transformation` nodes.
+    /// The DAG reads every transformation pipeline's own models directory;
+    /// `rocky serve` compiles one. A node the compile did not cover is
+    /// `false`, so a client can draw it without offering a detail link that
+    /// answers 404. Also `false` while the server holds no compile result
+    /// (the compile failed or has not finished): the detail route cannot
+    /// serve the model then either.
+    ///
+    /// The two reads are not one snapshot: the graph is read from disk when
+    /// the route is asked, the compile is the last one `serve` published. A
+    /// model added a moment ago can be `false` until the next compile.
+    ///
+    /// Absent from `rocky dag`, which has no separate compile to compare
+    /// against, and from every non-transformation node.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compiled: Option<bool>,
 }
 
 /// Partition shape metadata for time-interval nodes.
@@ -9457,6 +9476,12 @@ pub enum AuditSubjectKind {
     /// ids like `freeze:…` / `draft:…` / `autoapply:…`, which never had a
     /// plan file).
     Plan,
+    /// A `product:<name>` subject whose `products/<name>.toml` spec loads
+    /// (#2003). Resolved through the spec's one output model, the same join
+    /// `rocky audit --product <name>` scopes the ledger by: the decisions whose
+    /// graph keys name that model, the runs that executed it, its blast
+    /// radius.
+    Product,
 }
 
 /// JSON output for `rocky audit --for <table|run|plan>` — the custody chain.

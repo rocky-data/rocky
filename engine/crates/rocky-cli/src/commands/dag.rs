@@ -344,6 +344,7 @@ fn build_dag_output(
                 freshness,
                 partition_shape,
                 depends_on,
+                compiled: None,
             }
         })
         .collect();

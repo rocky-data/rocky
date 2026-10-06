@@ -1354,7 +1354,32 @@ async fn full_dag(
     .await?
     .map_err(|e| ApiError::internal(e.to_string()))?;
 
-    Ok(PrettyJson(output))
+    let compile = state.compile_result.read().await;
+    Ok(PrettyJson(mark_compiled_nodes(output, compile.as_ref())))
+}
+
+/// Mark each `transformation` node with whether `compile` covers it (#2011).
+///
+/// The graph walks every transformation pipeline's own models directory;
+/// the server compiles one directory, and `GET /api/v1/models/{name}` reads
+/// that compile. Without the mark the DAG offered nodes the detail route
+/// answers 404 for, and nothing on either route said so. The lookup is the
+/// one `get_model` makes, so the mark and the route agree by construction.
+/// No compile result means no node is servable: `false`, never omitted.
+fn mark_compiled_nodes(
+    mut output: DagOutput,
+    compile: Option<&rocky_compiler::compile::CompileResult>,
+) -> DagOutput {
+    for node in &mut output.nodes {
+        if node.kind == rocky_core::unified_dag::NodeKind::Transformation.to_string() {
+            // Both lookups `get_model` makes before it answers 200.
+            node.compiled = Some(compile.is_some_and(|result| {
+                result.semantic_graph.model_schema(&node.label).is_some()
+                    && result.project.model(&node.label).is_some()
+            }));
+        }
+    }
+    output
 }
 
 /// `GET /api/v1/runs` — canonical [`HistoryOutput`] (project run history).
@@ -2091,11 +2116,24 @@ async fn custody_chain(
         .ok_or_else(ApiError::engine_not_ready)?;
     let state_path = state_path_for(&state);
     let models_dir = state.models_dir.clone();
+    let product = subject.strip_prefix("product:").map(str::to_string);
     let output = store_read(&state, move || {
         compute_audit_for(&root, &config, &state_path, &models_dir, &subject)
     })
     .await?
-    .map_err(|e| map_state_err(e, state.mutation_permit.running_job()))?;
+    .map_err(|e| {
+        // A `product:<name>` subject whose spec exists but does not load
+        // (#2003): the same `409` `GET /api/v1/audit?product=` answers.
+        match (
+            e.downcast_ref::<rocky_core::product::spec::SpecRejected>(),
+            &product,
+        ) {
+            (Some(reject), Some(name)) => {
+                ApiError::product_spec_invalid(name, reject.code, &reject.message)
+            }
+            _ => map_state_err(e, state.mutation_permit.running_job()),
+        }
+    })?;
     Ok(PrettyJson(output))
 }
 
@@ -2197,12 +2235,7 @@ async fn audit_ledger(
 /// name no spec file and no state record, and the route can answer 404
 /// without touching the filesystem or the store.
 fn is_bare_product_name(name: &str) -> bool {
-    let mut bytes = name.bytes();
-    match bytes.next() {
-        Some(b) if b.is_ascii_alphabetic() || b == b'_' => {}
-        _ => return false,
-    }
-    bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_')
+    crate::commands::audit::is_bare_product_name(name)
 }
 
 /// `GET /api/v1/schedule` — a read-only scheduler snapshot.
@@ -5407,6 +5440,10 @@ mod tests {
             (a.as_str(), "plan", true),
             ("freeze:global", "plan", true),
             ("nothing_here", "model", false),
+            // #2003: a product resolves through its spec's output model; one
+            // with no spec is the unresolved model chain it always was.
+            ("product:revenue_daily", "product", true),
+            ("product:nope", "model", false),
         ] {
             let resp = reqwest::get(format!("{base}/api/v1/custody/{subject}"))
                 .await
@@ -5420,6 +5457,16 @@ mod tests {
             assert_eq!(json["subject_kind"], kind, "{subject}");
             assert_eq!(json["resolved"], resolved, "{subject}");
         }
+
+        // #2003: a spec that exists but does not load is the audit route's
+        // `409 product_spec_invalid`, not a 500.
+        std::fs::write(root.join("products/broken.toml"), b"not = [toml").unwrap();
+        let resp = reqwest::get(format!("{base}/api/v1/custody/product:broken"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 409);
+        let err: ErrorEnvelope = resp.json().await.unwrap();
+        assert_eq!(err.code, "product_spec_invalid");
 
         let long = "m".repeat(MAX_CUSTODY_SUBJECT_BYTES + 1);
         let resp = reqwest::get(format!("{base}/api/v1/custody/{long}"))
@@ -6636,13 +6683,16 @@ mod tests {
         let (_dir, models_dir, config_path) = minimal_dag_project();
         let state_path = pinned_state_path(&models_dir);
         let state = pinned_server(models_dir.clone(), Some(config_path.clone()), &state_path);
-        let base = spawn_router(state).await;
+        // Settle the compile first: `GET /dag` marks each node against it.
+        state.recompile().await;
+        let base = spawn_router(state.clone()).await;
         let resp = reqwest::get(format!("{base}/api/v1/dag")).await.unwrap();
         assert_eq!(resp.status(), 200);
         let api = resp.text().await.unwrap();
 
-        let reference = reference_bytes(
-            &dag_output(
+        let compile = state.compile_result.read().await;
+        let reference = reference_bytes(&mark_compiled_nodes(
+            dag_output(
                 &config_path,
                 &state_path,
                 // `pinned_server` builds state the way `serve` without
@@ -6656,8 +6706,103 @@ mod tests {
                 None,
             )
             .unwrap(),
-        );
+            compile.as_ref(),
+        ));
+        // Byte parity with `rocky dag`, plus the one field the route adds.
         assert_eq!(api, reference, "GET /dag must match `rocky dag`");
+        assert!(api.contains("\"compiled\": true"), "{api}");
+    }
+
+    /// #2011: with `serve` holding the defaulted `models/` directory, the DAG
+    /// walks every transformation pipeline's own root, but the server compiles
+    /// only `models/`. A node from another root is drawn, and the detail
+    /// route answers 404 for it. The DAG must say so on the node — and the
+    /// mark must agree with what `GET /api/v1/models/{name}` answers.
+    #[tokio::test]
+    async fn dag_marks_the_nodes_the_server_compile_does_not_cover() {
+        let dir = tempfile::tempdir().unwrap();
+        for (sub, model) in [("models", "stg"), ("reporting", "rpt")] {
+            let root = dir.path().join(sub);
+            std::fs::create_dir_all(&root).unwrap();
+            std::fs::write(root.join(format!("{model}.sql")), "SELECT 1 AS id").unwrap();
+            std::fs::write(
+                root.join(format!("{model}.toml")),
+                format!(
+                    "name = \"{model}\"\n\n[strategy]\ntype = \"full_refresh\"\n\n\
+                     [target]\ncatalog = \"c\"\nschema = \"s\"\ntable = \"{model}\"\n"
+                ),
+            )
+            .unwrap();
+        }
+        let config_path = dir.path().join("rocky.toml");
+        std::fs::write(
+            &config_path,
+            "[adapter]\ntype = \"duckdb\"\npath = \"test.duckdb\"\n\n\
+             [pipeline.core]\ntype = \"transformation\"\nmodels = \"models/**\"\n\n\
+             [pipeline.core.target.governance]\nauto_create_schemas = true\n\n\
+             [pipeline.reporting]\ntype = \"transformation\"\nmodels = \"reporting/**\"\n\n\
+             [pipeline.reporting.target.governance]\nauto_create_schemas = true\n",
+        )
+        .unwrap();
+        let models_dir = dir.path().join("models");
+        let state_path = pinned_state_path(dir.path());
+        let state = pinned_server(models_dir, Some(config_path), &state_path);
+        let outcome = state.recompile().await;
+        assert!(outcome.compile_error.is_none(), "{outcome:?}");
+        let base = spawn_router(state.clone()).await;
+
+        let resp = reqwest::get(format!("{base}/api/v1/dag")).await.unwrap();
+        assert_eq!(resp.status(), 200);
+        let dag: serde_json::Value = resp.json().await.unwrap();
+        let mark = |label: &str| {
+            dag["nodes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|n| n["label"] == label && n["kind"] == "transformation")
+                .unwrap_or_else(|| panic!("{label} must be in the served DAG: {dag}"))["compiled"]
+                .clone()
+        };
+        assert_eq!(mark("stg"), serde_json::json!(true));
+        assert_eq!(mark("rpt"), serde_json::json!(false));
+        // Only transformation nodes carry the mark.
+        for node in dag["nodes"].as_array().unwrap() {
+            if node["kind"] != "transformation" {
+                assert!(node.get("compiled").is_none(), "{node}");
+            }
+        }
+
+        // The mark agrees with the detail route.
+        let served = reqwest::get(format!("{base}/api/v1/models/stg"))
+            .await
+            .unwrap();
+        assert_eq!(served.status(), 200);
+        let unserved = reqwest::get(format!("{base}/api/v1/models/rpt"))
+            .await
+            .unwrap();
+        assert_eq!(unserved.status(), 404);
+
+        // No compile result: no node is servable, so every mark is false.
+        let marked = mark_compiled_nodes(
+            dag_output(
+                &dir.path().join("rocky.toml"),
+                &state_path,
+                None,
+                None,
+                None,
+                false,
+                None,
+            )
+            .unwrap(),
+            None,
+        );
+        let transformation: Vec<_> = marked
+            .nodes
+            .iter()
+            .filter(|n| n.kind == "transformation")
+            .collect();
+        assert_eq!(transformation.len(), 2);
+        assert!(transformation.iter().all(|n| n.compiled == Some(false)));
     }
 
     /// A project whose transformation pipeline declares a **custom** model root,
@@ -6717,7 +6862,9 @@ mod tests {
         let default_models_dir = dir.path().join("models");
         let state_path = pinned_state_path(dir.path());
         let state = pinned_server(default_models_dir, Some(config_path.clone()), &state_path);
-        let base = spawn_router(state).await;
+        // Settle the compile first: `GET /dag` marks each node against it.
+        state.recompile().await;
+        let base = spawn_router(state.clone()).await;
         let resp = reqwest::get(format!("{base}/api/v1/dag")).await.unwrap();
         assert_eq!(resp.status(), 200);
         let api = resp.text().await.unwrap();
@@ -6744,10 +6891,16 @@ mod tests {
             "node must carry its materialization strategy"
         );
 
-        let reference = reference_bytes(
-            &dag_output(&config_path, &state_path, None, None, None, false, None).unwrap(),
-        );
+        let compile = state.compile_result.read().await;
+        let reference = reference_bytes(&mark_compiled_nodes(
+            dag_output(&config_path, &state_path, None, None, None, false, None).unwrap(),
+            compile.as_ref(),
+        ));
         assert_eq!(api, reference, "GET /dag must match `rocky dag`");
+        // #2011's own shape: the graph names `stg` from `transforms/`; the
+        // server compiled the defaulted `models/`, which does not cover it.
+        assert_eq!(stg["compiled"], false, "{api}");
+        drop(compile);
 
         // A single custom root is still a root the compiler can read, so
         // `--column-lineage` must keep working here. Asserting on the EDGES,

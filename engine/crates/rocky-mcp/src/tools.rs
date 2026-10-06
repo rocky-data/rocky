@@ -5651,6 +5651,16 @@ impl RockyMcpServer {
             &subject,
         )
         .map_err(|e| {
+            // A `product:<name>` subject whose spec exists but does not load
+            // (#2003) is the caller's to fix, not an internal fault.
+            if e.downcast_ref::<rocky_core::product::spec::SpecRejected>()
+                .is_some()
+            {
+                return ToolError::invalid_argument(
+                    format!("{e:#}"),
+                    "Fix products/<name>.toml until `rocky product verify <name>` accepts it.",
+                );
+            }
             ToolError::internal(
                 format!("{e:#}"),
                 "Could not assemble the custody chain; ensure the project's state store is \

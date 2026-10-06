@@ -47,6 +47,14 @@ class AuditSubjectKind3(StrEnum):
     plan = "plan"
 
 
+class AuditSubjectKind4(StrEnum):
+    """
+    A `product:<name>` subject whose `products/<name>.toml` spec loads (#2003). Resolved through the spec's one output model, the same join `rocky audit --product <name>` scopes the ledger by: the decisions whose graph keys name that model, the runs that executed it, its blast radius.
+    """
+
+    product = "product"
+
+
 class AuditVerifyEntry(BaseModel):
     """
     One post-apply verification outcome inside [`AuditChainVerify`] — a decision-ledger custody row with a non-empty `verify_after` check list.
@@ -523,7 +531,9 @@ class AuditForOutput(BaseModel):
     """
     The selector as supplied on the command line.
     """
-    subject_kind: AuditSubjectKind1 | AuditSubjectKind2 | AuditSubjectKind3
+    subject_kind: (
+        AuditSubjectKind1 | AuditSubjectKind2 | AuditSubjectKind3 | AuditSubjectKind4
+    )
     """
     What the selector resolved to.
     """

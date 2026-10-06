@@ -468,6 +468,16 @@ class DagNodeOutput(BaseModel):
     Cross-references the engine's internal `UnifiedNode` with model configs, seeds, and pipeline configs to attach the metadata that orchestrators need (target, strategy, freshness, partition shape).
     """
 
+    compiled: bool | None = None
+    """
+    Whether the serving process's current compile covers this node, i.e. whether `GET /api/v1/models/{label}` can serve it (#2011).
+
+    Set only by `GET /api/v1/dag`, and only on `transformation` nodes. The DAG reads every transformation pipeline's own models directory; `rocky serve` compiles one. A node the compile did not cover is `false`, so a client can draw it without offering a detail link that answers 404. Also `false` while the server holds no compile result (the compile failed or has not finished): the detail route cannot serve the model then either.
+
+    The two reads are not one snapshot: the graph is read from disk when the route is asked, the compile is the last one `serve` published. A model added a moment ago can be `false` until the next compile.
+
+    Absent from `rocky dag`, which has no separate compile to compare against, and from every non-transformation node.
+    """
     depends_on: list[str] | None = None
     """
     Upstream node IDs (derived from DAG edges).
