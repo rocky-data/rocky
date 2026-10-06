@@ -28,6 +28,38 @@ class BriefBudgetStatus(BaseModel):
     """
 
 
+class BriefDecisionKind1(StrEnum):
+    """
+    A policy gate evaluated a plan. `effect` is the policy verdict.
+    """
+
+    evaluation = "evaluation"
+
+
+class BriefDecisionKind2(StrEnum):
+    """
+    A post-apply verification row. `effect` says whether the named checks passed; it is not a policy verdict.
+    """
+
+    verify_after_custody = "verify_after_custody"
+
+
+class BriefDecisionKind3(StrEnum):
+    """
+    An operator froze a scope. Recorded with `effect = deny`.
+    """
+
+    freeze = "freeze"
+
+
+class BriefDecisionKind4(StrEnum):
+    """
+    An operator lifted a freeze. Recorded with `effect = allow`.
+    """
+
+    unfreeze = "unfreeze"
+
+
 class BriefDegradedRule(BaseModel):
     """
     A budget-exhausted (degraded) rule inside [`BriefAutonomySection`].
@@ -468,6 +500,15 @@ class BriefDecisionEntry(BaseModel):
 
     Ordered by restrictiveness for incomparable-rule tie-breaking: `Deny` is a hard override (handled separately), and among non-deny verdicts `RequireReview` is more restrictive than `Allow`.
     """
+    kind: (
+        BriefDecisionKind1
+        | BriefDecisionKind2
+        | BriefDecisionKind3
+        | BriefDecisionKind4
+    )
+    """
+    What kind of row this is. Only `evaluation` rows carry a policy verdict in `effect`, and only they are counted by the agent-activity counters.
+    """
     model: str
     """
     The model the decision was about.
@@ -557,7 +598,7 @@ class BriefFreshnessSection(BaseModel):
 
 class BriefPrincipalActivity(BaseModel):
     """
-    Per-principal decision counts inside [`BriefAgentActivitySection`].
+    Per-principal evaluation counts inside [`BriefAgentActivitySection`]. Like the section's own counters, these count policy evaluations only.
     """
 
     allow: conint(ge=0)
@@ -570,6 +611,9 @@ class BriefPrincipalActivity(BaseModel):
     """
     require_review: conint(ge=0)
     total: conint(ge=0)
+    """
+    Policy evaluations by this principal in the window.
+    """
 
 
 class BriefQualitySection(BaseModel):
@@ -659,9 +703,14 @@ class BriefSchedulerSection(BaseModel):
 class BriefAgentActivitySection(BaseModel):
     """
     Agent-activity section — the policy-decision ledger rolled up by principal.
+
+    The counters count policy EVALUATIONS only (#2043). The ledger also holds freeze and unfreeze rows (an operator's act, recorded as `deny` / `allow`) and post-apply verification rows (whose `effect` is a check verdict), and none of those is a policy decision. Every row in the window is still listed in `decisions`, with its `kind`, so `total` can be smaller than the length of `decisions`.
     """
 
     allow: conint(ge=0)
+    """
+    Evaluations that allowed the plan.
+    """
     availability: SectionAvailability7 | SectionAvailability8 | SectionAvailability9
     """
     Whether a brief section's underlying query succeeded and had data.
@@ -670,16 +719,25 @@ class BriefAgentActivitySection(BaseModel):
     """
     by_principal: list[BriefPrincipalActivity]
     """
-    One roll-up per acting principal (`human` / `agent`).
+    One roll-up of evaluations per acting principal (`human` / `agent`).
     """
     decisions: list[BriefDecisionEntry]
     """
-    Every decision in the window, newest first, each fully cited.
+    Every ledger row in the window, newest first, each fully cited and labelled with its `kind` — evaluations and the rows the counters skip.
     """
     deny: conint(ge=0)
+    """
+    Evaluations that denied the plan.
+    """
     note: str | None = None
     require_review: conint(ge=0)
+    """
+    Evaluations that required review.
+    """
     total: conint(ge=0)
+    """
+    Policy evaluations in the window. Not the length of `decisions`: freeze, unfreeze and verification rows are listed but not counted.
+    """
 
 
 class BriefOutput(BaseModel):

@@ -61,7 +61,7 @@ The printed address opens Estate, even though Needs you is first in the sidebar.
 
 ![The estate screen for the playground project: a project strip with one transformation pipeline, one DuckDB adapter and three compiled models, the newest run, and a DAG of raw_orders, customer_orders and revenue_summary](/ui-estate.png)
 
-Below the project strip, the DAG draws every model and the edges between them. Click a model to open its detail: its columns (with their types, where the compiler inferred them) and its compiled SQL. The server caps the SQL at 256 KiB and says so when it cuts it. Further down, the estate lists recent runs and the pipelines that declare a `[schedule]`.
+Below the project strip, the DAG draws every model and the edges between them. Click a model to open its detail: its columns (with their types, where the compiler inferred them) and its compiled SQL. The server caps the SQL at 256 KiB and says so when it cuts it. Further down, the estate lists recent runs and the pipelines that declare a `[schedule]`. The Schedule panel also shows the webhook demands waiting in the spool, which no tick has claimed yet. If the server cannot read the spool, the panel shows that error instead of a count.
 
 ## Review
 

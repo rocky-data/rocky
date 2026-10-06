@@ -9996,29 +9996,74 @@ pub struct BriefActiveFreeze {
 }
 
 /// Agent-activity section — the policy-decision ledger rolled up by principal.
+///
+/// The counters count policy EVALUATIONS only (#2043). The ledger also holds
+/// freeze and unfreeze rows (an operator's act, recorded as `deny` / `allow`)
+/// and post-apply verification rows (whose `effect` is a check verdict), and
+/// none of those is a policy decision. Every row in the window is still
+/// listed in `decisions`, with its `kind`, so `total` can be smaller than the
+/// length of `decisions`.
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct BriefAgentActivitySection {
     pub availability: SectionAvailability,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    /// Policy evaluations in the window. Not the length of `decisions`:
+    /// freeze, unfreeze and verification rows are listed but not counted.
     pub total: u64,
+    /// Evaluations that allowed the plan.
     pub allow: u64,
+    /// Evaluations that required review.
     pub require_review: u64,
+    /// Evaluations that denied the plan.
     pub deny: u64,
-    /// One roll-up per acting principal (`human` / `agent`).
+    /// One roll-up of evaluations per acting principal (`human` / `agent`).
     pub by_principal: Vec<BriefPrincipalActivity>,
-    /// Every decision in the window, newest first, each fully cited.
+    /// Every ledger row in the window, newest first, each fully cited and
+    /// labelled with its `kind` — evaluations and the rows the counters skip.
     pub decisions: Vec<BriefDecisionEntry>,
 }
 
-/// Per-principal decision counts inside [`BriefAgentActivitySection`].
+/// Per-principal evaluation counts inside [`BriefAgentActivitySection`].
+/// Like the section's own counters, these count policy evaluations only.
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct BriefPrincipalActivity {
     pub principal: rocky_core::config::PolicyPrincipal,
+    /// Policy evaluations by this principal in the window.
     pub total: u64,
     pub allow: u64,
     pub require_review: u64,
     pub deny: u64,
+}
+
+/// What kind of event a ledger row records, so a reader can tell a policy
+/// evaluation from the other rows the policy-decision ledger holds.
+///
+/// Mirrors `rocky_core::state::DecisionKind`, the one classifier (#1957).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum BriefDecisionKind {
+    /// A policy gate evaluated a plan. `effect` is the policy verdict.
+    Evaluation,
+    /// A post-apply verification row. `effect` says whether the named checks
+    /// passed; it is not a policy verdict.
+    VerifyAfterCustody,
+    /// An operator froze a scope. Recorded with `effect = deny`.
+    Freeze,
+    /// An operator lifted a freeze. Recorded with `effect = allow`.
+    Unfreeze,
+}
+
+impl From<rocky_core::state::DecisionKind> for BriefDecisionKind {
+    fn from(kind: rocky_core::state::DecisionKind) -> Self {
+        use rocky_core::state::DecisionKind;
+        match kind {
+            DecisionKind::Evaluation => BriefDecisionKind::Evaluation,
+            DecisionKind::VerifyAfterCustody => BriefDecisionKind::VerifyAfterCustody,
+            DecisionKind::Freeze => BriefDecisionKind::Freeze,
+            DecisionKind::Unfreeze => BriefDecisionKind::Unfreeze,
+        }
+    }
 }
 
 /// One recorded policy decision, cited for the digest.
@@ -10041,6 +10086,10 @@ pub struct BriefDecisionEntry {
     /// The model the decision was about.
     pub model: String,
     pub effect: rocky_core::config::PolicyEffect,
+    /// What kind of row this is. Only `evaluation` rows carry a policy
+    /// verdict in `effect`, and only they are counted by the agent-activity
+    /// counters.
+    pub kind: BriefDecisionKind,
     /// Index of the winning `[[policy.rules]]` entry, or `null` for the
     /// default posture.
     #[serde(skip_serializing_if = "Option::is_none")]

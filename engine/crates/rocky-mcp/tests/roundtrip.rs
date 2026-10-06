@@ -8794,3 +8794,87 @@ async fn draft_contract_unloadable_policy_with_an_uninspectable_leftover_says_so
         "the refused draft really is still on disk once the directory is searchable again"
     );
 }
+
+/// #1900: `schedule_status` reports the webhook demands waiting in the spool
+/// — the half the claims snapshot is blind to — through the same producer as
+/// `GET /api/v1/schedule/spool`, so the two agree by construction.
+#[tokio::test]
+async fn schedule_status_reports_waiting_spool_demands() {
+    let dir = TempDir::new().unwrap();
+    write_project(dir.path(), &dir.path().join("test.duckdb"));
+    let rocky_dir = dir.path().join(".rocky");
+    rocky_core::schedule::spool::accept(
+        &rocky_dir,
+        "p",
+        rocky_core::schedule::spool::WebhookKind::Id,
+        "delivery-1",
+        "deadbeef",
+        chrono::DateTime::parse_from_rfc3339("2026-09-10T10:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc),
+    )
+    .unwrap();
+    let server = RockyMcpServer::new(dir.path().join("rocky.toml"));
+
+    let client = connect(server).await;
+    let result = client
+        .call_tool(CallToolRequestParams::new("schedule_status"))
+        .await
+        .expect("schedule_status call");
+
+    assert_ne!(result.is_error, Some(true), "{result:?}");
+    let sc = result
+        .structured_content
+        .expect("schedule_status returns structured content");
+    assert_eq!(sc["spool"]["counts"]["pending"], serde_json::json!(1));
+    assert_eq!(
+        sc["spool"]["pending"][0]["token"],
+        serde_json::json!("delivery-1")
+    );
+    let reference =
+        rocky_cli::commands::compute_schedule_spool(&dir.path().join("rocky.toml")).unwrap();
+    assert_eq!(
+        sc["spool"],
+        serde_json::to_value(&reference).unwrap(),
+        "the tool must report the spool producer's document unchanged"
+    );
+    // The claims snapshot is still there, unchanged in shape.
+    assert!(sc.get("counts").is_some() && sc.get("tick_lock").is_some());
+
+    client.cancel().await.unwrap();
+}
+
+/// #1900: an unreadable spool is a tool error, never an empty list — the
+/// #1710/#1752/#1731 bug class is a present spool that reads as "nothing
+/// waiting".
+#[cfg(unix)]
+#[tokio::test]
+async fn schedule_status_errors_on_an_unreadable_spool() {
+    let dir = TempDir::new().unwrap();
+    write_project(dir.path(), &dir.path().join("test.duckdb"));
+    let rocky_dir = dir.path().join(".rocky");
+    std::fs::create_dir_all(&rocky_dir).unwrap();
+    // Present (a dangling symlink), but impossible to enumerate.
+    std::os::unix::fs::symlink(
+        dir.path().join("nowhere"),
+        rocky_dir.join("pending-demands"),
+    )
+    .unwrap();
+    let server = RockyMcpServer::new(dir.path().join("rocky.toml"));
+
+    let client = connect(server).await;
+    let result = client
+        .call_tool(CallToolRequestParams::new("schedule_status"))
+        .await
+        .expect("the call itself completes");
+
+    assert_eq!(
+        result.is_error,
+        Some(true),
+        "an unreadable spool must be an error, not an empty listing: {result:?}"
+    );
+    let text = format!("{result:?}");
+    assert!(text.contains("spool"), "{text}");
+
+    client.cancel().await.unwrap();
+}

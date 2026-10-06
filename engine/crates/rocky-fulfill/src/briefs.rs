@@ -174,7 +174,15 @@ pub fn default_brief(kind: TaskBriefKind) -> &'static str {
 ///
 /// `briefs_dir` is resolved through the staged commit's containment
 /// primitive against `project_root`: an absolute path, a traversing
-/// path, or a symlinked-ancestor escape is refused outright.
+/// path, or a symlinked-ancestor escape is refused outright. The file
+/// itself is read through `read_no_follow_bytes`, so a symlinked leaf and
+/// (on unix) a hard-linked one are refused too.
+///
+/// Overrides are a TRUSTED input (#1943): they are project configuration,
+/// written by whoever owns `rocky.toml`, not by a worker. The containment
+/// and the link refusals are not there because the author is distrusted;
+/// they make sure the bytes that become the worker's prompt are the
+/// project's own file and not a second name for one outside it.
 pub fn load_template(
     kind: TaskBriefKind,
     project_root: &Path,
@@ -190,12 +198,30 @@ pub fn load_template(
                              briefs_dir must be a plain relative directory inside the project"
                     )
                 })?;
-            if candidate.exists() {
-                std::fs::read_to_string(&candidate).with_context(|| {
-                    format!("failed to read brief override {}", candidate.display())
-                })?
-            } else {
-                default_brief(kind).to_string()
+            // Through the descriptor-bound import reader every fulfillment
+            // sink uses (#1633), not a following `read_to_string`: a symlink
+            // at the leaf fails the `O_NOFOLLOW` open, and on unix a hard
+            // link (a second name for an inode outside the project, which
+            // every path check passes) is refused on the descriptor. Only an
+            // ABSENT file falls back to the default; a dangling symlink is a
+            // refusal, never a silent default.
+            match rocky_core::product::commit::read_no_follow_bytes(&candidate) {
+                Ok(bytes) => String::from_utf8(bytes).map_err(|err| {
+                    anyhow::anyhow!("brief override {} is not UTF-8: {err}", candidate.display())
+                })?,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    default_brief(kind).to_string()
+                }
+                Err(err) => {
+                    return Err(err).with_context(|| {
+                        format!(
+                            "failed to read brief override {} — a `briefs_dir` override must \
+                             be a regular file with exactly one name (not a symlink, not a \
+                             hard link)",
+                            candidate.display()
+                        )
+                    });
+                }
             }
         }
         None => default_brief(kind).to_string(),
@@ -379,6 +405,53 @@ mod tests {
         )
         .expect("renders");
         assert!(fallback.contains("candidate product spec"));
+    }
+
+    /// #1633: a brief override that is a HARD LINK to a file outside the
+    /// project passes `briefs_dir` containment (it is an ordinary regular
+    /// file at a contained path) and used to be read with `read_to_string`
+    /// straight into the worker's prompt. The import reader refuses it on
+    /// the descriptor; nothing falls back to the default either, because the
+    /// file is present.
+    #[cfg(unix)]
+    #[test]
+    fn a_hardlinked_override_is_refused_not_imported() {
+        let outside_dir = tempfile::tempdir().expect("tempdir");
+        let outside = outside_dir.path().join("secret.md");
+        std::fs::write(&outside, "outside bytes for {product}").expect("write");
+        let root = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(root.path().join("briefs")).expect("mkdir");
+        std::fs::hard_link(&outside, root.path().join("briefs/drafting.md")).expect("link");
+
+        let err = load_template(
+            TaskBriefKind::Drafting,
+            root.path(),
+            Some(Path::new("briefs")),
+        )
+        .expect_err("a hard-linked override must be refused");
+
+        assert!(format!("{err:#}").contains("hard link"), "{err:#}");
+    }
+
+    /// The same rule's other leaf: a symlinked override — even a dangling
+    /// one — is a refusal, never the silent default `exists()` used to pick.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_override_is_refused_even_when_dangling() {
+        let root = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(root.path().join("briefs")).expect("mkdir");
+        std::os::unix::fs::symlink(
+            root.path().join("nowhere.md"),
+            root.path().join("briefs/drafting.md"),
+        )
+        .expect("symlink");
+
+        load_template(
+            TaskBriefKind::Drafting,
+            root.path(),
+            Some(Path::new("briefs")),
+        )
+        .expect_err("a symlinked override must be refused, not defaulted");
     }
 
     /// F2: an override brief passes the SAME exclusion validation as the

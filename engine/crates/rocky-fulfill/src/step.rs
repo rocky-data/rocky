@@ -1675,7 +1675,15 @@ impl Runner {
                 expected_digest,
                 ..
             }) => {
-                // Integrity: the hand-off digest must match the bytes.
+                // A trait-boundary guard, not proof of intent (#1633,
+                // decided 2026-09-30). The digest must match the bytes, which
+                // binds the confined write below to exactly the bytes the
+                // driver handed over. For `SubprocessDriver` the digest was
+                // computed from those same bytes after the worker exited, so
+                // this cannot fail there: it proves which bytes were
+                // accepted, not what the worker meant to write. It is a real
+                // check only for a driver whose digest comes from somewhere
+                // else — the replay driver's recorded session.
                 let actual = rocky_core::product::spec::spec_digest(&candidate_spec_bytes);
                 if actual != expected_digest {
                     return Ok(Event::ElicitationFinished {

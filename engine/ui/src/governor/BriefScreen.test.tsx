@@ -25,6 +25,7 @@ export const BRIEF: BriefOutput = {
         capability: "schema_change.breaking",
         principal: "agent",
         effect: "require_review",
+        kind: "evaluation",
         reason: "breaking change to a contract column",
         decision_ref: "decision:esc-1",
         timestamp: "2026-09-04T10:00:00Z",
@@ -45,6 +46,7 @@ export const BRIEF: BriefOutput = {
         capability: "propose",
         principal: "agent",
         effect: "allow",
+        kind: "evaluation",
         rule_id: 0,
         reason: "propose is allowed for the output model",
         decision_ref: "decision:act-1",
@@ -56,10 +58,24 @@ export const BRIEF: BriefOutput = {
         capability: "apply",
         principal: "agent",
         effect: "require_review",
+        kind: "evaluation",
         rule_id: null,
         reason: "<img src=x onerror=alert(1)> hostile reason",
         decision_ref: "decision:act-2",
         timestamp: "2026-09-04T10:00:00Z",
+      },
+      // Listed, not counted (#2043): `total` above is 2 evaluations.
+      {
+        plan_id: "freeze:models/fct_orders",
+        model: "models/fct_orders",
+        capability: "apply",
+        principal: "human",
+        effect: "deny",
+        kind: "freeze",
+        rule_id: null,
+        reason: "frozen by the on-call",
+        decision_ref: "decision:act-3",
+        timestamp: "2026-09-04T11:00:00Z",
       },
     ],
   },
@@ -130,6 +146,11 @@ describe("BriefScreen", () => {
     const activity = screen.getByRole("region", { name: "Agent activity" });
     expect(within(activity).getByText("decision:act-1")).toBeInTheDocument();
     expect(within(activity).getByText("decision:act-2")).toBeInTheDocument();
+    // The freeze row is listed with its kind, and the summary counts
+    // evaluations only.
+    const freeze = within(activity).getByText("decision:act-3").closest("tr") as HTMLElement;
+    expect(within(freeze).getByText("freeze")).toBeInTheDocument();
+    expect(within(activity).getByText(/2 policy evaluations: 1 allow/)).toBeInTheDocument();
 
     const runs = screen.getByRole("region", { name: "Runs" });
     expect(within(runs).getByText("run-attention-1")).toBeInTheDocument();
