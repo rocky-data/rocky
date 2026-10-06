@@ -707,9 +707,9 @@ mod tests {
             );
             let models = [(
                 "ti",
-                "SELECT CAST(TIMESTAMP '2026-01-01 12:00:00' AS DATE) AS order_date \
-                 WHERE TIMESTAMP '2026-01-01 12:00:00' >= @start_date \
-                 AND TIMESTAMP '2026-01-01 12:00:00' < @end_date\n",
+                "SELECT order_date \
+                 FROM (SELECT CAST(TIMESTAMP '2026-01-01 12:00:00' AS DATE) AS order_date) AS src \
+                 WHERE order_date >= @start_date AND order_date < @end_date\n",
                 toml.as_str(),
             )];
             let adapter = "[adapter]\ntype = \"test-fail-write\"\npath = \"observe-version\"\n";
