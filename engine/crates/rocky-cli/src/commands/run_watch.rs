@@ -54,8 +54,8 @@ const EVENT_CHANNEL_CAP: usize = 64;
 /// A signal that makes the loop drop an in-flight iteration first settles the
 /// remote-state session that iteration held — its terminal upload, under the
 /// session's own durability rules (#1603). The exit is non-zero only when that
-/// upload fails and the rules say it must not be lost (a governed run, or
-/// `[state] on_upload_failure = "fail"`); see `stop_interrupted_iteration`.
+/// upload fails and `[state] on_upload_failure = "fail"` says it must not be
+/// lost; see `stop_interrupted_iteration`.
 ///
 /// # Arguments
 ///
@@ -441,9 +441,9 @@ pub async fn run_watch(
 ///                          Err ──▶ exit non-zero (fail closed)
 /// ```
 ///
-/// A settlement failure is returned, so the watcher exits non-zero: a governed
-/// (`Durable`) session or `on_upload_failure = "fail"` must not lose its upload
-/// behind a clean exit. The default `skip` posture warns and still exits 0,
+/// A settlement failure is returned, so the watcher exits non-zero: under
+/// `on_upload_failure = "fail"` the upload must not be lost behind a clean
+/// exit (watch runs are never governed, so `Durable` does not arise here). The default `skip` posture warns and still exits 0,
 /// exactly as `finalize` would. A second Ctrl-C during settlement terminates
 /// at once with 130, the same escape hatch the run's own shutdown offers.
 ///
@@ -457,6 +457,12 @@ async fn stop_interrupted_iteration<F: std::future::Future>(
     sink.arm();
     drop(iteration);
     if sink.pending() == 0 {
+        return Ok(());
+    }
+    if !sink.owes_upload() {
+        // Local backend, suppressed, or never downloaded: settling only
+        // consumes the sessions, so there is nothing to wait for.
+        sink.settle_all().await?;
         return Ok(());
     }
     eprintln!(

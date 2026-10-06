@@ -159,6 +159,7 @@ fields (timestamps, branch schema, run ids) run to run.
 
 - `rocky` ≥ 1.18.0 on PATH
 - `duckdb` CLI for seeding (`brew install duckdb`)
+- `jq`, to check that `preview diff` and `preview cost` paired with the branch run
 - `git`, and the POC inside a git checkout (`rocky preview create` runs
   `git diff` against the base ref)
 

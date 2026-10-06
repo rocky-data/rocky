@@ -470,17 +470,10 @@ fn unreadable_spool(dir: &SpoolDir, detail: &str) -> io::Error {
 pub fn list_pending_files(rocky_dir: &Path) -> io::Result<Vec<PathBuf>> {
     let dir = spool_dir(rocky_dir);
     let mut out = Vec::new();
-    let entries = match std::fs::read_dir(&dir) {
-        Ok(e) => e,
-        // `NotFound` has two meanings here and only one of them is "no demand
-        // is pending". Ask the shared discriminator which one this is.
-        Err(e) if e.kind() == io::ErrorKind::NotFound => match classify_missing_spool(&dir) {
-            PathPresence::Absent => return Ok(out),
-            PathPresence::Present { detail } => {
-                return Err(unreadable_spool(&dir, &detail));
-            }
-        },
-        Err(e) => return Err(e),
+    // `NotFound` has two meanings here and only one of them is "no demand is
+    // pending". `read_spool_dir` asks the discriminator which one this is.
+    let Some(entries) = read_spool_dir(&dir)? else {
+        return Ok(out);
     };
     for entry in entries {
         let entry = entry?;
@@ -612,13 +605,8 @@ pub fn quarantine(pending: &Path, now: DateTime<Utc>) -> io::Result<PathBuf> {
 /// make on its own: see #1712.
 pub fn count_corrupt(rocky_dir: &Path) -> io::Result<usize> {
     let dir = spool_dir(rocky_dir);
-    let entries = match std::fs::read_dir(&dir) {
-        Ok(e) => e,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => match classify_missing_spool(&dir) {
-            PathPresence::Absent => return Ok(0),
-            PathPresence::Present { detail } => return Err(unreadable_spool(&dir, &detail)),
-        },
-        Err(e) => return Err(e),
+    let Some(entries) = read_spool_dir(&dir)? else {
+        return Ok(0);
     };
     let mut n = 0;
     for entry in entries {
@@ -668,13 +656,8 @@ pub struct TombstoneSweep {
 /// and is kept. That is the fail-safe direction: the dedup window stays closed.
 pub fn sweep_tombstones(rocky_dir: &Path) -> io::Result<TombstoneSweep> {
     let dir = spool_dir(rocky_dir);
-    let entries = match std::fs::read_dir(&dir) {
-        Ok(e) => e,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => match classify_missing_spool(&dir) {
-            PathPresence::Absent => return Ok(TombstoneSweep::default()),
-            PathPresence::Present { detail } => return Err(unreadable_spool(&dir, &detail)),
-        },
-        Err(e) => return Err(e),
+    let Some(entries) = read_spool_dir(&dir)? else {
+        return Ok(TombstoneSweep::default());
     };
     // The directory just listed, so it is readable: give a spool created before
     // the sentinel existed its sentinel now (#1903). Best effort — a read-only
@@ -764,6 +747,37 @@ fn ensure_sentinel(dir: &SpoolDir) -> io::Result<bool> {
     }
     fsync_dir(dir.as_path())?;
     Ok(true)
+}
+
+/// Open the spool directory for listing: `Ok(None)` for a spool that is
+/// genuinely absent, `Ok(Some(_))` for one that listed, and an error — never
+/// `None` — for one that is there but cannot be listed.
+///
+/// The one place the three read sites ([`list_pending_files`],
+/// [`count_corrupt`], [`sweep_tombstones`]) turn a `NotFound` into a verdict,
+/// so they cannot drift apart and the sentinel check is tested once for all
+/// of them (#1903).
+fn read_spool_dir(dir: &SpoolDir) -> io::Result<Option<std::fs::ReadDir>> {
+    read_spool_dir_with(dir, |path| std::fs::read_dir(path), &RealFs)
+}
+
+/// [`read_spool_dir`] with the listing call and the probe injected, so the
+/// masked shape a Linux runner cannot produce is testable end to end.
+fn read_spool_dir_with<T>(
+    dir: &SpoolDir,
+    read_dir: impl FnOnce(&Path) -> io::Result<T>,
+    fs: &dyn FsProbe,
+) -> io::Result<Option<T>> {
+    match read_dir(dir.as_path()) {
+        Ok(entries) => Ok(Some(entries)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            match classify_missing_spool_with(dir, fs) {
+                PathPresence::Absent => Ok(None),
+                PathPresence::Present { detail } => Err(unreadable_spool(dir, &detail)),
+            }
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// What a `NotFound` from reading the spool directory means: the shared
@@ -1064,6 +1078,46 @@ mod tests {
                 panic!("a spool whose sentinel answers must not read as absent")
             }
         }
+    }
+
+    /// The same masked shape through the read path the three read sites
+    /// share: the listing reports `NotFound`, the sentinel answers, and the
+    /// read refuses with the same wording every site uses — not "nothing
+    /// pending", not "zero corrupt", not "nothing to sweep".
+    #[test]
+    fn the_shared_spool_read_refuses_a_masked_listing_with_a_sentinel() {
+        let rocky_dir = PathBuf::from("/proj/.rocky");
+        let dir = spool_dir(&rocky_dir);
+        let masked = MaskedFs {
+            missing: vec![dir.as_path().to_path_buf()],
+            broken: vec![],
+        };
+        let refused = read_spool_dir_with(
+            &dir,
+            |_| Err::<(), _>(io::Error::from(io::ErrorKind::NotFound)),
+            &masked,
+        )
+        .expect_err("a spool whose sentinel answers must not list as absent");
+        assert!(
+            refused.to_string().contains("cannot be read")
+                && refused.to_string().contains(SENTINEL_NAME),
+            "got: {refused}"
+        );
+
+        // Control: no sentinel, so the same NotFound is honest absence.
+        let absent = MaskedFs {
+            missing: vec![dir.as_path().to_path_buf(), dir.join(SENTINEL_NAME)],
+            broken: vec![],
+        };
+        assert!(
+            read_spool_dir_with(
+                &dir,
+                |_| Err::<(), _>(io::Error::from(io::ErrorKind::NotFound)),
+                &absent,
+            )
+            .unwrap()
+            .is_none()
+        );
     }
 
     /// The control: no sentinel either, so this is a spool that was never

@@ -2220,10 +2220,7 @@ impl std::fmt::Debug for DroppedSessionSink {
         f.debug_struct("DroppedSessionSink")
             .field(
                 "armed",
-                &self
-                    .inner
-                    .armed
-                    .load(std::sync::atomic::Ordering::SeqCst),
+                &self.inner.armed.load(std::sync::atomic::Ordering::SeqCst),
             )
             .finish_non_exhaustive()
     }
@@ -2298,6 +2295,17 @@ impl DroppedSessionSink {
         }
     }
 
+    /// Whether any session waiting to be settled will attempt a remote
+    /// upload — the only case where settling can take noticeable time.
+    pub fn owes_upload(&self) -> bool {
+        self.inner
+            .sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .any(DroppedSession::owes_upload)
+    }
+
     /// How many sessions are waiting to be settled.
     pub fn pending(&self) -> usize {
         self.inner
@@ -2358,18 +2366,7 @@ impl DroppedSession {
             let _ = handle.await;
         }
 
-        let skip_reason = if !self.acquired {
-            Some("the session never downloaded state")
-        } else if let Some(reason) = self.suppress_reason {
-            Some(reason)
-        } else if !self.authority.is_usable() {
-            Some("non-authoritative state download")
-        } else if matches!(self.cfg.backend, StateBackend::Local) {
-            Some("local backend")
-        } else {
-            None
-        };
-        if let Some(reason) = skip_reason {
+        if let Some(reason) = self.no_upload_reason() {
             info!(
                 reason,
                 outcome = "skipped",
@@ -2380,21 +2377,18 @@ impl DroppedSession {
 
         let _writer = match wait_for_writer_lock(&self.state_path).await {
             Ok(lock) => lock,
-            Err(e) => {
-                let cfg = match self.durability {
-                    FinalizeDurability::Durable => StateConfig {
-                        on_upload_failure: StateUploadFailureMode::Fail,
-                        ..self.cfg.clone()
-                    },
-                    FinalizeDurability::ConfigDefault => self.cfg.clone(),
-                };
-                return apply_upload_failure_policy(&cfg, Err(e));
-            }
+            Err(e) => return apply_upload_failure_policy(&self.effective_cfg(), Err(e)),
         };
         info!(
             state_path = %self.state_path.display(),
             "interrupted run: performing its terminal state upload"
         );
+        // A CAS conflict stays fail-closed even under `skip`, as everywhere
+        // else (`apply_upload_failure_policy`). Here it can have an innocent
+        // cause — the dropped run committed its own interrupted checkpoint
+        // without recording the new generation — but it cannot be told apart
+        // from a lost cross-pod race, and overwriting a winner is the worse
+        // error. The cost is a non-zero exit, never lost or clobbered state.
         terminal_upload(
             &self.cfg,
             self.durability,
@@ -2403,6 +2397,41 @@ impl DroppedSession {
             self.replicate_schema_cache,
         )
         .await
+    }
+
+    /// Why this session owes no terminal upload, if it owes none: it never
+    /// downloaded (pushing local state over a remote it never read is a
+    /// blind overwrite), an upload suppression was recorded, the download
+    /// was not authoritative, or the backend is local.
+    fn no_upload_reason(&self) -> Option<&'static str> {
+        if !self.acquired {
+            Some("the session never downloaded state")
+        } else if let Some(reason) = self.suppress_reason {
+            Some(reason)
+        } else if !self.authority.is_usable() {
+            Some("non-authoritative state download")
+        } else if matches!(self.cfg.backend, StateBackend::Local) {
+            Some("local backend")
+        } else {
+            None
+        }
+    }
+
+    /// Whether [`settle`][Self::settle] will attempt a remote upload.
+    pub fn owes_upload(&self) -> bool {
+        self.no_upload_reason().is_none()
+    }
+
+    /// The config the upload runs under: `Durable` forces
+    /// `on_upload_failure = "fail"`.
+    fn effective_cfg(&self) -> StateConfig {
+        match self.durability {
+            FinalizeDurability::Durable => StateConfig {
+                on_upload_failure: StateUploadFailureMode::Fail,
+                ..self.cfg.clone()
+            },
+            FinalizeDurability::ConfigDefault => self.cfg.clone(),
+        }
     }
 }
 
@@ -7034,8 +7063,7 @@ mod tests {
         let local = dir.path().join(".rocky-state.redb");
         let cfg = s3_session_config(StateUploadFailureMode::Fail);
 
-        let mut session =
-            RemoteStateSession::new(&cfg, &local, FinalizeDurability::Durable, false);
+        let mut session = RemoteStateSession::new(&cfg, &local, FinalizeDurability::Durable, false);
         assert_eq!(session.acquire().await.unwrap(), StateAuthority::FreshStart);
         // What the run committed before the signal landed.
         {
@@ -7109,6 +7137,44 @@ mod tests {
             .await
             .expect_err("a governed session must not lose its upload behind an Ok");
         assert!(err.to_string().contains("injected fault"), "got: {err}");
+        test_support::clear();
+    }
+
+    /// A CAS conflict at settlement fails closed even under `skip`, the same
+    /// invariant every other upload keeps: a dropped session never overwrites
+    /// a remote that moved after it downloaded.
+    #[tokio::test]
+    async fn a_cas_conflict_at_settlement_fails_closed_even_under_skip() {
+        test_support::clear();
+        let _faults = install_counting_provider();
+        let dir = TempDir::new().unwrap();
+        let local = dir.path().join(".rocky-state.redb");
+        seed_state_file(&local);
+        let cfg = StateConfig {
+            concurrency_control: Some(ConcurrencyControl::Cas),
+            ..s3_session_config(StateUploadFailureMode::Skip)
+        };
+        let mut first =
+            RemoteStateSession::new(&cfg, &local, FinalizeDurability::ConfigDefault, false);
+        let _ = first.acquire().await.unwrap();
+        first.finalize().await.unwrap();
+
+        let mut dropped =
+            RemoteStateSession::new(&cfg, &local, FinalizeDurability::ConfigDefault, false);
+        let _ = dropped.acquire().await.unwrap();
+        // The remote advances after the dropped session captured its base.
+        let mut racer =
+            RemoteStateSession::new(&cfg, &local, FinalizeDurability::ConfigDefault, false);
+        let _ = racer.acquire().await.unwrap();
+        racer.finalize().await.unwrap();
+
+        let sink = DroppedSessionSink::new();
+        drop_inside_scope(&sink, dropped, true).await;
+        let settled = sink.settle_all().await;
+        assert!(
+            matches!(settled, Err(StateSyncError::CasConflict { .. })),
+            "a conflict must fail closed, not be skipped: {settled:?}"
+        );
         test_support::clear();
     }
 
@@ -7188,7 +7254,10 @@ mod tests {
             "no upload while a writer still holds the store"
         );
         drop(writer);
-        settle.await.unwrap().expect("settles once the writer closes");
+        settle
+            .await
+            .unwrap()
+            .expect("settles once the writer closes");
         assert_eq!(faults.count(crate::fault_store::FaultOp::Put), 1);
     }
 
