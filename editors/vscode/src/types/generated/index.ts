@@ -173,6 +173,10 @@ export type {
 export type { OptimizeOutput, OptimizeRecommendation } from "./optimize";
 
 // Plan
+export type { PackageAddOutput, PackageDiagnostic, PackageDroppedTest, PackageFailedModel, PackageSourceOutput, PackageVendorReport } from "./package_add";
+export type { PackageListEntry, PackageListOutput } from "./package_list";
+export type { PackageRemoveOutput } from "./package_remove";
+export type { PackageUpdateOutput } from "./package_update";
 export type { IntentCheckOutput, PlanOutput, PlannedStatement } from "./plan";
 
 // Run (canonical source for all run-only nested types)
