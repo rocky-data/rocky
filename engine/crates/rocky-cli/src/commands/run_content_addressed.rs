@@ -2685,8 +2685,8 @@ mod tests {
             assert_eq!(row.size_bytes, file.size_bytes);
         }
 
-        // RV1-P1b: the recorded version names the last commit and folds
-        // every group's hash, never only the last group's.
+        // RV1-P1b: the recorded version names every group's commit and
+        // folds every group's hash, never only the last group's.
         let mut hashes: Vec<String> = summary
             .written_files
             .iter()
@@ -2697,7 +2697,7 @@ mod tests {
             crate::commands::run_output_version::content_addressed_output_version(&model, &summary),
             rocky_core::state::OutputVersion::ContentAddressed {
                 table: "c.s.t".into(),
-                delta_version: 3,
+                delta_versions: vec![1, 2, 3],
                 blake3: rocky_core::state::partitioned_output_blake3(&hashes),
                 files: hashes,
             }

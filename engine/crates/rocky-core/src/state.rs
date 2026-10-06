@@ -2784,10 +2784,12 @@ where
 pub enum OutputVersion {
     /// Rocky wrote this output itself through the content-addressed writer.
     ///
-    /// `delta_version` is the Delta commit version of the last commit this
-    /// execution made (a partitioned write makes one commit per partition
-    /// group today, so it is the last group's commit). On a point-to reuse it
-    /// is the pointer commit.
+    /// `delta_versions` holds every Delta commit version this execution made,
+    /// sorted and without repeats. An unpartitioned write makes one commit, so
+    /// it holds one entry; on a point-to reuse that entry is the pointer
+    /// commit. A partitioned write makes one commit per partition group today,
+    /// so it holds one entry per group. RV1-P1a will make it one commit per
+    /// run.
     ///
     /// `files` holds the blake3 (hex) of every parquet file the execution
     /// committed, sorted. `blake3` is the identity of the whole output: the
@@ -2796,7 +2798,7 @@ pub enum OutputVersion {
     /// Build it with [`OutputVersion::content_addressed`].
     ContentAddressed {
         table: String,
-        delta_version: u64,
+        delta_versions: Vec<u64>,
         blake3: String,
         files: Vec<String>,
     },
@@ -2805,15 +2807,26 @@ pub enum OutputVersion {
     ///
     /// This is an observation, not a proof. Another writer can commit between
     /// Rocky's write and the read, so `version` can name a later commit than
-    /// the one Rocky made. It is never an earlier one.
+    /// the one Rocky made. It is never an earlier one. Concurrent
+    /// `time_interval` partitions of one model can each observe a sibling
+    /// partition's later commit.
+    ///
+    /// `(table, version)` is not unique over time: a `DROP` + `CREATE` (for
+    /// example a full refresh with a pre-drop, or `atomic_drop_and_create` on
+    /// a kind switch) starts a new Delta table at version 0, so an earlier
+    /// incarnation can carry the same pair.
     DeltaObserved { table: String, version: u64 },
-    /// The warehouse job id of the last statement Rocky ran for this output
-    /// (BigQuery `jobReference.jobId`). `ended_at` is Rocky's clock when the
-    /// output's statements had returned, not the warehouse's job end time.
+    /// A warehouse job id for this output (BigQuery `jobReference.jobId`).
+    ///
+    /// `job_id` is the job id of the **last** statement Rocky ran for the
+    /// model. That statement may not be the one that wrote the data (for
+    /// example a trailing statement after the write), so the id identifies
+    /// the run's work, not proof of the data commit.
     WarehouseJob {
         table: String,
         job_id: String,
-        ended_at: chrono::DateTime<chrono::Utc>,
+        /// Rocky's clock after the write, not the job's end time.
+        recorded_at: chrono::DateTime<chrono::Utc>,
     },
     /// No version identity is available. The reason is a closed set, so a
     /// reader can tell "the adapter cannot say" from "the read failed".
@@ -2839,6 +2852,8 @@ pub enum UnversionedReason {
     /// The adapter supports a version read, but the read failed. The run
     /// itself still succeeded.
     ObserveFailed,
+    /// Rocky did not query the version, to keep replication cost unchanged.
+    NotObserved,
 }
 
 /// The whole-output blake3 (hex) of a partitioned content-addressed write.
@@ -2859,8 +2874,9 @@ pub fn partitioned_output_blake3(file_hashes: &[String]) -> String {
 }
 
 impl OutputVersion {
-    /// Build [`OutputVersion::ContentAddressed`] from the per-file hashes of
-    /// one execution. `partitioned` selects the whole-output identity: the
+    /// Build [`OutputVersion::ContentAddressed`] from the commit versions and
+    /// per-file hashes of one execution. Both are sorted; the versions lose
+    /// repeats. `partitioned` selects the whole-output identity: the
     /// single file's hash, or [`partitioned_output_blake3`] over all files.
     ///
     /// An unpartitioned write commits exactly one file. If `partitioned` is
@@ -2868,10 +2884,13 @@ impl OutputVersion {
     /// anyway, so the identity never silently covers only one file.
     pub fn content_addressed(
         table: String,
-        delta_version: u64,
+        commit_versions: Vec<u64>,
         file_hashes: Vec<String>,
         partitioned: bool,
     ) -> Self {
+        let mut delta_versions = commit_versions;
+        delta_versions.sort_unstable();
+        delta_versions.dedup();
         let mut files = file_hashes;
         files.sort_unstable();
         let blake3 = match files.as_slice() {
@@ -2880,7 +2899,7 @@ impl OutputVersion {
         };
         OutputVersion::ContentAddressed {
             table,
-            delta_version,
+            delta_versions,
             blake3,
             files,
         }
@@ -11138,11 +11157,16 @@ mod tests {
         let mut all = vec![
             OutputVersion::content_addressed(
                 "c.s.t".to_string(),
-                4,
+                vec![5, 4],
                 vec!["bb".to_string(), "aa".to_string()],
                 true,
             ),
-            OutputVersion::content_addressed("c.s.t".to_string(), 1, vec!["aa".into()], false),
+            OutputVersion::content_addressed(
+                "c.s.t".to_string(),
+                vec![1],
+                vec!["aa".into()],
+                false,
+            ),
             OutputVersion::DeltaObserved {
                 table: "c.s.t".to_string(),
                 version: 7,
@@ -11150,7 +11174,7 @@ mod tests {
             OutputVersion::WarehouseJob {
                 table: "p.d.t".to_string(),
                 job_id: "job_123".to_string(),
-                ended_at: ts,
+                recorded_at: ts,
             },
         ];
         // Exhaustive on purpose: a new reason fails to compile here until it
@@ -11161,13 +11185,15 @@ mod tests {
             UnversionedReason::WarehouseManagedRefresh,
             UnversionedReason::NoOutput,
             UnversionedReason::ObserveFailed,
+            UnversionedReason::NotObserved,
         ] {
             match reason {
                 UnversionedReason::AdapterHasNoVersion
                 | UnversionedReason::ViewHasNoStoredData
                 | UnversionedReason::WarehouseManagedRefresh
                 | UnversionedReason::NoOutput
-                | UnversionedReason::ObserveFailed => {}
+                | UnversionedReason::ObserveFailed
+                | UnversionedReason::NotObserved => {}
             }
             all.push(OutputVersion::Unversioned { reason });
         }
@@ -11228,8 +11254,8 @@ mod tests {
                 r#"{"kind":"unversioned","reason":"observe_failed"}"#,
             ),
             (
-                OutputVersion::content_addressed("c.s.t".into(), 3, vec!["ab".into()], false),
-                r#"{"kind":"content_addressed","table":"c.s.t","delta_version":3,"blake3":"ab","files":["ab"]}"#,
+                OutputVersion::content_addressed("c.s.t".into(), vec![3], vec!["ab".into()], false),
+                r#"{"kind":"content_addressed","table":"c.s.t","delta_versions":[3],"blake3":"ab","files":["ab"]}"#,
             ),
         ];
         for (value, expected) in pins {
@@ -11309,13 +11335,20 @@ mod tests {
             partitioned_output_blake3(&a[..2])
         );
 
-        let va = OutputVersion::content_addressed("t".into(), 5, a, true);
-        let vb = OutputVersion::content_addressed("t".into(), 5, b, true);
+        let va = OutputVersion::content_addressed("t".into(), vec![6, 5, 7], a, true);
+        let vb = OutputVersion::content_addressed("t".into(), vec![7, 6, 5], b, true);
         assert_eq!(va, vb, "same files in another order are the same version");
-        let OutputVersion::ContentAddressed { blake3, files, .. } = va else {
+        let OutputVersion::ContentAddressed {
+            blake3,
+            files,
+            delta_versions,
+            ..
+        } = va
+        else {
             panic!("content_addressed builds ContentAddressed");
         };
         assert_eq!(files, vec!["11", "22", "33"], "files are stored sorted");
+        assert_eq!(delta_versions, vec![5, 6, 7], "every commit, sorted");
         assert_ne!(blake3, "11", "a partitioned write folds, never one file");
     }
 
@@ -11323,20 +11356,26 @@ mod tests {
     /// hash. A partitioned write with one group still folds.
     #[test]
     fn test_content_addressed_identity_per_shape() {
-        let single = OutputVersion::content_addressed("t".into(), 2, vec!["ab".into()], false);
+        let single =
+            OutputVersion::content_addressed("t".into(), vec![2], vec!["ab".into()], false);
         assert!(matches!(
             &single,
             OutputVersion::ContentAddressed { blake3, .. } if blake3 == "ab"
         ));
-        let one_group = OutputVersion::content_addressed("t".into(), 2, vec!["ab".into()], true);
+        let one_group =
+            OutputVersion::content_addressed("t".into(), vec![2], vec!["ab".into()], true);
         assert!(matches!(
             &one_group,
             OutputVersion::ContentAddressed { blake3, .. }
                 if *blake3 == partitioned_output_blake3(&["ab".to_string()])
         ));
         // Defensive: an "unpartitioned" list of two files never reports one.
-        let two =
-            OutputVersion::content_addressed("t".into(), 2, vec!["b".into(), "a".into()], false);
+        let two = OutputVersion::content_addressed(
+            "t".into(),
+            vec![2],
+            vec!["b".into(), "a".into()],
+            false,
+        );
         assert!(matches!(
             &two,
             OutputVersion::ContentAddressed { blake3, .. }

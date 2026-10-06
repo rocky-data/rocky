@@ -17226,21 +17226,10 @@ async fn process_table(
         }
     }
 
-    // The replicated table's version identity, read after the copy (RV1-P1b).
-    // One extra metadata query per table on Databricks; none elsewhere. A
-    // failed read is recorded as `observe_failed`; it never fails the table.
+    // RV1-P1b: replication sends no version query, to keep its cost
+    // unchanged; the record says `not_observed`.
     let job_ids: Vec<String> = exec_stats.job_id.clone().into_iter().collect();
-    let output_version = super::run_output_version::observe_table_version(
-        warehouse,
-        &TableRef {
-            catalog: target_table.catalog.clone(),
-            schema: target_table.schema.clone(),
-            table: target_table.table.clone(),
-        },
-        &job_ids,
-        Utc::now(),
-    )
-    .await;
+    let output_version = super::run_output_version::replication_output_version();
 
     Ok(TableOutcome::Materialized(Box::new(TableResult {
         probe_rate_limited,

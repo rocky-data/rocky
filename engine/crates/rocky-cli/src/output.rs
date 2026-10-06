@@ -5897,6 +5897,19 @@ impl RunOutput {
     ) -> rocky_core::state::RunRecord {
         let mut models = Vec::with_capacity(self.materializations.len() + self.errors.len());
 
+        // RV1-P1b: one summary warning per run for failed version reads,
+        // instead of one per table.
+        if let Some(summary) = crate::commands::run_output_version::observe_failed_summary(
+            self.materializations.iter().map(|m| {
+                (
+                    m.asset_key.last().map_or("<unknown>", String::as_str),
+                    m.output_version.as_ref(),
+                )
+            }),
+        ) {
+            tracing::warn!("{summary}");
+        }
+
         for mat in &self.materializations {
             let duration_ms = mat.duration_ms;
             let model_started = mat.started_at;

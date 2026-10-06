@@ -171,6 +171,10 @@ fn promotion_kind(result: &QueryResult) -> AdapterResult<Option<ObjectKind>> {
     }
 }
 
+/// The cap on the after-write version read. It is a single attempt; a slow
+/// answer becomes `observe_failed`, never a delay to the run.
+const OBSERVE_VERSION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// `DESCRIBE HISTORY <table> LIMIT 1`, with the table name formatted by the
 /// dialect, which validates every part. An invalid identifier is an error,
 /// never SQL.
@@ -333,14 +337,26 @@ impl WarehouseAdapter for DatabricksWarehouseAdapter {
             .map_err(AdapterError::new)
     }
 
-    /// `DESCRIBE HISTORY <table> LIMIT 1` and its `version` column. The
+    /// `DESCRIBE HISTORY <table> LIMIT 1` and its `version` column, read
+    /// with one attempt, no retries, no draw from the run's retry budget and
+    /// a 10 s cap (`OBSERVE_VERSION_TIMEOUT`). The
     /// table name goes through the dialect, which accepts only
     /// `[a-zA-Z0-9_]` in every part, the same rule as every other statement. A non-Delta table, an empty history or a missing column is
     /// an error, so the runner records `observe_failed` rather than a guess.
     async fn observed_table_version(&self, table: &TableRef) -> AdapterResult<Option<u64>> {
         let sql = describe_history_sql(&self.dialect, table)?;
-        let result = self.execute_query(&sql).await?;
-        latest_history_version(&result).map(Some)
+        // One attempt, no retry budget, short timeout: an optional read must
+        // never cost the run's real writes anything.
+        let result = self
+            .connector
+            .execute_sql_single_attempt(&sql, OBSERVE_VERSION_TIMEOUT)
+            .await
+            .map_err(AdapterError::new)?;
+        latest_history_version(&QueryResult {
+            columns: result.columns.iter().map(|c| c.name.clone()).collect(),
+            rows: result.rows,
+        })
+        .map(Some)
     }
 
     async fn describe_table(&self, table: &TableRef) -> AdapterResult<Vec<ColumnInfo>> {

@@ -12,16 +12,20 @@
 //!            │ no
 //!   observed_table_version(t)  ── Some(v) ─▶ DeltaObserved  (Databricks)
 //!                              ── None ────▶ Unversioned { adapter_has_no_version }
-//!                              ── Err ─────▶ Unversioned { observe_failed } + warn
+//!                              ── Err ─────▶ Unversioned { observe_failed }
 //! ```
 //!
 //! A failed version read never fails the run: the data is already written.
+//! The adapter makes the read with one attempt, no retries and no draw from
+//! the run's retry budget. Failed reads are summed into one warning per run
+//! by [`observe_failed_summary`]. Replicated tables are not observed at all
+//! ([`UnversionedReason::NotObserved`]), so replication cost is unchanged.
 
 use chrono::{DateTime, Utc};
 use rocky_core::state::{OutputVersion, UnversionedReason};
 use rocky_core::traits::WarehouseAdapter;
 use rocky_ir::{MaterializationStrategy, ModelIr, TableRef};
-use tracing::warn;
+use tracing::debug;
 
 use super::run_content_addressed::ContentAddressedRunSummary;
 
@@ -63,19 +67,19 @@ pub(crate) fn fixed_unversioned_reason(
 /// adapter reported one, otherwise the adapter's observed table version.
 ///
 /// `job_ids` are the statement job ids in execution order; the last one is
-/// the statement that finished the write. `ended_at` is Rocky's clock after
-/// the write returned.
+/// recorded (it may not be the statement that wrote the data). `recorded_at`
+/// is Rocky's clock after the write returned.
 pub(crate) async fn observe_table_version(
     warehouse: &dyn WarehouseAdapter,
     table: &TableRef,
     job_ids: &[String],
-    ended_at: DateTime<Utc>,
+    recorded_at: DateTime<Utc>,
 ) -> OutputVersion {
     if let Some(job_id) = job_ids.last() {
         return OutputVersion::WarehouseJob {
             table: table_name(table),
             job_id: job_id.clone(),
-            ended_at,
+            recorded_at,
         };
     }
     match warehouse.observed_table_version(table).await {
@@ -87,7 +91,8 @@ pub(crate) async fn observe_table_version(
             reason: UnversionedReason::AdapterHasNoVersion,
         },
         Err(e) => {
-            warn!(
+            // One summary warning per run comes from `observe_failed_summary`.
+            debug!(
                 table = %table_name(table),
                 error = %e,
                 "could not read the output version after the write; \
@@ -107,12 +112,59 @@ pub(crate) async fn observe_output_version(
     strategy: &MaterializationStrategy,
     table: &TableRef,
     job_ids: &[String],
-    ended_at: DateTime<Utc>,
+    recorded_at: DateTime<Utc>,
 ) -> OutputVersion {
     match fixed_unversioned_reason(strategy) {
         Some(reason) => OutputVersion::Unversioned { reason },
-        None => observe_table_version(warehouse, table, job_ids, ended_at).await,
+        None => observe_table_version(warehouse, table, job_ids, recorded_at).await,
     }
+}
+
+/// The version a replicated table records. Replication sends no version
+/// query, so its cost is unchanged.
+pub(crate) fn replication_output_version() -> OutputVersion {
+    OutputVersion::Unversioned {
+        reason: UnversionedReason::NotObserved,
+    }
+}
+
+/// One warning line for every failed version read in a run, or `None` when
+/// no read failed. Names the count and the first three tables.
+pub(crate) fn observe_failed_summary<'a>(
+    versions: impl IntoIterator<Item = (&'a str, Option<&'a OutputVersion>)>,
+) -> Option<String> {
+    let failed: Vec<&str> = versions
+        .into_iter()
+        .filter(|(_, v)| {
+            matches!(
+                v,
+                Some(OutputVersion::Unversioned {
+                    reason: UnversionedReason::ObserveFailed
+                })
+            )
+        })
+        .map(|(name, _)| name)
+        .collect();
+    if failed.is_empty() {
+        return None;
+    }
+    let shown = failed
+        .iter()
+        .take(3)
+        .copied()
+        .collect::<Vec<_>>()
+        .join(", ");
+    let more = failed.len().saturating_sub(3);
+    let tail = if more > 0 {
+        format!(" and {more} more")
+    } else {
+        String::new()
+    };
+    Some(format!(
+        "could not read the output version of {} model(s) after the write ({shown}{tail}); \
+         recorded observe_failed, the run is not affected",
+        failed.len()
+    ))
 }
 
 /// The version of a content-addressed write, taken from the files the
@@ -134,7 +186,11 @@ pub(crate) fn content_addressed_output_version(
     };
     OutputVersion::content_addressed(
         table_name(&table),
-        summary.commit_version,
+        summary
+            .written_files
+            .iter()
+            .map(|f| f.commit_version)
+            .collect(),
         summary
             .written_files
             .iter()
@@ -266,7 +322,7 @@ mod tests {
             OutputVersion::WarehouseJob {
                 table: "c.s.t".into(),
                 job_id: "job_b".into(),
-                ended_at
+                recorded_at: ended_at
             }
         );
         assert_eq!(wh.calls(), 0);
@@ -298,6 +354,33 @@ mod tests {
         assert_eq!(wh.calls(), 0);
     }
 
+    /// Failed reads collapse into one line with the count and the first
+    /// three tables.
+    #[test]
+    fn observe_failed_summary_names_count_and_first_tables() {
+        let failed = OutputVersion::Unversioned {
+            reason: UnversionedReason::ObserveFailed,
+        };
+        let ok = OutputVersion::DeltaObserved {
+            table: "t".into(),
+            version: 1,
+        };
+        assert_eq!(
+            observe_failed_summary([("a", Some(&ok)), ("b", None)]),
+            None
+        );
+        let line = observe_failed_summary([
+            ("a", Some(&failed)),
+            ("b", Some(&ok)),
+            ("c", Some(&failed)),
+            ("d", Some(&failed)),
+            ("e", Some(&failed)),
+        ])
+        .unwrap();
+        assert!(line.contains("4 model(s)"), "{line}");
+        assert!(line.contains("(a, c, d and 1 more)"), "{line}");
+    }
+
     // --- Through the real `run()` entry point ----------------------------
 
     #[cfg(feature = "duckdb")]
@@ -317,6 +400,31 @@ mod tests {
             String,
             tempfile::TempDir,
         ) {
+            run_project_with(
+                adapter_toml,
+                None,
+                models,
+                setup,
+                PartitionRunOptions::default(),
+            )
+            .await
+        }
+
+        /// [`run_project`] with a custom pipeline section (`None` keeps the
+        /// default `tx` transformation pipeline over `models/`) and
+        /// partition options.
+        async fn run_project_with(
+            adapter_toml: &str,
+            pipeline_toml: Option<&str>,
+            models: &[(&str, &str, &str)],
+            setup: impl FnOnce(&std::path::Path),
+            opts: PartitionRunOptions,
+        ) -> (
+            anyhow::Result<()>,
+            std::collections::BTreeMap<String, rocky_core::state::ModelExecution>,
+            String,
+            tempfile::TempDir,
+        ) {
             let tmp = tempfile::TempDir::new().unwrap();
             let dir = tmp.path();
             let models_dir = dir.join("models");
@@ -328,12 +436,17 @@ mod tests {
             let config_path = dir.join("rocky.toml");
             std::fs::write(
                 &config_path,
-                format!(
-                    "{adapter_toml}\n[state]\nbackend = \"local\"\n\n\
-                     [pipeline.tx]\ntype = \"transformation\"\nmodels = '{}'\n\n\
-                     [pipeline.tx.target]\nadapter = \"default\"\n",
-                    models_dir.join("**").display(),
-                ),
+                match pipeline_toml {
+                    Some(pipeline) => {
+                        format!("{adapter_toml}\n[state]\nbackend = \"local\"\n\n{pipeline}")
+                    }
+                    None => format!(
+                        "{adapter_toml}\n[state]\nbackend = \"local\"\n\n\
+                         [pipeline.tx]\ntype = \"transformation\"\nmodels = '{}'\n\n\
+                         [pipeline.tx.target]\nadapter = \"default\"\n",
+                        models_dir.join("**").display(),
+                    ),
+                },
             )
             .unwrap();
             let state_path = dir.join("state.redb");
@@ -355,7 +468,7 @@ mod tests {
                 None,
                 false,
                 None,
-                &PartitionRunOptions::default(),
+                &opts,
                 None,
                 None,
                 None,
@@ -514,6 +627,126 @@ mod tests {
             );
         }
 
+        fn delta_observed(table: &str) -> Option<OutputVersion> {
+            Some(OutputVersion::DeltaObserved {
+                table: table.into(),
+                version: 42,
+            })
+        }
+
+        /// Replication (`process_table`) records `not_observed` and sends no
+        /// version query, so its cost is unchanged.
+        #[tokio::test]
+        async fn replication_records_not_observed() {
+            use rocky_core::traits::WarehouseAdapter;
+            let db_dir = tempfile::TempDir::new().unwrap();
+            let db = db_dir.path().join("warehouse.duckdb");
+            {
+                let a = rocky_duckdb::adapter::DuckDbWarehouseAdapter::open(&db).unwrap();
+                a.execute_statement("CREATE SCHEMA raw__acme")
+                    .await
+                    .unwrap();
+                a.execute_statement("CREATE TABLE raw__acme.orders AS SELECT 1 AS id")
+                    .await
+                    .unwrap();
+            }
+            let adapter = format!(
+                "[adapter]\ntype = \"duckdb\"\npath = \"{}\"\n",
+                db.display()
+            );
+            let pipeline = "[pipeline.p1]\ntype = \"replication\"\nstrategy = \"full_refresh\"\n\n\
+                 [pipeline.p1.source.discovery]\nadapter = \"default\"\n\n\
+                 [pipeline.p1.source.schema_pattern]\nprefix = \"raw__\"\nseparator = \"__\"\n\
+                 components = [\"source\"]\n\n\
+                 [pipeline.p1.target]\nadapter = \"default\"\ncatalog_template = \"warehouse\"\n\
+                 schema_template = \"staging__{source}\"\n\n\
+                 [pipeline.p1.target.governance]\nauto_create_schemas = true\n";
+            let (result, execs, _, _tmp) = run_project_with(
+                &adapter,
+                Some(pipeline),
+                &[],
+                |_| {},
+                PartitionRunOptions::default(),
+            )
+            .await;
+            result.expect("the replication run must succeed");
+            assert_eq!(
+                execs["orders"].output_version,
+                unversioned(UnversionedReason::NotObserved),
+                "{:?}",
+                execs.keys().collect::<Vec<_>>()
+            );
+        }
+
+        /// A snapshot model (`execute_snapshot_model`) records the version
+        /// read after its write.
+        #[tokio::test]
+        async fn snapshot_model_records_its_version() {
+            let toml = format!(
+                "[strategy]\ntype = \"snapshot\"\nunique_key = \"id\"\nstrategy = \"timestamp\"\n\
+                 updated_at = \"updated_at\"\n\n{MAIN}"
+            );
+            let models = [(
+                "snap",
+                "SELECT 1 AS id, TIMESTAMP '2026-01-01 00:00:00' AS updated_at\n",
+                toml.as_str(),
+            )];
+            let adapter = "[adapter]\ntype = \"test-fail-write\"\npath = \"observe-version\"\n";
+            let (result, execs, _, _tmp) = run_project(adapter, &models, |_| {}).await;
+            result.expect("the snapshot model run must succeed");
+            assert_eq!(execs["snap"].output_version, delta_observed(".main.snap"));
+        }
+
+        /// A time_interval partition (`run_one_partition`) records the
+        /// version read after its write.
+        #[tokio::test]
+        async fn time_interval_partition_records_its_version() {
+            let toml = format!(
+                "[strategy]\ntype = \"time_interval\"\ntime_column = \"order_date\"\n\
+                 granularity = \"day\"\nfirst_partition = \"2026-01-01\"\n\n{MAIN}"
+            );
+            let models = [(
+                "ti",
+                "SELECT CAST(TIMESTAMP '2026-01-01 12:00:00' AS DATE) AS order_date \
+                 WHERE TIMESTAMP '2026-01-01 12:00:00' >= @start_date \
+                 AND TIMESTAMP '2026-01-01 12:00:00' < @end_date\n",
+                toml.as_str(),
+            )];
+            let adapter = "[adapter]\ntype = \"test-fail-write\"\npath = \"observe-version\"\n";
+            let opts = PartitionRunOptions {
+                latest: true,
+                ..PartitionRunOptions::default()
+            };
+            let (result, execs, _, _tmp) =
+                run_project_with(adapter, None, &models, |_| {}, opts).await;
+            result.expect("the time_interval run must succeed");
+            assert_eq!(execs["ti"].output_version, delta_observed(".main.ti"));
+        }
+
+        /// A `snapshot` pipeline (`run_local::run_snapshot`) records the
+        /// version read after its write.
+        #[tokio::test]
+        async fn snapshot_pipeline_records_its_version() {
+            let adapter = "[adapter]\ntype = \"test-fail-write\"\npath = \"accept-all\"\n";
+            let pipeline = "[pipeline.snap]\ntype = \"snapshot\"\nunique_key = [\"id\"]\n\
+                 updated_at = \"updated_at\"\n\n\
+                 [pipeline.snap.source]\ncatalog = \"c\"\nschema = \"raw\"\ntable = \"customers\"\n\n\
+                 [pipeline.snap.target]\ncatalog = \"c\"\nschema = \"snapshots\"\ntable = \"hist\"\n";
+            let (result, execs, _, _tmp) = run_project_with(
+                adapter,
+                Some(pipeline),
+                &[],
+                |_| {},
+                PartitionRunOptions::default(),
+            )
+            .await;
+            result.expect("the snapshot pipeline run must succeed");
+            assert_eq!(
+                execs["hist"].output_version,
+                delta_observed("c.snapshots.hist")
+            );
+        }
+
         /// content_addressed: the record names the Delta commit Rocky made
         /// and the blake3 of the file it wrote, the same hash the artifact
         /// ledger holds.
@@ -569,7 +802,7 @@ mod tests {
                 execs["m"].output_version,
                 Some(OutputVersion::ContentAddressed {
                     table: "c.s.m".into(),
-                    delta_version: 1,
+                    delta_versions: vec![1],
                     blake3: artifact.blake3_hash.clone(),
                     files: vec![artifact.blake3_hash.clone()],
                 })
