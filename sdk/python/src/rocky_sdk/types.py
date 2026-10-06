@@ -1393,6 +1393,12 @@ from .types_generated import (  # noqa: E402, F401
     ModelRetentionStatus,
     OptimizeOutput,
     OptimizeRecommendation,
+    PackageAddOutput,
+    PackageListEntry,
+    PackageListOutput,
+    PackageRemoveOutput,
+    PackageUpdateOutput,
+    PackageVendorReport,
     PartitionShapeOutput,
     PermissionSummary,
     PerModelCostHistorical,
@@ -1582,6 +1588,10 @@ RockyOutput = (
     | PromotePlan
     | CompactApplyOutput
     | ArchiveApplyOutput
+    | PackageAddOutput
+    | PackageUpdateOutput
+    | PackageListOutput
+    | PackageRemoveOutput
     | ProductApproveOutput
     | ProductCompileOutput
     | ProductListOutput
@@ -1633,6 +1643,10 @@ _SIMPLE_DISPATCH: dict[str, type[BaseModel]] = {
     "compact apply": CompactApplyOutput,
     "archive apply": ArchiveApplyOutput,
     "review_status": ReviewStatusOutput,
+    "package_add": PackageAddOutput,
+    "package_update": PackageUpdateOutput,
+    "package_list": PackageListOutput,
+    "package_remove": PackageRemoveOutput,
     "product_verify": ProductVerifyOutput,
     "product_compile": ProductCompileOutput,
     "product_approve": ProductApproveOutput,

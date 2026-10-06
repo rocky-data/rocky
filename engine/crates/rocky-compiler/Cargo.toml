@@ -12,6 +12,7 @@ rocky-ir = { path = "../rocky-ir" }
 rocky-lang = { path = "../rocky-lang" }
 rocky-sql = { path = "../rocky-sql" }
 anyhow = { workspace = true }
+blake3 = { workspace = true }
 chrono = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

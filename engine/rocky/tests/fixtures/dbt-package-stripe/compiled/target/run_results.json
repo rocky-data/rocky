@@ -1,0 +1,330 @@
+{
+ "args": {
+  "full_refresh": true
+ },
+ "metadata": {
+  "invocation_id": "bab1e9ad-ab14-4105-b9d7-f0c2be700a37"
+ },
+ "results": [
+  {
+   "status": "success",
+   "unique_id": "model.stripe.stg_stripe__balance_transaction_tmp"
+  },
+  {
+   "status": "success",
+   "unique_id": "model.stripe.stg_stripe__account_tmp"
+  },
+  {
+   "status": "success",
+   "unique_id": "model.stripe.stg_stripe__charge_tmp"
+  },
+  {
+   "status": "success",
+   "unique_id": "model.stripe.stg_stripe__card_tmp"
+  },
+  {
+   "status": "success",
+   "unique_id": "model.stripe.stg_stripe__coupon_tmp"
+  },
+  {
+   "status": "success",
+   "unique_id": "model.stripe.stg_stripe__discount_tmp"
+  },
+  {
+   "status": "success",
+   "unique_id": "model.stripe.stg_stripe__customer_tmp"
+  },
+  {
+   "status": "success",
+   "unique_id": "model.stripe.stg_stripe__dispute_tmp"
+  },
+  {
+   "status": "success",
+   "unique_id": "model.stripe.stg_stripe__invoice_line_item_tmp"
+  },
+  {
+   "status": "success",
+   "unique_id": "model.stripe.stg_stripe__fee_tmp"
+  },
+  {
+   "status": "success",
+   "unique_id": "model.stripe.stg_stripe__invoice_tmp"
+  },
+  {
+   "status": "success",
+   "unique_id": "model.stripe.stg_stripe__payment_intent_tmp"
+  },
+  {
+   "status": "success",
+   "unique_id": "model.stripe.stg_stripe__payment_method_card_tmp"
+  },
+  {
+   "status": "success",
+   "unique_id": "model.stripe.stg_stripe__payment_method_tmp"
+  },
+  {
+   "status": "success",
+   "unique_id": "model.stripe.stg_stripe__payout_balance_transaction_tmp"
+  },
+  {
+   "status": "success",
+   "unique_id": "model.stripe.stg_stripe__payout_tmp"
+  },
+  {
+   "status": "success",
+   "unique_id": "model.stripe.stg_stripe__price_plan_tmp"
+  },
+  {
+   "status": "success",
+   "unique_id": "model.stripe.stg_stripe__product_tmp"
+  },
+  {
+   "status": "success",
+   "unique_id": "model.stripe.stg_stripe__refund_tmp"
+  },
+  {
+   "status": "success",
+   "unique_id": "model.stripe.stg_stripe__subscription_discount_tmp"
+  },
+  {
+   "status": "success",
+   "unique_id": "model.stripe.stg_stripe__subscription_item_tmp"
+  },
+  {
+   "status": "success",
+   "unique_id": "model.stripe.stg_stripe__transfer_tmp"
+  },
+  {
+   "status": "success",
+   "unique_id": "model.stripe.stg_stripe__subscription_tmp"
+  },
+  {
+   "status": "success",
+   "unique_id": "model.stripe.stg_stripe__balance_transaction"
+  },
+  {
+   "status": "success",
+   "unique_id": "model.stripe.stg_stripe__charge"
+  },
+  {
+   "status": "success",
+   "unique_id": "model.stripe.stg_stripe__coupon"
+  },
+  {
+   "status": "success",
+   "unique_id": "model.stripe.stg_stripe__account"
+  },
+  {
+   "status": "success",
+   "unique_id": "model.stripe.stg_stripe__card"
+  },
+  {
+   "status": "success",
+   "unique_id": "model.stripe.stg_stripe__customer"
+  },
+  {
+   "status": "success",
+   "unique_id": "model.stripe.stg_stripe__invoice_line_item"
+  },
+  {
+   "status": "success",
+   "unique_id": "model.stripe.stg_stripe__discount"
+  },
+  {
+   "status": "success",
+   "unique_id": "model.stripe.stg_stripe__dispute"
+  },
+  {
+   "status": "success",
+   "unique_id": "model.stripe.stg_stripe__fee"
+  },
+  {
+   "status": "success",
+   "unique_id": "model.stripe.stg_stripe__payment_intent"
+  },
+  {
+   "status": "success",
+   "unique_id": "model.stripe.stg_stripe__payment_method_card"
+  },
+  {
+   "status": "success",
+   "unique_id": "model.stripe.stg_stripe__invoice"
+  },
+  {
+   "status": "success",
+   "unique_id": "model.stripe.stg_stripe__payout_balance_transaction"
+  },
+  {
+   "status": "success",
+   "unique_id": "model.stripe.stg_stripe__payment_method"
+  },
+  {
+   "status": "success",
+   "unique_id": "model.stripe.stg_stripe__price_plan"
+  },
+  {
+   "status": "success",
+   "unique_id": "model.stripe.stg_stripe__payout"
+  },
+  {
+   "status": "success",
+   "unique_id": "model.stripe.stg_stripe__product"
+  },
+  {
+   "status": "success",
+   "unique_id": "model.stripe.stg_stripe__refund"
+  },
+  {
+   "status": "success",
+   "unique_id": "model.stripe.stg_stripe__subscription_discount"
+  },
+  {
+   "status": "success",
+   "unique_id": "model.stripe.stg_stripe__subscription_item"
+  },
+  {
+   "status": "success",
+   "unique_id": "model.stripe.int_stripe__incomplete_charges"
+  },
+  {
+   "status": "success",
+   "unique_id": "test.stripe.not_null_stg_stripe__balance_transaction_balance_transaction_id.0ac20e778f"
+  },
+  {
+   "status": "success",
+   "unique_id": "test.stripe.not_null_stg_stripe__charge_charge_id.8941bc704a"
+  },
+  {
+   "status": "success",
+   "unique_id": "test.stripe.not_null_stg_stripe__account_account_id.374858379a"
+  },
+  {
+   "status": "success",
+   "unique_id": "model.stripe.stg_stripe__transfer"
+  },
+  {
+   "status": "success",
+   "unique_id": "model.stripe.stg_stripe__subscription"
+  },
+  {
+   "status": "success",
+   "unique_id": "test.stripe.not_null_stg_stripe__card_card_id.edadd3106a"
+  },
+  {
+   "status": "success",
+   "unique_id": "test.stripe.not_null_stg_stripe__customer_customer_id.2e70421da0"
+  },
+  {
+   "status": "success",
+   "unique_id": "test.stripe.not_null_stg_stripe__invoice_line_item_invoice_line_item_id.5b9c83b5f3"
+  },
+  {
+   "status": "success",
+   "unique_id": "test.stripe.not_null_stg_stripe__fee_balance_transaction_id.725d4ac005"
+  },
+  {
+   "status": "success",
+   "unique_id": "test.stripe.not_null_stg_stripe__payment_intent_payment_intent_id.cb5b4d09eb"
+  },
+  {
+   "status": "success",
+   "unique_id": "test.stripe.not_null_stg_stripe__payment_method_card_payment_method_id.f246b11438"
+  },
+  {
+   "status": "success",
+   "unique_id": "test.stripe.not_null_stg_stripe__invoice_invoice_id.34cc0ff095"
+  },
+  {
+   "status": "success",
+   "unique_id": "test.stripe.not_null_stg_stripe__payment_method_payment_method_id.0a8907c471"
+  },
+  {
+   "status": "success",
+   "unique_id": "test.stripe.not_null_stg_stripe__refund_refund_id.7c6dcedec0"
+  },
+  {
+   "status": "success",
+   "unique_id": "test.stripe.not_null_stg_stripe__payout_payout_id.6864a8acfc"
+  },
+  {
+   "status": "success",
+   "unique_id": "model.stripe.stripe__balance_transactions"
+  },
+  {
+   "status": "success",
+   "unique_id": "test.stripe.not_null_stg_stripe__subscription_item_subscription_item_id.dd9153a54a"
+  },
+  {
+   "status": "success",
+   "unique_id": "model.stripe.stripe__invoice_details"
+  },
+  {
+   "status": "success",
+   "unique_id": "test.stripe.not_null_stg_stripe__subscription_subscription_id.b242b1f7bc"
+  },
+  {
+   "status": "success",
+   "unique_id": "model.stripe.stripe__subscription_details"
+  },
+  {
+   "status": "success",
+   "unique_id": "model.stripe.stripe__line_item_enhanced"
+  },
+  {
+   "status": "success",
+   "unique_id": "model.stripe.stripe__activity_itemized_2"
+  },
+  {
+   "status": "success",
+   "unique_id": "model.stripe.stripe__balance_change_from_activity_itemized_3"
+  },
+  {
+   "status": "success",
+   "unique_id": "model.stripe.int_stripe__date_spine"
+  },
+  {
+   "status": "success",
+   "unique_id": "model.stripe.stripe__subscription_item_mrr_report"
+  },
+  {
+   "status": "success",
+   "unique_id": "model.stripe.stripe__ending_balance_reconciliation_itemized_4"
+  },
+  {
+   "status": "success",
+   "unique_id": "model.stripe.stripe__payout_itemized_3"
+  },
+  {
+   "status": "success",
+   "unique_id": "model.stripe.stripe__invoice_line_item_details"
+  },
+  {
+   "status": "success",
+   "unique_id": "model.stripe.int_stripe__account_daily"
+  },
+  {
+   "status": "success",
+   "unique_id": "analysis.stripe.stripe__arr_snapshot_analysis"
+  },
+  {
+   "status": "success",
+   "unique_id": "analysis.stripe.stripe__customer_mrr_analysis"
+  },
+  {
+   "status": "success",
+   "unique_id": "model.stripe.int_stripe__account_rolling_totals"
+  },
+  {
+   "status": "success",
+   "unique_id": "model.stripe.stripe__customer_overview"
+  },
+  {
+   "status": "success",
+   "unique_id": "model.stripe.int_stripe__account_partitions"
+  },
+  {
+   "status": "success",
+   "unique_id": "model.stripe.stripe__daily_overview"
+  }
+ ]
+}

@@ -164,6 +164,11 @@ pub(crate) fn schemas() -> Vec<(&'static str, serde_json::Value)> {
         entry::<crate::commands::product::ProductStatusOutput>("product_status"),
         entry::<crate::commands::product::ProductListOutput>("product_list"),
         entry::<crate::commands::product::ProductJournalOutput>("product_journal"),
+        // dbt Hub package vendoring.
+        entry::<crate::commands::package::PackageAddOutput>("package_add"),
+        entry::<crate::commands::package::PackageUpdateOutput>("package_update"),
+        entry::<crate::commands::package::PackageListOutput>("package_list"),
+        entry::<crate::commands::package::PackageRemoveOutput>("package_remove"),
         entry::<crate::output::FulfillOutput>("fulfill"),
         entry::<PolicyTestOutput>("policy_test"),
         entry::<PolicyFreezeOutput>("policy_freeze"),

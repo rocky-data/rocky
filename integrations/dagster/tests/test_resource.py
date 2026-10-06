@@ -2844,3 +2844,30 @@ def test_product_journal_translates_client_errors_to_failure():
             1, stderr_tail="product 'nope' is not known", duration_ms=5
         )
         rocky.product_journal("nope")
+
+
+# ---------------------------------------------------------------------------
+# package_list — delegation to the SDK client
+# ---------------------------------------------------------------------------
+
+
+def test_package_list_delegates_to_the_client():
+    """``RockyResource.package_list()`` hands the client's typed result back
+    unchanged."""
+    from rocky_sdk.types import PackageListOutput
+
+    listed = PackageListOutput.model_validate(
+        {
+            "version": "1.76.0",
+            "command": "package_list",
+            "lockfile": "rocky-packages.lock",
+            "packages": [],
+            "count": 0,
+        }
+    )
+    rocky = RockyResource()
+    with patch.object(RockyResource, "_get_client") as get_client:
+        get_client.return_value.package_list.return_value = listed
+        result = rocky.package_list()
+    assert result is listed
+    get_client.return_value.package_list.assert_called_once_with()

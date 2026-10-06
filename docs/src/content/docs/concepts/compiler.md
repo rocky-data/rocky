@@ -419,6 +419,7 @@ span, and sometimes a suggested fix.
 | `E052` | A model's `[redshift]` table options cannot render (an invalid or contradictory `dist_key` / `sort_key`), or sit on a strategy that builds no table. See [Redshift](/reference/adapters/redshift/#table-distribution-and-sort-keys) |
 | `E053` | ClickHouse cannot run the model as configured: its `[clickhouse]` table options cannot render or sit on a strategy that builds no table, or it is a `merge` model (or `incremental` with `unique_key`) and a warehouse the model runs on is ClickHouse, which has no `MERGE`. See [ClickHouse](/reference/adapters/clickhouse/#strategies) |
 | `E054` | SQL Server cannot run the model's SQL: its CTEs cannot be lifted to the start of the statement, even after Rocky renames colliding nested CTEs. Emitted when a warehouse the model runs on is SQL Server. See [SQL Server](/reference/adapters/sqlserver/) |
+| `E055` | `rocky package` refused to vendor a dbt package: a bad spec, `dbt` not on `PATH`, an adapter with no dbt profile mapping, a failed `dbt deps` or `dbt compile`, a compile that came out wrong without `--build-empty` (all-NULL columns or a placeholder `*`), a package model name or `[target]` table the project already uses (ignoring case), a package model that reads a seed or a model that was not vendored, vendored SQL that does not parse, Jinja or a credential-like name in a var, a dbt step past `--dbt-timeout`, or a `remove` that would delete edited files without `--force`. See [Use dbt packages](/guides/dbt-packages/) |
 | `W001` | Unused model (no downstream consumers) |
 | `W002` | Duplicate column in model output |
 | `W004` | Classification tag with no matching `[mask]` strategy |
@@ -441,6 +442,7 @@ span, and sometimes a suggested fix.
 | `W048` | A model reads a model version whose `deprecation_date` has passed or is less than 30 days away |
 | `W052` | A `[redshift]` `dist_key` or `sort_key` column is not in the model's output |
 | `W053` | A `[clickhouse]` `order_by` or `partition_by` column is not in the model's output |
+| `W055` | `rocky package` vendored a package with something to review: an edited file the new version changed (written beside it as `.incoming`), a package model it could not vendor, an incremental model that fell back to full refresh, or dbt tests it did not map |
 | `I001` | Model dependency inferred from SQL |
 | `I002` | Some, but not all, output columns have unknown types — provide source schemas for more type checking |
 | `I003` | A contract declares a type for a column whose type Rocky could not infer, so `E011` did not check it |

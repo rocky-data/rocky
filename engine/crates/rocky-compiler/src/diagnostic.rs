@@ -332,6 +332,28 @@ pub const E053: &str = "E053";
 /// (for example as a column). A project that also configures another
 /// warehouse is not refused at compile time.
 pub const E054: &str = "E054";
+/// `rocky package` refused to vendor a dbt Hub package.
+///
+/// Emitted by `rocky package add|update|remove` (`commands/package.rs`) for a
+/// malformed `<namespace>/<name>[@<version>]` spec, `dbt` missing from `PATH`,
+/// a Rocky adapter with no dbt profile mapping (supported: duckdb, snowflake,
+/// databricks, bigquery, postgres), a failed `dbt deps` / `dbt compile`, a
+/// compile without `--build-empty` (or from `--compiled`) where an
+/// introspecting macro found no upstream columns (a model selecting only
+/// NULLs from a table, or the `dbt_utils.star` placeholder), a package model
+/// whose resolved name an existing project or package model already owns,
+/// compared case-insensitively (package models keep their dbt names; Rocky
+/// never prefixes them), two package models differing only by case, a
+/// `[target]` table another model already writes, a vendored model that
+/// reads a model that was not vendored or a dbt seed, vendored SQL that does
+/// not parse, a previously vendored model that no longer imports (`update`),
+/// a dbt project name already vendored from another Hub package, Jinja in a
+/// var (from flags or the lockfile), a credential-like var name without
+/// `--allow-secret-var`, a dbt step past `--dbt-timeout`, a symlink under
+/// `models/packages/`, or
+/// a `remove` that would delete locally edited vendored files without
+/// `--force`. Nothing is written when it fires.
+pub const E055: &str = "E055";
 
 // Warnings
 /// Unused model (no downstream consumers).
@@ -531,6 +553,17 @@ pub const W052: &str = "W052";
 /// W006 guard), as W052 is. ClickHouse rejects the `CREATE TABLE` at run time
 /// if the column really is missing.
 pub const W053: &str = "W053";
+/// `rocky package` vendored a dbt package with something to review.
+///
+/// Emitted by `rocky package add|update` for: a locally edited vendored file
+/// the new upstream version changed (kept; the new version is written beside
+/// it as `<file>.incoming`), or one upstream removed (kept); a package model
+/// that could not be vendored (including one dbt compiled with an
+/// introspection placeholder); a dbt `incremental` model that did not map to a
+/// Rocky incremental strategy; dbt tests outside `not_null`, `unique`,
+/// `accepted_values` and `relationships` (dropped, counted); and a
+/// `dbt run --empty` that did not build every model.
+pub const W055: &str = "W055";
 
 /// Every warning code the compile pipeline can emit: the `W###` codes above
 /// plus [`P002`]. `rocky compile --deny-warnings` accepts only these.
@@ -539,6 +572,12 @@ pub const WARNING_CODES: &[&str] = &[
     W001, W002, W004, W005, W006, W010, W011, W012, W013, W030, W031, W041, W042, W043, W044, W046,
     W048, W049, W050, W051, W052, W053, P002,
 ];
+
+/// Warning codes other commands emit, never `rocky compile`, so
+/// `--deny-warnings` does not accept them: [`W055`] (`rocky package`).
+/// The registry test requires every `W###` constant in exactly one of this
+/// list and [`WARNING_CODES`].
+pub const NON_COMPILE_WARNING_CODES: &[&str] = &[W055];
 
 /// Whether `code` (case-insensitive, surrounding spaces ignored) is a
 /// warning code in [`WARNING_CODES`].
@@ -984,13 +1023,14 @@ mod tests {
         declared.sort_unstable();
         let mut listed: Vec<&str> = WARNING_CODES
             .iter()
+            .chain(NON_COMPILE_WARNING_CODES)
             .filter_map(|c| c.strip_prefix('W'))
             .collect();
         listed.sort_unstable();
         assert_eq!(declared, listed);
         assert!(is_warning_code(" w042 "));
         assert!(is_warning_code("P002"));
-        for bad in ["W999", "W42", "W 042", "E042", "", "P001"] {
+        for bad in ["W999", "W42", "W 042", "E042", "", "P001", "W055"] {
             assert!(!is_warning_code(bad), "{bad}");
         }
     }

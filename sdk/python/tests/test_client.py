@@ -1061,6 +1061,137 @@ def test_product_list_argv_and_typed_parse():
         assert client.product_list().products == []
 
 
+def _package_report(name: str = "stripe") -> dict:
+    return {
+        "name": name,
+        "hub": "fivetran/stripe",
+        "version": "1.10.1",
+        "version_spec": ">=1.0.0,<2.0.0",
+        "dbt_version": "1.12.5",
+        "adapter": "duckdb",
+        "target_schema": "main",
+        "vars_hash": "blake3:00",
+        "mode": "build-empty",
+        "includes": [],
+        "models": ["stg_stripe__charge"],
+        "models_added": ["stg_stripe__charge"],
+        "models_removed": [],
+        "sources": [
+            {"name": "stripe.charge", "catalog": "dev", "schema": "stripe", "table": "charge"}
+        ],
+        "tests_mapped": 1,
+        "tests_dropped": [],
+        "incremental_fallbacks": [],
+        "failed_models": [],
+        "files_written": ["models/packages/stripe/stg_stripe__charge.sql"],
+        "files_incoming": [],
+        "files_deleted": [],
+        "files_kept_edited": [],
+        "files_unchanged": 0,
+    }
+
+
+def test_package_add_argv_and_typed_parse():
+    """``package_add`` passes the spec, each var, and the build flags, and
+    parses the vendor report with its W055 diagnostics."""
+    from rocky_sdk.types import PackageAddOutput
+
+    add_json = json.dumps(
+        {
+            "version": "1.76.0",
+            "command": "package_add",
+            "lockfile": "rocky-packages.lock",
+            "package": _package_report(),
+            "diagnostics": [{"code": "W055", "severity": "warning", "message": "1 dbt test(s)"}],
+        }
+    )
+    client = _client()
+    with patch.object(client, "run_cli", return_value=add_json) as run_cli:
+        added = client.package_add(
+            "fivetran/stripe@>=1.0.0,<2.0.0",
+            vars={"stripe_schema": "raw_stripe"},
+            target_schema="analytics",
+            compiled="/tmp/dbt",
+            build_empty=True,
+            allow_secret_var=True,
+            dbt_timeout=60,
+        )
+    assert run_cli.call_args[0][0] == [
+        "package",
+        "add",
+        "fivetran/stripe@>=1.0.0,<2.0.0",
+        "--vars",
+        "stripe_schema=raw_stripe",
+        "--target-schema",
+        "analytics",
+        "--compiled",
+        "/tmp/dbt",
+        "--build-empty",
+        "--allow-secret-var",
+        "--dbt-timeout",
+        "60",
+    ]
+    assert isinstance(added, PackageAddOutput)
+    assert added.package.models == ["stg_stripe__charge"]
+    assert added.diagnostics[0].code == "W055"
+
+
+def test_package_update_list_remove_argv_and_typed_parse():
+    """``package_update`` / ``package_list`` / ``package_remove`` shell the
+    matching verbs and parse their outputs."""
+    from rocky_sdk.types import PackageListOutput, PackageRemoveOutput, PackageUpdateOutput
+
+    client = _client()
+    update_json = json.dumps(
+        {
+            "version": "1.76.0",
+            "command": "package_update",
+            "lockfile": "rocky-packages.lock",
+            "packages": [_package_report()],
+            "diagnostics": [],
+        }
+    )
+    with patch.object(client, "run_cli", return_value=update_json) as run_cli:
+        updated = client.package_update("stripe")
+    assert run_cli.call_args[0][0] == ["package", "update", "stripe"]
+    assert isinstance(updated, PackageUpdateOutput)
+    with patch.object(client, "run_cli", return_value=update_json) as run_cli:
+        client.package_update()
+    assert run_cli.call_args[0][0] == ["package", "update"]
+    with patch.object(client, "run_cli", return_value=update_json) as run_cli:
+        client.package_update("stripe", build_empty=False)
+    assert run_cli.call_args[0][0] == ["package", "update", "stripe", "--build-empty=false"]
+
+    list_json = json.dumps(
+        {
+            "version": "1.76.0",
+            "command": "package_list",
+            "lockfile": "rocky-packages.lock",
+            "packages": [],
+            "count": 0,
+        }
+    )
+    with patch.object(client, "run_cli", return_value=list_json) as run_cli:
+        listed = client.package_list()
+    assert run_cli.call_args[0][0] == ["package", "list"]
+    assert isinstance(listed, PackageListOutput)
+    assert listed.count == 0
+
+    remove_json = json.dumps(
+        {
+            "version": "1.76.0",
+            "command": "package_remove",
+            "lockfile": "rocky-packages.lock",
+            "name": "stripe",
+            "files_deleted": ["models/packages/stripe/stg_stripe__charge.sql"],
+        }
+    )
+    with patch.object(client, "run_cli", return_value=remove_json) as run_cli:
+        removed = client.package_remove("stripe", force=True)
+    assert run_cli.call_args[0][0] == ["package", "remove", "stripe", "--force"]
+    assert isinstance(removed, PackageRemoveOutput)
+
+
 def test_product_journal_argv_and_typed_parse():
     """``product_journal`` shells ``product journal <name>`` and parses the
     rows in append order; a known product with no rows is an empty journal."""

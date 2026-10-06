@@ -368,14 +368,32 @@ fn collect_nested(inner: &LineageResult, out: &mut Vec<String>) {
 
 fn extract_query_lineage(query: &Query, outer_ctes: &CteScope) -> Result<LineageResult, String> {
     let ctes = bind_cte_names(query, outer_ctes);
-    let mut nested_sources = walk_cte_bodies(query, outer_ctes);
-    match query.body.as_ref() {
+    let nested_sources = walk_cte_bodies(query, outer_ctes);
+    extract_set_expr_lineage(query.body.as_ref(), &ctes, nested_sources)
+}
+
+/// Lineage of one query body, with `nested_sources` already gathered from the
+/// enclosing query's `WITH` bodies.
+///
+/// A set operation (`UNION [ALL]`, `INTERSECT`, `EXCEPT`) takes its output
+/// column names, and so its column entries, from the LEFT branch, as SQL
+/// does. The right branch's relations are dependencies, not relations the
+/// output projects from, so they land in `nested_sources` (never in
+/// `source_tables`, which drives alias resolution and `SELECT *` expansion).
+/// Column edges from the right branch are not recorded: lineage under-reports
+/// there rather than refusing the whole model.
+fn extract_set_expr_lineage(
+    body: &SetExpr,
+    ctes: &CteScope,
+    mut nested_sources: Vec<String>,
+) -> Result<LineageResult, String> {
+    match body {
         SetExpr::Select(select) => {
             // A derived table's own reads come back alongside the relations.
             // The `(subquery)` entry stays in `source_tables` — alias
             // resolution and star expansion still need it — but it names no
             // object, so the names inside it are what a consumer depends on.
-            let (source_tables, derived_reads) = extract_tables(&select.from, &ctes);
+            let (source_tables, derived_reads) = extract_tables(&select.from, ctes);
             nested_sources.extend(derived_reads);
             nested_sources.sort();
             nested_sources.dedup();
@@ -394,11 +412,24 @@ fn extract_query_lineage(query: &Query, outer_ctes: &CteScope) -> Result<Lineage
             })
         }
         SetExpr::Query(inner) => {
-            let mut result = extract_query_lineage(inner, &ctes)?;
+            let mut result = extract_query_lineage(inner, ctes)?;
             nested_sources.append(&mut result.nested_sources);
             nested_sources.sort();
             nested_sources.dedup();
             result.nested_sources = nested_sources;
+            Ok(result)
+        }
+        SetExpr::SetOperation { left, right, .. } => {
+            let mut result = extract_set_expr_lineage(left, ctes, nested_sources)?;
+            // A right branch the extractor cannot read (`VALUES`, `TABLE t`)
+            // contributes no reads rather than refusing the whole model: the
+            // output columns come from the left branch either way.
+            if let Ok(right) = extract_set_expr_lineage(right, ctes, Vec::new()) {
+                collect_nested(&right, &mut result.nested_sources);
+                result.row_selection.extend(right.row_selection);
+            }
+            result.nested_sources.sort();
+            result.nested_sources.dedup();
             Ok(result)
         }
         _ => Err("unsupported query type for lineage".to_string()),
@@ -1685,29 +1716,82 @@ mod tests {
         );
     }
 
-    /// A limitation, pinned so it is a known gap rather than a surprise: a CTE
-    /// body that is a SET OPERATION contributes nothing.
-    ///
-    /// `extract_query_lineage` handles `SetExpr::Select` and `SetExpr::Query`
-    /// and returns `Err` for `SetExpr::SetOperation`, so `walk_cte_bodies`
-    /// skips such a body entirely. `UNION ALL` inside a recursive CTE is the
-    /// ordinary spelling of one, so #1867's fix does not reach it.
-    ///
-    /// This test exists because the recursive test above was originally
-    /// written with a `UNION ALL` body and PASSED VACUOUSLY — the CTE name was
-    /// absent because nothing was walked, not because self-binding worked.
+    /// A CTE body that is a SET OPERATION is walked: both branches' reads
+    /// surface. This was a pinned gap — `UNION ALL` inside a CTE is the
+    /// ordinary spelling, and the body used to contribute nothing.
     #[test]
-    fn a_set_operation_cte_body_contributes_no_reads() {
+    fn a_set_operation_cte_body_contributes_both_branches() {
         let sql = "WITH walk AS ( \
                      SELECT id FROM seed \
                      UNION ALL \
                      SELECT id FROM other \
                    ) SELECT id FROM walk";
 
-        assert!(
-            referenced_tables(sql).unwrap().is_empty(),
-            "known gap: a set-operation body is not walked, so `seed` and \
-             `other` derive no edge"
+        assert_eq!(
+            referenced_tables(sql).unwrap(),
+            vec!["other".to_string(), "seed".to_string()]
+        );
+    }
+
+    /// A recursive CTE's self-reference in the right branch is a CTE binding,
+    /// not a read.
+    #[test]
+    fn a_recursive_union_cte_does_not_read_itself() {
+        let sql = "WITH RECURSIVE walk AS ( \
+                     SELECT id FROM seed \
+                     UNION ALL \
+                     SELECT id FROM walk \
+                   ) SELECT id FROM walk";
+
+        assert_eq!(referenced_tables(sql).unwrap(), vec!["seed".to_string()]);
+    }
+
+    /// A top-level set operation used to fail lineage outright ("unsupported
+    /// query type"), which failed dependency resolution for the whole project.
+    /// Output columns come from the left branch; the right branch's reads are
+    /// dependencies.
+    #[test]
+    fn a_top_level_union_takes_columns_from_the_left_and_reads_from_both() {
+        let result = extract_lineage(
+            "SELECT a.id, a.amount FROM left_t a \
+             UNION ALL SELECT b.id, b.total FROM right_t b \
+             UNION ALL SELECT c.id, c.total FROM third_t c",
+        )
+        .unwrap();
+        let targets: Vec<&str> = result
+            .columns
+            .iter()
+            .map(|c| c.target_column.as_str())
+            .collect();
+        assert_eq!(targets, vec!["id", "amount"]);
+        assert_eq!(
+            result.source_tables.len(),
+            1,
+            "only the left branch projects"
+        );
+        assert_eq!(result.source_tables[0].name, "left_t");
+        assert_eq!(
+            result.nested_sources,
+            vec!["right_t".to_string(), "third_t".to_string()]
+        );
+        assert!(!result.has_star);
+    }
+
+    #[test]
+    fn a_union_with_a_values_branch_still_extracts() {
+        let result = extract_lineage("SELECT id, name FROM t UNION ALL VALUES (1, 'x')").unwrap();
+        assert_eq!(result.source_tables[0].name, "t");
+        assert_eq!(result.columns.len(), 2);
+    }
+
+    #[test]
+    fn a_union_under_with_resolves_cte_reads_in_both_branches() {
+        let sql = "WITH x AS (SELECT id FROM base) \
+                   SELECT * FROM x UNION ALL SELECT id FROM extra";
+
+        assert_eq!(
+            referenced_tables(sql).unwrap(),
+            vec!["base".to_string(), "extra".to_string()]
         );
     }
 

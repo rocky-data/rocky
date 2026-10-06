@@ -74,6 +74,10 @@ from rocky_sdk.types import (
     ModelHistoryResult,
     ModelLineageResult,
     OptimizeResult,
+    PackageAddOutput,
+    PackageListOutput,
+    PackageRemoveOutput,
+    PackageUpdateOutput,
     PlanResult,
     ProductApproveOutput,
     ProductCompileOutput,
@@ -1252,6 +1256,156 @@ class RockyClient:
             command="product_list",
         )
 
+    def package_add(
+        self,
+        spec: str,
+        *,
+        vars: dict[str, str] | None = None,
+        target_schema: str | None = None,
+        compiled: str | None = None,
+        build_empty: bool | None = None,
+        allow_secret_var: bool = False,
+        dbt_timeout: int | None = None,
+        timeout_seconds: int | None = None,
+    ) -> PackageAddOutput:
+        """Run ``rocky package add <namespace>/<name>[@<version>]``.
+
+        Vendors a dbt Hub package (e.g. ``fivetran/stripe@>=1.0.0,<2.0.0``)
+        as Rocky models under ``models/packages/<package>/`` and records it in
+        ``rocky-packages.lock``. Runs dbt once (``deps``, ``compile``) unless
+        ``compiled`` names an already-compiled dbt project. ``build_empty=True``
+        first runs ``dbt run --empty``, which writes empty
+        ``rocky_package_build*`` schemas to the warehouse and runs package
+        hooks; packages whose macros read upstream columns (Fivetran staging)
+        need it or ``compiled``, and are refused (E055) without either.
+        ``allow_secret_var`` accepts credential-like var names (vars are
+        stored in clear text in the lockfile); ``dbt_timeout`` limits each dbt
+        step, in seconds (engine default 1800).
+        A refusal raises ``RockyCommandError``; findings to review (W055) come
+        back in ``diagnostics``.
+
+        Example:
+
+            Vendor the Fivetran Stripe package and check what did not map::
+
+                from rocky_sdk import RockyClient
+
+                client = RockyClient(config_path="rocky.toml")
+                result = client.package_add(
+                    "fivetran/stripe@>=1.0.0,<2.0.0",
+                    vars={"stripe_schema": "raw_stripe"},
+                    build_empty=True,
+                )
+
+                print(len(result.package.models), "models vendored")
+                for d in result.diagnostics:
+                    print(d.code, d.message)
+        """
+        args = ["package", "add", spec, *_package_build_args(vars, target_schema, compiled)]
+        args.extend(_build_empty_args(build_empty))
+        args.extend(_dbt_run_args(allow_secret_var, dbt_timeout))
+        return _parse_rocky_json(
+            self.run_cli(args, timeout_seconds=timeout_seconds),
+            PackageAddOutput,
+            command="package_add",
+        )
+
+    def package_update(
+        self,
+        name: str | None = None,
+        *,
+        vars: dict[str, str] | None = None,
+        compiled: str | None = None,
+        build_empty: bool | None = None,
+        allow_secret_var: bool = False,
+        dbt_timeout: int | None = None,
+        timeout_seconds: int | None = None,
+    ) -> PackageUpdateOutput:
+        """Run ``rocky package update [<name>]``.
+
+        Recompiles vendored packages (all of them when ``name`` is ``None``)
+        in the mode recorded in the lockfile; ``build_empty`` overrides it.
+        Files you edited are never overwritten: when upstream also changed
+        one, the new version is written beside it as ``<file>.incoming``.
+
+        Example:
+
+            Update every package and list the files that need a manual merge::
+
+                from rocky_sdk import RockyClient
+
+                client = RockyClient(config_path="rocky.toml")
+                result = client.package_update()
+
+                for pkg in result.packages:
+                    for path in pkg.files_incoming:
+                        print("merge by hand:", path, "->", path + ".incoming")
+        """
+        args = ["package", "update"]
+        if name is not None:
+            args.append(name)
+        args.extend(_package_build_args(vars, None, compiled))
+        args.extend(_build_empty_args(build_empty))
+        args.extend(_dbt_run_args(allow_secret_var, dbt_timeout))
+        return _parse_rocky_json(
+            self.run_cli(args, timeout_seconds=timeout_seconds),
+            PackageUpdateOutput,
+            command="package_update",
+        )
+
+    def package_list(self) -> PackageListOutput:
+        """Run ``rocky package list`` — vendored packages from the lockfile,
+        with any locally edited, missing, or pending ``.incoming`` files.
+        Never mutates.
+
+        Example:
+
+            Flag packages with local edits::
+
+                from rocky_sdk import RockyClient
+
+                client = RockyClient(config_path="rocky.toml")
+                for pkg in client.package_list().packages:
+                    print(pkg.name, pkg.version, len(pkg.models), "models")
+                    if pkg.files_modified:
+                        print("  edited:", pkg.files_modified)
+        """
+        return _parse_rocky_json(
+            self.run_cli(["package", "list"]),
+            PackageListOutput,
+            command="package_list",
+        )
+
+    def package_remove(self, name: str, *, force: bool = False) -> PackageRemoveOutput:
+        """Run ``rocky package remove <name>``.
+
+        Deletes the package's vendored files and its lock entry. Refuses
+        (``RockyCommandError``, E055) when you edited a vendored file, unless
+        ``force`` is set.
+
+        Example:
+
+            Remove a package, keeping edits safe by default::
+
+                from rocky_sdk import RockyClient, RockyCommandError
+
+                client = RockyClient(config_path="rocky.toml")
+                try:
+                    result = client.package_remove("stripe")
+                except RockyCommandError as exc:
+                    print("refused:", exc.stderr_tail)
+                else:
+                    print(len(result.files_deleted), "files deleted")
+        """
+        args = ["package", "remove", name]
+        if force:
+            args.append("--force")
+        return _parse_rocky_json(
+            self.run_cli(args),
+            PackageRemoveOutput,
+            command="package_remove",
+        )
+
     def product_journal(self, product: str) -> ProductJournalOutput:
         """Run ``rocky product journal <name>`` — the product's fulfillment
         journal, every persisted transition in append order.
@@ -1903,3 +2057,35 @@ class RockyClient:
         return _parse_rocky_json(
             self.run_cli(args), RetentionStatusOutput, command="retention-status"
         )
+
+
+def _package_build_args(
+    vars: dict[str, str] | None, target_schema: str | None, compiled: str | None
+) -> list[str]:
+    """Flags shared by ``rocky package add`` and ``rocky package update``."""
+    args: list[str] = []
+    for key, value in (vars or {}).items():
+        args.extend(["--vars", f"{key}={value}"])
+    if target_schema is not None:
+        args.extend(["--target-schema", target_schema])
+    if compiled is not None:
+        args.extend(["--compiled", compiled])
+    return args
+
+
+def _build_empty_args(build_empty: bool | None) -> list[str]:
+    """``--build-empty[=false]`` for ``rocky package add`` / ``update``; ``None``
+    leaves the engine default (compile only on ``add``, the lockfile's mode on
+    ``update``)."""
+    if build_empty is None:
+        return []
+    return ["--build-empty"] if build_empty else ["--build-empty=false"]
+
+
+def _dbt_run_args(allow_secret_var: bool, dbt_timeout: int | None) -> list[str]:
+    """``--allow-secret-var`` and ``--dbt-timeout`` for ``rocky package add`` /
+    ``update``."""
+    args = ["--allow-secret-var"] if allow_secret_var else []
+    if dbt_timeout is not None:
+        args.extend(["--dbt-timeout", str(dbt_timeout)])
+    return args

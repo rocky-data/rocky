@@ -5,6 +5,7 @@ pub mod dbt_attach;
 pub mod dbt_governance;
 pub mod dbt_macros;
 pub mod dbt_manifest;
+pub mod dbt_package;
 pub mod dbt_profiles;
 pub mod dbt_project;
 pub mod dbt_snapshots;
