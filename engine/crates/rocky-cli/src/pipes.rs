@@ -112,6 +112,53 @@ pub struct PipesEmitter {
     /// `--parallel` partition execution path) can emit concurrently
     /// without interleaving lines.
     pub(crate) channel: Mutex<Box<dyn Write + Send>>,
+    /// The checks the orchestrator declared, read from the Pipes context's
+    /// `extras` under [`EXTRAS_DECLARED_CHECKS`] (#2160). `None` when the
+    /// launcher sent none — an older dagster-rocky, or a plain
+    /// `PipesSubprocessClient` — and then the engine reports only what it
+    /// produced, exactly as before.
+    pub(crate) declared_checks: Option<DeclaredChecks>,
+}
+
+/// Pipes context `extras` key carrying the orchestrator's declared checks
+/// (#2160). The value is an object mapping a slash-joined, engine-native
+/// asset key (the same string every `report_asset_*` message carries) to the
+/// list of check names declared on it:
+///
+/// ```json
+/// {"rocky_declared_checks": {"fivetran/acme/orders": ["row_count", "column_match"]}}
+/// ```
+///
+/// Dagster fails the whole step when a declared check gets no result over
+/// Pipes, and the integration cannot tell an absent table from a failed one
+/// on that wire. So the engine answers every declared check it did not
+/// produce with an explicit `not_evaluated` row — see
+/// `emit_pipes_events` in `commands/run.rs`.
+pub const EXTRAS_DECLARED_CHECKS: &str = "rocky_declared_checks";
+
+/// Declared check names per engine-native asset key (slash-joined). Names are
+/// stored sanitized with [`sanitize_check_name`], the form every
+/// `report_asset_check` message carries.
+pub type DeclaredChecks = std::collections::BTreeMap<String, std::collections::BTreeSet<String>>;
+
+/// Map a check name onto Dagster's `^[A-Za-z0-9_]+$` alphabet.
+///
+/// Engine check results carry structured names (`null_rate:<col>`,
+/// `cross_source_overlap:<src>.<table>`, `<kind>:<col>` assertions). Pipes IS
+/// the Dagster protocol, so the invalid characters are mapped here so the
+/// emitted name matches the spec the dagster-rocky component pre-declares
+/// (which applies the same mapping, `sanitize_check_name`).
+pub fn sanitize_check_name(check_name: &str) -> String {
+    check_name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 impl std::fmt::Debug for PipesEmitter {
@@ -137,11 +184,12 @@ impl PipesEmitter {
     /// zlib-decompress is not a lenient variant of the protocol, it's
     /// malformed, and is refused before pipeline execution.
     pub fn detect() -> Result<Option<Self>> {
-        let Some(channel) = Self::requested_channel()? else {
+        let Some((channel, declared_checks)) = Self::requested_channel()? else {
             return Ok(None);
         };
         let emitter = PipesEmitter {
             channel: Mutex::new(channel),
+            declared_checks,
         };
         // Must be the first line ever written to the channel — see
         // `opened`'s doc comment.
@@ -157,7 +205,13 @@ impl PipesEmitter {
         Ok(())
     }
 
-    fn requested_channel() -> Result<Option<Box<dyn Write + Send>>> {
+    /// The orchestrator's declared checks, when the launcher sent them.
+    pub fn declared_checks(&self) -> Option<&DeclaredChecks> {
+        self.declared_checks.as_ref()
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn requested_channel() -> Result<Option<(Box<dyn Write + Send>, Option<DeclaredChecks>)>> {
         // Unit tests mutate process-global Pipes vars. Serialize every read,
         // including library callers that do not explicitly take the lock.
         #[cfg(test)]
@@ -167,7 +221,8 @@ impl PipesEmitter {
             Err(env::VarError::NotPresent) => return Ok(None),
             Err(env::VarError::NotUnicode(_)) => bail!("{ENV_PIPES_CONTEXT} is not valid Unicode"),
         };
-        decode_pipes_param(&raw_context, ENV_PIPES_CONTEXT)?;
+        let context_params = decode_pipes_param(&raw_context, ENV_PIPES_CONTEXT)?;
+        let declared_checks = declared_checks_from_context_params(&context_params)?;
         let raw_messages = match env::var(ENV_PIPES_MESSAGES) {
             Ok(value) => value,
             Err(env::VarError::NotPresent) => {
@@ -176,7 +231,7 @@ impl PipesEmitter {
             Err(env::VarError::NotUnicode(_)) => bail!("{ENV_PIPES_MESSAGES} is not valid Unicode"),
         };
         let params = decode_pipes_param(&raw_messages, ENV_PIPES_MESSAGES)?;
-        Self::open_channel(&params).map(Some)
+        Self::open_channel(&params).map(|channel| Some((channel, declared_checks)))
     }
 
     /// Open the message channel based on the writer params.
@@ -285,22 +340,9 @@ impl PipesEmitter {
         severity: PipesCheckSeverity,
         metadata: &Value,
     ) {
-        // Dagster check names must match `^[A-Za-z0-9_]+$`, but engine check
-        // results carry structured names (`null_rate:<col>`,
-        // `cross_source_overlap:<src>.<table>`, `<kind>:<col>` assertions).
-        // Pipes IS the Dagster protocol, so map the invalid characters here so
-        // the emitted name matches the spec the dagster-rocky component
-        // pre-declares (which applies the same mapping, `sanitize_check_name`).
-        let check_name: String = check_name
-            .chars()
-            .map(|c| {
-                if c.is_ascii_alphanumeric() || c == '_' {
-                    c
-                } else {
-                    '_'
-                }
-            })
-            .collect();
+        // Dagster check names must match `^[A-Za-z0-9_]+$`; see
+        // `sanitize_check_name`.
+        let check_name = sanitize_check_name(check_name);
         self.write_message(
             "report_asset_check",
             &json!({
@@ -381,6 +423,62 @@ fn decode_pipes_param(raw: &str, env_var_name: &str) -> Result<Value> {
         .map_err(|_| anyhow!("{env_var_name} cannot be JSON-decoded"))
 }
 
+/// Read [`EXTRAS_DECLARED_CHECKS`] from the decoded `DAGSTER_PIPES_CONTEXT`
+/// params (#2160).
+///
+/// The params name where the context data lives, the way
+/// `dagster_pipes.PipesDefaultContextLoader` reads them: `{"path": <file>}`
+/// (the `PipesTempFileContextInjector` every `PipesSubprocessClient` uses by
+/// default) or `{"data": {...}}` inline. Any other shape (a custom injector)
+/// carries no declared checks this crate can read, so it yields `None` — the
+/// engine then reports only what it produced, as it always has.
+///
+/// Fails closed on the shapes it does read: a context file that cannot be
+/// read, context data that is not JSON, or a declared-checks value of the
+/// wrong shape is an error before execution, not a silently empty set. An
+/// empty set would read as "nothing is declared" and drop exactly the
+/// not-evaluated rows the orchestrator asked for.
+fn declared_checks_from_context_params(params: &Value) -> Result<Option<DeclaredChecks>> {
+    let data = if let Some(path) = params.get("path") {
+        let path = path
+            .as_str()
+            .ok_or_else(|| anyhow!("{ENV_PIPES_CONTEXT} 'path' is not a string"))?;
+        let raw = std::fs::read_to_string(path)
+            .map_err(|_| anyhow!("{ENV_PIPES_CONTEXT} context file cannot be read"))?;
+        serde_json::from_str::<Value>(&raw)
+            .map_err(|_| anyhow!("{ENV_PIPES_CONTEXT} context file is not valid JSON"))?
+    } else if let Some(data) = params.get("data") {
+        data.clone()
+    } else {
+        return Ok(None);
+    };
+    let Some(declared) = data
+        .get("extras")
+        .and_then(|extras| extras.get(EXTRAS_DECLARED_CHECKS))
+    else {
+        return Ok(None);
+    };
+    let map = declared.as_object().ok_or_else(|| {
+        anyhow!("{ENV_PIPES_CONTEXT} extras.{EXTRAS_DECLARED_CHECKS} must be an object")
+    })?;
+    let mut out = DeclaredChecks::new();
+    for (asset_key, names) in map {
+        let names = names.as_array().ok_or_else(|| {
+            anyhow!(
+                "{ENV_PIPES_CONTEXT} extras.{EXTRAS_DECLARED_CHECKS} values must be lists of check names"
+            )
+        })?;
+        let entry = out.entry(asset_key.clone()).or_default();
+        for name in names {
+            let name = name.as_str().ok_or_else(|| {
+                anyhow!("{ENV_PIPES_CONTEXT} extras.{EXTRAS_DECLARED_CHECKS} check names must be strings")
+            })?;
+            entry.insert(sanitize_check_name(name));
+        }
+    }
+    Ok(Some(out))
+}
+
 /// Wrap every metadata value the way the real `dagster_pipes` SDK does
 /// before it reaches the wire.
 ///
@@ -453,6 +551,7 @@ mod tests {
             .expect("open temp file");
         PipesEmitter {
             channel: Mutex::new(Box::new(file)),
+            declared_checks: None,
         }
     }
 
@@ -493,6 +592,73 @@ mod tests {
             .unwrap();
         let compressed = encoder.finish().unwrap();
         B64.encode(compressed)
+    }
+
+    /// #2160: the declared checks ride the Pipes context's `extras`, read
+    /// from the context file (`{"path": ...}`, `PipesSubprocessClient`'s
+    /// default injector) or inline (`{"data": ...}`).
+    #[test]
+    fn declared_checks_read_from_context_file_and_inline_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = dir.path().join("context.json");
+        std::fs::write(
+            &ctx,
+            serde_json::to_string(&json!({
+                "run_id": "r",
+                "extras": {
+                    "plan_id": "p",
+                    EXTRAS_DECLARED_CHECKS: {"acme/orders": ["row_count", "null_rate:id"]},
+                },
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let from_file =
+            declared_checks_from_context_params(&json!({"path": ctx.to_str().unwrap()}))
+                .unwrap()
+                .expect("declared checks present");
+        let names: Vec<&str> = from_file["acme/orders"]
+            .iter()
+            .map(String::as_str)
+            .collect();
+        // Sanitized the same way every `report_asset_check` name is.
+        assert_eq!(names, vec!["null_rate_id", "row_count"]);
+
+        let inline = declared_checks_from_context_params(&json!({
+            "data": {"extras": {EXTRAS_DECLARED_CHECKS: {"a/b": ["column_match"]}}}
+        }))
+        .unwrap()
+        .expect("declared checks present");
+        assert!(inline["a/b"].contains("column_match"));
+    }
+
+    /// #2160: no declared checks is `None` (the wire stays as it was);
+    /// a malformed or unreadable source is an error, never an empty set.
+    #[test]
+    fn declared_checks_absent_is_none_and_malformed_fails_closed() {
+        assert!(
+            declared_checks_from_context_params(&json!({"data": {"extras": {}}}))
+                .unwrap()
+                .is_none()
+        );
+        // A custom injector's shape carries nothing this crate can read.
+        assert!(
+            declared_checks_from_context_params(&json!({"bucket": "b", "key": "k"}))
+                .unwrap()
+                .is_none()
+        );
+        for bad in [
+            json!({"data": {"extras": {EXTRAS_DECLARED_CHECKS: ["row_count"]}}}),
+            json!({"data": {"extras": {EXTRAS_DECLARED_CHECKS: {"a": "row_count"}}}}),
+            json!({"data": {"extras": {EXTRAS_DECLARED_CHECKS: {"a": [1]}}}}),
+            json!({"path": "/nonexistent/rocky-pipes-context.json"}),
+            json!({"path": 7}),
+        ] {
+            assert!(
+                declared_checks_from_context_params(&bad).is_err(),
+                "must fail closed: {bad}"
+            );
+        }
     }
 
     #[test]

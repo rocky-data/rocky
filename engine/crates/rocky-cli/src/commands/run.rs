@@ -9508,6 +9508,22 @@ async fn auto_sweep_retention_at_end_of_run(
 pub(super) fn emit_pipes_events(pipes: &crate::pipes::PipesEmitter, output: &RunOutput) {
     use serde_json::json;
 
+    // Every (asset key, sanitized check name) this run reported, so the
+    // declared-check pass at the end answers only what nothing else did.
+    let mut reported: std::collections::HashSet<(String, String)> =
+        std::collections::HashSet::new();
+    let mut report = |asset_key: &str,
+                      check_name: &str,
+                      passed: bool,
+                      severity: crate::pipes::PipesCheckSeverity,
+                      metadata: &serde_json::Value| {
+        reported.insert((
+            asset_key.to_string(),
+            crate::pipes::sanitize_check_name(check_name),
+        ));
+        pipes.report_asset_check(asset_key, check_name, passed, severity, metadata);
+    };
+
     // Materializations.
     for mat in &output.materializations {
         let asset_key = mat.asset_key.join("/");
@@ -9553,7 +9569,7 @@ pub(super) fn emit_pipes_events(pipes: &crate::pipes::PipesEmitter, output: &Run
                 .get("passed")
                 .and_then(serde_json::Value::as_bool)
                 .unwrap_or(true);
-            pipes.report_asset_check(
+            report(
                 &asset_key,
                 &check_name,
                 passed,
@@ -9576,7 +9592,7 @@ pub(super) fn emit_pipes_events(pipes: &crate::pipes::PipesEmitter, output: &Run
         // (#2073, the same shape of bug `check_results` avoids by
         // carrying its own `asset_key`).
         let asset_key = action.asset_key.join("/");
-        pipes.report_asset_check(
+        report(
             &asset_key,
             "drift",
             true,
@@ -9626,7 +9642,7 @@ pub(super) fn emit_pipes_events(pipes: &crate::pipes::PipesEmitter, output: &Run
     for anomaly in &output.anomalies {
         let asset_key = anomaly.asset_key.join("/");
         anomalous_asset_keys.insert(asset_key.clone());
-        pipes.report_asset_check(
+        report(
             &asset_key,
             "row_count_anomaly",
             false,
@@ -9645,7 +9661,7 @@ pub(super) fn emit_pipes_events(pipes: &crate::pipes::PipesEmitter, output: &Run
             continue;
         }
         if evaluation.evaluated {
-            pipes.report_asset_check(
+            report(
                 &asset_key,
                 "row_count_anomaly",
                 true,
@@ -9657,7 +9673,7 @@ pub(super) fn emit_pipes_events(pipes: &crate::pipes::PipesEmitter, output: &Run
                 .not_evaluated_reason
                 .as_deref()
                 .unwrap_or("the engine gave no reason");
-            pipes.report_asset_check(
+            report(
                 &asset_key,
                 "row_count_anomaly",
                 false,
@@ -9666,6 +9682,149 @@ pub(super) fn emit_pipes_events(pipes: &crate::pipes::PipesEmitter, output: &Run
             );
         }
     }
+
+    if let Some(declared) = pipes.declared_checks() {
+        for row in not_evaluated_declared_checks(output, declared, &reported) {
+            pipes.report_asset_check(
+                &row.asset_key,
+                &row.check_name,
+                false,
+                crate::pipes::PipesCheckSeverity::Warn,
+                &json!({
+                    "status": "not_evaluated",
+                    "rocky/not_evaluated_cause": row.cause.as_str(),
+                    "rocky/reason": row.reason,
+                }),
+            );
+        }
+    }
+}
+
+/// Why a declared check got no verdict from this run (#2160). Sent on the
+/// Pipes wire as `rocky/not_evaluated_cause` so the integration can map each
+/// cause without guessing from absence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum NotEvaluatedCause {
+    /// The table failed in this run (it is in `errors`), so no check ran.
+    CopyFailed,
+    /// `prune_unchanged` skipped the table: the source is unchanged since the
+    /// last copy. The integration carries the prior verdict forward.
+    PrunedUnchanged,
+    /// The table was excluded from this run for another reason (see
+    /// `excluded_tables`).
+    Excluded,
+    /// The table was materialized, but this run produced no result for the
+    /// check — it is not enabled for this pipeline, or did not apply.
+    NotProduced,
+    /// The run never reached the table: not discovered under this filter, not
+    /// a replication pipeline, or the run stopped early.
+    NotReached,
+}
+
+impl NotEvaluatedCause {
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            NotEvaluatedCause::CopyFailed => "copy_failed",
+            NotEvaluatedCause::PrunedUnchanged => "pruned_unchanged",
+            NotEvaluatedCause::Excluded => "excluded",
+            NotEvaluatedCause::NotProduced => "not_produced",
+            NotEvaluatedCause::NotReached => "not_reached",
+        }
+    }
+}
+
+/// One declared check the run did not answer, with the cause.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct NotEvaluatedCheck {
+    pub asset_key: String,
+    pub check_name: String,
+    pub cause: NotEvaluatedCause,
+    pub reason: String,
+}
+
+/// Every declared `(asset key, check)` that `reported` does not cover, with
+/// why (#2160).
+///
+/// Over Dagster Pipes a declared check with no result fails the whole step,
+/// and a passing placeholder would stamp a pass on a table whose copy failed.
+/// The integration cannot tell those apart on the wire, so the engine — which
+/// knows which tables failed, were pruned or were never reached — answers each
+/// one explicitly. Every row is sent `passed: false`: a check that did not run
+/// is not a check that passed (#1741). The integration turns the
+/// `pruned_unchanged` cause back into the prior verdict, the same as streaming
+/// mode does.
+///
+/// `declared` and `reported` are both keyed on the slash-joined engine-native
+/// asset key and the sanitized check name, the exact strings the wire carries.
+pub(super) fn not_evaluated_declared_checks(
+    output: &RunOutput,
+    declared: &crate::pipes::DeclaredChecks,
+    reported: &std::collections::HashSet<(String, String)>,
+) -> Vec<NotEvaluatedCheck> {
+    use std::collections::{HashMap, HashSet};
+
+    let failed: HashMap<String, &str> = output
+        .errors
+        .iter()
+        .map(|e| (e.asset_key.join("/"), e.error.as_str()))
+        .collect();
+    let excluded: HashMap<String, &str> = output
+        .excluded_tables
+        .iter()
+        .map(|t| (t.asset_key.join("/"), t.reason.as_str()))
+        .collect();
+    let materialized: HashSet<String> = output
+        .materializations
+        .iter()
+        .map(|m| m.asset_key.join("/"))
+        .collect();
+
+    let mut rows = Vec::new();
+    for (asset_key, names) in declared {
+        for check_name in names {
+            if reported.contains(&(asset_key.clone(), check_name.clone())) {
+                continue;
+            }
+            let (cause, reason) = if failed.contains_key(asset_key) {
+                (
+                    NotEvaluatedCause::CopyFailed,
+                    "the table failed in this run, so the check did not run".to_string(),
+                )
+            } else if excluded.get(asset_key) == Some(&"unchanged_since_last_copy") {
+                (
+                    NotEvaluatedCause::PrunedUnchanged,
+                    "source unchanged since the last copy (prune_unchanged); \
+                     the check was not re-evaluated"
+                        .to_string(),
+                )
+            } else if let Some(why) = excluded.get(asset_key) {
+                (
+                    NotEvaluatedCause::Excluded,
+                    format!("the table was excluded from this run ({why})"),
+                )
+            } else if materialized.contains(asset_key) {
+                (
+                    NotEvaluatedCause::NotProduced,
+                    format!(
+                        "the table was copied, but rocky produced no {check_name} result \
+                         (the check is not enabled for this pipeline, or did not apply)"
+                    ),
+                )
+            } else {
+                (
+                    NotEvaluatedCause::NotReached,
+                    "rocky did not reach this table in this run".to_string(),
+                )
+            };
+            rows.push(NotEvaluatedCheck {
+                asset_key: asset_key.clone(),
+                check_name: check_name.clone(),
+                cause,
+                reason,
+            });
+        }
+    }
+    rows
 }
 
 /// Compile and execute every model in `models_dir` against the given
@@ -23859,6 +24018,7 @@ auto_create_schemas = true
             .unwrap();
         let emitter = PipesEmitter {
             channel: Mutex::new(Box::new(file)),
+            declared_checks: None,
         };
 
         let mut advisory = rocky_core::checks::check_row_count(10, 7);
@@ -23915,6 +24075,7 @@ auto_create_schemas = true
             .unwrap();
         let emitter = PipesEmitter {
             channel: Mutex::new(Box::new(file)),
+            declared_checks: None,
         };
 
         let output = RunOutput {
@@ -24064,6 +24225,7 @@ auto_create_schemas = true
             .unwrap();
         let emitter = PipesEmitter {
             channel: Mutex::new(Box::new(file)),
+            declared_checks: None,
         };
 
         let mut output = RunOutput::new("tenant=acme".into(), 0, 1);
@@ -24170,6 +24332,174 @@ auto_create_schemas = true
                 "raw_value": "no row count was measured for this table",
                 "type": "__infer__"
             })
+        );
+    }
+
+    /// #2160: over Pipes, every check the orchestrator declared gets a row.
+    /// A declared check the run did not produce is answered with an explicit
+    /// `not_evaluated`, `passed: false` row naming the cause — never left
+    /// silent (Dagster then fails the whole step) and never a pass (the copy
+    /// may have failed). Checks the run did produce are not duplicated.
+    #[test]
+    fn test_emit_pipes_answers_every_declared_check_with_a_cause() {
+        use crate::output::{ExcludedTableOutput, RunOutput, TableCheckOutput, TableErrorOutput};
+        use crate::pipes::PipesEmitter;
+        use std::collections::{BTreeMap, BTreeSet};
+        use std::io::Read;
+        use std::sync::Mutex;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pipes_declared.txt");
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .unwrap();
+        let declared_names: BTreeSet<String> = ["row_count", "column_match"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let declared: BTreeMap<String, BTreeSet<String>> = [
+            "acme/copied",
+            "acme/failed",
+            "acme/pruned",
+            "acme/excluded",
+            "acme/unreached",
+        ]
+        .into_iter()
+        .map(|k| (k.to_string(), declared_names.clone()))
+        .collect();
+        let emitter = PipesEmitter {
+            channel: Mutex::new(Box::new(file)),
+            declared_checks: Some(declared),
+        };
+
+        let mut output = RunOutput::new("tenant=acme".into(), 0, 1);
+        output.materializations = vec![mat_for_manifest(&["acme", "copied"], None)];
+        // `copied` produced row_count but not column_match (not enabled).
+        output.check_results = vec![TableCheckOutput {
+            asset_key: vec!["acme".into(), "copied".into()],
+            checks: vec![rocky_core::checks::check_row_count(10, 10)],
+        }];
+        output.errors = vec![TableErrorOutput {
+            asset_key: vec!["acme".into(), "failed".into()],
+            error: "copy failed".into(),
+            failure_kind: crate::output::FailureKind::QueryRejected,
+            cooldown_seconds: None,
+        }];
+        output.excluded_tables = vec![
+            ExcludedTableOutput {
+                asset_key: vec!["acme".into(), "pruned".into()],
+                source_schema: "src".into(),
+                table_name: "pruned".into(),
+                reason: "unchanged_since_last_copy".into(),
+            },
+            ExcludedTableOutput {
+                asset_key: vec!["acme".into(), "excluded".into()],
+                source_schema: "src".into(),
+                table_name: "excluded".into(),
+                reason: "missing_from_source".into(),
+            },
+        ];
+
+        emit_pipes_events(&emitter, &output);
+
+        let mut content = String::new();
+        std::fs::File::open(&path)
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
+        let checks: Vec<serde_json::Value> = content
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+            .filter(|m| m["method"] == "report_asset_check")
+            .collect();
+
+        // One row per declared (table, check): 5 tables x 2 checks.
+        let mut seen: BTreeMap<(String, String), &serde_json::Value> = BTreeMap::new();
+        for c in &checks {
+            let key = (
+                c["params"]["asset_key"].as_str().unwrap().to_string(),
+                c["params"]["check_name"].as_str().unwrap().to_string(),
+            );
+            assert!(
+                seen.insert(key.clone(), c).is_none(),
+                "duplicate row for {key:?}"
+            );
+        }
+        assert_eq!(seen.len(), 10, "unexpected rows: {content}");
+
+        let raw = |c: &serde_json::Value, k: &str| c["params"]["metadata"][k]["raw_value"].clone();
+        // The produced check is reported once, as the engine measured it.
+        let produced = seen[&("acme/copied".into(), "row_count".into())];
+        assert_eq!(produced["params"]["passed"], true);
+        assert!(
+            produced["params"]["metadata"]
+                .get("rocky/not_evaluated_cause")
+                .is_none()
+        );
+
+        for (asset, check, cause) in [
+            ("acme/copied", "column_match", "not_produced"),
+            ("acme/failed", "row_count", "copy_failed"),
+            ("acme/failed", "column_match", "copy_failed"),
+            ("acme/pruned", "row_count", "pruned_unchanged"),
+            ("acme/excluded", "row_count", "excluded"),
+            ("acme/unreached", "column_match", "not_reached"),
+        ] {
+            let row = seen[&(asset.to_string(), check.to_string())];
+            assert_eq!(
+                row["params"]["passed"], false,
+                "{asset}/{check} must not pass"
+            );
+            assert_eq!(row["params"]["severity"], "WARN");
+            assert_eq!(raw(row, "status"), "not_evaluated");
+            assert_eq!(
+                raw(row, "rocky/not_evaluated_cause"),
+                cause,
+                "{asset}/{check}"
+            );
+            assert!(
+                raw(row, "rocky/reason")
+                    .as_str()
+                    .is_some_and(|r| !r.is_empty())
+            );
+        }
+    }
+
+    /// #2160: without declared checks in the Pipes context (an older
+    /// integration, or a plain `PipesSubprocessClient`), nothing is added —
+    /// the wire is unchanged.
+    #[test]
+    fn test_emit_pipes_without_declared_checks_adds_no_rows() {
+        use crate::output::RunOutput;
+        use crate::pipes::PipesEmitter;
+        use std::io::Read;
+        use std::sync::Mutex;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pipes_undeclared.txt");
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .unwrap();
+        let emitter = PipesEmitter {
+            channel: Mutex::new(Box::new(file)),
+            declared_checks: None,
+        };
+        let mut output = RunOutput::new("tenant=acme".into(), 0, 1);
+        output.materializations = vec![mat_for_manifest(&["acme", "copied"], None)];
+        emit_pipes_events(&emitter, &output);
+        let mut content = String::new();
+        std::fs::File::open(&path)
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
+        assert!(
+            !content.contains("report_asset_check"),
+            "no check rows expected: {content}"
         );
     }
 

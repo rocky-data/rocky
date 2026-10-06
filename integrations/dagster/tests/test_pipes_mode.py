@@ -805,3 +805,186 @@ def test_real_handler_marks_received_opened_message_after_a_real_stream():
         proxy.handle_message(message)
 
     assert handler.received_opened_message is True
+
+
+# ---------------------------------------------------------------------------
+# Declared checks over Pipes (#2160) — the engine answers every declared check
+# it did not produce with an explicit not-evaluated row; the integration sends
+# the declared set and maps the rows. A declared check must never be left
+# without a result (Dagster fails the whole step) and never stamped a pass.
+# ---------------------------------------------------------------------------
+
+
+def test_run_pipes_sends_declared_checks_as_pipes_extras():
+    from dagster_rocky.resource import PIPES_DECLARED_CHECKS_EXTRA
+
+    rocky = RockyResource()
+    context = MagicMock(spec=dg.AssetExecutionContext)
+    with (
+        _patch_plan_step(),
+        patch("dagster_rocky.resource.dg.PipesSubprocessClient") as client_cls,
+    ):
+        instance = client_cls.return_value
+        instance.run = MagicMock(return_value=MagicMock())
+        rocky.run_pipes(
+            context,
+            filter="tenant=acme",
+            include_keys={dg.AssetKey(["a"])},
+            declared_checks={"fivetran/acme/orders": ("row_count", "column_match")},
+        )
+    extras = instance.run.call_args.kwargs["extras"]
+    assert extras["plan_id"] == "a" * 64
+    assert extras[PIPES_DECLARED_CHECKS_EXTRA] == {
+        "fivetran/acme/orders": ["row_count", "column_match"]
+    }
+
+
+def test_run_pipes_without_declared_checks_sends_only_the_plan_id():
+    rocky = RockyResource()
+    context = MagicMock(spec=dg.AssetExecutionContext)
+    with (
+        _patch_plan_step(),
+        patch("dagster_rocky.resource.dg.PipesSubprocessClient") as client_cls,
+    ):
+        instance = client_cls.return_value
+        instance.run = MagicMock(return_value=MagicMock())
+        rocky.run_pipes(context, filter="tenant=acme")
+    assert instance.run.call_args.kwargs["extras"] == {"plan_id": "a" * 64}
+
+
+def _declared_group():
+    from dagster_rocky.component import _GroupBuild
+
+    orders = dg.AssetKey(["warehouse", "acme", "orders"])
+    users = dg.AssetKey(["warehouse", "acme", "users"])
+    group = _GroupBuild(
+        name="acme",
+        source_ids={"acme"},
+        filter="client=acme",
+        rocky_key_to_dagster_key={
+            ("fivetran", "acme", "orders"): orders,
+            ("fivetran", "acme", "users"): users,
+        },
+    )
+    return group, orders, users
+
+
+def _not_evaluated(asset_key: dg.AssetKey, check_name: str, cause: str) -> dg.AssetCheckResult:
+    """The shape Dagster's handler builds from the engine's not-evaluated row."""
+    return dg.AssetCheckResult(
+        asset_key=asset_key,
+        check_name=check_name,
+        passed=False,
+        severity=dg.AssetCheckSeverity.WARN,
+        metadata={
+            "status": dg.MetadataValue.text("not_evaluated"),
+            "rocky/not_evaluated_cause": dg.MetadataValue.text(cause),
+            "rocky/reason": dg.MetadataValue.text("why"),
+        },
+    )
+
+
+def _drive(group, selected, declared, results, **kwargs):
+    from dagster_rocky.component import _run_filters_pipes
+
+    context = MagicMock(spec=dg.AssetExecutionContext)
+    context.log = MagicMock()
+    rocky = MagicMock(spec=RockyResource)
+    fake_invocation = MagicMock()
+    fake_invocation.get_results = MagicMock(return_value=iter(results))
+    rocky.run_pipes = MagicMock(return_value=fake_invocation)
+    out = list(
+        _run_filters_pipes(
+            context=context,
+            rocky=rocky,
+            filters=["client=acme"],
+            group=group,
+            selected_keys=selected,
+            declared_check_pairs=declared,
+            **kwargs,
+        )
+    )
+    return out, rocky.run_pipes.call_args.kwargs
+
+
+def test_run_filters_pipes_sends_the_declared_checks_it_does_not_yield_itself():
+    """Native-path keyed; minus unselected assets, minus checks the component
+    yields itself (compliance / contract), minus group checks."""
+    from dagster_rocky.component import GROUP_CHECK_METADATA_KEY
+
+    group, orders, users = _declared_group()
+    group_spec = dg.AssetCheckSpec(
+        name="cross_source_overlap",
+        asset=orders,
+        metadata={GROUP_CHECK_METADATA_KEY: True},
+    )
+    declared = {
+        (orders, "row_count"),
+        (orders, "column_match"),
+        (orders, "contract"),
+        (orders, "cross_source_overlap"),
+        (users, "row_count"),
+    }
+    real = dg.AssetCheckResult(asset_key=orders, check_name="row_count", passed=True)
+    _out, kwargs = _drive(
+        group,
+        {orders},
+        declared,
+        [real],
+        check_specs=[group_spec],
+        pre_yielded_checks={(orders, "contract")},
+    )
+    assert kwargs["declared_checks"] == {"fivetran/acme/orders": ["column_match", "row_count"]}
+
+
+def test_run_filters_pipes_maps_each_not_evaluated_cause_and_never_passes_a_failed_copy():
+    group, orders, users = _declared_group()
+    declared = {(orders, "row_count"), (users, "row_count"), (users, "column_match")}
+    out, _ = _drive(
+        group,
+        {orders, users},
+        declared,
+        [
+            _not_evaluated(orders, "row_count", "copy_failed"),
+            _not_evaluated(users, "row_count", "not_produced"),
+            _not_evaluated(users, "column_match", "pruned_unchanged"),
+        ],
+    )
+    by_pair = {(r.asset_key, r.check_name): r for r in out}
+    assert set(by_pair) == declared
+    assert len(out) == 3
+    failed_copy = by_pair[(orders, "row_count")]
+    assert failed_copy.passed is False
+    assert failed_copy.severity == dg.AssetCheckSeverity.WARN
+    assert by_pair[(users, "row_count")].passed is False
+    # Pruned: the streaming placeholder's mapping (no prior verdict on record
+    # here, so the explicit "pruned before this check ever ran" status).
+    pruned = by_pair[(users, "column_match")]
+    assert pruned.metadata["rocky/pruned_unchanged"].value is True
+
+
+def test_run_filters_pipes_real_result_wins_over_a_not_evaluated_row_for_the_same_pair():
+    group, orders, _users = _declared_group()
+    declared = {(orders, "row_count")}
+    real = dg.AssetCheckResult(asset_key=orders, check_name="row_count", passed=True)
+    out, _ = _drive(
+        group,
+        {orders},
+        declared,
+        [_not_evaluated(orders, "row_count", "not_reached"), real],
+    )
+    assert out == [real]
+
+
+def test_run_filters_pipes_fails_closed_on_a_declared_check_with_no_answer():
+    """An engine that predates #2160 sends nothing for an unproduced check;
+    the step must not fail, and the check must not pass."""
+    group, orders, users = _declared_group()
+    declared = {(orders, "column_match"), (users, "row_count")}
+    out, _ = _drive(group, {orders}, declared, [])
+    assert len(out) == 1
+    (result,) = out
+    assert (result.asset_key, result.check_name) == (orders, "column_match")
+    assert result.passed is False
+    assert result.severity == dg.AssetCheckSeverity.WARN
+    assert result.metadata["rocky/not_evaluated_cause"].value == "no_verdict"

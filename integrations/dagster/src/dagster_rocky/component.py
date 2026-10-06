@@ -184,7 +184,7 @@ def _engine_schema_mismatch_failure(command: str, exc: ValidationError) -> dg.Fa
 
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Iterator, Mapping
+    from collections.abc import Iterable, Iterator, Mapping, Sequence
     from collections.abc import Set as AbstractSet
 
 #: Metadata key stamped on the zero-row ``MaterializeResult`` that the
@@ -2873,6 +2873,9 @@ def _make_rocky_asset(
                 group=group,
                 selected_keys=selected_keys,
                 declared_check_pairs=declared_check_pairs,
+                check_specs=check_specs,
+                pre_yielded_checks=compliance_yielded | contract_yielded,
+                instance=context.instance,
             )
             # In pipes mode, the placeholder pass inside ``_emit_results``
             # doesn't run — but we still need to yield the collected
@@ -2926,6 +2929,9 @@ def _run_filters_pipes(
     group: _GroupBuild,
     selected_keys: set[dg.AssetKey],
     declared_check_pairs: set[tuple[dg.AssetKey, str]],
+    check_specs: Sequence[dg.AssetCheckSpec] = (),
+    pre_yielded_checks: AbstractSet[tuple[dg.AssetKey, str]] = frozenset(),
+    instance: dg.DagsterInstance | None = None,
 ) -> Iterator[object]:
     """Execute ``rocky run`` for each filter over the Dagster Pipes protocol.
 
@@ -2948,8 +2954,53 @@ def _run_filters_pipes(
     made Dagster raise ``DagsterInvariantViolationError`` and FAIL THE STEP
     (#1673). They are now filtered out here and carried as an
     ``AssetObservation`` with a warning, the same as on the streaming path.
+
+    **Every declared check gets a verdict (#2160).** Dagster fails the step
+    when a declared check yields nothing, and over Pipes the integration
+    cannot tell a table that was never reached from one whose copy failed. So
+    the declared checks the engine owes (every declared pair on a selected
+    asset, minus the ones this component yields itself —
+    ``pre_yielded_checks``, the compliance and contract results — and minus
+    group checks, which yield nothing by design) are sent to the engine as
+    Pipes ``extras`` (``rocky_declared_checks``, keyed by the engine-native
+    path). The engine answers each one it did not produce with a
+    ``passed=False`` row whose ``rocky/not_evaluated_cause`` says why. Those
+    rows are mapped here:
+
+    - ``pruned_unchanged`` carries the last recorded verdict forward, exactly
+      as the streaming placeholder does (:func:`_pruned_check_placeholder`);
+    - every other cause is yielded as sent: a WARN failure, never a pass;
+    - a not-evaluated row for a pair that already has a real result (two
+      native tables folding onto one asset) is dropped — the real one wins.
+
+    A declared pair that still has no result once every filter has run (an
+    engine that predates #2160) gets a ``passed=False`` WARN result naming
+    that gap. Fail-closed: it reports no verdict rather than failing the whole
+    step, and never stamps a pass.
     """
     rocky_key_to_dagster_key = group.rocky_key_to_dagster_key
+    group_check_pairs = {
+        (cs.asset_key, cs.name) for cs in check_specs if cs.metadata.get(GROUP_CHECK_METADATA_KEY)
+    }
+    owed_pairs = sorted(
+        (
+            pair
+            for pair in declared_check_pairs
+            if pair[0] in selected_keys
+            and pair not in pre_yielded_checks
+            and pair not in group_check_pairs
+        ),
+        key=lambda pair: (pair[0].to_user_string(), pair[1]),
+    )
+    native_paths_by_key: dict[dg.AssetKey, list[tuple[str, ...]]] = defaultdict(list)
+    for native_path, dagster_key in rocky_key_to_dagster_key.items():
+        native_paths_by_key[dagster_key].append(native_path)
+    declared_checks: dict[str, list[str]] = {}
+    for asset_key, check_name in owed_pairs:
+        for native_path in native_paths_by_key.get(asset_key, ()):
+            declared_checks.setdefault("/".join(native_path), []).append(check_name)
+    yielded: set[tuple[dg.AssetKey, str]] = set()
+    not_evaluated: dict[tuple[dg.AssetKey, str], tuple[str, dg.AssetCheckResult]] = {}
 
     def asset_key_fn(path: list[str]) -> dg.AssetKey | None:
         # Exact tuple match — engine and component agree on the shape
@@ -2994,6 +3045,7 @@ def _run_filters_pipes(
             filter=f,
             asset_key_fn=asset_key_fn,
             include_keys=selected_keys,
+            declared_checks=declared_checks or None,
         )
         for result in invocation.get_results():
             # Drift is never a declared check spec (see DRIFT_CHECK_NAME) —
@@ -3008,6 +3060,20 @@ def _run_filters_pipes(
                 and result.check_name == DRIFT_CHECK_NAME
             ):
                 yield _drift_pipes_result_to_observation(result)
+                continue
+            # The engine's explicit "not evaluated" answer to a declared check
+            # (#2160). Held until every filter has run, so a real result for
+            # the same pair — from another native table folding onto this
+            # asset — wins instead of colliding with it.
+            cause = _pipes_not_evaluated_cause(result)
+            if (
+                cause is not None
+                and isinstance(result, dg.AssetCheckResult)
+                and result.asset_key is not None
+                and result.check_name is not None
+                and (result.asset_key, result.check_name) in declared_check_pairs
+            ):
+                not_evaluated.setdefault((result.asset_key, result.check_name), (cause, result))
                 continue
             # Only ``AssetCheckResult`` is constrained by the declared specs.
             # Pipes reports a check as a TOP-LEVEL result (see
@@ -3033,7 +3099,54 @@ def _run_filters_pipes(
                 if observation is not None:
                     yield observation
                 continue
+            if (
+                isinstance(result, dg.AssetCheckResult)
+                and result.asset_key is not None
+                and result.check_name is not None
+            ):
+                yielded.add((result.asset_key, result.check_name))
             yield result
+
+    for pair, (cause, result) in not_evaluated.items():
+        if pair in yielded or pair in pre_yielded_checks:
+            continue
+        yielded.add(pair)
+        if cause == "pruned_unchanged":
+            yield _pruned_check_placeholder(pair[0], pair[1], instance)
+        else:
+            yield result
+
+    for asset_key, check_name in owed_pairs:
+        if (asset_key, check_name) in yielded:
+            continue
+        status = (
+            "no verdict from rocky over Pipes: the engine sent neither a result "
+            "nor a not-evaluated row for this check (an engine that predates "
+            "declared-check reporting, or a table outside this run)"
+        )
+        yield dg.AssetCheckResult(
+            asset_key=asset_key,
+            check_name=check_name,
+            passed=False,
+            severity=dg.AssetCheckSeverity.WARN,
+            metadata={
+                "status": dg.MetadataValue.text(status),
+                "rocky/not_evaluated_cause": dg.MetadataValue.text("no_verdict"),
+            },
+        )
+
+
+def _pipes_not_evaluated_cause(result: object) -> str | None:
+    """The engine's ``rocky/not_evaluated_cause`` on a Pipes check row, if any.
+
+    Only the engine's answers to declared checks (#2160) carry it; a real
+    result, and the anomaly detector's own not-evaluated row, do not.
+    """
+    if not isinstance(result, dg.AssetCheckResult):
+        return None
+    value = (result.metadata or {}).get("rocky/not_evaluated_cause")
+    value = getattr(value, "value", value)
+    return value if isinstance(value, str) else None
 
 
 def _emit_governance_events(
@@ -4047,6 +4160,59 @@ def _latest_completed_check_verdict(
     return evaluation.passed, evaluation.severity
 
 
+def _pruned_check_placeholder(
+    asset_key: dg.AssetKey,
+    check_name: str,
+    instance: dg.DagsterInstance | None,
+) -> dg.AssetCheckResult:
+    """The verdict for a declared check on a ``prune_unchanged``-pruned table.
+
+    Carries the last completed evaluation forward (see
+    :func:`_latest_completed_check_verdict`); with none on record, passes with
+    an explicit "pruned before this check ever ran" status. Shared by the
+    streaming placeholder pass and the Pipes path, where the engine names the
+    prune as the ``pruned_unchanged`` not-evaluated cause (#2160).
+    """
+    prior = _latest_completed_check_verdict(instance, dg.AssetCheckKey(asset_key, check_name))
+    if prior is None:
+        return dg.AssetCheckResult(
+            asset_key=asset_key,
+            check_name=check_name,
+            passed=True,
+            description=(
+                "source unchanged since last copy (prune_unchanged) — "
+                "table was pruned before this check ever ran; no "
+                "recorded result to carry forward"
+            ),
+            metadata={
+                "status": dg.MetadataValue.text(
+                    "not checked: source unchanged since last copy "
+                    "(prune_unchanged) — no prior evaluation on record"
+                ),
+                "rocky/pruned_unchanged": dg.MetadataValue.bool(True),
+            },
+        )
+    prior_passed, prior_severity = prior
+    return dg.AssetCheckResult(
+        asset_key=asset_key,
+        check_name=check_name,
+        passed=prior_passed,
+        severity=prior_severity,
+        description=(
+            "source unchanged — not re-evaluated; carrying forward the last recorded result"
+        ),
+        metadata={
+            "status": dg.MetadataValue.text(
+                "not re-checked: source unchanged since last copy "
+                "(prune_unchanged) — carrying forward the last "
+                f"recorded result "
+                f"({'passed' if prior_passed else 'failed'})"
+            ),
+            "rocky/pruned_unchanged": dg.MetadataValue.bool(True),
+        },
+    )
+
+
 def _emit_placeholder_checks(
     *,
     check_specs: list[dg.AssetCheckSpec],
@@ -4164,48 +4330,7 @@ def _emit_placeholder_checks(
             continue
 
         if cs.asset_key in pruned_keys:
-            prior = _latest_completed_check_verdict(
-                instance, dg.AssetCheckKey(cs.asset_key, cs.name)
-            )
-            if prior is None:
-                yield dg.AssetCheckResult(
-                    asset_key=cs.asset_key,
-                    check_name=cs.name,
-                    passed=True,
-                    description=(
-                        "source unchanged since last copy (prune_unchanged) — "
-                        "table was pruned before this check ever ran; no "
-                        "recorded result to carry forward"
-                    ),
-                    metadata={
-                        "status": dg.MetadataValue.text(
-                            "not checked: source unchanged since last copy "
-                            "(prune_unchanged) — no prior evaluation on record"
-                        ),
-                        "rocky/pruned_unchanged": dg.MetadataValue.bool(True),
-                    },
-                )
-            else:
-                prior_passed, prior_severity = prior
-                yield dg.AssetCheckResult(
-                    asset_key=cs.asset_key,
-                    check_name=cs.name,
-                    passed=prior_passed,
-                    severity=prior_severity,
-                    description=(
-                        "source unchanged — not re-evaluated; carrying forward "
-                        "the last recorded result"
-                    ),
-                    metadata={
-                        "status": dg.MetadataValue.text(
-                            "not re-checked: source unchanged since last copy "
-                            "(prune_unchanged) — carrying forward the last "
-                            f"recorded result "
-                            f"({'passed' if prior_passed else 'failed'})"
-                        ),
-                        "rocky/pruned_unchanged": dg.MetadataValue.bool(True),
-                    },
-                )
+            yield _pruned_check_placeholder(cs.asset_key, cs.name, instance)
             continue
 
         materialized = cs.asset_key in materialized_keys
