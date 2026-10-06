@@ -395,15 +395,36 @@ pub fn compute_audit_for(
     let plan_on_disk = is_hex64 && plan_file_path(root, selector).exists();
     let run_match = runs.iter().any(|r| r.run_id == selector);
     let plan_in_ledger = decisions.iter().any(|d| d.plan_id == selector);
+    // A `product:<name>` subject (#2003) resolves through its spec's output
+    // model — the join `rocky audit --product <name>` scopes the ledger by.
+    // Decision rows carry no product id: the product loop files its rows
+    // under `draft:<model>` plan ids, so `product:<name>` used to fall through
+    // to the Model join and answer an empty, unresolved chain for a product
+    // with decisions on record. A spec that does not load is refused, the
+    // same rejection `--product` gives, rather than reported as a model
+    // nobody decided on.
+    let product_scope = match selector.strip_prefix("product:") {
+        Some(name) if !plan_on_disk && !run_match && !plan_in_ledger => {
+            Some(resolve_product_scope(root, name).map_err(|reject| anyhow::anyhow!("{reject}"))?)
+        }
+        _ => None,
+    };
     let kind = if plan_on_disk {
         AuditSubjectKind::Plan
     } else if run_match {
         AuditSubjectKind::Run
     } else if plan_in_ledger {
         AuditSubjectKind::Plan
+    } else if product_scope.is_some() {
+        AuditSubjectKind::Product
     } else {
         AuditSubjectKind::Model
     };
+    // The name the model-keyed links join on: the product's output model for
+    // a product subject, the selector itself otherwise.
+    let join_key: &str = product_scope
+        .as_ref()
+        .map_or(selector, |scope| scope.output_model.as_str());
 
     // The set of models the subject touches — drives the runs join and the
     // blast-radius computation.
@@ -412,15 +433,15 @@ pub fn compute_audit_for(
         _ => None,
     };
 
-    let decisions_link = build_decisions_link(kind, selector, &decisions);
+    let decisions_link = build_decisions_link(kind, join_key, &decisions);
     let plan_link = build_plan_link(kind, selector, &decisions_link, root);
-    let runs_link = build_runs_link(kind, selector, subject_run, &runs);
+    let runs_link = build_runs_link(kind, join_key, subject_run, &runs);
     let verify_link = build_verify_link(kind, selector, &plan_link, &decisions);
 
     // Subject models for the blast radius: the model itself, the run's executed
     // models, or the plan's changed models.
     let subject_models: Vec<String> = match kind {
-        AuditSubjectKind::Model => vec![selector.to_string()],
+        AuditSubjectKind::Model | AuditSubjectKind::Product => vec![join_key.to_string()],
         AuditSubjectKind::Run => subject_run
             .map(|r| {
                 let mut m: Vec<String> = r
@@ -438,7 +459,8 @@ pub fn compute_audit_for(
     let blast_link = build_blast_radius_link(config_path, state_path, models_dir, &subject_models);
 
     let resolved = match kind {
-        AuditSubjectKind::Plan | AuditSubjectKind::Run => true,
+        // A product subject is chosen only when its spec loaded.
+        AuditSubjectKind::Plan | AuditSubjectKind::Run | AuditSubjectKind::Product => true,
         AuditSubjectKind::Model => {
             !decisions_link.entries.is_empty()
                 || !runs_link.runs.is_empty()
@@ -497,13 +519,16 @@ fn build_decisions_link(
         .iter()
         .filter(|d| match kind {
             AuditSubjectKind::Plan => d.plan_id == selector,
+            // A product subject arrives here as its output model (#2003).
             // `graph_keys` yields the recorded model set AND `model`, so a
             // backfill / gc / restore escalation is now findable by the models
             // it actually touches — it never was, because its `model` holds a
             // summary no user would type (#1766). Purely additive: the summary
             // still matches too, which the audit screen depends on
             // (`AuditScreen.tsx` renders `subject={entry.model}`).
-            _ => d.graph_keys().any(|m| m == selector),
+            AuditSubjectKind::Model | AuditSubjectKind::Product | AuditSubjectKind::Run => {
+                d.graph_keys().any(|m| m == selector)
+            }
         })
         .collect();
     // Newest first.
@@ -541,7 +566,9 @@ fn build_plan_link(
     let plan_id: Option<String> = match kind {
         AuditSubjectKind::Plan => Some(selector.to_string()),
         // The newest decision on the model names the plan that governed it.
-        AuditSubjectKind::Model => decisions_link.entries.first().map(|e| e.plan_id.clone()),
+        AuditSubjectKind::Model | AuditSubjectKind::Product => {
+            decisions_link.entries.first().map(|e| e.plan_id.clone())
+        }
         AuditSubjectKind::Run => None,
     };
 
@@ -634,7 +661,7 @@ fn build_runs_link(
 ) -> AuditChainRuns {
     let matched: Vec<&RunRecord> = match kind {
         AuditSubjectKind::Run => subject_run.into_iter().collect(),
-        AuditSubjectKind::Model => {
+        AuditSubjectKind::Model | AuditSubjectKind::Product => {
             let mut m: Vec<&RunRecord> = runs
                 .iter()
                 .filter(|r| r.models_executed.iter().any(|e| e.model_name == selector))
@@ -707,7 +734,7 @@ fn build_verify_link(
     // Which plan id's custody rows count as this subject's verification?
     let subject_plan_id: Option<String> = match kind {
         AuditSubjectKind::Plan => Some(selector.to_string()),
-        AuditSubjectKind::Model => plan_link.plan_id.clone(),
+        AuditSubjectKind::Model | AuditSubjectKind::Product => plan_link.plan_id.clone(),
         AuditSubjectKind::Run => Some(format!("autoapply-verify:{selector}")),
     };
 
@@ -2121,6 +2148,80 @@ mod tests {
         assert!(out.resolved, "a ledger-only plan id must resolve: {out:?}");
         assert_eq!(out.decisions.total, 1);
         assert_eq!(out.decisions.entries[0].plan_id, "freeze:global");
+    }
+
+    /// #2003: `product:<name>` resolves through the spec's output model — the
+    /// join `--product` uses — instead of falling through to an empty,
+    /// unresolved model chain. The product loop files its rows under
+    /// `draft:<model>` plan ids; none of them names the product.
+    #[test]
+    fn audit_for_resolves_a_product_subject_through_its_output_model() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        let models_dir = root.join("models");
+        fs::create_dir_all(&models_dir).unwrap();
+        let state_path = root.join("state.redb");
+        {
+            let store = rocky_core::state::StateStore::open(&state_path).unwrap();
+            for (seq, model) in [(1, "revenue_daily"), (2, "revenue_daily"), (3, "other")] {
+                store
+                    .record_policy_decision(&decision(
+                        seq,
+                        &format!("draft:{model}"),
+                        model,
+                        PolicyEffect::Allow,
+                    ))
+                    .unwrap();
+            }
+        }
+        fs::create_dir_all(root.join("products")).unwrap();
+        fs::write(
+            root.join("products/daily_revenue.toml"),
+            SPEC_FIXTURE.replace("name   = \"revenue_daily\"", "name   = \"daily_revenue\""),
+        )
+        .unwrap();
+
+        let out = compute_audit_for(
+            root,
+            &root.join("rocky.toml"),
+            &state_path,
+            &models_dir,
+            "product:daily_revenue",
+        )
+        .unwrap();
+
+        assert_eq!(out.subject_kind, AuditSubjectKind::Product);
+        assert!(out.resolved, "a product with a spec must resolve: {out:?}");
+        assert_eq!(out.subject, "product:daily_revenue");
+        assert_eq!(out.decisions.total, 2, "{:?}", out.decisions);
+        assert!(
+            out.decisions
+                .entries
+                .iter()
+                .all(|e| e.plan_id == "draft:revenue_daily")
+        );
+        assert_eq!(out.plan.plan_id.as_deref(), Some("draft:revenue_daily"));
+    }
+
+    /// #2003: a `product:` subject whose spec does not load is refused with the
+    /// loader's rejection — the same answer `--product` gives — not reported as
+    /// a model nobody decided on.
+    #[test]
+    fn audit_for_refuses_a_product_subject_with_no_spec() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        let err = compute_audit_for(
+            root,
+            &root.join("rocky.toml"),
+            &root.join("state.redb"),
+            &root.join("models"),
+            "product:nope",
+        )
+        .expect_err("a product with no spec must not resolve as a model");
+        assert!(
+            format!("{err:#}").contains("[spec-file-missing]"),
+            "unexpected error: {err:#}"
+        );
     }
 
     #[test]

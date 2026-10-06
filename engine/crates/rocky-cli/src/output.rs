@@ -9311,6 +9311,12 @@ pub enum AuditSubjectKind {
     /// ids like `freeze:…` / `draft:…` / `autoapply:…`, which never had a
     /// plan file).
     Plan,
+    /// A `product:<name>` subject whose `products/<name>.toml` spec loads
+    /// (#2003). Resolved through the spec's one output model, the same join
+    /// `rocky audit --product <name>` scopes the ledger by: the decisions whose
+    /// graph keys name that model, the runs that executed it, its blast
+    /// radius.
+    Product,
 }
 
 /// JSON output for `rocky audit --for <table|run|plan>` — the custody chain.
