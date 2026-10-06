@@ -1,32 +1,50 @@
 //! Automatic dependency resolution from SQL table references.
 //!
 //! Extracts table references from model SQL and classifies them as:
-//! - **Model refs** — bare names matching another model in the project
+//! - **Model refs** — bare names bound to a model of the project
 //! - **Source refs** — two-part qualified names (`schema.table`)
 //! - **Raw refs** — three-part fully qualified names (`catalog.schema.table`)
 //!
-//! Model refs become DAG edges. Source and raw refs are external dependencies.
+//! Model refs become DAG edges. Source and raw refs are external dependencies;
+//! the run-time physical derivation (`rocky_core::physical_edges`) orders the
+//! qualified ones that name a model's target.
 //!
-//! A bare name matches by MODEL NAME, and that is only sometimes the same
-//! question as "does this read return that model's output" (#1354). Nothing
-//! rewrites a bare reference on the default path (`--defer` and shadow routing
-//! are the only rewrites), so on a warehouse run `FROM customers` resolves
-//! through connection state to a PHYSICAL table called `customers` — which is
-//! not the output of a model that writes `prod.customers_v2`. On the local
-//! path it is: `rocky_engine::executor::execute_locally` (`rocky test`,
-//! `rocky ci`) materializes every model as `CREATE OR REPLACE TABLE
-//! <model name>`, ignoring the configured target, so there the bare read does
-//! reach the model.
+//! # How a bare read binds (#1354)
 //!
-//! The edge is therefore kept — dropping it breaks the local path and can
-//! reorder `semantic.rs`, changing `SELECT *` expansion — and the ambiguity is
-//! reported instead, as D012. `rocky_core::physical_edges::bare_name_binds` is
-//! the shared spelling of "does a bare read of this name reach this model's
-//! target", used here and by the content-reuse read resolver.
+//! A bare `FROM x` carries no catalog and no schema, so the warehouse resolves
+//! it through the connection's search path to a PHYSICAL table called `x`.
+//! Local execution (`rocky test`, `rocky ci`) materializes every model at its
+//! configured `[target]` and binds a bare read the same way, so both paths
+//! encode one semantics, and the compiler binds a bare read by the table a
+//! model WRITES, not by the model's name:
+//!
+//! 1. An ephemeral model is read by its NAME: it writes nothing, and the
+//!    inliner rewrites a bare read of its name into a CTE.
+//! 2. A model reading a table with its own target's name reads itself or a
+//!    same-named table elsewhere: the read is external.
+//! 3. Otherwise the candidates are the other models whose target table is `x`
+//!    (compared folded, [`rocky_core::physical_edges::fold_identifier`]).
+//!    - none: the read is external;
+//!    - one: the read binds to it;
+//!    - several: the read binds to the one that is also NAMED `x`, else to the
+//!      one the reader lists in `depends_on`; if neither picks exactly one,
+//!      the read is ambiguous and refused as `E056`. Rocky cannot see the
+//!      search path that would choose, so it does not guess.
+//!
+//! A binding by table alone — the model is not named `x`, and the reader did
+//! not declare it — is the weakest evidence. If it would close a dependency
+//! cycle it is dropped, the read is treated as external, and `D013` says so:
+//! a guess about the search path must not refuse a project or reverse an edge
+//! stronger evidence set.
+//!
+//! A bare read of a model's NAME that does not bind to that model — its target
+//! table is spelled differently — is reported as `D012`: the read is external,
+//! or binds to whichever model writes a table of that name.
 
 use std::collections::{HashMap, HashSet};
 
 use rocky_core::models::Model;
+use rocky_core::physical_edges::fold_identifier;
 use rocky_ir::dag::DagNode;
 use rocky_sql::lineage;
 use thiserror::Error;
@@ -89,10 +107,9 @@ pub enum ResolveError {
 /// - Three-part `catalog.schema.table` → `RawRef`
 /// - Bare name NOT matching a model → `RawRef` (unknown external table)
 ///
-/// The bare-name match is by model NAME, not by the model's target table. On a
-/// warehouse run that can name a different object than the model writes —
-/// [`resolve_dependencies`] reports it as D012 rather than dropping the edge.
-/// See the module docs and #1354 for why the edge is kept.
+/// This is a classification by NAME. Dependency derivation does not use it
+/// for bare reads: [`resolve_dependencies`] binds a bare read by the table a
+/// model writes (#1354; see the module docs).
 pub fn classify_table_ref(name: &str, model_names: &HashSet<String>) -> TableRefKind {
     let parts: Vec<&str> = name.split('.').collect();
     match parts.len() {
@@ -118,8 +135,8 @@ pub fn classify_table_ref(name: &str, model_names: &HashSet<String>) -> TableRef
 
 /// Resolve dependencies for all models by parsing their SQL.
 ///
-/// Returns `DagNode` entries with `depends_on` auto-populated from SQL table refs
-/// that match other model names, along with a cache of `LineageResult` per model
+/// Returns `DagNode` entries with `depends_on` auto-populated from the bare
+/// SQL table refs that bind to other models (see the module docs), along with a cache of `LineageResult` per model
 /// (keyed by model name) so downstream phases can reuse the parsed lineage
 /// without re-parsing SQL.
 ///
@@ -144,27 +161,8 @@ pub fn resolve_dependencies_with_externals(
     externals: &std::collections::BTreeSet<String>,
 ) -> Result<ResolveOutput, ResolveError> {
     let model_names: HashSet<String> = models.iter().map(|m| m.config.name.clone()).collect();
-    // Models a bare read of their own NAME does not reach on a warehouse run:
-    // the target table is spelled differently, so the search path resolves the
-    // name to some other physical object (#1354). Mapped to the target they do
-    // write, for the D012 message. `bare_name_binds` is the shared spelling of
-    // that question — the content-reuse read resolver asks it too.
-    let renamed_targets: HashMap<&str, String> = models
-        .iter()
-        .filter(|m| {
-            !rocky_core::physical_edges::bare_name_binds(&m.config.name, &m.config.target.table)
-        })
-        .map(|m| {
-            let t = &m.config.target;
-            let spelled = if t.catalog.is_empty() {
-                format!("{}.{}", t.schema, t.table)
-            } else {
-                format!("{}.{}.{}", t.catalog, t.schema, t.table)
-            };
-            (m.config.name.as_str(), spelled)
-        })
-        .collect();
-    let mut dag_nodes = Vec::with_capacity(models.len());
+    let index = BareReadIndex::new(models);
+    let mut per_model = Vec::with_capacity(models.len());
     let mut lineage_cache = HashMap::with_capacity(models.len());
     let mut diagnostics = Vec::new();
 
@@ -193,44 +191,10 @@ pub fn resolve_dependencies_with_externals(
             continue;
         }
 
-        let (auto_deps, renamed_target_reads) = extract_deps_from_lineage(
-            &lineage_result,
-            &model.config.name,
-            &model_names,
-            &renamed_targets,
-        );
+        let (auto_deps, notes) = extract_deps_from_lineage(&lineage_result, model, &index);
 
-        // D012: this edge exists because the names match, and on a warehouse
-        // run it may name a different object than the model writes. The edge is
-        // KEPT — `rocky_engine::executor::execute_locally` (`rocky test`,
-        // `rocky ci`) materializes each model under its own NAME, so there the
-        // read really does reach it, and dropping the edge would break that
-        // path and reorder `semantic.rs` (changing `SELECT *` expansion).
-        // Reporting is what this layer can honestly do; #1354 holds the
-        // decision about which execution semantics the graph should encode.
-        for bare in &renamed_target_reads {
-            let target = &renamed_targets[bare.as_str()];
-            diagnostics.push(
-                Diagnostic::warning(
-                    "D012",
-                    &model.config.name,
-                    format!(
-                        "bare read of '{bare}' matches model '{bare}' by name, so Rocky \
-                         derives a dependency on it — but that model's configured target is \
-                         '{target}'. A bare name carries no schema, so on a warehouse run it \
-                         resolves through the connection's search path to a physical table \
-                         called '{bare}', not to '{target}', and the edge may be false. It \
-                         holds where the bare name IS the object: `rocky test` and `rocky ci` \
-                         materialize each model under its own name, and `--defer` rewrites a \
-                         selected model's read of an unbuilt upstream to that upstream's defer \
-                         target."
-                    ),
-                )
-                .with_suggestion(format!(
-                    "Give model '{bare}' a target table called '{bare}' so the name and \
-                     the object agree, or reference the object you mean explicitly in the SQL"
-                )),
-            );
+        for note in notes {
+            diagnostics.push(note.into_diagnostic(&model.config.name, &index));
         }
 
         // D011: warn when explicit depends_on is non-empty but misses auto-derived deps
@@ -243,6 +207,7 @@ pub fn resolve_dependencies_with_externals(
                 .collect();
             let missing: Vec<&String> = auto_deps
                 .iter()
+                .map(|d| &d.producer)
                 .filter(|d| !explicit.contains(d.as_str()))
                 .collect();
             if !missing.is_empty() {
@@ -272,28 +237,16 @@ pub fn resolve_dependencies_with_externals(
             }
         }
 
-        // Merge: explicit depends_on + auto-resolved, deduplicated via HashSet.
+        lineage_cache.insert(model.config.name.clone(), lineage_result);
         // An explicit entry satisfied outside the project is not a model edge.
-        let mut all_deps: Vec<String> = model
+        let declared: Vec<String> = model
             .config
             .depends_on
             .iter()
             .filter(|d| model_names.contains(*d) || !externals.contains(*d))
             .cloned()
             .collect();
-        let mut seen: HashSet<String> = all_deps.iter().cloned().collect();
-        for dep in auto_deps {
-            if seen.insert(dep.clone()) {
-                all_deps.push(dep);
-            }
-        }
-
-        lineage_cache.insert(model.config.name.clone(), lineage_result);
-
-        dag_nodes.push(DagNode {
-            name: model.config.name.clone(),
-            depends_on: all_deps,
-        });
+        per_model.push((model.config.name.clone(), declared, auto_deps));
     }
 
     if !parse_failures.is_empty() {
@@ -305,74 +258,434 @@ pub fn resolve_dependencies_with_externals(
         });
     }
 
+    let (dag_nodes, dropped) = settle_dependencies(&per_model);
+    for (consumer, producer) in dropped {
+        diagnostics.push(dropped_binding_diagnostic(&consumer, &producer));
+    }
+
     Ok((dag_nodes, lineage_cache, diagnostics))
+}
+
+/// The model edges the compiler derives from SQL, as `(consumer, producer)`
+/// model names, over `models` — which may span several pipelines.
+///
+/// The same binding [`resolve_dependencies`] derives a model's dependencies
+/// with, for a caller that schedules its own graph: `rocky run --dag` passes
+/// these to `rocky_core::unified_dag::build_runtime_dag_with_model_edges`
+/// instead of matching reads against node labels a second time (#1629).
+/// Declared `depends_on` entries are not included; the graph adds those
+/// itself. A model whose SQL does not parse derives no edges here — its own
+/// compile refuses it. A model name that appears twice is indexed once.
+#[must_use]
+pub fn derived_model_edges(models: &[Model]) -> Vec<(String, String)> {
+    let mut seen_names = HashSet::new();
+    let unique: Vec<Model> = models
+        .iter()
+        .filter(|m| seen_names.insert(m.config.name.clone()))
+        .cloned()
+        .collect();
+    let index = BareReadIndex::new(&unique);
+    let mut per_model = Vec::with_capacity(unique.len());
+    let mut auto: HashSet<(String, String)> = HashSet::new();
+    for model in &unique {
+        let deps = match lineage::extract_lineage(&model.sql) {
+            Ok(lineage_result) => extract_deps_from_lineage(&lineage_result, model, &index).0,
+            Err(_) => Vec::new(),
+        };
+        for d in &deps {
+            auto.insert((model.config.name.clone(), d.producer.clone()));
+        }
+        per_model.push((
+            model.config.name.clone(),
+            model.config.depends_on.clone(),
+            deps,
+        ));
+    }
+    // Settled exactly as `resolve_dependencies` settles them, so a binding it
+    // drops as a cycle-closer is dropped here too. Declared entries are left
+    // to the graph.
+    let (nodes, _dropped) = settle_dependencies(&per_model);
+    nodes
+        .into_iter()
+        .flat_map(|n| {
+            let name = n.name;
+            n.depends_on
+                .into_iter()
+                .map(move |d| (name.clone(), d))
+                .collect::<Vec<_>>()
+        })
+        .filter(|edge| auto.contains(edge))
+        .collect()
+}
+
+/// Every model a bare read could bind to, indexed for [`BareReadIndex::bind`]
+/// (#1354).
+///
+/// Public so local execution (`rocky_engine::executor`) binds a bare read
+/// with the same rule the compile graph was derived with: one spelling, so the
+/// two cannot disagree about which model a read reaches.
+pub struct BareReadIndex<'a> {
+    /// Ephemeral models, by exact name. A bare read of the name is inlined.
+    ephemeral: HashSet<&'a str>,
+    /// Models that write a table, by folded target table.
+    by_table: HashMap<String, Vec<&'a Model>>,
+    /// Models that write a table, by exact name. Used only to report `D012`.
+    by_name: HashMap<&'a str, &'a Model>,
+}
+
+impl<'a> BareReadIndex<'a> {
+    /// Index `models` (the whole project).
+    #[must_use]
+    pub fn new(models: &'a [Model]) -> Self {
+        let mut index = BareReadIndex {
+            ephemeral: HashSet::new(),
+            by_table: HashMap::new(),
+            by_name: HashMap::new(),
+        };
+        for m in models {
+            if matches!(
+                m.config.strategy,
+                rocky_core::models::StrategyConfig::Ephemeral
+            ) {
+                index.ephemeral.insert(m.config.name.as_str());
+            } else {
+                index
+                    .by_table
+                    .entry(fold_identifier(&m.config.target.table))
+                    .or_default()
+                    .push(m);
+                index.by_name.insert(m.config.name.as_str(), m);
+            }
+        }
+        index
+    }
+
+    /// What a bare read spelled `read` in `reader` binds to. See the module
+    /// docs for the rule.
+    #[must_use]
+    pub fn bind(&self, read: &str, reader: &Model) -> BareBinding {
+        bind_bare_read(read, reader, self)
+    }
+}
+
+/// What a bare read binds to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BareBinding {
+    /// The read is this model's output.
+    Model(String),
+    /// No model writes a table of that name: the read is external.
+    External,
+    /// Several models write a table of that name and nothing picks one.
+    Ambiguous(Vec<String>),
+}
+
+/// Bind a bare read spelled `read` in `reader` (#1354; rules in the module
+/// docs). The reader never binds to itself: a model reading a table that has
+/// its own target's name reads another schema's table.
+fn bind_bare_read(read: &str, reader: &Model, index: &BareReadIndex<'_>) -> BareBinding {
+    if index.ephemeral.contains(read) && read != reader.config.name {
+        return BareBinding::Model(read.to_string());
+    }
+    let folded = fold_identifier(read);
+    // A model reading a table with its OWN target's name reads itself (an
+    // incremental self-read) or a same-named table in another schema the
+    // search path decides. Neither is evidence for a sibling that happens to
+    // write that name, so the read is external.
+    if fold_identifier(&reader.config.target.table) == folded {
+        return BareBinding::External;
+    }
+    let candidates: Vec<&Model> = index
+        .by_table
+        .get(&folded)
+        .map(|ms| {
+            ms.iter()
+                .copied()
+                .filter(|m| m.config.name != reader.config.name)
+                .collect()
+        })
+        .unwrap_or_default();
+    match candidates.as_slice() {
+        [] => BareBinding::External,
+        [only] => BareBinding::Model(only.config.name.clone()),
+        several => {
+            let named: Vec<&&Model> = several
+                .iter()
+                .filter(|m| fold_identifier(&m.config.name) == folded)
+                .collect();
+            if let [one] = named.as_slice() {
+                return BareBinding::Model(one.config.name.clone());
+            }
+            let declared: Vec<&&Model> = several
+                .iter()
+                .filter(|m| reader.config.depends_on.contains(&m.config.name))
+                .collect();
+            if let [one] = declared.as_slice() {
+                return BareBinding::Model(one.config.name.clone());
+            }
+            let mut names: Vec<String> = several.iter().map(|m| m.config.name.clone()).collect();
+            names.sort();
+            BareBinding::Ambiguous(names)
+        }
+    }
+}
+
+/// A finding about one bare read, reported once per reader and read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BareReadNote {
+    /// `D012`: the read matches model `named` by name, but binds elsewhere.
+    NameDoesNotBind {
+        named: String,
+        bound: Option<String>,
+    },
+    /// `E056`: several models write the table and nothing picks one.
+    Ambiguous {
+        read: String,
+        candidates: Vec<String>,
+    },
+}
+
+impl BareReadNote {
+    fn into_diagnostic(self, reader: &str, index: &BareReadIndex<'_>) -> Diagnostic {
+        let spell = |name: &str| {
+            index.by_name.get(name).map_or_else(
+                || name.to_string(),
+                |m| {
+                    let t = &m.config.target;
+                    if t.catalog.is_empty() {
+                        format!("{}.{}", t.schema, t.table)
+                    } else {
+                        format!("{}.{}.{}", t.catalog, t.schema, t.table)
+                    }
+                },
+            )
+        };
+        match self {
+            BareReadNote::NameDoesNotBind { named, bound } => {
+                let target = spell(&named);
+                let outcome = match &bound {
+                    None => format!(
+                        "No model writes a table called '{named}', so Rocky treats the read as \
+                         an external table and derives no dependency on model '{named}'"
+                    ),
+                    Some(other) => format!(
+                        "Model '{other}' writes '{}', so the read binds to '{other}' and \
+                         derives no dependency on model '{named}'",
+                        spell(other)
+                    ),
+                };
+                Diagnostic::warning(
+                    "D012",
+                    reader,
+                    format!(
+                        "bare read of '{named}' matches model '{named}' by name, but that \
+                         model writes '{target}'. A bare name carries no schema, so the \
+                         warehouse resolves it through the search path to a table called \
+                         '{named}', and `rocky test` / `rocky ci` bind it the same way. \
+                         {outcome}."
+                    ),
+                )
+                .with_suggestion(format!(
+                    "Read '{target}' explicitly if you mean model '{named}'s output, or give \
+                     model '{named}' a target table called '{named}'"
+                ))
+            }
+            BareReadNote::Ambiguous { read, candidates } => {
+                let listed = candidates
+                    .iter()
+                    .map(|c| format!("'{c}' ({})", spell(c)))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                Diagnostic::error(
+                    crate::diagnostic::E056,
+                    reader,
+                    format!(
+                        "bare read of '{read}' is ambiguous: models {listed} all write a \
+                         table called '{read}'. A bare name carries no schema, and Rocky \
+                         cannot see the search path that would choose, so it binds none of \
+                         them rather than guess"
+                    ),
+                )
+                .with_suggestion(format!(
+                    "Qualify the read with its schema (for example '{}'), or list the \
+                     intended model in depends_on",
+                    candidates
+                        .first()
+                        .map_or_else(|| read.clone(), |c| spell(c))
+                ))
+            }
+        }
+    }
 }
 
 /// Extract model dependencies from a pre-computed `LineageResult`.
 ///
-/// Returns two lists, both deduplicated and in SQL order:
-/// 1. the names of referenced models (bare names that match known model
-///    names), excluding self-references — the DAG edges;
-/// 2. the subset of those whose model writes a differently-named target, so
-///    the edge rests on a name match a warehouse run does not honour (#1354).
-///    Only a `ModelRef` can appear here, so a dotted name never can. This
-///    compares TABLE COMPONENTS only: a model named `customers` targeting
-///    `prod.customers` does not qualify even though a bare read resolves
-///    through the session's current schema, which may not be `prod`. Rocky
-///    cannot observe that schema, so the check is "is the name even the right
-///    table", not "is the binding sound".
-///    Self-references are excluded from both: a model reading its own name
-///    gets no edge, so there is nothing to qualify.
+/// Returns the names of the models the reader depends on, deduplicated and in
+/// SQL order, excluding self-references, plus a note for each bare read that
+/// binds somewhere a reader might not expect (`D012`) or nowhere because it
+/// is ambiguous (`E056`). Only a single-part read can bind to a model; a
+/// qualified read is external here (#1354; see the module docs).
 fn extract_deps_from_lineage(
     lineage_result: &lineage::LineageResult,
-    model_name: &str,
-    model_names: &HashSet<String>,
-    renamed_targets: &HashMap<&str, String>,
-) -> (Vec<String>, Vec<String>) {
+    reader: &Model,
+    index: &BareReadIndex<'_>,
+) -> (Vec<Dep>, Vec<BareReadNote>) {
     let mut deps = Vec::new();
     let mut seen = HashSet::new();
-    let mut renamed_target_reads = Vec::new();
+    let mut notes = Vec::new();
+    let mut noted = HashSet::new();
 
-    for table_ref in &lineage_result.source_tables {
+    // Reads that live inside a derived table or a `WITH` body (#1867) are
+    // dependencies too, and derive edges exactly like a top-level read. They
+    // are already lower-cased and stripped of `WITH`-bound names by
+    // `extract_lineage`, so the CTE-shadowing rule (#1892) holds for them.
+    let top_level = lineage_result.source_tables.iter().filter_map(|table_ref| {
         // A CTE is local to the query and names no object outside it, so a CTE
         // that happens to share a model's name must not derive an edge to it
         // — and two models with mutual local CTE names must not close a cycle
         // that does not exist (#1892).
         match table_ref.binding {
-            lineage::TableBinding::Cte => continue,
-            lineage::TableBinding::Physical => {}
+            lineage::TableBinding::Cte => None,
+            lineage::TableBinding::Physical => Some(&table_ref.name),
         }
-        if let TableRefKind::ModelRef(name) = classify_table_ref(&table_ref.name, model_names) {
-            // Don't add self-references
-            if name != model_name && seen.insert(name.clone()) {
-                if renamed_targets.contains_key(name.as_str()) {
-                    renamed_target_reads.push(name.clone());
+    });
+    for name in top_level.chain(lineage_result.nested_sources.iter()) {
+        if name.contains('.') {
+            continue;
+        }
+        let binding = bind_bare_read(name, reader, index);
+        let bound = match &binding {
+            BareBinding::Model(m) => Some(m.clone()),
+            BareBinding::External => None,
+            BareBinding::Ambiguous(candidates) => {
+                if noted.insert(name.clone()) {
+                    notes.push(BareReadNote::Ambiguous {
+                        read: name.clone(),
+                        candidates: candidates.clone(),
+                    });
                 }
-                deps.push(name);
+                None
             }
-        }
-    }
-
-    // Reads that live inside a derived table or a `WITH` body (#1867). They
-    // are dependencies, not relations the outer query selects from, so they
-    // arrive on their own field rather than in `source_tables` — but they
-    // derive edges exactly like a top-level read.
-    //
-    // Already lower-cased and already stripped of `WITH`-bound names by
-    // `extract_lineage`, so the CTE-shadowing rule (#1892) holds here too.
-    for name in &lineage_result.nested_sources {
-        if let TableRefKind::ModelRef(name) = classify_table_ref(name, model_names)
-            && name != model_name
-            && seen.insert(name.clone())
+        };
+        // D012: the read is a model's NAME, the model is not the binding.
+        if let Some(named) = index.by_name.get(name.as_str())
+            && named.config.name != reader.config.name
+            && bound.as_deref() != Some(name.as_str())
+            && !matches!(binding, BareBinding::Ambiguous(_))
+            && noted.insert(name.clone())
         {
-            if renamed_targets.contains_key(name.as_str()) {
-                renamed_target_reads.push(name.clone());
-            }
-            deps.push(name);
+            notes.push(BareReadNote::NameDoesNotBind {
+                named: name.clone(),
+                bound: bound.clone(),
+            });
+        }
+        if let Some(dep) = bound
+            && dep != reader.config.name
+            && seen.insert(dep.clone())
+        {
+            // Bound by the table alone: the model is not named after the read,
+            // the reader did not declare it, and it is not an inlined
+            // ephemeral. Weaker evidence than a name that agrees.
+            let table_only = fold_identifier(&dep) != fold_identifier(name)
+                && !reader.config.depends_on.contains(&dep)
+                && !index.ephemeral.contains(dep.as_str());
+            deps.push(Dep {
+                producer: dep,
+                table_only,
+            });
         }
     }
 
-    (deps, renamed_target_reads)
+    (deps, notes)
+}
+
+/// One auto-derived dependency of a reader.
+#[derive(Debug, Clone)]
+struct Dep {
+    producer: String,
+    /// Bound by target table alone (see [`extract_deps_from_lineage`]).
+    table_only: bool,
+}
+
+/// Settle every model's dependencies (#1354).
+///
+/// `per_model` is `(model, declared depends_on, auto-derived deps)`. Declared
+/// entries and auto deps whose name agrees go in first. A table-only binding
+/// then joins only if it closes no cycle: a bare name has no schema, so a
+/// binding by table alone is a guess about the search path, and a guess must
+/// not turn a project that compiled into a refused cycle or reverse an edge
+/// stronger evidence set. A dropped binding is returned as
+/// `(consumer, producer)` so the caller can report it (D013).
+fn settle_dependencies(
+    per_model: &[(String, Vec<String>, Vec<Dep>)],
+) -> (Vec<DagNode>, Vec<(String, String)>) {
+    let mut deps: Vec<(String, Vec<String>)> = per_model
+        .iter()
+        .map(|(name, declared, auto)| {
+            let mut all = declared.clone();
+            for d in auto.iter().filter(|d| !d.table_only) {
+                if !all.contains(&d.producer) {
+                    all.push(d.producer.clone());
+                }
+            }
+            (name.clone(), all)
+        })
+        .collect();
+    let mut dropped = Vec::new();
+    for (index, (consumer, _, auto)) in per_model.iter().enumerate() {
+        for d in auto.iter().filter(|d| d.table_only) {
+            if deps[index].1.contains(&d.producer) {
+                continue;
+            }
+            if depends_transitively(&deps, &d.producer, consumer) {
+                dropped.push((consumer.clone(), d.producer.clone()));
+            } else {
+                deps[index].1.push(d.producer.clone());
+            }
+        }
+    }
+    let nodes = deps
+        .into_iter()
+        .map(|(name, depends_on)| DagNode { name, depends_on })
+        .collect();
+    (nodes, dropped)
+}
+
+/// Whether `from` depends, directly or not, on `target` in `deps`.
+fn depends_transitively(deps: &[(String, Vec<String>)], from: &str, target: &str) -> bool {
+    let by_name: HashMap<&str, &Vec<String>> = deps.iter().map(|(n, d)| (n.as_str(), d)).collect();
+    let mut stack = vec![from];
+    let mut seen = HashSet::new();
+    while let Some(current) = stack.pop() {
+        if current == target {
+            return true;
+        }
+        if !seen.insert(current) {
+            continue;
+        }
+        if let Some(next) = by_name.get(current) {
+            stack.extend(next.iter().map(String::as_str));
+        }
+    }
+    false
+}
+
+/// The D013 warning for a table-only binding dropped because it closed a
+/// cycle.
+fn dropped_binding_diagnostic(consumer: &str, producer: &str) -> Diagnostic {
+    Diagnostic::warning(
+        "D013",
+        consumer,
+        format!(
+            "a bare read in '{consumer}' names the table model '{producer}' writes, but '{producer}' \
+             already depends on '{consumer}', so the binding would close a cycle. A bare name has \
+             no schema, so Rocky treats this read as an external table and derives no dependency \
+             on '{producer}'"
+        ),
+    )
+    .with_suggestion(format!(
+        "Qualify the read with its schema, or list '{producer}' in depends_on if '{consumer}' \
+         really reads it"
+    ))
 }
 
 #[cfg(test)]
@@ -641,17 +954,13 @@ mod tests {
         m
     }
 
-    /// #1354: a bare read that matches a model by NAME while that model writes
-    /// a differently-named table. The edge is KEPT and the ambiguity reported.
-    ///
-    /// Keeping it is not indecision. `rocky_engine::executor::execute_locally`
-    /// (`rocky test`, `rocky ci`) materializes every model as
-    /// `CREATE OR REPLACE TABLE <model name>`, ignoring the configured target,
-    /// so on that path this read really does return the model's output and the
-    /// edge orders it correctly. On a warehouse run it does not. One graph, two
-    /// execution semantics — D012 says so rather than picking silently.
+    /// #1354 step 2: a bare read that matches a model by NAME while that model
+    /// writes a differently-named table does not reach it — on a warehouse the
+    /// search path finds a table called `customers`, and `rocky test` now
+    /// materializes the model at `prod.customers_v2` and binds the same way.
+    /// No edge; D012 says what happened.
     #[test]
-    fn a_bare_read_of_a_renamed_target_models_name_keeps_its_edge_and_warns() {
+    fn a_bare_read_of_a_renamed_target_models_name_derives_no_edge_and_warns() {
         let models = vec![
             make_model_with_target("customers", "SELECT 1 AS id", "prod", "customers_v2"),
             make_model("rollup", "SELECT id FROM customers"),
@@ -659,19 +968,20 @@ mod tests {
 
         let (dag_nodes, _lineage_cache, diags) = resolve_dependencies(&models).unwrap();
         let rollup = dag_nodes.iter().find(|n| n.name == "rollup").unwrap();
-        assert_eq!(
-            rollup.depends_on,
-            vec!["customers"],
-            "the edge is kept: dropping it breaks `rocky test`, which materializes by name"
+        assert!(
+            rollup.depends_on.is_empty(),
+            "a name match is not a binding: {:?}",
+            rollup.depends_on
         );
 
         let d012: Vec<&Diagnostic> = diags.iter().filter(|d| &*d.code == "D012").collect();
         assert_eq!(d012.len(), 1, "{diags:?}");
         assert_eq!(d012[0].model, "rollup");
+        assert!(!d012[0].is_error(), "{:?}", d012[0]);
         assert!(
-            d012[0].message.contains("customers")
-                && d012[0].message.contains("warehouse.prod.customers_v2"),
-            "the warning must name the read and the target it may not reach: {}",
+            d012[0].message.contains("warehouse.prod.customers_v2")
+                && d012[0].message.contains("external table"),
+            "the warning must name the target and say the read is external: {}",
             d012[0].message
         );
         // A wrapped message literal that loses its `\` continuations reads as
@@ -685,19 +995,16 @@ mod tests {
         );
     }
 
-    /// The harm #1354 reports, pinned as it stands today: the name edge makes
-    /// the TRUE physical-read edge look like a cycle-closer, so the run-time
-    /// derivation skips it and the pair executes in the wrong order.
+    /// The harm #1354 reported, now fixed: with no name edge, the TRUE
+    /// physical-read edge is not a cycle-closer, so the run-time derivation
+    /// keeps it and `rollup` runs before the model that reads it.
     ///
     /// ```text
-    ///   rollup --(name match)--------► customers
-    ///   customers --(reads warehouse.silver.rollup)--► rollup   SKIPPED (cycle)
+    ///   before: rollup --(name match)--► customers;  customers ► rollup SKIPPED
+    ///   after:  customers --(reads warehouse.silver.rollup)--► rollup  KEPT
     /// ```
-    ///
-    /// This test asserts the DEFECT, not a fix. Invert it when #1354 is
-    /// resolved — whichever way the owner resolves it, this assertion moves.
     #[test]
-    fn the_name_edge_still_suppresses_the_true_physical_read_edge() {
+    fn the_true_physical_read_edge_is_no_longer_suppressed() {
         let models = vec![
             make_model_with_target(
                 "customers",
@@ -718,25 +1025,186 @@ mod tests {
                     .collect::<Vec<_>>()
             })
             .collect();
-        assert_eq!(
-            existing,
-            vec![("rollup".to_string(), "customers".to_string())]
-        );
+        assert!(existing.is_empty(), "{existing:?}");
 
         let edge_models: Vec<rocky_core::physical_edges::PhysicalEdgeModel<'_>> = models
             .iter()
             .map(rocky_core::physical_edges::PhysicalEdgeModel::from_model)
             .collect();
         let derived = rocky_core::physical_edges::derive_physical_edges(&edge_models, &existing);
-        assert!(
-            derived.edges.is_empty(),
-            "the true edge is still suppressed today: {derived:?}"
-        );
         assert_eq!(
-            derived.skipped_cycle_edges,
+            derived.edges,
             vec![("customers".to_string(), "rollup".to_string())],
-            "and the suppression is at least reported as a scheduling warning"
+            "{derived:?}"
         );
+        assert!(derived.skipped_cycle_edges.is_empty(), "{derived:?}");
+    }
+
+    /// #1354 step 2: a bare read binds to the model that WRITES that table,
+    /// whatever the model is called, and says nothing — that is the binding
+    /// working, not an ambiguity.
+    #[test]
+    fn a_bare_read_binds_to_the_model_that_writes_the_table() {
+        let models = vec![
+            make_model_with_target("stg_events", "SELECT 2 AS id", "z", "events"),
+            make_model("summary", "SELECT id FROM events"),
+        ];
+        let (dag_nodes, _, diags) = resolve_dependencies(&models).unwrap();
+        let summary = dag_nodes.iter().find(|n| n.name == "summary").unwrap();
+        assert_eq!(summary.depends_on, vec!["stg_events"]);
+        assert!(diags.is_empty(), "{diags:?}");
+    }
+
+    /// #2045 shape 3: two models write a table called `events` in different
+    /// schemas. The one also NAMED `events` is the binding, whatever order the
+    /// schemas sort in.
+    #[test]
+    fn several_writers_of_one_table_bind_to_the_one_named_after_it() {
+        for (first, second) in [("a", "z"), ("z", "a")] {
+            let models = vec![
+                make_model_with_target("events", "SELECT 2 AS id", first, "events"),
+                make_model_with_target("other", "SELECT 1 AS id", second, "events"),
+                make_model_with_target("summary", "SELECT id FROM events", "marts", "summary"),
+            ];
+            let (dag_nodes, _, diags) = resolve_dependencies(&models).unwrap();
+            let summary = dag_nodes.iter().find(|n| n.name == "summary").unwrap();
+            assert_eq!(summary.depends_on, vec!["events"], "{first}/{second}");
+            assert!(diags.is_empty(), "{diags:?}");
+        }
+    }
+
+    /// Several writers, none named after the table: `depends_on` picks one,
+    /// and with nothing to pick the read is refused as E056 and binds to none.
+    #[test]
+    fn an_ambiguous_bare_read_is_refused_unless_depends_on_picks_one() {
+        let writers = || {
+            vec![
+                make_model_with_target("stg_a", "SELECT 1 AS id", "a", "events"),
+                make_model_with_target("stg_z", "SELECT 2 AS id", "z", "events"),
+            ]
+        };
+
+        let mut models = writers();
+        models.push(make_model("summary", "SELECT id FROM events"));
+        let (dag_nodes, _, diags) = resolve_dependencies(&models).unwrap();
+        let summary = dag_nodes.iter().find(|n| n.name == "summary").unwrap();
+        assert!(summary.depends_on.is_empty(), "{:?}", summary.depends_on);
+        let e056: Vec<&Diagnostic> = diags.iter().filter(|d| &*d.code == "E056").collect();
+        assert_eq!(e056.len(), 1, "{diags:?}");
+        assert!(e056[0].is_error(), "{:?}", e056[0]);
+        assert_eq!(e056[0].model, "summary");
+        assert!(
+            e056[0].message.contains("'stg_a' (warehouse.a.events)")
+                && e056[0].message.contains("'stg_z' (warehouse.z.events)")
+                && !e056[0].message.contains("  "),
+            "{}",
+            e056[0].message
+        );
+
+        let mut models = writers();
+        models.push(make_model_with_deps(
+            "summary",
+            "SELECT id FROM events",
+            vec!["stg_z"],
+        ));
+        let (dag_nodes, _, diags) = resolve_dependencies(&models).unwrap();
+        let summary = dag_nodes.iter().find(|n| n.name == "summary").unwrap();
+        assert_eq!(summary.depends_on, vec!["stg_z"]);
+        assert!(diags.iter().all(|d| &*d.code != "E056"), "{diags:?}");
+    }
+
+    /// A model that reads a table with its own target's name reads itself or
+    /// a same-named table the search path picks — never evidence for a
+    /// sibling that writes that name. The read is external.
+    #[test]
+    fn a_read_of_the_readers_own_table_name_is_external() {
+        let models = vec![
+            make_model_with_target("stg_orders", "SELECT id FROM orders", "staging", "orders"),
+            make_model_with_target("raw_orders", "SELECT 1 AS id", "raw", "orders"),
+        ];
+        let (dag_nodes, _, diags) = resolve_dependencies(&models).unwrap();
+        let stg = dag_nodes.iter().find(|n| n.name == "stg_orders").unwrap();
+        assert!(stg.depends_on.is_empty(), "{:?}", stg.depends_on);
+        assert!(diags.is_empty(), "{diags:?}");
+
+        let models = vec![make_model_with_target(
+            "stg_orders",
+            "SELECT id FROM orders",
+            "staging",
+            "orders",
+        )];
+        let (dag_nodes, _, _) = resolve_dependencies(&models).unwrap();
+        assert!(dag_nodes[0].depends_on.is_empty());
+    }
+
+    /// A binding by table alone that would close a cycle is dropped with
+    /// D013, not refused: `stg_customers` reads the raw `customers` source,
+    /// and `dim_customers` — which reads `stg_customers` by name — happens to
+    /// write a table called `customers`. Compiled before; must still compile.
+    #[test]
+    fn a_table_only_binding_that_closes_a_cycle_is_dropped_with_d013() {
+        let models = vec![
+            make_model_with_target(
+                "stg_customers",
+                "SELECT id FROM customers",
+                "staging",
+                "stg_customers",
+            ),
+            make_model_with_target(
+                "dim_customers",
+                "SELECT id FROM stg_customers",
+                "marts",
+                "customers",
+            ),
+        ];
+        let (dag_nodes, _, diags) = resolve_dependencies(&models).unwrap();
+        rocky_ir::dag::topological_sort(&dag_nodes).expect("no cycle");
+        let deps = |n: &str| {
+            dag_nodes
+                .iter()
+                .find(|d| d.name == n)
+                .unwrap()
+                .depends_on
+                .clone()
+        };
+        assert_eq!(deps("dim_customers"), vec!["stg_customers"]);
+        assert!(deps("stg_customers").is_empty());
+        let d013: Vec<&Diagnostic> = diags.iter().filter(|d| &*d.code == "D013").collect();
+        assert_eq!(d013.len(), 1, "{diags:?}");
+        assert_eq!(d013[0].model, "stg_customers");
+        assert!(!d013[0].is_error() && !d013[0].message.contains("  "));
+        assert_eq!(
+            derived_model_edges(&models),
+            vec![("dim_customers".to_string(), "stg_customers".to_string())],
+            "`run --dag` settles the same way"
+        );
+    }
+
+    /// An ephemeral model writes nothing; the inliner rewrites a bare read of
+    /// its NAME. So it binds by name, and a model that merely shares its
+    /// nominal target table is not a candidate for it.
+    #[test]
+    fn an_ephemeral_model_binds_by_name_and_never_by_table() {
+        let mut eph = make_model_with_target("eph", "SELECT 2 AS v", "s", "t");
+        eph.config.strategy = StrategyConfig::Ephemeral;
+        let models = vec![
+            make_model_with_target("real", "SELECT 1 AS v", "s", "t"),
+            eph,
+            make_model("reads_eph", "SELECT v FROM eph"),
+            make_model("reads_t", "SELECT v FROM t"),
+        ];
+        let (dag_nodes, _, diags) = resolve_dependencies(&models).unwrap();
+        let deps = |n: &str| {
+            dag_nodes
+                .iter()
+                .find(|d| d.name == n)
+                .unwrap()
+                .depends_on
+                .clone()
+        };
+        assert_eq!(deps("reads_eph"), vec!["eph"]);
+        assert_eq!(deps("reads_t"), vec!["real"]);
+        assert!(diags.is_empty(), "{diags:?}");
     }
 
     /// The common case — a model whose target table is its own name — must

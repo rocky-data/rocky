@@ -1236,6 +1236,63 @@ fn deferred_externalized_edges_for(
 /// reads and unknown read sets retain their existing opt-in containment policy.
 /// A selected model whose inputs were successfully externalized by `--defer`
 /// has no local declared input edge for this execution.
+/// The refusals [`run_with_explicit_contracts`] can make from the config and
+/// its flags alone, made before any I/O (#1609): no idempotency claim, state
+/// store, Pipes channel or adapter exists yet when this runs.
+///
+/// Each check is the one the run body makes later — same function, same
+/// message — so a run this lets through meets nothing new there.
+#[allow(clippy::too_many_arguments)]
+fn preflight_run_config(
+    cfg: &rocky_core::config::RockyConfig,
+    pipeline_name_arg: Option<&str>,
+    model_only: bool,
+    resume_requested: bool,
+    run_all: bool,
+    models_dir_override: bool,
+    governed: bool,
+    registry_override: bool,
+) -> Result<()> {
+    refuse_governed_side_effects(governed, &cfg.hooks)?;
+    ensure_resume_supported(
+        resume_requested,
+        !run_all && !models_dir_override,
+        "mixed replication and transformation execution",
+    )?;
+    if model_only {
+        ensure_resume_supported(resume_requested, false, "model-only")?;
+        resolve_model_run_target(cfg, pipeline_name_arg)?;
+        return Ok(());
+    }
+    let (_, pipeline) = registry::resolve_pipeline(cfg, pipeline_name_arg)?;
+    ensure_resume_supported(
+        resume_requested,
+        matches!(pipeline, rocky_core::config::PipelineConfig::Replication(_)),
+        pipeline.pipeline_type_str(),
+    )?;
+    anyhow::ensure!(
+        !registry_override
+            || matches!(pipeline, rocky_core::config::PipelineConfig::Replication(_)),
+        "an adapter registry override reaches only the model-only and replication arms; \
+         the {} arm builds its own registry",
+        pipeline.pipeline_type_str()
+    );
+    Ok(())
+}
+
+/// Drop the dependency edges OF every model in `not_run` from the runtime
+/// graph (#1630). Such a model does not execute, so its reads order nothing;
+/// kept, they can close a cycle that makes the physical-read derivation skip
+/// a true read of the model's own target. Edges ONTO it stay, so its readers
+/// are still withheld.
+fn drop_reads_of_models_that_do_not_run(dag_nodes: &mut [DagNode], not_run: &BTreeSet<String>) {
+    for node in dag_nodes.iter_mut() {
+        if not_run.contains(&node.name) {
+            node.depends_on.clear();
+        }
+    }
+}
+
 fn compile_error_descendant_blocks(
     dag_nodes: &[DagNode],
     failed: &BTreeSet<String>,
@@ -3058,6 +3115,7 @@ pub async fn run(
         reviewed_source_state,
         None,
         actor,
+        None,
     )
     .await
 }
@@ -3157,6 +3215,14 @@ pub async fn run_with_explicit_contracts(
     // (`DriftGovernor`, `finalize_drift_verify_after`). A label only: the
     // custody rows are still evaluated as the `agent` class.
     actor: &rocky_core::config::PrincipalRef,
+    // #1609 (ruled 2026-09-17, shape A): an adapter registry the caller
+    // already holds, used instead of building one from the config. `None`
+    // for every production caller. It reaches the model-only and replication
+    // arms, which build their registry here; the transformation, quality,
+    // snapshot and load arms build their own, so a run that would dispatch to
+    // one of them with an override is refused rather than silently bypassing
+    // it — a test must never pass because a different path did the work.
+    registry_override: Option<&AdapterRegistry>,
 ) -> Result<RunTermination> {
     // Refuse a broken Dagster Pipes launch before an idempotency claim, state
     // session, hook, or warehouse statement can run.
@@ -3233,6 +3299,23 @@ pub async fn run_with_explicit_contracts(
             shadow,
         )?;
     }
+    // #1609: refuse every flag the config alone rules out BEFORE any I/O —
+    // the idempotency claim, the state store, the Pipes channel, and the
+    // adapters. Refused later, the claim leaves a `Failed` stamp that skips
+    // the corrected retry under `dedup_on = "any"`, the destination adapter
+    // has already opened (a DuckDB file is created), and the end-of-run
+    // retention sweep runs. The same checks run again where the body needs
+    // their results; here they only refuse.
+    preflight_run_config(
+        &loaded.config,
+        pipeline_name_arg,
+        model_name_filter.is_some() || defer_opts.selected_models.is_some(),
+        resume_run_id.is_some() || resume_latest,
+        run_all,
+        models_dir.is_some(),
+        governed_ctx.is_some(),
+        registry_override.is_some(),
+    )?;
     // With `-o json` stdout is reserved for the JSON payload — route any
     // human-readable summary/progress line (e.g. a `depends_on` upstream
     // pipeline's "Copied …") to stderr so it can't precede the JSON document.
@@ -3416,7 +3499,14 @@ pub async fn run_with_explicit_contracts(
             None => selected_models.is_some_and(|set| set.contains(name)),
         };
         ensure_resume_supported(resume_requested, false, "model-only")?;
-        let adapter_registry = AdapterRegistry::from_config(rocky_cfg)?;
+        let built_registry;
+        let adapter_registry = match registry_override {
+            Some(registry) => registry,
+            None => {
+                built_registry = AdapterRegistry::from_config(rocky_cfg)?;
+                &built_registry
+            }
+        };
         // An explicit `--pipeline` alongside `--model` (also how the unified-DAG
         // sub-runner drives each transformation node) resolves the model against
         // THAT pipeline's target adapter and schema-creation policy — not the
@@ -4615,7 +4705,14 @@ pub async fn run_with_explicit_contracts(
     let entry_marker_freezes = freeze_fence.active_snapshot().await?;
 
     // Build adapter registry and resolve adapters
-    let adapter_registry = AdapterRegistry::from_config(rocky_cfg)?;
+    let built_registry;
+    let adapter_registry = match registry_override {
+        Some(registry) => registry,
+        None => {
+            built_registry = AdapterRegistry::from_config(rocky_cfg)?;
+            &built_registry
+        }
+    };
     let warehouse_adapter = adapter_registry.warehouse_adapter(&pipeline.target.adapter)?;
 
     // Batch check adapter (optional): present when the warehouse has any
@@ -10444,19 +10541,33 @@ pub(crate) fn case_near_miss_remedy(rules: rocky_sql::defer::IdentifierCaseRules
 /// whose `[target]` names no catalog (#1629); `rocky run --dag` establishes
 /// the same catalog for the same models, so the two schedulers derive the
 /// same edges.
+///
+/// `not_run` are the models that will not execute (an error diagnostic,
+/// #1630). Their reads order nothing, so they are no reader here and their
+/// own edges are dropped from the runtime graph; kept, they could close a
+/// cycle that makes the derivation skip a TRUE read of their target. They
+/// stay producers, so a reader of their target is ordered — and withheld —
+/// after them.
 fn augment_physical_read_edges(
     compile_result: &mut rocky_compiler::compile::CompileResult,
     contain_failures: bool,
     default_catalog: Option<&str>,
+    not_run: &BTreeSet<String>,
     warnings: &mut Vec<String>,
 ) -> Result<()> {
+    drop_reads_of_models_that_do_not_run(&mut compile_result.project.dag_nodes, not_run);
     let inputs: Vec<rocky_core::physical_edges::PhysicalEdgeModel<'_>> = compile_result
         .project
         .models
         .iter()
         .map(|m| {
-            rocky_core::physical_edges::PhysicalEdgeModel::from_model(m)
-                .with_effective_catalog(default_catalog)
+            let mut input = rocky_core::physical_edges::PhysicalEdgeModel::from_model(m)
+                .with_effective_catalog(default_catalog);
+            if not_run.contains(&m.config.name) {
+                // A query that reads no table: a producer, never a reader.
+                input.sql = "SELECT 1";
+            }
+            input
         })
         .collect();
     let existing: Vec<(String, String)> = compile_result
@@ -12398,14 +12509,59 @@ pub(crate) async fn execute_models_with_explicit_contracts(
         }
         output.shadow = true;
     } else {
+        // #1630: a model with an error diagnostic does not run, so its own
+        // reads order nothing. Left in the graph, they can close a cycle that
+        // makes the derivation skip a TRUE read of its target as the
+        // cycle-closer — and that reader then runs on the stale table.
         let default_catalog = warehouse.default_catalog();
         augment_physical_read_edges(
             &mut compile_result,
             resilience.contain_failures,
             default_catalog.as_deref(),
+            &compile_failed_models,
             &mut output.scheduling_warnings,
         )?;
         refuse_on_scheduling_warnings(strict_scheduling, &output.scheduling_warnings)?;
+        // A model that reads a failed model's target by its qualified name is
+        // withheld like one that reads it by a compile edge: the table was not
+        // rebuilt. Under `[resilience] contain_failures` the containment
+        // ledger already withholds physical readers from its own layering.
+        if !resilience.contain_failures {
+            let physical_blocks = compile_error_descendant_blocks(
+                &compile_result.project.dag_nodes,
+                &compile_failed_models,
+                &externalized_defer_edges,
+            );
+            for (model, blocked_by) in physical_blocks {
+                if compile_excluded_models.contains(&model) {
+                    continue;
+                }
+                compile_excluded_models.insert(model.clone());
+                let in_scope = model_name_filter.is_none_or(|selected| selected == model)
+                    && model_set.is_none_or(|set| set.contains(&model));
+                if !in_scope {
+                    continue;
+                }
+                if !root_error_in_scope {
+                    output.tables_failed += 1;
+                    output.errors.push(crate::output::TableErrorOutput {
+                        asset_key: vec![model.clone()],
+                        error: format!(
+                            "model '{model}' was withheld because upstream compile failure(s) \
+                             affect: {}",
+                            blocked_by.join(", ")
+                        ),
+                        failure_kind: crate::output::FailureKind::CompileError,
+                        cooldown_seconds: None,
+                    });
+                }
+                output.contained.push(crate::output::ContainedModelOutput {
+                    model,
+                    unblock_hint: super::containment::unblock_hint(&blocked_by, false),
+                    blocked_by,
+                });
+            }
+        }
     }
 
     // #1093: capture governance from the same in-memory model set the
@@ -22068,6 +22224,188 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
         )
         .await
         .map(|_| ())
+    }
+
+    /// Drive `run_with_explicit_contracts` with an idempotency key and an
+    /// optional registry override (#1609).
+    #[allow(clippy::too_many_arguments)]
+    async fn drive_preflight_test_run(
+        config_path: &std::path::Path,
+        state_path: &std::path::Path,
+        pipeline: Option<&str>,
+        model: Option<&str>,
+        registry_override: Option<&AdapterRegistry>,
+    ) -> anyhow::Result<RunTermination> {
+        super::run_with_explicit_contracts(
+            config_path,
+            std::sync::Arc::new(
+                rocky_core::config::load_rocky_config_fingerprinted(config_path).unwrap(),
+            ),
+            None,
+            pipeline,
+            state_path,
+            None,
+            false,
+            None,
+            false,
+            None,
+            false,
+            None,
+            &PartitionRunOptions::default(),
+            model,
+            None,
+            Some("preflight-key"),
+            None,
+            &DeferOptions::default(),
+            &SkipRunOptions::default(),
+            &rocky_core::run_vars::RunVars::new(),
+            None,
+            None,
+            false,
+            None,
+            None,
+            &rocky_core::config::PrincipalRef::unnamed(),
+            registry_override,
+        )
+        .await
+    }
+
+    /// #1609: a run whose flags the config alone rules out is refused before
+    /// ANY I/O — no idempotency claim (so a corrected retry with the same key
+    /// is not skipped as a duplicate), no state store, no destination adapter
+    /// (a DuckDB file would be created). Both shapes reported on the issue.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn config_refusals_land_before_the_claim_the_state_store_and_the_adapter() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("warehouse.duckdb");
+        let config_path = dir.path().join("rocky.toml");
+        let state_path = dir.path().join("state.redb");
+        std::fs::write(
+            &config_path,
+            format!(
+                "[adapter]\ntype = \"duckdb\"\npath = \"{}\"\n\n\
+                 [state]\nbackend = \"local\"\n\n\
+                 [pipeline.dq]\ntype = \"quality\"\n\n\
+                 [pipeline.dq.target]\nadapter = \"default\"\n\n\
+                 [[pipeline.dq.tables]]\ncatalog = \"warehouse\"\nschema = \"main\"\n\
+                 table = \"orders\"\n\n[pipeline.dq.checks]\nenabled = true\n\n\
+                 [pipeline.t1]\ntype = \"transformation\"\nmodels = \"models/**\"\n\n\
+                 [pipeline.t1.target]\nadapter = \"default\"\n\n\
+                 [pipeline.t2]\ntype = \"transformation\"\nmodels = \"models/**\"\n\n\
+                 [pipeline.t2.target]\nadapter = \"default\"\n",
+                db_path.display()
+            ),
+        )
+        .unwrap();
+
+        // `--model <name> --pipeline <a quality pipeline>`.
+        let err = drive_preflight_test_run(&config_path, &state_path, Some("dq"), Some("m"), None)
+            .await
+            .expect_err("a quality pipeline cannot run a model");
+        assert!(
+            err.to_string().contains("not transformation"),
+            "unexpected error: {err:#}"
+        );
+        assert!(!state_path.exists(), "no claim, no state store: {err:#}");
+        assert!(!db_path.exists(), "no adapter was opened: {err:#}");
+
+        // A multi-pipeline project run with no `--pipeline`.
+        let err = drive_preflight_test_run(&config_path, &state_path, None, None, None)
+            .await
+            .expect_err("three pipelines and no --pipeline");
+        assert!(
+            err.to_string().contains("multiple pipelines defined"),
+            "unexpected error: {err:#}"
+        );
+        assert!(!state_path.exists(), "no claim, no state store: {err:#}");
+        assert!(!db_path.exists(), "no adapter was opened: {err:#}");
+
+        // A registry override the dispatched arm would not use is refused, so
+        // a test can never pass because a different registry did the work.
+        let registry = AdapterRegistry::from_config(
+            &rocky_core::config::load_rocky_config_fingerprinted(&config_path)
+                .unwrap()
+                .config,
+        )
+        .unwrap();
+        let err =
+            drive_preflight_test_run(&config_path, &state_path, Some("t1"), None, Some(&registry))
+                .await
+                .expect_err("the transformation arm builds its own registry");
+        assert!(
+            err.to_string().contains("registry override"),
+            "unexpected error: {err:#}"
+        );
+        assert!(!state_path.exists(), "no claim, no state store: {err:#}");
+    }
+
+    /// #1609: the override IS the registry a model-only run uses. The model
+    /// reads a table that exists only in the override's database; the
+    /// configured database is never opened.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn a_registry_override_is_the_registry_the_run_uses() {
+        let dir = tempfile::tempdir().unwrap();
+        let configured_db = dir.path().join("configured.duckdb");
+        let override_db = dir.path().join("override.duckdb");
+        let config_path = dir.path().join("rocky.toml");
+        let state_path = dir.path().join("state.redb");
+        let config_text = |db: &std::path::Path| {
+            format!(
+                "[adapter]\ntype = \"duckdb\"\npath = \"{}\"\n\n\
+                 [state]\nbackend = \"local\"\n\n\
+                 [pipeline.t]\ntype = \"transformation\"\nmodels = \"models/**\"\n\n\
+                 [pipeline.t.target]\nadapter = \"default\"\n",
+                db.display()
+            )
+        };
+        std::fs::write(&config_path, config_text(&configured_db)).unwrap();
+        let models = dir.path().join("models");
+        std::fs::create_dir(&models).unwrap();
+        std::fs::write(models.join("m.sql"), "SELECT v FROM main.src\n").unwrap();
+        std::fs::write(
+            models.join("m.toml"),
+            "[strategy]\ntype = \"full_refresh\"\n\n[target]\ncatalog = \"\"\n\
+             schema = \"main\"\ntable = \"m\"\n",
+        )
+        .unwrap();
+
+        let override_config = dir.path().join("override.toml");
+        std::fs::write(&override_config, config_text(&override_db)).unwrap();
+        let registry = AdapterRegistry::from_config(
+            &rocky_core::config::load_rocky_config_fingerprinted(&override_config)
+                .unwrap()
+                .config,
+        )
+        .unwrap();
+        registry
+            .warehouse_adapter("default")
+            .unwrap()
+            .execute_statement("CREATE TABLE main.src AS SELECT 7 AS v")
+            .await
+            .unwrap();
+
+        drive_preflight_test_run(
+            &config_path,
+            &state_path,
+            Some("t"),
+            Some("m"),
+            Some(&registry),
+        )
+        .await
+        .expect("the model reads the override's table");
+        assert!(
+            !configured_db.exists(),
+            "the configured database was never opened"
+        );
+        let rows = registry
+            .warehouse_adapter("default")
+            .unwrap()
+            .execute_query("SELECT v FROM main.m")
+            .await
+            .unwrap();
+        assert_eq!(rows.rows.len(), 1, "{rows:?}");
     }
 
     #[cfg(feature = "duckdb")]
@@ -34105,8 +34443,14 @@ auto_create_schemas = true
         );
 
         let mut warnings = Vec::new();
-        super::augment_physical_read_edges(&mut compiled, false, None, &mut warnings)
-            .expect("augmentation");
+        super::augment_physical_read_edges(
+            &mut compiled,
+            false,
+            None,
+            &BTreeSet::new(),
+            &mut warnings,
+        )
+        .expect("augmentation");
         assert_eq!(
             compiled.project.layers,
             vec![
@@ -34136,8 +34480,14 @@ auto_create_schemas = true
             .expect("compile models");
 
         let mut warnings = Vec::new();
-        super::augment_physical_read_edges(&mut compiled, false, None, &mut warnings)
-            .expect("mutual reads must not refuse the run");
+        super::augment_physical_read_edges(
+            &mut compiled,
+            false,
+            None,
+            &BTreeSet::new(),
+            &mut warnings,
+        )
+        .expect("mutual reads must not refuse the run");
         assert_eq!(
             compiled.project.layers,
             vec![vec!["b".to_string()], vec!["a".to_string()]],
@@ -34226,8 +34576,14 @@ auto_create_schemas = true
         );
 
         let mut warnings = Vec::new();
-        super::augment_physical_read_edges(&mut compiled, false, Some("db"), &mut warnings)
-            .expect("augmentation");
+        super::augment_physical_read_edges(
+            &mut compiled,
+            false,
+            Some("db"),
+            &BTreeSet::new(),
+            &mut warnings,
+        )
+        .expect("augmentation");
         assert_eq!(
             compiled.project.layers,
             vec![vec!["orders".to_string()], vec!["mart".to_string()]],
@@ -34257,8 +34613,14 @@ auto_create_schemas = true
         let mut compiled = compile_models(&models_dir);
 
         let mut warnings = Vec::new();
-        super::augment_physical_read_edges(&mut compiled, false, None, &mut warnings)
-            .expect("augmentation");
+        super::augment_physical_read_edges(
+            &mut compiled,
+            false,
+            None,
+            &BTreeSet::new(),
+            &mut warnings,
+        )
+        .expect("augmentation");
         assert_eq!(
             compiled.project.layers.len(),
             1,
@@ -34384,8 +34746,14 @@ auto_create_schemas = true
         let mut compiled = compile_models(&models_dir);
 
         let mut warnings = Vec::new();
-        super::augment_physical_read_edges(&mut compiled, false, Some("prod"), &mut warnings)
-            .expect("augmentation");
+        super::augment_physical_read_edges(
+            &mut compiled,
+            false,
+            Some("prod"),
+            &BTreeSet::new(),
+            &mut warnings,
+        )
+        .expect("augmentation");
         assert_eq!(upstreams_of(&compiled, "beta"), vec!["alpha".to_string()]);
         assert!(
             upstreams_of(&compiled, "alpha").is_empty(),
@@ -38471,6 +38839,120 @@ auto_create_schemas = true
                 assert!(!table_exists(&verify, "up").await);
             }
         }
+    }
+
+    /// #1630: a model with an error diagnostic does not run, so its own reads
+    /// must not decide the order. Here `x` fails compile (E056: its bare read
+    /// of `t` is ambiguous) and also bare-reads `y`; `y` reads `x`'s target
+    /// by name. `x`'s edge onto `y` used to make `y`'s true read of `main.x`
+    /// look like a cycle-closer, so it was skipped and `y` built from the
+    /// stale `main.x` left by an earlier run. Now `y` is withheld.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn a_physical_reader_of_a_failed_model_is_withheld_not_run_on_stale_rows() {
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir(&models_dir).unwrap();
+        let db = tmp.path().join("p1630.duckdb");
+        let state = StateStore::open(&tmp.path().join("state")).unwrap();
+        {
+            let s = DuckDbWarehouseAdapter::open(&db).unwrap();
+            s.execute_statement("CREATE SCHEMA IF NOT EXISTS other")
+                .await
+                .unwrap();
+            // What an earlier run of `x` left behind.
+            s.execute_statement("CREATE TABLE main.x AS SELECT 99 AS id")
+                .await
+                .unwrap();
+        }
+        let write = |name: &str, sql: &str, schema: &str, table: &str| {
+            std::fs::write(models_dir.join(format!("{name}.sql")), sql).unwrap();
+            std::fs::write(
+                models_dir.join(format!("{name}.toml")),
+                format!(
+                    "[strategy]\ntype = \"full_refresh\"\n\n[target]\ncatalog = \"\"\n\
+                     schema = \"{schema}\"\ntable = \"{table}\"\n"
+                ),
+            )
+            .unwrap();
+        };
+        write("w1", "SELECT 1 AS id\n", "main", "t");
+        write("w2", "SELECT 2 AS id\n", "other", "t");
+        write("x", "SELECT t.id FROM t CROSS JOIN y\n", "main", "x");
+        write("y", "SELECT id FROM main.x\n", "main", "y");
+
+        let adapter = DuckDbWarehouseAdapter::open(&db).expect("open duckdb");
+        let mut output = RunOutput::new(String::new(), 0, 1);
+        let gate_off = SkipGateConfig {
+            feature_enabled: false,
+            force_rebuild: false,
+            rowcount_fallback: false,
+            lag_tolerance_seconds: 0,
+            shadow_or_branch: false,
+            full_refresh: false,
+        };
+        let res = super::execute_models(
+            &models_dir,
+            None,
+            &adapter as &dyn rocky_core::traits::WarehouseAdapter,
+            Some(&state),
+            &PartitionRunOptions::default(),
+            "run-1630",
+            None,
+            None,
+            &mut output,
+            None,
+            None,
+            &rocky_core::config::SchemaCacheConfig::default(),
+            false,
+            None,
+            &DeferOptions::default(),
+            gate_off,
+            false,
+            false,
+            &rocky_core::run_vars::RunVars::new(),
+            rocky_core::config::ResilienceConfig::default(),
+            false,
+            true,
+            None,
+            None,
+            false,
+        )
+        .await;
+        drop(adapter);
+        assert!(res.is_ok(), "{:?}", res.as_ref().err());
+
+        assert!(
+            output
+                .errors
+                .iter()
+                .any(|e| e.asset_key == vec!["x".to_string()] && e.error.contains("[E056]")),
+            "{:?}",
+            output.errors
+        );
+        assert!(
+            !output
+                .materializations
+                .iter()
+                .any(|m| m.asset_key.last().map(String::as_str) == Some("y")),
+            "`y` must not build from the stale `main.x`: {:?}",
+            output.materializations
+        );
+        assert!(
+            output.contained.iter().any(|c| c.model == "y"),
+            "`y` is reported as withheld: {:?}",
+            output.contained
+        );
+        let verify = DuckDbWarehouseAdapter::open(&db).unwrap();
+        assert!(!table_exists(&verify, "y").await);
+        assert!(
+            output.scheduling_warnings.is_empty(),
+            "no true edge was skipped as a cycle-closer: {:?}",
+            output.scheduling_warnings
+        );
     }
 
     /// End to end through `execute_models`: an invalid ephemeral use (here

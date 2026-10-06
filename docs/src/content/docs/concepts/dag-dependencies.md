@@ -11,7 +11,7 @@ order. A DAG is a directed acyclic graph: nodes with one-way edges and no cycles
 Edges come from two places, merged:
 
 - An explicit `depends_on` list in a model's TOML.
-- A bare table name in the model's SQL that matches another model in the project. Rocky infers that edge and reports it as diagnostic `I001`.
+- A bare table name in the model's SQL that another model writes as its `[target]` table. Rocky infers that edge and reports it as diagnostic `I001`. A bare read of a model's name whose target table is spelled differently is not an edge; Rocky reports it as `D012`. A binding by table alone that would close a cycle is dropped and reported as `D013`.
 
 Rocky then topologically sorts the merged set. The result is an execution plan
 with layers that run in parallel.

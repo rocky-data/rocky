@@ -228,20 +228,18 @@ pub fn fold_identifier(s: &str) -> String {
 /// not answer to a bare `FROM customers`: the name matches, the object does
 /// not (#1354).
 ///
-/// This is a question about the WAREHOUSE. `rocky test` / `rocky ci` go
-/// through `rocky_engine::executor::execute_locally`, which materializes every
-/// model as `CREATE OR REPLACE TABLE <model name>` and ignores the configured
-/// target — there a bare read of the name always reaches the model, whatever
-/// this returns. Callers must know which execution they are reasoning about.
+/// `rocky test` / `rocky ci` (`rocky_engine::executor::execute_locally`)
+/// materialize every model at its configured target too, so the answer is the
+/// same on both paths (#1354).
 ///
 /// The comparison folds both sides through [`fold_identifier`], so a project
 /// that spells its targets in upper case (`[target] table = "CUSTOMERS"` for
 /// model `customers` — the common Snowflake shape) still binds.
 ///
-/// Two callers, one spelling: `rocky_compiler::resolve::resolve_dependencies`
-/// (which reports the mismatch as D012 and keeps the edge — see #1354 for why
-/// dropping it is not that layer's call) and the content-reuse read resolver
-/// in `rocky-cli` (which refuses to bind the read, failing closed to a build).
+/// The content-reuse read resolver in `rocky-cli` asks it (and refuses to
+/// bind such a read, failing closed to a build). `rocky_compiler::resolve`
+/// binds every bare read by target table with the same fold, so for it this
+/// read derives no edge and is reported as D012.
 #[must_use]
 pub fn bare_name_binds(model_name: &str, target_table: &str) -> bool {
     fold_identifier(model_name) == fold_identifier(target_table)
