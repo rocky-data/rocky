@@ -5326,6 +5326,82 @@ impl StateStore {
     }
 }
 
+impl StateStore {
+    /// Rocky's record of the `_error_*` label columns it wrote to `table`
+    /// with quarantine `tag` (#2065), or `None` when there is none.
+    ///
+    /// `table` is the source's dialect-formatted name, the physical identity
+    /// the `tag` statement wrote. See
+    /// [`crate::quarantine::QuarantineOwnership`] for what the record proves.
+    ///
+    /// Stored in the existing [`METADATA`] table under a dedicated key prefix,
+    /// so it adds no table and moves no schema version. A record that cannot
+    /// be parsed is an error, not "no record": no record would refuse the run
+    /// anyway, but the error names the real cause.
+    pub fn get_quarantine_ownership(
+        &self,
+        table: &str,
+    ) -> Result<Option<crate::quarantine::QuarantineOwnership>, StateError> {
+        let txn = self.db.begin_read()?;
+        let metadata = txn.open_table(METADATA)?;
+        match metadata.get(quarantine_ownership_key(table).as_str())? {
+            Some(value) => Ok(Some(serde_json::from_str(value.value())?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Replace Rocky's `tag` ownership record for `table` (#2065). See
+    /// [`Self::get_quarantine_ownership`].
+    pub fn set_quarantine_ownership(
+        &self,
+        table: &str,
+        ownership: &crate::quarantine::QuarantineOwnership,
+    ) -> Result<(), StateError> {
+        let value = serde_json::to_string(ownership)?;
+        let txn = self.db.begin_write()?;
+        {
+            let mut metadata = txn.open_table(METADATA)?;
+            metadata.insert(quarantine_ownership_key(table).as_str(), value.as_str())?;
+        }
+        self.commit_write(txn)?;
+        Ok(())
+    }
+}
+
+/// Metadata key prefix for the quarantine `tag` label-ownership record (see
+/// [`StateStore::get_quarantine_ownership`]).
+const QUARANTINE_OWNERSHIP_KEY_PREFIX: &str = "quarantine_ownership:";
+
+fn quarantine_ownership_key(table: &str) -> String {
+    format!("{QUARANTINE_OWNERSHIP_KEY_PREFIX}{table}")
+}
+
+#[cfg(test)]
+mod quarantine_ownership_tests {
+    use super::StateStore;
+
+    #[test]
+    fn ownership_round_trips_per_table_and_defaults_to_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
+        let table = "\"db\".\"s\".\"orders\"";
+        assert_eq!(store.get_quarantine_ownership(table).unwrap(), None);
+        let record = crate::quarantine::QuarantineOwnership {
+            labels: vec!["_error_a".to_string()],
+            columns: vec!["id".to_string(), "_error_a".to_string()],
+        };
+        store.set_quarantine_ownership(table, &record).unwrap();
+        assert_eq!(store.get_quarantine_ownership(table).unwrap(), Some(record));
+        // Physical identity: a different spelling is a different record.
+        assert_eq!(
+            store
+                .get_quarantine_ownership("\"db\".\"s\".\"Orders\"")
+                .unwrap(),
+            None
+        );
+    }
+}
+
 /// Metadata key for the timestamp of the most recent end-of-run
 /// auto-sweep (see [`StateStore::get_last_retention_sweep_at`]).
 const LAST_RETENTION_SWEEP_AT_KEY: &str = "last_retention_sweep_at";
