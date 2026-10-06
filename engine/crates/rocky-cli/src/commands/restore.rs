@@ -3490,6 +3490,9 @@ mod tests {
             /// command-level gate. Two attempts: 1 + 2 × 2 = 5. Reloading in
             /// the fence costs one more per write (6 here: attempt 2 finds the
             /// bytes attempt 1 wrote, so it does not write or reach the fence).
+            /// The total is pinned to the current seam structure: a new gate or
+            /// a `spawn_blocking` around `model_attributes` (the counter is
+            /// thread-local) must update it.
             #[tokio::test]
             async fn restore_cas_seam_loads_models_per_attempt_not_per_write() {
                 let _serial = rocky_core::state_sync::remote_testing::serial_guard();
