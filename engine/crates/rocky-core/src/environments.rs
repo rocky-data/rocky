@@ -603,10 +603,10 @@ mod tests {
         let p: EnvPointer = serde_json::from_str(future).unwrap();
         assert!(p.version.known().is_none());
         assert!(matches!(p.version, PointerVersion::Unreadable(_)));
+        // Kept as written (the same JSON value; key order is not kept).
         assert_eq!(
-            serde_json::to_string(&p).unwrap(),
-            future,
-            "kept as written"
+            serde_json::to_value(&p).unwrap(),
+            serde_json::from_str::<serde_json::Value>(future).unwrap()
         );
 
         // A whole head with one unknown pointer reads; the other stays known.
