@@ -5103,6 +5103,7 @@ mod tests {
                     hash_scheme: None,
                     output_column_hashes: None,
                     attempts: Vec::new(),
+                    output_version: None,
                 }],
                 trigger: RunTrigger::Manual,
                 config_hash: "c".to_string(),

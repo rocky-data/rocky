@@ -171,6 +171,49 @@ fn promotion_kind(result: &QueryResult) -> AdapterResult<Option<ObjectKind>> {
     }
 }
 
+/// The cap on the after-write version read. It is a single attempt; a slow
+/// answer becomes `observe_failed`, never a delay to the run.
+const OBSERVE_VERSION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// `DESCRIBE HISTORY <table> LIMIT 1`, with the table name formatted by the
+/// dialect, which validates every part. An invalid identifier is an error,
+/// never SQL.
+fn describe_history_sql(dialect: &dyn SqlDialect, table: &TableRef) -> AdapterResult<String> {
+    let target = dialect.format_table_ref(&table.catalog, &table.schema, &table.table)?;
+    Ok(format!("DESCRIBE HISTORY {target} LIMIT 1"))
+}
+
+/// The `version` of the newest row of a `DESCRIBE HISTORY` result.
+///
+/// The Statement Execution API returns cells as JSON strings (`"7"`); a
+/// number is accepted too. `DESCRIBE HISTORY` lists the newest commit first,
+/// so with `LIMIT 1` the answer is the one row. No row, no `version` column,
+/// a null or a non-integer cell is an error.
+fn latest_history_version(result: &QueryResult) -> AdapterResult<u64> {
+    let idx = result
+        .columns
+        .iter()
+        .position(|c| c.eq_ignore_ascii_case("version"))
+        .ok_or_else(|| AdapterError::msg("DESCRIBE HISTORY returned no `version` column"))?;
+    let row = result
+        .rows
+        .first()
+        .ok_or_else(|| AdapterError::msg("DESCRIBE HISTORY returned no rows"))?;
+    let cell = row
+        .get(idx)
+        .ok_or_else(|| AdapterError::msg("DESCRIBE HISTORY row has no `version` cell"))?;
+    let parsed = match cell {
+        serde_json::Value::String(s) => s.trim().parse::<u64>().ok(),
+        serde_json::Value::Number(n) => n.as_u64(),
+        _ => None,
+    };
+    parsed.ok_or_else(|| {
+        AdapterError::msg(format!(
+            "DESCRIBE HISTORY `version` is not a table version: {cell}"
+        ))
+    })
+}
+
 #[async_trait]
 impl WarehouseAdapter for DatabricksWarehouseAdapter {
     fn dialect(&self) -> &dyn SqlDialect {
@@ -292,6 +335,28 @@ impl WarehouseAdapter for DatabricksWarehouseAdapter {
             .describe_detail_marker(&table.catalog, &table.schema, &table.table)
             .await
             .map_err(AdapterError::new)
+    }
+
+    /// `DESCRIBE HISTORY <table> LIMIT 1` and its `version` column, read
+    /// with one attempt, no retries, no draw from the run's retry budget and
+    /// a 10 s cap (`OBSERVE_VERSION_TIMEOUT`). The
+    /// table name goes through the dialect, which accepts only
+    /// `[a-zA-Z0-9_]` in every part, the same rule as every other statement. A non-Delta table, an empty history or a missing column is
+    /// an error, so the runner records `observe_failed` rather than a guess.
+    async fn observed_table_version(&self, table: &TableRef) -> AdapterResult<Option<u64>> {
+        let sql = describe_history_sql(&self.dialect, table)?;
+        // One attempt, no retry budget, short timeout: an optional read must
+        // never cost the run's real writes anything.
+        let result = self
+            .connector
+            .execute_sql_single_attempt(&sql, OBSERVE_VERSION_TIMEOUT)
+            .await
+            .map_err(AdapterError::new)?;
+        latest_history_version(&QueryResult {
+            columns: result.columns.iter().map(|c| c.name.clone()).collect(),
+            rows: result.rows,
+        })
+        .map(Some)
     }
 
     async fn describe_table(&self, table: &TableRef) -> AdapterResult<Vec<ColumnInfo>> {
@@ -677,6 +742,53 @@ fn parse_databricks_i128(v: &serde_json::Value) -> AdapterResult<i128> {
 mod tests {
     use super::*;
     use rocky_catalog_core::{ColumnSchema as CatalogColumnSchema, TableSchema as CatalogSchema};
+
+    #[test]
+    fn describe_history_sql_validates_identifiers() {
+        let table = TableRef {
+            catalog: "main".into(),
+            schema: "marts".into(),
+            table: "fct_orders".into(),
+        };
+        assert_eq!(
+            describe_history_sql(&DatabricksSqlDialect, &table).unwrap(),
+            "DESCRIBE HISTORY main.marts.fct_orders LIMIT 1"
+        );
+        let hostile = TableRef {
+            table: "t` ; DROP TABLE x; --".into(),
+            ..table
+        };
+        assert!(describe_history_sql(&DatabricksSqlDialect, &hostile).is_err());
+    }
+
+    #[test]
+    fn latest_history_version_parses_string_and_number_cells() {
+        let result = |cols: Vec<&str>, rows: Vec<Vec<serde_json::Value>>| QueryResult {
+            columns: cols.into_iter().map(String::from).collect(),
+            rows,
+        };
+        let ok = result(
+            vec!["version", "timestamp", "operation"],
+            vec![vec![
+                serde_json::json!("12"),
+                serde_json::json!("2026-10-06T00:00:00Z"),
+                serde_json::json!("WRITE"),
+            ]],
+        );
+        assert_eq!(latest_history_version(&ok).unwrap(), 12);
+        let numeric = result(vec!["VERSION"], vec![vec![serde_json::json!(3)]]);
+        assert_eq!(latest_history_version(&numeric).unwrap(), 3);
+
+        for bad in [
+            result(vec!["version"], vec![]),
+            result(vec!["operation"], vec![vec![serde_json::json!("WRITE")]]),
+            result(vec!["version"], vec![vec![serde_json::Value::Null]]),
+            result(vec!["version"], vec![vec![serde_json::json!("-1")]]),
+            result(vec!["version"], vec![vec![serde_json::json!("abc")]]),
+        ] {
+            assert!(latest_history_version(&bad).is_err(), "{:?}", bad.rows);
+        }
+    }
 
     #[test]
     fn promotion_probe_sql_and_kinds() {

@@ -13135,6 +13135,13 @@ pub(crate) async fn execute_models_with_explicit_contracts(
                             // above; routed onto `ModelExecution.upstream_freshness`
                             // by `to_run_record`.
                             consumed_column_baseline,
+                            // The version identity of this write, from the files the
+                            // writer just committed (RV1-P1b). State only.
+                            output_version: Some(
+                                super::run_output_version::content_addressed_output_version(
+                                    &model_ir, &summary,
+                                ),
+                            ),
                         });
                         // Make this model's producer column hashes visible to
                         // later content-addressed models that consume it, so a
@@ -14972,6 +14979,21 @@ async fn execute_one_plain_model(
         model_ir.target.schema.clone(),
         model_ir.target.table.clone(),
     ];
+    // The output's version identity, read after the write (RV1-P1b). Taken
+    // after `model_duration_ms` so the read does not count toward the build.
+    // A failed read is recorded as `observe_failed`; it never fails the model.
+    let output_version = super::run_output_version::observe_output_version(
+        warehouse,
+        &model_ir.materialization,
+        &rocky_ir::TableRef {
+            catalog: model_ir.target.catalog.clone(),
+            schema: model_ir.target.schema.clone(),
+            table: model_ir.target.table.clone(),
+        },
+        &job_ids_acc,
+        Utc::now(),
+    )
+    .await;
     Ok(MaterializationOutput {
         asset_key,
         notes: pending_drop
@@ -15015,6 +15037,7 @@ async fn execute_one_plain_model(
         output_column_hashes: None,
         // Consumer baseline is content-addressed-path only.
         consumed_column_baseline: None,
+        output_version: Some(output_version),
     })
 }
 
@@ -15225,6 +15248,21 @@ async fn execute_snapshot_model(
         }
     }
 
+    let duration_ms = model_start.elapsed().as_millis() as u64;
+    // The snapshot table's version identity, read after the write (RV1-P1b).
+    // A failed read is recorded as `observe_failed`; it never fails the model.
+    let output_version = super::run_output_version::observe_output_version(
+        warehouse,
+        &model_ir.materialization,
+        &rocky_ir::TableRef {
+            catalog: model_ir.target.catalog.clone(),
+            schema: model_ir.target.schema.clone(),
+            table: model_ir.target.table.clone(),
+        },
+        &job_ids_acc,
+        Utc::now(),
+    )
+    .await;
     Ok(MaterializationOutput {
         asset_key: vec![
             model_ir.target.catalog.clone(),
@@ -15234,7 +15272,7 @@ async fn execute_snapshot_model(
         notes,
         attempts: Vec::new(),
         rows_copied: None,
-        duration_ms: model_start.elapsed().as_millis() as u64,
+        duration_ms,
         started_at: model_started_at,
         metadata: MaterializationMetadata {
             strategy: transformation_strategy_name(&model_ir.materialization).to_string(),
@@ -15260,6 +15298,7 @@ async fn execute_snapshot_model(
         )),
         output_column_hashes: None,
         consumed_column_baseline: None,
+        output_version: Some(output_version),
     })
 }
 
@@ -15700,6 +15739,23 @@ async fn run_one_partition(
     let sql_hash = Some(crate::output::sql_fingerprint(&stmts));
     let column_count = exec_ctx.column_count_for(model_name);
     let compile_time_ms = exec_ctx.compile_time_ms_for(model_name);
+    // The table's version identity, read after this partition's write
+    // (RV1-P1b). Partitions can run concurrently, so on a Delta table the
+    // observed version can be a sibling partition's later commit; the
+    // variant says "observed", never "made". A failed read is recorded as
+    // `observe_failed`; it never fails the partition.
+    let output_version = super::run_output_version::observe_output_version(
+        warehouse,
+        &tplan_ir.materialization,
+        &rocky_ir::TableRef {
+            catalog: tplan_ir.target.catalog.clone(),
+            schema: tplan_ir.target.schema.clone(),
+            table: tplan_ir.target.table.clone(),
+        },
+        &job_ids_acc,
+        chrono::Utc::now(),
+    )
+    .await;
     PartitionExecutionResult {
         partition_key: key.clone(),
         outcome: Ok(MaterializationOutput {
@@ -15741,6 +15797,7 @@ async fn run_one_partition(
             output_column_hashes: None,
             // Consumer baseline is content-addressed-path only.
             consumed_column_baseline: None,
+            output_version: Some(output_version),
         }),
     }
 }
@@ -17169,6 +17226,11 @@ async fn process_table(
         }
     }
 
+    // RV1-P1b: replication sends no version query, to keep its cost
+    // unchanged; the record says `not_observed`.
+    let job_ids: Vec<String> = exec_stats.job_id.clone().into_iter().collect();
+    let output_version = super::run_output_version::replication_output_version();
+
     Ok(TableOutcome::Materialized(Box::new(TableResult {
         probe_rate_limited,
         materialization: MaterializationOutput {
@@ -17198,7 +17260,7 @@ async fn process_table(
             // `{tenant}` component on the task. `None` for non-tenant
             // patterns; carried onto the persisted ModelExecution.
             tenant: task.tenant.clone(),
-            job_ids: exec_stats.job_id.clone().into_iter().collect(),
+            job_ids,
             // Replication materializations are not gated by --skip-unchanged
             // in v1 (the gate covers transformation models).
             skip_internal: None,
@@ -17210,6 +17272,7 @@ async fn process_table(
             output_column_hashes: None,
             // Consumer baseline is content-addressed-path only.
             consumed_column_baseline: None,
+            output_version: Some(output_version),
         },
         drift_checked: true,
         drift_detected: drift_action,
@@ -23317,6 +23380,7 @@ auto_create_schemas = true
             recipe_identity: identity,
             output_column_hashes: None,
             consumed_column_baseline: None,
+            output_version: None,
         }
     }
 
@@ -36867,6 +36931,7 @@ auto_create_schemas = true
                 hash_scheme: None,
                 output_column_hashes: None,
                 attempts: Vec::new(),
+                output_version: None,
             }],
             trigger: rocky_core::state::RunTrigger::Manual,
             config_hash: "cfg".to_string(),
@@ -39149,6 +39214,7 @@ auto_create_schemas = true
             // content-addressed consumer sees fct's current output == its prior.
             output_column_hashes: Some(vec![ch("amount", "H_FCT_OUT")]),
             attempts: Vec::new(),
+            output_version: None,
         };
         let run = rocky_core::state::RunRecord {
             run_id: "run-1".to_string(),
@@ -39349,6 +39415,7 @@ auto_create_schemas = true
             hash_scheme: Some(identity.hash_scheme.clone()),
             output_column_hashes: Some(vec![ch("amount", "H_FCT_OUT")]),
             attempts: Vec::new(),
+            output_version: None,
         };
         let base_run = rocky_core::state::RunRecord {
             run_id: "run-prior".to_string(),
@@ -39486,6 +39553,7 @@ auto_create_schemas = true
                 hash_scheme: Some(identity.hash_scheme.clone()),
                 output_column_hashes: Some(vec![ch("amount", "H_FCT_OUT")]),
                 attempts: Vec::new(),
+                output_version: None,
             }],
             trigger: rocky_core::state::RunTrigger::Manual,
             config_hash: "cfg".to_string(),
@@ -40468,6 +40536,7 @@ auto_create_schemas = true
                 hash_scheme: Some(identity.hash_scheme.clone()),
                 output_column_hashes: Some(fct_out.clone()),
                 attempts: Vec::new(),
+                output_version: None,
             };
             let run = rocky_core::state::RunRecord {
                 run_id: "run-1".to_string(),
@@ -40773,6 +40842,7 @@ auto_create_schemas = true
                 hash_scheme: Some(identity.hash_scheme.clone()),
                 output_column_hashes: None,
                 attempts: Vec::new(),
+                output_version: None,
             };
             store
                 .record_run(&rocky_core::state::RunRecord {

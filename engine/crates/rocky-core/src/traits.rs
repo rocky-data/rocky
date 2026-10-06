@@ -598,6 +598,32 @@ pub trait WarehouseAdapter: Send + Sync {
         Ok(None)
     }
 
+    /// The current version number of a table, read after Rocky wrote it.
+    ///
+    /// The runner records the answer as
+    /// [`crate::state::OutputVersion::DeltaObserved`]. It is an observation,
+    /// not a proof: another writer can commit between Rocky's write and this
+    /// read, so the version can be later than Rocky's commit, never earlier.
+    ///
+    /// - **Databricks:** the `version` column of `DESCRIBE HISTORY <table>
+    ///   LIMIT 1` (Delta tables).
+    /// - **Every other adapter:** `Ok(None)`, the default. The runner records
+    ///   `Unversioned { reason: adapter_has_no_version }`.
+    ///
+    /// The read is optional, so an implementation must make **one attempt**:
+    /// no retries, no draw from a shared run-level retry budget, no circuit
+    /// breaker accounting, and a short timeout. It must never cost the run's
+    /// real writes anything.
+    ///
+    /// # Errors
+    ///
+    /// Returns `AdapterError` if the query fails or its answer has no usable
+    /// version. The runner records `Unversioned { reason: observe_failed }`
+    /// and logs a warning. A failed read never fails the run.
+    async fn observed_table_version(&self, _table: &TableRef) -> AdapterResult<Option<u64>> {
+        Ok(None)
+    }
+
     /// Cheap connectivity check. Exercises the auth path and verifies
     /// the warehouse is reachable without doing real work.
     ///

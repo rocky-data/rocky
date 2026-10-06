@@ -2382,6 +2382,7 @@ auto_create_schemas = true
             hash_scheme: Some("v1".to_string()),
             output_column_hashes: None,
             attempts: Vec::new(),
+            output_version: None,
         };
         store
             .record_run(&RunRecord {

@@ -761,6 +761,54 @@ impl DatabricksConnector {
         }
     }
 
+    /// Run one optional, read-only statement with a single attempt.
+    ///
+    /// Unlike [`Self::execute_sql`], this never retries, never draws from the
+    /// run-level retry budget and never touches the circuit breaker, so a
+    /// failing optional read cannot cost a later real write anything. The
+    /// whole call (submit and poll) is capped at `timeout`; on expiry it
+    /// returns [`ConnectorError::Timeout`] and the client stops waiting.
+    ///
+    /// Used for the after-write version read (RV1-P1b), whose failure is
+    /// recorded, not raised.
+    pub async fn execute_sql_single_attempt(
+        &self,
+        sql: &str,
+        timeout: Duration,
+    ) -> Result<QueryResult, ConnectorError> {
+        let response = match tokio::time::timeout(
+            timeout,
+            self.submit_and_wait_once(sql, ResultFormat::InlineJson),
+        )
+        .await
+        {
+            Ok(result) => result?,
+            Err(_) => {
+                return Err(ConnectorError::Timeout {
+                    id: "<single-attempt>".to_string(),
+                    seconds: timeout.as_secs(),
+                });
+            }
+        };
+        rocky_observe::metrics::METRICS.inc_statements_executed();
+        let total_row_count = response.manifest.as_ref().and_then(|m| m.total_row_count);
+        let columns = response
+            .manifest
+            .and_then(|m| m.schema)
+            .map(|s| s.columns)
+            .unwrap_or_default();
+        let rows = response
+            .result
+            .and_then(|r| r.data_array)
+            .unwrap_or_default();
+        Ok(QueryResult {
+            statement_id: response.statement_id,
+            columns,
+            rows,
+            total_row_count,
+        })
+    }
+
     /// Fetch table-level byte statistics using `DESCRIBE DETAIL`.
     ///
     /// Issues `DESCRIBE DETAIL <catalog>.<schema>.<table>` against the

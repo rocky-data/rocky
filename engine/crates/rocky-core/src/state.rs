@@ -911,6 +911,18 @@ const SNAPSHOT_MEMORY_WARN_BYTES: u64 = 128 * 1024 * 1024;
 ///   **The phase that makes a gate read the id (RV4-P2, signatures) MUST bump.**
 ///   From then on an older binary that ignores the id would decide
 ///   differently, which is the v31 lesson above.
+///
+/// - **[`ModelExecution::output_version`]** (RV1-P1b, at v31). The version
+///   identity of each model output. Nothing reads it in P1b; it is recorded
+///   only. A v31 binary without the field ignores it and drops nothing it
+///   would act on. A row from an older binary reads back `None`, which means
+///   "not recorded". The field is omitted when `None` and read leniently.
+///   Guarded by `test_v31_model_execution_forward_deserializes_output_version_none`
+///   and `test_v31_rollback_mirror_reads_a_row_with_output_version`.
+///
+///   **RV1-P2 MUST bump to v32 when publish starts reading `output_version`.**
+///   From then on an older binary that ignores the version would publish
+///   differently, which is the v31 lesson above.
 const CURRENT_SCHEMA_VERSION: u32 = 31;
 
 /// Errors from the embedded redb state store.
@@ -2711,6 +2723,187 @@ pub struct ModelExecution {
     /// and the `ledger_record_serialization_pinned` golden.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attempts: Vec<AttemptRecord>,
+
+    // --- Output version (RV1-P1b, no schema bump) ------------------------
+    /// The version identity of the output this execution wrote, as the
+    /// warehouse reports it. See [`OutputVersion`] for what each variant
+    /// proves and what it does not.
+    ///
+    /// `None` means "not recorded": a failed execution, or a record written
+    /// by a binary that predates this field. A successful execution on this
+    /// binary always records `Some`, and an adapter that has no version
+    /// records [`OutputVersion::Unversioned`] with a reason.
+    ///
+    /// Added WITHOUT a schema bump; see the note above
+    /// [`CURRENT_SCHEMA_VERSION`]. Omitted when `None`, so the
+    /// `ledger_record_serialization_pinned` golden stays byte-identical.
+    ///
+    /// Written strictly, read leniently: a value this binary cannot parse (a
+    /// later binary's new variant or reason, or a corrupt value) reads as
+    /// `None` instead of failing the whole run-history read.
+    /// State-internal: not part of any `*Output` JSON schema, so no codegen.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_output_version_lenient"
+    )]
+    pub output_version: Option<OutputVersion>,
+}
+
+/// Lenient reader for [`ModelExecution::output_version`]: any value that does
+/// not parse as an [`OutputVersion`] reads as `None` ("not recorded"). No gate
+/// reads the version yet, so losing an unparseable one is safe; failing the
+/// row (and with it every run-history read) is not.
+fn deserialize_output_version_lenient<'de, D>(
+    deserializer: D,
+) -> Result<Option<OutputVersion>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = <Option<serde_json::Value> as serde::Deserialize>::deserialize(deserializer)?;
+    Ok(raw.and_then(|v| serde_json::from_value(v).ok()))
+}
+
+/// The version identity of one model output, recorded per execution (RV1-P1b).
+///
+/// Each variant says how strong its claim is. Only
+/// [`OutputVersion::ContentAddressed`] is a proof that Rocky made the commit
+/// it names, because Rocky owns that write.
+///
+/// ```text
+///   content_addressed  Rocky wrote the files and the Delta commit   proof
+///   delta_observed     DESCRIBE HISTORY read after the write       observation
+///   warehouse_job      the warehouse job id of the last statement  job identity
+///   unversioned        no version available, with a closed reason  none
+/// ```
+///
+/// Serialized with a `kind` tag in snake_case, for example
+/// `{"kind":"delta_observed","table":"c.s.t","version":7}`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum OutputVersion {
+    /// Rocky wrote this output itself through the content-addressed writer.
+    ///
+    /// `delta_versions` holds every Delta commit version this execution made,
+    /// sorted and without repeats. An unpartitioned write makes one commit, so
+    /// it holds one entry; on a point-to reuse that entry is the pointer
+    /// commit. A partitioned write makes one commit per partition group today,
+    /// so it holds one entry per group. RV1-P1a will make it one commit per
+    /// run.
+    ///
+    /// `files` holds the blake3 (hex) of every parquet file the execution
+    /// committed, sorted. `blake3` is the identity of the whole output: the
+    /// single file's hash for an unpartitioned write, or
+    /// [`partitioned_output_blake3`] over `files` for a partitioned write.
+    /// Build it with [`OutputVersion::content_addressed`].
+    ContentAddressed {
+        table: String,
+        delta_versions: Vec<u64>,
+        blake3: String,
+        files: Vec<String>,
+    },
+    /// The Delta table version Rocky read with `DESCRIBE HISTORY` **after**
+    /// its write finished.
+    ///
+    /// This is an observation, not a proof. Another writer can commit between
+    /// Rocky's write and the read, so `version` can name a later commit than
+    /// the one Rocky made. It is never an earlier one. Concurrent
+    /// `time_interval` partitions of one model can each observe a sibling
+    /// partition's later commit.
+    ///
+    /// `(table, version)` is not unique over time: a `DROP` + `CREATE` (for
+    /// example a full refresh with a pre-drop, or `atomic_drop_and_create` on
+    /// a kind switch) starts a new Delta table at version 0, so an earlier
+    /// incarnation can carry the same pair.
+    DeltaObserved { table: String, version: u64 },
+    /// A warehouse job id for this output (BigQuery `jobReference.jobId`).
+    ///
+    /// `job_id` is the job id of the **last** statement Rocky ran for the
+    /// model. That statement may not be the one that wrote the data (for
+    /// example a trailing statement after the write), so the id identifies
+    /// the run's work, not proof of the data commit.
+    WarehouseJob {
+        table: String,
+        job_id: String,
+        /// Rocky's clock after the write, not the job's end time.
+        recorded_at: chrono::DateTime<chrono::Utc>,
+    },
+    /// No version identity is available. The reason is a closed set, so a
+    /// reader can tell "the adapter cannot say" from "the read failed".
+    Unversioned { reason: UnversionedReason },
+}
+
+/// Why an execution recorded [`OutputVersion::Unversioned`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UnversionedReason {
+    /// The adapter exposes no table version (DuckDB, Trino, Postgres,
+    /// Redshift, ClickHouse, SQL Server, and Snowflake until its query id is
+    /// wired).
+    AdapterHasNoVersion,
+    /// A view stores no data, so there is no data version to record.
+    ViewHasNoStoredData,
+    /// The warehouse refreshes the output on its own schedule
+    /// (`materialized_view`, `dynamic_table`), so no write of Rocky's names
+    /// a version.
+    WarehouseManagedRefresh,
+    /// The model writes nothing (`ephemeral`).
+    NoOutput,
+    /// The adapter supports a version read, but the read failed. The run
+    /// itself still succeeded.
+    ObserveFailed,
+    /// Rocky did not query the version, to keep replication cost unchanged.
+    NotObserved,
+}
+
+/// The whole-output blake3 (hex) of a partitioned content-addressed write.
+///
+/// Recipe: sort the per-file blake3 hex strings, then hash the domain tag
+/// `rocky.partitioned-output.v1\n` followed by each sorted hash and a `\n`.
+/// Sorting makes the result independent of the order the groups were written.
+pub fn partitioned_output_blake3(file_hashes: &[String]) -> String {
+    let mut sorted: Vec<&str> = file_hashes.iter().map(String::as_str).collect();
+    sorted.sort_unstable();
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"rocky.partitioned-output.v1\n");
+    for hash in sorted {
+        hasher.update(hash.as_bytes());
+        hasher.update(b"\n");
+    }
+    hasher.finalize().to_hex().to_string()
+}
+
+impl OutputVersion {
+    /// Build [`OutputVersion::ContentAddressed`] from the commit versions and
+    /// per-file hashes of one execution. Both are sorted; the versions lose
+    /// repeats. `partitioned` selects the whole-output identity: the
+    /// single file's hash, or [`partitioned_output_blake3`] over all files.
+    ///
+    /// An unpartitioned write commits exactly one file. If `partitioned` is
+    /// false but the list does not hold exactly one hash, the fold is used
+    /// anyway, so the identity never silently covers only one file.
+    pub fn content_addressed(
+        table: String,
+        commit_versions: Vec<u64>,
+        file_hashes: Vec<String>,
+        partitioned: bool,
+    ) -> Self {
+        let mut delta_versions = commit_versions;
+        delta_versions.sort_unstable();
+        delta_versions.dedup();
+        let mut files = file_hashes;
+        files.sort_unstable();
+        let blake3 = match files.as_slice() {
+            [only] if !partitioned => only.clone(),
+            _ => partitioned_output_blake3(&files),
+        };
+        OutputVersion::ContentAddressed {
+            table,
+            delta_versions,
+            blake3,
+            files,
+        }
+    }
 }
 
 /// Where a run wrote its results. Missing on records written before #2172.
@@ -9887,6 +10080,7 @@ mod tests {
                 hash_scheme: None,
                 output_column_hashes: None,
                 attempts: Vec::new(),
+                output_version: None,
             }],
         );
         store.record_run(&run).unwrap();
@@ -10085,6 +10279,7 @@ mod tests {
                 hash_scheme: None,
                 output_column_hashes: None,
                 attempts: Vec::new(),
+                output_version: None,
             })
             .collect();
         for i in 0..1440u32 {
@@ -10382,6 +10577,7 @@ mod tests {
             hash_scheme: None,
             output_column_hashes: None,
             attempts: Vec::new(),
+            output_version: None,
         }
     }
 
@@ -10473,6 +10669,7 @@ mod tests {
                     hash_scheme: None,
                     output_column_hashes: None,
                     attempts: Vec::new(),
+                    output_version: None,
                 },
                 ModelExecution {
                     model_name: "customers".to_string(),
@@ -10494,6 +10691,7 @@ mod tests {
                     hash_scheme: None,
                     output_column_hashes: None,
                     attempts: Vec::new(),
+                    output_version: None,
                 },
             ],
         );
@@ -10530,6 +10728,7 @@ mod tests {
                     hash_scheme: None,
                     output_column_hashes: None,
                     attempts: Vec::new(),
+                    output_version: None,
                 }],
             );
             store.record_run(&run).unwrap();
@@ -10859,6 +11058,7 @@ mod tests {
                 hash: "col-hash".to_string(),
             }]),
             attempts: Vec::new(),
+            output_version: None,
         };
         let json = serde_json::to_string(&exec).unwrap();
         let back: ModelExecution = serde_json::from_str(&json).unwrap();
@@ -10911,6 +11111,7 @@ mod tests {
             hash_scheme: Some("v1".to_string()),
             output_column_hashes: None,
             attempts: Vec::new(),
+            output_version: None,
         };
         let exec_json = serde_json::to_string(&exec).unwrap();
 
@@ -10945,6 +11146,241 @@ mod tests {
             prov_json, PROV_GOLDEN,
             "ProvenanceRecord wire format drifted"
         );
+    }
+
+    // --- RV1-P1b: ModelExecution.output_version ---------------------------
+
+    /// One value of every [`OutputVersion`] variant and every
+    /// [`UnversionedReason`], for the round-trip tests.
+    fn every_output_version() -> Vec<OutputVersion> {
+        let ts: chrono::DateTime<chrono::Utc> = "2024-01-01T12:00:00Z".parse().unwrap();
+        let mut all = vec![
+            OutputVersion::content_addressed(
+                "c.s.t".to_string(),
+                vec![5, 4],
+                vec!["bb".to_string(), "aa".to_string()],
+                true,
+            ),
+            OutputVersion::content_addressed(
+                "c.s.t".to_string(),
+                vec![1],
+                vec!["aa".into()],
+                false,
+            ),
+            OutputVersion::DeltaObserved {
+                table: "c.s.t".to_string(),
+                version: 7,
+            },
+            OutputVersion::WarehouseJob {
+                table: "p.d.t".to_string(),
+                job_id: "job_123".to_string(),
+                recorded_at: ts,
+            },
+        ];
+        // Exhaustive on purpose: a new reason fails to compile here until it
+        // joins the round-trip set.
+        for reason in [
+            UnversionedReason::AdapterHasNoVersion,
+            UnversionedReason::ViewHasNoStoredData,
+            UnversionedReason::WarehouseManagedRefresh,
+            UnversionedReason::NoOutput,
+            UnversionedReason::ObserveFailed,
+            UnversionedReason::NotObserved,
+        ] {
+            match reason {
+                UnversionedReason::AdapterHasNoVersion
+                | UnversionedReason::ViewHasNoStoredData
+                | UnversionedReason::WarehouseManagedRefresh
+                | UnversionedReason::NoOutput
+                | UnversionedReason::ObserveFailed
+                | UnversionedReason::NotObserved => {}
+            }
+            all.push(OutputVersion::Unversioned { reason });
+        }
+        all
+    }
+
+    /// A row written before RV1-P1b has no `output_version` key. It must read
+    /// back `None` ("not recorded"), and re-serialize without the key.
+    #[test]
+    fn test_v31_model_execution_forward_deserializes_output_version_none() {
+        let old = r#"{"model_name":"fct_orders","started_at":"2024-01-01T12:00:00Z","finished_at":"2024-01-01T12:00:00Z","duration_ms":2000,"rows_affected":10,"status":"success","sql_hash":"sql","skip_hash":null,"upstream_freshness":null,"bytes_scanned":null,"bytes_written":null,"tenant":null,"recipe_hash":null,"input_hash":null,"input_proof_class":null,"env_hash":null,"hash_scheme":null,"output_column_hashes":null}"#;
+        let exec: ModelExecution = serde_json::from_str(old).unwrap();
+        assert!(exec.output_version.is_none());
+        let again = serde_json::to_string(&exec).unwrap();
+        assert!(!again.contains("output_version"), "{again}");
+    }
+
+    /// Every variant round-trips through the `ModelExecution` blob, and
+    /// through a real run-history row in redb.
+    #[test]
+    fn test_output_version_every_variant_round_trips() {
+        let (store, _dir) = temp_store();
+        for (i, version) in every_output_version().into_iter().enumerate() {
+            let mut exec = model_execution("fct_orders");
+            exec.output_version = Some(version.clone());
+            let json = serde_json::to_string(&exec).unwrap();
+            let back: ModelExecution = serde_json::from_str(&json).unwrap();
+            assert_eq!(back.output_version.as_ref(), Some(&version), "{json}");
+
+            let run_id = format!("run-ov-{i}");
+            store
+                .record_run(&minimal_run_record(&run_id, vec![exec]))
+                .unwrap();
+            let stored = store.get_run(&run_id).unwrap().unwrap();
+            assert_eq!(
+                stored.models_executed[0].output_version.as_ref(),
+                Some(&version)
+            );
+        }
+    }
+
+    /// The wire shape is part of the record: a `kind` tag and snake_case
+    /// names. Pin one of each so a renamed variant fails here.
+    #[test]
+    fn test_output_version_wire_shape_pinned() {
+        let pins = [
+            (
+                OutputVersion::DeltaObserved {
+                    table: "c.s.t".into(),
+                    version: 7,
+                },
+                r#"{"kind":"delta_observed","table":"c.s.t","version":7}"#,
+            ),
+            (
+                OutputVersion::Unversioned {
+                    reason: UnversionedReason::ObserveFailed,
+                },
+                r#"{"kind":"unversioned","reason":"observe_failed"}"#,
+            ),
+            (
+                OutputVersion::content_addressed("c.s.t".into(), vec![3], vec!["ab".into()], false),
+                r#"{"kind":"content_addressed","table":"c.s.t","delta_versions":[3],"blake3":"ab","files":["ab"]}"#,
+            ),
+        ];
+        for (value, expected) in pins {
+            assert_eq!(serde_json::to_string(&value).unwrap(), expected);
+        }
+    }
+
+    /// A value a later binary writes (a new variant or reason) reads as
+    /// `None` here, and the rest of the row still reads.
+    #[test]
+    fn test_unknown_output_version_reads_as_not_recorded() {
+        for bad in [
+            serde_json::json!({"kind": "iceberg_snapshot", "table": "t", "id": 9}),
+            serde_json::json!({"kind": "unversioned", "reason": "something_new"}),
+            serde_json::json!("garbage"),
+        ] {
+            let mut row = serde_json::to_value(model_execution("fct_orders")).unwrap();
+            row["output_version"] = bad.clone();
+            let back: ModelExecution = serde_json::from_value(row)
+                .expect("an unknown output_version must not fail the row");
+            assert!(back.output_version.is_none(), "{bad}");
+            assert_eq!(back.model_name, "fct_orders");
+        }
+    }
+
+    /// Rollback: a v31 binary from before RV1-P1b has no `output_version`
+    /// field. It must still read a row this build wrote with the field set.
+    /// The mirror struct is the pre-P1b shape, with serde's default
+    /// unknown-field handling.
+    #[test]
+    fn test_v31_rollback_mirror_reads_a_row_with_output_version() {
+        #[derive(serde::Deserialize)]
+        #[allow(dead_code)]
+        struct PreP1bModelExecution {
+            model_name: String,
+            started_at: chrono::DateTime<chrono::Utc>,
+            finished_at: chrono::DateTime<chrono::Utc>,
+            duration_ms: u64,
+            rows_affected: Option<u64>,
+            status: String,
+            sql_hash: String,
+            #[serde(default)]
+            skip_hash: Option<String>,
+            #[serde(default)]
+            upstream_freshness: Option<Vec<UpstreamSig>>,
+            bytes_scanned: Option<u64>,
+            bytes_written: Option<u64>,
+            #[serde(default)]
+            tenant: Option<String>,
+            #[serde(default)]
+            recipe_hash: Option<String>,
+            #[serde(default)]
+            output_column_hashes: Option<Vec<ColumnHash>>,
+            #[serde(default)]
+            attempts: Vec<AttemptRecord>,
+        }
+        for version in every_output_version() {
+            let mut exec = model_execution("fct_orders");
+            exec.output_version = Some(version);
+            let bytes = serde_json::to_vec(&exec).unwrap();
+            assert!(String::from_utf8_lossy(&bytes).contains("\"output_version\""));
+            let old: PreP1bModelExecution = serde_json::from_slice(&bytes)
+                .expect("a pre-P1b v31 binary must read a row that carries output_version");
+            assert_eq!(old.model_name, "fct_orders");
+        }
+    }
+
+    /// The partitioned whole-output hash does not depend on the order the
+    /// groups were written, and it does depend on every file.
+    #[test]
+    fn test_partitioned_output_blake3_is_order_independent() {
+        let a = vec!["11".to_string(), "22".to_string(), "33".to_string()];
+        let b = vec!["33".to_string(), "11".to_string(), "22".to_string()];
+        assert_eq!(partitioned_output_blake3(&a), partitioned_output_blake3(&b));
+        assert_ne!(
+            partitioned_output_blake3(&a),
+            partitioned_output_blake3(&a[..2])
+        );
+
+        let va = OutputVersion::content_addressed("t".into(), vec![6, 5, 7], a, true);
+        let vb = OutputVersion::content_addressed("t".into(), vec![7, 6, 5], b, true);
+        assert_eq!(va, vb, "same files in another order are the same version");
+        let OutputVersion::ContentAddressed {
+            blake3,
+            files,
+            delta_versions,
+            ..
+        } = va
+        else {
+            panic!("content_addressed builds ContentAddressed");
+        };
+        assert_eq!(files, vec!["11", "22", "33"], "files are stored sorted");
+        assert_eq!(delta_versions, vec![5, 6, 7], "every commit, sorted");
+        assert_ne!(blake3, "11", "a partitioned write folds, never one file");
+    }
+
+    /// An unpartitioned write is one file, and its identity is that file's
+    /// hash. A partitioned write with one group still folds.
+    #[test]
+    fn test_content_addressed_identity_per_shape() {
+        let single =
+            OutputVersion::content_addressed("t".into(), vec![2], vec!["ab".into()], false);
+        assert!(matches!(
+            &single,
+            OutputVersion::ContentAddressed { blake3, .. } if blake3 == "ab"
+        ));
+        let one_group =
+            OutputVersion::content_addressed("t".into(), vec![2], vec!["ab".into()], true);
+        assert!(matches!(
+            &one_group,
+            OutputVersion::ContentAddressed { blake3, .. }
+                if *blake3 == partitioned_output_blake3(&["ab".to_string()])
+        ));
+        // Defensive: an "unpartitioned" list of two files never reports one.
+        let two = OutputVersion::content_addressed(
+            "t".into(),
+            vec![2],
+            vec!["b".into(), "a".into()],
+            false,
+        );
+        assert!(matches!(
+            &two,
+            OutputVersion::ContentAddressed { blake3, .. }
+                if *blake3 == partitioned_output_blake3(&["a".to_string(), "b".to_string()])
+        ));
     }
 
     /// End-to-end variant of the forward-compat guard: write a v5 blob
