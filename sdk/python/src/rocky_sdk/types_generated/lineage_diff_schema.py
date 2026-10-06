@@ -8,6 +8,22 @@ from enum import StrEnum
 from pydantic import BaseModel, conint
 
 
+class CiDiffMode3(StrEnum):
+    """
+    Compare the HEAD commit, read from git objects. The default.
+    """
+
+    head = "head"
+
+
+class CiDiffMode4(StrEnum):
+    """
+    Compare the working tree: staged, unstaged, untracked, renamed and deleted files on disk (`--working-tree`).
+    """
+
+    working_tree = "working_tree"
+
+
 class ColumnChangeType(StrEnum):
     """
     Column was added in the incoming side.
@@ -32,6 +48,38 @@ class ColumnChangeType7(StrEnum):
     type_changed = "type_changed"
 
 
+class ConsumerImpactStatus1(StrEnum):
+    """
+    HEAD still reads (or newly reads) the removed column. This consumer breaks.
+    """
+
+    newly_broken = "newly_broken"
+
+
+class ConsumerImpactStatus2(StrEnum):
+    """
+    Lineage could not decide: HEAD did not compile, or the consumer mentions the column in a place lineage cannot attribute.
+    """
+
+    unknown = "unknown"
+
+
+class ConsumerImpactStatus3(StrEnum):
+    """
+    The consumer model no longer exists on HEAD.
+    """
+
+    deleted = "deleted"
+
+
+class ConsumerImpactStatus4(StrEnum):
+    """
+    The consumer still exists on HEAD and provably no longer reads the column.
+    """
+
+    repaired = "repaired"
+
+
 class DiffSummary(BaseModel):
     """
     High-level summary across all models in a diff run.
@@ -42,6 +90,38 @@ class DiffSummary(BaseModel):
     removed: conint(ge=0)
     total_models: conint(ge=0)
     unchanged: conint(ge=0)
+
+
+class LineageConsumerImpact(BaseModel):
+    """
+    One direct consumer of a removed column, classified.
+    """
+
+    columns: list[str] | None = None
+    """
+    Consumer output columns involved: the HEAD-side columns for `newly_broken`, the base-side columns otherwise. Empty when the read affects every column (a filter or join key).
+    """
+    model: str
+    """
+    The consumer model.
+    """
+    reason: str
+    """
+    One-line, human-readable explanation of the classification.
+    """
+    status: (
+        ConsumerImpactStatus1
+        | ConsumerImpactStatus2
+        | ConsumerImpactStatus3
+        | ConsumerImpactStatus4
+    )
+    """
+    What happened to a consumer of a removed column.
+    """
+    via: list[str] | None = None
+    """
+    How the consumer reads the column: `value`, or a row-selection kind (`join_key`, `filter`, `group_by`, `having`, `qualify`, `window_partition`, `window_order`).
+    """
 
 
 class LineageQualifiedColumn(BaseModel):
@@ -91,6 +171,10 @@ class LineageColumnChange(BaseModel):
     The kind of change observed for a single column.
     """
     column_name: str
+    consumer_impact: list[LineageConsumerImpact] | None = None
+    """
+    For a removed (or renamed-away) column: what happened to each model that read it directly, found by comparing the base and HEAD lineage graphs. Includes reads through value lineage and through row selection (join keys, filters, group keys, window keys). Omitted for other change types and when no consumer was found.
+    """
     downstream_consumers: list[LineageQualifiedColumn] | None = None
     """
     Columns reached by walking the lineage graph downstream from `(model_name, column_name)` on HEAD's compile. Empty when the column no longer exists on HEAD (e.g. for removed columns) or when the trace finds no consumers.
@@ -120,9 +204,13 @@ class LineageDiffOutput(BaseModel):
 
     The markdown payload is rendered server-side and ready to drop into a PR comment — answers "what does this PR change downstream?" in one command.
 
-    Trace direction is fixed to **downstream from HEAD only** in v1. Removed columns therefore report an empty consumer set (the column no longer exists on HEAD's compile, so its downstream reach can't be walked); the structural diff still surfaces the removal.
+    `downstream_consumers` is traced **downstream from HEAD**, so a removed column reports an empty set there. Removed columns instead carry `consumer_impact`: each direct consumer on the base side (or HEAD side), classified by comparing the base and HEAD lineage graphs.
     """
 
+    base_commit: str | None = None
+    """
+    Commit the base side was read from (merge base of `base_ref` and HEAD). Omitted when it could not be computed.
+    """
     base_ref: str
     """
     Git ref used as the comparison base (e.g. `main`).
@@ -135,6 +223,10 @@ class LineageDiffOutput(BaseModel):
     markdown: str
     """
     Pre-rendered Markdown suitable for posting as a GitHub PR comment.
+    """
+    mode: CiDiffMode3 | CiDiffMode4
+    """
+    Which snapshot was compared against the base. See [`CiDiffMode`].
     """
     results: list[LineageDiffResult]
     """

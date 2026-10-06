@@ -263,7 +263,7 @@ pub fn run_unit_tests(
             .map(|m| rocky_core::sql_gen::local_test_sql(m).into_owned());
         for test in &unit_tests[name] {
             match &compiled_sql {
-                Some(sql) => results.push(run_one_unit_test(name, sql, test)),
+                Some(sql) => results.push(run_one_unit_test(name, sql, test, &compile_result)),
                 None => results.push(UnitTestResult {
                     model: name.clone(),
                     test: test.name.clone(),
@@ -287,7 +287,12 @@ pub fn run_unit_tests(
 
 /// Execute one unit test: seed `given` fixtures, materialize the model against
 /// them, and compare the output to `expect`.
-fn run_one_unit_test(model: &str, compiled_sql: &str, test: &UnitTestDef) -> UnitTestResult {
+fn run_one_unit_test(
+    model: &str,
+    compiled_sql: &str,
+    test: &UnitTestDef,
+    compile_result: &rocky_compiler::compile::CompileResult,
+) -> UnitTestResult {
     let fail = |msg: String, mismatches: Vec<RowMismatch>| UnitTestResult {
         model: model.to_string(),
         test: test.name.clone(),
@@ -307,6 +312,17 @@ fn run_one_unit_test(model: &str, compiled_sql: &str, test: &UnitTestDef) -> Uni
         Ok(d) => d,
         Err(e) => return fail(format!("DuckDB init failed: {e}"), Vec::new()),
     };
+
+    // User-defined functions the model may call.
+    if let Some((function, e)) = crate::executor::create_local_functions(compile_result, &db)
+        .into_iter()
+        .next()
+    {
+        return fail(
+            format!("failed to create function '{function}': {e}"),
+            Vec::new(),
+        );
+    }
 
     // Seed the mock input fixtures.
     for fx in &test.given {
@@ -592,6 +608,29 @@ mod tests {
         )
         .unwrap();
         (dir, models)
+    }
+
+    /// A model that calls a user-defined function (`functions/`) runs under
+    /// `rocky test`: the function is created as a macro first.
+    #[test]
+    fn model_calling_a_udf_executes_locally() {
+        let (tmp, models) = scaffold_two_model_project();
+        let functions = tmp.path().join("functions");
+        std::fs::create_dir_all(&functions).unwrap();
+        std::fs::write(
+            functions.join("double_it.toml"),
+            "returns = \"BIGINT\"\n[[arguments]]\nname = \"x\"\ntype = \"BIGINT\"\n",
+        )
+        .unwrap();
+        std::fs::write(functions.join("double_it.sql"), "x * 2").unwrap();
+        std::fs::write(
+            models.join("good_mart.sql"),
+            "SELECT double_it(id) AS doubled, status FROM raw_orders",
+        )
+        .unwrap();
+        let result = run_tests(&models, None, None, &rocky_core::run_vars::RunVars::new()).unwrap();
+        assert!(result.failures.is_empty(), "{:?}", result.failures);
+        assert_eq!(result.passed, 2);
     }
 
     /// Unfiltered run reports every model — passes too, not just failures —

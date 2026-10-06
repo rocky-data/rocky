@@ -65,7 +65,8 @@ pub struct SkippedModelLite {
     /// The model's name.
     pub model: String,
     /// Why no statement was rendered for it — a strategy that needs a live
-    /// warehouse, or one Rocky refuses outright such as `ephemeral` (E038).
+    /// warehouse, or `ephemeral`, which is inlined into its consumers and has
+    /// no statement of its own.
     pub reason: String,
 }
 

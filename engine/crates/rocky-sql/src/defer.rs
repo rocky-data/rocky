@@ -596,7 +596,8 @@ impl CteScope {
     }
 }
 
-/// The CTE scope stack shared by both rewriters in this module.
+/// The CTE scope stack shared by both rewriters in this module, and by the
+/// ephemeral-model inliner in [`crate::ephemeral`].
 ///
 /// Both need the identical alias rule, so this is one struct rather than a
 /// trait. Owning it in both visitors is what keeps them from drifting apart:
@@ -607,19 +608,33 @@ impl CteScope {
 /// case-insensitive dialect `WITH Orders … FROM orders` was not treated as
 /// shadowed (those are ONE CTE there) and the reference was rewritten to a
 /// table the author never named.
-struct CteScopeStack {
+pub(crate) struct CteScopeStack {
     frames: Vec<CteScope>,
     case_rules: IdentifierCaseRules,
     recursive_visibility: RecursiveCteVisibility,
+    /// Treat every `WITH` as recursive. T-SQL has no `RECURSIVE` keyword: a
+    /// CTE that names itself is recursive, so its own alias is in scope in
+    /// its body.
+    implicit_recursion: bool,
 }
 
 impl CteScopeStack {
-    fn new(case_rules: IdentifierCaseRules, recursive_visibility: RecursiveCteVisibility) -> Self {
+    pub(crate) fn new(
+        case_rules: IdentifierCaseRules,
+        recursive_visibility: RecursiveCteVisibility,
+    ) -> Self {
         Self {
             frames: Vec::new(),
             case_rules,
             recursive_visibility,
+            implicit_recursion: false,
         }
+    }
+
+    /// Every `WITH` counts as recursive (T-SQL; see the field).
+    pub(crate) fn with_implicit_recursion(mut self) -> Self {
+        self.implicit_recursion = true;
+        self
     }
 
     /// The lookup form of an identifier: resolved the way the warehouse
@@ -646,7 +661,7 @@ impl CteScopeStack {
     /// Call from `pre_visit_query`. Positions the PARENT frame — this query is
     /// either one of its CTE bodies or part of its body — then pushes this
     /// query's own frame.
-    fn enter_query(&mut self, query: &Query) {
+    pub(crate) fn enter_query(&mut self, query: &Query) {
         let addr = Self::addr_of(query);
         if let Some(parent) = self.frames.last_mut() {
             parent.region = parent
@@ -658,7 +673,10 @@ impl CteScopeStack {
         let mut frame = CteScope {
             aliases: Vec::new(),
             body_addr: HashMap::new(),
-            recursive: query.with.as_ref().is_some_and(|w| w.recursive),
+            recursive: query
+                .with
+                .as_ref()
+                .is_some_and(|w| w.recursive || self.implicit_recursion),
             region: Region::Body,
         };
         if let Some(with) = &query.with {
@@ -675,15 +693,38 @@ impl CteScopeStack {
 
     /// Call from `post_visit_query`. Leaving a child returns the parent to its
     /// own body, where every alias is visible again.
-    fn exit_query(&mut self) {
+    pub(crate) fn exit_query(&mut self) {
         self.frames.pop();
         if let Some(parent) = self.frames.last_mut() {
             parent.region = Region::Body;
         }
     }
 
+    /// The CTE `value` binds to at this point of the walk: the frame's depth
+    /// (0 = outermost query) and the alias's index in that query's `WITH`
+    /// list. The innermost visible alias wins.
+    pub(crate) fn resolve(&self, value: &str, quoted: bool) -> Option<(usize, usize)> {
+        let name = self.lookup_form(value, quoted);
+        self.frames
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(depth, frame)| {
+                frame
+                    .visible(self.recursive_visibility)
+                    .iter()
+                    .rposition(|alias| *alias == name)
+                    .map(|index| (depth, index))
+            })
+    }
+
+    /// The number of queries the walk is currently inside.
+    pub(crate) fn depth(&self) -> usize {
+        self.frames.len()
+    }
+
     /// Whether `value` names a CTE in scope at this point of the walk.
-    fn is_shadowed(&self, value: &str, quoted: bool) -> bool {
+    pub(crate) fn is_shadowed(&self, value: &str, quoted: bool) -> bool {
         let name = self.lookup_form(value, quoted);
         self.frames
             .iter()

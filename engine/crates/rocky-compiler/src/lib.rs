@@ -17,20 +17,30 @@
 pub mod arena;
 pub mod blast_radius;
 pub mod cache;
+pub mod clickhouse_options;
 pub mod compile;
 pub mod contracts;
 pub mod cost_check;
 pub mod diagnostic;
+pub mod ephemeral;
+pub mod freshness;
+pub mod governance;
+pub mod group_by;
 pub mod import;
 pub mod limits;
+pub mod operand_check;
 pub mod partial;
 pub mod project;
+pub mod redshift_options;
 pub mod resolve;
 pub mod salsa_compile;
 pub mod schema_cache;
 pub mod semantic;
+pub mod snapshot;
+pub mod source_refs;
 pub mod typecheck;
 pub mod types;
+pub mod udf;
 
 // Re-export miette for downstream crates that need the rendering types.
 pub use miette;

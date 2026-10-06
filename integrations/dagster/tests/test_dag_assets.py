@@ -778,3 +778,152 @@ def test_transformation_execution_names_the_nodes_own_pipeline():
         call.args[0]: call.kwargs.get("pipeline") for call in mock_rocky.run_model.call_args_list
     }
     assert by_model == {"one": "alpha", "two": "beta"}, by_model
+
+
+# ---------------------------------------------------------------------------
+# Ephemeral models
+# ---------------------------------------------------------------------------
+
+
+def _ephemeral_chain_dag() -> DagResult:
+    """``raw (seed) -> eph_a (ephemeral) -> eph_b (ephemeral) -> fct``."""
+    return _make_dag_result(
+        nodes=[
+            {
+                "id": "seed:raw",
+                "kind": "seed",
+                "label": "raw",
+                "target": {"catalog": "w", "schema": "s", "table": "raw"},
+            },
+            {
+                "id": "transformation:eph_a",
+                "kind": "transformation",
+                "label": "eph_a",
+                "target": {"catalog": "w", "schema": "s", "table": "eph_a"},
+                "strategy": {"type": "ephemeral"},
+                "depends_on": ["seed:raw"],
+            },
+            {
+                "id": "transformation:eph_b",
+                "kind": "transformation",
+                "label": "eph_b",
+                "target": {"catalog": "w", "schema": "s", "table": "eph_b"},
+                "strategy": {"type": "ephemeral"},
+                "depends_on": ["transformation:eph_a"],
+            },
+            {
+                "id": "transformation:fct",
+                "kind": "transformation",
+                "label": "fct",
+                "target": {"catalog": "w", "schema": "s", "table": "fct"},
+                "strategy": {"type": "full_refresh"},
+                "depends_on": ["transformation:eph_b"],
+            },
+        ],
+        column_lineage=[
+            {
+                "source": {"model": "raw", "column": "amount"},
+                "target": {"model": "eph_a", "column": "amount"},
+                "transform": "direct",
+            },
+            {
+                "source": {"model": "eph_a", "column": "amount"},
+                "target": {"model": "eph_b", "column": "amt"},
+                "transform": "direct",
+            },
+            {
+                "source": {"model": "eph_b", "column": "amt"},
+                "target": {"model": "fct", "column": "total"},
+                "transform": "expression",
+            },
+        ],
+    )
+
+
+def test_ephemeral_nodes_get_no_asset_and_lineage_passes_through_them():
+    """An ephemeral model is never materialized (``rocky run --model`` on it
+    is E038), so it gets no asset. Its consumer depends on, and traces column
+    lineage to, the ephemeral model's own materialized upstream."""
+    specs, node_map = build_dag_specs(_ephemeral_chain_dag(), translator=RockyDagsterTranslator())
+    raw_key = node_map["seed:raw"]
+    fct_key = dg.AssetKey(["w", "s", "fct"])
+    assert {s.key for s in specs} == {raw_key, fct_key}
+    assert "transformation:eph_a" not in node_map
+    assert "transformation:eph_b" not in node_map
+
+    fct = next(s for s in specs if s.key == fct_key)
+    assert {dep.asset_key for dep in fct.deps} == {raw_key}
+    lineage = fct.metadata["dagster/column_lineage"]
+    assert lineage.deps_by_column["total"] == [
+        dg.TableColumnDep(asset_key=raw_key, column_name="amount")
+    ]
+
+
+def test_materializing_the_dag_never_runs_an_ephemeral_model():
+    from unittest.mock import MagicMock
+
+    mock_rocky = MagicMock()
+    mock_rocky.run_model.return_value = _dag_run_result(status="Success")
+    assets = build_dag_multi_assets(
+        _ephemeral_chain_dag(), rocky=mock_rocky, translator=RockyDagsterTranslator()
+    )
+    result = dg.materialize(assets, raise_on_error=False)
+    assert result.success
+    run_models = sorted(call.args[0] for call in mock_rocky.run_model.call_args_list)
+    assert run_models == ["fct"]
+
+
+_CHAIN = ["m1", "m2", "m3", "m4", "m5"]
+
+
+def _chained_transformations_dag() -> DagResult:
+    """``m1 -> m2 -> … -> m5``, all transformations in one group, listed
+    consumer-first so payload order alone would run each before its upstream.
+    Five links make an accidentally ordered set iteration (1 in 120) unlikely
+    enough that the test fails reliably without the fix."""
+    nodes = []
+    for i, name in reversed(list(enumerate(_CHAIN))):
+        node = {
+            "id": f"transformation:{name}",
+            "kind": "transformation",
+            "label": name,
+            "target": {"catalog": "w", "schema": "s", "table": name},
+            "strategy": {"type": "full_refresh"},
+        }
+        if i > 0:
+            node["depends_on"] = [f"transformation:{_CHAIN[i - 1]}"]
+        nodes.append(node)
+    return _make_dag_result(nodes=nodes)
+
+
+def test_chained_transformations_in_one_group_run_upstream_first():
+    """Chained models share one multi_asset. Dagster refuses an output
+    yielded before an in-group dependency, so the group must run and yield
+    in dependency order, not set order."""
+    from unittest.mock import MagicMock
+
+    mock_rocky = MagicMock()
+    mock_rocky.run_model.return_value = _dag_run_result(status="Success")
+    assets = build_dag_multi_assets(
+        _chained_transformations_dag(), rocky=mock_rocky, translator=RockyDagsterTranslator()
+    )
+    assert len(assets) == 1
+    result = dg.materialize(assets, raise_on_error=False)
+    assert result.success
+    assert [call.args[0] for call in mock_rocky.run_model.call_args_list] == _CHAIN
+    materialized = [e.asset_key for e in result.get_asset_materialization_events()]
+    assert materialized == [dg.AssetKey(["w", "s", name]) for name in _CHAIN]
+
+
+def test_topological_order_is_stable_and_tolerates_cycles():
+    from dagster_rocky.dag_assets import _topological_spec_keys
+
+    a, b, c = (dg.AssetKey([n]) for n in "abc")
+    specs = [
+        dg.AssetSpec(key=c, deps=[a]),
+        dg.AssetSpec(key=b),
+        dg.AssetSpec(key=a, deps=[dg.AssetKey(["outside"])]),
+    ]
+    assert _topological_spec_keys(specs) == [b, a, c]
+    cyclic = [dg.AssetSpec(key=a, deps=[b]), dg.AssetSpec(key=b, deps=[a])]
+    assert _topological_spec_keys(cyclic) == [a, b]

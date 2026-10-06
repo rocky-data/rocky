@@ -383,6 +383,7 @@ fn strategy_label(s: &StrategyConfig) -> &'static str {
         StrategyConfig::View => "view",
         StrategyConfig::MaterializedView => "materialized_view",
         StrategyConfig::DynamicTable { .. } => "dynamic_table",
+        StrategyConfig::Snapshot { .. } => "snapshot",
     }
 }
 

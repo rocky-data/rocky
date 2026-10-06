@@ -524,6 +524,9 @@ fn build_02_replication_incremental() -> ModelIr {
         raw_target("events"),
         MaterializationStrategy::Incremental {
             timestamp_column: "_synced_at".into(),
+            unique_key: Vec::new(),
+            lookback: None,
+            filter_column: None,
         },
         raw_source("events"),
         ColumnSelection::Explicit(vec![
@@ -925,9 +928,9 @@ fn ir_recipe_hash_pinned() {
 
 /// `ephemeral` had a fixture here, and its four snapshots were one byte
 /// each: the generator returned no statement, and the empty file read as a
-/// strategy that worked. It is refused now (E038, #1996) — not materialized,
-/// and never inlined into a consumer — so the refusal is what gets pinned,
-/// on every dialect, and no empty snapshot can pass for SQL again.
+/// strategy that worked (#1996). An ephemeral model has no statement of its
+/// own — compile inlines it into each consumer — so the generator refuses
+/// it on every dialect, and no empty snapshot can pass for SQL again.
 #[test]
 fn ephemeral_is_refused_on_every_dialect() {
     let mut ir = ModelIr::transformation(
@@ -950,7 +953,7 @@ fn ephemeral_is_refused_on_every_dialect() {
             .expect_err("an ephemeral model must not produce SQL");
         let msg = err.to_string();
         assert!(
-            msg.contains("active_orders") && msg.contains("E038") && msg.contains("view"),
+            msg.contains("active_orders") && msg.contains("E038") && msg.contains("inlined"),
             "{}: {msg}",
             dialect.name()
         );

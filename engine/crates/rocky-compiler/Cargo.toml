@@ -24,6 +24,7 @@ tracing = { workspace = true }
 indexmap = { workspace = true }
 regex = { workspace = true }
 sqlparser = { workspace = true }
+strsim = { workspace = true }
 salsa = { workspace = true }
 glob = { workspace = true }
 bumpalo = "3"

@@ -63,8 +63,10 @@ modes Rocky does not model. Integrate them, do not replace them.
 | BigQuery | Beta | Yes | Planned | **Yes** |
 | Trino | Beta | Yes | No | No |
 | DuckDB | **Yes** | Yes | No | No |
-| Redshift | Planned | Yes | Planned | No |
-| PostgreSQL | Planned | Yes | No | No |
+| Redshift | Beta | Yes | Planned | No |
+| PostgreSQL | Beta | Yes | No | No |
+| ClickHouse | Beta | Yes | No | No |
+| SQL Server / Azure SQL / Fabric | Beta | Yes | No | No |
 
 ## Materialization Strategies
 

@@ -50,6 +50,63 @@ pub struct DocModel {
     pub columns: Vec<DocColumn>,
     /// Declarative tests declared on this model.
     pub tests: Vec<TestDecl>,
+    /// Access, ownership and version, when the model declares any of them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub governance: Option<DocGovernance>,
+}
+
+/// Governance shown for a model: access level, ownership group and owner,
+/// and version. See [`crate::model_governance`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DocGovernance {
+    /// `private`, `protected` or `public`.
+    pub access: String,
+    /// Ownership group, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+    /// Owner of the group, as `name <email>`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
+    /// Version line, e.g. `v1 of orders (latest v2)` or `latest of orders (v2)`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    /// Deprecation date of this version (`YYYY-MM-DD`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deprecation_date: Option<String>,
+}
+
+impl DocGovernance {
+    /// Governance for `config`, or `None` when the model declares no access,
+    /// group, owner or version (the page then looks exactly as before).
+    pub fn from_config(config: &crate::models::ModelConfig) -> Option<Self> {
+        let gov = &config.governance;
+        if gov.access.is_none()
+            && gov.access_group.is_none()
+            && gov.owner.is_none()
+            && gov.version.is_none()
+        {
+            return None;
+        }
+        let version = gov.version.as_ref().map(|v| match v.version {
+            Some(n) => format!("v{n} of {} (latest v{})", v.model, v.latest_version),
+            None => format!("latest of {} (v{})", v.model, v.latest_version),
+        });
+        Some(Self {
+            access: gov.effective_access().to_string(),
+            group: gov.access_group.clone(),
+            owner: gov
+                .owner
+                .as_ref()
+                .map(crate::model_governance::GroupOwner::display)
+                .filter(|s| !s.is_empty()),
+            version,
+            deprecation_date: gov
+                .version
+                .as_ref()
+                .and_then(|v| v.deprecation_date)
+                .map(|d| d.to_string()),
+        })
+    }
 }
 
 /// Top-level documentation index — the input to [`generate_index_html`].
@@ -81,6 +138,7 @@ fn strategy_label(strategy: &StrategyConfig) -> String {
         StrategyConfig::View => "view".into(),
         StrategyConfig::MaterializedView => "materialized_view".into(),
         StrategyConfig::DynamicTable { .. } => "dynamic_table".into(),
+        StrategyConfig::Snapshot { .. } => "snapshot".into(),
     }
 }
 
@@ -145,6 +203,7 @@ pub fn build_doc_index(
                 depends_on: m.config.depends_on.clone(),
                 columns,
                 tests: m.config.tests.clone(),
+                governance: DocGovernance::from_config(&m.config),
             }
         })
         .collect();
@@ -219,6 +278,7 @@ pub fn generate_index_html(index: &DocIndex) -> String {
   .strategy-ephemeral { background: #21262d; color: #8b949e; }
   .strategy-delete_insert { background: #2d1a1a; color: #f85149; }
   .strategy-microbatch { background: #1a2332; color: #79c0ff; }
+  .strategy-snapshot { background: #1f2a1a; color: #a5d6a7; }
 
   .count { color: #8b949e; font-variant-numeric: tabular-nums; }
 
@@ -316,6 +376,27 @@ pub fn generate_index_html(index: &DocIndex) -> String {
             html.push_str(&format!(
                 "        <div class=\"description\">{}</div>\n",
                 html_escape(desc)
+            ));
+        }
+
+        // Governance: access, group, owner, version
+        if let Some(gov) = &model.governance {
+            let mut parts = vec![format!("Access: {}", html_escape(&gov.access))];
+            if let Some(g) = &gov.group {
+                parts.push(format!("Group: {}", html_escape(g)));
+            }
+            if let Some(o) = &gov.owner {
+                parts.push(format!("Owner: {}", html_escape(o)));
+            }
+            if let Some(v) = &gov.version {
+                parts.push(format!("Version: {}", html_escape(v)));
+            }
+            if let Some(d) = &gov.deprecation_date {
+                parts.push(format!("Deprecated after: {}", html_escape(d)));
+            }
+            html.push_str(&format!(
+                "        <div class=\"governance\">{}</div>\n",
+                parts.join(" &middot; ")
             ));
         }
 
@@ -460,6 +541,7 @@ mod tests {
         DocIndex {
             models: vec![
                 DocModel {
+                    governance: None,
                     name: "stg_orders".into(),
                     description: Some("Staged orders from Shopify".into()),
                     target: "acme.staging.stg_orders".into(),
@@ -513,6 +595,7 @@ mod tests {
                     ],
                 },
                 DocModel {
+                    governance: None,
                     name: "fct_revenue".into(),
                     description: None,
                     target: "acme.marts.fct_revenue".into(),
@@ -619,6 +702,7 @@ mod tests {
     fn html_escapes_special_characters() {
         let index = DocIndex {
             models: vec![DocModel {
+                governance: None,
                 name: "model_with_<angle>".into(),
                 description: Some("Uses & ampersands and \"quotes\"".into()),
                 target: "cat.sch.tbl".into(),
@@ -659,6 +743,7 @@ mod tests {
     fn html_no_deps_shows_empty_message() {
         let index = DocIndex {
             models: vec![DocModel {
+                governance: None,
                 name: "standalone".into(),
                 description: None,
                 target: "cat.sch.tbl".into(),
@@ -678,6 +763,7 @@ mod tests {
     fn html_no_tests_shows_empty_message() {
         let index = DocIndex {
             models: vec![DocModel {
+                governance: None,
                 name: "untested".into(),
                 description: None,
                 target: "cat.sch.tbl".into(),
@@ -698,7 +784,11 @@ mod tests {
         assert_eq!(strategy_label(&StrategyConfig::FullRefresh), "full_refresh");
         assert_eq!(
             strategy_label(&StrategyConfig::Incremental {
-                timestamp_column: "ts".into()
+                timestamp_column: Some("ts".into()),
+                unique_key: Vec::new(),
+                lookback: None,
+                filter_column: None,
+                on_schema_change: Default::default(),
             }),
             "incremental"
         );

@@ -1644,13 +1644,15 @@ pub struct ProjectFreshnessConfig {
     /// Default timestamp column used to evaluate freshness at runtime.
     /// Carried into a model that declares no `[freshness]` block of its
     /// own; a model that declares one keeps its own value, or none. Only
-    /// inherited alongside an `expected_lag_seconds`. No runtime check
-    /// reads it yet.
+    /// inherited alongside an `expected_lag_seconds`. `rocky freshness`
+    /// reads `MAX(time_column)` from each inheriting model's target; when a
+    /// model does not have the column it measures the last successful build
+    /// instead.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub time_column: Option<String>,
     /// Default severity reported when the freshness check trips.
-    /// Inherited on the same terms as `time_column`. No runtime check
-    /// reads it yet.
+    /// Inherited on the same terms as `time_column`. Under `error`, a stale
+    /// model makes `rocky freshness` exit 1.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub severity: Option<crate::tests::TestSeverity>,
 }
@@ -2463,6 +2465,28 @@ pub struct SchemaCacheConfig {
     /// another machine's stale type stamps. Opt in to `true` for teams
     /// that want cross-machine cache warm-up via a shared state backend.
     pub replicate: bool,
+    /// Treat every source schema the compiler knows as authoritative for
+    /// missing-column checks. Defaults to `false`.
+    ///
+    /// A direct reference to a column a known source schema lacks is a
+    /// `W041` warning when that schema came from a seed file
+    /// (`rocky compile --with-seed`) or from a cache entry older than
+    /// `trusted_max_age_seconds`: a stale schema must not fail a
+    /// valid build. Set this to `true` to escalate those warnings to the
+    /// `E041` error, matching a strict "refuse what you cannot prove"
+    /// posture. `rocky compile --strict-sources` sets it for one
+    /// invocation.
+    pub strict_sources: bool,
+    /// Age, in seconds, under which a cached source schema is trusted as
+    /// current. Defaults to unset: no cache entry is trusted, so a missing
+    /// source column found against the cache is a `W041` warning.
+    ///
+    /// When set, a missing source column found against a cache entry
+    /// younger than this is the `E041` error instead. Only entries that
+    /// survive `ttl_seconds` are read at all, so a value above the
+    /// TTL trusts every cached entry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trusted_max_age_seconds: Option<u64>,
 }
 
 impl Default for SchemaCacheConfig {
@@ -2471,6 +2495,8 @@ impl Default for SchemaCacheConfig {
             enabled: true,
             ttl_seconds: 86_400,
             replicate: false,
+            strict_sources: false,
+            trusted_max_age_seconds: None,
         }
     }
 }
@@ -2479,6 +2505,13 @@ impl SchemaCacheConfig {
     /// Convenience: TTL as a `chrono::Duration` for the read path.
     pub fn ttl(&self) -> chrono::Duration {
         chrono::Duration::seconds(self.ttl_seconds as i64)
+    }
+
+    /// Convenience: [`Self::trusted_max_age_seconds`] as a
+    /// `chrono::Duration`, saturating at `i64::MAX` seconds.
+    pub fn trusted_max_age(&self) -> Option<chrono::Duration> {
+        self.trusted_max_age_seconds
+            .map(|secs| chrono::Duration::seconds(i64::try_from(secs).unwrap_or(i64::MAX)))
     }
 
     /// Apply an optional `--cache-ttl <seconds>` CLI override.
@@ -5084,6 +5117,9 @@ impl AdapterConfig {
     /// | `snowflake`  | `account`, `host` (when configured), `database`            |
     /// | `bigquery`   | `project_id`                                               |
     /// | `trino`      | `host`, `catalog` (the `database` slot)                    |
+    /// | `postgres`, `redshift` | `host`, `database`, `port` (from `[extra]`, when set) |
+    /// | `clickhouse` | `host`, `port` (from `[extra]`, when set)                  |
+    /// | `sqlserver`  | `host`, `database`, `port` (from `[extra]`, when set)     |
     /// | `fivetran`   | `destination_id`                                           |
     /// | `airbyte`, `iceberg` | `host`                                             |
     /// | `manual`     | the type alone                                             |
@@ -5095,7 +5131,9 @@ impl AdapterConfig {
     ///
     /// Never in the identity: `username`, `password`, `token`, `oauth_token`,
     /// `pat`, `private_key_path`, `client_id`, `client_secret`, `api_key`,
-    /// `api_secret`, `role`, and the `[extra]` table. A Snowflake session
+    /// `api_secret`, `role`, and the `[extra]` table (except a PostgreSQL /
+    /// Redshift / ClickHouse / SQL Server `port`, which is a locator). A
+    /// Snowflake session
     /// with no `database` (a PAT or OAuth session, say) writes into the
     /// session's default database, and the identity does **not** stand a
     /// user name in for it: two such sessions on one account are one
@@ -5173,6 +5211,36 @@ impl AdapterConfig {
             "trino" => {
                 push("host", self.host.as_deref());
                 push("catalog", self.database.as_deref());
+            }
+            "postgres" | "redshift" => {
+                push("host", self.host.as_deref());
+                push("database", self.database.as_deref());
+                // A port in `[extra]` moves the endpoint as much as one
+                // written `host:port` (which the host locator keeps).
+                let port = self.extra.get("port").map(|p| match p {
+                    serde_json::Value::String(s) => s.trim().to_string(),
+                    other => other.to_string(),
+                });
+                push("port", port.as_deref());
+            }
+            "clickhouse" => {
+                // Every target names its database, so the session's default
+                // `database` does not locate them; host and port do.
+                push("host", self.host.as_deref());
+                let port = self.extra.get("port").map(|p| match p {
+                    serde_json::Value::String(s) => s.trim().to_string(),
+                    other => other.to_string(),
+                });
+                push("port", port.as_deref());
+            }
+            "sqlserver" => {
+                push("host", self.host.as_deref());
+                push("database", self.database.as_deref());
+                let port = self.extra.get("port").map(|p| match p {
+                    serde_json::Value::String(s) => s.trim().to_string(),
+                    other => other.to_string(),
+                });
+                push("port", port.as_deref());
             }
             "fivetran" => push("destination_id", self.destination_id.as_deref()),
             "airbyte" | "iceberg" => push("host", self.host.as_deref()),
@@ -6647,6 +6715,13 @@ pub struct TransformationPipelineConfig {
     /// Optional native-schedule declaration. See [`ScheduleConfig`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schedule: Option<ScheduleConfig>,
+
+    /// External sources the pipeline's models read, with optional freshness
+    /// expectations checked by `rocky freshness`. Declared as
+    /// `[[pipeline.<name>.sources]]`. See
+    /// [`crate::source_freshness::PipelineSourceConfig`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sources: Vec<crate::source_freshness::PipelineSourceConfig>,
 }
 
 fn default_models_glob() -> String {
@@ -13975,6 +14050,7 @@ max_rows = 1000
             enabled: true,
             ttl_seconds: 7200,
             replicate: false,
+            ..SchemaCacheConfig::default()
         };
         let overridden = cfg.clone().with_ttl_override(None);
         assert_eq!(overridden.ttl_seconds, 7200);
@@ -13990,6 +14066,7 @@ max_rows = 1000
             enabled: true,
             ttl_seconds: 86_400,
             replicate: true,
+            ..SchemaCacheConfig::default()
         };
         let overridden = cfg.with_ttl_override(Some(60));
         assert_eq!(overridden.ttl_seconds, 60);

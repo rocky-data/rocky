@@ -909,6 +909,11 @@ fn leaf_star_over_a_known_external_source_expands_to_its_columns() {
 
 /// Write a two-model project whose leaf declares `leaf_strategy`.
 fn write_strategy_project(dir: &std::path::Path, leaf_strategy: &str) {
+    write_strategy_project_with_sql(dir, leaf_strategy, "SELECT id, updated_at FROM src");
+}
+
+/// [`write_strategy_project`] with the leaf's SQL given.
+fn write_strategy_project_with_sql(dir: &std::path::Path, leaf_strategy: &str, leaf_sql: &str) {
     use std::fs;
     let models_dir = dir.join("models");
     fs::create_dir_all(&models_dir).unwrap();
@@ -922,11 +927,7 @@ fn write_strategy_project(dir: &std::path::Path, leaf_strategy: &str) {
         "name = \"src\"\n\n[strategy]\ntype = \"full_refresh\"\n\n[target]\ncatalog = \"warehouse\"\nschema = \"s\"\ntable = \"src\"\n",
     )
     .unwrap();
-    fs::write(
-        models_dir.join("leaf.sql"),
-        "SELECT id, updated_at FROM src",
-    )
-    .unwrap();
+    fs::write(models_dir.join("leaf.sql"), leaf_sql).unwrap();
     fs::write(
         models_dir.join("leaf.toml"),
         format!(
@@ -952,10 +953,31 @@ fn compile_strategy_project(leaf_strategy: &str) -> rocky_compiler::compile::Com
 /// `rocky run` excludes a model from execution only for error-severity
 /// diagnostics keyed on its name, and `rocky test` / `emit-sql` refuse on
 /// `has_errors`. A warning would leave the duplicating INSERT running.
+fn compile_leaf(leaf_strategy: &str, leaf_sql: &str) -> rocky_compiler::compile::CompileResult {
+    let dir = tempfile::tempdir().unwrap();
+    write_strategy_project_with_sql(dir.path(), leaf_strategy, leaf_sql);
+    let config = CompilerConfig {
+        models_dir: dir.path().join("models"),
+        contracts_dir: None,
+        source_schemas: HashMap::new(),
+        ..Default::default()
+    };
+    compile(&config).unwrap()
+}
+
+fn codes_on_leaf(result: &rocky_compiler::compile::CompileResult) -> Vec<String> {
+    result
+        .diagnostics
+        .iter()
+        .filter(|d| d.model == "leaf")
+        .map(|d| d.code.to_string())
+        .collect()
+}
+
 #[test]
 fn an_incremental_transformation_model_is_refused_with_e037() {
-    let result =
-        compile_strategy_project("type = \"incremental\"\ntimestamp_column = \"updated_at\"");
+    // No watermark: the only SQL left would be an unfiltered INSERT.
+    let result = compile_strategy_project("type = \"incremental\"");
 
     let e037: Vec<_> = result
         .diagnostics
@@ -988,48 +1010,182 @@ fn an_incremental_transformation_model_is_refused_with_e037() {
         !suggestion.contains("microbatch"),
         "the suggestion uses the canonical time_interval spelling"
     );
+    assert!(
+        suggestion.contains("timestamp_column") && suggestion.contains("@incremental_filter"),
+        "the suggestion points at the watermark config: {suggestion}"
+    );
     assert!(result.has_errors, "an E037 must make the compile fail");
 }
 
-/// #1996: an ephemeral model is never materialized and never inlined, so a
-/// consumer reads whatever physical table carries the name. The refusal must
-/// be an ERROR on the model that declares the strategy, for the same reason
-/// E037 must: `rocky run` excludes a model from execution only on an
-/// error-severity diagnostic keyed on its name.
-#[test]
-fn an_ephemeral_model_is_refused_with_e038() {
-    let result = compile_strategy_project("type = \"ephemeral\"");
+// ---- WP6: incremental transformation models with a watermark ----
 
-    let e038: Vec<_> = result
-        .diagnostics
-        .iter()
-        .filter(|d| &*d.code == "E038")
-        .collect();
-    assert_eq!(
-        e038.len(),
-        1,
-        "exactly one E038, got: {:?}",
-        result.diagnostics
-    );
-    let d = e038[0];
-    assert!(
-        d.is_error(),
-        "E038 must be an error so the model is excluded from execution"
-    );
-    assert_eq!(
-        d.model, "leaf",
-        "the diagnostic names the model that declares the strategy"
-    );
-    let suggestion = d.suggestion.as_deref().unwrap_or_default();
-    assert!(
-        suggestion.contains("view"),
-        "the suggestion names the strategy that works: {suggestion}"
-    );
-    assert!(result.has_errors, "an E038 must make the compile fail");
+const INCREMENTAL_WM: &str = "type = \"incremental\"\ntimestamp_column = \"updated_at\"";
+
+/// Valid controls: a placeholder, a passthrough watermark without one, the
+/// `watermark` alias, and a keyed lookback all compile with no E037/E046/W046.
+#[test]
+fn incremental_models_with_a_safe_watermark_compile_clean() {
+    let cases = [
+        (
+            INCREMENTAL_WM,
+            "SELECT id, updated_at FROM src WHERE @incremental_filter",
+        ),
+        (INCREMENTAL_WM, "SELECT id, updated_at FROM src"),
+        (
+            "type = \"incremental\"\nwatermark = \"updated_at\"",
+            "SELECT s.id, s.updated_at FROM src AS s",
+        ),
+        (
+            "type = \"incremental\"\ntimestamp_column = \"updated_at\"\nunique_key = [\"id\"]\n\
+             lookback = \"3 days\"\nfilter_column = \"s.updated_at\"",
+            "SELECT s.id, s.updated_at FROM src AS s WHERE @incremental_filter AND s.id > 0",
+        ),
+    ];
+    for (strategy, sql) in cases {
+        let result = compile_leaf(strategy, sql);
+        let codes = codes_on_leaf(&result);
+        assert!(
+            !codes
+                .iter()
+                .any(|c| matches!(c.as_str(), "E037" | "E046" | "W046")),
+            "{sql}: unexpected {codes:?} in {:?}",
+            result.diagnostics
+        );
+        assert!(!result.has_errors, "{sql}: {:?}", result.diagnostics);
+    }
 }
 
-/// Boundary: the refusal is scoped to `ephemeral`. Every other strategy a
-/// model can declare compiles clean of E038.
+/// Without a placeholder, filtering the output is only sound when the
+/// watermark is copied unchanged from one physical input table. An aggregate,
+/// a cast, a column read through a CTE or derived table, or a top-level LIMIT
+/// is refused with E046, also when a placeholder sits only in a comment.
+#[test]
+fn incremental_without_a_provable_filter_place_is_refused_with_e046() {
+    for sql in [
+        "SELECT id, MAX(updated_at) AS updated_at FROM src GROUP BY id",
+        "SELECT id, CAST(updated_at AS TIMESTAMP) AS updated_at FROM src",
+        "SELECT id, updated_at + INTERVAL 1 DAY AS updated_at FROM src -- WHERE @incremental_filter",
+        // Direct at the top, but the CTE body aggregates.
+        "WITH s AS (SELECT id, MAX(updated_at) AS updated_at FROM src GROUP BY id) \
+         SELECT id, updated_at FROM s",
+        // Same through a derived table.
+        "SELECT d.id, d.updated_at FROM (SELECT id, MAX(updated_at) AS updated_at FROM src \
+         GROUP BY id) AS d",
+        // LIMIT picks rows before the output filter would.
+        "SELECT id, updated_at FROM src ORDER BY updated_at LIMIT 10",
+    ] {
+        let result = compile_leaf(INCREMENTAL_WM, sql);
+        let e046: Vec<_> = result
+            .diagnostics
+            .iter()
+            .filter(|d| &*d.code == "E046" && d.model == "leaf")
+            .collect();
+        assert_eq!(e046.len(), 1, "{sql}: {:?}", result.diagnostics);
+        assert!(
+            e046[0].is_error(),
+            "{sql}: E046 must exclude the model from runs"
+        );
+        assert!(
+            e046[0]
+                .suggestion
+                .as_deref()
+                .unwrap_or_default()
+                .contains("@incremental_filter"),
+            "{sql}: the suggestion says where the placeholder goes"
+        );
+        assert!(result.has_errors);
+    }
+}
+
+#[test]
+fn incremental_watermark_must_be_an_output_column() {
+    let result = compile_leaf(
+        INCREMENTAL_WM,
+        "SELECT id FROM src WHERE @incremental_filter",
+    );
+    let e046: Vec<_> = result
+        .diagnostics
+        .iter()
+        .filter(|d| &*d.code == "E046" && d.model == "leaf")
+        .collect();
+    assert_eq!(e046.len(), 1, "{:?}", result.diagnostics);
+    assert!(
+        e046[0].message.contains("not an output column"),
+        "{}",
+        e046[0].message
+    );
+}
+
+#[test]
+fn placeholder_under_another_strategy_is_refused_with_e046() {
+    let result = compile_leaf(
+        "type = \"full_refresh\"",
+        "SELECT id, updated_at FROM src WHERE @incremental_filter",
+    );
+    assert!(
+        codes_on_leaf(&result).contains(&"E046".to_string()),
+        "{:?}",
+        result.diagnostics
+    );
+    // A literal or commented placeholder is not a placeholder.
+    let result = compile_leaf(
+        "type = \"full_refresh\"",
+        "SELECT id, '@incremental_filter' AS note FROM src -- @incremental_filter",
+    );
+    assert!(
+        !codes_on_leaf(&result).contains(&"E046".to_string()),
+        "{:?}",
+        result.diagnostics
+    );
+}
+
+#[test]
+fn incremental_filter_column_must_be_a_column_reference() {
+    let result = compile_leaf(
+        "type = \"incremental\"\ntimestamp_column = \"updated_at\"\nfilter_column = \"a.b.c\"",
+        "SELECT id, updated_at FROM src WHERE @incremental_filter",
+    );
+    assert!(
+        codes_on_leaf(&result).contains(&"E046".to_string()),
+        "{:?}",
+        result.diagnostics
+    );
+}
+
+/// A lookback re-reads rows already in the target; without a key to merge
+/// on, they are appended again. Warning, not error.
+#[test]
+fn lookback_without_unique_key_warns_w046() {
+    let result = compile_leaf(
+        "type = \"incremental\"\ntimestamp_column = \"updated_at\"\nlookback = \"1 day\"",
+        "SELECT id, updated_at FROM src WHERE @incremental_filter",
+    );
+    let w046: Vec<_> = result
+        .diagnostics
+        .iter()
+        .filter(|d| &*d.code == "W046" && d.model == "leaf")
+        .collect();
+    assert_eq!(w046.len(), 1, "{:?}", result.diagnostics);
+    assert!(!w046[0].is_error());
+    assert!(!result.has_errors, "{:?}", result.diagnostics);
+}
+
+/// #1996: `type = "ephemeral"` used to be refused outright with E038, because
+/// nothing inlined it. Consumers now inline it as a CTE, so a plain ephemeral
+/// model compiles clean; E038 only marks the uses inlining cannot serve
+/// (`ephemeral.rs`).
+#[test]
+fn an_ephemeral_model_compiles_clean() {
+    let result = compile_strategy_project("type = \"ephemeral\"");
+    assert!(
+        !result.diagnostics.iter().any(|d| &*d.code == "E038"),
+        "a plain ephemeral model is not an invalid use: {:?}",
+        result.diagnostics
+    );
+    assert!(!result.has_errors, "{:?}", result.diagnostics);
+}
+
+/// Boundary: no other strategy a model can declare produces E038.
 #[test]
 fn e038_does_not_fire_for_other_strategies() {
     for strategy in [
@@ -1238,6 +1394,161 @@ fn defaulted_dsl_microbatch_is_refused_and_defaulted_sql_window_compiles() {
         "bounded inherited SQL must compile cleanly: {:?}",
         bounded_only.diagnostics
     );
+}
+
+// ---- E041 / W041: missing external source columns ----
+
+mod source_column_refs {
+    use std::collections::HashMap;
+    use std::path::Path;
+
+    use rocky_compiler::compile::{CompilerConfig, compile};
+    use rocky_compiler::diagnostic::Severity;
+    use rocky_compiler::source_refs::{SourceProvenance, SourceSchemaOrigin};
+    use rocky_compiler::types::{RockyType, TypedColumn};
+
+    fn write_model(dir: &Path, name: &str, sql: &str) {
+        std::fs::write(dir.join(format!("{name}.sql")), sql).unwrap();
+        std::fs::write(
+            dir.join(format!("{name}.toml")),
+            format!(
+                "name = \"{name}\"\n\n[strategy]\ntype = \"full_refresh\"\n\n[target]\n\
+                 catalog = \"c\"\nschema = \"s\"\ntable = \"{name}\"\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    fn cols(names: &[&str]) -> Vec<TypedColumn> {
+        names
+            .iter()
+            .map(|name| TypedColumn {
+                name: (*name).to_string(),
+                data_type: RockyType::Unknown,
+                nullable: true,
+            })
+            .collect()
+    }
+
+    /// The brief's seed: `raw.orders` and `raw.customers`.
+    fn sources() -> HashMap<String, Vec<TypedColumn>> {
+        HashMap::from([
+            (
+                "raw.orders".to_string(),
+                cols(&["order_id", "customer_id", "amount", "status", "order_date"]),
+            ),
+            (
+                "raw.customers".to_string(),
+                cols(&["customer_id", "customer_name", "email"]),
+            ),
+        ])
+    }
+
+    fn compile_with(
+        models: &[(&str, &str)],
+        origin: Option<SourceSchemaOrigin>,
+    ) -> rocky_compiler::compile::CompileResult {
+        let dir = tempfile::TempDir::new().unwrap();
+        for (name, sql) in models {
+            write_model(dir.path(), name, sql);
+        }
+        let source_schemas = sources();
+        let source_provenance = origin
+            .map(|origin| SourceProvenance::uniform(source_schemas.keys(), &origin))
+            .unwrap_or_default();
+        compile(&CompilerConfig {
+            models_dir: dir.path().to_path_buf(),
+            source_schemas,
+            source_provenance,
+            ..Default::default()
+        })
+        .unwrap()
+    }
+
+    fn codes(result: &rocky_compiler::compile::CompileResult, code: &str) -> usize {
+        result
+            .diagnostics
+            .iter()
+            .filter(|d| d.code.as_ref() == code)
+            .count()
+    }
+
+    const D1: &str = "SELECT order_id, customer_id, order_total FROM raw.orders";
+
+    #[test]
+    fn d1_against_live_schema_fails_compile_with_e041() {
+        let result = compile_with(&[("stg_orders", D1)], Some(SourceSchemaOrigin::Live));
+        assert!(result.has_errors);
+        let e041: Vec<_> = result
+            .diagnostics
+            .iter()
+            .filter(|d| d.code.as_ref() == "E041")
+            .collect();
+        assert_eq!(e041.len(), 1, "{:?}", result.diagnostics);
+        assert_eq!(e041[0].severity, Severity::Error);
+        assert_eq!(e041[0].model, "stg_orders");
+        assert!(e041[0].message.contains("order_total"));
+        assert!(e041[0].message.contains("raw.orders"));
+    }
+
+    #[test]
+    fn d1_against_seed_schema_warns_and_compiles() {
+        let result = compile_with(&[("stg_orders", D1)], Some(SourceSchemaOrigin::Seed));
+        assert!(!result.has_errors, "{:?}", result.diagnostics);
+        assert_eq!(codes(&result, "W041"), 1);
+    }
+
+    #[test]
+    fn d1_without_provenance_is_unchanged() {
+        let result = compile_with(&[("stg_orders", D1)], None);
+        assert!(!result.has_errors, "{:?}", result.diagnostics);
+        assert_eq!(codes(&result, "E041") + codes(&result, "W041"), 0);
+    }
+
+    #[test]
+    fn valid_controls_stay_clean_against_live_schema() {
+        let result = compile_with(
+            &[
+                (
+                    "stg_orders",
+                    "SELECT order_id, customer_id, amount FROM raw.orders",
+                ),
+                (
+                    "fct_revenue",
+                    "SELECT c.customer_name, SUM(o.amount) AS total FROM stg_orders o \
+                     JOIN raw.customers c ON o.customer_id = c.customer_id \
+                     GROUP BY c.customer_name",
+                ),
+                (
+                    "v1",
+                    "SELECT order_id AS id2, id2 + 1 AS next_id FROM raw.orders",
+                ),
+                ("v2", "SELECT 10::BIGINT = '10'::VARCHAR AS equal_value"),
+                (
+                    "v3",
+                    "SELECT scoped.order_id FROM (SELECT order_id FROM raw.orders) AS scoped",
+                ),
+                (
+                    "v4",
+                    "SELECT sha256(customer_name) AS customer_hash FROM raw.customers",
+                ),
+                (
+                    "g1_s2",
+                    "WITH stg_orders AS (SELECT order_id, amount FROM raw.orders) \
+                     SELECT stg_orders.amount FROM stg_orders",
+                ),
+                ("stg_star", "SELECT * FROM raw.orders"),
+                ("g1_s3", "SELECT s.amount FROM stg_star AS s"),
+            ],
+            Some(SourceSchemaOrigin::Live),
+        );
+        assert_eq!(
+            codes(&result, "E041") + codes(&result, "W041"),
+            0,
+            "{:?}",
+            result.diagnostics
+        );
+    }
 }
 
 // ---- DSL `in [...]` / `not in [...]` (plan-15) ----

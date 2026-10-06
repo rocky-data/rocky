@@ -151,6 +151,7 @@ pub(crate) fn schemas() -> Vec<(&'static str, serde_json::Value)> {
         entry::<PreviewRowsOutput>("preview_rows"),
         entry::<ComplianceOutput>("compliance"),
         entry::<RetentionStatusOutput>("retention_status"),
+        entry::<crate::commands::freshness::FreshnessOutput>("freshness"),
         entry::<RetentionSweepOutput>("state_retention_sweep"),
         entry::<ReviewOutput>("review"),
         entry::<ReviewQueueOutput>("review_queue"),

@@ -135,6 +135,12 @@ export type BreakingChange =
  */
 export type BreakingSeverity = "breaking" | "warning" | "info";
 /**
+ * Which code snapshot `rocky ci-diff` / `rocky lineage-diff` compares against the base.
+ *
+ * Selection (which files changed) and compilation (what those files contain) always read the same snapshot, so the report never mixes a committed file list with uncommitted contents.
+ */
+export type CiDiffMode = "head" | "working_tree";
+/**
  * The kind of change observed for a single column.
  */
 export type ColumnChangeType = "added" | "removed" | "type_changed";
@@ -149,6 +155,10 @@ export type ModelDiffStatus = "unchanged" | "modified" | "added" | "removed";
  * Reports which models changed between two git refs, with optional column-level structural diffs when compilation succeeds on both sides.
  */
 export interface CiDiffOutput {
+  /**
+   * Commit the base side was read from: the merge base of `base_ref` and HEAD. Omitted when git could not compute one and `base_ref` itself was used (e.g. a shallow clone).
+   */
+  base_commit?: string | null;
   /**
    * Git ref used as the comparison base (e.g. `main`).
    */
@@ -166,6 +176,10 @@ export interface CiDiffOutput {
    * Pre-rendered Markdown suitable for posting as a GitHub PR comment.
    */
   markdown: string;
+  /**
+   * Which snapshot was compared against the base: `head` (the HEAD commit; uncommitted edits ignored) or `working_tree` (files on disk, including staged, unstaged and untracked changes).
+   */
+  mode: CiDiffMode;
   /**
    * Per-model diff results.
    */

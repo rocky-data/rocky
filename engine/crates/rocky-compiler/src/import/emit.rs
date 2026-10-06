@@ -107,6 +107,8 @@ pub fn emit_repo(inputs: &EmitInputs<'_>) -> Result<EmissionResult, String> {
         }
     }
 
+    write_governance_files(&inputs.import.imported, &models_dir)?;
+
     write_models_defaults(&models_dir, inputs.default_catalog, inputs.default_schema)?;
 
     let rocky_toml_path = inputs.out_dir.join("rocky.toml");
@@ -156,6 +158,99 @@ pub fn emit_repo(inputs: &EmitInputs<'_>) -> Result<EmissionResult, String> {
         rocky_toml_path,
         unknown_materializations,
     })
+}
+
+/// Write the governance files dbt kept outside model files:
+///
+/// - `models/groups/<group>.toml` with an `[owner]` table, for each dbt group
+///   that has an owner and is used by an imported model;
+/// - `models/<name>.toml`, one version declaration per versioned dbt model.
+///   When the latest version already materializes to `<name>` (a dbt `alias`),
+///   the declaration sets `latest_alias = false` so the alias view does not
+///   collide with it.
+fn write_governance_files(models: &[ImportedModel], models_dir: &Path) -> Result<(), String> {
+    use std::collections::BTreeMap;
+
+    let mut owners: BTreeMap<&str, &rocky_core::model_governance::GroupOwner> = BTreeMap::new();
+    // base name -> (latest, [(v, deprecation)], latest target table)
+    // (version, deprecation date) entries of one versioned model.
+    type VersionEntries = Vec<(u32, Option<String>)>;
+    let mut versions: BTreeMap<&str, (u32, VersionEntries)> = BTreeMap::new();
+    let mut latest_tables: BTreeMap<&str, &str> = BTreeMap::new();
+    for m in models {
+        let gov = &m.config.governance;
+        if let (Some(g), Some(owner)) = (gov.access_group.as_deref(), gov.owner.as_ref()) {
+            owners.insert(g, owner);
+        }
+        if let Some(info) = &gov.version
+            && let Some(v) = info.version
+        {
+            let entry = versions
+                .entry(info.model.as_str())
+                .or_insert((info.latest_version, Vec::new()));
+            entry
+                .1
+                .push((v, info.deprecation_date.map(|d| d.to_string())));
+            if v == info.latest_version {
+                latest_tables.insert(info.model.as_str(), m.config.target.table.as_str());
+            }
+        }
+    }
+
+    if !owners.is_empty() {
+        let groups_dir = models_dir.join("groups");
+        std::fs::create_dir_all(&groups_dir)
+            .map_err(|e| format!("failed to create {}: {e}", groups_dir.display()))?;
+        for (group, owner) in owners {
+            if !is_safe_model_file_stem(group) {
+                return Err(format!("dbt group name {group:?} is not a safe file name"));
+            }
+            let mut body = String::from("# Imported from a dbt group definition.\n[owner]\n");
+            if let Some(n) = &owner.name {
+                body.push_str(&format!("name = \"{}\"\n", toml_escape(n)));
+            }
+            if let Some(e) = &owner.email {
+                body.push_str(&format!("email = \"{}\"\n", toml_escape(e)));
+            }
+            let path = groups_dir.join(format!("{group}.toml"));
+            std::fs::write(&path, body)
+                .map_err(|e| format!("failed to write {}: {e}", path.display()))?;
+        }
+    }
+
+    for (base, (latest, mut entries)) in versions {
+        if !is_safe_model_file_stem(base) {
+            return Err(format!("dbt model name {base:?} is not a safe file name"));
+        }
+        // An unversioned model with the same name would make `<base>.toml`
+        // its sidecar, not a declaration.
+        if models.iter().any(|m| m.name == base) {
+            continue;
+        }
+        entries.sort_by_key(|(v, _)| *v);
+        entries.dedup_by_key(|(v, _)| *v);
+        let mut body = format!(
+            "# Version declaration for the versioned dbt model `{base}`. Each version is\n\
+             # the model `{base}_v<N>`; `{base}` itself reads the latest version.\n\
+             latest_version = {latest}\n"
+        );
+        if latest_tables.get(base) == Some(&base) {
+            body.push_str(
+                "# The latest version already materializes to this name (dbt alias).\n\
+                 latest_alias = false\n",
+            );
+        }
+        for (v, deprecation) in entries {
+            body.push_str(&format!("\n[[versions]]\nv = {v}\n"));
+            if let Some(d) = deprecation {
+                body.push_str(&format!("deprecation_date = \"{d}\"\n"));
+            }
+        }
+        let path = models_dir.join(format!("{base}.toml"));
+        std::fs::write(&path, body)
+            .map_err(|e| format!("failed to write {}: {e}", path.display()))?;
+    }
+    Ok(())
 }
 
 fn clone_model(m: &ImportedModel) -> ImportedModel {
@@ -321,7 +416,7 @@ fn annotate_unsupported_jinja(sql: &str) -> String {
     out
 }
 
-fn render_model_sidecar(config: &ModelConfig) -> String {
+pub(crate) fn render_model_sidecar(config: &ModelConfig) -> String {
     // Lean serializer — matches the pattern used by `rocky ai` for sidecars
     // (see CHANGELOG #414): we deliberately do NOT serialize empty default
     // collections (`depends_on = []`, etc.) so the file stays compact. Every
@@ -339,6 +434,14 @@ fn render_model_sidecar(config: &ModelConfig) -> String {
     if let Some(intent) = &config.intent {
         out.push_str(&format!("intent = \"{}\"\n", toml_escape(intent)));
     }
+    // dbt `access` / `group`. A version's access is written per version file;
+    // the shared declaration does not repeat it.
+    if let Some(access) = config.governance.access {
+        out.push_str(&format!("access = \"{access}\"\n"));
+    }
+    if let Some(group) = &config.governance.access_group {
+        out.push_str(&format!("access_group = \"{}\"\n", toml_escape(group)));
+    }
     out.push('\n');
 
     out.push_str("[strategy]\n");
@@ -346,12 +449,42 @@ fn render_model_sidecar(config: &ModelConfig) -> String {
         StrategyConfig::FullRefresh => {
             out.push_str("type = \"full_refresh\"\n");
         }
-        StrategyConfig::Incremental { timestamp_column } => {
+        StrategyConfig::Incremental {
+            timestamp_column,
+            unique_key,
+            lookback,
+            on_schema_change,
+            filter_column,
+        } => {
             out.push_str("type = \"incremental\"\n");
-            out.push_str(&format!(
-                "timestamp_column = \"{}\"\n",
-                toml_escape(timestamp_column)
-            ));
+            if let Some(timestamp_column) = timestamp_column {
+                out.push_str(&format!(
+                    "timestamp_column = \"{}\"\n",
+                    toml_escape(timestamp_column)
+                ));
+            }
+            if !unique_key.is_empty() {
+                let keys: Vec<String> = unique_key
+                    .iter()
+                    .map(|k| format!("\"{}\"", toml_escape(k)))
+                    .collect();
+                out.push_str(&format!("unique_key = [{}]\n", keys.join(", ")));
+            }
+            if let Some(lookback) = lookback {
+                out.push_str(&format!("lookback = \"{lookback}\"\n"));
+            }
+            if let Some(filter_column) = filter_column {
+                out.push_str(&format!(
+                    "filter_column = \"{}\"\n",
+                    toml_escape(filter_column)
+                ));
+            }
+            if *on_schema_change != rocky_ir::OnSchemaChange::default() {
+                out.push_str(&format!(
+                    "on_schema_change = \"{}\"\n",
+                    on_schema_change.as_str()
+                ));
+            }
         }
         StrategyConfig::Merge {
             unique_key,
@@ -439,6 +572,9 @@ fn render_model_sidecar(config: &ModelConfig) -> String {
         StrategyConfig::ContentAddressed { .. } => {
             out.push_str("type = \"full_refresh\"\n");
         }
+        StrategyConfig::Snapshot { .. } => {
+            render_snapshot_strategy(&config.strategy, &mut out);
+        }
     }
     out.push('\n');
 
@@ -495,6 +631,86 @@ fn render_model_sidecar(config: &ModelConfig) -> String {
 /// filename component: non-empty, no path separators, no parent-/absolute-path
 /// escape. A dbt manifest node name is third-party input, so a name failing
 /// this (`../x`, `/etc/x`, `a/b`) must not reach a `models_dir.join(...)`.
+/// The body of a `type = "snapshot"` `[strategy]` block. Every key stays in
+/// the `[strategy]` table (inline tables only), so the caller's next header
+/// still starts a new table.
+fn render_snapshot_strategy(strategy: &StrategyConfig, out: &mut String) {
+    let StrategyConfig::Snapshot {
+        unique_key,
+        snapshot_strategy,
+        updated_at,
+        check_cols,
+        hard_deletes,
+        invalidate_hard_deletes,
+        snapshot_meta_column_names,
+        valid_to_current,
+    } = strategy
+    else {
+        return;
+    };
+    let list = |items: &[String]| {
+        items
+            .iter()
+            .map(|c| format!("\"{}\"", toml_escape(c)))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    out.push_str("type = \"snapshot\"\n");
+    if let Some(key) = unique_key {
+        out.push_str(&format!("unique_key = [{}]\n", list(&key.columns())));
+    }
+    if let Some(kind) = snapshot_strategy {
+        let kind = match kind {
+            rocky_core::snapshot_model::SnapshotStrategyKind::Timestamp => "timestamp",
+            rocky_core::snapshot_model::SnapshotStrategyKind::Check => "check",
+        };
+        out.push_str(&format!("strategy = \"{kind}\"\n"));
+    }
+    if let Some(col) = updated_at {
+        out.push_str(&format!("updated_at = \"{}\"\n", toml_escape(col)));
+    }
+    match check_cols {
+        None => {}
+        Some(rocky_core::snapshot_model::SnapshotCheckColsConfig::Keyword(word)) => {
+            out.push_str(&format!("check_cols = \"{}\"\n", toml_escape(word)));
+        }
+        Some(rocky_core::snapshot_model::SnapshotCheckColsConfig::List(cols)) => {
+            out.push_str(&format!("check_cols = [{}]\n", list(cols)));
+        }
+    }
+    if let Some(mode) = hard_deletes {
+        out.push_str(&format!("hard_deletes = \"{}\"\n", mode.as_str()));
+    }
+    if let Some(flag) = invalidate_hard_deletes {
+        out.push_str(&format!("invalidate_hard_deletes = {flag}\n"));
+    }
+    if let Some(expr) = valid_to_current {
+        out.push_str(&format!("valid_to_current = \"{}\"\n", toml_escape(expr)));
+    }
+    if let Some(meta) = snapshot_meta_column_names {
+        let mut fields = vec![
+            format!("valid_from = \"{}\"", toml_escape(&meta.valid_from)),
+            format!("valid_to = \"{}\"", toml_escape(&meta.valid_to)),
+        ];
+        match meta.is_current.name() {
+            Some(name) => fields.push(format!("is_current = \"{}\"", toml_escape(name))),
+            None => fields.push("is_current = false".to_string()),
+        }
+        fields.push(format!("scd_id = \"{}\"", toml_escape(&meta.scd_id)));
+        if let Some(col) = &meta.updated_at {
+            fields.push(format!("updated_at = \"{}\"", toml_escape(col)));
+        }
+        fields.push(format!(
+            "is_deleted = \"{}\"",
+            toml_escape(&meta.is_deleted)
+        ));
+        out.push_str(&format!(
+            "snapshot_meta_column_names = {{ {} }}\n",
+            fields.join(", ")
+        ));
+    }
+}
+
 fn is_safe_model_file_stem(name: &str) -> bool {
     !name.is_empty()
         && !name.contains('/')
@@ -1241,19 +1457,17 @@ mod tests {
         }
     }
 
-    /// The emitter writes each model's strategy as the importer mapped it.
-    ///
-    /// It used to rewrite a listed model to `ephemeral` at write time, a
-    /// leftover of the pre-Wave-2 `view → ephemeral` mapping whose only
-    /// caller passed an empty list. `ephemeral` does not compile at all now
-    /// (E038, #1996), so an emitted sidecar must never carry it.
+    /// The emitter writes each model's strategy as the importer mapped it —
+    /// no rewrite at write time. A dbt `ephemeral` model stays ephemeral (Rocky
+    /// inlines it into its consumers); a `view` stays a view.
     #[test]
-    fn an_emitted_sidecar_never_carries_ephemeral() {
+    fn an_emitted_sidecar_carries_the_mapped_strategy() {
         let dbt_dir = tempfile::TempDir::new().unwrap();
         let out_dir = tempfile::TempDir::new().unwrap();
         let imported = vec![
             make_model("v_users", StrategyConfig::View, "SELECT 1"),
             make_model("t_users", StrategyConfig::FullRefresh, "SELECT 1"),
+            make_model("e_users", StrategyConfig::Ephemeral, "SELECT 1"),
         ];
         let result = empty_result(imported);
         let profile = resolution_for_kind(AdapterKind::DuckDb, "duckdb");
@@ -1270,14 +1484,17 @@ mod tests {
         })
         .unwrap();
 
-        for (model, expected) in [("v_users", "view"), ("t_users", "full_refresh")] {
+        for (model, expected) in [
+            ("v_users", "view"),
+            ("t_users", "full_refresh"),
+            ("e_users", "ephemeral"),
+        ] {
             let body = std::fs::read_to_string(out_dir.path().join(format!("models/{model}.toml")))
                 .unwrap();
             assert!(
                 body.contains(&format!("type = \"{expected}\"")),
                 "{model}: {body}"
             );
-            assert!(!body.contains("ephemeral"), "{model}: {body}");
         }
     }
 

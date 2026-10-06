@@ -107,6 +107,14 @@ suite("Rocky Extension", () => {
     );
   });
 
+  test("rocky.freshness command exists", async () => {
+    const commands = await vscode.commands.getCommands(true);
+    assert.ok(
+      commands.includes("rocky.freshness"),
+      "rocky.freshness command should be registered",
+    );
+  });
+
   test("rocky.optimize command exists", async () => {
     const commands = await vscode.commands.getCommands(true);
     assert.ok(

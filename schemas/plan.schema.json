@@ -1148,7 +1148,7 @@
       "type": "array"
     },
     "skipped": {
-      "description": "Models excluded from the SQL preview or refused by compilation, with the reason for each. This includes SQL that needs a live warehouse to render and compiler errors such as E038 for an `ephemeral` model.",
+      "description": "Models excluded from the SQL preview or refused by compilation, with the reason for each. This includes SQL that needs a live warehouse to render, compiler errors, and `ephemeral` models, which are inlined into their consumers and render no statement of their own.",
       "items": {
         "$ref": "#/definitions/SkippedModel"
       },

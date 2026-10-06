@@ -53,7 +53,11 @@ use std::path::Path;
 use rocky_compiler::diagnostic::{self, Diagnostic};
 use rocky_core::breaking_change::{BreakingChange, diff_project_ir};
 use rocky_core::config::RockyConfig;
-use rocky_core::imports::{ImportsError, PinStatus, load_snapshot, verify_pin};
+use rocky_core::imports::{
+    ImportsError, PinStatus, SnapshotGovernance, load_snapshot, load_snapshot_with_governance,
+    verify_pin,
+};
+use rocky_core::model_governance::{DeprecationStatus, deprecation_status};
 use rocky_core::models::Model;
 
 /// How a consumer model references a producer target.
@@ -162,18 +166,46 @@ pub fn imports_diagnostics(
     config_dir: &Path,
     consumer_models: &[Model],
 ) -> Vec<Diagnostic> {
+    imports_diagnostics_at(
+        config,
+        config_dir,
+        consumer_models,
+        rocky_core::model_governance::governance_today(),
+    )
+}
+
+/// [`imports_diagnostics`] with an injected "today" for the W048
+/// deprecation window.
+pub fn imports_diagnostics_at(
+    config: &RockyConfig,
+    config_dir: &Path,
+    consumer_models: &[Model],
+    today: chrono::NaiveDate,
+) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
 
     for (import_name, entry) in &config.imports {
         let dir = config_dir.join(&entry.path);
 
-        let current = match load_snapshot(&dir, &entry.snapshot) {
-            Ok(ir) => ir,
+        let (current, governance) = match load_snapshot_with_governance(&dir, &entry.snapshot) {
+            Ok(loaded) => loaded,
             Err(e) => {
                 diagnostics.push(load_failure_diagnostic(import_name, "snapshot", &e));
                 continue;
             }
         };
+
+        // E047 / W048 — access and deprecation of the producer models each
+        // consumer reads through `[[sources]]`. Needs no baseline.
+        if let Some(gov) = &governance {
+            governance_import_diagnostics(
+                &mut diagnostics,
+                import_name,
+                gov,
+                consumer_models,
+                today,
+            );
+        }
 
         // E033 — recipe-hash pin verification.
         if let PinStatus::Mismatch { expected, actual } = verify_pin(&current, entry.pin.as_deref())
@@ -319,6 +351,70 @@ pub fn imports_diagnostics(
     }
 
     diagnostics
+}
+
+/// E047 for a consumer source that names a producer model the producer
+/// withheld (not `public`); W048 for one that names a deprecated version.
+fn governance_import_diagnostics(
+    diagnostics: &mut Vec<Diagnostic>,
+    import_name: &str,
+    gov: &SnapshotGovernance,
+    consumer_models: &[Model],
+    today: chrono::NaiveDate,
+) {
+    for model in consumer_models {
+        for source in &model.config.sources {
+            let target = source_full_name(source);
+            if let Some(withheld) = gov.withheld.get(&target) {
+                diagnostics.push(
+                    Diagnostic::error(
+                        diagnostic::E047,
+                        &model.config.name,
+                        format!(
+                            "import '{import_name}': model '{}' reads '{target}', but producer \
+                             model '{}' is {} — only public models may be referenced from \
+                             another project",
+                            model.config.name, withheld.name, withheld.access
+                        ),
+                    )
+                    .with_suggestion(format!(
+                        "ask the producer to set `access = \"public\"` on '{}' and republish, \
+                         or read a public model instead",
+                        withheld.name
+                    )),
+                );
+                continue;
+            }
+            let Some(info) = gov.models.get(&target).and_then(|m| m.version.as_ref()) else {
+                continue;
+            };
+            let Some(date) = info.deprecation_date else {
+                continue;
+            };
+            let when = match deprecation_status(Some(date), today) {
+                DeprecationStatus::NotDeprecated => continue,
+                DeprecationStatus::Past { .. } => format!("was deprecated on {date}"),
+                DeprecationStatus::Upcoming { days } => {
+                    format!("will be deprecated on {date} (in {days} day(s))")
+                }
+            };
+            diagnostics.push(
+                Diagnostic::warning(
+                    diagnostic::W048,
+                    &model.config.name,
+                    format!(
+                        "import '{import_name}': model '{}' reads '{target}', a version of \
+                         '{}' that {when}",
+                        model.config.name, info.model
+                    ),
+                )
+                .with_suggestion(format!(
+                    "move to the latest version (v{}) of '{}'",
+                    info.latest_version, info.model
+                )),
+            );
+        }
+    }
 }
 
 /// Classify a snapshot load failure. A snapshot declaring a too-new format
@@ -844,5 +940,70 @@ mod tests {
         let e034: Vec<_> = diags.iter().filter(|d| &*d.code == "E034").collect();
         assert_eq!(e034.len(), 1, "expected one E034, got: {diags:?}");
         assert_eq!(e034[0].severity, diagnostic::Severity::Error);
+    }
+
+    /// `rocky compile` checks imports against each model as authored. An
+    /// ephemeral model that reads a dropped producer column gets one E030.
+    /// Its consumers (which declare the same producer source) read only
+    /// `id`; checked against their inlined SQL they would repeat the E030.
+    #[test]
+    fn e030_on_an_ephemeral_model_is_not_repeated_on_its_consumers() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let baseline = producer_snapshot(&["id", "customer_id", "shipped_at"]);
+        let current = producer_snapshot(&["id", "customer_id"]);
+        for (file, ir) in [("baseline.json", &baseline), ("current.json", &current)] {
+            std::fs::write(root.join(file), serde_json::to_string_pretty(ir).unwrap()).unwrap();
+        }
+        std::fs::write(
+            root.join("rocky.toml"),
+            "[adapter]\ntype = \"duckdb\"\npath = \":memory:\"\n\n\
+             [pipeline.p]\ntype = \"transformation\"\nmodels = \"models/**\"\n\
+             target = { adapter = \"default\" }\n\n\
+             [imports.orders]\npath = \".\"\nsnapshot = \"current.json\"\n\
+             baseline = \"baseline.json\"\npin = \"*\"\n",
+        )
+        .unwrap();
+        let models = root.join("models");
+        std::fs::create_dir_all(&models).unwrap();
+        let sidecar = |strategy: &str| {
+            format!(
+                "[strategy]\ntype = \"{strategy}\"\n\n[target]\ncatalog = \"c\"\nschema = \"s\"\n\n\
+                 [[sources]]\ncatalog = \"shop\"\nschema = \"core\"\ntable = \"orders\"\n"
+            )
+        };
+        std::fs::write(
+            models.join("eph.sql"),
+            "SELECT id, shipped_at FROM shop.core.orders",
+        )
+        .unwrap();
+        std::fs::write(models.join("eph.toml"), sidecar("ephemeral")).unwrap();
+        for consumer in ["c1", "c2"] {
+            std::fs::write(models.join(format!("{consumer}.sql")), "SELECT id FROM eph").unwrap();
+            std::fs::write(
+                models.join(format!("{consumer}.toml")),
+                sidecar("full_refresh"),
+            )
+            .unwrap();
+        }
+        let out = crate::commands::compile_output(
+            Some(&root.join("rocky.toml")),
+            &root.join("state.redb"),
+            &models,
+            None,
+            None,
+            false,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        let e030: Vec<&str> = out
+            .diagnostics
+            .iter()
+            .filter(|d| &*d.code == "E030")
+            .map(|d| d.model.as_str())
+            .collect();
+        assert_eq!(e030, vec!["eph"], "{:?}", out.diagnostics);
     }
 }

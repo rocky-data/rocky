@@ -106,6 +106,7 @@ _COMMAND_SCHEMA: dict[str, str] = {
     "tick": "tick.schema.json",
     "compliance": "compliance.schema.json",
     "retention-status": "retention_status.schema.json",
+    "freshness": "freshness.schema.json",
     "catalog": "catalog.schema.json",
     "branch approve": "branch_approve.schema.json",
     "branch promote": "branch_promote.schema.json",

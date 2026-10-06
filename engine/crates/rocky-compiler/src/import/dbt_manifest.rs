@@ -29,6 +29,23 @@ pub struct DbtManifest {
     /// Counts of resource classes the importer does not translate, captured at
     /// parse time so the sweep can report them.
     pub dropped: DbtDroppedCounts,
+    /// dbt `groups`, keyed by group name, with their owners.
+    pub groups: std::collections::BTreeMap<String, rocky_core::model_governance::GroupOwner>,
+}
+
+/// dbt model governance on a manifest node: access, group, and version.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct DbtNodeGovernance {
+    /// `private`, `protected` or `public`, as dbt wrote it.
+    pub access: Option<String>,
+    /// dbt group name.
+    pub group: Option<String>,
+    /// The node's version, as dbt wrote it (`1`, `"2"`, `1.5`, ...).
+    pub version: Option<String>,
+    /// The model's latest version, as dbt wrote it.
+    pub latest_version: Option<String>,
+    /// Deprecation date (`YYYY-MM-DD`, possibly with a time part).
+    pub deprecation_date: Option<String>,
 }
 
 /// Counts of dbt resource classes the importer skips. Surfaced (not silently
@@ -71,6 +88,8 @@ pub struct DbtManifestNode {
     /// the importer matches against it to rewrite compiled upstream refs back
     /// to bare Rocky model names. `None` on manifests that predate the field.
     pub relation_name: Option<String>,
+    /// Access, group and version (dbt model governance).
+    pub governance: DbtNodeGovernance,
 }
 
 /// Dependency information for a manifest node.
@@ -122,6 +141,9 @@ pub struct DbtNodeConfig {
     /// Rocky does not auto-generate `{model}.contract.toml` on import; the
     /// importer surfaces this so the migration is never silently lossy.
     pub contract: Option<DbtContractConfig>,
+    /// Snapshot config (`strategy`, `updated_at`, `check_cols`,
+    /// `hard_deletes`, …) — `Some` only for `resource_type: snapshot` nodes.
+    pub snapshot: Option<super::dbt_snapshots::DbtSnapshotConfig>,
 }
 
 /// dbt model `contract` config — whether the model enforces a declared
@@ -224,6 +246,24 @@ struct RawManifest {
     semantic_models: HashMap<String, serde_json::Value>,
     #[serde(default)]
     exposures: HashMap<String, serde_json::Value>,
+    #[serde(default)]
+    groups: HashMap<String, RawGroup>,
+}
+
+#[derive(Deserialize, Default)]
+struct RawGroup {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    owner: Option<RawGroupOwner>,
+}
+
+#[derive(Deserialize, Default)]
+struct RawGroupOwner {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    email: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -354,6 +394,16 @@ struct RawNode {
     database: Option<String>,
     #[serde(default)]
     relation_name: Option<String>,
+    #[serde(default)]
+    access: Option<String>,
+    #[serde(default)]
+    group: Option<String>,
+    #[serde(default)]
+    version: Option<serde_json::Value>,
+    #[serde(default)]
+    latest_version: Option<serde_json::Value>,
+    #[serde(default)]
+    deprecation_date: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -411,6 +461,29 @@ struct RawNodeConfig {
     /// `contract` — dbt model contract enforcement block.
     #[serde(default)]
     contract: Option<RawContract>,
+    // Snapshot-node config. Read only for `resource_type: snapshot`.
+    #[serde(default)]
+    strategy: Option<String>,
+    #[serde(default)]
+    updated_at: Option<String>,
+    #[serde(default)]
+    check_cols: Option<serde_json::Value>,
+    #[serde(default)]
+    hard_deletes: Option<String>,
+    #[serde(default)]
+    invalidate_hard_deletes: Option<bool>,
+    #[serde(default)]
+    snapshot_meta_column_names: Option<std::collections::BTreeMap<String, Option<String>>>,
+    #[serde(default)]
+    dbt_valid_to_current: Option<String>,
+    #[serde(default)]
+    target_schema: Option<String>,
+    #[serde(default)]
+    target_database: Option<String>,
+    #[serde(default)]
+    access: Option<String>,
+    #[serde(default)]
+    group: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -457,8 +530,9 @@ struct RawManifestSource {
 
 /// Parse a manifest.json file.
 ///
-/// Uses a buffered reader for efficiency with large manifests. Only model
-/// nodes are retained; tests, seeds, and snapshots are filtered out.
+/// Uses a buffered reader for efficiency with large manifests. Model and
+/// snapshot nodes are retained (snapshots import as `type = "snapshot"`
+/// models); tests and seeds are filtered out.
 pub fn parse_manifest(path: &Path) -> Result<DbtManifest, String> {
     let file =
         std::fs::File::open(path).map_err(|e| format!("failed to open {}: {e}", path.display()))?;
@@ -479,11 +553,9 @@ pub fn parse_manifest(path: &Path) -> Result<DbtManifest, String> {
     };
 
     let dropped = DbtDroppedCounts {
-        snapshots: raw
-            .nodes
-            .values()
-            .filter(|n| n.resource_type == "snapshot")
-            .count(),
+        // Snapshots convert to `type = "snapshot"` models; one that cannot
+        // convert is reported as an import failure with its reason.
+        snapshots: 0,
         metrics: raw.metrics.len(),
         semantic_models: raw.semantic_models.len(),
         exposures: raw.exposures.len(),
@@ -492,7 +564,7 @@ pub fn parse_manifest(path: &Path) -> Result<DbtManifest, String> {
     let nodes = raw
         .nodes
         .into_iter()
-        .filter(|(_, n)| n.resource_type == "model")
+        .filter(|(_, n)| n.resource_type == "model" || n.resource_type == "snapshot")
         .map(|(id, n)| {
             let node = convert_node(n);
             (id, node)
@@ -520,7 +592,24 @@ pub fn parse_manifest(path: &Path) -> Result<DbtManifest, String> {
         .map(|(id, ut)| (id, convert_unit_test(ut)))
         .collect();
 
+    let groups = raw
+        .groups
+        .into_values()
+        .filter(|g| !g.name.is_empty())
+        .map(|g| {
+            let owner = g.owner.unwrap_or_default();
+            (
+                g.name,
+                rocky_core::model_governance::GroupOwner {
+                    name: owner.name.filter(|s| !s.is_empty()),
+                    email: owner.email.filter(|s| !s.is_empty()),
+                },
+            )
+        })
+        .collect();
+
     Ok(DbtManifest {
+        groups,
         metadata,
         full_refresh_compiled,
         successfully_compiled_nodes,
@@ -575,9 +664,62 @@ fn rows_from_json(v: serde_json::Value) -> Vec<serde_json::Value> {
     }
 }
 
+/// A manifest version value (`1`, `"2"`, `1.5`) as text. `None` for null.
+fn json_version(v: Option<serde_json::Value>) -> Option<String> {
+    match v? {
+        serde_json::Value::Null => None,
+        serde_json::Value::String(s) if s.is_empty() => None,
+        serde_json::Value::String(s) => Some(s),
+        other => Some(other.to_string()),
+    }
+}
+
 fn convert_node(raw: RawNode) -> DbtManifestNode {
     let depends_on = raw.depends_on.unwrap_or_default();
-    let config = raw.config.unwrap_or_default();
+    let mut config = raw.config.unwrap_or_default();
+
+    let snapshot = (raw.resource_type == "snapshot").then(|| {
+        // Target dbt's resolved relation, so `rocky run` continues the
+        // history dbt built: the node's `schema` is after
+        // `generate_schema_name` (a YAML snapshot's `schema: snapshots` can
+        // land in `analytics_snapshots`). Fall back to `target_schema`.
+        match raw.schema.as_deref().filter(|s| !s.is_empty()) {
+            Some(resolved) => config.schema = Some(resolved.to_string()),
+            None => {
+                if config.schema.is_none() {
+                    config.schema = config.target_schema.clone();
+                }
+            }
+        }
+        super::dbt_snapshots::DbtSnapshotConfig {
+            unique_key: config.unique_key.clone(),
+            strategy: config.strategy.take(),
+            updated_at: config.updated_at.take(),
+            check_cols: config.check_cols.take(),
+            hard_deletes: config.hard_deletes.take(),
+            invalidate_hard_deletes: config.invalidate_hard_deletes,
+            snapshot_meta_column_names: config.snapshot_meta_column_names.take(),
+            dbt_valid_to_current: config.dbt_valid_to_current.take(),
+            target_schema: config.target_schema.clone(),
+            target_database: config.target_database.clone(),
+            schema: config.schema.clone(),
+            database: None,
+            alias: config.alias.clone(),
+        }
+    });
+    let governance = DbtNodeGovernance {
+        access: raw
+            .access
+            .or_else(|| config.access.clone())
+            .filter(|s| !s.is_empty()),
+        group: raw
+            .group
+            .or_else(|| config.group.clone())
+            .filter(|s| !s.is_empty()),
+        version: json_version(raw.version),
+        latest_version: json_version(raw.latest_version),
+        deprecation_date: raw.deprecation_date.filter(|s| !s.is_empty()),
+    };
 
     let unique_key = config.unique_key.and_then(|v| match v {
         serde_json::Value::String(s) => Some(UniqueKeyValue::Single(s)),
@@ -663,6 +805,7 @@ fn convert_node(raw: RawNode) -> DbtManifestNode {
             contract: config.contract.map(|c| DbtContractConfig {
                 enforced: c.enforced,
             }),
+            snapshot,
         },
         columns,
         description: raw.description.filter(|d| !d.is_empty()),
@@ -670,6 +813,7 @@ fn convert_node(raw: RawNode) -> DbtManifestNode {
         schema: raw.schema.unwrap_or_default(),
         database: raw.database.unwrap_or_default(),
         relation_name: raw.relation_name.filter(|s| !s.is_empty()),
+        governance,
     }
 }
 
@@ -706,7 +850,7 @@ pub fn extract_model_name(unique_id: &str) -> &str {
 pub fn depends_on_to_rocky(nodes: &[String]) -> Vec<String> {
     nodes
         .iter()
-        .filter(|n| n.starts_with("model."))
+        .filter(|n| n.starts_with("model.") || n.starts_with("snapshot."))
         .map(|n| extract_model_name(n).to_string())
         .collect()
 }

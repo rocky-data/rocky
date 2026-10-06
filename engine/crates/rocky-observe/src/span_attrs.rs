@@ -220,6 +220,10 @@ pub const WAREHOUSE_NAMES: &[&str] = &[
     "duckdb",
     "iceberg",
     "trino",
+    "postgres",
+    "redshift",
+    "clickhouse",
+    "sqlserver",
 ];
 
 #[cfg(test)]

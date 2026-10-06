@@ -767,7 +767,9 @@ rocky emit-sql --model stg_orders --out-dir sql/ # Emit a single model
 - The dialect is the project's configured target adapter type, resolved from `rocky.toml` without credentials. With no resolvable config it defaults to DuckDB. All models render in this one resolved dialect, so for a project whose models target more than one adapter, the emitted SQL matches `rocky run` only for the models whose target uses that dialect.
 - **Full-refresh models.** Emit a complete `CREATE OR REPLACE TABLE … AS …` that runs as-is against a fresh warehouse and matches what a run executes in the resolved dialect.
 - **Merge and `delete_insert` models.** Emit their steady-state statement against an existing target. `rocky run` bootstraps the target table on first build, which a static emit cannot reproduce, so each such file carries a leading `-- NOTE:` comment.
-- **Compile errors.** Any error stops the whole export, before `--model` filters. `type = "incremental"` on a transformation model fails with `E037`, and `type = "ephemeral"` fails with `E038`. Either blocks every model.
+- **Compile errors.** Any error stops the whole export, before `--model` filters. `type = "incremental"` on a transformation model fails with `E037`. An invalid `ephemeral` use fails with `E038`. Either blocks every model.
+- **Ephemeral models.** Get no statement of their own and are reported as skipped. Each consumer's statement carries the model as a `__rocky_ephemeral__<model>` CTE.
+- **Compile errors.** Any error stops the whole export, before `--model` filters. `type = "incremental"` with no watermark on a transformation model fails with `E037`, and `type = "ephemeral"` fails with `E038`. Either blocks every model.
 - A model whose SQL cannot be rendered offline is reported on stderr rather than silently dropped. A Snowflake dynamic table is one: it needs a live compute-warehouse name.
 
 This command prints SQL or writes files; it has no JSON output mode.

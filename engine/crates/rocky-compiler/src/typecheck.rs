@@ -19,8 +19,8 @@ use sqlparser::parser::Parser;
 
 use crate::compile::default_type_mapper;
 use crate::diagnostic::{
-    Diagnostic, E001, E020, E021, E022, E023, E024, E025, E026, E035, E037, E038, E039, I001, I002,
-    SourceSpan, W001, W002, W004, W005, W006,
+    Diagnostic, E001, E020, E021, E022, E023, E024, E025, E026, E035, E037, E039, E046, I001, I002,
+    SourceSpan, W001, W002, W004, W005, W006, W046,
 };
 use crate::semantic::{ModelSchema, SemanticGraph};
 use crate::types::{RockyType, TypedColumn};
@@ -72,7 +72,7 @@ pub struct TypeCheckResult {
 /// table + column keys look up independently (a flat `(String, String)`
 /// key would need `format!("{table}.{col}")` at the lookup site and
 /// re-introduce the allocation).
-struct TypeScope {
+pub(crate) struct TypeScope {
     /// column_name → (type, nullable) for all columns in scope.
     columns: HashMap<CiKey<'static>, (RockyType, bool)>,
     /// table → { column → (type, nullable) } for qualified references.
@@ -436,6 +436,12 @@ fn compute_model_typecheck(
 ) -> ModelTypecheckOutput {
     let model_start = Instant::now();
     let mut diagnostics: Vec<Diagnostic> = Vec::new();
+    // User-defined functions: installed for this model's inference only.
+    let udf_scope = crate::udf::TypecheckScope::enter(
+        graph.functions(),
+        model_name,
+        model_by_name.get(model_name).map(|m| m.sql.as_str()),
+    );
 
     // Extract references from this model's SQL if available.
     let ref_map = if let Some(model) = model_by_name.get(model_name) {
@@ -496,15 +502,16 @@ fn compute_model_typecheck(
     // Lineage resolves aliases to source models, losing which occurrence an
     // outer join null-extends. Infer in the SQL relation scope before using
     // the resulting nullable bit for contracts and downstream models.
-    let needs_inference = typed_cols.iter().any(|col| {
-        graph
-            .producing_edge(model_name, &col.name)
-            .is_some_and(|edge| {
-                edge.transform.is_cast()
-                    || (!col.nullable
-                        && edge.transform == rocky_sql::lineage::TransformKind::Direct)
-            })
-    });
+    let needs_inference = udf_scope.is_active()
+        || typed_cols.iter().any(|col| {
+            graph
+                .producing_edge(model_name, &col.name)
+                .is_some_and(|edge| {
+                    edge.transform.is_cast()
+                        || (!col.nullable
+                            && edge.transform == rocky_sql::lineage::TransformKind::Direct)
+                })
+        });
     let inferred_cols = model_by_name
         .get(model_name)
         .filter(|_| needs_inference)
@@ -541,6 +548,12 @@ fn compute_model_typecheck(
             }
         }
     }
+    if udf_scope.is_active()
+        && let Some(model) = model_by_name.get(model_name)
+    {
+        crate::udf::apply_direct_call_types(&model.sql, graph.functions(), &mut typed_cols);
+    }
+    diagnostics.extend(udf_scope.finish());
     let enhanced_diags = enhanced_inference(
         model_name,
         graph,
@@ -564,6 +577,32 @@ fn compute_model_typecheck(
         graph,
         model_by_name,
     ));
+
+    // Step 2c: GROUP BY validity (E044). Names resolve only against upstream
+    // models this model depends on and known source schemas; anything else
+    // is unknown and stays silent.
+    if let Some(model) = model_by_name.get(model_name) {
+        let relation_columns = |name: &str| -> Option<Vec<String>> {
+            let columns = if name.contains('.') {
+                typed_models.get(name).or_else(|| {
+                    typed_models
+                        .iter()
+                        .find(|(key, _)| key.contains('.') && key.eq_ignore_ascii_case(name))
+                        .map(|(_, columns)| columns)
+                })
+            } else if model_schema.upstream.iter().any(|up| up == name) {
+                typed_models.get(name)
+            } else {
+                None
+            }?;
+            Some(columns.iter().map(|column| column.name.clone()).collect())
+        };
+        diagnostics.extend(crate::group_by::check_group_by(
+            model_name,
+            &model.sql,
+            &relation_columns,
+        ));
+    }
 
     // Step 3: SELECT * warning
     let schema_incomplete = model_schema.has_star
@@ -613,14 +652,26 @@ fn compute_model_typecheck(
     // parenthesised or computed item lineage cannot name) and an emptiness
     // check misses the partial case.
     if let Some(model) = model_by_name.get(model_name) {
-        diagnostics.extend(check_incremental_strategy(model));
-        diagnostics.extend(check_ephemeral_strategy(model));
+        diagnostics.extend(check_incremental_strategy(
+            model,
+            &typed_cols,
+            model_schema.schema_is_complete(),
+        ));
         diagnostics.extend(check_time_interval_strategy(model, &typed_cols));
         diagnostics.extend(check_merge_strategy(
             model,
             &typed_cols,
             model_schema.schema_is_complete(),
         ));
+        diagnostics.extend(crate::snapshot::check_snapshot_strategy(
+            model,
+            &typed_cols,
+            model_schema.schema_is_complete(),
+            model_schema.has_star,
+        ));
+        // After the checks above (which judge the SELECT's own columns):
+        // a snapshot's table also holds its metadata columns.
+        crate::snapshot::append_snapshot_metadata_columns(model, &mut typed_cols);
     }
 
     // Step 6: Enrich diagnostics with the model's file path as a SourceSpan
@@ -771,11 +822,31 @@ fn check_known_missing_projection_refs(
     let qualifier = alias
         .as_ref()
         .map_or(relation_name, |alias| alias.name.value.as_str());
+    // A snapshot model's table holds its SELECT's columns plus the SCD2
+    // metadata columns (`valid_from`, `is_current`, ...), which the semantic
+    // graph does not list. Readers of the snapshot may project them.
+    let snapshot_meta: Vec<String> = upstream_model
+        .config
+        .strategy
+        .snapshot_lowered()
+        .map(|lowered| {
+            lowered
+                .spec
+                .meta_columns
+                .reserved()
+                .into_iter()
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
     let column_exists = |name: &str| {
         upstream_schema
             .columns
             .iter()
             .any(|column| column.name.eq_ignore_ascii_case(name))
+            || snapshot_meta
+                .iter()
+                .any(|meta| meta.eq_ignore_ascii_case(name))
     };
 
     let mut diagnostics = Vec::new();
@@ -847,7 +918,7 @@ fn check_known_missing_projection_refs(
     diagnostics
 }
 
-fn is_warehouse_pseudo_column(name: &str) -> bool {
+pub(crate) fn is_warehouse_pseudo_column(name: &str) -> bool {
     name.eq_ignore_ascii_case("rowid")
         || name.eq_ignore_ascii_case("_metadata")
         || name.eq_ignore_ascii_case("_partitiontime")
@@ -1159,76 +1230,231 @@ fn check_merge_strategy(
         .collect()
 }
 
-/// E037 — refuse `type = "incremental"` on a transformation model (#1990).
+/// E037 / E046 / W046 — validate a transformation `incremental` model (#1990).
 ///
-/// The transformation path lowers `incremental` to `INSERT INTO <target>
-/// <model SQL>` with no watermark filter, so every run after the first appends
-/// the whole result again and exits 0. Every [`rocky_core::models::Model`] is a
-/// transformation model (replication tables have no sidecar and never reach
-/// this pass), so no variant check is needed here.
+/// An `incremental` model loads only rows past the target's own
+/// `MAX(<watermark>)`. That needs a watermark column and a place to apply it:
+///
+/// - no `timestamp_column` (alias `watermark`) → **E037**: the only SQL left
+///   is an unfiltered INSERT that appends every row again on each run;
+/// - an `@incremental_filter` placeholder in the SQL → valid;
+/// - no placeholder → the runtime filters the model's *output* column, which
+///   is only equivalent when lineage proves that column is a direct
+///   passthrough (`TransformKind::Direct`) of one input column. Anything else
+///   (an expression, an aggregate, a `SELECT *`, SQL lineage cannot read) →
+///   **E046**, naming where to put the placeholder;
+/// - a watermark absent from a provably complete output schema → **E046**:
+///   the target would have no such column to take `MAX` of;
+/// - `lookback` without `unique_key` → **W046**: the re-read window is
+///   appended again on every run.
+///
+/// A placeholder in a model of any other strategy is **E046** too: nothing
+/// would resolve it, and the warehouse would reject the SQL.
 ///
 /// Loaded `microbatch` models are normalized to `time_interval` before this
 /// check, so they receive the partition-window validation instead.
-fn check_incremental_strategy(model: &rocky_core::models::Model) -> Vec<Diagnostic> {
+fn check_incremental_strategy(
+    model: &rocky_core::models::Model,
+    typed_cols: &[TypedColumn],
+    schema_complete: bool,
+) -> Vec<Diagnostic> {
+    use rocky_core::incremental_filter::{PLACEHOLDER, has_placeholder};
     use rocky_core::models::StrategyConfig;
 
-    let StrategyConfig::Incremental { .. } = &model.config.strategy else {
+    let model_name = model.config.name.as_str();
+    let StrategyConfig::Incremental {
+        timestamp_column,
+        unique_key,
+        lookback,
+        filter_column,
+        ..
+    } = &model.config.strategy
+    else {
+        if has_placeholder(&model.sql) {
+            return vec![
+                Diagnostic::error(
+                    E046,
+                    model_name,
+                    format!(
+                        "model '{model_name}' uses `{PLACEHOLDER}`, but its strategy is not \
+                         `incremental`: nothing resolves the placeholder, so the warehouse \
+                         would reject the SQL"
+                    ),
+                )
+                .with_suggestion(
+                    "Set `[strategy] type = \"incremental\"` with `timestamp_column`, or remove \
+                     the placeholder",
+                ),
+            ];
+        }
         return Vec::new();
     };
-    let model_name = model.config.name.as_str();
-    vec![
-        Diagnostic::error(
-            E037,
-            model_name,
-            format!(
-                "model '{model_name}' uses `type = \"incremental\"`, which is not supported on \
-                 transformation models: it emits an unfiltered INSERT and appends every row \
-                 again on each run"
+
+    let Some(watermark) = timestamp_column.as_deref().filter(|w| !w.is_empty()) else {
+        return vec![
+            Diagnostic::error(
+                E037,
+                model_name,
+                format!(
+                    "model '{model_name}' uses `type = \"incremental\"` with no watermark \
+                     column: without one Rocky can only emit an unfiltered INSERT, which \
+                     appends every row again on each run"
+                ),
+            )
+            .with_suggestion(format!(
+                "Declare the watermark in [strategy] — `timestamp_column = \"updated_at\"` — and \
+                 put `{PLACEHOLDER}` where the filter belongs (`WHERE {PLACEHOLDER}`); or use \
+                 `type = \"merge\"`, `\"delete_insert\"`, `\"time_interval\"` or \
+                 `\"full_refresh\"`"
+            )),
+        ];
+    };
+
+    if rocky_sql::validation::validate_identifier(watermark).is_err() {
+        return vec![
+            Diagnostic::error(
+                E046,
+                model_name,
+                format!(
+                    "model '{model_name}': incremental watermark '{watermark}' is not a plain \
+                 column name"
+                ),
+            )
+            .with_suggestion("Name an output column of the model: letters, digits and `_`"),
+        ];
+    }
+
+    let mut diagnostics = Vec::new();
+
+    if let Some(filter) = filter_column
+        && let Err(reason) = rocky_core::incremental_filter::validate_filter_column(filter)
+    {
+        diagnostics.push(
+            Diagnostic::error(
+                E046,
+                model_name,
+                format!("model '{model_name}': incremental {reason}"),
+            )
+            .with_suggestion(
+                "Set `filter_column` to a column or `<alias>.<column>` of the model's input",
             ),
-        )
-        .with_suggestion(
-            "Use `type = \"merge\"` with a `unique_key`, `type = \"delete_insert\"` with \
-             `partition_by`, `type = \"time_interval\"` with `@start_date`/`@end_date` in the \
-             SQL, or `type = \"full_refresh\"`",
-        ),
-    ]
+        );
+    }
+
+    if schema_complete
+        && !typed_cols.is_empty()
+        && !typed_cols
+            .iter()
+            .any(|c| c.name.eq_ignore_ascii_case(watermark))
+    {
+        diagnostics.push(
+            Diagnostic::error(
+                E046,
+                model_name,
+                format!(
+                    "model '{model_name}': incremental watermark '{watermark}' is not an output \
+                     column, so the target has no '{watermark}' to take MAX() of"
+                ),
+            )
+            .with_suggestion(format!(
+                "Select the watermark in the model output. Output columns: {}",
+                typed_cols
+                    .iter()
+                    .map(|c| c.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )),
+        );
+    }
+
+    if !has_placeholder(&model.sql) && !watermark_is_direct_passthrough(&model.sql, watermark) {
+        diagnostics.push(
+            Diagnostic::error(
+                E046,
+                model_name,
+                format!(
+                    "model '{model_name}' declares incremental watermark '{watermark}' but its \
+                     SQL has no `{PLACEHOLDER}`, and Rocky cannot prove '{watermark}' passes \
+                     straight through from an input column, so filtering the model output on \
+                     it may not select the new input rows"
+                ),
+            )
+            .with_suggestion(format!(
+                "Put `{PLACEHOLDER}` in the WHERE clause that reads the source \
+                 (`WHERE {PLACEHOLDER}`), and set `filter_column = \"<alias>.<column>\"` in \
+                 [strategy] when it compares a qualified or renamed input column"
+            )),
+        );
+    }
+
+    if lookback.is_some_and(|lb| lb.amount > 0) && unique_key.is_empty() {
+        diagnostics.push(
+            Diagnostic::warning(
+                W046,
+                model_name,
+                format!(
+                    "model '{model_name}' sets an incremental `lookback` without `unique_key`: \
+                     each run appends the re-read window again, duplicating those rows"
+                ),
+            )
+            .with_suggestion("Add `unique_key` so the window is merged, or remove `lookback`"),
+        );
+    }
+
+    diagnostics
 }
 
-/// E038 — refuse `type = "ephemeral"` (#1996).
-///
-/// An ephemeral model emits no statement, and no pass rewrites a consumer's
-/// reference to it into a CTE. The consumer's SQL keeps a bare
-/// `FROM <model>`, so it reads whatever physical table carries that name:
-/// a catalog error when none exists, and a stale or unrelated table when one
-/// does. Both ways the model's own rows are never read.
-///
-/// `view` gives what `ephemeral` promised — no copied data, always-fresh
-/// reads — for one view object per model, on every dialect. A private
-/// intermediate has a second answer: an earlier step of a `.rocky` model,
-/// which does fold into the later steps at lowering.
-fn check_ephemeral_strategy(model: &rocky_core::models::Model) -> Vec<Diagnostic> {
-    use rocky_core::models::StrategyConfig;
+/// Whether `watermark` is an output column copied unchanged from one column
+/// of a physical input table — the only shape for which filtering the model's
+/// output equals filtering its input. Any doubt answers `false`:
+/// unparseable SQL, a `SELECT *`, an expression, two output columns of that
+/// name, a column read from a CTE or a derived table (whose own body may
+/// aggregate), or a top-level `LIMIT` / `OFFSET` / `FETCH` (which picks rows
+/// before the filter would).
+fn watermark_is_direct_passthrough(sql: &str, watermark: &str) -> bool {
+    use rocky_sql::lineage::{TableBinding, TransformKind};
 
-    let StrategyConfig::Ephemeral = &model.config.strategy else {
-        return Vec::new();
+    let Ok(statements) = Parser::parse_sql(&rocky_sql::dialect::DatabricksDialect, sql) else {
+        return false;
     };
-    let model_name = model.config.name.as_str();
-    vec![
-        Diagnostic::error(
-            E038,
-            model_name,
-            format!(
-                "model '{model_name}' uses `type = \"ephemeral\"`, which is not supported: an \
-                 ephemeral model is not materialized and is not inlined into its consumers, so \
-                 a consumer reads whatever table already carries the name"
-            ),
-        )
-        .with_suggestion(
-            "Use `type = \"view\"` for an intermediate other models read: no copied data, \
-             always-fresh reads, one view object. For an intermediate only one model reads, \
-             make it an earlier step of that model in a `.rocky` file",
-        ),
-    ]
+    let [Statement::Query(query)] = statements.as_slice() else {
+        return false;
+    };
+    if query.with.is_some() || query.limit_clause.is_some() || query.fetch.is_some() {
+        return false;
+    }
+    let Ok(lineage) = rocky_sql::lineage::extract_lineage(sql) else {
+        return false;
+    };
+    let mut edges = lineage
+        .columns
+        .iter()
+        .filter(|c| c.target_column.eq_ignore_ascii_case(watermark));
+    let (Some(edge), None) = (edges.next(), edges.next()) else {
+        return false;
+    };
+    if !matches!(edge.transform, TransformKind::Direct) {
+        return false;
+    }
+    let physical = |t: &&rocky_sql::lineage::TableReference| {
+        t.binding == TableBinding::Physical && t.name != "(subquery)"
+    };
+    match edge.source_table.as_deref() {
+        Some(qualifier) => lineage.source_tables.iter().any(|t| {
+            let named = t
+                .alias
+                .as_deref()
+                .is_some_and(|a| a.eq_ignore_ascii_case(qualifier))
+                || t.name.eq_ignore_ascii_case(qualifier)
+                || t.name
+                    .rsplit('.')
+                    .next()
+                    .is_some_and(|last| last.eq_ignore_ascii_case(qualifier));
+            named && physical(&t)
+        }),
+        // An unqualified column is unambiguous only with one relation.
+        None => matches!(lineage.source_tables.as_slice(), [only] if physical(&only)),
+    }
 }
 
 /// E024 — both `@start_date` and `@end_date` must bound the rows the model
@@ -2092,7 +2318,7 @@ fn enhanced_inference(
 ///
 /// This is the core expression-level type inference function.
 /// Used by both the enhanced inference pass and for ad-hoc type checking.
-fn infer_expr_type(expr: &Expr, scope: &TypeScope) -> (RockyType, bool) {
+pub(crate) fn infer_expr_type(expr: &Expr, scope: &TypeScope) -> (RockyType, bool) {
     match expr {
         // Column reference
         Expr::Identifier(ident) => scope.lookup(&ident.value),
@@ -2351,7 +2577,9 @@ fn infer_function_type(func: &ast::Function, scope: &TypeScope) -> (RockyType, b
         }
 
         "CAST" => (RockyType::Unknown, true), // handled by Expr::Cast above
-        _ => (RockyType::Unknown, true),
+        // A project UDF (`functions/`) types to its declared return type.
+        _ => crate::udf::infer_active_call(func, &|expr| infer_expr_type(expr, scope))
+            .unwrap_or((RockyType::Unknown, true)),
     }
 }
 
@@ -2528,8 +2756,8 @@ pub fn infer_select_types(
 }
 
 #[derive(Default)]
-struct SelectInference {
-    columns: Vec<TypedColumn>,
+pub(crate) struct SelectInference {
+    pub(crate) columns: Vec<TypedColumn>,
     // Projection indexes keep metadata aligned with duplicate wildcard names.
     reference_outputs: HashSet<usize>,
 }
@@ -2573,7 +2801,7 @@ fn infer_select_types_with_lookup<'a>(
     infer_query_types(query, lookup)
 }
 
-fn infer_query_types<'a>(
+pub(crate) fn infer_query_types<'a>(
     query: &ast::Query,
     lookup: &dyn Fn(&str) -> Option<&'a [TypedColumn]>,
 ) -> Result<SelectInference, String> {
@@ -2595,32 +2823,7 @@ fn infer_query_types<'a>(
         SetExpr::Query(query) => return infer_query_types(query, &lookup),
         _ => return Err("unsupported query form".to_string()),
     };
-    let mut from_scope = JoinScope::default();
-    for from in &select.from {
-        let joined = infer_join_relations(from, &lookup);
-        from_scope.relations.extend(joined.relations);
-        from_scope.columns.extend(joined.columns);
-    }
-    let mut type_scope = TypeScope::new();
-    for col in &from_scope.columns {
-        type_scope
-            .columns
-            .entry(CiKey::owned(col.name.clone()))
-            .and_modify(|ty| *ty = (RockyType::Unknown, true))
-            .or_insert_with(|| (col.data_type.clone(), col.nullable));
-    }
-    for relation in &from_scope.relations {
-        for col in &relation.columns {
-            type_scope
-                .qualified
-                .entry(CiKey::owned(relation.qualifier.clone()))
-                .or_default()
-                .insert(
-                    CiKey::owned(col.name.clone()),
-                    (col.data_type.clone(), col.nullable),
-                );
-        }
-    }
+    let (from_scope, type_scope) = select_type_scope(select, &lookup);
 
     let mut inferred = SelectInference::default();
 
@@ -2665,13 +2868,50 @@ fn infer_query_types<'a>(
     Ok(inferred)
 }
 
-struct RelationColumns {
+/// Build the relation scope of one `SELECT`: its `FROM` / `JOIN` relations
+/// and the [`TypeScope`] that resolves bare and qualified column names
+/// against them. A bare name exposed by more than one relation is ambiguous
+/// and resolves to `Unknown`.
+pub(crate) fn select_type_scope<'a>(
+    select: &ast::Select,
+    lookup: &dyn Fn(&str) -> Option<&'a [TypedColumn]>,
+) -> (JoinScope, TypeScope) {
+    let mut from_scope = JoinScope::default();
+    for from in &select.from {
+        let joined = infer_join_relations(from, lookup);
+        from_scope.relations.extend(joined.relations);
+        from_scope.columns.extend(joined.columns);
+    }
+    let mut type_scope = TypeScope::new();
+    for col in &from_scope.columns {
+        type_scope
+            .columns
+            .entry(CiKey::owned(col.name.clone()))
+            .and_modify(|ty| *ty = (RockyType::Unknown, true))
+            .or_insert_with(|| (col.data_type.clone(), col.nullable));
+    }
+    for relation in &from_scope.relations {
+        for col in &relation.columns {
+            type_scope
+                .qualified
+                .entry(CiKey::owned(relation.qualifier.clone()))
+                .or_default()
+                .insert(
+                    CiKey::owned(col.name.clone()),
+                    (col.data_type.clone(), col.nullable),
+                );
+        }
+    }
+    (from_scope, type_scope)
+}
+
+pub(crate) struct RelationColumns {
     qualifier: String,
     columns: Vec<TypedColumn>,
 }
 
 #[derive(Default)]
-struct JoinScope {
+pub(crate) struct JoinScope {
     // Qualified references retain each side's columns. USING/NATURAL keys
     // merge only in the unqualified output used by SELECT * and bare names.
     relations: Vec<RelationColumns>,
@@ -2849,7 +3089,7 @@ fn infer_relation_columns<'a>(
     }
 }
 
-fn rename_relation_columns(columns: &mut [TypedColumn], alias: &ast::TableAlias) {
+pub(crate) fn rename_relation_columns(columns: &mut [TypedColumn], alias: &ast::TableAlias) {
     for (col, alias) in columns.iter_mut().zip(&alias.columns) {
         col.name.clone_from(&alias.name.value);
     }
@@ -4245,6 +4485,45 @@ mod tests {
         assert!(diagnostic.message.contains("'stg_orders'"));
         assert_eq!(diagnostic.span.as_ref().map(|span| span.line), Some(1));
         assert_eq!(diagnostic.span.as_ref().map(|span| span.col), Some(1));
+    }
+
+    /// A snapshot model's table also holds the SCD2 metadata columns, so a
+    /// reader projecting them must not get E039; a truly absent column still
+    /// does.
+    #[test]
+    fn snapshot_metadata_columns_are_readable_downstream() {
+        let mut snap = make_model(
+            "snap",
+            "SELECT order_id, amount, updated_at FROM raw.orders",
+        );
+        snap.config.strategy = toml::from_str(
+            "type = \"snapshot\"\nunique_key = \"order_id\"\nstrategy = \"timestamp\"\n\
+             updated_at = \"updated_at\"\nsnapshot_meta_column_names = { scd_id = \"version_id\" }",
+        )
+        .unwrap();
+        let result = compile_typechecks(vec![
+            snap.clone(),
+            make_model(
+                "reader",
+                "SELECT order_id, valid_from, valid_to, is_current, version_id FROM snap",
+            ),
+        ]);
+        assert!(
+            e039_diagnostics(&result).is_empty(),
+            "{:?}",
+            result.diagnostics
+        );
+
+        let result = compile_typechecks(vec![
+            snap,
+            make_model("reader", "SELECT order_id, snapshot_id FROM snap"),
+        ]);
+        assert_eq!(
+            e039_diagnostics(&result).len(),
+            1,
+            "{:?}",
+            result.diagnostics
+        );
     }
 
     #[test]
@@ -6094,6 +6373,7 @@ mod tests {
             max_lag_seconds: 3600,
             time_column: Some("event_ts".to_string()),
             severity: None,
+            declared_in_sidecar: true,
         });
         let models = vec![model];
         let typed = typed_models_for("events", &[("event_ts", RockyType::Timestamp)]);

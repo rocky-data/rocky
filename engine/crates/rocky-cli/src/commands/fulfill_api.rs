@@ -814,7 +814,10 @@ pub async fn observe_max_time_column(
     let target_ref = dialect
         .format_table_ref(&target.catalog, &target.schema, &target.table)
         .map_err(|e| anyhow::anyhow!("could not format target table: {e}"))?;
-    let sql = format!("SELECT MAX({time_column}) FROM {target_ref}");
+    let sql = format!(
+        "SELECT {} FROM {target_ref}",
+        dialect.max_aggregate(time_column)
+    );
     let query = warehouse
         .execute_query(&sql)
         .await
@@ -1139,7 +1142,8 @@ mod tests {
             write_file(&models_dir.join("bad.sql"), b"SELECT 1 AS id\n");
             write_file(
                 &models_dir.join("bad.toml"),
-                b"name = \"bad\"\n[strategy]\ntype = \"ephemeral\"\n[target]\ncatalog = \"warehouse\"\nschema = \"main\"\ntable = \"bad\"\n",
+                // `[[tests]]` on an ephemeral model is an invalid use: E038.
+                b"name = \"bad\"\n[strategy]\ntype = \"ephemeral\"\n[target]\ncatalog = \"warehouse\"\nschema = \"main\"\ntable = \"bad\"\n[[tests]]\ntype = \"not_null\"\ncolumn = \"id\"\n",
             );
             let config_path = root.join("rocky.toml");
             write_file(

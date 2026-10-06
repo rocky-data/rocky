@@ -244,7 +244,8 @@ pub fn generate_freshness_sql(
     rocky_sql::validation::validate_identifier(timestamp_column)?;
     let ref_str = dialect.format_table_ref(&table.catalog, &table.schema, &table.table)?;
     Ok(format!(
-        "SELECT MAX({timestamp_column}) AS max_ts FROM {ref_str}"
+        "SELECT {} AS max_ts FROM {ref_str}",
+        dialect.max_aggregate(timestamp_column)
     ))
 }
 

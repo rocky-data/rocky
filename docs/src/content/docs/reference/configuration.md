@@ -156,8 +156,8 @@ Declare a connection once, then reference it by name from any number of pipeline
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `type` | string | Yes | Adapter type. One of `"databricks"`, `"snowflake"`, `"duckdb"`, `"bigquery"`, `"trino"`, `"fivetran"`, `"airbyte"`, `"iceberg"`, `"manual"`. An unrecognized value is a hard error. |
-| `kind` | `"data"` \| `"discovery"` | See description | The role of this block. `"discovery"` is **required** for the discovery-only types: `fivetran`, `airbyte`, `iceberg` and `manual`. Leave it out for `databricks` and `snowflake`, which move data only. For `duckdb` and `bigquery`, which can do both, leaving it out registers both roles. Rocky does not check `kind` for `trino`. |
+| `type` | string | Yes | Adapter type. One of `"databricks"`, `"snowflake"`, `"duckdb"`, `"bigquery"`, `"trino"`, `"postgres"`, `"redshift"`, `"clickhouse"`, `"sqlserver"`, `"fivetran"`, `"airbyte"`, `"iceberg"`, `"manual"`. An unrecognized value is a hard error. |
+| `kind` | `"data"` \| `"discovery"` | See description | The role of this block. `"discovery"` is **required** for the discovery-only types: `fivetran`, `airbyte`, `iceberg` and `manual`. Leave it out for `databricks`, `snowflake`, `postgres`, `redshift`, `clickhouse` and `sqlserver`, which move data only. For `duckdb` and `bigquery`, which can do both, leaving it out registers both roles. Rocky does not check `kind` for `trino`. |
 | `retry` | table | No | Retry policy (see [`[adapter.NAME.retry]`](#adapternameretry)). |
 | `extra` | table | No | Escape hatch for adapter-specific keys Rocky's typed config doesn't model (see below). |
 
@@ -182,6 +182,10 @@ The connection fields, authentication, and examples for each adapter type live o
 - [Databricks](/reference/adapters/databricks/) — SQL warehouse + Unity Catalog governance
 - [Snowflake](/reference/adapters/snowflake/) — PAT, OAuth, key-pair, and password auth
 - [BigQuery](/reference/adapters/bigquery/) — project/location plus environment-supplied credentials
+- [PostgreSQL](/reference/adapters/postgres/) — host, database and role, with libpq-style `sslmode`
+- [Redshift](/reference/adapters/redshift/) (Beta) — the PostgreSQL adapter's fields plus dist/sort keys and late-binding views
+- [ClickHouse](/reference/adapters/clickhouse/) (Beta) — HTTP interface with user/password and TLS, plus table engine and sort keys
+- [SQL Server](/reference/adapters/sqlserver/) (Beta) — SQL Server, Azure SQL and Fabric Warehouse; SQL auth or Entra ID
 - [Fivetran](/reference/adapters/fivetran/) — metadata-only source discovery
 
 `type = "trino"`, `type = "airbyte"`, and `type = "iceberg"` are accepted by the config parser but have no dedicated page yet; configure adapter-specific keys through [`[adapter.NAME.extra]`](#adaptername).
@@ -611,6 +615,36 @@ table_retries = 1
 ```
 
 ---
+
+### `[[pipeline.NAME.sources]]`
+
+Declare the external tables a transformation pipeline reads, and how fresh each must be. A source is a table your models read but do not build, for example a landing table that Fivetran loads. [`rocky freshness`](/reference/commands/core-pipeline/#rocky-freshness) checks each declared freshness block against the warehouse. Transformation pipelines only.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `catalog` | string | `""` | Catalog of the table. Leave it out for two-part names (DuckDB). |
+| `schema` | string | (required) | Schema of the table. |
+| `table` | string | (required) | Table name. |
+| `freshness.loaded_at_field` | string | (required in `freshness`) | Column that holds each row's load time. Use a `DATE` or `TIMESTAMP` column. |
+| `freshness.warn_after` | string | (unset) | Age above which the source reports `warn`. Format: a positive integer and one unit, `s`, `h` or `d` (`"3600s"`, `"12h"`, `"7d"`). |
+| `freshness.error_after` | string | (unset) | Age above which the source reports `error`. Must not be shorter than `warn_after`. |
+| `freshness.filter` | string | (unset) | SQL predicate that limits the rows Rocky takes the maximum over. Rocky adds it as `WHERE (<filter>)`. A `;` is refused. |
+
+Set at least one of `warn_after` and `error_after`.
+
+```toml
+[[pipeline.silver.sources]]
+schema = "raw"
+table  = "orders"
+
+[pipeline.silver.sources.freshness]
+loaded_at_field = "_loaded_at"
+warn_after      = "12h"
+error_after     = "24h"
+filter          = "status <> 'test'"
+```
+
+`rocky compile` checks each block. It raises `E050` for a block it cannot evaluate: no threshold, a duration that does not parse, `error_after` shorter than `warn_after`, a `loaded_at_field` that is not a plain column name, or a `filter` with a `;`. It raises `W050` when the compiler's source schema shows the `loaded_at_field` as missing or not a date or time type. That schema comes from a seed or the schema cache and can be out of date, so this case only warns.
 
 ### `[pipeline.NAME.schedule]`
 
@@ -1047,11 +1081,20 @@ Control how long a cached table shape stays trusted, and whether other machines 
 | `enabled` | bool | `true` | Enable schema cache reads + writes. Set to `false` for strict CI where every typecheck should resolve against the current warehouse. |
 | `ttl_seconds` | integer | `86400` | TTL for cache entries in seconds (default 24h). Lower for high-DDL-churn teams. |
 | `replicate` | bool | `false` | Replicate the schema cache via `[state]` sync. Default is off; a fresh clone should warm its cache from its own `rocky apply`, not inherit another machine's stale types. |
+| `trusted_max_age_seconds` | integer | unset | Cache entries younger than this are trusted as current. A reference to a column a trusted entry lacks is the `E041` error. Older entries, and every entry when the key is unset, give the `W041` warning. |
+| `strict_sources` | bool | `false` | Trust every known source schema, including seeds and old cache entries. Every `W041` becomes `E041`. `rocky compile --strict-sources` does the same for one invocation. |
 
 ```toml
 [cache.schemas]
 ttl_seconds = 3600   # 1h TTL for teams with high-DDL churn
 replicate = true     # opt in to share cache via the remote state backend
+```
+
+`trusted_max_age_seconds` and `strict_sources` control the missing-source-column check. See [Missing columns in external sources](/concepts/compiler/#missing-columns-in-external-sources-e041--w041).
+
+```toml
+[cache.schemas]
+trusted_max_age_seconds = 3600   # entries cached in the last hour refuse with E041
 ```
 
 A Valkey-backed runtime cache exists in the codebase but `rocky.toml` does not reach it yet. A future `[cache.valkey]` key is reserved for it.
@@ -1246,8 +1289,8 @@ Set a project-wide staleness budget, so you do not repeat the same threshold in 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `expected_lag_seconds` | integer | (unset) | Maximum lag before a model counts as stale. This is the field that makes the block active: without it, Rocky treats the project as having no freshness default and inherits nothing. |
-| `time_column` | string | (unset) | Timestamp column to measure lag from. Inherited by a model that declares no `[freshness]` block. No runtime check reads it yet. |
-| `severity` | string | (unset) | `"error"` or `"warning"`. Inherited by a model that declares no `[freshness]` block. No runtime check reads it yet. |
+| `time_column` | string | (unset) | Timestamp column to measure lag from. Inherited by a model that declares no `[freshness]` block. [`rocky freshness`](/reference/commands/core-pipeline/#rocky-freshness) reads `MAX(time_column)` from the model's target table. |
+| `severity` | string | (unset) | `"error"` or `"warning"`. Inherited by a model that declares no `[freshness]` block. Under `"error"`, a stale model makes `rocky freshness` exit 1. |
 
 ```toml
 [freshness]

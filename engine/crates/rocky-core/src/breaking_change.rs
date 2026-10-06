@@ -434,19 +434,42 @@ fn diff_materialization(
         (
             MaterializationStrategy::Incremental {
                 timestamp_column: o_ts,
+                unique_key: o_uk,
+                ..
             },
             MaterializationStrategy::Incremental {
                 timestamp_column: n_ts,
+                unique_key: n_uk,
+                ..
             },
-        ) if o_ts != n_ts => findings.push(BreakingFinding {
-            change: BreakingChange::MaterializationKeyChanged {
-                model: model.to_string(),
-                key_kind: "timestamp_column".to_string(),
-                old: vec![o_ts.clone()],
-                new: vec![n_ts.clone()],
-            },
-            severity: BreakingSeverity::Breaking,
-        }),
+        ) => {
+            if o_ts != n_ts {
+                findings.push(BreakingFinding {
+                    change: BreakingChange::MaterializationKeyChanged {
+                        model: model.to_string(),
+                        key_kind: "timestamp_column".to_string(),
+                        old: vec![o_ts.clone()],
+                        new: vec![n_ts.clone()],
+                    },
+                    severity: BreakingSeverity::Breaking,
+                });
+            }
+            // A transformation `incremental` key switches append <-> upsert
+            // (or changes which rows an upsert replaces).
+            let o_uk_vec: Vec<String> = o_uk.iter().map(std::string::ToString::to_string).collect();
+            let n_uk_vec: Vec<String> = n_uk.iter().map(std::string::ToString::to_string).collect();
+            if o_uk_vec != n_uk_vec {
+                findings.push(BreakingFinding {
+                    change: BreakingChange::MaterializationKeyChanged {
+                        model: model.to_string(),
+                        key_kind: "unique_key".to_string(),
+                        old: o_uk_vec,
+                        new: n_uk_vec,
+                    },
+                    severity: BreakingSeverity::Breaking,
+                });
+            }
+        }
         (
             MaterializationStrategy::Merge {
                 unique_key: o_uk,
@@ -610,6 +633,64 @@ fn diff_materialization(
                         key_kind: "partition_columns".to_string(),
                         old: o_pc.clone(),
                         new: n_pc.clone(),
+                    },
+                    severity: BreakingSeverity::Breaking,
+                });
+            }
+        }
+        (MaterializationStrategy::Snapshot(o), MaterializationStrategy::Snapshot(n)) => {
+            // A new key re-identifies every history row; renamed metadata
+            // columns break every reader of the history. Change-detection and
+            // hard-delete settings only affect future versions.
+            let o_uk: Vec<String> = o.unique_key.iter().map(ToString::to_string).collect();
+            let n_uk: Vec<String> = n.unique_key.iter().map(ToString::to_string).collect();
+            if o_uk != n_uk {
+                findings.push(BreakingFinding {
+                    change: BreakingChange::MaterializationKeyChanged {
+                        model: model.to_string(),
+                        key_kind: "unique_key".to_string(),
+                        old: o_uk,
+                        new: n_uk,
+                    },
+                    severity: BreakingSeverity::Breaking,
+                });
+            }
+            // What readers depend on: the metadata column names and how a
+            // current version is marked. Adding `is_deleted` (a switch to
+            // `new_record`) only adds a column, so it is compared only when
+            // both sides write it.
+            let reader_shape = |spec: &rocky_ir::SnapshotSpec, other: &rocky_ir::SnapshotSpec| {
+                let meta = &spec.meta_columns;
+                let mut shape = vec![
+                    format!("valid_from={}", meta.valid_from),
+                    format!("valid_to={}", meta.valid_to),
+                    format!("is_current={}", meta.is_current.name().unwrap_or("<none>")),
+                    format!("scd_id={}", meta.scd_id),
+                    format!(
+                        "updated_at={}",
+                        meta.updated_at.as_deref().unwrap_or("<none>")
+                    ),
+                    format!(
+                        "valid_to_current={}",
+                        spec.valid_to_current.as_deref().unwrap_or("NULL")
+                    ),
+                ];
+                if spec.hard_deletes == rocky_ir::SnapshotHardDeletes::NewRecord
+                    && other.hard_deletes == rocky_ir::SnapshotHardDeletes::NewRecord
+                {
+                    shape.push(format!("is_deleted={}", meta.is_deleted));
+                }
+                shape
+            };
+            let o_meta = reader_shape(o, n);
+            let n_meta = reader_shape(n, o);
+            if o_meta != n_meta {
+                findings.push(BreakingFinding {
+                    change: BreakingChange::MaterializationKeyChanged {
+                        model: model.to_string(),
+                        key_kind: "snapshot_meta_column_names".to_string(),
+                        old: o_meta,
+                        new: n_meta,
                     },
                     severity: BreakingSeverity::Breaking,
                 });
@@ -810,6 +891,7 @@ fn strategy_tag(s: &MaterializationStrategy) -> &'static str {
         MaterializationStrategy::DeleteInsert { .. } => "delete_insert",
         MaterializationStrategy::Microbatch { .. } => "microbatch",
         MaterializationStrategy::ContentAddressed { .. } => "content_addressed",
+        MaterializationStrategy::Snapshot(_) => "snapshot",
     }
 }
 
@@ -1078,6 +1160,9 @@ mod tests {
         let mut m = base_model();
         m.materialization = MaterializationStrategy::Incremental {
             timestamp_column: "created_at".to_string(),
+            unique_key: Vec::new(),
+            lookback: None,
+            filter_column: None,
         };
         let new = project(vec![m]);
         let findings = diff_project_ir(&old, &new);

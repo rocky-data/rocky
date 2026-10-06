@@ -68,6 +68,8 @@ struct SnapshotEnvelope {
     #[allow(dead_code)]
     snapshot_version: u32,
     ir: ProjectIr,
+    #[serde(default)]
+    governance: Option<SnapshotGovernance>,
 }
 
 /// Borrowing envelope used when writing a snapshot (avoids cloning the IR).
@@ -75,6 +77,55 @@ struct SnapshotEnvelope {
 struct SnapshotEnvelopeRef<'a> {
     snapshot_version: u32,
     ir: &'a ProjectIr,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    governance: Option<&'a SnapshotGovernance>,
+}
+
+/// Governance metadata a producer publishes beside its IR: the access level,
+/// ownership and version of each exported model, plus the targets of the
+/// models it withheld because they are not `public`.
+///
+/// Lives in the envelope, not in [`ProjectIr`], so it never enters the
+/// recipe hash: adding it changes no existing pin. Older consumers ignore the
+/// key; snapshots without it load with `None`. Additive, so the format version
+/// stays [`SNAPSHOT_FORMAT_VERSION`].
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SnapshotGovernance {
+    /// Exported models keyed by target full name (`catalog.schema.table`).
+    #[serde(default)]
+    pub models: std::collections::BTreeMap<String, ExportedModelGovernance>,
+    /// Withheld models keyed by target full name. A consumer that reads one of
+    /// these targets gets E047.
+    #[serde(default)]
+    pub withheld: std::collections::BTreeMap<String, WithheldModel>,
+}
+
+/// Governance of one exported model.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ExportedModelGovernance {
+    /// Producer model name.
+    pub name: String,
+    /// Declared access; `None` when the producer predates access levels.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access: Option<crate::model_governance::ModelAccess>,
+    /// Ownership group.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access_group: Option<String>,
+    /// Group owner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<crate::model_governance::GroupOwner>,
+    /// Version metadata for a versioned model or its latest alias.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<crate::model_governance::ModelVersionInfo>,
+}
+
+/// A producer model left out of the snapshot because it is not `public`.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct WithheldModel {
+    /// Producer model name.
+    pub name: String,
+    /// Its access level (`private` or `protected`).
+    pub access: crate::model_governance::ModelAccess,
 }
 
 /// Serialize `ir` into a versioned snapshot envelope at `path`.
@@ -89,9 +140,23 @@ struct SnapshotEnvelopeRef<'a> {
 /// [`ImportsError::Parse`] if serialization fails (should not happen for a
 /// well-formed `ProjectIr`).
 pub fn write_snapshot(ir: &ProjectIr, path: &Path) -> Result<(), ImportsError> {
+    write_snapshot_with_governance(ir, None, path)
+}
+
+/// [`write_snapshot`] plus the producer's [`SnapshotGovernance`].
+///
+/// # Errors
+///
+/// Same as [`write_snapshot`].
+pub fn write_snapshot_with_governance(
+    ir: &ProjectIr,
+    governance: Option<&SnapshotGovernance>,
+    path: &Path,
+) -> Result<(), ImportsError> {
     let envelope = SnapshotEnvelopeRef {
         snapshot_version: SNAPSHOT_FORMAT_VERSION,
         ir,
+        governance,
     };
     let json = serde_json::to_string_pretty(&envelope).map_err(|source| ImportsError::Parse {
         path: path.display().to_string(),
@@ -130,6 +195,19 @@ pub enum PinStatus {
 /// [`ImportsError::Parse`] if it is not valid snapshot JSON, and
 /// [`ImportsError::UnsupportedVersion`] if it declares a future format version.
 pub fn load_snapshot(dir: &Path, file: &str) -> Result<ProjectIr, ImportsError> {
+    load_snapshot_with_governance(dir, file).map(|(ir, _)| ir)
+}
+
+/// [`load_snapshot`] plus the envelope's [`SnapshotGovernance`], when the
+/// producer wrote one. A pre-versioning bare snapshot has none.
+///
+/// # Errors
+///
+/// Same as [`load_snapshot`].
+pub fn load_snapshot_with_governance(
+    dir: &Path,
+    file: &str,
+) -> Result<(ProjectIr, Option<SnapshotGovernance>), ImportsError> {
     let path = dir.join(file);
     let display = path.display().to_string();
     let contents = std::fs::read_to_string(&path).map_err(|source| ImportsError::ReadFile {
@@ -162,12 +240,14 @@ pub fn load_snapshot(dir: &Path, file: &str) -> Result<ProjectIr, ImportsError> 
                     path: display,
                     source,
                 })?;
-            Ok(envelope.ir)
+            Ok((envelope.ir, envelope.governance))
         }
-        None => serde_json::from_value(value).map_err(|source| ImportsError::Parse {
-            path: display,
-            source,
-        }),
+        None => serde_json::from_value(value)
+            .map(|ir| (ir, None))
+            .map_err(|source| ImportsError::Parse {
+                path: display,
+                source,
+            }),
     }
 }
 
@@ -327,6 +407,42 @@ mod tests {
             from_headerless.recipe_hash().to_hex().to_string(),
             from_enveloped.recipe_hash().to_hex().to_string(),
             "wrapping in an envelope must not change recipe_hash — #774 pins must still match"
+        );
+    }
+
+    #[test]
+    fn governance_round_trips_and_leaves_recipe_hash_alone() {
+        use crate::model_governance::ModelAccess;
+        let ir = sample_ir();
+        let mut gov = SnapshotGovernance::default();
+        gov.models.insert(
+            "shop.core.orders".into(),
+            ExportedModelGovernance {
+                name: "orders".into(),
+                access: Some(ModelAccess::Public),
+                access_group: None,
+                owner: None,
+                version: None,
+            },
+        );
+        gov.withheld.insert(
+            "shop.core.secret".into(),
+            WithheldModel {
+                name: "secret".into(),
+                access: ModelAccess::Private,
+            },
+        );
+        let dir = tempfile::tempdir().unwrap();
+        write_snapshot_with_governance(&ir, Some(&gov), &dir.path().join("g.json")).unwrap();
+        write_snapshot(&ir, &dir.path().join("plain.json")).unwrap();
+        let (with, loaded_gov) = load_snapshot_with_governance(dir.path(), "g.json").unwrap();
+        let (plain, no_gov) = load_snapshot_with_governance(dir.path(), "plain.json").unwrap();
+        assert_eq!(loaded_gov, Some(gov));
+        assert_eq!(no_gov, None);
+        assert_eq!(
+            with.recipe_hash().to_hex().to_string(),
+            plain.recipe_hash().to_hex().to_string(),
+            "governance metadata must not change the recipe hash"
         );
     }
 

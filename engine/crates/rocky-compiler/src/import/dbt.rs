@@ -100,7 +100,7 @@ pub enum ImportMethod {
 /// Category of import warning.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WarningCategory {
-    /// View or ephemeral materialization not natively supported.
+    /// A dbt materialization Rocky has no equivalent for.
     UnsupportedMaterialization,
     /// Jinja control flow that cannot be translated faithfully.
     JinjaControlFlow,
@@ -404,6 +404,7 @@ pub fn import_from_manifest(
             manifest.full_refresh_compiled,
             &manifest.successfully_compiled_nodes,
             &model_relations,
+            &manifest.groups,
             &mut result,
         );
     }
@@ -440,7 +441,7 @@ fn record_dropped_constructs(dropped: &dbt_manifest::DbtDroppedCounts, result: &
         (
             "snapshot",
             dropped.snapshots,
-            "Rocky has no snapshot pipeline yet — re-implement as a [snapshot] pipeline or keep it in dbt",
+            "the snapshot could not be read from the manifest",
         ),
         (
             "metric",
@@ -845,12 +846,20 @@ fn resolve_node_coords(
     } else {
         node.database.clone()
     };
+    // dbt's default relation for version N of a versioned model is
+    // `<name>_v<N>`, which is also the Rocky model name.
     let table = node
         .config
         .alias
         .clone()
-        .unwrap_or_else(|| node.name.clone());
+        .unwrap_or_else(|| manifest_rocky_name(node).unwrap_or_else(|_| node.name.clone()));
     (catalog, schema, table)
+}
+
+/// Rocky model name of a manifest node: `<name>_v<N>` for a versioned dbt
+/// model, else the node name. Errors on a version that is not a whole number.
+fn manifest_rocky_name(node: &DbtManifestNode) -> Result<String, String> {
+    super::dbt_governance::rocky_model_name(&node.name, node.governance.version.as_deref())
 }
 
 /// Build the upstream-model lookup keyed by dbt `unique_id`. Only `model.*`
@@ -868,7 +877,7 @@ fn build_model_relation_map(
             (
                 id.clone(),
                 UpstreamModel {
-                    bare_name: node.name.clone(),
+                    bare_name: manifest_rocky_name(node).unwrap_or_else(|_| node.name.clone()),
                     fqn_candidates: relation_candidates(node, default_target),
                 },
             )
@@ -996,6 +1005,7 @@ fn is_relation_ident_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '_'
 }
 
+#[allow(clippy::too_many_arguments)]
 fn import_manifest_node(
     node: &DbtManifestNode,
     default_target: &TargetConfig,
@@ -1003,12 +1013,40 @@ fn import_manifest_node(
     manifest_full_refresh_compiled: bool,
     successfully_compiled_nodes: &std::collections::HashSet<String>,
     model_relations: &HashMap<String, UpstreamModel>,
+    groups: &std::collections::BTreeMap<String, rocky_core::model_governance::GroupOwner>,
     result: &mut ImportResult,
 ) {
+    // A snapshot node converts to a `type = "snapshot"` model, or fails with
+    // the reason; it is never dropped.
+    let snapshot_strategy = match &node.config.snapshot {
+        Some(cfg) => match super::dbt_snapshots::snapshot_strategy_from_dbt(cfg) {
+            Ok(strategy) => Some(strategy),
+            Err(reason) => {
+                result.failed.push(ImportFailure {
+                    name: node.name.clone(),
+                    reason,
+                });
+                return;
+            }
+        },
+        None => None,
+    };
+    // A versioned dbt model (`version: N`) becomes the Rocky model
+    // `<name>_v<N>`; the emitter writes the shared version declaration.
+    let rocky_name = match manifest_rocky_name(node) {
+        Ok(name) => name,
+        Err(reason) => {
+            result.failed.push(ImportFailure {
+                name: node.name.clone(),
+                reason,
+            });
+            return;
+        }
+    };
     if node.config.materialized == "incremental" {
         if node.config.full_refresh == Some(false) {
             result.failed.push(ImportFailure {
-                name: node.name.clone(),
+                name: rocky_name.clone(),
                 reason: INCREMENTAL_FULL_REFRESH_DISABLED.to_string(),
             });
             return;
@@ -1018,7 +1056,7 @@ fn import_manifest_node(
             || node.compiled_code.is_none()
         {
             result.failed.push(ImportFailure {
-                name: node.name.clone(),
+                name: rocky_name.clone(),
                 reason: INCREMENTAL_COMPILE_EVIDENCE_REFUSED.to_string(),
             });
             return;
@@ -1032,14 +1070,73 @@ fn import_manifest_node(
     let (catalog, schema, table) = resolve_node_coords(node, default_target);
     let this_ref = format!("{catalog}.{schema}.{table}");
 
+    // The standard dbt watermark filter (`{% if is_incremental() %} WHERE
+    // <col> > (SELECT MAX(<wm>) FROM {{ this }}) {% endif %}`) maps to a Rocky
+    // `incremental` model. The compile-evidence gates above still apply.
+    let conversion = if node.config.materialized == "incremental" {
+        find_is_incremental_filter(&node.raw_code).and_then(|recognized| {
+            map_is_incremental_conversion(
+                &node.config,
+                &node.name,
+                Some(&recognized.watermark),
+                recognized.filter_column.as_deref(),
+            )
+            .map(|converted| (recognized, converted))
+        })
+    } else {
+        None
+    };
+
     // Use compiled_code (Jinja resolved) if available, else raw_code. dbt's
     // compiled body carries qualified upstream model refs (`"db"."schema"."up"`);
     // rewrite those back to bare Rocky names so the imported repo compiles and
     // unit-tests. The raw_code fallback already lowers `{{ ref() }}` to a bare
     // name via `convert_jinja_to_sql`, so it needs no rewrite. (FR-046)
-    let mut sql = match &node.compiled_code {
-        Some(code) => rewrite_upstream_refs_to_bare(code, node, model_relations),
-        None => {
+    let placeholder_sql = conversion.as_ref().and_then(|(recognized, _)| {
+        if recognized.other_statement_tags {
+            return None;
+        }
+        let converted = convert_jinja_to_sql(&recognized.rewritten, &this_ref);
+        // An expression the converter cannot lower (a custom macro call)
+        // would be left as a TODO comment; the compiled code is exact.
+        (!converted.contains("TODO: unsupported Jinja")).then_some(converted)
+    });
+    if conversion.is_some() && placeholder_sql.is_none() {
+        result.warnings.push(ImportWarning {
+            model: node.name.clone(),
+            category: WarningCategory::MappedConstruct,
+            message: "raw_code has Jinja beyond the `is_incremental()` filter, so the model SQL \
+                      is the full-refresh compiled_code with no `@incremental_filter` \
+                      placeholder; Rocky filters the output on the watermark column instead, \
+                      which `rocky compile` allows only for a passthrough column (E046)"
+                .to_string(),
+            suggestion: Some(
+                "if `rocky compile` reports E046, add `WHERE @incremental_filter` to the \
+                 imported SQL where dbt applied the filter, and set `filter_column` in the \
+                 sidecar [strategy] block when it compares a qualified or renamed input column"
+                    .to_string(),
+            ),
+        });
+    }
+    let mut sql = match (&placeholder_sql, &node.compiled_code) {
+        (Some(converted), _) => converted.clone(),
+        (None, Some(code)) => rewrite_upstream_refs_to_bare(code, node, model_relations),
+        (None, None) if snapshot_strategy.is_some() => {
+            // A legacy snapshot's raw_code is the whole `{% snapshot %}` block;
+            // only its body is the SELECT.
+            let body = super::dbt_snapshots::legacy_snapshot_blocks(&node.raw_code)
+                .first()
+                .map_or(node.raw_code.as_str(), |b| b.body);
+            if body.contains("{%") {
+                result.failed.push(ImportFailure {
+                    name: node.name.clone(),
+                    reason: RAW_JINJA_CONTROL_REFUSED.to_string(),
+                });
+                return;
+            }
+            convert_jinja_to_sql(body, &this_ref)
+        }
+        (None, None) => {
             if node.raw_code.contains("{%") {
                 result.failed.push(ImportFailure {
                     name: node.name.clone(),
@@ -1070,11 +1167,24 @@ fn import_manifest_node(
     // Map strategy from manifest config — covers all dbt materializations
     // (`table`, `view`, `materialized_view`, `incremental`, `ephemeral`,
     // `microbatch`) plus the `incremental_strategy` discriminator.
+    let on_schema_change_mapped = conversion.is_some();
     let StrategyMappingOutput {
         strategy,
         warnings: strategy_warnings,
         structured,
-    } = map_manifest_strategy(&node.config, &node.name, microbatch_mode);
+    } = match (conversion, snapshot_strategy) {
+        (Some((_, converted)), _) => StrategyMappingOutput {
+            strategy: converted.strategy,
+            warnings: converted.warnings,
+            structured: Vec::new(),
+        },
+        (None, Some(strategy)) => StrategyMappingOutput {
+            strategy,
+            warnings: vec![super::dbt_snapshots::snapshot_import_note(&node.name)],
+            structured: Vec::new(),
+        },
+        (None, None) => map_manifest_strategy(&node.config, &node.name, microbatch_mode),
+    };
 
     // #1990: an incremental dbt model with no Rocky append equivalent falls
     // back to `full_refresh`. That is safe only when the SQL has no dbt
@@ -1111,7 +1221,7 @@ fn import_manifest_node(
     // Surface dbt-databricks specifics that Rocky doesn't auto-translate
     // (databricks_tags, pre/post hooks, on_schema_change). Emitted as
     // structured warnings so the downstream UI can route them.
-    collect_dropped_config_warnings(&node.config, &node.name, result);
+    collect_dropped_config_warnings(&node.config, &node.name, on_schema_change_mapped, result);
 
     // Surface a dropped model contract (`contract: { enforced: true }` +
     // column data_type/constraints). Rocky enforces contracts via a sidecar
@@ -1123,14 +1233,40 @@ fn import_manifest_node(
     // points at an out-of-tree macro the user needs to hand-port.
     collect_unresolvable_macros(&sql, &node.name, result);
 
-    // Map dependencies
-    let depends_on = dbt_manifest::depends_on_to_rocky(&node.depends_on.nodes);
+    // Map dependencies. Resolve through the relation map first so a versioned
+    // upstream (`model.p.orders.v1`) maps to `orders_v1`, not to `v1`. A
+    // snapshot upstream (`snapshot.p.orders_snap`) is a Rocky model too.
+    let depends_on = node
+        .depends_on
+        .nodes
+        .iter()
+        .filter(|id| id.starts_with("model.") || id.starts_with("snapshot."))
+        .map(|id| match model_relations.get(id) {
+            Some(upstream) => upstream.bare_name.clone(),
+            None => dbt_manifest::extract_model_name(id).to_string(),
+        })
+        .collect();
 
     // Use description as intent
     let intent = node.description.clone();
 
+    // dbt model governance: access, group (+ owner), version.
+    let (governance, governance_warnings) = super::dbt_governance::governance_from_dbt(
+        &super::dbt_governance::DbtGovernanceInput {
+            name: &node.name,
+            rocky_name: &rocky_name,
+            access: node.governance.access.as_deref(),
+            group: node.governance.group.as_deref(),
+            version: node.governance.version.as_deref(),
+            latest_version: node.governance.latest_version.as_deref(),
+            deprecation_date: node.governance.deprecation_date.as_deref(),
+        },
+        groups,
+    );
+    result.warnings.extend(governance_warnings);
+
     let config = ModelConfig {
-        name: node.name.clone(),
+        name: rocky_name.clone(),
         depends_on,
         strategy,
         target: TargetConfig {
@@ -1147,7 +1283,7 @@ fn import_manifest_node(
         format_options: None,
         classification: Default::default(),
         tags: dbt_tags_to_map(&node.tags),
-        governance: Default::default(),
+        governance,
         retention: None,
         budget: None,
         skip: None,
@@ -1156,7 +1292,7 @@ fn import_manifest_node(
     };
 
     result.imported.push(ImportedModel {
-        name: node.name.clone(),
+        name: rocky_name,
         sql: sql.trim().to_string(),
         config,
         unit_tests: Vec::new(),
@@ -1190,23 +1326,10 @@ fn map_manifest_strategy(
         "table" => StrategyConfig::FullRefresh,
         "view" => StrategyConfig::View,
         "materialized_view" => StrategyConfig::MaterializedView,
-        "ephemeral" => {
-            warnings.push(ImportWarning {
-                model: model_name.to_string(),
-                category: WarningCategory::UnsupportedMaterialization,
-                message: "materialized='ephemeral' has no Rocky equivalent — using full_refresh"
-                    .to_string(),
-                suggestion: Some(
-                    "dbt inlines an ephemeral model into its consumers; Rocky does not, and refuses `type = \"ephemeral\"` (E038). Use `type = \"view\"`, fold the SQL into the consumer, or keep the `full_refresh` table".to_string(),
-                ),
-            });
-            structured.push(ImportDbtStructuredWarning::UnsupportedMaterialization {
-                model: model_name.to_string(),
-                dbt_materialization: "ephemeral".to_string(),
-                action: "fell back to full_refresh".to_string(),
-            });
-            StrategyConfig::FullRefresh
-        }
+        // Rocky inlines an ephemeral model into each consumer as a CTE, the
+        // same contract as dbt. A consumer imported from `compiled_code`
+        // already carries dbt's `__dbt__cte__<name>` CTE and runs as-is.
+        "ephemeral" => StrategyConfig::Ephemeral,
         "incremental" => map_incremental_strategy(
             config,
             model_name,
@@ -1407,7 +1530,7 @@ fn map_incremental_strategy(
 
 /// Record a model whose dbt `incremental` config fell back to `full_refresh`
 /// as a structured `UnsupportedMaterialization`, the same shape the
-/// `ephemeral` and unrecognised-materialization fallbacks use, so it lands in
+/// unrecognised-materialization fallback uses, so it lands in
 /// MIGRATION-NOTES.md's "Items to translate manually" list and not only among
 /// the flat warnings.
 fn push_append_fallback(
@@ -1632,9 +1755,14 @@ fn rewrite_body_for_time_interval(sql: &str, event_time: &str) -> String {
 /// Collect structured warnings for dbt config Rocky can't auto-translate
 /// (databricks_tags, pre/post hooks, on_schema_change). These are
 /// dropped-on-purpose with an explicit pointer at the Rocky equivalent.
+///
+/// `on_schema_change_mapped` is true when the model became a Rocky
+/// `incremental` model, whose sidecar carries `on_schema_change` itself
+/// (see [`map_is_incremental_conversion`]); it is not dropped then.
 fn collect_dropped_config_warnings(
     config: &DbtNodeConfig,
     model_name: &str,
+    on_schema_change_mapped: bool,
     result: &mut ImportResult,
 ) {
     if !config.databricks_tags.is_empty() {
@@ -1693,7 +1821,11 @@ fn collect_dropped_config_warnings(
         });
     }
 
-    if let Some(value) = config.on_schema_change.as_deref() {
+    if let Some(value) = config
+        .on_schema_change
+        .as_deref()
+        .filter(|_| !on_schema_change_mapped)
+    {
         let rocky_equivalent = on_schema_change_to_rocky(value);
         result
             .structured_warnings
@@ -1829,7 +1961,7 @@ fn collect_unresolvable_macros(sql: &str, model_name: &str, result: &mut ImportR
 /// catching symlink-based escapes too. A not-yet-existing joined path that
 /// passed the syntactic check is allowed through (the caller already tolerates
 /// missing model dirs).
-fn safe_join_under(base: &Path, rel: &Path) -> Result<std::path::PathBuf, String> {
+pub(super) fn safe_join_under(base: &Path, rel: &Path) -> Result<std::path::PathBuf, String> {
     use std::path::Component;
 
     if rel.is_absolute() {
@@ -1978,6 +2110,23 @@ pub fn import_dbt_project(
         );
         model_yamls.extend(parsed);
     }
+    // dbt governance from YAML: access, group (+ owners), versions. A versioned
+    // model whose versions are plain `<name>_v<N>.sql` files with no
+    // per-version overrides imports as-is; any other versioned model still
+    // needs the manifest and stays refused.
+    let mut yaml_governance = super::dbt_governance::YamlGovernance::default();
+    for dir in &model_dirs {
+        super::dbt_governance::parse_governance_yamls(dir, &mut yaml_governance);
+    }
+    let mut simple_versions: HashMap<String, (String, u32)> = HashMap::new();
+    for (name, gov) in &yaml_governance.models {
+        if let Some(stems) = gov.simple_versions(name) {
+            for (stem, v) in stems {
+                versioned_names.remove(&stem);
+                simple_versions.insert(stem, (name.clone(), v));
+            }
+        }
+    }
     let settings = RawModelSettings {
         project: &project_config,
         model_yamls: &model_yamls,
@@ -1997,6 +2146,12 @@ pub fn import_dbt_project(
             )?;
         }
     }
+
+    // dbt snapshots (legacy `{% snapshot %}` blocks and YAML snapshots) live
+    // under `snapshot-paths`, not the model paths; convert them to
+    // `type = "snapshot"` models instead of dropping them.
+    super::dbt_snapshots::import_raw_snapshots(dbt_dir, default_target, &source_map, &mut result)?;
+    apply_yaml_governance(&mut result, &yaml_governance, &simple_versions);
 
     // Phase 2: Scan model YAML files for test definitions and convert them
     // to canonical Rocky `[[tests]]` (`TestDecl`) entries on each imported
@@ -2018,6 +2173,87 @@ pub fn import_dbt_project(
     }
 
     Ok(result)
+}
+
+/// An empty raw-path result, for unit tests of the per-construct importers.
+#[cfg(test)]
+pub(super) fn empty_import_result() -> ImportResult {
+    ImportResult {
+        imported: Vec::new(),
+        warnings: Vec::new(),
+        structured_warnings: Vec::new(),
+        failed: Vec::new(),
+        sources_found: 0,
+        sources_mapped: 0,
+        import_method: ImportMethod::Regex,
+        project_name: None,
+        dbt_version: None,
+        tests_found: 0,
+        tests_converted: 0,
+        tests_converted_custom: 0,
+        tests_skipped: 0,
+        macros_detected: 0,
+        macros_expanded: 0,
+        macros_manifest_resolved: 0,
+        macros_unsupported: 0,
+        unit_tests_found: 0,
+        unit_tests_converted: 0,
+        unit_tests_skipped: 0,
+        constructs_dropped: 0,
+        contracts_dropped: 0,
+    }
+}
+
+/// Attach YAML-declared access, group and version metadata to raw-imported
+/// models. `simple_versions` maps a version file stem to `(model, version)`.
+fn apply_yaml_governance(
+    result: &mut ImportResult,
+    yaml: &super::dbt_governance::YamlGovernance,
+    simple_versions: &HashMap<String, (String, u32)>,
+) {
+    for model in &mut result.imported {
+        let (base, version) = match simple_versions.get(&model.name) {
+            Some((base, v)) => (base.as_str(), Some(v.to_string())),
+            None => (model.name.as_str(), None),
+        };
+        let Some(gov) = yaml.models.get(base) else {
+            continue;
+        };
+        let version_entry = version.as_deref().and_then(|v| {
+            gov.versions.iter().find(|e| {
+                super::dbt_governance::parse_version(&e.v)
+                    .map(|n| n.to_string())
+                    .as_deref()
+                    == Some(v)
+            })
+        });
+        let latest = gov.latest_version.clone().or_else(|| {
+            gov.versions
+                .iter()
+                .filter_map(|e| super::dbt_governance::parse_version(&e.v))
+                .max()
+                .map(|n| n.to_string())
+        });
+        let deprecation = version_entry
+            .and_then(|e| e.deprecation_date.clone())
+            .or_else(|| version.as_ref().and(gov.deprecation_date.clone()));
+        let (governance, warnings) = super::dbt_governance::governance_from_dbt(
+            &super::dbt_governance::DbtGovernanceInput {
+                name: base,
+                rocky_name: &model.name,
+                access: gov.access.as_deref(),
+                group: gov.group.as_deref(),
+                version: version.as_deref(),
+                latest_version: latest.as_deref(),
+                deprecation_date: deprecation.as_deref(),
+            },
+            &yaml.groups,
+        );
+        let tags = std::mem::take(&mut model.config.governance.tags);
+        model.config.governance = governance;
+        model.config.governance.tags = tags;
+        result.warnings.extend(warnings);
+    }
 }
 
 struct RawModelSettings<'a> {
@@ -2098,7 +2334,10 @@ fn import_single_model(
 
     // The raw converter keeps the body of statement tags. Even a condition
     // unrelated to is_incremental() can leave a bounded query as full SQL.
-    if content.contains("{%") {
+    // The one exception is an incremental model's `is_incremental()` block,
+    // handled once the materialization is known.
+    let has_statement_tags = content.contains("{%");
+    if has_statement_tags && !contains_unresolved_is_incremental(&content) {
         return Err(RAW_JINJA_CONTROL_REFUSED.to_string());
     }
     if settings.versioned_names.contains(name) {
@@ -2137,19 +2376,79 @@ fn import_single_model(
     {
         return Err(RAW_CONFIG_UNRESOLVED.to_string());
     }
-    if effective_materialization.as_deref() == Some("incremental") {
-        return Err(RAW_INCREMENTAL_EVIDENCE_REFUSED.to_string());
-    }
-
     let mut warnings = Vec::new();
 
-    // Refuse is_incremental() before general Jinja handling. This must catch
-    // compound conditions too: otherwise the generic fallback removes the
-    // control tags and applies the guarded body unconditionally.
-    if contains_unresolved_is_incremental(&content) {
-        return Err(RAW_INCREMENTAL_ERROR.to_string());
-    }
-    let content_processed = content;
+    // An incremental model converts only through its `is_incremental()`
+    // block: the standard watermark filter becomes `@incremental_filter`
+    // (`TRUE` on the first run, so the first run loads every row); any other
+    // use is commented out as a TODO and the watermark is left unset, so
+    // `rocky compile` refuses the model (E037) until a human adds one. An
+    // incremental model with no `is_incremental()` use stays refused.
+    let mut incremental_strategy = None;
+    let mut todo_blocks = Vec::new();
+    let content_processed = if effective_materialization.as_deref() == Some("incremental") {
+        if !contains_unresolved_is_incremental(&content) {
+            return Err(RAW_INCREMENTAL_EVIDENCE_REFUSED.to_string());
+        }
+        let node_config = raw_dbt_node_config(&content, "incremental");
+        if let Some(recognized) = recognize_is_incremental_filter(&content) {
+            let Some(converted) = map_is_incremental_conversion(
+                &node_config,
+                name,
+                Some(&recognized.watermark),
+                recognized.filter_column.as_deref(),
+            ) else {
+                return Err(RAW_JINJA_CONTROL_REFUSED.to_string());
+            };
+            incremental_strategy = Some(converted.strategy);
+            warnings.extend(converted.warnings);
+            recognized.rewritten
+        } else {
+            let Some(converted) = map_is_incremental_conversion(&node_config, name, None, None)
+            else {
+                return Err(RAW_JINJA_CONTROL_REFUSED.to_string());
+            };
+            let (stripped, blocks) = comment_out_is_incremental_blocks(&content);
+            if stripped.contains("{%") {
+                return Err(RAW_JINJA_CONTROL_REFUSED.to_string());
+            }
+            if blocks.is_empty() || contains_unresolved_is_incremental(&stripped) {
+                return Err(RAW_INCREMENTAL_ERROR.to_string());
+            }
+            warnings.push(ImportWarning {
+                model: name.to_string(),
+                category: WarningCategory::JinjaControlFlow,
+                message: format!(
+                    "{} dbt `is_incremental()` block(s) not translated; imported as a \
+                     `-- {IS_INCREMENTAL_TODO}` comment with no watermark, so `rocky compile` \
+                     refuses the model (E037) until one is set",
+                    blocks.len()
+                ),
+                suggestion: Some(
+                    "set `timestamp_column` in the sidecar [strategy] block and put \
+                     `WHERE @incremental_filter` where the commented block was (plus \
+                     `filter_column` when it compares a qualified or renamed input column)"
+                        .to_string(),
+                ),
+            });
+            incremental_strategy = Some(converted.strategy);
+            warnings.extend(converted.warnings);
+            todo_blocks = blocks;
+            stripped
+        }
+    } else {
+        if has_statement_tags {
+            return Err(RAW_JINJA_CONTROL_REFUSED.to_string());
+        }
+        // Refuse is_incremental() before general Jinja handling. This must
+        // catch compound conditions too: otherwise the generic fallback
+        // removes the control tags and applies the guarded body
+        // unconditionally.
+        if contains_unresolved_is_incremental(&content) {
+            return Err(RAW_INCREMENTAL_ERROR.to_string());
+        }
+        content
+    };
 
     // `{{ var('x') }}` is now mapped to Rocky's native per-run variable marker
     // `@var(x)` (with `{{ var('x', 'd') }}` -> `@var(x, d)`) during
@@ -2171,8 +2470,13 @@ fn import_single_model(
     }
 
     // Extract config block
-    let (mut strategy, config_warnings) =
+    let (mut strategy, mut config_warnings) =
         extract_dbt_config(&content_processed, inline_materialization.as_deref());
+    if let Some(converted) = incremental_strategy {
+        // The generic mapping's warnings describe a strategy not applied.
+        strategy = converted;
+        config_warnings.clear();
+    }
     warnings.extend(config_warnings.into_iter().map(|msg| ImportWarning {
         model: name.to_string(),
         category: WarningCategory::UnsupportedMaterialization,
@@ -2194,14 +2498,7 @@ fn import_single_model(
                     strategy = StrategyConfig::MaterializedView;
                 }
                 "ephemeral" => {
-                    warnings.push(ImportWarning {
-                        model: name.to_string(),
-                        category: WarningCategory::UnsupportedMaterialization,
-                        message: "project config materialized='ephemeral' has no Rocky equivalent — using full_refresh".to_string(),
-                        suggestion: Some(
-                            "override per-model with `type = \"full_refresh\"` or `type = \"view\"`; Rocky refuses `type = \"ephemeral\"` (E038)".to_string(),
-                        ),
-                    });
+                    strategy = StrategyConfig::Ephemeral;
                 }
                 _ => {}
             }
@@ -2220,8 +2517,13 @@ fn import_single_model(
         default_target.catalog, resolved_schema_str, resolved_table
     );
 
-    // Convert Jinja refs to plain SQL.
-    let sql = convert_jinja_to_sql(&content_processed, &this_ref);
+    // Convert Jinja refs to plain SQL. Untranslated `is_incremental()` blocks
+    // sit behind sentinels until now so the converter leaves their quoted
+    // Jinja alone.
+    let mut sql = convert_jinja_to_sql(&content_processed, &this_ref);
+    for (sentinel, comment) in &todo_blocks {
+        sql = sql.replace(sentinel.as_str(), comment);
+    }
 
     // Resolve source references
     let mut model_sources = Vec::new();
@@ -2466,6 +2768,286 @@ fn extract_timestamp_from_where(block: &str) -> Option<String> {
 }
 
 // ---------------------------------------------------------------------------
+// is_incremental() watermark filter -> @incremental_filter
+// ---------------------------------------------------------------------------
+
+/// First line of the comment that replaces an `is_incremental()` block the
+/// importer could not translate.
+const IS_INCREMENTAL_TODO: &str = "TODO: dbt is_incremental() block not translated:";
+
+/// dbt's standard watermark filter:
+///
+/// ```text
+/// {% if is_incremental() %} <WHERE|AND> <lhs> > (SELECT MAX(<wm>) FROM {{ this }}) {% endif %}
+/// ```
+///
+/// Only a strict `>` matches: Rocky's filter is strict, so `>=` would
+/// silently change which rows load. An `{% else %}` branch does not match.
+const IS_INCREMENTAL_FILTER_PATTERN: &str = r"(?is)\{%-?\s*if\s+is_incremental\s*\(\s*\)\s*-?%\}\s*(?P<kw>where|and)\s+(?P<lhs>(?:[a-z_][a-z0-9_]*\.)?[a-z_][a-z0-9_]*)\s*>\s*\(\s*select\s+max\s*\(\s*(?P<wm>[a-z_][a-z0-9_]*)\s*\)\s*from\s*\{\{-?\s*this\s*-?\}\}\s*\)\s*\{%-?\s*endif\s*-?%\}";
+
+/// A recognized dbt watermark filter and the model SQL rewritten to Rocky's
+/// `@incremental_filter` placeholder.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RecognizedIncrementalFilter {
+    /// The `MAX(<wm>)` column: the model's watermark output column.
+    watermark: String,
+    /// The compared input expression (`<ident>` or `<alias>.<ident>`) when
+    /// it is not the watermark column itself. Becomes the sidecar's
+    /// `filter_column`.
+    filter_column: Option<String>,
+    /// The input with the block replaced by `<WHERE|AND> @incremental_filter`.
+    rewritten: String,
+    /// Whether the input holds a `{%` tag besides the recognized block.
+    other_statement_tags: bool,
+}
+
+/// Find exactly one standard `is_incremental()` watermark filter in raw dbt
+/// SQL and rewrite it to the placeholder. Other `{%` tags are allowed here
+/// (and reported); any other reference to `is_incremental` is not.
+fn find_is_incremental_filter(content: &str) -> Option<RecognizedIncrementalFilter> {
+    let filter_re = Regex::new(IS_INCREMENTAL_FILTER_PATTERN).expect("valid regex");
+    let mut found = filter_re.captures_iter(content);
+    let caps = found.next()?;
+    if found.next().is_some() {
+        return None;
+    }
+    let whole = caps.get(0)?;
+    let keyword = &caps["kw"];
+    let lhs = &caps["lhs"];
+    let watermark = caps["wm"].to_string();
+
+    let before = &content[..whole.start()];
+    let after = &content[whole.end()..];
+    let mut replacement = String::new();
+    if before
+        .chars()
+        .next_back()
+        .is_some_and(|c| !c.is_whitespace())
+    {
+        replacement.push(' ');
+    }
+    replacement.push_str(keyword);
+    replacement.push(' ');
+    replacement.push_str(rocky_core::incremental_filter::PLACEHOLDER);
+    if after.chars().next().is_some_and(|c| !c.is_whitespace()) {
+        replacement.push(' ');
+    }
+    let rewritten = format!("{before}{replacement}{after}");
+
+    // A second, unrecognized block, a `{% set %}` alias, or an
+    // `{{ is_incremental() }}` expression means the filter is not the whole
+    // incremental logic.
+    if contains_unresolved_is_incremental(&rewritten) {
+        return None;
+    }
+    let filter_column = (!lhs.eq_ignore_ascii_case(&watermark)).then(|| lhs.to_string());
+    Some(RecognizedIncrementalFilter {
+        watermark,
+        filter_column,
+        other_statement_tags: rewritten.contains("{%"),
+        rewritten,
+    })
+}
+
+/// Recognize the standard `is_incremental()` watermark filter when it is the
+/// only Jinja statement in the file. See [`IS_INCREMENTAL_FILTER_PATTERN`].
+fn recognize_is_incremental_filter(content: &str) -> Option<RecognizedIncrementalFilter> {
+    find_is_incremental_filter(content).filter(|recognized| !recognized.other_statement_tags)
+}
+
+/// Replace every `{% if ... is_incremental ... %} ... {% endif %}` block with
+/// a sentinel on its own line. Returns the new content and, per block, the
+/// sentinel plus the inert `-- ` comment that quotes the block. The caller
+/// swaps the comments in after Jinja conversion, so the converter never sees
+/// the quoted Jinja. An unterminated block is left in place.
+fn comment_out_is_incremental_blocks(content: &str) -> (String, Vec<(String, String)>) {
+    let mut output = String::with_capacity(content.len());
+    let mut blocks = Vec::new();
+    let mut copied_to = 0;
+    let mut cursor = 0;
+    // (block start, nesting depth) while inside an is_incremental() block.
+    let mut open: Option<(usize, usize)> = None;
+
+    while let Some(relative) = content[cursor..].find("{%") {
+        let tag_start = cursor + relative;
+        let body_start = tag_start + 2;
+        let Some(body_len) = find_jinja_tag_end(&content[body_start..], "%}") else {
+            break;
+        };
+        let tag_end = body_start + body_len + 2;
+        let body = content[body_start..body_start + body_len]
+            .trim()
+            .trim_start_matches('-')
+            .trim_end_matches('-')
+            .trim();
+        let keyword = body
+            .split(|c: char| !is_jinja_identifier_char(c))
+            .next()
+            .unwrap_or("");
+        cursor = tag_end;
+
+        match open {
+            None => {
+                if keyword == "if" && contains_unquoted_jinja_identifier(body, "is_incremental") {
+                    open = Some((tag_start, 1));
+                }
+            }
+            Some((start, depth)) => match keyword {
+                "if" => open = Some((start, depth + 1)),
+                "endif" if depth == 1 => {
+                    let sentinel = format!("__rocky_is_incremental_todo_{}__", blocks.len());
+                    let mut comment = format!("-- {IS_INCREMENTAL_TODO}");
+                    for line in content[start..tag_end].lines() {
+                        comment.push_str("\n-- ");
+                        comment.push_str(line.trim_end());
+                    }
+                    output.push_str(&content[copied_to..start]);
+                    if !output.is_empty() && !output.ends_with('\n') {
+                        output.push('\n');
+                    }
+                    output.push_str(&sentinel);
+                    output.push('\n');
+                    copied_to = tag_end;
+                    blocks.push((sentinel, comment));
+                    open = None;
+                }
+                "endif" => open = Some((start, depth - 1)),
+                _ => {}
+            },
+        }
+    }
+    output.push_str(&content[copied_to..]);
+    (output, blocks)
+}
+
+/// The Rocky strategy of a dbt incremental model converted through its
+/// `is_incremental()` block, plus the import warnings that explain it.
+struct IncrementalConversion {
+    strategy: StrategyConfig,
+    warnings: Vec<ImportWarning>,
+}
+
+/// Map a dbt incremental model's config onto [`StrategyConfig::Incremental`].
+///
+/// `watermark` is `None` when the `is_incremental()` block was not
+/// recognized: the sidecar then has no watermark and `rocky compile`
+/// refuses it (E037) until a human adds one. Returns `None` for an
+/// `incremental_strategy` the watermark conversion does not express
+/// (`insert_overwrite`, `microbatch`, anything unrecognized); the caller
+/// keeps its previous behavior for those.
+fn map_is_incremental_conversion(
+    config: &DbtNodeConfig,
+    model_name: &str,
+    watermark: Option<&str>,
+    filter_column: Option<&str>,
+) -> Option<IncrementalConversion> {
+    let keys = || match &config.unique_key {
+        Some(UniqueKeyValue::Single(key)) => vec![key.clone()],
+        Some(UniqueKeyValue::Multiple(keys)) => keys.clone(),
+        None => Vec::new(),
+    };
+    let kind = config
+        .incremental_strategy
+        .as_deref()
+        .map(str::to_ascii_lowercase);
+    // dbt `append` ignores unique_key; `merge` upserts on it, which Rocky's
+    // keyed incremental MERGE expresses. `delete+insert` is NOT converted: it
+    // deletes every target row of a key (often non-unique, such as a date)
+    // before inserting, which a MERGE does not reproduce.
+    let unique_key = match kind.as_deref() {
+        None | Some("merge") => keys(),
+        Some("append") => Vec::new(),
+        Some(_) => return None,
+    };
+
+    let mut warnings = Vec::new();
+    let mut warn = |category: WarningCategory, message: String, suggestion: &str| {
+        warnings.push(ImportWarning {
+            model: model_name.to_string(),
+            category,
+            message,
+            suggestion: Some(suggestion.to_string()),
+        });
+    };
+
+    let on_schema_change = match config
+        .on_schema_change
+        .as_deref()
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        None | Some("fail") => rocky_ir::OnSchemaChange::Fail,
+        Some("append_new_columns") => rocky_ir::OnSchemaChange::AppendNewColumns,
+        Some("sync_all_columns") => {
+            warn(
+                WarningCategory::UnsupportedMaterialization,
+                "on_schema_change='sync_all_columns' mapped to `append_new_columns`: Rocky adds \
+                 new columns but does not remove dropped ones (a column removed from the model \
+                 fails the run)"
+                    .to_string(),
+                "drop removed columns from the target by hand, or rebuild with `rocky run --full-refresh`",
+            );
+            rocky_ir::OnSchemaChange::AppendNewColumns
+        }
+        Some("ignore") => {
+            warn(
+                WarningCategory::UnsupportedMaterialization,
+                "on_schema_change='ignore' mapped to `fail`: Rocky fails the run on a column \
+                 mismatch instead of ignoring it"
+                    .to_string(),
+                "set `on_schema_change = \"append_new_columns\"` in the sidecar [strategy] block \
+                 to add new columns instead",
+            );
+            rocky_ir::OnSchemaChange::Fail
+        }
+        Some(other) => {
+            warn(
+                WarningCategory::UnsupportedMaterialization,
+                format!("on_schema_change='{other}' not recognized; mapped to `fail`"),
+                "set `on_schema_change` in the sidecar [strategy] block to `fail` or `append_new_columns`",
+            );
+            rocky_ir::OnSchemaChange::Fail
+        }
+    };
+
+    if !unique_key.is_empty()
+        && (config.merge_update_columns.is_some() || config.merge_exclude_columns.is_some())
+    {
+        warn(
+            WarningCategory::UnsupportedMaterialization,
+            "merge_update_columns / merge_exclude_columns dropped: Rocky's keyed incremental \
+             MERGE updates every column"
+                .to_string(),
+            "use a `merge` strategy with `update_columns` if only some columns may change",
+        );
+    }
+
+    if let Some(watermark) = watermark {
+        let compared = filter_column.unwrap_or(watermark);
+        warn(
+            WarningCategory::MappedConstruct,
+            format!(
+                "dbt `is_incremental()` filter on `{compared}` mapped to Rocky's \
+                 `@incremental_filter` with `timestamp_column = \"{watermark}\"`"
+            ),
+            "review the emitted SQL and [strategy] block; the first run and \
+             `rocky run --full-refresh` load every row",
+        );
+    }
+
+    Some(IncrementalConversion {
+        strategy: StrategyConfig::Incremental {
+            timestamp_column: watermark.map(str::to_string),
+            unique_key,
+            lookback: None,
+            on_schema_change,
+            filter_column: filter_column.map(str::to_string),
+        },
+        warnings,
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Config extraction
 // ---------------------------------------------------------------------------
 
@@ -2521,7 +3103,7 @@ fn inline_dbt_materialization(content: &str) -> Option<String> {
         .next_back()
 }
 
-fn dbt_config_calls(content: &str) -> Vec<&str> {
+pub(super) fn dbt_config_calls(content: &str) -> Vec<&str> {
     let mut calls = Vec::new();
     let mut rest = content;
     while let Some(start) = rest.find("{{") {
@@ -2600,7 +3182,7 @@ fn is_literal_config_value(value: &str) -> bool {
     false
 }
 
-fn quoted_literal_contents(value: &str) -> Option<&str> {
+pub(super) fn quoted_literal_contents(value: &str) -> Option<&str> {
     let quote = value.chars().next()?;
     if quote != '\'' && quote != '"' || !value.ends_with(quote) || value.len() < 2 {
         return None;
@@ -2619,7 +3201,7 @@ fn quoted_literal_contents(value: &str) -> Option<&str> {
     (!escaped).then_some(inner)
 }
 
-fn split_literal_items(value: &str) -> Option<Vec<&str>> {
+pub(super) fn split_literal_items(value: &str) -> Option<Vec<&str>> {
     if value.trim().is_empty() {
         return Some(Vec::new());
     }
@@ -2672,13 +3254,30 @@ fn extract_dbt_config(
 ) -> (StrategyConfig, Vec<String>) {
     let mut messages = Vec::new();
 
-    let calls = dbt_config_calls(content);
-    let Some(config_str) = calls.last().copied() else {
+    if dbt_config_calls(content).is_empty() {
         return (StrategyConfig::FullRefresh, messages);
-    };
+    }
+    let synthetic = raw_dbt_node_config(content, inline_materialization.unwrap_or("table"));
 
-    // Parse materialized
-    let materialized = inline_materialization.unwrap_or("table").to_string();
+    // The regex (`--no-manifest`) path always uses the default microbatch
+    // mapping. The `--microbatch-as=time_interval` translation needs the
+    // model's compiled body to rewrite (it injects `@start_date`/`@end_date`),
+    // which only the manifest path reliably provides; opting it in on the
+    // reduced-fidelity regex path would risk corrupting un-compiled Jinja.
+    let mapping = map_manifest_strategy(&synthetic, "<regex-path>", MicrobatchMode::Merge);
+    for w in mapping.warnings {
+        messages.push(w.message);
+    }
+
+    (mapping.strategy, messages)
+}
+
+/// Build a [`DbtNodeConfig`] from the last inline `{{ config(...) }}` call of
+/// a raw model, with `materialized` as given. Without a config call every
+/// other field is unset.
+fn raw_dbt_node_config(content: &str, materialized: &str) -> DbtNodeConfig {
+    let calls = dbt_config_calls(content);
+    let config_str = calls.last().copied().unwrap_or("");
 
     // Parse unique_key — accepts string-form (`unique_key='id'`) or
     // single-line list (`unique_key=['user_id', 'date']`).
@@ -2695,11 +3294,11 @@ fn extract_dbt_config(
     let batch_size = single_string_value(config_str, "batch_size");
     let lookback = single_string_value(config_str, "lookback").and_then(|s| s.parse::<u32>().ok());
 
-    // Build a synthetic DbtNodeConfig — the regex path doesn't recover
-    // databricks_tags / hooks / on_schema_change (they're multi-line in
-    // practice), so they're left empty.
-    let synthetic = DbtNodeConfig {
-        materialized: materialized.clone(),
+    // The regex path doesn't recover databricks_tags / hooks (they're
+    // multi-line in practice), so they're left empty. `on_schema_change` is a
+    // single literal and feeds the incremental conversion.
+    DbtNodeConfig {
+        materialized: materialized.to_string(),
         full_refresh: None,
         schema: None,
         unique_key,
@@ -2711,7 +3310,7 @@ fn extract_dbt_config(
         databricks_tags: BTreeMap::new(),
         pre_hook: Vec::new(),
         post_hook: Vec::new(),
-        on_schema_change: None,
+        on_schema_change: single_string_value(config_str, "on_schema_change"),
         // alias does not affect strategy selection; the regex path threads it
         // to target.table separately via extract_dbt_alias.
         alias: None,
@@ -2721,19 +3320,8 @@ fn extract_dbt_config(
         // not present in the inline `config()` call); contract detection is
         // manifest-only.
         contract: None,
-    };
-
-    // The regex (`--no-manifest`) path always uses the default microbatch
-    // mapping. The `--microbatch-as=time_interval` translation needs the
-    // model's compiled body to rewrite (it injects `@start_date`/`@end_date`),
-    // which only the manifest path reliably provides; opting it in on the
-    // reduced-fidelity regex path would risk corrupting un-compiled Jinja.
-    let mapping = map_manifest_strategy(&synthetic, "<regex-path>", MicrobatchMode::Merge);
-    for w in mapping.warnings {
-        messages.push(w.message);
+        snapshot: None,
     }
-
-    (mapping.strategy, messages)
 }
 
 /// Parse `unique_key=...` from a dbt config block. Accepts both
@@ -2787,8 +3375,16 @@ fn strip_surrounding_quotes(s: &str) -> &str {
     }
 }
 
-fn convert_jinja_to_sql(content: &str, this_ref: &str) -> String {
+pub(super) fn convert_jinja_to_sql(content: &str, this_ref: &str) -> String {
     let mut sql = strip_dbt_config_tags(content);
+
+    // {{ ref('model_name', v=2) }} / version=2 -> model_name_v2 (a pinned
+    // version of a versioned model).
+    let versioned_ref_re = Regex::new(
+        r#"\{\{\s*ref\s*\(\s*['"](\w+)['"]\s*,\s*(?:v|version)\s*=\s*['"]?(\d+)['"]?\s*\)\s*\}\}"#,
+    )
+    .unwrap();
+    sql = versioned_ref_re.replace_all(&sql, "${1}_v${2}").to_string();
 
     // {{ ref('model_name') }} -> model_name
     let ref_re = Regex::new(r#"\{\{\s*ref\s*\(\s*['"](\w+)['"]\s*\)\s*\}\}"#).unwrap();
@@ -3070,12 +3666,12 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_config_ephemeral_warns() {
+    fn test_extract_config_ephemeral_maps_to_ephemeral() {
         let input = "{{ config(materialized='ephemeral') }}";
         let (strategy, warnings) =
             extract_dbt_config(input, inline_dbt_materialization(input).as_deref());
-        assert!(matches!(strategy, StrategyConfig::FullRefresh));
-        assert!(!warnings.is_empty());
+        assert!(matches!(strategy, StrategyConfig::Ephemeral));
+        assert!(warnings.is_empty(), "{warnings:?}");
     }
 
     #[test]
@@ -3390,6 +3986,153 @@ models:
         assert_eq!(result.imported[0].config.depends_on, vec!["stg"]);
     }
 
+    /// dbt model governance survives a manifest import and the emitted repo
+    /// loads with the same meaning: versions become `<name>_v<N>` plus a
+    /// declaration, `ref(v=1)` pins `orders_v1`, access/group/owner carry over.
+    #[test]
+    fn manifest_import_carries_access_groups_and_versions() {
+        let node = |id: &str, name: &str, version: Option<i64>, code: &str, deps: Vec<&str>| {
+            let mut n = serde_json::json!({
+                "unique_id": id,
+                "name": name,
+                "resource_type": "model",
+                "compiled_code": code,
+                "raw_code": code,
+                "depends_on": { "nodes": deps, "macros": [] },
+                "config": { "materialized": "table" },
+                "columns": {},
+                "tags": [],
+                "schema": "s",
+                "database": "d",
+                "access": "public",
+                "group": "finance",
+            });
+            if let Some(v) = version {
+                n["version"] = serde_json::json!(v);
+                n["latest_version"] = serde_json::json!(2);
+                n["relation_name"] = serde_json::json!(format!("\"d\".\"s\".\"{name}_v{v}\""));
+                if v == 1 {
+                    n["deprecation_date"] = serde_json::json!("2026-12-31T00:00:00");
+                }
+            } else {
+                n["access"] = serde_json::json!("private");
+            }
+            n
+        };
+        let manifest_json = serde_json::json!({
+            "metadata": { "project_name": "proj" },
+            "nodes": {
+                "model.proj.orders.v1": node("model.proj.orders.v1", "orders", Some(1), "SELECT 1 AS id", vec![]),
+                "model.proj.orders.v2": node("model.proj.orders.v2", "orders", Some(2), "SELECT 1 AS id, 2 AS amount", vec![]),
+                "model.proj.reader": node(
+                    "model.proj.reader", "reader", None,
+                    "SELECT id FROM \"d\".\"s\".\"orders_v1\"",
+                    vec!["model.proj.orders.v1"],
+                ),
+            },
+            "sources": {},
+            "groups": {
+                "group.proj.finance": {
+                    "name": "finance",
+                    "owner": { "name": "Fin", "email": "fin@example.com" }
+                }
+            }
+        });
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("manifest.json");
+        std::fs::write(&path, manifest_json.to_string()).unwrap();
+        let manifest = dbt_manifest::parse_manifest(&path).unwrap();
+        let target = TargetConfig {
+            catalog: "d".to_string(),
+            schema: "s".to_string(),
+            table: String::new(),
+        };
+        let result = import_from_manifest(&manifest, &target, false, MicrobatchMode::Merge);
+        assert!(result.failed.is_empty(), "{:?}", result.failed);
+        let mut names: Vec<&str> = result.imported.iter().map(|m| m.name.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(names, vec!["orders_v1", "orders_v2", "reader"]);
+        let reader = result.imported.iter().find(|m| m.name == "reader").unwrap();
+        assert_eq!(reader.config.depends_on, vec!["orders_v1".to_string()]);
+        assert_eq!(reader.sql, "SELECT id FROM orders_v1");
+
+        let out = tempfile::TempDir::new().unwrap();
+        let profile = super::super::dbt_profiles::resolution_for_kind(
+            super::super::dbt_profiles::AdapterKind::DuckDb,
+            "duckdb",
+        );
+        super::super::emit::emit_repo(&super::super::emit::EmitInputs {
+            dbt_project_dir: dir.path(),
+            out_dir: out.path(),
+            overwrite: super::super::emit::OverwritePolicy::ReplaceContents,
+            profile: &profile,
+            default_catalog: "d",
+            default_schema: "s",
+            import: &result,
+            adapter_override_label: None,
+        })
+        .unwrap();
+        let models_dir = out.path().join("models");
+        let decl = std::fs::read_to_string(models_dir.join("orders.toml")).unwrap();
+        assert!(decl.contains("latest_version = 2"), "{decl}");
+        assert!(decl.contains("deprecation_date = \"2026-12-31\""), "{decl}");
+        let group = std::fs::read_to_string(models_dir.join("groups/finance.toml")).unwrap();
+        assert!(group.contains("email = \"fin@example.com\""), "{group}");
+
+        // The emitted repo loads: versions stamped, alias added, reader pinned.
+        let models = crate::project::Project::load_models(&models_dir, None).unwrap();
+        let project = crate::project::Project::from_models(models).unwrap();
+        let v1 = project.model("orders_v1").unwrap();
+        let info = v1.config.governance.version.as_ref().unwrap();
+        assert_eq!((info.version, info.latest_version), (Some(1), 2));
+        assert_eq!(
+            v1.config.governance.access,
+            Some(rocky_core::model_governance::ModelAccess::Public)
+        );
+        assert_eq!(
+            v1.config.governance.owner.as_ref().unwrap().name.as_deref(),
+            Some("Fin")
+        );
+        assert!(project.model("orders").is_some(), "latest alias");
+        let reader = project.model("reader").unwrap();
+        assert_eq!(
+            reader.config.governance.access,
+            Some(rocky_core::model_governance::ModelAccess::Private)
+        );
+    }
+
+    /// A dbt version that is not a whole number is refused with a reason,
+    /// never silently renamed.
+    #[test]
+    fn manifest_import_refuses_non_integer_version() {
+        let manifest_json = serde_json::json!({
+            "metadata": { "project_name": "proj" },
+            "nodes": {
+                "model.proj.orders.v1.5": {
+                    "unique_id": "model.proj.orders.v1.5",
+                    "name": "orders",
+                    "resource_type": "model",
+                    "compiled_code": "SELECT 1",
+                    "config": { "materialized": "table" },
+                    "version": 1.5
+                }
+            },
+            "sources": {}
+        });
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("manifest.json");
+        std::fs::write(&path, manifest_json.to_string()).unwrap();
+        let manifest = dbt_manifest::parse_manifest(&path).unwrap();
+        let target = TargetConfig {
+            catalog: "d".to_string(),
+            schema: "s".to_string(),
+            table: String::new(),
+        };
+        let result = import_from_manifest(&manifest, &target, false, MicrobatchMode::Merge);
+        assert!(result.imported.is_empty());
+        assert!(result.failed[0].reason.contains("not a whole number"));
+    }
+
     #[test]
     fn test_import_from_manifest_view_maps_to_view() {
         // Wave 2: `materialized='view'` now maps to StrategyConfig::View
@@ -3528,14 +4271,26 @@ sources:
         assert_eq!(result.imported[0].config.sources[0].schema, "raw_schema");
     }
 
-    #[test]
-    fn raw_append_incremental_guard_is_refused() {
+    fn import_raw_model(sql: &str) -> ImportResult {
         let dir = tempfile::TempDir::new().unwrap();
-
         std::fs::create_dir_all(dir.path().join("models")).unwrap();
+        std::fs::write(dir.path().join("models/fct_events.sql"), sql).unwrap();
+        let target = TargetConfig {
+            catalog: "warehouse".to_string(),
+            schema: "staging".to_string(),
+            table: String::new(),
+        };
+        import_dbt_project(dir.path(), &target).unwrap()
+    }
 
-        std::fs::write(
-            dir.path().join("models/fct_events.sql"),
+    /// An `is_incremental()` use the recognizer does not accept (a compound
+    /// condition here) is imported, not dropped: the block becomes an inert
+    /// TODO comment and the sidecar has no watermark, so `rocky compile`
+    /// refuses the model (E037) until a human finishes it. Before WP6 the
+    /// raw path refused the model outright.
+    #[test]
+    fn raw_unrecognized_incremental_guard_is_kept_as_a_todo() {
+        let result = import_raw_model(
             r#"
 {{ config(materialized='incremental') }}
 
@@ -3545,39 +4300,53 @@ FROM {{ ref('stg_events') }}
   WHERE event_time > (SELECT MAX(event_time) FROM {{ this }})
 {% endif %}
 "#,
-        )
-        .unwrap();
-
-        let target = TargetConfig {
-            catalog: "warehouse".to_string(),
-            schema: "staging".to_string(),
-            table: String::new(),
-        };
-
-        let result = import_dbt_project(dir.path(), &target).unwrap();
-        assert!(result.imported.is_empty());
-        assert_eq!(result.failed.len(), 1);
-        assert_eq!(result.failed[0].name, "fct_events");
+        );
+        assert!(result.failed.is_empty(), "{:?}", result.failed);
+        assert_eq!(result.imported.len(), 1);
+        let model = &result.imported[0];
         assert!(
-            result.failed[0]
-                .reason
-                .contains("raw import cannot evaluate Jinja control flow")
+            model
+                .sql
+                .contains("-- TODO: dbt is_incremental() block not translated:"),
+            "{}",
+            model.sql
         );
         assert!(
-            result.failed[0]
-                .reason
-                .contains("dbt compile --full-refresh")
+            model
+                .sql
+                .contains("--   WHERE event_time > (SELECT MAX(event_time) FROM {{ this }})"),
+            "the original block is quoted as a comment: {}",
+            model.sql
+        );
+        assert!(!model.sql.contains("@incremental_filter"), "{}", model.sql);
+        assert!(
+            matches!(
+                &model.config.strategy,
+                StrategyConfig::Incremental {
+                    timestamp_column: None,
+                    ..
+                }
+            ),
+            "{:?}",
+            model.config.strategy
+        );
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| w.message.contains("not translated") && w.message.contains("E037")),
+            "{:?}",
+            result.warnings
         );
     }
 
+    /// The standard watermark filter converts on the raw path: the block
+    /// becomes the placeholder and the key carries over (MERGE upsert).
     #[test]
-    fn raw_incremental_guard_is_refused_for_keyed_merge() {
-        let dir = tempfile::TempDir::new().unwrap();
-        std::fs::create_dir_all(dir.path().join("models")).unwrap();
-        std::fs::write(
-            dir.path().join("models/fct_events.sql"),
+    fn raw_standard_incremental_filter_converts_to_placeholder() {
+        let result = import_raw_model(
             r#"
-{{ config(materialized='incremental', unique_key='id') }}
+{{ config(materialized='incremental', unique_key='id', on_schema_change='append_new_columns') }}
 
 SELECT *
 FROM {{ ref('stg_events') }}
@@ -3585,24 +4354,109 @@ FROM {{ ref('stg_events') }}
   WHERE event_time > (SELECT MAX(event_time) FROM {{ this }})
 {% endif %}
 "#,
-        )
-        .unwrap();
-
-        let target = TargetConfig {
-            catalog: "warehouse".to_string(),
-            schema: "staging".to_string(),
-            table: String::new(),
-        };
-
-        let result = import_dbt_project(dir.path(), &target).unwrap();
-        assert!(result.imported.is_empty());
-        assert_eq!(result.failed.len(), 1);
-        assert_eq!(result.failed[0].name, "fct_events");
-        assert!(
-            result.failed[0]
-                .reason
-                .contains("dbt compile --full-refresh")
         );
+        assert!(result.failed.is_empty(), "{:?}", result.failed);
+        let model = &result.imported[0];
+        assert!(
+            model.sql.contains("WHERE @incremental_filter"),
+            "{}",
+            model.sql
+        );
+        assert!(!model.sql.contains("is_incremental"), "{}", model.sql);
+        assert!(!model.sql.contains("{%"), "{}", model.sql);
+        match &model.config.strategy {
+            StrategyConfig::Incremental {
+                timestamp_column,
+                unique_key,
+                lookback,
+                on_schema_change,
+                filter_column,
+            } => {
+                assert_eq!(timestamp_column.as_deref(), Some("event_time"));
+                assert_eq!(unique_key, &vec!["id".to_string()]);
+                assert!(lookback.is_none());
+                assert_eq!(
+                    *on_schema_change,
+                    rocky_ir::OnSchemaChange::AppendNewColumns
+                );
+                assert!(filter_column.is_none());
+            }
+            other => panic!("expected incremental, got {other:?}"),
+        }
+    }
+
+    /// `append` drops the key (dbt append ignores it); a qualified left side
+    /// becomes `filter_column`; `AND` keeps its keyword.
+    #[test]
+    fn raw_append_filter_with_qualified_column_converts() {
+        let result = import_raw_model(
+            r#"
+{{ config(materialized='incremental', incremental_strategy='append', unique_key='id') }}
+
+SELECT e.id, e.synced_at AS event_time
+FROM {{ ref('stg_events') }} e
+WHERE e.id > 0
+{%- if is_incremental() -%}
+  AND e.synced_at > (select max(event_time) from {{this}})
+{%- endif %}
+"#,
+        );
+        assert!(result.failed.is_empty(), "{:?}", result.failed);
+        let model = &result.imported[0];
+        assert!(
+            model.sql.contains("AND @incremental_filter"),
+            "{}",
+            model.sql
+        );
+        match &model.config.strategy {
+            StrategyConfig::Incremental {
+                timestamp_column,
+                unique_key,
+                filter_column,
+                ..
+            } => {
+                assert_eq!(timestamp_column.as_deref(), Some("event_time"));
+                assert!(unique_key.is_empty(), "append drops the key");
+                assert_eq!(filter_column.as_deref(), Some("e.synced_at"));
+            }
+            other => panic!("expected incremental, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn recognizer_accepts_only_the_standard_strict_filter() {
+        let ok = recognize_is_incremental_filter(
+            "SELECT * FROM t {% if is_incremental() %} WHERE ts > (SELECT MAX(ts) FROM {{ this }}) {% endif %}",
+        )
+        .expect("standard form");
+        assert_eq!(ok.watermark, "ts");
+        assert_eq!(ok.filter_column, None);
+        assert!(
+            ok.rewritten.contains("WHERE @incremental_filter"),
+            "{}",
+            ok.rewritten
+        );
+
+        for rejected in [
+            // `>=` re-reads rows at the watermark: a different filter.
+            "SELECT * FROM t {% if is_incremental() %} WHERE ts >= (SELECT MAX(ts) FROM {{ this }}) {% endif %}",
+            // An else branch carries first-run logic the placeholder cannot.
+            "SELECT * FROM t {% if is_incremental() %} WHERE ts > (SELECT MAX(ts) FROM {{ this }}) {% else %} WHERE 1=1 {% endif %}",
+            // The bound must come from the model's own table.
+            "SELECT * FROM t {% if is_incremental() %} WHERE ts > (SELECT MAX(ts) FROM other) {% endif %}",
+            // Two blocks.
+            "SELECT * FROM t {% if is_incremental() %} WHERE ts > (SELECT MAX(ts) FROM {{ this }}) {% endif %} \
+             UNION ALL SELECT * FROM u {% if is_incremental() %} WHERE ts > (SELECT MAX(ts) FROM {{ this }}) {% endif %}",
+            // Other statement tags.
+            "{% set x = 1 %} SELECT * FROM t {% if is_incremental() %} WHERE ts > (SELECT MAX(ts) FROM {{ this }}) {% endif %}",
+            // A literal bound.
+            "SELECT * FROM t {% if is_incremental() %} WHERE ts > '2024-01-01' {% endif %}",
+        ] {
+            assert!(
+                recognize_is_incremental_filter(rejected).is_none(),
+                "must not recognize: {rejected}"
+            );
+        }
     }
 
     #[test]
@@ -4022,9 +4876,81 @@ FROM {{ ref('stg_events') }}
         });
         let result = import_from_manifest_json(&manifest);
         assert_eq!(result.imported.len(), 1, "only the model imports");
-        assert_eq!(result.constructs_dropped, 2, "1 snapshot + 1 metric");
-        assert!(result.structured_warnings.iter().any(|w| matches!(w,
+        // A snapshot is no longer a dropped construct: one it cannot read
+        // (here, no config at all) is an import failure with the reason.
+        assert_eq!(result.constructs_dropped, 1, "1 metric");
+        assert!(
+            result
+                .failed
+                .iter()
+                .any(|f| f.name == "snap" && f.reason.contains("unique_key"))
+        );
+        assert!(!result.structured_warnings.iter().any(|w| matches!(w,
             ImportDbtStructuredWarning::DroppedConstruct { construct, .. } if construct == "snapshot")));
+    }
+
+    #[test]
+    fn test_manifest_snapshot_node_converts_to_snapshot_model() {
+        let manifest = serde_json::json!({
+            "metadata": { "project_name": "p" },
+            "nodes": {
+                "snapshot.p.orders_snap": {
+                    "unique_id": "snapshot.p.orders_snap", "name": "orders_snap",
+                    "resource_type": "snapshot",
+                    "compiled_code": "select * from \"d\".\"raw\".\"orders\"",
+                    "raw_code": "{% snapshot orders_snap %}{{ config(unique_key='id') }} select * from {{ source('raw','orders') }} {% endsnapshot %}",
+                    "depends_on": { "nodes": ["source.p.raw.orders"], "macros": [] },
+                    "config": {
+                        "materialized": "snapshot", "target_schema": "snapshots",
+                        "unique_key": ["id", "region"], "strategy": "check",
+                        "check_cols": "all", "hard_deletes": "invalidate",
+                        "snapshot_meta_column_names": { "dbt_valid_from": "start_at", "dbt_scd_id": null }
+                    },
+                    "tags": [], "schema": "analytics_snapshots", "database": "d"
+                },
+                "model.p.current_orders": model_node("current_orders",
+                    serde_json::json!({ "materialized": "table" }), serde_json::json!([]))
+            },
+            "sources": {}
+        });
+        let mut manifest = manifest;
+        manifest["nodes"]["model.p.current_orders"]["depends_on"] =
+            serde_json::json!({ "nodes": ["snapshot.p.orders_snap"], "macros": [] });
+        let result = import_from_manifest_json(&manifest);
+        assert!(
+            result.failed.is_empty(),
+            "{:?}",
+            result.failed.iter().map(|f| &f.reason).collect::<Vec<_>>()
+        );
+        let snap = result
+            .imported
+            .iter()
+            .find(|m| m.name == "orders_snap")
+            .expect("snapshot imported");
+        // dbt's resolved relation (after generate_schema_name), not the
+        // configured `target_schema`, so the run continues dbt's table.
+        assert_eq!(snap.config.target.schema, "analytics_snapshots");
+        assert_eq!(snap.sql, "select * from \"d\".\"raw\".\"orders\"");
+        let lowered = snap
+            .config
+            .strategy
+            .snapshot_lowered()
+            .expect("snapshot strategy");
+        assert!(lowered.problems.is_empty(), "{:?}", lowered.problems);
+        assert_eq!(lowered.spec.unique_key.len(), 2);
+        assert_eq!(
+            lowered.spec.hard_deletes,
+            rocky_ir::SnapshotHardDeletes::Invalidate
+        );
+        assert_eq!(lowered.spec.meta_columns.valid_from, "start_at");
+        assert_eq!(lowered.spec.meta_columns.scd_id, "dbt_scd_id");
+        let consumer = result
+            .imported
+            .iter()
+            .find(|m| m.name == "current_orders")
+            .expect("consumer imported");
+        assert_eq!(consumer.config.depends_on, vec!["orders_snap".to_string()]);
+        assert_eq!(result.constructs_dropped, 0);
     }
 
     #[test]
@@ -4223,7 +5149,7 @@ FROM {{ ref('stg_events') }}
     }
 
     #[test]
-    fn test_manifest_ephemeral_emits_warning() {
+    fn test_manifest_ephemeral_imports_as_ephemeral() {
         let manifest = serde_json::json!({
             "metadata": { "project_name": "p" },
             "nodes": {
@@ -4243,9 +5169,9 @@ FROM {{ ref('stg_events') }}
         let result = import_from_manifest_json(&manifest);
         assert!(matches!(
             result.imported[0].config.strategy,
-            StrategyConfig::FullRefresh
+            StrategyConfig::Ephemeral
         ));
-        assert!(result.structured_warnings.iter().any(|w| matches!(
+        assert!(!result.structured_warnings.iter().any(|w| matches!(
             w,
             ImportDbtStructuredWarning::UnsupportedMaterialization { dbt_materialization, .. }
                 if dbt_materialization == "ephemeral"
@@ -4348,6 +5274,8 @@ FROM {{ ref('stg_events') }}
     /// `full_refresh` fallback, every run would replace the table with only
     /// the recent rows. The model is refused, not imported, and says why.
     #[test]
+    // `>=` is not the standard filter Rocky converts (its filter is strict),
+    // so this model still takes the #1990 refusal path.
     fn test_append_model_using_is_incremental_is_refused_not_full_refreshed() {
         let manifest = serde_json::json!({
             "metadata": { "project_name": "p" },
@@ -4356,7 +5284,7 @@ FROM {{ ref('stg_events') }}
                     "unique_id": "model.p.events_append",
                     "name": "events_append",
                     "resource_type": "model",
-                    "raw_code": "SELECT * FROM {{ ref('raw_events') }}\n{% if is_incremental() %}\nWHERE updated_at > (SELECT MAX(updated_at) FROM {{ this }})\n{% endif %}",
+                    "raw_code": "SELECT * FROM {{ ref('raw_events') }}\n{% if is_incremental() %}\nWHERE updated_at >= (SELECT MAX(updated_at) FROM {{ this }})\n{% endif %}",
                     "compiled_code": "SELECT * FROM raw_events\nWHERE updated_at > '2026-09-01 00:00:00'",
                     "depends_on": { "nodes": [], "macros": [] },
                     "config": { "materialized": "incremental" },
@@ -4400,6 +5328,55 @@ FROM {{ ref('stg_events') }}
                 && w.message.contains("mapped to full_refresh")),
             "no warning may claim a full_refresh mapping for a refused model: {:?}",
             result.warnings
+        );
+    }
+
+    /// The standard `>` filter converts from a manifest too: the SQL is
+    /// rebuilt from `raw_code` with the placeholder, so the first run (and a
+    /// full refresh) loads every row instead of the compiled delta.
+    #[test]
+    fn manifest_standard_incremental_filter_converts_from_raw_code() {
+        let manifest = serde_json::json!({
+            "metadata": { "project_name": "p" },
+            "nodes": {
+                "model.p.events_append": {
+                    "unique_id": "model.p.events_append",
+                    "name": "events_append",
+                    "resource_type": "model",
+                    "raw_code": "SELECT * FROM {{ ref('raw_events') }}\n{% if is_incremental() %}\nWHERE updated_at > (SELECT MAX(updated_at) FROM {{ this }})\n{% endif %}",
+                    "compiled_code": "SELECT * FROM raw_events\nWHERE updated_at > '2026-09-01 00:00:00'",
+                    "depends_on": { "nodes": [], "macros": [] },
+                    "config": { "materialized": "incremental" },
+                    "columns": {}, "tags": [], "schema": "s", "database": "d"
+                }
+            },
+            "sources": {}
+        });
+        let result = import_from_manifest_json_with_evidence(&manifest, MicrobatchMode::Merge);
+        assert!(result.failed.is_empty(), "{:?}", result.failed);
+        let model = result
+            .imported
+            .iter()
+            .find(|m| m.name == "events_append")
+            .expect("imported");
+        assert!(
+            model.sql.contains("WHERE @incremental_filter"),
+            "{}",
+            model.sql
+        );
+        assert!(
+            !model.sql.contains("2026-09-01"),
+            "not the compiled delta: {}",
+            model.sql
+        );
+        assert!(
+            matches!(
+                &model.config.strategy,
+                StrategyConfig::Incremental { timestamp_column: Some(ts), unique_key, .. }
+                    if ts == "updated_at" && unique_key.is_empty()
+            ),
+            "{:?}",
+            model.config.strategy
         );
     }
 
@@ -4465,16 +5442,29 @@ FROM {{ ref('stg_events') }}
                 name,
                 model.sql
             );
-            if name == "orders_nokey" {
-                assert!(matches!(
+            // The keyed model with the standard `is_incremental()` filter
+            // converts to Rocky `incremental` (WP6); the macro-hidden filter
+            // keeps the keyed merge mapping from the full-refresh SQL.
+            match name {
+                "orders_inc" => assert!(
+                    matches!(
+                        &model.config.strategy,
+                        StrategyConfig::Incremental { timestamp_column: Some(ts), unique_key, .. }
+                            if ts == "updated_at" && unique_key == &vec!["id".to_string()]
+                    ),
+                    "{:?}",
+                    model.config.strategy
+                ),
+                // `delete+insert` keeps its own mapping: a keyed MERGE does
+                // not delete the target rows of a non-unique key.
+                "orders_nokey" => assert!(matches!(
                     model.config.strategy,
                     StrategyConfig::DeleteInsert { .. }
-                ));
-            } else {
-                assert!(matches!(
+                )),
+                _ => assert!(matches!(
                     model.config.strategy,
                     StrategyConfig::Merge { .. }
-                ));
+                )),
             }
         }
         assert_eq!(accepted.imported.len(), 3);
@@ -4817,6 +5807,47 @@ FROM {{ ref('stg_events') }}
                 .reason
                 .contains("cannot resolve a dbt config expression")
         );
+    }
+
+    /// Raw import takes a versioned model whose versions are plain
+    /// `<name>_v<N>.sql` files, and maps `ref(v=N)`, access and group.
+    #[test]
+    fn raw_import_takes_simple_versions_and_governance() {
+        let target = TargetConfig {
+            catalog: "w".into(),
+            schema: "s".into(),
+            table: String::new(),
+        };
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir(dir.path().join("models")).unwrap();
+        std::fs::write(
+            dir.path().join("models/properties.yml"),
+            "groups:\n  - name: finance\n    owner:\n      email: fin@example.com\nmodels:\n  - name: orders\n    access: public\n    group: finance\n    latest_version: 2\n    versions:\n      - v: 1\n        deprecation_date: 2026-12-31\n      - v: 2\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("models/orders_v1.sql"), "select 1 as id").unwrap();
+        std::fs::write(dir.path().join("models/orders_v2.sql"), "select 1 as id").unwrap();
+        std::fs::write(
+            dir.path().join("models/reader.sql"),
+            "select id from {{ ref('orders', v=1) }}",
+        )
+        .unwrap();
+        let result = import_dbt_project(dir.path(), &target).unwrap();
+        assert!(result.failed.is_empty(), "{:?}", result.failed);
+        let v1 = result
+            .imported
+            .iter()
+            .find(|m| m.name == "orders_v1")
+            .unwrap();
+        let info = v1.config.governance.version.as_ref().unwrap();
+        assert_eq!((info.version, info.latest_version), (Some(1), 2));
+        assert!(info.deprecation_date.is_some());
+        assert_eq!(
+            v1.config.governance.access_group.as_deref(),
+            Some("finance")
+        );
+        let reader = result.imported.iter().find(|m| m.name == "reader").unwrap();
+        assert_eq!(reader.sql, "select id from orders_v1");
     }
 
     #[test]
@@ -5712,6 +6743,7 @@ FROM {{ ref('stg_events') }}
                 merge_update_columns: None,
                 merge_exclude_columns: None,
                 contract: None,
+                snapshot: None,
             },
             columns: HashMap::new(),
             description: None,
@@ -5719,6 +6751,7 @@ FROM {{ ref('stg_events') }}
             schema: String::new(),
             database: String::new(),
             relation_name: None,
+            governance: Default::default(),
         }
     }
 

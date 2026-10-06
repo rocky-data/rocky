@@ -265,6 +265,11 @@ impl SqlDialect for BigQueryDialect {
         Ok(format!("REGEXP_CONTAINS({column}, r'{pattern}')"))
     }
 
+    fn interval_literal(&self, amount: u32, unit: &str) -> String {
+        // BigQuery's interval literal takes an unquoted integer.
+        format!("INTERVAL {amount} {unit}")
+    }
+
     fn date_minus_days_expr(&self, days: u32) -> rocky_core::traits::AdapterResult<String> {
         Ok(format!("DATE_SUB(CURRENT_DATE(), INTERVAL {days} DAY)"))
     }

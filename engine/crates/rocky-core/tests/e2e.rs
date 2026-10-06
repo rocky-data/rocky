@@ -272,6 +272,9 @@ fn test_incremental_pipeline_with_watermark() {
     let stored = store.get_watermark(table_key).unwrap().unwrap();
     let plan = sample_replication_ir(MaterializationStrategy::Incremental {
         timestamp_column: "_fivetran_synced".into(),
+        unique_key: Vec::new(),
+        lookback: None,
+        filter_column: None,
     });
     let sql = sql_gen::generate_insert_sql(&plan, &dialect, Some(&stored.last_value)).unwrap();
 
@@ -606,7 +609,11 @@ fn test_transformation_incremental() {
             table: "fct_events".into(),
         },
         MaterializationStrategy::Incremental {
-            timestamp_column: "updated_at".into(),
+            // No watermark declared.
+            timestamp_column: String::new(),
+            unique_key: Vec::new(),
+            lookback: None,
+            filter_column: None,
         },
         vec![SourceRef {
             catalog: "cat".into(),
@@ -623,11 +630,33 @@ fn test_transformation_incremental() {
         None,
     );
 
-    // #1990: refused, because a transformation model has no watermark and the
-    // only possible SQL is an unfiltered INSERT that duplicates every run.
+    // #1990: refused without a watermark: the only possible SQL is an
+    // unfiltered INSERT that duplicates every run.
     let err = sql_gen::generate_transformation_sql(&plan, &dialect)
         .expect_err("an incremental transformation model must not produce SQL");
     assert!(err.to_string().contains("E037"), "{err}");
+
+    // With a watermark, the incremental-run INSERT is filtered on the
+    // target's own MAX.
+    let mut with_watermark = plan.clone();
+    with_watermark.materialization = MaterializationStrategy::Incremental {
+        timestamp_column: "updated_at".into(),
+        unique_key: Vec::new(),
+        lookback: None,
+        filter_column: None,
+    };
+    let sql = sql_gen::generate_transformation_sql(&with_watermark, &dialect).unwrap();
+    assert_eq!(sql.len(), 1);
+    assert!(
+        sql[0].starts_with("INSERT INTO cat.silver.fct_events"),
+        "{}",
+        sql[0]
+    );
+    assert!(
+        sql[0].contains("(SELECT MAX(updated_at) FROM cat.silver.fct_events)"),
+        "{}",
+        sql[0]
+    );
 }
 
 #[test]
@@ -956,6 +985,9 @@ fn test_full_pipeline_flow_incremental_to_full_refresh() {
     let prior_wm = wm.unwrap();
     let plan = sample_replication_ir(MaterializationStrategy::Incremental {
         timestamp_column: "_fivetran_synced".into(),
+        unique_key: Vec::new(),
+        lookback: None,
+        filter_column: None,
     });
     let sql = sql_gen::generate_insert_sql(&plan, &dialect, Some(&prior_wm.last_value)).unwrap();
     assert!(sql.contains("INSERT INTO"));
@@ -1047,6 +1079,9 @@ fn test_exact_incremental_sql_output_first_run() {
 
     let plan = sample_replication_ir(MaterializationStrategy::Incremental {
         timestamp_column: "_fivetran_synced".into(),
+        unique_key: Vec::new(),
+        lookback: None,
+        filter_column: None,
     });
 
     // First run: no prior watermark in state, dialect emits the
@@ -1068,6 +1103,9 @@ fn test_exact_incremental_sql_output_with_prior_watermark() {
 
     let plan = sample_replication_ir(MaterializationStrategy::Incremental {
         timestamp_column: "_fivetran_synced".into(),
+        unique_key: Vec::new(),
+        lookback: None,
+        filter_column: None,
     });
 
     // Second run: state has the previous run's `MAX(ts) FROM source` value.
@@ -1117,6 +1155,9 @@ fn test_exact_insert_sql_output_first_run() {
 
     let plan = sample_replication_ir(MaterializationStrategy::Incremental {
         timestamp_column: "_fivetran_synced".into(),
+        unique_key: Vec::new(),
+        lookback: None,
+        filter_column: None,
     });
     let sql = sql_gen::generate_insert_sql(&plan, &dialect, None).unwrap();
 

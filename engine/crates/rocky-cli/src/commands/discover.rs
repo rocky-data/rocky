@@ -46,6 +46,9 @@ pub async fn discover(
         );
     }
 
+    if with_schemas {
+        refuse_schema_warmup_for_non_replication(&rocky_cfg, pipeline_name)?;
+    }
     let (name, pipeline) = registry::resolve_replication_pipeline(&rocky_cfg, pipeline_name)?;
     let pattern = pipeline.schema_pattern()?;
 
@@ -894,6 +897,31 @@ fn hex_encode(bytes: &[u8; 32]) -> String {
         let _ = write!(out, "{b:02x}");
     }
     out
+}
+
+/// `discover --with-schemas` warms the cache from a replication pipeline's
+/// discovered sources. A transformation pipeline has no discovery step, so
+/// the generic "only supports replication pipelines" refusal used to leave a
+/// user who followed the I003 advice with nowhere to go. Name the route that
+/// works instead: `rocky compile --with-seed`.
+fn refuse_schema_warmup_for_non_replication(
+    cfg: &rocky_core::config::RockyConfig,
+    pipeline_name: Option<&str>,
+) -> Result<()> {
+    let Ok((name, pipeline)) = registry::resolve_pipeline(cfg, pipeline_name) else {
+        // Let the ordinary resolution below report the selection error.
+        return Ok(());
+    };
+    if pipeline.as_replication().is_some() {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "pipeline '{name}' is type '{}': `rocky discover --with-schemas` warms the schema cache \
+         from a replication pipeline's discovered sources, and this pipeline has none. To give \
+         `rocky compile` source schemas for its models, put the source DDL in `data/seed.sql` and \
+         run `rocky compile --with-seed`",
+        pipeline.pipeline_type_str()
+    )
 }
 
 #[cfg(test)]

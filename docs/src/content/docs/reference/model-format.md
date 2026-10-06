@@ -56,6 +56,8 @@ The `.toml` file names the model, lists what it depends on, picks a materializat
 | `drop_existing_kind` | `"table"` or `"view"` | No | Standing permission to drop a target of this existing kind when switching between `full_refresh` and `view`. DuckDB only today. |
 | `depends_on` | list of strings | No | Names of upstream models that must run before this one. Defaults to `[]`. |
 | `group` | string | No | Name of a [config group](#config-groups) (`models/groups/<name>.toml`) this model opts into for shared routing and materialization. |
+| `access` | string | No | `private`, `protected` (default) or `public`. Who may reference the model. See [Model governance](/concepts/model-governance/). |
+| `access_group` | string | No | Ownership group for access checks. Falls back to `group`. Inherits no config. See [Model governance](/concepts/model-governance/#ownership-groups-and-owners). |
 | `retention` | string | No | Data retention policy for this model. Grammar `^\d+[dy]$` — e.g. `"90d"` or `"1y"`. See [Retention](#retention). |
 
 `drop_existing_kind` applies only when a `full_refresh` model finds a view, or a `view` model finds a table. Rocky checks the existing kind before using the permission. On DuckDB, the DROP and CREATE run in one transaction. Rocky refuses a `full_refresh` or `view` model carrying this key on every other adapter. The key is a standing permission on the model, not a one-time approval. Rocky keeps no ownership record for the old object; confirm the target belongs to this model before setting the key.
@@ -70,7 +72,9 @@ The `.toml` file names the model, lists what it depends on, picks a materializat
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `type` | string | `"full_refresh"` | Materialization type. One of `"full_refresh"`, `"merge"`, `"time_interval"`, `"view"`, `"materialized_view"`, `"dynamic_table"`, `"delete_insert"`, `"microbatch"`, `"content_addressed"`. Two are refused: `"incremental"` on a transformation model (`E037`, see [Incremental](#incremental)), and `"ephemeral"` outright (`E038`, see [Ephemeral](#ephemeral)). |
+| `type` | string | `"full_refresh"` | Materialization type. One of `"full_refresh"`, `"merge"`, `"time_interval"`, `"view"`, `"materialized_view"`, `"dynamic_table"`, `"delete_insert"`, `"microbatch"`, `"content_addressed"`, `"ephemeral"` (see [Ephemeral](#ephemeral)). `"incremental"` is refused on a transformation model (`E037`, see [Incremental](#incremental)). |
+| `type` | string | `"full_refresh"` | Materialization type. One of `"full_refresh"`, `"incremental"`, `"merge"`, `"time_interval"`, `"view"`, `"materialized_view"`, `"dynamic_table"`, `"delete_insert"`, `"microbatch"`, `"content_addressed"`. `"incremental"` needs a watermark column (`E037` without one, see [Incremental](#incremental)). `"ephemeral"` is refused outright (`E038`, see [Ephemeral](#ephemeral)). |
+| `type` | string | `"full_refresh"` | Materialization type. One of `"full_refresh"`, `"merge"`, `"time_interval"`, `"view"`, `"materialized_view"`, `"dynamic_table"`, `"delete_insert"`, `"microbatch"`, `"content_addressed"`, `"snapshot"` (see [Snapshot](#snapshot)). Two are refused: `"incremental"` on a transformation model (`E037`, see [Incremental](#incremental)), and `"ephemeral"` outright (`E038`, see [Ephemeral](#ephemeral)). |
 | `timestamp_column` | string | | Replication watermark column. Required for transformation `microbatch`; it names the output partition column. |
 | `unique_key` | list of strings | | Key columns for merge matching. Required when `type = "merge"`. |
 | `update_columns` | list of strings | | Columns to update on merge match. Defaults to all non-key columns if omitted. |
@@ -249,7 +253,7 @@ tier = "gold"
 
 A model's own `[tags]` override the group key by key, without dropping the rest. One model can set `tier = "silver"` and still inherit `domain = "finance"`. See [`[tags]`](#tags) for how the resolved tags surface on `models_detail[].tags` and project onto Dagster assets.
 
-A group file may carry `schema_template`, `strategy`, `tags`, `governance`, and `enforce`. Rocky rejects an unrecognized key at load, so a typo surfaces immediately.
+A group file may carry `schema_template`, `strategy`, `tags`, `governance`, `enforce`, and `[owner]` (`name`, `email`; see [Model governance](/concepts/model-governance/#ownership-groups-and-owners)). Rocky rejects an unrecognized key at load, so a typo surfaces immediately.
 
 ### `[classification]`
 
@@ -615,30 +619,79 @@ WHERE _fivetran_deleted = false
 
 ### Incremental
 
-A transformation model cannot use `type = "incremental"`. Rocky has no watermark to apply to a model's SQL, so the only statement this strategy could emit is `INSERT INTO <target> <model SQL>`. That appends the whole result again on every run.
+Loads only the rows newer than what the target already holds. Use it when the source has a column whose values only grow, such as `updated_at`. The column is the model's watermark (the value of the newest row already loaded).
 
-`rocky compile` reports the model as error `E037`, with this message:
+**SQL** (`models/fct_orders.sql`):
 
-> model 'fct_orders' uses `type = "incremental"`, which is not supported on transformation models: it emits an unfiltered INSERT and appends every row again on each run
+```sql
+SELECT order_id, customer_id, amount, status, updated_at
+FROM raw.orders
+WHERE @incremental_filter
+```
 
-`rocky test`, `rocky ci` and `rocky emit-sql` fail on the same error. `rocky plan` also refuses to write a plan when this model is in scope. The SQL generator refuses the model too, so `rocky estimate` cannot produce SQL for it.
+**Config** (`models/fct_orders.toml`):
 
-`rocky run` records the model as a failed table and leaves its existing table alone. If an earlier run built that table, it keeps the rows those runs appended again. By default, Rocky also withholds every model that depends on the failed one, directly or through another model. That includes an explicit `depends_on` entry and a bare, unqualified SQL read of the failed model's name. None of them build from that stale or missing table.
+```toml
+[strategy]
+type = "incremental"
+timestamp_column = "updated_at"   # the watermark; `watermark` is an alias
+unique_key = ["order_id"]         # optional: MERGE on this key instead of appending
+lookback = "2 days"               # optional: re-read this far below the watermark
+on_schema_change = "fail"         # or "append_new_columns"
+```
 
-This boundary follows the model graph: `depends_on` plus a bare-name read of another model. Under plain `rocky run`, a read of the same table by its qualified physical name (`schema.table` or `catalog.schema.table`) still escapes it. Add `depends_on` when that relationship must be withheld too. `rocky run --dag` also matches a read's last name segment against every model, so it withholds a qualified read of a failed model.
+| Key | Required | Meaning |
+|---|---|---|
+| `timestamp_column` | yes | An output column. Rocky reads `MAX` of it from the target each run. Alias: `watermark`. |
+| `unique_key` | no | Upsert on these columns with `MERGE`. Without it, Rocky appends. |
+| `lookback` | no | `"<n> seconds"`, `"minutes"`, `"hours"` or `"days"`. Re-reads late rows. Pair it with `unique_key`, or the re-read rows are appended again (`W046`). |
+| `on_schema_change` | no | `fail` (default) stops the run when the model's columns differ from the target's. `append_new_columns` adds new columns with `ALTER TABLE ... ADD COLUMN`. A removed column fails the run in both modes. |
+| `filter_column` | no | The input column `@incremental_filter` compares, when it is not the watermark itself: `"o.updated_at"` in a join, or `"_synced_at"` when the model renames it. |
 
-Set `contain_failures = true` under `[resilience]` to widen the hold to any model whose reads Rocky cannot prove are unrelated. It also contains a runtime failure the same way, reporting `PartialFailure` instead of stopping the run. See [`[resilience]`](/reference/configuration/#resilience). Rebuild the table before you trust it, for example with one `full_refresh` run.
+#### How Rocky resolves `@incremental_filter`
 
-Pick the strategy that matches what you need. These are the four the error names:
+The placeholder marks where the filter goes. Rocky replaces it on every run:
+
+```
+ run                          @incremental_filter becomes
+ ───────────────────────────  ──────────────────────────────────────────────
+ first run (no target yet)    TRUE                    → CREATE TABLE AS
+ rocky run --full-refresh     TRUE                    → CREATE OR REPLACE
+ every later run              (updated_at > (SELECT MAX(updated_at)
+                                 FROM <target>)
+                               OR NOT EXISTS
+                                 (SELECT 1 FROM <target>))
+                                                      → INSERT or MERGE
+```
+
+Rocky reads the watermark from the target, not from its state store. A manual edit of the target therefore moves the watermark too. The `NOT EXISTS` arm loads every row when the target exists but is empty. A `lookback` subtracts its interval from `MAX`. Rows whose watermark is `NULL` load only on the first run and on a full refresh, because `NULL` never compares greater.
+
+The run output reports the watermark. `metadata.watermark` holds the new `MAX` when it is a timestamp, and `notes` names the value the run started from.
+
+#### A model without the placeholder
+
+Rocky can filter the model's output instead of its input. It then runs `SELECT * FROM (<model>) AS _rocky_incremental WHERE <filter on the output column>`. This gives the same rows only when the watermark column is copied unchanged from one input table. `rocky compile` checks that with column lineage. It refuses a column read from a CTE or a subquery, and a model with a top-level `LIMIT`. `filter_column` has no effect on this path. When it cannot prove it, the compile fails with `E046` and asks for the placeholder. A model in the `.rocky` DSL always takes this path, because the DSL has no placeholder.
+
+#### What `rocky compile` refuses
+
+| Code | Cause |
+|---|---|
+| `E037` | `type = "incremental"` with no `timestamp_column`. Rocky could only append every row again on each run. |
+| `E046` | No placeholder and the watermark is not a provable passthrough. Also: the watermark is missing from the model's output, `timestamp_column` or `filter_column` is not a plain column name, or `@incremental_filter` appears in a model of another strategy. |
+| `W046` | `lookback` without `unique_key`. |
+
+`rocky run` records a refused model as a failed table and leaves its existing table alone. By default, Rocky also withholds every model that depends on it. Set `contain_failures = true` under `[resilience]` to widen that hold. See [`[resilience]`](/reference/configuration/#resilience).
+
+Other strategies fit other needs:
 
 | You need | Use |
 |---|---|
-| Update existing rows by key, insert new ones | [`merge`](#merge) with `unique_key` |
+| Update existing rows by key from the whole result | [`merge`](#merge) with `unique_key` |
 | Replace whole partitions | [`delete_insert`](#delete--insert) with `partition_by` |
 | Process one time window per run, with late data | [`time_interval`](#time-interval), with `@start_date` and `@end_date` in the SQL |
 | Rebuild the table from the model's SQL | [`full_refresh`](#full-refresh) |
 
-`incremental` still works on a replication pipeline. There Rocky copies source tables and filters each copy on a stored watermark. See [Incremental processing](/concepts/incremental/).
+On a replication pipeline, `incremental` copies source tables and filters each copy on a watermark in the state store. See [Incremental processing](/concepts/incremental/).
 
 ---
 
@@ -713,18 +766,58 @@ When `update_columns` is omitted, Rocky updates all non-key columns.
 
 ### Ephemeral
 
-`type = "ephemeral"` is refused. `rocky compile` reports the model as error `E038`, with this message:
+An ephemeral model is never materialized. Rocky creates no table or view for it. Instead, each model that reads it gets the ephemeral model's SQL as a CTE (a named subquery in a `WITH` clause). This matches dbt's `materialized='ephemeral'`.
 
-> model 'stg_recent_orders' uses `type = "ephemeral"`, which is not supported: an ephemeral model is not materialized and is not inlined into its consumers, so a consumer reads whatever table already carries the name
+**Config** (`models/eph_paid_orders.toml`):
 
-Rocky never inlined such a model. Nothing rewrote a consumer's `FROM <model>` into a `WITH` clause. So the consumer read whatever physical table already carried that name: an error when none existed, an unrelated table when one did.
+```toml
+[strategy]
+type = "ephemeral"
+```
 
-Two strategies cover what it was for:
+**SQL** (`models/eph_paid_orders.sql`):
 
-| You want | Use |
+```sql
+SELECT order_id, customer_id, amount FROM raw.orders WHERE status = 'paid'
+```
+
+A consumer reads it by its bare name, `FROM eph_paid_orders`. Rocky runs the consumer as:
+
+```sql
+WITH __rocky_ephemeral__eph_paid_orders AS (
+  SELECT order_id, customer_id, amount FROM raw.orders WHERE status = 'paid'
+)
+SELECT customer_id, SUM(amount) AS total
+FROM __rocky_ephemeral__eph_paid_orders AS eph_paid_orders
+GROUP BY customer_id
+```
+
+How the inlining works:
+
+- The CTE is named `__rocky_ephemeral__<model>`. If that name is already used in the statement, Rocky adds `_2`, `_3`, and so on.
+- A reference with no alias keeps the model name as its alias. So `eph_paid_orders.amount` still works.
+- The CTE goes in front of any `WITH` clause the consumer already has.
+- An ephemeral model that reads another ephemeral model works. Each one becomes one CTE, in dependency order, once per consumer.
+- Only a bare model name is a reference. A CTE of the same name in the consumer wins, and the model is not inlined.
+- The rewrite works on the parsed SQL, not on the text. The consumer's executed SQL loses its comments and original spacing.
+
+What each command does with an ephemeral model:
+
+| Command | Behavior |
 |---|---|
-| An intermediate that several models read | `type = "view"`. No copied data, always-fresh reads, one view object per model, on every dialect. |
-| An intermediate only one model reads | An earlier step of that model, in a [`.rocky` file](/concepts/rocky-dsl/). The step folds into the later ones when Rocky lowers the model. |
+| `rocky compile` | Type-checks the model and its consumers as written. Column types and lineage flow through the ephemeral model as through any other model. `--expand-macros` shows each consumer's SQL with the CTE inlined. |
+| `rocky run` | Skips the model. It never appears in `materializations`. `rocky run --dag` marks its node as skipped, and its consumers still run. |
+| `rocky run --model <ephemeral>` | Fails with `E038`. There is nothing to build. Run a model that reads it instead. |
+| `rocky plan`, `rocky emit-sql` | List the model as skipped. Its SQL appears inside each consumer's statement. |
+| Shadow and branch runs | Skip the model. The reads inside its inlined SQL are routed to shadow targets like any other read. |
+
+`rocky compile` reports `E038` for a use that cannot work:
+
+- The model declares `[[tests]]`. There is no table to test. Move the tests to a model that reads it.
+- Another model reads the model's nominal `[target]` by a qualified name, such as `main.eph_paid_orders`. No table has that name. Read the model by its bare name.
+- A consumer cannot be rewritten: its SQL is not one `SELECT` the parser accepts, or a `WITH RECURSIVE` CTE has the same name as a table the inlined SQL reads.
+
+A contract on an ephemeral model is checked at compile time against the inferred columns, as for any model.
 
 ---
 
@@ -806,6 +899,97 @@ table = "fct_events"
 ```
 
 The runtime executes the model SQL, converts the result to Arrow, hashes the Parquet bytes, uploads to `storage_prefix`, and emits a Delta log commit. `partition_columns` may be omitted for unpartitioned tables. Backed by the `rocky-iceberg` writer (shipped in engine v1.30.0 across Phases 1–5: discover, write, sync, partitioned, rowTracking, schema evolution).
+
+---
+
+### Snapshot
+
+A snapshot keeps the history of its model's rows. This is a slowly changing dimension of type 2 (SCD2): each change to a row adds a new version and closes the old one. Rocky follows [dbt snapshots](https://docs.getdbt.com/docs/build/snapshots), but a snapshot here is an ordinary model. It runs in the model DAG under `rocky run`, and downstream models can read it.
+
+**Config** (`models/customers_history.toml`):
+
+```toml
+[strategy]
+type = "snapshot"
+unique_key = "customer_id"     # one column, or a list for a composite key
+strategy = "timestamp"         # or "check"
+updated_at = "updated_at"      # timestamp strategy: the change column
+# check_cols = ["name", "email"] # check strategy: a list, or "all"
+hard_deletes = "invalidate"    # "ignore" (default), "invalidate", "new_record"
+
+[target]
+catalog = "analytics"
+schema = "snapshots"
+table = "customers_history"
+```
+
+The model SQL is a plain SELECT, for example `SELECT customer_id, name, email, updated_at FROM raw.customers`.
+
+**How a change is detected:**
+
+- `timestamp`: a row changed when its `updated_at` is later than the current version's. The new version's `valid_from` is that `updated_at`.
+- `check`: a row changed when a column in `check_cols` differs from the current version. NULL counts as a value. `"all"` compares every column except the key. The new version's `valid_from` is the run time, or the `updated_at` column when you also set one.
+
+**Columns Rocky adds to each row:**
+
+| Column | Meaning |
+|---|---|
+| `valid_from` | When this version became current. |
+| `valid_to` | When this version stopped being current. NULL on the current version. |
+| `is_current` | `TRUE` on the current version of each key. |
+| `snapshot_id` | A hash of the key and `valid_from`, unique per version. |
+| `is_deleted` | Only with `hard_deletes = "new_record"`: `TRUE` on a deletion marker. |
+
+These are the names the `snapshot` pipeline uses. Rename any of them with `snapshot_meta_column_names`. The dbt key names are accepted too, so an imported dbt config reads unchanged:
+
+```toml
+[strategy]
+type = "snapshot"
+unique_key = ["id", "region"]
+strategy = "check"
+check_cols = "all"
+snapshot_meta_column_names = { valid_from = "dbt_valid_from", valid_to = "dbt_valid_to", scd_id = "dbt_scd_id", updated_at = "dbt_updated_at", is_current = false }
+valid_to_current = "CAST('9999-12-31' AS TIMESTAMP)"
+```
+
+- `updated_at` in `snapshot_meta_column_names` adds a copy of the version's change time (dbt's `dbt_updated_at`). It is off by default.
+- `is_current = false` writes no flag column. A version is then current when its `valid_to` is NULL or equals `valid_to_current`. Use this to continue a snapshot table that dbt built.
+- `valid_to_current` (dbt's `dbt_valid_to_current`) is a SQL expression written to `valid_to` on current versions, in place of NULL.
+- `invalidate_hard_deletes = true` is accepted as dbt's older spelling of `hard_deletes = "invalidate"`.
+
+**What a run does:**
+
+```text
+first run   CREATE TABLE ... AS: every row becomes its first current version
+later runs  1. MERGE   close the current version of each changed key
+            2. INSERT  a new current version for each key with no current version
+            3. hard deletes (when not "ignore"):
+               invalidate  UPDATE: close the current version of each key that left the result
+               new_record  INSERT a deletion marker, then UPDATE: close the version it replaces
+```
+
+The statements run one after the other, without a transaction. Not every warehouse has multi-statement transactions. Instead, each step is safe to repeat:
+
+- A run that stops after step 1 leaves some keys with no current version. The next run's step 2 opens them.
+- Step 2 only inserts where no current version exists.
+- A deletion marker is not inserted twice.
+- A run over an unchanged source matches nothing, so it writes nothing.
+
+All statements in one run use one timestamp for "now". A version closed at step 1 and its successor from step 2 meet exactly.
+
+**Limits:**
+
+- `unique_key`, `updated_at` and `check_cols` must name output columns. To key on an expression, compute it in the model SQL and name it.
+- A row whose key is NULL is not snapshotted. A NULL key never matches its earlier version, so it would be inserted again on every run.
+- `is_deleted` is a metadata column only under `hard_deletes = "new_record"`. Under the other modes a model column with that name is ordinary data. If you leave `new_record`, keys whose current version is a deletion marker still reopen when they return.
+- The target keeps the columns it was created with. A column added to the model later is not captured, and `rocky run` reports it in the model's `notes`. Drop the target to rebuild the history with the new column.
+- The key must be unique in the model's result. Databricks and Snowflake refuse the MERGE when it is not.
+- `rocky plan` and `rocky emit-sql` show the steady-state statements, built from the compile-time column list. `rocky run` reads the column list from the target.
+- A `branch` promotion and a shadow run refuse a snapshot model, like the other strategies that build on rows the target already holds.
+- Each statement reads the model SELECT again, so a source that changes during a run can be seen differently by two statements. The next run reconciles it.
+- Databricks and Snowflake have not run these statements live yet. On Databricks, the run timestamp is a session-time-zone `TIMESTAMP`, and a model whose SELECT contains a subquery may be refused inside the hard-delete `UPDATE`.
+
+`rocky compile` reports an invalid config as `E049` and a risky one as `W049`. See the [diagnostic codes](/concepts/compiler/).
 
 ---
 

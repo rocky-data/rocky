@@ -18,6 +18,7 @@ use crate::contracts::{self, CompilerContract};
 use crate::diagnostic::{Diagnostic, W011};
 use crate::project::{Project, ProjectError};
 use crate::semantic::{self, SemanticGraph};
+use crate::source_refs;
 use crate::typecheck::{self, TypeCheckResult};
 use crate::types::{RockyType, TypedColumn};
 
@@ -134,6 +135,18 @@ pub struct CompilerConfig {
     /// E028 error diagnostic naming the variable. Distinct from `${ENV}`
     /// config-time interpolation, which resolves while parsing `rocky.toml`.
     pub run_vars: rocky_core::run_vars::RunVars,
+    /// Where each [`Self::source_schemas`] entry came from (live
+    /// introspection, schema cache, seed), plus the strict-sources switch.
+    /// Drives the E041 / W041 missing-source-column check in
+    /// [`crate::source_refs`]. The default records no origin, so the check
+    /// stays off for callers that don't know their schemas' provenance.
+    pub source_provenance: crate::source_refs::SourceProvenance,
+    /// Keep each consumer's authored SQL instead of replacing it with the
+    /// form that inlines its ephemeral upstreams as CTEs
+    /// ([`crate::ephemeral::apply_ephemerals`]). The language server sets
+    /// this: it maps diagnostics and symbols onto the authored text. Every
+    /// command that executes or renders SQL leaves it `false`.
+    pub preserve_authored_sql: bool,
 }
 
 /// Result of compilation.
@@ -351,17 +364,20 @@ fn substitute_run_vars_into_models(
 /// are merged into the final diagnostic set. Callers that don't use per-run
 /// variables pass an empty `Vec`.
 pub fn compile_project(
-    project: Project,
+    mut project: Project,
     config: &CompilerConfig,
     run_var_diagnostics: Vec<Diagnostic>,
 ) -> Result<CompileResult, CompileError> {
     let mut timings = PhaseTimings::default();
 
-    // 2. Build semantic graph
+    // 2. Build semantic graph, carrying the project's user-defined functions
+    //    (`functions/` beside the models dir) so typecheck can type UDF calls.
     let sg_start = Instant::now();
-    let semantic_graph =
+    let mut semantic_graph =
         semantic::build_semantic_graph(&project, &source_column_info(&config.source_schemas))
             .map_err(CompileError::SemanticGraph)?;
+    let (functions, function_diagnostics) = crate::udf::load_for_models_dir(&config.models_dir);
+    semantic_graph.set_functions(Arc::new(functions));
     timings.semantic_graph_ms = sg_start.elapsed().as_millis() as u64;
 
     // 3. Type check (with model SQL/paths for reference tracking)
@@ -461,6 +477,13 @@ pub fn compile_project(
         &type_check.typed_models,
         config.project_freshness.has_default(),
     );
+    // E050 / W050: a model `[freshness] time_column` that `rocky freshness`
+    // could not read as a load time.
+    let model_freshness_diagnostics = crate::freshness::check_model_freshness(
+        &project.models,
+        &type_check.typed_models,
+        &semantic_graph,
+    );
 
     // 9. Managed-Iceberg format_options (E035). Reject `format_options` the
     //    Databricks warehouse rejects at execution (partition_by + cluster_by
@@ -469,21 +492,62 @@ pub fn compile_project(
     //    a first-run warehouse rejection. (FR-044)
     let lakehouse_diagnostics = typecheck::check_lakehouse_format_options(&project.models);
 
+    // 9b. Redshift `[redshift]` table options (E052 / W052).
+    let redshift_diagnostics = crate::redshift_options::check_redshift_table_options(
+        &project.models,
+        &type_check.typed_models,
+        &semantic_graph,
+    );
+    // ClickHouse `[clickhouse]` table options (E053 / W053).
+    let clickhouse_diagnostics = crate::clickhouse_options::check_clickhouse_table_options(
+        &project.models,
+        &type_check.typed_models,
+        &semantic_graph,
+    );
+
     // 10. Merge all diagnostics.
     let mut diagnostics = type_check.diagnostics.clone();
     diagnostics.extend(contract_diagnostics.iter().cloned());
     diagnostics.extend(blast_radius_diagnostics);
     diagnostics.extend(classification_diagnostics);
     diagnostics.extend(freshness_diagnostics);
+    diagnostics.extend(model_freshness_diagnostics);
     diagnostics.extend(lakehouse_diagnostics);
+    diagnostics.extend(redshift_diagnostics);
+    diagnostics.extend(clickhouse_diagnostics);
     diagnostics.extend(run_var_diagnostics);
     diagnostics.extend(target_collision_diagnostics(&project));
+    // E041 / W041: direct references to columns absent from a source schema
+    // with known provenance. Whole-project and recomputed on every call.
+    diagnostics.extend(source_refs::check_source_column_refs(
+        &project.models,
+        &config.source_schemas,
+        &config.source_provenance,
+    ));
+    // User-defined functions: invalid definitions, then invalid calls (E051).
+    diagnostics.extend(function_diagnostics);
+    diagnostics.extend(crate::udf::check_model_calls(
+        &project.models,
+        semantic_graph.functions(),
+    ));
+    diagnostics.extend(crate::governance::governance_diagnostics(
+        &project,
+        &config.models_dir,
+        rocky_core::model_governance::governance_today(),
+    ));
+    crate::governance::drop_latest_alias_star_noise(&project, &mut diagnostics);
     // Dependency-resolution warnings (D011 depends_on mismatch, D012 an edge
     // derived from a name match a warehouse run does not honour). Produced by
     // `resolve::resolve_dependencies` and parked on the project until now;
     // without this merge they were written and never read, so the one place
     // that knows an edge is questionable said nothing.
     diagnostics.extend(project.resolve_diagnostics.iter().cloned());
+    // Ephemeral models: E038 checks, then inline them into their consumers.
+    // Last, so every pass above ran on the authored SQL.
+    diagnostics.extend(crate::ephemeral::apply_ephemerals(
+        &mut project,
+        !config.preserve_authored_sql,
+    ));
 
     let has_errors = diagnostics
         .iter()
@@ -549,9 +613,16 @@ pub fn compile_incremental(
     let project_load_ms = load_start.elapsed().as_millis() as u64;
 
     let sg_start = Instant::now();
-    let semantic_graph =
+    let mut semantic_graph =
         semantic::build_semantic_graph(&project, &source_column_info(&config.source_schemas))
             .map_err(CompileError::SemanticGraph)?;
+    let (functions, function_diagnostics) = crate::udf::load_for_models_dir(&config.models_dir);
+    // A changed function can retype any model that calls it, and the affected
+    // set below only tracks model files — fall through to a full compile.
+    if functions != **previous.semantic_graph.functions() {
+        return compile(config);
+    }
+    semantic_graph.set_functions(Arc::new(functions));
     let semantic_graph_ms = sg_start.elapsed().as_millis() as u64;
 
     // 2. Compute the affected set. The comparison must be with the NEW
@@ -703,25 +774,71 @@ pub fn compile_incremental(
         &type_check.typed_models,
         config.project_freshness.has_default(),
     );
+    // E050 / W050: a model `[freshness] time_column` that `rocky freshness`
+    // could not read as a load time.
+    let model_freshness_diagnostics = crate::freshness::check_model_freshness(
+        &project.models,
+        &type_check.typed_models,
+        &semantic_graph,
+    );
 
     // E035: managed-Iceberg format_options, mirroring the full-compile path so
     // the LSP (incremental) surface matches `rocky compile`. (FR-044)
     let lakehouse_diagnostics = typecheck::check_lakehouse_format_options(&project.models);
+    // E052 / W052, mirroring the full-compile path.
+    let redshift_diagnostics = crate::redshift_options::check_redshift_table_options(
+        &project.models,
+        &type_check.typed_models,
+        &semantic_graph,
+    );
+    // ClickHouse `[clickhouse]` table options (E053 / W053).
+    let clickhouse_diagnostics = crate::clickhouse_options::check_clickhouse_table_options(
+        &project.models,
+        &type_check.typed_models,
+        &semantic_graph,
+    );
 
     let mut diagnostics = type_check.diagnostics.clone();
     diagnostics.extend(contract_diagnostics.iter().cloned());
     diagnostics.extend(blast_radius_diagnostics);
     diagnostics.extend(classification_diagnostics);
     diagnostics.extend(freshness_diagnostics);
+    diagnostics.extend(model_freshness_diagnostics);
     diagnostics.extend(lakehouse_diagnostics);
+    diagnostics.extend(redshift_diagnostics);
+    diagnostics.extend(clickhouse_diagnostics);
     diagnostics.extend(run_var_diagnostics);
     diagnostics.extend(target_collision_diagnostics(&project));
+    // E041 / W041: direct references to columns absent from a source schema
+    // with known provenance. Whole-project and recomputed on every call.
+    diagnostics.extend(source_refs::check_source_column_refs(
+        &project.models,
+        &config.source_schemas,
+        &config.source_provenance,
+    ));
+    diagnostics.extend(function_diagnostics);
+    diagnostics.extend(crate::udf::check_model_calls(
+        &project.models,
+        semantic_graph.functions(),
+    ));
+    diagnostics.extend(crate::governance::governance_diagnostics(
+        &project,
+        &config.models_dir,
+        rocky_core::model_governance::governance_today(),
+    ));
+    crate::governance::drop_latest_alias_star_noise(&project, &mut diagnostics);
     // Dependency-resolution warnings (D011 depends_on mismatch, D012 an edge
     // derived from a name match a warehouse run does not honour). Produced by
     // `resolve::resolve_dependencies` and parked on the project until now;
     // without this merge they were written and never read, so the one place
     // that knows an edge is questionable said nothing.
     diagnostics.extend(project.resolve_diagnostics.iter().cloned());
+    // Same as the full path: ephemeral checks and inlining run last.
+    let mut project = project;
+    diagnostics.extend(crate::ephemeral::apply_ephemerals(
+        &mut project,
+        !config.preserve_authored_sql,
+    ));
 
     let has_errors = diagnostics
         .iter()
@@ -843,8 +960,21 @@ pub fn default_type_mapper(warehouse_type: &str) -> RockyType {
         "TIMESTAMP" => RockyType::Timestamp,
         "TIMESTAMP_NTZ" => RockyType::TimestampNtz,
         "VARIANT" => RockyType::Variant,
+        // ClickHouse `DateTime64(p)`: an instant with sub-second precision.
+        // The ClickHouse adapter reports it with its precision so drift sees
+        // a precision change; every precision is a `Timestamp` here.
+        _ if is_clickhouse_datetime64(&upper) => RockyType::Timestamp,
         _ => decimal_family_type(&upper),
     }
+}
+
+/// `DATETIME64(p)` (upper-cased ClickHouse `DateTime64(p)`), `p` in 0..=9.
+fn is_clickhouse_datetime64(upper: &str) -> bool {
+    upper
+        .strip_prefix("DATETIME64(")
+        .and_then(|rest| rest.strip_suffix(')'))
+        .and_then(|p| p.trim().parse::<u8>().ok())
+        .is_some_and(|p| p <= 9)
 }
 
 /// The decimal family as this mapper reads it: `DECIMAL` and `NUMERIC`.
@@ -1539,6 +1669,9 @@ mod tests {
             }
         );
         assert_eq!(default_type_mapper("unknown_type"), RockyType::Unknown);
+        // ClickHouse `DateTime64(p)`, as the ClickHouse adapter reports it.
+        assert_eq!(default_type_mapper("DateTime64(6)"), RockyType::Timestamp);
+        assert_eq!(default_type_mapper("DateTime64(x)"), RockyType::Unknown);
     }
 
     /// The decimal family has a grammar here too (#1646). Until this change

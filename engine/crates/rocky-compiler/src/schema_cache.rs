@@ -19,7 +19,7 @@
 //! a compiler operating without catalog awareness would see from a live
 //! `batch_describe_schema` call today.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, Duration, Utc};
 
@@ -27,6 +27,7 @@ use rocky_core::schema_cache::StoredColumn;
 use rocky_core::state::StateStore;
 
 use crate::compile::default_type_mapper;
+use crate::source_refs::{SourceProvenance, SourceSchemaOrigin};
 use crate::types::TypedColumn;
 
 /// Load cached source schemas as the `TypedColumn`-shaped map the typecheck
@@ -59,8 +60,31 @@ pub fn load_source_schemas_from_cache(
     now: DateTime<Utc>,
     ttl: Duration,
 ) -> anyhow::Result<HashMap<String, Vec<TypedColumn>>> {
+    load_source_schemas_with_provenance_from_cache(state, now, ttl, None)
+        .map(|(schemas, _provenance)| schemas)
+}
+
+/// [`load_source_schemas_from_cache`], plus the
+/// [`SourceSchemaOrigin::Cache`] of every entry it returns.
+///
+/// `trusted_max_age` is `[cache.schemas] trusted_max_age_seconds`: an entry
+/// written within it is marked `trusted`, which lets the missing-source-column
+/// check refuse (E041) rather than warn (W041). `None` trusts no entry.
+///
+/// A `<schema>.<table>` written under two catalogs gets no origin at all.
+/// The map still carries the last entry (for typing, as before), but which
+/// catalog a two-part `FROM <schema>.<table>` reads is the warehouse's
+/// call, so the entry cannot prove a column absent.
+pub fn load_source_schemas_with_provenance_from_cache(
+    state: &StateStore,
+    now: DateTime<Utc>,
+    ttl: Duration,
+    trusted_max_age: Option<Duration>,
+) -> anyhow::Result<(HashMap<String, Vec<TypedColumn>>, SourceProvenance)> {
     let entries = state.list_schema_cache()?;
     let mut out: HashMap<String, Vec<TypedColumn>> = HashMap::with_capacity(entries.len());
+    let mut provenance = SourceProvenance::default();
+    let mut ambiguous: HashSet<String> = HashSet::new();
 
     for (key, entry) in entries {
         if entry.is_expired(now, ttl) {
@@ -72,15 +96,27 @@ pub fn load_source_schemas_from_cache(
             // future-format key shouldn't take down the whole compile.
             continue;
         };
+        let trusted = trusted_max_age
+            .is_some_and(|max_age| now.signed_duration_since(entry.cached_at) <= max_age);
+        let origin = SourceSchemaOrigin::Cache {
+            cached_at: entry.cached_at,
+            trusted,
+        };
         let typed = entry
             .columns
             .into_iter()
             .map(stored_column_to_typed_column)
             .collect();
-        out.insert(compiler_key, typed);
+        if out.insert(compiler_key.clone(), typed).is_some() {
+            ambiguous.insert(compiler_key.clone());
+        }
+        provenance.origins.insert(compiler_key, origin);
+    }
+    for key in &ambiguous {
+        provenance.origins.remove(key);
     }
 
-    Ok(out)
+    Ok((out, provenance))
 }
 
 /// Translate `"<catalog>.<schema>.<table>"` -> `"<schema>.<table>"`.
@@ -214,6 +250,61 @@ mod tests {
         let map = load_source_schemas_from_cache(&store, now, Duration::hours(24)).unwrap();
         assert!(map.contains_key("staging.orders"));
         assert!(!map.contains_key("prodcat.staging.orders"));
+    }
+
+    #[test]
+    fn provenance_records_cache_origin_and_trust() {
+        let (store, _dir) = temp_state();
+        let now = Utc::now();
+        seed(&store, "cat", "s", "recent", now - Duration::minutes(5));
+        seed(&store, "cat", "s", "older", now - Duration::hours(3));
+
+        let (map, provenance) = load_source_schemas_with_provenance_from_cache(
+            &store,
+            now,
+            Duration::hours(24),
+            Some(Duration::hours(1)),
+        )
+        .unwrap();
+        assert_eq!(map.len(), 2);
+        assert!(matches!(
+            provenance.origins.get("s.recent"),
+            Some(SourceSchemaOrigin::Cache { trusted: true, .. })
+        ));
+        assert!(matches!(
+            provenance.origins.get("s.older"),
+            Some(SourceSchemaOrigin::Cache { trusted: false, .. })
+        ));
+
+        // No max age configured: nothing is trusted.
+        let (_, provenance) =
+            load_source_schemas_with_provenance_from_cache(&store, now, Duration::hours(24), None)
+                .unwrap();
+        assert!(matches!(
+            provenance.origins.get("s.recent"),
+            Some(SourceSchemaOrigin::Cache { trusted: false, .. })
+        ));
+    }
+
+    #[test]
+    fn provenance_drops_a_table_cached_under_two_catalogs() {
+        let (store, _dir) = temp_state();
+        let now = Utc::now();
+        seed(&store, "cat_a", "s", "orders", now);
+        seed(&store, "cat_b", "s", "orders", now);
+
+        let (map, provenance) = load_source_schemas_with_provenance_from_cache(
+            &store,
+            now,
+            Duration::hours(24),
+            Some(Duration::hours(1)),
+        )
+        .unwrap();
+        assert!(map.contains_key("s.orders"), "typing still uses the entry");
+        assert!(
+            !provenance.origins.contains_key("s.orders"),
+            "an ambiguous entry must not prove a column absent"
+        );
     }
 
     #[test]

@@ -313,6 +313,14 @@ export type {
   EnvMaskingStatus,
 } from "./compliance";
 
+// Freshness — `rocky freshness` source + model freshness report
+export type {
+  FreshnessCheckResult,
+  FreshnessOutput,
+  FreshnessStatus,
+  FreshnessSummary,
+} from "./freshness";
+
 // Preview (PR-bundle: create branch, diff base vs branch, cost delta)
 export type {
   PreviewCopiedModel,

@@ -130,7 +130,21 @@ The importer never inlines a connection secret. Passwords, API tokens, and servi
 | `microbatch` | `merge`, or `time_interval` when you pass `--microbatch-as time_interval`. Without a `unique_key`, `full_refresh` with a warning |
 | anything else | `full_refresh`, plus a TODO line in `MIGRATION-NOTES.md` |
 
-Rocky has no append strategy for transformation models: `incremental` is refused there with `E037`, because it would re-insert every row on each run. The importer never emits it. An append-style dbt model falls back to `full_refresh`, which cannot duplicate rows. The fallback covers four cases:
+An incremental model whose SQL uses dbt's standard watermark filter imports as a Rocky [`incremental`](/reference/model-format/#incremental) model. The filter must be one `{% if is_incremental() %}` block of this shape, with no `{% else %}`:
+
+```sql
+{% if is_incremental() %}
+  WHERE updated_at > (SELECT MAX(updated_at) FROM {{ this }})
+{% endif %}
+```
+
+The block becomes `WHERE @incremental_filter` (or `AND @incremental_filter`), and the sidecar gets `timestamp_column = "updated_at"`. A qualified or renamed left side (`o._synced_at > (SELECT MAX(updated_at) ...)`) also sets `filter_column`. Only a strict `>` is recognised. A `>=` compares differently, so it is not converted. The `unique_key` carries over when `incremental_strategy` is unset or `'merge'`; `'append'` drops it. Other strategies, `'delete+insert'` included, keep their previous mapping: a keyed `MERGE` does not delete every target row of a non-unique key. `on_schema_change` maps `fail` and `append_new_columns` directly, `sync_all_columns` to `append_new_columns`, and `ignore` to `fail`, each change with a warning.
+
+On the raw path, the other Jinja in the file must convert too. From a manifest, the importer rebuilds the SQL from `raw_code` when the block is its only statement tag. Otherwise it keeps the full-refresh `compiled_code` with no placeholder, and Rocky filters the model's output column. `rocky compile` then refuses the model with `E046` unless that column is a direct passthrough.
+
+On the raw path, an incremental model that uses `is_incremental()` in any other way is still imported. The block is commented out under a `-- TODO: dbt is_incremental() block not translated:` line, and the sidecar has no watermark. `rocky compile` refuses the model with `E037` until you add `timestamp_column` and the placeholder.
+
+Any other append-style dbt model falls back to `full_refresh`, which cannot duplicate rows. The fallback covers four cases:
 
 - `incremental` with no `unique_key`
 - `incremental_strategy = 'append'`, even with a `unique_key`
@@ -147,7 +161,7 @@ Some fallbacks are refused instead. A manifest import keeps dbt's compiled SQL, 
 An `incremental` model with a `unique_key` is imported as `merge` from the same compiled SQL. `merge` creates its table from that SQL on the first run, and so does `delete_insert`. If the SQL kept an `is_incremental()` filter, that first run goes wrong ([#2059](https://github.com/rocky-data/rocky/issues/2059)). The common filter, `MAX(...)` over the model's own table, fails because that table does not exist yet. A literal cutoff loads only the recent rows. The importer does not refuse this case. Remove the filter from the model's SQL before the first run.
 :::
 
-Rocky refuses a model whose raw Jinja calls `is_incremental()` on either raw-SQL path: `--no-manifest`, or a manifest node with no `compiled_code`. Without compiled SQL, Rocky cannot preserve dbt's first-run versus later-run distinction. Each refused model is listed under `failed_details`.
+Apart from the incremental conversion above, Rocky refuses a model whose raw Jinja calls `is_incremental()` on either raw-SQL path: `--no-manifest`, or a manifest node with no `compiled_code`. Without compiled SQL, Rocky cannot preserve dbt's first-run versus later-run distinction. Each refused model is listed under `failed_details`.
 
 A profile type Rocky does not support natively stubs a DuckDB `[adapter]`, so the emitted project still compiles. `MIGRATION-NOTES.md` records the original type under "Not Translated".
 
@@ -706,6 +720,8 @@ rocky list consumers <model> # What depends on this model
 ```
 
 Every subcommand supports `--output json` via `-o json`. Rocky finds models in the `models/` directory and in its immediate subdirectories, which covers the common `models/{layer}/` layout.
+
+`rocky list models` takes `--select`, `--exclude`, and `--state-ref` and lists only the selected models. Bare `rocky list` lists models too, so `rocky list --select +fct_orders` works like `dbt ls`. The JSON shape is the same as `rocky list models`. See [Node selection](/reference/node-selection/).
 
 See the [CLI Reference](/reference/cli/#rocky-list) for full examples and JSON output schemas.
 

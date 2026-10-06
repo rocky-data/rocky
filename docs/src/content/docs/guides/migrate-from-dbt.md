@@ -290,6 +290,7 @@ The importer translates each `{{ config(...) }}` key onto a Rocky sidecar field:
 | dbt `{{ config(...) }}` | Rocky sidecar |
 |---|---|
 | `materialized='table' \| 'incremental' \| 'view'` | The `[strategy]` block. `view` maps to Rocky's own `view` strategy. |
+| `materialized='ephemeral'` | `type = "ephemeral"`. Rocky inlines the model into each consumer as a CTE, as dbt does. A consumer imported from the manifest's compiled SQL already carries dbt's `__dbt__cte__<model>` CTE and runs as-is. |
 | `unique_key=...` | The `merge` strategy, with `unique_key` as an array. |
 | `alias='name'` | `[target].table`, the output relation, so the data lands in the aliased table rather than one named after the node. Dropping this would mis-route data silently. |
 | `materialized='microbatch'` | A `merge` strategy by default, or `time_interval`. Choose with `--microbatch-as <merge\|time_interval>`. `merge` reuses the dbt `unique_key` for an idempotent key-upsert, so dbt microbatch's partition-replace becomes a key upsert. `time_interval` maps the batch onto Rocky's partition-window model. Either way, `MIGRATION-NOTES.md` records the choice for review. |
@@ -302,6 +303,7 @@ It translates the rest of the project like this:
 - `{{ var('name') }}` / `{{ var('name', default) }}` → an `@var(name)` / `@var(name, default)` run-variable marker left in the emitted SQL, resolved at run time by `rocky run --var name=value` (see [Handle unsupported Jinja](#3-handle-unsupported-jinja))
 - dbt **tags** (node- and folder-level) → the sidecar `[tags]` block (`<tag> = "true"`)
 - `{{ this }}` → the model's own fully-qualified `catalog.schema.table`
+- dbt **model governance** → [Rocky model governance](/concepts/model-governance/). See [Access, groups and versions](#access-groups-and-versions) below.
 - **dbt generic tests** (`unique`, `not_null`, `accepted_values`, `relationships`) → `[[tests]]` blocks, column by column. This includes the *configured* forms that carry `severity:` (a `warn` becomes a Rocky warning, not a hard error) and `where:` (a row filter). See [Generic test mapping](#generic-test-mapping) below.
 - model-level **`dbt_utils.unique_combination_of_columns`** → a Rocky `composite` uniqueness `[[tests]]` block over the same column tuple. The columns come from the test config, so Rocky needs no model schema.
 - Top-level `dbt_project.yml` → the project name and the seeds path
@@ -313,13 +315,14 @@ The importer does not translate the items below, by design. Rocky has no Jinja r
 - **dbt tests with no native Rocky equivalent.** Beyond the canonical four, the importer converts several `dbt_utils` and `dbt_expectations` tests to native Rocky assertions: `unique_combination_of_columns`, `accepted_range` / `expect_column_values_to_be_between` (→ `in_range`), `expect_column_values_to_match_regex` (→ `regex_match`), `expect_column_values_to_be_in_set` (→ `accepted_values`), and `dbt_utils.expression_is_true` (→ `expression`). See [Generic test mapping](#generic-test-mapping). Anything outside that set — other `dbt_utils.*` and `dbt_expectations.*` tests, project-defined generics, other model-level tests — becomes a structured `UnsupportedTest` warning per occurrence. The emitted TOML carries no stub for it. Rewrite those as a Rocky `expression` test or a quality-pipeline check.
 - **Singular tests** in `tests/` (custom SQL): copy and rewrite them yourself.
 - **dbt macros and `dbt_packages/`.** Rocky has no Jinja runtime, so no macro body expands.
-- **Incremental models on the raw path:** **refused**, including models configured in `dbt_project.yml` or a model properties YAML file. Rocky cannot prove the first-run SQL from raw code. Run `dbt compile --full-refresh` and import the artifact pair. A non-incremental raw model that calls `is_incremental()` is also refused. Versioned models are refused because raw import cannot resolve their per-version settings.
+- **Incremental models on the raw path:** converted when the model uses dbt's standard `{% if is_incremental() %} WHERE <col> > (SELECT MAX(<col>) FROM {{ this }}) {% endif %}` filter. The block becomes Rocky's `@incremental_filter`, which loads every row on the first run. Another `is_incremental()` use is kept as a commented TODO with no watermark, so `rocky compile` refuses the model (`E037`) until you finish it. An incremental model with no `is_incremental()` block is **refused**, including models configured in `dbt_project.yml` or a model properties YAML file. Run `dbt compile --full-refresh` and import the artifact pair. See [`rocky import-dbt`](/reference/commands/development/#rocky-import-dbt). A non-incremental raw model that calls `is_incremental()` is also refused. Versioned models are refused because raw import cannot resolve their per-version settings.
 - **Jinja control flow** (`{% if %}`, `{% for %}`, `{% macro %}`, `{% call %}`, and whitespace-control forms) on the no-manifest path: **refused**. Raw conversion cannot evaluate these statements and would keep a conditional body without its guard. Run `dbt compile --full-refresh` and import with the manifest, or rewrite the model. `{{ var() }}` still converts to an `@var()` run-variable marker when used outside a config expression.
 - **Unmapped `materialized` values** (`dynamic_table`, `seed`): flattened to `full_refresh` and listed in `MIGRATION-NOTES.md`. `materialized_view` is not in this group; it maps to Rocky's own `materialized_view` strategy.
-- **Adapters Rocky does not support natively** (Postgres, Redshift, and others): the generated repo stubs DuckDB so the project still loads. Replace the `[adapter]` block once Rocky has an adapter for that warehouse, or pass `--target-adapter <kind>` to skip detection.
+- **Profile types the importer does not map** (Postgres, Redshift, and others): the generated repo stubs DuckDB so the project still loads. Replace the `[adapter]` block with the matching one — Rocky has [PostgreSQL](/reference/adapters/postgres/), [Redshift](/reference/adapters/redshift/) and [SQL Server](/reference/adapters/sqlserver/) adapters — or pass `--target-adapter <kind>` to skip detection.
 - **Custom Jinja macros that emit SQL** (`{{ generate_schema_name() }}`, a dynamic `UNION ALL` macro): reported as failed models, with the macro name in the reason.
 - **Python dbt models** (`.py` files): not SQL. Rewrite them yourself.
-- **Snapshots, MetricFlow metrics and semantic models, and exposures**: not translated, but **detected and counted**. Each one raises a `DroppedConstruct` warning and increments `constructs_dropped` in the JSON output, so an import is never silently lossy.
+- **Snapshots** convert to [`type = "snapshot"` models](/reference/model-format/#snapshot). Both legacy `{% snapshot %}` blocks and YAML snapshots (dbt 1.9+) convert, from a manifest or from the `snapshot-paths` directories. The model keeps dbt's column names (`dbt_valid_from`, `dbt_valid_to`, `dbt_scd_id`, `dbt_updated_at`, `dbt_is_deleted`) and writes no `is_current` column, so `rocky run` can continue a table dbt built. Two differences: new versions get Rocky's `dbt_scd_id` hash, not dbt's, and `dbt_is_deleted` is a BOOLEAN, not a string. A snapshot with a custom strategy macro, no `unique_key`, an expression as `unique_key`, or Jinja control flow in its body is reported as a failure with the reason. Without a manifest, a project-level `snapshots:` block in `dbt_project.yml` also fails the import, and the target schema is the configured one: dbt's `generate_schema_name` may have built the table elsewhere, so check the target before the first run. With a manifest, Rocky targets the relation dbt resolved.
+- **MetricFlow metrics and semantic models, and exposures**: not translated, but **detected and counted**. Each one raises a `DroppedConstruct` warning and increments `constructs_dropped` in the JSON output, so an import is never silently lossy.
 - **dbt model contracts** (`contract: {enforced: true}`, column `data_type` declarations, and `constraints`): not carried over to Rocky's contract model. The importer detects and reports them instead of dropping them. Each one emits a warning and increments a `contracts_dropped` counter in the JSON output and in `MIGRATION-NOTES.md`. You then know which models had a contract to re-author. See [Column-level contracts](#column-level-contracts-manual) for the Rocky equivalent.
 
 :::caution[Run `dbt compile --full-refresh` first]
@@ -603,6 +606,30 @@ A group differs from a dbt folder default in one way that matters when you migra
 
 A group also takes `enforce = true`. With that set, a member model that pins a field the group controls, its target schema or its strategy, fails to load. It does not diverge quietly. The group stops being an overridable default and becomes a guarantee that every model in it routes and materializes the same way.
 
+### Access, groups and versions
+
+dbt's [model governance](https://docs.getdbt.com/docs/mesh/govern/about-model-governance) maps onto [Rocky model governance](/concepts/model-governance/). The importer carries each part over:
+
+| dbt | Rocky |
+|---|---|
+| `access: private \| protected \| public` | `access = "..."` in the model sidecar. The meaning is the same. |
+| `group: finance` on a model | `access_group = "finance"` in the model sidecar. |
+| `groups:` entry with `owner: {name, email}` | `models/groups/finance.toml` with an `[owner]` table. |
+| `versions:` with `v: 1`, `v: 2` | Models `orders_v1` and `orders_v2`, plus the version declaration `models/orders.toml`. |
+| `latest_version: 2` | `latest_version = 2` in the declaration. `FROM orders` reads the latest version through a view. |
+| `deprecation_date` on a version | `deprecation_date = "YYYY-MM-DD"` on the version in the declaration. A reader gets `W048`. |
+| `{{ ref('orders', v=1) }}` | `orders_v1`, a pinned version. |
+| `{{ ref('orders') }}` to a versioned model | `orders`, the latest version. |
+
+Two points to check:
+
+- As in dbt, only `public` models may be read from another project. Rocky checks this in `rocky publish-ir` and in the consumer's `[[sources]]`.
+- Rocky versions are whole numbers. A dbt version such as `1.5` is refused with a reason; rename it to a whole number first.
+
+When dbt's latest version already materializes to the unversioned name (an `alias`), the importer sets `latest_alias = false` in the declaration, so the alias view does not collide with that table.
+
+With a manifest, dbt has already resolved every `access` and `group`, including `+access` and `+group` folder defaults from `dbt_project.yml`. Without a manifest, the importer reads `access` and `group` only from the model YAML or its `config:` block. It does not read the folder defaults, so set those on the models after import.
+
 ## 5. Compile the Imported Models
 
 Run the compiler to type-check every imported model:
@@ -706,6 +733,26 @@ rocky apply "$plan_id"
 ```
 
 Then compare row counts, column types, and data values between the dbt tables and the Rocky tables.
+
+### Select models the way you did in dbt
+
+Rocky accepts dbt's node selection syntax on `--select` and `--exclude`. The table maps the common dbt commands. See [Node selection](/reference/node-selection/) for the full grammar.
+
+| dbt | Rocky |
+|---|---|
+| `dbt ls --select <sel>` | `rocky list --select <sel>` |
+| `dbt compile --select <sel>` | `rocky compile --select <sel>`, or `rocky emit-sql --select <sel>` for the SQL |
+| `dbt run --select <sel>` | `rocky run --select <sel>` |
+| `dbt test --select <sel>` | `rocky test --select <sel>` |
+| `dbt docs generate --select <sel>` | `rocky docs --select <sel>` |
+| `--select +model`, `model+`, `2+model`, `@model` | The same graph operators |
+| `--select tag:nightly` | `--select tag:nightly`. Rocky matches a `[tags]` key or value. |
+| `--select path:models/staging` | The same |
+| `--select config.materialized:incremental` | The same. `table` matches Rocky's `full_refresh`. |
+| `--select source:raw+` | The same. Rocky matches the external tables a model reads. |
+| `--select state:modified+ --state path/to/artifacts` | `--select state:modified+ --state-ref main`. Rocky compares against a git ref, not a manifest. |
+| `--exclude <sel>` | The same |
+| `--defer --state path/to/artifacts` | `--defer`, optionally `--defer-to <schema>` |
 
 ## 9. Convert dbt Tests to Rocky Tests and Contracts
 
@@ -970,7 +1017,7 @@ The importer names each model after its SQL file's stem, so `stg_orders.sql` bec
 
 ### An incremental model imported as `full_refresh`
 
-Rocky has no append strategy for transformation models. It refuses `type = "incremental"` there with `E037`, because it would re-insert every row on each run. So the importer maps an append-style dbt model to `full_refresh`, which rebuilds from the model SQL and cannot duplicate rows:
+A dbt incremental model with the standard `is_incremental()` watermark filter imports as a Rocky `incremental` model with `@incremental_filter`. Without that filter there is no watermark to apply. A Rocky `incremental` model without one is refused with `E037`, because it would re-insert every row on each run. So the importer maps such an append-style dbt model to `full_refresh`, which rebuilds from the model SQL and cannot duplicate rows:
 
 - an `incremental` model with no `unique_key`
 - `incremental_strategy = 'append'`, even with a `unique_key`
@@ -980,7 +1027,7 @@ Rocky has no append strategy for transformation models. It refuses `type = "incr
 
 Each one appears as a warning. To keep incremental behaviour, give the model a `unique_key` and set `incremental_strategy` to `'merge'` or leave it unset. It then maps to `merge`. Otherwise, rewrite it as a [`time_interval`](/concepts/time-interval/) model with `@start_date` and `@end_date`.
 
-Any of these is refused when its dbt SQL uses `is_incremental()`. The compiled SQL can keep a delta filter. As `full_refresh`, every run would replace the table with only recent rows. Rewrite it by hand: remove the filter, then use `merge` with a `unique_key` or a `time_interval` model.
+Any of these is refused when its dbt SQL uses `is_incremental()` in a form other than the standard watermark filter. The compiled SQL can keep a delta filter. As `full_refresh`, every run would replace the table with only recent rows. Rewrite it by hand: remove the filter, then use `merge` with a `unique_key` or a `time_interval` model.
 
 :::caution[Incremental models need a full-refresh compile]
 Every manifest incremental model needs successful per-model evidence in a matching full-refresh artifact pair and `compiled_code`. Plain or selective compiles can leave unsafe or missing SQL. A custom macro can hide the `is_incremental()` call. Rocky's first run then fails or omits old rows.

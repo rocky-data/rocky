@@ -139,39 +139,199 @@ pub const E034: &str = "E034";
 /// can never drift. (FR-044)
 pub const E035: &str = "E035";
 
-/// A transformation model declares `type = "incremental"`.
+/// A transformation model declares `type = "incremental"` with no watermark.
 ///
 /// Emitted by `rocky compile` (`check_incremental_strategy` in `typecheck.rs`).
-/// On a transformation model the strategy lowers to a plain
-/// `INSERT INTO <target> <model SQL>` with no watermark filter, so every run
-/// after the first appends the whole result again (#1990). Replication
-/// pipelines are unaffected: their `incremental` copy does apply a watermark.
-/// The error names the strategies that work instead. `E036` is taken by the
-/// target-collision check in `compile.rs`, which emits it as a literal.
+/// Without a `timestamp_column` (alias `watermark`) the strategy could only
+/// lower to a plain `INSERT INTO <target> <model SQL>` with no filter, so every
+/// run after the first would append the whole result again (#1990). The error
+/// points at the watermark config and the `@incremental_filter` placeholder,
+/// and names the other strategies that work. Replication pipelines are
+/// unaffected: their `incremental` copy applies its own watermark. `E036` is
+/// taken by the target-collision check in `compile.rs`, which emits it as a
+/// literal.
 pub const E037: &str = "E037";
 
-/// A model declares `type = "ephemeral"`.
+/// An `ephemeral` model is used in a way that cannot work.
 ///
-/// Emitted by `rocky compile` (`check_ephemeral_strategy` in `typecheck.rs`).
-/// An ephemeral model is never materialized, and nothing inlines it: no pass
-/// in `rocky-compiler` or `rocky-sql` rewrites a consumer's `FROM <model>`
-/// into a CTE (#1996). A consumer therefore reads whatever physical table
-/// happens to carry that name — a catalog error when none exists, a silent
-/// read of a stale or unrelated table when one does. The error names
-/// `type = "view"`, which gives the same always-fresh reads with no copied
-/// data, on every dialect.
+/// Ephemeral models are supported: each consumer executes with the model's
+/// SQL inlined as a `__rocky_ephemeral__<model>` CTE (`ephemeral.rs`). Until
+/// that inlining existed (#1996) this code refused `type = "ephemeral"`
+/// outright; it now marks only the uses inlining cannot serve:
+///
+/// - `[[tests]]` on an ephemeral model — there is no table to test;
+/// - a qualified read of an ephemeral model's nominal `[target]`
+///   (`main.eph_orders`) — no table backs that name;
+/// - a consumer the inliner cannot rewrite (the SQL is not one parseable
+///   `SELECT`, or a `WITH RECURSIVE` CTE would capture a name the inlined
+///   SQL reads);
+/// - `rocky run --model <ephemeral>` — there is nothing to build (emitted
+///   by the CLI, not by `rocky compile`).
 pub const E038: &str = "E038";
 
 /// A direct projection reads a column absent from a complete in-project model.
 ///
 /// Emitted only when Rocky can prove the upstream model's output names are
-/// complete. External source schemas do not carry completeness or freshness
-/// provenance, so their unresolved references remain conservative `Unknown`s.
+/// complete. External sources are covered separately, by [`E041`] / [`W041`],
+/// which weigh where the source schema came from.
 pub const E039: &str = "E039";
 
 /// A `.rocky` string literal contains a backslash, whose SQL meaning varies
 /// by target dialect. Use a `.sql` model with the target's own escaping.
 pub const E040: &str = "E040";
+
+/// An aggregating query reads a column that is neither grouped nor inside an
+/// aggregate, in its SELECT list, HAVING, or ORDER BY.
+///
+/// Emitted by `rocky compile` only when the column provably belongs to a
+/// relation in the same query scope (an upstream model, a known source
+/// schema, a CTE, or a derived table). Unresolved names, `GROUP BY ALL`,
+/// projection aliases, and arguments of unknown functions stay silent. See
+/// `rocky_compiler::group_by` for the full rule set.
+pub const E044: &str = "E044";
+/// An aggregate's argument type has no overload on the target dialect, and the
+/// dialect does not cast it implicitly — e.g. `SUM(VARCHAR)` on DuckDB,
+/// BigQuery or Trino. The statement can never run. Emitted by `rocky compile`
+/// from [`crate::operand_check`], which carries the per-dialect table and its
+/// documentation sources. Where the dialect casts at run time instead, the
+/// same argument is [`W042`].
+pub const E042: &str = "E042";
+
+/// A comparison (`=`, `<>`, `<`, `IN`, `BETWEEN`, join `ON`, …) pairs types
+/// the target dialect refuses outright — e.g. `INT64 = STRING` on BigQuery or
+/// `bigint = varchar` on Trino. Emitted by `rocky compile` from
+/// [`crate::operand_check`]. Where the dialect casts implicitly and failure
+/// depends on the data, the same pair is [`W043`]. A same-named join key whose
+/// type differs across upstream models stays [`E001`]/[`W001`]'s.
+pub const E043: &str = "E043";
+/// A direct column reference names a column absent from an external source
+/// whose schema Rocky holds as authoritative.
+///
+/// Emitted by `rocky compile` (and the compile `rocky run` performs before it
+/// executes) from [`crate::source_refs::check_source_column_refs`]. The source
+/// schema counts as authoritative when it was introspected live during this
+/// invocation, when it came from a schema-cache entry younger than
+/// `[cache.schemas] trusted_max_age_seconds`, or when strict sources are on
+/// (`rocky compile --strict-sources` or `[cache.schemas] strict_sources`).
+/// Without one of those the same finding is [`W041`].
+///
+/// It fires only when the reference binds unambiguously: every relation the
+/// name could resolve against is a known source (no CTE, derived table,
+/// in-project model or table function in scope), no `SELECT` alias or
+/// relation name matches it, a `a.b` reference cannot also be read as a
+/// struct field, and the name is neither quoted (`"x"` is a string in BigQuery
+/// and, by default, Databricks) nor `_`-prefixed (warehouse metadata columns).
+/// Anything else keeps the conservative `Unknown` result. The
+/// message names the column and the source, and suggests close column names.
+pub const E041: &str = "E041";
+/// A user-defined function (`functions/`) or a call to one is invalid.
+///
+/// Emitted by `rocky compile` (`rocky_compiler::udf`). Attributed to the
+/// function when its definition cannot be created — `language` other than
+/// `"sql"` (Python UDFs are refused), a bad identifier or type, a missing
+/// body, a duplicate name, a call cycle between functions. Attributed to the
+/// calling model when a call passes the wrong number of arguments, names an
+/// invalid function, or passes an argument whose type no supported warehouse
+/// converts to the declared parameter type (e.g. a `DATE` into a `BIGINT`).
+/// Also the code `rocky run` / `rocky plan` use to refuse function DDL on a
+/// warehouse that cannot create it (Trino). Calls that Rocky cannot verify
+/// are [`W051`], never this.
+pub const E051: &str = "E051";
+/// A freshness declaration cannot be checked as written.
+///
+/// Emitted by `rocky compile` for a transformation pipeline's
+/// `[[pipeline.<name>.sources]]` `freshness` block when it declares neither
+/// `warn_after` nor `error_after`, a duration that does not parse (`"12h"`,
+/// `"3600s"`, `"7d"`), an `error_after` shorter than `warn_after`, a
+/// `loaded_at_field` that is not a plain identifier, or a `filter` carrying a
+/// statement terminator. Also emitted for a model's own sidecar `[freshness]`
+/// block (not an inherited one) whose `time_column` is absent from the
+/// model's output when that output is
+/// provably complete (no `SELECT *`, every projection named): the model's own
+/// SQL decides its output, so the absence is a fact, not a stale schema.
+pub const E050: &str = "E050";
+/// A transformation `incremental` model's watermark filter has no safe place.
+///
+/// Emitted by `rocky compile` (`check_incremental_strategy` in `typecheck.rs`)
+/// when the model declares a watermark but its SQL has no
+/// `@incremental_filter` placeholder and lineage cannot prove the watermark is
+/// a direct passthrough of one input column (so filtering the output is not
+/// the same as filtering the input); when the watermark is missing from a
+/// provably complete output schema or is not a plain column name; or when
+/// `@incremental_filter` appears in a model whose strategy is not
+/// `incremental`. The suggestion says where the placeholder goes.
+pub const E046: &str = "E046";
+/// A `type = "snapshot"` model's config is invalid.
+///
+/// Emitted by `rocky compile` (`check_snapshot_strategy` in `snapshot.rs`):
+/// a missing `unique_key` or `strategy`, `strategy = "timestamp"` without
+/// `updated_at`, `strategy = "check"` without `check_cols`, a key or change
+/// column that is an expression rather than a column name, an `updated_at` or
+/// `check_cols` entry the model's own explicit projection does not output,
+/// a unique key the projection computes non-deterministically (`random()`,
+/// `uuid()`, `now()`), an output column that collides with a snapshot metadata
+/// column, or an invalid metadata column name or `valid_to_current`.
+/// Absence is only an error when the model lists its columns itself; under
+/// `SELECT *` the compile-time schema may be stale, so it is W049 instead.
+pub const E049: &str = "E049";
+/// A model references a `private` model outside that model's ownership group.
+///
+/// Emitted by `rocky compile` for each such reference, on the consumer. Also
+/// emitted on a `private` model that belongs to no group (it could never be
+/// referenced). On the cross-project path it fires when a consumer's
+/// `[[sources]]` entry reads a producer model the producer did not publish as
+/// `public`. See `rocky_core::model_governance`.
+pub const E047: &str = "E047";
+
+/// A model-version problem: a version declaration whose `latest_version` is
+/// not declared, a declared version with no `<name>_v<N>` model, or a
+/// reference to a version that is not declared (or to the bare name of a
+/// versioned model whose `latest_alias` is off).
+pub const E048: &str = "E048";
+/// A model's `[redshift]` table options cannot render.
+///
+/// Emitted by `rocky compile` (`redshift_options::check_redshift_table_options`)
+/// for an invalid `dist_key` / `sort_key` column name, a contradictory
+/// combination (`dist_style = "key"` without `dist_key`, `dist_key` with
+/// another `dist_style`, `sort_style = "auto"` with columns, more than 8
+/// interleaved sort columns), or `[redshift]` on a strategy that builds no
+/// table (`view`, `materialized_view`, `dynamic_table`, `content_addressed`,
+/// `ephemeral`) or alongside a lakehouse `format`. The option rules are shared
+/// with the Redshift dialect's SQL-generation guard, so the two cannot drift.
+pub const E052: &str = "E052";
+/// ClickHouse cannot run a model as configured.
+///
+/// Emitted by `rocky compile` in two places:
+///
+/// - `clickhouse_options::check_clickhouse_table_options`, for a model's
+///   `[clickhouse]` block that cannot render (an engine that is not a
+///   parameterless MergeTree-family name, an invalid `order_by` column, a
+///   `partition_by` that is not a column or `fn(column)`), or that sits on a
+///   strategy that builds no table (`view`, `materialized_view`,
+///   `dynamic_table`, `content_addressed`, `ephemeral`) or alongside a
+///   lakehouse `format`. The option rules are shared with the ClickHouse
+///   dialect's SQL-generation guard.
+/// - the CLI's adapter check, for a `merge` model or an `incremental` model
+///   with a `unique_key` when every configured warehouse is ClickHouse:
+///   ClickHouse has no `MERGE` statement, so Rocky cannot update rows by key.
+///   A project that also configures a warehouse with `MERGE` is not refused at
+///   compile time; `rocky run` refuses at SQL generation if the model runs on
+///   ClickHouse.
+pub const E053: &str = "E053";
+/// SQL Server cannot run a model's SQL as written: its CTEs cannot be lifted
+/// to the head of the statement.
+///
+/// T-SQL accepts `WITH` only at the start of a statement, so Rocky lifts
+/// every CTE — nested ones included, such as those an inlined `ephemeral`
+/// model brings — into one leading list
+/// (`rocky_sqlserver::tsql::hoist_ctes`). Nested CTEs whose names collide are
+/// renamed in their own scope first (`final` → `final__2`). Emitted by the
+/// CLI's adapter check when every configured warehouse is SQL Server and the
+/// lift is still impossible: the SQL does not parse for the rename, or a
+/// nested CTE's name is also used unqualified elsewhere in the statement
+/// (for example as a column). A project that also configures another
+/// warehouse is not refused at compile time.
+pub const E054: &str = "E054";
 
 // Warnings
 /// Unused model (no downstream consumers).
@@ -224,6 +384,22 @@ pub const W005: &str = "W005";
 /// `rocky_compiler::typecheck::check_merge_strategy` for the per-adapter survey
 /// and the Snowflake limitation it accepts.
 pub const W006: &str = "W006";
+/// A freshness `loaded_at_field` / `time_column` may not be readable as a
+/// load time.
+///
+/// Emitted by `rocky compile` when the column's known type is concrete and
+/// not DATE / TIMESTAMP / TIMESTAMP_NTZ, or when a source's
+/// `loaded_at_field` is absent from the source schema the compiler holds.
+///
+/// # Why a warning and not an error
+///
+/// Source schemas reach the compiler from a seed (`--with-seed`) or the
+/// schema cache, and either can be stale: the warehouse may have gained the
+/// column since. A stale schema must never refuse a build, so an absent
+/// source column only warns. A model column whose output is not provably
+/// complete warns for the same reason. `rocky freshness` reports the real
+/// outcome against the warehouse as `runtime_error`.
+pub const W050: &str = "W050";
 /// Contract defines a column not in model output (but not required).
 pub const W010: &str = "W010";
 /// Contract exists for a model not found in the project.
@@ -274,6 +450,103 @@ pub const W030: &str = "W030";
 /// be too small, hence a warning rather than silence.
 pub const W031: &str = "W031";
 
+/// An aggregate's argument is implicitly cast at run time — e.g. `SUM(VARCHAR)`
+/// on Snowflake or Databricks — so the query fails on the first value that
+/// does not convert. Also emitted for [`E042`]'s cases when no target dialect
+/// is known. Escalate with `rocky compile --deny-warnings W042`.
+pub const W042: &str = "W042";
+
+/// A comparison relies on a value-dependent implicit cast — e.g. a `BIGINT`
+/// column compared with a `VARCHAR` column on DuckDB, Snowflake or Databricks,
+/// which fails at run time on the first text value that does not parse. A
+/// string literal that parses as a number is not reported. Escalate with
+/// `rocky compile --deny-warnings W043`.
+pub const W043: &str = "W043";
+/// [`E044`]'s finding on a model whose every target warehouse is
+/// PostgreSQL.
+///
+/// PostgreSQL accepts a column outside `GROUP BY` when it is functionally
+/// dependent on a grouped primary key
+/// (<https://www.postgresql.org/docs/current/sql-select.html#SQL-GROUPBY>).
+/// Rocky cannot see primary keys, so it cannot tell a valid query from an
+/// invalid one there, and warns instead of refusing. Emitted by
+/// `rocky compile`. Redshift does not allow this and keeps [`E044`].
+/// Escalate with `rocky compile --deny-warnings W044`.
+pub const W044: &str = "W044";
+/// A direct column reference names a column absent from an external source
+/// schema that may be out of date.
+///
+/// Same finding as [`E041`], at warning severity, for a source schema Rocky
+/// cannot treat as current: one read from a seed file
+/// (`rocky compile --with-seed`) or from a schema-cache entry older than
+/// `[cache.schemas] trusted_max_age_seconds` (unset by default, so every cache
+/// entry). The warehouse may already carry the column, so the compile still
+/// succeeds. Refresh the schema (fix the seed, or re-warm the cache with
+/// `rocky discover --with-schemas`), or escalate to [`E041`] with
+/// `rocky compile --strict-sources` or `[cache.schemas] strict_sources = true`.
+pub const W041: &str = "W041";
+/// A call to a user-defined function could not be fully verified.
+///
+/// Emitted by `rocky compile` (`rocky_compiler::udf`) when an argument's
+/// inferred type (or the declared parameter type) is unknown, when an
+/// argument relies on the warehouse converting it implicitly (e.g. a `VARCHAR`
+/// into a `BIGINT` parameter), or when a function body could not be parsed.
+/// A warning, not an error: the warehouse may well accept the call. Certain
+/// mismatches are [`E051`].
+pub const W051: &str = "W051";
+/// A transformation `incremental` model sets `lookback` without `unique_key`.
+///
+/// Emitted by `rocky compile` (`check_incremental_strategy` in `typecheck.rs`).
+/// A lookback re-reads rows at or below the target's watermark; appended
+/// without a key to merge on, those rows land in the target again on every
+/// run. A warning, not an error: an append-only consumer may tolerate it.
+pub const W046: &str = "W046";
+/// A `type = "snapshot"` model's config is valid but risky.
+///
+/// Emitted by `rocky compile` (`check_snapshot_strategy` in `snapshot.rs`):
+/// a `unique_key` the compiled SELECT does not output (it may be a
+/// `[[surrogate_key]]` column, added at run time), `strategy = "check"`
+/// comparing many columns (every run compares each one
+/// for every key), `updated_at` whose inferred type is not a timestamp or
+/// date, or a key / change column missing from a `SELECT *` model's
+/// compile-time schema, which may be stale.
+pub const W049: &str = "W049";
+/// A model references a model version whose `deprecation_date` has passed or
+/// falls within the next 30 days. The reference still compiles; move it to
+/// the latest version. The date is checked against today's UTC date, or
+/// `ROCKY_GOVERNANCE_TODAY` (`YYYY-MM-DD`) when set.
+pub const W048: &str = "W048";
+/// A `[redshift]` `dist_key` / `sort_key` names a column the model does not
+/// output.
+///
+/// Emitted only when the model's output columns are provably complete (the
+/// W006 guard). A warning, not an error, because that enumeration comes from
+/// lineage extraction; Redshift rejects the `CREATE TABLE` at run time if the
+/// column really is missing.
+pub const W052: &str = "W052";
+/// A `[clickhouse]` `order_by` / `partition_by` names a column the model does
+/// not output.
+///
+/// Emitted only when the model's output columns are provably complete (the
+/// W006 guard), as W052 is. ClickHouse rejects the `CREATE TABLE` at run time
+/// if the column really is missing.
+pub const W053: &str = "W053";
+
+/// Every warning code the compile pipeline can emit: the `W###` codes above
+/// plus [`P002`]. `rocky compile --deny-warnings` accepts only these.
+/// A unit test checks this list against the constants in this file.
+pub const WARNING_CODES: &[&str] = &[
+    W001, W002, W004, W005, W006, W010, W011, W012, W013, W030, W031, W041, W042, W043, W044, W046,
+    W048, W049, W050, W051, W052, W053, P002,
+];
+
+/// Whether `code` (case-insensitive, surrounding spaces ignored) is a
+/// warning code in [`WARNING_CODES`].
+pub fn is_warning_code(code: &str) -> bool {
+    let code = code.trim();
+    WARNING_CODES.iter().any(|c| c.eq_ignore_ascii_case(code))
+}
+
 // Info
 /// Model dependency inferred from SQL.
 pub const I001: &str = "I001";
@@ -312,8 +585,10 @@ pub const I002: &str = "I002";
 /// # How to clear it
 ///
 /// Give the compiler source schemas. Many commands read them from the schema
-/// cache, written by `rocky run` / `rocky discover --with-schemas`;
-/// `rocky compile` also accepts a seed file via `--with-seed`. Several
+/// cache, written by `rocky run` / `rocky discover --with-schemas` — both on
+/// replication pipelines only (`discover` refuses a transformation-only
+/// pipeline). `rocky compile` also accepts a seed file via `--with-seed`,
+/// the route that works for a transformation-only project. Several
 /// commands do not — they build a `CompilerConfig` with an empty map, so
 /// nothing clears this code under them today. `rocky test` and `rocky ci`
 /// are the two that matter here (`rocky_engine::test_runner`,
@@ -694,6 +969,32 @@ pub fn render_diagnostics(
 
 #[cfg(test)]
 mod tests {
+
+    /// `WARNING_CODES` lists every `W###` constant in this file, and only
+    /// codes that exist.
+    #[test]
+    fn warning_codes_registry_is_complete() {
+        let src = include_str!("diagnostic.rs");
+        let mut declared: Vec<&str> = src
+            .lines()
+            .filter_map(|l| l.strip_prefix("pub const W"))
+            .filter_map(|rest| rest.split(':').next())
+            .filter(|code| code.chars().all(|c| c.is_ascii_digit()))
+            .collect();
+        declared.sort_unstable();
+        let mut listed: Vec<&str> = WARNING_CODES
+            .iter()
+            .filter_map(|c| c.strip_prefix('W'))
+            .collect();
+        listed.sort_unstable();
+        assert_eq!(declared, listed);
+        assert!(is_warning_code(" w042 "));
+        assert!(is_warning_code("P002"));
+        for bad in ["W999", "W42", "W 042", "E042", "", "P001"] {
+            assert!(!is_warning_code(bad), "{bad}");
+        }
+    }
+
     use super::*;
 
     #[test]

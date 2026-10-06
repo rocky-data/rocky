@@ -18,8 +18,27 @@ export type StrategyConfig =
       [k: string]: unknown;
     }
   | {
-      timestamp_column: string;
+      /**
+       * The input column `@incremental_filter` compares, when it is not the watermark itself: a qualified column in a join (`"o.updated_at"`) or a source column the model renames (`"_synced_at"`). The bound is still `MAX(<timestamp_column>)` over the target.
+       */
+      filter_column?: string | null;
+      /**
+       * Re-read this far below the watermark, e.g. `"3 days"`, to catch late-arriving rows. Pair it with `unique_key`, or the re-read rows are appended again (W046).
+       */
+      lookback?: IncrementalLookback | null;
+      /**
+       * What a run does when the model's output columns no longer match the target: `fail` (default) or `append_new_columns`.
+       */
+      on_schema_change?: OnSchemaChange & string;
+      /**
+       * The watermark column: an output column of the model whose maximum in the target marks what is already loaded. `watermark` is accepted as an alias.
+       */
+      timestamp_column?: string | null;
       type: "incremental";
+      /**
+       * Upsert on these columns with `MERGE` instead of appending.
+       */
+      unique_key?: string[];
       [k: string]: unknown;
     }
   | {
@@ -103,13 +122,76 @@ export type StrategyConfig =
       storage_prefix: string;
       type: "content_addressed";
       [k: string]: unknown;
+    }
+  | {
+      /**
+       * Check-strategy columns: a list, or `"all"`.
+       */
+      check_cols?: SnapshotCheckColsConfig | null;
+      /**
+       * `"ignore"` (default), `"invalidate"` or `"new_record"`.
+       */
+      hard_deletes?: SnapshotHardDeletes | null;
+      /**
+       * dbt's legacy spelling of `hard_deletes = "invalidate"`.
+       */
+      invalidate_hard_deletes?: boolean | null;
+      /**
+       * Metadata column names (Rocky defaults; dbt keys accepted).
+       */
+      snapshot_meta_column_names?: SnapshotMetaColumns | null;
+      /**
+       * `"timestamp"` or `"check"`.
+       */
+      strategy?: SnapshotStrategyKind | null;
+      type: "snapshot";
+      /**
+       * Column, or list of columns, identifying a row of the output.
+       */
+      unique_key?: SnapshotUniqueKey | null;
+      /**
+       * Timestamp-strategy change column.
+       */
+      updated_at?: string | null;
+      /**
+       * SQL expression for `valid_to` on current versions instead of NULL.
+       */
+      valid_to_current?: string | null;
+      [k: string]: unknown;
     };
+export type IncrementalLookback = string;
+/**
+ * What an incremental run does when the model's output columns differ from the existing target's columns.
+ */
+export type OnSchemaChange = "fail" | "append_new_columns";
 /**
  * Partition granularity for `time_interval` materialization.
  *
  * The granularity determines: - The canonical partition key format (see [`TimeGrain::format_str`]). - How `@start_date` / `@end_date` placeholders are computed per partition. - What column types are valid (`hour` requires TIMESTAMP; others accept DATE).
  */
 export type TimeGrain = "hour" | "day" | "month" | "year";
+/**
+ * `check_cols` accepts a list of columns or the string `"all"`.
+ */
+export type SnapshotCheckColsConfig = string | string[];
+/**
+ * What a snapshot does with a key that disappears from the model's result.
+ */
+export type SnapshotHardDeletes = "ignore" | "invalidate" | "new_record";
+/**
+ * The `is_current` metadata column: a name, or `false` for none.
+ *
+ * A snapshot table built by dbt has no `is_current` column. Setting `is_current = false` lets Rocky continue such a table: a version is then current when its `valid_to` is NULL (or equals `valid_to_current`).
+ */
+export type SnapshotFlagColumn = string | boolean;
+/**
+ * The `strategy` key inside a snapshot `[strategy]` block.
+ */
+export type SnapshotStrategyKind = "timestamp" | "check";
+/**
+ * `unique_key` accepts one column name or a list (dbt parity).
+ */
+export type SnapshotUniqueKey = string | string[];
 
 /**
  * JSON output for `rocky dag`.
@@ -242,7 +324,7 @@ export interface DagNodeOutput {
  *
  * Declares the maximum allowed lag between successive materializations of the model plus the optional timestamp column used by the runtime freshness check.
  *
- * The compiler does not enforce the TTL — it's metadata consumed by downstream observability tooling (`dagster-rocky` `FreshnessPolicy`, `rocky doctor --freshness`, etc.). The compiler does however soft-warn (W005) when a model has at least one temporal output column but no `freshness` declaration anywhere in scope (per-model or project-level default).
+ * `rocky freshness` enforces the TTL at run time: it reads `MAX(time_column)` from the model's target table (or, without a `time_column`, the model's last successful build in the state store) and reports `warn`, or `error` when `severity = "error"`. `rocky run` does not gate on it. The compiler checks the `time_column` (E050 when absent from a provably complete output, W050 when not temporal), and soft-warns (W005) when a model has at least one temporal output column but no `freshness` declaration anywhere in scope (per-model or project-level default).
  */
 export interface ModelFreshnessConfig {
   /**
@@ -273,6 +355,38 @@ export interface PartitionShapeOutput {
    * Time granularity: `"daily"`, `"hourly"`, `"monthly"`, `"yearly"`.
    */
   granularity: string;
+  [k: string]: unknown;
+}
+/**
+ * Names of the metadata columns a snapshot model adds to its rows.
+ *
+ * The defaults match the `snapshot` pipeline. Each key also accepts the dbt spelling (`dbt_valid_from`, `dbt_valid_to`, `dbt_scd_id`, `dbt_updated_at`, `dbt_is_deleted`) so an imported `snapshot_meta_column_names` block reads unchanged.
+ */
+export interface SnapshotMetaColumns {
+  /**
+   * `TRUE` on the current version of each key. Default `is_current`; `false` writes no flag (dbt has no such column).
+   */
+  is_current?: SnapshotFlagColumn & string;
+  /**
+   * Deletion marker, written only under `hard_deletes = "new_record"`. Default `is_deleted`.
+   */
+  is_deleted?: string;
+  /**
+   * Deterministic per-version id: a hash of the key and `valid_from`. Default `snapshot_id`.
+   */
+  scd_id?: string;
+  /**
+   * Optional copy of the version's change timestamp (dbt's `dbt_updated_at`). Not written unless named.
+   */
+  updated_at?: string | null;
+  /**
+   * When this version became current. Default `valid_from`.
+   */
+  valid_from?: string;
+  /**
+   * When this version stopped being current. Default `valid_to`.
+   */
+  valid_to?: string;
   [k: string]: unknown;
 }
 /**

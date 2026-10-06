@@ -169,6 +169,8 @@ fn print_compile_result(
         None,
         // `rocky compile --watch` does not expose `--var`.
         &rocky_core::run_vars::RunVars::new(),
+        // Nor `--deny-warnings`.
+        &[],
     ) {
         Ok(()) => {
             if !output_json {

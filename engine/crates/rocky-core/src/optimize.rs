@@ -164,8 +164,9 @@ pub fn recommend_strategy(stats: &ModelStats, config: &CostConfig) -> Materializ
     let (recommended, reasoning, savings) =
         if stats.avg_duration_seconds < 2.0 && stats.downstream_references <= 1 {
             // A view: recomputing a fast model for one consumer beats
-            // storing it. `ephemeral` used to be recommended here and is now
-            // a compile error — it is never inlined (E038, #1996).
+            // storing it. `ephemeral` is not recommended: it inlines the SQL
+            // into every consumer, and run history cannot say whether that
+            // repeats expensive work.
             let savings = storage_cost_per_month;
             (
                 "view".to_string(),
@@ -258,9 +259,8 @@ mod tests {
         CostConfig::default()
     }
 
-    /// A fast single-consumer model gets `view`, never `ephemeral`:
-    /// `ephemeral` is a compile error (E038, #1996), so recommending it would
-    /// point at a strategy the project cannot compile.
+    /// A fast single-consumer model gets `view`, never `ephemeral`: the cost
+    /// model cannot tell whether inlining would repeat work per consumer.
     #[test]
     fn test_view_for_a_fast_single_consumer_model() {
         let stats = ModelStats {
@@ -454,8 +454,9 @@ mod tests {
         assert_eq!(result.recommended_strategy, "view");
     }
 
-    /// No branch may recommend a strategy `rocky compile` refuses. `ephemeral`
-    /// is E038 (#1996) and `incremental` is E037 (#1990).
+    /// No branch may recommend a strategy `rocky compile` refuses or the cost
+    /// model has no evidence for: `incremental` needs a watermark the optimizer
+    /// cannot pick (E037/E046), and `ephemeral` has no cost evidence.
     #[test]
     fn no_recommendation_names_a_refused_strategy() {
         for (duration, size, refs, runs) in [

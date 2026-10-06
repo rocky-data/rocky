@@ -157,6 +157,7 @@ pub fn generate_report(
             rocky_core::models::StrategyConfig::View => "view",
             rocky_core::models::StrategyConfig::MaterializedView => "materialized_view",
             rocky_core::models::StrategyConfig::DynamicTable { .. } => "dynamic_table",
+            rocky_core::models::StrategyConfig::Snapshot { .. } => "snapshot",
         };
         *by_materialization.entry(mat.to_string()).or_default() += 1;
 

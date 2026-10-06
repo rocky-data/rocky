@@ -504,6 +504,10 @@ impl RockyLsp {
             allow_unmasked,
             project_freshness,
             run_vars: rocky_core::run_vars::RunVars::new(),
+            source_provenance: Default::default(),
+            // Diagnostics and symbols map onto the authored text, so keep it
+            // rather than the ephemeral-inlined form.
+            preserve_authored_sql: true,
         };
 
         match rocky_compiler::compile::compile(&config) {
@@ -1419,6 +1423,10 @@ impl LanguageServer for RockyLsp {
                     allow_unmasked,
                     project_freshness,
                     run_vars: rocky_core::run_vars::RunVars::new(),
+                    source_provenance: Default::default(),
+                    // Diagnostics and symbols map onto the authored text, so keep it
+                    // rather than the ephemeral-inlined form.
+                    preserve_authored_sql: true,
                 };
 
                 // Try incremental compilation if we have a previous result.
@@ -1662,6 +1670,20 @@ impl LanguageServer for RockyLsp {
                     }));
                 }
             }
+        }
+
+        // A user-defined function (`functions/`) shows its declared signature.
+        if let Some(ref w) = word
+            && result.project.model(w).is_none()
+            && let Some(udf) = result.semantic_graph.functions().get(w)
+        {
+            return Ok(Some(Hover {
+                contents: HoverContents::Markup(MarkupContent {
+                    kind: MarkupKind::Markdown,
+                    value: udf.hover_markdown(),
+                }),
+                range: None,
+            }));
         }
 
         // Check if hovering on a model name (could be a referenced model, not the current file's model)
@@ -6392,6 +6414,10 @@ mod tests {
             allow_unmasked: cfg.classifications.allow_unmasked,
             project_freshness,
             run_vars: rocky_core::run_vars::RunVars::new(),
+            source_provenance: Default::default(),
+            // Diagnostics and symbols map onto the authored text, so keep it
+            // rather than the ephemeral-inlined form.
+            preserve_authored_sql: true,
         };
         let result = rocky_compiler::compile::compile(&compile_config).unwrap();
 

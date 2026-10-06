@@ -113,16 +113,31 @@ def build_model_specs(
             in the component layer, not here.
 
     Returns:
-        A list of ``dg.AssetSpec``, one per derived model. Empty when
-        ``compile_result.models_detail`` is empty.
+        A list of ``dg.AssetSpec``, one per derived model except ephemeral
+        ones (never materialized; their consumers depend on their upstreams
+        instead). Empty when ``compile_result.models_detail`` is empty.
     """
     # Accepted for forward compatibility (see docstring); contract check
     # specs are still emitted from the component layer.
     _ = contract_rules_by_model
 
+    # Ephemeral models are inlined into their consumers and never run on
+    # their own (``rocky run --model <ephemeral>`` is refused with E038), so
+    # they get no asset. A consumer's dependency on one is traced through to
+    # the ephemeral model's own upstreams, as in ``dag_assets``.
+    depends_on_by_name: dict[str, list[str]] = {
+        model.name: [str(d) for d in (getattr(model, "depends_on", None) or [])]
+        for model in compile_result.models_detail
+    }
+    ephemeral_names = {
+        model.name for model in compile_result.models_detail if _is_ephemeral_model(model)
+    }
+
     # Build a name → asset_key map up front so depends_on can be resolved.
     model_to_key: dict[str, dg.AssetKey] = {}
     for model in compile_result.models_detail:
+        if model.name in ephemeral_names:
+            continue
         model_to_key[model.name] = translator.get_model_asset_key(model)
 
     optimize_meta: dict[dg.AssetKey, dict[str, dg.MetadataValue]] = {}
@@ -131,8 +146,10 @@ def build_model_specs(
 
     specs: list[dg.AssetSpec] = []
     for model in compile_result.models_detail:
+        if model.name in ephemeral_names:
+            continue
         asset_key = model_to_key[model.name]
-        deps = _resolve_model_deps(model, model_to_key)
+        deps = _resolve_model_deps(model, model_to_key, depends_on_by_name, ephemeral_names)
         metadata: dict[str, dg.MetadataValue | str] = {
             **translator.get_model_metadata(model),
         }
@@ -159,22 +176,48 @@ def build_model_specs(
     return specs
 
 
+def _is_ephemeral_model(model: ModelDetail) -> bool:
+    """True when the model's strategy is ``ephemeral``.
+
+    ``strategy`` is a plain dict on the hand-written SDK model and a typed
+    object on the generated one, so both spellings of ``type`` are read.
+    """
+    strategy = getattr(model, "strategy", None)
+    if strategy is None:
+        return False
+    kind = strategy.get("type") if isinstance(strategy, dict) else getattr(strategy, "type", None)
+    return str(getattr(kind, "value", kind)) == "ephemeral"
+
+
 def _resolve_model_deps(
     model: ModelDetail,
     model_to_key: dict[str, dg.AssetKey],
+    depends_on_by_name: dict[str, list[str]] | None = None,
+    ephemeral_names: set[str] | None = None,
 ) -> list[dg.AssetKey]:
     """Resolve a model's ``depends_on`` list to AssetKey references.
 
-    Each entry is looked up in ``model_to_key``. Entries that don't
-    correspond to a known model are silently dropped — they're either
-    references to source replication tables (which the source-asset
-    surface handles) or typos.
+    An ephemeral upstream is replaced by its own upstreams (transitively,
+    order-preserving, de-duplicated). Each remaining entry is looked up in
+    ``model_to_key``. Entries that don't correspond to a known model are
+    silently dropped — they're either references to source replication
+    tables (which the source-asset surface handles) or typos.
     """
+    depends_on_by_name = depends_on_by_name or {}
+    ephemeral_names = ephemeral_names or set()
     deps: list[dg.AssetKey] = []
-    depends_on_field = getattr(model, "depends_on", None) or []
-    for entry in depends_on_field:
-        key = model_to_key.get(str(entry))
-        if key is not None:
+    seen: set[str] = set()
+    stack = list(reversed([str(e) for e in (getattr(model, "depends_on", None) or [])]))
+    while stack:
+        name = stack.pop()
+        if name in seen:
+            continue
+        seen.add(name)
+        if name in ephemeral_names:
+            stack.extend(reversed(depends_on_by_name.get(name, [])))
+            continue
+        key = model_to_key.get(name)
+        if key is not None and key not in deps:
             deps.append(key)
     return deps
 

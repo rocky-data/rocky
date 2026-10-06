@@ -686,7 +686,7 @@ class FulfillDriverConfig1(BaseModel):
     type: Type
 
 
-class Type23(StrEnum):
+class Type25(StrEnum):
     replay = "replay"
 
 
@@ -702,7 +702,7 @@ class FulfillDriverConfig2(BaseModel):
     """
     The recorded session file, relative to the project root.
     """
-    type: Type23
+    type: Type25
 
 
 class GcConfig(BaseModel):
@@ -935,23 +935,23 @@ class OnCollision3(StrEnum):
     error = "error"
 
 
-class Type24(StrEnum):
+class Type26(StrEnum):
     replication = "replication"
 
 
-class Type25(StrEnum):
+class Type27(StrEnum):
     transformation = "transformation"
 
 
-class Type26(StrEnum):
+class Type28(StrEnum):
     quality = "quality"
 
 
-class Type27(StrEnum):
+class Type29(StrEnum):
     snapshot = "snapshot"
 
 
-class Type28(StrEnum):
+class Type30(StrEnum):
     load = "load"
 
 
@@ -1224,55 +1224,55 @@ class PortabilityConfig(BaseModel):
     """
 
 
-class Type29(StrEnum):
+class Type31(StrEnum):
     not_null = "not_null"
 
 
-class Type30(StrEnum):
+class Type32(StrEnum):
     unique = "unique"
 
 
-class Type31(StrEnum):
+class Type33(StrEnum):
     accepted_values = "accepted_values"
 
 
-class Type32(StrEnum):
+class Type34(StrEnum):
     relationships = "relationships"
 
 
-class Type33(StrEnum):
+class Type35(StrEnum):
     expression = "expression"
 
 
-class Type34(StrEnum):
+class Type36(StrEnum):
     row_count_range = "row_count_range"
 
 
-class Type35(StrEnum):
+class Type37(StrEnum):
     in_range = "in_range"
 
 
-class Type36(StrEnum):
+class Type38(StrEnum):
     regex_match = "regex_match"
 
 
-class Type37(StrEnum):
+class Type39(StrEnum):
     aggregate = "aggregate"
 
 
-class Type38(StrEnum):
+class Type40(StrEnum):
     composite = "composite"
 
 
-class Type39(StrEnum):
+class Type41(StrEnum):
     unique_expr = "unique_expr"
 
 
-class Type40(StrEnum):
+class Type42(StrEnum):
     not_in_future = "not_in_future"
 
 
-class Type41(StrEnum):
+class Type43(StrEnum):
     older_than_n_days = "older_than_n_days"
 
 
@@ -1587,6 +1587,18 @@ class SchemaCacheConfig(BaseModel):
     """
     Replicate the schema cache via `state_sync` to the remote backend. Defaults to `false`: a dev on a fresh clone should not inherit another machine's stale type stamps. Opt in to `true` for teams that want cross-machine cache warm-up via a shared state backend.
     """
+    strict_sources: bool | None = False
+    """
+    Treat every source schema the compiler knows as authoritative for missing-column checks. Defaults to `false`.
+
+    A direct reference to a column a known source schema lacks is a `W041` warning when that schema came from a seed file (`rocky compile --with-seed`) or from a cache entry older than `trusted_max_age_seconds`: a stale schema must not fail a valid build. Set this to `true` to escalate those warnings to the `E041` error, matching a strict "refuse what you cannot prove" posture. `rocky compile --strict-sources` sets it for one invocation.
+    """
+    trusted_max_age_seconds: conint(ge=0) | None = None
+    """
+    Age, in seconds, under which a cached source schema is trusted as current. Defaults to unset: no cache entry is trusted, so a missing source column found against the cache is a `W041` warning.
+
+    When set, a missing source column found against a cache entry younger than this is the `E041` error instead. Only entries that survive `ttl_seconds` are read at all, so a value above the TTL trusts every cached entry.
+    """
     ttl_seconds: conint(ge=0) | None = 86400
     """
     TTL for cache entries in seconds. Defaults to 86400 (24 hours). Lower it for high-DDL-churn teams; raise it for projects whose sources change on a weekly or slower cadence.
@@ -1637,6 +1649,32 @@ class SnapshotSourceConfig(BaseModel):
     catalog: str
     schema_: str = Field(..., alias="schema")
     table: str
+
+
+class SourceFreshnessConfig(BaseModel):
+    """
+    Freshness expectation for one source (dbt `freshness:` parity).
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+    )
+    error_after: str | None = None
+    """
+    Age above which the source reports `error` and `rocky freshness` exits non-zero. Must not be shorter than `warn_after`.
+    """
+    filter: str | None = None
+    """
+    Optional SQL predicate limiting the rows the maximum is taken over, spliced as `WHERE (<filter>)`. A statement terminator is refused.
+    """
+    loaded_at_field: str
+    """
+    Column holding the load time of each row. Should be a TIMESTAMP or DATE column; `rocky freshness` reads `MAX(loaded_at_field)`.
+    """
+    warn_after: str | None = None
+    """
+    Age above which the source reports `warn` (`"12h"`, `"3600s"`, `"7d"`).
+    """
 
 
 class StateBackend1(StrEnum):
@@ -2059,7 +2097,12 @@ class CacheConfig(BaseModel):
         extra="forbid",
     )
     schemas: SchemaCacheConfig | None = Field(
-        {"enabled": True, "replicate": False, "ttl_seconds": 86400},
+        {
+            "enabled": True,
+            "replicate": False,
+            "strict_sources": False,
+            "ttl_seconds": 86400,
+        },
         validate_default=True,
     )
     """
@@ -2276,6 +2319,34 @@ class PipelineSourceConfig(BaseModel):
     """
 
 
+class PipelineSourceConfig2(BaseModel):
+    """
+    One external source a transformation pipeline reads.
+
+    `catalog` may be omitted (DuckDB and other two-part warehouses); it then defaults to the empty string, which the dialects render as `schema.table`.
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+    )
+    catalog: str | None = ""
+    """
+    Catalog (database) holding the table. Empty for two-part names.
+    """
+    freshness: SourceFreshnessConfig | None = None
+    """
+    Optional freshness expectation. A source without one is declared but never checked.
+    """
+    schema_: str = Field(..., alias="schema")
+    """
+    Schema holding the table.
+    """
+    table: str
+    """
+    Table name.
+    """
+
+
 class PolicyRule(BaseModel):
     """
     One `[[policy.rules]]` entry: `(principal, capability, scope) → effect`.
@@ -2354,11 +2425,11 @@ class ProjectFreshnessConfig(BaseModel):
     """
     severity: TestSeverity5 | TestSeverity6 | None = None
     """
-    Default severity reported when the freshness check trips. Inherited on the same terms as `time_column`. No runtime check reads it yet.
+    Default severity reported when the freshness check trips. Inherited on the same terms as `time_column`. Under `error`, a stale model makes `rocky freshness` exit 1.
     """
     time_column: str | None = None
     """
-    Default timestamp column used to evaluate freshness at runtime. Carried into a model that declares no `[freshness]` block of its own; a model that declares one keeps its own value, or none. Only inherited alongside an `expected_lag_seconds`. No runtime check reads it yet.
+    Default timestamp column used to evaluate freshness at runtime. Carried into a model that declares no `[freshness]` block of its own; a model that declares one keeps its own value, or none. Only inherited alongside an `expected_lag_seconds`. `rocky freshness` reads `MAX(time_column)` from each inheriting model's target; when a model does not have the column it measures the last successful build instead.
     """
 
 
@@ -2391,7 +2462,7 @@ class QualityAssertion1(BaseModel):
     """
     Table name this assertion applies to. Must match a table discovered from one of the pipeline's `[[tables]]` entries (by unqualified table name).
     """
-    type: Type29
+    type: Type31
 
 
 class QualityAssertion2(BaseModel):
@@ -2423,7 +2494,7 @@ class QualityAssertion2(BaseModel):
     """
     Table name this assertion applies to. Must match a table discovered from one of the pipeline's `[[tables]]` entries (by unqualified table name).
     """
-    type: Type30
+    type: Type32
 
 
 class QualityAssertion3(BaseModel):
@@ -2455,7 +2526,7 @@ class QualityAssertion3(BaseModel):
     """
     Table name this assertion applies to. Must match a table discovered from one of the pipeline's `[[tables]]` entries (by unqualified table name).
     """
-    type: Type31
+    type: Type33
     values: list[str]
     """
     The allowed values. Compared as string literals.
@@ -2499,7 +2570,7 @@ class QualityAssertion4(BaseModel):
     """
     Fully-qualified target table (`catalog.schema.table`).
     """
-    type: Type32
+    type: Type34
 
 
 class QualityAssertion5(BaseModel):
@@ -2535,7 +2606,7 @@ class QualityAssertion5(BaseModel):
     """
     A SQL boolean expression. Rows where `NOT (expression)` are failures.
     """
-    type: Type33
+    type: Type35
 
 
 class QualityAssertion6(BaseModel):
@@ -2575,7 +2646,7 @@ class QualityAssertion6(BaseModel):
     """
     Minimum row count (inclusive). `None` means no lower bound.
     """
-    type: Type34
+    type: Type36
 
 
 class QualityAssertion7(BaseModel):
@@ -2617,7 +2688,7 @@ class QualityAssertion7(BaseModel):
     """
     Minimum value (inclusive). `None` means no lower bound.
     """
-    type: Type35
+    type: Type37
 
 
 class QualityAssertion8(BaseModel):
@@ -2657,7 +2728,7 @@ class QualityAssertion8(BaseModel):
     """
     The regex pattern. Dialect-specific syntax — stick to the portable subset (character classes, anchors, quantifiers).
     """
-    type: Type36
+    type: Type38
 
 
 class QualityAssertion9(BaseModel):
@@ -2699,7 +2770,7 @@ class QualityAssertion9(BaseModel):
     """
     Aggregate operator.
     """
-    type: Type37
+    type: Type39
     value: str
     """
     Threshold to compare against. Parsed as `f64`.
@@ -2745,7 +2816,7 @@ class QualityAssertion10(BaseModel):
     """
     The kind of composite assertion. Currently `unique` only — kept as an enum to leave room for `not_null_any` / `not_null_all` in a later phase without another TestType.
     """
-    type: Type38
+    type: Type40
 
 
 class QualityAssertion11(BaseModel):
@@ -2785,7 +2856,7 @@ class QualityAssertion11(BaseModel):
     """
     SQL scalar expression whose value must be unique across rows.
     """
-    type: Type39
+    type: Type41
 
 
 class QualityAssertion12(BaseModel):
@@ -2817,7 +2888,7 @@ class QualityAssertion12(BaseModel):
     """
     Table name this assertion applies to. Must match a table discovered from one of the pipeline's `[[tables]]` entries (by unqualified table name).
     """
-    type: Type40
+    type: Type42
 
 
 class QualityAssertion13(BaseModel):
@@ -2853,7 +2924,7 @@ class QualityAssertion13(BaseModel):
     """
     N — days in the past. Must be > 0.
     """
-    type: Type41
+    type: Type43
 
 
 class QuarantineConfig(BaseModel):
@@ -3598,7 +3669,7 @@ class PipelineConfig1(ReplicationPipelineConfig):
     Pipeline configuration. The `type` field selects one of five variants — `replication` (default when omitted), `transformation`, `quality`, `snapshot`, or `load`. Each variant has its own field set; see the per-variant subschemas in `definitions`.
     """
 
-    type: Type24 | None = None
+    type: Type26 | None = None
 
 
 class PipelineConfig3(QualityPipelineConfig):
@@ -3606,7 +3677,7 @@ class PipelineConfig3(QualityPipelineConfig):
     Pipeline configuration. The `type` field selects one of five variants — `replication` (default when omitted), `transformation`, `quality`, `snapshot`, or `load`. Each variant has its own field set; see the per-variant subschemas in `definitions`.
     """
 
-    type: Type26
+    type: Type28
 
 
 class PipelineConfig5(LoadPipelineConfig):
@@ -3614,7 +3685,7 @@ class PipelineConfig5(LoadPipelineConfig):
     Pipeline configuration. The `type` field selects one of five variants — `replication` (default when omitted), `transformation`, `quality`, `snapshot`, or `load`. Each variant has its own field set; see the per-variant subschemas in `definitions`.
     """
 
-    type: Type28
+    type: Type30
 
 
 class SnapshotPipelineConfig(BaseModel):
@@ -3745,6 +3816,10 @@ class TransformationPipelineConfig(BaseModel):
     """
     Optional native-schedule declaration. See [`ScheduleConfig`].
     """
+    sources: list[PipelineSourceConfig2] | None = None
+    """
+    External sources the pipeline's models read, with optional freshness expectations checked by `rocky freshness`. Declared as `[[pipeline.<name>.sources]]`. See [`crate::source_freshness::PipelineSourceConfig`].
+    """
     target: TransformationTargetConfig
     """
     Target configuration (adapter + governance).
@@ -3756,7 +3831,7 @@ class PipelineConfig2(TransformationPipelineConfig):
     Pipeline configuration. The `type` field selects one of five variants — `replication` (default when omitted), `transformation`, `quality`, `snapshot`, or `load`. Each variant has its own field set; see the per-variant subschemas in `definitions`.
     """
 
-    type: Type25
+    type: Type27
 
 
 class PipelineConfig4(SnapshotPipelineConfig):
@@ -3764,7 +3839,7 @@ class PipelineConfig4(SnapshotPipelineConfig):
     Pipeline configuration. The `type` field selects one of five variants — `replication` (default when omitted), `transformation`, `quality`, `snapshot`, or `load`. Each variant has its own field set; see the per-variant subschemas in `definitions`.
     """
 
-    type: Type27
+    type: Type29
 
 
 class RockyConfig(BaseModel):
@@ -3816,7 +3891,14 @@ class RockyConfig(BaseModel):
     Declarative run-level budget. See [`BudgetConfig`] for the semantics of each limit and the breach action.
     """
     cache: CacheConfig | None = Field(
-        {"schemas": {"enabled": True, "replicate": False, "ttl_seconds": 86400}},
+        {
+            "schemas": {
+                "enabled": True,
+                "replicate": False,
+                "strict_sources": False,
+                "ttl_seconds": 86400,
+            }
+        },
         validate_default=True,
     )
     """

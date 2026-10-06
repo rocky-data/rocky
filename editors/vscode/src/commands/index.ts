@@ -20,7 +20,7 @@ import { catalog, history, metrics } from "./inspect";
 import { openInspector, showLineage } from "./inspector";
 import { lineageDiff } from "./lineageDiff";
 import { importDbt, validateMigration } from "./migration";
-import { doctor, optimize } from "./ops";
+import { doctor, freshness, optimize } from "./ops";
 import { previewCost, previewCreate, previewDiff } from "./preview";
 import { previewCte, previewModel } from "./previewRows";
 import { reviewPlan } from "./review";
@@ -87,6 +87,7 @@ export function registerCommands(context: vscode.ExtensionContext): void {
 
     // Health & analysis
     vscode.commands.registerCommand("rocky.doctor", doctor),
+    vscode.commands.registerCommand("rocky.freshness", freshness),
     vscode.commands.registerCommand("rocky.optimize", optimize),
 
     // Governance

@@ -333,9 +333,12 @@ pub(crate) async fn profile_column(
     // on every path. MIN/MAX (which are real cell values) are only selected
     // when the caller opted into `--with-data`.
     let agg_sql = if with_data {
+        // The dialect's text type: a bare `VARCHAR` is `VARCHAR(30)` in a
+        // T-SQL `CAST` and not a type at all on BigQuery.
+        let text = adapter.dialect().string_type_name();
         format!(
             "SELECT COUNT(*) AS n, COUNT({col}) AS non_null, COUNT(DISTINCT {col}) AS distinct_n, \
-             CAST(MIN({col}) AS VARCHAR) AS min_v, CAST(MAX({col}) AS VARCHAR) AS max_v \
+             CAST(MIN({col}) AS {text}) AS min_v, CAST(MAX({col}) AS {text}) AS max_v \
              FROM {table_ref}"
         )
     } else {
@@ -369,9 +372,14 @@ pub(crate) async fn profile_column(
     // For low-cardinality columns, fetch the observed domain as evidence —
     // only when `--with-data` opted into shipping raw cell values.
     let observed_values = if with_data && distinct > 0 && distinct <= LOW_CARDINALITY_CAP {
-        let domain_sql = format!(
-            "SELECT DISTINCT CAST({col} AS VARCHAR) AS v FROM {table_ref} \
-             WHERE {col} IS NOT NULL ORDER BY v LIMIT {DOMAIN_FETCH_LIMIT}"
+        let dialect = adapter.dialect();
+        let domain_sql = dialect.select_limited(
+            &format!(
+                "DISTINCT CAST({col} AS {}) AS v",
+                dialect.string_type_name()
+            ),
+            &format!("FROM {table_ref} WHERE {col} IS NOT NULL ORDER BY v"),
+            DOMAIN_FETCH_LIMIT,
         );
         let dr = adapter.execute_query(&domain_sql).await.map_err(|e| {
             anyhow::anyhow!("domain query failed for column '{}': {e}", typed_col.name)
@@ -766,8 +774,10 @@ adapter = "warehouse"
         }
         #[async_trait::async_trait]
         impl WarehouseAdapter for WithDataAdapter {
+            // The domain query takes its row limit and text type from the
+            // dialect (`TOP` on SQL Server, `LIMIT` here).
             fn dialect(&self) -> &dyn SqlDialect {
-                unimplemented!()
+                &rocky_databricks::dialect::DatabricksSqlDialect
             }
             async fn execute_statement(&self, _sql: &str) -> AdapterResult<()> {
                 unimplemented!()

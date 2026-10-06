@@ -119,9 +119,10 @@ fn emit_runnable_repo_from_rich_fixture() {
     assert_eq!(emission.seeds_copied, 1);
     assert!(emission.models_translated >= 3);
 
-    // GA regression: `dbt_packages/` and `snapshots/` trees sit outside the
-    // walked `models/` directory; the importer must leave them alone — no
-    // ghost model imports, no failure entries.
+    // GA regression: `dbt_packages/` sits outside the walked `models/`
+    // directory; the importer must leave it alone — no ghost model imports,
+    // no failure entries. `snapshots/` is read on purpose: its dbt snapshot
+    // converts to a `type = "snapshot"` model (asserted below).
     assert!(
         !result.imported.iter().any(|m| m.name == "some_macro"),
         "dbt_packages/.../some_macro.sql must not surface as an imported model"
@@ -131,12 +132,21 @@ fn emit_runnable_repo_from_rich_fixture() {
         "dbt_packages/.../some_macro.sql must not surface as a failure"
     );
     assert!(
-        !result.imported.iter().any(|m| m.name == "orders_snapshot"),
-        "snapshots/orders_snapshot.sql must not surface as an imported model"
+        result.imported.iter().any(|m| m.name == "orders_snapshot"
+            && matches!(m.config.strategy, StrategyConfig::Snapshot { .. })
+            && m.config.target.schema == "snapshots"),
+        "snapshots/orders_snapshot.sql must convert to a snapshot model"
     );
     assert!(
         !result.failed.iter().any(|f| f.name == "orders_snapshot"),
         "snapshots/orders_snapshot.sql must not surface as a failure"
+    );
+    let snapshot_sidecar =
+        std::fs::read_to_string(models_dir.join("orders_snapshot.toml")).unwrap();
+    assert!(
+        snapshot_sidecar.contains("type = \"snapshot\"")
+            && snapshot_sidecar.contains("updated_at = \"updated_at\""),
+        "{snapshot_sidecar}"
     );
 
     // A model with `{% if target.name == 'prod' %}` is refused in raw mode:

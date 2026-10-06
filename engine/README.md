@@ -5,7 +5,7 @@ or in the optional `.rocky` DSL. Rocky type-checks the model, resolves the
 dependency graph, generates SQL in your warehouse's dialect, and runs it.
 
 Rocky does not store your data. Storage and compute stay in Databricks,
-Snowflake, BigQuery, Trino, or DuckDB. There is no Jinja templating, no
+Snowflake, BigQuery, Trino, PostgreSQL, Redshift, ClickHouse, SQL Server, or DuckDB. There is no Jinja templating, no
 manifest file, and no separate parse step.
 
 ```
@@ -245,7 +245,7 @@ per model with a `-- rocky-allow: <construct>` comment.
 | **AI** | Intent metadata, schema-sync, intent extraction, test generation |
 | **IDE** | VS Code extension, full LSP (completion, hover, go-to-def, rename, code actions, inlay hints) |
 | **Quality** | Pipeline-level checks plus 13 declarative assertions with severity, filters, and row quarantine |
-| **Execution** | DuckDB (local), Databricks (production), Snowflake + BigQuery + Trino (beta) |
+| **Execution** | DuckDB (local), Databricks (production), Snowflake + BigQuery + Trino + PostgreSQL + Redshift + ClickHouse + SQL Server (beta) |
 | **Optimization** | Cost-based materialization, storage profiling, compaction, partition archival |
 | **Governance** | Unity Catalog tags, workspace isolation, declarative RBAC with GRANT/REVOKE diffing |
 | **Integration** | Dagster ([dagster-rocky](../integrations/dagster/)), `rocky import-dbt`, `rocky validate-migration`, CI pipeline |
@@ -297,6 +297,10 @@ For how Rocky compares to other SQL transformation tools, see the
 | Warehouse | BigQuery | Beta | SQL execution via the BigQuery connector |
 | Warehouse | DuckDB | Local / Testing | Embedded execution for development and CI |
 | Warehouse | Trino | Beta | REST `/v1/statement` polling client, Basic + JWT auth |
+| Warehouse | PostgreSQL | Beta | Native wire protocol (`tokio-postgres`, rustls TLS); `MERGE` or `ON CONFLICT`; live-tested against PostgreSQL 16 |
+| Warehouse | Redshift | Beta | Same crate as PostgreSQL; Redshift dialect, dist/sort keys, late-binding views; password auth; SQL unit-tested only |
+| Warehouse | ClickHouse | Beta | HTTP interface (`reqwest`, rustls TLS), user/password auth; `[clickhouse]` engine / `order_by` / `partition_by`; `merge` refused (E053); live-tested against ClickHouse 26.10 |
+| Warehouse | SQL Server | Beta | Native TDS (`tiberius`, rustls TLS); SQL Server, Azure SQL, Fabric Warehouse; SQL auth or Entra ID; live-tested against SQL Server 2022 |
 
 Build a custom adapter in Rust, or in any language, with the
 [Adapter SDK guide](https://rocky-data.dev/guides/adapter-sdk/). It walks

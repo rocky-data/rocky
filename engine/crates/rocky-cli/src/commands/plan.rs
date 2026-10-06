@@ -789,6 +789,10 @@ pub(crate) fn dialect_for_adapter_type(
         "snowflake" => Box::new(rocky_snowflake::dialect::SnowflakeSqlDialect),
         "bigquery" => Box::new(rocky_bigquery::dialect::BigQueryDialect),
         "trino" => Box::new(rocky_trino::dialect::TrinoDialect),
+        "postgres" => Box::new(rocky_postgres::PostgresDialect::new()),
+        "redshift" => Box::new(rocky_postgres::RedshiftDialect::new()),
+        "clickhouse" => Box::new(rocky_clickhouse::ClickHouseDialect::new()),
+        "sqlserver" => Box::new(rocky_sqlserver::SqlServerDialect::new()),
         #[cfg(feature = "duckdb")]
         "duckdb" => Box::new(rocky_duckdb::dialect::DuckDbSqlDialect),
         other => {
@@ -800,6 +804,18 @@ pub(crate) fn dialect_for_adapter_type(
             Box::new(rocky_databricks::dialect::DatabricksSqlDialect)
         }
     }
+}
+
+/// [`dialect_for_adapter_type`] for a whole `[adapter]` block, so options
+/// that change the rendered SQL (`postgres` `merge_mode`, `redshift`
+/// `late_binding_views`, `sqlserver` `flavor`) reach the preview exactly as
+/// `rocky run` will use them.
+pub(crate) fn dialect_for_adapter(
+    adapter: &rocky_core::config::AdapterConfig,
+) -> Box<dyn rocky_core::traits::SqlDialect> {
+    crate::registry::postgres_dialect_for_config(adapter)
+        .or_else(|| crate::registry::sqlserver_dialect_for_config(adapter))
+        .unwrap_or_else(|| dialect_for_adapter_type(&adapter.adapter_type))
 }
 
 /// Resolve the dialect an OFFLINE renderer previews SQL in, refusing a
@@ -870,19 +886,20 @@ pub(crate) fn preview_dialect(
                     .unwrap_or_default()
             )
         })?;
-    let adapter_type = config
-        .and_then(|cfg| {
-            // Prefer the default replication pipeline's target adapter; fall
-            // back to the first adapter declared in the config.
-            let target_adapter_name = registry::resolve_replication_pipeline(&cfg, None)
-                .ok()
-                .map(|(_, pipeline)| pipeline.target.adapter.clone());
-            target_adapter_name
-                .and_then(|name| cfg.adapters.get(&name).map(|a| a.adapter_type.clone()))
-                .or_else(|| cfg.adapters.values().next().map(|a| a.adapter_type.clone()))
-        })
-        .unwrap_or_else(|| "duckdb".to_string());
-    Ok(dialect_for_adapter_type(&adapter_type))
+    let adapter = config.and_then(|cfg| {
+        // Prefer the default replication pipeline's target adapter; fall
+        // back to the first adapter declared in the config.
+        let target_adapter_name = registry::resolve_replication_pipeline(&cfg, None)
+            .ok()
+            .map(|(_, pipeline)| pipeline.target.adapter.clone());
+        target_adapter_name
+            .and_then(|name| cfg.adapters.get(&name).cloned())
+            .or_else(|| cfg.adapters.values().next().cloned())
+    });
+    Ok(match adapter {
+        Some(adapter) => dialect_for_adapter(&adapter),
+        None => dialect_for_adapter_type("duckdb"),
+    })
 }
 
 /// Resolve the configured target adapter's standalone [`SqlDialect`] from a
@@ -917,14 +934,10 @@ pub(crate) fn resolve_dialect_from_config(
     let (_name, pipeline) = registry::resolve_pipeline(rocky_cfg, None)
         .context("failed to resolve pipeline to determine the target dialect")?;
     let adapter_name = pipeline.target_adapter();
-    let adapter_type = rocky_cfg
-        .adapters
-        .get(adapter_name)
-        .map(|a| a.adapter_type.as_str())
-        .with_context(|| {
-            format!("pipeline target adapter '{adapter_name}' is not defined in [adapters]")
-        })?;
-    Ok(dialect_for_adapter_type(adapter_type))
+    let adapter = rocky_cfg.adapters.get(adapter_name).with_context(|| {
+        format!("pipeline target adapter '{adapter_name}' is not defined in [adapters]")
+    })?;
+    Ok(dialect_for_adapter(adapter))
 }
 
 /// Map a transformation [`MaterializationStrategy`] to the `purpose` label used
@@ -942,6 +955,7 @@ fn strategy_purpose(strategy: &MaterializationStrategy) -> &'static str {
         MaterializationStrategy::DeleteInsert { .. } => "delete_insert",
         MaterializationStrategy::Microbatch { .. } => "microbatch",
         MaterializationStrategy::ContentAddressed { .. } => "content_addressed",
+        MaterializationStrategy::Snapshot(_) => "snapshot",
     }
 }
 
@@ -1178,6 +1192,8 @@ pub(crate) fn conditional_drops_for_run_plan(
         allow_unmasked: vec![],
         project_freshness: Default::default(),
         run_vars: rocky_core::run_vars::RunVars::new(),
+        source_provenance: Default::default(),
+        preserve_authored_sql: false,
     };
     let compiled = match models_glob {
         Some(glob) => compile::compile_matching(&config, glob),
@@ -1241,13 +1257,11 @@ pub(crate) fn conditional_drops_from_models(
                     .target_adapter()
                     .to_string()
             };
-            let adapter_type = cfg
+            let adapter = cfg
                 .adapters
                 .get(&adapter_name)
-                .with_context(|| format!("target adapter '{adapter_name}' is not configured"))?
-                .adapter_type
-                .as_str();
-            dialect_for_adapter_type(adapter_type)
+                .with_context(|| format!("target adapter '{adapter_name}' is not configured"))?;
+            dialect_for_adapter(adapter)
         }
         None => preview_dialect(Some(config_path))?,
     };
@@ -1390,7 +1404,7 @@ fn plan_preview_output_for_pipeline(
                 .adapters
                 .get(&adapter_name)
                 .with_context(|| format!("target adapter '{adapter_name}' is not configured"))?;
-            dialect_for_adapter_type(&adapter.adapter_type)
+            dialect_for_adapter(adapter)
         }
         _ => preview_dialect(config_path)?,
     };
@@ -1405,6 +1419,8 @@ fn plan_preview_output_for_pipeline(
         allow_unmasked: vec![],
         project_freshness: Default::default(),
         run_vars: rocky_core::run_vars::RunVars::new(),
+        source_provenance: Default::default(),
+        preserve_authored_sql: false,
     };
     let result = match compile::compile(&config) {
         Ok(r) => r,
@@ -1491,6 +1507,21 @@ fn plan_preview_output_for_pipeline(
             selected_model_paths.contains(path)
         })
         .context("invalid surrogate_key configuration")?;
+    // `--model <function>` selects a user-defined function: preview its DDL
+    // (and that of the functions it calls) only.
+    if let Some(name) = filter
+        && result.project.model(name).is_none()
+        && result.semantic_graph.functions().get(name).is_some()
+    {
+        for stmt in super::functions_ddl::statements_for(&result, [name], dialect.name())? {
+            output.statements.push(PlannedStatement {
+                purpose: "create_function".to_string(),
+                target: stmt.target,
+                sql: stmt.sql,
+            });
+        }
+        return Ok(output);
+    }
     if let Some(model) = filter
         && !project_ir
             .models
@@ -1501,6 +1532,35 @@ fn plan_preview_output_for_pipeline(
         // `model_not_found`; `Display` is unchanged from the previous
         // `anyhow::ensure!` string.
         return Err(anyhow::Error::new(ModelNotFound(model.to_string())));
+    }
+
+    // User-defined functions the previewed models call, in the order
+    // `rocky run` creates them: before every model, callees first. A function
+    // this warehouse cannot create is reported, not previewed.
+    let compile_failed: std::collections::HashSet<&str> = result
+        .diagnostics
+        .iter()
+        .filter(|d| d.is_error())
+        .map(|d| d.model.as_str())
+        .collect();
+    match super::functions_ddl::function_statements(
+        &result,
+        |name| filter.is_none_or(|f| f == name) && !compile_failed.contains(name),
+        dialect.name(),
+    ) {
+        Ok(statements) => {
+            for stmt in statements {
+                output.statements.push(PlannedStatement {
+                    purpose: "create_function".to_string(),
+                    target: stmt.target,
+                    sql: stmt.sql,
+                });
+            }
+        }
+        Err(e) => output.skipped.push(crate::output::SkippedModel {
+            model: "functions".to_string(),
+            reason: e.to_string(),
+        }),
     }
 
     for model_ir in &project_ir.models {
@@ -1645,6 +1705,8 @@ fn build_and_persist_run_plan(
         allow_unmasked: vec![],
         project_freshness: Default::default(),
         run_vars: rocky_core::run_vars::RunVars::new(),
+        source_provenance: Default::default(),
+        preserve_authored_sql: false,
     };
 
     let result = compile::compile(&config).context("failed to compile models for run plan")?;
@@ -2463,6 +2525,8 @@ pub fn populate_governance_actions(
         allow_unmasked: cfg.classifications.allow_unmasked.clone(),
         project_freshness: cfg.freshness.clone(),
         run_vars: rocky_core::run_vars::RunVars::new(),
+        source_provenance: Default::default(),
+        preserve_authored_sql: false,
     })
     .context("failed to compile project for governance preview")?;
 
@@ -2565,6 +2629,8 @@ async fn check_plan_budget(
         allow_unmasked: vec![],
         project_freshness: Default::default(),
         run_vars: rocky_core::run_vars::RunVars::new(),
+        source_provenance: Default::default(),
+        preserve_authored_sql: false,
     };
     let result = match rocky_compiler::compile::compile(&compile_cfg) {
         Ok(r) => r,
@@ -3560,6 +3626,9 @@ mod tests {
         assert_eq!(
             replication_copy_purpose(&MaterializationStrategy::Incremental {
                 timestamp_column: "ts".into(),
+                unique_key: Vec::new(),
+                lookback: None,
+                filter_column: None,
             }),
             "incremental_copy"
         );
@@ -3596,6 +3665,9 @@ mod tests {
         let incr = replication_copy_sql(
             &replication_ir(MaterializationStrategy::Incremental {
                 timestamp_column: "_updated_at".into(),
+                unique_key: Vec::new(),
+                lookback: None,
+                filter_column: None,
             }),
             dialect.as_ref(),
         )
@@ -4694,9 +4766,8 @@ table = "users"
 
     /// #1996: an ephemeral model renders no statement, and the preview used
     /// to drop it into a `debug!` log. An ephemeral-only project previewed as
-    /// an empty plan with exit 0 — the same silence that let the strategy
-    /// look like it worked. The model is now named in `skipped`, with the
-    /// refusal as its reason.
+    /// an empty plan with exit 0. The model is now named in `skipped`, with
+    /// the reason: it is inlined into its consumers instead.
     #[test]
     fn plan_preview_names_a_model_it_could_not_render() {
         let tmp = TempDir::new().unwrap();
@@ -4739,9 +4810,9 @@ table = "stg_users"
         // from drifting apart silently.
         assert_eq!(
             out.skipped[0].reason,
-            "invalid SQL generation request: model 'stg_users': `type = \"ephemeral\"` is not \
-             supported (E038) — an ephemeral model is not materialized and is not inlined into \
-             its consumers; use `type = \"view\"`"
+            "invalid SQL generation request: model 'stg_users': `type = \"ephemeral\"` renders \
+             no statement of its own — it is inlined as a CTE into each model that reads it, so \
+             there is nothing to build (E038 when selected directly)"
         );
     }
 

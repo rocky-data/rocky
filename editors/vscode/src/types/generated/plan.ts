@@ -220,7 +220,7 @@ export interface PlanOutput {
    */
   retention_actions?: RetentionAction[];
   /**
-   * Models excluded from the SQL preview or refused by compilation, with the reason for each. This includes SQL that needs a live warehouse to render and compiler errors such as E038 for an `ephemeral` model.
+   * Models excluded from the SQL preview or refused by compilation, with the reason for each. This includes SQL that needs a live warehouse to render, compiler errors, and `ephemeral` models, which are inlined into their consumers and render no statement of their own.
    */
   skipped?: SkippedModel[];
   statements: PlannedStatement[];

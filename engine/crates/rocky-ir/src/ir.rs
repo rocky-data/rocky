@@ -47,7 +47,29 @@ pub enum MaterializationStrategy {
     /// execute the runner re-queries `MAX(ts) FROM source` and persists
     /// that as the next watermark. Keeping the field off the strategy
     /// means recipe-hash inputs are runtime-state-free.
-    Incremental { timestamp_column: String },
+    ///
+    /// On a **transformation** model the watermark is read from the target
+    /// instead: the model SQL's `@incremental_filter` placeholder (or, when
+    /// the watermark column is a direct passthrough, a wrap of the whole
+    /// model) resolves to `<col> > (SELECT MAX(<col>) FROM <target>)`, so the
+    /// state store holds nothing for it. An empty `timestamp_column` there
+    /// means no watermark was declared, which is refused (E037).
+    Incremental {
+        timestamp_column: String,
+        /// Transformation only: upsert on these columns with `MERGE` instead
+        /// of appending. Empty means append. Replication leaves it empty.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        unique_key: Vec<Arc<str>>,
+        /// Transformation only: re-read this far below the target's
+        /// `MAX(watermark)` to pick up late-arriving rows.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        lookback: Option<crate::incremental::IncrementalLookback>,
+        /// Transformation only: the input column `@incremental_filter`
+        /// compares (`o.updated_at`, `_synced_at`) when it is not the
+        /// watermark itself. `None` compares the watermark column.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        filter_column: Option<String>,
+    },
     /// Upsert based on unique key columns.
     Merge {
         unique_key: Vec<Arc<str>>,
@@ -79,9 +101,9 @@ pub enum MaterializationStrategy {
         /// `Some(...)` when invoked by the runtime; `None` during static planning.
         window: Option<PartitionWindow>,
     },
-    /// Ephemeral model — refused (E038). It is not materialized, and nothing
-    /// inlines it into a consumer, so a consumer reads whatever table already
-    /// carries the name. Use `View` for an intermediate other models read.
+    /// Ephemeral model — never materialized and renders no statement. The
+    /// compiler inlines its SQL as a CTE into each consumer's `sql`, so a
+    /// consumer's IR already carries it.
     Ephemeral,
     /// Delete matching rows by partition key, then insert fresh data.
     /// Common dbt pattern for partition-based incremental loads where
@@ -125,6 +147,14 @@ pub enum MaterializationStrategy {
         /// `UniformWriter::discover()` returns; mismatch is a hard error.
         partition_columns: Vec<String>,
     },
+    /// SCD Type 2 snapshot of the model's SELECT (dbt `snapshot` parity).
+    ///
+    /// Each run closes the current version of every changed key and inserts
+    /// a new version; `hard_deletes` decides what happens to keys that leave
+    /// the result. SQL generation needs the model's output column list, so
+    /// the runner resolves it from the existing target (`describe_table`)
+    /// and `sql_gen` falls back to the typed columns for `plan`/`emit-sql`.
+    Snapshot(Box<crate::snapshot::SnapshotSpec>),
 }
 
 /// A single partition's time window, used to substitute `@start_date` /
@@ -1271,6 +1301,9 @@ mod tests {
             MaterializationStrategy::FullRefresh,
             MaterializationStrategy::Incremental {
                 timestamp_column: "_fivetran_synced".into(),
+                unique_key: Vec::new(),
+                lookback: None,
+                filter_column: None,
             },
             MaterializationStrategy::Merge {
                 unique_key: vec!["id".into()],
@@ -1293,6 +1326,16 @@ mod tests {
                 timestamp_column: "event_time".into(),
                 granularity: TimeGrain::Hour,
             },
+            MaterializationStrategy::Snapshot(Box::new(crate::snapshot::SnapshotSpec {
+                unique_key: vec!["id".into(), "region".into()],
+                change: crate::snapshot::SnapshotChangeStrategy::Check {
+                    check_cols: crate::snapshot::SnapshotCheckColumns::All,
+                    updated_at: Some("changed_at".into()),
+                },
+                hard_deletes: crate::snapshot::SnapshotHardDeletes::NewRecord,
+                meta_columns: crate::snapshot::SnapshotMetaColumns::default(),
+                valid_to_current: Some("'9999-12-31'".into()),
+            })),
         ];
 
         for strategy in &strategies {
@@ -1434,6 +1477,9 @@ mod tests {
             lineage_edges: vec![],
             materialization: MaterializationStrategy::Incremental {
                 timestamp_column: "_fivetran_synced".into(),
+                unique_key: Vec::new(),
+                lookback: None,
+                filter_column: None,
             },
             governance: GovernanceConfig {
                 permissions_file: None,

@@ -60,6 +60,15 @@ rmcp = { version = "3.0", features = ["server", "macros", "transport-io", "clien
 # DIFFERENT TOML parser than the engine's own `product::toml_compat`, so the
 # deferred-count assertion cannot agree with a buggy counter by construction.
 toml = { workspace = true }
+# `postgres_live_pipeline` seeds and reads back a live PostgreSQL through the
+# adapter (skipped unless ROCKY_POSTGRES_TEST_HOST is set).
+rocky-postgres = { path = "../crates/rocky-postgres" }
+# `clickhouse_live_pipeline` seeds and reads back a live ClickHouse through
+# the adapter (skipped unless ROCKY_CLICKHOUSE_TEST_HOST is set).
+rocky-clickhouse = { path = "../crates/rocky-clickhouse" }
+# `sqlserver_live_pipeline` seeds and reads back a live SQL Server through the
+# adapter (skipped unless ROCKY_SQLSERVER_TEST_HOST is set).
+rocky-sqlserver = { path = "../crates/rocky-sqlserver" }
 
 [lints]
 workspace = true

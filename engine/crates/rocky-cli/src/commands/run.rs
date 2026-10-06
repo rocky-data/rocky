@@ -1051,6 +1051,14 @@ pub struct DeferOptions {
     /// production home). When `Some(schema)`, every deferred reference is
     /// pointed at that schema instead (catalog + table preserved).
     pub defer_to: Option<String>,
+    /// Multi-model graph selection (`--select` / `--exclude`), already
+    /// resolved to model names. `None` (every caller that does not pass a
+    /// selector) keeps today's behavior. When `Some`, `rocky run` takes the
+    /// model-only path and builds exactly these models; with `--defer`, every
+    /// model outside the set is a deferred upstream. Lives here because the
+    /// selection is exactly what `--defer` defers *around*. A selection of one
+    /// model is passed as `--model` instead, so that path stays unchanged.
+    pub selected_models: Option<BTreeSet<String>>,
 }
 
 /// Remove the local-model E039 check only after `--defer` has successfully
@@ -1061,16 +1069,40 @@ pub struct DeferOptions {
 /// the single-model defer path that binding is necessarily unselected and the
 /// successful rewrite externalizes it. The external target's schema remains
 /// unknown here: an invalid column still fails at warehouse execution.
+///
+/// With a multi-model selection a selected model may read another selected
+/// (locally built) model, so E039 is suppressed only on a selected model whose
+/// edges were all externalized: it has an externalized edge and no declared
+/// input inside the selection.
 fn suppress_deferred_selected_e039(
     compile_result: &mut rocky_compiler::compile::CompileResult,
-    selected: Option<&str>,
+    selected: Option<&BTreeSet<String>>,
+    externalized: &BTreeMap<String, BTreeSet<String>>,
     defer_enabled: bool,
 ) {
     let Some(selected) = selected.filter(|_| defer_enabled) else {
         return;
     };
+    let suppressed_models: BTreeSet<&str> = if selected.len() == 1 {
+        selected.iter().map(String::as_str).collect()
+    } else {
+        selected
+            .iter()
+            .filter(|name| externalized.get(*name).is_some_and(|e| !e.is_empty()))
+            .filter(|name| {
+                compile_result
+                    .project
+                    .dag_nodes
+                    .iter()
+                    .find(|node| node.name == **name)
+                    .is_some_and(|node| node.depends_on.iter().all(|d| !selected.contains(d)))
+            })
+            .map(String::as_str)
+            .collect()
+    };
     let is_suppressed = |diagnostic: &rocky_compiler::diagnostic::Diagnostic| {
-        diagnostic.model == selected && diagnostic.code.as_ref() == rocky_compiler::diagnostic::E039
+        suppressed_models.contains(diagnostic.model.as_str())
+            && diagnostic.code.as_ref() == rocky_compiler::diagnostic::E039
     };
     compile_result
         .type_check
@@ -1091,12 +1123,25 @@ fn suppress_deferred_selected_e039(
 /// bare and qualified reads.
 fn deferred_externalized_edges(
     compile_result: &rocky_compiler::compile::CompileResult,
-    selected: Option<&str>,
+    selected: Option<&BTreeSet<String>>,
     defer_enabled: bool,
 ) -> BTreeMap<String, BTreeSet<String>> {
-    let Some(selected) = selected.filter(|_| defer_enabled) else {
+    let Some(selected_set) = selected.filter(|_| defer_enabled) else {
         return BTreeMap::new();
     };
+    selected_set
+        .iter()
+        .flat_map(|name| deferred_externalized_edges_for(compile_result, name, selected_set))
+        .collect()
+}
+
+/// [`deferred_externalized_edges`] for one selected model. A dependency that
+/// is itself selected is built locally, so it is never externalized.
+fn deferred_externalized_edges_for(
+    compile_result: &rocky_compiler::compile::CompileResult,
+    selected: &str,
+    selected_set: &BTreeSet<String>,
+) -> BTreeMap<String, BTreeSet<String>> {
     let Some(model) = compile_result.project.model(selected) else {
         return BTreeMap::new();
     };
@@ -1142,7 +1187,11 @@ fn deferred_externalized_edges(
         }),
     );
     let mut externalized = BTreeSet::new();
-    for dependency in &node.depends_on {
+    for dependency in node
+        .depends_on
+        .iter()
+        .filter(|d| !selected_set.contains(*d))
+    {
         let is_rewritten = |relation: &&ObjectName| {
             relation.0.len() == 1
                 && relation.0[0]
@@ -1243,6 +1292,10 @@ pub struct SkipRunOptions {
     /// pruning even when the config opts in — e.g. after a manual target-side
     /// mutation. No effect when `prune_unchanged` is off.
     pub no_prune: bool,
+    /// Whether `--full-refresh` was passed. Transformation `incremental`
+    /// models are rebuilt with `CREATE OR REPLACE TABLE ... AS`, every
+    /// `@incremental_filter` resolved to `TRUE`.
+    pub full_refresh: bool,
 }
 
 /// Fully-resolved configuration for the model-skip gate, assembled in
@@ -1271,6 +1324,11 @@ pub(crate) struct SkipGateConfig {
     /// never skip-eligible in v1 — they are verification runs that write to
     /// different targets, so skipping defeats their purpose.
     pub shadow_or_branch: bool,
+    /// `--full-refresh` — rebuild `incremental` transformation models. Rides
+    /// on this struct because it is the run-scoped build decision already
+    /// threaded to `execute_models`; like `--force-rebuild` it turns the skip
+    /// gate off.
+    pub full_refresh: bool,
 }
 
 impl SkipGateConfig {
@@ -1287,6 +1345,7 @@ impl SkipGateConfig {
             rowcount_fallback: run_config.skip_rowcount_fallback,
             lag_tolerance_seconds: run_config.lag_tolerance_seconds,
             shadow_or_branch,
+            full_refresh: skip_opts.full_refresh,
         }
     }
 
@@ -1294,7 +1353,9 @@ impl SkipGateConfig {
     /// is fully inert (default-off, force-rebuild, or a shadow/branch run),
     /// and `execute_models` takes the unchanged build-everything path.
     pub(crate) fn is_active(&self) -> bool {
-        self.feature_enabled && !self.force_rebuild && !self.shadow_or_branch
+        // `--full-refresh` is a forced rebuild too: a skipped model would
+        // report success without the rebuild the operator asked for.
+        self.feature_enabled && !self.force_rebuild && !self.shadow_or_branch && !self.full_refresh
     }
 
     /// The fully-inert gate — the default-off configuration used by tests
@@ -1307,6 +1368,7 @@ impl SkipGateConfig {
             rowcount_fallback: false,
             lag_tolerance_seconds: 0,
             shadow_or_branch: false,
+            full_refresh: false,
         }
     }
 }
@@ -1333,6 +1395,8 @@ pub(crate) struct ExecutionContext<'a> {
     /// resolved into injected metadata columns at materialization time.
     pub surrogate_keys:
         &'a std::collections::HashMap<String, Vec<rocky_core::models::SurrogateKeySpec>>,
+    /// `rocky run --full-refresh`: rebuild table-writing models from scratch.
+    pub full_refresh: bool,
 }
 
 impl<'a> ExecutionContext<'a> {
@@ -3146,10 +3210,17 @@ pub async fn run_with_explicit_contracts(
     // pipeline that does not resolve falls through, so the run body reports it
     // as it always did.
     if let Some(shadow) = shadow_config {
+        // A multi-model `--select` takes the model-only arm exactly like
+        // `--model`, so it is gated the same way.
+        let first_selected = defer_opts
+            .selected_models
+            .as_ref()
+            .and_then(|set| set.iter().next())
+            .map(String::as_str);
         require_shadow_support_for_config(
             &loaded.config,
             pipeline_name_arg,
-            model_name_filter,
+            model_name_filter.or(first_selected),
             shadow,
         )?;
     }
@@ -3320,7 +3391,21 @@ pub async fn run_with_explicit_contracts(
     // Model-only execution: skip the entire replication path and execute
     // just the named model. Dagster uses this for per-asset materialization
     // when it controls the DAG scheduling.
-    if let Some(target_model) = model_name_filter {
+    //
+    // A multi-model `--select` (resolved to `defer_opts.selected_models`) takes
+    // the same arm, building exactly the selected set. A one-model selection
+    // arrives as `model_name_filter`, so `target_model` stays the `--model`
+    // path unchanged.
+    let selected_models = defer_opts
+        .selected_models
+        .as_ref()
+        .filter(|_| model_name_filter.is_none());
+    if model_name_filter.is_some() || selected_models.is_some() {
+        let target_model: Option<&str> = model_name_filter;
+        let in_selection = |name: &str| match target_model {
+            Some(target) => name == target,
+            None => selected_models.is_some_and(|set| set.contains(name)),
+        };
         ensure_resume_supported(resume_requested, false, "model-only")?;
         let adapter_registry = AdapterRegistry::from_config(rocky_cfg)?;
         // An explicit `--pipeline` alongside `--model` (also how the unified-DAG
@@ -3491,8 +3576,10 @@ pub async fn run_with_explicit_contracts(
             state_store.as_ref(),
             partition_opts,
             &run_id,
-            Some(target_model),
-            None, // single-model path drives selection via `model_name_filter`
+            target_model,
+            // The single-model path drives selection via `model_name_filter`;
+            // a multi-model `--select` drives it through this set.
+            selected_models,
             &mut output,
             None, // model-only run has no pipeline hooks
             None,
@@ -3557,7 +3644,7 @@ pub async fn run_with_explicit_contracts(
                             .models
                             .iter()
                             .map(|m| m.name.as_str())
-                            .filter(|name| *name == target_model),
+                            .filter(|name| in_selection(name)),
                     )
                     .await
                 {
@@ -3577,12 +3664,27 @@ pub async fn run_with_explicit_contracts(
                     // fingerprint gate, never a fresh disk compile.
                     let governance_adapter =
                         adapter_registry.governance_adapter(&target_adapter_name);
-                    apply_model_governance_tags(
-                        &snapshot,
-                        governance_adapter.as_ref(),
-                        Some(target_model),
-                    )
-                    .await;
+                    match (target_model, selected_models) {
+                        (Some(target), _) => {
+                            apply_model_governance_tags(
+                                &snapshot,
+                                governance_adapter.as_ref(),
+                                Some(target),
+                            )
+                            .await;
+                        }
+                        (None, Some(set)) => {
+                            for model in set {
+                                apply_model_governance_tags(
+                                    &snapshot,
+                                    governance_adapter.as_ref(),
+                                    Some(model),
+                                )
+                                .await;
+                            }
+                        }
+                        (None, None) => {}
+                    }
                     // Write the recipe-identity attestation into the built table's
                     // warehouse metadata (Databricks Delta TBLPROPERTIES; no-op
                     // elsewhere). Reads the triple off the materialization; never
@@ -3602,7 +3704,7 @@ pub async fn run_with_explicit_contracts(
                 // too, instead of hard-coding `Unknown`.
                 let (failure_kind, cooldown_seconds) = classify_anyhow_error_with_cooldown(&e);
                 output.errors.push(crate::output::TableErrorOutput {
-                    asset_key: vec![target_model.to_string()],
+                    asset_key: vec![target_model.unwrap_or("<selection>").to_string()],
                     error: format!("{e:#}"),
                     failure_kind,
                     cooldown_seconds,
@@ -8284,7 +8386,10 @@ async fn run_batched_checks(
             let table_ref = dialect
                 .format_table_ref(&br.catalog, &br.schema, &br.table)
                 .map_err(anyhow::Error::from)?;
-            let sql = format!("SELECT COUNT(*), MAX({timestamp_column}) FROM {table_ref}");
+            let sql = format!(
+                "SELECT COUNT(*), {} FROM {table_ref}",
+                dialect.max_aggregate(timestamp_column)
+            );
             match warehouse.execute_query(&sql).await {
                 Ok(result) => {
                     // One row, two cells: the count, then the maximum. A
@@ -9603,7 +9708,7 @@ pub(super) fn emit_pipes_events(pipes: &crate::pipes::PipesEmitter, output: &Run
 /// reference.
 fn apply_defer_rewrite(
     compile_result: &mut rocky_compiler::compile::CompileResult,
-    model_name_filter: Option<&str>,
+    model_name_filter: Option<&BTreeSet<String>>,
     defer_opts: &DeferOptions,
     dialect: &dyn rocky_core::traits::SqlDialect,
 ) -> Result<()> {
@@ -9632,10 +9737,9 @@ fn apply_defer_rewrite(
             .with_context(|| format!("invalid --defer-to schema '{schema}'"))?;
     }
 
-    // Build the set of selected (built-locally) model names. Today `--model`
-    // selects exactly one model, but treat it as a set so the logic survives
-    // a future multi-select.
-    let selected_set: HashSet<&str> = std::iter::once(selected).collect();
+    // The selected (built-locally) model names: one for `--model`, several
+    // for a `--select` that resolved to more than one model.
+    let selected_set: HashSet<&str> = selected.iter().map(String::as_str).collect();
 
     // The deferred set = every compiled model not in the selection, mapped to
     // its qualified defer target. `--defer-to` overrides the schema part;
@@ -9770,12 +9874,15 @@ pub(crate) fn rewrite_quote_style(
 ) -> Result<Option<char>> {
     match dialect.name() {
         // `format_table_ref` renders bare identifiers.
-        "duckdb" | "databricks" => Ok(None),
+        "duckdb" | "databricks" | "postgres" | "redshift" | "clickhouse" => Ok(None),
         // `format_table_ref` renders backticks; its own comment gives the
         // reason (project IDs may contain hyphens).
         "bigquery" => Ok(Some('`')),
         // `format_table_ref` renders double quotes on both.
         "snowflake" | "trino" => Ok(Some('"')),
+        // `format_table_ref` renders `[brackets]`; sqlparser's `Ident` renders
+        // a `[` quote style as `[name]`.
+        "sqlserver" => Ok(Some('[')),
         other => anyhow::bail!(
             "cannot rewrite upstream references for dialect '{other}': its identifier quoting \
              is unknown, so a rewritten reference could name a different object than the one \
@@ -9941,6 +10048,18 @@ pub(crate) fn dialect_case_rules(
         // Trino: "Identifiers are not treated as case sensitive" —
         // trino.io/docs/current/language/reserved.html
         "duckdb" | "databricks" | "trino" => Ok(uniform(false)),
+        // PostgreSQL folds an UNQUOTED identifier to lower case, and
+        // `PostgresDialect::format_table_ref` renders every target bare — so
+        // two configured targets differing only by case are created as ONE
+        // object, and an unquoted reference resolves onto it the same way.
+        // (A quoted mixed-case reference in user SQL names a different
+        // object; Rocky never creates one.) —
+        // postgresql.org/docs/current/sql-syntax-lexical.html
+        // Redshift: identifiers are case-insensitive and folded to lower case,
+        // quoted ones included, unless the session sets
+        // `enable_case_sensitive_identifier` (off by default) —
+        // docs.aws.amazon.com/redshift/latest/dg/r_names.html
+        "postgres" | "redshift" => Ok(uniform(false)),
         // Two targets differing only by case can name two objects.
         //
         // BigQuery: dataset and table names are case-sensitive by default, so
@@ -9963,6 +10082,21 @@ pub(crate) fn dialect_case_rules(
         // `apply_shadow_rewrite` answers it with its own always-folding
         // `collision_identity`. Do not reuse this function for it.
         "bigquery" => Ok(uniform(true)),
+        // ClickHouse: database and table names are case-sensitive, quoted or
+        // not, with no session setting that changes it, and
+        // `ClickHouseDialect::format_table_ref` renders them bare — so
+        // `orders` and `Orders` are two tables —
+        // clickhouse.com/docs/sql-reference/syntax#identifiers
+        "clickhouse" => Ok(uniform(true)),
+        // SQL Server: identifier case follows the database COLLATION, quoted or
+        // not — the default `SQL_Latin1_General_CP1_CI_AS` folds case, a `_CS_`
+        // or `_BIN2` collation does not —
+        // learn.microsoft.com/sql/relational-databases/collations/collation-and-unicode-support
+        // The collation is database state Rocky does not read here, so this
+        // assumes case-sensitive, the fail-closed answer for the redirect
+        // question (same narrow reading as the BigQuery / Snowflake note
+        // above).
+        "sqlserver" => Ok(uniform(true)),
         // Snowflake carries a SECOND identity axis on top of case: it resolves
         // an UNQUOTED identifier by upper-casing it, while
         // `SnowflakeSqlDialect::format_table_ref` renders every component of a
@@ -10241,29 +10375,11 @@ fn apply_shadow_rewrite(
                     model.config.name
                 );
             }
-            // Ephemeral models emit no statements
-            // (`sql_gen::generate_transformation_sql` returns an empty vec), and
-            // the comments throughout this codebase describe them as "inlined as
-            // CTEs in downstream queries". No such inlining exists: nothing in
-            // `rocky-compiler` or `rocky-sql` rewrites a consumer's `FROM eph`
-            // into a CTE, and the dbt importer states outright that
-            // `materialized='ephemeral'` has no Rocky equivalent.
-            //
-            // So a consumer of an ephemeral model reads whatever physical table
-            // happens to carry that name. Under shadow that is the PRODUCTION
-            // table — the one thing this routing exists to prevent — and no
-            // rewrite here can fix it, because there is no shadow object to
-            // point the read at. Fail closed until inlining is real, the same
-            // way the two strategies above do.
-            rocky_core::models::StrategyConfig::Ephemeral => {
-                anyhow::bail!(
-                    "shadow/branch execution is not supported for ephemeral model '{}': \
-                     ephemeral models are not materialized and are not inlined into their \
-                     consumers, so a consumer would read the production table instead of an \
-                     isolated one. Give the model a materialized strategy to shadow it",
-                    model.config.name
-                );
-            }
+            // An ephemeral model builds nothing, so it has no shadow object.
+            // Its SQL is already inlined into each consumer, whose reads of
+            // the ephemeral model's upstreams this rewrite routes like any
+            // other read.
+            rocky_core::models::StrategyConfig::Ephemeral => continue,
             // The incremental family cannot produce a comparable shadow
             // (#1273). These strategies build on what the target ALREADY
             // holds, and a shadow target holds nothing:
@@ -10289,7 +10405,8 @@ fn apply_shadow_rewrite(
             rocky_core::models::StrategyConfig::Incremental { .. }
             | rocky_core::models::StrategyConfig::Merge { .. }
             | rocky_core::models::StrategyConfig::DeleteInsert { .. }
-            | rocky_core::models::StrategyConfig::Microbatch { .. } => {
+            | rocky_core::models::StrategyConfig::Microbatch { .. }
+            | rocky_core::models::StrategyConfig::Snapshot { .. } => {
                 anyhow::bail!(
                     "shadow/branch execution is not supported for model '{}': its \
                      '{}' strategy builds on rows the target already holds, and a shadow \
@@ -10301,6 +10418,7 @@ fn apply_shadow_rewrite(
                         rocky_core::models::StrategyConfig::Incremental { .. } => "incremental",
                         rocky_core::models::StrategyConfig::Merge { .. } => "merge",
                         rocky_core::models::StrategyConfig::DeleteInsert { .. } => "delete_insert",
+                        rocky_core::models::StrategyConfig::Snapshot { .. } => "snapshot",
                         _ => "microbatch",
                     }
                 );
@@ -10691,6 +10809,62 @@ pub(crate) fn resolve_model_run_target(
     }
 }
 
+/// Resolve `--select` / `--exclude` for a model run (`rocky run`, `rocky
+/// plan`) against the same models a `--model` run would compile: the
+/// `--models` override, else the owning transformation pipeline's configured
+/// directory and glob, else `./models`.
+///
+/// Ephemeral models are dropped from the result (they are never built on
+/// their own), except one named by the literal `--model` flag, which the
+/// runner refuses with E038. A selection of only ephemeral models is empty:
+/// "nothing to do".
+pub fn resolve_run_selection(
+    config_path: &Path,
+    state_path: &Path,
+    cache_ttl_override: Option<u64>,
+    pipeline_name_arg: Option<&str>,
+    models_dir: Option<&Path>,
+    selection: &crate::selection::SelectionArgs,
+) -> Result<BTreeSet<String>> {
+    let (mdir, models_glob) = if let Some(dir) = models_dir {
+        (dir.to_path_buf(), None)
+    } else {
+        let config = rocky_core::config::load_rocky_config(config_path)?;
+        let (_, _, configured_glob) = resolve_model_run_target(&config, pipeline_name_arg)?;
+        match configured_glob {
+            Some(glob) => {
+                let dir = match crate::models_loader::locate_models_dir(&glob, config_path)? {
+                    crate::models_loader::ModelsDir::Present(dir)
+                    | crate::models_loader::ModelsDir::Absent(dir) => dir,
+                };
+                (
+                    dir,
+                    Some(crate::models_loader::resolved_models_glob(
+                        &glob,
+                        config_path,
+                    )),
+                )
+            }
+            None => (PathBuf::from("models"), None),
+        }
+    };
+    anyhow::ensure!(
+        mdir.exists(),
+        "models directory '{}' not found (required for --select)",
+        mdir.display()
+    );
+    crate::selection::resolve_buildable_in_dir(
+        selection,
+        &mdir,
+        models_glob.as_deref(),
+        &crate::selection::StateContext {
+            config_path,
+            state_path,
+            cache_ttl_override,
+        },
+    )
+}
+
 /// The (catalog, schema) pairs an invocation may pre-create under
 /// `auto_create_schemas` — the models the selection will attempt to build.
 /// (Runtime exclusions decided later — containment poisoning, skip gates —
@@ -10717,6 +10891,11 @@ fn collect_auto_create_targets(
         if model_name_filter.is_some_and(|selected| selected != model.config.name)
             || model_set.is_some_and(|set| !set.contains(&model.config.name))
             || compile_failed.contains(&model.config.name)
+            // Ephemeral models write nothing, so they need no schema.
+            || matches!(
+                model.config.strategy,
+                rocky_core::models::StrategyConfig::Ephemeral
+            )
         {
             continue;
         }
@@ -11461,27 +11640,45 @@ pub(crate) async fn execute_models_with_explicit_contracts(
     // production capture failure → refuse (do NOT fall through to the live cache).
     // Only a genuinely-legacy plan (`None` + `!require`) and the non-gated paths
     // (bare `rocky run`, human apply) load the live cache — byte-identical.
+    //
+    // The cache path also carries each entry's provenance, so the compile
+    // below surfaces the E041 / W041 missing-source-column check before any
+    // model executes (an E041 model is excluded like any error-severity one).
+    // A reviewed snapshot carries no provenance: it is replayed as reviewed,
+    // and the check stays off for it.
     let cache_source_schemas = || {
         if schema_cache_config.enabled {
             match state_store {
-                Some(store) => rocky_compiler::schema_cache::load_source_schemas_from_cache(
-                    store,
-                    chrono::Utc::now(),
-                    schema_cache_config.ttl(),
-                )
-                .unwrap_or_default(),
-                None => std::collections::HashMap::new(),
+                Some(store) => {
+                    rocky_compiler::schema_cache::load_source_schemas_with_provenance_from_cache(
+                        store,
+                        chrono::Utc::now(),
+                        schema_cache_config.ttl(),
+                        schema_cache_config.trusted_max_age(),
+                    )
+                    .map(|(schemas, provenance)| {
+                        (
+                            schemas,
+                            provenance.with_strict(schema_cache_config.strict_sources),
+                        )
+                    })
+                    .unwrap_or_default()
+                }
+                None => Default::default(),
             }
         } else {
-            std::collections::HashMap::new()
+            Default::default()
         }
     };
-    let source_schemas = match exec_fp_gate {
+    let (source_schemas, source_provenance) = match exec_fp_gate {
         Some(gate) => match &gate.reviewed_source_schemas {
-            Some(snapshot) => snapshot
-                .iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect::<std::collections::HashMap<_, _>>(),
+            Some(snapshot) => (
+                snapshot
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect::<std::collections::HashMap<_, _>>(),
+                Default::default(),
+            ),
             None if gate.require => {
                 anyhow::bail!(
                     "refusing to execute plan '{}': it is a governed plan carrying no reviewed \
@@ -11507,6 +11704,7 @@ pub(crate) async fn execute_models_with_explicit_contracts(
         // This pre-execution compile stays scoped to typecheck +
         // contract diagnostics to avoid broadening its signature.
         run_vars: run_vars.clone(),
+        source_provenance,
         ..Default::default()
     };
 
@@ -11541,10 +11739,65 @@ pub(crate) async fn execute_models_with_explicit_contracts(
         }
     };
 
+    // PostgreSQL accepts a column functionally dependent on a grouped primary
+    // key, which Rocky cannot see, so E044 is the warning W044 there — the
+    // same downgrade `rocky compile` applies. Redshift keeps E044.
+    if warehouse.dialect().name() == "postgres"
+        && rocky_compiler::group_by::downgrade_for_postgres(&mut compile_result.diagnostics, |_| {
+            true
+        }) > 0
+    {
+        compile_result.has_errors = compile_result
+            .diagnostics
+            .iter()
+            .any(rocky_compiler::diagnostic::Diagnostic::is_error);
+    }
+
+    // `--model <function>` selects a user-defined function (`functions/`):
+    // create it and the functions it calls, and build no model.
+    if let Some(name) = model_name_filter
+        && compile_result.project.model(name).is_none()
+        && compile_result
+            .semantic_graph
+            .functions()
+            .get(name)
+            .is_some()
+    {
+        // Function DDL is not covered by the governed-apply fingerprint or
+        // the freeze fence, so a governed apply may not select a function.
+        anyhow::ensure!(
+            exec_fp_gate.is_none(),
+            "a governed apply cannot select user-defined function '{name}': function DDL is \
+             not covered by the plan fingerprint"
+        );
+        let statements = super::functions_ddl::statements_for(
+            &compile_result,
+            [name],
+            warehouse.dialect().name(),
+        )?;
+        let failed =
+            super::functions_ddl::create_functions(warehouse, &compile_result, &statements).await;
+        if let Some((function, e)) = failed.into_iter().next() {
+            anyhow::bail!("function '{function}': {e}");
+        }
+        return Ok(GovernanceSnapshot::default());
+    }
+
     if let Some(name) = model_name_filter {
         let selected = compile_result.project.model(name).ok_or_else(|| {
             anyhow::anyhow!("model '{name}' not found (no transformation model with that name)")
         })?;
+        // E038: an ephemeral model builds nothing on its own. `rocky run
+        // --dag` never dispatches one (`run_dag_exec.rs`), so only a direct
+        // `--model <ephemeral>` reaches this.
+        anyhow::ensure!(
+            !matches!(
+                selected.config.strategy,
+                rocky_core::models::StrategyConfig::Ephemeral
+            ),
+            "[E038] model '{name}' is ephemeral: it is inlined as a CTE into each model that \
+             reads it and has nothing to build on its own. Run a model that reads it instead"
+        );
         if contracts_dir.is_some() {
             anyhow::ensure!(
                 matches!(
@@ -11627,17 +11880,32 @@ pub(crate) async fn execute_models_with_explicit_contracts(
     // fingerprint above intentionally covers the pre-rewrite project. This
     // in-memory rewrite must succeed before E039 can be suppressed, and no
     // warehouse write occurs before either step.
-    let externalized_defer_edges =
-        deferred_externalized_edges(&compile_result, model_name_filter, defer_opts.enabled);
+    //
+    // The defer selection is `--model`, else the `--select` set (the
+    // `model_set` the model-only arm passes). A backfill also passes a
+    // `model_set` but never enables `--defer`, so every step below is inert.
+    let defer_selection: Option<BTreeSet<String>> = model_name_filter
+        .map(|name| BTreeSet::from([name.to_string()]))
+        .or_else(|| model_set.cloned());
+    let externalized_defer_edges = deferred_externalized_edges(
+        &compile_result,
+        defer_selection.as_ref(),
+        defer_opts.enabled,
+    );
     if defer_opts.enabled {
         apply_defer_rewrite(
             &mut compile_result,
-            model_name_filter,
+            defer_selection.as_ref(),
             defer_opts,
             warehouse.dialect(),
         )?;
     }
-    suppress_deferred_selected_e039(&mut compile_result, model_name_filter, defer_opts.enabled);
+    suppress_deferred_selected_e039(
+        &mut compile_result,
+        defer_selection.as_ref(),
+        &externalized_defer_edges,
+        defer_opts.enabled,
+    );
 
     let compile_failed_models: BTreeSet<String> = compile_result
         .diagnostics
@@ -11711,6 +11979,21 @@ pub(crate) async fn execute_models_with_explicit_contracts(
     //     `DagExecutor` then skipped the healthy descendants of nodes that had
     //     actually materialized successfully. The broken model's OWN node
     //     still reports it, which is where it belongs.
+    // W041 (a source column missing from a possibly-stale cached schema) does
+    // not block execution — the warehouse may have the column — but say so
+    // before the warehouse is touched, so a failure that follows is explained.
+    for d in compile_result
+        .diagnostics
+        .iter()
+        .filter(|d| d.code.as_ref() == rocky_compiler::diagnostic::W041)
+    {
+        warn!(
+            model = d.model.as_str(),
+            code = &*d.code,
+            message = &*d.message,
+            "compile warning"
+        );
+    }
     if compile_result.has_errors {
         let mut reported: BTreeSet<&str> = BTreeSet::new();
         for d in &compile_result.diagnostics {
@@ -11816,7 +12099,12 @@ pub(crate) async fn execute_models_with_explicit_contracts(
         for model in &compile_result.project.models {
             let selected = model_name_filter.is_none_or(|f| f == model.config.name)
                 && model_set.is_none_or(|set| set.contains(&model.config.name));
-            if !selected {
+            // An ephemeral model has no shadow object (it is never routed).
+            let ephemeral = matches!(
+                model.config.strategy,
+                rocky_core::models::StrategyConfig::Ephemeral
+            );
+            if !selected || ephemeral {
                 continue;
             }
             shadow_objects.push(crate::commands::shadow_lifecycle::ShadowObject {
@@ -11976,6 +12264,67 @@ pub(crate) async fn execute_models_with_explicit_contracts(
         }
     }
 
+    // User-defined functions (`functions/`): create every function a model
+    // this invocation builds calls — callees first — before any model runs.
+    // A function that cannot be created fails only the models that need it
+    // (and their declared descendants); everything else still builds.
+    let in_run = |name: &str| {
+        model_name_filter.is_none_or(|selected| selected == name)
+            && model_set.is_none_or(|set| set.contains(name))
+    };
+    let function_failures = match super::functions_ddl::function_statements(
+        &compile_result,
+        |name| in_run(name) && !compile_excluded_models.contains(name),
+        dialect.name(),
+    ) {
+        Ok(statements) => {
+            super::functions_ddl::create_functions(warehouse, &compile_result, &statements).await
+        }
+        Err(e) => compile_result
+            .semantic_graph
+            .functions()
+            .functions()
+            .map(|f| (f.def.name.clone(), format!("{e:#}")))
+            .collect(),
+    };
+    let function_blocked =
+        super::functions_ddl::callers_of_failed(&compile_result, &function_failures);
+    let mut newly_excluded: BTreeSet<String> = BTreeSet::new();
+    for (model, function) in &function_blocked {
+        if !in_run(model) || compile_excluded_models.contains(model) {
+            continue;
+        }
+        newly_excluded.insert(model.clone());
+        output.tables_failed += 1;
+        output.errors.push(crate::output::TableErrorOutput {
+            asset_key: vec![model.clone()],
+            error: format!(
+                "model '{model}' was not built: function '{function}' {}",
+                function_failures
+                    .get(function)
+                    .map(String::as_str)
+                    .unwrap_or("could not be created")
+            ),
+            failure_kind: crate::output::FailureKind::CompileError,
+            cooldown_seconds: None,
+        });
+    }
+    // Declared descendants keep their existing targets rather than reading a
+    // producer that was not rebuilt.
+    let mut changed = !newly_excluded.is_empty();
+    while changed {
+        changed = false;
+        for node in &compile_result.project.dag_nodes {
+            if !newly_excluded.contains(&node.name)
+                && node.depends_on.iter().any(|d| newly_excluded.contains(d))
+            {
+                newly_excluded.insert(node.name.clone());
+                changed = true;
+            }
+        }
+    }
+    compile_excluded_models.extend(newly_excluded);
+
     let mut models_executed = 0usize;
 
     // Bundle borrowed compile-time facts (typed schemas + per-model timings)
@@ -11990,6 +12339,7 @@ pub(crate) async fn execute_models_with_explicit_contracts(
         typed_models: &compile_result.type_check.typed_models,
         model_timings: &compile_result.model_timings,
         surrogate_keys: &surrogate_keys,
+        full_refresh: skip_gate.full_refresh,
     };
 
     // Intra-layer concurrency is strictly opt-in via `--parallel N`.
@@ -12005,7 +12355,17 @@ pub(crate) async fn execute_models_with_explicit_contracts(
     // Opt-in model-skip gate. Inert unless `skip_gate.is_active()`; when
     // inactive the gate below short-circuits and `execute_models` builds every
     // model exactly as before (no extra state reads / warehouse queries).
-    let mut gate = super::skip_gate::SkipGate::new(skip_gate, &compile_result.project);
+    // Models that call a project UDF: never skipped or reused, because their
+    // logic hash does not cover the function bodies they call.
+    let function_callers: std::collections::HashSet<String> = rocky_compiler::udf::function_usage(
+        &compile_result.project.models,
+        compile_result.semantic_graph.functions(),
+    )
+    .into_values()
+    .flatten()
+    .collect();
+    let mut gate = super::skip_gate::SkipGate::new(skip_gate, &compile_result.project)
+        .with_function_callers(function_callers.clone());
 
     // Failure-containment ledger (opt-in via `[resilience] contain_failures`).
     // Tracks the downstream closure of every failed / withheld model so a
@@ -12205,6 +12565,14 @@ pub(crate) async fn execute_models_with_explicit_contracts(
             // rebuilding from a failed producer's stale output.
             .filter(|name| !compile_excluded_models.contains(name.as_str()))
             .filter_map(|name| compile_result.project.model(name).map(|m| (name, m)))
+            // An ephemeral model is never executed: compile already inlined
+            // its SQL into every consumer. It reports no materialization.
+            .filter(|(_, m)| {
+                !matches!(
+                    m.config.strategy,
+                    rocky_core::models::StrategyConfig::Ephemeral
+                )
+            })
             .enumerate()
             .map(|(idx, (name, model))| (idx, name, model))
             .collect();
@@ -12684,11 +13052,15 @@ pub(crate) async fn execute_models_with_explicit_contracts(
                     );
                     match (model_is_unpartitioned, state_store) {
                         (true, Some(store)) => {
-                            let input_hash = compute_decision_input_hash(
-                                &model_ir,
-                                &reuse_target_by_model,
-                                &reuse_outputs,
-                            );
+                            let input_hash = if function_callers.contains(model_ir.name.as_ref()) {
+                                None
+                            } else {
+                                compute_decision_input_hash(
+                                    &model_ir,
+                                    &reuse_target_by_model,
+                                    &reuse_outputs,
+                                )
+                            };
                             Some(super::run_content_addressed::ReuseDecisionCtx {
                                 input_hash,
                                 state_store: store,
@@ -13824,6 +14196,7 @@ fn transformation_strategy_name(strategy: &MaterializationStrategy) -> &'static 
         MaterializationStrategy::DeleteInsert { .. } => "delete_insert",
         MaterializationStrategy::Microbatch { .. } => "microbatch",
         MaterializationStrategy::ContentAddressed { .. } => "content_addressed",
+        MaterializationStrategy::Snapshot(_) => "snapshot",
     }
 }
 
@@ -14060,7 +14433,8 @@ fn strategy_implies_object_kind(
         | S::Ephemeral
         | S::DeleteInsert { .. }
         | S::Microbatch { .. }
-        | S::ContentAddressed { .. } => None,
+        | S::ContentAddressed { .. }
+        | S::Snapshot(_) => None,
     }
 }
 
@@ -14161,6 +14535,17 @@ async fn execute_one_plain_model(
     if let Some(specs) = exec_ctx.surrogate_keys.get(model_name) {
         rocky_core::models::apply_surrogate_keys(&mut model_ir, specs, dialect)?;
     }
+    // `--full-refresh`: rebuild an `incremental` model from scratch. The rebuilt
+    // IR is a `FullRefresh` over the model SQL with every
+    // `@incremental_filter` resolved to `TRUE`, so it takes the CTAS path
+    // below; the recipe identity keeps describing the declared strategy.
+    let mut recipe_ir = None;
+    if exec_ctx.full_refresh
+        && super::run_incremental::rebuilds_on_full_refresh(&model_ir.materialization)
+    {
+        let rebuilt = super::run_incremental::full_refresh_ir(&model_ir, dialect);
+        recipe_ir = Some(std::mem::replace(&mut model_ir, rebuilt));
+    }
     let target_ref = dialect
         .format_table_ref(
             &model_ir.target.catalog,
@@ -14168,6 +14553,28 @@ async fn execute_one_plain_model(
             &model_ir.target.table,
         )
         .map_err(anyhow::Error::from)?;
+
+    // A snapshot model reads its target's columns before generating SQL, so
+    // it takes its own path (bootstrap, or close-and-open versions).
+    if let rocky_ir::MaterializationStrategy::Snapshot(spec) = &model_ir.materialization {
+        return execute_snapshot_model(
+            &model_ir,
+            spec,
+            model
+                .config
+                .strategy
+                .snapshot_lowered()
+                .map(|lowered| lowered.problems)
+                .unwrap_or_default(),
+            &target_ref,
+            warehouse,
+            dialect,
+            model_name,
+            model_start,
+            exec_ctx,
+        )
+        .await;
+    }
 
     // Strategy/target-kind reconciliation (#2037). `FullRefresh` and `View` each issue `CREATE OR REPLACE
     // <kind>` further down — `TABLE` for `FullRefresh`, `VIEW` for `View`
@@ -14188,11 +14595,26 @@ async fn execute_one_plain_model(
     // `INSERT`/`MERGE` into it); `MaterializedView`/`DynamicTable` are a
     // third and fourth object kind this binary check does not model.
     // Generate every statement before a permitted destructive change.
-    let exec_stmts = rocky_core::sql_gen::generate_transformation_sql_with_warehouse(
+    let mut exec_stmts = rocky_core::sql_gen::generate_transformation_sql_with_warehouse(
         &model_ir,
         dialect,
         warehouse.warehouse_name(),
     )?;
+    // An `incremental` model against an existing target: check its columns
+    // against the target (`on_schema_change`), pick a positional or named
+    // INSERT, and read the watermark it starts from. `None` leaves the target
+    // to the existence probe below (first run → bootstrap CTAS).
+    let incremental_run = if matches!(
+        model_ir.materialization,
+        rocky_ir::MaterializationStrategy::Incremental { .. }
+    ) {
+        super::run_incremental::prepare(model, &model_ir, warehouse, dialect).await?
+    } else {
+        None
+    };
+    if let Some(run) = &incremental_run {
+        exec_stmts.clone_from(&run.exec_stmts);
+    }
     let mut pending_drop: Option<(String, &'static str, &'static str)> = None;
     let mut kind_probe_note = None;
     if let Some(expected_kind) = strategy_implies_object_kind(&model_ir.materialization) {
@@ -14403,6 +14825,22 @@ async fn execute_one_plain_model(
         }
     }
 
+    // An incremental run against an existing target must have been planned
+    // by `run_incremental::prepare` (column check, named INSERT). If that
+    // describe failed but the existence probe then found the target, refuse
+    // rather than fall back to the unchecked positional INSERT.
+    if !skip_strategy_exec
+        && incremental_run.is_none()
+        && matches!(
+            model_ir.materialization,
+            rocky_ir::MaterializationStrategy::Incremental { .. }
+        )
+    {
+        return Err(anyhow::anyhow!(
+            "model '{model_name}': could not read the columns of {target_ref} to check them \
+             against the model before the incremental load; nothing was written"
+        ));
+    }
     info!(
         model = model_name,
         target = target_ref.as_str(),
@@ -14477,6 +14915,53 @@ async fn execute_one_plain_model(
         }
     }
 
+    // Report the watermark an `incremental` model now stands at, read back
+    // from the target (`MAX(<watermark>)`), and the one this run started from.
+    // The data is already committed, so a failed read is a note, not a
+    // failed model.
+    let mut incremental_notes = Vec::new();
+    let mut watermark = None;
+    let declared_ir = recipe_ir.as_ref().unwrap_or(&model_ir);
+    if let Some(run) = &incremental_run {
+        incremental_notes.extend(run.notes.iter().cloned());
+    }
+    if let rocky_ir::MaterializationStrategy::Incremental {
+        timestamp_column, ..
+    } = &declared_ir.materialization
+    {
+        match super::run_incremental::query_max(warehouse, &target_ref, timestamp_column).await {
+            Ok(after) => {
+                watermark = after.as_deref().and_then(parse_timestamp_cell);
+                let after = after.as_deref().unwrap_or("NULL (empty target)");
+                let note = match &incremental_run {
+                    Some(run) => incremental_load_note(
+                        model_name,
+                        &model_ir,
+                        warehouse.dialect(),
+                        run.prior_watermark.as_deref(),
+                        after,
+                    ),
+                    None => format!(
+                        "Full load of model '{model_name}' into {target_ref}; \
+                         MAX({timestamp_column}) is now {after}"
+                    ),
+                };
+                incremental_notes.push(note);
+            }
+            Err(e) => incremental_notes.push(format!(
+                "Model '{model_name}' loaded, but reading MAX({timestamp_column}) back from \
+                 {target_ref} failed: {e:#}"
+            )),
+        }
+    }
+    if let Some(declared) = &recipe_ir {
+        incremental_notes.push(format!(
+            "Full refresh: rebuilt {target_ref} for model '{model_name}' from its full SQL \
+             (declared strategy: {})",
+            transformation_strategy_name(&declared.materialization)
+        ));
+    }
+
     let model_duration_ms = model_start.elapsed().as_millis() as u64;
     let target_table_full_name = format!(
         "{}.{}.{}",
@@ -14496,6 +14981,7 @@ async fn execute_one_plain_model(
             })
             .into_iter()
             .chain(kind_probe_note)
+            .chain(incremental_notes)
             .collect(),
         attempts: Vec::new(),
         rows_copied: None,
@@ -14503,7 +14989,7 @@ async fn execute_one_plain_model(
         started_at: model_started_at,
         metadata: MaterializationMetadata {
             strategy: transformation_strategy_name(&model_ir.materialization).to_string(),
-            watermark: None,
+            watermark,
             target_table_full_name: Some(target_table_full_name),
             sql_hash: Some(crate::output::sql_fingerprint(&exec_stmts)),
             column_count: exec_ctx.column_count_for(model_name),
@@ -14522,12 +15008,257 @@ async fn execute_one_plain_model(
         // behavior byte-identical.
         skip_internal: None,
         recipe_identity: Some(crate::output::recipe_identity_internal(
-            &model_ir,
+            recipe_ir.as_ref().unwrap_or(&model_ir),
             warehouse.dialect().name(),
         )),
         // Not the content-addressed write path — no in-process column bytes.
         output_column_hashes: None,
         // Consumer baseline is content-addressed-path only.
+        consumed_column_baseline: None,
+    })
+}
+
+/// The run note for an incremental load against an existing target. The
+/// comparison comes from [`rocky_core::incremental_filter::predicate_summary`],
+/// the same resolution the SQL uses, so `filter_column` and `lookback` show
+/// as they were applied.
+fn incremental_load_note(
+    model_name: &str,
+    model_ir: &rocky_ir::ModelIr,
+    dialect: &dyn rocky_core::traits::SqlDialect,
+    prior_watermark: Option<&str>,
+    after: &str,
+) -> String {
+    let before = prior_watermark.unwrap_or("NULL (empty target)");
+    let timestamp_column = match &model_ir.materialization {
+        rocky_ir::MaterializationStrategy::Incremental {
+            timestamp_column, ..
+        } => timestamp_column.as_str(),
+        _ => "",
+    };
+    match rocky_core::incremental_filter::predicate_summary(model_ir, dialect) {
+        Ok(p) => format!(
+            "Incremental load of model '{model_name}': rows with {} > {} over the target, \
+             where MAX({timestamp_column}) was {before} before this run; \
+             MAX({timestamp_column}) is now {after}",
+            p.compared, p.bound
+        ),
+        Err(e) => format!(
+            "Incremental load of model '{model_name}' (filter could not be described: {e}); \
+             MAX({timestamp_column}) was {before} before this run and is now {after}"
+        ),
+    }
+}
+
+/// Execute one `type = "snapshot"` model (SCD Type 2 over the model SELECT).
+///
+/// First run: the target is absent, so a non-replacing CTAS loads every row
+/// as its first current version. Later runs: describe the target, take the
+/// model's columns from it (everything but the metadata columns), and run the
+/// close / open / hard-delete statements from
+/// [`rocky_core::snapshot_model::generate_snapshot_model_sql`]. The statements
+/// run in order without a transaction; that module documents why a run that
+/// stops part-way is safe to repeat.
+#[allow(clippy::too_many_arguments)]
+async fn execute_snapshot_model(
+    model_ir: &rocky_ir::ModelIr,
+    spec: &rocky_ir::SnapshotSpec,
+    lowering_problems: Vec<String>,
+    target_ref: &str,
+    warehouse: &dyn rocky_core::traits::WarehouseAdapter,
+    dialect: &dyn rocky_core::traits::SqlDialect,
+    model_name: &str,
+    model_start: Instant,
+    exec_ctx: ExecutionContext<'_>,
+) -> Result<MaterializationOutput> {
+    use rocky_core::snapshot_model;
+
+    // Lowering problems (e.g. conflicting `hard_deletes` spellings) are not
+    // representable in the spec, so re-check them here for callers that
+    // skipped the compile gate.
+    let mut problems = lowering_problems;
+    for problem in spec.problems() {
+        if !problems.contains(&problem) {
+            problems.push(problem);
+        }
+    }
+    if !problems.is_empty() {
+        anyhow::bail!(
+            "model '{model_name}' has an invalid snapshot config (E049): {}",
+            problems.join("; ")
+        );
+    }
+    // A warehouse that cannot run the SCD2 MERGE refuses before any probe,
+    // CTAS or ALTER reaches it.
+    snapshot_model::refuse_unsupported_dialect(dialect)
+        .with_context(|| format!("snapshot model '{model_name}' failed"))?;
+    let model_started_at = Utc::now();
+    let target_table = rocky_ir::TableRef {
+        catalog: model_ir.target.catalog.clone(),
+        schema: model_ir.target.schema.clone(),
+        table: model_ir.target.table.clone(),
+    };
+    // Same existence probe as the other bootstrap strategies: a retryable
+    // failure must not be read as "absent".
+    let existing = match warehouse.describe_table(&target_table).await {
+        Ok(columns) => Some(columns),
+        Err(e) if warehouse.classify_failure(&e).is_retryable() => {
+            return Err(anyhow::Error::from(e).context(format!(
+                "target existence probe for snapshot model '{model_name}' failed with a \
+                 retryable error; refusing to assume '{target_ref}' is absent"
+            )));
+        }
+        Err(_) => None,
+    };
+
+    let mut notes = Vec::new();
+    let statements = match &existing {
+        None => rocky_core::sql_gen::generate_transformation_initial_ddl(model_ir, dialect)?,
+        Some(columns) => {
+            let names: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
+            let mut stmts = Vec::new();
+            if snapshot_model::missing_is_deleted_column(spec, &names) {
+                stmts.push(snapshot_model::add_is_deleted_column_sql(
+                    spec, target_ref, dialect,
+                )?);
+            }
+            // Is the target's `is_deleted` column the deletion marker? Under
+            // `new_record`, yes. Otherwise it is a leftover marker from an
+            // earlier `new_record` run when the model itself does not output
+            // that column (known only when the compiler typed the model).
+            let marker_name = &spec.meta_columns.is_deleted;
+            let marker_column = columns
+                .iter()
+                .find(|c| c.name.eq_ignore_ascii_case(marker_name));
+            // The model's own output columns: a zero-row probe of its SELECT
+            // (the warehouse plans it without scanning), else the compiler's
+            // typed columns minus the metadata it appended.
+            let metadata = spec.meta_columns.written(spec.hard_deletes);
+            let probe = format!(
+                "SELECT * FROM (\n{}\n) AS rocky_snapshot_probe WHERE 1 = 0",
+                model_ir.sql.trim().trim_end_matches(';')
+            );
+            let model_columns: Option<Vec<String>> = match warehouse.execute_query(&probe).await {
+                Ok(result) if !result.columns.is_empty() => Some(result.columns),
+                _ => exec_ctx
+                    .typed_models
+                    .get(model_name)
+                    .filter(|typed| !typed.is_empty())
+                    .map(|typed| {
+                        typed
+                            .iter()
+                            .map(|c| c.name.clone())
+                            .filter(|n| !metadata.iter().any(|m| m.eq_ignore_ascii_case(n)))
+                            .collect()
+                    }),
+            };
+            let model_outputs_marker = model_columns
+                .as_ref()
+                .map(|cols| cols.iter().any(|c| c.eq_ignore_ascii_case(marker_name)));
+            let markers_present = spec.hard_deletes == rocky_ir::SnapshotHardDeletes::NewRecord
+                || (marker_column.is_some() && model_outputs_marker == Some(false));
+            if markers_present
+                && let Some(col) = marker_column
+                && !col.data_type.to_ascii_lowercase().contains("bool")
+            {
+                anyhow::bail!(
+                    "snapshot model '{model_name}': column '{}' of {target_ref} is {}, not \
+                     BOOLEAN, so Rocky cannot read or write it as the deletion marker (a \
+                     dbt-built `new_record` snapshot stores it as a string). Convert the column \
+                     to BOOLEAN, or use `hard_deletes = \"invalidate\"`",
+                    col.name,
+                    col.data_type
+                );
+            }
+            let source_columns =
+                snapshot_model::snapshot_source_columns_with(spec, &names, markers_present)
+                    .with_context(|| format!("snapshot model '{model_name}' failed"))?;
+            // The history keeps the columns it was created with. Say so when
+            // the model has grown a column the target cannot hold.
+            for col in model_columns.iter().flatten() {
+                if !source_columns.iter().any(|c| c.eq_ignore_ascii_case(col)) {
+                    notes.push(format!(
+                        "snapshot model '{model_name}': column '{col}' is not in {target_ref} \
+                         and is not captured; rebuild the snapshot to add it"
+                    ));
+                }
+            }
+            stmts.extend(snapshot_model::generate_snapshot_model_sql_with(
+                spec,
+                target_ref,
+                &model_ir.sql,
+                dialect,
+                &source_columns,
+                Utc::now(),
+                if markers_present {
+                    snapshot_model::ExistingMarkers::Present
+                } else {
+                    snapshot_model::ExistingMarkers::FromMode
+                },
+            )?);
+            stmts
+        }
+    };
+    for note in &notes {
+        warn!("{note}");
+    }
+    info!(
+        model = model_name,
+        target = target_ref,
+        statements = statements.len(),
+        bootstrap = existing.is_none(),
+        "executing snapshot model"
+    );
+
+    let mut bytes_scanned_acc: Option<u64> = None;
+    let mut bytes_written_acc: Option<u64> = None;
+    let mut job_ids_acc: Vec<String> = Vec::new();
+    for sql in &statements {
+        let stats = warehouse
+            .execute_statement_with_stats(sql)
+            .await
+            .map_err(|e| anyhow::Error::from(e).context(format!("model '{model_name}' failed")))?;
+        bytes_scanned_acc = accumulate_bytes(bytes_scanned_acc, stats.bytes_scanned);
+        bytes_written_acc = accumulate_bytes(bytes_written_acc, stats.bytes_written);
+        if let Some(jid) = stats.job_id {
+            job_ids_acc.push(jid);
+        }
+    }
+
+    Ok(MaterializationOutput {
+        asset_key: vec![
+            model_ir.target.catalog.clone(),
+            model_ir.target.schema.clone(),
+            model_ir.target.table.clone(),
+        ],
+        notes,
+        attempts: Vec::new(),
+        rows_copied: None,
+        duration_ms: model_start.elapsed().as_millis() as u64,
+        started_at: model_started_at,
+        metadata: MaterializationMetadata {
+            strategy: transformation_strategy_name(&model_ir.materialization).to_string(),
+            watermark: None,
+            target_table_full_name: Some(format!(
+                "{}.{}.{}",
+                model_ir.target.catalog, model_ir.target.schema, model_ir.target.table
+            )),
+            sql_hash: Some(crate::output::sql_fingerprint(&statements)),
+            column_count: exec_ctx.column_count_for(model_name),
+            compile_time_ms: exec_ctx.compile_time_ms_for(model_name),
+        },
+        partition: None,
+        cost_usd: None,
+        bytes_scanned: bytes_scanned_acc,
+        bytes_written: bytes_written_acc,
+        tenant: None,
+        job_ids: job_ids_acc,
+        skip_internal: None,
+        recipe_identity: Some(crate::output::recipe_identity_internal(
+            model_ir,
+            warehouse.dialect().name(),
+        )),
+        output_column_hashes: None,
         consumed_column_baseline: None,
     })
 }
@@ -15100,6 +15831,9 @@ pub(crate) fn build_replication_strategy_with_override(
     match effective_strategy {
         "incremental" => Ok(MaterializationStrategy::Incremental {
             timestamp_column: effective_timestamp.to_string(),
+            unique_key: Vec::new(),
+            lookback: None,
+            filter_column: None,
         }),
         "merge" => {
             // Resolve merge keys with per-field inheritance.
@@ -15209,7 +15943,10 @@ pub(crate) async fn query_target_max_timestamp(
                 target.full_name()
             )
         })?;
-    let sql = format!("SELECT MAX({timestamp_column}) FROM {target_ref}");
+    let sql = format!(
+        "SELECT {} FROM {target_ref}",
+        dialect.max_aggregate(timestamp_column)
+    );
 
     let result = warehouse
         .execute_query(&sql)
@@ -16244,10 +16981,12 @@ async fn process_table(
                 );
             }
             MaterializationStrategy::Ephemeral => {
-                // Ephemeral models are never materialized — skip.
+                // A replicated table must land somewhere; ephemeral means
+                // "never materialized" and is inlined only into SQL models.
                 anyhow::bail!(
-                    "ephemeral strategy is not supported on replication tables — \
-                     it only applies to transformation models"
+                    "ephemeral strategy is not supported on replication tables (E038) — \
+                     it only applies to transformation models, which inline it into the \
+                     models that read them"
                 );
             }
             MaterializationStrategy::DeleteInsert { .. } => {
@@ -16267,6 +17006,14 @@ async fn process_table(
                 anyhow::bail!(
                     "content_addressed strategy is not supported on replication tables — \
                      it only applies to transformation models"
+                );
+            }
+            MaterializationStrategy::Snapshot(_) => {
+                // A model snapshot historizes a model's SELECT; replication
+                // tables use the `snapshot` pipeline instead.
+                anyhow::bail!(
+                    "snapshot strategy is not supported on replication tables — \
+                     use a `type = \"snapshot\"` pipeline or a snapshot model"
                 );
             }
         }
@@ -17283,6 +18030,78 @@ fn post_copy_column_match(
 
 #[cfg(test)]
 mod tests {
+
+    /// B3: the run note reports the predicate the SQL applied — the
+    /// `filter_column` and the lookback-adjusted bound — not a bare
+    /// `<timestamp_column> > <prior MAX>`.
+    #[cfg(feature = "duckdb")]
+    #[test]
+    fn incremental_note_reports_filter_column_and_lookback() {
+        use rocky_ir::{
+            GovernanceConfig, IncrementalLookback, LookbackUnit, MaterializationStrategy, ModelIr,
+            TargetRef,
+        };
+        let model_ir = ModelIr::transformation(
+            TargetRef {
+                catalog: String::new(),
+                schema: "main".into(),
+                table: "fct".into(),
+            },
+            MaterializationStrategy::Incremental {
+                timestamp_column: "updated_at".into(),
+                unique_key: Vec::new(),
+                lookback: Some(IncrementalLookback {
+                    amount: 2,
+                    unit: LookbackUnit::Day,
+                }),
+                filter_column: Some("o.loaded_at".into()),
+            },
+            vec![],
+            "SELECT o.id, o.updated_at FROM raw.orders o WHERE @incremental_filter".into(),
+            GovernanceConfig {
+                permissions_file: None,
+                auto_create_catalogs: false,
+                auto_create_schemas: false,
+            },
+            None,
+            None,
+        );
+        let dialect = rocky_duckdb::dialect::DuckDbSqlDialect;
+        let note = super::incremental_load_note(
+            "fct",
+            &model_ir,
+            &dialect,
+            Some("2026-01-05 00:00:00"),
+            "2026-01-06 00:00:00",
+        );
+        let summary =
+            rocky_core::incremental_filter::predicate_summary(&model_ir, &dialect).unwrap();
+        assert!(
+            note.contains(&format!("rows with o.loaded_at > {}", summary.bound)),
+            "{note}"
+        );
+        assert!(
+            summary.bound.contains('2'),
+            "lookback in the bound: {}",
+            summary.bound
+        );
+        assert!(!note.contains("rows with updated_at > 2026"), "{note}");
+        assert!(note.contains("2026-01-05 00:00:00"), "{note}");
+        // The note's comparison is the one the SQL applies.
+        let sql = rocky_core::incremental_filter::incremental_select(
+            &model_ir,
+            &dialect,
+            rocky_core::incremental_filter::FilterMode::SinceTarget { target: "main.fct" },
+        )
+        .unwrap();
+        assert!(
+            sql.contains(&format!(
+                "o.loaded_at > (SELECT {} FROM main.fct)",
+                summary.bound
+            )),
+            "{sql}"
+        );
+    }
 
     #[test]
     fn timestamp_column_match_accepts_folded_snowflake_names_and_rejects_absence() {
@@ -22581,7 +23400,11 @@ auto_create_schemas = true
             StrategyConfig::FullRefresh,
             StrategyConfig::MaterializedView,
             StrategyConfig::Incremental {
-                timestamp_column: "ts".into(),
+                timestamp_column: Some("ts".into()),
+                unique_key: Vec::new(),
+                lookback: None,
+                filter_column: None,
+                on_schema_change: Default::default(),
             },
         ] {
             let target = governance_tag_target(&strategy, "warehouse", "marts", "fct_orders");
@@ -22817,6 +23640,7 @@ auto_create_schemas = true
             typed_models: &typed_models,
             model_timings: &model_timings,
             surrogate_keys: &surrogate_keys,
+            full_refresh: false,
         };
 
         assert_eq!(ctx.column_count_for("fct_orders"), Some(3));
@@ -22839,6 +23663,7 @@ auto_create_schemas = true
             typed_models: &typed_models,
             model_timings: &model_timings,
             surrogate_keys: &surrogate_keys,
+            full_refresh: false,
         };
 
         assert_eq!(ctx.column_count_for("raw__shopify__orders"), None);
@@ -25061,7 +25886,9 @@ timestamp_column = "_synced_at"
         );
         let strategy = build_replication_strategy(&pipeline).expect("strategy build");
         match strategy {
-            MaterializationStrategy::Incremental { timestamp_column } => {
+            MaterializationStrategy::Incremental {
+                timestamp_column, ..
+            } => {
                 assert_eq!(timestamp_column, "_synced_at");
             }
             other => panic!("expected Incremental, got {other:?}"),
@@ -25243,6 +26070,9 @@ merge_keys_fallback = ["fallback_only"]
         // carry an `update_columns` field.
         let strategy = MaterializationStrategy::Incremental {
             timestamp_column: "ts".to_string(),
+            unique_key: Vec::new(),
+            lookback: None,
+            filter_column: None,
         };
         let source_cols = vec![ColumnInfo {
             name: "id".to_string(),
@@ -25352,7 +26182,9 @@ merge_keys = ["id"]
         let strategy = build_replication_strategy_with_override(&pipeline, &resolved)
             .expect("strategy build with override");
         match strategy {
-            MaterializationStrategy::Incremental { timestamp_column } => {
+            MaterializationStrategy::Incremental {
+                timestamp_column, ..
+            } => {
                 assert_eq!(timestamp_column, "occurred_at");
             }
             other => panic!("expected Incremental, got {other:?}"),
@@ -25618,6 +26450,9 @@ merge_keys = ["id"]
         // The bootstrap case the bug missed: incremental strategy, first run.
         let strategy = MaterializationStrategy::Incremental {
             timestamp_column: "_fivetran_synced".to_string(),
+            unique_key: Vec::new(),
+            lookback: None,
+            filter_column: None,
         };
         let now = chrono::Utc::now();
 
@@ -26026,6 +26861,7 @@ table = "fct_events"
             typed_models: &typed_models,
             model_timings: &model_timings,
             surrogate_keys: &surrogate_keys,
+            full_refresh: false,
         };
 
         let failing = FailTargetDescribe {
@@ -26108,6 +26944,7 @@ email = "pii"
             typed_models: &typed_models,
             model_timings: &model_timings,
             surrogate_keys: &surrogate_keys,
+            full_refresh: false,
         };
         super::execute_one_plain_model(
             &model,
@@ -26274,6 +27111,7 @@ table = "orders_view"
             typed_models: &typed_models,
             model_timings: &model_timings,
             surrogate_keys: &surrogate_keys,
+            full_refresh: false,
         };
 
         let error = match super::execute_one_plain_model(
@@ -26403,6 +27241,7 @@ table = "orders_view"
             typed_models: &typed_models,
             model_timings: &model_timings,
             surrogate_keys: &surrogate_keys,
+            full_refresh: false,
         };
         let output = super::execute_one_plain_model(
             &model,
@@ -26480,6 +27319,7 @@ table = "orders_view"
             typed_models: &typed_models,
             model_timings: &model_timings,
             surrogate_keys: &surrogate_keys,
+            full_refresh: false,
         };
         let error = super::execute_one_plain_model(
             &model,
@@ -26639,6 +27479,7 @@ table = "orders_view"
             typed_models: &typed_models,
             model_timings: &model_timings,
             surrogate_keys: &surrogate_keys,
+            full_refresh: false,
         };
 
         let error = match super::execute_one_plain_model(
@@ -26766,6 +27607,7 @@ table = "fct_daily"
             typed_models: &typed_models,
             model_timings: &model_timings,
             surrogate_keys: &surrogate_keys,
+            full_refresh: false,
         };
         let mut output = RunOutput::new(String::new(), 0, 0);
 
@@ -26866,6 +27708,7 @@ table = "fct_daily"
             typed_models: &typed_models,
             model_timings: &model_timings,
             surrogate_keys: &surrogate_keys,
+            full_refresh: false,
         };
 
         let range = PartitionRunOptions {
@@ -26984,6 +27827,7 @@ table = "fct_events"
             typed_models: &typed_models,
             model_timings: &model_timings,
             surrogate_keys: &surrogate_keys,
+            full_refresh: false,
         };
 
         // A DuckDB lock-contention message → real `classify_failure` →
@@ -27105,6 +27949,7 @@ table = "fct_events"
             typed_models: &typed_models,
             model_timings: &model_timings,
             surrogate_keys: &surrogate_keys,
+            full_refresh: false,
         };
 
         // A non-transient probe failure (not a lock/contention message) →
@@ -27203,6 +28048,7 @@ table = "fct_events"
             typed_models: &typed_models,
             model_timings: &model_timings,
             surrogate_keys: &surrogate_keys,
+            full_refresh: false,
         };
 
         let failing = FailTargetDescribe {
@@ -28418,6 +29264,9 @@ timestamp_column = "ts"
         let dialect = DuckDbSqlDialect;
         let strategy = MaterializationStrategy::Incremental {
             timestamp_column: "ts".to_string(),
+            unique_key: Vec::new(),
+            lookback: None,
+            filter_column: None,
         };
         let target = TableRef {
             catalog: String::new(),
@@ -28558,6 +29407,9 @@ timestamp_column = "ts"
         let resolved = super::resolve_new_watermark(
             &MaterializationStrategy::Incremental {
                 timestamp_column: "ts".into(),
+                unique_key: Vec::new(),
+                lookback: None,
+                filter_column: None,
             },
             &adapter,
             &dialect,
@@ -28661,6 +29513,9 @@ timestamp_column = "ts"
         let dialect = DuckDbSqlDialect;
         let strategy = MaterializationStrategy::Incremental {
             timestamp_column: "_loaded_at".to_string(),
+            unique_key: Vec::new(),
+            lookback: None,
+            filter_column: None,
         };
         let target = TableRef {
             catalog: String::new(),
@@ -32542,6 +33397,79 @@ backend = "local"
         .expect("write model toml");
     }
 
+    /// Multi-model `--defer` (`--select` resolving to several models): an edge
+    /// to another SELECTED model is never externalized or rewritten, an edge
+    /// to an unselected model is, and E039 is kept on a model that still reads
+    /// a selected (locally built) input.
+    #[test]
+    fn multi_model_defer_externalizes_only_unselected_edges() {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir(&models_dir).expect("mkdir models");
+        write_model_with_target(&models_dir, "orders", "SELECT 1 AS id", "main", "orders");
+        write_model_with_target(&models_dir, "stg", "SELECT id FROM orders", "main", "stg");
+        write_model_with_target(&models_dir, "mart", "SELECT id FROM stg", "main", "mart");
+        write_model_with_target(
+            &models_dir,
+            "wide",
+            "SELECT o.id FROM orders o JOIN stg s ON o.id = s.id",
+            "main",
+            "wide",
+        );
+        let mut compiled =
+            rocky_compiler::compile::compile(&rocky_compiler::compile::CompilerConfig {
+                models_dir,
+                ..Default::default()
+            })
+            .expect("compile models");
+        let selected: BTreeSet<String> = ["stg", "mart", "wide"].map(String::from).into();
+
+        let edges = super::deferred_externalized_edges(&compiled, Some(&selected), true);
+        assert_eq!(
+            edges.get("stg"),
+            Some(&BTreeSet::from(["orders".to_string()])),
+            "stg's only input is unselected, so it is externalized"
+        );
+        assert!(
+            !edges.contains_key("mart"),
+            "mart reads selected stg, which is built locally: {edges:?}"
+        );
+        assert!(
+            edges.get("wide").is_none_or(|e| !e.contains("stg")),
+            "a selected input is never externalized: {edges:?}"
+        );
+        assert!(
+            super::deferred_externalized_edges(&compiled, Some(&selected), false).is_empty(),
+            "inert without --defer"
+        );
+
+        super::apply_defer_rewrite(
+            &mut compiled,
+            Some(&selected),
+            &super::DeferOptions {
+                enabled: true,
+                defer_to: Some("prod".to_string()),
+                selected_models: None,
+            },
+            &rocky_databricks::dialect::DatabricksSqlDialect,
+        )
+        .expect("defer rewrite");
+        let sql = |name: &str| {
+            compiled
+                .project
+                .models
+                .iter()
+                .find(|m| m.config.name == name)
+                .expect("model")
+                .sql
+                .clone()
+        };
+        assert!(sql("stg").contains("prod.orders"), "{}", sql("stg"));
+        assert!(!sql("mart").contains("prod."), "{}", sql("mart"));
+        assert!(sql("wide").contains("prod.orders"), "{}", sql("wide"));
+        assert!(!sql("wide").contains("prod.stg"), "{}", sql("wide"));
+    }
+
     /// #1350: the model-only fallback answers identically to naming the
     /// same pipeline explicitly — adapter, governance, and glob. The
     /// hardcoded-false governance was a #1305 fossil.
@@ -33602,10 +34530,11 @@ auto_create_schemas = true
                 .expect("compile models");
             super::apply_defer_rewrite(
                 &mut compiled,
-                Some("mart"),
+                Some(&std::collections::BTreeSet::from(["mart".to_string()])),
                 &super::DeferOptions {
                     enabled: true,
                     defer_to: None,
+                    selected_models: None,
                 },
                 &rocky_snowflake::dialect::SnowflakeSqlDialect,
             )
@@ -33957,23 +34886,22 @@ auto_create_schemas = true
 
     #[cfg(feature = "duckdb")]
     #[test]
-    fn shadow_rejects_ephemeral_models() {
+    fn shadow_skips_ephemeral_models_and_routes_their_inlined_reads() {
         let tmp = tempfile::TempDir::new().expect("temp dir");
         let models_dir = tmp.path().join("models");
         std::fs::create_dir(&models_dir).expect("mkdir models");
-        std::fs::write(models_dir.join("eph.sql"), "SELECT 1 AS id\n").expect("write sql");
+        write_model_with_target(&models_dir, "src", "SELECT 1 AS id", "main", "src");
+        std::fs::write(models_dir.join("eph.sql"), "SELECT id FROM src\n").expect("write sql");
         std::fs::write(
             models_dir.join("eph.toml"),
             "[strategy]\ntype = \"ephemeral\"\n\n\
              [target]\ncatalog = \"\"\nschema = \"main\"\ntable = \"eph\"\n",
         )
         .expect("write toml");
-        // Reads the ephemeral model's nominal target by physical name. Nothing
-        // inlines that read, so under shadow it would resolve to production.
         write_model_with_target(
             &models_dir,
             "consumer",
-            "SELECT id FROM main.eph",
+            "SELECT id FROM eph",
             "main",
             "consumer",
         );
@@ -33984,20 +34912,39 @@ auto_create_schemas = true
                 ..Default::default()
             })
             .expect("compile models");
+        assert!(!compiled.has_errors, "{:?}", compiled.diagnostics);
+        let config = rocky_core::shadow::ShadowConfig::default();
         let dialect = rocky_duckdb::dialect::DuckDbSqlDialect;
-        let err = super::apply_shadow_rewrite(
-            &mut compiled,
-            None,
-            None,
-            &rocky_core::shadow::ShadowConfig::default(),
-            &dialect,
-            false,
-        )
-        .expect_err("an ephemeral model must be rejected, not silently left on production");
-        let message = format!("{err:#}");
+        super::apply_shadow_rewrite(&mut compiled, None, None, &config, &dialect, false)
+            .expect("an ephemeral model has nothing to shadow and must not block the run");
+        let shadow_src = rocky_core::shadow::shadow_target(
+            &rocky_ir::TargetRef {
+                catalog: String::new(),
+                schema: "main".to_string(),
+                table: "src".to_string(),
+            },
+            &config,
+        );
+        let consumer = compiled.project.model("consumer").expect("consumer");
+        // The inlined CTE's read of `src` is routed to src's shadow, so the
+        // consumer never reads production through the ephemeral model.
         assert!(
-            message.contains("ephemeral model 'eph'") && message.contains("not inlined"),
-            "error must name the model and why it cannot be shadowed: {message}"
+            consumer.sql.contains(&shadow_src.table)
+                && consumer.sql.contains("__rocky_ephemeral__eph"),
+            "{}",
+            consumer.sql
+        );
+        // The ephemeral model itself keeps its production-shaped target: it is
+        // never executed, so it has no shadow object.
+        assert_eq!(
+            compiled
+                .project
+                .model("eph")
+                .expect("eph")
+                .config
+                .target
+                .table,
+            "eph"
         );
     }
 
@@ -34897,6 +35844,7 @@ auto_create_schemas = true
         let defer_opts = DeferOptions {
             enabled: true,
             defer_to: None,
+            selected_models: None,
         };
         let mut output = RunOutput::new(String::new(), 0, 1);
 
@@ -35422,6 +36370,7 @@ auto_create_schemas = true
             rowcount_fallback,
             lag_tolerance_seconds,
             shadow_or_branch: false,
+            full_refresh: false,
         }
     }
 
@@ -36021,6 +36970,7 @@ auto_create_schemas = true
             rowcount_fallback: true,
             lag_tolerance_seconds: 0,
             shadow_or_branch: false,
+            full_refresh: false,
         };
         let out2 = run_with_gate(
             &models_dir,
@@ -36305,6 +37255,7 @@ auto_create_schemas = true
                     rowcount_fallback: false,
                     lag_tolerance_seconds: 0,
                     shadow_or_branch: false,
+                    full_refresh: false,
                 },
                 false,
                 false,
@@ -36380,6 +37331,7 @@ auto_create_schemas = true
                     rowcount_fallback: false,
                     lag_tolerance_seconds: 0,
                     shadow_or_branch: false,
+                    full_refresh: false,
                 },
                 false,
                 false,
@@ -36435,6 +37387,7 @@ auto_create_schemas = true
                     rowcount_fallback: false,
                     lag_tolerance_seconds: 0,
                     shadow_or_branch: false,
+                    full_refresh: false,
                 },
                 false,
                 false,
@@ -36553,6 +37506,7 @@ auto_create_schemas = true
                 &DeferOptions {
                     enabled: true,
                     defer_to: Some("prod".to_string()),
+                    selected_models: None,
                 },
                 SkipGateConfig {
                     feature_enabled: false,
@@ -36560,6 +37514,7 @@ auto_create_schemas = true
                     rowcount_fallback: false,
                     lag_tolerance_seconds: 0,
                     shadow_or_branch: false,
+                    full_refresh: false,
                 },
                 false,
                 false,
@@ -36622,6 +37577,7 @@ auto_create_schemas = true
                     &DeferOptions {
                         enabled: true,
                         defer_to: Some("prod".to_string()),
+                        selected_models: None,
                     },
                     SkipGateConfig {
                         feature_enabled: false,
@@ -36629,6 +37585,7 @@ auto_create_schemas = true
                         rowcount_fallback: false,
                         lag_tolerance_seconds: 0,
                         shadow_or_branch: false,
+                        full_refresh: false,
                     },
                     false,
                     false,
@@ -36687,6 +37644,7 @@ auto_create_schemas = true
                 &DeferOptions {
                     enabled: true,
                     defer_to: Some("prod".to_string()),
+                    selected_models: None,
                 },
                 SkipGateConfig {
                     feature_enabled: false,
@@ -36694,6 +37652,7 @@ auto_create_schemas = true
                     rowcount_fallback: false,
                     lag_tolerance_seconds: 0,
                     shadow_or_branch: false,
+                    full_refresh: false,
                 },
                 false,
                 false,
@@ -36761,7 +37720,8 @@ auto_create_schemas = true
             std::fs::write(models_dir.join("up.sql"), "SELECT id, ts FROM main.ev\n").unwrap();
             std::fs::write(
                 models_dir.join("up.toml"),
-                "[strategy]\ntype = \"incremental\"\ntimestamp_column = \"ts\"\n\n\
+                // No watermark: E037.
+                "[strategy]\ntype = \"incremental\"\n\n\
                  [target]\ncatalog = \"\"\nschema = \"main\"\ntable = \"up\"\n",
             )
             .unwrap();
@@ -36781,6 +37741,7 @@ auto_create_schemas = true
                 rowcount_fallback: false,
                 lag_tolerance_seconds: 0,
                 shadow_or_branch: false,
+                full_refresh: false,
             };
             // Both outcomes are asserted below: the exclusion lands in `output`
             // either way, and the Result says whether the dependent could run.
@@ -36878,15 +37839,14 @@ auto_create_schemas = true
         }
     }
 
-    /// #1996 end to end through `execute_models`: an `ephemeral` model fails
-    /// compile with E038 and is excluded from the run, which records it as a
-    /// failed table. It writes nothing, so nothing reads its rows by accident.
+    /// End to end through `execute_models`: an invalid ephemeral use (here
+    /// `[[tests]]`, which need a table) fails compile with E038 and is
+    /// excluded from the run, which records it as a failed table. It writes
+    /// nothing, so nothing reads its rows by accident.
     ///
     /// Its declared dependent follows the same compile-error policy as E037:
     /// the failing model and its declared descendants are withheld even when
-    /// an old table carries the failed model's name. The ephemeral case makes
-    /// the stale-read risk especially visible because the model itself never
-    /// writes that table.
+    /// an old table carries the failed model's name.
     #[cfg(feature = "duckdb")]
     #[tokio::test]
     async fn an_e038_model_is_excluded_from_run_and_its_dependent_follows_policy() {
@@ -36926,10 +37886,11 @@ auto_create_schemas = true
             std::fs::write(
                 models_dir.join("up.toml"),
                 "[strategy]\ntype = \"ephemeral\"\n\n\
-                 [target]\ncatalog = \"\"\nschema = \"main\"\ntable = \"up\"\n",
+                 [target]\ncatalog = \"\"\nschema = \"main\"\ntable = \"up\"\n\n\
+                 [[tests]]\ntype = \"not_null\"\ncolumn = \"id\"\n",
             )
             .unwrap();
-            std::fs::write(models_dir.join("down.sql"), "SELECT id FROM main.up\n").unwrap();
+            std::fs::write(models_dir.join("down.sql"), "SELECT id FROM up\n").unwrap();
             std::fs::write(
                 models_dir.join("down.toml"),
                 "depends_on = [\"up\"]\n\n[strategy]\ntype = \"full_refresh\"\n\n\
@@ -36945,6 +37906,7 @@ auto_create_schemas = true
                 rowcount_fallback: false,
                 lag_tolerance_seconds: 0,
                 shadow_or_branch: false,
+                full_refresh: false,
             };
             // Both outcomes are asserted below: the exclusion lands in `output`
             // either way, and the Result says whether the dependent could run.
@@ -37079,10 +38041,11 @@ auto_create_schemas = true
         std::fs::write(
             models_dir.join("up.toml"),
             "[strategy]\ntype = \"ephemeral\"\n\n\
-             [target]\ncatalog = \"\"\nschema = \"main\"\ntable = \"up\"\n",
+             [target]\ncatalog = \"\"\nschema = \"main\"\ntable = \"up\"\n\n\
+             [[tests]]\ntype = \"not_null\"\ncolumn = \"id\"\n",
         )
         .unwrap();
-        std::fs::write(models_dir.join("down.sql"), "SELECT id FROM main.up\n").unwrap();
+        std::fs::write(models_dir.join("down.sql"), "SELECT id FROM up\n").unwrap();
         std::fs::write(
             models_dir.join("down.toml"),
             "depends_on = [\"up\"]\n\n[strategy]\ntype = \"full_refresh\"\n\n\
@@ -37108,6 +38071,7 @@ auto_create_schemas = true
             rowcount_fallback: false,
             lag_tolerance_seconds: 0,
             shadow_or_branch: false,
+            full_refresh: false,
         };
         let resilience = rocky_core::config::ResilienceConfig {
             contain_failures: true,
@@ -39997,6 +40961,7 @@ auto_create_schemas = true
             typed_models: &typed_models,
             model_timings: &model_timings,
             surrogate_keys: &surrogate_keys,
+            full_refresh: false,
         };
 
         for run_id in ["first", "second"] {
@@ -40141,6 +41106,7 @@ auto_create_schemas = true
             typed_models: &typed_models,
             model_timings: &model_timings,
             surrogate_keys: &surrogate_keys,
+            full_refresh: false,
         };
 
         // Conservative resilience config with zero backoff so the test is fast;

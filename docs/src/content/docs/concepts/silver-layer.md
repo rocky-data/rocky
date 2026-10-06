@@ -185,9 +185,9 @@ CREATE OR REPLACE TABLE target AS SELECT ...
 
 ### incremental
 
-A silver model cannot use `incremental`. Rocky has no watermark to apply to a model's SQL, so the strategy could only append the whole result again on every run. `rocky compile` refuses it with `E037`, and the error names four strategies that work: `merge`, `delete_insert`, `time_interval` and `full_refresh`. See [Incremental](/reference/model-format/#incremental) in the model format reference.
+A silver model loads only rows newer than its target's watermark. Declare the watermark column with `timestamp_column`, and put `@incremental_filter` where the filter belongs in the SQL. Rocky resolves the placeholder to `TRUE` on the first run and on `rocky run --full-refresh`. On every later run it becomes a comparison with `MAX(<watermark>)` read from the target. A model with no watermark is refused with `E037`. See [Incremental](/reference/model-format/#incremental) in the model format reference.
 
-`incremental` still works in the [bronze layer](/concepts/bronze-layer/), where Rocky copies source tables and filters each copy on a stored watermark.
+In the [bronze layer](/concepts/bronze-layer/), `incremental` copies source tables and filters each copy on a watermark in the state store.
 
 ### merge
 

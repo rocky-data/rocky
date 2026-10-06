@@ -1047,6 +1047,55 @@ pub trait SqlDialect: Send + Sync {
         format!("CREATE TABLE {target} AS\n{select_sql}")
     }
 
+    /// `CREATE TABLE … AS` carrying a model's `[redshift]` table attributes
+    /// (`DISTSTYLE` / `DISTKEY` / `SORTKEY`).
+    ///
+    /// `replace` selects the full-refresh form (replace an existing table,
+    /// like [`SqlDialect::create_table_as`]) or the first-run form (fail if
+    /// the table exists, like [`SqlDialect::create_table_as_new`]).
+    ///
+    /// The default refuses: only the Redshift dialect has these attributes,
+    /// and silently dropping them would build a table with the wrong
+    /// distribution. A model that sets `[redshift]` and targets another
+    /// warehouse fails at SQL generation with this message.
+    fn create_table_as_with_redshift_options(
+        &self,
+        _target: &str,
+        _select_sql: &str,
+        _options: &rocky_ir::RedshiftTableOptions,
+        _replace: bool,
+    ) -> AdapterResult<String> {
+        Err(AdapterError::msg(format!(
+            "the model sets `[redshift]` table options (dist_key / sort_key), which only the \
+             redshift adapter applies; this model targets {}",
+            self.name()
+        )))
+    }
+
+    /// `CREATE TABLE … AS` carrying a model's `[clickhouse]` table attributes
+    /// (`ENGINE` / `PARTITION BY` / `ORDER BY`).
+    ///
+    /// `replace` has the same meaning as on
+    /// [`SqlDialect::create_table_as_with_redshift_options`].
+    ///
+    /// The default refuses: only the ClickHouse dialect has these
+    /// attributes, and silently dropping them would build a table with the
+    /// wrong sorting key. A model that sets `[clickhouse]` and targets
+    /// another warehouse fails at SQL generation with this message.
+    fn create_table_as_with_clickhouse_options(
+        &self,
+        _target: &str,
+        _select_sql: &str,
+        _options: &rocky_ir::ClickHouseTableOptions,
+        _replace: bool,
+    ) -> AdapterResult<String> {
+        Err(AdapterError::msg(format!(
+            "the model sets `[clickhouse]` table options (engine / order_by / partition_by), \
+             which only the clickhouse adapter applies; this model targets {}",
+            self.name()
+        )))
+    }
+
     /// INSERT INTO ... SELECT (incremental append).
     fn insert_into(&self, target: &str, select_sql: &str) -> String;
 
@@ -1319,10 +1368,143 @@ pub trait SqlDialect: Send + Sync {
         select_sql: &str,
     ) -> AdapterResult<Vec<String>>;
 
+    /// The statements a `delete_insert` model executes, from its DELETE and
+    /// INSERT.
+    ///
+    /// Default: the two as separate statements, run in order — so the
+    /// DELETE commits before the INSERT runs. A dialect whose connector runs
+    /// a `;`-joined string as one transaction (PostgreSQL / Redshift) joins
+    /// them, so a failed INSERT leaves the deleted rows in place.
+    fn delete_insert_statements(&self, delete_sql: String, insert_sql: String) -> Vec<String> {
+        vec![delete_sql, insert_sql]
+    }
+
+    /// `Some(reason)` when this dialect cannot run the generic SCD2 snapshot
+    /// SQL (`CREATE TABLE IF NOT EXISTS … AS`, `MERGE INTO … AS target`
+    /// with a conditional `WHEN MATCHED AND …`). Snapshot generation refuses
+    /// with the reason instead of emitting SQL the warehouse rejects.
+    /// Default `None`: every dialect that predates the hook runs it.
+    fn snapshot_unsupported_reason(&self) -> Option<&'static str> {
+        None
+    }
+
+    /// `Some(reason)` when this dialect has no upsert to render
+    /// [`SqlDialect::merge_into`] with: a `merge` model, and an `incremental`
+    /// model with a `unique_key`, cannot run on it. `rocky compile` reports
+    /// the reason (E053) when every configured warehouse refuses, and
+    /// `merge_into` refuses with it at SQL generation. Default `None`: every
+    /// dialect that predates the hook renders a MERGE.
+    fn merge_unsupported_reason(&self) -> Option<&'static str> {
+        None
+    }
+
     /// DELETE FROM ... WHERE ... for delete+insert strategy.
     /// Default implementation uses ANSI SQL.
     fn delete_where(&self, target: &str, where_clause: &str) -> String {
         format!("DELETE FROM {target} WHERE {where_clause}")
+    }
+
+    /// The `DELETE` a `delete_insert` model runs before its INSERT: remove
+    /// every target row whose `partition_cols` values appear in `source_sql`.
+    ///
+    /// Default: `DELETE FROM t WHERE (a, b) IN (SELECT DISTINCT a, b FROM
+    /// (<source>) AS _rocky_incoming)`. SQL Server overrides — T-SQL has no
+    /// row-value `IN` and no CTE inside a derived table — with a correlated
+    /// `EXISTS`, which matches the same rows (a NULL partition value matches
+    /// nothing under either form).
+    ///
+    /// `partition_cols` are validated identifiers.
+    fn delete_partitions_sql(
+        &self,
+        target: &str,
+        partition_cols: &[std::sync::Arc<str>],
+        source_sql: &str,
+    ) -> String {
+        let cols = partition_cols.join(", ");
+        format!(
+            "DELETE FROM {target} WHERE ({cols}) IN (\
+             SELECT DISTINCT {cols} FROM ({source_sql}) AS _rocky_incoming\
+             )"
+        )
+    }
+
+    /// `INSERT INTO target (columns) SELECT columns FROM (<select>) AS …` —
+    /// an append that names its columns, for an incremental model whose
+    /// output column order differs from the target's.
+    ///
+    /// `columns` are validated identifiers. SQL Server overrides to lift the
+    /// model's CTEs out of the derived table.
+    fn insert_into_columns(&self, target: &str, columns: &[String], select_sql: &str) -> String {
+        let list = columns.join(", ");
+        format!(
+            "INSERT INTO {target} ({list})\nSELECT {list} FROM (\n{select_sql}\n) AS _rocky_incoming"
+        )
+    }
+
+    /// `ALTER TABLE … ADD COLUMN <column> <type>` for schema drift and an
+    /// incremental model's new columns.
+    ///
+    /// Default: the ANSI `ADD COLUMN` form. SQL Server overrides — T-SQL
+    /// spells it `ALTER TABLE t ADD <column> <type>` and refuses the
+    /// `COLUMN` keyword. Callers validate `column` and `data_type` first.
+    fn add_column_sql(&self, table_ref: &str, column: &str, data_type: &str) -> String {
+        format!("ALTER TABLE {table_ref} ADD COLUMN {column} {data_type}")
+    }
+
+    /// The maximum of `column` over the rows read, `NULL` when there are
+    /// none. Used by every `MAX(<timestamp>)` read Rocky interprets as "no
+    /// rows yet" when NULL: freshness, the incremental watermark, the
+    /// replication watermark. `column` is validated by the caller.
+    ///
+    /// Default: `MAX(<column>)`, which is NULL over no rows in standard SQL.
+    /// ClickHouse overrides: its `max` over no rows returns the type's
+    /// default (`1970-01-01 00:00:00` for a `DateTime`), not NULL.
+    fn max_aggregate(&self, column: &str) -> String {
+        format!("MAX({column})")
+    }
+
+    /// `expr` minus `amount` `unit`s, where `unit` is a singular upper-case
+    /// keyword (`SECOND`, `MINUTE`, `HOUR`, `DAY`). Used for an incremental
+    /// model's `lookback` against `MAX(<watermark>)`.
+    ///
+    /// Default: `<expr> - <interval_literal>`. SQL Server has no interval
+    /// type and overrides with `DATEADD(<unit>, -<amount>, <expr>)`.
+    fn subtract_interval_expr(&self, expr: &str, amount: u32, unit: &str) -> String {
+        format!("{expr} - {}", self.interval_literal(amount, unit))
+    }
+
+    /// A predicate that is always true, for an `@incremental_filter` on a
+    /// run that loads every row.
+    ///
+    /// Default: `TRUE`. SQL Server has no boolean literal and overrides with
+    /// `(1 = 1)`.
+    fn true_predicate(&self) -> &'static str {
+        "TRUE"
+    }
+
+    /// `SELECT <select_list> <rest>`, returning at most `limit` rows. `rest`
+    /// starts at `FROM` and may carry `WHERE` / `GROUP BY` / `ORDER BY`.
+    ///
+    /// Default: a trailing `LIMIT <n>`. SQL Server overrides with `SELECT
+    /// TOP (<n>)` — T-SQL has no `LIMIT`.
+    fn select_limited(&self, select_list: &str, rest: &str, limit: u64) -> String {
+        format!("SELECT {select_list} {rest} LIMIT {limit}")
+    }
+
+    /// `SELECT <select_list> FROM (<inner>) AS <alias>`, returning at most
+    /// `limit` rows. `inner` is a whole query, possibly starting with `WITH`.
+    ///
+    /// Default: `SELECT … FROM (<inner>) AS <alias> LIMIT <n>`. SQL Server
+    /// overrides to use `TOP` and to lift `inner`'s CTEs, which T-SQL refuses
+    /// inside a derived table.
+    fn wrap_select_limited(
+        &self,
+        inner: &str,
+        alias: &str,
+        select_list: &str,
+        limit: u64,
+    ) -> String {
+        format!("SELECT {select_list} FROM ({inner}) AS {alias} LIMIT {limit}")
     }
 
     /// SQL query that returns one row per user table in a catalog/schema,
@@ -1371,6 +1553,29 @@ pub trait SqlDialect: Send + Sync {
     /// it requires `DATE_SUB(CURRENT_DATE(), INTERVAL N DAY)`.
     fn date_minus_days_expr(&self, days: u32) -> AdapterResult<String> {
         Ok(format!("CURRENT_DATE - INTERVAL '{days}' DAY"))
+    }
+
+    /// A timestamp literal for a `time_interval` window bound: the partition
+    /// filter (`<time_column> >= <start> AND … < <end>`) and the
+    /// `@start_date` / `@end_date` placeholders. `ts` is whole seconds, UTC.
+    ///
+    /// Default: `'YYYY-MM-DD HH:MM:SS'`. SQL Server overrides: under
+    /// `SET DATEFORMAT dmy` (or a language that implies it) that string
+    /// compared with a `DATETIME` column reads as year-day-month.
+    fn timestamp_literal(&self, ts: &DateTime<Utc>) -> String {
+        format!("'{}'", ts.format("%Y-%m-%d %H:%M:%S"))
+    }
+
+    /// A SQL interval literal of `amount` units, where `unit` is a singular
+    /// upper-case keyword (`SECOND`, `MINUTE`, `HOUR`, `DAY`). Used for an
+    /// incremental model's `lookback`, subtracted from `MAX(<watermark>)`.
+    ///
+    /// Default: the ANSI `INTERVAL '<n>' <UNIT>` form, which DuckDB,
+    /// Databricks and Trino accept. BigQuery overrides with the unquoted
+    /// `INTERVAL <n> <UNIT>`, Snowflake with the single-string
+    /// `INTERVAL '<n> <UNIT>'`.
+    fn interval_literal(&self, amount: u32, unit: &str) -> String {
+        format!("INTERVAL '{amount}' {unit}")
     }
 
     /// SQL expression returning the current timestamp. Used by

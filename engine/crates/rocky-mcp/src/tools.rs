@@ -3945,9 +3945,11 @@ impl RockyMcpServer {
             .and_then(|p| prepared.dialect_tablesample(p.clamp(1, 100)))
             .map(|s| format!(" {s}"))
             .unwrap_or_default();
-        let sql = format!(
-            "SELECT * FROM {}{} LIMIT {}",
-            prepared.table_ref, sample, SAMPLE_MAX_ROWS
+        // `TOP (n)` on SQL Server, `LIMIT n` elsewhere.
+        let sql = prepared.adapter.dialect().select_limited(
+            "*",
+            &format!("FROM {}{}", prepared.table_ref, sample),
+            SAMPLE_MAX_ROWS as u64,
         );
 
         let qr = query_grounding(prepared.adapter.as_ref(), &sql)
@@ -4090,10 +4092,13 @@ impl RockyMcpServer {
         // guidance in `WORKER_INSTRUCTIONS_REWRITES` describes `top_values` as
         // best-effort instead of promising an error it does not raise.
         let top_values = if distinct > 0 && distinct <= PROFILE_TOP_VALUES_MAX as u64 {
-            let q = format!(
-                "SELECT CAST({col} AS {string_type}) AS v, COUNT(*) AS c FROM {} \
-                 GROUP BY {col} ORDER BY c DESC, v LIMIT {}",
-                prepared.table_ref, PROFILE_TOP_VALUES_MAX
+            let q = prepared.adapter.dialect().select_limited(
+                &format!("CAST({col} AS {string_type}) AS v, COUNT(*) AS c"),
+                &format!(
+                    "FROM {} GROUP BY {col} ORDER BY c DESC, v",
+                    prepared.table_ref
+                ),
+                PROFILE_TOP_VALUES_MAX as u64,
             );
             match query_grounding(prepared.adapter.as_ref(), &q).await {
                 Ok(r) => r

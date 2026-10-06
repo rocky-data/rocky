@@ -16,9 +16,12 @@
 //! Merge and delete_insert models emit their **steady-state** statement (a bare
 //! `MERGE` / `DELETE` + `INSERT` that operates on an existing target); `rocky
 //! run` creates the target table on first build, which a static emit cannot
-//! reproduce. Those files carry a leading note to that effect. (`incremental`
-//! is refused on transformation models, E037, and `ephemeral` is refused
-//! outright, E038; neither reaches this file.)
+//! reproduce. Those files carry a leading note to that effect. An
+//! `incremental` model emits its incremental-run statement, filtered on the
+//! target's `MAX(<watermark>)`, with the same note. (`incremental` without a
+//! watermark is refused, E037.) An `ephemeral` model emits no file of its
+//! own: compile inlines it as a CTE into each consumer, so the consumer's file
+//! carries it, and the model is listed as skipped.
 //!
 //! The dialect is the adapter `rocky run --model` selects from `rocky.toml`
 //! without credentials. With no project file it defaults to DuckDB. A
@@ -38,7 +41,7 @@ use rocky_core::models::SurrogateKeySpec;
 use rocky_core::sql_gen;
 use tracing::{debug, info};
 
-use super::plan::dialect_for_adapter_type;
+use super::plan::{dialect_for_adapter, dialect_for_adapter_type};
 use crate::registry;
 
 /// Resolve the model target dialect from the loaded config. Models use the
@@ -53,7 +56,7 @@ fn resolve_dialect(
             .adapters
             .get(&adapter_name)
             .ok_or_else(|| anyhow::anyhow!("target adapter '{adapter_name}' is not configured"))?;
-        return Ok(dialect_for_adapter_type(&adapter.adapter_type));
+        return Ok(dialect_for_adapter(adapter));
     }
     let adapter_type = config
         .and_then(|cfg| {
@@ -72,7 +75,7 @@ fn resolve_dialect(
 struct EmittedModel {
     name: String,
     sql: String,
-    /// `true` for merge/delete_insert statements that operate on an existing
+    /// `true` for merge/delete_insert/snapshot statements that operate on an existing
     /// target. `rocky run` creates the target table on first build, which a
     /// static emit does not reproduce, so this SQL is the steady-state
     /// operation, not a from-scratch build.
@@ -93,7 +96,7 @@ fn assumes_existing_target(strategy: &rocky_ir::MaterializationStrategy) -> bool
     use rocky_ir::MaterializationStrategy::*;
     matches!(
         strategy,
-        Incremental { .. } | Merge { .. } | DeleteInsert { .. }
+        Incremental { .. } | Merge { .. } | DeleteInsert { .. } | Snapshot(_)
     )
 }
 
@@ -101,11 +104,27 @@ fn assumes_existing_target(strategy: &rocky_ir::MaterializationStrategy) -> bool
 /// transformation model, applying declared surrogate-key columns so the output
 /// matches what `rocky run` would execute. `model_filter` restricts to a single
 /// model by name.
+#[cfg(test)]
 fn emit_models(
     config_path: Option<&Path>,
     models_dir: &Path,
     model_filter: Option<&str>,
     run_vars: &rocky_core::run_vars::RunVars,
+) -> Result<EmitResult> {
+    emit_models_selected(config_path, models_dir, model_filter, run_vars, None)
+}
+
+/// [`emit_models`], further narrowed by a `--select` / `--exclude`
+/// selection resolved against the compiled project.
+fn emit_models_selected(
+    config_path: Option<&Path>,
+    models_dir: &Path,
+    model_filter: Option<&str>,
+    run_vars: &rocky_core::run_vars::RunVars,
+    selection: Option<(
+        &crate::selection::SelectionArgs,
+        &crate::selection::StateContext<'_>,
+    )>,
 ) -> Result<EmitResult> {
     use rocky_compiler::compile::{self, CompilerConfig};
 
@@ -134,6 +153,8 @@ fn emit_models(
             .map(|c| c.freshness.clone())
             .unwrap_or_default(),
         run_vars: run_vars.clone(),
+        source_provenance: Default::default(),
+        preserve_authored_sql: false,
     };
     let result = match compile::compile(&config) {
         Ok(r) => r,
@@ -174,6 +195,17 @@ fn emit_models(
             errors.join("\n  ")
         );
     }
+
+    let selected: Option<std::collections::BTreeSet<String>> = match selection {
+        Some((args, ctx)) if args.is_active() => Some(crate::selection::resolve(
+            args,
+            &result.project,
+            models_dir,
+            ctx,
+        )?),
+        _ => None,
+    };
+    let in_selection = |name: &str| selected.as_ref().is_none_or(|set| set.contains(name));
 
     // Iterate in the project's topological execution order so the emitted files
     // are runnable in sequence (a model never precedes one it reads). Models not
@@ -221,6 +253,7 @@ fn emit_models(
         .models
         .iter()
         .filter(|m| model_filter.is_none_or(|f| m.config.name == f))
+        .filter(|m| in_selection(&m.config.name))
         .map(|m| std::path::PathBuf::from(&m.file_path))
         .collect();
     let surrogate_keys: HashMap<String, Vec<SurrogateKeySpec>> =
@@ -234,11 +267,26 @@ fn emit_models(
     let mut filter_matched = false;
     for model_ir in ordered {
         let model_name = model_ir.name.as_ref();
+        if !in_selection(model_name) {
+            continue;
+        }
         if let Some(f) = model_filter {
             if model_name != f {
                 continue;
             }
             filter_matched = true;
+        }
+
+        // An ephemeral model has no statement of its own: its SQL is already
+        // inlined as a CTE into every model that reads it.
+        if matches!(
+            model_ir.materialization,
+            rocky_ir::MaterializationStrategy::Ephemeral
+        ) {
+            skipped.push(format!(
+                "{model_name} (ephemeral: inlined as a CTE into each model that reads it)"
+            ));
+            continue;
         }
 
         let mut model_ir = model_ir.clone();
@@ -325,10 +373,32 @@ pub fn run_emit_sql(
     out_dir: Option<&Path>,
     run_vars: &rocky_core::run_vars::RunVars,
 ) -> Result<()> {
+    run_emit_sql_with_selection(
+        config_path,
+        models_dir,
+        model_filter,
+        out_dir,
+        run_vars,
+        None,
+    )
+}
+
+/// [`run_emit_sql`] narrowed by `--select` / `--exclude`.
+pub fn run_emit_sql_with_selection(
+    config_path: Option<&Path>,
+    models_dir: &Path,
+    model_filter: Option<&str>,
+    out_dir: Option<&Path>,
+    run_vars: &rocky_core::run_vars::RunVars,
+    selection: Option<(
+        &crate::selection::SelectionArgs,
+        &crate::selection::StateContext<'_>,
+    )>,
+) -> Result<()> {
     let EmitResult {
         models,
         mut skipped,
-    } = emit_models(config_path, models_dir, model_filter, run_vars)?;
+    } = emit_models_selected(config_path, models_dir, model_filter, run_vars, selection)?;
 
     if models.is_empty() {
         println!("emit-sql: no transformation SQL to emit.");
@@ -376,8 +446,8 @@ pub fn run_emit_sql(
 /// The SQL written for one model, prefixed with a note for merge and
 /// delete_insert statements that operate on an existing target (so a reader
 /// running the file against a fresh warehouse understands why a bare
-/// `MERGE`/`DELETE` expects the table to already exist). `incremental` never
-/// reaches here: it is refused on transformation models (#1990).
+/// `MERGE`/`DELETE` expects the table to already exist). An `incremental`
+/// statement also reads `MAX(<watermark>)` from that target.
 fn file_body(m: &EmittedModel) -> String {
     if m.assumes_existing_target {
         format!(

@@ -34,8 +34,8 @@ use rocky_compiler::semantic::{LineageEdge, SemanticGraph};
 use rocky_core::state::{RunStatus, StateStore};
 
 use crate::output::{
-    AssetKind, CatalogAsset, CatalogColumn, CatalogEdge, CatalogOutput, CatalogStats,
-    EdgeConfidence, RecipeIdentityView, config_fingerprint,
+    AssetKind, CatalogAsset, CatalogColumn, CatalogEdge, CatalogGovernance, CatalogOutput,
+    CatalogStats, EdgeConfidence, RecipeIdentityView, config_fingerprint,
 };
 use crate::registry::resolve_pipeline;
 use crate::scope::resolve_managed_tables_in_catalog;
@@ -233,6 +233,12 @@ pub fn compute_catalog_output(
             );
         }
     }
+    let models_by_name: HashMap<&str, &rocky_core::models::ModelConfig> = result
+        .project
+        .models
+        .iter()
+        .map(|m| (m.config.name.as_str(), &m.config))
+        .collect();
 
     // 7. Build assets from the SemanticGraph models (insertion-ordered
     //    via IndexMap). Source-only nodes (referenced but not declared
@@ -324,6 +330,9 @@ pub fn compute_catalog_output(
             last_materialized_at: None,
             last_run_id: None,
             recipe_identity: None,
+            governance: models_by_name
+                .get(name.as_str())
+                .and_then(|c| CatalogGovernance::from_config(c)),
         });
     }
 
@@ -1207,6 +1216,7 @@ mod tests {
                 last_materialized_at: None,
                 last_run_id: None,
                 recipe_identity: None,
+                governance: None,
             }
         }
 
@@ -1333,6 +1343,7 @@ mod tests {
                         last_materialized_at: None,
                         last_run_id: None,
                         recipe_identity: None,
+                        governance: None,
                     },
                     CatalogAsset {
                         fqn: "warehouse_a.public.customer_orders".to_string(),
@@ -1345,6 +1356,7 @@ mod tests {
                         last_materialized_at: None,
                         last_run_id: None,
                         recipe_identity: None,
+                        governance: None,
                     },
                     CatalogAsset {
                         fqn: "warehouse_b.public.revenue_summary".to_string(),
@@ -1357,6 +1369,7 @@ mod tests {
                         last_materialized_at: None,
                         last_run_id: None,
                         recipe_identity: None,
+                        governance: None,
                     },
                 ],
                 edges: vec![

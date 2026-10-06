@@ -14,7 +14,7 @@ Every model, replication or transformation, declares a materialization strategy.
 | Strategy | Behavior | Use case |
 |----------|----------|----------|
 | `full_refresh` | `CREATE OR REPLACE TABLE ... AS SELECT ...` | Small tables, schema changes, initial loads |
-| `incremental` | Replication only: `INSERT INTO ... SELECT ... WHERE ts > watermark`. A transformation model is refused with `E037` | Append-only source tables with a reliable timestamp |
+| `incremental` | `INSERT INTO ... SELECT ... WHERE ts > watermark` (or `MERGE` with a `unique_key`). Replication keeps the watermark in the state store. A transformation model reads it from its target with `@incremental_filter` | Source tables with a reliable timestamp |
 | `merge` | `MERGE INTO ... USING ... ON key WHEN MATCHED THEN UPDATE WHEN NOT MATCHED THEN INSERT` | Mutable data with a unique key |
 | `time_interval` | Per-partition `INSERT OVERWRITE` with `@start_date`/`@end_date` placeholders | Time-series data with partition-level reprocessing |
 | `microbatch` | `time_interval` alias with hourly defaults | dbt-compatible partition processing |

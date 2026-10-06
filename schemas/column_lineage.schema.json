@@ -35,6 +35,40 @@
         "model"
       ],
       "type": "object"
+    },
+    "RowSelectionEdgeRecord": {
+      "description": "One row-selection lineage edge. See `ColumnLineageOutput::row_selection`.",
+      "properties": {
+        "kind": {
+          "description": "`join_key`, `filter`, `group_by`, `having`, `qualify`, `window_partition` or `window_order`.",
+          "type": "string"
+        },
+        "source": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/LineageQualifiedColumn"
+            }
+          ],
+          "description": "The column that influences row selection."
+        },
+        "target_column": {
+          "description": "The single output column affected (window keys). Omitted when the edge affects every output column of `target_model`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "target_model": {
+          "description": "The model whose rows it influences.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "source",
+        "target_model"
+      ],
+      "type": "object"
     }
   },
   "description": "JSON output for `rocky lineage <model> --column <col>`.",
@@ -58,6 +92,13 @@
     },
     "model": {
       "type": "string"
+    },
+    "row_selection": {
+      "description": "Row-selection edges along the trace: columns that decide which rows or groups exist (join keys, filters, group keys, window keys) rather than feeding a value. `trace` stays value-derivation only.\n\nUpstream: the row-selection inputs of every model on the value trace, for the traced column. Downstream: the models whose rows the traced column (or a column derived from it) filters, joins, groups or partitions. Omitted when empty.",
+      "items": {
+        "$ref": "#/definitions/RowSelectionEdgeRecord"
+      },
+      "type": "array"
     },
     "trace": {
       "items": {

@@ -323,6 +323,7 @@ Rocky records the execution flags in the plan file, so `rocky apply` replays the
 | `--filter <key=value>` | `string` | | Filter sources by component value (e.g., `client=acme`). |
 | `--pipeline <NAME>` | `string` | | Pipeline name (required if multiple pipelines are defined). |
 | `--model <NAME>` | `string` | | Plan a single compiled model by name and skip replication. An alternative to `--filter` for model-only execution. |
+| `--select <SELECTOR>...`, `-s` / `--exclude <SELECTOR>...` / `--state-ref <REF>` | `string` | | [Node selection](/reference/node-selection/). The selection must resolve to exactly one model, which is then planned like `--model`. |
 | `--models <PATH>` | `PathBuf` | | Models directory for transformation execution. |
 | `--all` | `bool` | `false` | Plan both replication and compiled models. |
 | `--governance-override <JSON>` | `string` | | Additional governance config as inline JSON or `@file.json`, merged with the defaults. Resolved at plan time and stored in the plan. |
@@ -455,12 +456,12 @@ A model excluded from the preview or refused by compilation is listed in `skippe
   "skipped": [
     {
       "model": "stg_events",
-      "reason": "[E038] model 'stg_events' uses `type = \"ephemeral\"`, which is not supported: an ephemeral model is not materialized and is not inlined into its consumers, so a consumer reads whatever table already carries the name"
+      "reason": "invalid SQL generation request: model 'stg_events': `type = \"ephemeral\"` renders no statement of its own — it is inlined as a CTE into each model that reads it, so there is nothing to build (E038 when selected directly)"
     }
   ]
 ```
 
-The `reason` gives the compiler diagnostic or SQL generation error. A refused strategy puts a model there, and so does one that needs a live warehouse, such as a Snowflake dynamic table. The MCP `plan_preview` tool reports preview exclusions. The key is absent when nothing was skipped.
+The `reason` gives the compiler diagnostic or SQL generation error. An `ephemeral` model is always there: its SQL appears inside each consumer's statement instead. A model that needs a live warehouse, such as a Snowflake dynamic table, is there too. The MCP `plan_preview` tool reports preview exclusions. The key is absent when nothing was skipped.
 
 Plan with table output and a custom config:
 
@@ -610,6 +611,7 @@ rocky run [flags]
 | `--filter <key=value>` | `string` | | Filter sources by component value (e.g., `client=acme`). |
 | `--pipeline <NAME>` | `string` | | Pipeline name (required if multiple pipelines are defined). |
 | `--model <NAME>` | `string` | | Execute a single compiled model by name and skip replication. An alternative to `--filter` for model-only execution. |
+| `--select <SELECTOR>...`, `-s` / `--exclude <SELECTOR>...` / `--state-ref <REF>` | `string` | | Build the [selected models](/reference/node-selection/) and skip replication. Unselected upstreams are read as they exist. Not with `--dag`, `--watch`, `--all`, `--filter`, `--contracts`, or `--resume`. |
 | `--contracts <PATH>` | `PathBuf` | | Check the selected model against its contract in this directory during the run's own compile. Requires `--model` and `--pipeline`. |
 | `--governance-override <JSON>` | `string` | | Additional governance config as inline JSON or `@file.json`, merged with defaults. |
 | `--models <PATH>` | `PathBuf` | | Models directory for transformation execution. |
@@ -627,6 +629,7 @@ rocky run [flags]
 | `--defer-to <SCHEMA>` | `string` | | Schema the deferred upstream models resolve to. Requires `--defer`. Defaults to each unbuilt upstream's own configured target schema (its production home); pass this to point every deferred reference at a single schema instead (catalog + table are preserved). |
 | `--skip-unchanged` | `bool` | `false` | Turn on the model-skip gate for this invocation regardless of the `[run] skip_unchanged` config: skip re-materializing a transformation model whose logic and every upstream's data both appear unchanged. **Best-effort optimization, not a result-equivalence guarantee** — non-deterministic SQL and models without provably-complete lineage (CTEs, subqueries, `PIVOT`/`UNNEST`, set operations) always rebuild. See [`[run]`](/reference/configuration/#run) for the full eligibility rules. |
 | `--force-rebuild` | `bool` | `false` | Force every selected model to build, bypassing the `--skip-unchanged` gate entirely. The escape hatch for a guaranteed rebuild after a non-logic change the IR hash can't see (a UDF redefinition, a session-setting change). |
+| `--full-refresh` | `bool` | `false` | Rebuild transformation `incremental` models with `CREATE OR REPLACE TABLE ... AS`. Every `@incremental_filter` becomes `TRUE`, so the table holds the model's full result. Other strategies are unaffected: a `merge` or `delete_insert` model's SQL often selects only recent rows, and rebuilding from it would drop history. The flag also turns off the `--skip-unchanged` gate. |
 | `--var <name=value>` | `string` (repeatable) | | Bind a per-run variable substituted into model SQL wherever an `@var(name)` / `@var(name, default)` marker appears. Repeat for multiple variables. Distinct from config-time `${ENV}` substitution: `@var()` resolves the run's logical inputs at compile time, `${ENV}` resolves connection/config values while parsing `rocky.toml`. A model that references `@var(name)` with no `--var` binding and no inline default fails to compile, naming the missing variable. See [`@var()` run variables](/reference/model-format/#var-run-variables). |
 | `--parallel <N>` | `integer` | `4` without `--dag` | Models in a topological layer (and partitions of a `time_interval` model) run up to N at a time. Pass `--parallel 1` to run one model or partition at a time. Under `--dag` the flag bounds how many pipeline **nodes** run at once, and it has no default there: left unset, a `--dag` run keeps its unbounded node fan-out. It does **not** bound a replication pipeline's table fan-out, which comes from that pipeline's `[execution] concurrency` (default 32), so `--parallel 1` alone does not make a replication run serial. DuckDB always runs serially regardless of this flag (its adapter holds a single connection mutex); Snowflake and Databricks parallelize up to N. |
 
@@ -777,7 +780,6 @@ rocky compare --filter client=acme
 Shadow mode is only useful if it truly isolates the run from production. Rocky refuses the run rather than write a target it cannot isolate. A shadow or branch run fails closed in any of these cases.
 
 - The selected transformation set contains a `content_addressed` or `time_interval` model. Both need extra storage or partition-state isolation that shadow mode does not give them.
-- The selected set contains an `ephemeral` model. Compile already reports it as `E038`, and the shadow path refuses it again by name. A consumer would read the production table, because Rocky neither materializes nor inlines it.
 - The chosen suffix or schema would collide with a production target, or with another selected shadow target.
 - All three of the following hold at once:
   - the dialect treats identifier case as part of object identity (Snowflake and BigQuery);
@@ -871,6 +873,87 @@ acme_warehouse.staging__eu_central__stripe.charges    | 2026-03-29T22:15:00Z    
 
 - [`rocky run`](#rocky-run) -- update watermarks by executing the pipeline
 - [`rocky history`](/reference/commands/administration/#rocky-history) -- view run history
+
+---
+
+## `rocky freshness`
+
+Check how fresh each declared source and model is, against the warehouse. This is Rocky's form of `dbt source freshness`. It reads data only and writes nothing.
+
+```bash
+rocky freshness [flags]
+```
+
+Rocky checks two kinds of declaration:
+
+- **Sources.** Each [`[[pipeline.NAME.sources]]`](/reference/configuration/#pipelinenamesources) entry with a `freshness` block. Rocky runs `SELECT COUNT(*), MAX(loaded_at_field) FROM <table> [WHERE (<filter>)]`.
+- **Models.** Each model with a `[freshness]` block. With a `time_column`, Rocky reads `MAX(time_column)` from the model's target table. Without one, Rocky uses the model's last successful build from the state store.
+
+The age is the check time minus the newest load time. Rocky grades it:
+
+| Status | When |
+|--------|------|
+| `pass` | The age is within every threshold. |
+| `warn` | The age is greater than `warn_after`. Also when the newest load time is more than 60 seconds in the future: the age cannot be trusted. |
+| `error` | The age is greater than `error_after`. |
+| `runtime_error` | Rocky could not measure: invalid config, a failed query, or a value that does not read as a timestamp. |
+
+A table with no rows, or with only NULL load times, counts as never loaded. The worst threshold it declares applies. A model's `max_lag_seconds` is its warn threshold. Under `severity = "error"` it is the error threshold instead.
+
+**Exit code.** `1` when any check is `error` or `runtime_error`. `0` otherwise, including when checks only `warn`.
+
+`rocky run` does not call this command. To stop a run on stale sources, run `rocky freshness` first and stop on a non-zero exit.
+
+A model can inherit `time_column` from `_defaults.toml` or the project `[freshness]` block. When Rocky cannot read an inherited column on that model, it measures the last successful build instead and says so in `message`. A `time_column` in the model's own sidecar gets no fallback: a failed read is `runtime_error`.
+
+**Limits.**
+
+- Run history records a model build under its bare target table name. Two models whose targets share a table name in different schemas share that history. For a model without a `time_column`, the newer build of the two can hide a stale one. Set a `time_column` to measure the table itself.
+- With `[state] namespacing = "pipeline"`, the state-store fallback reads the global state file, so it may find no build.
+- Exit `1` covers both a stale check and a command failure (for example a config that does not load). A command failure prints no JSON report.
+- A load time with no time zone is read as UTC. A column filled in local time is off by the zone's offset. A SQL Server `DATETIME` filled with `GETDATE()` is the common case. Fill it with `SYSUTCDATETIME()`, or use a zoned type such as `DATETIMEOFFSET`.
+- Snowflake temporal cells arrive as epoch numbers and are decoded as such. That decoding follows the documented SQL API format and is not yet verified against a live account.
+
+### Flags
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--pipeline <NAME>` | `string` | | Check one transformation pipeline. By default Rocky checks every transformation pipeline. A replication pipeline is refused: it checks freshness with `[checks.freshness]` during `rocky run`. |
+
+### Examples
+
+```bash
+rocky freshness
+```
+
+```json
+{
+  "version": "1.76.0",
+  "command": "freshness",
+  "checked_at": "2026-10-04T12:00:00Z",
+  "sources": [
+    {
+      "name": "raw.orders",
+      "pipeline": "silver",
+      "table": "raw.orders",
+      "loaded_at_field": "_loaded_at",
+      "measured_from": "warehouse",
+      "max_loaded_at": "2026-10-03T23:00:00Z",
+      "age_seconds": 46800,
+      "warn_after_seconds": 43200,
+      "error_after_seconds": 86400,
+      "status": "warn"
+    }
+  ],
+  "models": [],
+  "summary": { "pass": 0, "warn": 1, "error": 0, "runtime_error": 0 }
+}
+```
+
+### Related Commands
+
+- [`rocky compile`](/reference/commands/modeling/#rocky-compile) -- checks the declarations (`E050`, `W050`)
+- [`rocky run`](#rocky-run) -- builds the models; does not check freshness
 
 ---
 

@@ -84,6 +84,58 @@
       ],
       "type": "object"
     },
+    "FunctionDetail": {
+      "description": "A user-defined function in `CompileOutput.functions`.",
+      "properties": {
+        "called_by": {
+          "description": "Models that call this function directly. `rocky run` creates the function before any of them is built.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "calls": {
+          "description": "Other project functions this function's body calls (created first).",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "deterministic": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "name": {
+          "type": "string"
+        },
+        "returns": {
+          "description": "Declared return type, as written.",
+          "type": "string"
+        },
+        "signature": {
+          "description": "`name(arg TYPE, ...) RETURNS TYPE`, as declared.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "called_by",
+        "name",
+        "returns",
+        "signature"
+      ],
+      "type": "object"
+    },
+    "IncrementalLookback": {
+      "type": "string"
+    },
     "ModelDetail": {
       "description": "Per-model summary projected from `rocky_core::models::ModelConfig`.\n\nIntentionally excludes fields that change run-to-run (timings, diagnostics) — those live on the run-level outputs. This is the stable, declarative shape of one compiled model, suitable for orchestrators that build asset definitions ahead of execution.",
       "properties": {
@@ -158,7 +210,7 @@
       "type": "object"
     },
     "ModelFreshnessConfig": {
-      "description": "Per-model freshness configuration.\n\nDeclares the maximum allowed lag between successive materializations of the model plus the optional timestamp column used by the runtime freshness check.\n\nThe compiler does not enforce the TTL — it's metadata consumed by downstream observability tooling (`dagster-rocky` `FreshnessPolicy`, `rocky doctor --freshness`, etc.). The compiler does however soft-warn (W005) when a model has at least one temporal output column but no `freshness` declaration anywhere in scope (per-model or project-level default).",
+      "description": "Per-model freshness configuration.\n\nDeclares the maximum allowed lag between successive materializations of the model plus the optional timestamp column used by the runtime freshness check.\n\n`rocky freshness` enforces the TTL at run time: it reads `MAX(time_column)` from the model's target table (or, without a `time_column`, the model's last successful build in the state store) and reports `warn`, or `error` when `severity = \"error\"`. `rocky run` does not gate on it. The compiler checks the `time_column` (E050 when absent from a provably complete output, W050 when not temporal), and soft-warns (W005) when a model has at least one temporal output column but no `freshness` declaration anywhere in scope (per-model or project-level default).",
       "properties": {
         "max_lag_seconds": {
           "description": "Maximum lag in seconds before the model is considered stale.\n\nAccepts both `max_lag_seconds` (legacy field name, preserved for existing sidecar fixtures + dagster Pydantic + VS Code bindings) and `expected_lag_seconds` (the documented public-facing name matching dbt freshness + SQLMesh defaults). Both deserialize to the same field; the serialized name stays `max_lag_seconds` so existing JSON/codegen consumers keep working unchanged.",
@@ -189,6 +241,25 @@
         "max_lag_seconds"
       ],
       "type": "object"
+    },
+    "OnSchemaChange": {
+      "description": "What an incremental run does when the model's output columns differ from the existing target's columns.",
+      "oneOf": [
+        {
+          "description": "Stop the run and name the added and removed columns. The default: nothing is written, and `rocky run --full-refresh` rebuilds the table.",
+          "enum": [
+            "fail"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Add each new output column to the target with `ALTER TABLE ... ADD COLUMN`, then load. Existing rows hold `NULL` in the new column. A column removed from the model still fails the run.",
+          "enum": [
+            "append_new_columns"
+          ],
+          "type": "string"
+        }
+      ]
     },
     "PhaseTimings": {
       "description": "Wall-clock duration of each compile phase.\n\nSurfaced in `CompileResult` so callers (CLI, Dagster, LSP) can attribute compile time to a specific stage instead of treating compile as a black box. `typecheck_join_keys_ms` is a sub-timer of `typecheck_ms` so we can decide whether the cross-model join-key check needs further optimization without re-instrumenting later.",
@@ -244,6 +315,123 @@
       ],
       "type": "string"
     },
+    "SnapshotCheckColsConfig": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      ],
+      "description": "`check_cols` accepts a list of columns or the string `\"all\"`."
+    },
+    "SnapshotFlagColumn": {
+      "anyOf": [
+        {
+          "description": "Write the flag under this column name.",
+          "type": "string"
+        },
+        {
+          "description": "`false`: write no flag column. `true` means the default name.",
+          "type": "boolean"
+        }
+      ],
+      "description": "The `is_current` metadata column: a name, or `false` for none.\n\nA snapshot table built by dbt has no `is_current` column. Setting `is_current = false` lets Rocky continue such a table: a version is then current when its `valid_to` is NULL (or equals `valid_to_current`)."
+    },
+    "SnapshotHardDeletes": {
+      "description": "What a snapshot does with a key that disappears from the model's result.",
+      "oneOf": [
+        {
+          "description": "Keep the last version current. The default, as in dbt.",
+          "enum": [
+            "ignore"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Close the current version: set `valid_to` and clear `is_current`.",
+          "enum": [
+            "invalidate"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Close the current version and insert a deletion-marker version with `is_deleted = TRUE`.",
+          "enum": [
+            "new_record"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "SnapshotMetaColumns": {
+      "description": "Names of the metadata columns a snapshot model adds to its rows.\n\nThe defaults match the `snapshot` pipeline. Each key also accepts the dbt spelling (`dbt_valid_from`, `dbt_valid_to`, `dbt_scd_id`, `dbt_updated_at`, `dbt_is_deleted`) so an imported `snapshot_meta_column_names` block reads unchanged.",
+      "properties": {
+        "is_current": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/SnapshotFlagColumn"
+            }
+          ],
+          "default": "is_current",
+          "description": "`TRUE` on the current version of each key. Default `is_current`; `false` writes no flag (dbt has no such column)."
+        },
+        "is_deleted": {
+          "default": "is_deleted",
+          "description": "Deletion marker, written only under `hard_deletes = \"new_record\"`. Default `is_deleted`.",
+          "type": "string"
+        },
+        "scd_id": {
+          "default": "snapshot_id",
+          "description": "Deterministic per-version id: a hash of the key and `valid_from`. Default `snapshot_id`.",
+          "type": "string"
+        },
+        "updated_at": {
+          "description": "Optional copy of the version's change timestamp (dbt's `dbt_updated_at`). Not written unless named.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "valid_from": {
+          "default": "valid_from",
+          "description": "When this version became current. Default `valid_from`.",
+          "type": "string"
+        },
+        "valid_to": {
+          "default": "valid_to",
+          "description": "When this version stopped being current. Default `valid_to`.",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "SnapshotStrategyKind": {
+      "description": "The `strategy` key inside a snapshot `[strategy]` block.",
+      "enum": [
+        "timestamp",
+        "check"
+      ],
+      "type": "string"
+    },
+    "SnapshotUniqueKey": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      ],
+      "description": "`unique_key` accepts one column name or a list (dbt parity)."
+    },
     "SourceSpan": {
       "description": "Location in a source file.",
       "properties": {
@@ -286,19 +474,61 @@
           "type": "object"
         },
         {
+          "description": "Load only rows newer than the target's current watermark.\n\nOn a transformation model the model SQL marks where the filter goes with `@incremental_filter` (`filter_column` names a qualified or renamed input column to compare). Each incremental run resolves it to `<col> > (SELECT MAX(<watermark>) FROM <target>)`, minus `lookback`; the first run and `rocky run --full-refresh` resolve it to `TRUE`. With no placeholder, a watermark column that the model passes straight through from one input is filtered on the model's output instead; anything else is refused (E046). No watermark at all is refused (E037).",
           "properties": {
+            "filter_column": {
+              "default": null,
+              "description": "The input column `@incremental_filter` compares, when it is not the watermark itself: a qualified column in a join (`\"o.updated_at\"`) or a source column the model renames (`\"_synced_at\"`). The bound is still `MAX(<timestamp_column>)` over the target.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "lookback": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/IncrementalLookback"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "Re-read this far below the watermark, e.g. `\"3 days\"`, to catch late-arriving rows. Pair it with `unique_key`, or the re-read rows are appended again (W046)."
+            },
+            "on_schema_change": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/OnSchemaChange"
+                }
+              ],
+              "default": "fail",
+              "description": "What a run does when the model's output columns no longer match the target: `fail` (default) or `append_new_columns`."
+            },
             "timestamp_column": {
-              "type": "string"
+              "default": null,
+              "description": "The watermark column: an output column of the model whose maximum in the target marks what is already loaded. `watermark` is accepted as an alias.",
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "type": {
               "enum": [
                 "incremental"
               ],
               "type": "string"
+            },
+            "unique_key": {
+              "default": [],
+              "description": "Upsert on these columns with `MERGE` instead of appending.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
             }
           },
           "required": [
-            "timestamp_column",
             "type"
           ],
           "type": "object"
@@ -386,7 +616,7 @@
           "type": "object"
         },
         {
-          "description": "Ephemeral model — refused at compile time (E038). No table is created and no consumer inlines it, so it is kept only to name the refusal.",
+          "description": "Ephemeral model — never materialized. `rocky compile` inlines its SQL as a `__rocky_ephemeral__<name>` CTE into every model that reads it, and `rocky run` skips the node. Invalid uses are E038.",
           "properties": {
             "type": {
               "enum": [
@@ -529,6 +759,97 @@
             "type"
           ],
           "type": "object"
+        },
+        {
+          "description": "SCD Type 2 snapshot of the model's SELECT (dbt `snapshot` parity). Each run closes changed versions and opens new ones; see [`crate::snapshot_model`]. Every field is optional here so a missing one is reported as E049 by `rocky compile` rather than as a TOML parse error.",
+          "properties": {
+            "check_cols": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/SnapshotCheckColsConfig"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Check-strategy columns: a list, or `\"all\"`."
+            },
+            "hard_deletes": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/SnapshotHardDeletes"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "`\"ignore\"` (default), `\"invalidate\"` or `\"new_record\"`."
+            },
+            "invalidate_hard_deletes": {
+              "description": "dbt's legacy spelling of `hard_deletes = \"invalidate\"`.",
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
+            "snapshot_meta_column_names": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/SnapshotMetaColumns"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Metadata column names (Rocky defaults; dbt keys accepted)."
+            },
+            "strategy": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/SnapshotStrategyKind"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "`\"timestamp\"` or `\"check\"`."
+            },
+            "type": {
+              "enum": [
+                "snapshot"
+              ],
+              "type": "string"
+            },
+            "unique_key": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/SnapshotUniqueKey"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Column, or list of columns, identifying a row of the output."
+            },
+            "updated_at": {
+              "description": "Timestamp-strategy change column.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "valid_to_current": {
+              "description": "SQL expression for `valid_to` on current versions instead of NULL.",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
         }
       ]
     },
@@ -609,6 +930,13 @@
       },
       "description": "Expanded SQL for each model after macro substitution. Only populated when `--expand-macros` is passed. Keys are model names, values are the SQL after all `@macro()` calls have been replaced.",
       "type": "object"
+    },
+    "functions": {
+      "description": "User-defined functions declared under `functions/` that passed validation, with the models that call each one. Under `--model`, only the selected function, or the functions the selected model calls. Empty (and omitted) when the project declares none.",
+      "items": {
+        "$ref": "#/definitions/FunctionDetail"
+      },
+      "type": "array"
     },
     "has_errors": {
       "description": "Whether the diagnostics this result describes include error-severity entries — and, for the CLI, whether the command exits non-zero.\n\nUnder `--model` this is computed from the exact-attribution filter above, so it says nothing about whether the selected model's upstreams compile: an error attributed to another model is filtered out and leaves this `false`, even though `rocky run` would classify that model as a compile error and exclude it from execution. A failure that aborts compilation outright rather than emitting a diagnostic — an unparseable model, a semantic-graph or contract-load failure — fails the command before any scoping applies. To learn whether a model can be built, compile without a selector.",

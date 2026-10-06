@@ -16,9 +16,9 @@ Reach for this strategy when:
 - Your model aggregates by date and you need per-day rebuilds
 - You want cost and row counts reported per partition
 
-A transformation model cannot use `incremental`. Rocky refuses it with `E037`,
-because it would append every row again on each run. If each row has a key you
-can match on, `merge` is the simpler choice.
+A transformation `incremental` model is the other option. It loads the rows
+newer than the target's watermark and needs no partition column. See
+[Incremental](/reference/model-format/#incremental).
 
 ## TOML reference
 
@@ -323,9 +323,17 @@ discriminator into a Dagster `DailyPartitionsDefinition`, or `Hourly`,
 
 ## Comparison with `incremental`
 
-There is no choice to make on a transformation model. `rocky compile` refuses `type = "incremental"` there with `E037`. Rocky has no watermark to apply to the model's SQL, so the strategy would append every row again on each run. `time_interval` is the strategy for time-windowed reprocessing of a model.
+Both strategies process only part of the data on each run. They differ in what decides the part:
 
-`incremental` remains a [replication](/concepts/incremental/) strategy, where Rocky filters each copy of a source table on a stored watermark.
+| | `incremental` | `time_interval` |
+|---|---|---|
+| Unit of work | Rows newer than the target's `MAX(<watermark>)` | One partition window per statement |
+| SQL marker | `@incremental_filter` | `@start_date` and `@end_date` |
+| Late data | `lookback` with `unique_key` | `lookback` partitions |
+| Backfill a range | `rocky run --full-refresh` rebuilds all | `--from` / `--to` |
+| State | Read from the target | `PARTITIONS` table in the state store |
+
+Pick `time_interval` when the output is grouped by date and a day must be recomputed as a whole. Pick `incremental` when new or changed rows can be loaded on their own. See [Incremental](/reference/model-format/#incremental).
 
 ## Limitations (v1)
 
@@ -334,8 +342,9 @@ The following are deferred:
 - **Rocky DSL placeholder syntax** — `@start_date` / `@end_date` are
   recognized in `.sql` files only. The `.rocky` parser will gain `@var`
   syntax in v1.1.
-- **Postgres adapter** — it doesn't exist yet. When it ships, `time_interval`
-  will route via a parent table plus a child-partition truncate.
+- **Native partitions on PostgreSQL and Redshift** — both adapters run
+  `time_interval` as `DELETE` then `INSERT` in one transaction. A
+  declarative-partition (child-table truncate) route is a follow-up.
 - **Sub-day granularities** below `hour` — belongs in streaming systems.
 - **Multi-column partitions** — single time column only in v1.
 - **Partition column transformations** — `time_column` must be a real

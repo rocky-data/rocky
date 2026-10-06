@@ -39,6 +39,45 @@ class CatalogColumn(BaseModel):
     """
 
 
+class CatalogGovernance(BaseModel):
+    """
+    Model governance on a [`CatalogAsset`]: access level, ownership group and owner, and model version.
+    """
+
+    access: str
+    """
+    `private`, `protected` (the default) or `public`.
+    """
+    deprecation_date: str | None = None
+    """
+    Deprecation date of this version (`YYYY-MM-DD`).
+    """
+    group: str | None = None
+    """
+    Ownership group (`access_group`, else the config `group`).
+    """
+    latest_version: conint(ge=0) | None = None
+    """
+    The latest version of [`Self::versioned_model`].
+    """
+    owner_email: str | None = None
+    """
+    Group owner's email, from the group file's `[owner]`.
+    """
+    owner_name: str | None = None
+    """
+    Group owner's name, from the group file's `[owner]`.
+    """
+    version: conint(ge=0) | None = None
+    """
+    This model's version. Absent on the latest alias.
+    """
+    versioned_model: str | None = None
+    """
+    Unversioned model name, for a model version or the latest alias.
+    """
+
+
 class CatalogStats(BaseModel):
     """
     Aggregate counts for the emitted catalog.
@@ -109,6 +148,10 @@ class CatalogAsset(BaseModel):
     fqn: str
     """
     Fully-qualified target identifier (`catalog.schema.table`) when resolvable, otherwise the model name.
+    """
+    governance: CatalogGovernance | None = None
+    """
+    Access level, ownership and version, when the model declares any of them. Absent for sources and for models with no governance keys.
     """
     intent: str | None = None
     """

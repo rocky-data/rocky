@@ -130,6 +130,29 @@ pub struct ModelGovernanceConfig {
     /// strings, used verbatim — no prefix is applied.
     #[serde(default)]
     pub tags: std::collections::BTreeMap<String, String>,
+    /// Resolved access level from the sidecar's top-level `access` key.
+    /// `None` means the key was not set: the model is `protected`. See
+    /// [`crate::model_governance`].
+    #[serde(default, skip_deserializing, skip_serializing_if = "Option::is_none")]
+    pub access: Option<crate::model_governance::ModelAccess>,
+    /// Resolved ownership group: the top-level `access_group` key, else the
+    /// model's config `group`. Consulted only for `private` models.
+    #[serde(default, skip_deserializing, skip_serializing_if = "Option::is_none")]
+    pub access_group: Option<String>,
+    /// Owner of [`Self::access_group`], from that group file's `[owner]`.
+    #[serde(default, skip_deserializing, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<crate::model_governance::GroupOwner>,
+    /// Version metadata, set on the models of a version declaration and on
+    /// the latest alias. See [`crate::model_governance::apply_versions`].
+    #[serde(default, skip_deserializing, skip_serializing_if = "Option::is_none")]
+    pub version: Option<crate::model_governance::ModelVersionInfo>,
+}
+
+impl ModelGovernanceConfig {
+    /// The effective access level (`protected` when unset).
+    pub fn effective_access(&self) -> crate::model_governance::ModelAccess {
+        self.access.unwrap_or_default()
+    }
 }
 
 /// TOML frontmatter in a model SQL file.
@@ -155,11 +178,11 @@ pub struct ModelConfig {
     /// Used by `rocky ai-sync` to propose updates when upstream schemas change.
     #[serde(default)]
     pub intent: Option<String>,
-    /// Per-model freshness expectation. Declarative-only — the compiler does
-    /// not enforce anything; downstream consumers (`dagster-rocky` to attach
-    /// `FreshnessPolicy`, `rocky doctor --freshness` to surface stale
-    /// models, the upcoming Dagster UI freshness badge) read this field
-    /// from the compile JSON output.
+    /// Per-model freshness expectation. `rocky freshness` enforces it against
+    /// the warehouse (exit non-zero when a `severity = "error"` model is
+    /// stale); `rocky compile` checks the `time_column` (E050 / W050).
+    /// Downstream consumers (`dagster-rocky` `FreshnessPolicy`) also read
+    /// this field from the compile JSON output.
     #[serde(default)]
     pub freshness: Option<ModelFreshnessConfig>,
     /// Declarative tests for this model. Parsed from `[[tests]]` arrays in
@@ -312,12 +335,14 @@ pub struct ModelConfig {
 /// the model plus the optional timestamp column used by the runtime
 /// freshness check.
 ///
-/// The compiler does not enforce the TTL — it's metadata consumed by
-/// downstream observability tooling (`dagster-rocky` `FreshnessPolicy`,
-/// `rocky doctor --freshness`, etc.). The compiler does however soft-warn
-/// (W005) when a model has at least one temporal output column but no
-/// `freshness` declaration anywhere in scope (per-model or project-level
-/// default).
+/// `rocky freshness` enforces the TTL at run time: it reads
+/// `MAX(time_column)` from the model's target table (or, without a
+/// `time_column`, the model's last successful build in the state store) and
+/// reports `warn`, or `error` when `severity = "error"`. `rocky run` does not
+/// gate on it. The compiler checks the `time_column` (E050 when absent from a
+/// provably complete output, W050 when not temporal), and soft-warns (W005)
+/// when a model has at least one temporal output column but no `freshness`
+/// declaration anywhere in scope (per-model or project-level default).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ModelFreshnessConfig {
     /// Maximum lag in seconds before the model is considered stale.
@@ -341,6 +366,15 @@ pub struct ModelFreshnessConfig {
     /// `error` to fail the pipeline on stale data.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub severity: Option<crate::tests::TestSeverity>,
+    /// True only when the model's own sidecar declares this block. False when
+    /// it was inherited from `_defaults.toml` or the project `[freshness]`,
+    /// or read back from JSON. An inherited `time_column` was not written for
+    /// this model, so the compiler never refuses on it (E050) and
+    /// `rocky freshness` falls back to the state store when it cannot be read.
+    /// Not serialized.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub declared_in_sidecar: bool,
 }
 
 impl ModelFreshnessConfig {
@@ -361,6 +395,7 @@ impl ModelFreshnessConfig {
             max_lag_seconds,
             time_column: default.time_column.clone(),
             severity: default.severity,
+            declared_in_sidecar: false,
         })
     }
 }
@@ -388,8 +423,42 @@ pub enum StrategyConfig {
     #[default]
     #[serde(rename = "full_refresh")]
     FullRefresh,
+    /// Load only rows newer than the target's current watermark.
+    ///
+    /// On a transformation model the model SQL marks where the filter goes
+    /// with `@incremental_filter` (`filter_column` names a qualified or
+    /// renamed input column to compare). Each incremental run resolves it
+    /// to `<col> > (SELECT MAX(<watermark>) FROM <target>)`, minus `lookback`;
+    /// the first run and `rocky run --full-refresh` resolve it to `TRUE`. With
+    /// no placeholder, a watermark column that the model passes straight
+    /// through from one input is filtered on the model's output instead;
+    /// anything else is refused (E046). No watermark at all is refused (E037).
     #[serde(rename = "incremental")]
-    Incremental { timestamp_column: String },
+    Incremental {
+        /// The watermark column: an output column of the model whose maximum
+        /// in the target marks what is already loaded. `watermark` is accepted
+        /// as an alias.
+        #[serde(default, alias = "watermark")]
+        timestamp_column: Option<String>,
+        /// Upsert on these columns with `MERGE` instead of appending.
+        #[serde(default)]
+        unique_key: Vec<String>,
+        /// Re-read this far below the watermark, e.g. `"3 days"`, to catch
+        /// late-arriving rows. Pair it with `unique_key`, or the re-read rows
+        /// are appended again (W046).
+        #[serde(default)]
+        lookback: Option<rocky_ir::IncrementalLookback>,
+        /// What a run does when the model's output columns no longer match
+        /// the target: `fail` (default) or `append_new_columns`.
+        #[serde(default)]
+        on_schema_change: rocky_ir::OnSchemaChange,
+        /// The input column `@incremental_filter` compares, when it is not the
+        /// watermark itself: a qualified column in a join (`"o.updated_at"`)
+        /// or a source column the model renames (`"_synced_at"`). The bound
+        /// is still `MAX(<timestamp_column>)` over the target.
+        #[serde(default)]
+        filter_column: Option<String>,
+    },
     #[serde(rename = "merge")]
     Merge {
         unique_key: Vec<String>,
@@ -422,8 +491,9 @@ pub enum StrategyConfig {
         #[serde(default)]
         first_partition: Option<String>,
     },
-    /// Ephemeral model — refused at compile time (E038). No table is created
-    /// and no consumer inlines it, so it is kept only to name the refusal.
+    /// Ephemeral model — never materialized. `rocky compile` inlines its SQL
+    /// as a `__rocky_ephemeral__<name>` CTE into every model that reads it,
+    /// and `rocky run` skips the node. Invalid uses are E038.
     #[serde(rename = "ephemeral")]
     Ephemeral,
     /// Delete+Insert: delete matching rows by partition key, then insert.
@@ -480,6 +550,78 @@ pub enum StrategyConfig {
         #[serde(default)]
         partition_columns: Vec<String>,
     },
+    /// SCD Type 2 snapshot of the model's SELECT (dbt `snapshot` parity).
+    /// Each run closes changed versions and opens new ones; see
+    /// [`crate::snapshot_model`]. Every field is optional here so a missing
+    /// one is reported as E049 by `rocky compile` rather than as a TOML
+    /// parse error.
+    #[serde(rename = "snapshot")]
+    Snapshot {
+        /// Column, or list of columns, identifying a row of the output.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        unique_key: Option<crate::snapshot_model::SnapshotUniqueKey>,
+        /// `"timestamp"` or `"check"`.
+        #[serde(default, rename = "strategy", skip_serializing_if = "Option::is_none")]
+        snapshot_strategy: Option<crate::snapshot_model::SnapshotStrategyKind>,
+        /// Timestamp-strategy change column.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        updated_at: Option<String>,
+        /// Check-strategy columns: a list, or `"all"`.
+        #[serde(
+            default,
+            alias = "check_columns",
+            skip_serializing_if = "Option::is_none"
+        )]
+        check_cols: Option<crate::snapshot_model::SnapshotCheckColsConfig>,
+        /// `"ignore"` (default), `"invalidate"` or `"new_record"`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        hard_deletes: Option<rocky_ir::SnapshotHardDeletes>,
+        /// dbt's legacy spelling of `hard_deletes = "invalidate"`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        invalidate_hard_deletes: Option<bool>,
+        /// Metadata column names (Rocky defaults; dbt keys accepted).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        snapshot_meta_column_names: Option<Box<rocky_ir::SnapshotMetaColumns>>,
+        /// SQL expression for `valid_to` on current versions instead of NULL.
+        #[serde(
+            default,
+            alias = "dbt_valid_to_current",
+            skip_serializing_if = "Option::is_none"
+        )]
+        valid_to_current: Option<String>,
+    },
+}
+
+impl StrategyConfig {
+    /// Lower a `type = "snapshot"` strategy to its IR spec plus the config
+    /// problems found on the way (E049). `None` for every other strategy.
+    pub fn snapshot_lowered(&self) -> Option<crate::snapshot_model::LoweredSnapshot> {
+        let StrategyConfig::Snapshot {
+            unique_key,
+            snapshot_strategy,
+            updated_at,
+            check_cols,
+            hard_deletes,
+            invalidate_hard_deletes,
+            snapshot_meta_column_names,
+            valid_to_current,
+        } = self
+        else {
+            return None;
+        };
+        Some(crate::snapshot_model::lower_snapshot_config(
+            crate::snapshot_model::SnapshotConfigFields {
+                unique_key: unique_key.as_ref(),
+                strategy: *snapshot_strategy,
+                updated_at: updated_at.as_deref(),
+                check_cols: check_cols.as_ref(),
+                hard_deletes: *hard_deletes,
+                invalidate_hard_deletes: *invalidate_hard_deletes,
+                meta_columns: snapshot_meta_column_names.as_deref(),
+                valid_to_current: valid_to_current.as_deref(),
+            },
+        ))
+    }
 }
 
 fn default_batch_size() -> NonZeroU32 {
@@ -542,6 +684,16 @@ pub struct RawModelConfig {
     pub format: Option<LakehouseFormat>,
     #[serde(default)]
     pub format_options: Option<LakehouseOptions>,
+    /// Amazon Redshift table attributes from a `[redshift]` sidecar block.
+    /// Folded into [`LakehouseOptions::redshift`] on resolve, so it reaches
+    /// the IR (and the recipe hash) through `format_options`.
+    #[serde(default)]
+    pub redshift: Option<rocky_ir::RedshiftTableOptions>,
+    /// ClickHouse table attributes from a `[clickhouse]` sidecar block.
+    /// Folded into [`LakehouseOptions::clickhouse`] on resolve, like
+    /// `redshift`.
+    #[serde(default)]
+    pub clickhouse: Option<rocky_ir::ClickHouseTableOptions>,
     /// Column classification tags from the `[classification]` sidecar
     /// block. See [`ModelConfig::classification`].
     #[serde(default)]
@@ -592,6 +744,16 @@ pub struct RawModelConfig {
     /// [`TestDecl`]s and appended to `tests` at load.
     #[serde(default)]
     pub use_test: Vec<TestRef>,
+
+    /// Access level: `private`, `protected` (the default) or `public`. See
+    /// [`crate::model_governance`].
+    #[serde(default)]
+    pub access: Option<crate::model_governance::ModelAccess>,
+
+    /// Ownership group for access checks. Falls back to `group` when unset.
+    /// Unlike `group`, it inherits no config; it names who owns the model.
+    #[serde(default)]
+    pub access_group: Option<String>,
 }
 
 /// The exact existing object kind a model owner permits Rocky to drop.
@@ -807,6 +969,11 @@ pub struct GroupConfig {
     /// overridable defaults unless the author opts in).
     #[serde(default)]
     pub enforce: bool,
+    /// Accountable owner of the group (`[owner] name = "...", email = "..."`).
+    /// Shown for every model whose ownership group is this group, in
+    /// `rocky docs` and `rocky catalog`.
+    #[serde(default)]
+    pub owner: Option<crate::model_governance::GroupOwner>,
 }
 
 /// Load config groups from `<models_dir>/groups/*.toml`. Each file defines one
@@ -1086,8 +1253,17 @@ fn resolve_model_config(
     // the Dagster-only `[tags]` above.
     let mut governance_tags = group.map(|g| g.governance.tags.clone()).unwrap_or_default();
     governance_tags.extend(raw.governance.tags);
+    // Ownership group: an explicit `access_group`, else the config `group`.
+    // Only a `private` model consults it, so the fallback changes nothing for
+    // a project that predates access levels.
+    let access_group = raw.access_group.clone().or_else(|| raw.group.clone());
+    let owner = crate::model_governance::owner_of(access_group.as_deref(), ctx.groups);
     let governance = ModelGovernanceConfig {
         tags: governance_tags,
+        access: raw.access,
+        access_group,
+        owner,
+        version: None,
     };
 
     // Enforcement: when the group sets `enforce = true`, a member model may not
@@ -1163,6 +1339,10 @@ fn resolve_model_config(
     // no freshness today, unlike `strategy` above.)
     let freshness = raw
         .freshness
+        .map(|f| ModelFreshnessConfig {
+            declared_in_sidecar: true,
+            ..f
+        })
         .or_else(|| defaults.and_then(|d| d.freshness.clone()))
         .or_else(|| {
             ctx.project_freshness
@@ -1254,7 +1434,24 @@ fn resolve_model_config(
         freshness,
         tests,
         format: raw.format,
-        format_options: raw.format_options,
+        // An empty `[redshift]` block sets nothing; it must not make another
+        // dialect refuse the model.
+        format_options: fold_clickhouse_options(
+            match raw
+                .redshift
+                .filter(|r| *r != rocky_ir::RedshiftTableOptions::default())
+            {
+                // `[redshift]` wins over a `[format_options.redshift]` spelling of
+                // the same thing; both land in one place.
+                Some(redshift) => {
+                    let mut opts = raw.format_options.unwrap_or_default();
+                    opts.redshift = Some(redshift);
+                    Some(opts)
+                }
+                None => raw.format_options,
+            },
+            raw.clickhouse,
+        ),
         classification: raw.classification,
         tags,
         governance,
@@ -1264,6 +1461,23 @@ fn resolve_model_config(
         name_declared,
         target_table_declared,
     })
+}
+
+/// Fold a `[clickhouse]` sidecar block into `format_options`, as `[redshift]`
+/// is above. An empty block sets nothing, so it must not make another
+/// dialect refuse the model.
+fn fold_clickhouse_options(
+    format_options: Option<LakehouseOptions>,
+    clickhouse: Option<rocky_ir::ClickHouseTableOptions>,
+) -> Option<LakehouseOptions> {
+    match clickhouse.filter(|c| *c != rocky_ir::ClickHouseTableOptions::default()) {
+        Some(clickhouse) => {
+            let mut opts = format_options.unwrap_or_default();
+            opts.clickhouse = Some(clickhouse);
+            Some(opts)
+        }
+        None => format_options,
+    }
 }
 
 /// Extract the pre-substitution `name` and `target.table` from raw TOML
@@ -1342,11 +1556,25 @@ impl Model {
     pub fn to_model_ir(&self) -> ModelIr {
         let strategy = match &self.config.strategy {
             StrategyConfig::FullRefresh => MaterializationStrategy::FullRefresh,
-            StrategyConfig::Incremental { timestamp_column } => {
-                MaterializationStrategy::Incremental {
-                    timestamp_column: timestamp_column.clone(),
-                }
-            }
+            StrategyConfig::Incremental {
+                timestamp_column,
+                unique_key,
+                lookback,
+                // Runtime-only: it decides what a run does on a column
+                // mismatch, not what SQL the model compiles to.
+                on_schema_change: _,
+                filter_column,
+            } => MaterializationStrategy::Incremental {
+                // An absent watermark lowers to "" — every generator refuses
+                // that (E037) rather than emitting an unfiltered INSERT.
+                timestamp_column: timestamp_column.clone().unwrap_or_default(),
+                unique_key: unique_key
+                    .iter()
+                    .map(|k| std::sync::Arc::from(k.as_str()))
+                    .collect(),
+                lookback: *lookback,
+                filter_column: filter_column.clone(),
+            },
             StrategyConfig::Merge {
                 unique_key,
                 update_columns,
@@ -1404,6 +1632,32 @@ impl Model {
             StrategyConfig::DynamicTable { target_lag } => MaterializationStrategy::DynamicTable {
                 target_lag: target_lag.clone(),
             },
+            // Invalid configs still lower (with empty fields); `rocky compile`
+            // reports them as E049 and SQL generation refuses them.
+            StrategyConfig::Snapshot {
+                unique_key,
+                snapshot_strategy,
+                updated_at,
+                check_cols,
+                hard_deletes,
+                invalidate_hard_deletes,
+                snapshot_meta_column_names,
+                valid_to_current,
+            } => MaterializationStrategy::Snapshot(Box::new(
+                crate::snapshot_model::lower_snapshot_config(
+                    crate::snapshot_model::SnapshotConfigFields {
+                        unique_key: unique_key.as_ref(),
+                        strategy: *snapshot_strategy,
+                        updated_at: updated_at.as_deref(),
+                        check_cols: check_cols.as_ref(),
+                        hard_deletes: *hard_deletes,
+                        invalidate_hard_deletes: *invalidate_hard_deletes,
+                        meta_columns: snapshot_meta_column_names.as_deref(),
+                        valid_to_current: valid_to_current.as_deref(),
+                    },
+                )
+                .spec,
+            )),
         };
 
         // Collapse a fully-absent budget (both cost fields None) into
@@ -1720,6 +1974,12 @@ pub fn load_models_from_dir_filtered(
             }
         })
         .collect::<Result<Vec<_>, _>>()?;
+
+    // Model versions: stamp version metadata, rewrite `<name>@v<N>` pins and
+    // add each declaration's latest alias. A directory with no declaration
+    // only has its (rare) `@v` pins rewritten.
+    let version_decls = crate::model_governance::load_version_decls_from_dir(dir)?;
+    crate::model_governance::apply_versions(&mut models, &version_decls, ctx.groups);
 
     models.sort_unstable_by(|a, b| a.config.name.cmp(&b.config.name));
     Ok(models)

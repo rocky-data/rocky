@@ -1461,9 +1461,13 @@ fn transformation_promote_kind(
         StrategyConfig::DynamicTable { .. } => {
             anyhow::bail!("branch promotion is undefined for dynamic_table models")
         }
+        StrategyConfig::Snapshot { .. } => {
+            anyhow::bail!("branch promotion is undefined for snapshot models")
+        }
         StrategyConfig::ContentAddressed { .. } => {
             anyhow::bail!("branch promotion is undefined for content_addressed models")
         }
+        // Skipped by the caller; reaching here is a caller bug.
         StrategyConfig::Ephemeral => {
             anyhow::bail!("branch promotion is undefined for ephemeral models")
         }
@@ -1520,13 +1524,23 @@ fn assert_generated_promote_target(
     } else {
         quote_fqn(dialect, target)?
     };
-    let verb = match kind {
-        PromoteKind::View => "CREATE OR REPLACE VIEW",
-        PromoteKind::Table if dialect.full_refresh_needs_predrop() => "CREATE TABLE",
-        PromoteKind::Table => "CREATE OR REPLACE TABLE",
+    let expected = match kind {
+        PromoteKind::View => format!("CREATE OR REPLACE VIEW {statement_target} AS"),
+        // The dialect's own full-refresh shape, so a dialect whose replace is
+        // a script (PostgreSQL / Redshift: `DROP TABLE IF EXISTS t;\nCREATE
+        // TABLE t AS`) is checked against what it really emits.
+        PromoteKind::Table => {
+            const BODY: &str = "\u{0}";
+            let rendered = dialect.create_table_as(&statement_target, BODY);
+            rendered
+                .strip_suffix(BODY)
+                .unwrap_or(&rendered)
+                .trim_end()
+                .to_string()
+        }
     };
     anyhow::ensure!(
-        statement.starts_with(&format!("{verb} {statement_target} AS")),
+        statement.starts_with(&expected),
         "generated promote statement does not target '{}'",
         target.full_name()
     );
@@ -1588,6 +1602,15 @@ fn production_view_sql(
 }
 
 fn quote_fqn(dialect: &dyn rocky_core::traits::SqlDialect, target: &TargetRef) -> Result<String> {
+    // PostgreSQL / Redshift render targets bare (`format_table_ref`), and a
+    // quoted name is case-sensitive there: `"marts"."Orders"` is not the
+    // table `rocky run` created as `marts.orders`. Promote must name the
+    // same object, so it uses the dialect's own rendering (which also drops
+    // an empty catalog instead of emitting `""`).
+    // ClickHouse renders `database.table` bare and has no catalog level.
+    if matches!(dialect.name(), "postgres" | "redshift" | "clickhouse") {
+        return Ok(dialect.format_table_ref(&target.catalog, &target.schema, &target.table)?);
+    }
     Ok(format!(
         "{}.{}.{}",
         quote_part(dialect, &target.catalog)?,
@@ -1872,6 +1895,11 @@ fn plan_transformation_from_models(
         else {
             continue;
         };
+        // An ephemeral model has no branch object to promote: each consumer's
+        // compiled SQL already inlines it.
+        if matches!(strategy, rocky_core::models::StrategyConfig::Ephemeral) {
+            continue;
+        }
         let kind = transformation_promote_kind(&strategy)
             .with_context(|| format!("cannot promote model '{model_name}'"))?;
         let key = rocky_sql::defer::CollisionIdentity::of(&prod.catalog, &prod.schema, &prod.table);
@@ -3267,6 +3295,47 @@ mod tests {
             "{create}"
         );
         assert!(!create.contains("OR REPLACE"));
+    }
+
+    #[test]
+    fn postgres_promote_renders_bare_and_passes_the_target_check() {
+        let dialect = rocky_postgres::PostgresDialect::new();
+        let prod = TargetRef {
+            catalog: "analytics".into(),
+            schema: "marts".into(),
+            table: "Orders".into(),
+        };
+        let source = TargetRef {
+            catalog: "analytics".into(),
+            schema: "branch_x".into(),
+            table: "Orders".into(),
+        };
+        // No separate pre-drop: the replace is one atomic script.
+        assert_eq!(
+            promote_pre_drop_sql(&dialect, &prod, PromoteKind::Table).unwrap(),
+            None
+        );
+        let create = build_promote_sql(&dialect, &prod, &source, PromoteKind::Table).unwrap();
+        assert_eq!(
+            create,
+            "DROP TABLE IF EXISTS analytics.marts.Orders;\nCREATE TABLE analytics.marts.Orders AS\n\
+             SELECT * FROM analytics.branch_x.Orders"
+        );
+        assert_generated_promote_target(&dialect, PromoteKind::Table, &prod, &create).unwrap();
+        // A statement aimed elsewhere still fails the check.
+        let other = TargetRef {
+            table: "customers".into(),
+            ..prod.clone()
+        };
+        assert!(
+            assert_generated_promote_target(&dialect, PromoteKind::Table, &other, &create).is_err()
+        );
+        // An empty catalog renders two-part, never `""`.
+        let two_part = TargetRef {
+            catalog: String::new(),
+            ..prod
+        };
+        assert_eq!(quote_fqn(&dialect, &two_part).unwrap(), "marts.Orders");
     }
 
     #[test]
@@ -4754,6 +4823,39 @@ adapter = "default"
         assert_eq!(rows.rows[0][1].as_str(), Some("3"));
     }
 
+    /// An ephemeral model has no branch object: promotion skips it and plans
+    /// only its consumer, whose compiled SQL already inlines it.
+    #[test]
+    fn promote_skips_ephemeral_models() {
+        let tmp = TempDir::new().unwrap();
+        let models = tmp.path().join("models");
+        std::fs::create_dir(&models).unwrap();
+        std::fs::write(models.join("eph.sql"), "SELECT 1 AS id").unwrap();
+        std::fs::write(
+            models.join("eph.toml"),
+            "name = \"eph\"\n[strategy]\ntype = \"ephemeral\"\n[target]\ncatalog = \"warehouse\"\nschema = \"marts\"\ntable = \"eph\"\n",
+        )
+        .unwrap();
+        write_transformation_model(
+            &models,
+            "fct",
+            "warehouse",
+            "marts",
+            "fct",
+            "SELECT id FROM eph",
+        );
+        let snapshot = crate::models_loader::load_project_models_matching(
+            &models,
+            &format!("{}/**", models.display()),
+            None,
+        )
+        .unwrap();
+        let planned =
+            plan_transformation_from_models(snapshot, &sample_record("fix"), None).unwrap();
+        assert_eq!(planned.len(), 1, "only the consumer is promoted");
+        assert_eq!(planned[0].prod.table, "fct");
+    }
+
     #[test]
     fn promote_uses_loaded_sidecar_snapshot_for_view_destination() {
         let tmp = TempDir::new().unwrap();
@@ -5358,7 +5460,6 @@ adapter = "default"
                 "content_addressed",
                 "storage_prefix = \"s3://bucket/model\"\n",
             ),
-            ("ephemeral", ""),
         ] {
             std::fs::write(models.join("unsupported.toml"), format!("name = \"unsupported\"\n[strategy]\ntype = \"{kind}\"\n{extra}[target]\ncatalog = \"memory\"\nschema = \"main\"\ntable = \"unsupported\"\n")).unwrap();
             let err = discover_branch_targets_for_plan(

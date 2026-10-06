@@ -11,6 +11,29 @@ class LineageQualifiedColumn(BaseModel):
     model: str
 
 
+class RowSelectionEdgeRecord(BaseModel):
+    """
+    One row-selection lineage edge. See `ColumnLineageOutput::row_selection`.
+    """
+
+    kind: str
+    """
+    `join_key`, `filter`, `group_by`, `having`, `qualify`, `window_partition` or `window_order`.
+    """
+    source: LineageQualifiedColumn
+    """
+    The column that influences row selection.
+    """
+    target_column: str | None = None
+    """
+    The single output column affected (window keys). Omitted when the edge affects every output column of `target_model`.
+    """
+    target_model: str
+    """
+    The model whose rows it influences.
+    """
+
+
 class LineageEdgeRecord(BaseModel):
     source: LineageQualifiedColumn
     target: LineageQualifiedColumn
@@ -36,5 +59,11 @@ class ColumnLineageOutput(BaseModel):
     Every downstream column that transitively consumes `(model, column)`, deduplicated and deterministically sorted. An author-time "what does changing this column affect" signal, always populated regardless of `direction` so the default (upstream) trace still carries the blast radius. Inspection only — this never feeds a build/skip/reuse decision. Empty when the column has no consumers.
     """
     model: str
+    row_selection: list[RowSelectionEdgeRecord] | None = None
+    """
+    Row-selection edges along the trace: columns that decide which rows or groups exist (join keys, filters, group keys, window keys) rather than feeding a value. `trace` stays value-derivation only.
+
+    Upstream: the row-selection inputs of every model on the value trace, for the traced column. Downstream: the models whose rows the traced column (or a column derived from it) filters, joins, groups or partitions. Omitted when empty.
+    """
     trace: list[LineageEdgeRecord]
     version: str

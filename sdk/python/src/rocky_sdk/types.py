@@ -661,9 +661,9 @@ class PlanResult(BaseModel):
     budget_diagnostics: list[Diagnostic] = []
     #: ``True`` when at least one ``budget_diagnostics`` entry is error-level.
     has_budget_errors: bool = False
-    #: Models the preview could not render, with the reason. A refused
-    #: strategy (``ephemeral``, E038) and a strategy that needs a live
-    #: warehouse both land here. Empty when every model rendered.
+    #: Models the preview could not render, with the reason. An
+    #: ``ephemeral`` model (inlined into its consumers) and a strategy that
+    #: needs a live warehouse both land here. Empty when every model rendered.
     skipped: list[SkippedModel] = []
 
 
@@ -737,10 +737,9 @@ class ModelFreshnessConfig(BaseModel):
     """Per-model freshness configuration projected from model TOML frontmatter.
 
     Mirrors :class:`rocky_core::models::ModelFreshnessConfig` on the Rust
-    side. Declarative-only — the compiler does not enforce anything;
-    downstream consumers (``dagster-rocky`` for ``FreshnessPolicy``,
-    ``rocky doctor --freshness``) read this field from the compile JSON
-    output.
+    side. ``rocky freshness`` enforces it against the warehouse (see
+    :meth:`rocky_sdk.RockyClient.freshness`); ``dagster-rocky`` also reads it
+    from the compile JSON output to attach a ``FreshnessPolicy``.
     """
 
     max_lag_seconds: int
@@ -814,6 +813,11 @@ class CompileResult(BaseModel):
     #: Expanded SQL per model after macro substitution. Populated only when
     #: ``--expand-macros`` is passed; ``{}`` otherwise.
     expanded_sql: dict[str, str] = Field(default_factory=dict)
+    #: User-defined functions declared under ``functions/`` that passed
+    #: validation, each with its ``signature`` and the models that call it
+    #: (``called_by``). Loose ``dict`` — the nested shape lives on the
+    #: generated ``CompileOutput.functions``. ``[]`` when none are declared.
+    functions: list[dict] = Field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -878,6 +882,20 @@ class ModelLineageResult(BaseModel):
     nodes: list[dict] = Field(default_factory=list)
 
 
+class RowSelectionEdge(BaseModel):
+    """A row-selection lineage edge: ``source`` decides which rows or groups
+    ``target_model`` produces (join key, filter, group key, window key)."""
+
+    source: QualifiedColumn
+    target_model: str
+    #: The one output column affected (window keys). ``None`` means every
+    #: output column of ``target_model``.
+    target_column: str | None = None
+    #: ``join_key``, ``filter``, ``group_by``, ``having``, ``qualify``,
+    #: ``window_partition`` or ``window_order``.
+    kind: str
+
+
 class ColumnLineageResult(BaseModel):
     """Output of ``rocky lineage <model>.<column> --json`` (single column trace)."""
 
@@ -892,6 +910,10 @@ class ColumnLineageResult(BaseModel):
     #: Downstream consumers of the traced column. Empty when tracing upstream
     #: or when the column has no downstream consumers.
     downstream_consumers: list[QualifiedColumn] = Field(default_factory=list)
+    #: Row-selection edges along the trace (join keys, filters, group and
+    #: window keys). ``trace`` stays value-derivation only. Empty for older
+    #: binaries.
+    row_selection: list[RowSelectionEdge] = Field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -1345,7 +1367,11 @@ from .types_generated import (  # noqa: E402, F401
     ErrorEnvelope,
     ExecutedRunOutput,
     FailedSourceOutput,
+    FreshnessCheckResult,
     FreshnessConfigOutput,
+    FreshnessOutput,
+    FreshnessStatus,
+    FreshnessSummary,
     FulfillOutput,
     GcApplyOutput,
     HistoryOutput,
@@ -1549,6 +1575,7 @@ RockyOutput = (
     | RestoreApplyOutput
     | ComplianceOutput
     | RetentionStatusOutput
+    | FreshnessOutput
     | CatalogOutput
     | ApproveOutput
     | BranchPromoteOutput
@@ -1598,6 +1625,7 @@ _SIMPLE_DISPATCH: dict[str, type[BaseModel]] = {
     "tick": TickOutput,
     "compliance": ComplianceOutput,
     "retention-status": RetentionStatusOutput,
+    "freshness": FreshnessOutput,
     "catalog": CatalogOutput,
     "branch approve": ApproveOutput,
     "branch promote": BranchPromoteOutput,

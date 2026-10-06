@@ -3961,6 +3961,8 @@ effect = "require_review"
                 allow_unmasked: cfg.classifications.allow_unmasked.clone(),
                 project_freshness: cfg.freshness.clone(),
                 run_vars: rocky_core::run_vars::RunVars::new(),
+                source_provenance: Default::default(),
+                preserve_authored_sql: false,
             })
         };
         let diagnostics = |result: &compile::CompileResult, code: &str| -> Vec<String> {

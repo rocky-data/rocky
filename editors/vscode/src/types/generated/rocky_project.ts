@@ -942,6 +942,18 @@ export interface SchemaCacheConfig {
    */
   replicate?: boolean;
   /**
+   * Treat every source schema the compiler knows as authoritative for missing-column checks. Defaults to `false`.
+   *
+   * A direct reference to a column a known source schema lacks is a `W041` warning when that schema came from a seed file (`rocky compile --with-seed`) or from a cache entry older than `trusted_max_age_seconds`: a stale schema must not fail a valid build. Set this to `true` to escalate those warnings to the `E041` error, matching a strict "refuse what you cannot prove" posture. `rocky compile --strict-sources` sets it for one invocation.
+   */
+  strict_sources?: boolean;
+  /**
+   * Age, in seconds, under which a cached source schema is trusted as current. Defaults to unset: no cache entry is trusted, so a missing source column found against the cache is a `W041` warning.
+   *
+   * When set, a missing source column found against a cache entry younger than this is the `E041` error instead. Only entries that survive `ttl_seconds` are read at all, so a value above the TTL trusts every cached entry.
+   */
+  trusted_max_age_seconds?: number | null;
+  /**
    * TTL for cache entries in seconds. Defaults to 86400 (24 hours). Lower it for high-DDL-churn teams; raise it for projects whose sources change on a weekly or slower cadence.
    */
   ttl_seconds?: number;
@@ -995,11 +1007,11 @@ export interface ProjectFreshnessConfig {
    */
   expected_lag_seconds?: number | null;
   /**
-   * Default severity reported when the freshness check trips. Inherited on the same terms as `time_column`. No runtime check reads it yet.
+   * Default severity reported when the freshness check trips. Inherited on the same terms as `time_column`. Under `error`, a stale model makes `rocky freshness` exit 1.
    */
   severity?: TestSeverity | null;
   /**
-   * Default timestamp column used to evaluate freshness at runtime. Carried into a model that declares no `[freshness]` block of its own; a model that declares one keeps its own value, or none. Only inherited alongside an `expected_lag_seconds`. No runtime check reads it yet.
+   * Default timestamp column used to evaluate freshness at runtime. Carried into a model that declares no `[freshness]` block of its own; a model that declares one keeps its own value, or none. Only inherited alongside an `expected_lag_seconds`. `rocky freshness` reads `MAX(time_column)` from each inheriting model's target; when a model does not have the column it measures the last successful build instead.
    */
   time_column?: string | null;
 }
@@ -1633,10 +1645,58 @@ export interface TransformationPipelineConfig {
    */
   schedule?: ScheduleConfig | null;
   /**
+   * External sources the pipeline's models read, with optional freshness expectations checked by `rocky freshness`. Declared as `[[pipeline.<name>.sources]]`. See [`crate::source_freshness::PipelineSourceConfig`].
+   */
+  sources?: PipelineSourceConfig2[];
+  /**
    * Target configuration (adapter + governance).
    */
   target: TransformationTargetConfig;
   [k: string]: unknown;
+}
+/**
+ * One external source a transformation pipeline reads.
+ *
+ * `catalog` may be omitted (DuckDB and other two-part warehouses); it then defaults to the empty string, which the dialects render as `schema.table`.
+ */
+export interface PipelineSourceConfig2 {
+  /**
+   * Catalog (database) holding the table. Empty for two-part names.
+   */
+  catalog?: string;
+  /**
+   * Optional freshness expectation. A source without one is declared but never checked.
+   */
+  freshness?: SourceFreshnessConfig | null;
+  /**
+   * Schema holding the table.
+   */
+  schema: string;
+  /**
+   * Table name.
+   */
+  table: string;
+}
+/**
+ * Freshness expectation for one source (dbt `freshness:` parity).
+ */
+export interface SourceFreshnessConfig {
+  /**
+   * Age above which the source reports `error` and `rocky freshness` exits non-zero. Must not be shorter than `warn_after`.
+   */
+  error_after?: string | null;
+  /**
+   * Optional SQL predicate limiting the rows the maximum is taken over, spliced as `WHERE (<filter>)`. A statement terminator is refused.
+   */
+  filter?: string | null;
+  /**
+   * Column holding the load time of each row. Should be a TIMESTAMP or DATE column; `rocky freshness` reads `MAX(loaded_at_field)`.
+   */
+  loaded_at_field: string;
+  /**
+   * Age above which the source reports `warn` (`"12h"`, `"3600s"`, `"7d"`).
+   */
+  warn_after?: string | null;
 }
 /**
  * Target configuration for transformation pipelines.

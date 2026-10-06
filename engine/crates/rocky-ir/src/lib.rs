@@ -36,19 +36,29 @@
 pub mod archive_plan;
 pub mod compact_plan;
 pub mod dag;
+pub mod incremental;
 pub mod ir;
 pub mod lakehouse;
 pub mod lineage;
 pub mod mask;
+pub mod snapshot;
 pub mod time_grain;
 pub mod types;
 
 pub use archive_plan::ArchivePlanIr;
 pub use compact_plan::CompactPlanIr;
 pub use dag::{DagError, DagNode, execution_layers, topological_sort};
+pub use incremental::{IncrementalLookback, LookbackUnit, OnSchemaChange};
 pub use ir::*;
-pub use lakehouse::{LakehouseError, LakehouseFormat, LakehouseOptions};
+pub use lakehouse::{
+    ClickHouseTableOptions, LakehouseError, LakehouseFormat, LakehouseOptions, RedshiftDistStyle,
+    RedshiftSortStyle, RedshiftTableOptions,
+};
 pub use lineage::{LineageEdge, QualifiedColumn};
 pub use mask::MaskStrategy;
+pub use snapshot::{
+    SnapshotChangeStrategy, SnapshotCheckColumns, SnapshotFlagColumn, SnapshotHardDeletes,
+    SnapshotMetaColumns, SnapshotSpec,
+};
 pub use time_grain::TimeGrain;
 pub use types::{RockyType, StructField, TypedColumn, common_supertype, is_assignable};

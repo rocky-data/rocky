@@ -821,6 +821,20 @@ enum Command {
         /// Applies to the default plan subcommand only.
         #[arg(long, global = false)]
         model: Option<String>,
+        /// dbt-style node selection (see `rocky run --select`). A persisted
+        /// plan carries one model, so the selection must resolve to exactly
+        /// one model; it is then planned as `--model <name>`.
+        /// Applies to the default plan subcommand only.
+        #[arg(short = 's', long, value_name = "SELECTOR", num_args = 1.., global = false)]
+        select: Vec<String>,
+        /// Remove models from `--select` (same grammar).
+        /// Applies to the default plan subcommand only.
+        #[arg(long, value_name = "SELECTOR", num_args = 1.., global = false)]
+        exclude: Vec<String>,
+        /// Git ref for `state:` selectors (default: main).
+        /// Applies to the default plan subcommand only.
+        #[arg(long, value_name = "REF", global = false)]
+        state_ref: Option<String>,
         /// Additional governance config (JSON or @file.json), merged with defaults.
         /// Resolved at plan time and persisted into the `RunPlan` payload.
         /// Applies to the default plan subcommand only.
@@ -1014,6 +1028,13 @@ enum Command {
         /// Alternative to --filter for model-only execution.
         #[arg(long)]
         model: Option<String>,
+        /// `--select` / `--exclude` build the selected transformation models
+        /// (skips replication). Unselected upstreams are read as they exist
+        /// in the warehouse (dbt semantics); combine with `--defer` to read
+        /// them from production. A selection of one model runs exactly like
+        /// `--model`.
+        #[command(flatten)]
+        selection: SelectArgs,
         /// Check an explicitly selected model contract in the same compile
         /// that supplies the model executed by this run.
         #[arg(long, requires_all = ["model", "pipeline"])]
@@ -1249,6 +1270,15 @@ enum Command {
         #[arg(long)]
         no_prune: bool,
 
+        /// Rebuild transformation `incremental` models from scratch with
+        /// `CREATE OR REPLACE TABLE ... AS`, resolving every
+        /// `@incremental_filter` to `TRUE`. Other strategies are unaffected:
+        /// `merge` / `delete_insert` SQL often selects only recent rows, so
+        /// rebuilding from it could drop history. Also turns off the
+        /// `--skip-unchanged` gate. Default OFF.
+        #[arg(long)]
+        full_refresh: bool,
+
         /// Per-run variable substituted into model SQL. Repeatable:
         /// `--var region=us --var since=2024-01-01`.
         ///
@@ -1355,6 +1385,8 @@ enum Command {
         /// and docs then render without column tables.
         #[arg(long = "var", value_name = "NAME=VALUE")]
         var: Vec<String>,
+        #[command(flatten)]
+        selection: SelectArgs,
     },
 
     /// Inspect or manage the state store.
@@ -1375,9 +1407,12 @@ enum Command {
         /// Contracts directory
         #[arg(long)]
         contracts: Option<PathBuf>,
-        /// Filter to a single model
+        /// Filter to a single model (exact name). Cannot be combined with
+        /// `--select`.
         #[arg(long)]
         model: Option<String>,
+        #[command(flatten)]
+        selection: SelectArgs,
         /// Show expanded SQL after macro substitution
         #[arg(long)]
         expand_macros: bool,
@@ -1392,12 +1427,26 @@ enum Command {
         #[arg(long)]
         with_seed: bool,
 
+        /// Treat every known source schema as authoritative: a direct
+        /// reference to a column the source lacks is the E041 error even when
+        /// the schema came from a seed (`--with-seed`) or an untrusted cache
+        /// entry, which otherwise warn with W041. Same as
+        /// `[cache.schemas] strict_sources = true`.
+        #[arg(long)]
+        strict_sources: bool,
+
         /// Per-run variable substituted into model SQL (repeatable). Resolves
         /// `@var(name)` markers to the supplied value so `rocky compile` type-
         /// checks the same SQL `rocky run --var …` would execute. A required
         /// `@var(name)` with no value and no inline default is a compile error.
         #[arg(long = "var", value_name = "NAME=VALUE")]
         var: Vec<String>,
+
+        /// Treat these warning codes as errors (comma-separated or
+        /// repeatable), e.g. `--deny-warnings W042,W043`. A listed warning
+        /// is reported at error severity and fails the compile.
+        #[arg(long = "deny-warnings", value_name = "CODES", value_delimiter = ',')]
+        deny_warnings: Vec<String>,
 
         /// EXPERIMENTAL. Attach to a dbt project instead of reading Rocky
         /// models: read `<DIR>/target/manifest.json` (and `run_results.json`)
@@ -1477,9 +1526,12 @@ enum Command {
         /// Models directory
         #[arg(long, default_value = "models")]
         models: PathBuf,
-        /// Filter to a single model
+        /// Filter to a single model (exact name). Cannot be combined with
+        /// `--select`.
         #[arg(long)]
         model: Option<String>,
+        #[command(flatten)]
+        selection: SelectArgs,
         /// Write one `<model>.sql` file per model into this directory.
         /// When omitted, the concatenated SQL is printed to stdout.
         #[arg(long)]
@@ -1569,8 +1621,8 @@ enum Command {
         ///
         /// Accepted: `full_refresh` (default), `merge`.
         /// `incremental` is refused: on a transformation model it re-inserts
-        /// every row on each run (E037). `ephemeral` is refused: it is not
-        /// materialized and not inlined into its consumers (E038). Other
+        /// every row on each run (E037). `ephemeral` is refused: a generated
+        /// model has no consumer yet to inline it into. Other
         /// strategies in `StrategyConfig` (`time_interval`, `delete_insert`,
         /// `microbatch`) require richer flag plumbing and are deliberately
         /// out of scope for this first cut.
@@ -1864,9 +1916,12 @@ enum Command {
         /// Contracts directory
         #[arg(long)]
         contracts: Option<PathBuf>,
-        /// Test a single model
+        /// Test a single model (exact name). Cannot be combined with
+        /// `--select`.
         #[arg(long)]
         model: Option<String>,
+        #[command(flatten)]
+        selection: SelectArgs,
         /// Run declarative [[tests]] from model sidecars against the warehouse
         #[arg(long)]
         declarative: bool,
@@ -1920,6 +1975,12 @@ enum Command {
         /// the exit code. The hard gate lives on `rocky branch promote`.
         #[arg(long)]
         semantic: bool,
+        /// Compare the working tree instead of the HEAD commit. Selection and
+        /// compilation then both include staged, unstaged, untracked, renamed
+        /// and deleted files. By default both read the HEAD commit, so
+        /// uncommitted edits are ignored.
+        #[arg(long)]
+        working_tree: bool,
     },
 
     /// Per-changed-column downstream impact, formatted for PR review
@@ -1937,6 +1998,10 @@ enum Command {
         /// Models directory
         #[arg(long, default_value = "models")]
         models: PathBuf,
+        /// Compare the working tree instead of the HEAD commit (see
+        /// `rocky ci-diff --working-tree`).
+        #[arg(long)]
+        working_tree: bool,
     },
 
     /// Scaffold a new warehouse adapter crate
@@ -2311,10 +2376,31 @@ enum Command {
         drift: bool,
     },
 
+    /// Check source and model freshness against the warehouse.
+    ///
+    /// Reads `MAX(loaded_at_field)` for every `[[pipeline.<name>.sources]]`
+    /// entry with a `freshness` block, and `MAX(time_column)` (or the last
+    /// successful build) for every model `[freshness]` block. Reports
+    /// `pass` / `warn` / `error` / `runtime_error` per check and exits 1 on
+    /// any `error` or `runtime_error`.
+    Freshness {
+        /// Check only this transformation pipeline (default: all of them)
+        #[arg(long)]
+        pipeline: Option<String>,
+    },
+
     /// List project contents: pipelines, adapters, models, sources
+    ///
+    /// Bare `rocky list` (optionally with `--select` / `--exclude`) lists
+    /// models, like `dbt ls`.
     List {
         #[command(subcommand)]
-        action: ListAction,
+        action: Option<ListAction>,
+        /// Models directory (bare `rocky list` only)
+        #[arg(long, default_value = "models")]
+        models: PathBuf,
+        #[command(flatten)]
+        selection: SelectArgs,
     },
 
     /// Run health checks and report system status
@@ -3096,6 +3182,8 @@ enum ListAction {
         /// Models directory
         #[arg(long, default_value = "models")]
         models: PathBuf,
+        #[command(flatten)]
+        selection: SelectArgs,
     },
     /// List source configurations for each pipeline
     Sources,
@@ -3115,6 +3203,59 @@ enum ListAction {
         #[arg(long, default_value = "models")]
         models: PathBuf,
     },
+}
+
+/// dbt-style node selection flags, shared by every command that subsets
+/// models. Grammar: `docs/src/content/docs/reference/node-selection.md`.
+#[derive(clap::Args, Debug, Clone, Default)]
+struct SelectArgs {
+    /// Select models with dbt-style node selection: names and globs
+    /// (`stg_*`), graph operators (`+m`, `m+`, `2+m`, `m+3`, `@m`), and
+    /// methods (`tag:`, `path:`, `file:`, `config.materialized:`, `source:`,
+    /// `state:modified`, `state:new`). Space-separated terms union;
+    /// comma-joined terms intersect. Repeatable.
+    #[arg(short = 's', long = "select", value_name = "SELECTOR", num_args = 1..)]
+    select: Vec<String>,
+    /// Remove models from the selection, using the same grammar as
+    /// `--select`. Without `--select`, excludes from every model.
+    #[arg(long, value_name = "SELECTOR", num_args = 1..)]
+    exclude: Vec<String>,
+    /// Git ref that `state:modified` / `state:new` diff against (committed
+    /// changes `<ref>...HEAD`, as `rocky ci-diff` does). Default: main.
+    #[arg(long, value_name = "REF")]
+    state_ref: Option<String>,
+    /// `state:` selectors compare the working tree (staged, unstaged and
+    /// untracked files) instead of committed changes, as
+    /// `rocky ci-diff --working-tree` does.
+    #[arg(long)]
+    state_working_tree: bool,
+}
+
+impl SelectArgs {
+    fn into_selection(self) -> rocky_cli::selection::SelectionArgs {
+        rocky_cli::selection::SelectionArgs {
+            select: self.select,
+            exclude: self.exclude,
+            state_ref: self.state_ref,
+            state_working_tree: self.state_working_tree,
+            required_model: None,
+        }
+    }
+}
+
+/// Split `--model` from `--select` / `--exclude`. With no selection flag,
+/// `--model` keeps its exact-name path (and its "model not found" error).
+/// With one, `--model <name>` folds in as `--select name:<name>`; passing both
+/// `--model` and `--select` is refused.
+fn split_model_and_selection(
+    model: Option<String>,
+    selection: SelectArgs,
+) -> Result<(Option<String>, Option<rocky_cli::selection::SelectionArgs>)> {
+    let selection = selection.into_selection();
+    if !selection.is_active() {
+        return Ok((model, None));
+    }
+    Ok((None, Some(selection.with_model(model.as_deref())?)))
 }
 
 /// Restore the kernel-default SIGPIPE disposition so that piping the CLI
@@ -3921,6 +4062,9 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             filter,
             pipeline,
             model,
+            select,
+            exclude,
+            state_ref,
             governance_override,
             models: models_dir,
             all,
@@ -3956,6 +4100,9 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                     ("--filter", filter.is_some()),
                     ("--pipeline", pipeline.is_some()),
                     ("--model", model.is_some()),
+                    ("--select", !select.is_empty()),
+                    ("--exclude", !exclude.is_empty()),
+                    ("--state-ref", state_ref.is_some()),
                     ("--governance-override", governance_override.is_some()),
                     ("--models", models_dir.is_some()),
                     ("--all", all),
@@ -3997,6 +4144,41 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                          (resume is an explicit override of idempotent skip)"
                         );
                     }
+                    let selection = rocky_cli::selection::SelectionArgs {
+                        select,
+                        exclude,
+                        state_ref,
+                        state_working_tree: false,
+                        required_model: None,
+                    };
+                    let model = if selection.is_active() {
+                        anyhow::ensure!(
+                            !all && filter.is_none() && !dag,
+                            "--select / --exclude cannot be combined with --all, --filter, or --dag"
+                        );
+                        let selection = selection.with_model(model.as_deref())?;
+                        let set = rocky_cli::commands::resolve_run_selection(
+                            &cli.config,
+                            &state_path,
+                            cli.cache_ttl,
+                            pipeline.as_deref(),
+                            models_dir.as_deref(),
+                            &selection,
+                        )?;
+                        match set.len() {
+                            0 => anyhow::bail!(
+                                "the selection matched no models; no plan was written"
+                            ),
+                            1 => set.into_iter().next(),
+                            n => anyhow::bail!(
+                                "the selection resolved to {n} models, but a persisted plan \
+                                 carries one model; narrow the selection, or use `rocky run \
+                                 --select` to build several models in one step"
+                            ),
+                        }
+                    } else {
+                        model
+                    };
                     let gov_override = parse_governance_override(governance_override.as_deref())?;
                     let partition_opts = rocky_cli::commands::PartitionRunOptions {
                         partition,
@@ -4078,6 +4260,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             filter,
             pipeline,
             model,
+            selection,
             contracts,
             governance_override,
             models: models_dir,
@@ -4106,9 +4289,55 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             force_rebuild,
             no_reuse,
             no_prune,
+            full_refresh,
             var,
             assume_fresh_state,
         } => {
+            // `--select` / `--exclude`: resolve to model names up front. One
+            // model becomes `--model` (the unchanged single-model path); more
+            // ride `DeferOptions::selected_models` into the same model-only arm.
+            let selection = selection.into_selection();
+            let (model, selected_models) = if selection.is_active() {
+                anyhow::ensure!(
+                    !dag && !watch
+                        && !run_all
+                        && filter.is_none()
+                        && contracts.is_none()
+                        && resume.is_none()
+                        && !resume_latest,
+                    "--select / --exclude choose transformation models and cannot be combined \
+                     with --dag, --watch, --all, --filter, --contracts, --resume, or \
+                     --resume-latest"
+                );
+                let selection = selection.with_model(model.as_deref())?;
+                let mut set = rocky_cli::commands::resolve_run_selection(
+                    &cli.config,
+                    &state_path,
+                    cli.cache_ttl,
+                    pipeline.as_deref(),
+                    models_dir.as_deref(),
+                    &selection,
+                )?;
+                if set.is_empty() {
+                    // dbt semantics: an empty selection is "nothing to do",
+                    // not an error. The warning is already logged. JSON
+                    // callers still get a (empty, successful) `RunOutput`.
+                    if json {
+                        let mut output = rocky_cli::output::RunOutput::new(String::new(), 0, 1);
+                        output.pipeline_type = Some("transformation".to_string());
+                        output.status = output.derive_run_status();
+                        rocky_cli::output::print_json(&output)?;
+                    }
+                    return Ok(());
+                }
+                if set.len() == 1 {
+                    (set.pop_first(), None)
+                } else {
+                    (None, Some(set))
+                }
+            } else {
+                (model, None)
+            };
             // Reject an unsupported pipeline using config alone. Resolving a
             // branch opens the state store, even when it is read-only.
             if let Some(name) = branch.as_ref() {
@@ -4120,10 +4349,18 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                     cleanup_after: false,
                     branch: Some(name.clone()),
                 };
+                // A multi-model `--select` takes the model-only path, so it
+                // is gated like `--model`.
+                let selected_model = model.as_deref().or_else(|| {
+                    selected_models
+                        .as_ref()
+                        .and_then(|set| set.first())
+                        .map(String::as_str)
+                });
                 rocky_cli::commands::require_shadow_support_for_config(
                     &config,
                     pipeline.as_deref(),
-                    model.as_deref(),
+                    selected_model,
                     &pending_shadow,
                 )?;
             }
@@ -4275,6 +4512,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             let defer_opts = rocky_cli::commands::DeferOptions {
                 enabled: defer,
                 defer_to,
+                selected_models,
             };
 
             // CLI overlay for the opt-in model-skip gate. Default-OFF: both
@@ -4285,6 +4523,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                 force_rebuild,
                 no_reuse,
                 no_prune,
+                full_refresh,
             };
             // Who is running (RV4-P1): stamped on the drift auto-apply
             // custody rows. Resolved here, once, for all three run shapes.
@@ -4470,6 +4709,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             models,
             output_path,
             var,
+            selection,
         } => {
             let run_vars = rocky_core::run_vars::RunVars::parse_pairs(&var)
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -4481,6 +4721,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                 cli.cache_ttl,
                 &run_vars,
                 json,
+                Some(&selection.into_selection()),
             )
         }
         Command::State { action } => match action {
@@ -4536,14 +4777,18 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             models,
             contracts,
             model,
+            selection,
             expand_macros,
             target_dialect,
             with_seed,
+            strict_sources,
             var,
+            deny_warnings,
             dbt_project,
         } => {
             let run_vars = rocky_core::run_vars::RunVars::parse_pairs(&var)
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
+            let (model, selection) = split_model_and_selection(model, selection)?;
             if let Some(dbt_project) = dbt_project {
                 rocky_cli::commands::run_compile_dbt_attach(
                     &dbt_project,
@@ -4554,9 +4799,12 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                     target_dialect.map(Into::into),
                     cli.cache_ttl,
                     &run_vars,
+                    strict_sources,
+                    &deny_warnings,
+                    selection.as_ref(),
                 )
             } else {
-                rocky_cli::commands::run_compile(
+                rocky_cli::commands::run_compile_with_options(
                     Some(cli.config.as_path()),
                     &state_path,
                     &models,
@@ -4568,6 +4816,9 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                     with_seed,
                     cli.cache_ttl,
                     &run_vars,
+                    strict_sources,
+                    &deny_warnings,
+                    selection.as_ref(),
                 )
             }
         }
@@ -4600,17 +4851,25 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
         Command::EmitSql {
             models,
             model,
+            selection,
             out_dir,
             var,
         } => {
             let run_vars = rocky_core::run_vars::RunVars::parse_pairs(&var)
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
-            rocky_cli::commands::run_emit_sql(
+            let (model, selection) = split_model_and_selection(model, selection)?;
+            let state_ctx = rocky_cli::selection::StateContext {
+                config_path: &cli.config,
+                state_path: &state_path,
+                cache_ttl_override: cli.cache_ttl,
+            };
+            rocky_cli::commands::run_emit_sql_with_selection(
                 Some(cli.config.as_path()),
                 &models,
                 model.as_deref(),
                 out_dir.as_deref(),
                 &run_vars,
+                selection.as_ref().map(|s| (s, &state_ctx)),
             )
         }
         Command::Catalog {
@@ -4885,10 +5144,17 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             models,
             contracts,
             model,
+            selection,
             declarative,
             pipeline,
             var,
         } => {
+            let (model, selection) = split_model_and_selection(model, selection)?;
+            if declarative && selection.is_some() {
+                anyhow::bail!(
+                    "--select / --exclude are not yet supported with --declarative; use --model"
+                );
+            }
             if declarative {
                 rocky_cli::commands::run_declarative_tests(
                     &cli.config,
@@ -4901,12 +5167,18 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             } else {
                 let run_vars = rocky_core::run_vars::RunVars::parse_pairs(&var)
                     .map_err(|e| anyhow::anyhow!("{e}"))?;
-                rocky_cli::commands::run_test(
+                let state_ctx = rocky_cli::selection::StateContext {
+                    config_path: &cli.config,
+                    state_path: &state_path,
+                    cache_ttl_override: cli.cache_ttl,
+                };
+                rocky_cli::commands::run_test_with_selection(
                     &models,
                     contracts.as_deref(),
                     model.as_deref(),
                     json,
                     &run_vars,
+                    selection.as_ref().map(|s| (s, &state_ctx)),
                 )
             }
         }
@@ -4924,6 +5196,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             base_ref,
             models,
             semantic,
+            working_tree,
         } => rocky_cli::commands::run_ci_diff(
             &cli.config,
             &state_path,
@@ -4932,14 +5205,20 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             json,
             semantic,
             cli.cache_ttl,
+            rocky_cli::commands::ci_diff_mode(working_tree),
         ),
-        Command::LineageDiff { base_ref, models } => rocky_cli::commands::run_lineage_diff(
+        Command::LineageDiff {
+            base_ref,
+            models,
+            working_tree,
+        } => rocky_cli::commands::run_lineage_diff(
             &cli.config,
             &state_path,
             &base_ref,
             &models,
             json,
             cli.cache_ttl,
+            rocky_cli::commands::ci_diff_mode(working_tree),
         ),
         Command::InitAdapter { name } => rocky_cli::commands::run_init_adapter(&name),
         Command::TestAdapter {
@@ -5412,18 +5691,53 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             )
             .await
         }
-        Command::List { action } => match action {
-            ListAction::Pipelines => rocky_cli::commands::list_pipelines(&cli.config, json),
-            ListAction::Adapters => rocky_cli::commands::list_adapters(&cli.config, json),
-            ListAction::Models { models } => rocky_cli::commands::list_models(&models, json),
-            ListAction::Sources => rocky_cli::commands::list_sources(&cli.config, json),
-            ListAction::Deps { model, models } => {
-                rocky_cli::commands::list_deps(&model, &models, json)
+        Command::Freshness { pipeline } => {
+            rocky_cli::commands::run_freshness(&cli.config, &state_path, pipeline.as_deref(), json)
+                .await
+        }
+        Command::List {
+            action,
+            models: list_models_dir,
+            selection: list_selection,
+        } => {
+            if action.is_some() && list_selection.select.len() + list_selection.exclude.len() > 0 {
+                anyhow::bail!(
+                    "put --select / --exclude after the subcommand: `rocky list models --select ...`"
+                );
             }
-            ListAction::Consumers { model, models } => {
-                rocky_cli::commands::list_consumers(&model, &models, json)
+            let state_ctx = rocky_cli::selection::StateContext {
+                config_path: &cli.config,
+                state_path: &state_path,
+                cache_ttl_override: cli.cache_ttl,
+            };
+            match action {
+                None => rocky_cli::commands::list_models_selected(
+                    &list_models_dir,
+                    json,
+                    &list_selection.into_selection(),
+                    &state_ctx,
+                ),
+                Some(ListAction::Pipelines) => {
+                    rocky_cli::commands::list_pipelines(&cli.config, json)
+                }
+                Some(ListAction::Adapters) => rocky_cli::commands::list_adapters(&cli.config, json),
+                Some(ListAction::Models { models, selection }) => {
+                    rocky_cli::commands::list_models_selected(
+                        &models,
+                        json,
+                        &selection.into_selection(),
+                        &state_ctx,
+                    )
+                }
+                Some(ListAction::Sources) => rocky_cli::commands::list_sources(&cli.config, json),
+                Some(ListAction::Deps { model, models }) => {
+                    rocky_cli::commands::list_deps(&model, &models, json)
+                }
+                Some(ListAction::Consumers { model, models }) => {
+                    rocky_cli::commands::list_consumers(&model, &models, json)
+                }
             }
-        },
+        }
         Command::Doctor { check, verbose } => {
             rocky_cli::commands::doctor(&cli.config, &state_path, json, check.as_deref(), verbose)
                 .await
@@ -6570,6 +6884,11 @@ mod tests {
                 semantic: _,
                 intent: _,
                 base: _,
+                // Node selection resolves to `--model` before the plan is
+                // built; covered by `rocky/tests/node_selection.rs`.
+                select: _,
+                exclude: _,
+                state_ref: _,
             } => extract(
                 filter,
                 pipeline,
