@@ -1366,10 +1366,11 @@ fn mark_compiled_nodes(
 ) -> DagOutput {
     for node in &mut output.nodes {
         if node.kind == rocky_core::unified_dag::NodeKind::Transformation.to_string() {
-            node.compiled =
-                Some(compile.is_some_and(|result| {
-                    result.semantic_graph.model_schema(&node.label).is_some()
-                }));
+            // Both lookups `get_model` makes before it answers 200.
+            node.compiled = Some(compile.is_some_and(|result| {
+                result.semantic_graph.model_schema(&node.label).is_some()
+                    && result.project.model(&node.label).is_some()
+            }));
         }
     }
     output
@@ -2109,11 +2110,24 @@ async fn custody_chain(
         .ok_or_else(ApiError::engine_not_ready)?;
     let state_path = state_path_for(&state);
     let models_dir = state.models_dir.clone();
+    let product = subject.strip_prefix("product:").map(str::to_string);
     let output = store_read(&state, move || {
         compute_audit_for(&root, &config, &state_path, &models_dir, &subject)
     })
     .await?
-    .map_err(|e| map_state_err(e, state.mutation_permit.running_job()))?;
+    .map_err(|e| {
+        // A `product:<name>` subject whose spec exists but does not load
+        // (#2003): the same `409` `GET /api/v1/audit?product=` answers.
+        match (
+            e.downcast_ref::<rocky_core::product::spec::SpecRejected>(),
+            &product,
+        ) {
+            (Some(reject), Some(name)) => {
+                ApiError::product_spec_invalid(name, reject.code, &reject.message)
+            }
+            _ => map_state_err(e, state.mutation_permit.running_job()),
+        }
+    })?;
     Ok(PrettyJson(output))
 }
 
@@ -2215,12 +2229,7 @@ async fn audit_ledger(
 /// name no spec file and no state record, and the route can answer 404
 /// without touching the filesystem or the store.
 fn is_bare_product_name(name: &str) -> bool {
-    let mut bytes = name.bytes();
-    match bytes.next() {
-        Some(b) if b.is_ascii_alphabetic() || b == b'_' => {}
-        _ => return false,
-    }
-    bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_')
+    crate::commands::audit::is_bare_product_name(name)
 }
 
 /// `GET /api/v1/schedule` — a read-only scheduler snapshot.
@@ -5425,6 +5434,10 @@ mod tests {
             (a.as_str(), "plan", true),
             ("freeze:global", "plan", true),
             ("nothing_here", "model", false),
+            // #2003: a product resolves through its spec's output model; one
+            // with no spec is the unresolved model chain it always was.
+            ("product:revenue_daily", "product", true),
+            ("product:nope", "model", false),
         ] {
             let resp = reqwest::get(format!("{base}/api/v1/custody/{subject}"))
                 .await
@@ -5438,6 +5451,16 @@ mod tests {
             assert_eq!(json["subject_kind"], kind, "{subject}");
             assert_eq!(json["resolved"], resolved, "{subject}");
         }
+
+        // #2003: a spec that exists but does not load is the audit route's
+        // `409 product_spec_invalid`, not a 500.
+        std::fs::write(root.join("products/broken.toml"), b"not = [toml").unwrap();
+        let resp = reqwest::get(format!("{base}/api/v1/custody/product:broken"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 409);
+        let err: ErrorEnvelope = resp.json().await.unwrap();
+        assert_eq!(err.code, "product_spec_invalid");
 
         let long = "m".repeat(MAX_CUSTODY_SUBJECT_BYTES + 1);
         let resp = reqwest::get(format!("{base}/api/v1/custody/{long}"))
@@ -6643,13 +6666,16 @@ mod tests {
         let (_dir, models_dir, config_path) = minimal_dag_project();
         let state_path = pinned_state_path(&models_dir);
         let state = pinned_server(models_dir.clone(), Some(config_path.clone()), &state_path);
-        let base = spawn_router(state).await;
+        // Settle the compile first: `GET /dag` marks each node against it.
+        state.recompile().await;
+        let base = spawn_router(state.clone()).await;
         let resp = reqwest::get(format!("{base}/api/v1/dag")).await.unwrap();
         assert_eq!(resp.status(), 200);
         let api = resp.text().await.unwrap();
 
-        let reference = reference_bytes(
-            &dag_output(
+        let compile = state.compile_result.read().await;
+        let reference = reference_bytes(&mark_compiled_nodes(
+            dag_output(
                 &config_path,
                 &state_path,
                 // `pinned_server` builds state the way `serve` without
@@ -6663,28 +6689,11 @@ mod tests {
                 None,
             )
             .unwrap(),
-        );
-        assert_eq!(
-            without_compiled_marks(&api),
-            json_value(&reference),
-            "GET /dag must match `rocky dag`"
-        );
-    }
-
-    /// The served DAG with the `compiled` marks removed (#2011): the one field
-    /// `GET /api/v1/dag` adds to `rocky dag`'s output, asserted on its own in
-    /// `dag_marks_the_nodes_the_server_compile_does_not_cover`. Compared as
-    /// JSON values, not bytes, because the removal reserializes.
-    fn without_compiled_marks(api: &str) -> serde_json::Value {
-        let mut v: serde_json::Value = serde_json::from_str(api).unwrap();
-        for node in v["nodes"].as_array_mut().unwrap() {
-            node.as_object_mut().unwrap().remove("compiled");
-        }
-        v
-    }
-
-    fn json_value(bytes: &str) -> serde_json::Value {
-        serde_json::from_str(bytes).unwrap()
+            compile.as_ref(),
+        ));
+        // Byte parity with `rocky dag`, plus the one field the route adds.
+        assert_eq!(api, reference, "GET /dag must match `rocky dag`");
+        assert!(api.contains("\"compiled\": true"), "{api}");
     }
 
     /// #2011: with `serve` holding the defaulted `models/` directory, the DAG
@@ -6836,7 +6845,9 @@ mod tests {
         let default_models_dir = dir.path().join("models");
         let state_path = pinned_state_path(dir.path());
         let state = pinned_server(default_models_dir, Some(config_path.clone()), &state_path);
-        let base = spawn_router(state).await;
+        // Settle the compile first: `GET /dag` marks each node against it.
+        state.recompile().await;
+        let base = spawn_router(state.clone()).await;
         let resp = reqwest::get(format!("{base}/api/v1/dag")).await.unwrap();
         assert_eq!(resp.status(), 200);
         let api = resp.text().await.unwrap();
@@ -6863,14 +6874,16 @@ mod tests {
             "node must carry its materialization strategy"
         );
 
-        let reference = reference_bytes(
-            &dag_output(&config_path, &state_path, None, None, None, false, None).unwrap(),
-        );
-        assert_eq!(
-            without_compiled_marks(&api),
-            json_value(&reference),
-            "GET /dag must match `rocky dag`"
-        );
+        let compile = state.compile_result.read().await;
+        let reference = reference_bytes(&mark_compiled_nodes(
+            dag_output(&config_path, &state_path, None, None, None, false, None).unwrap(),
+            compile.as_ref(),
+        ));
+        assert_eq!(api, reference, "GET /dag must match `rocky dag`");
+        // #2011's own shape: the graph names `stg` from `transforms/`; the
+        // server compiled the defaulted `models/`, which does not cover it.
+        assert_eq!(stg["compiled"], false, "{api}");
+        drop(compile);
 
         // A single custom root is still a root the compiler can read, so
         // `--column-lineage` must keep working here. Asserting on the EDGES,

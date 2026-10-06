@@ -91,6 +91,21 @@ pub fn resolve_product_scope(
     })
 }
 
+/// The loader's code for "no `products/<name>.toml`".
+const SPEC_FILE_MISSING: &str = "spec-file-missing";
+
+/// Whether `name` is a bare identifier (`[A-Za-z_][A-Za-z0-9_]*`), the only
+/// shape a product spec path is ever built from. Anything else — a `/`, a
+/// `..`, an empty name — could address a file outside `products/`.
+pub(crate) fn is_bare_product_name(name: &str) -> bool {
+    let mut bytes = name.bytes();
+    match bytes.next() {
+        Some(b) if b.is_ascii_alphabetic() || b == b'_' => {}
+        _ => return false,
+    }
+    bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
 /// The `--actor` / `--since` filter of `rocky audit` (RV4-P1), parsed.
 ///
 /// `Default` is "no filter": every row passes.
@@ -400,12 +415,24 @@ pub fn compute_audit_for(
     // Decision rows carry no product id: the product loop files its rows
     // under `draft:<model>` plan ids, so `product:<name>` used to fall through
     // to the Model join and answer an empty, unresolved chain for a product
-    // with decisions on record. A spec that does not load is refused, the
-    // same rejection `--product` gives, rather than reported as a model
-    // nobody decided on.
+    // with decisions on record.
+    //
+    // The spec path is built only from a bare identifier — the guard the
+    // product routes apply — so `product:../rocky` never opens a file outside
+    // `products/`; such a subject is no product, and resolves as a model. A
+    // product with no spec file is the same unresolved model chain it always
+    // was (an approved product whose spec was deleted still lists). A spec
+    // that exists but does not load is refused as the typed `SpecRejected`,
+    // so the HTTP route and the MCP tool can answer it as a spec problem.
     let product_scope = match selector.strip_prefix("product:") {
-        Some(name) if !plan_on_disk && !run_match && !plan_in_ledger => {
-            Some(resolve_product_scope(root, name).map_err(|reject| anyhow::anyhow!("{reject}"))?)
+        Some(name)
+            if is_bare_product_name(name) && !plan_on_disk && !run_match && !plan_in_ledger =>
+        {
+            match resolve_product_scope(root, name) {
+                Ok(scope) => Some(scope),
+                Err(reject) if reject.code == SPEC_FILE_MISSING => None,
+                Err(reject) => return Err(anyhow::Error::new(reject)),
+            }
         }
         _ => None,
     };
@@ -2203,25 +2230,50 @@ mod tests {
         assert_eq!(out.plan.plan_id.as_deref(), Some("draft:revenue_daily"));
     }
 
-    /// #2003: a `product:` subject whose spec does not load is refused with the
-    /// loader's rejection — the same answer `--product` gives — not reported as
-    /// a model nobody decided on.
+    /// #2003: a `product:` subject with no spec, or a name that is not a bare
+    /// identifier, is the unresolved model chain it always was. The traversal
+    /// case must not open the file it names: `x.toml` beside `products/` is
+    /// not TOML, so reading it would be an error, not an `Ok`.
     #[test]
-    fn audit_for_refuses_a_product_subject_with_no_spec() {
+    fn audit_for_product_subject_without_a_loadable_name_stays_an_unresolved_model() {
         let dir = TempDir::new().unwrap();
         let root = dir.path();
+        fs::create_dir_all(root.join("products")).unwrap();
+        fs::write(root.join("x.toml"), "not = [toml").unwrap();
+        for subject in ["product:nope", "product:../x", "product:", "product:a/b"] {
+            let out = compute_audit_for(
+                root,
+                &root.join("rocky.toml"),
+                &root.join("state.redb"),
+                &root.join("models"),
+                subject,
+            )
+            .unwrap_or_else(|e| panic!("{subject}: {e:#}"));
+            assert_eq!(out.subject_kind, AuditSubjectKind::Model, "{subject}");
+            assert!(!out.resolved, "{subject}");
+        }
+    }
+
+    /// #2003: a spec that exists but does not load is refused with the typed
+    /// loader rejection, so callers can answer it as a spec problem.
+    #[test]
+    fn audit_for_refuses_a_product_subject_whose_spec_does_not_load() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("products")).unwrap();
+        fs::write(root.join("products/broken.toml"), "not = [toml").unwrap();
         let err = compute_audit_for(
             root,
             &root.join("rocky.toml"),
             &root.join("state.redb"),
             &root.join("models"),
-            "product:nope",
+            "product:broken",
         )
-        .expect_err("a product with no spec must not resolve as a model");
-        assert!(
-            format!("{err:#}").contains("[spec-file-missing]"),
-            "unexpected error: {err:#}"
-        );
+        .expect_err("an invalid spec must not resolve");
+        let reject = err
+            .downcast_ref::<rocky_core::product::spec::SpecRejected>()
+            .unwrap_or_else(|| panic!("not a typed spec rejection: {err:#}"));
+        assert_ne!(reject.code, SPEC_FILE_MISSING);
     }
 
     #[test]
