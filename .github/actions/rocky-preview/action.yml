@@ -1,8 +1,9 @@
 name: 'Rocky Preview'
 description: >-
-  Run rocky preview create + diff + cost against a pull request and post a
-  single Markdown comment summarising the prune set, structural diff, and
-  cost delta. Idempotent across pushes via comment upsert.
+  Run rocky preview create, a `rocky run --branch` of the PR's models, then
+  preview diff + cost against a pull request, and post a single Markdown
+  comment summarising the prune set, structural diff, and cost delta.
+  Idempotent across pushes via comment upsert.
 
 inputs:
   base_ref:
@@ -10,7 +11,8 @@ inputs:
     required: true
   branch_name:
     description: >-
-      Preview branch name passed to `rocky preview create` as `--name`.
+      Preview branch name passed to `rocky preview create` as `--name` and
+      to `rocky run` as `--branch`.
       Defaults to `pr_<PR number>_<head ref slug>` so PRs with equivalent
       slugs cannot overwrite each other's preview schema. The result is at
       most 64 characters. Explicit names are slugged to `[A-Za-z0-9_]`;
@@ -18,7 +20,7 @@ inputs:
     required: false
     default: ''
   models_dir:
-    description: 'Directory containing the model files. Passed to `rocky preview create --models`.'
+    description: 'Directory containing the model files. Passed to `rocky preview create --models` and `rocky run --models`.'
     required: false
     default: 'models'
   working_directory:
@@ -70,9 +72,8 @@ outputs:
   delta_usd:
     description: >-
       Total branch-vs-base USD cost delta. Empty string when no paired runs
-      exist in the state store yet (e.g. before Phase 1.5 lands actual
-      branch-run execution, or on first preview against an unpopulated
-      base).
+      exist in the state store (the branch run failed or was skipped because
+      the PR changes no models, or the base has no recorded run yet).
     value: ${{ steps.run-preview.outputs.delta_usd }}
 
 runs:
@@ -118,7 +119,14 @@ runs:
         irm https://raw.githubusercontent.com/rocky-data/rocky/main/engine/install.ps1 | iex
         Add-Content -Path $env:GITHUB_PATH -Value "$env:LOCALAPPDATA\rocky\bin"
 
-    # --- Step 2: run the three preview commands -----------------------------
+    # --- Step 2: create the preview, run it, then diff + cost -------------
+    #
+    # `preview create` only plans and copies; it records no run. `preview
+    # diff` and `preview cost` pair the run recorded with `--branch <name>`
+    # against the base run, so without the `rocky run --branch` step below
+    # they have nothing to pair (#2162). The branch name is identifier-safe
+    # by construction (`name.sh` slugs to `[A-Za-z0-9_]`), which `rocky run
+    # --branch` requires.
     #
     # Each subcommand runs with `set +e` so a non-zero exit doesn't abort
     # the script — the action always wants to post something to the PR even
@@ -177,6 +185,28 @@ runs:
         # failed before emitting JSON.
         if [ -z "$BRANCH_NAME" ] && [ -s "$WORK/create.json" ]; then
           BRANCH_NAME="$(jq -r '.branch_name // ""' "$WORK/create.json" 2>/dev/null || true)"
+        fi
+
+        # ---- branch run ----
+        # Records the run `preview diff` / `preview cost` pair against the
+        # base. Skipped when create failed (no branch is registered) or when
+        # the prune set is empty (the PR changes no models, so there is
+        # nothing to run and the comment says so).
+        : > "$WORK/run.log"
+        : > "$WORK/run.err"
+        : > "$WORK/run_failed"
+        : > "$WORK/run_skipped"
+        PRUNE_FOR_RUN="$(jq -r '.prune_set | length' "$WORK/create.json" 2>/dev/null || echo 0)"
+        if [ -s "$WORK/create_failed" ] || [ -z "$BRANCH_NAME" ]; then
+          echo "preview create did not register a branch" > "$WORK/run_skipped"
+        elif [ "$PRUNE_FOR_RUN" = "0" ]; then
+          echo "the PR changes no pipeline models" > "$WORK/run_skipped"
+        # Human-readable output on purpose: nothing reads it back (diff and
+        # cost read the recorded run from the state store), and every JSON
+        # payload this action does read goes through the normalizer.
+        elif ! rocky run --branch "$BRANCH_NAME" --models "$ROCKY_PREVIEW_MODELS_DIR" \
+            > "$WORK/run.log" 2> "$WORK/run.err"; then
+          echo failed > "$WORK/run_failed"
         fi
 
         # ---- preview diff ----
@@ -278,6 +308,21 @@ runs:
           if grep -q 'unknown revision\|bad revision\|not found' "$WORK_DIR/create.err" 2>/dev/null; then
             printf "> :information_source: Couldn't compute base — was the base branch fetched? Set \`fetch-depth: 0\` on \`actions/checkout\`.\n\n" >> "$BODY"
           fi
+        fi
+
+        # ---- branch run section ----
+        # Only a failure is worth a section: a successful run shows up as
+        # the diff and cost below, and a skip is already explained by the
+        # create section.
+        if [ -s "$WORK_DIR/run_failed" ]; then
+          printf -- '---\n\n' >> "$BODY"
+          printf '### :x: `rocky run --branch %s` failed\n\n```\n' "${BRANCH_NAME:-?}" >> "$BODY"
+          if [ -s "$WORK_DIR/run.err" ]; then
+            head -c 8192 "$WORK_DIR/run.err" >> "$BODY"
+          else
+            printf '(no stderr captured)' >> "$BODY"
+          fi
+          printf '\n```\n\n' >> "$BODY"
         fi
 
         # ---- diff section ----
@@ -385,9 +430,13 @@ runs:
       run: |
         set -e
         FAILED=0
-        for f in create_failed diff_failed cost_failed; do
+        for f in create_failed run_failed diff_failed cost_failed; do
           if [ -s "$WORK_DIR/$f" ]; then
-            echo "::error::rocky preview ${f%_failed} failed"
+            if [ "$f" = run_failed ]; then
+              echo "::error::rocky run --branch failed"
+            else
+              echo "::error::rocky preview ${f%_failed} failed"
+            fi
             FAILED=1
           fi
         done

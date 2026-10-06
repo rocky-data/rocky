@@ -708,6 +708,11 @@ pub enum FinalizeDurability {
 /// cannot outlive the run. The tripwire is a diagnostic + resource net, NOT a
 /// durability guarantee — a panic between mutation and `finalize` still skips
 /// the upload.
+///
+/// The one deliberate drop is `rocky run --watch` stopping an iteration on a
+/// signal. It runs the iteration inside an armed [`DroppedSessionSink`], so the
+/// session hands itself over and the watch loop settles its terminal upload
+/// instead of tripping (#1603).
 #[derive(Debug)]
 pub struct RemoteStateSession {
     /// Owned config snapshot — never a path (execute-from-owned).
@@ -2154,39 +2159,14 @@ impl RemoteStateSession {
             );
             return Ok(());
         }
-        // CAS terminal commit: conditionally upload against the base captured at
-        // acquire. A lost cross-pod race surfaces `CasConflict` (fail-closed,
-        // never swallowed). `Durable` still forces `on_upload_failure = Fail`
-        // for the transport-error case.
-        if self.cas_enabled() {
-            let cfg = match self.durability {
-                FinalizeDurability::Durable => StateConfig {
-                    on_upload_failure: StateUploadFailureMode::Fail,
-                    ..self.cfg.clone()
-                },
-                FinalizeDurability::ConfigDefault => self.cfg.clone(),
-            };
-            return upload_state_cas(
-                &cfg,
-                &self.state_path,
-                self.base.as_ref(),
-                self.replicate_schema_cache,
-            )
-            .await;
-        }
-
-        match self.durability {
-            FinalizeDurability::Durable => {
-                let durable_cfg = StateConfig {
-                    on_upload_failure: StateUploadFailureMode::Fail,
-                    ..self.cfg.clone()
-                };
-                upload_state(&durable_cfg, &self.state_path, self.replicate_schema_cache).await
-            }
-            FinalizeDurability::ConfigDefault => {
-                upload_state(&self.cfg, &self.state_path, self.replicate_schema_cache).await
-            }
-        }
+        terminal_upload(
+            &self.cfg,
+            self.durability,
+            &self.state_path,
+            self.base.as_ref(),
+            self.replicate_schema_cache,
+        )
+        .await
     }
 
     /// Deliberate no-upload consumption for error/interrupted exits: stops
@@ -2241,9 +2221,364 @@ impl RemoteStateSession {
     }
 }
 
+impl RemoteStateSession {
+    /// Move everything settlement needs out of `self` and mark it consumed, so
+    /// the `Drop` that called this neither trips nor aborts the periodic task
+    /// the settler is about to join.
+    fn take_for_settlement(&mut self) -> DroppedSession {
+        self.finalized = true;
+        DroppedSession {
+            cfg: std::mem::take(&mut self.cfg),
+            state_path: std::mem::take(&mut self.state_path),
+            acquired: self.acquired,
+            authority: self.authority,
+            durability: self.durability,
+            suppress_reason: self.suppress_reason,
+            periodic: self.periodic.take(),
+            periodic_shutdown: self.periodic_shutdown.take(),
+            base: self.base.take(),
+            replicate_schema_cache: self.replicate_schema_cache,
+        }
+    }
+}
+
+/// How long [`DroppedSession::settle`] waits for the dropped run's last
+/// `StateStore` writer to close before it gives up on the upload.
+///
+/// The writers a dropped run can leave behind are detached `spawn_blocking`
+/// ledger commits (deferred watermarks, progress checkpoints), which finish in
+/// milliseconds. The bound is for a wedged one: the settler must not hang the
+/// shutdown it is part of.
+pub const DROPPED_SESSION_WRITER_WAIT: Duration = Duration::from_secs(30);
+
+/// Poll interval for [`DROPPED_SESSION_WRITER_WAIT`].
+const DROPPED_SESSION_WRITER_POLL: Duration = Duration::from_millis(25);
+
+tokio::task_local! {
+    /// Where a [`RemoteStateSession`] dropped without `finalize`/`abandon`
+    /// hands itself, when the code that dropped it installed a sink and armed
+    /// it. See [`DroppedSessionSink`].
+    static DROPPED_SESSIONS: DroppedSessionSink;
+}
+
+/// Catches the [`RemoteStateSession`]s a deliberately dropped run future still
+/// held, so their terminal upload runs instead of being skipped (#1603).
+///
+/// `rocky run --watch` stops an iteration on a signal by dropping its future.
+/// A session inside it never reaches `finalize`/`abandon`, and `Drop` cannot
+/// await an upload. So the watch loop runs the iteration inside
+/// [`scope`][Self::scope], [`arm`][Self::arm]s the sink just before it drops
+/// the future, and then [`settle_all`][Self::settle_all]s what was handed over:
+///
+/// ```text
+///   signal ──▶ sink.arm() ──▶ drop(iteration)
+///                                 │
+///                                 └─▶ RemoteStateSession::drop
+///                                        armed sink in scope? ──yes──▶ hand over
+///                                                             └─no───▶ tripwire
+///   sink.settle_all() ──▶ join periodic ──▶ wait for writers ──▶ terminal upload
+/// ```
+///
+/// The sink is armed only for that deliberate drop. A session dropped while
+/// the run is still being polled — an early `?` return, a panic — is the
+/// calling-path bug the tripwire exists for, and it still trips: the sink
+/// never turns an error path into an upload.
+#[derive(Clone, Default)]
+pub struct DroppedSessionSink {
+    inner: Arc<DroppedSessionSinkInner>,
+}
+
+#[derive(Default)]
+struct DroppedSessionSinkInner {
+    armed: std::sync::atomic::AtomicBool,
+    sessions: std::sync::Mutex<Vec<DroppedSession>>,
+}
+
+impl std::fmt::Debug for DroppedSessionSink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DroppedSessionSink")
+            .field(
+                "armed",
+                &self.inner.armed.load(std::sync::atomic::Ordering::SeqCst),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+impl DroppedSessionSink {
+    /// A fresh, unarmed sink.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Run `future` with this sink installed. Sessions created inside it, on
+    /// this task, hand themselves here when dropped unsettled while the sink
+    /// is armed — including when `future` itself is dropped, because tokio
+    /// drops a scoped future with its task-local still set.
+    pub fn scope<F: std::future::Future>(
+        &self,
+        future: F,
+    ) -> tokio::task::futures::TaskLocalFuture<DroppedSessionSink, F> {
+        DROPPED_SESSIONS.scope(self.clone(), future)
+    }
+
+    /// From now on an unsettled session dropped in scope is handed over, not
+    /// tripped. Call this immediately before deliberately dropping the scoped
+    /// future.
+    pub fn arm(&self) {
+        self.inner
+            .armed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Accept `session` if armed. `false` means the caller must trip.
+    fn accept(&self, session: &mut RemoteStateSession) -> bool {
+        if !self.inner.armed.load(std::sync::atomic::Ordering::SeqCst) {
+            return false;
+        }
+        let dropped = session.take_for_settlement();
+        self.inner
+            .sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(dropped);
+        true
+    }
+
+    /// Settle every session handed over so far. Each is attempted even when an
+    /// earlier one fails; the first failure is returned.
+    ///
+    /// # Errors
+    ///
+    /// The first [`DroppedSession::settle`] failure — a terminal upload that
+    /// the session's durability says must not be lost.
+    pub async fn settle_all(&self) -> Result<usize, StateSyncError> {
+        let sessions = std::mem::take(
+            &mut *self
+                .inner
+                .sessions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        let count = sessions.len();
+        let mut first_error = None;
+        for session in sessions {
+            if let Err(e) = session.settle().await {
+                warn!(error = %e, "settling an interrupted run's state session failed");
+                first_error.get_or_insert(e);
+            }
+        }
+        match first_error {
+            Some(e) => Err(e),
+            None => Ok(count),
+        }
+    }
+
+    /// Whether any session waiting to be settled will attempt a remote
+    /// upload — the only case where settling can take noticeable time.
+    pub fn owes_upload(&self) -> bool {
+        self.inner
+            .sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .any(DroppedSession::owes_upload)
+    }
+
+    /// How many sessions are waiting to be settled.
+    pub fn pending(&self) -> usize {
+        self.inner
+            .sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
+    }
+}
+
+/// A [`RemoteStateSession`] whose run future was dropped before it reached
+/// `finalize` or `abandon`, waiting for [`settle`][Self::settle].
+#[derive(Debug)]
+pub struct DroppedSession {
+    cfg: StateConfig,
+    state_path: PathBuf,
+    acquired: bool,
+    authority: StateAuthority,
+    durability: FinalizeDurability,
+    suppress_reason: Option<&'static str>,
+    periodic: Option<tokio::task::JoinHandle<()>>,
+    periodic_shutdown: Option<Arc<tokio::sync::Notify>>,
+    base: Option<Generation>,
+    replicate_schema_cache: bool,
+}
+
+impl DroppedSession {
+    /// Finish what the dropped run owed its remote state: the terminal upload,
+    /// under the same rules [`RemoteStateSession::finalize`] applies.
+    ///
+    /// 1. Drain and join the periodic uploader, as `finalize` does.
+    /// 2. Skip the upload — `Ok`, nothing to push — when the session never
+    ///    downloaded (pushing local state over a remote it never read is a
+    ///    blind overwrite), when an upload suppression was recorded, when the
+    ///    download was not authoritative, or on the local backend.
+    /// 3. Wait, bounded by [`DROPPED_SESSION_WRITER_WAIT`], for the advisory
+    ///    writer lock every `StateStore` writer holds, and hold it through the
+    ///    upload. A detached ledger commit from the dropped run is therefore
+    ///    finished, never torn, when the file is read.
+    /// 4. Upload exactly as `finalize` would: CAS against the base captured at
+    ///    acquire when CAS is effective, `Durable` forcing
+    ///    `on_upload_failure = "fail"`.
+    ///
+    /// The uploaded ledger is what the run had committed when it was dropped —
+    /// the same kind of mid-run snapshot the periodic uploader ships, and what
+    /// an interrupted replication run already publishes as its checkpoint.
+    ///
+    /// # Errors
+    ///
+    /// A lost upload, or a writer that never let go, as the durability policy
+    /// decides: `Durable` (governed) always errs, `ConfigDefault` errs only
+    /// under `on_upload_failure = "fail"`. A CAS conflict always errs.
+    pub async fn settle(mut self) -> Result<(), StateSyncError> {
+        if let Some(shutdown) = self.periodic_shutdown.take() {
+            shutdown.notify_one();
+        }
+        if let Some(handle) = self.periodic.take() {
+            let _ = handle.await;
+        }
+
+        if let Some(reason) = self.no_upload_reason() {
+            info!(
+                reason,
+                outcome = "skipped",
+                "interrupted run: no terminal state upload owed"
+            );
+            return Ok(());
+        }
+
+        let _writer = match wait_for_writer_lock(&self.state_path).await {
+            Ok(lock) => lock,
+            Err(e) => return apply_upload_failure_policy(&self.effective_cfg(), Err(e)),
+        };
+        info!(
+            state_path = %self.state_path.display(),
+            "interrupted run: performing its terminal state upload"
+        );
+        // A CAS conflict stays fail-closed even under `skip`, as everywhere
+        // else (`apply_upload_failure_policy`). Here it can have an innocent
+        // cause — the dropped run committed its own interrupted checkpoint
+        // without recording the new generation — but it cannot be told apart
+        // from a lost cross-pod race, and overwriting a winner is the worse
+        // error. The cost is a non-zero exit, never lost or clobbered state.
+        terminal_upload(
+            &self.cfg,
+            self.durability,
+            &self.state_path,
+            self.base.as_ref(),
+            self.replicate_schema_cache,
+        )
+        .await
+    }
+
+    /// Why this session owes no terminal upload, if it owes none: it never
+    /// downloaded (pushing local state over a remote it never read is a
+    /// blind overwrite), an upload suppression was recorded, the download
+    /// was not authoritative, or the backend is local.
+    fn no_upload_reason(&self) -> Option<&'static str> {
+        if !self.acquired {
+            Some("the session never downloaded state")
+        } else if let Some(reason) = self.suppress_reason {
+            Some(reason)
+        } else if !self.authority.is_usable() {
+            Some("non-authoritative state download")
+        } else if matches!(self.cfg.backend, StateBackend::Local) {
+            Some("local backend")
+        } else {
+            None
+        }
+    }
+
+    /// Whether [`settle`][Self::settle] will attempt a remote upload.
+    pub fn owes_upload(&self) -> bool {
+        self.no_upload_reason().is_none()
+    }
+
+    /// The config the upload runs under: `Durable` forces
+    /// `on_upload_failure = "fail"`.
+    fn effective_cfg(&self) -> StateConfig {
+        match self.durability {
+            FinalizeDurability::Durable => StateConfig {
+                on_upload_failure: StateUploadFailureMode::Fail,
+                ..self.cfg.clone()
+            },
+            FinalizeDurability::ConfigDefault => self.cfg.clone(),
+        }
+    }
+}
+
+/// Take the state file's advisory writer lock, retrying while another writer
+/// holds it, up to [`DROPPED_SESSION_WRITER_WAIT`].
+async fn wait_for_writer_lock(
+    state_path: &Path,
+) -> Result<crate::state::StateWriterLock, StateSyncError> {
+    let deadline = tokio::time::Instant::now() + DROPPED_SESSION_WRITER_WAIT;
+    loop {
+        match crate::state::try_acquire_writer_lock(state_path) {
+            Ok(lock) => return Ok(lock),
+            Err(crate::state::StateError::LockHeldByOther { .. })
+                if tokio::time::Instant::now() < deadline =>
+            {
+                tokio::time::sleep(DROPPED_SESSION_WRITER_POLL).await;
+            }
+            Err(e) => {
+                return Err(StateSyncError::Io(std::io::Error::other(format!(
+                    "the interrupted run's state store at {} was never released, so its \
+                     terminal upload could not read a settled ledger: {e}",
+                    state_path.display()
+                ))));
+            }
+        }
+    }
+}
+
+/// The terminal upload body shared by [`RemoteStateSession::finalize`] and
+/// [`DroppedSession::settle`], so the two cannot drift.
+///
+/// CAS terminal commit when CAS is effective: conditionally upload against the
+/// base captured at acquire. A lost cross-pod race surfaces `CasConflict`
+/// (fail-closed, never swallowed). `Durable` forces
+/// `on_upload_failure = Fail` for the transport-error case on both legs.
+async fn terminal_upload(
+    cfg: &StateConfig,
+    durability: FinalizeDurability,
+    state_path: &Path,
+    base: Option<&Generation>,
+    replicate_schema_cache: bool,
+) -> Result<(), StateSyncError> {
+    let effective = match durability {
+        FinalizeDurability::Durable => StateConfig {
+            on_upload_failure: StateUploadFailureMode::Fail,
+            ..cfg.clone()
+        },
+        FinalizeDurability::ConfigDefault => cfg.clone(),
+    };
+    if cas_effective(cfg) {
+        return upload_state_cas(&effective, state_path, base, replicate_schema_cache).await;
+    }
+    upload_state(&effective, state_path, replicate_schema_cache).await
+}
+
 impl Drop for RemoteStateSession {
     fn drop(&mut self) {
         if self.finalized {
+            return;
+        }
+        // A deliberate drop under an armed sink (`rocky run --watch` stopping
+        // an iteration on a signal): hand the session over so the watch loop
+        // performs its terminal upload. Not a bug, so no tripwire (#1603).
+        if DROPPED_SESSIONS
+            .try_with(|sink| sink.accept(self))
+            .unwrap_or(false)
+        {
+            debug!("RemoteStateSession handed to the dropped-session sink for settlement");
             return;
         }
         // Resource net first (the debug_assert below panics in debug builds):
@@ -6773,6 +7108,236 @@ mod tests {
             false,
         );
         drop(session);
+    }
+
+    /// Drop `session` the way `rocky run --watch` drops an interrupted
+    /// iteration: owned by a future running inside `sink`'s scope, polled
+    /// once so it is genuinely in flight, then dropped. Arms the sink first
+    /// when `arm` is set.
+    async fn drop_inside_scope(sink: &DroppedSessionSink, session: RemoteStateSession, arm: bool) {
+        let mut iteration = Box::pin(sink.scope(async move {
+            let _held = session;
+            std::future::pending::<()>().await;
+        }));
+        tokio::select! {
+            biased;
+            () = &mut iteration => unreachable!("the iteration never completes"),
+            () = std::future::ready(()) => {}
+        }
+        if arm {
+            sink.arm();
+        }
+        drop(iteration);
+    }
+
+    /// #1603. A session dropped with its run future under an armed sink is
+    /// handed over instead of tripping, and settling it performs the terminal
+    /// upload the dropped run skipped — carrying what the run had committed.
+    #[tokio::test]
+    async fn a_session_dropped_under_an_armed_sink_settles_its_terminal_upload() {
+        test_support::clear();
+        let provider = ObjectStoreProvider::in_memory();
+        let _guard = test_support::install(provider.clone());
+        let dir = TempDir::new().unwrap();
+        let local = dir.path().join(".rocky-state.redb");
+        let cfg = s3_session_config(StateUploadFailureMode::Fail);
+
+        let mut session = RemoteStateSession::new(&cfg, &local, FinalizeDurability::Durable, false);
+        assert_eq!(session.acquire().await.unwrap(), StateAuthority::FreshStart);
+        // What the run committed before the signal landed.
+        {
+            let store = StateStore::open(&local).unwrap();
+            store
+                .init_run_progress("interrupted-run", &["wh.raw.orders".into()], None)
+                .unwrap();
+        }
+
+        let sink = DroppedSessionSink::new();
+        drop_inside_scope(&sink, session, true).await;
+        assert_eq!(sink.pending(), 1, "the dropped session was handed over");
+
+        assert_eq!(sink.settle_all().await.unwrap(), 1);
+        assert_eq!(sink.pending(), 0);
+
+        let restored = TempDir::new().unwrap();
+        let restored_path = restored.path().join(".rocky-state.redb");
+        assert_eq!(
+            download_state(&cfg, &restored_path, false).await.unwrap(),
+            StateAuthority::Authoritative,
+            "settlement must have uploaded the ledger the dropped run skipped"
+        );
+        let store = StateStore::open(&restored_path).unwrap();
+        assert!(
+            store.get_run_progress("interrupted-run").unwrap().is_some(),
+            "the uploaded ledger carries what the run committed before the drop"
+        );
+        test_support::clear();
+    }
+
+    /// The sink only catches the deliberate drop. Unarmed — the run future
+    /// dropped a session while still being polled, an early `?` — it is the
+    /// calling-path bug the tripwire exists for, and it still trips.
+    #[tokio::test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "dropped without finalize/abandon")]
+    async fn an_unarmed_sink_still_trips_the_tripwire() {
+        let session = RemoteStateSession::new(
+            &StateConfig::default(),
+            Path::new("/nonexistent/.rocky-state.redb"),
+            FinalizeDurability::ConfigDefault,
+            false,
+        );
+        let sink = DroppedSessionSink::new();
+        drop_inside_scope(&sink, session, false).await;
+    }
+
+    /// Fail closed: a governed (`Durable`) dropped session whose terminal
+    /// upload fails makes settlement fail, even under the configured `skip`.
+    #[tokio::test]
+    async fn settling_a_durable_dropped_session_fails_closed_on_a_lost_upload() {
+        test_support::clear();
+        let faults = install_counting_provider();
+        faults.arm(
+            crate::fault_store::FaultOp::Put,
+            crate::fault_store::FaultMode::FailAll,
+        );
+        let dir = TempDir::new().unwrap();
+        let local = dir.path().join(".rocky-state.redb");
+        seed_state_file(&local);
+        let skip_cfg = s3_session_config(StateUploadFailureMode::Skip);
+
+        let mut session =
+            RemoteStateSession::new(&skip_cfg, &local, FinalizeDurability::Durable, false);
+        let _ = session.acquire().await.unwrap();
+        let sink = DroppedSessionSink::new();
+        drop_inside_scope(&sink, session, true).await;
+        let err = sink
+            .settle_all()
+            .await
+            .expect_err("a governed session must not lose its upload behind an Ok");
+        assert!(err.to_string().contains("injected fault"), "got: {err}");
+        test_support::clear();
+    }
+
+    /// A CAS conflict at settlement fails closed even under `skip`, the same
+    /// invariant every other upload keeps: a dropped session never overwrites
+    /// a remote that moved after it downloaded.
+    #[tokio::test]
+    async fn a_cas_conflict_at_settlement_fails_closed_even_under_skip() {
+        test_support::clear();
+        let _faults = install_counting_provider();
+        let dir = TempDir::new().unwrap();
+        let local = dir.path().join(".rocky-state.redb");
+        seed_state_file(&local);
+        let cfg = StateConfig {
+            concurrency_control: Some(ConcurrencyControl::Cas),
+            ..s3_session_config(StateUploadFailureMode::Skip)
+        };
+        let mut first =
+            RemoteStateSession::new(&cfg, &local, FinalizeDurability::ConfigDefault, false);
+        let _ = first.acquire().await.unwrap();
+        first.finalize().await.unwrap();
+
+        let mut dropped =
+            RemoteStateSession::new(&cfg, &local, FinalizeDurability::ConfigDefault, false);
+        let _ = dropped.acquire().await.unwrap();
+        // The remote advances after the dropped session captured its base.
+        let mut racer =
+            RemoteStateSession::new(&cfg, &local, FinalizeDurability::ConfigDefault, false);
+        let _ = racer.acquire().await.unwrap();
+        racer.finalize().await.unwrap();
+
+        let sink = DroppedSessionSink::new();
+        drop_inside_scope(&sink, dropped, true).await;
+        let settled = sink.settle_all().await;
+        assert!(
+            matches!(settled, Err(StateSyncError::CasConflict { .. })),
+            "a conflict must fail closed, not be skipped: {settled:?}"
+        );
+        test_support::clear();
+    }
+
+    /// The no-clobber rules `finalize` honours hold for a dropped session
+    /// too: a recorded suppression or a non-authoritative download uploads
+    /// nothing.
+    #[tokio::test]
+    async fn a_suppressed_dropped_session_settles_without_uploading() {
+        test_support::clear();
+        let faults = install_counting_provider();
+        let dir = TempDir::new().unwrap();
+        let local = dir.path().join(".rocky-state.redb");
+        seed_state_file(&local);
+
+        let mut suppressed = RemoteStateSession::new(
+            &s3_session_config(StateUploadFailureMode::Fail),
+            &local,
+            FinalizeDurability::Durable,
+            false,
+        );
+        let _ = suppressed.acquire().await.unwrap();
+        suppressed.set_suppress_upload("forward-incompat recreate");
+        let mut indeterminate = RemoteStateSession::new(
+            &s3_session_config(StateUploadFailureMode::Fail),
+            &local,
+            FinalizeDurability::Durable,
+            false,
+        );
+        let _ = indeterminate.acquire().await.unwrap();
+        indeterminate.authority = StateAuthority::Indeterminate;
+
+        let sink = DroppedSessionSink::new();
+        drop_inside_scope(&sink, suppressed, true).await;
+        drop_inside_scope(&sink, indeterminate, true).await;
+        assert_eq!(sink.settle_all().await.unwrap(), 2);
+        test_support::clear();
+        assert_eq!(
+            faults.count(crate::fault_store::FaultOp::Put),
+            0,
+            "a suppressed or non-authoritative session must not touch the remote"
+        );
+    }
+
+    /// Settlement waits for the dropped run's last `StateStore` writer — a
+    /// detached ledger commit — to close before it reads the file, so the
+    /// upload never ships a half-written ledger.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn settlement_waits_for_the_last_writer_before_uploading() {
+        let _serial = test_support::serial_guard();
+        test_support::clear();
+        let (faults, _global) = install_counting_provider_global();
+        let dir = TempDir::new().unwrap();
+        let local = dir.path().join(".rocky-state.redb");
+        seed_state_file(&local);
+
+        let mut session = RemoteStateSession::new(
+            &s3_session_config(StateUploadFailureMode::Fail),
+            &local,
+            FinalizeDurability::Durable,
+            false,
+        );
+        let _ = session.acquire().await.unwrap();
+
+        // A writer the dropped run left behind, still open.
+        let writer = StateStore::open(&local).unwrap();
+        let sink = DroppedSessionSink::new();
+        drop_inside_scope(&sink, session, true).await;
+
+        let settle = tokio::spawn({
+            let sink = sink.clone();
+            async move { sink.settle_all().await }
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            faults.count(crate::fault_store::FaultOp::Put),
+            0,
+            "no upload while a writer still holds the store"
+        );
+        drop(writer);
+        settle
+            .await
+            .unwrap()
+            .expect("settles once the writer closes");
+        assert_eq!(faults.count(crate::fault_store::FaultOp::Put), 1);
     }
 
     /// `abandon` disarms the tripwire — a deliberate no-upload consumption
