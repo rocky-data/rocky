@@ -433,18 +433,34 @@ fn decode_pipes_param(raw: &str, env_var_name: &str) -> Result<Value> {
 /// carries no declared checks this crate can read, so it yields `None` — the
 /// engine then reports only what it produced, as it always has.
 ///
-/// Fails closed on the shapes it does read: a context file that cannot be
-/// read, context data that is not JSON, or a declared-checks value of the
-/// wrong shape is an error before execution, not a silently empty set. An
-/// empty set would read as "nothing is declared" and drop exactly the
-/// not-evaluated rows the orchestrator asked for.
+/// A context file that cannot be read is `None` with a warning: the engine
+/// never needed it before, so it must not start refusing launches whose
+/// file it cannot see. What it does read fails closed: context data that is
+/// not JSON, or a declared-checks value of the wrong shape, is an error
+/// before execution, not a silently empty set. An empty set would read as
+/// "nothing is declared" and drop exactly the not-evaluated rows the
+/// orchestrator asked for.
 fn declared_checks_from_context_params(params: &Value) -> Result<Option<DeclaredChecks>> {
     let data = if let Some(path) = params.get("path") {
         let path = path
             .as_str()
             .ok_or_else(|| anyhow!("{ENV_PIPES_CONTEXT} 'path' is not a string"))?;
-        let raw = std::fs::read_to_string(path)
-            .map_err(|_| anyhow!("{ENV_PIPES_CONTEXT} context file cannot be read"))?;
+        let raw = match std::fs::read_to_string(path) {
+            Ok(raw) => raw,
+            Err(e) => {
+                // Rocky never needed this file before #2160, and a launcher can
+                // name one the engine cannot see (another mount, a relative
+                // path from another cwd). Degrade to "no declared checks" and
+                // say so: the integration then reports each unanswered check
+                // as `no_verdict` — still never a pass.
+                tracing::warn!(
+                    error = %e,
+                    "{ENV_PIPES_CONTEXT} context file cannot be read; \
+                     declared checks will not be answered by the engine"
+                );
+                return Ok(None);
+            }
+        };
         serde_json::from_str::<Value>(&raw)
             .map_err(|_| anyhow!("{ENV_PIPES_CONTEXT} context file is not valid JSON"))?
     } else if let Some(data) = params.get("data") {
@@ -641,6 +657,14 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+        // A context file the engine cannot see degrades the same way.
+        assert!(
+            declared_checks_from_context_params(
+                &json!({"path": "/nonexistent/rocky-pipes-context.json"})
+            )
+            .unwrap()
+            .is_none()
+        );
         // A custom injector's shape carries nothing this crate can read.
         assert!(
             declared_checks_from_context_params(&json!({"bucket": "b", "key": "k"}))
@@ -651,7 +675,6 @@ mod tests {
             json!({"data": {"extras": {EXTRAS_DECLARED_CHECKS: ["row_count"]}}}),
             json!({"data": {"extras": {EXTRAS_DECLARED_CHECKS: {"a": "row_count"}}}}),
             json!({"data": {"extras": {EXTRAS_DECLARED_CHECKS: {"a": [1]}}}}),
-            json!({"path": "/nonexistent/rocky-pipes-context.json"}),
             json!({"path": 7}),
         ] {
             assert!(

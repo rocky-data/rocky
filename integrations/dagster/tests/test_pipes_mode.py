@@ -988,3 +988,96 @@ def test_run_filters_pipes_fails_closed_on_a_declared_check_with_no_answer():
     assert result.passed is False
     assert result.severity == dg.AssetCheckSeverity.WARN
     assert result.metadata["rocky/not_evaluated_cause"].value == "no_verdict"
+
+
+def test_run_filters_pipes_keeps_the_most_telling_cause_across_filters():
+    """Every filter's run is sent the whole declared map, so filter 1 answers
+    ``not_reached`` for a table filter 2 owns. The prune (carried forward) and
+    the failed copy must win over it whichever arrives first."""
+    from dagster_rocky.component import _run_filters_pipes
+
+    group, orders, users = _declared_group()
+    declared = {(orders, "row_count"), (users, "row_count")}
+    context = MagicMock(spec=dg.AssetExecutionContext)
+    context.log = MagicMock()
+    rocky = MagicMock(spec=RockyResource)
+    first, second = MagicMock(), MagicMock()
+    first.get_results = MagicMock(
+        return_value=iter(
+            [
+                _not_evaluated(orders, "row_count", "not_reached"),
+                _not_evaluated(users, "row_count", "copy_failed"),
+            ]
+        )
+    )
+    second.get_results = MagicMock(
+        return_value=iter(
+            [
+                _not_evaluated(orders, "row_count", "pruned_unchanged"),
+                _not_evaluated(users, "row_count", "not_reached"),
+            ]
+        )
+    )
+    rocky.run_pipes = MagicMock(side_effect=[first, second])
+    out = list(
+        _run_filters_pipes(
+            context=context,
+            rocky=rocky,
+            filters=["client=a", "client=b"],
+            group=group,
+            selected_keys={orders, users},
+            declared_check_pairs=declared,
+        )
+    )
+    by_pair = {(r.asset_key, r.check_name): r for r in out}
+    assert len(out) == 2
+    assert by_pair[(orders, "row_count")].metadata["rocky/pruned_unchanged"].value is True
+    failed = by_pair[(users, "row_count")]
+    assert failed.passed is False
+    assert failed.metadata["rocky/not_evaluated_cause"].value == "copy_failed"
+
+
+def test_run_filters_pipes_warns_when_a_real_result_shadows_a_failed_copy():
+    group, orders, _users = _declared_group()
+    real = dg.AssetCheckResult(asset_key=orders, check_name="row_count", passed=True)
+    from dagster_rocky.component import _run_filters_pipes
+
+    context = MagicMock(spec=dg.AssetExecutionContext)
+    context.log = MagicMock()
+    rocky = MagicMock(spec=RockyResource)
+    invocation = MagicMock()
+    invocation.get_results = MagicMock(
+        return_value=iter([real, _not_evaluated(orders, "row_count", "copy_failed")])
+    )
+    rocky.run_pipes = MagicMock(return_value=invocation)
+    out = list(
+        _run_filters_pipes(
+            context=context,
+            rocky=rocky,
+            filters=["client=acme"],
+            group=group,
+            selected_keys={orders},
+            declared_check_pairs={(orders, "row_count")},
+        )
+    )
+    assert out == [real]
+    assert "failed its copy" in context.log.warning.call_args.args[0]
+
+
+def test_run_filters_pipes_passes_compliance_by_absence_and_does_not_ask_the_engine():
+    """``compliance_exception``'s producer is the component's own scan, which
+    reports a crash explicitly; silence from a scan that ran is the clean
+    verdict, as in streaming mode."""
+    from dagster_rocky.observability import COMPLIANCE_CHECK_NAME
+
+    group, orders, _users = _declared_group()
+    declared = {(orders, COMPLIANCE_CHECK_NAME), (orders, "row_count")}
+    out, kwargs = _drive(
+        group,
+        {orders},
+        declared,
+        [dg.AssetCheckResult(asset_key=orders, check_name="row_count", passed=True)],
+    )
+    assert kwargs["declared_checks"] == {"fivetran/acme/orders": ["row_count"]}
+    (compliance,) = [r for r in out if r.check_name == COMPLIANCE_CHECK_NAME]
+    assert compliance.passed is True

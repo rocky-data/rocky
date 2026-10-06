@@ -2970,8 +2970,20 @@ def _run_filters_pipes(
     - ``pruned_unchanged`` carries the last recorded verdict forward, exactly
       as the streaming placeholder does (:func:`_pruned_check_placeholder`);
     - every other cause is yielded as sent: a WARN failure, never a pass;
-    - a not-evaluated row for a pair that already has a real result (two
-      native tables folding onto one asset) is dropped — the real one wins.
+    - when several rows answer one pair (every filter's run is sent the whole
+      declared map, and two native tables can fold onto one asset), the most
+      telling cause wins (:data:`_NOT_EVALUATED_CAUSE_PRIORITY`): a failed
+      copy over anything, a carried-forward prune only over "never reached";
+    - a real result for the pair wins over every not-evaluated row. When a
+      ``copy_failed`` row is shadowed that way (one folded native table
+      failed, another produced the check) a warning names it — the result
+      already yielded cannot be withdrawn.
+
+    A pass-by-absence check (:data:`PASS_BY_ABSENCE_CHECK_NAMES`, i.e.
+    ``compliance_exception``) is not sent: its producer is the compliance scan
+    this component runs itself, which yields an explicit failure on every
+    asset when it crashes. So an asset it reported nothing for gets the same
+    passing "no exception reported" verdict the streaming placeholder gives.
 
     A declared pair that still has no result once every filter has run (an
     engine that predates #2160) gets a ``passed=False`` WARN result naming
@@ -2992,11 +3004,12 @@ def _run_filters_pipes(
         ),
         key=lambda pair: (pair[0].to_user_string(), pair[1]),
     )
+    engine_owed_pairs = [pair for pair in owed_pairs if pair[1] not in PASS_BY_ABSENCE_CHECK_NAMES]
     native_paths_by_key: dict[dg.AssetKey, list[tuple[str, ...]]] = defaultdict(list)
     for native_path, dagster_key in rocky_key_to_dagster_key.items():
         native_paths_by_key[dagster_key].append(native_path)
     declared_checks: dict[str, list[str]] = {}
-    for asset_key, check_name in owed_pairs:
+    for asset_key, check_name in engine_owed_pairs:
         for native_path in native_paths_by_key.get(asset_key, ()):
             declared_checks.setdefault("/".join(native_path), []).append(check_name)
     yielded: set[tuple[dg.AssetKey, str]] = set()
@@ -3073,7 +3086,10 @@ def _run_filters_pipes(
                 and result.check_name is not None
                 and (result.asset_key, result.check_name) in declared_check_pairs
             ):
-                not_evaluated.setdefault((result.asset_key, result.check_name), (cause, result))
+                pair = (result.asset_key, result.check_name)
+                held = not_evaluated.get(pair)
+                if held is None or _not_evaluated_rank(cause) > _not_evaluated_rank(held[0]):
+                    not_evaluated[pair] = (cause, result)
                 continue
             # Only ``AssetCheckResult`` is constrained by the declared specs.
             # Pipes reports a check as a TOP-LEVEL result (see
@@ -3109,6 +3125,13 @@ def _run_filters_pipes(
 
     for pair, (cause, result) in not_evaluated.items():
         if pair in yielded or pair in pre_yielded_checks:
+            if cause == "copy_failed" and pair in yielded:
+                context.log.warning(
+                    f"Check {pair[1]!r} on {pair[0].to_user_string()!r}: one Rocky table "
+                    f"folding onto this asset failed its copy, but another produced a "
+                    f"result, which was already reported. The asset's verdict reflects "
+                    f"only the table that produced it."
+                )
             continue
         yielded.add(pair)
         if cause == "pruned_unchanged":
@@ -3118,6 +3141,15 @@ def _run_filters_pipes(
 
     for asset_key, check_name in owed_pairs:
         if (asset_key, check_name) in yielded:
+            continue
+        if check_name in PASS_BY_ABSENCE_CHECK_NAMES:
+            yield dg.AssetCheckResult(
+                asset_key=asset_key,
+                check_name=check_name,
+                passed=True,
+                severity=dg.AssetCheckSeverity.WARN,
+                metadata={"status": dg.MetadataValue.text(f"no {check_name} reported by rocky")},
+            )
             continue
         status = (
             "no verdict from rocky over Pipes: the engine sent neither a result "
@@ -3134,6 +3166,28 @@ def _run_filters_pipes(
                 "rocky/not_evaluated_cause": dg.MetadataValue.text("no_verdict"),
             },
         )
+
+
+#: Which engine not-evaluated cause wins when several answer one declared
+#: check (#2160): the one that says the most about the asset. A failed copy
+#: beats everything; "never reached" loses to everything, including a prune
+#: (whose prior verdict is then carried forward). An unknown cause from a
+#: newer engine ranks below ``not_reached``.
+_NOT_EVALUATED_CAUSE_PRIORITY: tuple[str, ...] = (
+    "copy_failed",
+    "excluded",
+    "not_produced",
+    "pruned_unchanged",
+    "not_reached",
+)
+
+
+def _not_evaluated_rank(cause: str) -> int:
+    """Higher is more telling; see :data:`_NOT_EVALUATED_CAUSE_PRIORITY`."""
+    try:
+        return len(_NOT_EVALUATED_CAUSE_PRIORITY) - _NOT_EVALUATED_CAUSE_PRIORITY.index(cause)
+    except ValueError:
+        return 0
 
 
 def _pipes_not_evaluated_cause(result: object) -> str | None:

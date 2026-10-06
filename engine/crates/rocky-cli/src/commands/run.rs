@@ -133,7 +133,7 @@ fn record_pruned(
         asset_key: pruned.asset_key,
         source_schema: pruned.source_schema,
         table_name: pruned.table_name,
-        reason: "unchanged_since_last_copy".to_string(),
+        reason: PRUNED_UNCHANGED_REASON.to_string(),
     });
 }
 
@@ -9700,6 +9700,10 @@ pub(super) fn emit_pipes_events(pipes: &crate::pipes::PipesEmitter, output: &Run
     }
 }
 
+/// The `excluded_tables` reason a `prune_unchanged` skip records. Read back
+/// by the declared-check pass below, and by dagster-rocky (`component.py`).
+pub(super) const PRUNED_UNCHANGED_REASON: &str = "unchanged_since_last_copy";
+
 /// Why a declared check got no verdict from this run (#2160). Sent on the
 /// Pipes wire as `rocky/not_evaluated_cause` so the integration can map each
 /// cause without guessing from absence.
@@ -9790,7 +9794,7 @@ pub(super) fn not_evaluated_declared_checks(
                     NotEvaluatedCause::CopyFailed,
                     "the table failed in this run, so the check did not run".to_string(),
                 )
-            } else if excluded.get(asset_key) == Some(&"unchanged_since_last_copy") {
+            } else if excluded.get(asset_key) == Some(&PRUNED_UNCHANGED_REASON) {
                 (
                     NotEvaluatedCause::PrunedUnchanged,
                     "source unchanged since the last copy (prune_unchanged); \
