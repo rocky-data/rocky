@@ -62,6 +62,7 @@ fn exec(name: &str, start: chrono::DateTime<Utc>, dur_ms: i64) -> ModelExecution
         hash_scheme: None,
         output_column_hashes: None,
         attempts: Vec::new(),
+        output_version: None,
     }
 }
 

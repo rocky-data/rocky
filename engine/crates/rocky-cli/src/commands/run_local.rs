@@ -1636,6 +1636,22 @@ pub async fn run_snapshot(
 
     if tables_failed == 0 {
         output.tables_copied = 1;
+        let duration_ms = start.elapsed().as_millis() as u64;
+        // The snapshot table's version identity, read after the write
+        // (RV1-P1b). This path records no job ids, so BigQuery reads as
+        // `adapter_has_no_version` here. A failed read is recorded as
+        // `observe_failed`; it never fails the run.
+        let output_version = super::run_output_version::observe_table_version(
+            warehouse_adapter.as_ref(),
+            &rocky_ir::TableRef {
+                catalog: pipeline.target.catalog.clone(),
+                schema: pipeline.target.schema.clone(),
+                table: pipeline.target.table.clone(),
+            },
+            &[],
+            Utc::now(),
+        )
+        .await;
         output.materializations.push(MaterializationOutput {
             attempts: Vec::new(),
             notes: vec![],
@@ -1645,7 +1661,7 @@ pub async fn run_snapshot(
                 pipeline.target.table.clone(),
             ],
             rows_copied: None,
-            duration_ms: start.elapsed().as_millis() as u64,
+            duration_ms,
             started_at,
             metadata: MaterializationMetadata {
                 strategy: "snapshot_scd2".to_string(),
@@ -1674,6 +1690,7 @@ pub async fn run_snapshot(
             output_column_hashes: None,
             // Consumer baseline is content-addressed-path only.
             consumed_column_baseline: None,
+            output_version: Some(output_version),
         });
     } else {
         output.tables_failed = 1;

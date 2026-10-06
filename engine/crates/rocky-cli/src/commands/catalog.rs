@@ -1348,6 +1348,7 @@ mod tests {
                 hash_scheme: None,
                 output_column_hashes: None,
                 attempts: Vec::new(),
+                output_version: None,
             }
         }
     }

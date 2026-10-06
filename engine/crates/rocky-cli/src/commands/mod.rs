@@ -77,6 +77,7 @@ mod run_content_addressed;
 mod run_dag_exec;
 mod run_incremental;
 mod run_local;
+pub(crate) mod run_output_version;
 mod run_watch;
 pub mod schedule_spool;
 pub mod schedule_status;

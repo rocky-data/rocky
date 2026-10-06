@@ -1320,6 +1320,17 @@ pub struct MaterializationOutput {
     #[serde(skip)]
     #[schemars(skip)]
     pub consumed_column_baseline: Option<Vec<rocky_core::state::UpstreamSig>>,
+    /// State-internal version identity of the output this materialization
+    /// wrote (RV1-P1b), stamped at the execution site right after the write.
+    /// [`RunOutput::to_run_record`] copies it onto the persisted
+    /// [`rocky_core::state::ModelExecution::output_version`].
+    ///
+    /// Never serialized and never part of the JSON schema (via `#[serde(skip)]`
+    /// and `#[schemars(skip)]`) — same pattern as [`Self::output_column_hashes`].
+    /// RV1-P2 decides the public shape.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub output_version: Option<rocky_core::state::OutputVersion>,
 }
 
 /// State-internal skip-gate result for one materialized model, carried on
@@ -6032,6 +6043,19 @@ impl RunOutput {
     ) -> rocky_core::state::RunRecord {
         let mut models = Vec::with_capacity(self.materializations.len() + self.errors.len());
 
+        // RV1-P1b: one summary warning per run for failed version reads,
+        // instead of one per table.
+        if let Some(summary) = crate::commands::run_output_version::observe_failed_summary(
+            self.materializations.iter().map(|m| {
+                (
+                    m.asset_key.last().map_or("<unknown>", String::as_str),
+                    m.output_version.as_ref(),
+                )
+            }),
+        ) {
+            tracing::warn!("{summary}");
+        }
+
         for mat in &self.materializations {
             let duration_ms = mat.duration_ms;
             let model_started = mat.started_at;
@@ -6091,6 +6115,9 @@ impl RunOutput {
                 // never inside them, so a retried-then-succeeded build stays
                 // byte-indistinguishable downstream from a first-try success.
                 attempts: mat.attempts.clone(),
+                // The output's version identity, stamped at the execution
+                // site right after the write (RV1-P1b). State only.
+                output_version: mat.output_version.clone(),
             });
         }
 
@@ -6130,6 +6157,9 @@ impl RunOutput {
                 // when the retry layer produced them, ride on its
                 // `MaterializationOutput` instead.
                 attempts: Vec::new(),
+                // A failed execution recorded no output version ("not
+                // recorded"); it may have written nothing at all.
+                output_version: None,
             });
         }
 
@@ -7376,6 +7406,7 @@ mod cost_finalize_tests {
             recipe_identity: None,
             output_column_hashes: None,
             consumed_column_baseline: None,
+            output_version: None,
         }
     }
 
@@ -7670,6 +7701,7 @@ mod run_record_tests {
             recipe_identity: None,
             output_column_hashes: None,
             consumed_column_baseline: None,
+            output_version: None,
         }
     }
 

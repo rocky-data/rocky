@@ -370,6 +370,20 @@ pub(crate) enum FailingWriteKind {
     ContentQueryCircuitBreaker,
     ContentMsckRateLimit,
     ContentMsckCircuitBreaker,
+    /// Fails nothing. Answers the content-addressed fixture query and
+    /// accepts the post-commit MSCK, so a content-addressed run succeeds.
+    ContentOk,
+    /// Fails nothing. `observed_table_version` answers `Some(42)`, as a
+    /// Delta table on Databricks would (RV1-P1b).
+    ObserveVersion,
+    /// Fails nothing but `observed_table_version`, which errors. The run
+    /// must still succeed and record `observe_failed` (RV1-P1b).
+    ObserveFail,
+    /// Touches no database: every statement and query succeeds (queries
+    /// return no rows), `describe_table` answers `(id INTEGER, updated_at
+    /// TIMESTAMP)` and `observed_table_version` answers `Some(42)`. Drives a
+    /// `snapshot` pipeline, whose SCD2 SQL DuckDB rejects, through `run()`.
+    AcceptAll,
 }
 
 #[cfg(feature = "duckdb")]
@@ -400,6 +414,13 @@ impl FailingWriteWarehouseAdapter {
                 consecutive_failures: 5,
                 cooldown_seconds: Some(180),
             },
+            FailingWriteKind::ContentOk
+            | FailingWriteKind::ObserveVersion
+            | FailingWriteKind::ObserveFail
+            | FailingWriteKind::AcceptAll => ConnectorError::StatementFailed {
+                id: "injected".to_string(),
+                message: "injected DESCRIBE HISTORY failure".to_string(),
+            },
         };
         AdapterError::new(error)
     }
@@ -413,6 +434,20 @@ impl WarehouseAdapter for FailingWriteWarehouseAdapter {
     }
 
     async fn execute_statement(&self, sql: &str) -> AdapterResult<()> {
+        if matches!(self.failure, FailingWriteKind::AcceptAll) {
+            return Ok(());
+        }
+        if matches!(
+            self.failure,
+            FailingWriteKind::ContentOk
+                | FailingWriteKind::ObserveVersion
+                | FailingWriteKind::ObserveFail
+        ) {
+            if sql.starts_with("MSCK REPAIR TABLE ") {
+                return Ok(());
+            }
+            return self.inner.execute_statement(sql).await;
+        }
         if matches!(
             self.failure,
             FailingWriteKind::ContentQueryRateLimit | FailingWriteKind::ContentQueryCircuitBreaker
@@ -430,6 +465,12 @@ impl WarehouseAdapter for FailingWriteWarehouseAdapter {
     }
 
     async fn execute_query(&self, sql: &str) -> AdapterResult<QueryResult> {
+        if matches!(self.failure, FailingWriteKind::AcceptAll) {
+            return Ok(QueryResult {
+                columns: vec![],
+                rows: vec![],
+            });
+        }
         if matches!(
             self.failure,
             FailingWriteKind::ContentQueryRateLimit | FailingWriteKind::ContentQueryCircuitBreaker
@@ -447,11 +488,33 @@ impl WarehouseAdapter for FailingWriteWarehouseAdapter {
     }
 
     async fn describe_table(&self, table: &TableRef) -> AdapterResult<Vec<ColumnInfo>> {
+        if matches!(self.failure, FailingWriteKind::AcceptAll) {
+            return Ok(vec![
+                ColumnInfo {
+                    name: "id".to_string(),
+                    data_type: "INTEGER".to_string(),
+                    nullable: false,
+                },
+                ColumnInfo {
+                    name: "updated_at".to_string(),
+                    data_type: "TIMESTAMP".to_string(),
+                    nullable: false,
+                },
+            ]);
+        }
         self.inner.describe_table(table).await
     }
 
     fn classify_failure(&self, err: &AdapterError) -> rocky_core::failure_class::FailureClass {
         self.inner.classify_failure(err)
+    }
+
+    async fn observed_table_version(&self, table: &TableRef) -> AdapterResult<Option<u64>> {
+        match self.failure {
+            FailingWriteKind::ObserveVersion | FailingWriteKind::AcceptAll => Ok(Some(42)),
+            FailingWriteKind::ObserveFail => Err(self.injected_error()),
+            _ => self.inner.observed_table_version(table).await,
+        }
     }
 }
 
