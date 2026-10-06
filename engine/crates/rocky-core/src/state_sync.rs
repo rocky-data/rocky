@@ -9391,10 +9391,11 @@ mod environment_publish_tests {
 
         let (head, history, _) = remote_view(&h).await;
         assert_eq!(head.head_publish_id, "staging#2");
-        assert_eq!(head.pointers.len(), 2, "staging#1 pointer kept + winner's");
-        for (model, pointer) in &winner.to {
-            assert_eq!(&head.pointers[model], pointer, "remote head = winner");
-        }
+        // Either racer can win. The head is staging#1's pointers with the
+        // winner's merged over them — and nothing of the loser's.
+        let mut expected = history[0].to.clone();
+        expected.extend(winner.to.clone());
+        assert_eq!(head.pointers, expected, "remote head = staging#1 + winner");
         let seqs: Vec<u64> = history.iter().map(|r| r.seq).collect();
         assert_eq!(seqs, vec![1, 2]);
         assert_eq!(history[1].prior_publish_id.as_deref(), Some("staging#1"));
