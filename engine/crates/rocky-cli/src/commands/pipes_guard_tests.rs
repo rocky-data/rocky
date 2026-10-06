@@ -147,6 +147,7 @@ async fn contracts_refusal_does_not_send_pipes_opened() {
         None,
         Some(&dir.path().join("contracts")),
         &rocky_core::config::PrincipalRef::unnamed(),
+        None,
     )
     .await;
     assert!(

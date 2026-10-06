@@ -5595,6 +5595,7 @@ pub async fn run_apply_inline_for_run(
         None, // #1460: inline `rocky run`, not a persisted plan
         contracts_dir,
         actor,
+        None,
     )
     .await
     .map(|_| ())
