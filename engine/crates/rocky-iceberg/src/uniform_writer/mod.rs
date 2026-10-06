@@ -282,6 +282,19 @@ pub struct ReplaceOutcome {
     pub files: Vec<WriteResult>,
 }
 
+/// The object-store [`Path`] of a table-relative object key under `prefix`.
+///
+/// The key's segments are already escaped (see [`commit::escape_path_name`]),
+/// so they are parsed as they are. `Path::from` would percent-encode a `%`
+/// a second time and the object would not sit at the key the log names.
+fn object_path(prefix: &str, relative_key: &str) -> Result<Path> {
+    // `Path::from(prefix)` spells the prefix the way every other key of this
+    // table spells it; the relative key is appended verbatim.
+    let joined = format!("{}/{relative_key}", Path::from(prefix));
+    Path::parse(&joined)
+        .map_err(|e| UniformWriterError::DeltaLog(format!("output key `{relative_key}`: {e}")))
+}
+
 impl ReplaceOutcome {
     /// The single file of an unpartitioned (or single-group) replace.
     fn into_single(self) -> Result<WriteResult> {
@@ -300,7 +313,8 @@ impl ReplaceOutcome {
 /// added by a replace commit.
 #[derive(Debug, Clone)]
 struct StagedFile {
-    /// `add.path`, relative to the table prefix.
+    /// `add.path`, relative to the table prefix and URI-encoded as the log
+    /// carries it. Its [`discover::canonical_key`] is the object key.
     path: String,
     /// The `add` body, without row-tracking fields.
     add: serde_json::Map<String, serde_json::Value>,
@@ -813,18 +827,21 @@ impl UniformWriter {
             let column_hashes = compute_column_hashes(batch)?;
             // Hive-style partition prefix, in the table's partition_columns
             // order so the path is deterministic. Empty when unpartitioned.
-            let mut add_file_path = String::new();
+            // Each segment is escaped like Spark's partition directories;
+            // see `commit::escape_path_name`.
+            let mut object_key = String::new();
             for col in &state.partition_columns {
                 let v = partition_values.get(col).ok_or_else(|| {
                     UniformWriterError::DeltaLog(format!(
                         "missing partition value for column `{col}`"
                     ))
                 })?;
-                add_file_path.push_str(&format!("{col}={v}/"));
+                object_key.push_str(&commit::partition_dir(col, v));
+                object_key.push('/');
             }
-            add_file_path.push_str(&format!("{hash}.parquet"));
+            object_key.push_str(&format!("{hash}.parquet"));
             let file_size = parquet_bytes.len() as u64;
-            let parquet_path = Path::from(format!("{prefix}/{add_file_path}"));
+            let parquet_path = object_path(&prefix, &object_key)?;
 
             // 2. PUT the Parquet. Same content → same hash → same key →
             // idempotent. A re-PUT also restores bytes a VACUUM deleted.
@@ -835,13 +852,19 @@ impl UniformWriter {
             let add = commit::build_add_action(&commit::AddInputs {
                 batch,
                 state: &state,
-                add_file_path: &add_file_path,
+                add_file_path: &object_key,
                 file_size,
                 modification_time_millis,
                 partition_values,
             })?;
+            // The URI-encoded `add.path`; its canonical key is `object_key`.
+            let log_path = add
+                .get("path")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
             staged.push(StagedFile {
-                path: add_file_path,
+                path: log_path,
                 add,
                 blake3_hash: hash,
                 column_hashes,
@@ -1065,11 +1088,18 @@ impl UniformWriter {
             .iter()
             .map(|(key, &i)| (i, live.files.get(key).map_or(table_version, |f| f.version)))
             .collect();
+        // The canonical key is the decoded `add.path` under the prefix: the
+        // object key, not the URI-encoded log spelling.
+        let key_of: HashMap<usize, &str> =
+            new_keys.iter().map(|(key, &i)| (i, key.as_str())).collect();
         let files = staged
             .iter()
             .enumerate()
             .map(|(i, s)| WriteResult {
-                file_path: Path::from(format!("{prefix}/{}", s.path)).to_string(),
+                file_path: key_of.get(&i).map_or_else(
+                    || Path::from(format!("{prefix}/{}", s.path)).to_string(),
+                    |k| (*k).to_string(),
+                ),
                 blake3_hash: s.blake3_hash.clone(),
                 column_hashes: s.column_hashes.clone(),
                 commit_version: version_of.get(&i).copied().unwrap_or(table_version),
@@ -2797,6 +2827,135 @@ mod tests {
             discover::proven_removed_at(&*store, "b", "tbl", &rel, 1, i64::MAX / 2).await,
             RemovalProof::Held(RemovalHoldReason::RetentionUnknown)
         );
+    }
+
+    // -- add.path is URI-encoded; the object key is Spark-escaped -------------
+
+    /// Every object key under `prefix/` that ends in `.parquet`.
+    async fn parquet_keys(store: &InMemory, prefix: &str) -> Vec<String> {
+        use futures::TryStreamExt;
+        let mut out = Vec::new();
+        let mut stream = store.list(Some(&object_store::path::Path::from(prefix)));
+        while let Some(meta) = stream.try_next().await.unwrap() {
+            let k = meta.location.to_string();
+            if k.ends_with(".parquet") {
+                out.push(k);
+            }
+        }
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn special_partition_values_escape_like_spark_and_encode_in_the_log() {
+        // (value, object-key directory, add.path directory)
+        let cases = [
+            ("50%off", "region=50%25off", "region=50%2525off"),
+            ("a b", "region=a b", "region=a%20b"),
+            ("x#y", "region=x%23y", "region=x%2523y"),
+            ("q?r", "region=q%3Fr", "region=q%253Fr"),
+            ("a/b", "region=a%2Fb", "region=a%252Fb"),
+            ("k=v", "region=k%3Dv", "region=k%253Dv"),
+            ("über", "region=über", "region=%C3%BCber"),
+            ("eu", "region=eu", "region=eu"),
+        ];
+        for (value, dir, log_dir) in cases {
+            let key = format!("{}/H.parquet", commit::partition_dir("region", value));
+            assert_eq!(key, format!("{dir}/H.parquet"), "object key for {value:?}");
+            let logged = commit::delta_log_path(&key);
+            assert_eq!(
+                logged,
+                format!("{log_dir}/H.parquet"),
+                "add.path for {value:?}"
+            );
+            assert_eq!(
+                discover::canonical_key(&logged, "b", "tbl").as_deref(),
+                Some(format!("tbl/{key}").as_str()),
+                "canonical_key(add.path) is the object key for {value:?}"
+            );
+        }
+        // An ordinary key is the same in all three forms: logs written before
+        // this change still match.
+        let plain = "region=eu-1_x.y/0123abcd.parquet";
+        assert_eq!(commit::delta_log_path(plain), plain);
+    }
+
+    #[tokio::test]
+    async fn special_partition_values_round_trip_and_move_only_changed_files() {
+        let store: Arc<InMemory> = Arc::new(InMemory::new());
+        seed_partitioned_bootstrap(&store, "ptbl").await;
+        let writer = make_unpartitioned_writer(store.clone() as Arc<dyn ObjectStore>, "ptbl");
+        let pv = |r: &str| HashMap::from([("region".to_string(), r.to_string())]);
+        let groups = |hash_rows: usize| {
+            vec![
+                (pv("50%off"), make_partitioned_batch("50%off", 2)),
+                (pv("a b"), make_partitioned_batch("a b", 3)),
+                (pv("x#y"), make_partitioned_batch("x#y", hash_rows)),
+            ]
+        };
+
+        // Run 1: the object keys are Spark-escaped, the add paths encoded.
+        let run1 = writer.write_partitioned_batches(groups(1)).await.unwrap();
+        assert_eq!(run1.table_version, 1);
+        let keys = parquet_keys(&store, "ptbl").await;
+        let file_paths: Vec<String> = {
+            let mut v: Vec<String> = run1.files.iter().map(|f| f.file_path.clone()).collect();
+            v.sort();
+            v
+        };
+        assert_eq!(keys, file_paths, "file_path names the stored object");
+        let lines = commit_lines(&store, "ptbl", 1).await;
+        let mut added: Vec<&str> = actions(&lines, "add")
+            .iter()
+            .map(|a| a["path"].as_str().unwrap())
+            .collect();
+        added.sort();
+        let dirs: Vec<&str> = added.iter().map(|p| p.split('/').next().unwrap()).collect();
+        assert_eq!(
+            dirs,
+            vec!["region=50%2525off", "region=a%20b", "region=x%2523y"]
+        );
+        let mut canon: Vec<String> = added
+            .iter()
+            .map(|p| discover::canonical_key(p, "", "ptbl").unwrap())
+            .collect();
+        canon.sort();
+        assert_eq!(canon, keys, "canonical_key(add.path) == the object key");
+
+        // Run 2: the same output finds every file live and writes no commit.
+        let run2 = writer.write_partitioned_batches(groups(1)).await.unwrap();
+        assert!(!run2.committed, "unchanged special-value files still match");
+        assert!(!commit_exists(&store, "ptbl", 2).await);
+
+        // Run 3: only `x#y` changes → one remove of its old file, one add.
+        let x_old = run1
+            .files
+            .iter()
+            .find(|f| f.file_path.contains("x%23y"))
+            .unwrap()
+            .file_path
+            .clone();
+        let run3 = writer.write_partitioned_batches(groups(4)).await.unwrap();
+        assert_eq!(run3.table_version, 2);
+        let lines = commit_lines(&store, "ptbl", 2).await;
+        let removed: Vec<&str> = actions(&lines, "remove")
+            .iter()
+            .map(|r| r["path"].as_str().unwrap())
+            .collect();
+        let added: Vec<&str> = actions(&lines, "add")
+            .iter()
+            .map(|a| a["path"].as_str().unwrap())
+            .collect();
+        assert_eq!(removed.len(), 1, "{removed:?}");
+        assert_eq!(
+            discover::canonical_key(removed[0], "", "ptbl").unwrap(),
+            x_old,
+            "the remove names the old x#y object"
+        );
+        assert_eq!(added.len(), 1, "{added:?}");
+        assert!(added[0].starts_with("region=x%2523y/"));
+        let live = replay_live_paths(&store, "ptbl").await;
+        assert_eq!(live.len(), 3);
     }
 
     // -- row ids come from the same replay as the head ------------------------

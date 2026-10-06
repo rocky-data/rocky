@@ -31,12 +31,95 @@ use serde_json::{Map, Value, json};
 
 use super::{Result, UniformTableState, UniformWriterError};
 
+// -- paths: the object key and the log path ---------------------------------
+//
+//   partition value  ──escape_path_name──▶  object key   `region=50%25off/H.parquet`
+//   object key       ──delta_log_path────▶  add.path     `region=50%2525off/H.parquet`
+//   add.path         ──canonical_key─────▶  object key   (one percent-decode)
+//
+// The object key follows Spark: a Hive-style `<col>=<value>` directory with
+// each name and value escaped by `ExternalCatalogUtils.escapePathName`. The
+// Delta protocol requires `add.path` to be URI-encoded, so the log carries the
+// key URI-encoded once more, as Spark's Delta writer does. For ordinary values
+// (letters, digits, `-`, `_`, `.`) all three forms are the same string.
+
+/// Escape one partition column name or value for a Hive-style directory
+/// name, like Spark's `ExternalCatalogUtils.escapePathName`.
+///
+/// Escapes the ASCII control characters, DEL and
+/// `"` `#` `%` `'` `*` `/` `:` `=` `?` `\` `{` `[` `]` `^` as `%XX`
+/// (upper-case hex). Spark leaves NUL unescaped; this escapes it too, because
+/// an object key cannot hold it. Other characters, space and non-ASCII
+/// included, stay as they are.
+pub fn escape_path_name(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for c in raw.chars() {
+        let escape = c.is_ascii_control()
+            || matches!(
+                c,
+                '"' | '#' | '%' | '\'' | '*' | '/' | ':' | '=' | '?' | '\\' | '{' | '[' | ']' | '^'
+            );
+        if escape {
+            out.push_str(&format!("%{:02X}", c as u32));
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// The Hive-style directory segment `<col>=<value>` for one partition value,
+/// both sides escaped with [`escape_path_name`].
+pub fn partition_dir(column: &str, value: &str) -> String {
+    format!("{}={}", escape_path_name(column), escape_path_name(value))
+}
+
+/// Characters a URI path segment keeps as they are: RFC 3986 `unreserved`
+/// plus the `sub-delims` and `@`. Every other byte is percent-encoded, `%`,
+/// space, `#`, `?`, `:` and all non-ASCII bytes included.
+const LOG_PATH_SEGMENT: &percent_encoding::AsciiSet = &percent_encoding::NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'.')
+    .remove(b'_')
+    .remove(b'~')
+    .remove(b'!')
+    .remove(b'$')
+    .remove(b'&')
+    .remove(b'\'')
+    .remove(b'(')
+    .remove(b')')
+    .remove(b'*')
+    .remove(b'+')
+    .remove(b',')
+    .remove(b';')
+    .remove(b'=')
+    .remove(b'@');
+
+/// The Delta `add.path` for a table-relative object key: each `/`-separated
+/// segment URI-encoded, the `/` separators kept.
+///
+/// The Delta protocol requires `path` to be URI-encoded. A reader decodes it
+/// once to find the object, so [`super::discover::canonical_key`] of the
+/// result is the object key again.
+pub fn delta_log_path(relative_key: &str) -> String {
+    relative_key
+        .split('/')
+        .map(|seg| percent_encoding::utf8_percent_encode(seg, LOG_PATH_SEGMENT).to_string())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 /// Inputs to [`build_add_action`] for one freshly built parquet file.
 ///
 /// For unpartitioned tables, pass `partition_values: &HashMap::new()` and
 /// `add_file_path: "<hash>.parquet"`. For partitioned tables, pass a map
 /// keyed by logical partition-column name with stringified values and an
-/// `add_file_path` like `<col>=<value>/<hash>.parquet`.
+/// `add_file_path` like `<col>=<value>/<hash>.parquet` (each segment built
+/// with [`partition_dir`]).
+///
+/// `add_file_path` is the table-relative **object key**, not yet
+/// URI-encoded. [`build_add_action`] writes it to `add.path` through
+/// [`delta_log_path`].
 #[derive(Debug, Clone, Copy)]
 pub struct AddInputs<'a> {
     pub batch: &'a RecordBatch,
@@ -65,7 +148,10 @@ pub fn build_add_action(inputs: &AddInputs) -> Result<Map<String, Value>> {
     let partition_values_physical = translate_partition_values(inputs)?;
 
     let mut add_obj = Map::new();
-    add_obj.insert("path".into(), Value::String(inputs.add_file_path.into()));
+    add_obj.insert(
+        "path".into(),
+        Value::String(delta_log_path(inputs.add_file_path)),
+    );
     add_obj.insert(
         "partitionValues".into(),
         Value::Object(partition_values_physical),

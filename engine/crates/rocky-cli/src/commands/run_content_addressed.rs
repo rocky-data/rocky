@@ -231,8 +231,12 @@ pub(crate) async fn removal_proof_given_store(
         store,
         Arc::new(NoOpSqlClient),
     );
+    // `file_path` is the object key; the proof compares Delta log paths,
+    // which are URI-encoded. Encode once so a partition value such as `50%off`
+    // (key `region=50%25off/…`) matches its `add.path`.
+    let log_path = rocky_iceberg::uniform_writer::commit::delta_log_path(&table_relative);
     writer
-        .proven_removed(&bucket, &table_relative, expected_add_version)
+        .proven_removed(&bucket, &log_path, expected_add_version)
         .await
 }
 
