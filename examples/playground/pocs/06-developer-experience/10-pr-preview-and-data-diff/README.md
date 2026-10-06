@@ -3,7 +3,7 @@
 > **Category:** 06-developer-experience
 > **Credentials:** none (DuckDB)
 > **Runtime:** < 30s
-> **Rocky features:** `rocky preview create`, `rocky preview diff`, `rocky preview cost`
+> **Rocky features:** `rocky preview create`, `rocky run --branch`, `rocky preview diff`, `rocky preview cost`
 
 ## What it shows
 
@@ -53,19 +53,20 @@ without committing it (POCs don't create commits). So in a local run:
 - With an empty prune set, `preview create` copies **all 5** models from
   the base schema via CTAS (`copy_strategy: "ctas"`) and re-runs none;
   `run_status` is `"planned"` with an empty `run_id`.
-- Because nothing ran `rocky run --branch pr_preview_poc_10`, there is
-  no branch run in the state store, so `preview diff` reports
-  `models: []` (*"No paired runs in the state store"*) and
-  `preview cost` reports an empty `branch_run_id` (*"No branch run
-  yet"*).
+- `run.sh` then runs `rocky run --branch pr_preview_poc_10` itself. That
+  run builds all 5 models, with the working-tree edit, into the branch
+  schema and records a branch run in the state store.
+- `preview diff` and `preview cost` pair that branch run against the
+  base run from step 4. `run.sh` fails unless both found it: the diff
+  must cover at least one model, and the cost output must name a
+  `branch_run_id`.
 
 The local run therefore exercises the **CLI surface, branch
-registration, CTAS copy-from-base, and all three output schemas**. A
-non-empty prune set needs a committed diff. The row-level data diff and
-the cost delta also need a run recorded with `rocky run --branch
-<name>`. Neither `run.sh` nor the composite GitHub Action runs it yet
-([#2162](https://github.com/rocky-data/rocky/issues/2162)), so both
-stay empty.
+registration, CTAS copy-from-base, the branch run, and the paired diff
+and cost**. Only a non-empty prune set needs a committed diff. The
+composite GitHub Action runs the same `rocky run --branch` step between
+`preview create` and `preview diff`, skipping it when the prune set is
+empty ([#2162](https://github.com/rocky-data/rocky/issues/2162)).
 
 ## Why it's distinctive
 
@@ -124,6 +125,7 @@ Compare:
     ├── compile.json                 from `rocky compile`
     ├── run_main.json                from `rocky run`
     ├── preview_create.json          from `rocky preview create`
+    ├── run_branch.json              from `rocky run --branch`
     ├── preview_diff.json            from `rocky preview diff` (sampled)
     ├── preview_diff_bisection.json  from `rocky preview diff --algorithm bisection`
     └── preview_cost.json            from `rocky preview cost`
@@ -186,13 +188,15 @@ cd examples/playground/pocs/06-developer-experience/10-pr-preview-and-data-diff
    registers the branch and, with an empty prune set, copies all 5
    models from the base schema via DuckDB CTAS
    (`copy_strategy: "ctas"`).
-8. `rocky preview diff --name pr_preview_poc_10` — row-count diff
+8. `rocky run --branch pr_preview_poc_10` — runs the pipeline, with the
+   edit, into the branch schema and records the branch run.
+9. `rocky preview diff --name pr_preview_poc_10` — row-count diff
    between the branch run and the base run. Re-invoked with
-   `--algorithm bisection`. Both report no paired branch run in a
-   local run.
-9. `rocky preview cost --name pr_preview_poc_10` — per-model bytes /
-   duration / USD delta vs. the newest run that is not the branch's own.
-10. Reverts the synthetic change (`trap`-protected, idempotent).
+   `--algorithm bisection`, which skips the POC's `full_refresh` models.
+10. `rocky preview cost --name pr_preview_poc_10` — per-model bytes /
+    duration / USD delta vs. the base run.
+11. Checks that diff and cost both paired with the branch run, then
+    reverts the synthetic change (`trap`-protected, idempotent).
 
 ## Related
 
