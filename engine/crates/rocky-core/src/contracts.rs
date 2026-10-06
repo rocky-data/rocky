@@ -192,9 +192,13 @@ pub fn validate_contract(
 /// *evolution*, which a single-table load can't meaningfully evaluate (there
 /// is no prior target snapshot in scope). When declared, they are surfaced
 /// as warnings rather than silently ignored.
+///
+/// `dialect` names the warehouse that described `landed_columns`. It changes
+/// one reading only — see [`GateDialect`].
 pub fn validate_contract_typed(
     contract: &ContractConfig,
     landed_columns: &[ColumnInfo],
+    dialect: GateDialect,
 ) -> ContractResult {
     let mut violations = Vec::new();
     let mut warnings = Vec::new();
@@ -247,8 +251,11 @@ pub fn validate_contract_typed(
         // data, and the remedy is to edit the contract — so naming it is
         // the useful response. The same shape is closed on the
         // compile-time gate by I003 (#1240).
-        let landed_ty = warehouse_type_to_rocky(&col.data_type);
-        let expected_ty = warehouse_type_to_rocky(&req.data_type);
+        //
+        // Both sides are read under the warehouse's own rules, so a bare
+        // BigQuery `NUMERIC` means `NUMERIC(38, 9)` on either side (#1856).
+        let landed_ty = gate_type_to_rocky(&col.data_type, dialect);
+        let expected_ty = gate_type_to_rocky(&req.data_type, dialect);
         let landed_unknown = landed_ty == RockyType::Unknown;
         let expected_unknown = expected_ty == RockyType::Unknown;
         if landed_unknown {
@@ -303,6 +310,62 @@ pub fn validate_contract_typed(
         passed: violations.is_empty(),
         violations,
         warnings,
+    }
+}
+
+/// The warehouse whose types the load gate is reading.
+///
+/// [`warehouse_type_to_rocky`] takes no dialect, so a bare `NUMERIC` is
+/// [`RockyType::Unknown`] there: its digits differ across warehouses. The load
+/// gate does know the warehouse, and on BigQuery a bare `NUMERIC` is documented
+/// as `NUMERIC(38, 9)` — and `INFORMATION_SCHEMA.COLUMNS.data_type` reports a
+/// default-precision column as exactly that bare string. Without this a
+/// default-precision BigQuery `NUMERIC` could never satisfy any typed contract
+/// (#1856).
+///
+/// Scoped to the gate on purpose. [`warehouse_type_to_rocky`] is pinned equal
+/// to the compiler's mapper, and a dialect-free `(38, 9)` there would refuse a
+/// Snowflake contract written `NUMERIC` against a landed `NUMBER(38,0)`. The
+/// describe output is not rewritten either: other consumers (drift's widening
+/// allowlist, the compiler's schema cache) match the bare string.
+///
+/// A bare `BIGNUMERIC` stays [`RockyType::Unknown`] on BigQuery too: its
+/// default is `BIGNUMERIC(76.76, 38)`, which no integer `(p, s)` represents.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GateDialect {
+    /// Read every type with [`warehouse_type_to_rocky`] only.
+    Portable,
+    /// BigQuery: additionally read a bare `NUMERIC` as `NUMERIC(38, 9)`.
+    BigQuery,
+}
+
+impl GateDialect {
+    /// The gate reading for a `SqlDialect::name()`. Unknown names get
+    /// [`GateDialect::Portable`], which refuses a bare `NUMERIC` — the reading
+    /// that existed before #1856.
+    #[must_use]
+    pub fn from_dialect_name(name: &str) -> Self {
+        if name == "bigquery" {
+            Self::BigQuery
+        } else {
+            Self::Portable
+        }
+    }
+}
+
+/// BigQuery's documented precision and scale for a bare `NUMERIC`.
+const BIGQUERY_DEFAULT_NUMERIC: RockyType = RockyType::Decimal {
+    precision: 38,
+    scale: 9,
+};
+
+/// [`warehouse_type_to_rocky`], plus the one reading that needs the warehouse.
+fn gate_type_to_rocky(raw: &str, dialect: GateDialect) -> RockyType {
+    match dialect {
+        GateDialect::BigQuery if raw.trim().eq_ignore_ascii_case("NUMERIC") => {
+            BIGQUERY_DEFAULT_NUMERIC
+        }
+        GateDialect::BigQuery | GateDialect::Portable => warehouse_type_to_rocky(raw),
     }
 }
 
@@ -716,7 +779,7 @@ mod tests {
             ..Default::default()
         };
         let landed = vec![col_n("id", "BIGINT", true), col_n("name", "VARCHAR", true)];
-        let result = validate_contract_typed(&contract, &landed);
+        let result = validate_contract_typed(&contract, &landed, GateDialect::Portable);
         assert!(result.passed, "violations: {:?}", result.violations);
         assert!(
             result.warnings.is_empty(),
@@ -736,7 +799,7 @@ mod tests {
             ..Default::default()
         };
         let landed = vec![col_n("name", "VARCHAR", true)];
-        let result = validate_contract_typed(&contract, &landed);
+        let result = validate_contract_typed(&contract, &landed, GateDialect::Portable);
         assert!(!result.passed);
         assert_eq!(result.violations[0].rule, "required_column");
     }
@@ -753,7 +816,7 @@ mod tests {
             ..Default::default()
         };
         let landed = vec![col_n("id", "BIGINT", true)];
-        let result = validate_contract_typed(&contract, &landed);
+        let result = validate_contract_typed(&contract, &landed, GateDialect::Portable);
         assert!(!result.passed);
         assert_eq!(result.violations[0].rule, "required_column_type");
     }
@@ -771,7 +834,7 @@ mod tests {
             ..Default::default()
         };
         let landed = vec![col_n("name", "VARCHAR", true)];
-        let result = validate_contract_typed(&contract, &landed);
+        let result = validate_contract_typed(&contract, &landed, GateDialect::Portable);
         assert!(result.passed, "violations: {:?}", result.violations);
     }
 
@@ -789,7 +852,7 @@ mod tests {
             ..Default::default()
         };
         let landed = vec![col_n("id", "INT", true)];
-        let result = validate_contract_typed(&contract, &landed);
+        let result = validate_contract_typed(&contract, &landed, GateDialect::Portable);
         assert!(result.passed, "violations: {:?}", result.violations);
     }
 
@@ -806,7 +869,7 @@ mod tests {
             ..Default::default()
         };
         let landed = vec![col_n("id", "BIGINT", true)];
-        let result = validate_contract_typed(&contract, &landed);
+        let result = validate_contract_typed(&contract, &landed, GateDialect::Portable);
         assert!(!result.passed);
         assert_eq!(result.violations[0].rule, "required_column_type");
     }
@@ -829,7 +892,11 @@ mod tests {
                 }],
                 ..Default::default()
             };
-            let result = validate_contract_typed(&contract, &[col_n("amount", landed_type, true)]);
+            let result = validate_contract_typed(
+                &contract,
+                &[col_n("amount", landed_type, true)],
+                GateDialect::Portable,
+            );
 
             assert_eq!(
                 result.passed, should_pass,
@@ -863,7 +930,7 @@ mod tests {
             ..Default::default()
         };
         let landed = vec![col_n("geo", "GEOMETRY", true)];
-        let result = validate_contract_typed(&contract, &landed);
+        let result = validate_contract_typed(&contract, &landed, GateDialect::Portable);
         assert!(
             !result.passed,
             "an uncomparable landed type must refuse, not pass: {result:?}"
@@ -919,7 +986,11 @@ mod tests {
                 }],
                 ..Default::default()
             };
-            let result = validate_contract_typed(&contract, &[col_n("c", landed, true)]);
+            let result = validate_contract_typed(
+                &contract,
+                &[col_n("c", landed, true)],
+                GateDialect::Portable,
+            );
             assert!(
                 result.passed,
                 "landed '{landed}' against '{declared}' must still pass: {:?}",
@@ -941,7 +1012,7 @@ mod tests {
             ..Default::default()
         };
         let landed = vec![col_n("id", "BIGINT", true)];
-        let result = validate_contract_typed(&contract, &landed);
+        let result = validate_contract_typed(&contract, &landed, GateDialect::Portable);
         assert!(result.passed, "violations: {:?}", result.violations);
         assert_eq!(result.warnings.len(), 1, "warnings: {:?}", result.warnings);
         let w = &result.warnings[0];
@@ -972,7 +1043,7 @@ mod tests {
             ..Default::default()
         };
         let landed = vec![col_n("geo", "GEOMETRY", true)];
-        let result = validate_contract_typed(&contract, &landed);
+        let result = validate_contract_typed(&contract, &landed, GateDialect::Portable);
         assert!(!result.passed, "violations: {:?}", result.violations);
         assert_eq!(
             result.violations.len(),
@@ -1083,7 +1154,11 @@ mod tests {
             }],
             ..Default::default()
         };
-        let result = validate_contract_typed(&contract, &[col_n("amount", "NUMERIC", true)]);
+        let result = validate_contract_typed(
+            &contract,
+            &[col_n("amount", "NUMERIC", true)],
+            GateDialect::Portable,
+        );
 
         assert!(
             !result.passed,
@@ -1100,6 +1175,120 @@ mod tests {
         );
     }
 
+    fn numeric_contract(declared: &str) -> ContractConfig {
+        ContractConfig {
+            required_columns: vec![RequiredColumn {
+                name: "amount".into(),
+                data_type: declared.into(),
+                nullable: true,
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// #1856 — on BigQuery a bare `NUMERIC` is its documented default,
+    /// `NUMERIC(38, 9)`, so a correct contract passes and a narrower one is
+    /// refused by comparison rather than as unverifiable.
+    ///
+    /// Mutation: make `gate_type_to_rocky` ignore `dialect`. The pass
+    /// assertions then fail with `unverifiable_landed_type`.
+    #[test]
+    fn bigquery_bare_numeric_reads_as_its_documented_default() {
+        let landed = [col_n("amount", "NUMERIC", true)];
+        for declared in [
+            "NUMERIC(38,9)",
+            "NUMERIC(38, 9)",
+            "BIGNUMERIC(76,38)",
+            "DECIMAL(40,9)",
+        ] {
+            let result = validate_contract_typed(
+                &numeric_contract(declared),
+                &landed,
+                GateDialect::BigQuery,
+            );
+            assert!(result.passed, "{declared}: {result:?}");
+            assert!(result.warnings.is_empty(), "{declared}: {result:?}");
+        }
+
+        // Spelling of the bare name does not matter.
+        for spelled in ["numeric", " NUMERIC ", "Numeric"] {
+            let result = validate_contract_typed(
+                &numeric_contract("NUMERIC(38,9)"),
+                &[col_n("amount", spelled, true)],
+                GateDialect::BigQuery,
+            );
+            assert!(result.passed, "{spelled:?}: {result:?}");
+        }
+
+        // Narrower contracts are refused as a TYPE mismatch: (38, 9) does not
+        // fit in fewer integer digits or fewer decimal places.
+        for declared in ["NUMERIC(10,2)", "NUMERIC(38,0)", "NUMERIC(38,10)"] {
+            let result = validate_contract_typed(
+                &numeric_contract(declared),
+                &landed,
+                GateDialect::BigQuery,
+            );
+            assert!(!result.passed, "{declared}: {result:?}");
+            assert_eq!(
+                result.violations[0].rule, "required_column_type",
+                "{declared}"
+            );
+        }
+    }
+
+    /// #1856 — the reading is BigQuery's only. The same landed string on any
+    /// other warehouse still refuses as unverifiable, and a bare `BIGNUMERIC`
+    /// still refuses on BigQuery: no integer `(p, s)` covers its range.
+    #[test]
+    fn bare_numeric_default_is_bigquery_only_and_not_bignumeric() {
+        let contract = numeric_contract("NUMERIC(38,9)");
+        for dialect in ["snowflake", "databricks", "duckdb", "trino", ""] {
+            let result = validate_contract_typed(
+                &contract,
+                &[col_n("amount", "NUMERIC", true)],
+                GateDialect::from_dialect_name(dialect),
+            );
+            assert!(!result.passed, "{dialect}: {result:?}");
+            assert_eq!(result.violations[0].rule, "unverifiable_landed_type");
+        }
+
+        let result = validate_contract_typed(
+            &numeric_contract("BIGNUMERIC(76,38)"),
+            &[col_n("amount", "BIGNUMERIC", true)],
+            GateDialect::from_dialect_name("bigquery"),
+        );
+        assert!(!result.passed, "{result:?}");
+        assert_eq!(result.violations[0].rule, "unverifiable_landed_type");
+
+        // A parameterized landed type is read the same everywhere.
+        let result = validate_contract_typed(
+            &numeric_contract("NUMERIC(38,9)"),
+            &[col_n("amount", "NUMERIC(10, 2)", true)],
+            GateDialect::BigQuery,
+        );
+        assert!(result.passed, "{result:?}");
+    }
+
+    /// #1856 — the declared side is read under the same rule on BigQuery, so a
+    /// contract written bare `NUMERIC` is checked rather than skipped with a
+    /// warning. Elsewhere it stays an unchecked-type warning.
+    #[test]
+    fn bigquery_declared_bare_numeric_is_compared() {
+        let contract = numeric_contract("NUMERIC");
+        let fits = [col_n("amount", "NUMERIC(10, 2)", true)];
+        let result = validate_contract_typed(&contract, &fits, GateDialect::BigQuery);
+        assert!(result.passed && result.warnings.is_empty(), "{result:?}");
+
+        let wider = [col_n("amount", "BIGNUMERIC(50, 10)", true)];
+        let result = validate_contract_typed(&contract, &wider, GateDialect::BigQuery);
+        assert!(!result.passed, "{result:?}");
+        assert_eq!(result.violations[0].rule, "required_column_type");
+
+        let result = validate_contract_typed(&contract, &wider, GateDialect::Portable);
+        assert!(result.passed, "{result:?}");
+        assert_eq!(result.warnings.len(), 1, "{result:?}");
+    }
+
     /// The other half of #1646, and the defect #1721 exists to close: a
     /// contract written `NUMERIC(38,0)` accepted a landed bare `NUMERIC`,
     /// which on BigQuery holds nine decimal places. #1646 made it noisy;
@@ -1114,7 +1303,11 @@ mod tests {
             }],
             ..Default::default()
         };
-        let result = validate_contract_typed(&contract, &[col_n("amount", "NUMERIC", true)]);
+        let result = validate_contract_typed(
+            &contract,
+            &[col_n("amount", "NUMERIC", true)],
+            GateDialect::Portable,
+        );
 
         assert!(
             !result.passed,
@@ -1166,7 +1359,11 @@ mod tests {
             }],
             ..Default::default()
         };
-        let result = validate_contract_typed(&contract, &[col_n("amount", "NUMBER(38,0)", true)]);
+        let result = validate_contract_typed(
+            &contract,
+            &[col_n("amount", "NUMBER(38,0)", true)],
+            GateDialect::Portable,
+        );
         assert!(result.passed, "violations: {:?}", result.violations);
         assert_eq!(result.warnings.len(), 1, "warnings: {:?}", result.warnings);
         let w = &result.warnings[0];
@@ -1192,8 +1389,11 @@ mod tests {
             }],
             ..Default::default()
         };
-        let result =
-            validate_contract_typed(&contract, &[col_n("amount", "DECIMAL(10,2,3)", true)]);
+        let result = validate_contract_typed(
+            &contract,
+            &[col_n("amount", "DECIMAL(10,2,3)", true)],
+            GateDialect::Portable,
+        );
         assert!(!result.passed, "violations: {:?}", result.violations);
         assert_eq!(
             result.violations.len(),
@@ -1239,7 +1439,7 @@ mod tests {
             ..Default::default()
         };
         let landed = vec![col_n("id", "BIGINT", true)]; // landed nullable
-        let result = validate_contract_typed(&contract, &landed);
+        let result = validate_contract_typed(&contract, &landed, GateDialect::Portable);
         assert!(!result.passed);
         assert_eq!(result.violations[0].rule, "required_column_nullability");
     }
@@ -1255,7 +1455,7 @@ mod tests {
             }],
         };
         let landed = vec![col_n("id", "BIGINT", true)];
-        let result = validate_contract_typed(&contract, &landed);
+        let result = validate_contract_typed(&contract, &landed, GateDialect::Portable);
         // Unenforceable clauses must surface as warnings, not silently no-op,
         // and must not fail the contract.
         assert!(result.passed);
