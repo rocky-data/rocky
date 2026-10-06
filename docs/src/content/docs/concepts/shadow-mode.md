@@ -200,34 +200,30 @@ does not govern the next, so it asks for an unambiguous spelling instead.
 
 ### CTE names on Snowflake
 
-The same rule decides whether a CTE hides a bare table name. Rocky now folds an
+The same rule decides whether a CTE hides a bare table name. Rocky folds an
 unquoted CTE alias and an unquoted reference to upper case before comparing them,
-and leaves a quoted one as written — the way Snowflake reads them under its
-default `QUOTED_IDENTIFIERS_IGNORE_CASE = FALSE`. Four pairs change answer:
+and leaves a quoted one as written. That is how Snowflake reads them under its
+default `QUOTED_IDENTIFIERS_IGNORE_CASE = FALSE`.
 
-| CTE alias | Reference | Before | Now |
-|---|---|---|---|
-| `orders` | `ORDERS` | free | hidden |
-| `Orders` | `orders` | free | hidden |
-| `"orders"` | `orders` | hidden | free |
-| `orders` | `"orders"` | hidden | free |
+With `QUOTED_IDENTIFIERS_IGNORE_CASE = TRUE`, a double-quoted identifier folds to
+upper case too. Some pairs are then hidden under one setting and free under the
+other. Rocky cannot observe the setting for the statement it is deciding, so it
+refuses those pairs instead of guessing:
 
-An unquoted alias with an identically spelled unquoted reference still hides it,
-which is the ordinary shape and does not change.
+| CTE alias | Reference | `FALSE` (default) | `TRUE` | Rocky |
+|---|---|---|---|---|
+| `orders` | `orders` | hidden | hidden | hidden |
+| `Orders` | `orders` | hidden | hidden | hidden |
+| `"orders"` | `orders` | free | hidden | refuses |
+| `orders` | `"orders"` | free | hidden | refuses |
+| `"Orders"` | `"orders"` | free | hidden | refuses |
 
-In a shadow or branch run the freed reference goes to the matcher, which routes
-it or refuses it. `--defer` has no matcher and no refusal: the freed reference is
-a table reference, and a bare name that matches a model name is that model, so
-`--defer` qualifies it to that model's target.
-
-With `QUOTED_IDENTIFIERS_IGNORE_CASE = TRUE` a double-quoted identifier folds to
-upper case too, so `WITH "orders"` does hide `FROM orders` and Rocky's answer is
-wrong. On `--defer` that is silent, because nothing on that path can refuse.
-Rocky can *observe* the setting on a connection, but that answer describes one
-request and does not govern the next one, so it cannot decide this. The rule
-before this one had the mirror of that problem under the default setting, so the
-error now falls on an opt-out configuration rather than the common one. Tracked
-in issue #1622.
+The refusal applies only when the reference would otherwise name an upstream
+that the command redirects. That covers a deferred model on `--defer`, a routed
+upstream on a shadow or branch run, an upstream on `branch promote`, and a
+recorded upstream on `rocky replay --execute`. To fix it, spell the CTE alias
+and the reference alike: both unquoted, or both quoted with the same case. Or
+rename the CTE. Tracked in issue #1622.
 
 ## Shadow target rewriting
 

@@ -1609,6 +1609,14 @@ fn production_view_sql(
         rewritten.ambiguous_refs,
         rewritten.case_fold_only_refs
     );
+    anyhow::ensure!(
+        rewritten.setting_dependent_refs.is_empty(),
+        "cannot bind production upstreams for view '{}': cannot tell whether reference(s) {:?} \
+         read an upstream or a CTE of the same name. {}",
+        ir.name,
+        rewritten.setting_dependent_refs,
+        super::run::SETTING_DEPENDENT_CTE_REMEDY
+    );
     let mut production_ir = ir.clone();
     production_ir.sql = rewritten.sql;
     // The same SQL generator that `rocky run` uses for a production view.
@@ -4892,6 +4900,61 @@ adapter = "default"
         assert!(
             assert_generated_promote_target(&dialect, PromoteKind::View, &swapped, &sql).is_err()
         );
+    }
+
+    /// #1622 on `branch promote`: binding a promoted view to its production
+    /// upstreams refuses a reference whose CTE binding depends on Snowflake's
+    /// `QUOTED_IDENTIFIERS_IGNORE_CASE`, in both quoting directions.
+    ///
+    /// Mutation: drop the `setting_dependent_refs` ensure in
+    /// `production_view_sql`. Both directions then return `Ok` and fail here.
+    #[test]
+    fn promote_view_refuses_a_setting_dependent_cte_binding() {
+        let tmp = TempDir::new().unwrap();
+        let models = tmp.path().join("models");
+        std::fs::create_dir(&models).unwrap();
+        write_transformation_model(&models, "view", "WAREHOUSE", "MARTS", "V", "SELECT 1 AS id");
+        std::fs::write(
+            models.join("view.toml"),
+            "name = \"view\"\n[strategy]\ntype = \"view\"\n[target]\ncatalog = \
+             \"WAREHOUSE\"\nschema = \"MARTS\"\ntable = \"V\"\n",
+        )
+        .unwrap();
+        let snapshot = crate::models_loader::load_project_models_matching(
+            &models,
+            &format!("{}/**", models.display()),
+            None,
+        )
+        .unwrap();
+        let planned =
+            plan_transformation_from_models(snapshot, &sample_record("fix"), None).unwrap();
+        let base = planned[0].model_ir.as_ref().unwrap();
+        let upstreams = [TargetRef {
+            catalog: "WAREHOUSE".to_string(),
+            schema: "MAIN".to_string(),
+            table: "ORDERS".to_string(),
+        }];
+        let dialect = rocky_snowflake::dialect::SnowflakeSqlDialect;
+        let bind = |sql: &str| {
+            let mut ir = base.clone();
+            ir.sql = sql.to_string();
+            production_view_sql(&dialect, &ir, &upstreams)
+        };
+
+        let (control, used) = bind("SELECT * FROM orders").expect("control binds");
+        assert_eq!(used.len(), 1, "{control}");
+
+        for sql in [
+            "WITH \"orders\" AS (SELECT 1 AS id) SELECT * FROM orders",
+            "WITH orders AS (SELECT 1 AS id) SELECT * FROM \"orders\"",
+        ] {
+            let message = format!("{:#}", bind(sql).expect_err(sql));
+            assert!(
+                message.contains("CTE of the same name")
+                    && message.contains("QUOTED_IDENTIFIERS_IGNORE_CASE"),
+                "{sql}: {message}"
+            );
+        }
     }
 
     #[tokio::test]
