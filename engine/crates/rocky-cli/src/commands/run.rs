@@ -39691,6 +39691,7 @@ auto_create_schemas = true
             env_hash: Some(identity.env_hash.clone()),
             hash_scheme: Some(identity.hash_scheme.clone()),
             output_column_hashes: Some(vec![ch("amount", "H_FCT_OUT")]),
+            output_version: None,
             attempts: Vec::new(),
         };
         let prod_run: rocky_core::state::RunRecord = serde_json::from_value(serde_json::json!({
