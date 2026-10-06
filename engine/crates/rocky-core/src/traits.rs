@@ -610,6 +610,11 @@ pub trait WarehouseAdapter: Send + Sync {
     /// - **Every other adapter:** `Ok(None)`, the default. The runner records
     ///   `Unversioned { reason: adapter_has_no_version }`.
     ///
+    /// The read is optional, so an implementation must make **one attempt**:
+    /// no retries, no draw from a shared run-level retry budget, no circuit
+    /// breaker accounting, and a short timeout. It must never cost the run's
+    /// real writes anything.
+    ///
     /// # Errors
     ///
     /// Returns `AdapterError` if the query fails or its answer has no usable
