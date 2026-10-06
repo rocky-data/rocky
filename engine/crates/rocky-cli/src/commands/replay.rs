@@ -1700,6 +1700,80 @@ fn build_replay_renames(
     Ok(renames)
 }
 
+/// Why an upstream redirection into the replay namespace cannot be trusted,
+/// or `None` when every recorded upstream was redirected unambiguously.
+///
+/// Checked rewrite: every recorded upstream must be located (unambiguously)
+/// among the recipe's table references, otherwise executing the SQL would read
+/// the production upstream's *current* contents.
+fn replay_redirect_refusal(
+    outcome: &rocky_sql::defer::UpstreamRewriteOutcome,
+    renames: &std::collections::HashMap<
+        rocky_sql::defer::TargetIdentity,
+        rocky_sql::defer::DeferTarget,
+    >,
+    case_rules: rocky_sql::defer::IdentifierCaseRules,
+) -> Option<String> {
+    if !outcome.ambiguous_refs.is_empty() {
+        return Some(format!(
+            "table reference(s) {:?} match more than one recorded upstream, so the \
+                 redirection into the replay namespace is ambiguous — fail-closed rather \
+                 than guess which replayed upstream to read",
+            outcome.ambiguous_refs
+        ));
+    }
+    // Reachable for the first time now that real rules are in play. Without
+    // this arm the completeness check below still refuses — fail-closed —
+    // but reports "not found among the recipe's table references", sending
+    // an operator hunting a missing reference when the actual cause is that
+    // the reference and the recorded upstream differ only by case.
+    if !outcome.case_fold_only_refs.is_empty() {
+        return Some(format!(
+            "table reference(s) {:?} match a recorded upstream only when identifier \
+                 case is ignored, and this warehouse treats case as part of object \
+                 identity — so whether they name that upstream cannot be decided here. \
+                 Redirecting could read the wrong table and not redirecting would read \
+                 production, so neither is safe. {} This replay reads a RECORDED run, so \
+                 editing the model now does not change what was recorded: fix the spelling, \
+                 record a new run, and replay that one",
+            outcome.case_fold_only_refs,
+            // The same remedy text the shadow refusal prints, from the
+            // same function. On a folding dialect the reference is
+            // normally spelled EXACTLY like the recorded upstream and
+            // still names another object, so a message that talks only
+            // about case sends the operator hunting a difference that is
+            // not there (#1282).
+            crate::commands::run::case_near_miss_remedy(case_rules)
+        ));
+    }
+    // A reference whose CTE binding depends on Snowflake's
+    // QUOTED_IDENTIFIERS_IGNORE_CASE (#1622). If the recipe ALSO reads the
+    // upstream under another spelling, the completeness check below passes, so
+    // this arm is the only thing standing between the replay and a guess.
+    if !outcome.setting_dependent_refs.is_empty() {
+        return Some(format!(
+            "cannot tell whether table reference(s) {:?} read a recorded upstream or a \
+                 CTE of the same name. {} This replay reads a RECORDED run, so editing the \
+                 model now does not change what was recorded: fix the spelling, record a new \
+                 run, and replay that one",
+            outcome.setting_dependent_refs,
+            crate::commands::run::SETTING_DEPENDENT_CTE_REMEDY
+        ));
+    }
+    if let Some(missing) = renames
+        .keys()
+        .find(|k| !outcome.rewritten_keys.contains(*k))
+    {
+        return Some(format!(
+            "recorded upstream '{missing}' was not found among the recipe's table \
+                 references, so its reference cannot be redirected into the replay \
+                 namespace — fail-closed rather than let the recipe read the production \
+                 upstream's current contents"
+        ));
+    }
+    None
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn replay_execute_warehouse_node(
     store: &StateStore,
@@ -1789,60 +1863,8 @@ async fn replay_execute_warehouse_node(
                 );
             }
         };
-        if !outcome.ambiguous_refs.is_empty() {
-            return non_replayable_exec(
-                &cand.model_name,
-                cand.nondeterministic,
-                vec![format!(
-                    "table reference(s) {:?} match more than one recorded upstream, so the \
-                     redirection into the replay namespace is ambiguous — fail-closed rather \
-                     than guess which replayed upstream to read",
-                    outcome.ambiguous_refs
-                )],
-            );
-        }
-        // Reachable for the first time now that real rules are in play. Without
-        // this arm the completeness check below still refuses — fail-closed —
-        // but reports "not found among the recipe's table references", sending
-        // an operator hunting a missing reference when the actual cause is that
-        // the reference and the recorded upstream differ only by case.
-        if !outcome.case_fold_only_refs.is_empty() {
-            return non_replayable_exec(
-                &cand.model_name,
-                cand.nondeterministic,
-                vec![format!(
-                    "table reference(s) {:?} match a recorded upstream only when identifier \
-                     case is ignored, and this warehouse treats case as part of object \
-                     identity — so whether they name that upstream cannot be decided here. \
-                     Redirecting could read the wrong table and not redirecting would read \
-                     production, so neither is safe. {} This replay reads a RECORDED run, so \
-                     editing the model now does not change what was recorded: fix the spelling, \
-                     record a new run, and replay that one",
-                    outcome.case_fold_only_refs,
-                    // The same remedy text the shadow refusal prints, from the
-                    // same function. On a folding dialect the reference is
-                    // normally spelled EXACTLY like the recorded upstream and
-                    // still names another object, so a message that talks only
-                    // about case sends the operator hunting a difference that is
-                    // not there (#1282).
-                    crate::commands::run::case_near_miss_remedy(case_rules)
-                )],
-            );
-        }
-        if let Some(missing) = renames
-            .keys()
-            .find(|k| !outcome.rewritten_keys.contains(*k))
-        {
-            return non_replayable_exec(
-                &cand.model_name,
-                cand.nondeterministic,
-                vec![format!(
-                    "recorded upstream '{missing}' was not found among the recipe's table \
-                     references, so its reference cannot be redirected into the replay \
-                     namespace — fail-closed rather than let the recipe read the production \
-                     upstream's current contents"
-                )],
-            );
+        if let Some(reason) = replay_redirect_refusal(&outcome, &renames, case_rules) {
+            return non_replayable_exec(&cand.model_name, cand.nondeterministic, vec![reason]);
         }
         outcome.sql
     };
@@ -2537,6 +2559,50 @@ mod tests {
             1,
             "on a folding dialect the two spellings name one object"
         );
+    }
+
+    /// #1622 — a recipe reference whose CTE binding depends on Snowflake's
+    /// `QUOTED_IDENTIFIERS_IGNORE_CASE` refuses the replay, in both quoting
+    /// directions. The recipe also reads the upstream qualified, so the
+    /// completeness check is satisfied and only the setting-dependent arm can
+    /// refuse; the CTE-free control proves that.
+    ///
+    /// Mutation: delete the `setting_dependent_refs` arm in
+    /// `replay_redirect_refusal`. Both directions then return `None`.
+    #[test]
+    fn replay_refuses_a_setting_dependent_cte_binding() {
+        let rules = rocky_sql::defer::IdentifierCaseRules::uniform_uppercasing(true);
+        let renames =
+            super::build_replay_renames(&["DB.MAIN.ORDERS".to_string()], "replay_ns", rules)
+                .unwrap();
+        let refusal = |sql: &str| {
+            let outcome = rocky_sql::defer::rewrite_upstream_refs(
+                sql,
+                &renames,
+                rules,
+                rocky_sql::defer::RecursiveCteVisibility::PrecedingAndSelf,
+            )
+            .unwrap();
+            super::replay_redirect_refusal(&outcome, &renames, rules)
+        };
+
+        assert_eq!(
+            refusal("SELECT * FROM orders JOIN main.orders AS m ON TRUE"),
+            None,
+            "control: without the CTE every reference redirects"
+        );
+        for (cte, reference) in [("\"orders\"", "orders"), ("orders", "\"orders\"")] {
+            let sql = format!(
+                "WITH {cte} AS (SELECT 1 AS id) \
+                 SELECT * FROM {reference} JOIN main.orders AS m ON TRUE"
+            );
+            let reason = refusal(&sql).unwrap_or_else(|| panic!("{cte} / {reference} must refuse"));
+            assert!(
+                reason.contains("CTE of the same name")
+                    && reason.contains("QUOTED_IDENTIFIERS_IGNORE_CASE"),
+                "{cte} / {reference}: {reason}"
+            );
+        }
     }
 
     /// The extracted helper keeps the caller's two fail-closed validations.
