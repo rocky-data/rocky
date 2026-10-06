@@ -155,6 +155,7 @@ fn emit_models_selected(
         run_vars: run_vars.clone(),
         source_provenance: Default::default(),
         preserve_authored_sql: false,
+        external_dependencies: Default::default(),
     };
     let result = match compile::compile(&config) {
         Ok(r) => r,

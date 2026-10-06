@@ -295,6 +295,40 @@
       ],
       "type": "string"
     },
+    "ProductionRunScope": {
+      "description": "Which runs a report about production counted (#2201).\n\nShadow and branch runs are never counted. Runs recorded before runs carried a scope are counted or not per report, and `unrecorded_runs_counted` says which.",
+      "properties": {
+        "excluded_runs": {
+          "description": "Shadow and branch runs the report left out.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "production_runs": {
+          "description": "Runs recorded as production that the report read.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "unrecorded_runs": {
+          "description": "Runs with no recorded scope that the report read.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "unrecorded_runs_counted": {
+          "description": "`true` when runs with no recorded scope count as production in this report. Their write target is unknown.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "excluded_runs",
+        "production_runs",
+        "unrecorded_runs",
+        "unrecorded_runs_counted"
+      ],
+      "type": "object"
+    },
     "RecipeIdentityView": {
       "description": "The recipe-identity triple surfaced on a model record — the answer to \"what exact program, over what inputs, in what environment produced this?\".\n\nRead back from the persisted [`rocky_core::state::ModelExecution`]. Every field is optional: a record written before the triple was captured (state schema predating it) or a failed execution carries none of them, and the input side is absent on the default run path (which observes no inputs). The whole object is omitted from JSON when nothing was recorded — see [`Self::from_execution`] — so output for pre-triple records is unchanged.",
       "properties": {
@@ -372,6 +406,17 @@
     "project_name": {
       "description": "Pipeline name used to build the catalog. When the project has multiple pipelines, this is the first one in declaration order.",
       "type": "string"
+    },
+    "run_scope": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/ProductionRunScope"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Which runs the run-history enrichment read (#2201). Shadow and branch runs never set `last_run_id` or an asset's `last_materialized_at`; runs recorded before runs carried a scope do. Absent when the state store could not be read."
     },
     "stats": {
       "$ref": "#/definitions/CatalogStats"

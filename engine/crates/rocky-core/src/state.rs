@@ -2722,6 +2722,63 @@ pub enum RunScope {
     Branch { name: String },
 }
 
+/// How a reader that reports on production should treat one run (#2201).
+///
+/// Shadow and branch runs wrote somewhere other than production, so a reader
+/// that reports on production never counts them. A run recorded before
+/// [`RunRecord::run_scope`] existed carries no scope: where it wrote is
+/// unknown, and each reader decides on its own whether such runs count —
+/// see [`UnrecordedScope`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProductionScope {
+    /// Recorded with `run_scope = production`.
+    Production,
+    /// Recorded before the scope field existed. Its write target is unknown.
+    Unrecorded,
+    /// A shadow or branch run. Never production.
+    NotProduction,
+}
+
+/// Whether a production reader counts runs whose scope was never recorded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnrecordedScope {
+    /// Count them as production. For reports whose job is to surface what
+    /// happened, where dropping old runs would hide history.
+    Count,
+    /// Leave them out. For readers that act on the answer, where an unknown
+    /// write target must fall back to the safe action.
+    Exclude,
+}
+
+impl RunRecord {
+    /// Classify this run for a reader that reports on production.
+    ///
+    /// A record with no `run_scope` but a `rocky_branch` is a branch run: the
+    /// `rocky_branch` field predates `run_scope` (#2032), so it is known
+    /// evidence, not a guess.
+    #[must_use]
+    pub fn production_scope(&self) -> ProductionScope {
+        match &self.run_scope {
+            Some(RunScope::Production) => ProductionScope::Production,
+            Some(RunScope::Shadow { .. } | RunScope::Branch { .. }) => {
+                ProductionScope::NotProduction
+            }
+            None if self.rocky_branch.is_some() => ProductionScope::NotProduction,
+            None => ProductionScope::Unrecorded,
+        }
+    }
+
+    /// Whether a production reader with policy `unrecorded` counts this run.
+    #[must_use]
+    pub fn counts_as_production(&self, unrecorded: UnrecordedScope) -> bool {
+        match self.production_scope() {
+            ProductionScope::Production => true,
+            ProductionScope::Unrecorded => unrecorded == UnrecordedScope::Count,
+            ProductionScope::NotProduction => false,
+        }
+    }
+}
+
 /// A complete pipeline run record.
 ///
 /// # Governance audit trail (schema v6)
@@ -4025,7 +4082,26 @@ impl StateStore {
         model_name: &str,
         limit: usize,
     ) -> Result<Vec<ModelExecution>, StateError> {
+        self.get_model_history_matching(model_name, limit, |_| true)
+    }
+
+    /// [`Self::get_model_history`] over only the runs `keep` accepts.
+    ///
+    /// The run predicate runs inside the scan, before the cap, for the same
+    /// reason the model filter does: filtering a capped page afterwards would
+    /// return fewer executions than exist. Production readers pass
+    /// [`RunRecord::counts_as_production`] here so shadow and branch builds
+    /// never stand in for production ones (#2201).
+    pub fn get_model_history_matching(
+        &self,
+        model_name: &str,
+        limit: usize,
+        keep: impl Fn(&RunRecord) -> bool,
+    ) -> Result<Vec<ModelExecution>, StateError> {
         let per_run = self.scan_runs_newest_first(limit, |run| {
+            if !keep(&run) {
+                return None;
+            }
             let execs: Vec<ModelExecution> = run
                 .models_executed
                 .into_iter()
@@ -5981,6 +6057,16 @@ impl StateStore {
     /// evaluate `after` (upstream success completion) and `freshness` (own run
     /// staleness). A `None`-pipeline record — a model-only run, or one predating
     /// the field — never matches, so it can neither satisfy nor block a demand.
+    ///
+    /// Only production runs count (#2201). A `--shadow` or `--branch` run of
+    /// the pipeline built somewhere else, so it must neither satisfy a
+    /// downstream's `after` demand nor reset its own `freshness` budget. A run
+    /// recorded before `run_scope` existed is NOT counted
+    /// ([`UnrecordedScope::Exclude`]): it may have been a `--shadow` run, and
+    /// counting it could silently skip a due production run. The cost of
+    /// excluding it is bounded and visible: right after an upgrade a
+    /// `freshness` pipeline reads as never run and fires once, and an `after`
+    /// downstream waits for its upstream's next production success.
     pub fn latest_successful_run(&self, pipeline: &str) -> Result<Option<RunRecord>, StateError> {
         let txn = self.db.begin_read()?;
         let table = txn.open_table(RUN_HISTORY)?;
@@ -5990,6 +6076,7 @@ impl StateStore {
             let run: RunRecord = serde_json::from_slice(value.value())?;
             if run.pipeline.as_deref() == Some(pipeline)
                 && run.status == RunStatus::Success
+                && run.counts_as_production(UnrecordedScope::Exclude)
                 && best
                     .as_ref()
                     .is_none_or(|b| run.finished_at > b.finished_at)
@@ -9438,6 +9525,94 @@ mod tests {
         txn.commit().unwrap();
         assert_eq!(store.get_run("old").unwrap().unwrap().run_scope, None);
         assert_eq!(store.list_runs(1).unwrap()[0].run_scope, None);
+    }
+
+    /// #2201: the production classification of every scope, including the
+    /// pre-#2200 record that names a Rocky branch — known branch evidence, not
+    /// an unknown scope.
+    #[test]
+    fn production_scope_classifies_every_recorded_shape() {
+        let mut run = minimal_run_record("r", vec![]);
+        assert_eq!(run.production_scope(), ProductionScope::Production);
+        run.run_scope = Some(RunScope::Shadow { schema: None });
+        assert_eq!(run.production_scope(), ProductionScope::NotProduction);
+        run.run_scope = Some(RunScope::Branch { name: "b".into() });
+        assert_eq!(run.production_scope(), ProductionScope::NotProduction);
+        run.run_scope = None;
+        assert_eq!(run.production_scope(), ProductionScope::Unrecorded);
+        assert!(run.counts_as_production(UnrecordedScope::Count));
+        assert!(!run.counts_as_production(UnrecordedScope::Exclude));
+        run.rocky_branch = Some("b".into());
+        assert_eq!(run.production_scope(), ProductionScope::NotProduction);
+        assert!(!run.counts_as_production(UnrecordedScope::Count));
+    }
+
+    /// #2201: a shadow run of a pipeline must not satisfy the scheduler's
+    /// "latest successful run" — it built somewhere other than production.
+    #[test]
+    fn latest_successful_run_ignores_shadow_and_branch_runs() {
+        let (store, _dir) = temp_store();
+        let t0 = Utc::now() - chrono::Duration::hours(3);
+        let mut prod = minimal_run_record("prod", vec![]);
+        prod.pipeline = Some("raw".into());
+        prod.started_at = t0;
+        prod.finished_at = t0;
+        store.record_run(&prod).unwrap();
+        let mut shadow = minimal_run_record("shadow", vec![]);
+        shadow.pipeline = Some("raw".into());
+        shadow.run_scope = Some(RunScope::Shadow { schema: None });
+        shadow.started_at = t0 + chrono::Duration::hours(1);
+        shadow.finished_at = shadow.started_at;
+        store.record_run(&shadow).unwrap();
+        let mut branch = minimal_run_record("branch", vec![]);
+        branch.pipeline = Some("raw".into());
+        branch.run_scope = Some(RunScope::Branch { name: "b".into() });
+        branch.started_at = t0 + chrono::Duration::hours(2);
+        branch.finished_at = branch.started_at;
+        store.record_run(&branch).unwrap();
+
+        let latest = store.latest_successful_run("raw").unwrap().unwrap();
+        assert_eq!(latest.run_id, "prod");
+
+        // A newer pre-#2200 record (no scope) does not count either: it may
+        // have been a shadow run.
+        let mut legacy = minimal_run_record("legacy", vec![]);
+        legacy.pipeline = Some("raw".into());
+        legacy.run_scope = None;
+        legacy.started_at = t0 + chrono::Duration::minutes(30);
+        legacy.finished_at = legacy.started_at;
+        store.record_run(&legacy).unwrap();
+        let latest = store.latest_successful_run("raw").unwrap().unwrap();
+        assert_eq!(latest.run_id, "prod");
+    }
+
+    /// #2201: the scoped model history skips executions from runs the
+    /// predicate rejects, inside the scan rather than after the cap.
+    #[test]
+    fn model_history_matching_filters_runs_before_the_cap() {
+        let (store, _dir) = temp_store();
+        let exec = |run: &str| ModelExecution {
+            sql_hash: run.to_string(),
+            ..model_execution("m")
+        };
+        let t0 = Utc::now() - chrono::Duration::hours(2);
+        let mut prod = minimal_run_record("prod", vec![exec("prod")]);
+        prod.started_at = t0;
+        store.record_run(&prod).unwrap();
+        let mut shadow = minimal_run_record("shadow", vec![exec("shadow")]);
+        shadow.run_scope = Some(RunScope::Shadow { schema: None });
+        shadow.started_at = t0 + chrono::Duration::hours(1);
+        store.record_run(&shadow).unwrap();
+
+        let all = store.get_model_history("m", 1).unwrap();
+        assert_eq!(all[0].sql_hash, "shadow");
+        let scoped = store
+            .get_model_history_matching("m", 1, |r| {
+                r.counts_as_production(UnrecordedScope::Exclude)
+            })
+            .unwrap();
+        assert_eq!(scoped.len(), 1);
+        assert_eq!(scoped[0].sql_hash, "prod");
     }
 
     #[test]

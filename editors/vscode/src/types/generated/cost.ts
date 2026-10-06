@@ -6,6 +6,11 @@
  */
 
 /**
+ * Where a recorded run wrote its results, as `rocky history` and `rocky cost` report it (#2201).
+ */
+export type RunScopeKind = "production" | "shadow" | "branch" | "unrecorded";
+
+/**
  * JSON output for `rocky cost <run_id|latest>`.
  *
  * Historical per-run cost attribution read from the embedded state store's [`rocky_core::state::RunRecord`]. Re-derives per-model cost via [`rocky_core::cost::compute_observed_cost_usd`] — the same formula [`RunOutput::populate_cost_summary`] applies at the end of a live run. The per-model and per-run totals make the "what did my last run cost?" question answerable from the recorded run alone, without re-materialising tables.
@@ -32,6 +37,10 @@ export interface CostOutput {
   groups?: CostGroup[] | null;
   per_model: PerModelCostHistorical[];
   run_id: string;
+  /**
+   * Where the reported run wrote (#2201). `rocky cost latest` reports the newest production run: shadow and branch runs are skipped, and a run recorded before runs carried a scope is eligible and reads `unrecorded` here. An explicit run id reports that run, whatever its scope.
+   */
+  run_scope?: RunScopeKind & string;
   started_at: string;
   status: string;
   /**

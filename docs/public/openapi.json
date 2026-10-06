@@ -3531,6 +3531,20 @@
             ],
             "description": "Data-quality status in the window."
           },
+          "run_scope": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ProductionRunScope"
+              }
+            ],
+            "default": {
+              "excluded_runs": 0,
+              "production_runs": 0,
+              "unrecorded_runs": 0,
+              "unrecorded_runs_counted": false
+            },
+            "description": "Which of the window's runs the digest counted (#2201). A brief reports on production: shadow and branch runs are left out of every run-derived section. Runs recorded before runs carried a scope are counted, so a pre-upgrade failure is never hidden."
+          },
           "runs": {
             "allOf": [
               {
@@ -4308,6 +4322,17 @@
           "project_name": {
             "description": "Pipeline name used to build the catalog. When the project has multiple pipelines, this is the first one in declaration order.",
             "type": "string"
+          },
+          "run_scope": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ProductionRunScope"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Which runs the run-history enrichment read (#2201). Shadow and branch runs never set `last_run_id` or an asset's `last_materialized_at`; runs recorded before runs carried a scope do. Absent when the state store could not be read."
           },
           "stats": {
             "$ref": "#/components/schemas/CatalogStats"
@@ -5985,6 +6010,15 @@
           },
           "run_id": {
             "type": "string"
+          },
+          "run_scope": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/RunScopeKind"
+              }
+            ],
+            "default": "unrecorded",
+            "description": "Where the reported run wrote (#2201). `rocky cost latest` reports the newest production run: shadow and branch runs are skipped, and a run recorded before runs carried a scope is eligible and reads `unrecorded` here. An explicit run id reports that run, whatever its scope."
           },
           "started_at": {
             "type": "string"
@@ -11687,6 +11721,12 @@
             "minimum": 0.0,
             "type": "integer"
           },
+          "excluded_non_production_snapshots": {
+            "description": "Quality snapshots skipped, while reading the newest ones, because a shadow or branch run wrote them (#2201): they measured a non-production table. A snapshot whose run carries no recorded scope, or whose run record is gone, is kept. Omitted when zero.",
+            "format": "uint",
+            "minimum": 0.0,
+            "type": "integer"
+          },
           "message": {
             "type": [
               "string",
@@ -12693,6 +12733,20 @@
               "$ref": "#/components/schemas/OptimizeRecommendation"
             },
             "type": "array"
+          },
+          "run_scope": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ProductionRunScope"
+              }
+            ],
+            "default": {
+              "excluded_runs": 0,
+              "production_runs": 0,
+              "unrecorded_runs": 0,
+              "unrecorded_runs_counted": false
+            },
+            "description": "Which runs the recommendations were computed from. Shadow and branch runs are left out; runs with no recorded scope are counted, so history from before #2200 still informs the averages (#2201)."
           },
           "total_models_analyzed": {
             "format": "uint",
@@ -16566,6 +16620,40 @@
         ],
         "type": "object"
       },
+      "ProductionRunScope": {
+        "description": "Which runs a report about production counted (#2201).\n\nShadow and branch runs are never counted. Runs recorded before runs carried a scope are counted or not per report, and `unrecorded_runs_counted` says which.",
+        "properties": {
+          "excluded_runs": {
+            "description": "Shadow and branch runs the report left out.",
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "production_runs": {
+            "description": "Runs recorded as production that the report read.",
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "unrecorded_runs": {
+            "description": "Runs with no recorded scope that the report read.",
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "unrecorded_runs_counted": {
+            "description": "`true` when runs with no recorded scope count as production in this report. Their write target is unknown.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "excluded_runs",
+          "production_runs",
+          "unrecorded_runs",
+          "unrecorded_runs_counted"
+        ],
+        "type": "object"
+      },
       "ProfileColumnStats": {
         "description": "Observed data profile for one column.",
         "properties": {
@@ -16902,6 +16990,15 @@
           },
           "run_id": {
             "type": "string"
+          },
+          "run_scope": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/RunScopeKind"
+              }
+            ],
+            "default": "unrecorded",
+            "description": "Where it wrote (#2201). The last run reported here is the newest production run, or one recorded before runs carried a scope (`unrecorded`); shadow and branch runs are never reported here."
           },
           "started_at": {
             "description": "RFC 3339.",
@@ -20057,6 +20154,15 @@
           "run_id": {
             "type": "string"
           },
+          "run_scope": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/RunScopeKind"
+              }
+            ],
+            "default": "unrecorded",
+            "description": "Where the run wrote: `production`, `shadow`, `branch`, or `unrecorded` for a run recorded before runs carried a scope (#2201). Always emitted, like [`Self::pipeline`], because readers that report on production count only `production` runs."
+          },
           "session_source": {
             "description": "Session origin — `\"cli\"`, `\"dagster\"`, `\"lsp\"`, or `\"http_api\"`. Emitted as the lowercase variant string so JSON consumers can match on it without knowing the Rust enum shape.",
             "type": [
@@ -20394,6 +20500,39 @@
           }
         },
         "type": "object"
+      },
+      "RunScopeKind": {
+        "description": "Where a recorded run wrote its results, as `rocky history` and `rocky cost` report it (#2201).",
+        "oneOf": [
+          {
+            "description": "Wrote production targets.",
+            "enum": [
+              "production"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "`rocky run --shadow` / `--shadow-schema`: wrote shadow targets.",
+            "enum": [
+              "shadow"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "`rocky run --branch <name>`: wrote a named Rocky branch.",
+            "enum": [
+              "branch"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "Recorded before runs carried a scope (#2200). Where it wrote is unknown. Also what a reader of an older payload without the field sees.",
+            "enum": [
+              "unrecorded"
+            ],
+            "type": "string"
+          }
+        ]
       },
       "RunStatus": {
         "description": "Status of a pipeline run.\n\n`Success` / `PartialFailure` / `Failure` cover the terminal outcomes of a run that actually executed. `SkippedIdempotent` / `SkippedInFlight` are the short-circuit outcomes of `rocky run --idempotency-key` — see [`crate::idempotency`].",

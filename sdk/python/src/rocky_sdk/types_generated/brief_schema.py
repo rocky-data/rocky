@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from enum import StrEnum
 
-from pydantic import BaseModel, conint
+from pydantic import BaseModel, Field, conint
 
 
 class BriefBudgetStatus(BaseModel):
@@ -299,6 +299,31 @@ class PolicyPrincipal6(StrEnum):
     """
 
     agent = "agent"
+
+
+class ProductionRunScope(BaseModel):
+    """
+    Which runs a report about production counted (#2201).
+
+    Shadow and branch runs are never counted. Runs recorded before runs carried a scope are counted or not per report, and `unrecorded_runs_counted` says which.
+    """
+
+    excluded_runs: conint(ge=0)
+    """
+    Shadow and branch runs the report left out.
+    """
+    production_runs: conint(ge=0)
+    """
+    Runs recorded as production that the report read.
+    """
+    unrecorded_runs: conint(ge=0)
+    """
+    Runs with no recorded scope that the report read.
+    """
+    unrecorded_runs_counted: bool
+    """
+    `true` when runs with no recorded scope count as production in this report. Their write target is unknown.
+    """
 
 
 class SectionAvailability7(StrEnum):
@@ -704,6 +729,18 @@ class BriefOutput(BaseModel):
     quality: BriefQualitySection
     """
     Data-quality status in the window.
+    """
+    run_scope: ProductionRunScope | None = Field(
+        {
+            "excluded_runs": 0,
+            "production_runs": 0,
+            "unrecorded_runs": 0,
+            "unrecorded_runs_counted": False,
+        },
+        validate_default=True,
+    )
+    """
+    Which of the window's runs the digest counted (#2201). A brief reports on production: shadow and branch runs are left out of every run-derived section. Runs recorded before runs carried a scope are counted, so a pre-upgrade failure is never hidden.
     """
     runs: BriefRunsSection
     """

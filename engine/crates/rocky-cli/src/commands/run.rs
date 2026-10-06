@@ -1059,6 +1059,14 @@ pub struct DeferOptions {
     /// selection is exactly what `--defer` defers *around*. A selection of one
     /// model is passed as `--model` instead, so that path stays unchanged.
     pub selected_models: Option<BTreeSet<String>>,
+    /// Names a model's `depends_on` may list that the caller resolved outside
+    /// this run's models: the seeds and load pipelines of the `rocky run
+    /// --dag` graph, which ordered this sub-run after them (#2138). Passed to
+    /// the compile as [`rocky_compiler::compile::CompilerConfig::external_dependencies`].
+    /// Unrelated to `--defer` (nothing is rewritten); it rides here because
+    /// this is the one options value every sub-run already carries to the
+    /// compile. Empty outside `--dag`.
+    pub external_dependencies: std::collections::BTreeSet<String>,
 }
 
 /// Remove the local-model E039 check only after `--defer` has successfully
@@ -11705,6 +11713,7 @@ pub(crate) async fn execute_models_with_explicit_contracts(
         // contract diagnostics to avoid broadening its signature.
         run_vars: run_vars.clone(),
         source_provenance,
+        external_dependencies: defer_opts.external_dependencies.clone(),
         ..Default::default()
     };
 
@@ -13838,11 +13847,16 @@ fn latest_execution_with_run_id(
     store: &StateStore,
     model_name: &str,
 ) -> Option<(String, rocky_core::state::ModelExecution)> {
+    // The same production-only baseline the gate's clause (C) reads (#2201):
+    // the two answer one question and must not disagree about which build
+    // that is.
     let runs = store
         .list_runs_matching(1, |run| {
-            run.models_executed
-                .iter()
-                .any(|m| m.model_name == model_name)
+            run.counts_as_production(rocky_core::state::UnrecordedScope::Exclude)
+                && run
+                    .models_executed
+                    .iter()
+                    .any(|m| m.model_name == model_name)
         })
         .ok()?;
     runs.into_iter().find_map(|run| {
@@ -33450,6 +33464,7 @@ backend = "local"
                 enabled: true,
                 defer_to: Some("prod".to_string()),
                 selected_models: None,
+                ..Default::default()
             },
             &rocky_databricks::dialect::DatabricksSqlDialect,
         )
@@ -34535,6 +34550,7 @@ auto_create_schemas = true
                     enabled: true,
                     defer_to: None,
                     selected_models: None,
+                    ..Default::default()
                 },
                 &rocky_snowflake::dialect::SnowflakeSqlDialect,
             )
@@ -35845,6 +35861,7 @@ auto_create_schemas = true
             enabled: true,
             defer_to: None,
             selected_models: None,
+            ..Default::default()
         };
         let mut output = RunOutput::new(String::new(), 0, 1);
 
@@ -36689,6 +36706,80 @@ auto_create_schemas = true
         );
     }
 
+    /// #2201: the plain gate's baseline is the latest PRODUCTION build.
+    ///
+    /// Production built predicate A. A shadow run then built predicate B (the
+    /// shadow run is simulated by re-recording run-2 with a shadow scope; the
+    /// gate reads only the record). A production run of B must BUILD — its
+    /// production table still holds A — instead of skipping on the shadow
+    /// build's matching logic hash.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn gate_ignores_a_newer_shadow_build_as_baseline() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir(&models_dir).unwrap();
+        let db = tmp.path().join("g.duckdb");
+        let state = StateStore::open(&tmp.path().join("state")).unwrap();
+
+        seed_src(&db, 5).await;
+        write_model_with_skip(
+            &models_dir,
+            "agg",
+            "SELECT id FROM main.src WHERE id > 1",
+            "",
+        );
+        run_with_gate(
+            &models_dir,
+            &db,
+            &state,
+            active_gate(true, 0),
+            "run-1",
+            rocky_core::state::RunStatus::Success,
+        )
+        .await;
+
+        write_model_with_skip(
+            &models_dir,
+            "agg",
+            "SELECT id FROM main.src WHERE id > 2",
+            "",
+        );
+        run_with_gate(
+            &models_dir,
+            &db,
+            &state,
+            active_gate(true, 0),
+            "run-2",
+            rocky_core::state::RunStatus::Success,
+        )
+        .await;
+        let mut shadow = state.get_run("run-2").unwrap().expect("run-2 recorded");
+        shadow.run_scope = Some(rocky_core::state::RunScope::Shadow { schema: None });
+        state.record_run(&shadow).unwrap();
+
+        let out3 = run_with_gate(
+            &models_dir,
+            &db,
+            &state,
+            active_gate(true, 0),
+            "run-3",
+            rocky_core::state::RunStatus::Success,
+        )
+        .await;
+        assert!(
+            built(&out3, "agg"),
+            "a shadow build must not be the production skip baseline"
+        );
+        assert_eq!(
+            decision_for(&out3, "agg"),
+            Some((
+                crate::output::ModelDecision::Build,
+                "model logic changed since last build"
+            )),
+        );
+    }
+
     /// Upstream rowcount changed ⇒ BUILD (rowcount-fallback signal).
     #[cfg(feature = "duckdb")]
     #[tokio::test]
@@ -37507,6 +37598,7 @@ auto_create_schemas = true
                     enabled: true,
                     defer_to: Some("prod".to_string()),
                     selected_models: None,
+                    ..Default::default()
                 },
                 SkipGateConfig {
                     feature_enabled: false,
@@ -37578,6 +37670,7 @@ auto_create_schemas = true
                         enabled: true,
                         defer_to: Some("prod".to_string()),
                         selected_models: None,
+                        ..Default::default()
                     },
                     SkipGateConfig {
                         feature_enabled: false,
@@ -37645,6 +37738,7 @@ auto_create_schemas = true
                     enabled: true,
                     defer_to: Some("prod".to_string()),
                     selected_models: None,
+                    ..Default::default()
                 },
                 SkipGateConfig {
                     feature_enabled: false,
@@ -39417,6 +39511,143 @@ auto_create_schemas = true
             }
             _ => panic!("expected a skip on the out-of-window prior build"),
         }
+    }
+
+    /// #2201: the column-skip baseline is the latest PRODUCTION build.
+    ///
+    /// A newer shadow build of `fct` (a failed one here, so taking it as the
+    /// baseline forces a build) must not displace the production build the
+    /// gate skips on. And a build whose run carries no recorded scope is not
+    /// a trusted baseline at all: where it wrote is unknown, so the gate
+    /// builds.
+    #[test]
+    fn column_skip_baseline_is_the_latest_production_build() {
+        use rocky_ir::{GovernanceConfig, TargetRef};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = StateStore::open(&tmp.path().join("state")).unwrap();
+        let mut model_ir = ModelIr::transformation(
+            TargetRef {
+                catalog: "cat".into(),
+                schema: "sch".into(),
+                table: "fct".into(),
+            },
+            MaterializationStrategy::ContentAddressed {
+                storage_prefix: "s3://bucket/fct".into(),
+                partition_columns: vec![],
+            },
+            vec![],
+            "SELECT amount FROM u".into(),
+            GovernanceConfig {
+                permissions_file: None,
+                auto_create_catalogs: false,
+                auto_create_schemas: false,
+            },
+            None,
+            None,
+        );
+        model_ir.name = std::sync::Arc::from("fct");
+        let adapter = "duckdb";
+        let identity = crate::output::recipe_identity_internal(&model_ir, adapter);
+        let target_by_model = build_reuse_target_by_model([("u", &target_cfg("cat", "sch", "u"))]);
+        let mut built = std::collections::HashMap::new();
+        built.insert("cat.sch.u".to_string(), vec![ch("amount", "H_AMOUNT")]);
+        let prior_baseline =
+            compute_consumer_baseline(&model_ir.sql, &target_by_model, &built).unwrap();
+        let now = chrono::DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap();
+        let prior_exec = rocky_core::state::ModelExecution {
+            model_name: "fct".to_string(),
+            started_at: now,
+            finished_at: now,
+            duration_ms: 0,
+            rows_affected: None,
+            status: "success".to_string(),
+            sql_hash: String::new(),
+            skip_hash: None,
+            upstream_freshness: Some(prior_baseline),
+            bytes_scanned: None,
+            bytes_written: None,
+            tenant: None,
+            recipe_hash: Some(identity.recipe_hash.clone()),
+            input_hash: None,
+            input_proof_class: None,
+            env_hash: Some(identity.env_hash.clone()),
+            hash_scheme: Some(identity.hash_scheme.clone()),
+            output_column_hashes: Some(vec![ch("amount", "H_FCT_OUT")]),
+            attempts: Vec::new(),
+        };
+        let prod_run: rocky_core::state::RunRecord = serde_json::from_value(serde_json::json!({
+            "run_id": "run-prod",
+            "started_at": now,
+            "finished_at": now,
+            "status": "Success",
+            "models_executed": [],
+            "trigger": "Manual",
+            "config_hash": "cfg",
+            "run_scope": "production",
+        }))
+        .unwrap();
+        let mut prod_run = prod_run;
+        prod_run.models_executed = vec![prior_exec.clone()];
+        store.record_run(&prod_run).unwrap();
+        store
+            .record_artifact(&rocky_core::state::ArtifactRecord {
+                blake3_hash: "F1HASH".to_string(),
+                run_id: "run-prod".to_string(),
+                model_name: "fct".to_string(),
+                file_path: "s3://bucket/fct/F1HASH.parquet".to_string(),
+                commit_version: 0,
+                size_bytes: 100,
+                written_at: now,
+            })
+            .unwrap();
+
+        let mut shadow = prod_run.clone();
+        shadow.run_id = "run-shadow".to_string();
+        shadow.started_at = now + chrono::Duration::minutes(1);
+        shadow.finished_at = shadow.started_at;
+        shadow.run_scope = Some(rocky_core::state::RunScope::Shadow { schema: None });
+        shadow.models_executed[0].status = "failed".to_string();
+        store.record_run(&shadow).unwrap();
+
+        let decide = |store: &StateStore| {
+            try_content_addressed_column_skip(
+                true,
+                false,
+                "fct",
+                &model_ir,
+                adapter,
+                Some(store),
+                &target_by_model,
+                &built,
+            )
+        };
+        match decide(&store) {
+            ColumnSkipOutcome::Skip { prior_blake3, .. } => assert_eq!(prior_blake3, "F1HASH"),
+            _ => panic!("the newer shadow build must not displace the production baseline"),
+        }
+
+        // The same production build, recorded before runs carried a scope.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = StateStore::open(&tmp.path().join("state")).unwrap();
+        let mut legacy = prod_run.clone();
+        legacy.run_scope = None;
+        store.record_run(&legacy).unwrap();
+        store
+            .record_artifact(&rocky_core::state::ArtifactRecord {
+                blake3_hash: "F1HASH".to_string(),
+                run_id: "run-prod".to_string(),
+                model_name: "fct".to_string(),
+                file_path: "s3://bucket/fct/F1HASH.parquet".to_string(),
+                commit_version: 0,
+                size_bytes: 100,
+                written_at: now,
+            })
+            .unwrap();
+        assert!(
+            matches!(decide(&store), ColumnSkipOutcome::Build),
+            "a build of unknown scope is not a trusted skip baseline"
+        );
     }
 
     /// FIX-cluster regression: the column-level skip **fails closed on a

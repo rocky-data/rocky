@@ -147,6 +147,12 @@ pub struct CompilerConfig {
     /// this: it maps diagnostics and symbols onto the authored text. Every
     /// command that executes or renders SQL leaves it `false`.
     pub preserve_authored_sql: bool,
+    /// Names a model's `depends_on` may list that are satisfied outside the
+    /// compiled models — today, the seeds `rocky run --dag` resolved and
+    /// ordered before the model's sub-run (#2138). Such an entry is left out
+    /// of the model DAG instead of being refused as an unknown model. Empty by
+    /// default: every other caller still refuses an unknown name.
+    pub external_dependencies: std::collections::BTreeSet<String>,
 }
 
 /// Result of compilation.
@@ -296,7 +302,7 @@ fn compile_preloaded_models_inner(
     load_start: Instant,
 ) -> Result<CompileResult, CompileError> {
     let run_var_diagnostics = substitute_run_vars_into_models(&mut models, &config.run_vars);
-    let project = Project::from_models(models)?;
+    let project = Project::from_models_with_externals(models, &config.external_dependencies)?;
     let project_load_ms = load_start.elapsed().as_millis() as u64;
 
     let mut result = compile_project(project, config, run_var_diagnostics)?;
@@ -609,7 +615,7 @@ pub fn compile_incremental(
     let load_start = Instant::now();
     let mut models = Project::load_models(&config.models_dir, Some(&config.project_freshness))?;
     let run_var_diagnostics = substitute_run_vars_into_models(&mut models, &config.run_vars);
-    let project = Project::from_models(models)?;
+    let project = Project::from_models_with_externals(models, &config.external_dependencies)?;
     let project_load_ms = load_start.elapsed().as_millis() as u64;
 
     let sg_start = Instant::now();

@@ -338,6 +338,7 @@ fn compile_inner(
         // spans that do not exist in the consumer's file. The inlined form
         // is written back after them, for `--expand-macros`.
         preserve_authored_sql: true,
+        external_dependencies: Default::default(),
     };
 
     let mut result = compile::compile(&config)?;

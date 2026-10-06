@@ -4607,6 +4607,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                 enabled: defer,
                 defer_to,
                 selected_models,
+                ..Default::default()
             };
 
             // CLI overlay for the opt-in model-skip gate. Default-OFF: both

@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+from enum import StrEnum
+
 from pydantic import BaseModel, conint
 
 
@@ -43,6 +45,38 @@ class ProjectPipelineOutput(BaseModel):
     """
 
 
+class RunScopeKind9(StrEnum):
+    """
+    Wrote production targets.
+    """
+
+    production = "production"
+
+
+class RunScopeKind10(StrEnum):
+    """
+    `rocky run --shadow` / `--shadow-schema`: wrote shadow targets.
+    """
+
+    shadow = "shadow"
+
+
+class RunScopeKind11(StrEnum):
+    """
+    `rocky run --branch <name>`: wrote a named Rocky branch.
+    """
+
+    branch = "branch"
+
+
+class RunScopeKind12(StrEnum):
+    """
+    Recorded before runs carried a scope (#2200). Where it wrote is unknown. Also what a reader of an older payload without the field sees.
+    """
+
+    unrecorded = "unrecorded"
+
+
 class ProjectRunOutput(BaseModel):
     """
     The newest run, as the dashboard summarised it.
@@ -54,6 +88,12 @@ class ProjectRunOutput(BaseModel):
     """
     models_executed: conint(ge=0)
     run_id: str
+    run_scope: (
+        RunScopeKind9 | RunScopeKind10 | RunScopeKind11 | RunScopeKind12 | None
+    ) = "unrecorded"
+    """
+    Where it wrote (#2201). The last run reported here is the newest production run, or one recorded before runs carried a scope (`unrecorded`); shadow and branch runs are never reported here.
+    """
     started_at: str
     """
     RFC 3339.

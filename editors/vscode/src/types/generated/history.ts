@@ -6,6 +6,10 @@
  */
 
 /**
+ * Where a recorded run wrote its results, as `rocky history` and `rocky cost` report it (#2201).
+ */
+export type RunScopeKind = "production" | "shadow" | "branch" | "unrecorded";
+/**
  * What left an [`UnrecordedRunRecord`] in the ledger (#1884).
  */
 export type UnrecordedRunEvidence = "checkpoint" | "run_started";
@@ -70,6 +74,10 @@ export interface RunHistoryRecord {
    */
   rocky_version?: string | null;
   run_id: string;
+  /**
+   * Where the run wrote: `production`, `shadow`, `branch`, or `unrecorded` for a run recorded before runs carried a scope (#2201). Always emitted, like [`Self::pipeline`], because readers that report on production count only `production` runs.
+   */
+  run_scope?: RunScopeKind & string;
   /**
    * Session origin — `"cli"`, `"dagster"`, `"lsp"`, or `"http_api"`. Emitted as the lowercase variant string so JSON consumers can match on it without knowing the Rust enum shape.
    */

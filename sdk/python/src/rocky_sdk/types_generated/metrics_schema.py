@@ -41,6 +41,10 @@ class MetricsOutput(BaseModel):
     column_trend: list[ColumnTrendPoint] | None = None
     command: str
     count: conint(ge=0)
+    excluded_non_production_snapshots: conint(ge=0) | None = None
+    """
+    Quality snapshots skipped, while reading the newest ones, because a shadow or branch run wrote them (#2201): they measured a non-production table. A snapshot whose run carries no recorded scope, or whose run record is gone, is kept. Omitted when zero.
+    """
     message: str | None = None
     model: str
     snapshots: list[MetricsSnapshotEntry]

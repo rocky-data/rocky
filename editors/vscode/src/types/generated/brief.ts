@@ -94,6 +94,10 @@ export interface BriefOutput {
    */
   quality: BriefQualitySection;
   /**
+   * Which of the window's runs the digest counted (#2201). A brief reports on production: shadow and branch runs are left out of every run-derived section. Runs recorded before runs carried a scope are counted, so a pre-upgrade failure is never hidden.
+   */
+  run_scope?: ProductionRunScope;
+  /**
    * Pipeline runs in the window, with the ones needing attention listed.
    */
   runs: BriefRunsSection;
@@ -383,6 +387,30 @@ export interface BriefQualityEntry {
   observed_at: string;
   row_count: number;
   run_id: string;
+  [k: string]: unknown;
+}
+/**
+ * Which runs a report about production counted (#2201).
+ *
+ * Shadow and branch runs are never counted. Runs recorded before runs carried a scope are counted or not per report, and `unrecorded_runs_counted` says which.
+ */
+export interface ProductionRunScope {
+  /**
+   * Shadow and branch runs the report left out.
+   */
+  excluded_runs: number;
+  /**
+   * Runs recorded as production that the report read.
+   */
+  production_runs: number;
+  /**
+   * Runs with no recorded scope that the report read.
+   */
+  unrecorded_runs: number;
+  /**
+   * `true` when runs with no recorded scope count as production in this report. Their write target is unknown.
+   */
+  unrecorded_runs_counted: boolean;
   [k: string]: unknown;
 }
 /**

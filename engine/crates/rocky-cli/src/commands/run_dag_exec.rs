@@ -116,7 +116,16 @@ impl StateTurnstile {
 /// `SkipGate::upstream_unchanged`). That is fail-safe — never a stale skip — but
 /// more conservative than a single monolithic run, where the per-layer barrier
 /// makes every upstream verdict visible. Raw-source freshness skips still apply.
-fn default_sub_runner(actor: rocky_core::config::PrincipalRef) -> SubRunner {
+///
+/// `actor` is the outer run's principal, recorded on every sub-run.
+/// `external_dependencies` are the names [`dag_external_dependencies`] took
+/// from the graph. Every sub-run compiles with them, so a model whose
+/// `depends_on` names a seed or load pipeline is not refused as naming an
+/// unknown model (#2138): the graph already ordered it after that node.
+fn default_sub_runner(
+    actor: rocky_core::config::PrincipalRef,
+    external_dependencies: Arc<std::collections::BTreeSet<String>>,
+) -> SubRunner {
     Arc::new(
         move |config_path: PathBuf,
               loaded: Arc<rocky_core::config::LoadedConfig>,
@@ -127,6 +136,10 @@ fn default_sub_runner(actor: rocky_core::config::PrincipalRef) -> SubRunner {
               skip_opts,
               shadow_config: Option<rocky_core::shadow::ShadowConfig>| {
             let actor = actor.clone();
+            let defer_opts = super::run::DeferOptions {
+                external_dependencies: (*external_dependencies).clone(),
+                ..super::run::DeferOptions::default()
+            };
             Box::pin(async move {
                 super::run::run(
                     &config_path,
@@ -149,7 +162,9 @@ fn default_sub_runner(actor: rocky_core::config::PrincipalRef) -> SubRunner {
                     None,
                     // DAG sub-runs inherit no `--env`.
                     None,
-                    &super::run::DeferOptions::default(),
+                    // No `--defer` under `--dag`; this carries only the
+                    // graph's seed and load names (#2138).
+                    &defer_opts,
                     // The build-escape-hatch overlay (`--force-rebuild` /
                     // `--no-reuse`) threaded from the outer `rocky run --dag`.
                     &skip_opts,
@@ -360,7 +375,7 @@ pub async fn run_with_dag(
         partition_opts: partition_opts.clone(),
         skip_opts: *skip_opts,
         shadow_config: shadow_config.cloned(),
-        sub_runner: default_sub_runner(actor.clone()),
+        sub_runner: default_sub_runner(actor.clone(), Arc::new(dag_external_dependencies(&dag))),
         state_turns: StateTurnstile::new(),
     };
     let executor = dag_executor_with_bound(dispatcher, node_concurrency);
@@ -411,6 +426,30 @@ pub async fn run_with_dag(
         anyhow::bail!("DAG execution had {} failed node(s)", result.failed);
     }
     Ok(())
+}
+
+/// The names a model's `depends_on` may give that the graph resolved to a
+/// node other than a model: every seed, and every pipeline with a load node
+/// (a load pipeline, or a replication pipeline's load). A per-model sub-run
+/// compiles models only, so it is told these names are satisfied outside it
+/// (#2138). A name that a model also carries never reaches a sub-run: the
+/// graph refuses a `depends_on` on it as ambiguous.
+fn dag_external_dependencies(
+    dag: &rocky_core::unified_dag::UnifiedDag,
+) -> std::collections::BTreeSet<String> {
+    dag.nodes
+        .iter()
+        .filter_map(|node| match node.kind {
+            NodeKind::Seed => Some(node.label.clone()),
+            NodeKind::Load => node.pipeline.clone(),
+            NodeKind::Source
+            | NodeKind::Replication
+            | NodeKind::Transformation
+            | NodeKind::Quality
+            | NodeKind::Snapshot
+            | NodeKind::Test => None,
+        })
+        .collect()
 }
 
 /// What [`run_with_dag`] schedules from: the graph with every inferred edge,
@@ -1833,7 +1872,10 @@ mod tests {
             partition_opts: PartitionRunOptions::default(),
             skip_opts: SkipRunOptions::default(),
             shadow_config: None,
-            sub_runner: default_sub_runner(rocky_core::config::PrincipalRef::unnamed()),
+            sub_runner: default_sub_runner(
+                rocky_core::config::PrincipalRef::unnamed(),
+                Arc::default(),
+            ),
             state_turns: StateTurnstile::new(),
         };
         let id = NodeId::new("seed", "countries");
@@ -1972,6 +2014,142 @@ mod tests {
             .execute_sql("SELECT COUNT(*) FROM proj.silver.dim_country")
             .unwrap();
         assert_eq!(cell_i64(&model_rows.rows[0][0]), 2, "model rows");
+    }
+
+    /// #2138: a model whose `depends_on` names a seed must not fail its
+    /// `--dag` sub-run.
+    ///
+    /// The graph orders `dim_country` after `seed:countries` from the
+    /// `depends_on` alone — the model's SQL never reads the seed, so no
+    /// physical or label edge exists. Before the fix the model's per-model
+    /// sub-run compiled models only and refused `countries` as an unknown
+    /// model, so the node failed and the DAG exited non-zero.
+    #[tokio::test]
+    async fn a_model_depending_on_a_seed_by_name_runs_under_dag() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("models")).unwrap();
+        std::fs::create_dir_all(root.join("seeds")).unwrap();
+        let db_path = root.join("proj.duckdb");
+        std::fs::write(
+            root.join("rocky.toml"),
+            format!(
+                "[adapter.local]\n\
+                 type = \"duckdb\"\n\
+                 path = \"{}\"\n\n\
+                 [pipeline.silver]\n\
+                 type = \"transformation\"\n\n\
+                 [pipeline.silver.target]\n\
+                 adapter = \"local\"\n\n\
+                 [pipeline.silver.target.governance]\n\
+                 auto_create_catalogs = true\n\
+                 auto_create_schemas = true\n",
+                db_path.display()
+            ),
+        )
+        .unwrap();
+        std::fs::write(root.join("seeds/countries.csv"), "code\nUS\nGB\n").unwrap();
+        std::fs::write(
+            root.join("seeds/countries.toml"),
+            "name = \"countries\"\n\n[target]\ncatalog = \"proj\"\nschema = \"seeds\"\ntable = \"countries\"\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("models/stg.sql"), "SELECT 1 AS id\n").unwrap();
+        std::fs::write(
+            root.join("models/stg.toml"),
+            "name = \"stg\"\ndepends_on = [\"countries\"]\n\n\
+             [target]\ncatalog = \"proj\"\nschema = \"silver\"\ntable = \"stg\"\n",
+        )
+        .unwrap();
+
+        let config_path = root.join("rocky.toml");
+        let cfg = dag_snapshot(&config_path);
+        let planned = plan_runtime_dag(&config_path, &cfg.config).expect("graph builds");
+        assert!(
+            planned.runtime.dag.edges.iter().any(|e| {
+                e.from == NodeId::new("seed", "countries")
+                    && e.to == NodeId::new("transformation", "stg")
+            }),
+            "the declared depends_on orders the model after the seed"
+        );
+        assert_eq!(
+            dag_external_dependencies(&planned.runtime.dag),
+            std::collections::BTreeSet::from(["countries".to_string()])
+        );
+
+        run_with_dag(
+            &config_path,
+            cfg,
+            &root.join(".rocky-state.redb"),
+            false,
+            &PartitionRunOptions::default(),
+            &crate::commands::run::SkipRunOptions::default(),
+            None,
+            None,
+            &rocky_core::config::PrincipalRef::unnamed(),
+        )
+        .await
+        .expect("a depends_on naming a seed must not fail the model's sub-run");
+
+        let adapter = DuckDbWarehouseAdapter::open(&db_path).unwrap();
+        let conn = adapter.shared_connector();
+        let guard = conn.lock().unwrap();
+        let rows = guard
+            .execute_sql("SELECT COUNT(*) FROM proj.silver.stg")
+            .unwrap();
+        assert_eq!(cell_i64(&rows.rows[0][0]), 1, "the model materialized");
+    }
+
+    /// #2138 negative control: only names the graph resolved to a seed or
+    /// load are accepted. A misspelled `depends_on` is still an unknown
+    /// dependency — the model's node fails and the DAG run fails.
+    #[tokio::test]
+    async fn a_misspelled_depends_on_still_fails_under_dag() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("models")).unwrap();
+        std::fs::create_dir_all(root.join("seeds")).unwrap();
+        let db_path = root.join("proj.duckdb");
+        std::fs::write(
+            root.join("rocky.toml"),
+            format!(
+                "[adapter.local]\ntype = \"duckdb\"\npath = \"{}\"\n\n\
+                 [pipeline.silver]\ntype = \"transformation\"\n\n\
+                 [pipeline.silver.target]\nadapter = \"local\"\n\n\
+                 [pipeline.silver.target.governance]\nauto_create_catalogs = true\n\
+                 auto_create_schemas = true\n",
+                db_path.display()
+            ),
+        )
+        .unwrap();
+        std::fs::write(root.join("seeds/countries.csv"), "code\nUS\n").unwrap();
+        std::fs::write(
+            root.join("seeds/countries.toml"),
+            "name = \"countries\"\n\n[target]\ncatalog = \"proj\"\nschema = \"seeds\"\ntable = \"countries\"\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("models/stg.sql"), "SELECT 1 AS id\n").unwrap();
+        std::fs::write(
+            root.join("models/stg.toml"),
+            "name = \"stg\"\ndepends_on = [\"countires\"]\n\n\
+             [target]\ncatalog = \"proj\"\nschema = \"silver\"\ntable = \"stg\"\n",
+        )
+        .unwrap();
+        let config_path = root.join("rocky.toml");
+        let err = run_with_dag(
+            &config_path,
+            dag_snapshot(&config_path),
+            &root.join(".rocky-state.redb"),
+            false,
+            &PartitionRunOptions::default(),
+            &crate::commands::run::SkipRunOptions::default(),
+            None,
+            None,
+            &rocky_core::config::PrincipalRef::unnamed(),
+        )
+        .await
+        .expect_err("a misspelled depends_on must still fail");
+        assert!(format!("{err:#}").contains("failed node"), "{err:#}");
     }
 
     /// #2018: `rocky run --dag` must load a seed on a project with MORE THAN
@@ -2374,7 +2552,10 @@ mod tests {
             partition_opts: PartitionRunOptions::default(),
             skip_opts: SkipRunOptions::default(),
             shadow_config: None,
-            sub_runner: default_sub_runner(rocky_core::config::PrincipalRef::unnamed()),
+            sub_runner: default_sub_runner(
+                rocky_core::config::PrincipalRef::unnamed(),
+                Arc::default(),
+            ),
             state_turns: StateTurnstile::new(),
         };
         let id = NodeId::new("seed", "orders");
@@ -2484,7 +2665,10 @@ mod tests {
             partition_opts: PartitionRunOptions::default(),
             skip_opts: SkipRunOptions::default(),
             shadow_config: None,
-            sub_runner: default_sub_runner(rocky_core::config::PrincipalRef::unnamed()),
+            sub_runner: default_sub_runner(
+                rocky_core::config::PrincipalRef::unnamed(),
+                Arc::default(),
+            ),
             state_turns: StateTurnstile::new(),
         };
         let id = NodeId::new("seed", "orders");
@@ -3431,14 +3615,113 @@ mod tests {
         }
     }
 
+    /// #2202 item 2: a seed and a model writing one table are refused at
+    /// graph build even when nothing reads the table. Before, the model gate
+    /// looked at models only, so the two became unordered nodes and
+    /// whichever finished last decided the rows.
+    #[test]
+    fn a_seed_and_a_model_writing_one_table_are_refused_without_a_reader() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write_fixture_project(
+            root,
+            &transformation_block("t"),
+            &[("orders_copy", "main", "seeds", "orders", "SELECT 1 AS id")],
+        );
+        std::fs::create_dir_all(root.join("seeds")).unwrap();
+        std::fs::write(root.join("seeds/orders.csv"), "id\n1\n").unwrap();
+        let err = plan_fixture(root).expect_err("two writers of one table must refuse");
+        let message = format!("{err:#}");
+        assert!(
+            matches!(
+                err.downcast_ref::<unified_dag::UnifiedDagError>(),
+                Some(unified_dag::UnifiedDagError::DuplicateProducerTarget { .. })
+            ),
+            "{message}"
+        );
+        assert!(
+            message.contains("model 'orders_copy' (target main.seeds.orders)")
+                && message.contains("seed 'orders' (target main.seeds.orders)")
+                && message.contains("adapter 'local'"),
+            "{message}"
+        );
+
+        // The control: the model writes another schema, and the plan builds.
+        write_fixture_project(
+            root,
+            &transformation_block("t"),
+            &[("orders_copy", "main", "silver", "orders", "SELECT 1 AS id")],
+        );
+        plan_fixture(root).expect("different tables plan cleanly");
+    }
+
+    /// #2202 item 2: a load pipeline and a model writing one table are
+    /// refused at graph build, as two models would be.
+    #[test]
+    fn a_load_pipeline_and_a_model_writing_one_table_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write_fixture_project(
+            root,
+            &format!(
+                "{}[pipeline.ingest]\ntype = \"load\"\nsource_dir = \"data/\"\n\n\
+                 [pipeline.ingest.target]\nadapter = \"local\"\ncatalog = \"prod\"\n\
+                 schema = \"bronze\"\ntable = \"events\"\n",
+                transformation_block("t")
+            ),
+            &[("events_copy", "prod", "bronze", "events", "SELECT 1 AS id")],
+        );
+        let err = plan_fixture(root).expect_err("two writers of one table must refuse");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("load pipeline 'ingest' (target prod.bronze.events)")
+                && message.contains("model 'events_copy' (target prod.bronze.events)"),
+            "{message}"
+        );
+    }
+
+    /// #2202 item 3 through the production planner: a model whose
+    /// `depends_on` names a label a seed and a model share is refused, not
+    /// bound to whichever node was built last.
+    #[test]
+    fn depends_on_a_label_a_seed_and_a_model_share_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write_fixture_project(
+            root,
+            &transformation_block("t"),
+            &[
+                ("orders", "main", "silver", "orders", "SELECT 1 AS id"),
+                ("mart", "main", "marts", "mart", "SELECT 1 AS id"),
+            ],
+        );
+        std::fs::write(
+            root.join("models/mart.toml"),
+            "name = \"mart\"\ndepends_on = [\"orders\"]\n\n[strategy]\ntype = \"full_refresh\"\n\n\
+             [target]\ncatalog = \"main\"\nschema = \"marts\"\ntable = \"mart\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("seeds")).unwrap();
+        std::fs::write(root.join("seeds/orders.csv"), "id\n1\n").unwrap();
+        let message = format!(
+            "{:#}",
+            plan_fixture(root).expect_err("an ambiguous depends_on must refuse")
+        );
+        assert!(
+            message.contains("model 'mart' declares depends_on 'orders'")
+                && message.contains("model 'orders' and seed 'orders'"),
+            "{message}"
+        );
+    }
+
     /// Two writers of one table, through the production planner and real seed
     /// discovery. A model `orders` writes `main.seeds.orders`, and so does the
     /// sidecar-free seed `orders.csv`: the seed loader defaults it to the
     /// `seeds` schema and to the catalog of the pipeline the seeds load
     /// against (`main`, its fallback, for a project with no replication
-    /// pipeline), and drops and recreates whatever is there. A read of
-    /// `main.seeds.orders` cannot be pinned to the model alone — it is
-    /// refused, not resolved to one of two definite writers.
+    /// pipeline), and drops and recreates whatever is there. Since #2202 the
+    /// duplicate-target gate refuses the two writers before any read is
+    /// resolved; the message still names both, with their targets.
     #[test]
     fn a_sidecar_free_seed_and_a_model_writing_one_table_make_its_readers_ambiguous() {
         let dir = tempfile::tempdir().unwrap();

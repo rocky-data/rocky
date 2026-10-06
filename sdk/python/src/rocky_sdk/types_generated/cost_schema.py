@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+from enum import StrEnum
+
 from pydantic import BaseModel, conint
 
 
@@ -74,6 +76,38 @@ class PerModelCostHistorical(BaseModel):
     """
 
 
+class RunScopeKind1(StrEnum):
+    """
+    Wrote production targets.
+    """
+
+    production = "production"
+
+
+class RunScopeKind2(StrEnum):
+    """
+    `rocky run --shadow` / `--shadow-schema`: wrote shadow targets.
+    """
+
+    shadow = "shadow"
+
+
+class RunScopeKind3(StrEnum):
+    """
+    `rocky run --branch <name>`: wrote a named Rocky branch.
+    """
+
+    branch = "branch"
+
+
+class RunScopeKind4(StrEnum):
+    """
+    Recorded before runs carried a scope (#2200). Where it wrote is unknown. Also what a reader of an older payload without the field sees.
+    """
+
+    unrecorded = "unrecorded"
+
+
 class CostOutput(BaseModel):
     """
     JSON output for `rocky cost <run_id|latest>`.
@@ -102,6 +136,12 @@ class CostOutput(BaseModel):
     """
     per_model: list[PerModelCostHistorical]
     run_id: str
+    run_scope: RunScopeKind1 | RunScopeKind2 | RunScopeKind3 | RunScopeKind4 | None = (
+        "unrecorded"
+    )
+    """
+    Where the reported run wrote (#2201). `rocky cost latest` reports the newest production run: shadow and branch runs are skipped, and a run recorded before runs carried a scope is eligible and reads `unrecorded` here. An explicit run id reports that run, whatever its scope.
+    """
     started_at: str
     status: str
     total_bytes_scanned: conint(ge=0) | None = None
