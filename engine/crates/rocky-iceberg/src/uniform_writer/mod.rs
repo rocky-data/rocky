@@ -230,6 +230,10 @@ pub struct UniformTableState {
     ///
     /// `0` for tables without rowTracking, and for rowTracking-enabled
     /// tables that have not yet been written to.
+    ///
+    /// Informational only. A replace commit allocates row ids from the
+    /// live-set replay that also picks the commit version, never from this
+    /// value: a commit can land between `discover()` and the replace.
     pub row_tracking_next_id: u64,
 }
 
@@ -873,7 +877,7 @@ impl UniformWriter {
         &self,
         staged: Vec<StagedFile>,
         mut live: discover::LiveSet,
-        mut state: UniformTableState,
+        state: UniformTableState,
         modification_time_millis: i64,
     ) -> Result<ReplaceOutcome> {
         use std::collections::{BTreeMap, BTreeSet};
@@ -956,8 +960,15 @@ impl UniformWriter {
 
             let target_version = live.head_version + 1;
             // Allocate row ids for the files this commit adds, one
-            // contiguous range per file, in order.
-            let mut next_row_id = state.row_tracking_next_id;
+            // contiguous range per file, in order. The high-water mark comes
+            // from the same log replay as `head_version`: a mark read in a
+            // separate pass can be older than the head this commit follows,
+            // and the ranges would then overlap the head's row ids.
+            let mut next_row_id = if state.row_tracking_enabled {
+                live.row_tracking_next_id()?
+            } else {
+                0
+            };
             let mut high_water_mark = None;
             let mut adds = Vec::new();
             for (key, &i) in &new_keys {
@@ -1018,13 +1029,9 @@ impl UniformWriter {
                     | object_store::Error::Precondition { .. },
                 ) => {
                     // Another commit took `target_version`. Re-read the live
-                    // set, protocol and metadata so the next attempt reflects
-                    // the new head.
+                    // set, protocol, metadata and row-id high-water mark in
+                    // one replay so the next attempt reflects the new head.
                     live = self.live_set().await?;
-                    if state.row_tracking_enabled {
-                        state.row_tracking_next_id =
-                            discover::discover_row_tracking_next_id(&*self.store, &prefix).await?;
-                    }
                     tracing::warn!(
                         attempt = attempt + 1,
                         previous_target = target_version,
@@ -2790,6 +2797,139 @@ mod tests {
             discover::proven_removed_at(&*store, "b", "tbl", &rel, 1, i64::MAX / 2).await,
             RemovalProof::Held(RemovalHoldReason::RetentionUnknown)
         );
+    }
+
+    // -- row ids come from the same replay as the head ------------------------
+
+    /// A competitor commit at `version` that adds one rowTracking file and
+    /// bumps `rowIdHighWaterMark` to `hwm`.
+    async fn put_row_tracking_competitor(store: &InMemory, prefix: &str, version: u64, hwm: u64) {
+        put_commit(
+            store,
+            prefix,
+            version,
+            &[
+                serde_json::json!({"commitInfo": {}}),
+                serde_json::json!({"add": {
+                    "path": "competitor.parquet", "partitionValues": {}, "size": 9,
+                    "modificationTime": 0, "dataChange": true,
+                    "baseRowId": 0, "defaultRowCommitVersion": version
+                }}),
+                serde_json::json!({"domainMetadata": {
+                    "domain": "delta.rowTracking",
+                    "configuration": format!("{{\"rowIdHighWaterMark\":{hwm}}}"),
+                    "removed": false
+                }}),
+            ],
+        )
+        .await;
+    }
+
+    /// The `baseRowId` of the only add, and the high-water mark, of `version`.
+    async fn row_ids_of(store: &InMemory, prefix: &str, version: u64) -> (u64, u64) {
+        let lines = commit_lines(store, prefix, version).await;
+        let adds = actions(&lines, "add");
+        assert_eq!(adds.len(), 1, "one add in commit {version}");
+        let base = adds[0]["baseRowId"].as_u64().unwrap();
+        let dm = actions(&lines, "domainMetadata");
+        let cfg: Value = serde_json::from_str(dm[0]["configuration"].as_str().unwrap()).unwrap();
+        (base, cfg["rowIdHighWaterMark"].as_u64().unwrap())
+    }
+
+    /// ```text
+    ///   discover()          next row id 0, head 0
+    ///   competitor v1       rowIdHighWaterMark 99
+    ///   replace             reads head 1 ──▶ commits v2, baseRowId 100
+    /// ```
+    #[tokio::test]
+    async fn a_commit_after_discover_moves_the_row_id_range_above_its_mark() {
+        let store: Arc<InMemory> = Arc::new(InMemory::new());
+        seed_row_tracking_bootstrap(&store, "rt").await;
+        let writer = make_unpartitioned_writer(store.clone() as Arc<dyn ObjectStore>, "rt");
+        let state = writer.discover().await.unwrap();
+        assert_eq!(state.row_tracking_next_id, 0);
+
+        put_row_tracking_competitor(&store, "rt", 1, 99).await;
+
+        let result = writer
+            .write_batch_with_state(make_batch(5), state)
+            .await
+            .unwrap();
+        assert_eq!(result.commit_version, 2);
+        assert_eq!(
+            row_ids_of(&store, "rt", 2).await,
+            (100, 104),
+            "row ids start above the competitor's mark, not at the stale 0"
+        );
+    }
+
+    /// ```text
+    ///   live set read at head 0 (stale)
+    ///   competitor v1       rowIdHighWaterMark 99
+    ///   commit v1 ──▶ 412 ──▶ re-read ──▶ commits v2, baseRowId 100
+    /// ```
+    #[tokio::test]
+    async fn a_conflict_retry_allocates_row_ids_from_the_new_head() {
+        let store: Arc<InMemory> = Arc::new(InMemory::new());
+        seed_row_tracking_bootstrap(&store, "rt").await;
+        let writer = make_unpartitioned_writer(store.clone() as Arc<dyn ObjectStore>, "rt");
+        let state = writer.discover().await.unwrap();
+        let stale = discover::read_live_set(&*store, "rt", "c.s.t", "")
+            .await
+            .unwrap();
+        assert_eq!(stale.head_version, 0);
+
+        put_row_tracking_competitor(&store, "rt", 1, 99).await;
+
+        let batch = make_batch(3);
+        let pv = HashMap::new();
+        let add = commit::build_add_action(&commit::AddInputs {
+            batch: &batch,
+            state: &state,
+            add_file_path: "b.parquet",
+            file_size: 11,
+            modification_time_millis: 0,
+            partition_values: &pv,
+        })
+        .unwrap();
+        let staged = StagedFile {
+            path: "b.parquet".into(),
+            add,
+            blake3_hash: "b".into(),
+            column_hashes: Vec::new(),
+            num_records: 3,
+            size_bytes: 11,
+        };
+        let outcome = writer
+            .commit_replace(vec![staged], stale, state, 0)
+            .await
+            .unwrap();
+        assert_eq!(outcome.table_version, 2, "the 412 at v1 retried at v2");
+        assert_eq!(row_ids_of(&store, "rt", 2).await, (100, 102));
+    }
+
+    #[test]
+    fn the_live_set_takes_the_latest_row_tracking_mark() {
+        // Same rule as `discover_row_tracking_next_id`: none → 0, a negative
+        // mark → 0, otherwise mark + 1; a malformed mark is an error.
+        let dm = |cfg: &str| {
+            Some(serde_json::json!({"domain": "delta.rowTracking", "configuration": cfg}))
+        };
+        let mut live = discover::LiveSet {
+            head_version: 0,
+            files: Default::default(),
+            append_only: false,
+            protocol: Value::Null,
+            metadata: Value::Null,
+            row_tracking_domain: None,
+        };
+        assert_eq!(live.row_tracking_next_id().unwrap(), 0);
+        live.row_tracking_domain = dm(r#"{"rowIdHighWaterMark":-1}"#);
+        assert_eq!(live.row_tracking_next_id().unwrap(), 0);
+        live.row_tracking_domain = dm(r#"{"rowIdHighWaterMark":41}"#);
+        assert_eq!(live.row_tracking_next_id().unwrap(), 42);
+        live.row_tracking_domain = dm(r#"{}"#);
+        assert!(live.row_tracking_next_id().is_err());
     }
 
     /// Not a CI test. Writes two replace scenarios to the directory in
