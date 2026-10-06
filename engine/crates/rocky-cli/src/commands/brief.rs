@@ -40,11 +40,11 @@ use crate::commands::audit::plan_file_path;
 use crate::commands::review::select_outstanding;
 use crate::output::{
     BriefActiveFreeze, BriefAgentActivitySection, BriefAutonomySection, BriefBudgetStatus,
-    BriefCostSection, BriefDecisionEntry, BriefDecisionKind, BriefDegradedRule, BriefDriftEntry, BriefDriftSection,
-    BriefEscalationsSection, BriefFailedModel, BriefFreshnessEntry, BriefFreshnessSection,
-    BriefOutput, BriefPrincipalActivity, BriefQualityEntry, BriefQualitySection, BriefRunCost,
-    BriefRunEntry, BriefRunsSection, BriefSchedulerFailureEntry, BriefSchedulerSection,
-    BriefSinceMode, SectionAvailability, print_json,
+    BriefCostSection, BriefDecisionEntry, BriefDecisionKind, BriefDegradedRule, BriefDriftEntry,
+    BriefDriftSection, BriefEscalationsSection, BriefFailedModel, BriefFreshnessEntry,
+    BriefFreshnessSection, BriefOutput, BriefPrincipalActivity, BriefQualityEntry,
+    BriefQualitySection, BriefRunCost, BriefRunEntry, BriefRunsSection, BriefSchedulerFailureEntry,
+    BriefSchedulerSection, BriefSinceMode, SectionAvailability, print_json,
 };
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -1888,8 +1888,15 @@ mod tests {
         assert_eq!(section.total, 1, "only the evaluation is counted");
         assert_eq!(section.allow, 1);
         assert_eq!(section.require_review, 0);
-        assert_eq!(section.deny, 0, "no freeze or failed check is a policy deny");
-        assert_eq!(section.by_principal.len(), 1, "the human only froze and unfroze");
+        assert_eq!(
+            section.deny, 0,
+            "no freeze or failed check is a policy deny"
+        );
+        assert_eq!(
+            section.by_principal.len(),
+            1,
+            "the human only froze and unfroze"
+        );
         assert_eq!(section.by_principal[0].principal, PolicyPrincipal::Agent);
         assert_eq!(section.by_principal[0].total, 1);
         assert_eq!(section.by_principal[0].deny, 0);
@@ -1922,10 +1929,19 @@ mod tests {
         let text = render_markdown(&out);
 
         let lines: Vec<&str> = text.lines().collect();
-        let eval_line = lines.iter().find(|l| l.contains("`a`")).expect("evaluation row");
-        let freeze_line = lines.iter().find(|l| l.contains("`b`")).expect("freeze row");
+        let eval_line = lines
+            .iter()
+            .find(|l| l.contains("`a`"))
+            .expect("evaluation row");
+        let freeze_line = lines
+            .iter()
+            .find(|l| l.contains("`b`"))
+            .expect("freeze row");
         assert!(eval_line.contains(" DENY "), "{eval_line}");
-        assert!(freeze_line.contains("freeze [effect deny]"), "{freeze_line}");
+        assert!(
+            freeze_line.contains("freeze [effect deny]"),
+            "{freeze_line}"
+        );
         assert!(!freeze_line.contains("DENY"), "{freeze_line}");
         assert!(
             text.contains("1 policy evaluation(s): 0 allow · 0 review · 1 deny"),

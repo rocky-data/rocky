@@ -207,10 +207,7 @@ pub fn load_template(
             // refusal, never a silent default.
             match rocky_core::product::commit::read_no_follow_bytes(&candidate) {
                 Ok(bytes) => String::from_utf8(bytes).map_err(|err| {
-                    anyhow::anyhow!(
-                        "brief override {} is not UTF-8: {err}",
-                        candidate.display()
-                    )
+                    anyhow::anyhow!("brief override {} is not UTF-8: {err}", candidate.display())
                 })?,
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
                     default_brief(kind).to_string()
