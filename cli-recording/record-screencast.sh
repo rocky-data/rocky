@@ -70,12 +70,13 @@ if curl -fsS --max-time 2 "http://127.0.0.1:$PORT/api/v1/health" >/dev/null 2>&1
 fi
 
 echo "▶ starting rocky serve --ui on :$PORT"
+# The same store the tapes use (outside models/, #2169).
 # `exec` so $! is the rocky process itself, not a subshell whose child would
 # survive the trap.
 (
     cd "$WS" || exit 1
     exec env ROCKY_SERVE_TOKEN="$TOKEN" ROCKY_SERVE_TOKEN_SCOPE=read-only \
-        rocky serve --ui --port "$PORT"
+        rocky --state-path .rocky/state.redb serve --ui --port "$PORT"
 ) > "$OUT/serve.log" 2>&1 &
 SERVER=$!
 cleanup() {

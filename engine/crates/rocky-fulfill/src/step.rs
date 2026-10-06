@@ -64,6 +64,8 @@ pub fn run_fulfill_approve_spec(
     output_json: bool,
 ) -> Result<()> {
     let root = std::env::current_dir().context("failed to get current working directory")?;
+    refuse_state_store_in_models(&root, state_path)?;
+    create_state_store_parent(state_path)?;
     let output = fulfill_api::product_approve(&root, state_path, product)?;
     if output_json {
         fulfill_api::print_json(&output)?;
@@ -79,9 +81,158 @@ pub fn run_fulfill_approve_spec(
                 output.product_id, output.spec_digest, output.approver, output.snapshot_path
             );
         }
-        println!("next: rocky fulfill {product}");
+        println!(
+            "next: {}",
+            with_state_path(&format!("rocky fulfill {product}"), state_path)
+        );
     }
     Ok(())
+}
+
+/// Refuse a state store that sits inside the models directory (#2169).
+///
+/// The store holds what the gates read: the fulfillment record, its
+/// compare-and-swap state, the journal and the approval record. The
+/// documented drafting worker may write `models/`, so a store under it is
+/// one the worker can rewrite. The default store is
+/// `models/.rocky-state.redb`, so every unconfigured project lands here
+/// and must pass `--state-path` to a location outside `models/`.
+///
+/// Both sides are compared after resolving `..` and symlinks on the part
+/// of each path that exists, so neither a `models/../models/x` spelling
+/// nor a link into `models/` slips past. A path that cannot be resolved
+/// at all is compared as written.
+fn refuse_state_store_in_models(root: &Path, state_path: &Path) -> Result<()> {
+    let models_dir = root.join("models");
+    let store = resolve_existing_prefix(&root.join(state_path));
+    let models = resolve_existing_prefix(&models_dir);
+    if store.starts_with(&models) {
+        bail!(
+            "refusing to run: the state store {} is inside the models directory {}. \
+             The drafting worker may write models/, and the state store holds the \
+             approval record and the journal the gates read. Pass --state-path with a \
+             location outside models/ that the worker cannot write (for example \
+             `rocky --state-path .rocky/state.redb fulfill ...`), and pass the same \
+             --state-path to every `rocky fulfill`, `rocky fulfill approve-spec` and \
+             `rocky review` call for this project.",
+            state_path.display(),
+            models_dir.display()
+        );
+    }
+    Ok(())
+}
+
+/// Create the directory the state store goes in. The store has to move out
+/// of `models/` (see [`refuse_state_store_in_models`]), so its new home is
+/// often a directory nothing has made yet, such as `.rocky/`.
+fn create_state_store_parent(state_path: &Path) -> Result<()> {
+    if let Some(parent) = state_path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "failed to create the state store directory {}",
+                parent.display()
+            )
+        })?;
+    }
+    Ok(())
+}
+
+/// `path` as the filesystem resolves it: the longest prefix that exists
+/// is canonicalized (symlinks and `..` resolved by the OS, so `link/..`
+/// means the link target's parent), and the missing tail is appended with
+/// `.` and `..` folded lexically.
+///
+/// A symlink whose target does not exist yet does not canonicalize, but
+/// opening the store through it creates the file at the target. So the
+/// first missing component that is itself a link is followed by hand and
+/// resolved again — `.rocky/state.redb -> ../models/x.redb` resolves into
+/// `models/`. A loop of links stops after a bounded number of hops and
+/// returns the path as written.
+fn resolve_existing_prefix(path: &Path) -> PathBuf {
+    resolve_existing_prefix_hops(path, 40)
+}
+
+fn resolve_existing_prefix_hops(path: &Path, hops: u32) -> PathBuf {
+    use std::path::Component;
+    let components: Vec<Component<'_>> = path.components().collect();
+    for split in (0..=components.len()).rev() {
+        let prefix: PathBuf = components[..split].iter().collect();
+        let base = if split == 0 {
+            Some(PathBuf::new())
+        } else {
+            prefix.canonicalize().ok()
+        };
+        let Some(mut resolved) = base else {
+            let dangling = std::fs::symlink_metadata(&prefix)
+                .map(|m| m.file_type().is_symlink())
+                .unwrap_or(false);
+            if dangling
+                && hops > 0
+                && let Ok(target) = std::fs::read_link(&prefix)
+            {
+                let mut next = match prefix.parent() {
+                    Some(parent) => parent.join(target),
+                    None => target,
+                };
+                for component in &components[split..] {
+                    next.push(component);
+                }
+                return resolve_existing_prefix_hops(&next, hops - 1);
+            }
+            continue;
+        };
+        for component in &components[split..] {
+            match component {
+                Component::CurDir => {}
+                Component::ParentDir => {
+                    resolved.pop();
+                }
+                other => resolved.push(other),
+            }
+        }
+        return resolved;
+    }
+    path.to_path_buf()
+}
+
+/// A printed `rocky ...` next step with this invocation's `--state-path`
+/// added, so the human who runs it reaches the same store (#2169). The
+/// flag is global, so it goes right after `rocky`.
+fn with_state_path(command: &str, state_path: &Path) -> String {
+    match command.strip_prefix("rocky ") {
+        Some(rest) => format!(
+            "rocky --state-path {} {rest}",
+            shell_quote(&state_path.display().to_string())
+        ),
+        None => command.to_string(),
+    }
+}
+
+/// A stop message with this invocation's `--state-path` added to every
+/// `rocky <verb>` command it quotes, so a human who copies a command out of
+/// the prose reaches the same store as one who runs `next_command` (#2169).
+fn message_with_state_path(message: &str, state_path: &Path) -> String {
+    let flag = format!(
+        "rocky --state-path {} ",
+        shell_quote(&state_path.display().to_string())
+    );
+    ["fulfill ", "review ", "product ", "apply "]
+        .iter()
+        .fold(message.to_string(), |text, verb| {
+            text.replace(&format!("rocky {verb}"), &format!("{flag}{verb}"))
+        })
+}
+
+/// Single-quote `s` for a POSIX shell unless every character is plainly safe.
+fn shell_quote(s: &str) -> String {
+    let plain = !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '/' | ':' | '+'));
+    if plain {
+        s.to_string()
+    } else {
+        format!("'{}'", s.replace('\'', "'\\''"))
+    }
 }
 
 /// `rocky fulfill <product>` — drive the reconciler one invocation
@@ -102,6 +253,8 @@ pub async fn run_fulfill(
     output_json: bool,
 ) -> Result<()> {
     let root = std::env::current_dir().context("failed to get current working directory")?;
+    refuse_state_store_in_models(&root, state_path)?;
+    create_state_store_parent(state_path)?;
     let cfg = rocky_core::config::load_rocky_config(config_path)
         .with_context(|| format!("failed to load config from {}", config_path.display()))?;
     let runner = Runner {
@@ -151,14 +304,20 @@ pub async fn run_fulfill(
     // another process) claims immediately.
     let released = runner.store.release(&final_record, Utc::now())?;
 
+    let next_command = stop
+        .next_command
+        .as_deref()
+        .map(|next| with_state_path(next, state_path));
+    let message = message_with_state_path(&stop.message, state_path);
+
     let output = fulfill_api::FulfillOutput {
         version: VERSION.to_string(),
         command: "fulfill".to_string(),
         product: product.to_string(),
         product_id: released.product_id.clone(),
         state: released.state.tag().to_string(),
-        message: stop.message.clone(),
-        next_command: stop.next_command.clone(),
+        message: message.clone(),
+        next_command: next_command.clone(),
         spec_digest: released.spec_digest.clone(),
         plan_id: released.plan_id.clone(),
     };
@@ -166,8 +325,8 @@ pub async fn run_fulfill(
         fulfill_api::print_json(&output)?;
     } else {
         println!("product {product}: {}", released.state.tag());
-        println!("{}", stop.message);
-        if let Some(next) = &stop.next_command {
+        println!("{message}");
+        if let Some(next) = &next_command {
             println!("next: {next}");
         }
     }
@@ -2093,5 +2252,101 @@ mod deferred_check_counting {
 
         // A genuine zero is a real answer, and renders no clause.
         assert_eq!(deferred_report(Ok(0)), (Some(0), None));
+    }
+}
+
+#[cfg(test)]
+mod state_store_placement {
+    use super::{refuse_state_store_in_models, with_state_path};
+    use std::path::Path;
+
+    #[test]
+    fn the_default_store_inside_models_is_refused() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("models")).unwrap();
+        for inside in [
+            "models/.rocky-state.redb",
+            "models/.rocky-state/client_a.redb",
+            "./models/../models/.rocky-state.redb",
+        ] {
+            let err = refuse_state_store_in_models(root.path(), Path::new(inside))
+                .expect_err(inside)
+                .to_string();
+            assert!(err.contains("--state-path"), "{inside}: {err}");
+        }
+        // Absolute spelling of the same file.
+        let absolute = root.path().join("models/.rocky-state.redb");
+        assert!(refuse_state_store_in_models(root.path(), &absolute).is_err());
+    }
+
+    #[test]
+    fn a_store_outside_models_is_accepted() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("models")).unwrap();
+        for outside in [
+            ".rocky/state.redb",
+            ".rocky-state.redb",
+            "models-state/x.redb",
+            "models/../state.redb",
+        ] {
+            refuse_state_store_in_models(root.path(), Path::new(outside))
+                .unwrap_or_else(|e| panic!("{outside}: {e}"));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_into_models_is_refused() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("models")).unwrap();
+        std::os::unix::fs::symlink(root.path().join("models"), root.path().join("state")).unwrap();
+        assert!(refuse_state_store_in_models(root.path(), Path::new("state/x.redb")).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_symlink_into_models_is_refused() {
+        // The target does not exist yet, so the link does not canonicalize,
+        // but opening the store through it would create the file in models/.
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("models")).unwrap();
+        std::fs::create_dir(root.path().join(".rocky")).unwrap();
+        std::os::unix::fs::symlink(
+            "../models/state.redb",
+            root.path().join(".rocky/state.redb"),
+        )
+        .unwrap();
+        assert!(refuse_state_store_in_models(root.path(), Path::new(".rocky/state.redb")).is_err());
+        // A dangling link that points outside models/ is still accepted.
+        std::os::unix::fs::symlink("../elsewhere.redb", root.path().join(".rocky/other.redb"))
+            .unwrap();
+        refuse_state_store_in_models(root.path(), Path::new(".rocky/other.redb")).unwrap();
+    }
+
+    #[test]
+    fn the_stop_message_quotes_commands_with_the_state_path() {
+        assert_eq!(
+            super::message_with_state_path(
+                "plan p awaits human review; after approving, re-run: rocky fulfill x",
+                Path::new(".rocky/state.redb")
+            ),
+            "plan p awaits human review; after approving, re-run: \
+             rocky --state-path .rocky/state.redb fulfill x"
+        );
+    }
+
+    #[test]
+    fn the_printed_next_step_carries_the_state_path() {
+        assert_eq!(
+            with_state_path(
+                "rocky fulfill approve-spec p",
+                Path::new(".rocky/state.redb")
+            ),
+            "rocky --state-path .rocky/state.redb fulfill approve-spec p"
+        );
+        assert_eq!(
+            with_state_path("rocky review plan-1 --approve", Path::new("/tmp/a b.redb")),
+            "rocky --state-path '/tmp/a b.redb' review plan-1 --approve"
+        );
     }
 }

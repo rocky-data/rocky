@@ -11,6 +11,11 @@ One product goes from nothing to a live table, driven by one binary. You write n
 SQL and pre-create no spec. `rocky fulfill revenue_daily` drives the loop end to
 end — including one repair round, because the recorded first draft is wrong:
 
+Every `rocky` call in `run.sh` passes `--state-path .rocky/state.redb`.
+`rocky fulfill` refuses the default store, `models/.rocky-state.redb`, because
+the drafting worker may write `models/`
+([#2169](https://github.com/rocky-data/rocky/issues/2169)).
+
 ```
 elicit spec ─▶ human approves spec ─▶ lower to contract ─▶ agent drafts SQL
    ─▶ verify ──red (E010)──▶ repair round (agent redrafts) ─▶ re-verify green
