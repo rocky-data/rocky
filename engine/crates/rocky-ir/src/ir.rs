@@ -123,11 +123,14 @@ pub enum MaterializationStrategy {
     /// Content-addressed write to a Delta UniForm table.
     ///
     /// The model's SELECT is executed by the runtime; the resulting rows
-    /// are written as a content-hash-named Parquet file via the
-    /// `rocky_iceberg::uniform_writer` library, and a `_delta_log/{N}.json`
-    /// commit references it. Cross-engine reads (DuckDB iceberg_scan,
-    /// Iceberg-aware Trino, ...) require `MSCK REPAIR TABLE ... SYNC
-    /// METADATA` after each commit; the runtime issues this automatically.
+    /// are written as content-hash-named Parquet files via the
+    /// `rocky_iceberg::uniform_writer` library. Each run **replaces** the
+    /// table with one `_delta_log/{N}.json` commit that removes the live
+    /// files not in the new output and adds the new ones (no commit when
+    /// the output is unchanged). A Delta checkpoint makes the write refuse.
+    /// Cross-engine reads (DuckDB iceberg_scan, Iceberg-aware Trino, ...)
+    /// require `MSCK REPAIR TABLE ... SYNC METADATA` after each commit; the
+    /// runtime issues this automatically.
     ///
     /// SQL generation does not run for this strategy — `sql_gen` returns
     /// an error, and the runner takes over the materialization path. See
@@ -140,8 +143,8 @@ pub enum MaterializationStrategy {
         storage_prefix: String,
         /// If non-empty, the model's SELECT must produce exactly these
         /// partition columns. The runtime pre-groups rows by partition
-        /// tuple and emits one `add` action per group. Empty means the
-        /// target is unpartitioned.
+        /// tuple and emits one `add` action per group, all in the run's one
+        /// commit. Empty means the target is unpartitioned.
         ///
         /// At runtime, this list is asserted equal to what
         /// `UniformWriter::discover()` returns; mismatch is a hard error.

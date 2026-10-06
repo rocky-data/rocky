@@ -354,8 +354,8 @@ fn hash_arrow_column(field: &Field, array: &ArrayRef) -> Result<String> {
 ///   [`discover::recover_add_action_for_version`]). Its `stats`
 ///   (`numRecords` + min/max/nullCount) carry over byte-for-byte.
 /// - `add_file_path` — the content-addressed path (`<hash>.parquet`) the new
-///   commit references; used both as the `add.path` and as the
-///   double-count pre-check key. It is `recovered_add["path"]`, surfaced
+///   commit references; used both as the `add.path` and as the key the
+///   replace compares against the live set. It is `recovered_add["path"]`, surfaced
 ///   explicitly so the writer never has to re-parse the lifted action.
 /// - `blake3_hash` / `num_records` / `size_bytes` — `R`'s recorded artifact
 ///   identity, flowed straight into the returned [`WriteResult`] so the
@@ -2334,5 +2334,55 @@ mod tests {
             other => panic!("expected AppendOnlyTable, got {other:?}"),
         }
         assert!(!commit_exists(&store, "tbl", 3).await);
+    }
+
+    /// Not a CI test. Writes two replace scenarios to the directory in
+    /// `ROCKY_DELTA_EXPORT_DIR` so an outside Delta reader (delta-rs) can
+    /// check them. See the RV1-P1a experiment record in rocky-plans.
+    #[tokio::test]
+    #[ignore]
+    async fn export_replace_tables_for_an_external_reader() {
+        let Ok(dir) = std::env::var("ROCKY_DELTA_EXPORT_DIR") else {
+            eprintln!("skipping: ROCKY_DELTA_EXPORT_DIR not set");
+            return;
+        };
+        use futures::TryStreamExt;
+        let store: Arc<InMemory> = Arc::new(InMemory::new());
+        seed_bootstrap(&store, "unpart").await;
+        let w = make_unpartitioned_writer(store.clone() as Arc<dyn ObjectStore>, "unpart");
+        w.write_batch(make_batch(4)).await.unwrap(); // v1: ids 0..3
+        w.write_batch(make_batch(6)).await.unwrap(); // v2: ids 0..5
+        w.write_batch(make_batch(6)).await.unwrap(); // no-op
+
+        seed_partitioned_bootstrap(&store, "part").await;
+        let w = make_unpartitioned_writer(store.clone() as Arc<dyn ObjectStore>, "part");
+        let pv = |r: &str| HashMap::from([("region".to_string(), r.to_string())]);
+        w.write_partitioned_batches(vec![
+            (pv("eu"), make_partitioned_batch("eu", 2)),
+            (pv("us"), make_partitioned_batch("us", 3)),
+            (pv("ap"), make_partitioned_batch("ap", 1)),
+        ])
+        .await
+        .unwrap(); // v1: eu 2, us 3, ap 1
+        w.write_partitioned_batches(vec![
+            (pv("eu"), make_partitioned_batch("eu", 4)),
+            (pv("us"), make_partitioned_batch("us", 3)),
+        ])
+        .await
+        .unwrap(); // v2: eu 4, us 3
+
+        let mut stream = store.list(None);
+        while let Some(meta) = stream.try_next().await.unwrap() {
+            let bytes = store
+                .get(&meta.location)
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap();
+            let out = std::path::Path::new(&dir).join(meta.location.as_ref());
+            std::fs::create_dir_all(out.parent().unwrap()).unwrap();
+            std::fs::write(out, &bytes).unwrap();
+        }
     }
 }
