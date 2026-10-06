@@ -821,7 +821,7 @@ pub(super) fn parse_delta_interval_millis(raw: &str) -> Option<i64> {
     let lower = raw.trim().to_ascii_lowercase();
     let body = lower.strip_prefix("interval").unwrap_or(&lower);
     let tokens: Vec<&str> = body.split_whitespace().collect();
-    if tokens.is_empty() || tokens.len() % 2 != 0 {
+    if tokens.is_empty() || !tokens.len().is_multiple_of(2) {
         return None;
     }
     let mut total: i64 = 0;
@@ -1002,7 +1002,7 @@ pub(super) async fn proven_removed_at<S: ObjectStore + ?Sized>(
                         .map(str::to_string);
                 }
                 "commitInfo" => {
-                    commit_ts = action.get("timestamp").and_then(|v| v.as_i64());
+                    commit_ts = action.get("timestamp").and_then(serde_json::Value::as_i64);
                 }
                 "add" | "remove" => {
                     let Some(p) = action.get("path").and_then(|v| v.as_str()) else {
@@ -1014,8 +1014,9 @@ pub(super) async fn proven_removed_at<S: ObjectStore + ?Sized>(
                     if canon == target_canonical {
                         target_actions.push(key == "remove");
                         if key == "remove" {
-                            target_remove_ts =
-                                action.get("deletionTimestamp").and_then(|v| v.as_i64());
+                            target_remove_ts = action
+                                .get("deletionTimestamp")
+                                .and_then(serde_json::Value::as_i64);
                         }
                     }
                 }
@@ -1575,15 +1576,16 @@ pub(super) async fn read_live_set<S: ObjectStore + ?Sized>(
                 }
                 "protocol" => protocol = Some(action.clone()),
                 "metaData" => metadata = Some(action.clone()),
-                "domainMetadata" => {
-                    if action.get("domain").and_then(|v| v.as_str()) == Some("delta.clustering")
-                        && action.get("removed").and_then(|v| v.as_bool()) != Some(true)
-                    {
-                        return Err(UniformWriterError::UnsupportedTableFeature {
-                            table: table.to_string(),
-                            feature: "clustering (`delta.clustering` domain)".to_string(),
-                        });
-                    }
+                "domainMetadata"
+                    if action.get("domain").and_then(|v| v.as_str())
+                        == Some("delta.clustering")
+                        && action.get("removed").and_then(serde_json::Value::as_bool)
+                            != Some(true) =>
+                {
+                    return Err(UniformWriterError::UnsupportedTableFeature {
+                        table: table.to_string(),
+                        feature: "clustering (`delta.clustering` domain)".to_string(),
+                    });
                 }
                 _ => {}
             }
