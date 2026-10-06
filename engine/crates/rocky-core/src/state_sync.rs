@@ -4740,7 +4740,6 @@ pub async fn publish_pointers(
 
 /// The publish transition WITHOUT the CAS guard. Tests use it to show what
 /// the guard prevents.
-
 async fn publish_pointers_with_hook(
     session: &LedgerSeamSession,
     request: &crate::environments::PublishRequest,
