@@ -3327,23 +3327,30 @@ mod tests {
         );
     }
 
-    /// A bare read binds to the model that WRITES the table, whatever it is
-    /// called — the compiler's rule, so `--dag` orders it too (#1629).
+    /// The compiler's binding orders a read the physical pass cannot see
+    /// (#1629): a read of an ephemeral model, which writes no table, so no
+    /// physical edge reaches it and the label pass no longer matches models.
     #[test]
-    fn run_dag_orders_a_bare_read_after_the_model_that_writes_it() {
+    fn run_dag_orders_a_read_of_an_ephemeral_model_by_the_compilers_edge() {
         let dir = tempfile::tempdir().unwrap();
         write_fixture_project(
             dir.path(),
             &transformation_block("t"),
             &[
-                ("stg_events", "db", "z", "events", "SELECT 1 AS id"),
-                ("summary", "db", "marts", "summary", "SELECT id FROM events"),
+                ("eph", "db", "s", "eph", "SELECT 2 AS id"),
+                ("summary", "db", "marts", "summary", "SELECT id FROM eph"),
             ],
         );
+        std::fs::write(
+            dir.path().join("models/eph.toml"),
+            "name = \"eph\"\n\n[strategy]\ntype = \"ephemeral\"\n\n\
+             [target]\ncatalog = \"db\"\nschema = \"s\"\ntable = \"eph\"\n",
+        )
+        .unwrap();
         let planned = plan_fixture(dir.path()).expect("plans");
         assert!(planned_edge(
             &planned,
-            "transformation:stg_events",
+            "transformation:eph",
             "transformation:summary"
         ));
     }
