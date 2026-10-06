@@ -266,6 +266,35 @@ const FULFILL_STATE: TableDefinition<&str, &[u8]> = TableDefinition::new("fulfil
 /// [`CURRENT_SCHEMA_VERSION`] records this posture and its revisit
 /// condition.
 const PRODUCT_APPROVALS: TableDefinition<&str, &[u8]> = TableDefinition::new("product_approvals");
+/// Environment heads (RV1-P2, schema v32): one
+/// [`crate::environments::EnvironmentRecord`] per environment, keyed by the
+/// environment name. Written only by [`StateStore::publish_pointers`], which
+/// reads and moves the head in one write transaction.
+///
+/// **Replicated** (NOT in [`LOCAL_ONLY_TABLE_NAMES`]): every pod must see the
+/// same head, or a publish could not detect a concurrent one.
+const ENVIRONMENTS: TableDefinition<&str, &[u8]> = TableDefinition::new("environments");
+/// Append-only publish history (RV1-P2, schema v32): one
+/// [`crate::environments::PublishRecord`] per publish, keyed by
+/// [`crate::environments::history_key`] (`"{env}|{seq:020}"`) so a prefix scan
+/// returns one environment's history in sequence order. Insert-only: a write
+/// to an existing key is refused, never overwritten.
+///
+/// **Replicated** (NOT in [`LOCAL_ONLY_TABLE_NAMES`]), like [`ENVIRONMENTS`].
+const PUBLISH_HISTORY: TableDefinition<&str, &[u8]> = TableDefinition::new("publish_history");
+/// The schema version that added [`ENVIRONMENTS`] and [`PUBLISH_HISTORY`].
+const ENVIRONMENT_TABLES_SINCE_SCHEMA_VERSION: u32 = 32;
+/// Tables a read-only open tolerates being absent, and only in a store
+/// stamped below [`ENVIRONMENT_TABLES_SINCE_SCHEMA_VERSION`].
+///
+/// A v31 store (or older, down to v22) holds every table except these two.
+/// Refusing it read-only would break `rocky state`, `rocky history` and
+/// `rocky serve` reads after an upgrade until some read-write open ran. The
+/// environment readers map a missing table to "no environments", which is
+/// the truth for a store written before environments existed. A store
+/// stamped v32 or later that lacks one of them is damaged, and is still
+/// refused with [`StateError::ReadOnlyNeedsInit`].
+const READ_ONLY_TOLERATED_ABSENT_BEFORE_V32: &[&str] = &["environments", "publish_history"];
 /// Key/value store for internal metadata (e.g. `"schema_version"`).
 const METADATA: TableDefinition<&str, &str> = TableDefinition::new("metadata");
 
@@ -401,6 +430,8 @@ const SNAPSHOT_TABLE_REGISTRY: &[(&str, TableShape)] = &[
     ("schedule_claims", TableShape::StrBytes),
     ("fulfill_state", TableShape::StrBytes),
     ("product_approvals", TableShape::StrBytes),
+    ("environments", TableShape::StrBytes),
+    ("publish_history", TableShape::StrBytes),
     ("metadata", TableShape::StrStr),
 ];
 
@@ -895,6 +926,34 @@ const SNAPSHOT_MEMORY_WARN_BYTES: u64 = 128 * 1024 * 1024;
 ///   and `watermarks_confirmed` keys, added without a bump earlier, ride
 ///   this fence too.
 ///
+/// - **v32** — adds the [`ENVIRONMENTS`] + [`PUBLISH_HISTORY`] tables (RV1-P2):
+///   named environments whose pointers name a model's recorded output
+///   version, and an append-only history of every publish. Pure additive
+///   table change (the v22 shape). Both tables replicate. Guarded by
+///   `test_v31_opens_and_creates_environment_tables`.
+///
+///   **Why it is a bump and not a rider.** A publish reads
+///   [`ModelExecution::output_version`] and refuses a model without one. That
+///   gate is a decision, so the field it reads is no longer "recorded only"
+///   (see its note below). The bump also fences the new tables from a v31
+///   binary: a v31 binary that uploaded a store would carry the rows it
+///   cannot read, but it would not see a concurrent publish.
+///
+///   **On upgrade.** A v31 store opened read-write is stamped v32 in place
+///   and gets the two empty tables; every record is kept. A read-only open
+///   of a store stamped below v32 tolerates the two tables being absent and
+///   reads them as empty ([`READ_ONLY_TOLERATED_ABSENT_BEFORE_V32`]); a store
+///   stamped v32 that lacks them is refused. Remote state carries forward
+///   from the `v31/` key ([`crate::state_sync`]); the first upload creates
+///   the `v32/` key and the `v31/` key is never written.
+///
+///   **On rollback.** The version check runs at OPEN.
+///   [`SchemaMismatchPolicy::Fail`] refuses with the version pair.
+///   [`SchemaMismatchPolicy::Recreate`] starts a fresh local store and never
+///   uploads it. A v31 binary uses the `v31/` remote key, so it neither reads
+///   nor overwrites environments a v32 binary published; it also does not
+///   see them.
+///
 /// # Fields added without a bump
 ///
 /// A serde-additive field needs no bump when an older binary that ignores it
@@ -920,10 +979,9 @@ const SNAPSHOT_MEMORY_WARN_BYTES: u64 = 128 * 1024 * 1024;
 ///   Guarded by `test_v31_model_execution_forward_deserializes_output_version_none`
 ///   and `test_v31_rollback_mirror_reads_a_row_with_output_version`.
 ///
-///   **RV1-P2 MUST bump to v32 when publish starts reading `output_version`.**
-///   From then on an older binary that ignores the version would publish
-///   differently, which is the v31 lesson above.
-const CURRENT_SCHEMA_VERSION: u32 = 31;
+///   **RV1-P2 bumped to v32 when publish started reading `output_version`**
+///   (see the v32 stanza above). The field itself is unchanged.
+const CURRENT_SCHEMA_VERSION: u32 = 32;
 
 /// Errors from the embedded redb state store.
 #[derive(Debug, Error)]
@@ -966,7 +1024,8 @@ pub enum StateError {
     /// A read transaction cannot create a table, and a read-only open never
     /// escalates to a write to create one in a store that holds anything
     /// (#1545, C1-P1b). Only a store written by a Rocky older than schema
-    /// v22 — the last table addition — can be in this state; an empty
+    /// v22 can be in this state (v32 added two tables, but a read-only open
+    /// tolerates their absence below v32); an empty
     /// database is bootstrapped instead, and a remote restore keeps every
     /// table. Any read-write open (a `rocky run`, `rocky load`, `rocky apply`)
     /// creates the tables and stamps the version; reads work from then on.
@@ -1015,6 +1074,24 @@ pub enum StateError {
 
     #[error("run progress {run_id:?} is missing; refusing to confirm its watermarks")]
     MissingRunProgress { run_id: String },
+
+    /// A publish found a different environment head than the caller expected.
+    /// Nothing was written. `None` on either side means "no environment".
+    #[error(
+        "publish conflict on environment {env:?}: expected head {}, found {}; another publish \
+         moved it. Re-read the environment and publish again",
+        .expected.as_deref().unwrap_or("<none: create>"),
+        .found.as_deref().unwrap_or("<none>")
+    )]
+    PublishConflict {
+        env: String,
+        expected: Option<String>,
+        found: Option<String>,
+    },
+
+    /// An environment or publish request was refused before any write.
+    #[error(transparent)]
+    Environment(#[from] crate::environments::EnvironmentError),
 }
 
 impl From<redb::TransactionError> for StateError {
@@ -1631,6 +1708,8 @@ impl StateStore {
             SCHEDULE_CLAIMS.name(),
             FULFILL_STATE.name(),
             PRODUCT_APPROVALS.name(),
+            ENVIRONMENTS.name(),
+            PUBLISH_HISTORY.name(),
         ]
     }
 
@@ -1642,8 +1721,14 @@ impl StateStore {
     /// [`table_names`][Self::table_names]. That is checked here directly with
     /// `list_tables()` instead of being inferred from the version stamp: a
     /// store stamped at an older version still carries every table when no
-    /// table was added since (the last one was at v22), and a store the stamp
-    /// says nothing about — unversioned — is judged by what is on disk.
+    /// table was added since, and a store the stamp says nothing about —
+    /// unversioned — is judged by what is on disk.
+    ///
+    /// One exception, keyed on the stamp: a store stamped below v32 may lack
+    /// the two v32 tables (`environments`, `publish_history`; see
+    /// [`READ_ONLY_TOLERATED_ABSENT_BEFORE_V32`]). It opens, and the
+    /// environment readers answer "none". A store stamped v32 or later, or
+    /// unversioned, that lacks them is refused like any other.
     ///
     /// Before this, any stamp other than exactly [`CURRENT_SCHEMA_VERSION`]
     /// fell through to the write path, which took a redb WRITE transaction
@@ -1658,7 +1743,8 @@ impl StateStore {
     /// A store that holds something but lacks a table is refused with
     /// [`StateError::ReadOnlyNeedsInit`] naming the missing tables; the next
     /// read-write open creates them. Only a store written by a Rocky older
-    /// than schema v22 can be in that state: a remote restore keeps every
+    /// than schema v22 (the last table addition before v32) can be in that
+    /// state: a remote restore keeps every
     /// table (it empties the local-only ones, it does not drop them —
     /// `state_sync::clear_named_tables`). A forward-incompatible stamp is
     /// always [`StateError::SchemaMismatch`] here: no read-only caller
@@ -1697,9 +1783,17 @@ impl StateStore {
             });
         }
 
+        // A store stamped below v32 predates the environment tables; their
+        // absence is expected there and the readers answer "none". The
+        // version condition matters: a v32+ store missing them is damaged.
+        let tolerate_env_tables =
+            found.is_some_and(|v| v < ENVIRONMENT_TABLES_SINCE_SCHEMA_VERSION);
         let missing: Vec<String> = Self::table_names()
             .into_iter()
             .filter(|name| !present.contains(*name))
+            .filter(|name| {
+                !(tolerate_env_tables && READ_ONLY_TOLERATED_ABSENT_BEFORE_V32.contains(name))
+            })
             .map(str::to_string)
             .collect();
         if missing.is_empty() {
@@ -1817,6 +1911,8 @@ impl StateStore {
             let _table = txn.open_table(SCHEDULE_CLAIMS)?;
             let _table = txn.open_table(FULFILL_STATE)?;
             let _table = txn.open_table(PRODUCT_APPROVALS)?;
+            let _table = txn.open_table(ENVIRONMENTS)?;
+            let _table = txn.open_table(PUBLISH_HISTORY)?;
         }
         // Construction-time commit: this runs on the raw `db` handle before any
         // `StateStore` (and thus any `write_epoch`) exists, so it deliberately
@@ -2751,8 +2847,9 @@ pub struct ModelExecution {
 }
 
 /// Lenient reader for [`ModelExecution::output_version`]: any value that does
-/// not parse as an [`OutputVersion`] reads as `None` ("not recorded"). No gate
-/// reads the version yet, so losing an unparseable one is safe; failing the
+/// not parse as an [`OutputVersion`] reads as `None` ("not recorded"). The
+/// v32 publish gate refuses `None`, so losing an unparseable one fails closed
+/// (the model cannot be published); failing the
 /// row (and with it every run-history read) is not.
 fn deserialize_output_version_lenient<'de, D>(
     deserializer: D,
@@ -8429,6 +8526,232 @@ pub fn validate_namespace(ns: &str) -> Result<&str, rocky_sql::validation::Valid
 /// surfaces a clean error to the user.
 fn sanitize_namespace(ns: &str) -> Option<&str> {
     validate_namespace(ns).ok()
+}
+
+// --- Environments and publish history (RV1-P2, schema v32) -----------------
+
+/// Open an environment table in a read transaction, mapping "the table does
+/// not exist" to `None`. Only a store stamped below v32 opened read-only can
+/// lack it (see [`READ_ONLY_TOLERATED_ABSENT_BEFORE_V32`]); there it means
+/// "no environments", which is the truth for such a store.
+fn open_env_table_if_present(
+    txn: &redb::ReadTransaction,
+    def: TableDefinition<&'static str, &'static [u8]>,
+) -> Result<Option<redb::ReadOnlyTable<&'static str, &'static [u8]>>, StateError> {
+    match txn.open_table(def) {
+        Ok(table) => Ok(Some(table)),
+        Err(redb::TableError::TableDoesNotExist(_)) => Ok(None),
+        Err(e) => Err(StateError::Table(e)),
+    }
+}
+
+impl StateStore {
+    /// The current head of environment `name`, or `None` when it does not
+    /// exist.
+    pub fn get_environment(
+        &self,
+        name: &crate::environments::EnvironmentName,
+    ) -> Result<Option<crate::environments::EnvironmentRecord>, StateError> {
+        let txn = self.db.begin_read()?;
+        let Some(table) = open_env_table_if_present(&txn, ENVIRONMENTS)? else {
+            return Ok(None);
+        };
+        match table.get(name.as_str())? {
+            Some(v) => Ok(Some(serde_json::from_slice(v.value())?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Every environment head, ordered by name.
+    pub fn list_environments(
+        &self,
+    ) -> Result<Vec<crate::environments::EnvironmentRecord>, StateError> {
+        let txn = self.db.begin_read()?;
+        let Some(table) = open_env_table_if_present(&txn, ENVIRONMENTS)? else {
+            return Ok(Vec::new());
+        };
+        let mut out = Vec::new();
+        for entry in table.iter()? {
+            let (_, v) = entry?;
+            out.push(serde_json::from_slice(v.value())?);
+        }
+        Ok(out)
+    }
+
+    /// The publish history of environment `name`, oldest first (seq 1, 2, ...).
+    pub fn publish_history(
+        &self,
+        name: &crate::environments::EnvironmentName,
+    ) -> Result<Vec<crate::environments::PublishRecord>, StateError> {
+        let txn = self.db.begin_read()?;
+        let Some(table) = open_env_table_if_present(&txn, PUBLISH_HISTORY)? else {
+            return Ok(Vec::new());
+        };
+        // `|` sorts after every byte the name grammar allows ('|' = 0x7C is
+        // above 'z' = 0x7A), and `}` is the next byte, so this range holds
+        // exactly the keys `"{name}|..."` — never another environment's.
+        let lo = format!("{name}|");
+        let hi = format!("{name}}}");
+        let mut out = Vec::new();
+        for entry in table.range(lo.as_str()..hi.as_str())? {
+            let (_, v) = entry?;
+            out.push(serde_json::from_slice(v.value())?);
+        }
+        Ok(out)
+    }
+
+    /// Move environment pointers: read the head, compare it with
+    /// `request.expected_head`, resolve every source to a recorded output
+    /// version, then write the new head and one history row. All of it runs
+    /// in ONE redb write transaction, so two writers on this store cannot
+    /// both move the same head.
+    ///
+    /// Merge semantics: the new head keeps every pointer it held and replaces
+    /// (or adds) the pointers for the models in the request.
+    ///
+    /// This is the local transaction only. Across pods, call
+    /// [`crate::state_sync::publish_pointers`], which replays this whole
+    /// method on a fresh copy when the shared blob moved.
+    ///
+    /// # Errors
+    ///
+    /// - [`StateError::PublishConflict`] when the head is not
+    ///   `expected_head` (`None` = the environment must not exist).
+    /// - [`StateError::Environment`] for an empty request, a duplicate model,
+    ///   a model whose execution has no usable output version (missing, or
+    ///   [`OutputVersion::Unversioned`]), or an existing history key.
+    ///
+    /// Nothing is written on any error.
+    pub fn publish_pointers(
+        &self,
+        request: &crate::environments::PublishRequest,
+    ) -> Result<crate::environments::PublishRecord, StateError> {
+        use crate::environments::{
+            EnvironmentError, EnvironmentRecord, PublishRecord, PublishScope, history_key,
+            publish_id, resolve_pointer,
+        };
+        let env = &request.environment;
+        if request.sources.is_empty() {
+            return Err(EnvironmentError::EmptyPublish {
+                environment: env.to_string(),
+            }
+            .into());
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for source in &request.sources {
+            if !seen.insert(source.model.as_str()) {
+                return Err(EnvironmentError::DuplicateModel {
+                    environment: env.to_string(),
+                    model: source.model.clone(),
+                }
+                .into());
+            }
+        }
+
+        let txn = self.db.begin_write()?;
+        let record = {
+            let mut envs = txn.open_table(ENVIRONMENTS)?;
+            let current: Option<EnvironmentRecord> = match envs.get(env.as_str())? {
+                Some(v) => Some(serde_json::from_slice(v.value())?),
+                None => None,
+            };
+            // The head comparison. It runs inside the write transaction, so
+            // no other writer on this store can move the head between this
+            // read and the insert below. Dropping `txn` on return aborts.
+            let found = current.as_ref().map(|c| c.head_publish_id.clone());
+            if found != request.expected_head {
+                return Err(StateError::PublishConflict {
+                    env: env.to_string(),
+                    expected: request.expected_head.clone(),
+                    found,
+                });
+            }
+
+            let runs = txn.open_table(RUN_HISTORY)?;
+            let mut to = std::collections::BTreeMap::new();
+            for source in &request.sources {
+                let run: Option<RunRecord> = match runs.get(source.run_id.as_str())? {
+                    Some(v) => Some(serde_json::from_slice(v.value())?),
+                    None => None,
+                };
+                let pointer = resolve_pointer(source, run.as_ref()).map_err(|reason| {
+                    EnvironmentError::Refused {
+                        environment: env.to_string(),
+                        model: source.model.clone(),
+                        reason,
+                    }
+                })?;
+                to.insert(source.model.clone(), pointer);
+            }
+            drop(runs);
+
+            let (seq, prior, mut pointers) = match current {
+                Some(c) => {
+                    let seq = c.seq.checked_add(1).ok_or(EnvironmentError::SeqOverflow {
+                        environment: env.to_string(),
+                        seq: c.seq,
+                    })?;
+                    (seq, Some(c.head_publish_id), c.pointers)
+                }
+                None => (1, None, std::collections::BTreeMap::new()),
+            };
+            let from: std::collections::BTreeMap<_, _> = to
+                .keys()
+                .filter_map(|m| pointers.get(m).map(|p| (m.clone(), p.clone())))
+                .collect();
+            for (model, pointer) in &to {
+                pointers.insert(model.clone(), pointer.clone());
+            }
+            let now = chrono::Utc::now();
+            let id = publish_id(env, seq);
+            let record = PublishRecord {
+                publish_id: id.clone(),
+                environment: env.clone(),
+                seq,
+                prior_publish_id: prior,
+                principal: request.principal.clone(),
+                published_at: now,
+                from,
+                to,
+                plan_id: request.plan_id.clone(),
+                scope: PublishScope::StateOnly,
+            };
+            let head = EnvironmentRecord {
+                name: env.clone(),
+                seq,
+                head_publish_id: id,
+                pointers,
+                updated_at: now,
+                updated_by: request.principal.clone(),
+            };
+
+            let mut history = txn.open_table(PUBLISH_HISTORY)?;
+            let key = history_key(env, seq);
+            if history.get(key.as_str())?.is_some() {
+                return Err(EnvironmentError::HistoryRowExists { key }.into());
+            }
+            history.insert(key.as_str(), serde_json::to_vec(&record)?.as_slice())?;
+            envs.insert(env.as_str(), serde_json::to_vec(&head)?.as_slice())?;
+            record
+        };
+        self.commit_write(txn)?;
+        Ok(record)
+    }
+}
+
+/// Test support: make the store at `path` look like one a v31 binary wrote —
+/// stamped `31`, without the two v32 tables. Stamp FIRST (the stamp helper
+/// opens read-write, which would recreate the tables), then drop them with
+/// raw redb.
+#[cfg(any(test, feature = "test-support"))]
+pub fn force_pre_v32_store(path: &Path) {
+    force_schema_version(path, "31");
+    let db = Database::open(path).expect("reopen to drop the v32 tables");
+    let txn = db.begin_write().expect("write txn");
+    txn.delete_table(ENVIRONMENTS).expect("drop environments");
+    txn.delete_table(PUBLISH_HISTORY)
+        .expect("drop publish_history");
+    txn.commit().expect("commit");
 }
 
 #[cfg(test)]
@@ -16155,7 +16478,10 @@ mod tests {
         // serde-additive shape. NO table change either — so this stanza moves
         // the version only; guarded by
         // `test_v25_run_record_forward_deserializes_verify_after_failed_false`.
-        const EXPECTED_VERSION: u32 = 31;
+        // v32 adds the `environments` + `publish_history` tables (RV1-P2) —
+        // new tables, so they ARE in EXPECTED_TABLES below; guarded by
+        // `test_v31_opens_and_creates_environment_tables`. Both replicate.
+        const EXPECTED_VERSION: u32 = 32;
         // v28 adds `PolicyDecisionRecord::models` (#1766), the graph keys
         // behind a plan-level review escalation's human label. The same
         // serde-additive shape as v25-v27: NO table change — `EXPECTED_TABLES`
@@ -16181,6 +16507,7 @@ mod tests {
             "check_history",
             "dag_snapshots",
             "discover_snapshots",
+            "environments",
             "fulfill_state",
             "grace_periods",
             "idempotency_keys",
@@ -16193,6 +16520,7 @@ mod tests {
             "partitions",
             "policy_decisions",
             "product_approvals",
+            "publish_history",
             "quality_history",
             "run_history",
             "run_progress",

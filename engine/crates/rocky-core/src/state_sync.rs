@@ -82,6 +82,22 @@ pub enum StateSyncError {
     CasConflict { key: String },
 
     #[error(
+        "publish conflict on environment {env:?}: expected head {}, found {}; another publish \
+         moved it. Re-read the environment and publish again",
+        .expected.as_deref().unwrap_or("<none: create>"),
+        .found.as_deref().unwrap_or("<none>")
+    )]
+    /// A [`publish_pointers`] attempt found a different environment head than
+    /// the caller expected — on the first attempt or on a replay after a CAS
+    /// conflict. A semantic refusal: the seam aborts without uploading and
+    /// puts the remote winner back locally. Retrying cannot change it.
+    PublishConflict {
+        env: String,
+        expected: Option<String>,
+        found: Option<String>,
+    },
+
+    #[error(
         "ledger-seam compare-and-swap conflict on shared state blob '{key}' after {attempts} \
          attempts: concurrent writers kept advancing it; preserving the remote winner \
          (fail-closed)"
@@ -4634,11 +4650,88 @@ fn is_transient(err: &StateSyncError) -> bool {
         // A seam-transition failure is a domain refusal from the caller's
         // closure, not a transport fault — retrying cannot change it.
         | StateSyncError::SeamTransition(_)
+        // A publish conflict is a semantic refusal: the head moved.
+        | StateSyncError::PublishConflict { .. }
         // Configuration refusals: retrying cannot change the store or the
         // marker.
         | StateSyncError::CasUnsupported { .. }
         | StateSyncError::CasRequired { .. } => false,
     }
+}
+
+/// Hook run inside each [`publish_pointers`] attempt, after the local
+/// transaction and before the conditional upload. Test seam only.
+type PublishAttemptHook =
+    Arc<dyn Fn(u32) -> Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send + Sync>;
+
+/// Map a local publish error to the seam's error type. A head conflict
+/// becomes the typed [`StateSyncError::PublishConflict`], so it travels the
+/// seam's failure path (restore the remote winner, no upload) as itself.
+fn publish_error(e: crate::state::StateError) -> StateSyncError {
+    match e {
+        crate::state::StateError::PublishConflict {
+            env,
+            expected,
+            found,
+        } => StateSyncError::PublishConflict {
+            env,
+            expected,
+            found,
+        },
+        other => StateSyncError::State(other),
+    }
+}
+
+/// Publish environment pointers against the shared state (RV1-P2).
+///
+/// Runs [`StateStore::publish_pointers`] as one [`LedgerSeamSession`]
+/// transition: download the blob with its generation, run the local
+/// transaction, upload with compare-and-swap. When the blob moved, the WHOLE
+/// transaction replays on the winner (up to three attempts):
+///
+/// ```text
+///   blob moved by an unrelated run finalize ──▶ replay, same head ──▶ Ok
+///   blob moved by another publish           ──▶ replay, new head  ──▶ PublishConflict
+/// ```
+///
+/// On the Local backend it is one local transaction, no remote I/O. Under
+/// `concurrency_control = "off"` it is the legacy half-seam (one download,
+/// one transaction, one unconditional upload): two concurrent publishes can
+/// then both succeed and one is lost. Use CAS for shared environments.
+///
+/// # Errors
+///
+/// [`StateSyncError::PublishConflict`] when the head is not the expected
+/// one; [`StateSyncError::State`] wrapping
+/// [`crate::state::StateError::Environment`] for a refused request; plus
+/// every seam error ([`StateSyncError::LedgerSeamConflict`], transport).
+pub async fn publish_pointers(
+    session: &LedgerSeamSession,
+    request: &crate::environments::PublishRequest,
+) -> Result<crate::environments::PublishRecord, StateSyncError> {
+    publish_pointers_with_hook(session, request, None).await
+}
+
+async fn publish_pointers_with_hook(
+    session: &LedgerSeamSession,
+    request: &crate::environments::PublishRequest,
+    hook: Option<PublishAttemptHook>,
+) -> Result<crate::environments::PublishRecord, StateSyncError> {
+    let attempt_number = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    session
+        .execute(move |store, _base| {
+            let request = request.clone();
+            let hook = hook.clone();
+            let n = attempt_number.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            Box::pin(async move {
+                let result = store.publish_pointers(&request);
+                if let Some(hook) = hook {
+                    hook(n).await;
+                }
+                result.map_err(publish_error)
+            })
+        })
+        .await
 }
 
 #[cfg(test)]
