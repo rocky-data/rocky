@@ -1,3 +1,4 @@
+import type { ScheduleSpoolOutput } from "@rocky-types/schedule_spool";
 import type { ScheduleStatusOutput } from "@rocky-types/schedule_status";
 import { EmptyState, StatusCard, type Tone } from "../components";
 import { NOT_RECORDED, formatInstant, orNotRecorded } from "../format";
@@ -100,6 +101,42 @@ export function SchedulePanel({ status, now }: { status: ScheduleStatusOutput; n
         </table>
         </div>
       )}
+    </div>
+  );
+}
+
+/**
+ * The webhook demands waiting in the spool, from `GET /api/v1/schedule/spool`
+ * (#1900). `GET /api/v1/schedule` reports claims, which exist only once a
+ * tick picks a demand up, so a demand still in the spool appears nowhere in
+ * the panel above. Without this, a scheduler whose ticks stopped looks
+ * healthy while demands pile up.
+ *
+ * Only a spool that was read renders here. A refused or unreachable read is
+ * shown as that error by the caller, never as 0 waiting.
+ */
+export function SpoolCounts({ spool }: { spool: ScheduleSpoolOutput }) {
+  const { counts } = spool;
+  return (
+    <div className="grid gap-2 sm:grid-cols-3" role="group" aria-label="Waiting webhook demands">
+      <StatusCard
+        label="waiting demands"
+        value={counts.pending}
+        tone={counts.pending > 0 ? "pending" : "muted"}
+        sub="accepted by the webhook, not yet claimed by a tick"
+      />
+      <StatusCard
+        label="unreadable demands"
+        value={counts.skipped}
+        tone={counts.skipped > 0 ? "risk" : "muted"}
+        sub="in the spool, but could not be read"
+      />
+      <StatusCard
+        label="quarantined"
+        value={counts.corrupt}
+        tone={counts.corrupt > 0 ? "risk" : "muted"}
+        sub="set aside by a tick as corrupt"
+      />
     </div>
   );
 }

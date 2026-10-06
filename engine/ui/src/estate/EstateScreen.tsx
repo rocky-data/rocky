@@ -4,6 +4,7 @@ import type { HistoryOutput } from "@rocky-types/history";
 import type { ModelDetailOutput } from "@rocky-types/model_detail";
 import type { ModelListOutput } from "@rocky-types/model_list";
 import type { ProjectOutput } from "@rocky-types/project";
+import type { ScheduleSpoolOutput } from "@rocky-types/schedule_spool";
 import type { ScheduleStatusOutput } from "@rocky-types/schedule_status";
 import { apiGet } from "../api";
 import { StatusCard } from "../components";
@@ -12,7 +13,7 @@ import { ModelDetail } from "./ModelDetail";
 import { type CompiledModels, anyNotCompiled, compiledModels, isWholeList } from "./nodeRoute";
 import { ProjectStrip } from "./ProjectStrip";
 import { RunsPanel } from "./RunsPanel";
-import { SchedulePanel } from "./SchedulePanel";
+import { SchedulePanel, SpoolCounts } from "./SchedulePanel";
 import { type Resource, useResource } from "./useResource";
 
 /** The producers this screen reads. Tests hand in fixtures. */
@@ -23,6 +24,8 @@ export interface EstateLoaders {
   models: () => Promise<ModelListOutput>;
   runs: () => Promise<HistoryOutput>;
   schedule: () => Promise<ScheduleStatusOutput>;
+  /** The webhook demands waiting in the spool, which `schedule` cannot see. */
+  spool: () => Promise<ScheduleSpoolOutput>;
   detail: (name: string) => Promise<ModelDetailOutput>;
 }
 
@@ -32,6 +35,7 @@ export const defaultLoaders: EstateLoaders = {
   models: () => apiGet<ModelListOutput>("models"),
   runs: () => apiGet<HistoryOutput>("runs"),
   schedule: () => apiGet<ScheduleStatusOutput>("schedule"),
+  spool: () => apiGet<ScheduleSpoolOutput>("schedule/spool"),
   detail: (name) => apiGet<ModelDetailOutput>(`models/${encodeURIComponent(name)}`),
 };
 
@@ -73,6 +77,7 @@ export function EstateScreen({
   const models = useResource(loaders.models, [loaders], recheck ? recheckMs : undefined);
   const runs = useResource(loaders.runs, [loaders], refreshMs);
   const schedule = useResource(loaders.schedule, [loaders], refreshMs);
+  const spool = useResource(loaders.spool, [loaders], refreshMs);
   const [selected, setSelected] = useState<string | null>(null);
   // Bumped by Refresh, so an open model's detail is read again too.
   const [generation, setGeneration] = useState(0);
@@ -113,6 +118,7 @@ export function EstateScreen({
     models.reload();
     runs.reload();
     schedule.reload();
+    spool.reload();
     setGeneration((g) => g + 1);
   };
 
@@ -158,10 +164,15 @@ export function EstateScreen({
         <Loaded resource={runs}>{(value) => <RunsPanel history={value} now={now} />}</Loaded>
       </Panel>
 
-      <Panel title="Schedule" producer="GET /api/v1/schedule">
-        <Loaded resource={schedule}>
-          {(value) => <SchedulePanel status={value} now={now} />}
-        </Loaded>
+      <Panel title="Schedule" producer="GET /api/v1/schedule + GET /api/v1/schedule/spool">
+        <div className="space-y-3">
+          {/* Its own resource, so a refused spool read shows as that refusal
+              while the claims above still render — and never as 0 waiting. */}
+          <Loaded resource={spool}>{(value) => <SpoolCounts spool={value} />}</Loaded>
+          <Loaded resource={schedule}>
+            {(value) => <SchedulePanel status={value} now={now} />}
+          </Loaded>
+        </div>
       </Panel>
     </div>
   );

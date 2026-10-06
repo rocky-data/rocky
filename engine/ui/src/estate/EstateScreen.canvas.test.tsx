@@ -10,6 +10,7 @@ import type { DagOutput } from "@rocky-types/dag";
 import type { HistoryOutput } from "@rocky-types/history";
 import type { ModelDetailOutput } from "@rocky-types/model_detail";
 import type { ModelListOutput } from "@rocky-types/model_list";
+import type { ScheduleSpoolOutput } from "@rocky-types/schedule_spool";
 import type { ScheduleStatusOutput } from "@rocky-types/schedule_status";
 import historyFixture from "@rocky-fixtures/history.json";
 import { installFlowCanvas, nodeElement } from "../test/flowCanvas";
@@ -56,6 +57,15 @@ function loaders(models: () => Promise<ModelListOutput>, load: EstateLoaders["de
         tick_lock: { state: "never" },
         timezone: "UTC",
       }) as ScheduleStatusOutput,
+    spool: async () =>
+      ({
+        command: "state-schedule-spool",
+        counts: { pending: 0, skipped: 0, corrupt: 0 },
+        pending: [],
+        skipped: [],
+        spool_path: "/p/.rocky/pending-demands",
+        version: "0",
+      }) as ScheduleSpoolOutput,
     detail: load,
   };
 }
