@@ -82,9 +82,20 @@
 //! the Windows paragraph at the end of this header is the whole story
 //! there, and it is a weaker one.
 //!
+//! Recovery's rollback does NOT publish by rename (#1633). It reads each
+//! recorded `.ff-prev` through `read_no_follow` — every backup, before the
+//! first mutation — and writes THOSE bytes over the final in place
+//! (`O_NOFOLLOW`, regular file, `nlink == 1` on unix), so the object
+//! validated and the object published are one read. A hardlink parked at a
+//! `.ff-prev` is refused there with nothing restored; a rename would have
+//! made the project's committed file a second name for an outside inode.
+//! The cost is that a restore is a copy, not an atomic rename: a crash
+//! mid-write leaves the `.ff-prev` and the journal, and the next recovery
+//! repeats it.
+//!
 //! At the OPEN, precisely. Custody of the staged inode ends when the write
-//! closes it, and the rename that PUBLISHES it (`.ff-staged` → final, and
-//! recovery's `.ff-prev` → final) is pathname-based: a writer who replaces
+//! closes it, and the rename that PUBLISHES it (`.ff-staged` → final) is
+//! pathname-based: a writer who replaces
 //! the staged name with a symlink between the close and the rename gets that
 //! symlink renamed into place as the artifact, because `rename` acts on the
 //! name it is given and never follows it. Nothing is written through the
@@ -625,6 +636,13 @@ fn refuse_hard_linked(
 /// write; `InvalidInput` when what was opened is not a regular file, or (on
 /// unix) has more than one hard link.
 pub fn write_no_follow(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    overwrite_no_follow(path, bytes).map(drop)
+}
+
+/// [`write_no_follow`], handing back the descriptor it wrote through so a
+/// caller can finish on the SAME file — recovery's restore sets the backup's
+/// mode on it rather than on a second path lookup.
+fn overwrite_no_follow(path: &Path, bytes: &[u8]) -> std::io::Result<std::fs::File> {
     use std::io::Write as _;
     let mut options = std::fs::OpenOptions::new();
     // `truncate(false)`: the truncate happens below, once the descriptor is
@@ -656,7 +674,8 @@ pub fn write_no_follow(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
          does not own.",
     )?;
     file.set_len(0)?;
-    file.write_all(bytes)
+    file.write_all(bytes)?;
+    Ok(file)
 }
 
 /// The largest artifact read whole through the no-follow read helpers.
@@ -829,6 +848,27 @@ fn copy_no_follow(src: &Path, dst: &Path) -> std::io::Result<()> {
     let (bytes, permissions) = read_no_follow(src)?;
     let backup = create_new_no_follow(dst, Some(0o600))?;
     write_backup(backup, &bytes, &permissions)
+}
+
+/// Publish a restored backup over its final: the bytes recovery already took
+/// custody of, written in place through [`overwrite_no_follow`], then the
+/// backup's mode (masked to `0o777`, as [`write_backup`] does) set on that
+/// same descriptor. Never a rename: a rename publishes whatever the source
+/// NAME resolves to at that moment, which is the #1633 hole.
+fn restore_no_follow(
+    final_path: &Path,
+    bytes: &[u8],
+    permissions: &std::fs::Permissions,
+) -> std::io::Result<()> {
+    let file = overwrite_no_follow(final_path, bytes)?;
+    #[cfg(unix)]
+    let permissions = {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::Permissions::from_mode(permissions.mode() & 0o777)
+    };
+    #[cfg(not(unix))]
+    let permissions = permissions.clone();
+    file.set_permissions(permissions)
 }
 
 /// Write the backup body and apply its mode, both on the DESCRIPTOR so a
@@ -1615,7 +1655,45 @@ pub fn recover_generation(project_root: &Path, parsed: &ParsedSpec) -> SpecResul
         }
     };
 
+    // Custody of every backup a rollback will publish, taken BEFORE the
+    // first mutation (#1633). The restore used to be `rename(prev, final)`
+    // after a path-only `is_symlink` check — and a HARDLINK at `.ff-prev` is
+    // an ordinary regular file to every path check, so a second name for an
+    // inode outside the project would have been renamed into place as the
+    // project's committed file. No race needed.
+    //
+    // Now the bytes that get published are the bytes read here, through the
+    // one descriptor-bound reader every import sink uses
+    // (`read_no_follow`): `O_NOFOLLOW` refuses a symlinked leaf, the
+    // descriptor must be a regular file, and on unix a link count above one
+    // is refused. Validation and publication are bound to the same object
+    // because they ARE the same read: nothing re-resolves the `.ff-prev`
+    // name between the check and the write. Reading them all first means a
+    // refused backup leaves every final, every backup, and the journal
+    // exactly as they were.
+    let mut restores: Vec<Option<(Vec<u8>, std::fs::Permissions)>> =
+        Vec::with_capacity(resolved_finals.len());
     for (entry, final_path) in &resolved_finals {
+        let prev = prev_sibling(final_path);
+        if committed || !entry.has_prev || !prev.exists() {
+            restores.push(None);
+            continue;
+        }
+        let backup = read_no_follow(&prev).map_err(|err| {
+            SpecRejected::new(
+                "commit-io",
+                format!(
+                    "reading the backup {} to restore {} failed: {err}. Recovery restored \
+                     nothing and kept the journal, so the next run asks again.",
+                    prev.display(),
+                    final_path.display()
+                ),
+            )
+        })?;
+        restores.push(Some(backup));
+    }
+
+    for ((entry, final_path), restore) in resolved_finals.iter().zip(restores) {
         let staged = staged_sibling(final_path);
         let prev = prev_sibling(final_path);
         if committed {
@@ -1634,10 +1712,24 @@ pub fn recover_generation(project_root: &Path, parsed: &ParsedSpec) -> SpecResul
         // alone contradicted that: a partial `.ff-prev` left by an earlier
         // failed attempt would be renamed over the final, undoing a commit
         // the journal never recorded a backup for (#1502).
-        if entry.has_prev && prev.exists() {
-            std::fs::rename(&prev, final_path)
+        if let Some((bytes, permissions)) = restore {
+            // A COPY of the bytes custody was taken of above, not a rename of
+            // a name: the written file is the project's own final, rewritten
+            // in place without following a link at its leaf (and refused,
+            // on unix, when the final itself carries a second name). A crash
+            // between this write and the removal below leaves the `.ff-prev`
+            // and the journal, and the next recovery repeats the restore —
+            // a half-written final digests to neither generation, so the
+            // marker check above routes it back here.
+            restore_no_follow(final_path, &bytes, &permissions)
                 .map_err(|err| io_reject("restoring", final_path, &err))?;
-        } else if !entry.has_prev && prev.exists() {
+            std::fs::remove_file(&prev).map_err(|err| io_reject("removing", &prev, &err))?;
+        } else if entry.has_prev {
+            // The journal recorded a backup that was absent when custody was
+            // taken above. Nothing was vetted, so nothing is restored — the
+            // same outcome as before for a recorded-but-missing backup, and
+            // a `.ff-prev` that appears after that read is never published.
+        } else if prev.exists() {
             // A backup the journal does not know about. Refusing is the
             // conservative half of the trade this module already made: the
             // producer deliberately leaves a failed backup in place rather
@@ -1655,7 +1747,7 @@ pub fn recover_generation(project_root: &Path, parsed: &ParsedSpec) -> SpecResul
                     final_path.display()
                 ),
             ));
-        } else if !entry.has_prev {
+        } else {
             // A brand-new file that already renamed into place is uncommitted
             // generation content with nothing underneath — remove it. But
             // decide that by READING it. The same fold as the marker above
@@ -3853,6 +3945,136 @@ mod tests {
             "and the in-project name still names the same untouched bytes"
         );
         assert!(!manifest_path(&project).exists(), "nothing was committed");
+    }
+
+    /// #1633, finding 1: recovery used to restore with
+    /// `rename(.ff-prev, final)` after a path-only `is_symlink` check. A
+    /// HARDLINK at `.ff-prev` is an ordinary regular file to that check, so
+    /// a forged journal recording a backup (`has_prev: true`) plus an
+    /// uncommitted marker selected rollback, and the rename made the
+    /// project's committed contract a second name for an outside inode. No
+    /// race needed.
+    ///
+    /// The restore now reads every backup through the descriptor-bound
+    /// reader BEFORE the first mutation, so the refusal leaves every final,
+    /// every backup and the journal as they were — including the OTHER
+    /// entry, whose backup is a legitimate one.
+    #[cfg(unix)]
+    #[test]
+    fn recovery_refuses_a_hardlinked_backup_and_publishes_nothing() {
+        use std::os::unix::fs::MetadataExt as _;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let outside = dir.path().join("outside-secret");
+        std::fs::write(&outside, b"a developer's private bytes outside the project")
+            .expect("write");
+        let project = seeded_project(dir.path());
+        let parsed = parsed_d3();
+
+        // The sidecar entry: an ordinary backup, listed FIRST so a restore
+        // loop that mutated as it went would already have touched it.
+        let sidecar = project.join(sidecar_rel(&parsed));
+        write_file(&sidecar, b"the uncommitted sidecar");
+        let sidecar_prev = prev_sibling(&sidecar);
+        write_file(&sidecar_prev, b"the previous sidecar");
+
+        // The contract entry: its `.ff-prev` is a second name for the
+        // outside file.
+        let contract = project.join(contract_rel(&parsed));
+        write_file(&contract, b"the uncommitted contract");
+        let contract_prev = prev_sibling(&contract);
+        plant_hardlink(&contract_prev, &outside);
+
+        let journal = write_journal(
+            &project,
+            "revenue_daily",
+            &forged_journal_payload(&[
+                serde_json::json!({
+                    "final": sidecar_rel(&parsed),
+                    "staged_sha": content_digest(b"the uncommitted sidecar"),
+                    "has_prev": true,
+                }),
+                serde_json::json!({
+                    "final": contract_rel(&parsed),
+                    "staged_sha": content_digest(b"the uncommitted contract"),
+                    "has_prev": true,
+                }),
+            ]),
+        );
+
+        let error = recover_generation(&project, &parsed)
+            .expect_err("a hard-linked backup must refuse the rollback");
+
+        assert_eq!(error.code, "commit-io");
+        assert!(
+            error.message.contains("hard link"),
+            "the refusal must name the vector, got: {}",
+            error.message
+        );
+        assert_eq!(
+            std::fs::read(&contract).expect("final intact"),
+            b"the uncommitted contract",
+            "the hard-linked backup must not have been published over the final"
+        );
+        assert_eq!(
+            std::fs::metadata(&contract).expect("final").nlink(),
+            1,
+            "the project's final must not have become a second name for the outside inode"
+        );
+        assert_eq!(
+            std::fs::read(&outside).expect("still there"),
+            b"a developer's private bytes outside the project",
+            "the out-of-project file must be untouched"
+        );
+        assert_eq!(
+            std::fs::read(&sidecar).expect("sidecar intact"),
+            b"the uncommitted sidecar",
+            "custody is taken before the first mutation: no entry is restored"
+        );
+        assert!(sidecar_prev.is_file(), "the legitimate backup is kept");
+        assert!(journal.is_file(), "the journal is kept for the next run");
+    }
+
+    /// The restore is a copy now, not a rename — so pin what a rename gave
+    /// for free: the backup's bytes AND its mode land on the final, and the
+    /// backup is consumed.
+    #[cfg(unix)]
+    #[test]
+    fn recovery_restores_a_backup_by_copy_with_its_mode() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let project = seeded_project(dir.path());
+        let parsed = parsed_d3();
+        let contract = project.join(contract_rel(&parsed));
+        write_file(&contract, b"the uncommitted contract");
+        let prev = prev_sibling(&contract);
+        write_file(&prev, b"the previous contract");
+        std::fs::set_permissions(&prev, std::fs::Permissions::from_mode(0o640)).expect("chmod");
+        write_journal(
+            &project,
+            "revenue_daily",
+            &forged_journal_payload(&[serde_json::json!({
+                "final": contract_rel(&parsed),
+                "staged_sha": content_digest(b"the uncommitted contract"),
+                "has_prev": true,
+            })]),
+        );
+
+        let action = recover_generation(&project, &parsed).expect("rolls back");
+
+        assert_eq!(action, RecoveryAction::RolledBack);
+        assert_eq!(
+            std::fs::read(&contract).expect("restored"),
+            b"the previous contract"
+        );
+        assert_eq!(
+            std::fs::metadata(&contract)
+                .expect("restored")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o640
+        );
+        assert!(!prev.exists(), "the restored backup is consumed");
     }
 
     /// The negative that keeps the guard honest: one link is what EVERY

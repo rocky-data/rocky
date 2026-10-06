@@ -551,3 +551,80 @@ fn apply_is_invoked_from_exactly_one_module() {
         "the typed apply core must be invoked from exactly one module"
     );
 }
+
+/// Every FOLLOWING file read in this crate's production code, by file, with
+/// the reason it is allowed to follow (#1633).
+///
+/// The custody rule is one rule, not a per-call-site decision: bytes this
+/// crate takes from a file a worker (or anyone below the operator) could
+/// have placed, and then hands on — into `products/`, `models/`, or a
+/// worker's prompt — are read through `read_no_follow_bytes`, which refuses
+/// a symlinked leaf and, on unix, a hard link, on the descriptor it reads.
+/// A plain `std::fs::read` / `read_to_string` / `File::open` / `fs::copy`
+/// follows whatever the name resolves to. So every one that remains is
+/// listed here with its reason, and a NEW one fails this test until someone
+/// either routes it through the import reader or adds it here deliberately,
+/// in a reviewer-visible diff.
+const FOLLOWING_READS: &[(&str, usize, &str)] = &[
+    (
+        "driver.rs",
+        2,
+        "`/proc/<pid>/task/<pid>/children` (kernel-provided) and the replay \
+         driver's session file (an operator's CLI argument, not a worker output)",
+    ),
+    (
+        "step.rs",
+        4,
+        "the approved spec snapshot: every read is digest-compared against the \
+         approval record in the state store, a value the file's writer does not \
+         control, before the bytes are used",
+    ),
+];
+
+/// The production half of a source file: everything before its first
+/// top-level `#[cfg(test)]` / `#[cfg(all(test, …))]` module.
+fn production_code(text: &str) -> &str {
+    let mut offset = 0;
+    for line in text.split_inclusive('\n') {
+        if line.starts_with("#[cfg(test)]") || line.starts_with("#[cfg(all(test") {
+            return &text[..offset];
+        }
+        offset += line.len();
+    }
+    text
+}
+
+#[test]
+fn every_following_read_is_inventoried() {
+    const SHAPES: &[&str] = &[
+        "fs::read(",
+        "fs::read_to_string(",
+        "File::open(",
+        "fs::copy(",
+    ];
+    let mut found: BTreeSet<(String, usize)> = BTreeSet::new();
+    for (path, text) in crate_sources() {
+        if path.ends_with("inventory.rs") {
+            continue;
+        }
+        let code = strip_comments_and_strings(production_code(&text));
+        let count: usize = SHAPES.iter().map(|shape| code.matches(shape).count()).sum();
+        if count > 0 {
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            found.insert((name, count));
+        }
+    }
+    let pinned: BTreeSet<(String, usize)> = FOLLOWING_READS
+        .iter()
+        .map(|(file, count, _)| ((*file).to_string(), *count))
+        .collect();
+    assert_eq!(
+        found, pinned,
+        "a following file read appeared or disappeared in production code. Bytes a worker \
+         could have placed go through `rocky_core::product::commit::read_no_follow_bytes`; \
+         anything else is added to FOLLOWING_READS with its reason (#1633)"
+    );
+}
