@@ -2856,6 +2856,8 @@ mod tests {
             ("q?r", "region=q%3Fr", "region=q%253Fr"),
             ("a/b", "region=a%2Fb", "region=a%252Fb"),
             ("k=v", "region=k%3Dv", "region=k%253Dv"),
+            ("a<b", "region=a%3Cb", "region=a%253Cb"),
+            ("t~", "region=t%7E", "region=t%257E"),
             ("über", "region=über", "region=%C3%BCber"),
             ("eu", "region=eu", "region=eu"),
         ];
@@ -2878,6 +2880,141 @@ mod tests {
         // this change still match.
         let plain = "region=eu-1_x.y/0123abcd.parquet";
         assert_eq!(commit::delta_log_path(plain), plain);
+    }
+
+    /// The object key of every ASCII value equals the key the earlier writer
+    /// stored through `Path::from(raw)`, except for the four characters
+    /// Spark escapes and `Path::from` did not (`'` `:` `=` and `/`, which
+    /// `Path::from` split into a directory). Those four move to a new key
+    /// and the transition commit removes the old one, so no object is left
+    /// behind still referenced under a key the log no longer names.
+    #[test]
+    fn object_keys_match_the_earlier_path_from_keys() {
+        for b in 1u8..0x80 {
+            let c = b as char;
+            if matches!(c, '\'' | ':' | '=' | '/') {
+                continue;
+            }
+            let value = format!("a{c}b");
+            let old = Path::from(format!("t/region={value}/H.parquet")).to_string();
+            let new = object_path(
+                "t",
+                &format!("{}/H.parquet", commit::partition_dir("region", &value)),
+            )
+            .unwrap()
+            .to_string();
+            assert_eq!(new, old, "object key for byte {b:#04x}");
+        }
+    }
+
+    /// A table the earlier writer built: object keys from `Path::from(raw)`,
+    /// `add.path` the raw `region=<value>/…` string.
+    ///
+    /// ```text
+    ///   v1  legacy adds (raw add.path)
+    ///   v2  transition: remove every legacy spelling, add the encoded one
+    ///   --  third run: no commit
+    /// ```
+    #[tokio::test]
+    async fn a_legacy_raw_log_makes_one_transition_commit_and_keeps_shared_objects() {
+        use std::collections::{BTreeMap, BTreeSet};
+        let store: Arc<InMemory> = Arc::new(InMemory::new());
+        seed_partitioned_bootstrap(&store, "ptbl").await;
+        let writer = make_unpartitioned_writer(store.clone() as Arc<dyn ObjectStore>, "ptbl");
+        let state = writer.discover().await.unwrap();
+        let values = ["50%off", "x#y", "2024-01-01 00:00:00", "a<b", "eu"];
+        let pv = |r: &str| HashMap::from([("region".to_string(), r.to_string())]);
+        let groups = || -> Vec<_> {
+            values
+                .iter()
+                .map(|v| (pv(v), make_partitioned_batch(v, 2)))
+                .collect()
+        };
+
+        // v1, as the pre-fix writer wrote it.
+        let mut legacy_lines = vec![serde_json::json!({"commitInfo": {}})];
+        let mut legacy_keys = BTreeMap::new();
+        for (p, batch) in groups() {
+            let bytes = parquet_builder::build_parquet(&batch, &state).unwrap();
+            let hash = blake3::hash(&bytes).to_hex().to_string();
+            let raw = format!("region={}/{hash}.parquet", p["region"]);
+            let key = Path::from(format!("ptbl/{raw}"));
+            store
+                .put(&key, PutPayload::from(Bytes::from(bytes.clone())))
+                .await
+                .unwrap();
+            let mut add = commit::build_add_action(&commit::AddInputs {
+                batch: &batch,
+                state: &state,
+                add_file_path: &raw,
+                file_size: bytes.len() as u64,
+                modification_time_millis: 0,
+                partition_values: &p,
+            })
+            .unwrap();
+            add.insert("path".into(), Value::from(raw.clone()));
+            legacy_lines.push(serde_json::json!({ "add": add }));
+            legacy_keys.insert(p["region"].clone(), (raw, key.to_string()));
+        }
+        put_commit(&store, "ptbl", 1, &legacy_lines).await;
+
+        // Run 1 of the new writer: one transition commit.
+        let run = writer.write_partitioned_batches(groups()).await.unwrap();
+        assert_eq!(run.table_version, 2);
+        assert!(!commit_exists(&store, "ptbl", 3).await, "one commit");
+        let lines = commit_lines(&store, "ptbl", 2).await;
+        let canon = |key: &str, action: &Value| {
+            discover::canonical_key(action["path"].as_str().unwrap(), "", "ptbl")
+                .unwrap_or_else(|| panic!("{key} path does not resolve"))
+        };
+        let removed: BTreeSet<String> = actions(&lines, "remove")
+            .into_iter()
+            .map(|r| canon("remove", r))
+            .collect();
+        let added: BTreeSet<String> = actions(&lines, "add")
+            .into_iter()
+            .map(|a| canon("add", a))
+            .collect();
+        assert!(removed.is_disjoint(&added), "{removed:?} vs {added:?}");
+        // `eu` is spelled the same both ways: neither removed nor re-added.
+        assert_eq!(removed.len(), 4, "{removed:?}");
+        assert_eq!(added.len(), 4, "{added:?}");
+        let removed_raw: BTreeSet<&str> = actions(&lines, "remove")
+            .into_iter()
+            .map(|r| r["path"].as_str().unwrap())
+            .collect();
+        for v in ["50%off", "x#y", "2024-01-01 00:00:00", "a<b"] {
+            assert!(removed_raw.contains(legacy_keys[v].0.as_str()), "{v}");
+        }
+
+        // Every live file resolves to an object that exists. For `%`, `#`
+        // and `<` the new add names the SAME object the legacy add stored,
+        // so that object stays referenced. The timestamp's `:` now escapes,
+        // so it gets a new object and the old one is removed in the log.
+        let keys: BTreeSet<String> = parquet_keys(&store, "ptbl").await.into_iter().collect();
+        let live = discover::read_live_set(&*store, "ptbl", "c.s.t", "")
+            .await
+            .unwrap();
+        for k in live.files.keys() {
+            assert!(keys.contains(k), "live {k} has no object");
+        }
+        for v in ["50%off", "x#y", "a<b", "eu"] {
+            assert!(
+                live.files.contains_key(&legacy_keys[v].1),
+                "{v} object still live"
+            );
+        }
+        let ts_old = &legacy_keys["2024-01-01 00:00:00"].1;
+        assert!(!live.files.contains_key(ts_old));
+        assert!(
+            removed.contains(ts_old),
+            "the old timestamp object is removed in the log"
+        );
+
+        // Run 2: stable, no commit.
+        let again = writer.write_partitioned_batches(groups()).await.unwrap();
+        assert!(!again.committed);
+        assert!(!commit_exists(&store, "ptbl", 3).await);
     }
 
     #[tokio::test]

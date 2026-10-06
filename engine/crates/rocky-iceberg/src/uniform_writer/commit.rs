@@ -38,26 +38,54 @@ use super::{Result, UniformTableState, UniformWriterError};
 //   add.path         ──canonical_key─────▶  object key   (one percent-decode)
 //
 // The object key follows Spark: a Hive-style `<col>=<value>` directory with
-// each name and value escaped by `ExternalCatalogUtils.escapePathName`. The
+// each name and value escaped as `ExternalCatalogUtils.escapePathName` does,
+// plus the few characters `object_store` also encodes (see
+// `escape_path_name`). The
 // Delta protocol requires `add.path` to be URI-encoded, so the log carries the
 // key URI-encoded once more, as Spark's Delta writer does. For ordinary values
 // (letters, digits, `-`, `_`, `.`) all three forms are the same string.
 
 /// Escape one partition column name or value for a Hive-style directory
-/// name, like Spark's `ExternalCatalogUtils.escapePathName`.
+/// name: Spark's `ExternalCatalogUtils.escapePathName`, widened to also cover
+/// every character `object_store`'s `Path::from` percent-encodes.
 ///
-/// Escapes the ASCII control characters, DEL and
-/// `"` `#` `%` `'` `*` `/` `:` `=` `?` `\` `{` `[` `]` `^` as `%XX`
-/// (upper-case hex). Spark leaves NUL unescaped; this escapes it too, because
-/// an object key cannot hold it. Other characters, space and non-ASCII
-/// included, stay as they are.
+/// Escaped as `%XX` (upper-case hex):
+///
+/// | Source | Characters |
+/// |---|---|
+/// | Spark | ASCII controls, DEL, `"` `#` `%` `'` `*` `/` `:` `=` `?` `\` `{` `[` `]` `^` |
+/// | `Path::from` only | `}` `` ` `` `<` `>` `\|` `~` |
+///
+/// The second row keeps the stored object key of every value the same as
+/// the key the earlier writer produced with `Path::from(raw)`, so no earlier
+/// object is left behind under an old key. Spark itself leaves those six
+/// characters (and NUL) as they are; a Spark reader still decodes them,
+/// because unescaping decodes any `%XX`. Space and non-ASCII stay as they are.
 pub fn escape_path_name(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
     for c in raw.chars() {
         let escape = c.is_ascii_control()
             || matches!(
                 c,
-                '"' | '#' | '%' | '\'' | '*' | '/' | ':' | '=' | '?' | '\\' | '{' | '[' | ']' | '^'
+                '"' | '#'
+                    | '%'
+                    | '\''
+                    | '*'
+                    | '/'
+                    | ':'
+                    | '='
+                    | '?'
+                    | '\\'
+                    | '{'
+                    | '['
+                    | ']'
+                    | '^'
+                    | '}'
+                    | '`'
+                    | '<'
+                    | '>'
+                    | '|'
+                    | '~'
             );
         if escape {
             out.push_str(&format!("%{:02X}", c as u32));
