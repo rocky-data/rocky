@@ -1566,12 +1566,56 @@ async fn gc_seam_regate(
     .await
 }
 
+/// The policy and model attributes a ledger-seam re-gate evaluates, resolved
+/// once so one seam attempt can reuse them across its fences (#2270).
+///
+/// Resolving loads the models directory (a full compile). Within one attempt
+/// neither the attributes nor the attempt's decision snapshot change; only
+/// the freeze-marker LIST must be fresh at each check, and
+/// [`ledger_seam_regate_resolved`] always re-LISTs.
+pub(crate) struct ResolvedRegate {
+    /// `None`: no config, or no `[policy]` — nothing to gate.
+    /// `Some(Err(gate))`: the resolver's own outcome (a `Deny` refuses —
+    /// including models that could not be loaded; any other outcome is
+    /// satisfied by the review gate the command already passed).
+    /// `Some(Ok(..))`: the policy and attributes to evaluate.
+    resolved: Option<std::result::Result<RegatePolicy, PolicyGate>>,
+}
+
+/// A resolved `[policy]` and the model attributes it is evaluated against.
+type RegatePolicy = (
+    rocky_core::config::PolicyConfig,
+    BTreeMap<String, rocky_core::policy::ModelAttributes>,
+);
+
+/// Resolve the policy and model attributes for [`ledger_seam_regate_resolved`].
+pub(crate) fn resolve_ledger_seam_regate(
+    cfg: Option<&rocky_core::config::RockyConfig>,
+    touched: &BTreeMap<String, PolicyCapability>,
+    models_dir: &Path,
+    models_glob: Option<&str>,
+) -> ResolvedRegate {
+    let resolved = cfg.and_then(|c| c.policy.as_ref()).map(|policy| {
+        crate::commands::apply::resolve_policy_and_attrs(
+            Some(policy),
+            touched,
+            models_dir,
+            models_glob,
+        )
+    });
+    ResolvedRegate { resolved }
+}
+
 /// The per-attempt policy re-gate shared by the review-gated ledger seams
 /// (`gc` and `restore`, #1242). See [`gc_seam_regate`] for the contract;
 /// `verb` names the plan kind in the refusal (`"gc"`, `"restore"`).
 ///
 /// Only a `Deny` refuses: both seams sit behind an unconditional review gate
 /// the command already passed, so a `require_review` outcome is satisfied.
+///
+/// Resolves the policy and model attributes afresh; a caller that checks
+/// several times within one attempt resolves once with
+/// [`resolve_ledger_seam_regate`] and calls [`ledger_seam_regate_resolved`].
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn ledger_seam_regate(
     verb: &str,
@@ -1586,11 +1630,43 @@ pub(crate) async fn ledger_seam_regate(
     fresh_store: Option<&StateStore>,
     stage: &str,
 ) -> Result<(), rocky_core::state_sync::StateSyncError> {
+    let resolved = resolve_ledger_seam_regate(cfg, touched, models_dir, models_glob);
+    ledger_seam_regate_resolved(
+        verb,
+        cfg,
+        &resolved,
+        plan_id,
+        principal,
+        actor,
+        touched,
+        prior_decisions,
+        fresh_store,
+        stage,
+    )
+    .await
+}
+
+/// [`ledger_seam_regate`] over an already-resolved policy and attribute map.
+/// The freeze-marker LIST still runs fresh on every call (fail-closed), so a
+/// marker that lands after `resolved` was built still refuses.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn ledger_seam_regate_resolved(
+    verb: &str,
+    cfg: Option<&rocky_core::config::RockyConfig>,
+    resolved: &ResolvedRegate,
+    plan_id: &str,
+    principal: rocky_core::config::PolicyPrincipal,
+    actor: &rocky_core::config::PrincipalRef,
+    touched: &BTreeMap<String, PolicyCapability>,
+    prior_decisions: &[rocky_core::state::PolicyDecisionRecord],
+    fresh_store: Option<&StateStore>,
+    stage: &str,
+) -> Result<(), rocky_core::state_sync::StateSyncError> {
     use rocky_core::state_sync::StateSyncError;
     let Some(cfg) = cfg else {
         return Ok(());
     };
-    let Some(policy) = cfg.policy.as_ref() else {
+    let Some(resolved) = resolved.resolved.as_ref() else {
         return Ok(());
     };
     let fresh_markers = crate::commands::apply::marker_freezes_before_gate(cfg, touched)
@@ -1600,13 +1676,8 @@ pub(crate) async fn ledger_seam_regate(
                 "freeze-marker LIST failed {stage} (fail-closed): {e:#}"
             ))
         })?;
-    let (policy, attrs_map) = match crate::commands::apply::resolve_policy_and_attrs(
-        Some(policy),
-        touched,
-        models_dir,
-        models_glob,
-    ) {
-        Ok(pair) => pair,
+    let (policy, attrs_map) = match resolved {
+        Ok((policy, attrs_map)) => (policy, attrs_map),
         // The resolver's error IS a gate outcome. Mirror the pre-seam
         // treatment: only a Deny blocks gc (require_review is satisfied by
         // the hard review gate the command already passed).
@@ -1623,12 +1694,12 @@ pub(crate) async fn ledger_seam_regate(
         Err(_) => return Ok(()),
     };
     let gate = crate::commands::apply::evaluate_apply_policy_core(
-        &policy,
+        policy,
         plan_id,
         principal,
         actor,
         touched,
-        &attrs_map,
+        attrs_map,
         crate::commands::apply::GateSubjects::CompiledModels,
         prior_decisions,
         &fresh_markers,

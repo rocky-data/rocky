@@ -1322,6 +1322,15 @@ pub enum PolicyGate {
     },
 }
 
+// Counts `model_attributes` calls on this thread, so a test can prove how
+// often a gate loads the models directory (#2270). Thread-local because
+// tests run in parallel; a `#[tokio::test]` runs on one thread.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static MODEL_ATTRIBUTE_LOADS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
 /// Build the apply-time [`ModelAttributes`] for every compiled model under
 /// `models_dir`, mirroring `rocky policy check`: `classifications` is the
 /// distinct column-classification set, `layer` is the `layer` tag, and
@@ -1331,6 +1340,9 @@ fn model_attributes(
     models_glob: Option<&str>,
 ) -> Result<BTreeMap<String, ModelAttributes>, String> {
     use rocky_compiler::compile::{self, CompilerConfig};
+
+    #[cfg(test)]
+    MODEL_ATTRIBUTE_LOADS.with(|n| n.set(n.get() + 1));
 
     let config = CompilerConfig {
         models_dir: models_dir.to_path_buf(),

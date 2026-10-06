@@ -1044,29 +1044,32 @@ pub(crate) async fn run_restore_apply_in_with(
 /// The fence a remote restore seam attempt consults before each object write:
 /// the full policy re-gate over a fresh marker LIST and the attempt's
 /// pre-transition decision snapshot (enforcement-only — no audit row).
+///
+/// The policy and model attributes are resolved once per attempt and shared
+/// (#2270): within one attempt they do not change, and loading the models
+/// directory before every write cost one full compile per artifact. The
+/// freeze-marker LIST still runs fresh on every check.
 struct RegateFence {
     cfg: rocky_core::config::RockyConfig,
     plan_id: String,
     principal: PolicyPrincipal,
     actor: rocky_core::config::PrincipalRef,
     touched: BTreeMap<String, PolicyCapability>,
-    models_dir: std::path::PathBuf,
-    models_glob: Option<String>,
+    resolved: Arc<crate::commands::gc::ResolvedRegate>,
     prior_decisions: Vec<rocky_core::state::PolicyDecisionRecord>,
 }
 
 #[async_trait::async_trait]
 impl ObjectWriteFence for RegateFence {
     async fn check(&self) -> Result<()> {
-        crate::commands::gc::ledger_seam_regate(
+        crate::commands::gc::ledger_seam_regate_resolved(
             "restore",
             Some(&self.cfg),
+            &self.resolved,
             &self.plan_id,
             self.principal,
             &self.actor,
             &self.touched,
-            &self.models_dir,
-            self.models_glob.as_deref(),
             &self.prior_decisions,
             None,
             "before re-materializing an artifact",
@@ -1250,15 +1253,23 @@ pub(crate) async fn restore_apply_output(
                         "could not snapshot the fresh decision ledger: {e:#}"
                     ))
                 })?;
-                crate::commands::gc::ledger_seam_regate(
+                // Load the models once for this attempt's gate and every
+                // pre-write fence (#2270). The pre-publish recheck below
+                // still resolves afresh.
+                let resolved = Arc::new(crate::commands::gc::resolve_ledger_seam_regate(
+                    Some(&cfg),
+                    &touched,
+                    &models_dir,
+                    models_glob.as_deref(),
+                ));
+                crate::commands::gc::ledger_seam_regate_resolved(
                     "restore",
                     Some(&cfg),
+                    &resolved,
                     &plan_id,
                     principal,
                     &actor,
                     &touched,
-                    &models_dir,
-                    models_glob.as_deref(),
                     &prior_decisions,
                     Some(fresh_store),
                     "during this restore apply",
@@ -1270,8 +1281,7 @@ pub(crate) async fn restore_apply_output(
                     principal,
                     actor: actor.clone(),
                     touched: touched.clone(),
-                    models_dir: models_dir.clone(),
-                    models_glob: models_glob.clone(),
+                    resolved: Arc::clone(&resolved),
                     prior_decisions: prior_decisions.clone(),
                 };
                 let exec = execute_restore_apply(
@@ -3397,6 +3407,124 @@ mod tests {
                 let remote = published(&harness).await;
                 assert_eq!(remote.refcount_for_hash(&wr.blake3_hash).unwrap(), 0);
                 assert!(remote.list_tombstones().unwrap()[0].restored_at.is_none());
+            }
+
+            fn model_loads() -> usize {
+                crate::commands::apply::MODEL_ATTRIBUTE_LOADS.with(std::cell::Cell::get)
+            }
+
+            /// #2270: the pre-write fence reuses the attempt's model load. Five
+            /// writes cost no further load, and a freeze marker that lands
+            /// after the load still refuses the next write (the marker LIST
+            /// stays fresh per check).
+            #[tokio::test]
+            async fn restore_fence_reuses_the_attempt_model_load_for_every_write() {
+                let _serial = rocky_core::state_sync::remote_testing::serial_guard();
+                let harness = CrossPodHarness::new_s3_like();
+                let dir = TempDir::new().unwrap();
+                let root = dir.path();
+                let config = write_config(root, true);
+                let cfg = rocky_core::config::load_rocky_config(&config).unwrap();
+                let touched = BTreeMap::from([("orders".to_string(), PolicyCapability::Restore)]);
+                let models_dir = gc_models_dir(Some(&cfg), &config);
+
+                let before = model_loads();
+                let resolved = Arc::new(crate::commands::gc::resolve_ledger_seam_regate(
+                    Some(&cfg),
+                    &touched,
+                    &models_dir,
+                    None,
+                ));
+                assert_eq!(
+                    model_loads() - before,
+                    1,
+                    "the attempt loads the models once"
+                );
+                let fence = RegateFence {
+                    cfg,
+                    plan_id: "plan-2270".to_string(),
+                    principal: PolicyPrincipal::Human,
+                    actor: rocky_core::config::PrincipalRef::unnamed(),
+                    touched,
+                    resolved,
+                    prior_decisions: Vec::new(),
+                };
+                for write in 0..5 {
+                    fence
+                        .check()
+                        .await
+                        .unwrap_or_else(|e| panic!("write {write} must pass: {e:#}"));
+                }
+                assert_eq!(
+                    model_loads() - before,
+                    1,
+                    "five pre-write checks must not reload the models directory"
+                );
+
+                rocky_core::freeze_marker::write_freeze_marker(
+                    &harness.provider,
+                    &rocky_core::freeze_marker::FreezeMarker {
+                        freeze_id: "after-the-load".to_string(),
+                        principal: PolicyPrincipal::Human,
+                        scope: "any".to_string(),
+                        reason: "landed after the attempt resolved its models".to_string(),
+                        created_at: Utc::now(),
+                    },
+                )
+                .await
+                .unwrap();
+                let err = fence
+                    .check()
+                    .await
+                    .expect_err("a marker after the model load must still refuse the write");
+                assert!(
+                    format!("{err:#}").contains("before re-materializing an artifact"),
+                    "{err:#}"
+                );
+                assert_eq!(model_loads() - before, 1);
+            }
+
+            /// #2270 end to end: with `[policy]` set, each CAS attempt loads
+            /// the models twice — once shared by its gate and every pre-write
+            /// fence, once for the pre-publish recheck — plus once for the
+            /// command-level gate. Two attempts: 1 + 2 × 2 = 5. Reloading in
+            /// the fence costs one more per write (7 here).
+            #[tokio::test]
+            async fn restore_cas_seam_loads_models_per_attempt_not_per_write() {
+                let _serial = rocky_core::state_sync::remote_testing::serial_guard();
+                let harness = CrossPodHarness::new_s3_like();
+                let dir = TempDir::new().unwrap();
+                let root = dir.path();
+                let cas = Arc::new(InMemory::new());
+                let (_wr, _obj_path, plan_id) =
+                    seed_remote_eviction(&harness, root, cas.clone()).await;
+                let config = write_config(root, true);
+                harness.faults.arm_precondition_failures(state_key(), 1);
+
+                let key = state_key();
+                let updates = harness.faults.put_count(&key, PutKind::Update);
+                let before = model_loads();
+                let out = apply(
+                    &harness,
+                    root,
+                    &config,
+                    &plan_id,
+                    cas.clone(),
+                    Arc::new(HookedWarehouse::plain()),
+                )
+                .await
+                .expect("the second attempt must commit");
+                assert_eq!(out.restored_count, 1, "{out:?}");
+                assert_eq!(
+                    harness.faults.put_count(&key, PutKind::Update) - updates,
+                    2,
+                    "the armed conflict must force exactly two attempts"
+                );
+                assert_eq!(
+                    model_loads() - before,
+                    5,
+                    "1 command gate + 2 attempts × (1 shared gate/fence load + 1 pre-publish)"
+                );
             }
         }
     }
