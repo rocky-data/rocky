@@ -588,7 +588,7 @@ mod tests {
     use super::*;
     use rocky_core::state::{RunRecord, RunScope, StateStore};
 
-    fn run(id: &str, at: DateTime<Utc>, scope: Option<RunScope>) -> RunRecord {
+    fn run(id: &str, at: DateTime<Utc>, scope: Option<&RunScope>) -> RunRecord {
         serde_json::from_value(serde_json::json!({
             "run_id": id,
             "started_at": at,
@@ -620,20 +620,20 @@ mod tests {
         let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
         let t0 = Utc::now() - chrono::Duration::hours(5);
         store
-            .record_run(&run("prod", t0, Some(RunScope::Production)))
+            .record_run(&run("prod", t0, Some(&RunScope::Production)))
             .unwrap();
         store
             .record_run(&run(
                 "shadow",
                 t0 + chrono::Duration::hours(1),
-                Some(RunScope::Shadow { schema: None }),
+                Some(&RunScope::Shadow { schema: None }),
             ))
             .unwrap();
         store
             .record_run(&run(
                 "branch",
                 t0 + chrono::Duration::hours(2),
-                Some(RunScope::Branch { name: "b".into() }),
+                Some(&RunScope::Branch { name: "b".into() }),
             ))
             .unwrap();
         assert_eq!(last_production_build(&store, ["orders"]).unwrap(), Some(t0));
