@@ -536,11 +536,11 @@ pub fn compile_project(
         rocky_core::model_governance::governance_today(),
     ));
     crate::governance::drop_latest_alias_star_noise(&project, &mut diagnostics);
-    // Dependency-resolution warnings (D011 depends_on mismatch, D012 an edge
-    // derived from a name match a warehouse run does not honour). Produced by
-    // `resolve::resolve_dependencies` and parked on the project until now;
-    // without this merge they were written and never read, so the one place
-    // that knows an edge is questionable said nothing.
+    // Dependency-resolution diagnostics (D011 depends_on mismatch, D012 a bare
+    // read of a model's name that does not reach the table it writes, E056 an
+    // ambiguous bare read). Produced by `resolve::resolve_dependencies` and
+    // parked on the project until now; without this merge they were written
+    // and never read.
     diagnostics.extend(project.resolve_diagnostics.iter().cloned());
     // Ephemeral models: E038 checks, then inline them into their consumers.
     // Last, so every pass above ran on the authored SQL.
@@ -827,11 +827,11 @@ pub fn compile_incremental(
         rocky_core::model_governance::governance_today(),
     ));
     crate::governance::drop_latest_alias_star_noise(&project, &mut diagnostics);
-    // Dependency-resolution warnings (D011 depends_on mismatch, D012 an edge
-    // derived from a name match a warehouse run does not honour). Produced by
-    // `resolve::resolve_dependencies` and parked on the project until now;
-    // without this merge they were written and never read, so the one place
-    // that knows an edge is questionable said nothing.
+    // Dependency-resolution diagnostics (D011 depends_on mismatch, D012 a bare
+    // read of a model's name that does not reach the table it writes, E056 an
+    // ambiguous bare read). Produced by `resolve::resolve_dependencies` and
+    // parked on the project until now; without this merge they were written
+    // and never read.
     diagnostics.extend(project.resolve_diagnostics.iter().cloned());
     // Same as the full path: ephemeral checks and inlining run last.
     let mut project = project;
@@ -1441,8 +1441,8 @@ mod tests {
     /// The wire, not the writer: `resolve::resolve_dependencies` produced
     /// D011/D012 warnings that were parked on `Project::resolve_diagnostics`
     /// and never read by anything. A warning nobody merges is a warning nobody
-    /// sees, so #1354's "this edge rests on a name match the warehouse does
-    /// not honour" would have been silent. This test fails if the merge is
+    /// sees, so #1354's "this read matches a model's name but not the table it
+    /// writes" would have been silent. This test fails if the merge is
     /// removed.
     #[test]
     fn dependency_resolution_warnings_reach_the_diagnostic_set() {
@@ -1475,15 +1475,15 @@ mod tests {
         assert_eq!(d012[0].model, "rollup");
         assert!(!result.has_errors, "D012 is a warning, not an error");
 
-        // The edge is reported, not removed — see the module docs in
-        // `resolve.rs` for why removing it is not this layer's call.
+        // A name match is not a binding (#1354): the read derives no edge,
+        // and D012 says so.
         let rollup = result
             .project
             .dag_nodes
             .iter()
             .find(|n| n.name == "rollup")
             .unwrap();
-        assert_eq!(rollup.depends_on, vec!["customers"]);
+        assert!(rollup.depends_on.is_empty(), "{:?}", rollup.depends_on);
 
         // The INCREMENTAL path merges diagnostics at its own site. The LSP
         // recompiles through it on every debounced file change, so a wire test

@@ -807,8 +807,9 @@ mod tests {
         write("a", "SELECT 1 AS id", "a_tbl");
         // Physical 2-part read of a's target — no ref edge to `a`.
         write("d", "SELECT id FROM s.a_tbl", "d_tbl");
-        // Ref-declared downstream of the physical reader.
-        write("e", "SELECT id FROM d", "e_tbl");
+        // Bare-read downstream of the physical reader. A bare read binds to
+        // the model that WRITES the table (#1354), so it names `d_tbl`.
+        write("e", "SELECT id FROM d_tbl", "e_tbl");
 
         let config = CompilerConfig {
             models_dir: dir.path().to_path_buf(),

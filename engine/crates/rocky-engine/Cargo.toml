@@ -9,6 +9,7 @@ rust-version.workspace = true
 [dependencies]
 rocky-compiler = { path = "../rocky-compiler" }
 rocky-core = { path = "../rocky-core" }
+rocky-ir = { path = "../rocky-ir" }
 rocky-duckdb = { path = "../rocky-duckdb", optional = true }
 rocky-sql = { path = "../rocky-sql" }
 serde = { workspace = true }
