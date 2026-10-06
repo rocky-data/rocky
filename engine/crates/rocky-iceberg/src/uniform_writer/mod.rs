@@ -230,6 +230,10 @@ pub struct UniformTableState {
     ///
     /// `0` for tables without rowTracking, and for rowTracking-enabled
     /// tables that have not yet been written to.
+    ///
+    /// Informational only. A replace commit allocates row ids from the
+    /// live-set replay that also picks the commit version, never from this
+    /// value: a commit can land between `discover()` and the replace.
     pub row_tracking_next_id: u64,
 }
 
@@ -278,6 +282,19 @@ pub struct ReplaceOutcome {
     pub files: Vec<WriteResult>,
 }
 
+/// The object-store [`Path`] of a table-relative object key under `prefix`.
+///
+/// The key's segments are already escaped (see [`commit::escape_path_name`]),
+/// so they are parsed as they are. `Path::from` would percent-encode a `%`
+/// a second time and the object would not sit at the key the log names.
+fn object_path(prefix: &str, relative_key: &str) -> Result<Path> {
+    // `Path::from(prefix)` spells the prefix the way every other key of this
+    // table spells it; the relative key is appended verbatim.
+    let joined = format!("{}/{relative_key}", Path::from(prefix));
+    Path::parse(&joined)
+        .map_err(|e| UniformWriterError::DeltaLog(format!("output key `{relative_key}`: {e}")))
+}
+
 impl ReplaceOutcome {
     /// The single file of an unpartitioned (or single-group) replace.
     fn into_single(self) -> Result<WriteResult> {
@@ -296,7 +313,8 @@ impl ReplaceOutcome {
 /// added by a replace commit.
 #[derive(Debug, Clone)]
 struct StagedFile {
-    /// `add.path`, relative to the table prefix.
+    /// `add.path`, relative to the table prefix and URI-encoded as the log
+    /// carries it. Its [`discover::canonical_key`] is the object key.
     path: String,
     /// The `add` body, without row-tracking fields.
     add: serde_json::Map<String, serde_json::Value>,
@@ -809,18 +827,21 @@ impl UniformWriter {
             let column_hashes = compute_column_hashes(batch)?;
             // Hive-style partition prefix, in the table's partition_columns
             // order so the path is deterministic. Empty when unpartitioned.
-            let mut add_file_path = String::new();
+            // Each segment is escaped like Spark's partition directories;
+            // see `commit::escape_path_name`.
+            let mut object_key = String::new();
             for col in &state.partition_columns {
                 let v = partition_values.get(col).ok_or_else(|| {
                     UniformWriterError::DeltaLog(format!(
                         "missing partition value for column `{col}`"
                     ))
                 })?;
-                add_file_path.push_str(&format!("{col}={v}/"));
+                object_key.push_str(&commit::partition_dir(col, v));
+                object_key.push('/');
             }
-            add_file_path.push_str(&format!("{hash}.parquet"));
+            object_key.push_str(&format!("{hash}.parquet"));
             let file_size = parquet_bytes.len() as u64;
-            let parquet_path = Path::from(format!("{prefix}/{add_file_path}"));
+            let parquet_path = object_path(&prefix, &object_key)?;
 
             // 2. PUT the Parquet. Same content → same hash → same key →
             // idempotent. A re-PUT also restores bytes a VACUUM deleted.
@@ -831,13 +852,19 @@ impl UniformWriter {
             let add = commit::build_add_action(&commit::AddInputs {
                 batch,
                 state: &state,
-                add_file_path: &add_file_path,
+                add_file_path: &object_key,
                 file_size,
                 modification_time_millis,
                 partition_values,
             })?;
+            // The URI-encoded `add.path`; its canonical key is `object_key`.
+            let log_path = add
+                .get("path")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
             staged.push(StagedFile {
-                path: add_file_path,
+                path: log_path,
                 add,
                 blake3_hash: hash,
                 column_hashes,
@@ -873,7 +900,7 @@ impl UniformWriter {
         &self,
         staged: Vec<StagedFile>,
         mut live: discover::LiveSet,
-        mut state: UniformTableState,
+        state: UniformTableState,
         modification_time_millis: i64,
     ) -> Result<ReplaceOutcome> {
         use std::collections::{BTreeMap, BTreeSet};
@@ -956,8 +983,15 @@ impl UniformWriter {
 
             let target_version = live.head_version + 1;
             // Allocate row ids for the files this commit adds, one
-            // contiguous range per file, in order.
-            let mut next_row_id = state.row_tracking_next_id;
+            // contiguous range per file, in order. The high-water mark comes
+            // from the same log replay as `head_version`: a mark read in a
+            // separate pass can be older than the head this commit follows,
+            // and the ranges would then overlap the head's row ids.
+            let mut next_row_id = if state.row_tracking_enabled {
+                live.row_tracking_next_id()?
+            } else {
+                0
+            };
             let mut high_water_mark = None;
             let mut adds = Vec::new();
             for (key, &i) in &new_keys {
@@ -1018,13 +1052,9 @@ impl UniformWriter {
                     | object_store::Error::Precondition { .. },
                 ) => {
                     // Another commit took `target_version`. Re-read the live
-                    // set, protocol and metadata so the next attempt reflects
-                    // the new head.
+                    // set, protocol, metadata and row-id high-water mark in
+                    // one replay so the next attempt reflects the new head.
                     live = self.live_set().await?;
-                    if state.row_tracking_enabled {
-                        state.row_tracking_next_id =
-                            discover::discover_row_tracking_next_id(&*self.store, &prefix).await?;
-                    }
                     tracing::warn!(
                         attempt = attempt + 1,
                         previous_target = target_version,
@@ -1058,11 +1088,18 @@ impl UniformWriter {
             .iter()
             .map(|(key, &i)| (i, live.files.get(key).map_or(table_version, |f| f.version)))
             .collect();
+        // The canonical key is the decoded `add.path` under the prefix: the
+        // object key, not the URI-encoded log spelling.
+        let key_of: HashMap<usize, &str> =
+            new_keys.iter().map(|(key, &i)| (i, key.as_str())).collect();
         let files = staged
             .iter()
             .enumerate()
             .map(|(i, s)| WriteResult {
-                file_path: Path::from(format!("{prefix}/{}", s.path)).to_string(),
+                file_path: key_of.get(&i).map_or_else(
+                    || Path::from(format!("{prefix}/{}", s.path)).to_string(),
+                    |k| (*k).to_string(),
+                ),
                 blake3_hash: s.blake3_hash.clone(),
                 column_hashes: s.column_hashes.clone(),
                 commit_version: version_of.get(&i).copied().unwrap_or(table_version),
@@ -2790,6 +2827,405 @@ mod tests {
             discover::proven_removed_at(&*store, "b", "tbl", &rel, 1, i64::MAX / 2).await,
             RemovalProof::Held(RemovalHoldReason::RetentionUnknown)
         );
+    }
+
+    // -- add.path is URI-encoded; the object key is Spark-escaped -------------
+
+    /// Every object key under `prefix/` that ends in `.parquet`.
+    async fn parquet_keys(store: &InMemory, prefix: &str) -> Vec<String> {
+        use futures::TryStreamExt;
+        let mut out = Vec::new();
+        let mut stream = store.list(Some(&object_store::path::Path::from(prefix)));
+        while let Some(meta) = stream.try_next().await.unwrap() {
+            let k = meta.location.to_string();
+            if k.ends_with(".parquet") {
+                out.push(k);
+            }
+        }
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn special_partition_values_escape_like_spark_and_encode_in_the_log() {
+        // (value, object-key directory, add.path directory)
+        let cases = [
+            ("50%off", "region=50%25off", "region=50%2525off"),
+            ("a b", "region=a b", "region=a%20b"),
+            ("x#y", "region=x%23y", "region=x%2523y"),
+            ("q?r", "region=q%3Fr", "region=q%253Fr"),
+            ("a/b", "region=a%2Fb", "region=a%252Fb"),
+            ("k=v", "region=k%3Dv", "region=k%253Dv"),
+            ("a<b", "region=a%3Cb", "region=a%253Cb"),
+            ("t~", "region=t%7E", "region=t%257E"),
+            ("über", "region=über", "region=%C3%BCber"),
+            ("eu", "region=eu", "region=eu"),
+        ];
+        for (value, dir, log_dir) in cases {
+            let key = format!("{}/H.parquet", commit::partition_dir("region", value));
+            assert_eq!(key, format!("{dir}/H.parquet"), "object key for {value:?}");
+            let logged = commit::delta_log_path(&key);
+            assert_eq!(
+                logged,
+                format!("{log_dir}/H.parquet"),
+                "add.path for {value:?}"
+            );
+            assert_eq!(
+                discover::canonical_key(&logged, "b", "tbl").as_deref(),
+                Some(format!("tbl/{key}").as_str()),
+                "canonical_key(add.path) is the object key for {value:?}"
+            );
+        }
+        // An ordinary key is the same in all three forms: logs written before
+        // this change still match.
+        let plain = "region=eu-1_x.y/0123abcd.parquet";
+        assert_eq!(commit::delta_log_path(plain), plain);
+    }
+
+    /// The object key of every ASCII value equals the key the earlier writer
+    /// stored through `Path::from(raw)`, except for the four characters
+    /// Spark escapes and `Path::from` did not (`'` `:` `=` and `/`, which
+    /// `Path::from` split into a directory). Those four move to a new key
+    /// and the transition commit removes the old one, so no object is left
+    /// behind still referenced under a key the log no longer names.
+    #[test]
+    fn object_keys_match_the_earlier_path_from_keys() {
+        for b in 1u8..0x80 {
+            let c = b as char;
+            if matches!(c, '\'' | ':' | '=' | '/') {
+                continue;
+            }
+            let value = format!("a{c}b");
+            let old = Path::from(format!("t/region={value}/H.parquet")).to_string();
+            let new = object_path(
+                "t",
+                &format!("{}/H.parquet", commit::partition_dir("region", &value)),
+            )
+            .unwrap()
+            .to_string();
+            assert_eq!(new, old, "object key for byte {b:#04x}");
+        }
+    }
+
+    /// A table the earlier writer built: object keys from `Path::from(raw)`,
+    /// `add.path` the raw `region=<value>/…` string.
+    ///
+    /// ```text
+    ///   v1  legacy adds (raw add.path)
+    ///   v2  transition: remove every legacy spelling, add the encoded one
+    ///   --  third run: no commit
+    /// ```
+    #[tokio::test]
+    async fn a_legacy_raw_log_makes_one_transition_commit_and_keeps_shared_objects() {
+        use std::collections::{BTreeMap, BTreeSet};
+        let store: Arc<InMemory> = Arc::new(InMemory::new());
+        seed_partitioned_bootstrap(&store, "ptbl").await;
+        let writer = make_unpartitioned_writer(store.clone() as Arc<dyn ObjectStore>, "ptbl");
+        let state = writer.discover().await.unwrap();
+        let values = ["50%off", "x#y", "2024-01-01 00:00:00", "a<b", "eu"];
+        let pv = |r: &str| HashMap::from([("region".to_string(), r.to_string())]);
+        let groups = || -> Vec<_> {
+            values
+                .iter()
+                .map(|v| (pv(v), make_partitioned_batch(v, 2)))
+                .collect()
+        };
+
+        // v1, as the pre-fix writer wrote it.
+        let mut legacy_lines = vec![serde_json::json!({"commitInfo": {}})];
+        let mut legacy_keys = BTreeMap::new();
+        for (p, batch) in groups() {
+            let bytes = parquet_builder::build_parquet(&batch, &state).unwrap();
+            let hash = blake3::hash(&bytes).to_hex().to_string();
+            let raw = format!("region={}/{hash}.parquet", p["region"]);
+            let key = Path::from(format!("ptbl/{raw}"));
+            store
+                .put(&key, PutPayload::from(Bytes::from(bytes.clone())))
+                .await
+                .unwrap();
+            let mut add = commit::build_add_action(&commit::AddInputs {
+                batch: &batch,
+                state: &state,
+                add_file_path: &raw,
+                file_size: bytes.len() as u64,
+                modification_time_millis: 0,
+                partition_values: &p,
+            })
+            .unwrap();
+            add.insert("path".into(), Value::from(raw.clone()));
+            legacy_lines.push(serde_json::json!({ "add": add }));
+            legacy_keys.insert(p["region"].clone(), (raw, key.to_string()));
+        }
+        put_commit(&store, "ptbl", 1, &legacy_lines).await;
+
+        // Run 1 of the new writer: one transition commit.
+        let run = writer.write_partitioned_batches(groups()).await.unwrap();
+        assert_eq!(run.table_version, 2);
+        assert!(!commit_exists(&store, "ptbl", 3).await, "one commit");
+        let lines = commit_lines(&store, "ptbl", 2).await;
+        let canon = |key: &str, action: &Value| {
+            discover::canonical_key(action["path"].as_str().unwrap(), "", "ptbl")
+                .unwrap_or_else(|| panic!("{key} path does not resolve"))
+        };
+        let removed: BTreeSet<String> = actions(&lines, "remove")
+            .into_iter()
+            .map(|r| canon("remove", r))
+            .collect();
+        let added: BTreeSet<String> = actions(&lines, "add")
+            .into_iter()
+            .map(|a| canon("add", a))
+            .collect();
+        assert!(removed.is_disjoint(&added), "{removed:?} vs {added:?}");
+        // `eu` is spelled the same both ways: neither removed nor re-added.
+        assert_eq!(removed.len(), 4, "{removed:?}");
+        assert_eq!(added.len(), 4, "{added:?}");
+        let removed_raw: BTreeSet<&str> = actions(&lines, "remove")
+            .into_iter()
+            .map(|r| r["path"].as_str().unwrap())
+            .collect();
+        for v in ["50%off", "x#y", "2024-01-01 00:00:00", "a<b"] {
+            assert!(removed_raw.contains(legacy_keys[v].0.as_str()), "{v}");
+        }
+
+        // Every live file resolves to an object that exists. For `%`, `#`
+        // and `<` the new add names the SAME object the legacy add stored,
+        // so that object stays referenced. The timestamp's `:` now escapes,
+        // so it gets a new object and the old one is removed in the log.
+        let keys: BTreeSet<String> = parquet_keys(&store, "ptbl").await.into_iter().collect();
+        let live = discover::read_live_set(&*store, "ptbl", "c.s.t", "")
+            .await
+            .unwrap();
+        for k in live.files.keys() {
+            assert!(keys.contains(k), "live {k} has no object");
+        }
+        for v in ["50%off", "x#y", "a<b", "eu"] {
+            assert!(
+                live.files.contains_key(&legacy_keys[v].1),
+                "{v} object still live"
+            );
+        }
+        let ts_old = &legacy_keys["2024-01-01 00:00:00"].1;
+        assert!(!live.files.contains_key(ts_old));
+        assert!(
+            removed.contains(ts_old),
+            "the old timestamp object is removed in the log"
+        );
+
+        // Run 2: stable, no commit.
+        let again = writer.write_partitioned_batches(groups()).await.unwrap();
+        assert!(!again.committed);
+        assert!(!commit_exists(&store, "ptbl", 3).await);
+    }
+
+    #[tokio::test]
+    async fn special_partition_values_round_trip_and_move_only_changed_files() {
+        let store: Arc<InMemory> = Arc::new(InMemory::new());
+        seed_partitioned_bootstrap(&store, "ptbl").await;
+        let writer = make_unpartitioned_writer(store.clone() as Arc<dyn ObjectStore>, "ptbl");
+        let pv = |r: &str| HashMap::from([("region".to_string(), r.to_string())]);
+        let groups = |hash_rows: usize| {
+            vec![
+                (pv("50%off"), make_partitioned_batch("50%off", 2)),
+                (pv("a b"), make_partitioned_batch("a b", 3)),
+                (pv("x#y"), make_partitioned_batch("x#y", hash_rows)),
+            ]
+        };
+
+        // Run 1: the object keys are Spark-escaped, the add paths encoded.
+        let run1 = writer.write_partitioned_batches(groups(1)).await.unwrap();
+        assert_eq!(run1.table_version, 1);
+        let keys = parquet_keys(&store, "ptbl").await;
+        let file_paths: Vec<String> = {
+            let mut v: Vec<String> = run1.files.iter().map(|f| f.file_path.clone()).collect();
+            v.sort();
+            v
+        };
+        assert_eq!(keys, file_paths, "file_path names the stored object");
+        let lines = commit_lines(&store, "ptbl", 1).await;
+        let mut added: Vec<&str> = actions(&lines, "add")
+            .iter()
+            .map(|a| a["path"].as_str().unwrap())
+            .collect();
+        added.sort();
+        let dirs: Vec<&str> = added.iter().map(|p| p.split('/').next().unwrap()).collect();
+        assert_eq!(
+            dirs,
+            vec!["region=50%2525off", "region=a%20b", "region=x%2523y"]
+        );
+        let mut canon: Vec<String> = added
+            .iter()
+            .map(|p| discover::canonical_key(p, "", "ptbl").unwrap())
+            .collect();
+        canon.sort();
+        assert_eq!(canon, keys, "canonical_key(add.path) == the object key");
+
+        // Run 2: the same output finds every file live and writes no commit.
+        let run2 = writer.write_partitioned_batches(groups(1)).await.unwrap();
+        assert!(!run2.committed, "unchanged special-value files still match");
+        assert!(!commit_exists(&store, "ptbl", 2).await);
+
+        // Run 3: only `x#y` changes → one remove of its old file, one add.
+        let x_old = run1
+            .files
+            .iter()
+            .find(|f| f.file_path.contains("x%23y"))
+            .unwrap()
+            .file_path
+            .clone();
+        let run3 = writer.write_partitioned_batches(groups(4)).await.unwrap();
+        assert_eq!(run3.table_version, 2);
+        let lines = commit_lines(&store, "ptbl", 2).await;
+        let removed: Vec<&str> = actions(&lines, "remove")
+            .iter()
+            .map(|r| r["path"].as_str().unwrap())
+            .collect();
+        let added: Vec<&str> = actions(&lines, "add")
+            .iter()
+            .map(|a| a["path"].as_str().unwrap())
+            .collect();
+        assert_eq!(removed.len(), 1, "{removed:?}");
+        assert_eq!(
+            discover::canonical_key(removed[0], "", "ptbl").unwrap(),
+            x_old,
+            "the remove names the old x#y object"
+        );
+        assert_eq!(added.len(), 1, "{added:?}");
+        assert!(added[0].starts_with("region=x%2523y/"));
+        let live = replay_live_paths(&store, "ptbl").await;
+        assert_eq!(live.len(), 3);
+    }
+
+    // -- row ids come from the same replay as the head ------------------------
+
+    /// A competitor commit at `version` that adds one rowTracking file and
+    /// bumps `rowIdHighWaterMark` to `hwm`.
+    async fn put_row_tracking_competitor(store: &InMemory, prefix: &str, version: u64, hwm: u64) {
+        put_commit(
+            store,
+            prefix,
+            version,
+            &[
+                serde_json::json!({"commitInfo": {}}),
+                serde_json::json!({"add": {
+                    "path": "competitor.parquet", "partitionValues": {}, "size": 9,
+                    "modificationTime": 0, "dataChange": true,
+                    "baseRowId": 0, "defaultRowCommitVersion": version
+                }}),
+                serde_json::json!({"domainMetadata": {
+                    "domain": "delta.rowTracking",
+                    "configuration": format!("{{\"rowIdHighWaterMark\":{hwm}}}"),
+                    "removed": false
+                }}),
+            ],
+        )
+        .await;
+    }
+
+    /// The `baseRowId` of the only add, and the high-water mark, of `version`.
+    async fn row_ids_of(store: &InMemory, prefix: &str, version: u64) -> (u64, u64) {
+        let lines = commit_lines(store, prefix, version).await;
+        let adds = actions(&lines, "add");
+        assert_eq!(adds.len(), 1, "one add in commit {version}");
+        let base = adds[0]["baseRowId"].as_u64().unwrap();
+        let dm = actions(&lines, "domainMetadata");
+        let cfg: Value = serde_json::from_str(dm[0]["configuration"].as_str().unwrap()).unwrap();
+        (base, cfg["rowIdHighWaterMark"].as_u64().unwrap())
+    }
+
+    /// ```text
+    ///   discover()          next row id 0, head 0
+    ///   competitor v1       rowIdHighWaterMark 99
+    ///   replace             reads head 1 ──▶ commits v2, baseRowId 100
+    /// ```
+    #[tokio::test]
+    async fn a_commit_after_discover_moves_the_row_id_range_above_its_mark() {
+        let store: Arc<InMemory> = Arc::new(InMemory::new());
+        seed_row_tracking_bootstrap(&store, "rt").await;
+        let writer = make_unpartitioned_writer(store.clone() as Arc<dyn ObjectStore>, "rt");
+        let state = writer.discover().await.unwrap();
+        assert_eq!(state.row_tracking_next_id, 0);
+
+        put_row_tracking_competitor(&store, "rt", 1, 99).await;
+
+        let result = writer
+            .write_batch_with_state(make_batch(5), state)
+            .await
+            .unwrap();
+        assert_eq!(result.commit_version, 2);
+        assert_eq!(
+            row_ids_of(&store, "rt", 2).await,
+            (100, 104),
+            "row ids start above the competitor's mark, not at the stale 0"
+        );
+    }
+
+    /// ```text
+    ///   live set read at head 0 (stale)
+    ///   competitor v1       rowIdHighWaterMark 99
+    ///   commit v1 ──▶ 412 ──▶ re-read ──▶ commits v2, baseRowId 100
+    /// ```
+    #[tokio::test]
+    async fn a_conflict_retry_allocates_row_ids_from_the_new_head() {
+        let store: Arc<InMemory> = Arc::new(InMemory::new());
+        seed_row_tracking_bootstrap(&store, "rt").await;
+        let writer = make_unpartitioned_writer(store.clone() as Arc<dyn ObjectStore>, "rt");
+        let state = writer.discover().await.unwrap();
+        let stale = discover::read_live_set(&*store, "rt", "c.s.t", "")
+            .await
+            .unwrap();
+        assert_eq!(stale.head_version, 0);
+
+        put_row_tracking_competitor(&store, "rt", 1, 99).await;
+
+        let batch = make_batch(3);
+        let pv = HashMap::new();
+        let add = commit::build_add_action(&commit::AddInputs {
+            batch: &batch,
+            state: &state,
+            add_file_path: "b.parquet",
+            file_size: 11,
+            modification_time_millis: 0,
+            partition_values: &pv,
+        })
+        .unwrap();
+        let staged = StagedFile {
+            path: "b.parquet".into(),
+            add,
+            blake3_hash: "b".into(),
+            column_hashes: Vec::new(),
+            num_records: 3,
+            size_bytes: 11,
+        };
+        let outcome = writer
+            .commit_replace(vec![staged], stale, state, 0)
+            .await
+            .unwrap();
+        assert_eq!(outcome.table_version, 2, "the 412 at v1 retried at v2");
+        assert_eq!(row_ids_of(&store, "rt", 2).await, (100, 102));
+    }
+
+    #[test]
+    fn the_live_set_takes_the_latest_row_tracking_mark() {
+        // Same rule as `discover_row_tracking_next_id`: none → 0, a negative
+        // mark → 0, otherwise mark + 1; a malformed mark is an error.
+        let dm = |cfg: &str| {
+            Some(serde_json::json!({"domain": "delta.rowTracking", "configuration": cfg}))
+        };
+        let mut live = discover::LiveSet {
+            head_version: 0,
+            files: Default::default(),
+            append_only: false,
+            protocol: Value::Null,
+            metadata: Value::Null,
+            row_tracking_domain: None,
+        };
+        assert_eq!(live.row_tracking_next_id().unwrap(), 0);
+        live.row_tracking_domain = dm(r#"{"rowIdHighWaterMark":-1}"#);
+        assert_eq!(live.row_tracking_next_id().unwrap(), 0);
+        live.row_tracking_domain = dm(r#"{"rowIdHighWaterMark":41}"#);
+        assert_eq!(live.row_tracking_next_id().unwrap(), 42);
+        live.row_tracking_domain = dm(r#"{}"#);
+        assert!(live.row_tracking_next_id().is_err());
     }
 
     /// Not a CI test. Writes two replace scenarios to the directory in

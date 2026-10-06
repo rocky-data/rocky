@@ -380,43 +380,47 @@ pub(super) async fn discover_row_tracking_next_id<S: ObjectStore + ?Sized>(
             let Some(dm) = value.get("domainMetadata") else {
                 continue;
             };
-            let domain = dm.get("domain").and_then(|v| v.as_str());
-            if domain != Some("delta.rowTracking") {
+            if dm.get("domain").and_then(|v| v.as_str()) != Some("delta.rowTracking") {
                 continue;
             }
-            // `configuration` is a JSON-encoded string. Inside it,
-            // `rowIdHighWaterMark` is the largest already-allocated
-            // row-id; the next write starts at +1.
-            let cfg_raw = dm
-                .get("configuration")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| {
-                    UniformWriterError::DeltaLog(
-                        "delta.rowTracking domainMetadata is missing configuration".into(),
-                    )
-                })?;
-            let cfg: serde_json::Value = serde_json::from_str(cfg_raw).map_err(|e| {
-                UniformWriterError::DeltaLog(format!(
-                    "delta.rowTracking configuration is not JSON: {e}"
-                ))
-            })?;
-            let high = cfg
-                .get("rowIdHighWaterMark")
-                .and_then(serde_json::Value::as_i64)
-                .ok_or_else(|| {
-                    UniformWriterError::DeltaLog(
-                        "delta.rowTracking configuration is missing rowIdHighWaterMark".into(),
-                    )
-                })?;
-            // Delta uses i64 in the wire format; row-ids start at 0 so
-            // a non-negative value is required.
-            if high < 0 {
-                return Ok(0);
-            }
-            return Ok((high as u64).saturating_add(1));
+            return row_tracking_next_id_from_domain(dm);
         }
     }
     Ok(0)
+}
+
+/// The next row id a `delta.rowTracking` `domainMetadata` action allows:
+/// its `rowIdHighWaterMark + 1`.
+///
+/// `rowIdHighWaterMark` is the largest already-allocated row id. A negative
+/// mark (no row id allocated yet) gives 0.
+pub(super) fn row_tracking_next_id_from_domain(dm: &serde_json::Value) -> Result<u64> {
+    // `configuration` is a JSON-encoded string.
+    let cfg_raw = dm
+        .get("configuration")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            UniformWriterError::DeltaLog(
+                "delta.rowTracking domainMetadata is missing configuration".into(),
+            )
+        })?;
+    let cfg: serde_json::Value = serde_json::from_str(cfg_raw).map_err(|e| {
+        UniformWriterError::DeltaLog(format!("delta.rowTracking configuration is not JSON: {e}"))
+    })?;
+    let high = cfg
+        .get("rowIdHighWaterMark")
+        .and_then(serde_json::Value::as_i64)
+        .ok_or_else(|| {
+            UniformWriterError::DeltaLog(
+                "delta.rowTracking configuration is missing rowIdHighWaterMark".into(),
+            )
+        })?;
+    // Delta uses i64 in the wire format; row-ids start at 0 so a
+    // non-negative value is required.
+    if high < 0 {
+        return Ok(0);
+    }
+    Ok((high as u64).saturating_add(1))
 }
 
 impl UniformWriter {
@@ -1299,6 +1303,9 @@ pub(super) struct LiveSet {
     pub protocol: serde_json::Value,
     /// The latest `metaData` action body.
     pub metadata: serde_json::Value,
+    /// The latest `delta.rowTracking` `domainMetadata` action body, from the
+    /// same replay as `head_version`. `None` when no commit carries one.
+    pub row_tracking_domain: Option<serde_json::Value>,
 }
 
 /// The parts of a table's protocol and metadata that shape a write. A change
@@ -1323,6 +1330,16 @@ impl TableShape {
 }
 
 impl LiveSet {
+    /// The next row id to allocate, from the same replay as `head_version`:
+    /// the latest `delta.rowTracking` `rowIdHighWaterMark + 1`, or 0 when no
+    /// commit carries one. Same rules and errors as
+    /// [`discover_row_tracking_next_id`].
+    pub fn row_tracking_next_id(&self) -> Result<u64> {
+        self.row_tracking_domain
+            .as_ref()
+            .map_or(Ok(0), row_tracking_next_id_from_domain)
+    }
+
     /// The write shape of the latest protocol + metadata, by the same rules
     /// `discover()` applies.
     pub fn shape(&self) -> Result<TableShape> {
@@ -1529,6 +1546,7 @@ pub(super) async fn read_live_set<S: ObjectStore + ?Sized>(
     let mut files: std::collections::BTreeMap<String, LiveFile> = Default::default();
     let mut protocol: Option<serde_json::Value> = None;
     let mut metadata: Option<serde_json::Value> = None;
+    let mut row_tracking_domain: Option<serde_json::Value> = None;
     for (version, path) in &versions {
         let version = *version;
         let body = store.get(path).await?.bytes().await?;
@@ -1536,6 +1554,9 @@ pub(super) async fn read_live_set<S: ObjectStore + ?Sized>(
             .map_err(|e| UniformWriterError::DeltaLog(format!("non-utf8 _delta_log: {e}")))?;
         let mut adds: Vec<(String, serde_json::Map<String, serde_json::Value>)> = Vec::new();
         let mut removes: Vec<(String, serde_json::Map<String, serde_json::Value>)> = Vec::new();
+        // The first `delta.rowTracking` domainMetadata of this commit. A
+        // later commit's one wins, as in `discover_row_tracking_next_id`.
+        let mut commit_row_tracking: Option<serde_json::Value> = None;
         for line in text.lines() {
             if line.trim().is_empty() {
                 continue;
@@ -1587,6 +1608,13 @@ pub(super) async fn read_live_set<S: ObjectStore + ?Sized>(
                         feature: "clustering (`delta.clustering` domain)".to_string(),
                     });
                 }
+                "domainMetadata"
+                    if action.get("domain").and_then(|v| v.as_str())
+                        == Some("delta.rowTracking")
+                        && commit_row_tracking.is_none() =>
+                {
+                    commit_row_tracking = Some(action.clone());
+                }
                 _ => {}
             }
         }
@@ -1605,6 +1633,9 @@ pub(super) async fn read_live_set<S: ObjectStore + ?Sized>(
             if has_dv(remove) {
                 return Err(UniformWriterError::DeletionVectorsUnsupported);
             }
+        }
+        if commit_row_tracking.is_some() {
+            row_tracking_domain = commit_row_tracking;
         }
         for (c, _) in &removes {
             files.remove(c);
@@ -1633,6 +1664,7 @@ pub(super) async fn read_live_set<S: ObjectStore + ?Sized>(
         append_only,
         protocol,
         metadata,
+        row_tracking_domain,
     })
 }
 

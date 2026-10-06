@@ -231,8 +231,12 @@ pub(crate) async fn removal_proof_given_store(
         store,
         Arc::new(NoOpSqlClient),
     );
+    // `file_path` is the object key; the proof compares Delta log paths,
+    // which are URI-encoded. Encode once so a partition value such as `50%off`
+    // (key `region=50%25off/…`) matches its `add.path`.
+    let log_path = rocky_iceberg::uniform_writer::commit::delta_log_path(&table_relative);
     writer
-        .proven_removed(&bucket, &table_relative, expected_add_version)
+        .proven_removed(&bucket, &log_path, expected_add_version)
         .await
 }
 
@@ -2536,6 +2540,43 @@ mod tests {
             )
             .await
             .unwrap();
+    }
+
+    /// gc proves the removal of a file whose partition value needs escaping.
+    /// The ledger records the object key (`region=50%25off/…`); the log names
+    /// it URI-encoded (`region=50%2525off/…`). Without the encoding in
+    /// `removal_proof_given_store` the proof never finds the file and holds.
+    #[tokio::test]
+    async fn removal_proof_matches_a_special_character_partition_key() {
+        let store = Arc::new(InMemory::new());
+        seed_region_partitioned_bootstrap(&store, "tgt").await;
+        let log_path = "region=50%2525off/h.parquet";
+        let commits = [
+            serde_json::json!({"add": {
+                "path": log_path, "partitionValues": {"col-region-uuid": "50%off"},
+                "size": 1, "modificationTime": 1, "dataChange": true
+            }}),
+            serde_json::json!({"remove": {
+                "path": log_path, "dataChange": true, "deletionTimestamp": 0
+            }}),
+        ];
+        for (i, line) in commits.iter().enumerate() {
+            store
+                .put(
+                    &ObjPath::from(format!("tgt/_delta_log/{:020}.json", i + 1)),
+                    PutPayload::from(format!("{line}\n").into_bytes()),
+                )
+                .await
+                .unwrap();
+        }
+        let proof = removal_proof_given_store(
+            store as Arc<dyn ObjectStore>,
+            "s3://b/tgt",
+            "tgt/region=50%25off/h.parquet",
+            1,
+        )
+        .await;
+        assert_eq!(proof, RemovalProof::ProvenRemoved { head_version: 2 });
     }
 
     fn fixed_rows_warehouse(key: &str, result: QueryResult) -> FixedRowsWarehouse {
