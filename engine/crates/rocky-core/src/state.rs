@@ -8754,6 +8754,442 @@ pub fn force_pre_v32_store(path: &Path) {
     txn.commit().expect("commit");
 }
 
+
+/// Test support: a successful run record whose executions carry the given
+/// output versions, one per `(model, version)`.
+#[cfg(any(test, feature = "test-support"))]
+pub fn run_with_output_versions(
+    run_id: &str,
+    models: &[(&str, Option<OutputVersion>)],
+) -> RunRecord {
+    let now = chrono::Utc::now();
+    RunRecord {
+        run_id: run_id.to_string(),
+        started_at: now,
+        finished_at: now,
+        status: RunStatus::Success,
+        models_executed: models
+            .iter()
+            .map(|(model, version)| ModelExecution {
+                model_name: (*model).to_string(),
+                started_at: now,
+                finished_at: now,
+                duration_ms: 1,
+                rows_affected: None,
+                status: "success".to_string(),
+                sql_hash: "h".to_string(),
+                skip_hash: None,
+                upstream_freshness: None,
+                bytes_scanned: None,
+                bytes_written: None,
+                tenant: None,
+                recipe_hash: None,
+                input_hash: None,
+                input_proof_class: None,
+                env_hash: None,
+                hash_scheme: None,
+                output_column_hashes: None,
+                attempts: Vec::new(),
+                output_version: version.clone(),
+            })
+            .collect(),
+        trigger: RunTrigger::Manual,
+        config_hash: "config-hash".to_string(),
+        triggering_identity: None,
+        session_source: SessionSource::Cli,
+        git_commit: None,
+        git_branch: None,
+        idempotency_key: None,
+        target_catalog: None,
+        hostname: "test-host".to_string(),
+        rocky_version: "0.0.0-test".to_string(),
+        check_outcomes: Vec::new(),
+        pipeline: None,
+        submission_id: None,
+        check_gate_failed: false,
+        verify_after_failed: false,
+        rocky_branch: None,
+        run_scope: Some(RunScope::Production),
+    }
+}
+
+#[cfg(test)]
+mod environment_tests {
+    use super::*;
+    use crate::config::PrincipalRef;
+    use crate::environments::{
+        EnvironmentError, EnvironmentName, PublishRefusal, PublishRequest, PublishScope,
+        PublishSource,
+    };
+
+    fn env(name: &str) -> EnvironmentName {
+        EnvironmentName::parse(name).unwrap()
+    }
+
+    fn delta(v: u64) -> Option<OutputVersion> {
+        Some(OutputVersion::DeltaObserved {
+            table: "c.s.t".into(),
+            version: v,
+        })
+    }
+
+    fn request(name: &str, expected: Option<&str>, sources: &[(&str, &str)]) -> PublishRequest {
+        PublishRequest {
+            environment: env(name),
+            expected_head: expected.map(str::to_string),
+            sources: sources
+                .iter()
+                .map(|(model, run_id)| PublishSource {
+                    model: (*model).to_string(),
+                    run_id: (*run_id).to_string(),
+                })
+                .collect(),
+            principal: PrincipalRef::unnamed(),
+            plan_id: None,
+        }
+    }
+
+    fn seeded() -> (StateStore, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
+        store
+            .record_run(&run_with_output_versions(
+                "r1",
+                &[("orders", delta(1)), ("customers", delta(5))],
+            ))
+            .unwrap();
+        store
+            .record_run(&run_with_output_versions("r2", &[("orders", delta(2))]))
+            .unwrap();
+        (store, dir)
+    }
+
+    /// Two sequential publishes from the same head: the second is refused
+    /// with the typed conflict and writes nothing. Mutation: drop the
+    /// in-transaction head comparison and the second publish succeeds.
+    #[test]
+    fn a_second_publish_from_a_stale_head_is_a_publish_conflict() {
+        let (store, _dir) = seeded();
+        let first = store
+            .publish_pointers(&request("staging", None, &[("orders", "r1")]))
+            .unwrap();
+        assert_eq!(first.publish_id, "staging#1");
+        assert_eq!(first.prior_publish_id, None);
+        assert_eq!(first.scope, PublishScope::StateOnly);
+
+        let second = store
+            .publish_pointers(&request("staging", Some("staging#1"), &[("orders", "r2")]))
+            .unwrap();
+        assert_eq!(second.publish_id, "staging#2");
+        assert_eq!(second.prior_publish_id.as_deref(), Some("staging#1"));
+        assert_eq!(second.from["orders"].run_id, "r1");
+        assert_eq!(second.to["orders"].run_id, "r2");
+
+        let err = store
+            .publish_pointers(&request(
+                "staging",
+                Some("staging#1"),
+                &[("customers", "r1")],
+            ))
+            .unwrap_err();
+        match err {
+            StateError::PublishConflict {
+                env,
+                expected,
+                found,
+            } => {
+                assert_eq!(env, "staging");
+                assert_eq!(expected.as_deref(), Some("staging#1"));
+                assert_eq!(found.as_deref(), Some("staging#2"));
+            }
+            other => panic!("expected PublishConflict, got {other:?}"),
+        }
+        let head = store.get_environment(&env("staging")).unwrap().unwrap();
+        assert_eq!(head.head_publish_id, "staging#2");
+        assert!(!head.pointers.contains_key("customers"), "nothing written");
+        assert_eq!(store.publish_history(&env("staging")).unwrap().len(), 2);
+    }
+
+    /// Create refuses an existing environment; an update refuses a missing one.
+    #[test]
+    fn create_and_update_check_existence() {
+        let (store, _dir) = seeded();
+        let err = store
+            .publish_pointers(&request("prod", Some("prod#1"), &[("orders", "r1")]))
+            .unwrap_err();
+        assert!(
+            matches!(&err, StateError::PublishConflict { found: None, .. }),
+            "{err:?}"
+        );
+        store
+            .publish_pointers(&request("prod", None, &[("orders", "r1")]))
+            .unwrap();
+        let err = store
+            .publish_pointers(&request("prod", None, &[("orders", "r2")]))
+            .unwrap_err();
+        assert!(
+            matches!(&err, StateError::PublishConflict { expected: None, found: Some(f), .. } if f == "prod#1"),
+            "{err:?}"
+        );
+    }
+
+    /// The head merges pointers; history is per environment, in seq order,
+    /// and a neighbour's rows never leak into the prefix scan.
+    #[test]
+    fn pointers_merge_and_history_is_scoped_and_ordered() {
+        let (store, _dir) = seeded();
+        store
+            .publish_pointers(&request("staging", None, &[("orders", "r1")]))
+            .unwrap();
+        store
+            .publish_pointers(&request("staging-2", None, &[("orders", "r2")]))
+            .unwrap();
+        store
+            .publish_pointers(&request("staging.x", None, &[("orders", "r2")]))
+            .unwrap();
+        store
+            .publish_pointers(&request(
+                "staging",
+                Some("staging#1"),
+                &[("customers", "r1")],
+            ))
+            .unwrap();
+        let head = store.get_environment(&env("staging")).unwrap().unwrap();
+        assert_eq!(head.seq, 2);
+        assert_eq!(head.pointers.len(), 2, "orders kept, customers added");
+        assert_eq!(head.pointers["orders"].version, delta(1).unwrap());
+        let history = store.publish_history(&env("staging")).unwrap();
+        let seqs: Vec<u64> = history.iter().map(|r| r.seq).collect();
+        assert_eq!(seqs, vec![1, 2]);
+        assert!(history.iter().all(|r| r.environment.as_str() == "staging"));
+        assert!(history[1].from.is_empty(), "customers was new");
+        let names: Vec<String> = store
+            .list_environments()
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name.to_string())
+            .collect();
+        assert_eq!(names, vec!["staging", "staging-2", "staging.x"]);
+    }
+
+    /// The output_version gate: a model with no recorded version, or an
+    /// `Unversioned` one, is refused by name and reason, and nothing is
+    /// written — not even the other, versioned, model in the same request.
+    #[test]
+    fn publish_refuses_missing_and_unversioned_output_version() {
+        let (store, _dir) = seeded();
+        store
+            .record_run(&run_with_output_versions(
+                "r3",
+                &[
+                    ("legacy", None),
+                    (
+                        "duck",
+                        Some(OutputVersion::Unversioned {
+                            reason: UnversionedReason::AdapterHasNoVersion,
+                        }),
+                    ),
+                    ("twice", delta(1)),
+                    ("twice", delta(2)),
+                ],
+            ))
+            .unwrap();
+        let cases: Vec<(&str, &str, PublishRefusal)> = vec![
+            (
+                "legacy",
+                "r3",
+                PublishRefusal::NoOutputVersion {
+                    run_id: "r3".into(),
+                },
+            ),
+            (
+                "duck",
+                "r3",
+                PublishRefusal::Unversioned {
+                    run_id: "r3".into(),
+                    reason: UnversionedReason::AdapterHasNoVersion,
+                },
+            ),
+            (
+                "twice",
+                "r3",
+                PublishRefusal::AmbiguousExecution {
+                    run_id: "r3".into(),
+                    count: 2,
+                },
+            ),
+            (
+                "orders",
+                "r3",
+                PublishRefusal::ModelNotInRun {
+                    run_id: "r3".into(),
+                },
+            ),
+            (
+                "orders",
+                "gone",
+                PublishRefusal::RunNotFound {
+                    run_id: "gone".into(),
+                },
+            ),
+        ];
+        for (model, run_id, expected) in cases {
+            let err = store
+                .publish_pointers(&request("prod", None, &[("orders", "r1"), (model, run_id)]))
+                .unwrap_err();
+            match err {
+                StateError::Environment(EnvironmentError::Refused {
+                    environment,
+                    model: m,
+                    reason,
+                }) => {
+                    assert_eq!(environment, "prod");
+                    assert_eq!(m, model);
+                    assert_eq!(reason, expected);
+                }
+                other => panic!("{model}: expected Refused, got {other:?}"),
+            }
+            assert!(store.get_environment(&env("prod")).unwrap().is_none());
+            assert!(store.publish_history(&env("prod")).unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn empty_and_duplicate_requests_are_refused() {
+        let (store, _dir) = seeded();
+        assert!(matches!(
+            store.publish_pointers(&request("prod", None, &[])),
+            Err(StateError::Environment(EnvironmentError::EmptyPublish { .. }))
+        ));
+        assert!(matches!(
+            store.publish_pointers(&request("prod", None, &[("orders", "r1"), ("orders", "r2")])),
+            Err(StateError::Environment(EnvironmentError::DuplicateModel { .. }))
+        ));
+    }
+
+    /// The pointer copies the version, so it survives the run row going away.
+    #[test]
+    fn pointers_survive_their_run_row_being_removed() {
+        let (store, _dir) = seeded();
+        store
+            .publish_pointers(&request("prod", None, &[("orders", "r1")]))
+            .unwrap();
+        let txn = store.db.begin_write().unwrap();
+        txn.open_table(RUN_HISTORY).unwrap().remove("r1").unwrap();
+        txn.commit().unwrap();
+        assert!(store.get_run("r1").unwrap().is_none());
+        let head = store.get_environment(&env("prod")).unwrap().unwrap();
+        assert_eq!(head.pointers["orders"].version, delta(1).unwrap());
+        assert_eq!(store.publish_history(&env("prod")).unwrap().len(), 1);
+    }
+
+    /// A v31 store opened read-write is stamped v32, gets the two empty
+    /// tables, and keeps its records.
+    #[test]
+    fn test_v31_opens_and_creates_environment_tables() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.redb");
+        {
+            let store = StateStore::open(&path).unwrap();
+            store
+                .record_run(&run_with_output_versions("r1", &[("orders", delta(1))]))
+                .unwrap();
+        }
+        force_pre_v32_store(&path);
+        assert_eq!(StateStore::peek_schema_version(&path).unwrap(), Some(31));
+
+        let store = StateStore::open(&path).unwrap();
+        assert_eq!(StateStore::peek_schema_version(&path).unwrap(), Some(32));
+        assert!(store.list_environments().unwrap().is_empty());
+        assert!(store.publish_history(&env("prod")).unwrap().is_empty());
+        assert!(store.get_run("r1").unwrap().is_some(), "records kept");
+        store
+            .publish_pointers(&request("prod", None, &[("orders", "r1")]))
+            .unwrap();
+    }
+
+    /// A v31 store opened read-only: the two v32 tables are absent, the open
+    /// succeeds, the readers answer "none", and nothing is written.
+    /// Mutation: drop the tolerance and this open is refused.
+    #[test]
+    fn test_v31_store_read_only_open_tolerates_missing_env_tables() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.redb");
+        {
+            let store = StateStore::open(&path).unwrap();
+            store
+                .record_run(&run_with_output_versions("r1", &[("orders", delta(1))]))
+                .unwrap();
+        }
+        force_pre_v32_store(&path);
+        let before = std::fs::read(&path).unwrap();
+
+        let store = StateStore::open_read_only(&path).expect("a v31 store opens read-only");
+        assert!(store.list_environments().unwrap().is_empty());
+        assert!(store.get_environment(&env("prod")).unwrap().is_none());
+        assert!(store.publish_history(&env("prod")).unwrap().is_empty());
+        assert!(store.get_run("r1").unwrap().is_some());
+        drop(store);
+        assert!(before == std::fs::read(&path).unwrap(), "read-only wrote");
+        assert_eq!(StateStore::peek_schema_version(&path).unwrap(), Some(31));
+    }
+
+    /// The tolerance is keyed on the stamp: a store stamped v32 that lacks
+    /// `environments` is damaged and is still refused read-only.
+    /// Mutation: drop the version condition and this open succeeds.
+    #[test]
+    fn test_v32_store_missing_environments_read_only_refuses() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.redb");
+        drop(StateStore::open(&path).unwrap());
+        {
+            let db = Database::open(&path).unwrap();
+            let txn = db.begin_write().unwrap();
+            assert!(txn.delete_table(ENVIRONMENTS).unwrap());
+            txn.commit().unwrap();
+        }
+        assert_eq!(StateStore::peek_schema_version(&path).unwrap(), Some(32));
+        match StateStore::open_read_only(&path).map(|_| ()) {
+            Err(StateError::ReadOnlyNeedsInit { found, missing, .. }) => {
+                assert_eq!(found, Some(32));
+                assert_eq!(missing, vec!["environments".to_string()]);
+            }
+            other => panic!("expected ReadOnlyNeedsInit, got {other:?}"),
+        }
+    }
+
+    /// A v31 store missing an OLDER table is still refused read-only: the
+    /// tolerance covers only the two v32 tables.
+    #[test]
+    fn test_v31_store_missing_an_older_table_is_still_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.redb");
+        drop(StateStore::open(&path).unwrap());
+        force_pre_v32_store(&path);
+        {
+            let db = Database::open(&path).unwrap();
+            let txn = db.begin_write().unwrap();
+            assert!(txn.delete_table(TOMBSTONES).unwrap());
+            txn.commit().unwrap();
+        }
+        match StateStore::open_read_only(&path).map(|_| ()) {
+            Err(StateError::ReadOnlyNeedsInit { missing, .. }) => {
+                assert_eq!(missing, vec!["tombstones".to_string()]);
+            }
+            other => panic!("expected ReadOnlyNeedsInit, got {other:?}"),
+        }
+    }
+
+    /// Both new tables replicate.
+    #[test]
+    fn environment_tables_are_not_local_only() {
+        for t in ["environments", "publish_history"] {
+            assert!(!LOCAL_ONLY_TABLE_NAMES.contains(&t));
+            assert!(!LOCAL_ONLY_TABLE_NAMES_REPLICATING_SCHEMA_CACHE.contains(&t));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
 

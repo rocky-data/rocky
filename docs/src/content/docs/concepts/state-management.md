@@ -47,6 +47,22 @@ The store carries a schema version. A newer engine migrates an older store forwa
 
 The version moves when an older engine would misread a newer record. Schema v31 is one such move. A checkpoint can list the targets whose post-copy checks still owe a run. An engine at v30 or older ignores that list and treats a recorded run as owing nothing, so it would skip those checks. From v31 on, an older engine never reaches that checkpoint.
 
+Schema v32 adds two tables, `environments` and `publish_history`. A v31 store opened for writing gets the two empty tables and the v32 stamp, and keeps every record. A read-only command (`rocky state`, `rocky history`, `rocky serve`) on a store stamped below v32 reads the two tables as empty. A store stamped v32 that lacks one of them is refused. An engine at v31 refuses a v32 store when it opens it, as above.
+
+### Environments (state only, preview)
+
+From v32, the engine API can record **environments**: named sets of pointers, such as `staging` or `prod`. Each pointer names a model and the output version that one run recorded for it. A publish moves pointers and appends one row to the publish history. There is no CLI verb yet.
+
+```
+  run history ──▶ publish(staging, expected head staging#1) ──┬──▶ head staging#2 + history row 2
+                                                              └──▶ head moved? refused, nothing written
+```
+
+- A publish names the head it expects. When another publish moved the head first, the publish is refused with a publish conflict. Over remote state with `concurrency_control = "cas"`, two pods that publish from the same head get one success and one conflict.
+- A publish refuses a model whose run recorded no output version, or recorded it as `unversioned`.
+- **A pointer does not pin data yet.** `rocky gc`, run-history retention and Delta `VACUUM` can remove a version that an environment points to. Pinning comes in a later phase.
+- A pointer changes no warehouse object. It is state only.
+
 ## Per-namespace state files
 
 redb permits **one writer per state file**. Fan out one `rocky run` per pipeline or per client, and every run competes for the same lock on the global `.rocky-state.redb`. They serialize even though they touch unrelated watermarks. Namespacing gives each run its own state file, so the runs proceed at the same time.
@@ -253,16 +269,16 @@ If the download fails, Rocky logs a warning and starts fresh from target-table m
 
 ### What a Schema Upgrade Does to Remote State
 
-This section says which remote state a new engine reads after a schema upgrade. Rocky stores remote state under a key that names the state schema version (the format version of the state file). The key looks like `<s3_prefix>v30/state.redb` on S3 or GCS and `<valkey_prefix>v30:state.redb` on Valkey. An engine release that changes the schema version therefore looks for a key that does not exist yet.
+This section says which remote state a new engine reads after a schema upgrade. Rocky stores remote state under a key that names the state schema version (the format version of the state file). The key looks like `<s3_prefix>v32/state.redb` on S3 or GCS and `<valkey_prefix>v32:state.redb` on Valkey. An engine release that changes the schema version therefore looks for a key that does not exist yet.
 
 When the current key is absent, Rocky looks for an older key. It probes older versions newest first, down to `v22`, and restores the first one it finds. The run then opens that state, migrates it in place, and uploads it under the current key. The policy ledger, the run history, and the watermarks all carry over.
 
 ```
-   download: v31 key? ── present ──▶ restore v31
+   download: v32 key? ── present ──▶ restore v32
                  │
                absent
                  ▼
-             v30 key? ── present ──▶ restore v30, upload writes v31
+             v31 key? ── present ──▶ restore v31, upload writes v32
                  │
                absent
                  ▼
@@ -281,7 +297,7 @@ Four effects to know before you upgrade or reset:
 
 - **Deleting only the current key does not reset state.** The next download restores the newest older key instead. To reset, delete every version key under the prefix, or point `s3_prefix`, `gcs_prefix` or `valkey_prefix` at a new prefix.
 - **A rollback reads the older key as it was.** If you go back to the older engine, it reads its own frozen key. Nothing written after the upgrade is in it, and nothing is merged back.
-- **A fresh start makes up to 9 existence checks, not 1.** All of them share `transfer_timeout_seconds`. A check that fails stops the download. An IAM policy that allows only the current version's path refuses the older paths, so the first run after an upgrade fails. Grant read access to the whole prefix.
+- **A fresh start makes up to 11 existence checks, not 1.** All of them share `transfer_timeout_seconds`. A check that fails stops the download. An IAM policy that allows only the current version's path refuses the older paths, so the first run after an upgrade fails. Grant read access to the whole prefix.
 - **Fields added since the older version read as empty.** For example, a run recorded before v25 does not carry the `check_gate_failed` flag, so it reads as `false`. Treat `--resume` of a run from before the upgrade with care.
 
 ### Retry and Failure Policy
