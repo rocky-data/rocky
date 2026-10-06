@@ -447,6 +447,32 @@ async fn check_model_column(
 }
 
 /// Without a `time_column`, a model is as fresh as its last successful build.
+/// The newest successful build of a model by a production run (#2201).
+///
+/// Run history keys an execution by the model name, or by the target table
+/// (the last asset-key component), so every key is searched. A shadow or
+/// branch run built somewhere other than the production target, so its
+/// build never makes the production model fresh. A run recorded before
+/// runs carried a scope counts, as in the other reporting readers.
+fn last_production_build<'a>(
+    store: &rocky_core::state::StateStore,
+    keys: impl IntoIterator<Item = &'a str>,
+) -> Result<Option<DateTime<Utc>>, rocky_core::state::StateError> {
+    let mut last_built: Option<DateTime<Utc>> = None;
+    for key in keys {
+        let history = store.get_model_history_matching(key, 50, |r| {
+            r.counts_as_production(rocky_core::state::UnrecordedScope::Count)
+        })?;
+        let newest = history
+            .iter()
+            .filter(|e| e.status == "success")
+            .map(|e| e.finished_at)
+            .max();
+        last_built = last_built.max(newest);
+    }
+    Ok(last_built)
+}
+
 fn check_model_state(
     store: &rocky_core::state::StateStore,
     pipeline: &str,
@@ -462,28 +488,19 @@ fn check_model_state(
     let mut result = model_shell(pipeline, model);
     result.measured_from = "state_store".to_string();
     result.loaded_at_field = None;
-    // Run history keys an execution by the model name, or by the target
-    // table (the last asset-key component) — look under both.
-    let mut last_built: Option<DateTime<Utc>> = None;
-    for key in [
-        model.config.name.as_str(),
-        model.config.target.table.as_str(),
-    ] {
-        match store.get_model_history(key, 50) {
-            Ok(history) => {
-                let newest = history
-                    .iter()
-                    .filter(|e| e.status == "success")
-                    .map(|e| e.finished_at)
-                    .max();
-                last_built = last_built.max(newest);
-            }
-            Err(e) => {
-                result.message = Some(format!("could not read run history: {e}"));
-                return result;
-            }
+    let last_built = match last_production_build(
+        store,
+        [
+            model.config.name.as_str(),
+            model.config.target.table.as_str(),
+        ],
+    ) {
+        Ok(t) => t,
+        Err(e) => {
+            result.message = Some(format!("could not read run history: {e}"));
+            return result;
         }
-    }
+    };
     let read = Ok((
         last_built,
         last_built
@@ -564,4 +581,72 @@ fn render_text(output: &FreshnessOutput) {
         "\n{} pass, {} warn, {} error, {} runtime_error",
         s.pass, s.warn, s.error, s.runtime_error
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rocky_core::state::{RunRecord, RunScope, StateStore};
+
+    fn run(id: &str, at: DateTime<Utc>, scope: Option<RunScope>) -> RunRecord {
+        serde_json::from_value(serde_json::json!({
+            "run_id": id,
+            "started_at": at,
+            "finished_at": at,
+            "status": "Success",
+            "models_executed": [{
+                "model_name": "orders",
+                "started_at": at,
+                "finished_at": at,
+                "duration_ms": 1,
+                "rows_affected": null,
+                "status": "success",
+                "sql_hash": id,
+            }],
+            "trigger": "Manual",
+            "config_hash": "h",
+            "hostname": "test",
+            "rocky_version": "0.0.0-test",
+            "run_scope": scope,
+        }))
+        .expect("run record")
+    }
+
+    /// #2201: a newer shadow or branch build does not make the production
+    /// model fresh; the newest production build does.
+    #[test]
+    fn last_build_ignores_shadow_and_branch_runs() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
+        let t0 = Utc::now() - chrono::Duration::hours(5);
+        store
+            .record_run(&run("prod", t0, Some(RunScope::Production)))
+            .unwrap();
+        store
+            .record_run(&run(
+                "shadow",
+                t0 + chrono::Duration::hours(1),
+                Some(RunScope::Shadow { schema: None }),
+            ))
+            .unwrap();
+        store
+            .record_run(&run(
+                "branch",
+                t0 + chrono::Duration::hours(2),
+                Some(RunScope::Branch { name: "b".into() }),
+            ))
+            .unwrap();
+        assert_eq!(
+            last_production_build(&store, ["orders"]).unwrap(),
+            Some(t0)
+        );
+
+        // A run recorded before runs carried a scope still counts.
+        let legacy = t0 + chrono::Duration::hours(3);
+        store.record_run(&run("legacy", legacy, None)).unwrap();
+        assert_eq!(
+            last_production_build(&store, ["orders"]).unwrap(),
+            Some(legacy)
+        );
+    }
 }
