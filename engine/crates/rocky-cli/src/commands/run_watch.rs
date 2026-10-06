@@ -23,6 +23,7 @@ use tokio::sync::mpsc;
 use tracing::warn;
 
 use rocky_core::config::GovernanceOverride;
+use rocky_core::state_sync::DroppedSessionSink;
 
 use super::run::{Interrupted, PartitionRunOptions, run};
 
@@ -49,6 +50,12 @@ const EVENT_CHANNEL_CAP: usize = 64;
 /// loop's own `ctrl_c` arm) or during one (consumed by the inner run, which
 /// reports it back as [`IterOutcome::interrupted`]). Requiring a second signal
 /// in the second case was #1405.
+///
+/// A signal that makes the loop drop an in-flight iteration first settles the
+/// remote-state session that iteration held — its terminal upload, under the
+/// session's own durability rules (#1603). The exit is non-zero only when that
+/// upload fails and the rules say it must not be lost (a governed run, or
+/// `[state] on_upload_failure = "fail"`); see `stop_interrupted_iteration`.
 ///
 /// # Arguments
 ///
@@ -232,7 +239,11 @@ pub async fn run_watch(
     // breadcrumbs are designed for exactly that — and is strictly cleaner
     // than the old mid-run default-disposition kill.
     {
-        let first_run = iter_once(
+        // The sink catches any remote-state session the iteration still holds
+        // if a signal makes us drop it, so its terminal upload is settled
+        // rather than skipped (#1603). See `stop_interrupted_iteration`.
+        let sink = DroppedSessionSink::new();
+        let mut first_run = Box::pin(sink.scope(iter_once(
             config_path,
             filter,
             pipeline_name_arg,
@@ -247,8 +258,7 @@ pub async fn run_watch(
             env,
             skip_opts,
             actor,
-        );
-        tokio::pin!(first_run);
+        )));
         let interrupted = tokio::select! {
             outcome = &mut first_run => outcome.interrupted,
             _ = &mut ctrl_c_signal => true,
@@ -280,6 +290,7 @@ pub async fn run_watch(
             } => true,
         };
         if interrupted {
+            stop_interrupted_iteration(first_run, &sink).await?;
             eprintln!("\n[watch] stopped");
             return Ok(());
         }
@@ -353,7 +364,8 @@ pub async fn run_watch(
                 // shutdown to the end of the iteration (or forever, for a
                 // stalled one). A signal latched during the debounce fires
                 // here immediately, before the re-run starts.
-                let rerun = iter_once(
+                let sink = DroppedSessionSink::new();
+                let mut rerun = Box::pin(sink.scope(iter_once(
                     config_path,
                     filter,
                     pipeline_name_arg,
@@ -368,8 +380,7 @@ pub async fn run_watch(
                     env,
                     skip_opts,
                     actor,
-                );
-                tokio::pin!(rerun);
+                )));
                 let interrupted = tokio::select! {
                     outcome = &mut rerun => outcome.interrupted,
                     _ = &mut ctrl_c_signal => true,
@@ -401,12 +412,67 @@ pub async fn run_watch(
                     } => true,
                 };
                 if interrupted {
+                    stop_interrupted_iteration(rerun, &sink).await?;
                     eprintln!("\n[watch] stopped");
                     return Ok(());
                 }
             }
         }
     }
+}
+
+/// Stop an iteration a signal interrupted, and settle what it owed its remote
+/// state (#1603).
+///
+/// The `select!` above stops a run by dropping its future. A
+/// `RemoteStateSession` inside it then never reaches `finalize`, and `Drop`
+/// cannot await an upload, so the run's terminal state upload used to be
+/// skipped — silently in release builds, and with a `debug_assert!` panic
+/// (exit 101) in debug ones. Arming `sink` before the drop makes each such
+/// session hand itself over instead, and this function performs its terminal
+/// upload under the session's own durability rules:
+///
+/// ```text
+///   signal ──▶ arm sink ──▶ drop iteration ──▶ sessions handed over
+///                                                    │
+///                     settle_all: join periodic, wait for writers, upload
+///                                                    │
+///                          Ok ──▶ "[watch] stopped", exit 0
+///                          Err ──▶ exit non-zero (fail closed)
+/// ```
+///
+/// A settlement failure is returned, so the watcher exits non-zero: a governed
+/// (`Durable`) session or `on_upload_failure = "fail"` must not lose its upload
+/// behind a clean exit. The default `skip` posture warns and still exits 0,
+/// exactly as `finalize` would. A second Ctrl-C during settlement terminates
+/// at once with 130, the same escape hatch the run's own shutdown offers.
+///
+/// When the iteration had already returned (the inner run handled the signal
+/// itself and settled its own session), dropping it hands over nothing and
+/// this is a no-op.
+async fn stop_interrupted_iteration<F: std::future::Future>(
+    iteration: std::pin::Pin<Box<F>>,
+    sink: &DroppedSessionSink,
+) -> Result<()> {
+    sink.arm();
+    drop(iteration);
+    if sink.pending() == 0 {
+        return Ok(());
+    }
+    eprintln!(
+        "[watch] settling the interrupted run's state upload; press Ctrl-C again to terminate \
+         without it"
+    );
+    tokio::spawn(async {
+        let _ = tokio::signal::ctrl_c().await;
+        eprintln!("\n[watch] second SIGINT — terminating without the state upload");
+        std::process::exit(130);
+    });
+    sink.settle_all().await.context(
+        "the interrupted run's terminal state upload failed, so the remote state ledger does \
+         not hold what the run committed",
+    )?;
+    Ok(())
 }
 
 /// What one watch iteration observed.
