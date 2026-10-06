@@ -59,7 +59,16 @@ From v32, the engine API can record **environments**: named sets of pointers, su
 ```
 
 - A publish names the head it expects. When another publish moved the head first, the publish is refused with a publish conflict. Over remote state with `concurrency_control = "cas"`, two pods that publish from the same head get one success and one conflict.
-- A publish refuses a model whose run recorded no output version, or recorded it as `unversioned`.
+- Over remote state, a publish needs compare-and-swap. With `concurrency_control = "off"` (or a store without conditional writes), two publishes could both report success and one would be lost with no error. So the publish is refused with `PublishRequiresCas`, before any download. A local state store is allowed: its writer lock serializes publishes.
+- A publish takes a model's version only from a run that can vouch for it. The publish is refused when:
+  - the run did not write production (a `--shadow` or `--branch` run, or an older record with no recorded scope);
+  - the run status is not `Success` or `PartialFailure`;
+  - the run failed its check gate or its `verify_after` gate;
+  - the model's own execution in that run did not succeed (this is how a `PartialFailure` run refuses its failed models);
+  - the run recorded no output version for the model, or recorded it as `unversioned`.
+- **Partitioned and replicated outputs cannot be published yet.** Run history names an execution by the last part of its asset key. A `time_interval` model records one execution per partition. A replication run can record one table name from two schemas. Both give more than one execution for one model name, and the publish is refused with a message that names the cause. How to combine partition versions into one pointer is a later decision (RV1-P3).
+- A `delta_observed` pointer names an observation, not a unique identity. A `DROP` + `CREATE` starts a new Delta table at version 0, so an earlier table with the same name can carry the same `(table, version)` pair.
+- A publish and a run on the same remote state contend like two runs. A publish replays on a fresh download when the blob moved. A run does not: under `cas` its finalize makes one conditional upload with no replay. A publish that lands between a run's start and its finalize makes that run fail with `CasConflict`. Two runs behave the same way today.
 - **A pointer does not pin data yet.** `rocky gc`, run-history retention and Delta `VACUUM` can remove a version that an environment points to. Pinning comes in a later phase.
 - A pointer changes no warehouse object. It is state only.
 

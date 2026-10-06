@@ -972,7 +972,7 @@ const SNAPSHOT_MEMORY_WARN_BYTES: u64 = 128 * 1024 * 1024;
 ///   differently, which is the v31 lesson above.
 ///
 /// - **[`ModelExecution::output_version`]** (RV1-P1b, at v31). The version
-///   identity of each model output. Nothing reads it in P1b; it is recorded
+///   identity of each model output. Nothing read it in P1b; it was recorded
 ///   only. A v31 binary without the field ignores it and drops nothing it
 ///   would act on. A row from an older binary reads back `None`, which means
 ///   "not recorded". The field is omitted when `None` and read leniently.
@@ -2830,7 +2830,13 @@ pub struct ModelExecution {
     /// binary always records `Some`, and an adapter that has no version
     /// records [`OutputVersion::Unversioned`] with a reason.
     ///
-    /// Added WITHOUT a schema bump; see the note above
+    /// **A gate reads it (v32).** The environment publish gate
+    /// (`environments::resolve_pointer`) copies it into an environment
+    /// pointer and refuses a model whose value is `None` or
+    /// [`OutputVersion::Unversioned`]. It is a decision input, not a
+    /// recorded-only field.
+    ///
+    /// Added WITHOUT a schema bump (at v31); see the note above
     /// [`CURRENT_SCHEMA_VERSION`]. Omitted when `None`, so the
     /// `ledger_record_serialization_pinned` golden stays byte-identical.
     ///
@@ -8754,6 +8760,19 @@ pub fn force_pre_v32_store(path: &Path) {
     txn.commit().expect("commit");
 }
 
+/// Test support: insert a raw `publish_history` row at `key` with no head
+/// that names it, so the next publish meets `HistoryRowExists`.
+#[cfg(test)]
+pub(crate) fn insert_orphan_history_row(path: &Path, key: &str) {
+    let db = Database::open(path).expect("open the store");
+    let txn = db.begin_write().expect("write txn");
+    {
+        let mut t = txn.open_table(PUBLISH_HISTORY).expect("history table");
+        t.insert(key, b"{}".as_slice()).expect("insert");
+    }
+    txn.commit().expect("commit");
+}
+
 /// Test support: a successful run record whose executions carry the given
 /// output versions, one per `(model, version)`.
 #[cfg(any(test, feature = "test-support"))]
@@ -8956,7 +8975,7 @@ mod environment_tests {
         let head = store.get_environment(&env("staging")).unwrap().unwrap();
         assert_eq!(head.seq, 2);
         assert_eq!(head.pointers.len(), 2, "orders kept, customers added");
-        assert_eq!(head.pointers["orders"].version, delta(1).unwrap());
+        assert_eq!(head.pointers["orders"].version.known(), delta(1).as_ref());
         let history = store.publish_history(&env("staging")).unwrap();
         let seqs: Vec<u64> = history.iter().map(|r| r.seq).collect();
         assert_eq!(seqs, vec![1, 2]);
@@ -9090,7 +9109,7 @@ mod environment_tests {
         txn.commit().unwrap();
         assert!(store.get_run("r1").unwrap().is_none());
         let head = store.get_environment(&env("prod")).unwrap().unwrap();
-        assert_eq!(head.pointers["orders"].version, delta(1).unwrap());
+        assert_eq!(head.pointers["orders"].version.known(), delta(1).as_ref());
         assert_eq!(store.publish_history(&env("prod")).unwrap().len(), 1);
     }
 

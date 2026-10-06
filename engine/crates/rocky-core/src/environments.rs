@@ -35,7 +35,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::config::PrincipalRef;
-use crate::state::{OutputVersion, UnversionedReason};
+use crate::state::{OutputVersion, RunScope, RunStatus, UnversionedReason};
 
 /// Longest environment name, in bytes. Matches the principal id limit.
 pub const ENVIRONMENT_NAME_MAX_LEN: usize = 63;
@@ -127,8 +127,39 @@ pub struct EnvPointer {
     pub model: String,
     /// The run that produced `version`.
     pub run_id: String,
-    /// The recorded output version. Never [`OutputVersion::Unversioned`].
-    pub version: OutputVersion,
+    /// The recorded output version. Never [`OutputVersion::Unversioned`]
+    /// when written. Read leniently: see [`PointerVersion`].
+    pub version: PointerVersion,
+}
+
+/// The version an [`EnvPointer`] holds, read leniently.
+///
+/// A later binary can add an [`OutputVersion`] variant. A strict read would
+/// then fail `get_environment`, `list_environments` and `publish_history` for
+/// every row in the table. Here such a value reads as
+/// [`PointerVersion::Unreadable`] and keeps its raw JSON, so the row still
+/// reads and a rewrite of the row keeps the value unchanged.
+///
+/// Untagged, so [`PointerVersion::Known`] serializes byte-for-byte as the
+/// bare [`OutputVersion`]. The wire shape is the same as a plain field.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum PointerVersion {
+    /// A version this binary can read.
+    Known(OutputVersion),
+    /// A value this binary cannot parse, kept as written.
+    Unreadable(serde_json::Value),
+}
+
+impl PointerVersion {
+    /// The version, when this binary can read it.
+    #[must_use]
+    pub fn known(&self) -> Option<&OutputVersion> {
+        match self {
+            Self::Known(v) => Some(v),
+            Self::Unreadable(_) => None,
+        }
+    }
 }
 
 /// The current head of one environment. Key: the environment name.
@@ -216,8 +247,39 @@ pub enum PublishRefusal {
     /// The run did not execute the model.
     #[error("run {run_id:?} did not execute the model")]
     ModelNotInRun { run_id: String },
+    /// The run did not write production. A shadow or branch run writes
+    /// somewhere else, so its version is not the production output.
+    #[error("run {run_id:?} wrote {scope}, not production; only a production run can be published")]
+    NotProduction { run_id: String, scope: String },
+    /// The run did not end in `Success` or `PartialFailure`.
+    #[error("run {run_id:?} ended with status {status:?}; only a successful run can be published")]
+    RunNotSuccessful {
+        run_id: String,
+        status: crate::state::RunStatus,
+    },
+    /// The run tripped its error-severity check gate.
+    #[error("run {run_id:?} failed its check gate")]
+    CheckGateFailed { run_id: String },
+    /// The run auto-applied schema drift that its `verify_after` gate did not
+    /// confirm.
+    #[error("run {run_id:?} failed its verify_after gate")]
+    VerifyAfterFailed { run_id: String },
+    /// The run executed the model, but that execution did not succeed. This
+    /// is how a `PartialFailure` run refuses its failed models.
+    #[error("run {run_id:?} recorded the model's execution as {status:?}, not \"success\"")]
+    ExecutionNotSuccessful { run_id: String, status: String },
     /// The run executed the model more than once, so the version is ambiguous.
-    #[error("run {run_id:?} executed the model {count} times; the version is ambiguous")]
+    ///
+    /// Run history keys an execution by the LAST segment of its asset key. A
+    /// `time_interval` model records one execution per partition, and a
+    /// replication run can record the same table name from two schemas. Both
+    /// land here. RV1-P2 refuses them; how to combine partition versions into
+    /// one pointer is an RV1-P3 decision.
+    #[error(
+        "run {run_id:?} recorded {count} executions for the model (a partitioned time_interval \
+         model, or a replicated table name shared by two schemas); partitioned and replicated \
+         outputs cannot be published yet"
+    )]
     AmbiguousExecution { run_id: String, count: usize },
     /// The execution recorded no output version (a failed execution, a binary
     /// older than RV1-P1b, or a value this binary cannot read).
@@ -271,6 +333,32 @@ pub(crate) fn resolve_pointer(
     let Some(run) = run else {
         return Err(PublishRefusal::RunNotFound { run_id });
     };
+    // Run-level truth first: a run that did not write production, did not
+    // succeed, or tripped a gate supplies no publishable version for ANY model.
+    match &run.run_scope {
+        Some(RunScope::Production) => {}
+        other => {
+            let scope = match other {
+                Some(RunScope::Shadow { .. }) => "a shadow target".to_string(),
+                Some(RunScope::Branch { name }) => format!("branch {name:?}"),
+                // A record that cannot say where it wrote fails closed.
+                _ => "an unrecorded scope".to_string(),
+            };
+            return Err(PublishRefusal::NotProduction { run_id, scope });
+        }
+    }
+    match run.status {
+        // PartialFailure is allowed: the per-execution check below refuses
+        // every model whose own execution did not succeed.
+        RunStatus::Success | RunStatus::PartialFailure => {}
+        status => return Err(PublishRefusal::RunNotSuccessful { run_id, status }),
+    }
+    if run.check_gate_failed {
+        return Err(PublishRefusal::CheckGateFailed { run_id });
+    }
+    if run.verify_after_failed {
+        return Err(PublishRefusal::VerifyAfterFailed { run_id });
+    }
     let mut matching = run
         .models_executed
         .iter()
@@ -285,6 +373,12 @@ pub(crate) fn resolve_pointer(
             count: extra + 1,
         });
     }
+    if exec.status != "success" {
+        return Err(PublishRefusal::ExecutionNotSuccessful {
+            run_id,
+            status: exec.status.clone(),
+        });
+    }
     match &exec.output_version {
         None => Err(PublishRefusal::NoOutputVersion { run_id }),
         Some(OutputVersion::Unversioned { reason }) => Err(PublishRefusal::Unversioned {
@@ -294,7 +388,7 @@ pub(crate) fn resolve_pointer(
         Some(version) => Ok(EnvPointer {
             model: source.model.clone(),
             run_id,
-            version: version.clone(),
+            version: PointerVersion::Known(version.clone()),
         }),
     }
 }
@@ -351,6 +445,178 @@ mod tests {
         );
         assert_eq!(history_key(&env, 7), "staging|00000000000000000007");
         assert_eq!(publish_id(&env, 7), "staging#7");
+    }
+
+    fn delta_run(run_id: &str) -> crate::state::RunRecord {
+        crate::state::run_with_output_versions(
+            run_id,
+            &[(
+                "orders",
+                Some(OutputVersion::DeltaObserved {
+                    table: "c.s.orders".into(),
+                    version: 3,
+                }),
+            )],
+        )
+    }
+
+    fn orders_from(run_id: &str) -> PublishSource {
+        PublishSource {
+            model: "orders".into(),
+            run_id: run_id.into(),
+        }
+    }
+
+    /// The baseline: a successful production run with a version publishes.
+    /// Every gate test below changes ONE field of this run.
+    #[test]
+    fn a_successful_production_run_resolves() {
+        let run = delta_run("r1");
+        let pointer = resolve_pointer(&orders_from("r1"), Some(&run)).unwrap();
+        assert_eq!(pointer.run_id, "r1");
+    }
+
+    /// Only a production run publishes. A shadow run, a branch run, and a
+    /// record with no scope are refused before any model is looked at.
+    #[test]
+    fn a_run_that_did_not_write_production_is_refused() {
+        for scope in [
+            Some(RunScope::Shadow {
+                schema: Some("s".into()),
+            }),
+            Some(RunScope::Branch {
+                name: "pr-1".into(),
+            }),
+            None,
+        ] {
+            let mut run = delta_run("r1");
+            run.run_scope = scope.clone();
+            let err = resolve_pointer(&orders_from("r1"), Some(&run)).unwrap_err();
+            assert!(
+                matches!(&err, PublishRefusal::NotProduction { run_id, .. } if run_id == "r1"),
+                "{scope:?}: {err:?}"
+            );
+        }
+    }
+
+    /// A run that failed, or never ran, is refused even if a model in it
+    /// recorded a version.
+    #[test]
+    fn a_run_that_did_not_succeed_is_refused() {
+        for status in [
+            RunStatus::Failure,
+            RunStatus::SkippedIdempotent,
+            RunStatus::SkippedInFlight,
+        ] {
+            let mut run = delta_run("r1");
+            run.status = status;
+            assert_eq!(
+                resolve_pointer(&orders_from("r1"), Some(&run)).unwrap_err(),
+                PublishRefusal::RunNotSuccessful {
+                    run_id: "r1".into(),
+                    status
+                }
+            );
+        }
+    }
+
+    /// A tripped check gate or verify_after gate refuses the whole run.
+    #[test]
+    fn a_run_that_tripped_a_gate_is_refused() {
+        let mut run = delta_run("r1");
+        run.check_gate_failed = true;
+        assert_eq!(
+            resolve_pointer(&orders_from("r1"), Some(&run)).unwrap_err(),
+            PublishRefusal::CheckGateFailed {
+                run_id: "r1".into()
+            }
+        );
+        let mut run = delta_run("r1");
+        run.verify_after_failed = true;
+        assert_eq!(
+            resolve_pointer(&orders_from("r1"), Some(&run)).unwrap_err(),
+            PublishRefusal::VerifyAfterFailed {
+                run_id: "r1".into()
+            }
+        );
+    }
+
+    /// A `PartialFailure` run publishes the models that succeeded and refuses
+    /// the ones that failed.
+    #[test]
+    fn a_partial_failure_run_publishes_only_its_successful_models() {
+        let mut run = delta_run("r1");
+        run.status = RunStatus::PartialFailure;
+        let mut failed = run.models_executed[0].clone();
+        failed.model_name = "customers".into();
+        failed.status = "failed".into();
+        run.models_executed.push(failed);
+        assert!(resolve_pointer(&orders_from("r1"), Some(&run)).is_ok());
+        let customers = PublishSource {
+            model: "customers".into(),
+            run_id: "r1".into(),
+        };
+        assert_eq!(
+            resolve_pointer(&customers, Some(&run)).unwrap_err(),
+            PublishRefusal::ExecutionNotSuccessful {
+                run_id: "r1".into(),
+                status: "failed".into()
+            }
+        );
+    }
+
+    /// Two executions under one model name refuse, and the message names
+    /// the cause so the user knows it is a P2 limit, not a broken run.
+    #[test]
+    fn a_partitioned_or_replicated_model_is_refused_with_its_cause() {
+        let mut run = delta_run("r1");
+        let second = run.models_executed[0].clone();
+        run.models_executed.push(second);
+        let err = resolve_pointer(&orders_from("r1"), Some(&run)).unwrap_err();
+        assert_eq!(
+            err,
+            PublishRefusal::AmbiguousExecution {
+                run_id: "r1".into(),
+                count: 2
+            }
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("time_interval"), "{msg}");
+        assert!(msg.contains("cannot be published yet"), "{msg}");
+    }
+
+    /// A pointer whose version is a variant this binary does not know still
+    /// reads, keeps its raw value, and writes it back unchanged. A known
+    /// version keeps the bare `OutputVersion` wire shape.
+    #[test]
+    fn a_pointer_with_an_unknown_version_variant_still_reads() {
+        let known = r#"{"model":"orders","run_id":"r1","version":{"kind":"delta_observed","table":"c.s.t","version":7}}"#;
+        let p: EnvPointer = serde_json::from_str(known).unwrap();
+        assert!(matches!(
+            p.version.known(),
+            Some(OutputVersion::DeltaObserved { version: 7, .. })
+        ));
+        assert_eq!(serde_json::to_string(&p).unwrap(), known);
+
+        let future =
+            r#"{"model":"orders","run_id":"r1","version":{"kind":"iceberg_snapshot","id":42}}"#;
+        let p: EnvPointer = serde_json::from_str(future).unwrap();
+        assert!(p.version.known().is_none());
+        assert!(matches!(p.version, PointerVersion::Unreadable(_)));
+        assert_eq!(
+            serde_json::to_string(&p).unwrap(),
+            future,
+            "kept as written"
+        );
+
+        // A whole head with one unknown pointer reads; the other stays known.
+        let head = format!(
+            r#"{{"name":"prod","seq":1,"head_publish_id":"prod#1","pointers":{{"a":{known},"b":{future}}},"updated_at":"2026-10-06T00:00:00Z","updated_by":{by}}}"#,
+            by = serde_json::to_string(&PrincipalRef::unnamed()).unwrap()
+        );
+        let rec: EnvironmentRecord = serde_json::from_str(&head).unwrap();
+        assert!(rec.pointers["a"].version.known().is_some());
+        assert!(rec.pointers["b"].version.known().is_none());
     }
 
     #[test]

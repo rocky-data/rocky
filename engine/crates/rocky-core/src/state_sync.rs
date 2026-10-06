@@ -124,6 +124,18 @@ pub enum StateSyncError {
     /// An unconditional upload found the `cas-required` marker beside the
     /// state object.
     CasRequired { marker: String },
+
+    #[error(
+        "refusing to publish environment pointers through the '{backend}' state store: it does \
+         not use compare-and-swap here, so two concurrent publishes could both report success \
+         and one would be lost without an error. Fix: set [state] concurrency_control = \"cas\" \
+         on a store that honours conditional writes (s3, gcs, or tiered), or publish against a \
+         local state store"
+    )]
+    /// [`publish_pointers`] on a remote backend whose effective
+    /// concurrency control is `off`. A lost publish is silent there, so it is
+    /// refused before any download.
+    PublishRequiresCas { backend: String },
 }
 
 /// State file name within the configured prefix.
@@ -4655,7 +4667,8 @@ fn is_transient(err: &StateSyncError) -> bool {
         // Configuration refusals: retrying cannot change the store or the
         // marker.
         | StateSyncError::CasUnsupported { .. }
-        | StateSyncError::CasRequired { .. } => false,
+        | StateSyncError::CasRequired { .. }
+        | StateSyncError::PublishRequiresCas { .. } => false,
     }
 }
 
@@ -4694,13 +4707,16 @@ fn publish_error(e: crate::state::StateError) -> StateSyncError {
 ///   blob moved by another publish           ──▶ replay, new head  ──▶ PublishConflict
 /// ```
 ///
-/// On the Local backend it is one local transaction, no remote I/O. Under
-/// `concurrency_control = "off"` it is the legacy half-seam (one download,
-/// one transaction, one unconditional upload): two concurrent publishes can
-/// then both succeed and one is lost. Use CAS for shared environments.
+/// On the Local backend it is one local transaction, no remote I/O; the
+/// local writer lock serializes publishes. On a remote backend the effective
+/// concurrency control must be `cas`: under `off` the seam is one download and
+/// one unconditional upload, so two concurrent publishes could both succeed
+/// and one would be lost silently. That case is refused up front.
 ///
 /// # Errors
 ///
+/// [`StateSyncError::PublishRequiresCas`] on a remote backend without
+/// effective CAS (nothing is downloaded or uploaded);
 /// [`StateSyncError::PublishConflict`] when the head is not the expected
 /// one; [`StateSyncError::State`] wrapping
 /// [`crate::state::StateError::Environment`] for a refused request; plus
@@ -4709,8 +4725,21 @@ pub async fn publish_pointers(
     session: &LedgerSeamSession,
     request: &crate::environments::PublishRequest,
 ) -> Result<crate::environments::PublishRecord, StateSyncError> {
+    if !matches!(session.cfg.backend, StateBackend::Local) {
+        // The same resolution `execute` performs: the backend default for an
+        // unset mode, confirmed by the startup probe.
+        let cfg = resolved_state_config(&session.cfg).await?;
+        if !cas_effective(&cfg) {
+            return Err(StateSyncError::PublishRequiresCas {
+                backend: cfg.backend.to_string(),
+            });
+        }
+    }
     publish_pointers_with_hook(session, request, None).await
 }
+
+/// The publish transition WITHOUT the CAS guard. Tests use it to show what
+/// the guard prevents.
 
 async fn publish_pointers_with_hook(
     session: &LedgerSeamSession,
@@ -9293,9 +9322,11 @@ mod environment_publish_tests {
         let _ = seed.acquire().await.unwrap();
         record_seed_runs(&h.open_store(&h.pod_a));
         seed.finalize().await.unwrap();
-        let first = publish_pointers(
+        // The unguarded path, so the `off` negative control can bootstrap.
+        let first = publish_pointers_with_hook(
             &LedgerSeamSession::new(&h.pod_a.cfg, &h.pod_a.state_path, false),
             &req("staging", None, &[("orders", "r1")]),
+            None,
         )
         .await
         .unwrap();
@@ -9400,12 +9431,156 @@ mod environment_publish_tests {
         assert_eq!(seqs, vec![1, 2]);
         assert_eq!(history[1].prior_publish_id.as_deref(), Some("staging#1"));
         assert_eq!(&history[1], winner);
+
+        // The loser's LOCAL store holds the remote winner, not its own
+        // refused transaction: same head, same history.
+        let loser_pod = if results[0].0.is_err() {
+            &h.pod_a
+        } else {
+            &h.pod_b
+        };
+        let local = h.open_store(loser_pod);
+        let staging = EnvironmentName::parse("staging").unwrap();
+        assert_eq!(
+            local.get_environment(&staging).unwrap().as_ref(),
+            Some(&head)
+        );
+        assert_eq!(local.publish_history(&staging).unwrap(), history);
         test_support::clear();
     }
 
-    /// Negative control: the same race with `concurrency_control = "off"`.
-    /// Both publishes report success and the remote keeps only one: an update
-    /// is lost. This proves the race above can fail, so its pass is evidence.
+    /// The guard: a remote backend with `concurrency_control = "off"` refuses
+    /// a publish with the typed error before any download or upload, because
+    /// a lost publish would be silent there (see the negative control below).
+    /// Mutation: drop the guard and the publish succeeds.
+    #[tokio::test]
+    async fn publish_through_a_remote_backend_without_cas_is_refused() {
+        let _serial = test_support::serial_guard();
+        test_support::clear();
+        let h = bootstrapped(ConcurrencyControl::Off).await;
+        let (gets, puts) = (
+            h.faults.count(crate::fault_store::FaultOp::Get),
+            h.faults.put_count_outside("cas-probe/"),
+        );
+        let err = publish_pointers(
+            &LedgerSeamSession::new(&h.pod_b.cfg, &h.pod_b.state_path, false),
+            &req("staging", Some("staging#1"), &[("orders", "r2")]),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(&err, StateSyncError::PublishRequiresCas { backend } if backend == "s3"),
+            "{err:?}"
+        );
+        assert!(!err.to_string().is_empty());
+        assert_eq!(h.faults.count(crate::fault_store::FaultOp::Get), gets);
+        assert_eq!(
+            h.faults.put_count_outside("cas-probe/"),
+            puts,
+            "nothing uploaded"
+        );
+        let (head, _, _) = remote_view(&h).await;
+        assert_eq!(head.head_publish_id, "staging#1");
+        test_support::clear();
+    }
+
+    /// A refused publish through the seam (a model the run did not execute,
+    /// and an existing history row) uploads nothing and leaves the local
+    /// store equal to the remote.
+    #[tokio::test]
+    async fn a_refused_publish_through_the_seam_uploads_nothing() {
+        let _serial = test_support::serial_guard();
+        test_support::clear();
+        let h = bootstrapped(ConcurrencyControl::Cas).await;
+        let session = LedgerSeamSession::new(&h.pod_b.cfg, &h.pod_b.state_path, false);
+        let staging = EnvironmentName::parse("staging").unwrap();
+
+        let puts = h.faults.put_count_outside("cas-probe/");
+        let err = publish_pointers(
+            &session,
+            &req("staging", Some("staging#1"), &[("customers", "r2")]),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                StateSyncError::State(crate::state::StateError::Environment(
+                    crate::environments::EnvironmentError::Refused { .. }
+                ))
+            ),
+            "{err:?}"
+        );
+        assert_eq!(
+            h.faults.put_count_outside("cas-probe/"),
+            puts,
+            "Refused uploads nothing"
+        );
+        let local = h.open_store(&h.pod_b);
+        assert_eq!(
+            local
+                .get_environment(&staging)
+                .unwrap()
+                .unwrap()
+                .head_publish_id,
+            "staging#1"
+        );
+        drop(local);
+
+        // Plant an orphan history row at seq 2 in the remote blob.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join(".rocky-state.redb");
+        let _ = download_state(&h.pod_a.cfg, &path, false).await.unwrap();
+        crate::state::insert_orphan_history_row(
+            &path,
+            &crate::environments::history_key(&staging, 2),
+        );
+        let key = "v32/state.redb";
+        assert!(h.provider.exists(key).await.unwrap());
+        h.provider
+            .put(key, Bytes::from(std::fs::read(&path).unwrap()))
+            .await
+            .unwrap();
+
+        let puts = h.faults.put_count_outside("cas-probe/");
+        let err = publish_pointers(
+            &session,
+            &req("staging", Some("staging#1"), &[("orders", "r2")]),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                StateSyncError::State(crate::state::StateError::Environment(
+                    crate::environments::EnvironmentError::HistoryRowExists { .. }
+                ))
+            ),
+            "{err:?}"
+        );
+        assert_eq!(
+            h.faults.put_count_outside("cas-probe/"),
+            puts,
+            "HistoryRowExists uploads nothing"
+        );
+        let local = h.open_store(&h.pod_b);
+        assert_eq!(
+            local
+                .get_environment(&staging)
+                .unwrap()
+                .unwrap()
+                .head_publish_id,
+            "staging#1"
+        );
+        test_support::clear();
+    }
+
+    /// Negative control: the same race with `concurrency_control = "off"`,
+    /// through the UNGUARDED inner path (the public `publish_pointers` now
+    /// refuses `off`). Both publishes report success and the remote keeps only
+    /// one: an update is lost. The in-store head check alone does not stop the
+    /// blob-level loss, which is why the guard exists. It also proves the race
+    /// above can fail, so its pass is evidence.
     #[tokio::test]
     async fn concurrent_publishes_without_cas_lose_an_update() {
         let _serial = test_support::serial_guard();
