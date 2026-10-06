@@ -370,6 +370,15 @@ pub(crate) enum FailingWriteKind {
     ContentQueryCircuitBreaker,
     ContentMsckRateLimit,
     ContentMsckCircuitBreaker,
+    /// Fails nothing. Answers the content-addressed fixture query and
+    /// accepts the post-commit MSCK, so a content-addressed run succeeds.
+    ContentOk,
+    /// Fails nothing. `observed_table_version` answers `Some(42)`, as a
+    /// Delta table on Databricks would (RV1-P1b).
+    ObserveVersion,
+    /// Fails nothing but `observed_table_version`, which errors. The run
+    /// must still succeed and record `observe_failed` (RV1-P1b).
+    ObserveFail,
 }
 
 #[cfg(feature = "duckdb")]
@@ -400,6 +409,12 @@ impl FailingWriteWarehouseAdapter {
                 consecutive_failures: 5,
                 cooldown_seconds: Some(180),
             },
+            FailingWriteKind::ContentOk
+            | FailingWriteKind::ObserveVersion
+            | FailingWriteKind::ObserveFail => ConnectorError::StatementFailed {
+                id: "injected".to_string(),
+                message: "injected DESCRIBE HISTORY failure".to_string(),
+            },
         };
         AdapterError::new(error)
     }
@@ -413,6 +428,17 @@ impl WarehouseAdapter for FailingWriteWarehouseAdapter {
     }
 
     async fn execute_statement(&self, sql: &str) -> AdapterResult<()> {
+        if matches!(
+            self.failure,
+            FailingWriteKind::ContentOk
+                | FailingWriteKind::ObserveVersion
+                | FailingWriteKind::ObserveFail
+        ) {
+            if sql.starts_with("MSCK REPAIR TABLE ") {
+                return Ok(());
+            }
+            return self.inner.execute_statement(sql).await;
+        }
         if matches!(
             self.failure,
             FailingWriteKind::ContentQueryRateLimit | FailingWriteKind::ContentQueryCircuitBreaker
@@ -452,6 +478,14 @@ impl WarehouseAdapter for FailingWriteWarehouseAdapter {
 
     fn classify_failure(&self, err: &AdapterError) -> rocky_core::failure_class::FailureClass {
         self.inner.classify_failure(err)
+    }
+
+    async fn observed_table_version(&self, table: &TableRef) -> AdapterResult<Option<u64>> {
+        match self.failure {
+            FailingWriteKind::ObserveVersion => Ok(Some(42)),
+            FailingWriteKind::ObserveFail => Err(self.injected_error()),
+            _ => self.inner.observed_table_version(table).await,
+        }
     }
 }
 

@@ -2535,3 +2535,82 @@ async fn an_unreadable_freshness_timestamp_is_omitted_and_a_null_is_kept() {
         );
     }
 }
+
+/// RV1-P1b: `observed_table_version` sends `DESCRIBE HISTORY ... LIMIT 1`
+/// with the quoted table name and reads the `version` cell of the answer.
+#[tokio::test]
+async fn test_observed_table_version_reads_describe_history() {
+    use rocky_core::traits::WarehouseAdapter;
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/api/2.0/sql/statements"))
+        .and(body_string_contains(
+            "DESCRIBE HISTORY `main`.`marts`.`fct_orders` LIMIT 1",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "statement_id": "stmt-history",
+            "status": { "state": "SUCCEEDED" },
+            "manifest": {
+                "schema": {
+                    "columns": [
+                        {"name": "version", "type_name": "LONG", "position": 0},
+                        {"name": "timestamp", "type_name": "TIMESTAMP", "position": 1},
+                        {"name": "operation", "type_name": "STRING", "position": 2}
+                    ]
+                },
+                "total_row_count": 1
+            },
+            "result": {
+                "data_array": [["42", "2026-10-06T10:00:00.000Z", "CREATE OR REPLACE TABLE AS SELECT"]]
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let adapter = rocky_databricks::adapter::DatabricksWarehouseAdapter::new(test_connector(&server));
+    let table = rocky_ir::TableRef {
+        catalog: "main".into(),
+        schema: "marts".into(),
+        table: "fct_orders".into(),
+    };
+    let version = adapter.observed_table_version(&table).await.unwrap();
+    assert_eq!(version, Some(42));
+}
+
+/// RV1-P1b: a failed `DESCRIBE HISTORY` (for example on a non-Delta table)
+/// is an `Err`, never a made-up version. The runner turns it into
+/// `observe_failed`.
+#[tokio::test]
+async fn test_observed_table_version_failure_is_an_error() {
+    use rocky_core::traits::WarehouseAdapter;
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/api/2.0/sql/statements"))
+        .and(body_string_contains("DESCRIBE HISTORY"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "statement_id": "stmt-history-fail",
+            "status": {
+                "state": "FAILED",
+                "error": {
+                    "error_code": "DELTA_ONLY_OPERATION",
+                    "message": "DESCRIBE HISTORY is only supported for Delta tables"
+                }
+            },
+            "manifest": null,
+            "result": null
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let adapter = rocky_databricks::adapter::DatabricksWarehouseAdapter::new(test_connector(&server));
+    let table = rocky_ir::TableRef {
+        catalog: "main".into(),
+        schema: "marts".into(),
+        table: "ice_orders".into(),
+    };
+    assert!(adapter.observed_table_version(&table).await.is_err());
+}

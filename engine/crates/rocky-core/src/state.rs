@@ -11129,6 +11129,220 @@ mod tests {
         );
     }
 
+    // --- RV1-P1b: ModelExecution.output_version ---------------------------
+
+    /// One value of every [`OutputVersion`] variant and every
+    /// [`UnversionedReason`], for the round-trip tests.
+    fn every_output_version() -> Vec<OutputVersion> {
+        let ts: chrono::DateTime<chrono::Utc> = "2024-01-01T12:00:00Z".parse().unwrap();
+        let mut all = vec![
+            OutputVersion::content_addressed(
+                "c.s.t".to_string(),
+                4,
+                vec!["bb".to_string(), "aa".to_string()],
+                true,
+            ),
+            OutputVersion::content_addressed("c.s.t".to_string(), 1, vec!["aa".into()], false),
+            OutputVersion::DeltaObserved {
+                table: "c.s.t".to_string(),
+                version: 7,
+            },
+            OutputVersion::WarehouseJob {
+                table: "p.d.t".to_string(),
+                job_id: "job_123".to_string(),
+                ended_at: ts,
+            },
+        ];
+        // Exhaustive on purpose: a new reason fails to compile here until it
+        // joins the round-trip set.
+        for reason in [
+            UnversionedReason::AdapterHasNoVersion,
+            UnversionedReason::ViewHasNoStoredData,
+            UnversionedReason::WarehouseManagedRefresh,
+            UnversionedReason::NoOutput,
+            UnversionedReason::ObserveFailed,
+        ] {
+            match reason {
+                UnversionedReason::AdapterHasNoVersion
+                | UnversionedReason::ViewHasNoStoredData
+                | UnversionedReason::WarehouseManagedRefresh
+                | UnversionedReason::NoOutput
+                | UnversionedReason::ObserveFailed => {}
+            }
+            all.push(OutputVersion::Unversioned { reason });
+        }
+        all
+    }
+
+    /// A row written before RV1-P1b has no `output_version` key. It must read
+    /// back `None` ("not recorded"), and re-serialize without the key.
+    #[test]
+    fn test_v31_model_execution_forward_deserializes_output_version_none() {
+        let old = r#"{"model_name":"fct_orders","started_at":"2024-01-01T12:00:00Z","finished_at":"2024-01-01T12:00:00Z","duration_ms":2000,"rows_affected":10,"status":"success","sql_hash":"sql","skip_hash":null,"upstream_freshness":null,"bytes_scanned":null,"bytes_written":null,"tenant":null,"recipe_hash":null,"input_hash":null,"input_proof_class":null,"env_hash":null,"hash_scheme":null,"output_column_hashes":null}"#;
+        let exec: ModelExecution = serde_json::from_str(old).unwrap();
+        assert!(exec.output_version.is_none());
+        let again = serde_json::to_string(&exec).unwrap();
+        assert!(!again.contains("output_version"), "{again}");
+    }
+
+    /// Every variant round-trips through the `ModelExecution` blob, and
+    /// through a real run-history row in redb.
+    #[test]
+    fn test_output_version_every_variant_round_trips() {
+        let (store, _dir) = temp_store();
+        for (i, version) in every_output_version().into_iter().enumerate() {
+            let mut exec = model_execution("fct_orders");
+            exec.output_version = Some(version.clone());
+            let json = serde_json::to_string(&exec).unwrap();
+            let back: ModelExecution = serde_json::from_str(&json).unwrap();
+            assert_eq!(back.output_version.as_ref(), Some(&version), "{json}");
+
+            let run_id = format!("run-ov-{i}");
+            store
+                .record_run(&minimal_run_record(&run_id, vec![exec]))
+                .unwrap();
+            let stored = store.get_run(&run_id).unwrap().unwrap();
+            assert_eq!(
+                stored.models_executed[0].output_version.as_ref(),
+                Some(&version)
+            );
+        }
+    }
+
+    /// The wire shape is part of the record: a `kind` tag and snake_case
+    /// names. Pin one of each so a renamed variant fails here.
+    #[test]
+    fn test_output_version_wire_shape_pinned() {
+        let pins = [
+            (
+                OutputVersion::DeltaObserved {
+                    table: "c.s.t".into(),
+                    version: 7,
+                },
+                r#"{"kind":"delta_observed","table":"c.s.t","version":7}"#,
+            ),
+            (
+                OutputVersion::Unversioned {
+                    reason: UnversionedReason::ObserveFailed,
+                },
+                r#"{"kind":"unversioned","reason":"observe_failed"}"#,
+            ),
+            (
+                OutputVersion::content_addressed("c.s.t".into(), 3, vec!["ab".into()], false),
+                r#"{"kind":"content_addressed","table":"c.s.t","delta_version":3,"blake3":"ab","files":["ab"]}"#,
+            ),
+        ];
+        for (value, expected) in pins {
+            assert_eq!(serde_json::to_string(&value).unwrap(), expected);
+        }
+    }
+
+    /// A value a later binary writes (a new variant or reason) reads as
+    /// `None` here, and the rest of the row still reads.
+    #[test]
+    fn test_unknown_output_version_reads_as_not_recorded() {
+        for bad in [
+            serde_json::json!({"kind": "iceberg_snapshot", "table": "t", "id": 9}),
+            serde_json::json!({"kind": "unversioned", "reason": "something_new"}),
+            serde_json::json!("garbage"),
+        ] {
+            let mut row = serde_json::to_value(model_execution("fct_orders")).unwrap();
+            row["output_version"] = bad.clone();
+            let back: ModelExecution = serde_json::from_value(row)
+                .expect("an unknown output_version must not fail the row");
+            assert!(back.output_version.is_none(), "{bad}");
+            assert_eq!(back.model_name, "fct_orders");
+        }
+    }
+
+    /// Rollback: a v31 binary from before RV1-P1b has no `output_version`
+    /// field. It must still read a row this build wrote with the field set.
+    /// The mirror struct is the pre-P1b shape, with serde's default
+    /// unknown-field handling.
+    #[test]
+    fn test_v31_rollback_mirror_reads_a_row_with_output_version() {
+        #[derive(serde::Deserialize)]
+        #[allow(dead_code)]
+        struct PreP1bModelExecution {
+            model_name: String,
+            started_at: chrono::DateTime<chrono::Utc>,
+            finished_at: chrono::DateTime<chrono::Utc>,
+            duration_ms: u64,
+            rows_affected: Option<u64>,
+            status: String,
+            sql_hash: String,
+            #[serde(default)]
+            skip_hash: Option<String>,
+            #[serde(default)]
+            upstream_freshness: Option<Vec<UpstreamSig>>,
+            bytes_scanned: Option<u64>,
+            bytes_written: Option<u64>,
+            #[serde(default)]
+            tenant: Option<String>,
+            #[serde(default)]
+            recipe_hash: Option<String>,
+            #[serde(default)]
+            output_column_hashes: Option<Vec<ColumnHash>>,
+            #[serde(default)]
+            attempts: Vec<AttemptRecord>,
+        }
+        for version in every_output_version() {
+            let mut exec = model_execution("fct_orders");
+            exec.output_version = Some(version);
+            let bytes = serde_json::to_vec(&exec).unwrap();
+            assert!(String::from_utf8_lossy(&bytes).contains("\"output_version\""));
+            let old: PreP1bModelExecution = serde_json::from_slice(&bytes)
+                .expect("a pre-P1b v31 binary must read a row that carries output_version");
+            assert_eq!(old.model_name, "fct_orders");
+        }
+    }
+
+    /// The partitioned whole-output hash does not depend on the order the
+    /// groups were written, and it does depend on every file.
+    #[test]
+    fn test_partitioned_output_blake3_is_order_independent() {
+        let a = vec!["11".to_string(), "22".to_string(), "33".to_string()];
+        let b = vec!["33".to_string(), "11".to_string(), "22".to_string()];
+        assert_eq!(partitioned_output_blake3(&a), partitioned_output_blake3(&b));
+        assert_ne!(
+            partitioned_output_blake3(&a),
+            partitioned_output_blake3(&a[..2])
+        );
+
+        let va = OutputVersion::content_addressed("t".into(), 5, a, true);
+        let vb = OutputVersion::content_addressed("t".into(), 5, b, true);
+        assert_eq!(va, vb, "same files in another order are the same version");
+        let OutputVersion::ContentAddressed { blake3, files, .. } = va else {
+            panic!("content_addressed builds ContentAddressed");
+        };
+        assert_eq!(files, vec!["11", "22", "33"], "files are stored sorted");
+        assert_ne!(blake3, "11", "a partitioned write folds, never one file");
+    }
+
+    /// An unpartitioned write is one file, and its identity is that file's
+    /// hash. A partitioned write with one group still folds.
+    #[test]
+    fn test_content_addressed_identity_per_shape() {
+        let single = OutputVersion::content_addressed("t".into(), 2, vec!["ab".into()], false);
+        assert!(matches!(
+            &single,
+            OutputVersion::ContentAddressed { blake3, .. } if blake3 == "ab"
+        ));
+        let one_group = OutputVersion::content_addressed("t".into(), 2, vec!["ab".into()], true);
+        assert!(matches!(
+            &one_group,
+            OutputVersion::ContentAddressed { blake3, .. }
+                if *blake3 == partitioned_output_blake3(&["ab".to_string()])
+        ));
+        // Defensive: an "unpartitioned" list of two files never reports one.
+        let two = OutputVersion::content_addressed("t".into(), 2, vec!["b".into(), "a".into()], false);
+        assert!(matches!(
+            &two,
+            OutputVersion::ContentAddressed { blake3, .. }
+                if *blake3 == partitioned_output_blake3(&["a".to_string(), "b".to_string()])
+        ));
+    }
+
     /// End-to-end variant of the forward-compat guard: write a v5 blob
     /// directly into the `run_history` redb table (bypassing
     /// `record_run`'s serialization), then read it back via the normal
