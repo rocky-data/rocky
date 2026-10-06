@@ -1152,7 +1152,9 @@ fn worker_tools_that_read_the_warehouse<'a>(table: &[(&'a str, WorkerToolEffect)
 ///
 /// The stripping therefore holds because no PRODUCTION client discovers or
 /// declares yet, not because this server refuses to speak `2026-07-28`. The
-/// negotiated version is `2025-11-25` against rmcp's own default client —
+/// negotiated version is `2025-11-25` against rmcp's own default client.
+/// Since rmcp 3.5 that client names `2026-07-28` (its new `LATEST`) and gets
+/// `2025-11-25` as the fallback, not as an echo. The result is the same and
 /// BLESSED, as part of row 1's `initialize` payload in
 /// `served_text_golden_pins_every_worded_surface`, so the day it moves the
 /// golden moves with it and this paragraph gets re-read. Closing the gap by

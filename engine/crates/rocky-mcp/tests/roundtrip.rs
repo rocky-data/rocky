@@ -5942,6 +5942,11 @@ async fn result_type_reaches_a_2026_07_28_client_and_no_other() {
     //    `LATEST` over `initialize`. Since rmcp 3.5 that is 2026-07-28, which
     //    has no handshake, so it lands on `LATEST_WITH_INITIALIZE`
     //    (2025-11-25). That is older, so the field is stripped.
+    assert!(
+        !ProtocolVersion::LATEST.has_initialize(),
+        "since rmcp 3.5 the default client names a version with no handshake, \
+         so the default peer below lands on the fallback, not an echo"
+    );
     let legacy = connect(RockyMcpServer::new(config_path)).await;
     let legacy_negotiated = legacy
         .peer_info()
