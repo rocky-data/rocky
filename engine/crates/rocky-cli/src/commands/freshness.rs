@@ -636,10 +636,7 @@ mod tests {
                 Some(RunScope::Branch { name: "b".into() }),
             ))
             .unwrap();
-        assert_eq!(
-            last_production_build(&store, ["orders"]).unwrap(),
-            Some(t0)
-        );
+        assert_eq!(last_production_build(&store, ["orders"]).unwrap(), Some(t0));
 
         // A run recorded before runs carried a scope still counts.
         let legacy = t0 + chrono::Duration::hours(3);

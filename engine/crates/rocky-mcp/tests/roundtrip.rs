@@ -5546,7 +5546,10 @@ async fn optimize_reports_message_without_history() {
 
     assert!(sc["recommendations"].as_array().unwrap().is_empty());
     assert!(
-        sc["message"].as_str().unwrap().contains("no run history"),
+        sc["message"]
+            .as_str()
+            .unwrap()
+            .contains("no production run history"),
         "empty optimize must explain why"
     );
 

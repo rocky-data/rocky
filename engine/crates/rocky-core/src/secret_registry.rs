@@ -461,11 +461,13 @@ mod tests {
     /// so no fragment of either survives.
     #[test]
     fn render_placeholders_leaves_no_fragment_of_overlapping_values() {
-        let a = "ROCKY-RENDER-ABCDEFGH1234";
-        let b = "12345678-ROCKY-RENDER-XYZ";
+        // The registry is process-wide, so the values must not contain one
+        // another test registers (`12345678` does, in the floor test).
+        let a = "ROCKY-RENDER-ABCDEFGHQWZX";
+        let b = "QWZXJKLV-ROCKY-RENDER-XYZ";
         register_substitution("ROCKY_RENDER_A", a);
         register_substitution("ROCKY_RENDER_B", b);
-        let text = "x ROCKY-RENDER-ABCDEFGH12345678-ROCKY-RENDER-XYZ y";
+        let text = "x ROCKY-RENDER-ABCDEFGHQWZXJKLV-ROCKY-RENDER-XYZ y";
         let out = render_placeholders(text);
         assert!(!out.contains("ABCDEFGH"), "{out}");
         assert!(!out.contains("RENDER-XYZ"), "{out}");

@@ -1038,19 +1038,16 @@ enabled = true
     assert_eq!(out["status"], "Failure", "{out}");
 }
 
-/// A source that already has a column named like a label still splits
-/// correctly.
+/// A source that already has a column named like a label refuses the split
+/// (#2065).
 ///
 /// `orders` carries `_error_not_null_name`, the label the `not_null(name)`
-/// assertion produces, as a quarantine table checked again would. DuckDB
-/// renames the second of two same-named columns in a CTAS. If the
-/// intermediate table held the label under its own name, the label would
-/// become `_error_not_null_name_1`, and the split would read the source's
-/// column instead: here every row carries a value there, so every row would
-/// be quarantined, the passing ones included. The intermediate table holds
-/// each label under a name with a per-run token, which no source column has.
+/// assertion produces, as a quarantine table checked again would. `split`
+/// never writes its source, so it cannot own that column: it refuses with
+/// `quarantine:compile` before any statement runs, rather than writing a
+/// valid table that carries a column it cannot tell from its own label.
 #[test]
-fn a_source_column_named_like_a_label_does_not_steer_the_split() {
+fn a_source_column_named_like_a_label_refuses_the_split() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let dir = tmp.path();
     let conn = duckdb::Connection::open(dir.join("fixture.duckdb")).expect("open duckdb");
@@ -1075,13 +1072,29 @@ enabled = true
 
     let run = rocky(dir, &["run"]);
     let out = json(&run);
-    assert_eq!(out["quarantine"][0]["ok"], serde_json::json!(true), "{out}");
+    let refusal = out["check_results"]
+        .as_array()
+        .expect("check_results")
+        .iter()
+        .flat_map(|r| r["checks"].as_array().expect("checks"))
+        .find(|c| c["name"] == serde_json::json!("quarantine:compile"))
+        .unwrap_or_else(|| panic!("a quarantine:compile refusal: {out}"));
+    assert_eq!(refusal["passed"], serde_json::json!(false), "{out}");
+    let reason = refusal["not_evaluated"].as_str().expect("reason");
+    assert!(reason.contains("_error_not_null_name"), "{reason}");
+    assert!(reason.contains("split"), "{reason}");
 
-    assert_eq!(ids(dir, "orders__valid"), [1], "{out}");
-    assert_eq!(ids(dir, "orders__quarantine"), [2], "{out}");
+    assert!(
+        !table_exists(dir, "orders__valid"),
+        "nothing is written: {out}"
+    );
+    assert!(
+        !table_exists(dir, "orders__quarantine"),
+        "nothing is written: {out}"
+    );
     assert_eq!(
-        columns(dir, "orders__valid"),
+        columns(dir, "orders"),
         ["id", "name", "_error_not_null_name"],
-        "the source's own column stays in the valid table"
+        "the source is untouched"
     );
 }
