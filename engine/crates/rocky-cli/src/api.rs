@@ -1348,7 +1348,31 @@ async fn full_dag(
     .await?
     .map_err(|e| ApiError::internal(e.to_string()))?;
 
-    Ok(PrettyJson(output))
+    let compile = state.compile_result.read().await;
+    Ok(PrettyJson(mark_compiled_nodes(output, compile.as_ref())))
+}
+
+/// Mark each `transformation` node with whether `compile` covers it (#2011).
+///
+/// The graph walks every transformation pipeline's own models directory;
+/// the server compiles one directory, and `GET /api/v1/models/{name}` reads
+/// that compile. Without the mark the DAG offered nodes the detail route
+/// answers 404 for, and nothing on either route said so. The lookup is the
+/// one `get_model` makes, so the mark and the route agree by construction.
+/// No compile result means no node is servable: `false`, never omitted.
+fn mark_compiled_nodes(
+    mut output: DagOutput,
+    compile: Option<&rocky_compiler::compile::CompileResult>,
+) -> DagOutput {
+    for node in &mut output.nodes {
+        if node.kind == rocky_core::unified_dag::NodeKind::Transformation.to_string() {
+            node.compiled =
+                Some(compile.is_some_and(|result| {
+                    result.semantic_graph.model_schema(&node.label).is_some()
+                }));
+        }
+    }
+    output
 }
 
 /// `GET /api/v1/runs` — canonical [`HistoryOutput`] (project run history).
@@ -6640,7 +6664,119 @@ mod tests {
             )
             .unwrap(),
         );
-        assert_eq!(api, reference, "GET /dag must match `rocky dag`");
+        assert_eq!(
+            without_compiled_marks(&api),
+            json_value(&reference),
+            "GET /dag must match `rocky dag`"
+        );
+    }
+
+    /// The served DAG with the `compiled` marks removed (#2011): the one field
+    /// `GET /api/v1/dag` adds to `rocky dag`'s output, asserted on its own in
+    /// `dag_marks_the_nodes_the_server_compile_does_not_cover`. Compared as
+    /// JSON values, not bytes, because the removal reserializes.
+    fn without_compiled_marks(api: &str) -> serde_json::Value {
+        let mut v: serde_json::Value = serde_json::from_str(api).unwrap();
+        for node in v["nodes"].as_array_mut().unwrap() {
+            node.as_object_mut().unwrap().remove("compiled");
+        }
+        v
+    }
+
+    fn json_value(bytes: &str) -> serde_json::Value {
+        serde_json::from_str(bytes).unwrap()
+    }
+
+    /// #2011: with `serve` holding the defaulted `models/` directory, the DAG
+    /// walks every transformation pipeline's own root, but the server compiles
+    /// only `models/`. A node from another root is drawn, and the detail
+    /// route answers 404 for it. The DAG must say so on the node — and the
+    /// mark must agree with what `GET /api/v1/models/{name}` answers.
+    #[tokio::test]
+    async fn dag_marks_the_nodes_the_server_compile_does_not_cover() {
+        let dir = tempfile::tempdir().unwrap();
+        for (sub, model) in [("models", "stg"), ("reporting", "rpt")] {
+            let root = dir.path().join(sub);
+            std::fs::create_dir_all(&root).unwrap();
+            std::fs::write(root.join(format!("{model}.sql")), "SELECT 1 AS id").unwrap();
+            std::fs::write(
+                root.join(format!("{model}.toml")),
+                format!(
+                    "name = \"{model}\"\n\n[strategy]\ntype = \"full_refresh\"\n\n\
+                     [target]\ncatalog = \"c\"\nschema = \"s\"\ntable = \"{model}\"\n"
+                ),
+            )
+            .unwrap();
+        }
+        let config_path = dir.path().join("rocky.toml");
+        std::fs::write(
+            &config_path,
+            "[adapter]\ntype = \"duckdb\"\npath = \"test.duckdb\"\n\n\
+             [pipeline.core]\ntype = \"transformation\"\nmodels = \"models/**\"\n\n\
+             [pipeline.core.target.governance]\nauto_create_schemas = true\n\n\
+             [pipeline.reporting]\ntype = \"transformation\"\nmodels = \"reporting/**\"\n\n\
+             [pipeline.reporting.target.governance]\nauto_create_schemas = true\n",
+        )
+        .unwrap();
+        let models_dir = dir.path().join("models");
+        let state_path = pinned_state_path(dir.path());
+        let state = pinned_server(models_dir, Some(config_path), &state_path);
+        let outcome = state.recompile().await;
+        assert!(outcome.compile_error.is_none(), "{outcome:?}");
+        let base = spawn_router(state.clone()).await;
+
+        let resp = reqwest::get(format!("{base}/api/v1/dag")).await.unwrap();
+        assert_eq!(resp.status(), 200);
+        let dag: serde_json::Value = resp.json().await.unwrap();
+        let mark = |label: &str| {
+            dag["nodes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|n| n["label"] == label && n["kind"] == "transformation")
+                .unwrap_or_else(|| panic!("{label} must be in the served DAG: {dag}"))["compiled"]
+                .clone()
+        };
+        assert_eq!(mark("stg"), serde_json::json!(true));
+        assert_eq!(mark("rpt"), serde_json::json!(false));
+        // Only transformation nodes carry the mark.
+        for node in dag["nodes"].as_array().unwrap() {
+            if node["kind"] != "transformation" {
+                assert!(node.get("compiled").is_none(), "{node}");
+            }
+        }
+
+        // The mark agrees with the detail route.
+        let served = reqwest::get(format!("{base}/api/v1/models/stg"))
+            .await
+            .unwrap();
+        assert_eq!(served.status(), 200);
+        let unserved = reqwest::get(format!("{base}/api/v1/models/rpt"))
+            .await
+            .unwrap();
+        assert_eq!(unserved.status(), 404);
+
+        // No compile result: no node is servable, so every mark is false.
+        let marked = mark_compiled_nodes(
+            dag_output(
+                &dir.path().join("rocky.toml"),
+                &state_path,
+                None,
+                None,
+                None,
+                false,
+                None,
+            )
+            .unwrap(),
+            None,
+        );
+        let transformation: Vec<_> = marked
+            .nodes
+            .iter()
+            .filter(|n| n.kind == "transformation")
+            .collect();
+        assert_eq!(transformation.len(), 2);
+        assert!(transformation.iter().all(|n| n.compiled == Some(false)));
     }
 
     /// A project whose transformation pipeline declares a **custom** model root,
@@ -6730,7 +6866,11 @@ mod tests {
         let reference = reference_bytes(
             &dag_output(&config_path, &state_path, None, None, None, false, None).unwrap(),
         );
-        assert_eq!(api, reference, "GET /dag must match `rocky dag`");
+        assert_eq!(
+            without_compiled_marks(&api),
+            json_value(&reference),
+            "GET /dag must match `rocky dag`"
+        );
 
         // A single custom root is still a root the compiler can read, so
         // `--column-lineage` must keep working here. Asserting on the EDGES,
