@@ -331,6 +331,9 @@ pub fn validate_contract_typed(
 ///
 /// A bare `BIGNUMERIC` stays [`RockyType::Unknown`] on BigQuery too: its
 /// default is `BIGNUMERIC(76.76, 38)`, which no integer `(p, s)` represents.
+/// A bare `DECIMAL` (BigQuery's alias for `NUMERIC`) is not read either:
+/// `INFORMATION_SCHEMA` reports `NUMERIC`, so only a contract could spell it,
+/// and an unread declared type is a warning, not a pass of the data.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GateDialect {
     /// Read every type with [`warehouse_type_to_rocky`] only.

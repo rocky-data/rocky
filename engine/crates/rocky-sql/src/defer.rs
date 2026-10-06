@@ -975,9 +975,6 @@ impl VisitorMut for DeferRewriter<'_> {
         let binding = self
             .scopes
             .binding(&ident.value, ident.quote_style.is_some());
-        if binding == CteBinding::Bound {
-            return ControlFlow::Continue(());
-        }
         // ‼️ EXACT, and deliberately not routed through `case_rules`. These keys
         // are Rocky MODEL names, not warehouse identifiers, and
         // `resolve::classify_table_ref` resolves a bare name to a model with an
@@ -985,14 +982,16 @@ impl VisitorMut for DeferRewriter<'_> {
         // compiler gave no dependency edge to, so `--defer` would disagree with
         // the DAG about what a name means. The case axis reaches the SCOPE STACK
         // above and nothing else.
-        if let Some(target) = self.deferred.get(&ident.value) {
-            if binding == CteBinding::SettingDependent {
-                // Bound under one reading of `QUOTED_IDENTIFIERS_IGNORE_CASE`,
-                // a deferred-model read under the other. Report, don't guess.
-                self.setting_dependent_refs.push(relation.to_string());
-            } else {
-                *relation = target.to_object_name();
-            }
+        let Some(target) = self.deferred.get(&ident.value) else {
+            return ControlFlow::Continue(());
+        };
+        // Exhaustive on purpose: a future variant must be decided here.
+        match binding {
+            CteBinding::Bound => {}
+            CteBinding::Free => *relation = target.to_object_name(),
+            // Bound under one reading of `QUOTED_IDENTIFIERS_IGNORE_CASE`, a
+            // deferred-model read under the other. Report, don't guess.
+            CteBinding::SettingDependent => self.setting_dependent_refs.push(relation.to_string()),
         }
         ControlFlow::Continue(())
     }
@@ -1709,6 +1708,62 @@ mod tests {
                 out.sql
             );
         }
+
+        // The answer follows the same scope rules as a plain binding: an outer
+        // frame's alias is visible in a nested subquery, a recursive CTE sees
+        // its own alias under either visibility policy, and a non-recursive
+        // CTE body does not see a later alias.
+        for (sql, visibility, expected) in [
+            (
+                "WITH \"orders\" AS (SELECT 1 AS id) \
+                 SELECT * FROM (SELECT * FROM orders) AS sub",
+                RecursiveCteVisibility::PrecedingAndSelf,
+                vec!["orders".to_string()],
+            ),
+            (
+                "WITH \"orders\" AS (SELECT 1 AS id) \
+                 SELECT * FROM (WITH x AS (SELECT 1) SELECT * FROM orders) AS sub",
+                RecursiveCteVisibility::PrecedingAndSelf,
+                vec!["orders".to_string()],
+            ),
+            (
+                "WITH RECURSIVE \"orders\" AS (SELECT 1 AS id UNION ALL SELECT id FROM orders) \
+                 SELECT * FROM \"orders\"",
+                RecursiveCteVisibility::PrecedingAndSelf,
+                vec!["orders".to_string()],
+            ),
+            (
+                "WITH RECURSIVE \"orders\" AS (SELECT 1 AS id UNION ALL SELECT id FROM orders) \
+                 SELECT * FROM \"orders\"",
+                RecursiveCteVisibility::Forward,
+                vec!["orders".to_string()],
+            ),
+            (
+                // `first` cannot see the later quoted alias, so its `orders` is
+                // a plain table read under both readings and routes; only the
+                // body's reference is setting-dependent.
+                "WITH first AS (SELECT * FROM orders), \"orders\" AS (SELECT 1 AS id) \
+                 SELECT * FROM first JOIN orders ON TRUE",
+                RecursiveCteVisibility::PrecedingAndSelf,
+                vec!["orders".to_string()],
+            ),
+        ] {
+            let out = rewrite_upstream_refs(sql, &renames, snowflake, visibility).unwrap();
+            assert_eq!(out.setting_dependent_refs, expected, "{sql}: {}", out.sql);
+        }
+        let out = rewrite_upstream_refs(
+            "WITH first AS (SELECT * FROM orders), \"orders\" AS (SELECT 1 AS id) \
+             SELECT * FROM first JOIN orders ON TRUE",
+            &renames,
+            snowflake,
+            RecursiveCteVisibility::PrecedingAndSelf,
+        )
+        .unwrap();
+        assert!(
+            out.sql.contains("\"shadow\""),
+            "the earlier CTE body's reference sees no alias and routes: {}",
+            out.sql
+        );
 
         // Without the CTE the same reference is routed — the refusal above is
         // about the binding, not the name.
