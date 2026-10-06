@@ -14,7 +14,6 @@ use std::path::Path;
 use anyhow::{Context, Result};
 
 use rocky_core::models::{Model, StrategyConfig};
-use rocky_core::secret_registry::render_placeholders_in;
 use rocky_core::seeds::SeedFile;
 use rocky_core::unified_dag::{self, NodeKind, UnifiedDag};
 use rocky_ir::TimeGrain;
@@ -294,16 +293,17 @@ fn build_dag_output(
                 NodeKind::Transformation => {
                     if let Some(model) = model_map.get(node.label.as_str()) {
                         // Sidecar values were `${VAR}`-expanded before parsing.
-                        // Print each resolved value as `${NAME}` (#1919),
-                        // except the target: it prints resolved, as `rocky
-                        // run`'s `asset_key` does, so asset keys still match.
-                        let strategy = render_placeholders_in(&model.config.strategy)
-                            .context("failed to render the model strategy for output")?;
+                        // The target, strategy and freshness print as `rocky
+                        // compile` prints them (#1919): the target resolved, as
+                        // `rocky run`'s `asset_key` is; strategy and freshness
+                        // resolved except a strategy's `storage_prefix`. See
+                        // `strategy_for_output`.
+                        let strategy =
+                            rocky_core::models::strategy_for_output(&model.config.strategy);
                         (
                             Some(model.config.target.clone()),
                             Some(strategy.clone()),
-                            render_placeholders_in(&model.config.freshness)
-                                .context("failed to render the model freshness for output")?,
+                            model.config.freshness.clone(),
                             extract_partition_shape(&strategy),
                         )
                     } else {
@@ -334,7 +334,7 @@ fn build_dag_output(
                 _ => (None, None, None, None),
             };
 
-            Ok(DagNodeOutput {
+            DagNodeOutput {
                 id: node.id.0.clone(),
                 kind: node.kind.to_string(),
                 label: node.label.clone(),
@@ -344,9 +344,9 @@ fn build_dag_output(
                 freshness,
                 partition_shape,
                 depends_on,
-            })
+            }
         })
-        .collect::<Result<_>>()?;
+        .collect();
 
     // Project edges.
     let edges: Vec<DagEdgeOutput> = dag
@@ -600,12 +600,13 @@ fn print_dag_table(output: &DagOutput) {
 mod secret_render_tests {
     use super::*;
 
-    /// #1919: `rocky dag --output json` prints a resolved sidecar value as
-    /// `${NAME}` in a model node's `strategy`, but prints the `target`
-    /// resolved, as `rocky run`'s `asset_key` does.
+    /// #1919: `rocky dag --output json` prints a model node's `target` and
+    /// its strategy's structure (here a column name) resolved, exactly as
+    /// `rocky compile` and `rocky run` print them, so consumers that match on
+    /// them still match.
     #[test]
-    fn dag_output_prints_a_resolved_sidecar_value_as_its_placeholder() {
-        const SECRET: &str = "rocky_1919_dag_column_feed";
+    fn dag_output_prints_target_and_strategy_structure_resolved() {
+        const COLUMN: &str = "rocky_1919_dag_column_feed";
         const CATALOG: &str = "rocky_1919_dag_catalog";
         let dir = tempfile::tempdir().unwrap();
         let models_dir = dir.path().join("models");
@@ -628,7 +629,7 @@ mod secret_render_tests {
         .unwrap();
         // SAFETY: test-only; the variable name is unique to this test.
         unsafe {
-            std::env::set_var("ROCKY_T1919_DAG", SECRET);
+            std::env::set_var("ROCKY_T1919_DAG", COLUMN);
             std::env::set_var("ROCKY_T1919_DAG_CATALOG", CATALOG);
         }
         let out = dag_output(
@@ -647,9 +648,8 @@ mod secret_render_tests {
         }
         let out = out.expect("dag builds");
         let json = serde_json::to_string(&out).unwrap();
-        assert!(!json.contains(SECRET), "leaked: {json}");
         assert!(
-            json.contains("\"timestamp_column\":\"${ROCKY_T1919_DAG}\""),
+            json.contains(&format!("\"timestamp_column\":\"{COLUMN}\"")),
             "{json}"
         );
         assert!(

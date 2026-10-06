@@ -238,6 +238,48 @@ pub fn ensure_rocky_gitignore(rocky_dir: &Path) {
     );
 }
 
+/// Make sure `rocky_dir/.gitignore` ignores `file_name`, a file directly in
+/// `.rocky/` that must never be committed (the plan digest key, #1919).
+///
+/// [`ensure_rocky_gitignore`] leaves an existing `.gitignore` alone, so a
+/// project that wrote its own (say, to commit `.rocky/plans/`) may not cover
+/// the file. This appends `/<file_name>` unless the file already ignores it:
+/// its own `/<file_name>` or `<file_name>` line, or a bare `*` with no `!`
+/// negation anywhere (a negation could re-include the file, so then the
+/// explicit line is appended; the last matching line wins in git).
+///
+/// Best-effort like [`ensure_rocky_gitignore`]: failures are ignored.
+pub fn ensure_rocky_gitignore_covers(rocky_dir: &Path, file_name: &str) {
+    let gitignore = rocky_dir.join(".gitignore");
+    let Ok(text) = std::fs::read_to_string(&gitignore) else {
+        return;
+    };
+    let rule = format!("/{file_name}");
+    let lines: Vec<&str> = text.lines().map(str::trim).collect();
+    let last_relevant = lines.iter().rev().find(|line| {
+        let pattern = line.strip_prefix('!').unwrap_or(line);
+        pattern == rule || pattern == file_name || pattern == "*" || pattern == "/*"
+    });
+    let ignored = match last_relevant {
+        Some(line) if line.starts_with('!') => false,
+        Some(line) if *line == rule || *line == file_name => true,
+        // `*` covers it unless some other negation could re-include it.
+        Some(_) => !lines.iter().any(|line| line.starts_with('!')),
+        None => false,
+    };
+    if ignored {
+        return;
+    }
+    let mut appended = text;
+    if !appended.is_empty() && !appended.ends_with('\n') {
+        appended.push('\n');
+    }
+    appended.push_str(&format!(
+        "# Rocky: never commit this file (it keys plan config digests).\n{rule}\n"
+    ));
+    let _ = std::fs::write(&gitignore, appended);
+}
+
 fn open_jsonl(path: &Path) -> io::Result<File> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -637,6 +679,44 @@ mod tests {
         let b = read_trace_from(dir, "run-B");
         assert_eq!(b.len(), 1);
         assert!(b.iter().all(|s| s.matches_run_id("run-B")));
+    }
+
+    /// #1919 follow-up: a custom `.rocky/.gitignore` that does not cover the
+    /// plan digest key gets an explicit line; one that does is left alone.
+    #[test]
+    fn ensure_rocky_gitignore_covers_appends_only_when_needed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rocky = tmp.path().join(".rocky");
+        std::fs::create_dir_all(&rocky).unwrap();
+        let gi = rocky.join(".gitignore");
+        let read = || std::fs::read_to_string(&gi).unwrap();
+
+        // A custom file that ignores only traces: the key line is appended once.
+        std::fs::write(&gi, "traces/").unwrap();
+        ensure_rocky_gitignore_covers(&rocky, "plan-digest.key");
+        assert!(
+            read().lines().any(|l| l == "/plan-digest.key"),
+            "{}",
+            read()
+        );
+        let once = read();
+        ensure_rocky_gitignore_covers(&rocky, "plan-digest.key");
+        assert_eq!(read(), once, "idempotent");
+
+        // The default `*` already covers it: untouched.
+        std::fs::write(&gi, "# Rocky\n*\n").unwrap();
+        ensure_rocky_gitignore_covers(&rocky, "plan-digest.key");
+        assert_eq!(read(), "# Rocky\n*\n");
+
+        // `*` with a negation that re-includes everything: appended.
+        std::fs::write(&gi, "*\n!*.key\n").unwrap();
+        ensure_rocky_gitignore_covers(&rocky, "plan-digest.key");
+        assert!(read().ends_with("/plan-digest.key\n"), "{}", read());
+
+        // An explicit negation of the key itself: the rule goes after it.
+        std::fs::write(&gi, "*\n!plan-digest.key\n").unwrap();
+        ensure_rocky_gitignore_covers(&rocky, "plan-digest.key");
+        assert!(read().ends_with("/plan-digest.key\n"), "{}", read());
     }
 
     #[test]
