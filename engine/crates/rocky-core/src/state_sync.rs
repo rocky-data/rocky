@@ -9262,7 +9262,10 @@ mod environment_publish_tests {
     /// — after the local transaction read (and moved) the head, before the
     /// upload. Both racers therefore read the same head and the same blob
     /// generation before either uploads.
-    fn barrier_hook(barrier: Arc<tokio::sync::Barrier>, attempts: Arc<AtomicU32>) -> PublishAttemptHook {
+    fn barrier_hook(
+        barrier: Arc<tokio::sync::Barrier>,
+        attempts: Arc<AtomicU32>,
+    ) -> PublishAttemptHook {
         Arc::new(move |n| {
             attempts.fetch_add(1, Ordering::SeqCst);
             let barrier = Arc::clone(&barrier);
@@ -9287,7 +9290,7 @@ mod environment_publish_tests {
             FinalizeDurability::Durable,
             false,
         );
-        seed.acquire().await.unwrap();
+        let _ = seed.acquire().await.unwrap();
         record_seed_runs(&h.open_store(&h.pod_a));
         seed.finalize().await.unwrap();
         let first = publish_pointers(
@@ -9304,10 +9307,13 @@ mod environment_publish_tests {
     async fn remote_view(h: &CrossPodHarness) -> (EnvironmentRecord, Vec<PublishRecord>, bool) {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join(".rocky-state.redb");
-        download_state(&h.pod_a.cfg, &path, false).await.unwrap();
+        let _ = download_state(&h.pod_a.cfg, &path, false).await.unwrap();
         let store = StateStore::open(&path).unwrap();
         let env = EnvironmentName::parse("staging").unwrap();
-        let head = store.get_environment(&env).unwrap().expect("staging exists");
+        let head = store
+            .get_environment(&env)
+            .unwrap()
+            .expect("staging exists");
         let history = store.publish_history(&env).unwrap();
         let has_r9 = store.get_run("r9").unwrap().is_some();
         (head, history, has_r9)
@@ -9411,7 +9417,9 @@ mod environment_publish_tests {
         )
         .await;
         for (r, attempts) in &results {
-            let record = r.as_ref().expect("without CAS both publishes report success");
+            let record = r
+                .as_ref()
+                .expect("without CAS both publishes report success");
             assert_eq!(record.publish_id, "staging#2", "both claim seq 2");
             assert_eq!(*attempts, 1);
         }
@@ -9442,7 +9450,7 @@ mod environment_publish_tests {
             FinalizeDurability::Durable,
             false,
         );
-        run.acquire().await.unwrap();
+        let _ = run.acquire().await.unwrap();
         h.open_store(&h.pod_a)
             .record_run(&run_with_output_versions("r9", &[("orders", delta(9))]))
             .unwrap();
@@ -9471,7 +9479,11 @@ mod environment_publish_tests {
         .await
         .expect("the replay finds the same head and wins");
         assert_eq!(record.publish_id, "staging#2");
-        assert_eq!(attempts.load(Ordering::SeqCst), 2, "one CAS conflict, one replay");
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            2,
+            "one CAS conflict, one replay"
+        );
 
         let (head, history, has_r9) = remote_view(&h).await;
         assert!(has_r9, "the run row survives the publish");
@@ -9491,9 +9503,12 @@ mod environment_publish_tests {
         publish_pointers(&session, &req("staging", None, &[("orders", "r1")]))
             .await
             .unwrap();
-        publish_pointers(&session, &req("staging", Some("staging#1"), &[("orders", "r2")]))
-            .await
-            .unwrap();
+        publish_pointers(
+            &session,
+            &req("staging", Some("staging#1"), &[("orders", "r2")]),
+        )
+        .await
+        .unwrap();
         let err = publish_pointers(
             &session,
             &req("staging", Some("staging#1"), &[("customers", "r3")]),
@@ -9529,15 +9544,19 @@ mod environment_publish_tests {
         let seed_dir = TempDir::new().unwrap();
         let v31 = v31_state_bytes(seed_dir.path());
         let (v31_key, v32_key) = ("v31/state.redb", "v32/state.redb");
-        h.provider.put(v31_key, Bytes::from(v31.clone())).await.unwrap();
+        h.provider
+            .put(v31_key, Bytes::from(v31.clone()))
+            .await
+            .unwrap();
 
         let authority = h.download(&h.pod_a).await.unwrap();
         assert_eq!(authority, StateAuthority::Authoritative);
+        // The first read-write open migrates the carried-forward store.
+        assert!(h.open_store(&h.pod_a).get_run("r1").unwrap().is_some());
         assert_eq!(
             StateStore::peek_schema_version(&h.pod_a.state_path).unwrap(),
             Some(32)
         );
-        assert!(h.open_store(&h.pod_a).get_run("r1").unwrap().is_some());
         assert!(!h.provider.exists(v32_key).await.unwrap());
 
         let record = publish_pointers(
@@ -9573,7 +9592,10 @@ mod environment_publish_tests {
         h.pod_b.cfg.concurrency_control = Some(ConcurrencyControl::Cas);
         let seed_dir = TempDir::new().unwrap();
         let v31 = v31_state_bytes(seed_dir.path());
-        h.provider.put("v31/state.redb", Bytes::from(v31.clone())).await.unwrap();
+        h.provider
+            .put("v31/state.redb", Bytes::from(v31.clone()))
+            .await
+            .unwrap();
 
         let results = race(
             &h,

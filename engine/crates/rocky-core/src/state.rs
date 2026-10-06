@@ -8754,7 +8754,6 @@ pub fn force_pre_v32_store(path: &Path) {
     txn.commit().expect("commit");
 }
 
-
 /// Test support: a successful run record whose executions carry the given
 /// output versions, one per `(model, version)`.
 #[cfg(any(test, feature = "test-support"))]
@@ -9035,7 +9034,11 @@ mod environment_tests {
         ];
         for (model, run_id, expected) in cases {
             let err = store
-                .publish_pointers(&request("prod", None, &[("orders", "r1"), (model, run_id)]))
+                .publish_pointers(&request(
+                    "prod",
+                    None,
+                    &[("customers", "r1"), (model, run_id)],
+                ))
                 .unwrap_err();
             match err {
                 StateError::Environment(EnvironmentError::Refused {
@@ -9059,11 +9062,19 @@ mod environment_tests {
         let (store, _dir) = seeded();
         assert!(matches!(
             store.publish_pointers(&request("prod", None, &[])),
-            Err(StateError::Environment(EnvironmentError::EmptyPublish { .. }))
+            Err(StateError::Environment(
+                EnvironmentError::EmptyPublish { .. }
+            ))
         ));
         assert!(matches!(
-            store.publish_pointers(&request("prod", None, &[("orders", "r1"), ("orders", "r2")])),
-            Err(StateError::Environment(EnvironmentError::DuplicateModel { .. }))
+            store.publish_pointers(&request(
+                "prod",
+                None,
+                &[("orders", "r1"), ("orders", "r2")]
+            )),
+            Err(StateError::Environment(
+                EnvironmentError::DuplicateModel { .. }
+            ))
         ));
     }
 
@@ -9098,8 +9109,9 @@ mod environment_tests {
         force_pre_v32_store(&path);
         assert_eq!(StateStore::peek_schema_version(&path).unwrap(), Some(31));
 
-        let store = StateStore::open(&path).unwrap();
+        drop(StateStore::open(&path).unwrap());
         assert_eq!(StateStore::peek_schema_version(&path).unwrap(), Some(32));
+        let store = StateStore::open(&path).unwrap();
         assert!(store.list_environments().unwrap().is_empty());
         assert!(store.publish_history(&env("prod")).unwrap().is_empty());
         assert!(store.get_run("r1").unwrap().is_some(), "records kept");
