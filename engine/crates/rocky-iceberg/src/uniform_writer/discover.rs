@@ -407,31 +407,6 @@ impl UniformWriter {
     }
 }
 
-/// True if a `_delta_log` commit body (JSONL) contains an `add` action whose
-/// `path` equals `add_file_path`.
-///
-/// Pure parsing — no I/O — so it is unit-testable. Each Delta commit line is a
-/// single-key object; we only inspect `add` actions and compare their `path`
-/// field against the content-addressed path the writer is about to commit.
-pub(super) fn commit_jsonl_contains_add_path(body: &[u8], add_file_path: &str) -> Result<bool> {
-    let text = std::str::from_utf8(body)
-        .map_err(|e| UniformWriterError::DeltaLog(format!("non-utf8 _delta_log: {e}")))?;
-    for line in text.lines() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        let value: serde_json::Value = serde_json::from_str(line)
-            .map_err(|e| UniformWriterError::DeltaLog(format!("scan add path: {e}")))?;
-        let Some(add) = value.get("add") else {
-            continue;
-        };
-        if add.get("path").and_then(|v| v.as_str()) == Some(add_file_path) {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
 /// Extract the first `add` action object from a `_delta_log` commit body
 /// (JSONL).
 ///
@@ -441,9 +416,11 @@ pub(super) fn commit_jsonl_contains_add_path(body: &[u8], add_file_path: &str) -
 /// lift a prior run's `add` action verbatim (path, size, stats,
 /// partitionValues, rowTracking fields) for a zero-byte-copy reuse commit.
 ///
-/// A point-to recovery targets a single content-addressed commit, which
-/// always carries exactly one `add` (the writer emits one `add` per commit —
-/// see `commit::build_commit_jsonl`), so returning the first is sufficient.
+/// A point-to recovery targets an unpartitioned content-addressed commit. Its
+/// replace commit carries removes plus exactly one `add` (see
+/// `commit::build_replace_commit_jsonl`), so returning the first is
+/// sufficient. A partitioned commit carries several adds; point-to refuses
+/// partitioned tables, and the runner checks the recovered basename.
 pub(super) fn first_add_action(
     body: &[u8],
 ) -> Result<Option<serde_json::Map<String, serde_json::Value>>> {
@@ -491,43 +468,6 @@ pub(super) async fn recover_add_action_for_version<S: ObjectStore + ?Sized>(
     })
 }
 
-/// Scan every `_delta_log/<20-digit>.json` commit for an `add` action that
-/// already references `add_file_path`, returning the commit version that did.
-///
-/// Used by the cond-put retry loop: on a 412 the writer must distinguish a
-/// genuine version race (some *other* commit grabbed the version it wanted →
-/// retry at a higher version) from a competing writer that landed *this exact
-/// content-addressed file* (→ do not add it a second time; return the existing
-/// commit). Scans newest → oldest and returns the first match.
-pub(super) async fn find_commit_with_add_path<S: ObjectStore + ?Sized>(
-    store: &S,
-    prefix: &str,
-    add_file_path: &str,
-) -> Result<Option<u64>> {
-    use futures::TryStreamExt;
-    let log_prefix = Path::from(format!("{prefix}/_delta_log"));
-    let mut versions: Vec<(u64, Path)> = Vec::new();
-    let mut stream = store.list(Some(&log_prefix));
-    while let Some(meta) = stream.try_next().await? {
-        let key = meta.location.to_string();
-        if let Some((_, last)) = key.rsplit_once('/')
-            && let Some(stem) = last.strip_suffix(".json")
-            && stem.len() == 20
-            && let Ok(v) = stem.parse::<u64>()
-        {
-            versions.push((v, meta.location));
-        }
-    }
-    versions.sort_by_key(|(v, _)| std::cmp::Reverse(*v));
-    for (version, path) in versions {
-        let body = store.get(&path).await?.bytes().await?;
-        if commit_jsonl_contains_add_path(&body, add_file_path)? {
-            return Ok(Some(version));
-        }
-    }
-    Ok(None)
-}
-
 /// Per-commit reference outcome for a single content-addressed file path.
 ///
 /// Returned by [`commit_jsonl_reference_for_path`] for one `_delta_log` commit
@@ -547,9 +487,9 @@ pub(super) enum PathReference {
 /// Classify how a single `_delta_log` commit body (JSONL) references
 /// `file_path`: as an `add`, as a `remove`, or not at all.
 ///
-/// Pure parsing — no I/O — so it is unit-testable. A single content-addressed
-/// commit carries exactly one `add` (see `commit::build_commit_jsonl`); a
-/// compaction/VACUUM commit carries a `remove`. If a commit somehow contains
+/// Pure parsing — no I/O — so it is unit-testable. A content-addressed
+/// replace commit carries `add`s for the new files and `remove`s for the old
+/// ones (see `commit::build_replace_commit_jsonl`), never both for one path. If a commit somehow contains
 /// both for the same path (it never does in practice), `Added` wins for that
 /// commit — but the cross-commit fold in [`add_path_is_live`] is what carries
 /// the real ordering, so a later `remove` commit still supersedes an earlier
@@ -1152,6 +1092,168 @@ pub(super) async fn next_commit_version<S: ObjectStore + ?Sized>(
     Ok(max_version.map_or(1, |v| v + 1))
 }
 
+/// One live data file: the `add` action that made it live, and the commit
+/// version that carried that `add`.
+#[derive(Debug, Clone)]
+pub(super) struct LiveFile {
+    pub version: u64,
+    pub add: serde_json::Map<String, serde_json::Value>,
+}
+
+/// The live file set of a table, replayed from its `_delta_log` JSON commits.
+///
+/// ```text
+///   for each commit, ascending:   live -= removes ; live += adds
+/// ```
+#[derive(Debug, Clone)]
+pub(super) struct LiveSet {
+    /// The highest `<20-digit>.json` commit version.
+    pub head_version: u64,
+    /// Live files keyed by the `add.path` string, exactly as the log wrote it.
+    pub files: std::collections::BTreeMap<String, LiveFile>,
+    /// The latest `metaData` sets `delta.appendOnly=true`.
+    pub append_only: bool,
+}
+
+/// Replay the table's `_delta_log` into its [`LiveSet`].
+///
+/// This is the read the replace commit is built from, so it refuses every
+/// shape it cannot replay in full:
+///
+/// - a checkpoint (`_last_checkpoint` or any `*.checkpoint*` file) →
+///   [`UniformWriterError::CheckpointPresent`]: the JSON tail may not be the
+///   whole history, and a missed live file would stay live after the replace;
+/// - a version gap, or no commits → `DeltaLog`;
+/// - one commit that both adds and removes the same path → `DeltaLog` (the
+///   protocol forbids it);
+/// - a live `add` that carries a deletion vector →
+///   [`UniformWriterError::DeletionVectorsUnsupported`].
+///
+/// `table` is the `catalog.schema.table` name the refusal names.
+pub(super) async fn read_live_set<S: ObjectStore + ?Sized>(
+    store: &S,
+    prefix: &str,
+    table: &str,
+) -> Result<LiveSet> {
+    use futures::TryStreamExt;
+    let log_prefix = Path::from(format!("{prefix}/_delta_log"));
+    let mut versions: Vec<(u64, Path)> = Vec::new();
+    let mut stream = store.list(Some(&log_prefix));
+    while let Some(meta) = stream.try_next().await? {
+        let key = meta.location.to_string();
+        let Some((_, last)) = key.rsplit_once('/') else {
+            continue;
+        };
+        if last == "_last_checkpoint" || last.contains(".checkpoint") {
+            return Err(UniformWriterError::CheckpointPresent {
+                table: table.to_string(),
+                checkpoint: key,
+            });
+        }
+        if let Some(stem) = last.strip_suffix(".json")
+            && stem.len() == 20
+            && let Ok(v) = stem.parse::<u64>()
+        {
+            versions.push((v, meta.location));
+        }
+    }
+    versions.sort_by_key(|(v, _)| *v);
+    let Some(&(head_version, _)) = versions.last() else {
+        return Err(UniformWriterError::DeltaLog(format!(
+            "table `{table}` has no `_delta_log/<version>.json` commits"
+        )));
+    };
+    for (i, (v, _)) in versions.iter().enumerate() {
+        if *v != i as u64 {
+            return Err(UniformWriterError::DeltaLog(format!(
+                "table `{table}`: `_delta_log` commit versions are not contiguous from 0 \
+                 (found {v} at position {i}); refusing to replace a history Rocky cannot replay"
+            )));
+        }
+    }
+
+    let mut files: std::collections::BTreeMap<String, LiveFile> = Default::default();
+    let mut append_only = false;
+    for (version, path) in &versions {
+        let body = store.get(path).await?.bytes().await?;
+        let text = std::str::from_utf8(&body)
+            .map_err(|e| UniformWriterError::DeltaLog(format!("non-utf8 _delta_log: {e}")))?;
+        let mut adds: Vec<serde_json::Map<String, serde_json::Value>> = Vec::new();
+        let mut removes: Vec<String> = Vec::new();
+        for line in text.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let value: serde_json::Value = serde_json::from_str(line).map_err(|e| {
+                UniformWriterError::DeltaLog(format!("commit {version}: replay: {e}"))
+            })?;
+            if let Some(add) = value.get("add") {
+                let obj = add.as_object().ok_or_else(|| {
+                    UniformWriterError::DeltaLog(format!(
+                        "commit {version}: `add` is not an object"
+                    ))
+                })?;
+                adds.push(obj.clone());
+            } else if let Some(remove) = value.get("remove") {
+                let p = remove.get("path").and_then(|v| v.as_str()).ok_or_else(|| {
+                    UniformWriterError::DeltaLog(format!(
+                        "commit {version}: `remove` has no string `path`"
+                    ))
+                })?;
+                removes.push(p.to_string());
+            } else if let Some(md) = value.get("metaData") {
+                append_only = md
+                    .get("configuration")
+                    .and_then(|c| c.get("delta.appendOnly"))
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|v| v.eq_ignore_ascii_case("true"));
+            }
+        }
+        let mut added_paths: std::collections::HashSet<String> = Default::default();
+        for add in &adds {
+            let p = add.get("path").and_then(|v| v.as_str()).ok_or_else(|| {
+                UniformWriterError::DeltaLog(format!(
+                    "commit {version}: `add` has no string `path`"
+                ))
+            })?;
+            added_paths.insert(p.to_string());
+        }
+        for p in &removes {
+            if added_paths.contains(p) {
+                return Err(UniformWriterError::DeltaLog(format!(
+                    "commit {version} both adds and removes `{p}`; the Delta protocol forbids it"
+                )));
+            }
+            files.remove(p);
+        }
+        for add in adds {
+            let p = add
+                .get("path")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+                .unwrap_or_default();
+            files.insert(
+                p,
+                LiveFile {
+                    version: *version,
+                    add,
+                },
+            );
+        }
+    }
+    if files
+        .values()
+        .any(|f| f.add.get("deletionVector").is_some_and(|dv| !dv.is_null()))
+    {
+        return Err(UniformWriterError::DeletionVectorsUnsupported);
+    }
+    Ok(LiveSet {
+        head_version,
+        files,
+        append_only,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1356,38 +1458,6 @@ mod tests {
         include_bytes!("../../tests/fixtures/exp09_rowtracking_bootstrap.json");
     const EXP11_PARTITIONED_BOOTSTRAP: &[u8] =
         include_bytes!("../../tests/fixtures/exp11_partitioned_bootstrap.json");
-
-    #[test]
-    fn commit_jsonl_contains_add_path_matches_only_the_add_path() {
-        // A realistic two-line commit: a commitInfo and an add action.
-        let body = br#"{"commitInfo":{"timestamp":1700000000000}}
-{"add":{"path":"data/abc123.parquet","size":42,"dataChange":true}}"#;
-
-        // The exact content-addressed path is found.
-        assert!(
-            commit_jsonl_contains_add_path(body, "data/abc123.parquet").unwrap(),
-            "the committed add path must be detected"
-        );
-        // A different path is not.
-        assert!(
-            !commit_jsonl_contains_add_path(body, "data/other.parquet").unwrap(),
-            "a non-matching path must not match"
-        );
-    }
-
-    #[test]
-    fn commit_jsonl_contains_add_path_ignores_remove_and_blank_lines() {
-        // A `remove` action referencing the same path must NOT count as a live
-        // add, and blank lines are skipped.
-        let body = br#"
-{"remove":{"path":"data/abc123.parquet","dataChange":true}}
-{"metaData":{"id":"x"}}
-"#;
-        assert!(
-            !commit_jsonl_contains_add_path(body, "data/abc123.parquet").unwrap(),
-            "a remove action must not be treated as a live add"
-        );
-    }
 
     #[test]
     fn first_add_action_returns_the_add_body() {

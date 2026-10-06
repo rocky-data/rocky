@@ -43,6 +43,28 @@ pub enum UniformWriterError {
 
     #[error("retry budget exhausted on conditional log put: {0}")]
     CondPutRetryExhausted(String),
+
+    /// The table's `_delta_log` holds a Delta checkpoint. Rocky's log reader
+    /// replays only the `<20-digit>.json` commits, so it cannot see every
+    /// live file. A replace that misses a live file leaves stale rows, so the
+    /// write refuses (RV1-D8, #2269).
+    #[error(
+        "table `{table}` has a Delta checkpoint (`{checkpoint}`). Rocky reads only the JSON \
+         commits in `_delta_log`, so it cannot list every live file, and it refuses to replace \
+         the table. Another engine wrote this checkpoint; tables that only Rocky writes never \
+         get one. To recover, drop the table, create it again on an empty storage prefix, and \
+         run the model again. Rocky then writes the whole output in one commit."
+    )]
+    CheckpointPresent { table: String, checkpoint: String },
+
+    /// The table sets `delta.appendOnly=true`, so a replace commit cannot
+    /// `remove` the files of the earlier build.
+    #[error(
+        "table `{table}` sets `delta.appendOnly=true`, so Rocky cannot remove the files of the \
+         earlier build. Run `ALTER TABLE {table} SET TBLPROPERTIES ('delta.appendOnly' = \
+         'false')`, then run the model again."
+    )]
+    AppendOnlyTable { table: String },
 }
 
 pub type Result<T> = std::result::Result<T, UniformWriterError>;

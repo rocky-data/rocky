@@ -6,17 +6,30 @@
 //! `MSCK REPAIR TABLE ... SYNC METADATA` via the warehouse SQL surface so
 //! UniForm regenerates the corresponding Iceberg metadata.
 //!
-//! Scope today (Phase 1 + Phase 2 + Phase 3):
-//! - Single writer; conditional-put on the log entry covers contention.
+//! Every write **replaces** the table (RV1-D8, #2269). One commit removes
+//! each live file that is not in the new output and adds each new file that
+//! is not live yet. An unchanged output writes no commit.
+//!
+//! ```text
+//!   run 1 ─▶ v1: add A                live = {A}
+//!   run 2 ─▶ v2: remove A, add B      live = {B}
+//!   run 3 (same output as run 2) ─▶ no commit, live = {B}
+//! ```
+//!
+//! Scope today:
+//! - Single writer; a conditional put on the log entry covers contention.
+//!   On a 412 the writer re-reads the live set and recomputes the removes.
 //! - External Delta UniForm table on an object store the writer can `PUT`.
 //! - Unpartitioned tables via [`UniformWriter::write_batch`].
-//! - Partitioned tables via [`UniformWriter::write_partitioned_batch`]
-//!   (caller pre-groups rows per partition tuple). `add.partitionValues`
-//!   is keyed by physical-name UUID, not logical name (Exp 11).
-//! - Row-tracking-enabled tables: every `add` action emits
+//! - Partitioned tables via [`UniformWriter::write_partitioned_batches`]:
+//!   the caller pre-groups rows per partition tuple, and all groups land in
+//!   one commit. `add.partitionValues` is keyed by physical-name UUID, not
+//!   logical name (Exp 11).
+//! - Row-tracking-enabled tables (unpartitioned): every `add` action emits
 //!   `baseRowId` + `defaultRowCommitVersion`, and each commit appends a
-//!   `domainMetadata` action that bumps the `rowIdHighWaterMark` (Exp 9
-//!   finding — reads projecting `_metadata.row_id` fail without these).
+//!   `domainMetadata` action that bumps the `rowIdHighWaterMark` (Exp 9).
+//! - The live set comes from the JSON commits only. A table with a Delta
+//!   checkpoint refuses the write ([`UniformWriterError::CheckpointPresent`]).
 //! - No schema evolution, no deletion vectors. The writer errors loudly
 //!   if it discovers DV at table-init time; UniForm + DV is forbidden
 //!   by Delta itself anyway.
@@ -222,9 +235,65 @@ pub struct WriteResult {
     /// and does not recompute them. The whole-body `blake3_hash` above is
     /// table-granular; these are the per-column signal.
     pub column_hashes: Vec<ColumnHash>,
+    /// The commit version of this file's live `add`: the replace commit when
+    /// this call added the file, or the earlier commit that added it when
+    /// the file was already live (unchanged content).
     pub commit_version: u64,
+    /// The table version whose snapshot is exactly this call's output: the
+    /// replace commit, or the current head on a no-op.
+    pub table_version: u64,
+    /// `true` when this call wrote a commit; `false` on a no-op (the output
+    /// was already the live set).
+    pub committed: bool,
     pub num_records: usize,
     pub size_bytes: u64,
+}
+
+/// Result of one replace: the table's live set now equals the files written
+/// by the call.
+///
+/// ```text
+///   live before ─▶ remove (live − new) ; add (new − live) ─▶ live after == new
+/// ```
+#[derive(Debug, Clone)]
+pub struct ReplaceOutcome {
+    /// The table version whose snapshot is exactly this output: the new
+    /// commit, or the current head when nothing changed.
+    pub table_version: u64,
+    /// `true` when a commit was written; `false` on a no-op.
+    pub committed: bool,
+    /// The `add.path` of every live file the commit removed.
+    pub removed_paths: Vec<String>,
+    /// One entry per output file, in the order the caller passed the groups.
+    pub files: Vec<WriteResult>,
+}
+
+impl ReplaceOutcome {
+    /// The single file of an unpartitioned (or single-group) replace.
+    fn into_single(self) -> Result<WriteResult> {
+        let n = self.files.len();
+        let mut files = self.files;
+        match (files.pop(), n) {
+            (Some(file), 1) => Ok(file),
+            _ => Err(UniformWriterError::DeltaLog(format!(
+                "expected exactly one output file, got {n}"
+            ))),
+        }
+    }
+}
+
+/// One output file, uploaded (or lifted, on a point-to) and ready to be
+/// added by a replace commit.
+#[derive(Debug, Clone)]
+struct StagedFile {
+    /// `add.path`, relative to the table prefix.
+    path: String,
+    /// The `add` body, without row-tracking fields.
+    add: serde_json::Map<String, serde_json::Value>,
+    blake3_hash: String,
+    column_hashes: Vec<ColumnHash>,
+    num_records: usize,
+    size_bytes: u64,
 }
 
 /// Compute per-column content hashes for a written [`RecordBatch`], in the
@@ -346,30 +415,28 @@ impl UniformWriter {
         &self.sql
     }
 
-    /// Write a single Arrow [`RecordBatch`] as a content-addressed Parquet
-    /// file plus a `_delta_log/{N:020}.json` commit referencing it.
+    /// Replace the table's content with one Arrow [`RecordBatch`], written as
+    /// a content-addressed Parquet file plus one replace commit.
     ///
-    /// **Unpartitioned tables only.** For partitioned tables, callers
-    /// pre-group rows by partition tuple and invoke
-    /// [`UniformWriter::write_partitioned_batch`] once per partition.
-    /// Mixing this entry point with a partitioned target returns
+    /// **Unpartitioned tables only.** For partitioned tables, use
+    /// [`UniformWriter::write_partitioned_batches`]. Mixing this entry point
+    /// with a partitioned target returns
     /// [`UniformWriterError::PartitionedUnsupported`].
     ///
     /// Calls [`UniformWriter::discover`] first to read the current table
-    /// state. To skip the discover round-trip (e.g. when the caller has a
-    /// fresh state from a prior call), use
+    /// state. To skip the discover round-trip, use
     /// [`UniformWriter::write_batch_with_state`].
     pub async fn write_batch(&self, batch: RecordBatch) -> Result<WriteResult> {
         let state = self.discover().await?;
         self.write_batch_with_state(batch, state).await
     }
 
-    /// Write a [`RecordBatch`] against a [`UniformTableState`] the caller
+    /// [`Self::write_batch`] against a [`UniformTableState`] the caller
     /// already obtained.
     ///
-    /// On a cond-put conflict (412 — another writer claimed `next_commit_version`
-    /// first), refetches the next version from the live `_delta_log/` listing
-    /// and retries up to [`COND_PUT_RETRY_BUDGET`] times.
+    /// The commit removes every live file and adds the new one (see
+    /// [`ReplaceOutcome`]). When the new file is already the only live file,
+    /// no commit is written and the result names the current version.
     pub async fn write_batch_with_state(
         &self,
         batch: RecordBatch,
@@ -380,29 +447,18 @@ impl UniformWriter {
                 state.partition_columns.clone(),
             ));
         }
-        let empty = HashMap::new();
-        self.write_internal(batch, state, &empty, |hash| format!("{hash}.parquet"))
-            .await
+        let outcome = self
+            .replace_with_batches(vec![(HashMap::new(), batch)], state)
+            .await?;
+        outcome.into_single()
     }
 
-    /// Write a single Arrow [`RecordBatch`] to a partitioned UniForm table.
+    /// Replace a partitioned table's content with one partition group.
     ///
-    /// The caller has pre-grouped rows so that every row in `batch`
-    /// belongs to the same partition tuple, and supplies that tuple as
-    /// `partition_values` keyed by logical column name. Stringification is
-    /// the caller's responsibility (Delta partition values are always
-    /// strings on the wire).
-    ///
-    /// The Parquet file is uploaded to a Hive-style prefix
-    /// (`<col1>=<val1>/<col2>=<val2>/.../<hash>.parquet`); the emitted
-    /// `add.partitionValues` is keyed by **physical** column name UUID, as
-    /// required by Delta column-mapping (Exp 11 finding).
-    ///
-    /// Errors:
-    /// - the target is unpartitioned → `DeltaLog` (caller should use
-    ///   [`Self::write_batch`])
-    /// - `partition_values` is missing a column or carries an unknown key
-    ///   → `DeltaLog`
+    /// Every row in `batch` belongs to the partition tuple
+    /// `partition_values` (keyed by logical column name). This is a
+    /// **replace**: every other partition's live files are removed. To write
+    /// several groups, use [`Self::write_partitioned_batches`].
     pub async fn write_partitioned_batch(
         &self,
         batch: RecordBatch,
@@ -413,14 +469,52 @@ impl UniformWriter {
             .await
     }
 
-    /// [`Self::write_partitioned_batch`] against a state the caller
-    /// already obtained.
+    /// [`Self::write_partitioned_batch`] against a state the caller already
+    /// obtained.
     pub async fn write_partitioned_batch_with_state(
         &self,
         batch: RecordBatch,
         partition_values: HashMap<String, String>,
         state: UniformTableState,
     ) -> Result<WriteResult> {
+        self.write_partitioned_batches_with_state(vec![(partition_values, batch)], state)
+            .await?
+            .into_single()
+    }
+
+    /// Replace a partitioned table's content with several partition groups,
+    /// in **one** commit.
+    ///
+    /// The caller has pre-grouped rows so that every row of a group's batch
+    /// belongs to that group's partition tuple, keyed by logical column name.
+    /// Stringification is the caller's job (Delta partition values are
+    /// strings on the wire).
+    ///
+    /// Each Parquet file is uploaded to a Hive-style prefix
+    /// (`<col1>=<val1>/<col2>=<val2>/.../<hash>.parquet`); each `add` keys
+    /// `partitionValues` by **physical** column UUID (Exp 11 finding).
+    ///
+    /// Errors:
+    /// - the target is unpartitioned → `DeltaLog` (use [`Self::write_batch`])
+    /// - the target uses rowTracking → `DeltaLog`
+    /// - a group's `partition_values` misses a column or has an unknown key
+    ///   → `DeltaLog`
+    pub async fn write_partitioned_batches(
+        &self,
+        groups: Vec<(HashMap<String, String>, RecordBatch)>,
+    ) -> Result<ReplaceOutcome> {
+        let state = self.discover().await?;
+        self.write_partitioned_batches_with_state(groups, state)
+            .await
+    }
+
+    /// [`Self::write_partitioned_batches`] against a state the caller already
+    /// obtained.
+    pub async fn write_partitioned_batches_with_state(
+        &self,
+        groups: Vec<(HashMap<String, String>, RecordBatch)>,
+        state: UniformTableState,
+    ) -> Result<ReplaceOutcome> {
         if state.partition_columns.is_empty() {
             return Err(UniformWriterError::DeltaLog(
                 "write_partitioned_batch called against unpartitioned table; \
@@ -428,54 +522,37 @@ impl UniformWriter {
                     .to_string(),
             ));
         }
-        // Scope guard: this writer allocates each partition group's baseRowId
-        // range from the per-call `state.row_tracking_next_id`, so it cannot
-        // sequence globally-disjoint ranges across >=2 groups — colliding
-        // ranges plus an under-counted rowIdHighWaterMark silently corrupt
-        // Delta row-tracking metadata. Refuse rowTracking here, mirroring
-        // `commit_pointer_with_state`; the caller must fall back to a normal
-        // build.
+        // Scope guard: the rowTracking + partitioned path has no live
+        // verification yet, so it stays refused, like the point-to writer.
+        // The caller must fall back to a normal build.
         if state.row_tracking_enabled {
             return Err(UniformWriterError::DeltaLog(
                 "partitioned content-addressed write does not support rowTracking \
-                 tables (per-group baseRowId allocation cannot be globally \
-                 sequenced across partition groups); falling back to a normal \
-                 build is the caller's responsibility"
+                 tables; falling back to a normal build is the caller's responsibility"
                     .to_string(),
             ));
         }
-        // Validate keys match the table's partition columns.
         let table_partitions: HashSet<&str> =
             state.partition_columns.iter().map(String::as_str).collect();
-        for col in &state.partition_columns {
-            if !partition_values.contains_key(col) {
-                return Err(UniformWriterError::DeltaLog(format!(
-                    "missing partition value for column `{col}` (table partition columns: {:?})",
-                    state.partition_columns
-                )));
+        for (partition_values, _) in &groups {
+            for col in &state.partition_columns {
+                if !partition_values.contains_key(col) {
+                    return Err(UniformWriterError::DeltaLog(format!(
+                        "missing partition value for column `{col}` (table partition columns: {:?})",
+                        state.partition_columns
+                    )));
+                }
+            }
+            for k in partition_values.keys() {
+                if !table_partitions.contains(k.as_str()) {
+                    return Err(UniformWriterError::DeltaLog(format!(
+                        "unexpected partition value for column `{k}` (table partition columns: {:?})",
+                        state.partition_columns
+                    )));
+                }
             }
         }
-        for k in partition_values.keys() {
-            if !table_partitions.contains(k.as_str()) {
-                return Err(UniformWriterError::DeltaLog(format!(
-                    "unexpected partition value for column `{k}` (table partition columns: {:?})",
-                    state.partition_columns
-                )));
-            }
-        }
-
-        // Pre-compute the Hive-style partition path prefix; iteration in
-        // table's partition_columns order keeps it deterministic.
-        let mut partition_prefix = String::new();
-        for col in &state.partition_columns {
-            let v = partition_values.get(col).expect("checked above");
-            partition_prefix.push_str(&format!("{col}={v}/"));
-        }
-        let pv_for_closure = partition_values.clone();
-        self.write_internal(batch, state, &pv_for_closure, move |hash| {
-            format!("{partition_prefix}{hash}.parquet")
-        })
-        .await
+        self.replace_with_batches(groups, state).await
     }
 
     /// Recover the [`PointerInputs`] for a point-to from a prior run `R`'s
@@ -521,50 +598,44 @@ impl UniformWriter {
     }
 
     /// Reuse a prior run `R`'s already-written content-addressed parquet by
-    /// emitting a Delta commit that **references R's existing blake3-named
+    /// emitting a replace commit that **references R's existing blake3-named
     /// file — with zero byte copy.** No SQL executes, no parquet is built,
     /// nothing is uploaded.
     ///
-    /// This is the strong (offline-byte-verifiable) reuse backend: the
-    /// reusing run's target gains a commit whose lone `add` action points at
-    /// the same object `R` wrote. `pointer.blake3_hash` and the underlying
-    /// bytes are `R`'s; only a new `_delta_log` entry (and, recorded
-    /// separately by the runner, a fresh `ArtifactRecord` at the same blake3)
-    /// distinguish the reusing run.
+    /// `pointer.blake3_hash` and the underlying bytes are `R`'s; only a new
+    /// `_delta_log` entry (and, recorded separately by the runner, a fresh
+    /// `ArtifactRecord` at the same blake3) distinguish the reusing run.
     ///
-    /// # Append-only safety — the double-count guard
+    /// # Replace semantics
     ///
-    /// Delta is append-only: two live `add` actions for the same `path`
-    /// **double-count** that file's rows (the writer's own cond-put handler
-    /// documents this — see [`Self::write_internal`]). A point-to therefore
-    /// **pre-checks** the live `_delta_log` for an existing `add` referencing
-    /// `pointer.add_file_path`:
-    /// - **already present** ⇒ the target already holds R's file; the reuse
-    ///   is satisfied with **no new commit** — returns that commit's version
-    ///   so the caller records the shared-bytes reference without
-    ///   re-counting.
-    /// - **absent** ⇒ land a fresh pointer commit at `next_commit_version`
-    ///   via the conditional-put loop (retrying on a genuine version race).
+    /// A point-to is a replace like any build (RV1-D8): after it, the live
+    /// set is exactly `{R's file}`.
+    /// - R's file is already the only live file ⇒ **no new commit**; the
+    ///   result names the version of R's live `add`.
+    /// - otherwise ⇒ one commit that removes every other live file and adds
+    ///   R's file unless it is live already.
     ///
     /// # Scope
     ///
     /// Unpartitioned, non-rowTracking tables only — validated against the
     /// discovered `state` (and guarded again in
-    /// [`commit::build_commit_jsonl_from_add`]). A partitioned or rowTracking
-    /// table returns an error rather than a partial point-to; the caller
-    /// falls back to a normal BUILD.
+    /// [`commit::lift_add_action`]). A partitioned or rowTracking table
+    /// returns an error rather than a partial point-to; the caller falls back
+    /// to a normal BUILD.
     ///
     /// # Errors
     ///
     /// - [`UniformWriterError::PartitionedUnsupported`] / a `DeltaLog` error
     ///   when the table is partitioned or rowTracking;
+    /// - [`UniformWriterError::CheckpointPresent`] when the log has a
+    ///   checkpoint;
     /// - [`UniformWriterError::CondPutRetryExhausted`] when the version race
     ///   never settles;
     /// - the underlying object-store / JSON errors otherwise.
     pub async fn commit_pointer_with_state(
         &self,
         pointer: &PointerInputs,
-        mut state: UniformTableState,
+        state: UniformTableState,
     ) -> Result<WriteResult> {
         // Scope guard: unpartitioned, non-rowTracking only. A partial
         // point-to is never emitted — the caller falls back to a BUILD.
@@ -581,112 +652,23 @@ impl UniformWriter {
                     .to_string(),
             ));
         }
-
         let prefix = self.config.prefix.trim_end_matches('/').to_string();
-        let parquet_path = Path::from(format!("{prefix}/{}", pointer.add_file_path));
-
-        // Double-count guard: if a live commit already references this exact
-        // content-addressed file, the target already holds R's bytes. Reuse
-        // is already satisfied — return that version, emit NO new commit.
-        if let Some(existing_version) =
-            discover::find_commit_with_add_path(&*self.store, &prefix, &pointer.add_file_path)
-                .await?
-        {
-            tracing::info!(
-                add_file_path = %pointer.add_file_path,
-                existing_version,
-                "point-to: target already references this content-addressed file; \
-                 reuse satisfied with no new commit (append-only double-count guard)"
-            );
-            return Ok(WriteResult {
-                file_path: parquet_path.to_string(),
-                blake3_hash: pointer.blake3_hash.clone(),
-                // Point-to reuse references R's already-written bytes; no
-                // Arrow batch is in hand to hash, so no per-column hashes are
-                // recomputed. R's own successful build recorded them.
-                column_hashes: Vec::new(),
-                commit_version: existing_version,
-                num_records: pointer.num_records,
-                size_bytes: pointer.size_bytes,
-            });
-        }
-
-        // File absent on the target: land a fresh pointer commit referencing
-        // R's parquet. Same cond-put loop as a build, minus build_parquet +
-        // the parquet PUT.
+        let live = discover::read_live_set(&*self.store, &prefix, &self.config.fqtn()).await?;
         let modification_time_millis = chrono::Utc::now().timestamp_millis();
-        for attempt in 0..COND_PUT_RETRY_BUDGET {
-            let target_version = state.next_commit_version;
-            let commit_body = commit::build_commit_jsonl_from_add(
-                &pointer.recovered_add,
-                &self.config.engine_info,
-                modification_time_millis,
-                &state.partition_columns,
-            )?;
-            let log_path = Path::from(format!("{prefix}/_delta_log/{target_version:020}.json"));
-            let opts = PutOptions {
-                mode: PutMode::Create,
-                ..Default::default()
-            };
-            match self
-                .store
-                .put_opts(&log_path, PutPayload::from(Bytes::from(commit_body)), opts)
-                .await
-            {
-                Ok(_) => {
-                    return Ok(WriteResult {
-                        file_path: parquet_path.to_string(),
-                        blake3_hash: pointer.blake3_hash.clone(),
-                        // Point-to reuse: no fresh Arrow batch to hash.
-                        column_hashes: Vec::new(),
-                        commit_version: target_version,
-                        num_records: pointer.num_records,
-                        size_bytes: pointer.size_bytes,
-                    });
-                }
-                Err(object_store::Error::AlreadyExists { .. }) => {
-                    // Re-run the double-count pre-check before retrying: a
-                    // concurrent point-to of the *same* file may have landed
-                    // while we raced on the version. If so, return its
-                    // version rather than adding the file a second time.
-                    if let Some(existing_version) = discover::find_commit_with_add_path(
-                        &*self.store,
-                        &prefix,
-                        &pointer.add_file_path,
-                    )
-                    .await?
-                    {
-                        tracing::info!(
-                            add_file_path = %pointer.add_file_path,
-                            existing_version,
-                            "point-to cond-put 412: file landed concurrently; returning \
-                             existing commit (double-count guard)"
-                        );
-                        return Ok(WriteResult {
-                            file_path: parquet_path.to_string(),
-                            blake3_hash: pointer.blake3_hash.clone(),
-                            // Point-to reuse: no fresh Arrow batch to hash.
-                            column_hashes: Vec::new(),
-                            commit_version: existing_version,
-                            num_records: pointer.num_records,
-                            size_bytes: pointer.size_bytes,
-                        });
-                    }
-                    let observed = discover::next_commit_version(&*self.store, &prefix).await?;
-                    state.next_commit_version = observed.max(target_version.saturating_add(1));
-                    tracing::warn!(
-                        attempt = attempt + 1,
-                        previous_target = target_version,
-                        new_target = state.next_commit_version,
-                        "point-to cond-put 412 on _delta_log entry; retrying"
-                    );
-                }
-                Err(e) => return Err(e.into()),
-            }
-        }
-        Err(UniformWriterError::CondPutRetryExhausted(format!(
-            "exhausted {COND_PUT_RETRY_BUDGET} retries chasing next_commit_version for a point-to"
-        )))
+        let add = commit::lift_add_action(&pointer.recovered_add, modification_time_millis)?;
+        let staged = StagedFile {
+            path: pointer.add_file_path.clone(),
+            add,
+            blake3_hash: pointer.blake3_hash.clone(),
+            // Point-to reuse references R's already-written bytes; no Arrow
+            // batch is in hand to hash. R's own build recorded them.
+            column_hashes: Vec::new(),
+            num_records: pointer.num_records,
+            size_bytes: pointer.size_bytes,
+        };
+        self.commit_replace(vec![staged], live, state, modification_time_millis)
+            .await?
+            .into_single()
     }
 
     /// Whether a prior run `R`'s content-addressed file is **still live** in
@@ -769,74 +751,154 @@ impl UniformWriter {
         .await
     }
 
-    /// Shared write pipeline used by both unpartitioned and partitioned
-    /// entry points. `path_for_hash` produces the `add.path` (relative to
-    /// the table prefix) given the blake3 hash of the Parquet bytes.
-    async fn write_internal(
+    /// Build and upload one Parquet file per group, then make one replace
+    /// commit. Shared by the unpartitioned and partitioned entry points.
+    ///
+    /// The live set is read **before** any byte is uploaded, so a refusal
+    /// (a checkpoint, an unreadable history) writes nothing.
+    async fn replace_with_batches(
         &self,
-        batch: RecordBatch,
-        mut state: UniformTableState,
-        partition_values: &HashMap<String, String>,
-        path_for_hash: impl FnOnce(&str) -> String,
-    ) -> Result<WriteResult> {
-        // 1. Build deterministic Parquet bytes from the input batch.
-        let parquet_bytes = parquet_builder::build_parquet(&batch, &state)?;
-        let hash = blake3::hash(&parquet_bytes).to_hex().to_string();
-        // Per-column content hashes over the same in-memory Arrow batch,
-        // computed in this pass (the batch is held right here, immediately
-        // before the whole-body blake3 above). Captured on every genuine
-        // build; nothing consults them yet.
-        let column_hashes = compute_column_hashes(&batch)?;
-        let add_file_path = path_for_hash(&hash);
-        let file_size = parquet_bytes.len() as u64;
+        groups: Vec<(HashMap<String, String>, RecordBatch)>,
+        state: UniformTableState,
+    ) -> Result<ReplaceOutcome> {
         let prefix = self.config.prefix.trim_end_matches('/').to_string();
-        let parquet_path = Path::from(format!("{prefix}/{add_file_path}"));
-
-        // 2. PUT the Parquet. Same content → same hash → same key → idempotent.
-        self.store
-            .put(&parquet_path, PutPayload::from(Bytes::from(parquet_bytes)))
-            .await?;
-
-        // 3. Loop: build commit, PUT with `If-None-Match: *`, retry on 412.
+        let live = discover::read_live_set(&*self.store, &prefix, &self.config.fqtn()).await?;
         let modification_time_millis = chrono::Utc::now().timestamp_millis();
-        let num_records = batch.num_rows();
-        for attempt in 0..COND_PUT_RETRY_BUDGET {
-            let target_version = state.next_commit_version;
-            // For rowTracking-enabled tables, allocate a contiguous range
-            // of row-ids for this commit's rows. `base` = current
-            // watermark; `new_high` = watermark + num_records - 1.
-            // Re-computed on every retry because state.row_tracking_next_id
-            // may advance between retries if the cond-put loser refreshes.
-            let row_tracking = if state.row_tracking_enabled {
-                if num_records == 0 {
-                    None
-                } else {
-                    let base = state.row_tracking_next_id;
-                    let new_high = base.checked_add(num_records as u64 - 1).ok_or_else(|| {
-                        UniformWriterError::DeltaLog(format!(
-                            "row_tracking_next_id={base} + {num_records} rows overflows u64"
-                        ))
-                    })?;
-                    Some(commit::RowTrackingCommit {
-                        base_row_id: base,
-                        default_row_commit_version: target_version,
-                        new_high_water_mark: new_high,
-                    })
-                }
-            } else {
-                None
-            };
-            let inputs = commit::CommitInputs {
-                batch: &batch,
+
+        let mut staged = Vec::with_capacity(groups.len());
+        for (partition_values, batch) in &groups {
+            // 1. Build deterministic Parquet bytes from the input batch.
+            let parquet_bytes = parquet_builder::build_parquet(batch, &state)?;
+            let hash = blake3::hash(&parquet_bytes).to_hex().to_string();
+            // Per-column content hashes over the same in-memory Arrow batch.
+            let column_hashes = compute_column_hashes(batch)?;
+            // Hive-style partition prefix, in the table's partition_columns
+            // order so the path is deterministic. Empty when unpartitioned.
+            let mut add_file_path = String::new();
+            for col in &state.partition_columns {
+                let v = partition_values.get(col).ok_or_else(|| {
+                    UniformWriterError::DeltaLog(format!(
+                        "missing partition value for column `{col}`"
+                    ))
+                })?;
+                add_file_path.push_str(&format!("{col}={v}/"));
+            }
+            add_file_path.push_str(&format!("{hash}.parquet"));
+            let file_size = parquet_bytes.len() as u64;
+            let parquet_path = Path::from(format!("{prefix}/{add_file_path}"));
+
+            // 2. PUT the Parquet. Same content → same hash → same key →
+            // idempotent. A re-PUT also restores bytes a VACUUM deleted.
+            self.store
+                .put(&parquet_path, PutPayload::from(Bytes::from(parquet_bytes)))
+                .await?;
+
+            let add = commit::build_add_action(&commit::AddInputs {
+                batch,
                 state: &state,
                 add_file_path: &add_file_path,
                 file_size,
                 modification_time_millis,
-                engine_info: &self.config.engine_info,
                 partition_values,
-                row_tracking,
-            };
-            let commit_body = commit::build_commit_jsonl(&inputs)?;
+            })?;
+            staged.push(StagedFile {
+                path: add_file_path,
+                add,
+                blake3_hash: hash,
+                column_hashes,
+                num_records: batch.num_rows(),
+                size_bytes: file_size,
+            });
+        }
+
+        // 3. One replace commit.
+        self.commit_replace(staged, live, state, modification_time_millis)
+            .await
+    }
+
+    /// Make the live set equal `staged`, in at most one commit.
+    ///
+    /// ```text
+    ///   live == new ──▶ no commit; table_version = current head
+    ///   otherwise   ──▶ commit head+1:  remove (live − new) ; add (new − live)
+    ///                     └─ 412 ──▶ re-read the live set, recompute, retry
+    /// ```
+    ///
+    /// The conditional PUT (`If-None-Match: *`) makes the commit atomic. A
+    /// 412 means another commit took the version: the live set is read again
+    /// so the removes reflect the new head, and the retry may turn into a
+    /// no-op when the winner already wrote this exact output.
+    async fn commit_replace(
+        &self,
+        staged: Vec<StagedFile>,
+        mut live: discover::LiveSet,
+        mut state: UniformTableState,
+        modification_time_millis: i64,
+    ) -> Result<ReplaceOutcome> {
+        use std::collections::BTreeSet;
+        let prefix = self.config.prefix.trim_end_matches('/').to_string();
+        let new_paths: BTreeSet<&str> = staged.iter().map(|s| s.path.as_str()).collect();
+
+        for attempt in 0..COND_PUT_RETRY_BUDGET {
+            let live_paths: BTreeSet<&str> = live.files.keys().map(String::as_str).collect();
+            if live_paths == new_paths {
+                tracing::info!(
+                    table = %self.config.fqtn(),
+                    version = live.head_version,
+                    "content-addressed output already live; no commit written"
+                );
+                return Ok(self.outcome(&staged, &live, live.head_version, false, Vec::new()));
+            }
+
+            let mut removes = Vec::new();
+            let mut removed_paths = Vec::new();
+            for (path, file) in &live.files {
+                if !new_paths.contains(path.as_str()) {
+                    removes.push(commit::build_remove_action(
+                        &file.add,
+                        modification_time_millis,
+                    )?);
+                    removed_paths.push(path.clone());
+                }
+            }
+            if !removes.is_empty() && live.append_only {
+                return Err(UniformWriterError::AppendOnlyTable {
+                    table: self.config.fqtn(),
+                });
+            }
+
+            let target_version = live.head_version + 1;
+            // Allocate row ids for the files this commit adds, one
+            // contiguous range per file, in order.
+            let mut next_row_id = state.row_tracking_next_id;
+            let mut high_water_mark = None;
+            let mut adds = Vec::new();
+            for s in staged.iter().filter(|s| !live.files.contains_key(&s.path)) {
+                let mut add = s.add.clone();
+                if state.row_tracking_enabled && s.num_records > 0 {
+                    let base = next_row_id;
+                    let high = base.checked_add(s.num_records as u64 - 1).ok_or_else(|| {
+                        UniformWriterError::DeltaLog(format!(
+                            "row_tracking_next_id={base} + {} rows overflows u64",
+                            s.num_records
+                        ))
+                    })?;
+                    commit::set_row_tracking(&mut add, base, target_version);
+                    next_row_id = high.saturating_add(1);
+                    high_water_mark = Some(high);
+                }
+                adds.push(add);
+            }
+
+            let body = commit::build_replace_commit_jsonl(&commit::ReplaceCommit {
+                engine_info: &self.config.engine_info,
+                timestamp_millis: modification_time_millis,
+                read_version: live.head_version,
+                partition_columns: &state.partition_columns,
+                removes: &removes,
+                adds: &adds,
+                row_tracking_high_water_mark: high_water_mark,
+            })?;
             let log_path = Path::from(format!("{prefix}/_delta_log/{target_version:020}.json"));
             let opts = PutOptions {
                 mode: PutMode::Create,
@@ -844,52 +906,17 @@ impl UniformWriter {
             };
             match self
                 .store
-                .put_opts(&log_path, PutPayload::from(Bytes::from(commit_body)), opts)
+                .put_opts(&log_path, PutPayload::from(Bytes::from(body)), opts)
                 .await
             {
                 Ok(_) => {
-                    return Ok(WriteResult {
-                        file_path: parquet_path.to_string(),
-                        blake3_hash: hash,
-                        column_hashes: column_hashes.clone(),
-                        commit_version: target_version,
-                        num_records: batch.num_rows(),
-                        size_bytes: file_size,
-                    });
+                    return Ok(self.outcome(&staged, &live, target_version, true, removed_paths));
                 }
                 Err(object_store::Error::AlreadyExists { .. }) => {
-                    // Distinguish a genuine version race from a competing writer
-                    // that already landed this exact content-addressed file. If
-                    // an existing `add` action references our `add_file_path`, a
-                    // concurrent identical write won — return its commit version
-                    // rather than adding the same file a second time at a higher
-                    // version (which would double-count rows/bytes).
-                    if let Some(existing_version) =
-                        discover::find_commit_with_add_path(&*self.store, &prefix, &add_file_path)
-                            .await?
-                    {
-                        tracing::info!(
-                            add_file_path = %add_file_path,
-                            existing_version,
-                            "cond-put 412: identical content-addressed file already \
-                             committed by a concurrent writer; returning existing commit"
-                        );
-                        return Ok(WriteResult {
-                            file_path: parquet_path.to_string(),
-                            blake3_hash: hash,
-                            column_hashes: column_hashes.clone(),
-                            commit_version: existing_version,
-                            num_records: batch.num_rows(),
-                            size_bytes: file_size,
-                        });
-                    }
-
-                    let observed = discover::next_commit_version(&*self.store, &prefix).await?;
-                    state.next_commit_version = observed.max(target_version.saturating_add(1));
-                    // The cond-put loser may also be racing on the
-                    // row-tracking watermark — re-scan the log so the
-                    // retry doesn't allocate row-ids that the winner
-                    // already claimed.
+                    // Another commit took `target_version`. Re-read the live
+                    // set so the removes reflect the new head.
+                    live =
+                        discover::read_live_set(&*self.store, &prefix, &self.config.fqtn()).await?;
                     if state.row_tracking_enabled {
                         state.row_tracking_next_id =
                             discover::discover_row_tracking_next_id(&*self.store, &prefix).await?;
@@ -897,9 +924,8 @@ impl UniformWriter {
                     tracing::warn!(
                         attempt = attempt + 1,
                         previous_target = target_version,
-                        new_target = state.next_commit_version,
-                        new_row_tracking_next_id = state.row_tracking_next_id,
-                        "cond-put 412 on _delta_log entry; retrying"
+                        new_head = live.head_version,
+                        "cond-put 412 on _delta_log entry; re-read the live set, retrying"
                     );
                 }
                 Err(e) => return Err(e.into()),
@@ -908,6 +934,40 @@ impl UniformWriter {
         Err(UniformWriterError::CondPutRetryExhausted(format!(
             "exhausted {COND_PUT_RETRY_BUDGET} retries chasing next_commit_version"
         )))
+    }
+
+    /// Assemble the [`ReplaceOutcome`] of a replace (or a no-op).
+    ///
+    /// A file that was live before the commit keeps the version of its live
+    /// `add`; a file this commit added gets `table_version`.
+    fn outcome(
+        &self,
+        staged: &[StagedFile],
+        live: &discover::LiveSet,
+        table_version: u64,
+        committed: bool,
+        removed_paths: Vec<String>,
+    ) -> ReplaceOutcome {
+        let prefix = self.config.prefix.trim_end_matches('/');
+        let files = staged
+            .iter()
+            .map(|s| WriteResult {
+                file_path: Path::from(format!("{prefix}/{}", s.path)).to_string(),
+                blake3_hash: s.blake3_hash.clone(),
+                column_hashes: s.column_hashes.clone(),
+                commit_version: live.files.get(&s.path).map_or(table_version, |f| f.version),
+                table_version,
+                committed,
+                num_records: s.num_records,
+                size_bytes: s.size_bytes,
+            })
+            .collect();
+        ReplaceOutcome {
+            table_version,
+            committed,
+            removed_paths,
+            files,
+        }
     }
 
     /// Trigger `MSCK REPAIR TABLE <fqtn> SYNC METADATA` on the warehouse so
@@ -1283,7 +1343,7 @@ mod tests {
         let state2 = writer.discover().await.unwrap();
         assert_eq!(state2.row_tracking_next_id, 10);
 
-        // A second write should allocate row-ids 10..19.
+        // A second write replaces the first and allocates row-ids 10..14.
         let result2 = writer.write_batch(make_batch(5)).await.unwrap();
         assert_eq!(result2.num_records, 5);
         let log_path2 = object_store::path::Path::from(format!(
@@ -1291,12 +1351,22 @@ mod tests {
         ));
         let log2 = store.get(&log_path2).await.unwrap().bytes().await.unwrap();
         let lines2: Vec<&str> = std::str::from_utf8(&log2).unwrap().lines().collect();
-        let add2: Value = serde_json::from_str(lines2[1]).unwrap();
+        assert_eq!(
+            lines2.len(),
+            4,
+            "commitInfo + remove + add + domainMetadata"
+        );
+        // The remove of the first file carries its row-tracking fields.
+        let remove2: Value = serde_json::from_str(lines2[1]).unwrap();
+        assert_eq!(remove2["remove"]["baseRowId"], 0);
+        assert_eq!(remove2["remove"]["defaultRowCommitVersion"], 1);
+        let add2: Value = serde_json::from_str(lines2[2]).unwrap();
         assert_eq!(add2["add"]["baseRowId"], 10);
-        let dm2: Value = serde_json::from_str(lines2[2]).unwrap();
+        assert_eq!(add2["add"]["defaultRowCommitVersion"], 2);
+        let dm2: Value = serde_json::from_str(lines2[3]).unwrap();
         let cfg2_raw = dm2["domainMetadata"]["configuration"].as_str().unwrap();
         let cfg2: Value = serde_json::from_str(cfg2_raw).unwrap();
-        // Existing 10 rows + new 5 → high water mark = 14.
+        // Row ids are never reused: 10 allocated earlier + 5 new → 14.
         assert_eq!(cfg2["rowIdHighWaterMark"], 14);
     }
 
@@ -1846,5 +1916,423 @@ mod tests {
             PathLiveness::Removed,
             "a removed file is Removed"
         );
+    }
+
+    // -- replace semantics (RV1-P1a, #2269) ----------------------------------
+
+    /// Independent Delta log replay for the tests: live = adds − removes,
+    /// commit by commit, in version order. It does NOT use the writer's own
+    /// reader. It also asserts the protocol rule that one commit never adds
+    /// and removes the same path.
+    async fn replay_live_paths(
+        store: &InMemory,
+        prefix: &str,
+    ) -> std::collections::BTreeSet<String> {
+        use futures::TryStreamExt;
+        let mut commits: Vec<(u64, object_store::path::Path)> = Vec::new();
+        let mut stream = store.list(Some(&object_store::path::Path::from(format!(
+            "{prefix}/_delta_log"
+        ))));
+        while let Some(meta) = stream.try_next().await.unwrap() {
+            let name = meta.location.filename().unwrap().to_string();
+            if let Some(stem) = name.strip_suffix(".json")
+                && stem.len() == 20
+            {
+                commits.push((stem.parse().unwrap(), meta.location));
+            }
+        }
+        commits.sort_by_key(|(v, _)| *v);
+        let mut live = std::collections::BTreeSet::new();
+        for (v, path) in commits {
+            let body = store.get(&path).await.unwrap().bytes().await.unwrap();
+            let mut adds = Vec::new();
+            let mut removes = Vec::new();
+            for line in std::str::from_utf8(&body).unwrap().lines() {
+                let value: Value = serde_json::from_str(line).unwrap();
+                if let Some(p) = value["add"]["path"].as_str() {
+                    adds.push(p.to_string());
+                }
+                if let Some(p) = value["remove"]["path"].as_str() {
+                    removes.push(p.to_string());
+                }
+            }
+            for p in &removes {
+                assert!(!adds.contains(p), "commit {v} adds and removes `{p}`");
+                live.remove(p);
+            }
+            live.extend(adds);
+        }
+        live
+    }
+
+    async fn commit_lines(store: &InMemory, prefix: &str, version: u64) -> Vec<Value> {
+        let body = store
+            .get(&object_store::path::Path::from(format!(
+                "{prefix}/_delta_log/{version:020}.json"
+            )))
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        std::str::from_utf8(&body)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect()
+    }
+
+    async fn commit_exists(store: &InMemory, prefix: &str, version: u64) -> bool {
+        store
+            .head(&object_store::path::Path::from(format!(
+                "{prefix}/_delta_log/{version:020}.json"
+            )))
+            .await
+            .is_ok()
+    }
+
+    fn basename(file_path: &str) -> String {
+        file_path.rsplit('/').next().unwrap().to_string()
+    }
+
+    fn actions<'a>(lines: &'a [Value], key: &str) -> Vec<&'a Value> {
+        lines.iter().filter_map(|l| l.get(key)).collect()
+    }
+
+    #[tokio::test]
+    async fn second_build_replaces_the_first() {
+        let store: Arc<InMemory> = Arc::new(InMemory::new());
+        seed_bootstrap(&store, "tbl").await;
+        let writer = make_unpartitioned_writer(store.clone() as Arc<dyn ObjectStore>, "tbl");
+
+        let a = writer.write_batch(make_batch(4)).await.unwrap();
+        let b = writer.write_batch(make_batch(5)).await.unwrap();
+        assert_eq!((a.commit_version, b.commit_version), (1, 2));
+        assert!(b.committed);
+        assert_eq!(b.table_version, 2);
+
+        let lines = commit_lines(&store, "tbl", 2).await;
+        let info = &lines[0]["commitInfo"];
+        assert_eq!(info["operation"], "WRITE");
+        assert_eq!(info["operationParameters"]["mode"], "Overwrite");
+        assert_eq!(info["isBlindAppend"], false);
+        let removes = actions(&lines, "remove");
+        let adds = actions(&lines, "add");
+        assert_eq!(removes.len(), 1, "exactly one remove");
+        assert_eq!(adds.len(), 1, "exactly one add");
+        assert_eq!(removes[0]["path"], basename(&a.file_path));
+        assert_eq!(removes[0]["dataChange"], true);
+        assert_eq!(removes[0]["extendedFileMetadata"], true);
+        assert_eq!(removes[0]["size"], a.size_bytes);
+        assert_eq!(adds[0]["path"], basename(&b.file_path));
+
+        let live = replay_live_paths(&store, "tbl").await;
+        assert_eq!(
+            live.into_iter().collect::<Vec<_>>(),
+            vec![basename(&b.file_path)],
+            "the live table equals the second output only"
+        );
+    }
+
+    #[tokio::test]
+    async fn identical_rebuild_writes_no_commit() {
+        let store: Arc<InMemory> = Arc::new(InMemory::new());
+        seed_bootstrap(&store, "tbl").await;
+        let writer = make_unpartitioned_writer(store.clone() as Arc<dyn ObjectStore>, "tbl");
+
+        let first = writer.write_batch(make_batch(3)).await.unwrap();
+        let again = writer.write_batch(make_batch(3)).await.unwrap();
+        assert!(first.committed);
+        assert!(!again.committed, "an unchanged output writes no commit");
+        assert_eq!(
+            again.table_version, 1,
+            "the no-op names the current version"
+        );
+        assert_eq!(again.commit_version, 1);
+        assert_eq!(again.blake3_hash, first.blake3_hash);
+        assert!(!commit_exists(&store, "tbl", 2).await);
+    }
+
+    #[tokio::test]
+    async fn partitioned_write_is_one_commit_and_moves_only_changed_files() {
+        let store: Arc<InMemory> = Arc::new(InMemory::new());
+        seed_partitioned_bootstrap(&store, "ptbl").await;
+        let writer = make_unpartitioned_writer(store.clone() as Arc<dyn ObjectStore>, "ptbl");
+        let pv = |r: &str| HashMap::from([("region".to_string(), r.to_string())]);
+
+        // Run 1: three groups land in ONE commit with three adds.
+        let run1 = writer
+            .write_partitioned_batches(vec![
+                (pv("eu"), make_partitioned_batch("eu", 2)),
+                (pv("us"), make_partitioned_batch("us", 3)),
+                (pv("ap"), make_partitioned_batch("ap", 1)),
+            ])
+            .await
+            .unwrap();
+        assert_eq!(run1.table_version, 1);
+        assert!(
+            !commit_exists(&store, "ptbl", 2).await,
+            "one commit, not one per group"
+        );
+        let lines = commit_lines(&store, "ptbl", 1).await;
+        assert_eq!(actions(&lines, "add").len(), 3);
+        assert_eq!(actions(&lines, "remove").len(), 0);
+        let eu1 = run1.files[0].file_path.clone();
+        let us1 = run1.files[1].file_path.clone();
+
+        // Run 2: eu changes, us is unchanged, ap disappears.
+        let run2 = writer
+            .write_partitioned_batches(vec![
+                (pv("eu"), make_partitioned_batch("eu", 4)),
+                (pv("us"), make_partitioned_batch("us", 3)),
+            ])
+            .await
+            .unwrap();
+        assert_eq!(run2.table_version, 2);
+        assert_eq!(run2.files[1].file_path, us1, "same content, same path");
+        assert_eq!(run2.files[1].commit_version, 1, "us keeps its live add");
+        assert_eq!(run2.files[0].commit_version, 2);
+        let lines = commit_lines(&store, "ptbl", 2).await;
+        let removed: Vec<&str> = actions(&lines, "remove")
+            .iter()
+            .map(|r| r["path"].as_str().unwrap())
+            .collect();
+        let added: Vec<&str> = actions(&lines, "add")
+            .iter()
+            .map(|a| a["path"].as_str().unwrap())
+            .collect();
+        let rel = |p: &str| p.strip_prefix("ptbl/").unwrap().to_string();
+        assert_eq!(removed.len(), 2, "old eu + ap: {removed:?}");
+        assert!(removed.contains(&rel(&eu1).as_str()));
+        assert!(
+            !removed.contains(&rel(&us1).as_str()),
+            "unchanged us is not removed"
+        );
+        assert_eq!(
+            added,
+            vec![rel(&run2.files[0].file_path)],
+            "only the new eu is added"
+        );
+        // The remove keeps the partition metadata of the live add.
+        let ap_remove = actions(&lines, "remove")
+            .into_iter()
+            .find(|r| r["path"].as_str().unwrap().starts_with("region=ap/"))
+            .unwrap();
+        assert_eq!(
+            ap_remove["partitionValues"],
+            serde_json::json!({"col-region-uuid": "ap"})
+        );
+
+        let live = replay_live_paths(&store, "ptbl").await;
+        let expected: std::collections::BTreeSet<String> =
+            [rel(&run2.files[0].file_path), rel(&us1)]
+                .into_iter()
+                .collect();
+        assert_eq!(live, expected);
+    }
+
+    #[tokio::test]
+    async fn a_checkpoint_refuses_the_write_and_writes_no_commit() {
+        for marker in [
+            "_last_checkpoint",
+            "00000000000000000001.checkpoint.parquet",
+        ] {
+            let store: Arc<InMemory> = Arc::new(InMemory::new());
+            seed_bootstrap(&store, "tbl").await;
+            let writer = make_unpartitioned_writer(store.clone() as Arc<dyn ObjectStore>, "tbl");
+            writer.write_batch(make_batch(2)).await.unwrap();
+            store
+                .put(
+                    &object_store::path::Path::from(format!("tbl/_delta_log/{marker}")),
+                    PutPayload::from(Bytes::from_static(b"{}")),
+                )
+                .await
+                .unwrap();
+
+            match writer.write_batch(make_batch(7)).await {
+                Err(UniformWriterError::CheckpointPresent { table, checkpoint }) => {
+                    assert_eq!(table, "c.s.t");
+                    assert!(checkpoint.ends_with(marker), "{checkpoint}");
+                    let msg =
+                        UniformWriterError::CheckpointPresent { table, checkpoint }.to_string();
+                    assert!(msg.contains("To recover"), "{msg}");
+                }
+                other => panic!("expected CheckpointPresent, got {other:?}"),
+            }
+            assert!(
+                !commit_exists(&store, "tbl", 2).await,
+                "no commit after a refusal"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_conflict_retry_recomputes_removes_against_the_new_head() {
+        let store: Arc<InMemory> = Arc::new(InMemory::new());
+        seed_bootstrap(&store, "tbl").await;
+        let writer = make_unpartitioned_writer(store.clone() as Arc<dyn ObjectStore>, "tbl");
+        let a = writer.write_batch(make_batch(2)).await.unwrap();
+
+        // Read the live set at head 1 ({A}), then let a competitor land v2
+        // (remove A, add C) before our commit.
+        let state = writer.discover().await.unwrap();
+        let stale = discover::read_live_set(&*store, "tbl", "c.s.t")
+            .await
+            .unwrap();
+        let competitor = format!(
+            "{{\"commitInfo\":{{}}}}\n\
+             {{\"remove\":{{\"path\":\"{}\",\"dataChange\":true}}}}\n\
+             {{\"add\":{{\"path\":\"c.parquet\",\"partitionValues\":{{}},\"size\":9,\
+             \"modificationTime\":0,\"dataChange\":true}}}}\n",
+            basename(&a.file_path)
+        );
+        store
+            .put(
+                &object_store::path::Path::from("tbl/_delta_log/00000000000000000002.json"),
+                PutPayload::from(Bytes::from(competitor)),
+            )
+            .await
+            .unwrap();
+
+        let batch = make_batch(6);
+        let pv = HashMap::new();
+        let add = commit::build_add_action(&commit::AddInputs {
+            batch: &batch,
+            state: &state,
+            add_file_path: "b.parquet",
+            file_size: 11,
+            modification_time_millis: 0,
+            partition_values: &pv,
+        })
+        .unwrap();
+        let staged = StagedFile {
+            path: "b.parquet".into(),
+            add,
+            blake3_hash: "b".into(),
+            column_hashes: Vec::new(),
+            num_records: 6,
+            size_bytes: 11,
+        };
+        let outcome = writer
+            .commit_replace(vec![staged], stale, state, 0)
+            .await
+            .unwrap();
+        assert_eq!(outcome.table_version, 3, "the 412 at v2 retried at v3");
+        let lines = commit_lines(&store, "tbl", 3).await;
+        let removed: Vec<&str> = actions(&lines, "remove")
+            .iter()
+            .map(|r| r["path"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            removed,
+            vec!["c.parquet"],
+            "removes reflect the new head, not the stale A"
+        );
+        let live = replay_live_paths(&store, "tbl").await;
+        assert_eq!(
+            live.into_iter().collect::<Vec<_>>(),
+            vec!["b.parquet".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_conflict_with_the_same_output_becomes_a_no_op() {
+        let store: Arc<InMemory> = Arc::new(InMemory::new());
+        seed_bootstrap(&store, "tbl").await;
+        let writer = make_unpartitioned_writer(store.clone() as Arc<dyn ObjectStore>, "tbl");
+        let a = writer.write_batch(make_batch(2)).await.unwrap();
+        let state = writer.discover().await.unwrap();
+        let stale = discover::read_live_set(&*store, "tbl", "c.s.t")
+            .await
+            .unwrap();
+        // A competitor lands exactly our output at v2.
+        let competitor = format!(
+            "{{\"commitInfo\":{{}}}}\n\
+             {{\"remove\":{{\"path\":\"{}\",\"dataChange\":true}}}}\n\
+             {{\"add\":{{\"path\":\"b.parquet\",\"partitionValues\":{{}},\"size\":11,\
+             \"modificationTime\":0,\"dataChange\":true}}}}\n",
+            basename(&a.file_path)
+        );
+        store
+            .put(
+                &object_store::path::Path::from("tbl/_delta_log/00000000000000000002.json"),
+                PutPayload::from(Bytes::from(competitor)),
+            )
+            .await
+            .unwrap();
+        let staged = StagedFile {
+            path: "b.parquet".into(),
+            add: serde_json::json!({"path": "b.parquet", "partitionValues": {}, "size": 11})
+                .as_object()
+                .unwrap()
+                .clone(),
+            blake3_hash: "b".into(),
+            column_hashes: Vec::new(),
+            num_records: 1,
+            size_bytes: 11,
+        };
+        let outcome = writer
+            .commit_replace(vec![staged], stale, state, 0)
+            .await
+            .unwrap();
+        assert!(!outcome.committed);
+        assert_eq!(outcome.table_version, 2);
+        assert!(!commit_exists(&store, "tbl", 3).await);
+    }
+
+    #[tokio::test]
+    async fn point_to_replaces_the_live_set() {
+        // Build A (v1), then B (v2). A point-to back to A is a replace: it
+        // removes B and re-adds A in one commit.
+        let store: Arc<InMemory> = Arc::new(InMemory::new());
+        seed_bootstrap(&store, "tbl").await;
+        let writer = make_unpartitioned_writer(store.clone() as Arc<dyn ObjectStore>, "tbl");
+        let a = writer.write_batch(make_batch(3)).await.unwrap();
+        let b = writer.write_batch(make_batch(8)).await.unwrap();
+        let pointer = writer
+            .recover_pointer_inputs(a.commit_version, a.blake3_hash.clone(), 3, a.size_bytes)
+            .await
+            .unwrap();
+        let state = writer.discover().await.unwrap();
+        let pr = writer
+            .commit_pointer_with_state(&pointer, state)
+            .await
+            .unwrap();
+        assert_eq!(pr.commit_version, 3);
+        let lines = commit_lines(&store, "tbl", 3).await;
+        assert_eq!(
+            lines[0]["commitInfo"]["operationParameters"]["mode"],
+            "Overwrite"
+        );
+        assert_eq!(actions(&lines, "remove")[0]["path"], basename(&b.file_path));
+        assert_eq!(actions(&lines, "add")[0]["path"], basename(&a.file_path));
+        let live = replay_live_paths(&store, "tbl").await;
+        assert_eq!(
+            live.into_iter().collect::<Vec<_>>(),
+            vec![basename(&a.file_path)]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_append_only_table_refuses_the_replace() {
+        let store: Arc<InMemory> = Arc::new(InMemory::new());
+        seed_bootstrap(&store, "tbl").await;
+        let writer = make_unpartitioned_writer(store.clone() as Arc<dyn ObjectStore>, "tbl");
+        writer.write_batch(make_batch(2)).await.unwrap();
+        // Land v2: the bootstrap metaData with delta.appendOnly=true.
+        let mut md = commit_lines(&store, "tbl", 0).await[1].clone();
+        md["metaData"]["configuration"]["delta.appendOnly"] = Value::from("true");
+        store
+            .put(
+                &object_store::path::Path::from("tbl/_delta_log/00000000000000000002.json"),
+                PutPayload::from(Bytes::from(format!("{md}\n"))),
+            )
+            .await
+            .unwrap();
+        match writer.write_batch(make_batch(5)).await {
+            Err(UniformWriterError::AppendOnlyTable { table }) => assert_eq!(table, "c.s.t"),
+            other => panic!("expected AppendOnlyTable, got {other:?}"),
+        }
+        assert!(!commit_exists(&store, "tbl", 3).await);
     }
 }
