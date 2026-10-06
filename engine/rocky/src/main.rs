@@ -1743,7 +1743,8 @@ enum Command {
         /// Directory name for the playground project
         #[arg(default_value = "rocky-playground")]
         path: String,
-        /// Template: quickstart, ecommerce, showcase
+        /// Template: quickstart. (`ecommerce` and `showcase` were removed: their
+        /// projects built no models.)
         #[arg(long, default_value = "quickstart")]
         template: String,
     },

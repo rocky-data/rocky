@@ -218,6 +218,25 @@ pub enum ConfigError {
     },
 
     #[error(
+        "adapter '{name}' has type 'manual' but lists no schemas; a manual discovery adapter \
+         discovers only what it lists. Add at least one [[adapter.{name}.schemas]] block with \
+         `name` and `tables`"
+    )]
+    ManualAdapterNoSchemas { name: EnvString },
+
+    #[error("adapter '{name}' (type 'manual'): {detail}")]
+    ManualAdapterInvalidSchema { name: EnvString, detail: EnvString },
+
+    #[error(
+        "adapter '{name}' (type '{adapter_type}') sets `schemas`, which only a type = \"manual\" \
+         discovery adapter reads; remove the [[adapter.{name}.schemas]] blocks"
+    )]
+    AdapterSchemasNotManual {
+        name: EnvString,
+        adapter_type: EnvString,
+    },
+
+    #[error(
         "pipeline '{pipeline}' source.adapter = '{adapter}' points to an adapter whose `kind` excludes data movement"
     )]
     PipelineSourceAdapterNotData {
@@ -4942,6 +4961,25 @@ pub struct AdapterConfig {
     /// as a discovery source — discovery and warehouse share the same database.
     pub path: Option<String>,
 
+    // -- Manual discovery fields --
+    /// The source schemas and tables a `type = "manual"` discovery adapter
+    /// returns, listed in config instead of fetched from an API.
+    ///
+    /// ```toml
+    /// [adapter.local_discovery]
+    /// type = "manual"
+    /// kind = "discovery"
+    ///
+    /// [[adapter.local_discovery.schemas]]
+    /// name = "raw__orders"
+    /// tables = ["orders", "order_items"]
+    /// ```
+    ///
+    /// Required (non-empty) on a `manual` adapter and refused on every other
+    /// type; see [`validate_manual_adapters`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub schemas: Vec<crate::source::ManualSchemaConfig>,
+
     /// Retry policy for this adapter.
     #[serde(default)]
     pub retry: RetryConfig,
@@ -5050,6 +5088,7 @@ impl std::fmt::Debug for AdapterConfig {
             .field("project_id", &self.project_id)
             .field("location", &self.location)
             .field("path", &self.path)
+            .field("schemas", &self.schemas)
             .field("retry", &self.retry)
             .field("cache", &self.cache)
             .field("ratelimit", &self.ratelimit)
@@ -8016,6 +8055,7 @@ type ConfigValidator = fn(&RockyConfig) -> Vec<ConfigError>;
 /// fail-fast consumer never reaches.
 const CONFIG_VALIDATORS: &[ConfigValidator] = &[
     validate_adapter_kinds,
+    validate_manual_adapters,
     validate_replication_strategies,
     validate_schema_pattern_reserved_components,
     validate_separators,
@@ -8119,6 +8159,81 @@ pub fn load_rocky_config_fingerprinted(path: &Path) -> Result<LoadedConfig, Conf
         config,
         fingerprint,
     })
+}
+
+/// Validate the inline `schemas` list of every `type = "manual"` discovery
+/// adapter (#1994), and refuse `schemas` on any other type.
+///
+/// A manual adapter discovers exactly what it lists, so:
+///
+/// - an empty list is refused — it could never plan a table;
+/// - every schema and table name must be a plain SQL identifier
+///   (`[a-zA-Z0-9_]+`), because the names are interpolated into the SQL the
+///   replication plan generates;
+/// - a schema listed twice, a schema with no tables, and a table listed twice
+///   in one schema are refused. Duplicates compare case-insensitively, since
+///   the warehouses behind these sources (Databricks, Snowflake) fold case.
+///
+/// `schemas` on a non-manual adapter would be silently ignored, so it is
+/// refused instead.
+///
+/// Part of [`CONFIG_VALIDATORS`], so `rocky validate` and every command that
+/// loads the config (`plan`, `run`, `discover`) agree.
+pub fn validate_manual_adapters(config: &RockyConfig) -> Vec<ConfigError> {
+    let mut errors = Vec::new();
+    for (name, adapter) in &config.adapters {
+        if adapter.adapter_type != "manual" {
+            if !adapter.schemas.is_empty() {
+                errors.push(ConfigError::AdapterSchemasNotManual {
+                    name: name.clone().into(),
+                    adapter_type: adapter.adapter_type.clone().into(),
+                });
+            }
+            continue;
+        }
+        if adapter.schemas.is_empty() {
+            errors.push(ConfigError::ManualAdapterNoSchemas {
+                name: name.clone().into(),
+            });
+            continue;
+        }
+        let mut seen_schemas = std::collections::HashSet::new();
+        for (index, schema) in adapter.schemas.iter().enumerate() {
+            let mut invalid = |detail: String| {
+                errors.push(ConfigError::ManualAdapterInvalidSchema {
+                    name: name.clone().into(),
+                    detail: detail.into(),
+                });
+            };
+            if let Err(e) = rocky_sql::validation::validate_identifier(&schema.name) {
+                invalid(format!("schemas[{index}].name: {e}"));
+                continue;
+            }
+            if !seen_schemas.insert(schema.name.to_ascii_lowercase()) {
+                invalid(format!("schema '{}' is listed more than once", schema.name));
+                continue;
+            }
+            if schema.tables.is_empty() {
+                invalid(format!(
+                    "schema '{}' lists no tables; list at least one in `tables`",
+                    schema.name
+                ));
+                continue;
+            }
+            let mut seen_tables = std::collections::HashSet::new();
+            for table in &schema.tables {
+                if let Err(e) = rocky_sql::validation::validate_identifier(table) {
+                    invalid(format!("schema '{}' tables: {e}", schema.name));
+                } else if !seen_tables.insert(table.to_ascii_lowercase()) {
+                    invalid(format!(
+                        "schema '{}' lists table '{table}' more than once",
+                        schema.name
+                    ));
+                }
+            }
+        }
+    }
+    errors
 }
 
 /// Validate every `[adapter.<name>.cache]` block's cross-field
@@ -12937,6 +13052,7 @@ table = "customers_history"
             project_id: None,
             location: None,
             path: None,
+            schemas: Vec::new(),
             retry: RetryConfig::default(),
             cache: None,
             ratelimit: None,

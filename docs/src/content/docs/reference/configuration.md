@@ -193,7 +193,42 @@ The connection fields, authentication, and examples for each adapter type live o
 
 ### `type = "manual"`
 
-Define source schemas and tables inline in `rocky.toml` instead of discovering them from an API. Use it for tests and for small sources whose shape does not change.
+A discovery adapter that lists source schemas and tables inline in `rocky.toml` instead of discovering them from an API. Use it when the source has no discovery adapter of its own, such as a Databricks or Snowflake source with no Fivetran in front of it, for tests, and for small sources whose shape does not change.
+
+It is discovery-only, so `kind = "discovery"` is required. List each schema as an `[[adapter.NAME.schemas]]` block:
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `schemas` | array of tables | Yes | The source schemas this adapter returns. At least one. |
+| `schemas[].name` | string | Yes | Schema name, matched against the pipeline's `schema_pattern.prefix` like any discovered schema. |
+| `schemas[].tables` | array of strings | Yes | Tables in the schema. At least one. |
+
+```toml
+[adapter.local_discovery]
+type = "manual"
+kind = "discovery"
+
+[[adapter.local_discovery.schemas]]
+name = "raw__orders"
+tables = ["orders", "order_items"]
+
+[pipeline.poc.source.discovery]
+adapter = "local_discovery"
+```
+
+The adapter discovers exactly what it lists, with no network call. It does not check that the tables exist. `rocky plan` plans every listed table, so a missing table fails at `rocky run`. `rocky discover` is different: when the pipeline sets `source.catalog`, it asks the source warehouse which tables exist and leaves out the missing ones, as it does for every discovery adapter.
+
+A listed schema is used only when the pipeline's `schema_pattern` parses it: the name must start with `prefix` (case-sensitive) and the rest must split into the declared `components`. Other listed schemas are skipped.
+
+`rocky validate` reports each of these as a `V057` error, and every command that loads the config (`plan`, `run`, `discover`) refuses it with the same message:
+
+- a manual adapter with no `schemas`;
+- a schema with no `tables`;
+- a schema or table name that is not a plain identifier (`[a-zA-Z0-9_]+`);
+- a schema listed twice, or a table listed twice in one schema (compared ignoring case);
+- `schemas` on an adapter whose type is not `manual`.
+
+When the `schema_pattern` of a pipeline that uses the adapter parses none of the listed schemas, `rocky validate` warns with `V058`: `plan` and `run` would find no table.
 
 ### `[adapter.NAME.retry]`
 

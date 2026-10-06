@@ -482,7 +482,8 @@ fn transformation_model_selections(
 ///
 /// Codes are a public contract, so the two pre-existing ones keep their exact
 /// meaning — V032 for `[adapter.*]` `kind` invariants, V033 for pipeline
-/// adapter-role mismatches — and everything else the chain rejects lands on
+/// adapter-role mismatches — V057 covers a `manual` adapter's `schemas` list
+/// (#1994), and everything else the chain rejects lands on
 /// V046 rather than the V001 parse code, which already carries both the "Config
 /// syntax valid" ok message and the "Failed to parse config" error.
 fn config_error_diagnostic(
@@ -497,6 +498,11 @@ fn config_error_diagnostic(
         ConfigError::AdapterMissingDiscoveryKind { name, .. }
         | ConfigError::AdapterKindUnsupported { name, .. } => {
             ("V032", Some(format!("adapter.{name}.kind")))
+        }
+        ConfigError::ManualAdapterNoSchemas { name }
+        | ConfigError::ManualAdapterInvalidSchema { name, .. }
+        | ConfigError::AdapterSchemasNotManual { name, .. } => {
+            ("V057", Some(format!("adapter.{name}.schemas")))
         }
         ConfigError::PipelineSourceAdapterNotData { pipeline, .. } => {
             ("V033", Some(format!("pipeline.{pipeline}.source.adapter")))
@@ -655,13 +661,22 @@ fn validate_adapter(
             });
         }
         "manual" => {
-            msgs.push(ValidateMessage {
-                severity: "ok".into(),
-                code: "V010".into(),
-                message: format!("adapter.{name}: manual"),
-                file: None,
-                field: None,
-            });
+            // An empty `schemas` list is a V057 error from the shared chain;
+            // this arm only reports the adapter's status.
+            if adapter.schemas.is_empty() {
+                ok = false;
+            } else {
+                msgs.push(ValidateMessage {
+                    severity: "ok".into(),
+                    code: "V010".into(),
+                    message: format!(
+                        "adapter.{name}: manual ({} schema(s) listed)",
+                        adapter.schemas.len()
+                    ),
+                    file: None,
+                    field: None,
+                });
+            }
         }
         "duckdb" => {
             msgs.push(ValidateMessage {
@@ -1295,6 +1310,43 @@ fn validate_replication_pipeline(
             ),
             file: None,
             field: Some(format!("adapter.{}.path", disc.adapter)),
+        });
+    }
+
+    // V058: a manual discovery adapter discovers only the schemas it lists,
+    // and `plan` / `run` then keep only the ones `schema_pattern` parses:
+    // the prefix must match (case-sensitively) and the rest must split into
+    // the declared components. A schema that fails either is skipped
+    // silently, so when none parses, plan and run find no table (#1994).
+    // Uses the same `SchemaPattern::parse` the executing paths use, so the
+    // warning and the plan cannot disagree. A warning, like V054: the config
+    // is loadable, it just plans nothing. An empty list is already the V057
+    // error, so it is not re-reported.
+    if let Ok(pattern) = &pattern_result
+        && let Some(ref disc) = pipeline.source.discovery
+        && let Some(disc_adapter) = cfg.adapters.get(&disc.adapter)
+        && disc_adapter.adapter_type == "manual"
+        && !disc_adapter.schemas.is_empty()
+        && !disc_adapter
+            .schemas
+            .iter()
+            .any(|schema| pattern.parse(&schema.name).is_ok())
+    {
+        msgs.push(ValidateMessage {
+            severity: "warn".into(),
+            code: "V058".into(),
+            message: format!(
+                "pipeline.{name}: no schema listed on manual discovery adapter '{}' matches the \
+                 schema_pattern (prefix '{}', components {:?}; the prefix match is \
+                 case-sensitive), so plan and run find no table. Rename a schema in \
+                 [[adapter.{}.schemas]] or change the pattern.",
+                disc.adapter,
+                pattern.prefix,
+                pipeline.source.schema_pattern.components,
+                disc.adapter
+            ),
+            file: None,
+            field: Some(format!("adapter.{}.schemas", disc.adapter)),
         });
     }
 
@@ -3371,6 +3423,201 @@ schema_template = "staging__{source}"
         assert!(
             !out.messages.iter().any(|m| m.code == "V049"),
             "known placeholders must not trigger V049: {:?}",
+            out.messages
+        );
+    }
+
+    /// A replication pipeline over DuckDB with a manual discovery adapter;
+    /// `{manual}` is the body of `[adapter.local_discovery]` after its
+    /// `type` / `kind` lines, `{prefix}` the schema-pattern prefix.
+    fn manual_pipeline_toml(manual: &str, prefix: &str) -> String {
+        format!(
+            r#"
+[adapter.warehouse]
+type = "duckdb"
+kind = "data"
+path = "warehouse.duckdb"
+
+[adapter.local_discovery]
+type = "manual"
+kind = "discovery"
+{manual}
+
+[pipeline.poc]
+type = "replication"
+
+[pipeline.poc.source]
+adapter = "warehouse"
+
+[pipeline.poc.source.discovery]
+adapter = "local_discovery"
+
+[pipeline.poc.source.schema_pattern]
+prefix = "{prefix}"
+separator = "__"
+components = ["source"]
+
+[pipeline.poc.target]
+adapter = "warehouse"
+catalog_template = "warehouse"
+schema_template = "staging__{{source}}"
+"#
+        )
+    }
+
+    fn messages_with(out: &ValidateOutput, code: &str, severity: &str) -> Vec<String> {
+        out.messages
+            .iter()
+            .filter(|m| m.code == code && m.severity == severity)
+            .map(|m| m.message.clone())
+            .collect()
+    }
+
+    /// #1994: a manual adapter that lists schemas is valid, with no V057
+    /// and no V058.
+    #[test]
+    fn manual_adapter_with_schemas_is_valid() {
+        let out = validate_toml(&manual_pipeline_toml(
+            r#"
+[[adapter.local_discovery.schemas]]
+name = "raw__orders"
+tables = ["orders"]
+"#,
+            "raw__",
+        ));
+        assert!(out.valid, "{:?}", out.messages);
+        assert!(messages_with(&out, "V057", "error").is_empty());
+        assert!(messages_with(&out, "V058", "warn").is_empty());
+    }
+
+    /// #1994: a manual adapter with no schemas used to report valid while
+    /// `plan` failed. It is now a V057 error on `adapter.<name>.schemas`.
+    #[test]
+    fn manual_adapter_without_schemas_is_v057_error() {
+        let out = validate_toml(&manual_pipeline_toml("", "raw__"));
+        assert!(!out.valid);
+        let v057: Vec<_> = out
+            .messages
+            .iter()
+            .filter(|m| m.code == "V057" && m.severity == "error")
+            .collect();
+        assert_eq!(v057.len(), 1, "{:?}", out.messages);
+        assert_eq!(
+            v057[0].field.as_deref(),
+            Some("adapter.local_discovery.schemas")
+        );
+        assert!(v057[0].message.contains("lists no schemas"));
+        assert!(
+            !out.adapters
+                .iter()
+                .find(|a| a.name == "local_discovery")
+                .unwrap()
+                .ok
+        );
+    }
+
+    /// Each malformed list is its own V057 error.
+    #[test]
+    fn manual_adapter_malformed_schemas_are_v057_errors() {
+        for (body, needle) in [
+            (
+                "[[adapter.local_discovery.schemas]]\nname = \"raw__orders\"\ntables = []\n",
+                "lists no tables",
+            ),
+            (
+                "[[adapter.local_discovery.schemas]]\nname = \"raw__o; DROP\"\ntables = [\"t\"]\n",
+                "invalid SQL identifier",
+            ),
+            (
+                "[[adapter.local_discovery.schemas]]\nname = \"raw__orders\"\ntables = [\"t-1\"]\n",
+                "invalid SQL identifier",
+            ),
+            (
+                "[[adapter.local_discovery.schemas]]\nname = \"raw__orders\"\ntables = [\"t\"]\n\
+                 [[adapter.local_discovery.schemas]]\nname = \"RAW__ORDERS\"\ntables = [\"t\"]\n",
+                "listed more than once",
+            ),
+            (
+                "[[adapter.local_discovery.schemas]]\nname = \"raw__orders\"\ntables = [\"t\", \"T\"]\n",
+                "more than once",
+            ),
+        ] {
+            let out = validate_toml(&manual_pipeline_toml(body, "raw__"));
+            let v057 = messages_with(&out, "V057", "error");
+            assert!(!out.valid, "{body}: {:?}", out.messages);
+            assert_eq!(v057.len(), 1, "{body}: {:?}", out.messages);
+            assert!(v057[0].contains(needle), "{body}: {}", v057[0]);
+        }
+    }
+
+    /// `schemas` on a non-manual adapter would be silently ignored, so it is
+    /// a V057 error too.
+    #[test]
+    fn schemas_on_a_non_manual_adapter_is_v057_error() {
+        let out = validate_toml(
+            r#"
+[adapter.local]
+type = "duckdb"
+path = "warehouse.duckdb"
+
+[[adapter.local.schemas]]
+name = "raw__orders"
+tables = ["orders"]
+"#,
+        );
+        let v057 = messages_with(&out, "V057", "error");
+        assert!(!out.valid);
+        assert_eq!(v057.len(), 1, "{:?}", out.messages);
+        assert!(v057[0].contains("only a type = \"manual\""), "{}", v057[0]);
+    }
+
+    /// No listed schema matches the prefix: plan would find nothing. V058
+    /// warns, naming the adapter's `schemas` field.
+    #[test]
+    fn manual_schemas_that_miss_the_prefix_are_v058_warning() {
+        let out = validate_toml(&manual_pipeline_toml(
+            r#"
+[[adapter.local_discovery.schemas]]
+name = "orders"
+tables = ["orders"]
+"#,
+            "raw__",
+        ));
+        let v058: Vec<_> = out
+            .messages
+            .iter()
+            .filter(|m| m.code == "V058" && m.severity == "warn")
+            .collect();
+        assert_eq!(v058.len(), 1, "{:?}", out.messages);
+        assert_eq!(
+            v058[0].field.as_deref(),
+            Some("adapter.local_discovery.schemas")
+        );
+        assert!(v058[0].message.contains("'raw__'"));
+    }
+
+    /// The review's case: the name starts with the prefix but has fewer
+    /// segments than `components` binds, so `plan` skips it. V058 must agree.
+    #[test]
+    fn manual_schemas_with_too_few_segments_are_v058_warning() {
+        let toml = manual_pipeline_toml(
+            r#"
+[[adapter.local_discovery.schemas]]
+name = "raw__orders"
+tables = ["orders"]
+"#,
+            "raw__",
+        )
+        .replace(
+            r#"components = ["source"]"#,
+            r#"components = ["tenant", "source"]"#,
+        )
+        .replace("staging__{source}", "staging__{tenant}__{source}");
+        let out = validate_toml(&toml);
+        assert_eq!(
+            messages_with(&out, "V058", "warn").len(),
+            1,
+            "{:?}",
             out.messages
         );
     }

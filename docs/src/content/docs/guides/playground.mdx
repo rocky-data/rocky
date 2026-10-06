@@ -33,15 +33,10 @@ my-project/
     └── seed.sql                         # DuckDB seed data
 ```
 
-The default template is `quickstart` (3 models). Two larger templates are available for exploring more features:
+The default template, `quickstart`, is the only template. `rocky playground` loads its seed into `playground.duckdb` when it creates the project, so `rocky run` builds every model on the first try.
 
-```bash
-rocky playground my-project --template ecommerce   # 10 models, sources/staging/intermediate/marts
-rocky playground my-project --template showcase    # ecommerce + Rocky DSL + extra contracts
-```
-
-:::caution
-Today `rocky run` builds nothing in an `ecommerce` or `showcase` project. It prints `Copied 0 tables` and exits 0. Use `quickstart` to follow this guide. [Issue #1983](https://github.com/rocky-data/rocky/issues/1983) tracks the fix.
+:::note
+Earlier releases also offered `--template ecommerce` and `--template showcase`. Their projects built no models on `rocky run`, so they were removed ([issue #1983](https://github.com/rocky-data/rocky/issues/1983)). Those names, and their aliases, now fail with a message that lists the remaining templates.
 :::
 
 Enter the project directory:
