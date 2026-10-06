@@ -41,7 +41,8 @@ pub(crate) fn fixed_unversioned_reason(
 ) -> Option<UnversionedReason> {
     match strategy {
         MaterializationStrategy::View => Some(UnversionedReason::ViewHasNoStoredData),
-        MaterializationStrategy::MaterializedView | MaterializationStrategy::DynamicTable { .. } => {
+        MaterializationStrategy::MaterializedView
+        | MaterializationStrategy::DynamicTable { .. } => {
             Some(UnversionedReason::WarehouseManagedRefresh)
         }
         MaterializationStrategy::Ephemeral => Some(UnversionedReason::NoOutput),
@@ -290,8 +291,8 @@ mod tests {
                 UnversionedReason::NoOutput,
             ),
         ] {
-            let v = observe_output_version(&wh, &strategy, &table(), &["job".into()], Utc::now())
-                .await;
+            let v =
+                observe_output_version(&wh, &strategy, &table(), &["job".into()], Utc::now()).await;
             assert_eq!(v, OutputVersion::Unversioned { reason });
         }
         assert_eq!(wh.calls(), 0);
@@ -301,9 +302,7 @@ mod tests {
 
     #[cfg(feature = "duckdb")]
     mod through_run {
-        use super::super::super::run::{
-            DeferOptions, PartitionRunOptions, SkipRunOptions, run,
-        };
+        use super::super::super::run::{DeferOptions, PartitionRunOptions, SkipRunOptions, run};
         use rocky_core::state::{OutputVersion, StateStore, UnversionedReason};
 
         /// Write a transformation project, run it, and return the recorded
@@ -370,7 +369,8 @@ mod tests {
                 None,
                 &rocky_core::config::PrincipalRef::unnamed(),
             )
-            .await;
+            .await
+            .map(|_| ());
             super::super::super::run::CAPTURED_RUN_OUTPUT_FOR_TEST
                 .lock()
                 .unwrap()
@@ -389,7 +389,10 @@ mod tests {
 
         /// Seed a `v=0` bootstrap for the one-column fixture table the
         /// `test-fail-write` adapter answers (`content_addressed_failure_probe`).
-        async fn seed_content_addressed_table(store: &object_store::memory::InMemory, prefix: &str) {
+        async fn seed_content_addressed_table(
+            store: &object_store::memory::InMemory,
+            prefix: &str,
+        ) {
             use object_store::{ObjectStoreExt as _, PutPayload, path::Path as ObjPath};
             let protocol = serde_json::json!({"protocol": {
                 "minReaderVersion": 2,
@@ -555,9 +558,7 @@ mod tests {
                     .unwrap();
             })
             .await;
-            super::super::super::run_content_addressed::remove_test_object_store(
-                &storage_prefix,
-            );
+            super::super::super::run_content_addressed::remove_test_object_store(&storage_prefix);
             result.expect("the content-addressed run must succeed");
 
             let state = StateStore::open(&tmp.path().join("state.redb")).unwrap();

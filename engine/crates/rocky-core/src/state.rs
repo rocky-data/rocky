@@ -11335,7 +11335,8 @@ mod tests {
                 if *blake3 == partitioned_output_blake3(&["ab".to_string()])
         ));
         // Defensive: an "unpartitioned" list of two files never reports one.
-        let two = OutputVersion::content_addressed("t".into(), 2, vec!["b".into(), "a".into()], false);
+        let two =
+            OutputVersion::content_addressed("t".into(), 2, vec!["b".into(), "a".into()], false);
         assert!(matches!(
             &two,
             OutputVersion::ContentAddressed { blake3, .. }

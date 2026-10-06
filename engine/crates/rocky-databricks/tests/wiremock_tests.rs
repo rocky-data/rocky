@@ -2569,7 +2569,8 @@ async fn test_observed_table_version_reads_describe_history() {
         .mount(&server)
         .await;
 
-    let adapter = rocky_databricks::adapter::DatabricksWarehouseAdapter::new(test_connector(&server));
+    let adapter =
+        rocky_databricks::adapter::DatabricksWarehouseAdapter::new(test_connector(&server));
     let table = rocky_ir::TableRef {
         catalog: "main".into(),
         schema: "marts".into(),
@@ -2606,7 +2607,8 @@ async fn test_observed_table_version_failure_is_an_error() {
         .mount(&server)
         .await;
 
-    let adapter = rocky_databricks::adapter::DatabricksWarehouseAdapter::new(test_connector(&server));
+    let adapter =
+        rocky_databricks::adapter::DatabricksWarehouseAdapter::new(test_connector(&server));
     let table = rocky_ir::TableRef {
         catalog: "main".into(),
         schema: "marts".into(),

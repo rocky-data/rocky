@@ -2684,6 +2684,24 @@ mod tests {
             assert_eq!(row.commit_version, file.commit_version);
             assert_eq!(row.size_bytes, file.size_bytes);
         }
+
+        // RV1-P1b: the recorded version names the last commit and folds
+        // every group's hash, never only the last group's.
+        let mut hashes: Vec<String> = summary
+            .written_files
+            .iter()
+            .map(|f| f.blake3_hash.clone())
+            .collect();
+        hashes.sort();
+        assert_eq!(
+            crate::commands::run_output_version::content_addressed_output_version(&model, &summary),
+            rocky_core::state::OutputVersion::ContentAddressed {
+                table: "c.s.t".into(),
+                delta_version: 3,
+                blake3: rocky_core::state::partitioned_output_blake3(&hashes),
+                files: hashes,
+            }
+        );
     }
 
     /// An unpartitioned build still yields exactly one written file, equal to
