@@ -486,16 +486,23 @@ fn plan_runtime_dag(
         .map(super::seed::default_seed_catalog);
 
     // Built in ONE place and in one order (see `build_runtime_dag`): declared
-    // edges, then physical-read edges (exact, catalog fallback, bare guess),
-    // then by-name label edges — a model that reads a seed or load is ordered
-    // after it without an explicit `depends_on`, and a guess never displaces an
-    // exact edge.
-    let runtime = unified_dag::build_runtime_dag(
+    // and compiler edges, then physical-read edges (exact, catalog fallback,
+    // bare guess), then by-name label edges to seeds and loads — a model that
+    // reads a seed or load is ordered after it without an explicit
+    // `depends_on`, and a guess never displaces an exact edge.
+    // Model-to-model edges come from the compiler's binding of each read, the
+    // one a plain `rocky run` and `rocky test` act on, not from a second
+    // matcher over node labels (#1629).
+    let all_models: Vec<rocky_core::models::Model> =
+        models_by_pipeline.values().flatten().cloned().collect();
+    let model_edges = rocky_compiler::resolve::derived_model_edges(&all_models);
+    let runtime = unified_dag::build_runtime_dag_with_model_edges(
         cfg,
         &models_by_pipeline,
         &seeds,
         seed_default_catalog.as_deref(),
         &default_catalog_of,
+        &model_edges,
     )
     .context("failed to build unified DAG")?;
     Ok(PlannedDag {
@@ -3268,6 +3275,77 @@ mod tests {
             .iter()
             .position(|phase| phase.iter().any(|n| n.id.0 == id))
             .unwrap_or_else(|| panic!("no node {id}"))
+    }
+
+    /// #1629's repro through the production planner. `customers` writes
+    /// `customers_v2` and reads `db.silver.rollup` — `rollup`'s exact target;
+    /// `rollup` bare-reads `customers`, a model NAME it does not reach. The
+    /// graph takes model edges from the compiler, which binds that read to no
+    /// model, so `rollup` runs first and no label guess is made or dropped.
+    #[test]
+    fn run_dag_orders_the_1629_repro_by_the_compilers_edges() {
+        let dir = tempfile::tempdir().unwrap();
+        write_fixture_project(
+            dir.path(),
+            &transformation_block("t"),
+            &[
+                (
+                    "customers",
+                    "db",
+                    "prod",
+                    "customers_v2",
+                    "SELECT y FROM db.silver.rollup",
+                ),
+                (
+                    "rollup",
+                    "db",
+                    "silver",
+                    "rollup",
+                    "SELECT 1 AS y FROM customers",
+                ),
+            ],
+        );
+        let planned = plan_fixture(dir.path()).expect("the repro plans");
+        assert!(planned_edge(
+            &planned,
+            "transformation:rollup",
+            "transformation:customers"
+        ));
+        assert!(!planned_edge(
+            &planned,
+            "transformation:customers",
+            "transformation:rollup"
+        ));
+        assert!(
+            planned.runtime.labels.skipped_cycle_edges.is_empty(),
+            "{:?}",
+            planned.runtime.labels
+        );
+        assert!(
+            planned_phase(&planned, "transformation:rollup")
+                < planned_phase(&planned, "transformation:customers")
+        );
+    }
+
+    /// A bare read binds to the model that WRITES the table, whatever it is
+    /// called — the compiler's rule, so `--dag` orders it too (#1629).
+    #[test]
+    fn run_dag_orders_a_bare_read_after_the_model_that_writes_it() {
+        let dir = tempfile::tempdir().unwrap();
+        write_fixture_project(
+            dir.path(),
+            &transformation_block("t"),
+            &[
+                ("stg_events", "db", "z", "events", "SELECT 1 AS id"),
+                ("summary", "db", "marts", "summary", "SELECT id FROM events"),
+            ],
+        );
+        let planned = plan_fixture(dir.path()).expect("plans");
+        assert!(planned_edge(
+            &planned,
+            "transformation:stg_events",
+            "transformation:summary"
+        ));
     }
 
     /// The catalog `run --dag` establishes for a DuckDB adapter must be the

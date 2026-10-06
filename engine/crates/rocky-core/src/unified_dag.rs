@@ -980,13 +980,18 @@ pub struct RuntimeDag {
 /// guess therefore never displaces an exact edge, and that does not depend on
 /// the order names sort in.
 ///
-/// 1. **Declared** — `depends_on` and pipeline chaining ([`build_unified_dag`]).
+/// 1. **Declared** — `depends_on` and pipeline chaining ([`build_unified_dag`]),
+///    then the **compiler's** model edges (`model_edges`): which model a bare
+///    read reaches, decided by `rocky_compiler::resolve` — the same answer a
+///    plain `rocky run` and `rocky test` act on (#1629).
 /// 2. **Physical reads** — a model reads another model's `[target]` by name:
 ///    exact three-part and two-part reads, then the catalog fallback, then
 ///    bare-name guesses ([`crate::physical_edges::derive_physical_edges`]).
-/// 3. **Label reads** — a model reads a name that is a model's, seed's or
-///    load's label. This is the weakest evidence: it matches the last segment
-///    of the read and ignores its schema and catalog. A label edge that would
+/// 3. **Label reads** — a model reads a name that is a seed's or load's
+///    label. This is the weakest evidence: it matches the last segment of the
+///    read and ignores its schema and catalog. A label that names a model adds
+///    no edge here: model-to-model edges are the compiler's (pass 1), and a
+///    second matcher would disagree with it (#1629). A label edge that would
 ///    close a cycle through a physical edge is skipped and reported. A cycle
 ///    made only of declared and label edges is not skipped — it is a genuine
 ///    cycle, and it keeps its loud refusal.
@@ -1015,7 +1020,38 @@ pub fn build_runtime_dag(
     seed_default_catalog: Option<&str>,
     default_catalog_of: &dyn Fn(&AdapterConfig) -> Option<String>,
 ) -> Result<RuntimeDag, UnifiedDagError> {
+    build_runtime_dag_with_model_edges(
+        config,
+        models_by_pipeline,
+        seeds,
+        seed_default_catalog,
+        default_catalog_of,
+        &[],
+    )
+}
+
+/// [`build_runtime_dag`], with the compiler's model edges.
+///
+/// `model_edges` are `(consumer, producer)` model names, as
+/// `rocky_compiler::resolve::derived_model_edges` returns them over every
+/// pipeline's models. An edge naming a model that is not a node of the graph
+/// is ignored. This crate cannot call the compiler, so the caller passes them;
+/// [`build_runtime_dag`] passes none, and then no edge between two models
+/// comes from their SQL except a physical read of a target.
+///
+/// # Errors
+///
+/// Everything [`build_runtime_dag`] refuses.
+pub fn build_runtime_dag_with_model_edges(
+    config: &RockyConfig,
+    models_by_pipeline: &ModelsByPipeline,
+    seeds: &[SeedFile],
+    seed_default_catalog: Option<&str>,
+    default_catalog_of: &dyn Fn(&AdapterConfig) -> Option<String>,
+    model_edges: &[(String, String)],
+) -> Result<RuntimeDag, UnifiedDagError> {
     let mut dag = build_unified_dag(config, models_by_pipeline, seeds)?;
+    add_model_edges(&mut dag, model_edges);
 
     // The catalog a catalogless `[target]` resolves in is a property of the
     // adapter the target writes through, so it is asked per adapter name.
@@ -1098,6 +1134,39 @@ pub fn build_runtime_dag(
         physical,
         labels,
     })
+}
+
+/// Add the compiler's `(consumer, producer)` model edges to `dag` (#1629).
+/// Both ends must be transformation nodes of the graph; an edge already
+/// present is not added twice.
+fn add_model_edges(dag: &mut UnifiedDag, model_edges: &[(String, String)]) {
+    let models: HashSet<&NodeId> = dag
+        .nodes
+        .iter()
+        .filter(|n| n.kind == NodeKind::Transformation)
+        .map(|n| &n.id)
+        .collect();
+    let mut existing: HashSet<(NodeId, NodeId)> = dag
+        .edges
+        .iter()
+        .map(|e| (e.from.clone(), e.to.clone()))
+        .collect();
+    let mut added = Vec::new();
+    for (consumer, producer) in model_edges {
+        let from = NodeId::new("transformation", producer);
+        let to = NodeId::new("transformation", consumer);
+        if from == to || !models.contains(&from) || !models.contains(&to) {
+            continue;
+        }
+        if existing.insert((from.clone(), to.clone())) {
+            added.push(UnifiedEdge {
+                from,
+                to,
+                edge_type: EdgeType::DataDependency,
+            });
+        }
+    }
+    dag.edges.extend(added);
 }
 
 /// Where a producing node writes, as far as that is declared or established.
@@ -1288,6 +1357,10 @@ fn producer_targets(
 /// be — or refused. Build order never decides: which node was built last says
 /// nothing about which one a read means (#1629).
 ///
+/// A read that resolves to a MODEL adds no edge here: the compiler binds reads
+/// of models, and its edges joined the graph in pass 1. Models still claim
+/// their labels, so a read that could be a model or a seed is still refused.
+///
 /// `physical` are the `(producer, consumer)` node pairs the physical pass
 /// settled. `targets` holds each producer's declared target. Inferred edges
 /// are de-duplicated against existing ones, so calling this repeatedly is
@@ -1355,8 +1428,8 @@ fn infer_label_dependencies(
             let Some(claimants) = producers.get(label) else {
                 continue;
             };
-            let producer_id = match claimants.as_slice() {
-                [(only, _)] => only,
+            let (producer_id, producer_kind_found) = match claimants.as_slice() {
+                [(only, kind)] => (only, *kind),
                 // Several nodes claim the label: the read must name exactly
                 // one of them by its physical target, and no other claimant
                 // may be able to be the same table. A claimant whose target is
@@ -1398,9 +1471,19 @@ fn infer_label_dependencies(
                             producers: described,
                         });
                     };
-                    *named
+                    let kind = claimants
+                        .iter()
+                        .find(|(id, _)| id == *named)
+                        .map_or(NodeKind::Transformation, |(_, kind)| *kind);
+                    (*named, kind)
                 }
             };
+            // A read of a model is the compiler's to bind (pass 1). Matching
+            // it here by label would be a second matcher that ignores the
+            // model's target, which is #1629.
+            if producer_kind_found == NodeKind::Transformation {
+                continue;
+            }
             // A model never depends on itself.
             if *producer_id != node.id {
                 candidates.insert((node.id.0.clone(), producer_id.0.clone()));
@@ -3330,8 +3413,12 @@ mod tests {
         }
     }
 
+    /// #1629: a read that matches a MODEL's label adds no label edge. Which
+    /// model a read reaches is the compiler's answer, passed in as
+    /// `model_edges`; matching labels here was a second matcher that ignored
+    /// the model's target.
     #[test]
-    fn test_infer_adds_edge_from_sql_ref() {
+    fn a_label_read_of_a_model_adds_no_label_edge() {
         let mut dag = dag_with_models(&[
             ("orders", NodeKind::Transformation),
             ("stg_orders", NodeKind::Transformation),
@@ -3342,7 +3429,27 @@ mod tests {
 
         infer_labels(&mut dag, &sql);
 
-        assert_eq!(dag.edges.len(), 1);
+        assert!(dag.edges.is_empty(), "{:?}", dag.edges);
+    }
+
+    /// The compiler's edges join the graph as given, between model nodes only.
+    #[test]
+    fn compiler_model_edges_join_the_graph() {
+        let mut dag = dag_with_models(&[
+            ("orders", NodeKind::Transformation),
+            ("stg_orders", NodeKind::Transformation),
+            ("countries", NodeKind::Seed),
+        ]);
+        add_model_edges(
+            &mut dag,
+            &[
+                ("stg_orders".to_string(), "orders".to_string()),
+                ("stg_orders".to_string(), "orders".to_string()),
+                ("stg_orders".to_string(), "countries".to_string()),
+                ("stg_orders".to_string(), "missing".to_string()),
+            ],
+        );
+        assert_eq!(dag.edges.len(), 1, "{:?}", dag.edges);
         assert_eq!(dag.edges[0].from, NodeId::new("transformation", "orders"));
         assert_eq!(dag.edges[0].to, NodeId::new("transformation", "stg_orders"));
         assert_eq!(dag.edges[0].edge_type, EdgeType::DataDependency);
@@ -3989,12 +4096,11 @@ mod tests {
     /// The repro shape from #1629's body. `customers` reads
     /// `warehouse.silver.rollup` — exactly `rollup`'s target — and `rollup`
     /// bare-reads `customers`, a name that matches only by label (the model
-    /// writes `customers_v2`). The label match is the weakest evidence in the
-    /// graph: it must not displace the exact read, so `rollup` runs first.
-    /// Before, the label edge was laid down first, the exact edge was skipped
-    /// as its cycle-closer, and `run --dag` refused the project.
+    /// writes `customers_v2`). The compiler binds that read to no model, so it
+    /// passes no edge for it, and no label pass guesses one: `rollup` runs
+    /// first on the exact read alone, with nothing skipped or reported.
     #[test]
-    fn an_exact_physical_read_outranks_a_contradicting_label_read() {
+    fn the_1629_repro_orders_by_the_exact_read_and_guesses_nothing() {
         let config = config_with_pipelines(vec![("t", transform_pipeline(vec![]))]);
         let by_pipeline = owned_by_sole_transformation(
             &config,
@@ -4011,8 +4117,17 @@ mod tests {
                 ),
             ],
         );
-        let runtime = build_runtime_dag(&config, &by_pipeline, &[], None, &no_catalog)
-            .expect("the exact edge stands and the guess is dropped, not refused");
+        // The compiler binds `rollup`'s bare `customers` to no model.
+        let model_edges: Vec<(String, String)> = Vec::new();
+        let runtime = build_runtime_dag_with_model_edges(
+            &config,
+            &by_pipeline,
+            &[],
+            None,
+            &no_catalog,
+            &model_edges,
+        )
+        .expect("the exact edge stands");
         assert!(has_edge(
             &runtime.dag,
             "transformation:rollup",
@@ -4027,17 +4142,10 @@ mod tests {
             phase_index(&runtime.dag, "transformation:rollup")
                 < phase_index(&runtime.dag, "transformation:customers")
         );
-        assert_eq!(
-            runtime.labels.skipped_cycle_edges,
-            vec![("rollup".to_string(), "customers".to_string())]
-        );
         assert!(
-            runtime
-                .warnings
-                .iter()
-                .any(|w| w.contains("label-based ordering") && w.contains("'customers'")),
-            "the dropped guess is reported: {:?}",
-            runtime.warnings
+            runtime.labels.skipped_cycle_edges.is_empty(),
+            "no guess was made, so none is dropped: {:?}",
+            runtime.labels
         );
     }
 
@@ -4052,8 +4160,17 @@ mod tests {
         let mut b = model("b", vec![], vec![]);
         b.sql = "SELECT y FROM a".into();
         let by_pipeline = owned_by_sole_transformation(&config, vec![a, b]);
-        let runtime = build_runtime_dag(&config, &by_pipeline, &[], None, &no_catalog)
-            .expect("the DAG builds; the cycle is the executor's to refuse");
+        // The compiler binds `b`'s read of `a` (target `a`).
+        let model_edges = [("b".to_string(), "a".to_string())];
+        let runtime = build_runtime_dag_with_model_edges(
+            &config,
+            &by_pipeline,
+            &[],
+            None,
+            &no_catalog,
+            &model_edges,
+        )
+        .expect("the DAG builds; the cycle is the executor's to refuse");
         assert!(
             execution_phases(&runtime.dag).is_err(),
             "a genuine cycle keeps its loud refusal"
@@ -4746,9 +4863,9 @@ mod tests {
         assert!(!report.warnings().is_empty());
     }
 
-    /// Status quo pinned: genuinely reciprocal label reads REFUSE loudly
-    /// (as the single-slot heuristic always did) — the guard must not
-    /// downgrade a real SQL cycle into a silent stale-read success.
+    /// Status quo pinned: genuinely reciprocal reads REFUSE loudly — the
+    /// guard must not downgrade a real SQL cycle into a silent stale-read
+    /// success. The compiler's edges carry the cycle now (#1629).
     #[test]
     fn mutual_label_reads_still_refuse_loudly() {
         let config = config_with_pipelines(vec![("t", transform_pipeline(vec![]))]);
@@ -4758,8 +4875,19 @@ mod tests {
         b.sql = "SELECT y FROM a".into();
         let models = vec![a.clone(), b.clone()];
         let by_pipeline = owned_by_sole_transformation(&config, models);
-        let runtime = build_runtime_dag(&config, &by_pipeline, &[], None, &no_catalog)
-            .expect("the DAG builds; the cycle is the executor's to refuse");
+        let model_edges = [
+            ("a".to_string(), "b".to_string()),
+            ("b".to_string(), "a".to_string()),
+        ];
+        let runtime = build_runtime_dag_with_model_edges(
+            &config,
+            &by_pipeline,
+            &[],
+            None,
+            &no_catalog,
+            &model_edges,
+        )
+        .expect("the DAG builds; the cycle is the executor's to refuse");
         assert!(
             runtime.labels.label_collisions.is_empty()
                 && runtime.labels.unparsed.is_empty()
