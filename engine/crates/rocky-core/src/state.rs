@@ -2784,12 +2784,12 @@ where
 pub enum OutputVersion {
     /// Rocky wrote this output itself through the content-addressed writer.
     ///
-    /// `delta_versions` holds every Delta commit version this execution made,
-    /// sorted and without repeats. An unpartitioned write makes one commit, so
-    /// it holds one entry; on a point-to reuse that entry is the pointer
-    /// commit. A partitioned write makes one commit per partition group today,
-    /// so it holds one entry per group. RV1-P1a will make it one commit per
-    /// run.
+    /// `delta_versions` holds the Delta version whose snapshot is exactly this
+    /// output, sorted and without repeats. Since RV1-P1a every execution makes
+    /// one replace commit (partitioned or not, build or point-to reuse), so it
+    /// holds one entry: that commit, or the current table version when the
+    /// output was already live and no commit was written. Records written
+    /// before RV1-P1a can hold one entry per partition group.
     ///
     /// `files` holds the blake3 (hex) of every parquet file the execution
     /// committed, sorted. `blake3` is the identity of the whole output: the

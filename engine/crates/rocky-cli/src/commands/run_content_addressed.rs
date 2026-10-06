@@ -7,12 +7,17 @@
 //!    `discover()` reports for the table.
 //! 3. Execute the model SQL via the warehouse adapter to obtain rows.
 //! 4. Convert rows + typed columns into an Arrow `RecordBatch`.
-//! 5. For unpartitioned targets: one `UniformWriter::write_batch` commit.
-//!    For partitioned targets: group rows by partition tuple and emit one
-//!    `write_partitioned_batch` commit per group.
+//! 5. Replace the table in **one** commit (RV1-D8, #2269). The commit
+//!    removes every live file that is not in the new output and adds every
+//!    new file that is not live yet. Unpartitioned targets write one file
+//!    (`UniformWriter::write_batch_with_state`). Partitioned targets group
+//!    rows by partition tuple and write one file per group, all in the same
+//!    commit (`UniformWriter::write_partitioned_batches_with_state`). An
+//!    unchanged output writes no commit. A Delta checkpoint makes the write
+//!    refuse.
 //! 6. Trigger `MSCK REPAIR TABLE ... SYNC METADATA` directly via the
 //!    warehouse adapter so DuckDB iceberg_scan + Iceberg-aware Trino can
-//!    see the new commit(s).
+//!    see the new commit.
 //!
 //! Supported `typed_columns` types:
 //! - `Boolean`, `Int32`, `Int64`, `Float32`, `Float64`, `Decimal{precision, scale}`
@@ -734,9 +739,9 @@ async fn evaluate_reuse_decision(
 /// Materialize a single model whose strategy is
 /// [`MaterializationStrategy::ContentAddressed`].
 ///
-/// Handles both unpartitioned (single `write_batch` commit) and
-/// partitioned (one `write_partitioned_batch` commit per partition tuple)
-/// targets.
+/// Handles both unpartitioned (one file) and partitioned (one file per
+/// partition tuple) targets. Either way the run makes **one** replace
+/// commit, or none when the output is already live.
 ///
 /// # Reuse decision
 ///
@@ -776,7 +781,7 @@ pub async fn execute_content_addressed_model(
     let sql_client: Arc<dyn SqlClient> = Arc::new(NoOpSqlClient);
     // Strip the bucket from the storage_prefix to derive the key prefix
     // the writer uses for `_delta_log/` etc.
-    let (_bucket, key_prefix) = parse_s3_url(storage_prefix)?;
+    let (bucket, key_prefix) = parse_s3_url(storage_prefix)?;
     let writer = UniformWriter::new(
         UniformWriterConfig {
             catalog: model_ir.target.catalog.clone(),
@@ -787,10 +792,12 @@ pub async fn execute_content_addressed_model(
         },
         store,
         sql_client,
-    );
+    )
+    // The bucket lets the replace resolve absolute `s3://` paths in the log.
+    .with_table_bucket(bucket);
 
     // 3. Discover state + assert partition_columns match.
-    let mut state = writer
+    let state = writer
         .discover()
         .await
         .with_context(|| format!("discover() failed for {:?}", model_ir.target))?;
@@ -872,45 +879,21 @@ pub async fn execute_content_addressed_model(
     let batch = query_result_to_record_batch(&model_ir.typed_columns, &result)?;
     let total_rows = batch.num_rows();
 
-    // 6. Write — split path on partitioned vs unpartitioned.
+    // 6. Write — one replace commit for the whole output.
     //
     // `output_column_hashes` is captured only on the unpartitioned path: a
     // partitioned model writes one file per partition group, and folding the
     // per-file column hashes into a single per-column table hash is a deferred
     // correctness surface. Partitioned models therefore record no per-column
-    // hashes (empty ⇒ a safe rebuild in the later skip gate), scoping this
-    // capture to unpartitioned tables first.
-    let (
-        last_blake3,
-        last_commit_version,
-        last_file_path,
-        total_size_bytes,
-        output_column_hashes,
-        written_files,
-    ) = if partition_columns.is_empty() {
+    // hashes (empty ⇒ a safe rebuild in the later skip gate).
+    let (table_version, files, output_column_hashes) = if partition_columns.is_empty() {
         let write_result = writer
             .write_batch_with_state(batch, state)
             .await
             .map_err(|e| anyhow!("write_batch failed: {e}"))?;
-        let written_files = vec![WrittenFile {
-            blake3_hash: write_result.blake3_hash.clone(),
-            file_path: write_result.file_path.clone(),
-            commit_version: write_result.commit_version,
-            size_bytes: write_result.size_bytes,
-        }];
-        (
-            write_result.blake3_hash,
-            write_result.commit_version,
-            write_result.file_path,
-            write_result.size_bytes,
-            write_result.column_hashes,
-            written_files,
-        )
+        let hashes = write_result.column_hashes.clone();
+        (write_result.table_version, vec![write_result], hashes)
     } else {
-        // Partitioned: group rows by partition tuple and emit one
-        // commit per group. Bump `state.next_commit_version` manually
-        // between groups so the cond-put loop in the writer doesn't
-        // burn a retry per group on the already-claimed version.
         let groups =
             group_batch_by_partition_tuple(&batch, partition_columns, &model_ir.typed_columns)?;
         if groups.is_empty() {
@@ -920,50 +903,38 @@ pub async fn execute_content_addressed_model(
                      than silent no-op)"
             ));
         }
-        let mut last_blake3 = String::new();
-        let mut last_commit_version = 0_u64;
-        let mut last_file_path = String::new();
-        let mut total_size_bytes = 0_u64;
-        // Every group's file, so the ledger records one row per group
-        // rather than only the last group's hash.
-        let mut written_files = Vec::with_capacity(groups.len());
-        for (pv_map, sub_batch) in groups {
-            let write_result = writer
-                .write_partitioned_batch_with_state(sub_batch, pv_map, state.clone())
-                .await
-                .map_err(|e| anyhow!("write_partitioned_batch failed: {e}"))?;
-            state.next_commit_version = write_result.commit_version + 1;
-            written_files.push(WrittenFile {
-                blake3_hash: write_result.blake3_hash.clone(),
-                file_path: write_result.file_path.clone(),
-                commit_version: write_result.commit_version,
-                size_bytes: write_result.size_bytes,
-            });
-            last_blake3 = write_result.blake3_hash;
-            last_commit_version = write_result.commit_version;
-            last_file_path = write_result.file_path;
-            total_size_bytes = total_size_bytes.saturating_add(write_result.size_bytes);
-        }
-        (
-            last_blake3,
-            last_commit_version,
-            last_file_path,
-            total_size_bytes,
-            // Partitioned outputs: no per-column table hash (deferred fold).
-            Vec::new(),
-            written_files,
-        )
+        let outcome = writer
+            .write_partitioned_batches_with_state(groups, state)
+            .await
+            .map_err(|e| anyhow!("write_partitioned_batches failed: {e}"))?;
+        // Partitioned outputs: no per-column table hash (deferred fold).
+        (outcome.table_version, outcome.files, Vec::new())
     };
+    // Every file of the output, so the ledger records one row per group.
+    let written_files: Vec<WrittenFile> = files
+        .iter()
+        .map(|f| WrittenFile {
+            blake3_hash: f.blake3_hash.clone(),
+            file_path: f.file_path.clone(),
+            commit_version: f.commit_version,
+            size_bytes: f.size_bytes,
+        })
+        .collect();
+    let total_size_bytes = files
+        .iter()
+        .fold(0_u64, |acc, f| acc.saturating_add(f.size_bytes));
+    let (last_blake3, last_file_path) = files
+        .last()
+        .map(|f| (f.blake3_hash.clone(), f.file_path.clone()))
+        .unwrap_or_default();
 
-    // 7. Sync iceberg metadata so cross-engine readers see the new
-    // commit(s). One MSCK call covers all the commits the partitioned loop
-    // just emitted.
+    // 7. Sync iceberg metadata so cross-engine readers see the new commit.
     sync_iceberg_metadata(warehouse, model_ir).await?;
 
     Ok(ContentAddressedRunSummary {
         num_rows: total_rows,
         blake3_hash: last_blake3,
-        commit_version: last_commit_version,
+        commit_version: table_version,
         file_path: last_file_path,
         size_bytes: total_size_bytes,
         output_column_hashes,
@@ -1103,8 +1074,9 @@ async fn sync_iceberg_metadata(
 ///    that window: a flip to not-live is an `Err`, which the caller treats as a
 ///    BUILD.
 /// 4. **Commit the pointer** via [`UniformWriter::commit_pointer_with_state`].
-///    Its append-only double-count guard makes a same-target re-commit a no-op
-///    (returns the existing commit version, emits no new commit).
+///    It is a replace commit: when R's file is already the only live file,
+///    it writes no commit and returns the version of R's live `add`.
+///    Otherwise one commit removes the other live files and adds R's file.
 ///
 /// A residual blake3 cross-check after the commit is kept only as a redundant
 /// tripwire on an internal writer regression; the writer copies the candidate
@@ -1187,8 +1159,8 @@ async fn attempt_point_to_reuse(
         ));
     }
 
-    // 4. Commit the zero-copy pointer. The double-count guard makes a
-    // same-target re-commit a no-op.
+    // 4. Commit the zero-copy pointer as a replace. When R's file is already
+    // the only live file, the writer writes no commit.
     let write_result = writer
         .commit_pointer_with_state(&pointer, state.clone())
         .await
@@ -1232,7 +1204,7 @@ async fn attempt_point_to_reuse(
             size_bytes: write_result.size_bytes,
         }],
         blake3_hash: write_result.blake3_hash,
-        commit_version: write_result.commit_version,
+        commit_version: write_result.table_version,
         file_path: write_result.file_path,
         size_bytes: write_result.size_bytes,
         // Point-to reuse references R's already-written bytes; no Arrow batch
@@ -1274,9 +1246,9 @@ fn num_records_from_recovered_add(
 /// `sub_batch` contains only the rows whose partition values match
 /// `partition_values_map`. The map is keyed by logical partition column
 /// name with stringified values, the shape
-/// [`UniformWriter::write_partitioned_batch`] expects.
+/// [`UniformWriter::write_partitioned_batches`] expects.
 ///
-/// Partition columns stay in the sub-batch — `write_partitioned_batch`'s
+/// Partition columns stay in the sub-batch — the writer's
 /// internal `build_parquet` drops them before writing the Parquet file.
 fn group_batch_by_partition_tuple(
     batch: &RecordBatch,
@@ -1425,6 +1397,9 @@ pub struct ReuseProvenance {
 pub struct ContentAddressedRunSummary {
     pub num_rows: usize,
     pub blake3_hash: String,
+    /// The Delta table version whose snapshot is exactly this run's output:
+    /// the run's one replace commit, or the current head when the output was
+    /// already live and no commit was written.
     pub commit_version: u64,
     pub file_path: String,
     pub size_bytes: u64,
@@ -1446,8 +1421,8 @@ pub struct ContentAddressedRunSummary {
     /// point-to reuse), in commit order. One entry for an unpartitioned build
     /// or a reuse; one entry **per partition group** for a partitioned build.
     ///
-    /// The scalar `blake3_hash` / `file_path` / `commit_version` above carry
-    /// only the **last** file. The artifact ledger must record every file, or
+    /// The scalar `blake3_hash` / `file_path` above carry only the **last**
+    /// file. The artifact ledger must record every file, or
     /// the refcount sweep undercounts every group but the last. Use
     /// [`artifact_records`] to build the ledger rows.
     pub written_files: Vec<WrittenFile>,
@@ -1458,6 +1433,9 @@ pub struct ContentAddressedRunSummary {
 pub struct WrittenFile {
     pub blake3_hash: String,
     pub file_path: String,
+    /// The commit that carries this file's live `add`. It is the run's
+    /// replace commit for a new file, or an earlier commit for a file whose
+    /// content did not change (that file is neither removed nor re-added).
     pub commit_version: u64,
     pub size_bytes: u64,
 }
@@ -2625,7 +2603,7 @@ mod tests {
             .await
             .expect("partitioned build must succeed");
 
-        // One file per group, in commit order, each with its own commit.
+        // One file per group, all in ONE replace commit (RV1-P1a).
         assert_eq!(
             summary.written_files.len(),
             3,
@@ -2637,7 +2615,17 @@ mod tests {
             .iter()
             .map(|f| f.commit_version)
             .collect();
-        assert_eq!(versions, vec![1, 2, 3]);
+        assert_eq!(versions, vec![1, 1, 1]);
+        assert_eq!(summary.commit_version, 1);
+        assert!(
+            store
+                .head(&ObjPath::from(format!(
+                    "{prefix}/_delta_log/00000000000000000002.json"
+                )))
+                .await
+                .is_err(),
+            "a partitioned build is one commit, not one per group"
+        );
         let distinct: std::collections::HashSet<&str> = summary
             .written_files
             .iter()
@@ -2685,8 +2673,8 @@ mod tests {
             assert_eq!(row.size_bytes, file.size_bytes);
         }
 
-        // RV1-P1b: the recorded version names every group's commit and
-        // folds every group's hash, never only the last group's.
+        // RV1-P1b: the recorded version folds every group's hash, never only
+        // the last group's. RV1-P1a: it names the run's one commit.
         let mut hashes: Vec<String> = summary
             .written_files
             .iter()
@@ -2697,7 +2685,7 @@ mod tests {
             crate::commands::run_output_version::content_addressed_output_version(&model, &summary),
             rocky_core::state::OutputVersion::ContentAddressed {
                 table: "c.s.t".into(),
-                delta_versions: vec![1, 2, 3],
+                delta_versions: vec![1],
                 blake3: rocky_core::state::partitioned_output_blake3(&hashes),
                 files: hashes,
             }
@@ -2745,6 +2733,327 @@ mod tests {
         assert_eq!(rows[0].blake3_hash, summary.blake3_hash);
         assert_eq!(rows[0].file_path, summary.file_path);
     }
+
+    // --- Replace semantics (RV1-P1a, #2269) --------------------------------
+
+    /// Independent replay of a table's `_delta_log`: live = adds − removes,
+    /// commit by commit. It does not use the writer's reader. It asserts that
+    /// no commit adds and removes the same path. Returns `(head, live)`.
+    async fn replay_live(
+        store: &InMemory,
+        prefix: &str,
+    ) -> (u64, std::collections::BTreeSet<String>) {
+        use futures::TryStreamExt;
+        let mut commits: Vec<(u64, ObjPath)> = Vec::new();
+        let mut stream = store.list(Some(&ObjPath::from(format!("{prefix}/_delta_log"))));
+        while let Some(meta) = stream.try_next().await.unwrap() {
+            let name = meta.location.filename().unwrap().to_string();
+            if let Some(stem) = name.strip_suffix(".json")
+                && stem.len() == 20
+            {
+                commits.push((stem.parse().unwrap(), meta.location));
+            }
+        }
+        commits.sort_by_key(|(v, _)| *v);
+        let head = commits.last().map(|(v, _)| *v).unwrap();
+        let mut live = std::collections::BTreeSet::new();
+        for (v, path) in commits {
+            let body = store.get(&path).await.unwrap().bytes().await.unwrap();
+            let (mut adds, mut removes) = (Vec::new(), Vec::new());
+            for line in std::str::from_utf8(&body).unwrap().lines() {
+                let value: serde_json::Value = serde_json::from_str(line).unwrap();
+                if let Some(p) = value["add"]["path"].as_str() {
+                    adds.push(format!("{prefix}/{p}"));
+                }
+                if let Some(p) = value["remove"]["path"].as_str() {
+                    removes.push(format!("{prefix}/{p}"));
+                }
+            }
+            for p in &removes {
+                assert!(!adds.contains(p), "commit {v} adds and removes `{p}`");
+                live.remove(p);
+            }
+            live.extend(adds);
+        }
+        (head, live)
+    }
+
+    fn unpartitioned_model(storage_prefix: &str) -> ModelIr {
+        let mut model = dummy_model_ir();
+        model.materialization = MaterializationStrategy::ContentAddressed {
+            storage_prefix: storage_prefix.to_string(),
+            partition_columns: vec![],
+        };
+        model.typed_columns = vec![col("id", RockyType::Int64, false)];
+        model
+    }
+
+    fn id_rows(ids: &[i64]) -> QueryResult {
+        QueryResult {
+            columns: vec!["id".into()],
+            rows: ids.iter().map(|i| vec![serde_json::json!(i)]).collect(),
+        }
+    }
+
+    async fn fresh_unpartitioned_table(tag: &str) -> (Arc<InMemory>, String, String) {
+        let prefix = format!("{tag}_{}", uuid::Uuid::new_v4().simple());
+        let storage_prefix = format!("s3://test-bucket/{prefix}");
+        let store: Arc<InMemory> = Arc::new(InMemory::new());
+        seed_id_only_bootstrap(&store, &prefix).await;
+        register_test_object_store(&storage_prefix, store.clone() as Arc<dyn ObjectStore>);
+        (store, prefix, storage_prefix)
+    }
+
+    /// #2269: a second build with a different output replaces the first.
+    /// The live table equals the second output only, and the run records one
+    /// Delta version.
+    #[tokio::test]
+    async fn second_run_replaces_the_first_run_output() {
+        let (store, prefix, storage_prefix) = fresh_unpartitioned_table("replace").await;
+        let model = unpartitioned_model(&storage_prefix);
+
+        let w1 = fixed_rows_warehouse("rca::replace-1", id_rows(&[1, 2, 3]));
+        let run1 = execute_content_addressed_model(&model, &w1, None)
+            .await
+            .unwrap();
+        let w2 = fixed_rows_warehouse("rca::replace-2", id_rows(&[4, 5]));
+        let run2 = execute_content_addressed_model(&model, &w2, None)
+            .await
+            .unwrap();
+        assert_ne!(run1.blake3_hash, run2.blake3_hash);
+
+        let (head, live) = replay_live(&store, &prefix).await;
+        assert_eq!(head, 2);
+        assert_eq!(
+            live.into_iter().collect::<Vec<_>>(),
+            vec![run2.file_path.clone()],
+            "the live table must equal the second output only"
+        );
+        assert_eq!(run2.commit_version, 2);
+        match crate::commands::run_output_version::content_addressed_output_version(&model, &run2) {
+            rocky_core::state::OutputVersion::ContentAddressed { delta_versions, .. } => {
+                assert_eq!(delta_versions, vec![2], "one entry per run");
+            }
+            other => panic!("expected ContentAddressed, got {other:?}"),
+        }
+        remove_test_object_store(&storage_prefix);
+    }
+
+    /// An identical rebuild writes no commit, and its output version names
+    /// the current version (the live one that already equals the output).
+    #[tokio::test]
+    async fn identical_rerun_writes_no_commit_and_records_the_current_version() {
+        let (store, prefix, storage_prefix) = fresh_unpartitioned_table("noop").await;
+        let model = unpartitioned_model(&storage_prefix);
+        let w = fixed_rows_warehouse("rca::noop", id_rows(&[7, 8]));
+        let run1 = execute_content_addressed_model(&model, &w, None)
+            .await
+            .unwrap();
+        let run2 = execute_content_addressed_model(&model, &w, None)
+            .await
+            .unwrap();
+        assert_eq!(run1.blake3_hash, run2.blake3_hash);
+        assert_eq!(run2.commit_version, 1);
+        assert_eq!(run2.written_files[0].commit_version, 1);
+        let (head, live) = replay_live(&store, &prefix).await;
+        assert_eq!(head, 1, "no second commit");
+        assert_eq!(live.len(), 1);
+        match crate::commands::run_output_version::content_addressed_output_version(&model, &run2) {
+            rocky_core::state::OutputVersion::ContentAddressed { delta_versions, .. } => {
+                assert_eq!(delta_versions, vec![1]);
+            }
+            other => panic!("expected ContentAddressed, got {other:?}"),
+        }
+        remove_test_object_store(&storage_prefix);
+    }
+
+    /// A partitioned rerun where one group changed: one commit; the unchanged
+    /// group's file is neither removed nor re-added; the vanished group's file
+    /// is removed.
+    #[tokio::test]
+    async fn partitioned_rerun_moves_only_changed_groups_in_one_commit() {
+        use rocky_ir::{GovernanceConfig, TargetRef};
+        let prefix = format!("partitioned_replace_{}", uuid::Uuid::new_v4().simple());
+        let storage_prefix = format!("s3://test-bucket/{prefix}");
+        let store: Arc<InMemory> = Arc::new(InMemory::new());
+        seed_region_partitioned_bootstrap(&store, &prefix).await;
+        register_test_object_store(&storage_prefix, store.clone() as Arc<dyn ObjectStore>);
+        let mut model = ModelIr::transformation(
+            TargetRef {
+                catalog: "c".into(),
+                schema: "s".into(),
+                table: "t".into(),
+            },
+            MaterializationStrategy::ContentAddressed {
+                storage_prefix: storage_prefix.clone(),
+                partition_columns: vec!["region".to_string()],
+            },
+            vec![],
+            "SELECT id, region FROM src".into(),
+            GovernanceConfig {
+                permissions_file: None,
+                auto_create_catalogs: false,
+                auto_create_schemas: false,
+            },
+            None,
+            None,
+        );
+        model.typed_columns = vec![
+            col("id", RockyType::Int64, false),
+            col("region", RockyType::String, false),
+        ];
+        let rows = |r: &[(i64, &str)]| QueryResult {
+            columns: vec!["id".into(), "region".into()],
+            rows: r
+                .iter()
+                .map(|(i, g)| vec![serde_json::json!(i), serde_json::json!(g)])
+                .collect(),
+        };
+        let w1 = fixed_rows_warehouse("rca::p1", rows(&[(1, "eu"), (2, "us"), (3, "ap")]));
+        let run1 = execute_content_addressed_model(&model, &w1, None)
+            .await
+            .unwrap();
+        // eu changes, us stays, ap disappears.
+        let w2 = fixed_rows_warehouse("rca::p2", rows(&[(9, "eu"), (2, "us")]));
+        let run2 = execute_content_addressed_model(&model, &w2, None)
+            .await
+            .unwrap();
+        assert_eq!(run2.commit_version, 2);
+        let us1 = &run1.written_files[1];
+        let us2 = &run2.written_files[1];
+        assert_eq!(us1.file_path, us2.file_path, "unchanged group, same file");
+        assert_eq!(
+            us2.commit_version, 1,
+            "the unchanged file keeps its live add"
+        );
+
+        let body = store
+            .get(&ObjPath::from(format!(
+                "{prefix}/_delta_log/00000000000000000002.json"
+            )))
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        let text = std::str::from_utf8(&body).unwrap();
+        let us_rel = us1.file_path.strip_prefix(&format!("{prefix}/")).unwrap();
+        assert!(
+            !text.contains(us_rel),
+            "the unchanged file is not touched: {text}"
+        );
+        assert_eq!(text.matches("\"remove\"").count(), 2, "old eu + ap");
+        assert_eq!(text.matches("\"add\"").count(), 1, "new eu only");
+
+        let (head, live) = replay_live(&store, &prefix).await;
+        assert_eq!(head, 2);
+        let expected: std::collections::BTreeSet<String> = run2
+            .written_files
+            .iter()
+            .map(|f| f.file_path.clone())
+            .collect();
+        assert_eq!(live, expected);
+        remove_test_object_store(&storage_prefix);
+    }
+
+    /// A→B→A: run 3 re-adds A after run 2 removed it. The run records the new
+    /// live-add version (3), not run 1's (1). The ledger keys rows by run, so
+    /// run 3 gets its own row; an upsert of one key rewrites `commit_version`.
+    /// Run 1's row for A is held while A is live again, and B (removed at v3)
+    /// is held inside Delta's retention window.
+    #[tokio::test]
+    async fn a_b_a_rebuild_records_the_new_live_add_version() {
+        let (store, _prefix, storage_prefix) = fresh_unpartitioned_table("aba").await;
+        let model = unpartitioned_model(&storage_prefix);
+        let wa = fixed_rows_warehouse("rca::aba-a", id_rows(&[1, 2]));
+        let wb = fixed_rows_warehouse("rca::aba-b", id_rows(&[3]));
+        let run1 = execute_content_addressed_model(&model, &wa, None)
+            .await
+            .unwrap();
+        let run2 = execute_content_addressed_model(&model, &wb, None)
+            .await
+            .unwrap();
+        let run3 = execute_content_addressed_model(&model, &wa, None)
+            .await
+            .unwrap();
+        assert_eq!(run3.blake3_hash, run1.blake3_hash);
+        assert_eq!(run3.file_path, run1.file_path);
+        assert_eq!(run1.written_files[0].commit_version, 1);
+        assert_eq!(run3.written_files[0].commit_version, 3, "the new live add");
+        assert_eq!(run3.commit_version, 3);
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = rocky_core::state::StateStore::open(&tmp.path().join("state.redb")).unwrap();
+        let now = chrono::Utc::now();
+        for (run_id, summary) in [("r1", &run1), ("r2", &run2), ("r3", &run3)] {
+            for row in artifact_records(summary, run_id, "fct_orders", now) {
+                state.record_artifact(&row).unwrap();
+            }
+        }
+        let row = |run: &str, path: &str| {
+            state
+                .get_artifact(run, "fct_orders", path)
+                .unwrap()
+                .unwrap()
+                .commit_version
+        };
+        assert_eq!(row("r1", &run1.file_path), 1);
+        assert_eq!(row("r3", &run3.file_path), 3);
+        // An upsert of the same key rewrites the version.
+        let mut again = artifact_records(&run3, "r1", "fct_orders", now);
+        state.record_artifact(&again.remove(0)).unwrap();
+        assert_eq!(
+            row("r1", &run1.file_path),
+            3,
+            "the upsert rewrites commit_version"
+        );
+
+        // A is live again: run 1's add at v1 is superseded by the v3 re-add.
+        let proof_a =
+            removal_proof_given_store(store.clone(), &storage_prefix, &run1.file_path, 1).await;
+        assert_eq!(proof_a, RemovalProof::Held(RemovalHoldReason::StillLive));
+        // B was removed at v3, but time travel can still read it.
+        let proof_b =
+            removal_proof_given_store(store.clone(), &storage_prefix, &run2.file_path, 2).await;
+        assert_eq!(
+            proof_b,
+            RemovalProof::Held(RemovalHoldReason::RetentionWindowOpen)
+        );
+        remove_test_object_store(&storage_prefix);
+    }
+
+    /// A Delta checkpoint makes the run refuse with the table name and the
+    /// checkpoint, and no commit is written.
+    #[tokio::test]
+    async fn a_checkpoint_makes_the_run_refuse() {
+        let (store, prefix, storage_prefix) = fresh_unpartitioned_table("checkpoint").await;
+        let model = unpartitioned_model(&storage_prefix);
+        let w = fixed_rows_warehouse("rca::ckpt-1", id_rows(&[1]));
+        execute_content_addressed_model(&model, &w, None)
+            .await
+            .unwrap();
+        store
+            .put(
+                &ObjPath::from(format!("{prefix}/_delta_log/_last_checkpoint")),
+                PutPayload::from(b"{}".to_vec()),
+            )
+            .await
+            .unwrap();
+        let w2 = fixed_rows_warehouse("rca::ckpt-2", id_rows(&[2]));
+        let err = execute_content_addressed_model(&model, &w2, None)
+            .await
+            .expect_err("a checkpoint must refuse the write");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("`c.s.t`"), "names the table: {msg}");
+        assert!(
+            msg.contains("_last_checkpoint"),
+            "names the checkpoint: {msg}"
+        );
+        assert!(msg.contains("To recover"), "says how to recover: {msg}");
+        let (head, _) = replay_live(&store, &prefix).await;
+        assert_eq!(head, 1, "no commit after the refusal");
+        remove_test_object_store(&storage_prefix);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2770,8 +3079,9 @@ mod tests {
 // The target table must be an external Delta UniForm table with
 // `delta.columnMapping.mode = 'name'`, unpartitioned, no rowTracking,
 // no deletion vectors, and the canonical `(id BIGINT, name STRING,
-// ts TIMESTAMP)` schema. The test is idempotent — it adds N rows per
-// run and asserts Photon `SELECT COUNT(*)` bumps by N.
+// ts TIMESTAMP)` schema. Each run replaces the table (#2269), so the test
+// asserts Photon `SELECT COUNT(*)` equals the run's N rows. The table must
+// carry no Delta checkpoint, or the write refuses (RV1-D8).
 
 #[cfg(test)]
 mod live_tests {
@@ -2914,17 +3224,22 @@ mod live_tests {
             "total rows across all partition groups"
         );
 
+        // Replace semantics (#2269): the live table equals this output only,
+        // whatever the table held before.
         let count_eu_after = read_region_count(warehouse_dyn, &fqtn, "eu").await;
         let count_us_after = read_region_count(warehouse_dyn, &fqtn, "us").await;
         assert_eq!(
-            count_eu_after,
-            count_eu_before + 2,
-            "eu partition must bump by 2 (before={count_eu_before}, after={count_eu_after})"
+            count_eu_after, 2,
+            "eu must hold exactly this run's 2 rows (before={count_eu_before})"
         );
         assert_eq!(
-            count_us_after,
-            count_us_before + 1,
-            "us partition must bump by 1 (before={count_us_before}, after={count_us_after})"
+            count_us_after, 1,
+            "us must hold exactly this run's 1 row (before={count_us_before})"
+        );
+        assert_eq!(
+            count_rows(warehouse_dyn, &fqtn).await,
+            3,
+            "the live table equals the output only"
         );
     }
 
@@ -3047,10 +3362,10 @@ mod live_tests {
             .as_i64()
             .or_else(|| n_after.rows[0][0].as_str().and_then(|s| s.parse().ok()))
             .expect("post-count i64");
+        // Replace semantics (#2269): the live table equals this output only.
         assert_eq!(
-            n_after,
-            n_before + 3,
-            "Photon count must bump by 3 (before={n_before}, after={n_after})"
+            n_after, 3,
+            "Photon count must equal this run's 3 rows (before={n_before}, after={n_after})"
         );
     }
 
@@ -3192,6 +3507,10 @@ mod live_tests {
             .expect("first build must succeed");
         assert!(r_summary.reused_from.is_none(), "first run is a build");
         let count_after_build = count_rows(warehouse_dyn, &fqtn).await;
+        assert_eq!(
+            count_after_build, 3,
+            "the build replaces the table: it holds R's 3 rows only"
+        );
         let input_hash = record_r_build(&store, &model_ir, "run-R", &r_summary);
         assert_eq!(
             store.refcount_for_hash(&r_summary.blake3_hash).unwrap(),
@@ -3255,15 +3574,16 @@ mod live_tests {
     /// A point-to into a removed file would be a silent wrong reuse, so the
     /// decision's liveness clause must catch the `remove` and fall back to a
     /// build. We force the removal deterministically with a `DELETE` of exactly
-    /// R's rows: the UniForm writer is append-only, so the only way R's `add`
-    /// becomes not-live is a later `remove` commit landing in the `_delta_log`
-    /// — which is precisely what a `DELETE` (or a VACUUM/compaction) emits.
+    /// R's rows: it lands a `remove` of R's `add` in the `_delta_log`, which is
+    /// what makes R's file not-live.
     ///
     /// We deliberately do *not* use `VACUUM ... RETAIN 0 HOURS` here: it needs
     /// `delta.retentionDurationCheck.enabled = false` set on the warehouse
-    /// (out-of-band, shared state we refuse to mutate from a test), and an
-    /// append-only writer never tombstones the live current version for VACUUM
-    /// to collect anyway, so that premise can't make R's own `add` not-live.
+    /// (out-of-band, shared state we refuse to mutate from a test).
+    ///
+    /// The `DELETE` is a Databricks commit. If it makes Databricks write a
+    /// Delta checkpoint, the fallback BUILD refuses with `CheckpointPresent`
+    /// (RV1-D8); recreate the sandbox table on an empty prefix and rerun.
     #[tokio::test]
     #[ignore]
     async fn reuse_falls_back_to_build_when_file_not_live() {
@@ -3317,12 +3637,11 @@ mod live_tests {
             summary.reused_from.is_none(),
             "with R's file removed, the run must BUILD, never point-to a missing file"
         );
-        // A fresh build re-materialized R's 3 rows.
+        // A fresh build replaced the table with R's 3 rows.
         let count_after = count_rows(warehouse_dyn, &fqtn).await;
         assert_eq!(
-            count_after,
-            count_before_reuse + 3,
-            "the fallback BUILD must re-materialize R's 3 rows"
+            count_after, 3,
+            "the fallback BUILD must leave exactly R's 3 rows (before={count_before_reuse})"
         );
     }
 
@@ -3395,9 +3714,8 @@ mod live_tests {
         );
         let count_after = count_rows(warehouse_dyn, &fqtn).await;
         assert_eq!(
-            count_after,
-            count_before + 3,
-            "the BUILD must materialize the 3 new rows"
+            count_after, 3,
+            "the BUILD replaces R's rows with the 3 new rows only (before={count_before})"
         );
     }
 }
