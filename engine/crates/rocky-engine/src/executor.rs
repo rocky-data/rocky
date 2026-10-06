@@ -144,6 +144,14 @@ pub fn execute_locally(compile_result: &CompileResult, db: &DuckDbConnector) -> 
         })
         .collect();
 
+    // The compile graph's own dependencies, which already dropped any
+    // table-only binding that would close a cycle (D013).
+    let compiled_deps: HashMap<&str, &[String]> = compile_result
+        .project
+        .dag_nodes
+        .iter()
+        .map(|n| (n.name.as_str(), n.depends_on.as_slice()))
+        .collect();
     // Models that failed or were withheld, with the reason a dependent cites.
     let mut broken: HashMap<String, String> = HashMap::new();
 
@@ -152,6 +160,17 @@ pub fn execute_locally(compile_result: &CompileResult, db: &DuckDbConnector) -> 
             continue;
         };
         if is_ephemeral(model) {
+            // Inlined into its readers: if what it reads did not build, its
+            // readers must not run either.
+            if let Some((upstream, why)) = depends_on
+                .iter()
+                .find_map(|d| broken.get(d).map(|why| (d.clone(), why.clone())))
+            {
+                broken.insert(
+                    model_name.clone(),
+                    format!("upstream '{upstream}' did not build ({why})"),
+                );
+            }
             result.skipped.push((
                 model_name.clone(),
                 "ephemeral: inlined into each model that reads it, nothing to build".to_string(),
@@ -189,6 +208,10 @@ pub fn execute_locally(compile_result: &CompileResult, db: &DuckDbConnector) -> 
             set_search_path(
                 model,
                 &sql,
+                compiled_deps
+                    .get(model_name.as_str())
+                    .copied()
+                    .unwrap_or(&[]),
                 &index,
                 &location_of,
                 &written,
@@ -296,7 +319,10 @@ fn attach_catalogs(models: &[Model], db: &DuckDbConnector) -> HashMap<String, St
     let mut attached: HashSet<String> = HashSet::new();
     for catalog in catalogs {
         let folded = fold_identifier(catalog);
-        if existing.contains(&folded) || !attached.insert(folded.clone()) {
+        // `memory` is the default in-memory database: reused. Every other
+        // reserved name is refused even when DuckDB lists it (`system`,
+        // `temp`): those are not databases a model may write into.
+        if folded == "memory" || !attached.insert(folded.clone()) {
             continue;
         }
         if RESERVED_CATALOGS.contains(&folded.as_str()) {
@@ -312,6 +338,9 @@ fn attach_catalogs(models: &[Model], db: &DuckDbConnector) -> HashMap<String, St
         }
         if let Err(e) = validate_identifier(catalog) {
             refused.insert(folded, e.to_string());
+            continue;
+        }
+        if existing.contains(&folded) {
             continue;
         }
         if let Err(e) = db.execute_statement(&format!("ATTACH ':memory:' AS {}", quote(catalog))) {
@@ -387,6 +416,7 @@ fn execution_order(
 fn set_search_path(
     model: &Model,
     sql: &str,
+    compiled_deps: &[String],
     index: &BareReadIndex<'_>,
     location_of: &HashMap<&str, Location>,
     written: &HashSet<(Location, String)>,
@@ -408,10 +438,31 @@ fn set_search_path(
             .collect()
     };
 
+    let two_part_reads: Vec<(String, String)> = lineage
+        .source_tables
+        .iter()
+        .filter(|t| matches!(t.binding, rocky_sql::lineage::TableBinding::Physical))
+        .map(|t| t.name.clone())
+        .chain(lineage.nested_sources.iter().cloned())
+        .filter_map(|n| {
+            let parts: Vec<&str> = n.split('.').collect();
+            match parts.as_slice() {
+                [schema, table] => Some((fold_identifier(schema), fold_identifier(table))),
+                _ => None,
+            }
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+
     let mut expected: Vec<(String, Option<Location>)> = Vec::new();
     let mut path: Vec<Location> = Vec::new();
     for read in &bare_reads {
         match index.bind(read, model) {
+            // A binding the compile graph dropped (D013) is an external read.
+            BareBinding::Model(producer) if !compiled_deps.contains(&producer) => {
+                expected.push((read.clone(), None));
+            }
             BareBinding::Model(producer) => {
                 let Some(loc) = location_of.get(producer.as_str()) else {
                     // An ephemeral producer: the compiler inlined it, so no
@@ -472,7 +523,55 @@ fn set_search_path(
             ));
         }
     }
+
+    // A two-part `schema.table` read resolves in the first catalog on the
+    // path that has that schema and table. Putting a producer's catalog on
+    // the path must not move a read that, with the default path, reaches a
+    // table in the default catalog: refuse instead of reading another table.
+    let default_catalog = fold_identifier(default_catalog);
+    let mut path_catalogs: Vec<&str> = Vec::new();
+    for (catalog, _) in &path {
+        if !path_catalogs.contains(&catalog.as_str()) {
+            path_catalogs.push(catalog);
+        }
+    }
+    for (schema, table) in two_part_reads {
+        let holders = catalogs_holding(db, &schema, &table)?;
+        let by_path = path_catalogs.iter().find(|c| holders.contains(**c));
+        if holders.contains(&default_catalog) && by_path.is_some_and(|c| **c != default_catalog) {
+            return Err(format!(
+                "read of '{schema}.{table}' would reach {}.{schema}.{table} locally, where a \
+                 bare read in the same model put that catalog on the search path; without \
+                 it the read reaches {default_catalog}.{schema}.{table}. Qualify the read \
+                 with its catalog so both agree",
+                by_path.map_or("", |c| *c)
+            ));
+        }
+    }
     Ok(())
+}
+
+/// The catalogs holding a table or view `schema.table`, folded.
+fn catalogs_holding(
+    db: &DuckDbConnector,
+    schema: &str,
+    table: &str,
+) -> Result<HashSet<String>, String> {
+    let r = db
+        .execute_sql(&format!(
+            "SELECT lower(database_name) FROM duckdb_tables() \
+             WHERE lower(schema_name) = {s} AND lower(table_name) = {t} \
+             UNION ALL \
+             SELECT lower(database_name) FROM duckdb_views() \
+             WHERE lower(schema_name) = {s} AND lower(view_name) = {t}",
+            s = literal(schema),
+            t = literal(table)
+        ))
+        .map_err(|e| format!("could not inspect local tables: {e}"))?;
+    Ok(r.rows
+        .iter()
+        .filter_map(|row| row.first()?.as_str().map(str::to_string))
+        .collect())
 }
 
 /// The first `(catalog, schema)` on `path` holding a table or view called
@@ -817,6 +916,55 @@ mod tests {
         );
     }
 
+    /// A two-part read that the default path sends to the default catalog
+    /// must not be redirected to an attached catalog because a bare read in
+    /// the same model put it on the path. Refused, not run on another table.
+    #[test]
+    fn a_two_part_read_the_path_would_redirect_is_refused() {
+        let (result, _db, _) = run(
+            &[
+                m("p", "SELECT 1 AS v", ("cat", "s", "t")),
+                m(
+                    "reader",
+                    "SELECT t.v + seed.v AS v FROM t CROSS JOIN s.t AS seed",
+                    ("cat", "out", "reader"),
+                ),
+            ],
+            "CREATE SCHEMA memory.s; CREATE TABLE memory.s.t AS SELECT 7 AS v",
+        );
+        let why = failure(&result, "reader").expect("the redirected read is refused");
+        assert!(
+            why.contains("'s.t' would reach cat.s.t") && why.contains("memory.s.t"),
+            "{why}"
+        );
+    }
+
+    /// A failed upstream withholds the readers of an ephemeral model that
+    /// reads it, though the ephemeral model itself never runs.
+    #[test]
+    fn a_failure_propagates_through_an_ephemeral_model() {
+        let eph = M {
+            name: "eph",
+            sql: "SELECT v FROM cat.s.u",
+            target: ("cat", "s", "eph"),
+            extra: "depends_on = [\"u\"]\n[strategy]\ntype = \"ephemeral\"",
+        };
+        let reader = M {
+            name: "reader",
+            sql: "SELECT v FROM eph",
+            target: ("cat", "s", "reader"),
+            extra: "",
+        };
+        let (result, db, _) = run(
+            &[m("u", "SELECT 1/'x' AS v", ("cat", "s", "u")), eph, reader],
+            "",
+        );
+        assert!(failure(&result, "u").is_some(), "{result:?}");
+        let why = failure(&result, "reader").expect("the reader is withheld");
+        assert!(why.contains("upstream 'eph'"), "{why}");
+        assert!(db.execute_sql("SELECT v FROM cat.s.reader").is_err());
+    }
+
     /// A catalog DuckDB reserves is refused for the models that target it,
     /// with the fix; `memory` already exists and is reused.
     #[test]
@@ -833,6 +981,10 @@ mod tests {
             why.contains("catalog 'main'") && why.contains("rocky.toml"),
             "{why}"
         );
+        // `system` exists in DuckDB but is no database a model may write.
+        let (result, _db, _) = run(&[m("in_system", "SELECT 1 AS v", ("system", "s", "x"))], "");
+        let why = failure(&result, "in_system").expect("system is reserved");
+        assert!(why.contains("catalog 'system'"), "{why}");
         assert_eq!(value(&db, "memory.s.in_memory"), "2");
     }
 

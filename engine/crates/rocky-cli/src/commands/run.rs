@@ -22059,7 +22059,7 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
             .await
             .expect_err("three pipelines and no --pipeline");
         assert!(
-            err.to_string().contains("pipeline"),
+            err.to_string().contains("multiple pipelines defined"),
             "unexpected error: {err:#}"
         );
         assert!(!state_path.exists(), "no claim, no state store: {err:#}");

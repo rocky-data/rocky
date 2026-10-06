@@ -20,7 +20,9 @@
 //!
 //! 1. An ephemeral model is read by its NAME: it writes nothing, and the
 //!    inliner rewrites a bare read of its name into a CTE.
-//! 2. Otherwise the candidates are the other models whose target table is `x`
+//! 2. A model reading a table with its own target's name reads itself or a
+//!    same-named table elsewhere: the read is external.
+//! 3. Otherwise the candidates are the other models whose target table is `x`
 //!    (compared folded, [`rocky_core::physical_edges::fold_identifier`]).
 //!    - none: the read is external;
 //!    - one: the read binds to it;
@@ -28,6 +30,12 @@
 //!      one the reader lists in `depends_on`; if neither picks exactly one,
 //!      the read is ambiguous and refused as `E056`. Rocky cannot see the
 //!      search path that would choose, so it does not guess.
+//!
+//! A binding by table alone — the model is not named `x`, and the reader did
+//! not declare it — is the weakest evidence. If it would close a dependency
+//! cycle it is dropped, the read is treated as external, and `D013` says so:
+//! a guess about the search path must not refuse a project or reverse an edge
+//! stronger evidence set.
 //!
 //! A bare read of a model's NAME that does not bind to that model — its target
 //! table is spelled differently — is reported as `D012`: the read is external,
@@ -136,7 +144,7 @@ pub fn classify_table_ref(name: &str, model_names: &HashSet<String>) -> TableRef
 /// preserved and merged with auto-resolved dependencies.
 pub fn resolve_dependencies(models: &[Model]) -> Result<ResolveOutput, ResolveError> {
     let index = BareReadIndex::new(models);
-    let mut dag_nodes = Vec::with_capacity(models.len());
+    let mut per_model = Vec::with_capacity(models.len());
     let mut lineage_cache = HashMap::with_capacity(models.len());
     let mut diagnostics = Vec::new();
 
@@ -181,6 +189,7 @@ pub fn resolve_dependencies(models: &[Model]) -> Result<ResolveOutput, ResolveEr
                 .collect();
             let missing: Vec<&String> = auto_deps
                 .iter()
+                .map(|d| &d.producer)
                 .filter(|d| !explicit.contains(d.as_str()))
                 .collect();
             if !missing.is_empty() {
@@ -210,21 +219,12 @@ pub fn resolve_dependencies(models: &[Model]) -> Result<ResolveOutput, ResolveEr
             }
         }
 
-        // Merge: explicit depends_on + auto-resolved, deduplicated via HashSet
-        let mut all_deps: Vec<String> = model.config.depends_on.clone();
-        let mut seen: HashSet<String> = all_deps.iter().cloned().collect();
-        for dep in auto_deps {
-            if seen.insert(dep.clone()) {
-                all_deps.push(dep);
-            }
-        }
-
         lineage_cache.insert(model.config.name.clone(), lineage_result);
-
-        dag_nodes.push(DagNode {
-            name: model.config.name.clone(),
-            depends_on: all_deps,
-        });
+        per_model.push((
+            model.config.name.clone(),
+            model.config.depends_on.clone(),
+            auto_deps,
+        ));
     }
 
     if !parse_failures.is_empty() {
@@ -234,6 +234,11 @@ pub fn resolve_dependencies(models: &[Model]) -> Result<ResolveOutput, ResolveEr
         return Err(ResolveError::LineageExtractionMany {
             failures: parse_failures,
         });
+    }
+
+    let (dag_nodes, dropped) = settle_dependencies(&per_model);
+    for (consumer, producer) in dropped {
+        diagnostics.push(dropped_binding_diagnostic(&consumer, &producer));
     }
 
     Ok((dag_nodes, lineage_cache, diagnostics))
@@ -258,15 +263,37 @@ pub fn derived_model_edges(models: &[Model]) -> Vec<(String, String)> {
         .cloned()
         .collect();
     let index = BareReadIndex::new(&unique);
-    let mut edges = Vec::new();
+    let mut per_model = Vec::with_capacity(unique.len());
+    let mut auto: HashSet<(String, String)> = HashSet::new();
     for model in &unique {
-        let Ok(lineage_result) = lineage::extract_lineage(&model.sql) else {
-            continue;
+        let deps = match lineage::extract_lineage(&model.sql) {
+            Ok(lineage_result) => extract_deps_from_lineage(&lineage_result, model, &index).0,
+            Err(_) => Vec::new(),
         };
-        let (deps, _notes) = extract_deps_from_lineage(&lineage_result, model, &index);
-        edges.extend(deps.into_iter().map(|d| (model.config.name.clone(), d)));
+        for d in &deps {
+            auto.insert((model.config.name.clone(), d.producer.clone()));
+        }
+        per_model.push((
+            model.config.name.clone(),
+            model.config.depends_on.clone(),
+            deps,
+        ));
     }
-    edges
+    // Settled exactly as `resolve_dependencies` settles them, so a binding it
+    // drops as a cycle-closer is dropped here too. Declared entries are left
+    // to the graph.
+    let (nodes, _dropped) = settle_dependencies(&per_model);
+    nodes
+        .into_iter()
+        .flat_map(|n| {
+            let name = n.name;
+            n.depends_on
+                .into_iter()
+                .map(move |d| (name.clone(), d))
+                .collect::<Vec<_>>()
+        })
+        .filter(|edge| auto.contains(edge))
+        .collect()
 }
 
 /// Every model a bare read could bind to, indexed for [`BareReadIndex::bind`]
@@ -338,6 +365,13 @@ fn bind_bare_read(read: &str, reader: &Model, index: &BareReadIndex<'_>) -> Bare
         return BareBinding::Model(read.to_string());
     }
     let folded = fold_identifier(read);
+    // A model reading a table with its OWN target's name reads itself (an
+    // incremental self-read) or a same-named table in another schema the
+    // search path decides. Neither is evidence for a sibling that happens to
+    // write that name, so the read is external.
+    if fold_identifier(&reader.config.target.table) == folded {
+        return BareBinding::External;
+    }
     let candidates: Vec<&Model> = index
         .by_table
         .get(&folded)
@@ -472,7 +506,7 @@ fn extract_deps_from_lineage(
     lineage_result: &lineage::LineageResult,
     reader: &Model,
     index: &BareReadIndex<'_>,
-) -> (Vec<String>, Vec<BareReadNote>) {
+) -> (Vec<Dep>, Vec<BareReadNote>) {
     let mut deps = Vec::new();
     let mut seen = HashSet::new();
     let mut notes = Vec::new();
@@ -526,11 +560,110 @@ fn extract_deps_from_lineage(
             && dep != reader.config.name
             && seen.insert(dep.clone())
         {
-            deps.push(dep);
+            // Bound by the table alone: the model is not named after the read,
+            // the reader did not declare it, and it is not an inlined
+            // ephemeral. Weaker evidence than a name that agrees.
+            let table_only = fold_identifier(&dep) != fold_identifier(name)
+                && !reader.config.depends_on.contains(&dep)
+                && !index.ephemeral.contains(dep.as_str());
+            deps.push(Dep {
+                producer: dep,
+                table_only,
+            });
         }
     }
 
     (deps, notes)
+}
+
+/// One auto-derived dependency of a reader.
+#[derive(Debug, Clone)]
+struct Dep {
+    producer: String,
+    /// Bound by target table alone (see [`extract_deps_from_lineage`]).
+    table_only: bool,
+}
+
+/// Settle every model's dependencies (#1354).
+///
+/// `per_model` is `(model, declared depends_on, auto-derived deps)`. Declared
+/// entries and auto deps whose name agrees go in first. A table-only binding
+/// then joins only if it closes no cycle: a bare name has no schema, so a
+/// binding by table alone is a guess about the search path, and a guess must
+/// not turn a project that compiled into a refused cycle or reverse an edge
+/// stronger evidence set. A dropped binding is returned as
+/// `(consumer, producer)` so the caller can report it (D013).
+fn settle_dependencies(
+    per_model: &[(String, Vec<String>, Vec<Dep>)],
+) -> (Vec<DagNode>, Vec<(String, String)>) {
+    let mut deps: Vec<(String, Vec<String>)> = per_model
+        .iter()
+        .map(|(name, declared, auto)| {
+            let mut all = declared.clone();
+            for d in auto.iter().filter(|d| !d.table_only) {
+                if !all.contains(&d.producer) {
+                    all.push(d.producer.clone());
+                }
+            }
+            (name.clone(), all)
+        })
+        .collect();
+    let mut dropped = Vec::new();
+    for (index, (consumer, _, auto)) in per_model.iter().enumerate() {
+        for d in auto.iter().filter(|d| d.table_only) {
+            if deps[index].1.contains(&d.producer) {
+                continue;
+            }
+            if depends_transitively(&deps, &d.producer, consumer) {
+                dropped.push((consumer.clone(), d.producer.clone()));
+            } else {
+                deps[index].1.push(d.producer.clone());
+            }
+        }
+    }
+    let nodes = deps
+        .into_iter()
+        .map(|(name, depends_on)| DagNode { name, depends_on })
+        .collect();
+    (nodes, dropped)
+}
+
+/// Whether `from` depends, directly or not, on `target` in `deps`.
+fn depends_transitively(deps: &[(String, Vec<String>)], from: &str, target: &str) -> bool {
+    let by_name: HashMap<&str, &Vec<String>> = deps.iter().map(|(n, d)| (n.as_str(), d)).collect();
+    let mut stack = vec![from];
+    let mut seen = HashSet::new();
+    while let Some(current) = stack.pop() {
+        if current == target {
+            return true;
+        }
+        if !seen.insert(current) {
+            continue;
+        }
+        if let Some(next) = by_name.get(current) {
+            stack.extend(next.iter().map(String::as_str));
+        }
+    }
+    false
+}
+
+/// The D013 warning for a table-only binding dropped because it closed a
+/// cycle.
+fn dropped_binding_diagnostic(consumer: &str, producer: &str) -> Diagnostic {
+    Diagnostic::warning(
+        "D013",
+        consumer,
+        format!(
+            "a bare read in '{consumer}' names the table model '{producer}' writes, but '{producer}' \
+             already depends on '{consumer}', so the binding would close a cycle. A bare name has \
+             no schema, so Rocky treats this read as an external table and derives no dependency \
+             on '{producer}'"
+        ),
+    )
+    .with_suggestion(format!(
+        "Qualify the read with its schema, or list '{producer}' in depends_on if '{consumer}' \
+         really reads it"
+    ))
 }
 
 #[cfg(test)]
@@ -920,18 +1053,18 @@ mod tests {
         assert!(diags.iter().all(|d| &*d.code != "E056"), "{diags:?}");
     }
 
-    /// A model that reads a table with its own target's name reads another
-    /// schema's table, never itself: it binds to the other writer, or is
-    /// external.
+    /// A model that reads a table with its own target's name reads itself or
+    /// a same-named table the search path picks — never evidence for a
+    /// sibling that writes that name. The read is external.
     #[test]
-    fn a_reader_never_binds_to_itself_by_table() {
+    fn a_read_of_the_readers_own_table_name_is_external() {
         let models = vec![
             make_model_with_target("stg_orders", "SELECT id FROM orders", "staging", "orders"),
             make_model_with_target("raw_orders", "SELECT 1 AS id", "raw", "orders"),
         ];
         let (dag_nodes, _, diags) = resolve_dependencies(&models).unwrap();
         let stg = dag_nodes.iter().find(|n| n.name == "stg_orders").unwrap();
-        assert_eq!(stg.depends_on, vec!["raw_orders"]);
+        assert!(stg.depends_on.is_empty(), "{:?}", stg.depends_on);
         assert!(diags.is_empty(), "{diags:?}");
 
         let models = vec![make_model_with_target(
@@ -942,6 +1075,49 @@ mod tests {
         )];
         let (dag_nodes, _, _) = resolve_dependencies(&models).unwrap();
         assert!(dag_nodes[0].depends_on.is_empty());
+    }
+
+    /// A binding by table alone that would close a cycle is dropped with
+    /// D013, not refused: `stg_customers` reads the raw `customers` source,
+    /// and `dim_customers` — which reads `stg_customers` by name — happens to
+    /// write a table called `customers`. Compiled before; must still compile.
+    #[test]
+    fn a_table_only_binding_that_closes_a_cycle_is_dropped_with_d013() {
+        let models = vec![
+            make_model_with_target(
+                "stg_customers",
+                "SELECT id FROM customers",
+                "staging",
+                "stg_customers",
+            ),
+            make_model_with_target(
+                "dim_customers",
+                "SELECT id FROM stg_customers",
+                "marts",
+                "customers",
+            ),
+        ];
+        let (dag_nodes, _, diags) = resolve_dependencies(&models).unwrap();
+        rocky_ir::dag::topological_sort(&dag_nodes).expect("no cycle");
+        let deps = |n: &str| {
+            dag_nodes
+                .iter()
+                .find(|d| d.name == n)
+                .unwrap()
+                .depends_on
+                .clone()
+        };
+        assert_eq!(deps("dim_customers"), vec!["stg_customers"]);
+        assert!(deps("stg_customers").is_empty());
+        let d013: Vec<&Diagnostic> = diags.iter().filter(|d| &*d.code == "D013").collect();
+        assert_eq!(d013.len(), 1, "{diags:?}");
+        assert_eq!(d013[0].model, "stg_customers");
+        assert!(!d013[0].is_error() && !d013[0].message.contains("  "));
+        assert_eq!(
+            derived_model_edges(&models),
+            vec![("dim_customers".to_string(), "stg_customers".to_string())],
+            "`run --dag` settles the same way"
+        );
     }
 
     /// An ephemeral model writes nothing; the inliner rewrites a bare read of
