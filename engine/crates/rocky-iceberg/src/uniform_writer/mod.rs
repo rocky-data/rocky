@@ -121,8 +121,9 @@ pub enum PathLiveness {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RemovalProof {
     /// Affirmatively proven removed: the target's own `add` is present in a
-    /// clean, checkpoint-free, contiguous commit history and the
-    /// highest-versioned commit referencing it is a `remove`. Safe to reclaim.
+    /// clean, checkpoint-free, contiguous commit history, the
+    /// highest-versioned commit referencing it is a `remove`, and Delta's
+    /// deleted-file retention window has passed. Safe to reclaim.
     ///
     /// Carries the Delta `head_version` (the highest `_delta_log` JSON commit)
     /// the proof validated against, so the caller can (a) re-verify the head has
@@ -170,6 +171,13 @@ pub enum RemovalHoldReason {
     StillLive,
     /// An object-store / log read failed — the proof could not be assembled.
     ReadError,
+    /// The file is provably removed, but Delta's retention window
+    /// (`deletionTimestamp + delta.deletedFileRetentionDuration`, default 7
+    /// days) has not passed: time travel can still read it.
+    RetentionWindowOpen,
+    /// The file is provably removed, but its deletion time or the table's
+    /// retention setting could not be read — the window cannot be checked.
+    RetentionUnknown,
 }
 
 impl RemovalHoldReason {
@@ -188,6 +196,8 @@ impl RemovalHoldReason {
             RemovalHoldReason::NeverAddedHere => "never_added_here",
             RemovalHoldReason::StillLive => "still_live",
             RemovalHoldReason::ReadError => "read_error",
+            RemovalHoldReason::RetentionWindowOpen => "retention_window_open",
+            RemovalHoldReason::RetentionUnknown => "retention_unknown",
         }
     }
 }
@@ -392,6 +402,9 @@ pub struct UniformWriter {
     config: UniformWriterConfig,
     store: Arc<dyn ObjectStore>,
     sql: Arc<dyn SqlClient>,
+    /// The table's object-store bucket, used to resolve absolute `s3://`
+    /// paths in the log. `None` makes every absolute path refuse.
+    table_bucket: Option<String>,
 }
 
 impl UniformWriter {
@@ -400,7 +413,30 @@ impl UniformWriter {
         store: Arc<dyn ObjectStore>,
         sql: Arc<dyn SqlClient>,
     ) -> Self {
-        Self { config, store, sql }
+        Self {
+            config,
+            store,
+            sql,
+            table_bucket: None,
+        }
+    }
+
+    /// Set the table's bucket so the live-set replay can resolve absolute
+    /// `s3://<bucket>/…` paths that another engine wrote into the log.
+    #[must_use]
+    pub fn with_table_bucket(mut self, bucket: impl Into<String>) -> Self {
+        self.table_bucket = Some(bucket.into());
+        self
+    }
+
+    fn bucket(&self) -> &str {
+        self.table_bucket.as_deref().unwrap_or_default()
+    }
+
+    /// Read the live set, resolving paths against this table.
+    async fn live_set(&self) -> Result<discover::LiveSet> {
+        let prefix = self.config.prefix.trim_end_matches('/').to_string();
+        discover::read_live_set(&*self.store, &prefix, &self.config.fqtn(), self.bucket()).await
     }
 
     pub fn config(&self) -> &UniformWriterConfig {
@@ -652,8 +688,7 @@ impl UniformWriter {
                     .to_string(),
             ));
         }
-        let prefix = self.config.prefix.trim_end_matches('/').to_string();
-        let live = discover::read_live_set(&*self.store, &prefix, &self.config.fqtn()).await?;
+        let live = self.live_set().await?;
         let modification_time_millis = chrono::Utc::now().timestamp_millis();
         let add = commit::lift_add_action(&pointer.recovered_add, modification_time_millis)?;
         let staged = StagedFile {
@@ -762,7 +797,7 @@ impl UniformWriter {
         state: UniformTableState,
     ) -> Result<ReplaceOutcome> {
         let prefix = self.config.prefix.trim_end_matches('/').to_string();
-        let live = discover::read_live_set(&*self.store, &prefix, &self.config.fqtn()).await?;
+        let live = self.live_set().await?;
         let modification_time_millis = chrono::Utc::now().timestamp_millis();
 
         let mut staged = Vec::with_capacity(groups.len());
@@ -819,15 +854,21 @@ impl UniformWriter {
     /// Make the live set equal `staged`, in at most one commit.
     ///
     /// ```text
+    ///   table shape changed since discover() ──▶ refuse, no commit
     ///   live == new ──▶ no commit; table_version = current head
     ///   otherwise   ──▶ commit head+1:  remove (live − new) ; add (new − live)
-    ///                     └─ 412 ──▶ re-read the live set, recompute, retry
+    ///                     └─ 412 / 409 ──▶ re-read the live set, recompute, retry
     /// ```
     ///
+    /// Files are compared by canonical key, so a live file that the log
+    /// spells as an absolute or percent-encoded path still matches the new
+    /// output's relative path. A `remove` copies the live file's own spelling.
+    ///
     /// The conditional PUT (`If-None-Match: *`) makes the commit atomic. A
-    /// 412 means another commit took the version: the live set is read again
-    /// so the removes reflect the new head, and the retry may turn into a
-    /// no-op when the winner already wrote this exact output.
+    /// conflict means another commit took the version: the live set, the
+    /// protocol and the metadata are read again. The removes then reflect the
+    /// new head, a schema or protocol change refuses, and the retry may turn
+    /// into a no-op when the winner already wrote this exact output.
     async fn commit_replace(
         &self,
         staged: Vec<StagedFile>,
@@ -835,30 +876,76 @@ impl UniformWriter {
         mut state: UniformTableState,
         modification_time_millis: i64,
     ) -> Result<ReplaceOutcome> {
-        use std::collections::BTreeSet;
+        use std::collections::{BTreeMap, BTreeSet};
         let prefix = self.config.prefix.trim_end_matches('/').to_string();
-        let new_paths: BTreeSet<&str> = staged.iter().map(|s| s.path.as_str()).collect();
+        // Canonical key of every staged file.
+        let mut new_keys: BTreeMap<String, usize> = BTreeMap::new();
+        for (i, s) in staged.iter().enumerate() {
+            let key =
+                discover::canonical_key(&s.path, self.bucket(), &prefix).ok_or_else(|| {
+                    UniformWriterError::DeltaLog(format!(
+                        "output path `{}` cannot be resolved inside the table",
+                        s.path
+                    ))
+                })?;
+            if new_keys.insert(key, i).is_some() {
+                return Err(UniformWriterError::DeltaLog(format!(
+                    "two output files resolve to the same path `{}`",
+                    s.path
+                )));
+            }
+        }
+        let expected_shape = discover::TableShape::of_state(&state);
+        let first_snapshot = (live.protocol.clone(), live.metadata.clone());
 
         for attempt in 0..COND_PUT_RETRY_BUDGET {
-            let live_paths: BTreeSet<&str> = live.files.keys().map(String::as_str).collect();
-            if live_paths == new_paths {
+            // The prepared files match the shape discover() saw. A schema,
+            // partitioning or protocol change since then refuses.
+            let shape = live.shape()?;
+            if shape != expected_shape {
+                return Err(UniformWriterError::TableChangedDuringWrite {
+                    table: self.config.fqtn(),
+                    what: describe_shape_change(&expected_shape, &shape),
+                });
+            }
+            if (&live.protocol, &live.metadata) != (&first_snapshot.0, &first_snapshot.1) {
+                return Err(UniformWriterError::TableChangedDuringWrite {
+                    table: self.config.fqtn(),
+                    what: "a later commit changed the table protocol or metadata".to_string(),
+                });
+            }
+
+            let live_keys: BTreeSet<&str> = live.files.keys().map(String::as_str).collect();
+            let new_key_set: BTreeSet<&str> = new_keys.keys().map(String::as_str).collect();
+            if live_keys == new_key_set {
                 tracing::info!(
                     table = %self.config.fqtn(),
                     version = live.head_version,
                     "content-addressed output already live; no commit written"
                 );
-                return Ok(self.outcome(&staged, &live, live.head_version, false, Vec::new()));
+                return Ok(self.outcome(
+                    &staged,
+                    &new_keys,
+                    &live,
+                    live.head_version,
+                    false,
+                    Vec::new(),
+                ));
             }
 
             let mut removes = Vec::new();
             let mut removed_paths = Vec::new();
-            for (path, file) in &live.files {
-                if !new_paths.contains(path.as_str()) {
-                    removes.push(commit::build_remove_action(
-                        &file.add,
-                        modification_time_millis,
-                    )?);
-                    removed_paths.push(path.clone());
+            for (key, file) in &live.files {
+                if !new_keys.contains_key(key) {
+                    let remove = commit::build_remove_action(&file.add, modification_time_millis)?;
+                    removed_paths.push(
+                        remove
+                            .get("path")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default()
+                            .to_string(),
+                    );
+                    removes.push(remove);
                 }
             }
             if !removes.is_empty() && live.append_only {
@@ -873,7 +960,11 @@ impl UniformWriter {
             let mut next_row_id = state.row_tracking_next_id;
             let mut high_water_mark = None;
             let mut adds = Vec::new();
-            for s in staged.iter().filter(|s| !live.files.contains_key(&s.path)) {
+            for (key, &i) in &new_keys {
+                if live.files.contains_key(key) {
+                    continue;
+                }
+                let s = &staged[i];
                 let mut add = s.add.clone();
                 if state.row_tracking_enabled && s.num_records > 0 {
                     let base = next_row_id;
@@ -910,13 +1001,26 @@ impl UniformWriter {
                 .await
             {
                 Ok(_) => {
-                    return Ok(self.outcome(&staged, &live, target_version, true, removed_paths));
+                    return Ok(self.outcome(
+                        &staged,
+                        &new_keys,
+                        &live,
+                        target_version,
+                        true,
+                        removed_paths,
+                    ));
                 }
-                Err(object_store::Error::AlreadyExists { .. }) => {
+                // object_store maps S3's 412 and its 409
+                // `ConditionalRequestConflict` on a create to `AlreadyExists`;
+                // `Precondition` is the other spelling some stores use.
+                Err(
+                    object_store::Error::AlreadyExists { .. }
+                    | object_store::Error::Precondition { .. },
+                ) => {
                     // Another commit took `target_version`. Re-read the live
-                    // set so the removes reflect the new head.
-                    live =
-                        discover::read_live_set(&*self.store, &prefix, &self.config.fqtn()).await?;
+                    // set, protocol and metadata so the next attempt reflects
+                    // the new head.
+                    live = self.live_set().await?;
                     if state.row_tracking_enabled {
                         state.row_tracking_next_id =
                             discover::discover_row_tracking_next_id(&*self.store, &prefix).await?;
@@ -925,7 +1029,7 @@ impl UniformWriter {
                         attempt = attempt + 1,
                         previous_target = target_version,
                         new_head = live.head_version,
-                        "cond-put 412 on _delta_log entry; re-read the live set, retrying"
+                        "conditional put conflict on _delta_log entry; re-read the live set, retrying"
                     );
                 }
                 Err(e) => return Err(e.into()),
@@ -943,19 +1047,25 @@ impl UniformWriter {
     fn outcome(
         &self,
         staged: &[StagedFile],
+        new_keys: &std::collections::BTreeMap<String, usize>,
         live: &discover::LiveSet,
         table_version: u64,
         committed: bool,
         removed_paths: Vec<String>,
     ) -> ReplaceOutcome {
         let prefix = self.config.prefix.trim_end_matches('/');
+        let version_of: HashMap<usize, u64> = new_keys
+            .iter()
+            .map(|(key, &i)| (i, live.files.get(key).map_or(table_version, |f| f.version)))
+            .collect();
         let files = staged
             .iter()
-            .map(|s| WriteResult {
+            .enumerate()
+            .map(|(i, s)| WriteResult {
                 file_path: Path::from(format!("{prefix}/{}", s.path)).to_string(),
                 blake3_hash: s.blake3_hash.clone(),
                 column_hashes: s.column_hashes.clone(),
-                commit_version: live.files.get(&s.path).map_or(table_version, |f| f.version),
+                commit_version: version_of.get(&i).copied().unwrap_or(table_version),
                 table_version,
                 committed,
                 num_records: s.num_records,
@@ -986,6 +1096,27 @@ impl UniformWriter {
         tracing::debug!(sql = %sql, "issuing MSCK REPAIR to sync iceberg metadata");
         self.sql.execute(&sql).await
     }
+}
+
+/// Name what differs between the shape `discover()` saw and the latest one.
+fn describe_shape_change(expected: &discover::TableShape, latest: &discover::TableShape) -> String {
+    let mut what = Vec::new();
+    if expected.partition_columns != latest.partition_columns {
+        what.push(format!(
+            "partition columns {:?} → {:?}",
+            expected.partition_columns, latest.partition_columns
+        ));
+    }
+    if expected.physical != latest.physical || expected.field_id != latest.field_id {
+        what.push("the schema or its column mapping changed".to_string());
+    }
+    if expected.row_tracking_enabled != latest.row_tracking_enabled {
+        what.push(format!(
+            "rowTracking {} → {}",
+            expected.row_tracking_enabled, latest.row_tracking_enabled
+        ));
+    }
+    what.join("; ")
 }
 
 #[cfg(test)]
@@ -2176,7 +2307,7 @@ mod tests {
         // Read the live set at head 1 ({A}), then let a competitor land v2
         // (remove A, add C) before our commit.
         let state = writer.discover().await.unwrap();
-        let stale = discover::read_live_set(&*store, "tbl", "c.s.t")
+        let stale = discover::read_live_set(&*store, "tbl", "c.s.t", "")
             .await
             .unwrap();
         let competitor = format!(
@@ -2242,7 +2373,7 @@ mod tests {
         let writer = make_unpartitioned_writer(store.clone() as Arc<dyn ObjectStore>, "tbl");
         let a = writer.write_batch(make_batch(2)).await.unwrap();
         let state = writer.discover().await.unwrap();
-        let stale = discover::read_live_set(&*store, "tbl", "c.s.t")
+        let stale = discover::read_live_set(&*store, "tbl", "c.s.t", "")
             .await
             .unwrap();
         // A competitor lands exactly our output at v2.
@@ -2334,6 +2465,331 @@ mod tests {
             other => panic!("expected AppendOnlyTable, got {other:?}"),
         }
         assert!(!commit_exists(&store, "tbl", 3).await);
+    }
+
+    // -- red-team fixes: protocol, shape, canonical paths, DVs ----------------
+
+    async fn put_commit(store: &InMemory, prefix: &str, version: u64, lines: &[Value]) {
+        let body: String = lines.iter().map(|l| format!("{l}\n")).collect();
+        store
+            .put(
+                &object_store::path::Path::from(format!("{prefix}/_delta_log/{version:020}.json")),
+                PutPayload::from(Bytes::from(body)),
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_feature_enabled_after_v0_refuses_the_replace() {
+        let store: Arc<InMemory> = Arc::new(InMemory::new());
+        seed_bootstrap(&store, "tbl").await;
+        let writer = make_unpartitioned_writer(store.clone() as Arc<dyn ObjectStore>, "tbl");
+        writer.write_batch(make_batch(2)).await.unwrap();
+        // v2: an `ALTER TABLE` that turns on in-commit timestamps.
+        let boot = commit_lines(&store, "tbl", 0).await;
+        let mut protocol = boot[0].clone();
+        protocol["protocol"]["writerFeatures"]
+            .as_array_mut()
+            .unwrap()
+            .push(Value::from("inCommitTimestamp"));
+        let mut md = boot[1].clone();
+        md["metaData"]["configuration"]["delta.enableInCommitTimestamps"] = Value::from("true");
+        put_commit(&store, "tbl", 2, &[protocol, md]).await;
+
+        match writer.write_batch(make_batch(5)).await {
+            Err(UniformWriterError::UnsupportedTableFeature { table, feature }) => {
+                assert_eq!(table, "c.s.t");
+                assert!(feature.contains("inCommitTimestamp"), "{feature}");
+            }
+            other => panic!("expected UnsupportedTableFeature, got {other:?}"),
+        }
+        assert!(
+            !commit_exists(&store, "tbl", 3).await,
+            "no commit after a refusal"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_config_only_feature_after_v0_refuses_the_replace() {
+        // The protocol stays the same; only the table configuration turns
+        // change data feed on.
+        let store: Arc<InMemory> = Arc::new(InMemory::new());
+        seed_bootstrap(&store, "tbl").await;
+        let writer = make_unpartitioned_writer(store.clone() as Arc<dyn ObjectStore>, "tbl");
+        writer.write_batch(make_batch(2)).await.unwrap();
+        let mut md = commit_lines(&store, "tbl", 0).await[1].clone();
+        md["metaData"]["configuration"]["delta.enableChangeDataFeed"] = Value::from("true");
+        put_commit(&store, "tbl", 2, &[md]).await;
+        match writer.write_batch(make_batch(5)).await {
+            Err(UniformWriterError::UnsupportedTableFeature { feature, .. }) => {
+                assert!(feature.contains("changeDataFeed"), "{feature}");
+            }
+            other => panic!("expected UnsupportedTableFeature, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn staged_commits_refuse_the_replace() {
+        let store: Arc<InMemory> = Arc::new(InMemory::new());
+        seed_bootstrap(&store, "tbl").await;
+        let writer = make_unpartitioned_writer(store.clone() as Arc<dyn ObjectStore>, "tbl");
+        writer.write_batch(make_batch(2)).await.unwrap();
+        store
+            .put(
+                &object_store::path::Path::from(
+                    "tbl/_delta_log/_staged_commits/00000000000000000002.uuid.json",
+                ),
+                PutPayload::from(Bytes::from_static(b"{}")),
+            )
+            .await
+            .unwrap();
+        match writer.write_batch(make_batch(5)).await {
+            Err(UniformWriterError::UnsupportedTableFeature { table, feature }) => {
+                assert_eq!(table, "c.s.t");
+                assert!(feature.contains("_staged_commits"), "{feature}");
+            }
+            other => panic!("expected UnsupportedTableFeature, got {other:?}"),
+        }
+        assert!(!commit_exists(&store, "tbl", 2).await);
+    }
+
+    #[tokio::test]
+    async fn an_unknown_action_refuses_the_replace() {
+        let store: Arc<InMemory> = Arc::new(InMemory::new());
+        seed_bootstrap(&store, "tbl").await;
+        let writer = make_unpartitioned_writer(store.clone() as Arc<dyn ObjectStore>, "tbl");
+        writer.write_batch(make_batch(2)).await.unwrap();
+        put_commit(&store, "tbl", 2, &[serde_json::json!({"futureAction": {}})]).await;
+        match writer.write_batch(make_batch(5)).await {
+            Err(UniformWriterError::UnsupportedTableFeature { feature, .. }) => {
+                assert!(feature.contains("futureAction"), "{feature}");
+            }
+            other => panic!("expected UnsupportedTableFeature, got {other:?}"),
+        }
+    }
+
+    /// A metaData commit with one more column than the bootstrap schema.
+    async fn alter_add_column(store: &InMemory, prefix: &str, version: u64) {
+        let mut md = commit_lines(store, prefix, 0).await[1].clone();
+        let mut schema: Value =
+            serde_json::from_str(md["metaData"]["schemaString"].as_str().unwrap()).unwrap();
+        schema["fields"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "name": "extra", "type": "string", "nullable": true, "metadata": {
+                    "delta.columnMapping.id": 9,
+                    "delta.columnMapping.physicalName": "col-extra-uuid"
+                }
+            }));
+        md["metaData"]["schemaString"] = Value::from(schema.to_string());
+        put_commit(store, prefix, version, &[md]).await;
+    }
+
+    #[tokio::test]
+    async fn a_schema_change_after_discover_refuses_without_a_commit() {
+        let store: Arc<InMemory> = Arc::new(InMemory::new());
+        seed_bootstrap(&store, "tbl").await;
+        let writer = make_unpartitioned_writer(store.clone() as Arc<dyn ObjectStore>, "tbl");
+        writer.write_batch(make_batch(2)).await.unwrap();
+        let stale_state = writer.discover().await.unwrap();
+        alter_add_column(&store, "tbl", 2).await;
+        match writer
+            .write_batch_with_state(make_batch(5), stale_state)
+            .await
+        {
+            Err(UniformWriterError::TableChangedDuringWrite { table, what }) => {
+                assert_eq!(table, "c.s.t");
+                assert!(what.contains("schema"), "{what}");
+            }
+            other => panic!("expected TableChangedDuringWrite, got {other:?}"),
+        }
+        assert!(!commit_exists(&store, "tbl", 3).await);
+    }
+
+    #[tokio::test]
+    async fn a_conflict_retry_rereads_the_schema_and_refuses_on_change() {
+        // The live set is read at head 1. A competitor then lands v2: an
+        // ALTER that adds a column. Our commit at v2 conflicts; the retry
+        // re-reads the metadata, sees the change and refuses.
+        let store: Arc<InMemory> = Arc::new(InMemory::new());
+        seed_bootstrap(&store, "tbl").await;
+        let writer = make_unpartitioned_writer(store.clone() as Arc<dyn ObjectStore>, "tbl");
+        writer.write_batch(make_batch(2)).await.unwrap();
+        let state = writer.discover().await.unwrap();
+        let stale = discover::read_live_set(&*store, "tbl", "c.s.t", "")
+            .await
+            .unwrap();
+        alter_add_column(&store, "tbl", 2).await;
+        let staged = StagedFile {
+            path: "b.parquet".into(),
+            add: serde_json::json!({"path": "b.parquet", "partitionValues": {}, "size": 11})
+                .as_object()
+                .unwrap()
+                .clone(),
+            blake3_hash: "b".into(),
+            column_hashes: Vec::new(),
+            num_records: 1,
+            size_bytes: 11,
+        };
+        match writer.commit_replace(vec![staged], stale, state, 0).await {
+            Err(UniformWriterError::TableChangedDuringWrite { .. }) => {}
+            other => panic!("expected TableChangedDuringWrite, got {other:?}"),
+        }
+        assert!(!commit_exists(&store, "tbl", 3).await);
+    }
+
+    /// The live `add` of the file a build produces, re-spelled by another
+    /// engine: v2 removes Rocky's relative spelling, v3 adds `spelling`.
+    async fn respell_live_file(store: &InMemory, prefix: &str, rel: &str, spelling: &str) {
+        let v1 = commit_lines(store, prefix, 1).await;
+        let add = actions(&v1, "add")[0].clone();
+        put_commit(
+            store,
+            prefix,
+            2,
+            &[serde_json::json!({"remove": {"path": rel, "dataChange": true}})],
+        )
+        .await;
+        let mut respelled = add.clone();
+        respelled["path"] = Value::from(spelling);
+        put_commit(store, prefix, 3, &[serde_json::json!({ "add": respelled })]).await;
+    }
+
+    #[tokio::test]
+    async fn an_absolute_spelling_of_the_same_file_is_not_moved() {
+        let store: Arc<InMemory> = Arc::new(InMemory::new());
+        seed_bootstrap(&store, "tbl").await;
+        let writer = make_unpartitioned_writer(store.clone() as Arc<dyn ObjectStore>, "tbl")
+            .with_table_bucket("bkt");
+        let first = writer.write_batch(make_batch(3)).await.unwrap();
+        let rel = basename(&first.file_path);
+        respell_live_file(&store, "tbl", &rel, &format!("s3://bkt/tbl/{rel}")).await;
+
+        let again = writer.write_batch(make_batch(3)).await.unwrap();
+        assert!(!again.committed, "same canonical file: no remove, no add");
+        assert_eq!(again.table_version, 3);
+        assert_eq!(
+            again.commit_version, 3,
+            "the version of the live (absolute) add"
+        );
+        assert!(!commit_exists(&store, "tbl", 4).await);
+
+        // A different output removes the file by its own (absolute) spelling.
+        writer.write_batch(make_batch(4)).await.unwrap();
+        let lines = commit_lines(&store, "tbl", 4).await;
+        assert_eq!(
+            actions(&lines, "remove")[0]["path"],
+            format!("s3://bkt/tbl/{rel}")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_percent_encoded_spelling_of_the_same_file_is_not_moved() {
+        let store: Arc<InMemory> = Arc::new(InMemory::new());
+        seed_partitioned_bootstrap(&store, "ptbl").await;
+        let writer = make_unpartitioned_writer(store.clone() as Arc<dyn ObjectStore>, "ptbl");
+        let pv = HashMap::from([("region".to_string(), "eu".to_string())]);
+        let first = writer
+            .write_partitioned_batch(make_partitioned_batch("eu", 2), pv.clone())
+            .await
+            .unwrap();
+        let rel = first.file_path.strip_prefix("ptbl/").unwrap().to_string();
+        let encoded = rel.replace('=', "%3D");
+        assert_ne!(encoded, rel);
+        respell_live_file(&store, "ptbl", &rel, &encoded).await;
+
+        let again = writer
+            .write_partitioned_batch(make_partitioned_batch("eu", 2), pv)
+            .await
+            .unwrap();
+        assert!(!again.committed, "same canonical file: no remove, no add");
+        assert!(!commit_exists(&store, "ptbl", 4).await);
+    }
+
+    #[tokio::test]
+    async fn a_deletion_vector_update_refuses_as_deletion_vectors_unsupported() {
+        let store: Arc<InMemory> = Arc::new(InMemory::new());
+        seed_bootstrap(&store, "tbl").await;
+        let writer = make_unpartitioned_writer(store.clone() as Arc<dyn ObjectStore>, "tbl");
+        let a = writer.write_batch(make_batch(3)).await.unwrap();
+        let rel = basename(&a.file_path);
+        // A legal DV update: remove + add of one path with different DVs.
+        let dv = serde_json::json!({"storageType": "u", "pathOrInlineDv": "x", "sizeInBytes": 1, "cardinality": 1});
+        put_commit(
+            &store,
+            "tbl",
+            2,
+            &[
+                serde_json::json!({"remove": {"path": rel, "dataChange": true}}),
+                serde_json::json!({"add": {"path": rel, "size": 1, "partitionValues": {}, "dataChange": true, "deletionVector": dv}}),
+            ],
+        )
+        .await;
+        assert!(matches!(
+            writer.write_batch(make_batch(4)).await,
+            Err(UniformWriterError::DeletionVectorsUnsupported)
+        ));
+
+        // A remove that carries a deletion vector also refuses.
+        let store: Arc<InMemory> = Arc::new(InMemory::new());
+        seed_bootstrap(&store, "tbl").await;
+        let writer = make_unpartitioned_writer(store.clone() as Arc<dyn ObjectStore>, "tbl");
+        let a = writer.write_batch(make_batch(3)).await.unwrap();
+        put_commit(
+            &store,
+            "tbl",
+            2,
+            &[serde_json::json!({"remove": {"path": basename(&a.file_path), "dataChange": true, "deletionVector": dv}})],
+        )
+        .await;
+        assert!(matches!(
+            writer.write_batch(make_batch(4)).await,
+            Err(UniformWriterError::DeletionVectorsUnsupported)
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_superseded_file_is_held_until_the_retention_window_passes() {
+        let store: Arc<InMemory> = Arc::new(InMemory::new());
+        seed_bootstrap(&store, "tbl").await;
+        let writer = make_unpartitioned_writer(store.clone() as Arc<dyn ObjectStore>, "tbl");
+        let a = writer.write_batch(make_batch(3)).await.unwrap();
+        writer.write_batch(make_batch(4)).await.unwrap(); // removes A at v2
+        let rel = basename(&a.file_path);
+        let deleted_at =
+            actions(&commit_lines(&store, "tbl", 2).await, "remove")[0]["deletionTimestamp"]
+                .as_i64()
+                .unwrap();
+        let week = 7 * 24 * 60 * 60 * 1000;
+        assert_eq!(
+            discover::proven_removed_at(&*store, "b", "tbl", &rel, 1, deleted_at + week - 1).await,
+            RemovalProof::Held(RemovalHoldReason::RetentionWindowOpen),
+            "inside the default 7-day window, time travel can still read A"
+        );
+        assert_eq!(
+            discover::proven_removed_at(&*store, "b", "tbl", &rel, 1, deleted_at + week).await,
+            RemovalProof::ProvenRemoved { head_version: 2 }
+        );
+
+        // A table-level retention setting is honoured.
+        let mut md = commit_lines(&store, "tbl", 0).await[1].clone();
+        md["metaData"]["configuration"]["delta.deletedFileRetentionDuration"] =
+            Value::from("interval 1 hours");
+        put_commit(&store, "tbl", 3, &[md.clone()]).await;
+        assert_eq!(
+            discover::proven_removed_at(&*store, "b", "tbl", &rel, 1, deleted_at + 3_600_000).await,
+            RemovalProof::ProvenRemoved { head_version: 3 }
+        );
+        // An unreadable retention setting holds.
+        md["metaData"]["configuration"]["delta.deletedFileRetentionDuration"] =
+            Value::from("seven days");
+        put_commit(&store, "tbl", 4, &[md]).await;
+        assert_eq!(
+            discover::proven_removed_at(&*store, "b", "tbl", &rel, 1, i64::MAX / 2).await,
+            RemovalProof::Held(RemovalHoldReason::RetentionUnknown)
+        );
     }
 
     /// Not a CI test. Writes two replace scenarios to the directory in

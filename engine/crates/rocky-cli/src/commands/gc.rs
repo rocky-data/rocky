@@ -419,9 +419,9 @@ fn report_notes(min_age_days: i64) -> Vec<String> {
          the file is safe to delete, and NOT that `rocky restore` can rebuild it (restore covers \
          only recipes that read no recorded upstreams; see the restore caveat below). `rocky \
          apply` reclaims an artifact only when its file is a proven `remove` in its table's Delta \
-         log; the append-only writer keeps older versions live, so a derivable file still \
-         referenced by the live table is held (only an external compaction/VACUUM makes it \
-         reclaimable)."
+         log and Delta's retention window (`delta.deletedFileRetentionDuration`, default 7 days) \
+         has passed since its removal. A derivable file the live table still references is \
+         held."
             .to_string(),
         "Restore coverage is narrower than derivability. `rocky restore` rebuilds an evicted \
          artifact only from a recipe that is non-partitioned, content-addressed, and reads no \
@@ -776,9 +776,11 @@ fn gc_plan_notes() -> Vec<String> {
          apply` additionally requires \
          each file to be a proven `remove` in its table's Delta log before evicting it (a \
          tombstone + retired ledger row — `rocky apply` performs no physical byte deletion). The \
-         append-only writer never removes on its own, so a file still referenced by the live \
-         table (including an older version) is HELD — only an external compaction/VACUUM makes it \
-         reclaimable. Expect apply to evict fewer artifacts than this plan lists (and none on a \
+         content-addressed writer replaces the table on each run, so it `remove`s the files of \
+         the build it supersedes. A removed file still stays HELD until Delta's retention window \
+         passes (`deletionTimestamp` + `delta.deletedFileRetentionDuration`, default 7 days), \
+         because time travel can still read it; a file the live table references is always HELD. \
+         Expect apply to evict fewer artifacts than this plan lists (and none on a \
          creds-free run, where liveness cannot be verified)."
             .to_string(),
         "`rocky apply` re-verifies each artifact against the live ledger AND its table's Delta \
@@ -1015,7 +1017,8 @@ fn print_plan_table(output: &GcPlanOutput) {
 /// The manifest-truth reclaimability verdict for a candidate artifact.
 pub(crate) enum ReclaimVerdict {
     /// The candidate's file is **affirmatively proven removed** in its own
-    /// table's Delta log (an external compaction/VACUUM retired it) — the
+    /// table's Delta log (a later replace, compaction or VACUUM retired it,
+    /// and Delta's deleted-file retention window has passed) — the
     /// ledger row may be tombstoned + retired. Carries the Delta head version
     /// the proof validated against, for the TOCTOU re-check + version-scoped
     /// tombstone.
@@ -1028,9 +1031,12 @@ pub(crate) enum ReclaimVerdict {
 /// Decides whether a content-addressed artifact may be **tombstoned + retired**
 /// from the ledger, by reading the manifest truth of its own table's Delta log.
 ///
-/// The append-only UniForm writer emits `add` actions and **never** `remove`,
-/// so multiple file versions are live at once and no ledger/hash heuristic can
-/// tell which files a live table still references — only the `_delta_log` can.
+/// The UniForm writer replaces the table on each run (RV1-P1a), so it
+/// `remove`s the files a run supersedes; other engines can add and remove
+/// files too. No ledger/hash heuristic can tell which files a live table
+/// still references — only the `_delta_log` can. A removed file also stays
+/// held until Delta's retention window passes, because time travel can still
+/// read it.
 /// An artifact is reclaimable **iff** the strict [`RemovalProof`] affirms it was
 /// `remove`d in its own table (bound to that table by prefix membership + its
 /// own `add` at its recorded commit version). Every other state — still live,
@@ -1115,11 +1121,13 @@ fn gc_apply_notes() -> Vec<String> {
             .to_string(),
         "Liveness is manifest-truth: an artifact is tombstoned + retired only when its file is \
          AFFIRMATIVELY PROVEN removed in its own table's Delta log (bound by prefix membership + \
-         its own `add` at its recorded commit version). The append-only writer never removes on \
-         its own, so a still-referenced file (including an older version) is HELD — only an \
-         external compaction/VACUUM makes a file reclaimable. Any anomaly (checkpoint, version \
-         gap, malformed commit, unsupported protocol, wrong prefix, unverifiable log) holds \
-         (fail-closed)."
+         its own `add` at its recorded commit version). The content-addressed writer replaces the \
+         table on each run and `remove`s the superseded build's files, so a superseded file is \
+         proven removed — but it is HELD until Delta's retention window passes \
+         (`deletionTimestamp` + `delta.deletedFileRetentionDuration`, default 7 days), because \
+         Delta time travel can still read it. A file the live table references is HELD. Any \
+         anomaly (checkpoint, version gap, malformed commit, unsupported protocol, wrong prefix, \
+         unverifiable log, unreadable retention) holds (fail-closed)."
             .to_string(),
         "The eviction of record is the durable tombstone + retired ledger row; the recipe itself \
          (canonical IR and recorded upstreams) stays in the provenance the tombstone references. \
@@ -1173,9 +1181,9 @@ fn gc_apply_notes() -> Vec<String> {
 ///    live row's hash equals the planned hash;
 /// 3. re-derives derivability *now* AND consults the [`LivenessOracle`] for
 ///    manifest truth — tombstoning only when the candidate's file is
-///    affirmatively proven removed in its own table's Delta log (the
-///    append-only writer keeps older versions live, so a ledger/hash heuristic
-///    cannot authorize a retirement);
+///    affirmatively proven removed in its own table's Delta log, past Delta's
+///    retention window (only the log knows which files are live, so a
+///    ledger/hash heuristic cannot authorize a retirement);
 /// 4. builds the tombstone from the LIVE candidate, never the plan payload;
 /// 5. relies on [`StateStore::evict_artifact`]'s in-transaction hash check as a
 ///    final guard against a race.
@@ -1256,10 +1264,10 @@ async fn execute_gc_apply(
         );
         match by_key.get(&key).copied() {
             Some(cand) if cand.output.derivable => {
-                // Manifest-truth liveness gate (authoritative). The append-only
-                // UniForm writer never emits `remove`, so an older content-hash
-                // file can stay live in the current snapshot alongside a newer
-                // one — no ledger/hash heuristic can tell. Read THIS table's
+                // Manifest-truth liveness gate (authoritative). Files come and
+                // go through the writer's replace commits and other engines'
+                // commits — no ledger/hash heuristic can tell which are live,
+                // or still inside Delta's retention window. Read THIS table's
                 // Delta log and evict only a file that is a proven `remove`;
                 // still-live, absent/truncated, or unverifiable (incl.
                 // creds-free) all HOLD.
@@ -3277,7 +3285,7 @@ auto_create_schemas = true
                 &[
                     &format!(r#"{{"add":{{"path":"{HA}.parquet"}}}}"#),
                     &format!(r#"{{"add":{{"path":"{HB}.parquet"}}}}"#),
-                    &format!(r#"{{"remove":{{"path":"{HA}.parquet"}}}}"#),
+                    &format!(r#"{{"remove":{{"path":"{HA}.parquet","deletionTimestamp":0}}}}"#),
                 ],
             )
             .await;
@@ -3393,7 +3401,7 @@ auto_create_schemas = true
                 "s3://b/cb/raw/orders",
                 &[
                     &format!(r#"{{"add":{{"path":"{HB}.parquet"}}}}"#),
-                    &format!(r#"{{"remove":{{"path":"{HB}.parquet"}}}}"#),
+                    &format!(r#"{{"remove":{{"path":"{HB}.parquet","deletionTimestamp":0}}}}"#),
                 ],
             )
             .await;
@@ -3430,7 +3438,7 @@ auto_create_schemas = true
             "s3://b/tgt/raw/orders",
             &[
                 &format!(r#"{{"add":{{"path":"{HA}.parquet"}}}}"#),
-                &format!(r#"{{"remove":{{"path":"{HA}.parquet"}}}}"#),
+                &format!(r#"{{"remove":{{"path":"{HA}.parquet","deletionTimestamp":0}}}}"#),
                 &format!(r#"{{"add":{{"path":"s3://b/tgt/raw/orders/{HA}.parquet"}}}}"#),
             ],
         )
@@ -3452,7 +3460,7 @@ auto_create_schemas = true
                 "s3://b/tgt/raw/orders",
                 &[
                     &format!(r#"{{"add":{{"path":"{HA}.parquet"}}}}"#),
-                    &format!(r#"{{"remove":{{"path":"{HA}.parquet"}}}}"#),
+                    &format!(r#"{{"remove":{{"path":"{HA}.parquet","deletionTimestamp":0}}}}"#),
                 ],
             )
             .await;
@@ -3492,7 +3500,7 @@ auto_create_schemas = true
                 "s3://b/other/raw/orders",
                 &[
                     &format!(r#"{{"add":{{"path":"{HA}.parquet"}}}}"#),
-                    &format!(r#"{{"remove":{{"path":"{HA}.parquet"}}}}"#),
+                    &format!(r#"{{"remove":{{"path":"{HA}.parquet","deletionTimestamp":0}}}}"#),
                 ],
             )
             .await;
@@ -3537,7 +3545,7 @@ auto_create_schemas = true
             "s3://b/tgt/raw/orders",
             &[
                 &format!(r#"{{"add":{{"path":"{HA}.parquet"}}}}"#),
-                &format!(r#"{{"remove":{{"path":"{HA}.parquet"}}}}"#),
+                &format!(r#"{{"remove":{{"path":"{HA}.parquet","deletionTimestamp":0}}}}"#),
                 &format!(r#"{{"add":{{"path":"/tgt/raw/orders/{HA}.parquet"}}}}"#),
             ],
         )
@@ -3570,7 +3578,7 @@ auto_create_schemas = true
         // prior last-line-wins heuristic would take the `remove` as the highest
         // reference and WRONGLY evict — the guard must HOLD regardless of order.
         let same_version = format!(
-            "{{\"add\":{{\"path\":\"{HA}.parquet\"}}}}\n{{\"remove\":{{\"path\":\"{HA}.parquet\"}}}}"
+            "{{\"add\":{{\"path\":\"{HA}.parquet\"}}}}\n{{\"remove\":{{\"path\":\"{HA}.parquet\",\"deletionTimestamp\":0}}}}"
         );
         let mut malformed = InMemoryLivenessOracle::new();
         malformed
@@ -3597,7 +3605,7 @@ auto_create_schemas = true
             "s3://b/tgt/raw/orders",
             &[
                 &format!(r#"{{"add":{{"path":"{HA}.parquet"}}}}"#),
-                &format!(r#"{{"remove":{{"path":"{HA}.parquet"}}}}"#),
+                &format!(r#"{{"remove":{{"path":"{HA}.parquet","deletionTimestamp":0}}}}"#),
             ],
         )
         .await;
@@ -3630,7 +3638,7 @@ auto_create_schemas = true
                 "s3://b/tgt/raw/orders",
                 &[
                     &format!(r#"{{"add":{{"path":"{HA}.parquet"}}}}"#),
-                    &format!(r#"{{"remove":{{"path":"{HA}.parquet"}}}}"#),
+                    &format!(r#"{{"remove":{{"path":"{HA}.parquet","deletionTimestamp":0}}}}"#),
                     &format!(r#"{{"add":{{"path":"//b/tgt/raw/orders/{HA}.parquet"}}}}"#),
                 ],
             )
@@ -3659,7 +3667,7 @@ auto_create_schemas = true
         let plan = plan_from_store(&store, now, 7);
 
         let add = format!(r#"{{"add":{{"path":"{HA}.parquet"}}}}"#);
-        let remove = format!(r#"{{"remove":{{"path":"{HA}.parquet"}}}}"#);
+        let remove = format!(r#"{{"remove":{{"path":"{HA}.parquet","deletionTimestamp":0}}}}"#);
 
         // v0 = commitInfo + metaData only (NO protocol), v1 add, v2 remove.
         let mut no_protocol = InMemoryLivenessOracle::new();
@@ -3709,7 +3717,7 @@ auto_create_schemas = true
         let plan = plan_from_store(&store, now, 7);
 
         let add = format!(r#"{{"add":{{"path":"{HA}.parquet"}}}}"#);
-        let remove = format!(r#"{{"remove":{{"path":"{HA}.parquet"}}}}"#);
+        let remove = format!(r#"{{"remove":{{"path":"{HA}.parquet","deletionTimestamp":0}}}}"#);
 
         // v1 add(HA), v2 remove(HA), v3 = `{}` (empty object).
         let mut empty = InMemoryLivenessOracle::new();
@@ -3753,7 +3761,7 @@ auto_create_schemas = true
         let plan = plan_from_store(&store, now, 7);
 
         let add = format!(r#"{{"add":{{"path":"{HA}.parquet"}}}}"#);
-        let remove = format!(r#"{{"remove":{{"path":"{HA}.parquet"}}}}"#);
+        let remove = format!(r#"{{"remove":{{"path":"{HA}.parquet","deletionTimestamp":0}}}}"#);
 
         for bad_protocol in [
             r#"{"protocol":{}}"#, // missing versions
@@ -3788,7 +3796,7 @@ auto_create_schemas = true
         let plan = plan_from_store(&store, now, 7);
 
         let add = format!(r#"{{"add":{{"path":"{HA}.parquet"}}}}"#);
-        let remove = format!(r#"{{"remove":{{"path":"{HA}.parquet"}}}}"#);
+        let remove = format!(r#"{{"remove":{{"path":"{HA}.parquet","deletionTimestamp":0}}}}"#);
 
         // v0, v1, v3 — v2 is MISSING → gap.
         let mut gapped = InMemoryLivenessOracle::new();

@@ -781,7 +781,7 @@ pub async fn execute_content_addressed_model(
     let sql_client: Arc<dyn SqlClient> = Arc::new(NoOpSqlClient);
     // Strip the bucket from the storage_prefix to derive the key prefix
     // the writer uses for `_delta_log/` etc.
-    let (_bucket, key_prefix) = parse_s3_url(storage_prefix)?;
+    let (bucket, key_prefix) = parse_s3_url(storage_prefix)?;
     let writer = UniformWriter::new(
         UniformWriterConfig {
             catalog: model_ir.target.catalog.clone(),
@@ -792,7 +792,9 @@ pub async fn execute_content_addressed_model(
         },
         store,
         sql_client,
-    );
+    )
+    // The bucket lets the replace resolve absolute `s3://` paths in the log.
+    .with_table_bucket(bucket);
 
     // 3. Discover state + assert partition_columns match.
     let state = writer
@@ -2951,6 +2953,72 @@ mod tests {
             .map(|f| f.file_path.clone())
             .collect();
         assert_eq!(live, expected);
+        remove_test_object_store(&storage_prefix);
+    }
+
+    /// A→B→A: run 3 re-adds A after run 2 removed it. The run records the new
+    /// live-add version (3), not run 1's (1). The ledger keys rows by run, so
+    /// run 3 gets its own row; an upsert of one key rewrites `commit_version`.
+    /// Run 1's row for A is held while A is live again, and B (removed at v3)
+    /// is held inside Delta's retention window.
+    #[tokio::test]
+    async fn a_b_a_rebuild_records_the_new_live_add_version() {
+        let (store, _prefix, storage_prefix) = fresh_unpartitioned_table("aba").await;
+        let model = unpartitioned_model(&storage_prefix);
+        let wa = fixed_rows_warehouse("rca::aba-a", id_rows(&[1, 2]));
+        let wb = fixed_rows_warehouse("rca::aba-b", id_rows(&[3]));
+        let run1 = execute_content_addressed_model(&model, &wa, None)
+            .await
+            .unwrap();
+        let run2 = execute_content_addressed_model(&model, &wb, None)
+            .await
+            .unwrap();
+        let run3 = execute_content_addressed_model(&model, &wa, None)
+            .await
+            .unwrap();
+        assert_eq!(run3.blake3_hash, run1.blake3_hash);
+        assert_eq!(run3.file_path, run1.file_path);
+        assert_eq!(run1.written_files[0].commit_version, 1);
+        assert_eq!(run3.written_files[0].commit_version, 3, "the new live add");
+        assert_eq!(run3.commit_version, 3);
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = rocky_core::state::StateStore::open(&tmp.path().join("state.redb")).unwrap();
+        let now = chrono::Utc::now();
+        for (run_id, summary) in [("r1", &run1), ("r2", &run2), ("r3", &run3)] {
+            for row in artifact_records(summary, run_id, "fct_orders", now) {
+                state.record_artifact(&row).unwrap();
+            }
+        }
+        let row = |run: &str, path: &str| {
+            state
+                .get_artifact(run, "fct_orders", path)
+                .unwrap()
+                .unwrap()
+                .commit_version
+        };
+        assert_eq!(row("r1", &run1.file_path), 1);
+        assert_eq!(row("r3", &run3.file_path), 3);
+        // An upsert of the same key rewrites the version.
+        let mut again = artifact_records(&run3, "r1", "fct_orders", now);
+        state.record_artifact(&again.remove(0)).unwrap();
+        assert_eq!(
+            row("r1", &run1.file_path),
+            3,
+            "the upsert rewrites commit_version"
+        );
+
+        // A is live again: run 1's add at v1 is superseded by the v3 re-add.
+        let proof_a =
+            removal_proof_given_store(store.clone(), &storage_prefix, &run1.file_path, 1).await;
+        assert_eq!(proof_a, RemovalProof::Held(RemovalHoldReason::StillLive));
+        // B was removed at v3, but time travel can still read it.
+        let proof_b =
+            removal_proof_given_store(store.clone(), &storage_prefix, &run2.file_path, 2).await;
+        assert_eq!(
+            proof_b,
+            RemovalProof::Held(RemovalHoldReason::RetentionWindowOpen)
+        );
         remove_test_object_store(&storage_prefix);
     }
 

@@ -82,7 +82,17 @@ is not in the new output. It adds every new file that is not live yet.
 
 Earlier versions stay in the Delta log. You can still read them with
 `VERSION AS OF`. Their files are now eligible for your `VACUUM`. After a
-`VACUUM`, the old versions are gone for good.
+`VACUUM`, the old versions are gone for good. `rocky gc` holds a replaced
+file until `delta.deletedFileRetentionDuration` (default 7 days) has passed
+since its removal.
+
+A replace is not an append, so it affects streaming readers:
+
+- **A Delta streaming reader fails on the first replace.** A `readStream` of
+  the table stops at a commit that removes data. Set `skipChangeCommits` on
+  the reader, or read the table as a batch.
+- **Each run replays the whole Delta log.** Rocky reads every JSON commit to
+  find the live files. The cost of that read grows with the number of commits.
 
 ### A Delta checkpoint makes the write refuse
 
@@ -101,8 +111,17 @@ To recover:
 2. Create it again on an empty `storage_prefix`.
 3. Run the model again. Rocky writes the whole output in one commit.
 
-A table with `delta.appendOnly = true` also refuses, because a replace must
-remove files. The error gives the `ALTER TABLE` statement that turns it off.
+### Other refusals
+
+Rocky also refuses the write, and writes no commit, in these cases:
+
+| Case | Why |
+|---|---|
+| `delta.appendOnly = true` | A replace must remove files. The error gives the `ALTER TABLE` that turns it off. |
+| A Delta feature turned on after the table was created, such as deletion vectors, in-commit timestamps, change data feed, v2 checkpoints, clustering or `CHECK` constraints | The writer does not implement the feature, so a commit could corrupt the table. Rocky checks the latest protocol and table properties, not only the first commit. |
+| Coordinated or catalog-managed commits (any file under `_delta_log/_staged_commits/`) | A direct commit would bypass the commit coordinator. |
+| A Delta action Rocky does not know | Rocky cannot replay the log with confidence. |
+| The schema, partitioning or protocol changed during the write | The prepared files no longer match the table. Run the model again. |
 
 ## Configuration
 
