@@ -1227,6 +1227,19 @@ fn deferred_externalized_edges_for(
 /// reads and unknown read sets retain their existing opt-in containment policy.
 /// A selected model whose inputs were successfully externalized by `--defer`
 /// has no local declared input edge for this execution.
+/// Drop the dependency edges OF every model in `not_run` from the runtime
+/// graph (#1630). Such a model does not execute, so its reads order nothing;
+/// kept, they can close a cycle that makes the physical-read derivation skip
+/// a true read of the model's own target. Edges ONTO it stay, so its readers
+/// are still withheld.
+fn drop_reads_of_models_that_do_not_run(dag_nodes: &mut [DagNode], not_run: &BTreeSet<String>) {
+    for node in dag_nodes.iter_mut() {
+        if not_run.contains(&node.name) {
+            node.depends_on.clear();
+        }
+    }
+}
+
 fn compile_error_descendant_blocks(
     dag_nodes: &[DagNode],
     failed: &BTreeSet<String>,
@@ -10205,19 +10218,33 @@ pub(crate) fn case_near_miss_remedy(rules: rocky_sql::defer::IdentifierCaseRules
 /// whose `[target]` names no catalog (#1629); `rocky run --dag` establishes
 /// the same catalog for the same models, so the two schedulers derive the
 /// same edges.
+///
+/// `not_run` are the models that will not execute (an error diagnostic,
+/// #1630). Their reads order nothing, so they are no reader here and their
+/// own edges are dropped from the runtime graph; kept, they could close a
+/// cycle that makes the derivation skip a TRUE read of their target. They
+/// stay producers, so a reader of their target is ordered — and withheld —
+/// after them.
 fn augment_physical_read_edges(
     compile_result: &mut rocky_compiler::compile::CompileResult,
     contain_failures: bool,
     default_catalog: Option<&str>,
+    not_run: &BTreeSet<String>,
     warnings: &mut Vec<String>,
 ) -> Result<()> {
+    drop_reads_of_models_that_do_not_run(&mut compile_result.project.dag_nodes, not_run);
     let inputs: Vec<rocky_core::physical_edges::PhysicalEdgeModel<'_>> = compile_result
         .project
         .models
         .iter()
         .map(|m| {
-            rocky_core::physical_edges::PhysicalEdgeModel::from_model(m)
-                .with_effective_catalog(default_catalog)
+            let mut input = rocky_core::physical_edges::PhysicalEdgeModel::from_model(m)
+                .with_effective_catalog(default_catalog);
+            if not_run.contains(&m.config.name) {
+                // A query that reads no table: a producer, never a reader.
+                input.sql = "SELECT 1";
+            }
+            input
         })
         .collect();
     let existing: Vec<(String, String)> = compile_result
@@ -12147,14 +12174,59 @@ pub(crate) async fn execute_models_with_explicit_contracts(
         }
         output.shadow = true;
     } else {
+        // #1630: a model with an error diagnostic does not run, so its own
+        // reads order nothing. Left in the graph, they can close a cycle that
+        // makes the derivation skip a TRUE read of its target as the
+        // cycle-closer — and that reader then runs on the stale table.
         let default_catalog = warehouse.default_catalog();
         augment_physical_read_edges(
             &mut compile_result,
             resilience.contain_failures,
             default_catalog.as_deref(),
+            &compile_failed_models,
             &mut output.scheduling_warnings,
         )?;
         refuse_on_scheduling_warnings(strict_scheduling, &output.scheduling_warnings)?;
+        // A model that reads a failed model's target by its qualified name is
+        // withheld like one that reads it by a compile edge: the table was not
+        // rebuilt. Under `[resilience] contain_failures` the containment
+        // ledger already withholds physical readers from its own layering.
+        if !resilience.contain_failures {
+            let physical_blocks = compile_error_descendant_blocks(
+                &compile_result.project.dag_nodes,
+                &compile_failed_models,
+                &externalized_defer_edges,
+            );
+            for (model, blocked_by) in physical_blocks {
+                if compile_excluded_models.contains(&model) {
+                    continue;
+                }
+                compile_excluded_models.insert(model.clone());
+                let in_scope = model_name_filter.is_none_or(|selected| selected == model)
+                    && model_set.is_none_or(|set| set.contains(&model));
+                if !in_scope {
+                    continue;
+                }
+                if !root_error_in_scope {
+                    output.tables_failed += 1;
+                    output.errors.push(crate::output::TableErrorOutput {
+                        asset_key: vec![model.clone()],
+                        error: format!(
+                            "model '{model}' was withheld because upstream compile failure(s) \
+                             affect: {}",
+                            blocked_by.join(", ")
+                        ),
+                        failure_kind: crate::output::FailureKind::CompileError,
+                        cooldown_seconds: None,
+                    });
+                }
+                output.contained.push(crate::output::ContainedModelOutput {
+                    model,
+                    unblock_hint: super::containment::unblock_hint(&blocked_by, false),
+                    blocked_by,
+                });
+            }
+        }
     }
 
     // #1093: capture governance from the same in-memory model set the
@@ -33677,8 +33749,14 @@ auto_create_schemas = true
         );
 
         let mut warnings = Vec::new();
-        super::augment_physical_read_edges(&mut compiled, false, None, &mut warnings)
-            .expect("augmentation");
+        super::augment_physical_read_edges(
+            &mut compiled,
+            false,
+            None,
+            &BTreeSet::new(),
+            &mut warnings,
+        )
+        .expect("augmentation");
         assert_eq!(
             compiled.project.layers,
             vec![
@@ -33708,8 +33786,14 @@ auto_create_schemas = true
             .expect("compile models");
 
         let mut warnings = Vec::new();
-        super::augment_physical_read_edges(&mut compiled, false, None, &mut warnings)
-            .expect("mutual reads must not refuse the run");
+        super::augment_physical_read_edges(
+            &mut compiled,
+            false,
+            None,
+            &BTreeSet::new(),
+            &mut warnings,
+        )
+        .expect("mutual reads must not refuse the run");
         assert_eq!(
             compiled.project.layers,
             vec![vec!["b".to_string()], vec!["a".to_string()]],
@@ -33798,8 +33882,14 @@ auto_create_schemas = true
         );
 
         let mut warnings = Vec::new();
-        super::augment_physical_read_edges(&mut compiled, false, Some("db"), &mut warnings)
-            .expect("augmentation");
+        super::augment_physical_read_edges(
+            &mut compiled,
+            false,
+            Some("db"),
+            &BTreeSet::new(),
+            &mut warnings,
+        )
+        .expect("augmentation");
         assert_eq!(
             compiled.project.layers,
             vec![vec!["orders".to_string()], vec!["mart".to_string()]],
@@ -33829,8 +33919,14 @@ auto_create_schemas = true
         let mut compiled = compile_models(&models_dir);
 
         let mut warnings = Vec::new();
-        super::augment_physical_read_edges(&mut compiled, false, None, &mut warnings)
-            .expect("augmentation");
+        super::augment_physical_read_edges(
+            &mut compiled,
+            false,
+            None,
+            &BTreeSet::new(),
+            &mut warnings,
+        )
+        .expect("augmentation");
         assert_eq!(
             compiled.project.layers.len(),
             1,
@@ -33956,8 +34052,14 @@ auto_create_schemas = true
         let mut compiled = compile_models(&models_dir);
 
         let mut warnings = Vec::new();
-        super::augment_physical_read_edges(&mut compiled, false, Some("prod"), &mut warnings)
-            .expect("augmentation");
+        super::augment_physical_read_edges(
+            &mut compiled,
+            false,
+            Some("prod"),
+            &BTreeSet::new(),
+            &mut warnings,
+        )
+        .expect("augmentation");
         assert_eq!(upstreams_of(&compiled, "beta"), vec!["alpha".to_string()]);
         assert!(
             upstreams_of(&compiled, "alpha").is_empty(),
@@ -37902,6 +38004,120 @@ auto_create_schemas = true
                 assert!(!table_exists(&verify, "up").await);
             }
         }
+    }
+
+    /// #1630: a model with an error diagnostic does not run, so its own reads
+    /// must not decide the order. Here `x` fails compile (E056: its bare read
+    /// of `t` is ambiguous) and also bare-reads `y`; `y` reads `x`'s target
+    /// by name. `x`'s edge onto `y` used to make `y`'s true read of `main.x`
+    /// look like a cycle-closer, so it was skipped and `y` built from the
+    /// stale `main.x` left by an earlier run. Now `y` is withheld.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn a_physical_reader_of_a_failed_model_is_withheld_not_run_on_stale_rows() {
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir(&models_dir).unwrap();
+        let db = tmp.path().join("p1630.duckdb");
+        let state = StateStore::open(&tmp.path().join("state")).unwrap();
+        {
+            let s = DuckDbWarehouseAdapter::open(&db).unwrap();
+            s.execute_statement("CREATE SCHEMA IF NOT EXISTS other")
+                .await
+                .unwrap();
+            // What an earlier run of `x` left behind.
+            s.execute_statement("CREATE TABLE main.x AS SELECT 99 AS id")
+                .await
+                .unwrap();
+        }
+        let write = |name: &str, sql: &str, schema: &str, table: &str| {
+            std::fs::write(models_dir.join(format!("{name}.sql")), sql).unwrap();
+            std::fs::write(
+                models_dir.join(format!("{name}.toml")),
+                format!(
+                    "[strategy]\ntype = \"full_refresh\"\n\n[target]\ncatalog = \"\"\n\
+                     schema = \"{schema}\"\ntable = \"{table}\"\n"
+                ),
+            )
+            .unwrap();
+        };
+        write("w1", "SELECT 1 AS id\n", "main", "t");
+        write("w2", "SELECT 2 AS id\n", "other", "t");
+        write("x", "SELECT t.id FROM t CROSS JOIN y\n", "main", "x");
+        write("y", "SELECT id FROM main.x\n", "main", "y");
+
+        let adapter = DuckDbWarehouseAdapter::open(&db).expect("open duckdb");
+        let mut output = RunOutput::new(String::new(), 0, 1);
+        let gate_off = SkipGateConfig {
+            feature_enabled: false,
+            force_rebuild: false,
+            rowcount_fallback: false,
+            lag_tolerance_seconds: 0,
+            shadow_or_branch: false,
+            full_refresh: false,
+        };
+        let res = super::execute_models(
+            &models_dir,
+            None,
+            &adapter as &dyn rocky_core::traits::WarehouseAdapter,
+            Some(&state),
+            &PartitionRunOptions::default(),
+            "run-1630",
+            None,
+            None,
+            &mut output,
+            None,
+            None,
+            &rocky_core::config::SchemaCacheConfig::default(),
+            false,
+            None,
+            &DeferOptions::default(),
+            gate_off,
+            false,
+            false,
+            &rocky_core::run_vars::RunVars::new(),
+            rocky_core::config::ResilienceConfig::default(),
+            false,
+            true,
+            None,
+            None,
+            false,
+        )
+        .await;
+        drop(adapter);
+        assert!(res.is_ok(), "{:?}", res.as_ref().err());
+
+        assert!(
+            output
+                .errors
+                .iter()
+                .any(|e| e.asset_key == vec!["x".to_string()] && e.error.contains("[E056]")),
+            "{:?}",
+            output.errors
+        );
+        assert!(
+            !output
+                .materializations
+                .iter()
+                .any(|m| m.asset_key.last().map(String::as_str) == Some("y")),
+            "`y` must not build from the stale `main.x`: {:?}",
+            output.materializations
+        );
+        assert!(
+            output.contained.iter().any(|c| c.model == "y"),
+            "`y` is reported as withheld: {:?}",
+            output.contained
+        );
+        let verify = DuckDbWarehouseAdapter::open(&db).unwrap();
+        assert!(!table_exists(&verify, "y").await);
+        assert!(
+            output.scheduling_warnings.is_empty(),
+            "no true edge was skipped as a cycle-closer: {:?}",
+            output.scheduling_warnings
+        );
     }
 
     /// End to end through `execute_models`: an invalid ephemeral use (here
