@@ -2537,7 +2537,7 @@ async fn an_unreadable_freshness_timestamp_is_omitted_and_a_null_is_kept() {
 }
 
 /// RV1-P1b: `observed_table_version` sends `DESCRIBE HISTORY ... LIMIT 1`
-/// with the quoted table name and reads the `version` cell of the answer.
+/// with the validated table name and reads the `version` cell of the answer.
 #[tokio::test]
 async fn test_observed_table_version_reads_describe_history() {
     use rocky_core::traits::WarehouseAdapter;
@@ -2546,7 +2546,7 @@ async fn test_observed_table_version_reads_describe_history() {
     Mock::given(method("POST"))
         .and(path("/api/2.0/sql/statements"))
         .and(body_string_contains(
-            "DESCRIBE HISTORY `main`.`marts`.`fct_orders` LIMIT 1",
+            "DESCRIBE HISTORY main.marts.fct_orders LIMIT 1",
         ))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "statement_id": "stmt-history",

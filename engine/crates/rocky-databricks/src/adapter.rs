@@ -171,8 +171,9 @@ fn promotion_kind(result: &QueryResult) -> AdapterResult<Option<ObjectKind>> {
     }
 }
 
-/// `DESCRIBE HISTORY <table> LIMIT 1`, with the table name validated and
-/// quoted by the dialect. An invalid identifier is an error, never SQL.
+/// `DESCRIBE HISTORY <table> LIMIT 1`, with the table name formatted by the
+/// dialect, which validates every part. An invalid identifier is an error,
+/// never SQL.
 fn describe_history_sql(dialect: &dyn SqlDialect, table: &TableRef) -> AdapterResult<String> {
     let target = dialect.format_table_ref(&table.catalog, &table.schema, &table.table)?;
     Ok(format!("DESCRIBE HISTORY {target} LIMIT 1"))
@@ -333,8 +334,8 @@ impl WarehouseAdapter for DatabricksWarehouseAdapter {
     }
 
     /// `DESCRIBE HISTORY <table> LIMIT 1` and its `version` column. The
-    /// table name goes through the dialect, which validates every part and
-    /// quotes it. A non-Delta table, an empty history or a missing column is
+    /// table name goes through the dialect, which accepts only
+    /// `[a-zA-Z0-9_]` in every part, the same rule as every other statement. A non-Delta table, an empty history or a missing column is
     /// an error, so the runner records `observe_failed` rather than a guess.
     async fn observed_table_version(&self, table: &TableRef) -> AdapterResult<Option<u64>> {
         let sql = describe_history_sql(&self.dialect, table)?;
@@ -727,7 +728,7 @@ mod tests {
     use rocky_catalog_core::{ColumnSchema as CatalogColumnSchema, TableSchema as CatalogSchema};
 
     #[test]
-    fn describe_history_sql_quotes_and_validates() {
+    fn describe_history_sql_validates_identifiers() {
         let table = TableRef {
             catalog: "main".into(),
             schema: "marts".into(),
@@ -735,7 +736,7 @@ mod tests {
         };
         assert_eq!(
             describe_history_sql(&DatabricksSqlDialect, &table).unwrap(),
-            "DESCRIBE HISTORY `main`.`marts`.`fct_orders` LIMIT 1"
+            "DESCRIBE HISTORY main.marts.fct_orders LIMIT 1"
         );
         let hostile = TableRef {
             table: "t` ; DROP TABLE x; --".into(),
