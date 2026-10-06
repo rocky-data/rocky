@@ -3923,9 +3923,14 @@ adapter = "db"
             "a tick must sweep an expired tombstone out of {}",
             spool_path.display()
         );
-        assert!(
-            std::fs::read_dir(&spool_path).unwrap().next().is_none(),
-            "the swept spool is empty — the sweep left nothing behind"
+        let left: Vec<_> = std::fs::read_dir(&spool_path)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(
+            left,
+            vec![std::ffi::OsString::from(spool::SENTINEL_NAME)],
+            "the sweep left nothing behind but the spool's sentinel (#1903)"
         );
         assert_eq!(spawner.run_count(), 1, "the sweep tick runs nothing");
     }
