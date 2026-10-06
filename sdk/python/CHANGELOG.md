@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **`RockyClient.profile(model, *, column=None, sample=0)`** wraps `rocky profile` and returns `ProfileOutput`. `sample > 0` needs the engine release that adds `rocky profile --sample`.
 - **`rocky_sdk.classify`**: an opt-in aid that suggests personal-data `[classification]` tags for a model's columns. `suggest()` writes nothing. A person accepts or rejects each suggestion, and `apply_accepted()` adds only the accepted tags to the model sidecar. It never changes an existing tag. Pattern rules run with no extra dependencies. The optional extra `rocky-sdk[classify]` adds the local Laya model (`laya==0.3.26`, PyTorch), which looks again at columns the rules left untagged. On a 160-column test set the combination found 68 of 72 personal-data columns, and 24 of its 92 suggestions were wrong.
+- **`RockyClient.package_add(spec, *, vars=None, target_schema=None, compiled=None, build_empty=None, allow_secret_var=False, dbt_timeout=None)`**, `package_update(name=None, ...)`, `package_list()` and `package_remove(name, *, force=False)` wrap the new `rocky package` verbs, which vendor dbt Hub packages as Rocky models. They return `PackageAddOutput`, `PackageUpdateOutput`, `PackageListOutput` and `PackageRemoveOutput`. A refusal (`E055`) raises `RockyCommandError`; findings to review (`W055`) are in `diagnostics`.
 
 ## [0.17.0] — 2026-10-03
 

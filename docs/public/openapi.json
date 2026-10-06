@@ -12855,6 +12855,481 @@
         ],
         "type": "object"
       },
+      "PackageAddOutput": {
+        "description": "JSON output of `rocky package add`.",
+        "properties": {
+          "command": {
+            "type": "string"
+          },
+          "diagnostics": {
+            "items": {
+              "$ref": "#/components/schemas/PackageDiagnostic"
+            },
+            "type": "array"
+          },
+          "lockfile": {
+            "description": "Path of `rocky-packages.lock`.",
+            "type": "string"
+          },
+          "package": {
+            "$ref": "#/components/schemas/PackageVendorReport"
+          },
+          "version": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "command",
+          "diagnostics",
+          "lockfile",
+          "package",
+          "version"
+        ],
+        "type": "object"
+      },
+      "PackageDiagnostic": {
+        "description": "A finding from `rocky package`: `E055` (refused) or `W055` (vendored, but something needs a look).",
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "model": {
+            "description": "The model the finding is about, when there is one.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "path": {
+            "description": "The vendored file the finding is about, when there is one.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "severity": {
+            "description": "`error` or `warning`.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "code",
+          "message",
+          "severity"
+        ],
+        "type": "object"
+      },
+      "PackageDroppedTest": {
+        "description": "A dbt test on a package model that was not mapped to Rocky.",
+        "properties": {
+          "attached_to": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "reason": {
+            "type": "string"
+          },
+          "test": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "reason",
+          "test"
+        ],
+        "type": "object"
+      },
+      "PackageFailedModel": {
+        "description": "A package model that could not be vendored.",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "reason"
+        ],
+        "type": "object"
+      },
+      "PackageListEntry": {
+        "description": "One vendored package, as `rocky package list` reports it.",
+        "properties": {
+          "adapter": {
+            "type": "string"
+          },
+          "compiled_at": {
+            "type": "string"
+          },
+          "dbt_version": {
+            "type": "string"
+          },
+          "files_incoming": {
+            "description": "Pending `<path>.incoming` files from an update.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "files_missing": {
+            "description": "Vendored files that are gone.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "files_modified": {
+            "description": "Vendored files whose content differs from what Rocky wrote.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "hub": {
+            "type": "string"
+          },
+          "includes": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "mode": {
+            "description": "`compile-only`, `build-empty` or `compiled`; replayed by `update`.",
+            "type": "string"
+          },
+          "models": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "name": {
+            "type": "string"
+          },
+          "sources": {
+            "items": {
+              "$ref": "#/components/schemas/PackageSourceOutput"
+            },
+            "type": "array"
+          },
+          "target_schema": {
+            "type": "string"
+          },
+          "version": {
+            "type": "string"
+          },
+          "version_spec": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "adapter",
+          "compiled_at",
+          "dbt_version",
+          "files_incoming",
+          "files_missing",
+          "files_modified",
+          "hub",
+          "includes",
+          "mode",
+          "models",
+          "name",
+          "sources",
+          "target_schema",
+          "version",
+          "version_spec"
+        ],
+        "type": "object"
+      },
+      "PackageListOutput": {
+        "description": "JSON output of `rocky package list`.",
+        "properties": {
+          "command": {
+            "type": "string"
+          },
+          "count": {
+            "format": "uint",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "lockfile": {
+            "type": "string"
+          },
+          "packages": {
+            "items": {
+              "$ref": "#/components/schemas/PackageListEntry"
+            },
+            "type": "array"
+          },
+          "version": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "command",
+          "count",
+          "lockfile",
+          "packages",
+          "version"
+        ],
+        "type": "object"
+      },
+      "PackageRemoveOutput": {
+        "description": "JSON output of `rocky package remove`.",
+        "properties": {
+          "command": {
+            "type": "string"
+          },
+          "files_deleted": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "lockfile": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "version": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "command",
+          "files_deleted",
+          "lockfile",
+          "name",
+          "version"
+        ],
+        "type": "object"
+      },
+      "PackageSourceOutput": {
+        "description": "A raw source table a vendored package reads.",
+        "properties": {
+          "catalog": {
+            "type": "string"
+          },
+          "name": {
+            "description": "`<source_name>.<table>` as the package declares it.",
+            "type": "string"
+          },
+          "schema": {
+            "type": "string"
+          },
+          "table": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "catalog",
+          "name",
+          "schema",
+          "table"
+        ],
+        "type": "object"
+      },
+      "PackageUpdateOutput": {
+        "description": "JSON output of `rocky package update`.",
+        "properties": {
+          "command": {
+            "type": "string"
+          },
+          "diagnostics": {
+            "items": {
+              "$ref": "#/components/schemas/PackageDiagnostic"
+            },
+            "type": "array"
+          },
+          "lockfile": {
+            "type": "string"
+          },
+          "packages": {
+            "items": {
+              "$ref": "#/components/schemas/PackageVendorReport"
+            },
+            "type": "array"
+          },
+          "version": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "command",
+          "diagnostics",
+          "lockfile",
+          "packages",
+          "version"
+        ],
+        "type": "object"
+      },
+      "PackageVendorReport": {
+        "description": "What `add` / `update` did for one package.",
+        "properties": {
+          "adapter": {
+            "description": "Rocky adapter type the package was compiled against.",
+            "type": "string"
+          },
+          "dbt_version": {
+            "type": "string"
+          },
+          "failed_models": {
+            "items": {
+              "$ref": "#/components/schemas/PackageFailedModel"
+            },
+            "type": "array"
+          },
+          "files_deleted": {
+            "description": "Vendored files deleted because upstream removed them.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "files_incoming": {
+            "description": "Files you edited that changed upstream: the new version is at `<path>.incoming`.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "files_kept_edited": {
+            "description": "Files you edited that were left as they are.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "files_unchanged": {
+            "format": "uint",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "files_written": {
+            "description": "Files written in place.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "hub": {
+            "description": "dbt Hub name (`fivetran/stripe`).",
+            "type": "string"
+          },
+          "includes": {
+            "description": "Dependency packages whose models were vendored alongside.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "incremental_fallbacks": {
+            "description": "dbt `incremental` models that did not stay incremental.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "mode": {
+            "description": "How the SQL was compiled: `compile-only` (`dbt compile` alone; nothing written to the warehouse), `build-empty` (`dbt run --empty` first) or `compiled` (`--compiled <dir>`).",
+            "type": "string"
+          },
+          "models": {
+            "description": "Every vendored model, sorted.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "models_added": {
+            "description": "Models new in this run (all of them on `add`).",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "models_removed": {
+            "description": "Models the previous version had and this one does not.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "name": {
+            "description": "dbt project name of the package; its directory under `models/packages/`.",
+            "type": "string"
+          },
+          "sources": {
+            "items": {
+              "$ref": "#/components/schemas/PackageSourceOutput"
+            },
+            "type": "array"
+          },
+          "target_schema": {
+            "description": "Schema the vendored models build into.",
+            "type": "string"
+          },
+          "tests_dropped": {
+            "items": {
+              "$ref": "#/components/schemas/PackageDroppedTest"
+            },
+            "type": "array"
+          },
+          "tests_mapped": {
+            "description": "dbt generic tests mapped to Rocky `[[tests]]`.",
+            "format": "uint",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "vars_hash": {
+            "type": "string"
+          },
+          "version": {
+            "description": "Version `dbt deps` resolved.",
+            "type": "string"
+          },
+          "version_spec": {
+            "description": "Version requirement the package was added with; empty means latest.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "adapter",
+          "dbt_version",
+          "failed_models",
+          "files_deleted",
+          "files_incoming",
+          "files_kept_edited",
+          "files_unchanged",
+          "files_written",
+          "hub",
+          "includes",
+          "incremental_fallbacks",
+          "mode",
+          "models",
+          "models_added",
+          "models_removed",
+          "name",
+          "sources",
+          "target_schema",
+          "tests_dropped",
+          "tests_mapped",
+          "vars_hash",
+          "version",
+          "version_spec"
+        ],
+        "type": "object"
+      },
       "PartitionInfo": {
         "description": "Partition window information for a single `time_interval` materialization.\n\n`key` is the canonical Rocky partition key (e.g. `\"2026-04-07\"` for daily; `\"2026-04-07T13\"` for hourly). `start` / `end` are the half-open `[start, end)` window the SQL substituted for `@start_date` / `@end_date`. `batched_with` lists any additional partition keys that were merged into this batch when `batch_size > 1` — empty for the default one-partition-per-statement case.",
         "properties": {

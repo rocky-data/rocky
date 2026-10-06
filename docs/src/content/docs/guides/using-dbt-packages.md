@@ -1,9 +1,14 @@
 ---
 title: Using Rocky with dbt Packages
-description: Run Rocky alongside dbt packages such as Fivetran, and build analytics on top of package-managed tables without converting them.
+description: Run Rocky alongside dbt packages such as Fivetran and build on package-managed tables, or vendor the package with rocky package.
 sidebar:
   order: 3
 ---
+
+There are two ways to use a dbt package such as a Fivetran connector package with Rocky:
+
+- **Vendor it** with [`rocky package add`](/guides/dbt-packages/). dbt compiles the package once, and the models become Rocky models. Rocky type-checks, runs and tests them, and your models read them by name. Use this when you want one tool to own the whole DAG.
+- **Run it alongside**, as this page describes. dbt keeps building the package, and Rocky reads its tables. Use this when dbt already runs the package for you and you only add models on top.
 
 You do not need to convert your dbt packages to use Rocky. A package such as [fivetran/facebook_ads](https://hub.getdbt.com/fivetran/facebook_ads/latest/) or [fivetran/stripe](https://hub.getdbt.com/fivetran/stripe/latest/) produces tables in your warehouse. Rocky references those tables directly, as external sources. An external source is a table Rocky reads but never builds, refreshes, or manages. So you keep vendor-maintained staging packages in dbt and write your custom analytics in Rocky.
 

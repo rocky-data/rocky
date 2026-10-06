@@ -1,0 +1,291 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "PackageDiagnostic": {
+      "description": "A finding from `rocky package`: `E055` (refused) or `W055` (vendored, but something needs a look).",
+      "properties": {
+        "code": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        },
+        "model": {
+          "description": "The model the finding is about, when there is one.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "path": {
+          "description": "The vendored file the finding is about, when there is one.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "severity": {
+          "description": "`error` or `warning`.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "code",
+        "message",
+        "severity"
+      ],
+      "type": "object"
+    },
+    "PackageDroppedTest": {
+      "description": "A dbt test on a package model that was not mapped to Rocky.",
+      "properties": {
+        "attached_to": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "reason": {
+          "type": "string"
+        },
+        "test": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "reason",
+        "test"
+      ],
+      "type": "object"
+    },
+    "PackageFailedModel": {
+      "description": "A package model that could not be vendored.",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "reason"
+      ],
+      "type": "object"
+    },
+    "PackageSourceOutput": {
+      "description": "A raw source table a vendored package reads.",
+      "properties": {
+        "catalog": {
+          "type": "string"
+        },
+        "name": {
+          "description": "`<source_name>.<table>` as the package declares it.",
+          "type": "string"
+        },
+        "schema": {
+          "type": "string"
+        },
+        "table": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "catalog",
+        "name",
+        "schema",
+        "table"
+      ],
+      "type": "object"
+    },
+    "PackageVendorReport": {
+      "description": "What `add` / `update` did for one package.",
+      "properties": {
+        "adapter": {
+          "description": "Rocky adapter type the package was compiled against.",
+          "type": "string"
+        },
+        "dbt_version": {
+          "type": "string"
+        },
+        "failed_models": {
+          "items": {
+            "$ref": "#/definitions/PackageFailedModel"
+          },
+          "type": "array"
+        },
+        "files_deleted": {
+          "description": "Vendored files deleted because upstream removed them.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "files_incoming": {
+          "description": "Files you edited that changed upstream: the new version is at `<path>.incoming`.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "files_kept_edited": {
+          "description": "Files you edited that were left as they are.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "files_unchanged": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "files_written": {
+          "description": "Files written in place.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "hub": {
+          "description": "dbt Hub name (`fivetran/stripe`).",
+          "type": "string"
+        },
+        "includes": {
+          "description": "Dependency packages whose models were vendored alongside.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "incremental_fallbacks": {
+          "description": "dbt `incremental` models that did not stay incremental.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "mode": {
+          "description": "How the SQL was compiled: `compile-only` (`dbt compile` alone; nothing written to the warehouse), `build-empty` (`dbt run --empty` first) or `compiled` (`--compiled <dir>`).",
+          "type": "string"
+        },
+        "models": {
+          "description": "Every vendored model, sorted.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "models_added": {
+          "description": "Models new in this run (all of them on `add`).",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "models_removed": {
+          "description": "Models the previous version had and this one does not.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "name": {
+          "description": "dbt project name of the package; its directory under `models/packages/`.",
+          "type": "string"
+        },
+        "sources": {
+          "items": {
+            "$ref": "#/definitions/PackageSourceOutput"
+          },
+          "type": "array"
+        },
+        "target_schema": {
+          "description": "Schema the vendored models build into.",
+          "type": "string"
+        },
+        "tests_dropped": {
+          "items": {
+            "$ref": "#/definitions/PackageDroppedTest"
+          },
+          "type": "array"
+        },
+        "tests_mapped": {
+          "description": "dbt generic tests mapped to Rocky `[[tests]]`.",
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "vars_hash": {
+          "type": "string"
+        },
+        "version": {
+          "description": "Version `dbt deps` resolved.",
+          "type": "string"
+        },
+        "version_spec": {
+          "description": "Version requirement the package was added with; empty means latest.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "adapter",
+        "dbt_version",
+        "failed_models",
+        "files_deleted",
+        "files_incoming",
+        "files_kept_edited",
+        "files_unchanged",
+        "files_written",
+        "hub",
+        "includes",
+        "incremental_fallbacks",
+        "mode",
+        "models",
+        "models_added",
+        "models_removed",
+        "name",
+        "sources",
+        "target_schema",
+        "tests_dropped",
+        "tests_mapped",
+        "vars_hash",
+        "version",
+        "version_spec"
+      ],
+      "type": "object"
+    }
+  },
+  "description": "JSON output of `rocky package add`.",
+  "properties": {
+    "command": {
+      "type": "string"
+    },
+    "diagnostics": {
+      "items": {
+        "$ref": "#/definitions/PackageDiagnostic"
+      },
+      "type": "array"
+    },
+    "lockfile": {
+      "description": "Path of `rocky-packages.lock`.",
+      "type": "string"
+    },
+    "package": {
+      "$ref": "#/definitions/PackageVendorReport"
+    },
+    "version": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "command",
+    "diagnostics",
+    "lockfile",
+    "package",
+    "version"
+  ],
+  "title": "PackageAddOutput",
+  "type": "object"
+}

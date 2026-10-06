@@ -40,6 +40,9 @@ vendor/
 # --- Defense-in-depth duplicates of subproject ignores ---
 # (in case someone runs cargo / npm / uv from the wrong directory)
 target/
+# Recorded dbt compile replayed by `rocky package --compiled` tests; dbt's
+# layout fixes the `target/` name.
+!engine/rocky/tests/fixtures/dbt-package-stripe/compiled/target/
 target-linux/
 node_modules/
 dist/

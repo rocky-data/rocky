@@ -53,6 +53,7 @@ mod load;
 mod lsp;
 mod metrics;
 mod optimize;
+pub mod package;
 #[cfg(test)]
 mod pipes_guard_tests;
 pub mod plan;
@@ -169,6 +170,9 @@ pub use load::run_load;
 pub use lsp::run_lsp;
 pub use metrics::{metrics_output, run_metrics};
 pub use optimize::{optimize_output, run_optimize};
+pub use package::{
+    PackageBuildOptions, run_package_add, run_package_list, run_package_remove, run_package_update,
+};
 pub use plan::{
     ModelNotFound, PlanRunOptions, compute_embedded_capabilities, plan, plan_preview_output,
     plan_promote, populate_governance_actions,

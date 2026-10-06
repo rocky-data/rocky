@@ -826,6 +826,12 @@ fn attach_intent(result: &mut ImportResult, model_name: &str, description: Optio
 struct UpstreamModel {
     bare_name: String,
     fqn_candidates: Vec<String>,
+    /// The upstream's own `depends_on` when it is `ephemeral`. dbt inlines an
+    /// ephemeral model's compiled body into each consumer as a
+    /// `__dbt__cte__<name>` CTE, so the consumer's `compiled_code` reads the
+    /// ephemeral's upstreams by their qualified relation even though they are
+    /// not in the consumer's own `depends_on`.
+    ephemeral_deps: Vec<String>,
 }
 
 /// Resolve a model node's output `(catalog, schema, table)` the way the emitted
@@ -879,6 +885,11 @@ fn build_model_relation_map(
                 UpstreamModel {
                     bare_name: manifest_rocky_name(node).unwrap_or_else(|_| node.name.clone()),
                     fqn_candidates: relation_candidates(node, default_target),
+                    ephemeral_deps: if node.config.materialized == "ephemeral" {
+                        node.depends_on.nodes.clone()
+                    } else {
+                        Vec::new()
+                    },
                 },
             )
         })
@@ -953,11 +964,8 @@ fn rewrite_upstream_refs_to_bare(
     models: &HashMap<String, UpstreamModel>,
 ) -> String {
     let mut out = body.to_string();
-    for upstream_id in &node.depends_on.nodes {
-        if !upstream_id.starts_with("model.") {
-            continue;
-        }
-        let Some(upstream) = models.get(upstream_id) else {
+    for upstream_id in compiled_model_reads(node, models) {
+        let Some(upstream) = models.get(&upstream_id) else {
             continue;
         };
         for needle in &upstream.fqn_candidates {
@@ -965,6 +973,28 @@ fn rewrite_upstream_refs_to_bare(
         }
     }
     out
+}
+
+/// The model `unique_id`s a node's `compiled_code` can read by relation: its
+/// own `depends_on` models plus, transitively, the upstreams of any
+/// `ephemeral` model among them (whose body dbt inlined as a CTE).
+fn compiled_model_reads(
+    node: &DbtManifestNode,
+    models: &HashMap<String, UpstreamModel>,
+) -> Vec<String> {
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut order = Vec::new();
+    let mut stack: Vec<String> = node.depends_on.nodes.iter().rev().cloned().collect();
+    while let Some(id) = stack.pop() {
+        if !id.starts_with("model.") || id == node.unique_id || !seen.insert(id.clone()) {
+            continue;
+        }
+        if let Some(upstream) = models.get(&id) {
+            stack.extend(upstream.ephemeral_deps.iter().rev().cloned());
+        }
+        order.push(id);
+    }
+    order
 }
 
 /// Replace every standalone occurrence of `needle` in `haystack` with
@@ -1236,7 +1266,7 @@ fn import_manifest_node(
     // Map dependencies. Resolve through the relation map first so a versioned
     // upstream (`model.p.orders.v1`) maps to `orders_v1`, not to `v1`. A
     // snapshot upstream (`snapshot.p.orders_snap`) is a Rocky model too.
-    let depends_on = node
+    let mut depends_on: Vec<String> = node
         .depends_on
         .nodes
         .iter()
@@ -1246,6 +1276,17 @@ fn import_manifest_node(
             None => dbt_manifest::extract_model_name(id).to_string(),
         })
         .collect();
+    // An inlined ephemeral's upstreams are read by this body too (by bare
+    // name, after the rewrite above), so they are dependencies of it.
+    if node.compiled_code.is_some() {
+        for id in compiled_model_reads(node, model_relations) {
+            if let Some(upstream) = model_relations.get(&id)
+                && !depends_on.contains(&upstream.bare_name)
+            {
+                depends_on.push(upstream.bare_name.clone());
+            }
+        }
+    }
 
     // Use description as intent
     let intent = node.description.clone();
@@ -6755,6 +6796,45 @@ WHERE e.id > 0
         }
     }
 
+    /// dbt inlines an ephemeral upstream as a `__dbt__cte__` CTE, so the
+    /// consumer's compiled body reads the EPHEMERAL's upstream by its qualified
+    /// relation. That read is rewritten too, transitively through chained
+    /// ephemerals, even though it is not in the consumer's own `depends_on`.
+    #[test]
+    fn test_rewrite_upstream_refs_reaches_through_inlined_ephemerals() {
+        let model = |bare: &str, deps: Vec<&str>| UpstreamModel {
+            bare_name: bare.to_string(),
+            fqn_candidates: vec![format!("\"dev\".\"s\".\"{bare}\"")],
+            ephemeral_deps: deps.into_iter().map(String::from).collect(),
+        };
+        let mut models = HashMap::new();
+        models.insert("model.p.base".to_string(), model("base", vec![]));
+        models.insert(
+            "model.p.eph2".to_string(),
+            model("eph2", vec!["model.p.base"]),
+        );
+        models.insert(
+            "model.p.eph1".to_string(),
+            model("eph1", vec!["model.p.eph2"]),
+        );
+        let node = bare_node("dn", vec!["model.p.eph1"]);
+
+        let body = "with __dbt__cte__eph2 as (select * from \"dev\".\"s\".\"base\"), \
+                    __dbt__cte__eph1 as (select * from __dbt__cte__eph2) \
+                    select * from __dbt__cte__eph1";
+        let rewritten = rewrite_upstream_refs_to_bare(body, &node, &models);
+        assert!(rewritten.contains("select * from base)"), "{rewritten}");
+        assert!(!rewritten.contains("\"dev\""), "{rewritten}");
+        assert_eq!(
+            compiled_model_reads(&node, &models),
+            vec![
+                "model.p.eph1".to_string(),
+                "model.p.eph2".to_string(),
+                "model.p.base".to_string()
+            ]
+        );
+    }
+
     #[test]
     fn test_rewrite_upstream_refs_rewrites_models_preserves_sources() {
         // `dn` depends on a model (`up`) and a source (`raw.events`). Only the
@@ -6768,6 +6848,7 @@ WHERE e.id > 0
                     "\"dev\".\"marts\".\"up\"".to_string(),
                     "dev.marts.up".to_string(),
                 ],
+                ephemeral_deps: vec![],
             },
         );
         let node = bare_node("dn", vec!["model.p.up", "source.p.raw.events"]);

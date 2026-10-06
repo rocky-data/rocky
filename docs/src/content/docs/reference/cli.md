@@ -11,7 +11,7 @@ Rocky ships one binary. Every subcommand below is a step in the pipeline lifecyc
 - **Modeling**: `compile`, `lineage`, `lineage-diff`, `test`, `ci`, `ci-diff`, `preview`, `emit-sql`, `catalog`, `publish-ir`, `imports`
 - **Data**: `seed`, `snapshot`, `docs`, `load`, `profile`
 - **AI**: `ai`, `ai-sync`, `ai-explain`, `ai-test`, `ai-contract`
-- **Development**: `playground`, `shell`, `watch`, `fmt`, `list`, `serve`, `lsp`, `mcp`, `import-dbt`, `init-adapter`, `adapter`, `hooks`, `validate-migration`, `test-adapter`, `completions`, `bench`
+- **Development**: `playground`, `shell`, `watch`, `fmt`, `list`, `serve`, `lsp`, `mcp`, `import-dbt`, `package`, `init-adapter`, `adapter`, `hooks`, `validate-migration`, `test-adapter`, `completions`, `bench`
 - **Administration**: `history`, `replay`, `trace`, `metrics`, `optimize`, `estimate`, `compact`, `profile-storage`, `archive`, `compliance`, `retention-status`, `export-schemas`, `export-openapi`
 - **Governance & Reclamation**: `policy`, `audit`, `review`, `brief`, `backfill`, `gc` — see [Governance & Reclamation Commands](/reference/commands/governance-reclamation/)
 - **Diagnostics**: `doctor`, `compare`
@@ -66,6 +66,7 @@ One line each, for finding the right command. Commands with a section on this pa
 | `lsp` | Start the Language Server Protocol server for IDE integration. |
 | `mcp` | Serve Rocky's tools to an AI agent over MCP. |
 | `import-dbt` | Convert a dbt project into Rocky models. |
+| [`package`](/reference/commands/development/#rocky-package) | Vendor a dbt Hub package as Rocky models (`add`, `update`, `list`, `remove`). |
 | `validate-migration` | Compare a migrated project against its dbt original. |
 | `init-adapter` | Scaffold a new warehouse adapter crate. |
 | `adapter` | Discover and inspect process adapters installed on `$PATH`. |
