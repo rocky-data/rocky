@@ -67,11 +67,11 @@
 //! `ModelIr` that will not deserialize, an unreachable object store or table
 //! state, a re-derivation whose blake3 differs from the tombstoned hash, a path
 //! outside the storage prefix, or a lost race on atomic ledger reinstatement).
-//! So [`check_recipe_recorded`] refuses any artifact whose recipe has recorded
-//! upstreams: a multi-input artifact is **not evicted** until multi-input
-//! restore lands. Re-running the pipeline is not a route back: it recomputes
-//! from *current* upstreams, and a recipe is only bit-reproducible against the
-//! inputs it recorded.
+//! So [`check_recipe_recorded`] calls restore's own shape predicate
+//! ([`restorable_recipe`]): a partitioned or multi-input artifact is **not
+//! evicted** until restore can rebuild it. Re-running the pipeline is not a
+//! route back: it recomputes from *current* upstreams, and a recipe is only
+//! bit-reproducible against the inputs it recorded.
 //!
 //! # Reachability
 //!
@@ -102,6 +102,7 @@ use crate::commands::apply::{
     PolicyGate, ai_plan_is_reviewed, evaluate_apply_policy_with_policy_matching,
 };
 use crate::commands::replay::classify_model;
+use crate::commands::restore::restorable_recipe;
 use crate::commands::review::record_plan_review_escalation;
 use crate::output::{
     GcApplyOutput, GcCandidateOutput, GcCheckOutput, GcEvictedOutput, GcPlan, GcPlanEviction,
@@ -120,41 +121,63 @@ type AdapterCost = (String, WarehouseType, f64, f64);
 // The eligibility checks — each a pure function, each fails closed.
 // ---------------------------------------------------------------------------
 
-/// Check 1 — recipe recorded with a strong (non-weak) input closure.
+/// Check 1 — recipe recorded, strong, and of a shape `rocky restore` rebuilds.
 ///
-/// A provenance record must exist *and* its input closure must be `strong`
-/// (every upstream is a content hash, and none are recorded). A `heuristic` closure means at least
-/// one input is a mutable-source freshness signal whose data may have moved
-/// on — such a table is not derivable.
+/// A provenance record must exist *and* its input closure must be `strong`.
+/// A `heuristic` closure means at least one input is a mutable-source
+/// freshness signal whose data may have moved on — such a table is not
+/// derivable.
 ///
-/// It also requires **no recorded upstreams**. `rocky restore` rebuilds only a
-/// zero-upstream recipe (multi-input rebuild needs DAG re-derivation, not yet
-/// implemented), so gc must not evict what restore cannot bring back. This
-/// keeps gc's eligible set a subset of restore's recovery set; pinned by
+/// The recipe must also pass [`restorable_recipe`], the same predicate
+/// `rocky restore` uses before it rebuilds: the canonical `ModelIr`
+/// deserializes, the recipe is content-addressed, it has **no partition
+/// columns**, and it reads **no recorded upstreams**. Restore cannot rebuild
+/// a partitioned or multi-input recipe yet, so gc must not evict one. Because
+/// both commands call one function, gc's eligible set stays a subset of
+/// restore's recovery set; pinned by
 /// `gc_admission_is_a_subset_of_restore_recovery` in `commands/restore.rs`.
-/// Relax this only together with multi-input restore.
-pub(crate) fn check_recipe_recorded(class: &ReplayCheckModelOutput) -> GcCheckOutput {
+pub(crate) fn check_recipe_recorded(
+    class: &ReplayCheckModelOutput,
+    prov: Option<&ProvenanceRecord>,
+) -> GcCheckOutput {
     let strong = class.proof_class.as_deref() == Some("strong");
-    let multi_input = !class.inputs.is_empty();
-    let passed = class.has_provenance && strong && !multi_input;
-    let detail = if !class.has_provenance {
-        "no provenance record — the producing run was not content-addressed, so the recipe was \
-         never captured"
-            .to_string()
-    } else if multi_input {
-        format!(
-            "recipe reads {} recorded upstream(s) — `rocky restore` cannot rebuild a multi-input \
-             recipe yet, so this artifact is not evicted",
-            class.inputs.len()
+    let (passed, detail) = if !class.has_provenance {
+        (
+            false,
+            "no provenance record — the producing run was not content-addressed, so the recipe \
+             was never captured"
+                .to_string(),
         )
-    } else if strong {
-        "recipe recorded with no upstreams and a strong input closure — restorable".to_string()
+    } else if !strong {
+        (
+            false,
+            format!(
+                "input closure is weak (proof_class={}) — derived from a mutable source whose \
+                 inputs may have moved on",
+                class.proof_class.as_deref().unwrap_or("unknown")
+            ),
+        )
     } else {
-        format!(
-            "input closure is weak (proof_class={}) — derived from a mutable source whose inputs \
-             may have moved on",
-            class.proof_class.as_deref().unwrap_or("unknown")
-        )
+        match prov.map(restorable_recipe) {
+            None => (
+                false,
+                "provenance could not be read for the restore-shape check — not evicted \
+                 (fail-closed)"
+                    .to_string(),
+            ),
+            Some(Err(reason)) => (
+                false,
+                format!(
+                    "`rocky restore` cannot rebuild this recipe, so it is not evicted: {reason}"
+                ),
+            ),
+            Some(Ok(_)) => (
+                true,
+                "recipe recorded with a strong input closure, in a shape `rocky restore` \
+                 rebuilds (content-addressed, unpartitioned, no recorded upstreams)"
+                    .to_string(),
+            ),
+        }
     };
     GcCheckOutput {
         check: "recipe_recorded".to_string(),
@@ -385,7 +408,7 @@ pub(crate) fn build_candidate(
     adapter: Option<&AdapterCost>,
 ) -> GcCandidateOutput {
     let checks = vec![
-        check_recipe_recorded(class),
+        check_recipe_recorded(class, prov),
         check_recipe_produces_output(&artifact.blake3_hash, &artifact.file_path, prov),
         check_replayable(class),
         check_unreferenced(refcount),
@@ -413,21 +436,21 @@ pub(crate) fn build_candidate(
 /// numbers. These are the honesty guardrails the plan mandates.
 fn report_notes(min_age_days: i64) -> Vec<String> {
     vec![
-        "`derivable` means a recipe was recorded and bound to this artifact's bytes — NOT that \
-         the file is safe to delete, and NOT that `rocky restore` can rebuild it (restore covers \
-         only recipes that read no recorded upstreams; see the restore caveat below). `rocky \
+        "`derivable` means a recipe was recorded, bound to this artifact's bytes, and has a \
+         shape `rocky restore` rebuilds — NOT that the file is safe to delete, and NOT that a \
+         restore will succeed (see the restore caveat below). `rocky \
          apply` reclaims an artifact only when its file is a proven `remove` in its table's Delta \
          log and Delta's retention window (`delta.deletedFileRetentionDuration`, default 7 days) \
          has passed since its removal. A derivable file the live table still references is \
          held."
             .to_string(),
-        "Restore coverage is narrower than derivability. `rocky restore` rebuilds an evicted \
-         artifact only from a recipe that is non-partitioned, content-addressed, and reads no \
-         recorded upstreams — and even then it can refuse (missing tombstone/provenance binding, \
-         canonical IR that will not deserialize, unreachable object store or table state, a \
-         re-derivation whose blake3 differs, a path outside the storage prefix, or a lost race \
-         on ledger reinstatement). A recipe with ANY recorded upstream cannot be restored today. \
-         Re-running the pipeline is not an equivalent: it recomputes from current upstreams and \
+        "Restore coverage. `rocky restore` rebuilds an evicted artifact only from a recipe \
+         that is non-partitioned, content-addressed, and reads no recorded upstreams. gc applies \
+         that same check (one shared predicate), so it does not mark a partitioned or \
+         multi-input artifact derivable. Restore can still refuse on live state (missing \
+         tombstone/provenance binding, unreachable object store or table state, partition \
+         columns on the live table, a re-derivation whose blake3 differs, a path outside the \
+         storage prefix, or a lost race on ledger reinstatement). Re-running the pipeline is not an equivalent: it recomputes from current upstreams and \
          need not reproduce the evicted bytes."
             .to_string(),
         "Scope: refcounts see Rocky-managed references only. A warehouse-side reference Rocky \
@@ -787,12 +810,11 @@ fn gc_plan_notes() -> Vec<String> {
             .to_string(),
         "Every eviction writes a durable tombstone (recipe triple + restore pointer) BEFORE \
          the ledger row is retired. `rocky restore` attempts a rebuild only for a recipe that is \
-         non-partitioned, content-addressed, and reads no recorded upstreams — and that shape is \
-         necessary, not sufficient: a supported recipe can still refuse (missing \
-         tombstone/provenance binding, canonical IR that will not deserialize, unreachable object \
-         store or table state, a re-derivation whose blake3 differs, a path outside the storage \
-         prefix, or a lost race on ledger reinstatement). A recipe with ANY recorded upstream \
-         CANNOT be restored today (multi-input DAG re-derivation is a later phase). Re-running \
+         non-partitioned, content-addressed, and reads no recorded upstreams, and gc plans only \
+         that shape (one shared check). The shape is necessary, not sufficient: a supported \
+         recipe can still refuse (missing tombstone/provenance binding, unreachable object store \
+         or table state, a re-derivation whose blake3 differs, a path outside the storage \
+         prefix, or a lost race on ledger reinstatement). Re-running \
          the pipeline is not an equivalent — it recomputes from current upstreams and need not \
          reproduce the evicted bytes. What is durably retained is the eviction record plus the \
          provenance the tombstone points at, not a guarantee that these exact bytes stay \
@@ -1138,15 +1160,13 @@ fn gc_apply_notes() -> Vec<String> {
         "`rocky restore <target>` writes a review-gated plan that rebuilds the artifact from the \
          recipe its tombstone references and asserts the recomputed blake3 equals the tombstoned \
          hash before any write becomes visible. KNOWN LIMITATION: restore attempts a rebuild only \
-         for non-partitioned, content-addressed recipes that read no recorded upstreams — it \
-         refuses a recipe with ANY recorded upstream rather than substituting current data, so a \
-         multi-input artifact evicted here cannot be restored today. That shape is necessary, not \
-         sufficient: a supported recipe can still refuse on a missing provenance binding, \
-         canonical IR that will not deserialize, unreachable object store or table state, a \
-         re-derivation whose blake3 differs, a path outside the storage prefix, or a lost race on \
-         ledger reinstatement. Re-running its pipeline recomputes the model from \
-         current upstreams and need not reproduce the evicted bytes; if those upstreams have \
-         moved on, the exact bytes are unrecoverable until multi-input restore lands."
+         for non-partitioned, content-addressed recipes that read no recorded upstreams. gc uses \
+         the same check, so a partitioned or multi-input artifact is never evicted here. That \
+         shape is necessary, not sufficient: a supported recipe can still refuse on a missing \
+         provenance binding, unreachable object store or table state, a re-derivation whose \
+         blake3 differs, a path outside the storage prefix, or a lost race on ledger \
+         reinstatement. Re-running its pipeline recomputes the model from current upstreams and \
+         need not reproduce the evicted bytes."
             .to_string(),
         "KNOWN LIMITATION: the liveness gate is a conservative-best-effort reader of the Delta \
          log, not a full Delta-protocol implementation. It HOLDs on any log shape it cannot \
@@ -1953,8 +1973,8 @@ pub(crate) async fn run_gc_apply_in_with(
              windows + TOCTOU-safe deletion), which is not yet implemented. Unset `[gc] \
              physical_delete` — the durable tombstone + retired ledger row is the eviction of \
              record, and the recipe stays in the provenance it references (`rocky restore` \
-             attempts a rebuild only for recipes that read no recorded upstreams, and can still \
-             refuse; a recipe with ANY recorded upstream cannot be restored today, and re-running \
+             attempts a rebuild only for unpartitioned recipes that read no recorded upstreams, \
+             gc evicts only that shape, restore can still refuse, and re-running \
              its pipeline recomputes from current upstreams rather than reproducing the evicted \
              bytes)."
         );
@@ -2192,35 +2212,75 @@ auto_create_schemas = true
 
     // -- individual checks ------------------------------------------------
 
+    /// A provenance record for `x`, written by the production `build_records`
+    /// path, with the given upstreams and partition columns.
+    fn shaped_prov(upstreams: &[UpstreamIdentity], partition_columns: &[&str]) -> ProvenanceRecord {
+        let mut ir = ca_ir("x", "SELECT 1 AS id");
+        ir.materialization = MaterializationStrategy::ContentAddressed {
+            storage_prefix: "s3://b/tgt/raw/x".to_string(),
+            partition_columns: partition_columns.iter().map(ToString::to_string).collect(),
+        };
+        let outputs = vec![OutputArtifact {
+            blake3_hash: HA.to_string(),
+            file_path: format!("s3://b/{HA}.parquet"),
+        }];
+        build_records(&ir, "r1", upstreams, &outputs, Utc::now())
+            .unwrap()
+            .1
+    }
+
     #[test]
     fn recipe_recorded_requires_strong_provenance() {
         let mut m = model("x");
-        assert!(check_recipe_recorded(&m).passed);
+        let prov = shaped_prov(&[], &[]);
+        assert!(check_recipe_recorded(&m, Some(&prov)).passed);
 
         m.proof_class = Some("heuristic".to_string());
-        let c = check_recipe_recorded(&m);
+        let c = check_recipe_recorded(&m, Some(&prov));
         assert!(!c.passed);
         assert!(c.detail.contains("weak"));
 
         m.has_provenance = false;
         m.proof_class = None;
-        let c = check_recipe_recorded(&m);
+        let c = check_recipe_recorded(&m, None);
         assert!(!c.passed);
         assert!(c.detail.contains("no provenance"));
     }
 
     #[test]
     fn recipe_recorded_refuses_recorded_upstreams() {
-        let mut m = model("x");
-        m.inputs.push(crate::output::ReplayCheckInputOutput {
-            upstream_key: "tgt.raw.customers".to_string(),
-            kind: "content".to_string(),
-            resolvable: true,
-            reason: None,
-        });
-        let c = check_recipe_recorded(&m);
+        let m = model("x");
+        let prov = shaped_prov(
+            &[UpstreamIdentity::Content {
+                upstream_key: "tgt.raw.customers".to_string(),
+                blake3_hash: HB.to_string(),
+            }],
+            &[],
+        );
+        let c = check_recipe_recorded(&m, Some(&prov));
         assert!(!c.passed, "restore cannot rebuild a multi-input recipe");
-        assert!(c.detail.contains("recorded upstream"));
+        assert!(c.detail.contains("recorded upstream"), "got: {}", c.detail);
+    }
+
+    /// #2283: restore refuses a partitioned recipe, so gc must too.
+    #[test]
+    fn recipe_recorded_refuses_partitioned_recipe() {
+        let m = model("x");
+        let prov = shaped_prov(&[], &["day"]);
+        let c = check_recipe_recorded(&m, Some(&prov));
+        assert!(!c.passed, "restore cannot rebuild a partitioned recipe");
+        assert!(
+            c.detail.contains("partitioned restore"),
+            "got: {}",
+            c.detail
+        );
+    }
+
+    /// A strong verdict whose provenance could not be read fails closed.
+    #[test]
+    fn recipe_recorded_fails_closed_without_the_provenance_row() {
+        let c = check_recipe_recorded(&model("x"), None);
+        assert!(!c.passed);
     }
 
     #[test]
@@ -2292,7 +2352,9 @@ auto_create_schemas = true
             model_name: art.model_name.clone(),
             input_hash: "ih".to_string(),
             skip_hash: "sh".to_string(),
-            model_ir_canonical_json: "{}".to_string(),
+            // A real content-addressed recipe: check 1 parses it with
+            // restore's shape predicate.
+            model_ir_canonical_json: ca_ir(&art.model_name, "SELECT 1 AS id").canonical_json(),
             upstreams: Vec::new(),
             output_blake3: vec![art.blake3_hash.clone()],
             output_path: vec![art.file_path.clone()],

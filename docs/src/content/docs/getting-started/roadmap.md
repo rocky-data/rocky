@@ -91,9 +91,9 @@ on it. It is a maturity grade for the code. It is not a claim about who uses Roc
   recorded recipe is bound to their exact bytes. Eviction is review-gated, even
   for a person, and leaves a tombstone. `rocky restore` re-derives the artifact
   and reinstates it only when the rebuilt bytes match the recorded hash exactly.
-  Otherwise it refuses. Restore covers recipes that read no recorded upstreams;
-  a multi-input recipe cannot be rebuilt yet, so eviction is not reversible for
-  every artifact.
+  Otherwise it refuses. Restore covers unpartitioned recipes that read no
+  recorded upstreams, and gc evicts only that shape. Restore can still refuse on
+  live state, so eviction is not reversible for every artifact.
 - **The governor's surface.** `rocky brief` renders an estate digest with every
   line cited to the ledger. `rocky audit --for <table|run|plan>` walks a custody
   chain end to end. `rocky audit --scorecard` reports acceptance and escalation
