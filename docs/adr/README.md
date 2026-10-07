@@ -19,3 +19,9 @@ Staging: **spine-first** (PR-A → PR-B → PR-F) then the CAS **fast-follow** (
 These ADRs went through three adversarial review rounds (a strategic-plan red team, an independent per-ADR second review, and a red team over the implementation plan); the corrections from all three are folded in.
 
 These three ADRs were authored under adversarial review (Codex, 10 findings dispositioned) and a cross-consistency pass. **Status: Accepted (2026-07-17) — implementation in progress.**
+
+## WP-00 / WP-04 / WP-07 / WP-08 — Identity, approval and trust boundaries (design gate)
+
+| ADR | Status | Closes |
+|---|---|---|
+| [`ADR-TRUST.md`](ADR-TRUST.md) | Proposed — awaiting ratification | The design half of RD-026, RD-035, RD-043 and RD-045. Defines verified principals, signed approvals, the worker / loop / operator boundary, and break-glass (ADR-CONTRACTS Open question E). |
