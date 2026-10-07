@@ -141,7 +141,7 @@ check it rather than take it on faith.
 ## Where Rocky is today
 
 The trust primitives (compiler, branches, replay, lineage, contracts, cost) are
-production-grade on Databricks. Snowflake, BigQuery, and Trino are Beta: the
+GA (live-tested) on Databricks. Snowflake, BigQuery, and Trino are Beta: the
 core run loop works, and conformance coverage is still growing. The wider AI
 workflow, Iceberg-native writes, and a semantic layer are on the roadmap.
 

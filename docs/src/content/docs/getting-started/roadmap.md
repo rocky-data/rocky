@@ -6,10 +6,15 @@ sidebar:
 ---
 
 The trust primitives (compiler, branches, run records, lineage, contracts, cost
-attribution) are production-grade on Databricks. Here is the state of everything
+attribution) are GA (live-tested) on Databricks. Here is the state of everything
 else.
 
-## Shipped and production-grade
+**GA (live-tested)** means two things. The adapter has a live test suite that
+runs against a real warehouse. And each feature in that section runs end to end
+on it. It is a maturity grade for the code. It is not a claim about who uses Rocky.
+**Beta** means the core run loop works, but conformance coverage is not complete.
+
+## Shipped and GA (live-tested)
 
 - **Databricks** is the production target for 2026: SQL Statement API, Unity
   Catalog, OAuth M2M, adaptive concurrency, and schema-prefix branches.
@@ -112,7 +117,7 @@ else.
 - **Snowflake, BigQuery, and Trino.** Connection, execution, and the core run
   loop work. Conformance coverage is still growing. We test against live
   warehouses, so corner cases get reported and fixed quickly. If your enterprise
-  warehouse is Snowflake or BigQuery and you need it production-grade today,
+  warehouse is Snowflake or BigQuery and you need it at GA today,
   [open a discussion](https://github.com/rocky-data/rocky/discussions). We want
   the failure reports.
 - **Iceberg.** REST-catalog source discovery works. Content-addressed writes
