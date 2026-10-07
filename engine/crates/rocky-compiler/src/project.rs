@@ -346,7 +346,17 @@ impl Project {
     ///
     /// Useful when models come from sources other than a directory
     /// (e.g., DSL lowering, dbt import).
-    pub fn from_models(mut models: Vec<Model>) -> Result<Self, ProjectError> {
+    pub fn from_models(models: Vec<Model>) -> Result<Self, ProjectError> {
+        Self::from_models_with_externals(models, &std::collections::BTreeSet::new())
+    }
+
+    /// [`Self::from_models`], accepting `externals` as `depends_on` names
+    /// satisfied outside the project. See
+    /// [`resolve::resolve_dependencies_with_externals`].
+    pub fn from_models_with_externals(
+        mut models: Vec<Model>,
+        externals: &std::collections::BTreeSet<String>,
+    ) -> Result<Self, ProjectError> {
         // Programmatic callers must see the same canonical strategy as file loaders.
         for model in &mut models {
             model.config.strategy = models::normalize_transformation_strategy(std::mem::take(
@@ -371,7 +381,7 @@ impl Project {
         let target_collisions = collide_on_target(&models);
 
         let (dag_nodes, lineage_cache, resolve_diagnostics) =
-            resolve::resolve_dependencies(&models)?;
+            resolve::resolve_dependencies_with_externals(&models, externals)?;
         let execution_order = dag::topological_sort(&dag_nodes)?;
         let layers = dag::execution_layers(&dag_nodes)?;
 

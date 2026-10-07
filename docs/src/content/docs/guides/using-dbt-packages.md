@@ -23,7 +23,7 @@ Rocky's SQL resolver classifies each table reference by how it is qualified:
 | `dbt_fivetran.stg_facebook_ads__ad_history` (two-part) | External source | No dependency |
 | `analytics.dbt_fivetran.stg_facebook_ads__ad_history` (three-part) | Fully qualified external | No dependency |
 
-A two-part or three-part reference is always external. Rocky reads from it, and never tries to build, refresh, or manage it. Only a bare name that matches another Rocky model in the project becomes a DAG edge.
+A two-part or three-part reference is always external. Rocky reads from it, and never tries to build, refresh, or manage it. Only a bare name that another Rocky model writes as its `[target]` table becomes a DAG edge.
 
 ## Example: Rocky on top of Fivetran dbt packages
 

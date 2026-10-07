@@ -210,6 +210,13 @@
             "null"
           ]
         },
+        "schemas": {
+          "description": "The source schemas and tables a `type = \"manual\"` discovery adapter returns, listed in config instead of fetched from an API.\n\n```toml [adapter.local_discovery] type = \"manual\" kind = \"discovery\"\n\n[[adapter.local_discovery.schemas]] name = \"raw__orders\" tables = [\"orders\", \"order_items\"] ```\n\nRequired (non-empty) on a `manual` adapter and refused on every other type; see [`validate_manual_adapters`].",
+          "items": {
+            "$ref": "#/definitions/ManualSchemaConfig"
+          },
+          "type": "array"
+        },
         "stampede": {
           "anyOf": [
             {
@@ -1824,6 +1831,28 @@
       "required": [
         "catalog",
         "schema"
+      ],
+      "type": "object"
+    },
+    "ManualSchemaConfig": {
+      "additionalProperties": false,
+      "description": "One source schema of a `type = \"manual\"` discovery adapter, with the tables in it, listed in `rocky.toml` for teams whose source has no discovery API (a Databricks or Snowflake source with no Fivetran in front).\n\n```toml [adapter.local_discovery] type = \"manual\" kind = \"discovery\"\n\n[[adapter.local_discovery.schemas]] name = \"raw__orders\" tables = [\"orders\", \"order_items\", \"returns\"]\n\n[[adapter.local_discovery.schemas]] name = \"raw__customers\" tables = [\"customers\", \"addresses\"] ```\n\nThe load-time rules (non-empty list, valid identifiers, no duplicates) live in `config::validate_manual_adapters`, so `rocky validate` and every executing command refuse the same configs.",
+      "properties": {
+        "name": {
+          "description": "Source schema name. Matched against the pipeline's `schema_pattern.prefix` exactly as a discovered schema would be.",
+          "type": "string"
+        },
+        "tables": {
+          "description": "Tables in the schema.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "name",
+        "tables"
       ],
       "type": "object"
     },

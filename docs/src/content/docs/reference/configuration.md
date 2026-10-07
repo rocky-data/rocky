@@ -193,7 +193,42 @@ The connection fields, authentication, and examples for each adapter type live o
 
 ### `type = "manual"`
 
-Define source schemas and tables inline in `rocky.toml` instead of discovering them from an API. Use it for tests and for small sources whose shape does not change.
+A discovery adapter that lists source schemas and tables inline in `rocky.toml` instead of discovering them from an API. Use it when the source has no discovery adapter of its own, such as a Databricks or Snowflake source with no Fivetran in front of it, for tests, and for small sources whose shape does not change.
+
+It is discovery-only, so `kind = "discovery"` is required. List each schema as an `[[adapter.NAME.schemas]]` block:
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `schemas` | array of tables | Yes | The source schemas this adapter returns. At least one. |
+| `schemas[].name` | string | Yes | Schema name, matched against the pipeline's `schema_pattern.prefix` like any discovered schema. |
+| `schemas[].tables` | array of strings | Yes | Tables in the schema. At least one. |
+
+```toml
+[adapter.local_discovery]
+type = "manual"
+kind = "discovery"
+
+[[adapter.local_discovery.schemas]]
+name = "raw__orders"
+tables = ["orders", "order_items"]
+
+[pipeline.poc.source.discovery]
+adapter = "local_discovery"
+```
+
+The adapter discovers exactly what it lists, with no network call. It does not check that the tables exist. `rocky plan` plans every listed table, so a missing table fails at `rocky run`. `rocky discover` is different: when the pipeline sets `source.catalog`, it asks the source warehouse which tables exist and leaves out the missing ones, as it does for every discovery adapter.
+
+A listed schema is used only when the pipeline's `schema_pattern` parses it: the name must start with `prefix` (case-sensitive) and the rest must split into the declared `components`. Other listed schemas are skipped.
+
+`rocky validate` reports each of these as a `V057` error, and every command that loads the config (`plan`, `run`, `discover`) refuses it with the same message:
+
+- a manual adapter with no `schemas`;
+- a schema with no `tables`;
+- a schema or table name that is not a plain identifier (`[a-zA-Z0-9_]+`);
+- a schema listed twice, or a table listed twice in one schema (compared ignoring case);
+- `schemas` on an adapter whose type is not `manual`.
+
+When the `schema_pattern` of a pipeline that uses the adapter parses none of the listed schemas, `rocky validate` warns with `V058`: `plan` and `run` would find no table.
 
 ### `[adapter.NAME.retry]`
 
@@ -791,6 +826,13 @@ Set `concurrency_control = "off"` to opt out. That is correct for a deployment w
 A writer on `off` uploads unconditionally, so one such writer could still overwrite every CAS writer. The marker stops that. The first CAS upload of a state object creates a small `cas-required` object beside it, for example `<prefix>/v9/state.redb.cas-required`. The write is create-once on its own key, like a freeze marker.
 
 A writer whose mode resolves to `off` checks for the marker when it starts, before it does any work, and again before each upload. If the marker exists, the writer stops with an error that names the fix. Reads are not affected. The fix is to set `concurrency_control = "cas"`, or to remove the explicit `"off"`, on that writer. Delete the marker only on purpose, when every writer of that state is deliberately moving to `"off"`. `rocky doctor` warns when the configured mode and the marker disagree.
+
+The marker sits under the schema-version folder (`v9/` above), and a schema bump does not move it. So the check also looks at each older version's folder, down to the oldest one Rocky still carries state forward from. A marker left by the fleet before an upgrade still stops an `off` writer after it. To delete the marker on purpose, delete it in every version folder that has one.
+
+Two limits are worth knowing:
+
+- **The check and the upload are separate steps.** An `off` writer checks for the marker, then uploads. A first CAS upload that creates the marker between those two steps does not stop that one upload. After the marker exists, every later `off` upload is refused.
+- **A marker can exist on a store that ignores conditional writes.** A CAS writer creates the marker even when its probe was inconclusive. If the store in fact ignores conditional headers, the `cas` writers are not protected from each other, yet the marker still blocks every `off` writer. Run `rocky doctor` until the probe passes, or set every writer to `"off"` and delete the marker on purpose.
 
 #### Upgrading to the `cas` default
 

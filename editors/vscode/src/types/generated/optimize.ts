@@ -14,6 +14,10 @@ export interface OptimizeOutput {
   command: string;
   message?: string | null;
   recommendations: OptimizeRecommendation[];
+  /**
+   * Which runs the recommendations were computed from. Shadow and branch runs are left out; runs with no recorded scope are counted, so history from before #2200 still informs the averages (#2201).
+   */
+  run_scope?: ProductionRunScope;
   total_models_analyzed: number;
   version: string;
   [k: string]: unknown;
@@ -39,5 +43,29 @@ export interface OptimizeRecommendation {
    * Projected monthly storage cost (USD).
    */
   storage_cost_per_month: number;
+  [k: string]: unknown;
+}
+/**
+ * Which runs a report about production counted (#2201).
+ *
+ * Shadow and branch runs are never counted. Runs recorded before runs carried a scope are counted or not per report, and `unrecorded_runs_counted` says which.
+ */
+export interface ProductionRunScope {
+  /**
+   * Shadow and branch runs the report left out.
+   */
+  excluded_runs: number;
+  /**
+   * Runs recorded as production that the report read.
+   */
+  production_runs: number;
+  /**
+   * Runs with no recorded scope that the report read.
+   */
+  unrecorded_runs: number;
+  /**
+   * `true` when runs with no recorded scope count as production in this report. Their write target is unknown.
+   */
+  unrecorded_runs_counted: boolean;
   [k: string]: unknown;
 }

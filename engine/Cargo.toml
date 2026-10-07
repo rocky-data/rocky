@@ -76,7 +76,7 @@ chrono-tz = "0.10"
 # Cron occurrence math for the schedule reconciler. croner declares no MSRV,
 # so the version is pinned exactly — a patch bump could raise the required
 # toolchain past the workspace's 1.88 floor without warning.
-croner = "=4.0.0"
+croner = "=4.0.1"
 
 # JSON Schema generation (Phase 2 — codegen source of truth for dagster + vscode types)
 schemars = { version = "0.8", features = ["chrono", "indexmap2"] }
@@ -119,7 +119,7 @@ tokio = { version = "1", features = ["full"] }
 # and `result_type_reaches_a_2026_07_28_client_and_no_other` green — NOT by
 # narrowing `supported_protocol_versions`, which is the extreme that test was
 # written to distinguish from a real fix.
-rmcp = { version = "=3.4.1", features = ["server", "macros", "transport-io"] }
+rmcp = { version = "=3.5.0", features = ["server", "macros", "transport-io"] }
 
 # HTTP
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip", "http2"] }

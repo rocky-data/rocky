@@ -551,3 +551,128 @@ fn apply_is_invoked_from_exactly_one_module() {
         "the typed apply core must be invoked from exactly one module"
     );
 }
+
+/// Every FOLLOWING file read, and every pathname publication (`fs::rename`,
+/// a raw `OpenOptions`), in this crate's production code, by file, with the
+/// reason it is allowed (#1633).
+///
+/// The custody rule is one rule, not a per-call-site decision: bytes this
+/// crate takes from a file a worker (or anyone below the operator) could
+/// have placed, and then hands on — into `products/`, `models/`, or a
+/// worker's prompt — are read through `read_no_follow_bytes`, which refuses
+/// a symlinked leaf and, on unix, a hard link, on the descriptor it reads.
+/// A plain `std::fs::read` / `read_to_string` / `File::open` / `fs::copy`
+/// follows whatever the name resolves to. So every one that remains is
+/// listed here with its reason, and a NEW one fails this test until someone
+/// either routes it through the import reader or adds it here deliberately,
+/// in a reviewer-visible diff.
+const FOLLOWING_READS: &[(&str, usize, &str)] = &[
+    (
+        "driver.rs",
+        2,
+        "`/proc/<pid>/task/<pid>/children` (kernel-provided) and the replay \
+         driver's session file (an operator's CLI argument, not a worker output)",
+    ),
+    (
+        "handoff.rs",
+        1,
+        "publication rename of the drafting hand-off: the source is a tmp this \
+         process just created O_EXCL and wrote the vetted bytes into, never a name \
+         a worker placed",
+    ),
+    (
+        "step.rs",
+        5,
+        "one publication rename of the candidate spec (same shape as handoff.rs: an \
+         O_EXCL tmp holding the bytes the outbox reader vetted), plus four reads of \
+         the approved spec snapshot, at the path the approval record in the state \
+         store names (the store is in the closed set fulfill.md lists). Three reads \
+         compare the bytes' digest against the approval record before use; the \
+         fourth (`apply`) hands its recomputed digest to the engine as \
+         `expect_spec_digest`, which apply compares against the digest the governed \
+         plan pinned at propose",
+    ),
+];
+
+/// The production code of a source file, with comments and strings already
+/// stripped: every top-level item gated `#[cfg(test)]` or
+/// `#[cfg(all(test, …))]` is cut out — wherever it sits, so production code
+/// AFTER a test module is still scanned. An item ends at the `;` or the
+/// balanced `}` that closes the first block after the attribute.
+fn production_code(code: &str) -> String {
+    let bytes = code.as_bytes();
+    let mut out = String::with_capacity(code.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let at_line_start = i == 0 || bytes[i - 1] == b'\n';
+        let rest = &code[i..];
+        if at_line_start && (rest.starts_with("#[cfg(test)]") || rest.starts_with("#[cfg(all(test"))
+        {
+            let mut j = i + rest.find(']').unwrap_or(0) + 1;
+            while j < bytes.len() && bytes[j] != b'{' && bytes[j] != b';' {
+                j += 1;
+            }
+            if j < bytes.len() && bytes[j] == b'{' {
+                let mut depth = 0usize;
+                while j < bytes.len() {
+                    match bytes[j] {
+                        b'{' => depth += 1,
+                        b'}' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                    j += 1;
+                }
+            }
+            i = (j + 1).min(bytes.len());
+            continue;
+        }
+        let next = rest.find('\n').map_or(bytes.len(), |n| i + n + 1);
+        out.push_str(&code[i..next]);
+        i = next;
+    }
+    out
+}
+
+#[test]
+fn every_following_read_is_inventoried() {
+    // A count per file, not per site, on purpose: the pin is a
+    // reviewer-visible number, and any change to it is a diff here.
+    const SHAPES: &[&str] = &[
+        "fs::read(",
+        "fs::read_to_string(",
+        "File::open(",
+        "fs::copy(",
+        "fs::rename(",
+        "OpenOptions::new(",
+    ];
+    let mut found: BTreeSet<(String, usize)> = BTreeSet::new();
+    for (path, text) in crate_sources() {
+        if path.ends_with("inventory.rs") {
+            continue;
+        }
+        let code = production_code(&strip_comments_and_strings(&text));
+        let count: usize = SHAPES.iter().map(|shape| code.matches(shape).count()).sum();
+        if count > 0 {
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            found.insert((name, count));
+        }
+    }
+    let pinned: BTreeSet<(String, usize)> = FOLLOWING_READS
+        .iter()
+        .map(|(file, count, _)| ((*file).to_string(), *count))
+        .collect();
+    assert_eq!(
+        found, pinned,
+        "a following file read appeared or disappeared in production code. Bytes a worker \
+         could have placed go through `rocky_core::product::commit::read_no_follow_bytes`; \
+         anything else is added to FOLLOWING_READS with its reason (#1633)"
+    );
+}

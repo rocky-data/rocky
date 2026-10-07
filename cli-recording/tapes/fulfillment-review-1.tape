@@ -25,6 +25,10 @@ Type "cd scratch/fulfillment-review" Enter
 # approval marker, and out of the frame.
 Type "export RUST_LOG=error ROCKY_SUPPRESS_DEPRECATION=1 ROCKY_SCRUB_HOST=1" Enter
 Type 'export PS1="> "' Enter
+# One state store outside models/ for every command: `rocky fulfill` refuses
+# the default store, which the drafting worker may write (#2169). The loop's
+# printed next steps show the flag.
+Type 'rocky() { command rocky --state-path .rocky/state.redb "$@"; }' Enter
 Type "clear" Enter
 Show
 

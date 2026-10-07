@@ -224,6 +224,7 @@ fn infer_column_map(
         run_vars: run_vars.clone(),
         source_provenance: Default::default(),
         preserve_authored_sql: true,
+        external_dependencies: Default::default(),
     };
     // The models are already loaded (and were loaded strictly), so compile
     // them directly instead of re-reading the directory — one load, and the

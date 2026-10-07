@@ -57,9 +57,11 @@ schema_template = "out"
 /// Spawn `server` on one end of a duplex pipe and return a connected client.
 ///
 /// The `()` handler requests `ClientConfig::default()`, whose `protocol_version`
-/// is rmcp's `ProtocolVersion::LATEST` — `2025-11-25` today. Every test
-/// in this file that uses `connect` is therefore describing THAT negotiated
-/// version, which matters for `resultType`: see
+/// is rmcp's `ProtocolVersion::LATEST` — `2026-07-28` since rmcp 3.5. That
+/// revision has no `initialize` handshake, so the server answers with its
+/// fallback, `ProtocolVersion::LATEST_WITH_INITIALIZE` (`2025-11-25`). Every
+/// test in this file that uses `connect` is therefore describing THAT
+/// negotiated version, which matters for `resultType`: see
 /// [`result_type_reaches_a_2026_07_28_client_and_no_other`].
 async fn connect(server: RockyMcpServer) -> rmcp::service::RunningService<rmcp::RoleClient, ()> {
     let (server_io, client_io) = tokio::io::duplex(64 * 1024);
@@ -5547,7 +5549,10 @@ async fn optimize_reports_message_without_history() {
 
     assert!(sc["recommendations"].as_array().unwrap().is_empty());
     assert!(
-        sc["message"].as_str().unwrap().contains("no run history"),
+        sc["message"]
+            .as_str()
+            .unwrap()
+            .contains("no production run history"),
         "empty optimize must explain why"
     );
 
@@ -5937,7 +5942,14 @@ async fn result_type_reaches_a_2026_07_28_client_and_no_other() {
     modern.cancel().await.unwrap();
 
     // 2. The default `()` client every other test in this file uses asks for
-    //    `LATEST` (2025-11-25), which is older, so the field is stripped.
+    //    `LATEST` over `initialize`. Since rmcp 3.5 that is 2026-07-28, which
+    //    has no handshake, so it lands on `LATEST_WITH_INITIALIZE`
+    //    (2025-11-25). That is older, so the field is stripped.
+    assert!(
+        !ProtocolVersion::LATEST.has_initialize(),
+        "since rmcp 3.5 the default client names a version with no handshake, \
+         so the default peer below lands on the fallback, not an echo"
+    );
     let legacy = connect(RockyMcpServer::new(config_path)).await;
     let legacy_negotiated = legacy
         .peer_info()
@@ -5946,9 +5958,10 @@ async fn result_type_reaches_a_2026_07_28_client_and_no_other() {
         .clone();
     assert_eq!(
         legacy_negotiated,
-        ProtocolVersion::LATEST,
-        "the default handler asks for rmcp's LATEST; if that constant moves \
-         past 2026-07-28 this whole test inverts and the tools.rs note about \
+        ProtocolVersion::LATEST_WITH_INITIALIZE,
+        "the default handler asks for rmcp's LATEST over `initialize` and lands \
+         on the newest handshake version; if that constant moves past \
+         2026-07-28 this whole test inverts and the tools.rs note about \
          'no client asks for it yet' has to be re-read"
     );
     assert!(
@@ -5984,11 +5997,12 @@ async fn result_type_reaches_a_2026_07_28_client_and_no_other() {
 
 /// The fallback `get_info` supplies is what an `initialize` naming
 /// `2026-07-28` gets under rmcp 3.2+, and it is the NEWEST handshake version,
-/// not the oldest (#1965). Nothing else exercised that value: the default
-/// client names `2025-11-25` and is echoed, the discover peer never sees the
-/// fallback, and rocky-fulfill's driver names `2024-11-05` and is echoed. So
-/// reverting the fallback to `V_2024_11_05` passed every other test; this one
-/// fails on it.
+/// not the oldest (#1965). Until rmcp 3.5 nothing else exercised that value:
+/// the default client named `2025-11-25` and was echoed, the discover peer
+/// never sees the fallback, and rocky-fulfill's driver names `2024-11-05` and
+/// is echoed. Since rmcp 3.5 the default client names `2026-07-28` too, so
+/// every `connect` test now goes through the fallback; this test still pins
+/// the value directly.
 ///
 /// Such a client is also a legacy peer once answered, so `resultType` is
 /// withheld from it, which is the half of the claim the changelog makes.
@@ -8779,4 +8793,88 @@ async fn draft_contract_unloadable_policy_with_an_uninspectable_leftover_says_so
         contract.is_file(),
         "the refused draft really is still on disk once the directory is searchable again"
     );
+}
+
+/// #1900: `schedule_status` reports the webhook demands waiting in the spool
+/// — the half the claims snapshot is blind to — through the same producer as
+/// `GET /api/v1/schedule/spool`, so the two agree by construction.
+#[tokio::test]
+async fn schedule_status_reports_waiting_spool_demands() {
+    let dir = TempDir::new().unwrap();
+    write_project(dir.path(), &dir.path().join("test.duckdb"));
+    let rocky_dir = dir.path().join(".rocky");
+    rocky_core::schedule::spool::accept(
+        &rocky_dir,
+        "p",
+        rocky_core::schedule::spool::WebhookKind::Id,
+        "delivery-1",
+        "deadbeef",
+        chrono::DateTime::parse_from_rfc3339("2026-09-10T10:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc),
+    )
+    .unwrap();
+    let server = RockyMcpServer::new(dir.path().join("rocky.toml"));
+
+    let client = connect(server).await;
+    let result = client
+        .call_tool(CallToolRequestParams::new("schedule_status"))
+        .await
+        .expect("schedule_status call");
+
+    assert_ne!(result.is_error, Some(true), "{result:?}");
+    let sc = result
+        .structured_content
+        .expect("schedule_status returns structured content");
+    assert_eq!(sc["spool"]["counts"]["pending"], serde_json::json!(1));
+    assert_eq!(
+        sc["spool"]["pending"][0]["token"],
+        serde_json::json!("delivery-1")
+    );
+    let reference =
+        rocky_cli::commands::compute_schedule_spool(&dir.path().join("rocky.toml")).unwrap();
+    assert_eq!(
+        sc["spool"],
+        serde_json::to_value(&reference).unwrap(),
+        "the tool must report the spool producer's document unchanged"
+    );
+    // The claims snapshot is still there, unchanged in shape.
+    assert!(sc.get("counts").is_some() && sc.get("tick_lock").is_some());
+
+    client.cancel().await.unwrap();
+}
+
+/// #1900: an unreadable spool is a tool error, never an empty list — the
+/// #1710/#1752/#1731 bug class is a present spool that reads as "nothing
+/// waiting".
+#[cfg(unix)]
+#[tokio::test]
+async fn schedule_status_errors_on_an_unreadable_spool() {
+    let dir = TempDir::new().unwrap();
+    write_project(dir.path(), &dir.path().join("test.duckdb"));
+    let rocky_dir = dir.path().join(".rocky");
+    std::fs::create_dir_all(&rocky_dir).unwrap();
+    // Present (a dangling symlink), but impossible to enumerate.
+    std::os::unix::fs::symlink(
+        dir.path().join("nowhere"),
+        rocky_dir.join("pending-demands"),
+    )
+    .unwrap();
+    let server = RockyMcpServer::new(dir.path().join("rocky.toml"));
+
+    let client = connect(server).await;
+    let result = client
+        .call_tool(CallToolRequestParams::new("schedule_status"))
+        .await
+        .expect("the call itself completes");
+
+    assert_eq!(
+        result.is_error,
+        Some(true),
+        "an unreadable spool must be an error, not an empty listing: {result:?}"
+    );
+    let text = format!("{result:?}");
+    assert!(text.contains("spool"), "{text}");
+
+    client.cancel().await.unwrap();
 }

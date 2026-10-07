@@ -1001,6 +1001,8 @@ class MetricsResult(BaseModel):
     #: Human-readable status message (e.g. "no snapshots yet"). ``None`` when
     #: the command has data to report.
     message: str | None = None
+    #: Snapshots skipped because a shadow or branch run wrote them (#2201).
+    excluded_non_production_snapshots: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -1021,6 +1023,19 @@ class MaterializationCost(BaseModel):
     reasoning: str
 
 
+class ProductionRunScope(BaseModel):
+    """Which runs a report about production counted (#2201).
+
+    Shadow and branch runs are never counted. Runs recorded before runs
+    carried a scope are counted when ``unrecorded_runs_counted`` is true.
+    """
+
+    unrecorded_runs_counted: bool
+    production_runs: int
+    unrecorded_runs: int
+    excluded_runs: int
+
+
 class OptimizeResult(BaseModel):
     """Output of ``rocky optimize --json``."""
 
@@ -1031,6 +1046,9 @@ class OptimizeResult(BaseModel):
     #: Human-readable status message (e.g. "no models to analyze"). ``None``
     #: when recommendations are present.
     message: str | None = None
+    #: Which runs the recommendations were computed from. ``None`` from a
+    #: binary that predates the field.
+    run_scope: ProductionRunScope | None = None
 
 
 # ---------------------------------------------------------------------------

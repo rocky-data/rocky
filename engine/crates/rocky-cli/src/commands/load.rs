@@ -15,7 +15,7 @@ use anyhow::{Context, Result, bail};
 use tracing::info;
 
 use rocky_adapter_sdk::{FileFormat, LoadOptions, LoadSource, LoaderAdapter, TableRef};
-use rocky_core::contracts::{ContractConfig, ContractResult, validate_contract_typed};
+use rocky_core::contracts::{ContractConfig, ContractResult, GateDialect, validate_contract_typed};
 use rocky_core::state::{LoadedFileRecord, StateStore};
 use rocky_core::traits::WarehouseAdapter;
 
@@ -612,6 +612,21 @@ impl std::fmt::Display for ContractGateError {
 
 impl std::error::Error for ContractGateError {}
 
+/// Validate the landed staging columns under the rules of the warehouse that
+/// described them. That warehouse decides one reading: a bare BigQuery
+/// `NUMERIC` is `NUMERIC(38, 9)` (#1856).
+fn validate_landed_contract(
+    contract: &ContractConfig,
+    landed: &[rocky_ir::ColumnInfo],
+    dialect: &dyn rocky_core::traits::SqlDialect,
+) -> ContractResult {
+    validate_contract_typed(
+        contract,
+        landed,
+        GateDialect::from_dialect_name(dialect.name()),
+    )
+}
+
 /// Load one file into a staging table, validate it against `contract`, and
 /// promote to `target` only if validation passes (true staging-promote gate).
 ///
@@ -698,7 +713,7 @@ async fn load_with_contract_gate(
             ));
         }
     };
-    let result = validate_contract_typed(contract, &landed);
+    let result = validate_landed_contract(contract, &landed, dialect);
 
     for warning in &result.warnings {
         tracing::warn!(table = %target, "{warning}");
@@ -1087,7 +1102,7 @@ required_columns = [
     #[cfg(feature = "duckdb")]
     #[tokio::test]
     async fn test_contract_gate_pass_surfaces_unenforceable_warning() {
-        use rocky_core::contracts::{ContractConfig, validate_contract_typed};
+        use rocky_core::contracts::{ContractConfig, GateDialect, validate_contract_typed};
         use rocky_core::traits::WarehouseAdapter;
         use rocky_duckdb::DuckDbConnector;
         use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
@@ -1150,10 +1165,47 @@ required_columns = [
             .await
             .unwrap();
         assert!(
-            !validate_contract_typed(&contract, &landed)
+            !validate_contract_typed(&contract, &landed, GateDialect::Portable)
                 .warnings
                 .is_empty()
         );
+    }
+
+    /// #1856 — the load gate reads the landed columns under the dialect of
+    /// the warehouse that described them: a bare `NUMERIC` from BigQuery
+    /// satisfies a `NUMERIC(38,9)` contract, the same string from any other
+    /// warehouse still refuses.
+    ///
+    /// Mutation: pass `GateDialect::Portable` in `validate_landed_contract`.
+    /// The BigQuery assertion then fails.
+    #[test]
+    fn landed_contract_uses_the_describing_warehouse_dialect() {
+        let contract = ContractConfig {
+            required_columns: vec![rocky_core::contracts::RequiredColumn {
+                name: "amount".into(),
+                data_type: "NUMERIC(38,9)".into(),
+                nullable: true,
+            }],
+            ..Default::default()
+        };
+        let landed = [rocky_ir::ColumnInfo {
+            name: "amount".into(),
+            data_type: "NUMERIC".into(),
+            nullable: true,
+        }];
+        let bigquery = super::validate_landed_contract(
+            &contract,
+            &landed,
+            &rocky_bigquery::dialect::BigQueryDialect,
+        );
+        assert!(bigquery.passed, "{bigquery:?}");
+        let snowflake = super::validate_landed_contract(
+            &contract,
+            &landed,
+            &rocky_snowflake::dialect::SnowflakeSqlDialect,
+        );
+        assert!(!snowflake.passed, "{snowflake:?}");
+        assert_eq!(snowflake.violations[0].rule, "unverifiable_landed_type");
     }
 
     /// A column that lands with a type outside Rocky's type map REFUSES the

@@ -48,6 +48,40 @@
         "storage_cost_per_month"
       ],
       "type": "object"
+    },
+    "ProductionRunScope": {
+      "description": "Which runs a report about production counted (#2201).\n\nShadow and branch runs are never counted. Runs recorded before runs carried a scope are counted or not per report, and `unrecorded_runs_counted` says which.",
+      "properties": {
+        "excluded_runs": {
+          "description": "Shadow and branch runs the report left out.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "production_runs": {
+          "description": "Runs recorded as production that the report read.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "unrecorded_runs": {
+          "description": "Runs with no recorded scope that the report read.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "unrecorded_runs_counted": {
+          "description": "`true` when runs with no recorded scope count as production in this report. Their write target is unknown.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "excluded_runs",
+        "production_runs",
+        "unrecorded_runs",
+        "unrecorded_runs_counted"
+      ],
+      "type": "object"
     }
   },
   "description": "JSON output for `rocky optimize`.\n\n`recommendations` is empty when no run history exists; `message` is populated in that case to explain why.",
@@ -66,6 +100,20 @@
         "$ref": "#/definitions/OptimizeRecommendation"
       },
       "type": "array"
+    },
+    "run_scope": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/ProductionRunScope"
+        }
+      ],
+      "default": {
+        "excluded_runs": 0,
+        "production_runs": 0,
+        "unrecorded_runs": 0,
+        "unrecorded_runs_counted": false
+      },
+      "description": "Which runs the recommendations were computed from. Shadow and branch runs are left out; runs with no recorded scope are counted, so history from before #2200 still informs the averages (#2201)."
     },
     "total_models_analyzed": {
       "format": "uint",

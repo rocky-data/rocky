@@ -85,6 +85,10 @@ struct FaultState {
     /// Simulate a store that accepts conditional-write headers and ignores
     /// them (older S3-compatible stores): every put lands unconditionally.
     ignore_conditional_writes: bool,
+    /// The `n`-th put (1-based, counted like [`FaultMode::FailNth`]) is
+    /// applied to the inner store and THEN reported as a failure: a write
+    /// whose response was lost after it landed.
+    land_then_fail_nth_put: Option<u64>,
 }
 
 fn lock(state: &Mutex<FaultState>) -> std::sync::MutexGuard<'_, FaultState> {
@@ -168,6 +172,13 @@ impl FaultHandle {
         lock(&self.0).ignore_conditional_writes = ignore;
     }
 
+    /// Make the `n`-th put (1-based, counted from the store's creation) land
+    /// and then report a transport error, as a write whose response is lost
+    /// does.
+    pub fn land_then_fail_nth_put(&self, n: u64) {
+        lock(&self.0).land_then_fail_nth_put = Some(n);
+    }
+
     /// `put_opts` calls observed on paths that do NOT start with `prefix`,
     /// across every write condition. Lets a test count state writes while
     /// ignoring the startup conditional-write probe's throwaway object
@@ -215,6 +226,10 @@ impl FaultingStore {
         record_and_check(&self.state, op)
     }
 
+    fn count_of(&self, op: FaultOp) -> u64 {
+        lock(&self.state).counts.get(&op).copied().unwrap_or(0)
+    }
+
     fn record_put(&self, location: &ObjectPath, mode: &PutMode) -> Result<(), object_store::Error> {
         let path = location.to_string();
         let kind = match mode {
@@ -258,16 +273,29 @@ impl ObjectStore for FaultingStore {
         opts: PutOptions,
     ) -> object_store::Result<PutResult> {
         self.check(FaultOp::Put)?;
+        let call_number = self.count_of(FaultOp::Put);
         self.record_put(location, &opts.mode)?;
-        let opts = if lock(&self.state).ignore_conditional_writes {
-            PutOptions {
-                mode: PutMode::Overwrite,
-                ..opts
-            }
-        } else {
-            opts
+        let (opts, land_then_fail) = {
+            let guard = lock(&self.state);
+            let land_then_fail = guard.land_then_fail_nth_put == Some(call_number);
+            let opts = if guard.ignore_conditional_writes {
+                PutOptions {
+                    mode: PutMode::Overwrite,
+                    ..opts
+                }
+            } else {
+                opts
+            };
+            (opts, land_then_fail)
         };
-        self.inner.put_opts(location, payload, opts).await
+        let result = self.inner.put_opts(location, payload, opts).await?;
+        if land_then_fail {
+            return Err(object_store::Error::Generic {
+                store: "FaultingStore",
+                source: format!("injected lost response: Put call #{call_number} landed").into(),
+            });
+        }
+        Ok(result)
     }
 
     async fn put_multipart_opts(

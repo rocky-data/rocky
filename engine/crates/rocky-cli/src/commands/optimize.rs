@@ -10,10 +10,10 @@ use rocky_core::models::StrategyConfig;
 use rocky_core::optimize::{
     CostConfig, MaterializationCost, ModelStats, UNKNOWN_STRATEGY, recommend_strategy,
 };
-use rocky_core::state::StateStore;
+use rocky_core::state::{StateStore, UnrecordedScope};
 use rocky_ir::dag::DagNode;
 
-use crate::output::{OptimizeOutput, OptimizeRecommendation, print_json};
+use crate::output::{OptimizeOutput, OptimizeRecommendation, ProductionRunScope, print_json};
 
 /// Build the optimize output from run history + the on-disk DAG. Pure
 /// compute — no printing — so other surfaces (the MCP `optimize` tool) can
@@ -48,11 +48,21 @@ pub fn optimize_output(
         None => CostConfig::default(),
     };
 
-    // Get all runs to extract model names and compute stats
-    let runs = store.list_runs(100)?;
+    // Get all runs to extract model names and compute stats.
+    //
+    // Production runs only (#2201): a shadow or branch run built a copy
+    // somewhere else, and its timings must not steer the production table's
+    // materialization. Runs recorded before runs carried a scope ARE counted:
+    // they are most of the history right after an upgrade, and dropping them
+    // would leave nothing to recommend from. `run_scope` in the output says
+    // how many of each were read.
+    let (runs, run_scope) =
+        ProductionRunScope::read(&store, 100, UnrecordedScope::Count, |_| true)?;
 
     if runs.is_empty() {
-        return Ok(OptimizeOutput::empty("no run history available"));
+        let mut out = OptimizeOutput::empty("no production run history available");
+        out.run_scope = run_scope;
+        return Ok(out);
     }
 
     // Build the DAG + each model's configured strategy from the models on
@@ -82,7 +92,9 @@ pub fn optimize_output(
     let total_runs = runs.len();
 
     for model_name in &model_names {
-        let history = store.get_model_history(model_name, 100)?;
+        let history = store.get_model_history_matching(model_name, 100, |run| {
+            run.counts_as_production(UnrecordedScope::Count)
+        })?;
         if history.is_empty() {
             continue;
         }
@@ -138,7 +150,9 @@ pub fn optimize_output(
             downstream_references: r.downstream_references as u64,
         })
         .collect();
-    Ok(OptimizeOutput::new(typed_recs))
+    let mut out = OptimizeOutput::new(typed_recs);
+    out.run_scope = run_scope;
+    Ok(out)
 }
 
 /// Execute `rocky optimize`.
@@ -157,7 +171,12 @@ pub fn run_optimize(
     }
 
     if output.recommendations.is_empty() && output.message.is_some() {
-        println!("No run history available. Run `rocky run` first to collect execution data.");
+        println!(
+            "No production run history available. Run `rocky run` first to collect execution data."
+        );
+        if let Some(note) = output.run_scope.note() {
+            println!("({note})");
+        }
         return Ok(());
     }
 
@@ -191,6 +210,9 @@ pub fn run_optimize(
     println!();
     println!("Total estimated monthly savings: ${total_savings:.2}");
     println!("Models analyzed: {}", output.recommendations.len());
+    if let Some(note) = output.run_scope.note() {
+        println!("({note})");
+    }
 
     Ok(())
 }
@@ -422,6 +444,69 @@ mod tests {
             "expected the fast-execution view reasoning, got: {}",
             rec.reasoning
         );
+    }
+
+    /// #2201: shadow and branch runs never feed a recommendation. A model
+    /// built only by a shadow run is not analyzed at all, the production
+    /// model's averages come from production runs alone, and `run_scope`
+    /// reports what was read.
+    #[test]
+    fn shadow_and_branch_runs_do_not_feed_recommendations() {
+        use rocky_core::state::RunScope;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let models_dir = tmp.path().join("models");
+        write_model(&models_dir, "v_active", "type = \"view\"\n");
+        let state_path = tmp.path().join("state.redb");
+        let store = StateStore::open(&state_path).unwrap();
+        for i in 0..5 {
+            store
+                .record_run(&run_with(
+                    &format!("prod-{i}"),
+                    vec![make_exec("v_active", 500, Some(1_000_000))],
+                ))
+                .unwrap();
+        }
+        // Slow shadow builds of the same model: counted, they would flip the
+        // fast-execution reasoning.
+        for i in 0..5 {
+            let mut shadow = run_with(
+                &format!("shadow-{i}"),
+                vec![
+                    make_exec("v_active", 600_000, Some(1_000_000)),
+                    make_exec("shadow_only", 1_000, None),
+                ],
+            );
+            shadow.run_scope = Some(RunScope::Shadow { schema: None });
+            store.record_run(&shadow).unwrap();
+        }
+        let mut branch = run_with("branch-0", vec![make_exec("shadow_only", 1_000, None)]);
+        branch.run_scope = Some(RunScope::Branch { name: "b".into() });
+        store.record_run(&branch).unwrap();
+        drop(store);
+
+        let output = optimize_output(
+            &state_path,
+            &tmp.path().join("rocky.toml"),
+            Some(&models_dir),
+            None,
+        )
+        .unwrap();
+        let names: Vec<&str> = output
+            .recommendations
+            .iter()
+            .map(|r| r.model_name.as_str())
+            .collect();
+        assert_eq!(names, vec!["v_active"]);
+        assert!(
+            output.recommendations[0]
+                .reasoning
+                .contains("fast execution"),
+            "{}",
+            output.recommendations[0].reasoning
+        );
+        assert_eq!(output.run_scope.production_runs, 5);
+        assert_eq!(output.run_scope.excluded_runs, 6);
+        assert!(output.run_scope.unrecorded_runs_counted);
     }
 
     /// A model that appears only in run history (absent from the compiled

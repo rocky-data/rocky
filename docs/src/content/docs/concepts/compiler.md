@@ -82,7 +82,7 @@ front ends onto one pipeline.
 The resolver reads each model's SQL, pulls out the table references, and sorts
 them into three kinds:
 
-- A **bare name** that matches another model in the project becomes a DAG edge. For example, `FROM orders` where `orders` is a model.
+- A **bare name** becomes a DAG edge to the model whose `[target]` table has that name. For example, `FROM orders` depends on the model that writes `orders`. The model's own name does not matter: a bare name has no schema, so the warehouse finds it by table name, and `rocky test` runs each model at its configured target and finds it the same way. When several models write `orders`, the one named `orders` wins, then the one in `depends_on`. Otherwise the read is refused as `E056`. An `ephemeral` model writes nothing, so it is read by its name.
 - A **two-part name** such as `schema.table` is an external source reference.
 - A **three-part name** such as `catalog.schema.table` is a fully qualified external reference.
 
@@ -420,6 +420,7 @@ span, and sometimes a suggested fix.
 | `E053` | ClickHouse cannot run the model as configured: its `[clickhouse]` table options cannot render or sit on a strategy that builds no table, or it is a `merge` model (or `incremental` with `unique_key`) and a warehouse the model runs on is ClickHouse, which has no `MERGE`. See [ClickHouse](/reference/adapters/clickhouse/#strategies) |
 | `E054` | SQL Server cannot run the model's SQL: its CTEs cannot be lifted to the start of the statement, even after Rocky renames colliding nested CTEs. Emitted when a warehouse the model runs on is SQL Server. See [SQL Server](/reference/adapters/sqlserver/) |
 | `E055` | `rocky package` refused to vendor a dbt package: a bad spec, `dbt` not on `PATH`, an adapter with no dbt profile mapping, a failed `dbt deps` or `dbt compile`, a compile that came out wrong without `--build-empty` (all-NULL columns or a placeholder `*`), a package model name or `[target]` table the project already uses (ignoring case), a package model that reads a seed or a model that was not vendored, vendored SQL that does not parse, Jinja or a credential-like name in a var, a dbt step past `--dbt-timeout`, or a `remove` that would delete edited files without `--force`. See [Use dbt packages](/guides/dbt-packages/) |
+| `E056` | A bare read (`FROM orders`, no schema) is ambiguous: several models write a table called `orders`, none is also named `orders`, and the reader's `depends_on` does not pick one. Rocky binds a bare read by the table a model writes, not by its name, and does not guess between candidates. Qualify the read with its schema or list the intended model in `depends_on` |
 | `W001` | Unused model (no downstream consumers) |
 | `W002` | Duplicate column in model output |
 | `W004` | Classification tag with no matching `[mask]` strategy |

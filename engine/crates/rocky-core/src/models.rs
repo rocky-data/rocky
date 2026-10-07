@@ -632,6 +632,44 @@ fn default_microbatch_granularity() -> TimeGrain {
     TimeGrain::Hour
 }
 
+/// A model strategy as `--output json` prints it (#1919).
+///
+/// Every field is structure that a consumer reads back as the resolved value:
+/// the variant tag, column names, granularity, `first_partition`, lookback and
+/// batch size, the lag specifier. dagster-rocky builds partitions from
+/// `first_partition` and `granularity`, and matches columns by name, so these
+/// print exactly as the engine runs them, the same rule as target coordinates.
+/// A secret does not belong in any of them.
+///
+/// The one field that is a location rather than structure, `storage_prefix`
+/// (an object-store path), prints each resolved `${VAR}` value as `${NAME}`.
+///
+/// The match is exhaustive on purpose: a new variant must decide which of its
+/// fields are structure before it compiles.
+#[must_use]
+pub fn strategy_for_output(strategy: &StrategyConfig) -> StrategyConfig {
+    match strategy {
+        StrategyConfig::FullRefresh
+        | StrategyConfig::Incremental { .. }
+        | StrategyConfig::Merge { .. }
+        | StrategyConfig::TimeInterval { .. }
+        | StrategyConfig::Ephemeral
+        | StrategyConfig::DeleteInsert { .. }
+        | StrategyConfig::Microbatch { .. }
+        | StrategyConfig::View
+        | StrategyConfig::MaterializedView
+        | StrategyConfig::DynamicTable { .. }
+        | StrategyConfig::Snapshot { .. } => strategy.clone(),
+        StrategyConfig::ContentAddressed {
+            storage_prefix,
+            partition_columns,
+        } => StrategyConfig::ContentAddressed {
+            storage_prefix: crate::secret_registry::render_placeholders(storage_prefix),
+            partition_columns: partition_columns.clone(),
+        },
+    }
+}
+
 /// Canonicalize transformation strategies before compiler or runner dispatch.
 /// All model loaders and in-memory project construction use this conversion.
 pub fn normalize_transformation_strategy(strategy: StrategyConfig) -> StrategyConfig {
@@ -2381,6 +2419,40 @@ fn split_frontmatter(content: &str) -> Option<(&str, &str)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #1919 follow-up: a strategy prints its structure resolved (the tag,
+    /// columns, grain, `first_partition`) because dagster-rocky builds
+    /// partitions from it, and renders only `storage_prefix`.
+    #[test]
+    fn strategy_for_output_keeps_structure_resolved_and_renders_the_prefix() {
+        const FIRST: &str = "2031-07-19";
+        const PREFIX: &str = "rocky-t1919-strategy-bucket-77aa";
+        crate::secret_registry::register_substitution("ROCKY_T1919_FIRST", FIRST);
+        crate::secret_registry::register_substitution("ROCKY_T1919_PREFIX", PREFIX);
+
+        let time_interval = StrategyConfig::TimeInterval {
+            time_column: "event_date".to_string(),
+            granularity: TimeGrain::Day,
+            lookback: 0,
+            batch_size: NonZeroU32::new(1).unwrap(),
+            first_partition: Some(FIRST.to_string()),
+        };
+        let printed = serde_json::to_value(strategy_for_output(&time_interval)).unwrap();
+        assert_eq!(printed["type"], "time_interval");
+        assert_eq!(printed["granularity"], "day");
+        assert_eq!(printed["first_partition"], FIRST);
+
+        let content_addressed = StrategyConfig::ContentAddressed {
+            storage_prefix: format!("s3://{PREFIX}/orders"),
+            partition_columns: vec!["event_date".to_string()],
+        };
+        let printed = serde_json::to_value(strategy_for_output(&content_addressed)).unwrap();
+        assert_eq!(
+            printed["storage_prefix"],
+            "s3://${ROCKY_T1919_PREFIX}/orders"
+        );
+        assert_eq!(printed["partition_columns"][0], "event_date");
+    }
 
     /// #1738. A model sidecar that is a dangling symlink must REFUSE, not
     /// compile the model against `_defaults.toml`.

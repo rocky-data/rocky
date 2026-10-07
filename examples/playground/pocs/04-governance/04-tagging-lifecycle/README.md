@@ -20,3 +20,8 @@ export DATABRICKS_TOKEN="..."
 export DATABRICKS_HTTP_PATH="..."
 ./run.sh
 ```
+
+The source table comes from the manual discovery adapter in `rocky.toml`,
+which lists `raw__orders.orders`. It must exist as `main.raw__orders.orders`
+in your workspace; edit `[[adapter.local_discovery.schemas]]` to point at a
+table you have.

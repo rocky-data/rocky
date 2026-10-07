@@ -126,12 +126,19 @@ pub enum DriverOutcome {
     /// An elicitation task's hand-off. The runner verifies
     /// `expected_digest` against the bytes BEFORE the confined write and
     /// refuses a mismatch.
+    ///
+    /// What that proves depends on where the digest came from (#1633). The
+    /// subprocess driver computes it from the bytes it read, so for that
+    /// driver the comparison records which bytes were accepted and cannot
+    /// fail; it does not prove what the worker meant to write. The replay
+    /// driver carries a recorded digest, so there it is a real check.
     Elicitation {
         /// The candidate spec, raw bytes.
         candidate_spec_bytes: Vec<u8>,
         /// The worker's questions for the human.
         questions: Vec<String>,
-        /// `sha256:<hex>` the hand-off claims for the bytes.
+        /// `sha256:<hex>` for the bytes. Computed by the subprocess driver
+        /// from the bytes themselves, recorded by the replay driver.
         expected_digest: String,
         /// The captured transcript.
         transcript_path: PathBuf,
@@ -483,13 +490,23 @@ fn collect_outcome(
     match brief.kind {
         TaskBriefKind::Elicitation => {
             let candidate = brief.outbox_dir.join(OUTBOX_CANDIDATE);
-            let candidate_spec_bytes = std::fs::read(&candidate).map_err(|e| {
+            let candidate_spec_bytes = read_outbox_bytes(&candidate).map_err(|e| {
                 DriverError::OutboxMissing(format!(
                     "the worker did not write {} ({e})",
                     candidate.display()
                 ))
             })?;
             let questions = read_questions(&brief.outbox_dir.join(OUTBOX_QUESTIONS))?;
+            // What this digest proves, stated so nobody reads more into it
+            // (#1633, decided 2026-09-30: document, no worker-declared digest).
+            // It is computed HERE, from the bytes just read, after the worker
+            // exited and its group was killed — so for this driver the
+            // runner's comparison in `step.rs` cannot fail. It records WHICH
+            // bytes the runner accepted, and keeps the `DriverOutcome`
+            // contract honest for a driver whose digest comes from elsewhere
+            // (the replay driver's recorded session is a real check). It does
+            // NOT prove what the worker meant to write: a worker-declared
+            // digest would only prove the worker agrees with itself.
             let expected_digest = rocky_core::product::spec::spec_digest(&candidate_spec_bytes);
             Ok(DriverOutcome::Elicitation {
                 candidate_spec_bytes,
@@ -521,10 +538,25 @@ fn collect_outcome(
     }
 }
 
+/// Read one outbox file through the descriptor-bound import reader (#1633).
+///
+/// The outbox is the one directory under `.rocky/fulfillment/<product>/` the
+/// worker WRITES, and what is read from it lands in the project: the
+/// candidate becomes `products/<name>.toml`, the model hand-off becomes
+/// `models/`. A following `std::fs::read` imported whatever a planted name
+/// resolved to — a symlink, or a hard link to an outside file that every
+/// path check passes. `read_no_follow_bytes` opens with `O_NOFOLLOW`,
+/// requires a regular file, bounds the size, and on unix refuses a link
+/// count above one on the descriptor it reads. `NotFound` stays `NotFound`,
+/// so an absent hand-off is still the typed outbox error.
+fn read_outbox_bytes(path: &Path) -> std::io::Result<Vec<u8>> {
+    rocky_core::product::commit::read_no_follow_bytes(path)
+}
+
 /// One required outbox file, or the typed outbox error naming it.
 fn read_outbox_file(brief: &TaskBrief, name: &str) -> Result<Vec<u8>, DriverError> {
     let path = brief.outbox_dir.join(name);
-    std::fs::read(&path).map_err(|e| {
+    read_outbox_bytes(&path).map_err(|e| {
         DriverError::OutboxMissing(format!(
             "the worker did not hand off {} ({e}) — the worker-profile `draft_model` tool \
              writes it; a round that never drafted, or was denied, has nothing to commit",
@@ -534,11 +566,19 @@ fn read_outbox_file(brief: &TaskBrief, name: &str) -> Result<Vec<u8>, DriverErro
 }
 
 fn read_questions(path: &Path) -> Result<Vec<String>, DriverError> {
-    if !path.exists() {
-        return Ok(Vec::new());
-    }
-    let raw = std::fs::read(path)
-        .map_err(|e| DriverError::OutboxMissing(format!("{}: {e}", path.display())))?;
+    // Optional: only an ABSENT file means "no questions". A dangling or
+    // live symlink, a hard link, or an unreadable file is an error, never
+    // an empty list.
+    let raw = match read_outbox_bytes(path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => {
+            return Err(DriverError::OutboxMissing(format!(
+                "{}: {e}",
+                path.display()
+            )));
+        }
+    };
     serde_json::from_slice::<Vec<String>>(&raw).map_err(|e| {
         DriverError::OutboxMissing(format!(
             "{} is not a JSON array of strings: {e}",
@@ -1503,6 +1543,66 @@ mod supervision_tests {
                 Err(DriverError::OutboxMissing(msg)) => assert!(msg.contains("model.sql"), "{msg}"),
                 other => panic!("{kind:?}: no hand-off must be typed: {other:?}"),
             }
+        }
+    }
+
+    /// #1633: a candidate in the outbox that is a HARD LINK to a parseable
+    /// spec outside the project used to be read with `std::fs::read` and
+    /// handed to the runner, which copied it into `products/<name>.toml`.
+    /// The outbox reader refuses it on the descriptor, and the outside file
+    /// is untouched.
+    #[cfg(unix)]
+    #[test]
+    fn a_hardlinked_outbox_candidate_is_refused_not_imported() {
+        let outside_dir = tempfile::tempdir().expect("tempdir");
+        let outside = outside_dir.path().join("other_project_spec.toml");
+        std::fs::write(&outside, "[product]\nname = \"battery\"\n").expect("write");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let brief = brief(TaskBriefKind::Elicitation, dir.path());
+        std::fs::create_dir_all(&brief.outbox_dir).expect("mkdir");
+        std::fs::hard_link(&outside, brief.outbox_dir.join(OUTBOX_CANDIDATE)).expect("link");
+
+        match collect_outcome(&brief, dir.path().join("t.log")) {
+            Err(DriverError::OutboxMissing(msg)) => {
+                assert!(msg.contains("hard link"), "{msg}")
+            }
+            other => panic!("a hard-linked candidate must be refused: {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read_to_string(&outside).expect("still there"),
+            "[product]\nname = \"battery\"\n"
+        );
+    }
+
+    /// Every outbox file goes through the same reader: the optional
+    /// questions file and the drafting hand-off refuse a hard link too, and
+    /// a present-but-refused questions file is an error, never "no
+    /// questions".
+    #[cfg(unix)]
+    #[test]
+    fn every_outbox_read_refuses_a_hard_link() {
+        let outside_dir = tempfile::tempdir().expect("tempdir");
+        let outside = outside_dir.path().join("outside.json");
+        std::fs::write(&outside, "[\"q\"]").expect("write");
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let elicit = brief(TaskBriefKind::Elicitation, dir.path());
+        std::fs::create_dir_all(&elicit.outbox_dir).expect("mkdir");
+        std::fs::write(elicit.outbox_dir.join(OUTBOX_CANDIDATE), "[product]\n").expect("write");
+        std::fs::hard_link(&outside, elicit.outbox_dir.join(OUTBOX_QUESTIONS)).expect("link");
+        match collect_outcome(&elicit, dir.path().join("t.log")) {
+            Err(DriverError::OutboxMissing(msg)) => assert!(msg.contains("hard link"), "{msg}"),
+            other => panic!("a hard-linked questions file must be refused: {other:?}"),
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let draft = brief(TaskBriefKind::Drafting, dir.path());
+        std::fs::create_dir_all(&draft.outbox_dir).expect("mkdir");
+        std::fs::hard_link(&outside, draft.outbox_dir.join(OUTBOX_MODEL_SQL)).expect("link");
+        std::fs::write(draft.outbox_dir.join(OUTBOX_MODEL_SIDECAR), "y").expect("write");
+        match collect_outcome(&draft, dir.path().join("t.log")) {
+            Err(DriverError::OutboxMissing(msg)) => assert!(msg.contains("hard link"), "{msg}"),
+            other => panic!("a hard-linked hand-off must be refused: {other:?}"),
         }
     }
 

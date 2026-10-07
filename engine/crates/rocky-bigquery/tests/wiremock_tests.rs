@@ -2014,3 +2014,93 @@ async fn local_file_create_table_uses_inferred_types() {
 
     let _ = std::fs::remove_file(&csv_path);
 }
+
+// ---------------------------------------------------------------------------
+// #1856 — default-precision NUMERIC through describe_table and the load gate
+// ---------------------------------------------------------------------------
+
+/// `INFORMATION_SCHEMA.COLUMNS` reports a default-precision column by its bare
+/// name (`NUMERIC`, `BIGNUMERIC`) and a parameterized one with its digits.
+/// This drives the real `BigQueryAdapter::describe_table` — the producer the
+/// load gate calls — against those rows, then the gate under the dialect the
+/// adapter itself reports.
+///
+/// - bare `NUMERIC` reads as BigQuery's documented `NUMERIC(38, 9)`: a correct
+///   contract passes, a narrower one is refused by comparison;
+/// - bare `BIGNUMERIC` still refuses as unverifiable;
+/// - the describe output itself is NOT rewritten (other consumers match the
+///   bare string).
+///
+/// Mutation: hand the gate `GateDialect::Portable` (or drop the BigQuery arm
+/// of `gate_type_to_rocky`). The `NUMERIC(38,9)` contract then refuses with
+/// `unverifiable_landed_type`.
+#[tokio::test]
+async fn describe_table_bare_numeric_satisfies_a_default_precision_contract() {
+    use rocky_core::contracts::{
+        ContractConfig, GateDialect, RequiredColumn, validate_contract_typed,
+    };
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(QUERIES_PATH))
+        .and(body_string_contains("INFORMATION_SCHEMA.COLUMNS"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jobComplete": true,
+            "jobReference": {"projectId": "test-project", "jobId": "job-describe"},
+            "schema": {
+                "fields": [
+                    {"name": "column_name", "type": "STRING"},
+                    {"name": "data_type", "type": "STRING"},
+                    {"name": "is_nullable", "type": "STRING"}
+                ]
+            },
+            "rows": [
+                {"f": [{"v": "amount"}, {"v": "NUMERIC"}, {"v": "YES"}]},
+                {"f": [{"v": "big"}, {"v": "BIGNUMERIC"}, {"v": "YES"}]},
+                {"f": [{"v": "price"}, {"v": "NUMERIC(10, 2)"}, {"v": "YES"}]},
+                {"f": [{"v": "id"}, {"v": "INT64"}, {"v": "NO"}]}
+            ],
+            "totalRows": "4"
+        })))
+        .mount(&server)
+        .await;
+
+    let adapter = test_adapter(&server);
+    let landed = adapter
+        .describe_table(&rocky_ir::TableRef {
+            catalog: "test-project".into(),
+            schema: "staging".into(),
+            table: "orders".into(),
+        })
+        .await
+        .expect("describe_table");
+    assert_eq!(
+        landed[0].data_type, "NUMERIC",
+        "the describe output keeps the bare string"
+    );
+
+    let gate = GateDialect::from_dialect_name(adapter.dialect().name());
+    assert_eq!(gate, GateDialect::BigQuery);
+    let contract = |column: &str, declared: &str| ContractConfig {
+        required_columns: vec![RequiredColumn {
+            name: column.into(),
+            data_type: declared.into(),
+            nullable: true,
+        }],
+        ..Default::default()
+    };
+
+    let result = validate_contract_typed(&contract("amount", "NUMERIC(38,9)"), &landed, gate);
+    assert!(result.passed, "{result:?}");
+
+    let result = validate_contract_typed(&contract("amount", "NUMERIC(10,2)"), &landed, gate);
+    assert!(!result.passed, "{result:?}");
+    assert_eq!(result.violations[0].rule, "required_column_type");
+
+    let result = validate_contract_typed(&contract("big", "BIGNUMERIC(76,38)"), &landed, gate);
+    assert!(!result.passed, "{result:?}");
+    assert_eq!(result.violations[0].rule, "unverifiable_landed_type");
+
+    let result = validate_contract_typed(&contract("price", "NUMERIC(38,9)"), &landed, gate);
+    assert!(result.passed, "{result:?}");
+}

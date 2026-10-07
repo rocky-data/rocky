@@ -35,7 +35,9 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use rocky_core::config::load_optional_project_config;
 use rocky_core::cost::{WarehouseType, compute_observed_cost_usd, warehouse_size_to_dbu_per_hour};
-use rocky_core::state::{ModelExecution, RunRecord, RunStatus, RunTrigger, StateStore};
+use rocky_core::state::{
+    ModelExecution, RunRecord, RunStatus, RunTrigger, StateStore, UnrecordedScope,
+};
 
 use crate::output::{CostGroup, CostOutput, PerModelCostHistorical};
 
@@ -102,13 +104,19 @@ fn trigger_str(trigger: &RunTrigger) -> &'static str {
 /// Resolve `target` (either a literal `run_id` or the alias `"latest"`)
 /// against the state store. Mirrors [`crate::commands::run_replay`]'s
 /// convention so the two commands accept the same targets.
+///
+/// `latest` is the newest production run (#2201): a shadow or branch run's
+/// cost is not production spend. A run recorded before runs carried a scope
+/// is eligible, as it was before; [`CostOutput::run_scope`] reports it as
+/// `unrecorded`. An explicit run id is honoured whatever its scope.
 fn resolve(store: &StateStore, target: &str) -> Result<RunRecord> {
     if target == "latest" {
-        let runs = store.list_runs(1)?;
-        return runs
-            .into_iter()
-            .next()
-            .context("no runs recorded yet — nothing to report cost for");
+        let runs =
+            store.list_runs_matching(1, |r| r.counts_as_production(UnrecordedScope::Count))?;
+        return runs.into_iter().next().context(
+            "no production runs recorded yet — nothing to report cost for. \
+             Pass a run id to report a shadow or branch run",
+        );
     }
     store
         .get_run(target)?
@@ -248,6 +256,7 @@ fn build_output(
         total_bytes_written: total_bytes_written_out,
         per_model,
         groups,
+        run_scope: crate::output::RunScopeKind::of(record),
     }
 }
 
@@ -325,6 +334,7 @@ fn print_table(output: &CostOutput) {
     println!("started_at: {}", output.started_at);
     println!("finished_at: {}", output.finished_at);
     println!("duration_ms: {}", output.duration_ms);
+    println!("run_scope: {}", output.run_scope.as_str());
     match &output.adapter_type {
         Some(t) => println!("adapter_type: {t}"),
         None => {
@@ -917,7 +927,49 @@ mod tests {
         let path = dir.path().join("state.redb");
         let store = StateStore::open(&path).unwrap();
         let err = resolve(&store, "latest").unwrap_err();
-        assert!(err.to_string().to_lowercase().contains("no runs"));
+        assert!(
+            err.to_string()
+                .to_lowercase()
+                .contains("no production runs")
+        );
+    }
+
+    /// #2201: `latest` skips a newer shadow or branch run, reports a
+    /// pre-#2200 run as `unrecorded`, and an explicit id still reaches a
+    /// shadow run.
+    #[test]
+    fn resolve_latest_skips_shadow_and_branch_runs() {
+        use rocky_core::state::RunScope;
+        let dir = TempDir::new().unwrap();
+        let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
+        let noon = Utc.with_ymd_and_hms(2026, 4, 21, 12, 0, 0).unwrap();
+        let mut legacy = sample_run_at("legacy", noon, vec![]);
+        legacy.run_scope = None;
+        store.record_run(&legacy).unwrap();
+        let mut shadow = sample_run_at("shadow", noon + chrono::Duration::hours(1), vec![]);
+        shadow.run_scope = Some(RunScope::Shadow { schema: None });
+        store.record_run(&shadow).unwrap();
+        let mut branch = sample_run_at("branch", noon + chrono::Duration::hours(2), vec![]);
+        branch.run_scope = Some(RunScope::Branch { name: "b".into() });
+        store.record_run(&branch).unwrap();
+
+        let latest = resolve(&store, "latest").unwrap();
+        assert_eq!(latest.run_id, "legacy");
+        let out = build_output(&latest, None, None, None);
+        assert_eq!(out.run_scope, crate::output::RunScopeKind::Unrecorded);
+
+        let named = resolve(&store, "shadow").unwrap();
+        assert_eq!(
+            build_output(&named, None, None, None).run_scope,
+            crate::output::RunScopeKind::Shadow
+        );
+
+        // Only non-production runs: `latest` refuses rather than reporting one.
+        let dir = TempDir::new().unwrap();
+        let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
+        store.record_run(&shadow).unwrap();
+        let err = resolve(&store, "latest").unwrap_err();
+        assert!(err.to_string().contains("no production runs"), "{err}");
     }
 
     #[test]

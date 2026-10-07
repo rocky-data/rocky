@@ -30,14 +30,14 @@ enum LogAction {
     Other,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Protocol {
     #[serde(default)]
     writer_features: Vec<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct MetaData {
     /// JSON-encoded schema string; nested inside the metaData action.
@@ -209,6 +209,20 @@ fn state_from_bootstrap_actions(actions: &[LogAction]) -> Result<UniformTableSta
     })
 }
 
+/// The bootstrap commit's `writerFeatures` and table configuration.
+fn bootstrap_features_and_config(actions: &[LogAction]) -> (Vec<String>, HashMap<String, String>) {
+    let mut features = Vec::new();
+    let mut config = HashMap::new();
+    for a in actions {
+        match a {
+            LogAction::Protocol(p) => features = p.writer_features.clone(),
+            LogAction::MetaData(m) => config = m.configuration.clone(),
+            LogAction::Other => {}
+        }
+    }
+    (features, config)
+}
+
 /// Walk `_delta_log/*.json` newest → oldest looking for the highest commit
 /// version that carries a `metaData` action. Returns the parsed schema +
 /// partition columns from that commit, or `None` if no post-bootstrap
@@ -259,6 +273,7 @@ pub(super) async fn discover_latest_metadata<S: ObjectStore + ?Sized>(
                 physical,
                 field_id,
                 partition_columns: metadata.partition_columns.clone(),
+                configuration: metadata.configuration.clone(),
             }));
         }
     }
@@ -273,6 +288,44 @@ pub(super) struct MetaDataSnapshot {
     pub physical: HashMap<String, String>,
     pub field_id: HashMap<String, i32>,
     pub partition_columns: Vec<String>,
+    pub configuration: HashMap<String, String>,
+}
+
+/// The `writerFeatures` of the newest commit that carries a `protocol`
+/// action, or `None` when no commit after the bootstrap does.
+async fn discover_latest_writer_features<S: ObjectStore + ?Sized>(
+    store: &S,
+    prefix: &str,
+) -> Result<Option<Vec<String>>> {
+    use futures::TryStreamExt;
+    let log_prefix = Path::from(format!("{prefix}/_delta_log"));
+    let mut versions: Vec<(u64, Path)> = Vec::new();
+    let mut stream = store.list(Some(&log_prefix));
+    while let Some(meta) = stream.try_next().await? {
+        let key = meta.location.to_string();
+        if let Some((_, last)) = key.rsplit_once('/')
+            && let Some(stem) = last.strip_suffix(".json")
+            && stem.len() == 20
+            && let Ok(v) = stem.parse::<u64>()
+            && v > 0
+        {
+            versions.push((v, meta.location));
+        }
+    }
+    versions.sort_by_key(|(v, _)| std::cmp::Reverse(*v));
+    for (_, path) in versions {
+        let body = store.get(&path).await?.bytes().await?;
+        let mut latest = None;
+        for a in parse_log_jsonl(&body)? {
+            if let LogAction::Protocol(p) = a {
+                latest = Some(p.writer_features);
+            }
+        }
+        if latest.is_some() {
+            return Ok(latest);
+        }
+    }
+    Ok(None)
 }
 
 /// Reject states the writer cannot serve.
@@ -327,43 +380,47 @@ pub(super) async fn discover_row_tracking_next_id<S: ObjectStore + ?Sized>(
             let Some(dm) = value.get("domainMetadata") else {
                 continue;
             };
-            let domain = dm.get("domain").and_then(|v| v.as_str());
-            if domain != Some("delta.rowTracking") {
+            if dm.get("domain").and_then(|v| v.as_str()) != Some("delta.rowTracking") {
                 continue;
             }
-            // `configuration` is a JSON-encoded string. Inside it,
-            // `rowIdHighWaterMark` is the largest already-allocated
-            // row-id; the next write starts at +1.
-            let cfg_raw = dm
-                .get("configuration")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| {
-                    UniformWriterError::DeltaLog(
-                        "delta.rowTracking domainMetadata is missing configuration".into(),
-                    )
-                })?;
-            let cfg: serde_json::Value = serde_json::from_str(cfg_raw).map_err(|e| {
-                UniformWriterError::DeltaLog(format!(
-                    "delta.rowTracking configuration is not JSON: {e}"
-                ))
-            })?;
-            let high = cfg
-                .get("rowIdHighWaterMark")
-                .and_then(serde_json::Value::as_i64)
-                .ok_or_else(|| {
-                    UniformWriterError::DeltaLog(
-                        "delta.rowTracking configuration is missing rowIdHighWaterMark".into(),
-                    )
-                })?;
-            // Delta uses i64 in the wire format; row-ids start at 0 so
-            // a non-negative value is required.
-            if high < 0 {
-                return Ok(0);
-            }
-            return Ok((high as u64).saturating_add(1));
+            return row_tracking_next_id_from_domain(dm);
         }
     }
     Ok(0)
+}
+
+/// The next row id a `delta.rowTracking` `domainMetadata` action allows:
+/// its `rowIdHighWaterMark + 1`.
+///
+/// `rowIdHighWaterMark` is the largest already-allocated row id. A negative
+/// mark (no row id allocated yet) gives 0.
+pub(super) fn row_tracking_next_id_from_domain(dm: &serde_json::Value) -> Result<u64> {
+    // `configuration` is a JSON-encoded string.
+    let cfg_raw = dm
+        .get("configuration")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            UniformWriterError::DeltaLog(
+                "delta.rowTracking domainMetadata is missing configuration".into(),
+            )
+        })?;
+    let cfg: serde_json::Value = serde_json::from_str(cfg_raw).map_err(|e| {
+        UniformWriterError::DeltaLog(format!("delta.rowTracking configuration is not JSON: {e}"))
+    })?;
+    let high = cfg
+        .get("rowIdHighWaterMark")
+        .and_then(serde_json::Value::as_i64)
+        .ok_or_else(|| {
+            UniformWriterError::DeltaLog(
+                "delta.rowTracking configuration is missing rowIdHighWaterMark".into(),
+            )
+        })?;
+    // Delta uses i64 in the wire format; row-ids start at 0 so a
+    // non-negative value is required.
+    if high < 0 {
+        return Ok(0);
+    }
+    Ok((high as u64).saturating_add(1))
 }
 
 impl UniformWriter {
@@ -379,6 +436,8 @@ impl UniformWriter {
         let body = self.store().get(&bootstrap_path).await?.bytes().await?;
         let actions = parse_log_jsonl(&body)?;
         let mut state = state_from_bootstrap_actions(&actions)?;
+        let (bootstrap_features, bootstrap_config) = bootstrap_features_and_config(&actions);
+        let mut latest_config: Option<HashMap<String, String>> = None;
 
         // Compute next_commit_version from the log listing. Writers skip
         // bootstrap's v=0 and append a new versioned JSON.
@@ -393,6 +452,20 @@ impl UniformWriter {
             state.physical = latest.physical;
             state.field_id = latest.field_id;
             state.partition_columns = latest.partition_columns;
+            latest_config = Some(latest.configuration);
+        }
+        // A later `ALTER TABLE` can also change the protocol (for example
+        // enable rowTracking). Recompute the feature flags from the latest
+        // protocol and configuration, by the same rules as the bootstrap.
+        let latest_features = discover_latest_writer_features(self.store(), &prefix).await?;
+        if latest_config.is_some() || latest_features.is_some() {
+            let features = latest_features.unwrap_or_else(|| bootstrap_features.clone());
+            let config = latest_config.unwrap_or_else(|| bootstrap_config.clone());
+            let flag = |k: &str| config.get(k).is_some_and(|v| v == "true");
+            state.row_tracking_enabled =
+                features.iter().any(|f| f == "rowTracking") || flag("delta.enableRowTracking");
+            state.deletion_vectors_enabled = features.iter().any(|f| f == "deletionVectors")
+                || flag("delta.enableDeletionVectors");
         }
 
         // For rowTracking-enabled tables, scan the log for the latest
@@ -407,31 +480,6 @@ impl UniformWriter {
     }
 }
 
-/// True if a `_delta_log` commit body (JSONL) contains an `add` action whose
-/// `path` equals `add_file_path`.
-///
-/// Pure parsing — no I/O — so it is unit-testable. Each Delta commit line is a
-/// single-key object; we only inspect `add` actions and compare their `path`
-/// field against the content-addressed path the writer is about to commit.
-pub(super) fn commit_jsonl_contains_add_path(body: &[u8], add_file_path: &str) -> Result<bool> {
-    let text = std::str::from_utf8(body)
-        .map_err(|e| UniformWriterError::DeltaLog(format!("non-utf8 _delta_log: {e}")))?;
-    for line in text.lines() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        let value: serde_json::Value = serde_json::from_str(line)
-            .map_err(|e| UniformWriterError::DeltaLog(format!("scan add path: {e}")))?;
-        let Some(add) = value.get("add") else {
-            continue;
-        };
-        if add.get("path").and_then(|v| v.as_str()) == Some(add_file_path) {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
 /// Extract the first `add` action object from a `_delta_log` commit body
 /// (JSONL).
 ///
@@ -441,9 +489,11 @@ pub(super) fn commit_jsonl_contains_add_path(body: &[u8], add_file_path: &str) -
 /// lift a prior run's `add` action verbatim (path, size, stats,
 /// partitionValues, rowTracking fields) for a zero-byte-copy reuse commit.
 ///
-/// A point-to recovery targets a single content-addressed commit, which
-/// always carries exactly one `add` (the writer emits one `add` per commit —
-/// see `commit::build_commit_jsonl`), so returning the first is sufficient.
+/// A point-to recovery targets an unpartitioned content-addressed commit. Its
+/// replace commit carries removes plus exactly one `add` (see
+/// `commit::build_replace_commit_jsonl`), so returning the first is
+/// sufficient. A partitioned commit carries several adds; point-to refuses
+/// partitioned tables, and the runner checks the recovered basename.
 pub(super) fn first_add_action(
     body: &[u8],
 ) -> Result<Option<serde_json::Map<String, serde_json::Value>>> {
@@ -491,43 +541,6 @@ pub(super) async fn recover_add_action_for_version<S: ObjectStore + ?Sized>(
     })
 }
 
-/// Scan every `_delta_log/<20-digit>.json` commit for an `add` action that
-/// already references `add_file_path`, returning the commit version that did.
-///
-/// Used by the cond-put retry loop: on a 412 the writer must distinguish a
-/// genuine version race (some *other* commit grabbed the version it wanted →
-/// retry at a higher version) from a competing writer that landed *this exact
-/// content-addressed file* (→ do not add it a second time; return the existing
-/// commit). Scans newest → oldest and returns the first match.
-pub(super) async fn find_commit_with_add_path<S: ObjectStore + ?Sized>(
-    store: &S,
-    prefix: &str,
-    add_file_path: &str,
-) -> Result<Option<u64>> {
-    use futures::TryStreamExt;
-    let log_prefix = Path::from(format!("{prefix}/_delta_log"));
-    let mut versions: Vec<(u64, Path)> = Vec::new();
-    let mut stream = store.list(Some(&log_prefix));
-    while let Some(meta) = stream.try_next().await? {
-        let key = meta.location.to_string();
-        if let Some((_, last)) = key.rsplit_once('/')
-            && let Some(stem) = last.strip_suffix(".json")
-            && stem.len() == 20
-            && let Ok(v) = stem.parse::<u64>()
-        {
-            versions.push((v, meta.location));
-        }
-    }
-    versions.sort_by_key(|(v, _)| std::cmp::Reverse(*v));
-    for (version, path) in versions {
-        let body = store.get(&path).await?.bytes().await?;
-        if commit_jsonl_contains_add_path(&body, add_file_path)? {
-            return Ok(Some(version));
-        }
-    }
-    Ok(None)
-}
-
 /// Per-commit reference outcome for a single content-addressed file path.
 ///
 /// Returned by [`commit_jsonl_reference_for_path`] for one `_delta_log` commit
@@ -547,9 +560,9 @@ pub(super) enum PathReference {
 /// Classify how a single `_delta_log` commit body (JSONL) references
 /// `file_path`: as an `add`, as a `remove`, or not at all.
 ///
-/// Pure parsing — no I/O — so it is unit-testable. A single content-addressed
-/// commit carries exactly one `add` (see `commit::build_commit_jsonl`); a
-/// compaction/VACUUM commit carries a `remove`. If a commit somehow contains
+/// Pure parsing — no I/O — so it is unit-testable. A content-addressed
+/// replace commit carries `add`s for the new files and `remove`s for the old
+/// ones (see `commit::build_replace_commit_jsonl`), never both for one path. If a commit somehow contains
 /// both for the same path (it never does in practice), `Added` wins for that
 /// commit — but the cross-commit fold in [`add_path_is_live`] is what carries
 /// the real ordering, so a later `remove` commit still supersedes an earlier
@@ -791,6 +804,72 @@ pub(super) async fn proven_removed<S: ObjectStore + ?Sized>(
     add_file_path: &str,
     expected_add_version: u64,
 ) -> super::RemovalProof {
+    proven_removed_at(
+        store,
+        table_bucket,
+        prefix,
+        add_file_path,
+        expected_add_version,
+        chrono::Utc::now().timestamp_millis(),
+    )
+    .await
+}
+
+/// The default `delta.deletedFileRetentionDuration`: 7 days, in milliseconds.
+const DEFAULT_DELETED_FILE_RETENTION_MILLIS: i64 = 7 * 24 * 60 * 60 * 1000;
+
+/// Parse a Delta calendar-interval string such as `interval 7 days` or
+/// `interval 1 week 2 hours` into milliseconds. `None` when the string does
+/// not parse, which the caller treats as "retention unknown" (hold).
+pub(super) fn parse_delta_interval_millis(raw: &str) -> Option<i64> {
+    let lower = raw.trim().to_ascii_lowercase();
+    let body = lower.strip_prefix("interval").unwrap_or(&lower);
+    let tokens: Vec<&str> = body.split_whitespace().collect();
+    if tokens.is_empty() || !tokens.len().is_multiple_of(2) {
+        return None;
+    }
+    let mut total: i64 = 0;
+    for pair in tokens.chunks(2) {
+        let n: i64 = pair[0].parse().ok()?;
+        if n < 0 {
+            return None;
+        }
+        let unit_ms: i64 = match pair[1].trim_end_matches('s') {
+            "week" => 7 * 24 * 60 * 60 * 1000,
+            "day" => 24 * 60 * 60 * 1000,
+            "hour" => 60 * 60 * 1000,
+            "minute" => 60 * 1000,
+            "second" => 1000,
+            "millisecond" => 1,
+            "microsecond" => {
+                total = total.checked_add(n / 1000)?;
+                continue;
+            }
+            _ => return None,
+        };
+        total = total.checked_add(n.checked_mul(unit_ms)?)?;
+    }
+    Some(total)
+}
+
+/// [`proven_removed`] at an explicit clock, so tests can place `now` inside
+/// or after the retention window.
+///
+/// On top of the strict proof, a removed file is reclaimable only after
+/// Delta's own retention: `deletionTimestamp` (or, when the remove has none,
+/// the commit's `commitInfo.timestamp`) plus
+/// `delta.deletedFileRetentionDuration` (default 7 days). Until then Delta
+/// time travel can still read the file, so the proof holds with
+/// [`RemovalHoldReason::RetentionWindowOpen`]. A timestamp or retention value
+/// that cannot be read holds with [`RemovalHoldReason::RetentionUnknown`].
+pub(super) async fn proven_removed_at<S: ObjectStore + ?Sized>(
+    store: &S,
+    table_bucket: &str,
+    prefix: &str,
+    add_file_path: &str,
+    expected_add_version: u64,
+    now_millis: i64,
+) -> super::RemovalProof {
     use super::{RemovalHoldReason as R, RemovalProof};
     use futures::TryStreamExt;
 
@@ -856,6 +935,10 @@ pub(super) async fn proven_removed<S: ObjectStore + ?Sized>(
     //    same-version state).
     let mut own_add_at_expected = false;
     let mut highest_ref: Option<(u64, bool)> = None; // (version, is_remove)
+    // When the highest reference is a remove: when it was deleted.
+    let mut highest_remove_ts: Option<i64> = None;
+    // The latest `delta.deletedFileRetentionDuration` (`None` = unset).
+    let mut retention_raw: Option<String> = None;
     // v0 MUST declare a supported protocol + metadata (Rocky's writer always
     // does). Without this, a history with NO protocol action at all would
     // bypass the protocol whitelist entirely and reach a proof (finding 3).
@@ -875,6 +958,9 @@ pub(super) async fn proven_removed<S: ObjectStore + ?Sized>(
         };
         // The target's file actions in THIS version (each entry is `is_remove`).
         let mut target_actions: Vec<bool> = Vec::new();
+        // The target remove's `deletionTimestamp`, and this commit's time.
+        let mut target_remove_ts: Option<i64> = None;
+        let mut commit_ts: Option<i64> = None;
         for line in text.lines() {
             if line.trim().is_empty() {
                 continue;
@@ -913,6 +999,14 @@ pub(super) async fn proven_removed<S: ObjectStore + ?Sized>(
                     if *version == 0 {
                         v0_has_metadata = true;
                     }
+                    retention_raw = action
+                        .get("configuration")
+                        .and_then(|c| c.get("delta.deletedFileRetentionDuration"))
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string);
+                }
+                "commitInfo" => {
+                    commit_ts = action.get("timestamp").and_then(serde_json::Value::as_i64);
                 }
                 "add" | "remove" => {
                     let Some(p) = action.get("path").and_then(|v| v.as_str()) else {
@@ -923,6 +1017,11 @@ pub(super) async fn proven_removed<S: ObjectStore + ?Sized>(
                     };
                     if canon == target_canonical {
                         target_actions.push(key == "remove");
+                        if key == "remove" {
+                            target_remove_ts = action
+                                .get("deletionTimestamp")
+                                .and_then(serde_json::Value::as_i64);
+                        }
                     }
                 }
                 _ => {}
@@ -941,6 +1040,11 @@ pub(super) async fn proven_removed<S: ObjectStore + ?Sized>(
             }
             // Versions are ascending, so this leaves the highest version's action.
             highest_ref = Some((*version, is_remove));
+            highest_remove_ts = if is_remove {
+                target_remove_ts.or(commit_ts)
+            } else {
+                None
+            };
         }
     }
 
@@ -955,9 +1059,25 @@ pub(super) async fn proven_removed<S: ObjectStore + ?Sized>(
     if !own_add_at_expected {
         return held(R::NeverAddedHere);
     }
-    match highest_ref {
-        Some((_, true)) => RemovalProof::ProvenRemoved { head_version },
-        _ => held(R::StillLive),
+    if !matches!(highest_ref, Some((_, true))) {
+        return held(R::StillLive);
+    }
+
+    // 6. Delta retention: time travel can still read the file until
+    //    `deletionTimestamp + delta.deletedFileRetentionDuration`.
+    let retention = match retention_raw.as_deref() {
+        None => Some(DEFAULT_DELETED_FILE_RETENTION_MILLIS),
+        Some(raw) => parse_delta_interval_millis(raw),
+    };
+    let (Some(deleted_at), Some(retention)) = (highest_remove_ts, retention) else {
+        return held(R::RetentionUnknown);
+    };
+    match deleted_at.checked_add(retention) {
+        Some(reclaimable_at) if now_millis >= reclaimable_at => {
+            RemovalProof::ProvenRemoved { head_version }
+        }
+        Some(_) => held(R::RetentionWindowOpen),
+        None => held(R::RetentionUnknown),
     }
 }
 
@@ -975,7 +1095,7 @@ pub(super) async fn proven_removed<S: ObjectStore + ?Sized>(
 /// verifying the bucket, or treat a single leading `/` as bucket-root absolute,
 /// else prefix-join a relative path, then resolve `.`/`..`) and **holds** any
 /// other shape (maximal conservatism — over-holding is safe).
-fn canonical_key(raw: &str, table_bucket: &str, key_prefix: &str) -> Option<String> {
+pub(super) fn canonical_key(raw: &str, table_bucket: &str, key_prefix: &str) -> Option<String> {
     let decoded = percent_encoding::percent_decode_str(raw)
         .decode_utf8()
         .ok()?
@@ -1152,9 +1272,455 @@ pub(super) async fn next_commit_version<S: ObjectStore + ?Sized>(
     Ok(max_version.map_or(1, |v| v + 1))
 }
 
+/// One live data file: the `add` action that made it live, and the commit
+/// version that carried that `add`.
+#[derive(Debug, Clone)]
+pub(super) struct LiveFile {
+    pub version: u64,
+    /// The `add` body exactly as the log wrote it. A `remove` copies its
+    /// `path` spelling from here.
+    pub add: serde_json::Map<String, serde_json::Value>,
+}
+
+/// The live file set of a table, replayed from its `_delta_log` JSON commits.
+///
+/// ```text
+///   for each commit, ascending:   live -= removes ; live += adds
+/// ```
+///
+/// Files are keyed by their **canonical** key ([`canonical_key`]): the
+/// bucket-relative object key, percent-decoded, so a relative, an absolute
+/// and an encoded spelling of one file are the same entry.
+#[derive(Debug, Clone)]
+pub(super) struct LiveSet {
+    /// The highest `<20-digit>.json` commit version.
+    pub head_version: u64,
+    /// Live files keyed by canonical key.
+    pub files: std::collections::BTreeMap<String, LiveFile>,
+    /// The latest `metaData` sets `delta.appendOnly=true`.
+    pub append_only: bool,
+    /// The latest `protocol` action body.
+    pub protocol: serde_json::Value,
+    /// The latest `metaData` action body.
+    pub metadata: serde_json::Value,
+    /// The latest `delta.rowTracking` `domainMetadata` action body, from the
+    /// same replay as `head_version`. `None` when no commit carries one.
+    pub row_tracking_domain: Option<serde_json::Value>,
+}
+
+/// The parts of a table's protocol and metadata that shape a write. A change
+/// to any of them between `discover()` and the commit makes the commit wrong.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct TableShape {
+    pub physical: HashMap<String, String>,
+    pub field_id: HashMap<String, i32>,
+    pub partition_columns: Vec<String>,
+    pub row_tracking_enabled: bool,
+}
+
+impl TableShape {
+    pub fn of_state(state: &UniformTableState) -> Self {
+        Self {
+            physical: state.physical.clone(),
+            field_id: state.field_id.clone(),
+            partition_columns: state.partition_columns.clone(),
+            row_tracking_enabled: state.row_tracking_enabled,
+        }
+    }
+}
+
+impl LiveSet {
+    /// The next row id to allocate, from the same replay as `head_version`:
+    /// the latest `delta.rowTracking` `rowIdHighWaterMark + 1`, or 0 when no
+    /// commit carries one. Same rules and errors as
+    /// [`discover_row_tracking_next_id`].
+    pub fn row_tracking_next_id(&self) -> Result<u64> {
+        self.row_tracking_domain
+            .as_ref()
+            .map_or(Ok(0), row_tracking_next_id_from_domain)
+    }
+
+    /// The write shape of the latest protocol + metadata, by the same rules
+    /// `discover()` applies.
+    pub fn shape(&self) -> Result<TableShape> {
+        let metadata: MetaData = serde_json::from_value(self.metadata.clone())
+            .map_err(|e| UniformWriterError::DeltaLog(format!("latest metaData: {e}")))?;
+        let protocol: Protocol = serde_json::from_value(self.protocol.clone())
+            .map_err(|e| UniformWriterError::DeltaLog(format!("latest protocol: {e}")))?;
+        let (physical, field_id) = parse_columns_from_metadata(&metadata)?;
+        Ok(TableShape {
+            physical,
+            field_id,
+            partition_columns: metadata.partition_columns.clone(),
+            row_tracking_enabled: row_tracking_enabled(&protocol, &metadata),
+        })
+    }
+}
+
+fn row_tracking_enabled(protocol: &Protocol, metadata: &MetaData) -> bool {
+    protocol.writer_features.iter().any(|f| f == "rowTracking")
+        || metadata
+            .configuration
+            .get("delta.enableRowTracking")
+            .is_some_and(|v| v == "true")
+}
+
+/// Table configuration keys that turn on a feature Rocky's writer does not
+/// implement. `None` as the value means "any value refuses".
+const UNSUPPORTED_CONFIG: &[(&str, Option<&str>, &str)] = &[
+    (
+        "delta.enableDeletionVectors",
+        Some("true"),
+        "deletionVectors",
+    ),
+    (
+        "delta.enableInCommitTimestamps",
+        Some("true"),
+        "inCommitTimestamp",
+    ),
+    ("delta.checkpointPolicy", Some("v2"), "v2Checkpoint"),
+    ("delta.enableChangeDataFeed", Some("true"), "changeDataFeed"),
+    ("delta.enableTypeWidening", Some("true"), "typeWidening"),
+];
+
+/// Refuse a protocol or metadata Rocky's writer cannot write correctly.
+///
+/// The protocol must pass the strict [`protocol_is_supported`] whitelist.
+/// The metadata must not turn on a feature through table configuration
+/// ([`UNSUPPORTED_CONFIG`], `delta.coordinatedCommits.*`, `delta.constraints.*`)
+/// or through column metadata (generated, identity or invariant columns),
+/// because the writer neither enforces nor fills them.
+fn validate_write_protocol(
+    table: &str,
+    protocol: &serde_json::Value,
+    metadata: &serde_json::Value,
+) -> Result<()> {
+    let refuse = |feature: String| {
+        Err(UniformWriterError::UnsupportedTableFeature {
+            table: table.to_string(),
+            feature,
+        })
+    };
+    if !protocol_is_supported(protocol) {
+        let mut unknown: Vec<String> = Vec::new();
+        for (key, allow) in [
+            ("readerFeatures", SUPPORTED_READER_FEATURES),
+            ("writerFeatures", SUPPORTED_WRITER_FEATURES),
+        ] {
+            for f in protocol
+                .get(key)
+                .and_then(|v| v.as_array())
+                .into_iter()
+                .flatten()
+            {
+                match f.as_str() {
+                    Some(name) if allow.contains(&name) => {}
+                    other => unknown.push(other.map_or_else(|| f.to_string(), str::to_string)),
+                }
+            }
+        }
+        return refuse(if unknown.is_empty() {
+            format!("protocol {protocol}")
+        } else {
+            unknown.join(", ")
+        });
+    }
+    if let Some(config) = metadata.get("configuration").and_then(|v| v.as_object()) {
+        for (key, value) in config {
+            let value = value.as_str().unwrap_or_default();
+            for (k, v, feature) in UNSUPPORTED_CONFIG {
+                if key == k && v.is_none_or(|v| value.eq_ignore_ascii_case(v)) {
+                    return refuse(format!("{feature} (`{key}={value}`)"));
+                }
+            }
+            if key.starts_with("delta.coordinatedCommits.") {
+                return refuse(format!("coordinatedCommits (`{key}`)"));
+            }
+            if key.starts_with("delta.constraints.") {
+                return refuse(format!("checkConstraints (`{key}`)"));
+            }
+        }
+    }
+    let schema = metadata
+        .get("schemaString")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    for (marker, feature) in [
+        ("delta.generationExpression", "generatedColumns"),
+        ("delta.identity.", "identityColumns"),
+        ("delta.invariants", "invariants (column)"),
+    ] {
+        if schema.contains(marker) {
+            return refuse(format!("{feature} (`{marker}` in the schema)"));
+        }
+    }
+    Ok(())
+}
+
+/// Replay the table's `_delta_log` into its [`LiveSet`].
+///
+/// This is the read the replace commit is built from, so it refuses every
+/// shape it cannot replay in full or write to correctly:
+///
+/// - a checkpoint (`_last_checkpoint` or any `*.checkpoint*` file) →
+///   [`UniformWriterError::CheckpointPresent`]: the JSON tail may not be the
+///   whole history, and a missed live file would stay live after the replace;
+/// - any file under `_delta_log/_staged_commits/` (coordinated or
+///   catalog-managed commits) → [`UniformWriterError::UnsupportedTableFeature`]:
+///   such commits are invisible here, and a direct commit would bypass the
+///   coordinator;
+/// - the latest `protocol` / `metaData` turning on a feature the writer does
+///   not implement ([`validate_write_protocol`]), a `delta.clustering` domain,
+///   or an action key outside [`KNOWN_ACTION_KEYS`] →
+///   [`UniformWriterError::UnsupportedTableFeature`];
+/// - a live file or a remove that carries a deletion vector, or one commit
+///   that adds and removes one path (a deletion-vector update) →
+///   [`UniformWriterError::DeletionVectorsUnsupported`];
+/// - a version gap, no commits, no protocol or metadata, a malformed line, or
+///   a path [`canonical_key`] cannot resolve → `DeltaLog`.
+///
+/// `table` is the `catalog.schema.table` name the refusal names;
+/// `table_bucket` resolves absolute `s3://` paths (empty when unknown, which
+/// makes every absolute path refuse).
+pub(super) async fn read_live_set<S: ObjectStore + ?Sized>(
+    store: &S,
+    prefix: &str,
+    table: &str,
+    table_bucket: &str,
+) -> Result<LiveSet> {
+    use futures::TryStreamExt;
+    let log_prefix = Path::from(format!("{prefix}/_delta_log"));
+    let mut versions: Vec<(u64, Path)> = Vec::new();
+    let mut stream = store.list(Some(&log_prefix));
+    while let Some(meta) = stream.try_next().await? {
+        let key = meta.location.to_string();
+        if key.contains("/_delta_log/_staged_commits/") {
+            return Err(UniformWriterError::UnsupportedTableFeature {
+                table: table.to_string(),
+                feature: format!("coordinated or catalog-managed commits (`{key}`)"),
+            });
+        }
+        let Some((_, last)) = key.rsplit_once('/') else {
+            continue;
+        };
+        if last == "_last_checkpoint" || last.contains(".checkpoint") {
+            return Err(UniformWriterError::CheckpointPresent {
+                table: table.to_string(),
+                checkpoint: key,
+            });
+        }
+        if let Some(stem) = last.strip_suffix(".json")
+            && stem.len() == 20
+            && let Ok(v) = stem.parse::<u64>()
+        {
+            versions.push((v, meta.location));
+        }
+    }
+    versions.sort_by_key(|(v, _)| *v);
+    let Some(&(head_version, _)) = versions.last() else {
+        return Err(UniformWriterError::DeltaLog(format!(
+            "table `{table}` has no `_delta_log/<version>.json` commits"
+        )));
+    };
+    for (i, (v, _)) in versions.iter().enumerate() {
+        if *v != i as u64 {
+            return Err(UniformWriterError::DeltaLog(format!(
+                "table `{table}`: `_delta_log` commit versions are not contiguous from 0 \
+                 (found {v} at position {i}); refusing to replace a history Rocky cannot replay"
+            )));
+        }
+    }
+
+    let canon = |p: &str, version: u64| -> Result<String> {
+        canonical_key(p, table_bucket, prefix).ok_or_else(|| {
+            UniformWriterError::DeltaLog(format!(
+                "table `{table}`: commit {version} references `{p}`, a path Rocky cannot resolve \
+                 inside this table"
+            ))
+        })
+    };
+    let has_dv = |m: &serde_json::Map<String, serde_json::Value>| {
+        m.get("deletionVector").is_some_and(|dv| !dv.is_null())
+    };
+
+    let mut files: std::collections::BTreeMap<String, LiveFile> = Default::default();
+    let mut protocol: Option<serde_json::Value> = None;
+    let mut metadata: Option<serde_json::Value> = None;
+    let mut row_tracking_domain: Option<serde_json::Value> = None;
+    for (version, path) in &versions {
+        let version = *version;
+        let body = store.get(path).await?.bytes().await?;
+        let text = std::str::from_utf8(&body)
+            .map_err(|e| UniformWriterError::DeltaLog(format!("non-utf8 _delta_log: {e}")))?;
+        let mut adds: Vec<(String, serde_json::Map<String, serde_json::Value>)> = Vec::new();
+        let mut removes: Vec<(String, serde_json::Map<String, serde_json::Value>)> = Vec::new();
+        // The first `delta.rowTracking` domainMetadata of this commit. A
+        // later commit's one wins, as in `discover_row_tracking_next_id`.
+        let mut commit_row_tracking: Option<serde_json::Value> = None;
+        for line in text.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let value: serde_json::Value = serde_json::from_str(line).map_err(|e| {
+                UniformWriterError::DeltaLog(format!("commit {version}: replay: {e}"))
+            })?;
+            let obj = value.as_object().filter(|o| o.len() == 1).ok_or_else(|| {
+                UniformWriterError::DeltaLog(format!(
+                    "commit {version}: a line is not a single-action JSON object"
+                ))
+            })?;
+            let (key, action) = obj.iter().next().expect("len == 1");
+            if !KNOWN_ACTION_KEYS.contains(&key.as_str()) {
+                return Err(UniformWriterError::UnsupportedTableFeature {
+                    table: table.to_string(),
+                    feature: format!("unknown Delta action `{key}` in commit {version}"),
+                });
+            }
+            match key.as_str() {
+                "add" | "remove" => {
+                    let body = action.as_object().ok_or_else(|| {
+                        UniformWriterError::DeltaLog(format!(
+                            "commit {version}: `{key}` is not an object"
+                        ))
+                    })?;
+                    let p = body.get("path").and_then(|v| v.as_str()).ok_or_else(|| {
+                        UniformWriterError::DeltaLog(format!(
+                            "commit {version}: `{key}` has no string `path`"
+                        ))
+                    })?;
+                    let entry = (canon(p, version)?, body.clone());
+                    if key == "add" {
+                        adds.push(entry);
+                    } else {
+                        removes.push(entry);
+                    }
+                }
+                "protocol" => protocol = Some(action.clone()),
+                "metaData" => metadata = Some(action.clone()),
+                "domainMetadata"
+                    if action.get("domain").and_then(|v| v.as_str())
+                        == Some("delta.clustering")
+                        && action.get("removed").and_then(serde_json::Value::as_bool)
+                            != Some(true) =>
+                {
+                    return Err(UniformWriterError::UnsupportedTableFeature {
+                        table: table.to_string(),
+                        feature: "clustering (`delta.clustering` domain)".to_string(),
+                    });
+                }
+                "domainMetadata"
+                    if action.get("domain").and_then(|v| v.as_str())
+                        == Some("delta.rowTracking")
+                        && commit_row_tracking.is_none() =>
+                {
+                    commit_row_tracking = Some(action.clone());
+                }
+                _ => {}
+            }
+        }
+        // A remove + add of one path in one commit is how Delta updates a
+        // file's deletion vector. Without deletion vectors the protocol
+        // forbids it.
+        for (c, remove) in &removes {
+            if let Some((_, add)) = adds.iter().find(|(a, _)| a == c) {
+                if has_dv(remove) || has_dv(add) {
+                    return Err(UniformWriterError::DeletionVectorsUnsupported);
+                }
+                return Err(UniformWriterError::DeltaLog(format!(
+                    "commit {version} both adds and removes `{c}`; the Delta protocol forbids it"
+                )));
+            }
+            if has_dv(remove) {
+                return Err(UniformWriterError::DeletionVectorsUnsupported);
+            }
+        }
+        if commit_row_tracking.is_some() {
+            row_tracking_domain = commit_row_tracking;
+        }
+        for (c, _) in &removes {
+            files.remove(c);
+        }
+        for (c, add) in adds {
+            files.insert(c, LiveFile { version, add });
+        }
+    }
+    if files.values().any(|f| has_dv(&f.add)) {
+        return Err(UniformWriterError::DeletionVectorsUnsupported);
+    }
+    let (Some(protocol), Some(metadata)) = (protocol, metadata) else {
+        return Err(UniformWriterError::DeltaLog(format!(
+            "table `{table}`: `_delta_log` carries no protocol or no metaData action"
+        )));
+    };
+    validate_write_protocol(table, &protocol, &metadata)?;
+    let append_only = metadata
+        .get("configuration")
+        .and_then(|c| c.get("delta.appendOnly"))
+        .and_then(|v| v.as_str())
+        .is_some_and(|v| v.eq_ignore_ascii_case("true"));
+    Ok(LiveSet {
+        head_version,
+        files,
+        append_only,
+        protocol,
+        metadata,
+        row_tracking_domain,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn delta_interval_parses_the_documented_forms() {
+        let day = 24 * 60 * 60 * 1000;
+        assert_eq!(
+            parse_delta_interval_millis("interval 7 days"),
+            Some(7 * day)
+        );
+        assert_eq!(
+            parse_delta_interval_millis("interval 1 week"),
+            Some(7 * day)
+        );
+        assert_eq!(
+            parse_delta_interval_millis("INTERVAL 168 HOURS"),
+            Some(7 * day)
+        );
+        assert_eq!(
+            parse_delta_interval_millis("interval 1 day 2 hours"),
+            Some(day + 2 * 3_600_000)
+        );
+        assert_eq!(parse_delta_interval_millis("seven days"), None);
+        assert_eq!(parse_delta_interval_millis("interval 3"), None);
+        assert_eq!(parse_delta_interval_millis("interval -1 days"), None);
+    }
+
+    #[test]
+    fn real_uniform_fixtures_pass_the_write_protocol_check() {
+        for body in [
+            EXP04_BOOTSTRAP,
+            EXP09_ROWTRACKING_BOOTSTRAP,
+            EXP11_PARTITIONED_BOOTSTRAP,
+        ] {
+            let mut protocol = None;
+            let mut metadata = None;
+            for line in std::str::from_utf8(body).unwrap().lines() {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let v: serde_json::Value = serde_json::from_str(line).unwrap();
+                if let Some(p) = v.get("protocol") {
+                    protocol = Some(p.clone());
+                }
+                if let Some(m) = v.get("metaData") {
+                    metadata = Some(m.clone());
+                }
+            }
+            validate_write_protocol("c.s.t", &protocol.unwrap(), &metadata.unwrap())
+                .expect("a real UniForm bootstrap must be writable");
+        }
+    }
 
     #[test]
     fn canonical_key_normalizes_relative_absolute_and_encoded_paths() {
@@ -1356,38 +1922,6 @@ mod tests {
         include_bytes!("../../tests/fixtures/exp09_rowtracking_bootstrap.json");
     const EXP11_PARTITIONED_BOOTSTRAP: &[u8] =
         include_bytes!("../../tests/fixtures/exp11_partitioned_bootstrap.json");
-
-    #[test]
-    fn commit_jsonl_contains_add_path_matches_only_the_add_path() {
-        // A realistic two-line commit: a commitInfo and an add action.
-        let body = br#"{"commitInfo":{"timestamp":1700000000000}}
-{"add":{"path":"data/abc123.parquet","size":42,"dataChange":true}}"#;
-
-        // The exact content-addressed path is found.
-        assert!(
-            commit_jsonl_contains_add_path(body, "data/abc123.parquet").unwrap(),
-            "the committed add path must be detected"
-        );
-        // A different path is not.
-        assert!(
-            !commit_jsonl_contains_add_path(body, "data/other.parquet").unwrap(),
-            "a non-matching path must not match"
-        );
-    }
-
-    #[test]
-    fn commit_jsonl_contains_add_path_ignores_remove_and_blank_lines() {
-        // A `remove` action referencing the same path must NOT count as a live
-        // add, and blank lines are skipped.
-        let body = br#"
-{"remove":{"path":"data/abc123.parquet","dataChange":true}}
-{"metaData":{"id":"x"}}
-"#;
-        assert!(
-            !commit_jsonl_contains_add_path(body, "data/abc123.parquet").unwrap(),
-            "a remove action must not be treated as a live add"
-        );
-    }
 
     #[test]
     fn first_add_action_returns_the_add_body() {
@@ -1678,7 +2212,8 @@ mod tests {
             br#"{"add":{"path":"data/h.parquet","partitionValues":{},"size":1,"modificationTime":1,"dataChange":true}}"#,
         );
         v0.push(b'\n');
-        let v1 = br#"{"remove":{"path":"data/h.parquet","dataChange":true}}"#.to_vec();
+        let v1 = br#"{"remove":{"path":"data/h.parquet","dataChange":true,"deletionTimestamp":0}}"#
+            .to_vec();
 
         async fn seed(v0: &[u8], v1: &[u8], with_checkpoint: bool) -> InMemory {
             let store = InMemory::new();

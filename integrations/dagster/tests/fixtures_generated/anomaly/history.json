@@ -21,7 +21,8 @@
           }
         }
       ],
-      "pipeline": "poc"
+      "pipeline": "poc",
+      "run_scope": "production"
     },
     {
       "run_id": "run-SENTINEL",
@@ -42,7 +43,8 @@
           }
         }
       ],
-      "pipeline": "poc"
+      "pipeline": "poc",
+      "run_scope": "production"
     },
     {
       "run_id": "run-SENTINEL",
@@ -63,7 +65,8 @@
           }
         }
       ],
-      "pipeline": "poc"
+      "pipeline": "poc",
+      "run_scope": "production"
     },
     {
       "run_id": "run-SENTINEL",
@@ -84,7 +87,8 @@
           }
         }
       ],
-      "pipeline": "poc"
+      "pipeline": "poc",
+      "run_scope": "production"
     }
   ],
   "count": 4

@@ -26,12 +26,18 @@ export DATABRICKS_HTTP_PATH="/sql/1.0/warehouses/<warehouse-id>"
 ./run.sh
 ```
 
+The source table comes from the manual discovery adapter in `rocky.toml`,
+which lists `raw__orders.orders`. It must exist as `main.raw__orders.orders`
+in your workspace; edit `[[adapter.local_discovery.schemas]]` to point at a
+table you have.
+
 ## Expected output
 
 `run.sh` writes golden JSON to `expected/`:
 
-- `expected/plan.json` — the reconciliation plan (dry-run): the `GRANT`/`REVOKE`
-  statements Rocky would emit to converge Unity Catalog to the desired state.
+- `expected/plan.json` — the dry-run replication plan: the `CREATE CATALOG`,
+  `CREATE SCHEMA` and copy statements for `raw__orders.orders`. Grants are not
+  in the plan; Rocky reconciles them against `SHOW GRANTS` during the run.
 - `expected/run.json` — the executed result; inspect its `permissions` block to
   see the grants that were applied.
 

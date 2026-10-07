@@ -124,20 +124,35 @@ The worker runs on the same machine as the runner and the review markers, and ma
 
 Be precise about what "acting as your user" means, because it is a property of how you deploy, not of Rocky. `.rocky/fulfillment/<product>/outbox/` is the one part of that directory the worker is meant to write. Elicitation writes `candidate_spec.toml` and, optionally, `questions.json` there directly. Drafting's `draft_model` tool mirrors its draft there. The loop deletes and recreates `outbox/` before every dispatch. A worker meant to write only that directory needs an inherited default, such as a umask or an ACL on its parent. A one-off `chmod` would not do: the next dispatch would erase it. The loop reads the outbox only after the worker exits and its process group is killed.
 
+Every file the loop takes from the outbox, and every `briefs_dir` override, is read the same way. On Unix the read refuses a symlink at the file and a file with a second hard link. So a link planted to a file outside the project is refused. It is never copied into `products/`, `models/`, or the worker's prompt. Crash recovery restores a `.ff-prev` backup the same way: it reads the backup under those rules and publishes the bytes it read through a new file, rather than renaming the backup itself into place.
+
+The loop checks a digest on the elicitation candidate before writing `products/<product>.toml`. With `type = "subprocess"` the loop computes that digest itself, from the candidate it read after the worker exited. It records which bytes were accepted. It does not prove what the worker meant to write. With `type = "replay"` the digest comes from the recorded session, so there it is a real check.
+
 The claims above hold only while these stay closed to the same principal that runs the worker:
 
 - `.rocky/plans/` — review markers. An unsigned marker with a matching plan id is accepted as approval.
 - The approved-spec snapshot, `.rocky/fulfillment/<product>/approved-<digest>.toml` — the file the apply step's digest gate reads.
 - The rest of `.rocky/fulfillment/<product>/` except `outbox/` — task transcripts, the committed lowering manifest, and its own staged and backup copies (`phase-staging.json`, `lowering-manifest.json.ff-staged`, `lowering-manifest.json.ff-prev`). The contract's and the sidecar's staged and backup copies (also `.ff-staged` / `.ff-prev`) sit beside them in `models/` instead, inside the repair window described below.
-- The state store — `.rocky-state.redb` by default, `.rocky-state/<key>.redb` when namespaced. It holds the loop's compare-and-swap state, its journal, and its approval record, not `.rocky/fulfillment/<product>/`.
+- The state store — wherever `--state-path` points; see below. It holds the loop's compare-and-swap state, its journal, and its approval record, not `.rocky/fulfillment/<product>/`.
 - `products/<product>.toml` — the working spec the next `approve-spec` snapshots, not an approved copy.
+- The `briefs_dir` overrides. They are trusted project configuration, like `rocky.toml`, and they become the worker's instructions.
 - `rocky.toml` — the runner reloads it on every invocation and spawns `[fulfill.driver].command` from it. `[policy]` and `[state]` come from the same file. A worker that can write it runs its own command as the runner next time.
 
-There is no layout today where a worker can write `models/` and the state store stays closed to it. The default state store lives inside `models/`, at `models/.rocky-state.redb`. `--state-path` does not fix this: the loop's own printed next step, `rocky fulfill approve-spec <product>`, carries no `--state-path`. Running it as printed uses the default store, regardless of what the loop itself was pointed at. The worker's own `rocky mcp --profile worker` resolves the default path itself, with no override. Its `draft_model` gate opens that store read-write to record policy decisions.
+The state store must sit outside every directory the worker can write. The default store lives inside `models/`, at `models/.rocky-state.redb`, so `rocky fulfill` and `rocky fulfill approve-spec` refuse to run on it. They also refuse a namespaced store under `models/.rocky-state/`, or a path that resolves into `models/` through `..` or a symlink. The error names the fix: pass `--state-path` with a location the worker cannot write.
 
-`rocky review --approve` resolves its own path the same way, independent of any `--state-path` you passed elsewhere. [#2169](https://github.com/rocky-data/rocky/issues/2169) tracks closing this gap. Until then, a worker that can write `models/` can reach the state store too, on top of everything else in this section. A worker that can also write anything in the closed list above is the hostile-local-process case, and nothing here defends against it. If your worker and your runner share a user, treat that as the concession it is.
+```bash
+rocky --state-path .rocky/state.redb fulfill revenue_daily
+```
 
-Two limits have their own tracking issues. A descendant that puts itself in a new session with `setsid` leaves the process group, is re-parented by the operating system, and survives the group kill; OS-level sandboxing is the fix ([#1491](https://github.com/rocky-data/rocky/issues/1491)). Rocky opens committed files with `O_NOFOLLOW` and creates them with `O_EXCL`, but it does not use directory-relative system calls, so a directory component swapped between the check and the open stays a window. `O_NOFOLLOW` is a Unix flag; on Windows one backup read follows a link.
+Pass the same `--state-path` to every `rocky fulfill`, `rocky fulfill approve-spec` and `rocky review` call for the project. Every next step the loop prints carries it, so a command run as printed reaches the store the loop reads. Commands quoted in a stop's message carry it too. `rocky fulfill approve-spec` without it refuses, like the loop. `rocky review` and `rocky product approve` do not check where the store is. Without the flag they use the default store, and an approval recorded there never reaches the loop.
+
+`.rocky/state.redb` is only safe if the worker cannot write `.rocky/`. Pick a path that fits how you deploy.
+
+The worker's own `rocky mcp --profile worker` does not take `--state-path`. Its `draft_model` gate opens the default store read-write to record policy decisions, so a worker run can create `models/.rocky-state.redb`. That store is not the one the gates read. The loop does not read it, and the next `rocky fulfill` without `--state-path` still refuses it.
+
+A worker that can also write anything in the closed list above is the hostile-local-process case, and nothing here defends against it. If your worker and your runner share a user, treat that as the concession it is.
+
+Two limits have their own tracking issues. A descendant that puts itself in a new session with `setsid` leaves the process group, is re-parented by the operating system, and survives the group kill; OS-level sandboxing is the fix ([#1491](https://github.com/rocky-data/rocky/issues/1491)). Rocky opens committed files with `O_NOFOLLOW` and creates them with `O_EXCL`, but it does not use directory-relative system calls, so a directory component swapped between the check and the open stays a window. `O_NOFOLLOW` is a Unix flag, and so is the hard-link check. On Windows the backup, outbox, and brief-override reads follow a link and do not count hard links.
 
 The full boundary, and how it applies to any agent rather than just this loop, is set out in [Operating Rocky with agents](/concepts/operating-rocky-with-agents/), "What the three gates do not defend against".
 

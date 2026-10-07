@@ -354,6 +354,11 @@ pub const E054: &str = "E054";
 /// a `remove` that would delete locally edited vendored files without
 /// `--force`. Nothing is written when it fires.
 pub const E055: &str = "E055";
+/// A bare read is ambiguous: several models write a table of that name, none
+/// of them is also named after it, and the reader's `depends_on` does not pick
+/// exactly one. A bare name carries no schema and Rocky cannot see the search
+/// path that would choose, so the read binds to none of them (#1354).
+pub const E056: &str = "E056";
 
 // Warnings
 /// Unused model (no downstream consumers).

@@ -798,18 +798,20 @@ fn history_run_text_prints_the_run_table_then_the_audit_table() {
     let state = state_path.to_str().unwrap();
 
     let expected_table = format!(
-        "{:<24} {:<24} {:<10} {:<8} {:<10}\n{}\n{:<24} {:<24} {:<10} {:<8} {:<10}\n\nTotal runs: 1\n",
+        "{:<24} {:<24} {:<10} {:<8} {:<10} {:<10}\n{}\n{:<24} {:<24} {:<10} {:<8} {:<10} {:<10}\n\nTotal runs: 1\n",
         "RUN ID",
         "STARTED",
         "STATUS",
         "MODELS",
         "TRIGGER",
-        "-".repeat(78),
+        "SCOPE",
+        "-".repeat(89),
         RUN_ID,
         "2026-04-21 12:00:00",
         "Success",
         2,
         "Manual",
+        "production",
     );
 
     let text = rocky_stdout(

@@ -114,6 +114,10 @@ cat > "$WORK/mcp-worker.json" <<JSON
 JSON
 
 cd "$WORK"
+# Every rocky call shares one state store OUTSIDE models/. `rocky fulfill`
+# refuses a store the drafting worker may write, and the default one lives in
+# models/ (#2169). Relative, so each scratch copy below gets its own store.
+rocky() { command rocky --state-path .rocky/state.redb "$@"; }
 rj() { local out="$1"; shift; rocky --output json "$@" >"$out" 2>"${out%.json}.err"; echo $?; }
 
 echo; echo "[live 1/4] cold elicitation — the worker samples and writes its own candidate spec"

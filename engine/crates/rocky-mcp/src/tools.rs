@@ -1152,7 +1152,9 @@ fn worker_tools_that_read_the_warehouse<'a>(table: &[(&'a str, WorkerToolEffect)
 ///
 /// The stripping therefore holds because no PRODUCTION client discovers or
 /// declares yet, not because this server refuses to speak `2026-07-28`. The
-/// negotiated version is `2025-11-25` against rmcp's own default client —
+/// negotiated version is `2025-11-25` against rmcp's own default client.
+/// Since rmcp 3.5 that client names `2026-07-28` (its new `LATEST`) and gets
+/// `2025-11-25` as the fallback, not as an echo. The result is the same and
 /// BLESSED, as part of row 1's `initialize` payload in
 /// `served_text_golden_pins_every_worded_surface`, so the day it moves the
 /// golden moves with it and this paragraph gets re-read. Closing the gap by
@@ -5501,9 +5503,13 @@ impl RockyMcpServer {
          last submission and outcome, consecutive failures, active claims, and tick-lock state. \
          Reports stored state only — it does NOT evaluate demand (side-effect free; \
          `rocky tick --dry-run` is the evaluation). `next_fire_at` in the past means an overdue \
-         pipeline, not a future promise. Reads the project's canonical state path: a scheduler \
-         started with an explicit `--state-path` override is not visible here — query that \
-         server's GET /api/v1/schedule instead."
+         pipeline, not a future promise. Also reports the webhook demands that are waiting in \
+         the spool and not yet claimed by a tick, under `spool` (the same reader as GET \
+         /api/v1/schedule/spool): `spool.counts.pending` above zero while ticks have stopped \
+         means demand is piling up. An unreadable spool is an error, never an empty list. \
+         Reads the project's canonical state path: a scheduler started with an explicit \
+         `--state-path` override is not visible here — query that server's GET \
+         /api/v1/schedule instead."
     )]
     async fn schedule_status(
         &self,
@@ -5515,6 +5521,7 @@ impl RockyMcpServer {
         // so this snapshot reports against the tick lock a `serve --scheduler`
         // or a cron `rocky tick` actually holds.
         let rocky_dir = commands::scheduler::rocky_dir_for_config(&config_path);
+        let spool_config_path = config_path.clone();
         let output = tokio::task::spawn_blocking(move || {
             commands::schedule_status::schedule_status_output(
                 &config_path,
@@ -5539,12 +5546,52 @@ impl RockyMcpServer {
                  with no [schedule] blocks returns an empty snapshot, not an error.",
             )
         })?;
-        let value = serde_json::to_value(&output).map_err(|e| {
+        // The waiting half (#1900). The snapshot above reports CLAIMS, which
+        // exist only once a tick has picked a demand up, so a demand sitting
+        // in the spool appears nowhere in it — a scheduler whose ticks
+        // stopped looked healthy here while demand piled up. Read through the
+        // ONE producer behind `rocky state schedule spool` and
+        // GET /api/v1/schedule/spool, so the three cannot drift. Fail-closed:
+        // a present-but-unreadable spool is a tool error, never an empty
+        // list (the #1710/#1752/#1731 bug class).
+        let spool = tokio::task::spawn_blocking(move || {
+            commands::schedule_spool::compute_schedule_spool(&spool_config_path)
+        })
+        .await
+        .map_err(|e| {
+            ToolError::internal(
+                format!("spool read task failed: {e}"),
+                "Retry; if it persists this is an internal join error.",
+            )
+        })?
+        .map_err(|e| {
+            ToolError::internal(
+                format!("could not read the webhook spool: {e}"),
+                "Inspect the spool directory's permissions — waiting webhook demands cannot \
+                 be counted while it is unreadable.",
+            )
+        })?;
+        let mut value = serde_json::to_value(&output).map_err(|e| {
             ToolError::internal(
                 format!("failed to serialize the schedule snapshot: {e}"),
                 "Retry; if it persists this is an internal serialization bug.",
             )
         })?;
+        let spool = serde_json::to_value(&spool).map_err(|e| {
+            ToolError::internal(
+                format!("failed to serialize the spool listing: {e}"),
+                "Retry; if it persists this is an internal serialization bug.",
+            )
+        })?;
+        value
+            .as_object_mut()
+            .ok_or_else(|| {
+                ToolError::internal(
+                    "the schedule snapshot did not serialize to an object".to_string(),
+                    "This is an internal serialization bug.",
+                )
+            })?
+            .insert("spool".to_string(), spool);
         Ok(Json(value))
     }
 
@@ -5651,6 +5698,16 @@ impl RockyMcpServer {
             &subject,
         )
         .map_err(|e| {
+            // A `product:<name>` subject whose spec exists but does not load
+            // (#2003) is the caller's to fix, not an internal fault.
+            if e.downcast_ref::<rocky_core::product::spec::SpecRejected>()
+                .is_some()
+            {
+                return ToolError::invalid_argument(
+                    format!("{e:#}"),
+                    "Fix products/<name>.toml until `rocky product verify <name>` accepts it.",
+                );
+            }
             ToolError::internal(
                 format!("{e:#}"),
                 "Could not assemble the custody chain; ensure the project's state store is \

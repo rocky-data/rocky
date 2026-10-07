@@ -4,13 +4,18 @@ host = "${DATABRICKS_HOST}"
 http_path = "${DATABRICKS_HTTP_PATH}"
 token = "${DATABRICKS_TOKEN}"
 
-# Discovery adapter — Databricks is data-only, so we declare a
-# manual discovery adapter to satisfy the pipeline's discovery
-# binding without enumerating any source tables (the POC only
-# exercises target-side workspace isolation, not discovery).
+# Discovery adapter — Databricks is data-only, so the source tables are
+# listed inline on a manual discovery adapter. It discovers exactly the
+# schemas listed below, matched against `schema_pattern.prefix`; the POC
+# exercises target-side workspace isolation, so one source table is enough.
+# `--filter source=orders` selects the `raw__orders` schema.
 [adapter.local_discovery]
 type = "manual"
 kind = "discovery"
+
+[[adapter.local_discovery.schemas]]
+name = "raw__orders"
+tables = ["orders"]
 
 [pipeline.poc]
 strategy = "full_refresh"
