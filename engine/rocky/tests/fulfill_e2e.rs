@@ -410,6 +410,34 @@ fn a_state_store_inside_models_is_refused_and_the_next_step_names_the_store() {
     );
 }
 
+/// #2278: the worker's `rocky mcp` records its `propose` decisions in the
+/// loop's store, not in the default `<models>/.rocky-state.redb`. Before
+/// the fix the worker never received `--state-path`, so custody on the
+/// loop's store was missing every worker decision.
+#[test]
+fn the_workers_decisions_land_in_the_loops_store() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dir = tmp.path();
+    write_project(dir, &session_json(&[]));
+    drive_to_plan_review(dir);
+
+    let default_store = dir.join("models/.rocky-state.redb");
+    assert!(
+        !default_store.exists(),
+        "the worker opened the default store {} instead of {STATE_PATH}",
+        default_store.display()
+    );
+    let store = state_store(dir);
+    let decisions = store.list_policy_decisions().expect("decisions");
+    let draft_id = format!("draft:{PRODUCT}");
+    assert!(
+        decisions.iter().any(|d| {
+            d.capability == rocky_core::config::PolicyCapability::Propose && d.plan_id == draft_id
+        }),
+        "no worker propose decision for {draft_id} in {STATE_PATH}: {decisions:?}"
+    );
+}
+
 #[test]
 fn happy_path_cold_init_to_observing() {
     let tmp = tempfile::tempdir().expect("tempdir");

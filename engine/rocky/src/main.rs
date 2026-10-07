@@ -5968,7 +5968,9 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             // win; otherwise the server acts as `mcp-<profile>`.
             let actor =
                 resolve_cli_principal_id(cli.principal_id.as_deref(), Some(profile.name()))?;
-            rocky_mcp::serve_stdio(config, profile, actor).await
+            // An explicit `--state-path` reaches the server, so its decision
+            // rows land in the store the caller chose (#2278).
+            rocky_mcp::serve_stdio(config, profile, actor, cli.state_path.clone()).await
         }
     };
 

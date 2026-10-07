@@ -109,6 +109,10 @@ pub struct TaskBrief {
     /// Where the transcript file goes
     /// (`.rocky/fulfillment/<name>/transcripts/`).
     pub transcript_dir: PathBuf,
+    /// The loop's state store. The replay driver passes it to the worker's
+    /// `rocky mcp` as `--state-path`, so the worker's decision rows land in
+    /// the store the loop and its custody chain read (#2278).
+    pub state_path: PathBuf,
     /// The task outbox (`.rocky/fulfillment/<name>/outbox/`), cleared by
     /// the driver before dispatch. The elicitation contract: the worker
     /// writes [`OUTBOX_CANDIDATE`] (+ optionally [`OUTBOX_QUESTIONS`])
@@ -827,12 +831,38 @@ impl ReplayDriver {
     }
 }
 
+/// Insert `--state-path <state_path>` after the program, so the worker's
+/// `rocky mcp` records into the loop's store instead of the default
+/// `<models>/.rocky-state.redb` (#2278). The flag is top-level, so it must
+/// precede the `mcp` subcommand. An argv that already names a store is
+/// left as recorded. The path is passed as an `OsString`, never through
+/// `display()`, so a store whose name is not UTF-8 reaches the worker
+/// byte for byte.
+fn with_worker_state_path(argv: Vec<String>, state_path: &Path) -> Vec<std::ffi::OsString> {
+    let names_a_store = argv
+        .iter()
+        .any(|a| a == "--state-path" || a.starts_with("--state-path="));
+    let mut out: Vec<std::ffi::OsString> = argv.into_iter().map(Into::into).collect();
+    if !names_a_store && !out.is_empty() {
+        out.splice(
+            1..1,
+            [
+                std::ffi::OsString::from("--state-path"),
+                state_path.as_os_str().to_os_string(),
+            ],
+        );
+    }
+    out
+}
+
 /// The session file shape (`[fulfill.driver] type = "replay"`).
 #[derive(Debug, serde::Deserialize)]
 struct ReplaySession {
     /// Overrides the MCP server command (defaults to
     /// `current_exe mcp --profile worker`). Recorded sessions in tests
-    /// point this at the built binary.
+    /// point this at the built binary. It must be a `rocky` invocation: the
+    /// driver inserts `--state-path <loop store>` after `argv[0]` unless the
+    /// recorded argv already carries `--state-path`.
     #[serde(default)]
     mcp_command: Option<Vec<String>>,
     /// Per-task recorded calls, keyed `elicitation` / `drafting` /
@@ -928,6 +958,8 @@ impl AgentDriver for ReplayDriver {
                 ]
             }
         };
+        let argv = with_worker_state_path(argv, &brief.state_path);
+        let program = argv[0].to_string_lossy().into_owned();
 
         let (mut transcript, transcript_path) = create_transcript(brief)?;
         let stderr_file = transcript
@@ -946,7 +978,7 @@ impl AgentDriver for ReplayDriver {
             .process_group(0);
         let mut server = cmd
             .spawn()
-            .map_err(|e| DriverError::Spawn(format!("{}: {e}", argv[0])))?;
+            .map_err(|e| DriverError::Spawn(format!("{program}: {e}")))?;
         let pgid = server
             .id()
             .ok_or_else(|| DriverError::Spawn("server exited before its pid was read".into()))?;
@@ -1162,6 +1194,7 @@ mod supervision_tests {
             product: "battery".to_string(),
             project_root: dir.to_path_buf(),
             transcript_dir: dir.join("transcripts"),
+            state_path: dir.join("state.redb"),
             outbox_dir: dir.join("outbox"),
         }
     }
@@ -1749,6 +1782,7 @@ mod windows_tests {
             product: "p".into(),
             project_root: dir.clone(),
             transcript_dir: dir.join("t"),
+            state_path: dir.join("s.redb"),
             outbox_dir: dir.join("o"),
         };
         let mut on_group = |_group: GroupStamp| Ok(());
@@ -1768,6 +1802,7 @@ mod escape_scope_tests {
             product: "battery".to_string(),
             project_root: dir.to_path_buf(),
             transcript_dir: dir.join("transcripts"),
+            state_path: dir.join("state.redb"),
             outbox_dir: dir.join("outbox"),
         }
     }
@@ -2094,5 +2129,62 @@ mod escape_scope_tests {
              residual); if the driver can now reach it, the containment story \
              improved — update the docs and this pin deliberately"
         );
+    }
+}
+
+#[cfg(test)]
+mod worker_state_path_tests {
+    use super::with_worker_state_path;
+    use std::ffi::OsString;
+    use std::path::Path;
+
+    fn argv(items: &[&str]) -> Vec<String> {
+        items.iter().map(ToString::to_string).collect()
+    }
+
+    fn os(items: &[&str]) -> Vec<OsString> {
+        items.iter().map(OsString::from).collect()
+    }
+
+    #[test]
+    fn the_loop_store_precedes_the_mcp_subcommand() {
+        let out = with_worker_state_path(
+            argv(&["rocky", "mcp", "--profile", "worker"]),
+            Path::new("/p/.rocky/state.redb"),
+        );
+        assert_eq!(
+            out,
+            os(&[
+                "rocky",
+                "--state-path",
+                "/p/.rocky/state.redb",
+                "mcp",
+                "--profile",
+                "worker"
+            ])
+        );
+    }
+
+    /// A store name that is not UTF-8 reaches the worker unchanged; a lossy
+    /// conversion would point the worker at a different file.
+    #[cfg(unix)]
+    #[test]
+    fn a_non_utf8_store_path_is_passed_byte_for_byte() {
+        use std::os::unix::ffi::OsStrExt;
+        let raw = std::ffi::OsStr::from_bytes(b"/p/st\xffate.redb");
+        let out = with_worker_state_path(argv(&["rocky", "mcp"]), Path::new(raw));
+        assert_eq!(out[2].as_os_str().as_bytes(), b"/p/st\xffate.redb");
+    }
+
+    #[test]
+    fn a_recorded_store_is_left_as_recorded() {
+        for recorded in [
+            argv(&["rocky", "--state-path", "x.redb", "mcp"]),
+            argv(&["rocky", "--state-path=x.redb", "mcp"]),
+        ] {
+            let out = with_worker_state_path(recorded.clone(), Path::new("/p/state.redb"));
+            let expected: Vec<OsString> = recorded.into_iter().map(Into::into).collect();
+            assert_eq!(out, expected);
+        }
     }
 }

@@ -795,6 +795,11 @@ pub struct RockyMcpServer {
     /// with `--principal-id` / `ROCKY_PRINCIPAL_ID` via [`Self::with_actor`].
     /// A self-asserted label: the gate still evaluates the `agent` class.
     actor: rocky_core::config::PrincipalRef,
+    /// An explicit `--state-path` for this process. `None` derives the
+    /// conventional `<models>/.rocky-state.redb`. Without it, a worker under
+    /// `rocky --state-path <p> fulfill` recorded its decisions in the default
+    /// store while the loop read `<p>` (#2278).
+    state_path_override: Option<PathBuf>,
     tool_router: ToolRouter<Self>,
     prompt_router: PromptRouter<Self>,
 }
@@ -2288,6 +2293,7 @@ impl RockyMcpServer {
             },
             instructions,
             actor: profile.default_actor(),
+            state_path_override: None,
             tool_router,
             prompt_router,
         })
@@ -2305,8 +2311,17 @@ impl RockyMcpServer {
         &self.actor
     }
 
+    /// Use `path` as this server's state store instead of the default
+    /// (`rocky --state-path <path> mcp`). `None` keeps the default.
+    #[must_use]
+    pub fn with_state_path(mut self, path: Option<PathBuf>) -> Self {
+        self.state_path_override = path;
+        self
+    }
+
     fn state_path(&self) -> PathBuf {
-        rocky_core::state::resolve_state_path(None, &self.models_dir).path
+        rocky_core::state::resolve_state_path(self.state_path_override.as_deref(), &self.models_dir)
+            .path
     }
 
     /// Whether this server serves the `review_queue` APPROVE action — writing

@@ -850,10 +850,7 @@ pub(crate) fn state_path_for(state: &ServerState) -> std::path::PathBuf {
     // instead, so the scheduler's cursors, claims, and child run history landed
     // in a different file than the one the operator selected (and than a
     // `rocky tick` on the same project would use), silently re-firing occurrences.
-    match &state.state_path {
-        Some(explicit) => explicit.clone(),
-        None => rocky_core::state::resolve_state_path(None, &state.models_dir).path,
-    }
+    state.resolved_state_path()
 }
 
 /// The `/api/v1` routes this build serves — the feature-detection surface
