@@ -444,6 +444,7 @@ span, and sometimes a suggested fix.
 | `W052` | A `[redshift]` `dist_key` or `sort_key` column is not in the model's output |
 | `W053` | A `[clickhouse]` `order_by` or `partition_by` column is not in the model's output |
 | `W055` | `rocky package` vendored a package with something to review: an edited file the new version changed (written beside it as `.incoming`), a package model it could not vendor, an incremental model that fell back to full refresh, or dbt tests it did not map |
+| `W056` | A vendored dbt package may be out of date. A vendored file no longer matches `rocky-packages.lock` or is missing, the lock's `version` differs from the version the files were vendored at, or the lock predates that record. Offline check; run `rocky package update` |
 | `I001` | Model dependency inferred from SQL |
 | `I002` | Some, but not all, output columns have unknown types — provide source schemas for more type checking |
 | `I003` | A contract declares a type for a column whose type Rocky could not infer, so `E011` did not check it |

@@ -569,13 +569,22 @@ pub const W053: &str = "W053";
 /// `accepted_values` and `relationships` (dropped, counted); and a
 /// `dbt run --empty` that did not build every model.
 pub const W055: &str = "W055";
+/// A vendored dbt package may be out of date.
+///
+/// Emitted by `rocky compile`, offline, from `rocky-packages.lock`, when: a
+/// vendored file no longer matches the hash recorded at vendor time (edited)
+/// or is gone; the lock's `version` differs from the version the files were
+/// vendored at; or the lock predates the `vendored_version` record, so the
+/// version cannot be checked. Run `rocky package update` to refresh. It does
+/// not compare against the warehouse or the upstream package.
+pub const W056: &str = "W056";
 
 /// Every warning code the compile pipeline can emit: the `W###` codes above
 /// plus [`P002`]. `rocky compile --deny-warnings` accepts only these.
 /// A unit test checks this list against the constants in this file.
 pub const WARNING_CODES: &[&str] = &[
     W001, W002, W004, W005, W006, W010, W011, W012, W013, W030, W031, W041, W042, W043, W044, W046,
-    W048, W049, W050, W051, W052, W053, P002,
+    W048, W049, W050, W051, W052, W053, W056, P002,
 ];
 
 /// Warning codes other commands emit, never `rocky compile`, so

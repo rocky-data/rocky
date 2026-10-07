@@ -1023,6 +1023,12 @@ pub struct LockedPackage {
     pub version_spec: String,
     /// Version `dbt deps` resolved.
     pub version: String,
+    /// Package version the files under `models/packages/` were written from.
+    /// Written next to [`Self::version`] by every `add` and `update`. When the
+    /// two differ, the lock was edited or merged without re-vendoring (W056).
+    /// Empty in a lock written before this field existed.
+    #[serde(default)]
+    pub vendored_version: String,
     pub dbt_version: String,
     /// Rocky adapter type dbt compiled against.
     pub adapter: String,
@@ -2640,6 +2646,7 @@ mod tests {
             hub: "fivetran/stripe".into(),
             version_spec: ">=1.0.0,<2.0.0".into(),
             version: "1.10.1".into(),
+            vendored_version: "1.10.1".into(),
             dbt_version: "1.12.5".into(),
             adapter: "duckdb".into(),
             adapter_name: "default".into(),

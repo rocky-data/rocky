@@ -32,9 +32,11 @@ use anyhow::{Context, Result, anyhow, bail};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use rocky_compiler::diagnostic::{Diagnostic, W056};
 use rocky_compiler::import::dbt_manifest;
 use rocky_compiler::import::dbt_package::{
-    self, BuildMode, INCOMING_SUFFIX, LOCKFILE_NAME, LockedPackage, PackageImport, PackagesLock,
+    self, BuildMode, INCOMING_SUFFIX, LOCKFILE_NAME, LockedPackage, PACKAGES_DIR, PackageImport,
+    PackagesLock,
 };
 use rocky_core::config::{AdapterConfig, RockyConfig};
 use rocky_core::models::TargetConfig;
@@ -288,6 +290,104 @@ fn project_root(config_path: &Path) -> PathBuf {
         Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
         _ => PathBuf::from("."),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Staleness check (W056), run by `rocky compile`
+// ---------------------------------------------------------------------------
+
+/// Offline check that vendored packages still match the lockfile. Used by
+/// `rocky compile`. Reads only `rocky-packages.lock` and the vendored files.
+///
+/// One W056 (warning) per package and problem: a vendored file was edited, a
+/// vendored file is gone, or the lock's `version` differs from
+/// `vendored_version`. A lock written before `vendored_version` existed gets
+/// one W056 naming those packages, because their version cannot be checked.
+/// No lockfile gives no diagnostics. An unreadable lockfile gives one W056 and
+/// compile goes on.
+///
+/// It does not compare with the warehouse or with the upstream package.
+pub fn stale_package_diagnostics(root: &Path) -> Vec<Diagnostic> {
+    let lock_path = root.join(LOCKFILE_NAME);
+    let lock = match PackagesLock::read(&lock_path) {
+        Ok(lock) => lock,
+        Err(e) => {
+            return vec![Diagnostic::warning(
+                W056,
+                "rocky-packages",
+                format!("could not check vendored packages: {e}"),
+            )];
+        }
+    };
+    let mut out = Vec::new();
+    let mut unstamped = Vec::new();
+    let mut packages: Vec<&LockedPackage> = lock.packages.iter().collect();
+    packages.sort_by(|a, b| a.name.cmp(&b.name));
+    for p in packages {
+        let refresh = format!("rocky package update {}", p.name);
+        if p.vendored_version.is_empty() {
+            unstamped.push(p.name.as_str());
+        } else if p.vendored_version != p.version {
+            let mut d = Diagnostic::warning(
+                W056,
+                &p.name,
+                format!(
+                    "vendored package `{}`: {LOCKFILE_NAME} pins version {}, but the files under \
+                     {PACKAGES_DIR}/{} were vendored at {}",
+                    p.name, p.version, p.name, p.vendored_version
+                ),
+            );
+            d.suggestion = Some(format!("run `{refresh}`"));
+            out.push(d);
+        }
+        let mut edited = Vec::new();
+        let mut missing = Vec::new();
+        for (rel, hash) in &p.files {
+            match dbt_package::read_disk(&root.join(rel)) {
+                dbt_package::DiskFile::Hash(h) if h == *hash => {}
+                dbt_package::DiskFile::Absent => missing.push(rel.as_str()),
+                _ => edited.push(rel.as_str()),
+            }
+        }
+        for (what, files) in [("no longer match", &edited), ("are missing", &missing)] {
+            if files.is_empty() {
+                continue;
+            }
+            let shown: Vec<&str> = files.iter().take(3).copied().collect();
+            let tail = match files.len() - shown.len() {
+                0 => String::new(),
+                more => format!(" and {more} more"),
+            };
+            let mut d = Diagnostic::warning(
+                W056,
+                &p.name,
+                format!(
+                    "vendored package `{}`: {} file(s) {what} {LOCKFILE_NAME}: {}{tail}",
+                    p.name,
+                    files.len(),
+                    shown.join(", ")
+                ),
+            );
+            d.suggestion = Some(format!(
+                "run `{refresh}` to review the upstream version; an intended edit is kept"
+            ));
+            out.push(d);
+        }
+    }
+    if let Some(first) = unstamped.first() {
+        let mut d = Diagnostic::warning(
+            W056,
+            first,
+            format!(
+                "{LOCKFILE_NAME} predates the vendored-version check, so the version of {} \
+                 cannot be checked",
+                unstamped.join(", ")
+            ),
+        );
+        d.suggestion = Some("run `rocky package update` to record it".to_string());
+        out.push(d);
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -741,6 +841,7 @@ fn vendor(
         hub: request.hub.clone(),
         version_spec: request.version_spec.clone(),
         version: resolved_version.clone(),
+        vendored_version: resolved_version.clone(),
         dbt_version: dbt_version.clone(),
         adapter: adapter.adapter_type.clone(),
         adapter_name: adapter_name.clone(),
@@ -1528,5 +1629,111 @@ mod tests {
         assert!(err.contains("--adapter"), "{err}");
         assert_eq!(select_adapter(&cfg, Some("b")).unwrap().0, "b");
         assert!(select_adapter(&cfg, Some("zzz")).is_err());
+    }
+
+    // ---- W056: stale vendored package ----
+
+    /// Write `models/packages/<name>/a.sql` and a lock that records it.
+    fn vendor_fixture(
+        root: &Path,
+        version: &str,
+        vendored_version: &str,
+    ) -> (PackagesLock, PathBuf) {
+        let rel = "models/packages/stripe/a.sql";
+        let file = root.join(rel);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, "select 1\n").unwrap();
+        let lock = PackagesLock {
+            version: dbt_package::LOCK_VERSION,
+            packages: vec![LockedPackage {
+                name: "stripe".into(),
+                hub: "fivetran/stripe".into(),
+                version: version.into(),
+                vendored_version: vendored_version.into(),
+                files: [(rel.to_string(), dbt_package::content_hash("select 1\n"))]
+                    .into_iter()
+                    .collect(),
+                ..LockedPackage::default()
+            }],
+        };
+        lock.write(&root.join(LOCKFILE_NAME)).unwrap();
+        (lock, file)
+    }
+
+    fn w056(root: &Path) -> Vec<Diagnostic> {
+        let diags = stale_package_diagnostics(root);
+        assert!(diags.iter().all(|d| &*d.code == "W056"), "{diags:?}");
+        diags
+    }
+
+    #[test]
+    fn a_fresh_vendored_package_has_no_w056() {
+        let dir = tempfile::tempdir().unwrap();
+        vendor_fixture(dir.path(), "1.10.1", "1.10.1");
+        assert!(w056(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn no_lockfile_has_no_w056() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(w056(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn an_edited_vendored_file_warns() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, file) = vendor_fixture(dir.path(), "1.10.1", "1.10.1");
+        std::fs::write(&file, "select 2\n").unwrap();
+        let diags = w056(dir.path());
+        assert_eq!(diags.len(), 1, "{diags:?}");
+        assert!(diags[0].message.contains("no longer match"), "{diags:?}");
+        assert!(diags[0].message.contains("stripe/a.sql"), "{diags:?}");
+    }
+
+    #[test]
+    fn a_missing_vendored_file_warns() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, file) = vendor_fixture(dir.path(), "1.10.1", "1.10.1");
+        std::fs::remove_file(&file).unwrap();
+        let diags = w056(dir.path());
+        assert_eq!(diags.len(), 1, "{diags:?}");
+        assert!(diags[0].message.contains("are missing"), "{diags:?}");
+    }
+
+    #[test]
+    fn a_lock_version_that_differs_from_the_vendored_version_warns() {
+        let dir = tempfile::tempdir().unwrap();
+        vendor_fixture(dir.path(), "1.11.0", "1.10.1");
+        let diags = w056(dir.path());
+        assert_eq!(diags.len(), 1, "{diags:?}");
+        assert!(
+            diags[0].message.contains("pins version 1.11.0"),
+            "{diags:?}"
+        );
+        assert!(diags[0].message.contains("vendored at 1.10.1"), "{diags:?}");
+    }
+
+    #[test]
+    fn a_lock_that_predates_the_version_record_warns_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut lock, _) = vendor_fixture(dir.path(), "1.10.1", "");
+        let mut second = lock.packages[0].clone();
+        second.name = "shopify".into();
+        second.files.clear();
+        lock.packages.push(second);
+        lock.write(&dir.path().join(LOCKFILE_NAME)).unwrap();
+        let diags = w056(dir.path());
+        assert_eq!(diags.len(), 1, "{diags:?}");
+        assert!(diags[0].message.contains("predates"), "{diags:?}");
+        assert!(diags[0].message.contains("shopify, stripe"), "{diags:?}");
+    }
+
+    #[test]
+    fn an_unreadable_lockfile_warns_instead_of_failing() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(LOCKFILE_NAME), "not = [valid").unwrap();
+        let diags = w056(dir.path());
+        assert_eq!(diags.len(), 1, "{diags:?}");
+        assert!(diags[0].message.contains("could not check"), "{diags:?}");
     }
 }

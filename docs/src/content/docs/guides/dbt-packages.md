@@ -190,6 +190,18 @@ If a model Rocky vendored before no longer imports, `update` refuses (`E055`) an
 
 Merge an `.incoming` file by hand, then delete it. Rocky does not load `.incoming` files as models. The JSON output lists the models the update added and removed.
 
+## Stale package warning
+
+`rocky compile` checks each vendored package against `rocky-packages.lock`. It reads only local files. It uses no network and no warehouse. It warns (`W056`) when:
+
+- a vendored file no longer matches the hash in the lockfile (you edited it), or the file is gone;
+- the lockfile `version` differs from `vendored_version`, the version the files were written from;
+- the lockfile was written before `vendored_version` existed. Rocky cannot check the version, so it says so once.
+
+A `W056` is a warning. Compile still succeeds. `rocky package update` refreshes the package and records `vendored_version`. An edit you want to keep is kept: `update` writes the new upstream file to `<file>.incoming`. Pass `--deny-warnings W056` to `rocky compile` to fail on it in CI.
+
+Rocky does not check the warehouse. If a connector added columns, the vendored models do not show it until you run `rocky package update`.
+
 ## List and remove
 
 ```bash

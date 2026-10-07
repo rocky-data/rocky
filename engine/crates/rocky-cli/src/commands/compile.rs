@@ -513,6 +513,17 @@ fn compile_inner(
         result.diagnostics.extend(import_diags);
     }
 
+    // W056: a vendored dbt package that no longer matches `rocky-packages.lock`.
+    // Offline; a project with no lockfile pays one failed `read`.
+    if let Some(path) = config_path {
+        let config_dir = path.parent().filter(|p| !p.as_os_str().is_empty());
+        result
+            .diagnostics
+            .extend(crate::commands::package::stale_package_diagnostics(
+                config_dir.unwrap_or_else(|| Path::new(".")),
+            ));
+    }
+
     // Every lint that reads model SQL has run on the authored text. Keep
     // that text for the miette source map (diagnostic spans point into it),
     // then write back the form that inlines ephemeral upstreams as CTEs —
@@ -2211,6 +2222,61 @@ schema_template = "s"
         // A strategy column is structure, printed as the engine runs it.
         assert_eq!(detail["strategy"]["timestamp_column"], COLUMN);
         assert_eq!(detail["tags"]["owner"], "${ROCKY_T1919_COMPILE}");
+    }
+
+    /// W056 reaches `rocky compile` output when a vendored file was edited,
+    /// and a fresh vendored package stays quiet.
+    #[test]
+    fn compile_output_carries_w056_for_an_edited_vendored_file() {
+        use rocky_compiler::import::dbt_package::{
+            LOCK_VERSION, LOCKFILE_NAME, LockedPackage, PackagesLock, content_hash,
+        };
+        let dir = TempDir::new().unwrap();
+        let models_dir = dir.path().join("models");
+        let rel = "models/packages/stripe/a.sql";
+        fs::create_dir_all(models_dir.join("packages/stripe")).unwrap();
+        fs::write(dir.path().join(rel), "SELECT 1 AS id\n").unwrap();
+        fs::write(
+            models_dir.join("packages/stripe/a.toml"),
+            "name = \"a\"\n\n[strategy]\ntype = \"full_refresh\"\n\n\
+             [target]\ncatalog = \"c\"\nschema = \"s\"\ntable = \"a\"\n",
+        )
+        .unwrap();
+        PackagesLock {
+            version: LOCK_VERSION,
+            packages: vec![LockedPackage {
+                name: "stripe".into(),
+                hub: "fivetran/stripe".into(),
+                version: "1.0.0".into(),
+                vendored_version: "1.0.0".into(),
+                files: [(rel.to_string(), content_hash("SELECT 1 AS id\n"))]
+                    .into_iter()
+                    .collect(),
+                ..LockedPackage::default()
+            }],
+        }
+        .write(&dir.path().join(LOCKFILE_NAME))
+        .unwrap();
+        let compile = || {
+            compile_output(
+                Some(&dir.path().join("rocky.toml")),
+                &dir.path().join(".rocky-state.redb"),
+                &models_dir,
+                None,
+                None,
+                false,
+                None,
+                false,
+                None,
+            )
+            .expect("compiles")
+        };
+        let w056 = |o: &CompileOutput| o.diagnostics.iter().filter(|d| &*d.code == "W056").count();
+        assert_eq!(w056(&compile()), 0, "fresh package must not warn");
+        fs::write(dir.path().join(rel), "SELECT 2 AS id\n").unwrap();
+        let out = compile();
+        assert_eq!(w056(&out), 1, "{:?}", out.diagnostics);
+        assert!(!out.has_errors);
     }
 
     #[test]
