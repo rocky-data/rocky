@@ -20,6 +20,8 @@ use rocky_sql::transpile::Dialect;
 
 use crate::output::{CompileOutput, CostHint, FunctionDetail, ModelDetail, print_json};
 
+use rocky_server::project_gates::ModelSqlForm;
+
 use super::ModelNotFound;
 
 /// Execute `rocky compile`.
@@ -379,28 +381,7 @@ fn compile_inner(
         .map(|config| ModelTargets::resolve(config, config_file_path));
 
     if let Some(targets) = &model_targets {
-        // PostgreSQL accepts a column functionally dependent on a grouped
-        // primary key, which Rocky cannot see: E044 is a warning (W044)
-        // there. Redshift keeps E044.
-        if rocky_compiler::group_by::downgrade_for_postgres(&mut result.diagnostics, |m| {
-            runs_only_on_postgres(targets, m)
-        }) > 0
-        {
-            result.has_errors = result.diagnostics.iter().any(Diagnostic::is_error);
-        }
-        // A warehouse that cannot create functions refuses them here (E051), at
-        // compile time, rather than mid-run.
-        result
-            .diagnostics
-            .extend(function_adapter_diagnostics(targets, &result));
-        // Likewise a warehouse that cannot run the SCD2 snapshot MERGE.
-        result
-            .diagnostics
-            .extend(snapshot_adapter_diagnostics(targets, &result));
-        // And one with no upsert at all (ClickHouse): E053.
-        result
-            .diagnostics
-            .extend(merge_adapter_diagnostics(targets, &result));
+        apply_adapter_gates(&mut result, targets);
     }
 
     // Portability lint. Effective target_dialect = CLI flag > [portability]
@@ -441,26 +422,13 @@ fn compile_inner(
     }
 
     // Aggregate-argument and comparison-operand checks (E042/W042,
-    // E043/W043). These judge against the warehouse that will run the SQL,
-    // so they need a dialect the compiler core does not carry; see
-    // `operand_target_for` for the precedence.
-    let operand_diags = rocky_compiler::operand_check::check_operand_types_per_model(
-        &result.project.models,
-        &result.semantic_graph,
-        &result.type_check.typed_models,
-        &|model| {
-            operand_target_for(
-                target_dialect,
-                project_config.as_ref(),
-                model_targets.as_ref(),
-                model,
-            )
-        },
+    // E043/W043). See `apply_operand_gates`.
+    apply_operand_gates(
+        &mut result,
+        project_config.as_ref(),
+        model_targets.as_ref(),
+        target_dialect,
     );
-    if operand_diags.iter().any(|d| d.severity == Severity::Error) {
-        result.has_errors = true;
-    }
-    result.diagnostics.extend(operand_diags);
 
     // Compute DAG-propagated cost estimates for all models.
     // Uses hardcoded stub statistics for leaf nodes — real catalog stats
@@ -530,9 +498,7 @@ fn compile_inner(
     // SQL Server lifts every CTE to the head of the statement; check that
     // on the inlined SQL, the text `rocky run` sends (E054).
     if let Some(targets) = &model_targets {
-        result
-            .diagnostics
-            .extend(sqlserver_cte_diagnostics(targets, &result));
+        apply_inlined_sql_gates(&mut result, targets);
     }
 
     // Load macros and expand model SQL when --expand-macros is set.
@@ -687,6 +653,86 @@ fn compile_inner(
     .with_functions(functions);
 
     Ok((output, text_data))
+}
+
+/// The project-level, per-model-target checks of `rocky compile`, for the
+/// surfaces that compile through `rocky_compiler::compile` directly:
+/// `rocky serve` and `rocky lsp`.
+///
+/// This is the ONE funnel for those surfaces. `rocky compile` runs the same
+/// three steps ([`apply_adapter_gates`], [`apply_operand_gates`],
+/// [`apply_inlined_sql_gates`]) itself, at its own points in a longer
+/// pipeline, so a model is judged against the same warehouses everywhere.
+/// E054 runs on both SQL forms. On [`ModelSqlForm::Authored`] SQL it can miss
+/// a CTE that only inlining adds, but it never reports one the inlined
+/// statement would not: inlining keeps every authored CTE.
+///
+/// `has_errors` is recomputed at the end. The callers read the flag, not the
+/// diagnostics, to decide whether the project compiled.
+pub fn apply_model_target_gates(
+    result: &mut compile::CompileResult,
+    config: &rocky_config::RockyConfig,
+    config_path: &Path,
+    _sql: ModelSqlForm,
+) {
+    let targets = ModelTargets::resolve(config, config_path);
+    apply_adapter_gates(result, &targets);
+    apply_operand_gates(result, Some(config), Some(&targets), None);
+    apply_inlined_sql_gates(result, &targets);
+    result.has_errors |= result.diagnostics.iter().any(Diagnostic::is_error);
+}
+
+/// E044 -> W044 on PostgreSQL, E051, E049 and E053, judged against the
+/// warehouses each model runs on.
+fn apply_adapter_gates(result: &mut compile::CompileResult, targets: &ModelTargets<'_>) {
+    // PostgreSQL accepts a column functionally dependent on a grouped
+    // primary key, which Rocky cannot see: E044 is a warning (W044)
+    // there. Redshift keeps E044.
+    if rocky_compiler::group_by::downgrade_for_postgres(&mut result.diagnostics, |m| {
+        runs_only_on_postgres(targets, m)
+    }) > 0
+    {
+        result.has_errors = result.diagnostics.iter().any(Diagnostic::is_error);
+    }
+    // A warehouse that cannot create functions refuses them here (E051), at
+    // compile time, rather than mid-run.
+    let function_diags = function_adapter_diagnostics(targets, result);
+    result.diagnostics.extend(function_diags);
+    // Likewise a warehouse that cannot run the SCD2 snapshot MERGE.
+    let snapshot_diags = snapshot_adapter_diagnostics(targets, result);
+    result.diagnostics.extend(snapshot_diags);
+    // And one with no upsert at all (ClickHouse): E053.
+    let merge_diags = merge_adapter_diagnostics(targets, result);
+    result.diagnostics.extend(merge_diags);
+}
+
+/// Aggregate-argument and comparison-operand checks (E042/W042, E043/W043).
+/// These judge against the warehouse that will run the SQL, so they need a
+/// dialect the compiler core does not carry; see `operand_target_for` for
+/// the precedence.
+fn apply_operand_gates(
+    result: &mut compile::CompileResult,
+    project_config: Option<&rocky_config::RockyConfig>,
+    targets: Option<&ModelTargets<'_>>,
+    target_dialect: Option<Dialect>,
+) {
+    let operand_diags = rocky_compiler::operand_check::check_operand_types_per_model(
+        &result.project.models,
+        &result.semantic_graph,
+        &result.type_check.typed_models,
+        &|model| operand_target_for(target_dialect, project_config, targets, model),
+    );
+    if operand_diags.iter().any(|d| d.severity == Severity::Error) {
+        result.has_errors = true;
+    }
+    result.diagnostics.extend(operand_diags);
+}
+
+/// SQL Server lifts every CTE to the head of the statement; check that on
+/// the inlined SQL, the text `rocky run` sends (E054).
+fn apply_inlined_sql_gates(result: &mut compile::CompileResult, targets: &ModelTargets<'_>) {
+    let diags = sqlserver_cte_diagnostics(targets, result);
+    result.diagnostics.extend(diags);
 }
 
 /// The warehouse dialects the E042/E043 operand checks judge `model` against.

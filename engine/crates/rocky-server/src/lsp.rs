@@ -512,7 +512,8 @@ impl RockyLsp {
         };
 
         match rocky_compiler::compile::compile(&config) {
-            Ok(result) => {
+            Ok(mut result) => {
+                apply_project_gates(&dir_path, &mut result);
                 self.publish_diagnostics(&result).await;
                 *self.compile_result.write().await = Some(result);
             }
@@ -1458,7 +1459,8 @@ impl LanguageServer for RockyLsp {
                     .flatten()
                 };
 
-                if let Some(result) = new_result {
+                if let Some(mut result) = new_result {
+                    apply_project_gates(&config.models_dir, &mut result);
                     let mut diags_by_file: HashMap<String, Vec<Diagnostic>> = HashMap::new();
                     for d in &result.diagnostics {
                         let file = if let Some(model) = result.project.model(&d.model) {
@@ -4602,6 +4604,33 @@ fn find_last_nonblank_before(lines: &[&str], before_idx: usize) -> usize {
 
 // ── Incremental compilation (Phase 3H) ──────────────────────────────────────
 
+/// Run the per-model-target checks of `rocky compile` over a fresh compile
+/// result, so the editor shows the diagnostics the CLI shows for a project
+/// with several pipelines. Both compile paths (`recompile` and the debounced
+/// `didChange` pass) call this one function.
+///
+/// Reads `rocky.toml` next to the models directory. A missing or unreadable
+/// file adds nothing here: the unreadable case is already published as W013
+/// by [`RockyLsp::publish_project_config_diagnostic`].
+fn apply_project_gates(
+    models_dir: &std::path::Path,
+    result: &mut rocky_compiler::compile::CompileResult,
+) {
+    let Some(toml_path) = RockyLsp::project_config_path(models_dir) else {
+        return;
+    };
+    let Ok(Some(config)) = rocky_core::config::load_optional_project_config(Some(&toml_path))
+    else {
+        return;
+    };
+    crate::project_gates::apply_project_gates(
+        result,
+        &config,
+        &toml_path,
+        crate::project_gates::ModelSqlForm::Authored,
+    );
+}
+
 /// Incremental compilation: recompile only changed models + dependents.
 ///
 /// §P3.1 — delegates to `rocky_compiler::compile::compile_incremental`,
@@ -4724,6 +4753,106 @@ mod tests {
         assert!(
             message.contains("compiling the project's models failed"),
             "the message says what failed: {message}"
+        );
+    }
+
+    /// The probe the editor test installs in place of `rocky-cli`'s checks:
+    /// it marks the compile results that carry a model named `gate_probe`.
+    fn probe_project_gates(
+        result: &mut rocky_compiler::compile::CompileResult,
+        _config: &rocky_core::config::RockyConfig,
+        _config_path: &std::path::Path,
+        _sql: crate::project_gates::ModelSqlForm,
+    ) {
+        if result.project.model("gate_probe").is_some() {
+            result
+                .diagnostics
+                .push(rocky_compiler::diagnostic::Diagnostic::warning(
+                    "W-GATE-PROBE",
+                    "gate_probe",
+                    "project gates ran",
+                ));
+        }
+    }
+
+    /// `rocky lsp` runs the per-model-target checks of `rocky compile` over
+    /// its compile result, read from the project's `rocky.toml`. Driven at the
+    /// protocol level like the test above, then read from the state the
+    /// editor's requests read.
+    #[tokio::test]
+    async fn the_startup_compile_runs_the_project_gates() {
+        use tower::Service as _;
+        use tower::ServiceExt as _;
+        use tower_lsp::jsonrpc::Request;
+
+        crate::project_gates::install_project_gates(probe_project_gates);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("project");
+        let models = root.join("models");
+        std::fs::create_dir_all(&models).unwrap();
+        std::fs::write(
+            root.join("rocky.toml"),
+            "[adapter.wh]\ntype = \"duckdb\"\npath = \":memory:\"\n",
+        )
+        .unwrap();
+        std::fs::write(models.join("gate_probe.sql"), "SELECT 1 AS id").unwrap();
+        std::fs::write(
+            models.join("gate_probe.toml"),
+            "[strategy]\ntype = \"full_refresh\"\n\n\
+             [target]\ncatalog = \"c\"\nschema = \"s\"\ntable = \"gate_probe\"\n",
+        )
+        .unwrap();
+
+        let (mut service, _socket) = LspService::new(|client| RockyLsp {
+            client,
+            compile_result: Arc::new(RwLock::new(None)),
+            models_dir: Arc::new(RwLock::new(None)),
+            documents: Arc::new(RwLock::new(HashMap::new())),
+            recompile_pending: Arc::new(AtomicBool::new(false)),
+            init_done: Arc::new(AtomicBool::new(false)),
+            init_notify: Arc::new(Notify::new()),
+            semantic_tokens_cache: Arc::new(RwLock::new(HashMap::new())),
+            schema_cache_throttle: SchemaCacheThrottle::new(),
+            config_diagnostic_published: Arc::new(AtomicBool::new(false)),
+            salsa_db: Arc::new(Mutex::new(RockyDatabase::default())),
+            salsa_sources: Arc::new(RwLock::new(HashMap::new())),
+        });
+
+        let root_uri = Url::from_directory_path(&root).unwrap();
+        let initialize = Request::build("initialize")
+            .id(1)
+            .params(serde_json::json!({ "capabilities": {}, "rootUri": root_uri }))
+            .finish();
+        service
+            .ready()
+            .await
+            .unwrap()
+            .call(initialize)
+            .await
+            .expect("initialize answers");
+        let initialized = Request::build("initialized")
+            .params(serde_json::json!({}))
+            .finish();
+        service
+            .ready()
+            .await
+            .unwrap()
+            .call(initialized)
+            .await
+            .expect("initialized answers");
+
+        let stored = service.inner().compile_result.read().await;
+        let result = stored
+            .as_ref()
+            .expect("the startup compile stored a result");
+        assert!(
+            result
+                .diagnostics
+                .iter()
+                .any(|d| &*d.code == "W-GATE-PROBE"),
+            "the project gates did not run over the LSP compile result: {:?}",
+            result.diagnostics
         );
     }
 
