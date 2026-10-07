@@ -88,6 +88,15 @@ fn target_exists(root: &Path) -> bool {
     n > 0
 }
 
+fn assert_refused(out: &Output) {
+    assert!(!out.status.success(), "run must be refused\n{}", show(out));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("refusing `rocky run --refuse-hooks`"),
+        "the refusal must be the --refuse-hooks one, not another failure\n{}",
+        show(out)
+    );
+}
+
 fn show(out: &Output) -> String {
     format!(
         "stdout:\n{}\nstderr:\n{}",
@@ -114,12 +123,7 @@ fn the_flag_refuses_a_shell_hook_before_it_fires() {
     let tmp = project(HOOK);
     let root = tmp.path();
     let out = rocky(root, &["run", "--refuse-hooks"]);
-    assert!(!out.status.success(), "run must be refused\n{}", show(&out));
-    assert!(
-        String::from_utf8_lossy(&out.stderr).contains("--refuse-hooks"),
-        "the refusal must name the flag\n{}",
-        show(&out)
-    );
+    assert_refused(&out);
     assert!(
         !root.join("hook_fired").exists(),
         "the hook must not fire\n{}",
@@ -132,11 +136,42 @@ fn the_flag_refuses_a_shell_hook_before_it_fires() {
     );
 }
 
+/// The exact invocation the `rocky-preview` action makes. The action's
+/// `preview create` registers the branch first, so the test does too.
+#[test]
+fn the_flag_refuses_the_preview_actions_branch_run() {
+    let tmp = project(HOOK);
+    let root = tmp.path();
+    let created = rocky(root, &["branch", "create", "pr_1_x"]);
+    assert!(
+        created.status.success(),
+        "branch create\n{}",
+        show(&created)
+    );
+    let out = rocky(
+        root,
+        &[
+            "run",
+            "--branch",
+            "pr_1_x",
+            "--models",
+            "models",
+            "--refuse-hooks",
+        ],
+    );
+    assert_refused(&out);
+    assert!(
+        !root.join("hook_fired").exists(),
+        "the hook must not fire\n{}",
+        show(&out)
+    );
+}
+
 #[test]
 fn the_flag_refuses_a_webhook() {
     let tmp = project(WEBHOOK);
     let out = rocky(tmp.path(), &["run", "--refuse-hooks"]);
-    assert!(!out.status.success(), "run must be refused\n{}", show(&out));
+    assert_refused(&out);
     assert!(
         !target_exists(tmp.path()),
         "nothing may be written\n{}",
@@ -149,10 +184,15 @@ fn the_flag_refuses_hooks_under_dag() {
     let tmp = project(HOOK);
     let root = tmp.path();
     let out = rocky(root, &["run", "--dag", "--refuse-hooks"]);
-    assert!(!out.status.success(), "run must be refused\n{}", show(&out));
+    assert_refused(&out);
     assert!(
         !root.join("hook_fired").exists(),
         "the hook must not fire\n{}",
+        show(&out)
+    );
+    assert!(
+        !target_exists(root),
+        "nothing may be written\n{}",
         show(&out)
     );
 }

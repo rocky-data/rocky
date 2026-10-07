@@ -33110,6 +33110,61 @@ backend = "local"
         assert!(super::refuse_configured_side_effects(&empty).is_ok());
     }
 
+    /// #2162 red team: the refusal's count must match what
+    /// `HookRegistry::from_config` registers, so the two cannot drift.
+    #[test]
+    fn side_effect_count_matches_the_hook_registry() {
+        use rocky_core::hooks::{
+            HookConfig, HookConfigOrList, HookRegistry, HooksConfig, WebhookConfigOrList,
+        };
+        let shell = || HookConfig {
+            command: "touch fired".to_string(),
+            timeout_ms: 1000,
+            on_failure: Default::default(),
+            env: Default::default(),
+        };
+        let with_hook = |key: &str, h: HookConfigOrList| HooksConfig {
+            webhooks: Default::default(),
+            hooks: [(key.to_string(), h)].into_iter().collect(),
+        };
+        let with_webhook = |key: &str, w: WebhookConfigOrList| HooksConfig {
+            webhooks: [(key.to_string(), w)].into_iter().collect(),
+            hooks: Default::default(),
+        };
+        let webhook: rocky_core::hooks::webhook::WebhookConfig =
+            toml::from_str("url = \"http://127.0.0.1:9/never\"").unwrap();
+        let cases = [
+            with_hook("on_pipeline_start", HookConfigOrList::Single(shell())),
+            with_hook(
+                "on_pipeline_start",
+                HookConfigOrList::Multiple(vec![shell()]),
+            ),
+            with_hook("on_pipeline_start", HookConfigOrList::Multiple(vec![])),
+            with_hook("on_typo_not_an_event", HookConfigOrList::Single(shell())),
+            with_webhook(
+                "on_pipeline_complete",
+                WebhookConfigOrList::Single(webhook.clone()),
+            ),
+            with_webhook(
+                "on_pipeline_complete",
+                WebhookConfigOrList::Multiple(vec![]),
+            ),
+            with_webhook("on_typo_not_an_event", WebhookConfigOrList::Single(webhook)),
+            HooksConfig {
+                webhooks: Default::default(),
+                hooks: Default::default(),
+            },
+        ];
+        for (i, hooks) in cases.iter().enumerate() {
+            let registered = HookRegistry::from_config(hooks).total_hook_count() > 0;
+            assert_eq!(
+                super::configures_side_effects(hooks),
+                registered,
+                "case {i}: the refusal and the registry disagree"
+            );
+        }
+    }
+
     /// Run one governed `execute_models` apply under a fixed gate and return the
     /// `Result` — the shared driver for the extras kill-checks below.
     #[cfg(feature = "duckdb")]

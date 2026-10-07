@@ -217,10 +217,24 @@ runs:
         if [ "$ROCKY_PREVIEW_ALLOW_HOOKS" = "true" ]; then
           RUN_HOOK_ARGS=()
         fi
+        # An engine older than 1.77.0 has no `--refuse-hooks`. Never fall
+        # back to running without it: report the branch run as failed, with
+        # the reason, so the comment says so (fail closed).
+        HOOKS_UNSUPPORTED=""
+        if [ "${#RUN_HOOK_ARGS[@]}" -gt 0 ]; then
+          RUN_HELP="$(rocky run --help 2>/dev/null || true)"
+          case "$RUN_HELP" in
+            *--refuse-hooks*) ;;
+            *) HOOKS_UNSUPPORTED=1 ;;
+          esac
+        fi
         if [ -s "$WORK/create_failed" ] || [ -z "$BRANCH_NAME" ]; then
           echo "preview create did not register a branch" > "$WORK/run_skipped"
         elif [ "$PRUNE_FOR_RUN" = "0" ]; then
           echo "the PR changes no pipeline models" > "$WORK/run_skipped"
+        elif [ -n "$HOOKS_UNSUPPORTED" ]; then
+          echo "this rocky has no \`rocky run --refuse-hooks\`, so the branch run did not start. Set \`rocky_version\` to 1.77.0 or later, or set \`allow_hooks: true\` only for a trusted config." > "$WORK/run.err"
+          echo failed > "$WORK/run_failed"
         # Human-readable output on purpose: nothing reads it back (diff and
         # cost read the recorded run from the state store), and every JSON
         # payload this action does read goes through the normalizer.
