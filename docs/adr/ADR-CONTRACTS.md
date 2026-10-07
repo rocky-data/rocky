@@ -27,7 +27,7 @@ The branch promotion gate (`rocky-cli/src/commands/branch.rs::evaluate_breaking_
 Three defects remain in these surfaces. Each one lets an incompatible change pass in silence.
 
 1. **Nested types are only partly compared (RD-011).** In `type_name_matches`, any inferred `Array(_)` matches a contract that says `Array` *or starts with* `Array<`. So `Array<Int64>` in a contract accepts `Array(String)`. `Map` works the same way. A `Struct` matches only the bare word `Struct`, so a contract cannot state field names or types at all.
-2. **The breaking-change classifier defaults to safe (RD-012).** `is_type_narrowing` ends in `_ => false`. A change it does not list is classified `Info`. So `Int32 → Boolean`, `Date → Int64` and `Decimal → String` are `Info`. The decimal arm compares only `np < op || ns < os`. It misses loss of integer digits: `Decimal(10,2) → Decimal(10,4)` drops from 8 integer digits to 6 and is classified as not narrowing. A change from `Unknown` to a concrete type also falls to `_ => false`. The cross-team `E031` inherits all of this, because `imports_check.rs` reads the same `narrowing` flag.
+2. **The breaking-change classifier is inconsistent (RD-012).** `is_type_narrowing` ends in `_ => false`. A flat change it does not list is classified `Info`. So `Int32 → Boolean`, `Date → Int64` and `Decimal → String` are `Info`. The decimal arm compares only `np < op || ns < os`. It misses loss of integer digits: `Decimal(10,2) → Decimal(10,4)` drops from 8 integer digits to 6 and is classified as not narrowing. A change from `Unknown` to a concrete type also falls to `_ => false`. Nested types go the other way. The arm `(Array(_) | Map(..) | Struct(_) | Variant, _) if !matches!(new, Variant) => true` flags every change away from a nested type as narrowing, even a widening one, so nested types are over-reported today. The cross-team `E031` inherits all of this, because `imports_check.rs` reads the same `narrowing` flag.
 3. **Promotion skips the gate when it cannot compile (RD-013).** `evaluate_breaking_change_gate` returns `Ok(None)` and records `BreakingChangesGateSkipped` when the models directory is missing, when HEAD's `compile::compile` returns `Err`, or when the base cannot be compiled. The caller lets the promote proceed on `None` (doc comment on `run_breaking_change_gate_for_plan`). The gate also never reads `has_errors`. A HEAD that compiles to `Ok` with error diagnostics still gets diffed, and its broken models may type as `Unknown`, which the classifier then treats as safe. The gate compiles with `contracts_dir: None`, so contracts in an explicit directory take no part.
 
 ### What is already closed — do not re-do
@@ -48,18 +48,22 @@ These were fixed in-tree after the audit. They are the base this ADR builds on.
   ─────────                    ─────                        ────────────────
   rocky compile ─┐             rocky run (execute_models)   branch promote / apply
   rocky ci      ─┤ E010-E014   ├ sidecar contract error     ├ breaking-change gate
-  rocky test    ─┤ I003 info   │  excludes the model        │  skips on compile Err
-  lsp / serve   ─┘             ├ --contracts <DIR>          │  or missing base
-                               │  (one selected model)      └ ignores has_errors
+  rocky test    ─┤ I003 info   │  excludes the model and    │  skips on compile Err
+  lsp / serve   ─┘ (sidecar    │  its descendants           │  or missing base
+                   only in LSP)│  (run, pipeline, backfill, └ ignores has_errors
+                               │  --dag, apply)
+                               ├ --contracts <DIR>
+                               │  (one selected model)
                                └ rocky load
                                   validate_contract_typed
                                   refuses before promote
 ```
 
 - **Compile.** `compile.rs` always loads sidecar contracts (`discover_contracts_from_models`) and merges an explicit directory when one is set. `validate_all_contracts` runs every contract.
-- **Run.** In `run.rs::execute_models`, the pre-execution compile includes sidecar contracts. `compile_failed_models` collects every model with an error diagnostic, and those models are excluded from execution and counted toward `tables_failed` (the `has_errors` block). So a sidecar contract error stops that model on this path. The `--contracts <DIR>` route adds explicit-directory contracts for one `full_refresh` model. This draft did not check whether every other write route (`--dag`, `rocky apply`, branch runs) reaches the same exclusion. The published capability matrix says "other run routes do not" check contracts. That sentence may understate sidecar enforcement. It needs a check before this ADR is accepted.
+- **Run.** `run.rs::execute_models_with_explicit_contracts` compiles with sidecar contracts. It collects every model with an error diagnostic (`is_error()`), excludes those models, and blocks their descendants (`compile_error_descendant_blocks`). So a sidecar contract error already stops the write to that model and to everything downstream. This serves the main model run, the pipeline arm and backfill. `--dag` sub-runs (`run_dag_exec.rs`) and `rocky apply` both call `run::run`, so they reach the same path. The explicit `--contracts <DIR>` route adds directory contracts for one selected `full_refresh` model only. That is by design. Branch and shadow routes were not traced. Not verified.
+- **LSP.** `lsp.rs` passes `contracts_dir: None`, but compile still merges sidecar contracts. So sidecar contract diagnostics reach the editor. Contracts in an explicit directory do not.
 - **Load.** `load.rs::load_with_contract_gate` loads into a staging table, runs `validate_contract_typed`, and drops staging without touching the target on failure. `protected_columns` and `allowed_type_changes` are parsed but only reported as warnings, because a load has no prior target snapshot.
-- **Dead code.** `rocky-core/src/contracts.rs::validate_contract` (the untyped, string-equality variant) has no caller outside its own tests.
+- **Dead code.** `rocky-core/src/contracts.rs::validate_contract` (the untyped, string-equality variant) has no production caller. It is `pub` in a `pub mod`, so it is public API of `rocky-core`. (`rocky-compiler` has its own, separate `validate_contract`, which is live.)
 
 ### Nullability today
 
@@ -127,11 +131,11 @@ What an unverified type *does* to the exit code at each gate is open. See Open q
 | Write (`rocky run`, `rocky load`) | **The guarantee** | A contract error stops the write to that table before the warehouse is touched. |
 | Review / release (branch promote, `rocky apply` of a promote plan) | Change control | Classify the change (§6). Refuse when the comparison cannot run (§7). |
 
-The guarantee holds only where a write is gated. Every user-facing page names the routes that gate a write and the routes that do not. Which routes must be gated is Open question D.
+The guarantee holds only where a write is gated. Sidecar contracts already gate the main run, pipeline, backfill, `--dag` and `apply` routes, including descendants. The known gaps are the explicit `--contracts <DIR>` (model-only by design) and `rocky load` for directory contracts. Branch and shadow routes are not verified. Every user-facing page names the routes that gate a write and the routes that do not. See Open question D.
 
 ### 6. Classifying a type or contract change
 
-**Type changes on a column (`breaking_change.rs`).** `is_type_narrowing` becomes an exhaustive table over `(RockyType, RockyType)` pairs with no default arm. Any pair not proven safe is breaking. In particular:
+**Type changes on a column (`breaking_change.rs`).** `is_type_narrowing` becomes an exhaustive table over `(RockyType, RockyType)` pairs with no default arm. Any pair not proven safe is breaking. The blanket arm that flags every nested change as narrowing is removed. The recursive comparison below replaces it, so a nested widening is no longer flagged. In particular:
 
 - Decimal compares integer digits (`precision - scale`) and scale separately. Losing either is breaking.
 - `Unknown` on either side is **not** `Info`. It is reported as unverified, and a gate treats it as breaking until resolved.
@@ -165,7 +169,7 @@ The breaking-change gate refuses a promote, instead of skipping, when:
 
 The gate compiles with the project's contracts, including an explicit contracts directory, not `contracts_dir: None`.
 
-The one exception is an explicit break-glass approval. It must be separately authorized, and it records the compiler failure text and both commit identities (base and HEAD) in the audit trail. A `BreakingChangesGateSkipped` event stops being a silent pass and becomes the record of that approval. The approval mechanism and who may grant it belong to ADR-TRUST.
+A break-glass exception may exist. If it does, it records the compiler failure text and both commit identities (base and HEAD) in the audit trail. A `BreakingChangesGateSkipped` event stops being a silent pass. Whether to have one, and who may grant it, is Open question E.
 
 ---
 
@@ -196,12 +200,26 @@ Today they are parsed, never enforced, and reported as warnings. A parsed-and-ig
 
 **Recommendation: Option 1 if the target schema is already read on that path; otherwise Option 2.** Keeping a warning-only field is not an option.
 
-**D. Which write routes must enforce a contract?**
+**D. Close the two known gaps in write enforcement?**
 
-- *Option 1 — every route that materializes a contracted table* (`rocky run` in all modes, `--dag`, `rocky apply`, branch runs, `rocky load`). The guarantee then means what it says.
-- *Option 2 — status quo, documented.* Sidecar contracts on the `execute_models` path, plus the opt-in `--contracts` route. Every other route is listed as unguarded.
+Sidecar contracts already gate the main run, pipeline, backfill, `--dag` and `apply` routes (see Context). The gaps:
 
-**Recommendation: Option 1, delivered in stages, with the docs listing the unguarded routes until each lands.** First establish which routes already reach the `execute_models` exclusion (see Context).
+- Explicit `--contracts <DIR>` checks one selected `full_refresh` model only. This is by design (#2182).
+- `rocky load` checks the load contract, not a model contract in a directory.
+- Branch and shadow routes are not verified.
+
+*Option 1 — close the gaps.* Trace the branch and shadow routes. Decide whether a directory contract should gate all selected models. *Option 2 — document them* as unguarded.
+
+**Recommendation: trace the branch and shadow routes first, then choose.** Do not state they are guarded or unguarded until traced.
+
+**E. Break-glass for a refused promote.**
+
+Who may approve a promote the gate refused, and how, depends on a trust ADR (ADR-TRUST) that does not exist yet.
+
+- *Option 1 — no break-glass.* A refused promote stays refused until the cause is fixed.
+- *Option 2 — break-glass after ADR-TRUST lands.* Until then, Option 1 applies.
+
+**Recommendation: Option 2.** Ship fail-closed first. Add the exception when its authorisation is defined.
 
 ---
 
@@ -210,17 +228,17 @@ Today they are parsed, never enforced, and reported as warnings. A parsed-and-ig
 ### What changes
 
 - `rocky-compiler/src/contracts.rs`: a recursive type parser and comparison replace the prefix match in `type_name_matches`. Contract structs reject unknown keys.
-- `rocky-core/src/breaking_change.rs`: `is_type_narrowing` becomes an exhaustive, default-breaking table. Nullability severities change as §6 says. Contracted columns are classified more strictly. **Prerequisite:** `diff_project_ir` sees only two `ProjectIr`s of `TypedColumn`s and does not know which columns are contracted. The classifier must be handed the contract set (contracted column names per model). Today nothing passes it.
+- `rocky-core/src/breaking_change.rs`: `is_type_narrowing` becomes an exhaustive, default-breaking table. Nullability severities change as §6 says. Contracted columns are classified more strictly. **Open prerequisite, no owner yet:** `diff_project_ir` sees only two `ProjectIr`s of `TypedColumn`s and does not know which columns are contracted. The classifier must be handed the contract set (contracted column names per model). Today nothing passes it. Someone must decide where that set comes from and own the work. Until then the contracted-column rules in §6 cannot be built.
 - `rocky-cli/src/commands/branch.rs`: `evaluate_breaking_change_gate` refuses where it skips today, reads `has_errors`, and compiles with contracts.
 - A new contract-to-contract diff at CI and promote.
-- `rocky-core/src/contracts.rs::validate_contract` (untyped, no production caller) is deleted.
+- `rocky-core/src/contracts.rs::validate_contract` (untyped, no production caller) is deleted. It is `pub` API of `rocky-core`, so this is a **breaking public change**. It needs a changelog entry.
 
 ### Deliberate behaviour changes (call these out for sign-off)
 
 1. Contracts that say `Array<T>` or `Map<K,V>` with the wrong `T`, `K` or `V` start failing with `E011`.
 2. A contract with a misspelled key stops parsing.
 3. Type changes that were `Info` become breaking. Promotes and imports that passed before can now be blocked.
-4. A promote with a type-invalid HEAD or an unavailable base is refused unless break-glass is used.
+4. A promote with a type-invalid HEAD or an unavailable base is refused. Whether any override exists is Open question E.
 
 ### Migration and compatibility
 
@@ -235,13 +253,13 @@ Today they are parsed, never enforced, and reported as warnings. A parsed-and-ig
   - **RD-010 and decimal inference.** Wrong decimal precision or scale from inference is ADR-TYPES. A contract can only be as right as the type it is handed.
   - **The unmerged WP-03 decimal-inference work.** ADR-TYPES decides whether to open or archive it. Part of its load-gate `Unknown` work may already be covered on `main` by #1721; that needs checking when ADR-TYPES is written.
   - **The rest of WP-04.** Per-model check identity, missing verification evidence, durable policy audit writes, and the hostile-agent boundary are not contract semantics. This ADR gives them a stable contract and classifier to build on.
-  - **Who may approve a break-glass promote.** ADR-TRUST.
+  - **Who may approve a break-glass promote.** Open question E, which depends on ADR-TRUST (not yet written).
 
 ### What it unblocks
 
 - **Recursive contract compatibility (RD-011).** The comparison rules and the `Unknown` policy are fixed, so the compiler work can start.
 - **Exhaustive breaking classification (RD-012).** The default-breaking rule and the nullability directions are fixed, so the table can be written and tested pair by pair.
-- **Fail-closed promotion (RD-013).** The refuse-not-skip rule and the break-glass record are fixed. The approval mechanism waits on ADR-TRUST.
+- **Fail-closed promotion (RD-013).** The refuse-not-skip rule is fixed. Any break-glass waits on Open question E.
 - **Governance semantics (WP-04).** WP-04 requires that missing or uncompilable evidence never produces a normal approval or promotion. §3, §6 and §7 define what "evidence" means for a contract.
 
 ---
@@ -252,7 +270,7 @@ Today they are parsed, never enforced, and reported as warnings. A parsed-and-ig
 |---|---|
 | **Keep prefix matching for nested types** (status quo) | `Array<Int64>` accepts `Array(String)`. A contract that names a type it does not check is worse than one that names nothing. This *is* RD-011. |
 | **Make `Unknown` a match again** (`is_assignable` semantics at the gate) | Reopens #1240 and #1721. "Rocky could not tell" is not evidence the data conforms. |
-| **Keep `_ => false` in `is_type_narrowing`** to avoid over-alarming | A default-safe classifier hides exactly the changes nobody thought of. Over-reporting is visible and fixable; under-reporting ships a break. Matches the cross-team `SELECT *` rule, which already over-reports by design. |
+| **Keep `_ => false` in `is_type_narrowing`** to avoid over-alarming | A default-safe classifier hides exactly the changes nobody thought of. Over-reporting is visible and fixable; under-reporting ships a break. Matches the cross-team `SELECT *` rule, which already over-reports by design. (Nested types already over-report today; the recursive comparison makes that precise.) |
 | **Semantic version field inside each contract file** | Authors would have to bump it by hand, and a forgotten bump is a silent break. A diff of old versus new at review time needs no author action. Revisit at 2.0 if contracts are published outside a repository. |
 | **Classify nullability from one side only** | Each direction breaks a different party (readers or data at rest). Picking one hides the other. |
 | **Skip the promote gate when HEAD fails to compile, but record it** (status quo) | The audit event records the skip, and the promote proceeds anyway. The change that most needs review gets none. |
@@ -287,9 +305,10 @@ Every assertion must fail with the fix reverted (`scripts/mutation-check.sh`, pe
 - Both nullability directions on a contracted column ⇒ breaking.
 - Contract diff: each weakening in §6 ⇒ breaking; each strengthening ⇒ compatible.
 - Cross-team: `E031` fires for a pair that was `_ => false` before.
+- Nested: `Array(Int32) -> Array(Int64)` (widening) is not narrowing, and `Array(Int64) -> Array(Int32)` is. Today both are flagged by the blanket nested arm.
 
 **Promotion (§7)**
 - HEAD `compile` returns `Err` ⇒ refused. HEAD returns `Ok` with an error diagnostic ⇒ refused.
 - Missing models directory, missing base ref, base that fails to compile ⇒ each refused.
-- The same cases with a valid break-glass approval ⇒ proceed, and the audit record holds the compiler failure and both commit identities.
+- If Open question E adopts a break-glass: the same cases with a valid approval ⇒ proceed, and the audit record holds the compiler failure and both commit identities.
 - A contract in an explicit contracts directory participates in the gate.
