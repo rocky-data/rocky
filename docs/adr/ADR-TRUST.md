@@ -58,14 +58,18 @@ Two defects follow from this table:
 
 ### What bypasses exist today
 
-`rocky branch promote` already has four ways past a gate. None needs any authority beyond running the command.
+`rocky branch promote` and `rocky plan promote` already have three ways past a gate that a user can invoke. None needs any authority beyond running the command. A fourth path is not a user bypass: it is a defect in the gate (see the table).
 
 | Bypass | Where | Recorded as |
 |---|---|---|
 | `--skip-approval` | `main.rs`, `Command::Branch` promote args | `AuditEventKind::ApprovalSkipped` |
 | `ROCKY_BRANCH_APPROVAL_SKIP` | `branch.rs::APPROVAL_SKIP_ENV` | `ApprovalSkipped`, with the env value as reason |
 | `--allow-breaking` | `main.rs`, promote args | `BreakingChangesAllowed` |
-| Gate could not run (fail open) | `branch.rs::run_breaking_change_gate_for_plan` | `BreakingChangesGateSkipped` |
+| Not user-invokable: the breaking-change gate could not run and the promote proceeds (fail open) | `branch.rs::run_breaking_change_gate_for_plan` | `BreakingChangesGateSkipped` |
+
+`--allow-breaking` is also a flag on `rocky plan promote` (`main.rs`, `PlanSubcommand::Promote`). `--skip-approval` is only on `rocky branch promote`.
+
+The gate order on a promote is: (1) the branch approval gate (`run_approval_gate`), then (2) the breaking-change gate (`run_breaking_change_gate_for_plan`). Both run at plan time, inside `build_promote_plan_inner`, before the plan is written. (3) The agent-policy gate (`gate_promote_plan`) runs at apply time. Bare `rocky branch promote` runs all three in one command. `rocky apply <promote-plan>` runs only the policy gate. It does not re-run the approval or breaking gate.
 
 The `AuditEvent` doc (`output.rs`) says these are "routed to stdout JSON only in v1; persistent audit storage is a follow-up". So an override leaves no durable record.
 
@@ -136,7 +140,7 @@ An approval is valid only when **all** of these hold. Each failure is a distinct
 1. The signature verifies against a key in the identity root (`bad_signature`).
 2. The key is not revoked (`revoked_key`, with the key id).
 3. The signed digest equals the current content digest (`state_hash_mismatch`, as today).
-4. The approval is not expired, and not dated in the future (`expired`, as today). Plan review markers gain an expiry; today they have none.
+4. The approval is not expired, and not dated in the future (`expired`, as today). Plan review markers and product approvals gain an expiry; today they have none (Open question G).
 5. The signer is allowed for this gate (`signer_not_allowed`). `allowed_signers` lists key ids and OIDC subjects, not emails.
 6. **The signer is not the author** (`self_approval`) when the plan is agent-authored (by class or by kind). A worker never holds a key, so it cannot sign at all. This rule also stops an agent with an OIDC identity from approving its own plan.
 7. **For an agent-authored plan, the signer is human class with a verified id.** An agent OIDC identity may approve only where policy names it.
@@ -158,7 +162,12 @@ Ruled 2026-10-07: a bad or missing signature **refuses**. A warning on an author
 The one exception is a **migration window for existing blake3 approvals**:
 
 - Default: refuse. A project opts in to the window with an explicit setting (for example `[trust] legacy_blake3 = "warn"`).
-- In the window, a valid blake3 branch approval or an unsigned review marker is accepted with a warning that names it. Each one leaves the window when it is re-signed. `rocky review --approve`, `rocky branch approve` and `rocky product approve` gain a re-sign path.
+- Review markers and product approvals carry **no signature at all today**. A review marker is a parsed file. A product approval is a ledger row with a free-text approver. Accepting one during the window is a **missing-signature** case, and the window covers it. It is not a bad-signature case.
+- The legacy format the window accepts, per kind:
+  - **Branch approval:** a record whose blake3 canonical-JSON signature verifies (`Blake3CanonicalJson`).
+  - **Plan review marker:** an unsigned `.reviewed.json` that parses and names the plan (the check in `review_marker_state`).
+  - **Product approval:** no legacy signed format exists. The window accepts an existing unsigned ledger row that matches the snapshot digest. A product approval written after the upgrade is signed.
+- In the window, a legacy item of those three kinds is accepted with a warning that names it. Each one leaves the window when it is re-signed. `rocky review --approve`, `rocky branch approve` and `rocky product approve` gain a re-sign path.
 - The window never covers a new approval. Every approval written after the upgrade is signed.
 - The setting is removed at a set release. See Open question C.
 
@@ -169,7 +178,7 @@ How big the window is, stated plainly. Branch approvals expire after 24 hours by
 RD-035 asks to keep signed approvals outside the agent-writable checkout. With signatures, the location of the **record** no longer decides integrity: a forged record fails rule 1 without the key. What must stay outside the worker's reach is the **private key**. So:
 
 - Approval records stay in `.rocky/` and in the ledger.
-- `approvals_dir_for_branch` resolves against the project root, not the working directory.
+- `approvals_dir_for_branch` resolves against the project root, not the working directory. This is Open question J.
 - The ruling of 2026-09-17 on `.rocky/plans/` (a trusted input, #1943) stands. Signing adds attribution and tamper evidence. It does not add containment. See Open question F.
 
 ### 3. Trust boundaries
@@ -192,7 +201,7 @@ Three parties act on a project. Each has a fixed set of things it may write.
 **The worker** (an agent process under `rocky mcp --profile worker`, or the subprocess the fulfillment driver runs):
 
 - May write: its task outbox, and `models/<model>.sql` and `.toml` through `draft_model`.
-- May read: the grounding tools on the worker allowlist, and the governance state **read-only**. Governance state means policy decision rows, approvals, product approval records and fulfillment records. A worker tool never writes them. A cache (for example the schema cache that `compile` may use through `state_path()`) is not governance state and may stay writable. Which allowlisted tools write the ledger today, and which tables, was not traced. The implementing change traces each one and adds a test per tool.
+- May read: the grounding tools on the worker allowlist, and the governance state **read-only**. Governance state means policy decision rows, approvals, product approval records and fulfillment records. A worker tool never writes them. A cache (for example the schema cache that `compile` may use through `state_path()`) is not governance state and may stay writable. A trace of the worker allowlist (`tools.rs::WORKER_PROFILE_TOOLS`, twelve tools) found no worker tool that writes governance state today. The only ledger write-open in `tools.rs` (`StateStore::open`) is in `pause_schedule`, which is not on the worker list. PR #2289 changes the draft tools, and it must keep the worker read-only for state. The implementing change adds a test per tool so a thirteenth tool cannot write it by accident.
 - Never holds: a signing key, warehouse write credentials, an OIDC token that can approve.
 - Never reaches: approve, propose, schedule, or any tool not on the allowlist (unchanged).
 
@@ -211,7 +220,7 @@ Three parties act on a project. Each has a fixed set of things it may write.
 
 ### 4. Break-glass
 
-Break-glass is a signed approval that overrides one refused gate. It answers ADR-CONTRACTS Open question E with that ADR's Option 2: the gate ships fail-closed first, and this mechanism is the only exception.
+Break-glass is a signed approval that overrides one refused gate. It answers ADR-CONTRACTS Open question E with that ADR's Option 2: the gate ships fail-closed first. ADR-CONTRACTS §7 refuses a promote when the comparison cannot run. Break-glass is the only exception to that refusal.
 
 **Who may break glass.** A human-class principal with a verified id that is listed in a separate `break_glass_signers` set in the identity root. Never an agent class. Never the worker profile. Never an unverified id. A CI OIDC identity may not break glass.
 
@@ -227,14 +236,18 @@ Break-glass is a signed approval that overrides one refused gate. It answers ADR
 
 **How it is recorded.** The break-glass record holds: the signer, the gate, the refusal reason text the gate printed, the content digest, the base and head commit ids, and the time. Rocky writes it to the durable state ledger **before** the action runs. If that write fails, the action fails. The stdout-only `AuditEvent` is not a record.
 
-**Lifetime.** Single use (bound to one digest) and short-lived. The default expiry is one hour.
+**Lifetime.** Single use (bound to one digest) and short-lived. The default expiry is one hour (Open question L).
 
-**What it replaces.** `--skip-approval`, `ROCKY_BRANCH_APPROVAL_SKIP` and `--allow-breaking` are removed. The fail-open `BreakingChangesGateSkipped` path becomes a refusal (ADR-CONTRACTS §7). Before 2.0 there is no compatibility shim. Each removal gets a changelog entry that names the break-glass command that replaces it.
+**What it replaces.** `--skip-approval`, `ROCKY_BRANCH_APPROVAL_SKIP` and `--allow-breaking` are removed. The fail-open `BreakingChangesGateSkipped` path becomes a refusal (ADR-CONTRACTS §7). Before 2.0 there is no compatibility shim. Each removal gets a changelog entry that names the break-glass command that replaces it. The full list of surfaces is in Consequences.
+
+**Landing order.** The removal must not land first. Signing keys, the identity root and break-glass ship, and are usable on a one-maintainer repository, **before** the flags are removed. Otherwise a sole maintainer has no way to promote a refused change. Order: (1) keys and identity root, (2) signed approvals, (3) break-glass, (4) remove the flags.
+
+**Where break-glass binds.** The approval and breaking gates run at plan time (see the gate order above). So a break-glass binds at **plan time**, when `rocky branch promote` or `rocky plan promote` builds the plan. The record names the plan's content digest. Apply of the replayed plan runs only the policy gate. Break-glass never bypasses a policy `deny`. Whether apply should re-verify the break-glass record, and the approval, against a branch that changed after planning is Open question K.
 
 ### 5. Already ruled, recorded here
 
 - **A `Run` capability** (ruled 2026-10-06): deferred, because no trigger tool exists. When one is built, it is a new `PolicyCapability::Run` variant, never a reuse of `Apply`. A test that "a deny must deny a trigger" lands first. The trust model above applies to it unchanged.
-- **An empty touched set** (ruled 2026-10-06): `PolicyGate::Allow` on an empty set is correct for a plan apply. Only an apply-shaped caller may reach it. On `main` as of this draft, `apply.rs` returns `Err(PolicyGate::Allow)` for an empty `touched` set with no check on the caller's shape. The ruled guard is not present at that site.
+- **An empty touched set** (ruled 2026-10-06): `PolicyGate::Allow` on an empty set is correct for a plan apply. Only an apply-shaped caller may reach it. PR #2289 adds an `EmptyTouched` guard: fail-closed, and opt-in per caller. That PR is the home of the ruled guard. This ADR does not restate the state of `main`.
 
 ---
 
@@ -291,6 +304,56 @@ The 2026-10-04 ruling requires OIDC for *agent* approvals, and labels local keys
 
 **Recommendation: Option 1.** A worker that can write a plan can also write models and config. Signing does not change that. An OS sandbox would.
 
+**Open question for ratification: G. Do review markers and product approvals expire?**
+
+Today neither expires. Rule 4 in §2.2 assumes they will.
+
+- *Option 1 — expire both, with a configurable age.* A stale approval stops counting.
+- *Option 2 — no expiry.* The digest binding already voids an approval when the content changes.
+
+**Recommendation: Option 1,** with a long default (for example 7 days for review markers). An approval that never ends is a standing credential.
+
+**Open question for ratification: H. Can a sole maintainer satisfy `min_approvers = 1` on their own plan?**
+
+- *Option 1 — yes for human-authored plans.* This matches Open question D, Option 2.
+- *Option 2 — no.* A one-maintainer repository then needs break-glass for every promote.
+
+**Recommendation: Option 1.** Rule 6 binds only agent-authored plans. A solo maintainer signs their own human-authored plan with a local key, labelled weaker.
+
+**Open question for ratification: I. What is the `allowed_signers` default when unset?**
+
+- *Option 1 — every key in the identity root may sign.*
+- *Option 2 — no one may sign until the list is set.* Safer, but an upgrade silently blocks approvals.
+
+**Recommendation: Option 1,** and `rocky doctor` warns when the list is unset and the root holds more than one key.
+
+**Open question for ratification: J. Move `approvals_dir_for_branch` to the project root?**
+
+Today it resolves against the working directory. Running from a subdirectory finds a different, empty approvals directory.
+
+- *Option 1 — resolve against the project root.* One location.
+- *Option 2 — keep the working directory.*
+
+**Recommendation: Option 1.** Migration note: on first run, if records exist at the old working-directory path and not at the root, Rocky refuses with a message that names the old path and the move command. It does not read both silently.
+
+**Open question for ratification: K. Does apply re-verify approval and break-glass for a replayed promote plan?**
+
+Apply of a promote plan runs only the policy gate today. Approval and breaking gates ran at plan time (traced in `apply.rs::run_apply_promote_plan` and `branch.rs`). It is not settled whether the branch can change between plan and apply in a way the plan digest does not cover.
+
+- *Option 1 — bind at plan time only.* Matches today.
+- *Option 2 — re-check the signature, expiry and revocation at apply.*
+
+**Recommendation: Option 2** for expiry and revocation (cheap, and a revoked key must stop working). Content checks stay at plan time.
+
+**Open question for ratification: L. Break-glass expiry of one hour.**
+
+The one-hour default in §4 is a guess. A break-glass is bound to a digest, so a short life is cheap.
+
+- *Option 1 — one hour, configurable.*
+- *Option 2 — no expiry; single use only.*
+
+**Recommendation: Option 1.** A signed override with no end is a standing credential.
+
 ---
 
 ## Consequences
@@ -301,7 +364,15 @@ The 2026-10-04 ruling requires OIDC for *agent* approvals, and labels local keys
 - `rocky-cli/src/plan_store.rs`: `PersistedPlan` gains an author `PrincipalRef`.
 - `rocky-cli/src/commands/branch.rs`, `review.rs`, `product.rs`: one approval model with a detached Ed25519 signature. `evaluate_artifact` gains the rules in §2.2. `min_approvers` counts distinct signers. `approvals_dir_for_branch` resolves against the project root.
 - `rocky-cli/src/output.rs`: a new `SignatureAlgorithm` variant. `ApproverSource::CiOidc` is emitted. New `RejectedApproval` reasons. A break-glass record type.
-- `--skip-approval`, `ROCKY_BRANCH_APPROVAL_SKIP` and `--allow-breaking` are removed (breaking CLI change).
+- **Breaking change across CLI, SDK and schema:** `--skip-approval`, `ROCKY_BRANCH_APPROVAL_SKIP` and `--allow-breaking` are removed. They reach more than `rocky branch promote`. Every surface:
+  - CLI: `rocky branch promote` (`--skip-approval`, `--allow-breaking`, the env var) and `rocky plan promote` (`--allow-breaking`), both in `engine/rocky/src/main.rs`. Also `PromotePlan.allow_breaking` in `plan.rs` and `apply.rs`, and `breaking_change.rs`.
+  - Python SDK: `skip_approval` and `allow_breaking` in `sdk/python/src/rocky_sdk/client.py`, and its tests.
+  - Dagster: `integrations/dagster/src/dagster_rocky/resource.py`, its tests and its changelog.
+  - Generated schemas and bindings: `schemas/branch_promote.schema.json`, `schemas/plan_promote.schema.json`, the matching Pydantic files in `sdk/python/src/rocky_sdk/types_generated/`, the TypeScript files in `editors/vscode/src/types/generated/`, and `docs/public/openapi.json`.
+  - Docs: `docs/src/content/docs/guides/ci-cd.md` (recommends the flag), `concepts/architecture-of-trust.md`, `reference/commands/core-pipeline.md`, `engine/README.md`, `engine/CHANGELOG.md`.
+  - Examples: the POC `examples/playground/pocs/06-developer-experience/15-semantic-breaking-change-gate/` (`run.sh` asserts the flag; its README) and `examples/playground/README.md`.
+  - Tests: `engine/rocky/tests/promote_breaking_block_stdout.rs`.
+  - Landing order is in §4: break-glass ships first.
 - `rocky-mcp`: the worker profile opens the ledger read-only.
 - `editors/vscode`: a workspace-trust gate and redacted argv logging.
 - A direct Ed25519 dependency. `ring` is in `Cargo.lock` only as a transitive dependency today.
