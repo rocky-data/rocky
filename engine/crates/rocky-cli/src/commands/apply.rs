@@ -1762,6 +1762,99 @@ async fn commit_governed_rule_decision(
     .await
 }
 
+/// Evaluate the agent-policy gate and make its decision rows durable on the
+/// remote `[state]` ledger in the same step (#2282).
+///
+/// A gate that records into the LOCAL file and returns leaves the row exposed:
+/// the next `download_state` (the loop's propose, an apply's pre-gate sync, a
+/// `rocky run` start) replaces the replicated `policy_decisions` table from
+/// remote, and a row that was never uploaded is gone before review, custody or
+/// the brief can read it. Under a remote backend with a `[policy]` block and a
+/// non-empty `touched` set this therefore runs through a
+/// [`rocky_core::state_sync::LedgerSeamSession`], like
+/// [`commit_governed_rule_decision`]: each attempt downloads the remote winner,
+/// evaluates the gate over that fresh ledger (and a fresh freeze-marker LIST),
+/// records its rows into the fresh store, and publishes. A concurrent writer
+/// that wins the compare-and-swap is never overwritten: the whole evaluation
+/// is replayed on the winner (three attempts, then a typed
+/// `LedgerSeamConflict`).
+///
+/// Unlike the apply seam, EVERY verdict is published, `Deny` and
+/// `RequireReview` included: a refused draft or propose still owes the audit
+/// ledger its row. Fail-closed: a download or publish failure is an `Err`.
+///
+/// Otherwise (Local backend, no `[policy]`, empty `touched`) the gate cannot
+/// reach a remote ledger and runs once over the local file with the hoisted
+/// `marker_freezes`, exactly as before.
+#[allow(clippy::too_many_arguments)]
+pub async fn evaluate_apply_policy_durable(
+    cfg: &rocky_core::config::RockyConfig,
+    plan_id: &str,
+    principal: PolicyPrincipal,
+    actor: &PrincipalRef,
+    touched: &BTreeMap<String, PolicyCapability>,
+    models_dir: &Path,
+    state_path: &Path,
+    marker_freezes: &[rocky_core::freeze_marker::ActiveMarkerFreeze],
+    prior_classifications: Option<&BTreeMap<String, Vec<String>>>,
+) -> Result<PolicyGate> {
+    if remote_state_backend_for_gate(cfg, touched).is_none() {
+        return Ok(evaluate_apply_policy_with_policy_matching_dual(
+            cfg.policy.as_ref(),
+            plan_id,
+            principal,
+            actor,
+            touched,
+            models_dir,
+            None,
+            GateLedger::Path(state_path),
+            marker_freezes,
+            prior_classifications,
+            GateSubjects::CompiledModels,
+        ));
+    }
+    // The attempt future must OWN everything it touches (the session's
+    // `for<'a>` bound); each attempt clones what its future needs.
+    let seam_cfg = cfg.clone();
+    let seam_plan_id = plan_id.to_string();
+    let seam_touched = touched.clone();
+    let seam_models_dir = models_dir.to_path_buf();
+    let seam_actor = actor.clone();
+    let seam_prior = prior_classifications.cloned();
+    commit_remote_ledger_seam(
+        cfg,
+        state_path,
+        "the policy gate decision",
+        move |fresh_store, _fresh_base| {
+            let cfg = seam_cfg.clone();
+            let plan_id = seam_plan_id.clone();
+            let touched = seam_touched.clone();
+            let models_dir = seam_models_dir.clone();
+            let actor = seam_actor.clone();
+            let prior = seam_prior.clone();
+            Box::pin(async move {
+                let marker_freezes = marker_freezes_before_gate(&cfg, &touched)
+                    .await
+                    .map_err(|e| seam_transition_error(&e))?;
+                Ok(evaluate_apply_policy_with_policy_matching_dual(
+                    cfg.policy.as_ref(),
+                    &plan_id,
+                    principal,
+                    &actor,
+                    &touched,
+                    &models_dir,
+                    None,
+                    GateLedger::Store(fresh_store),
+                    &marker_freezes,
+                    prior.as_ref(),
+                    GateSubjects::CompiledModels,
+                ))
+            })
+        },
+    )
+    .await
+}
+
 /// Finding 3 (post-verify half), migrated to the ledger seam (#1242): make the
 /// verify-after custody row durable on the remote ledger.
 ///
@@ -12731,5 +12824,180 @@ autonomy_budget = { failures = 1, window = "7d" }
                 .all(|d| d.plan_id != "plan-x"),
             "nothing of the losing seam may be published"
         );
+    }
+
+    const PROPOSE_RULE: &str = r#"
+[[policy.rules]]
+principal = "agent"
+capability = "propose"
+scope = { any = true }
+effect = "allow"
+"#;
+
+    const DRAFT_PLAN_ID: &str = "draft:orders";
+
+    fn propose_touched() -> BTreeMap<String, PolicyCapability> {
+        let mut t = BTreeMap::new();
+        t.insert("orders".to_string(), PolicyCapability::Propose);
+        t
+    }
+
+    async fn durable_draft_gate(
+        cfg: &rocky_core::config::RockyConfig,
+        root: &Path,
+        state_path: &Path,
+    ) -> super::PolicyGate {
+        super::evaluate_apply_policy_durable(
+            cfg,
+            DRAFT_PLAN_ID,
+            PolicyPrincipal::Agent,
+            &rocky_core::config::PrincipalRef::unnamed(),
+            &propose_touched(),
+            &root.join("models"),
+            state_path,
+            &[],
+            None,
+        )
+        .await
+        .expect("the gate decision must publish")
+    }
+
+    fn draft_rows(rows: &[PolicyDecisionRecord]) -> Vec<&PolicyDecisionRecord> {
+        rows.iter().filter(|d| d.plan_id == DRAFT_PLAN_ID).collect()
+    }
+
+    /// #2282: a worker's `draft_model` decision survives the loop's next
+    /// `download_state` (the one `propose` runs before its gate). The local
+    /// file is replaced by the remote blob on that download, so the row has
+    /// to be on the remote first. Under the old local-only write the row was
+    /// gone after the download.
+    #[tokio::test]
+    async fn a_draft_decision_survives_the_next_download() {
+        let _serial = rocky_core::state_sync::remote_testing::serial_guard();
+        let harness = CrossPodHarness::new_s3_like();
+        let root = tempfile::tempdir().unwrap();
+        let cfg = cas_config(root.path(), PROPOSE_RULE);
+
+        publish_winner(&harness.pod_b, |_| {}).await;
+        let gate = durable_draft_gate(&cfg, root.path(), &harness.pod_b.state_path).await;
+        assert!(matches!(gate, super::PolicyGate::Allow), "got {gate:?}");
+
+        // What `propose_governed_run_plan` does next.
+        let _authority = rocky_core::state_sync::download_state(
+            &harness.pod_b.cfg,
+            &harness.pod_b.state_path,
+            false,
+        )
+        .await
+        .unwrap();
+        let after = StateStore::open(&harness.pod_b.state_path).unwrap();
+        let rows = after.list_policy_decisions().unwrap();
+        assert_eq!(
+            draft_rows(&rows).len(),
+            1,
+            "the draft decision must survive the download: {rows:?}"
+        );
+    }
+
+    /// A denied draft still owes the ledger its row: every verdict publishes.
+    #[tokio::test]
+    async fn a_denied_draft_decision_is_published_too() {
+        let _serial = rocky_core::state_sync::remote_testing::serial_guard();
+        let harness = CrossPodHarness::new_s3_like();
+        let root = tempfile::tempdir().unwrap();
+        let cfg = cas_config(
+            root.path(),
+            "\n[[policy.rules]]\nprincipal = \"agent\"\ncapability = \"propose\"\n\
+             scope = { any = true }\neffect = \"deny\"\n",
+        );
+
+        publish_winner(&harness.pod_b, |_| {}).await;
+        let gate = durable_draft_gate(&cfg, root.path(), &harness.pod_b.state_path).await;
+        assert!(
+            matches!(gate, super::PolicyGate::Deny { .. }),
+            "got {gate:?}"
+        );
+
+        let remote = published(&harness).await;
+        let rows = remote.list_policy_decisions().unwrap();
+        let mine = draft_rows(&rows);
+        assert_eq!(mine.len(), 1, "{rows:?}");
+        assert_eq!(mine[0].effect, PolicyEffect::Deny);
+    }
+
+    /// A concurrent writer wins the compare-and-swap twice: the draft decision
+    /// is replayed on the winner, lands exactly once, and the winner's own
+    /// rows and tables survive. The seam never falls back to an
+    /// unconditional put.
+    #[tokio::test]
+    async fn a_draft_decision_replays_onto_a_concurrent_winner() {
+        let _serial = rocky_core::state_sync::remote_testing::serial_guard();
+        let harness = CrossPodHarness::new_s3_like();
+        let root = tempfile::tempdir().unwrap();
+        let cfg = cas_config(root.path(), PROPOSE_RULE);
+
+        publish_winner(&harness.pod_b, |_| {}).await;
+        publish_winner(&harness.pod_a, |store| {
+            winner_watermark(store);
+            store
+                .record_policy_decision(&row("other-plan", Some(0), &[], PolicyEffect::Allow))
+                .unwrap();
+        })
+        .await;
+        let key = state_key();
+        let updates = harness.faults.put_count(&key, PutKind::Update);
+        let unconditional = harness.faults.put_count(&key, PutKind::Unconditional);
+        harness.faults.arm_precondition_failures(&key, 2);
+
+        durable_draft_gate(&cfg, root.path(), &harness.pod_b.state_path).await;
+
+        assert_eq!(harness.faults.put_count(&key, PutKind::Update) - updates, 3);
+        assert_eq!(
+            harness.faults.put_count(&key, PutKind::Unconditional) - unconditional,
+            0
+        );
+        let remote = published(&harness).await;
+        assert!(remote.get_watermark(WINNER_KEY).unwrap().is_some());
+        let rows = remote.list_policy_decisions().unwrap();
+        assert_eq!(
+            draft_rows(&rows).len(),
+            1,
+            "exactly one draft row: {rows:?}"
+        );
+        assert_eq!(
+            rows.iter().filter(|d| d.plan_id == "other-plan").count(),
+            1,
+            "the winner's row must survive: {rows:?}"
+        );
+    }
+
+    /// Fail-closed: when every attempt conflicts the gate returns an error
+    /// (the draft tool rolls the draft back) and the remote winner is kept.
+    #[tokio::test]
+    async fn a_draft_decision_fails_closed_when_the_ledger_cannot_be_published() {
+        let _serial = rocky_core::state_sync::remote_testing::serial_guard();
+        let harness = CrossPodHarness::new_s3_like();
+        let root = tempfile::tempdir().unwrap();
+        let cfg = cas_config(root.path(), PROPOSE_RULE);
+
+        publish_winner(&harness.pod_a, winner_watermark).await;
+        harness.faults.arm_precondition_failures(state_key(), 3);
+
+        let result = super::evaluate_apply_policy_durable(
+            &cfg,
+            DRAFT_PLAN_ID,
+            PolicyPrincipal::Agent,
+            &rocky_core::config::PrincipalRef::unnamed(),
+            &propose_touched(),
+            &root.path().join("models"),
+            &harness.pod_b.state_path,
+            &[],
+            None,
+        )
+        .await;
+        assert!(result.is_err(), "exhaustion must not yield a verdict");
+        let remote = published(&harness).await;
+        assert!(remote.get_watermark(WINNER_KEY).unwrap().is_some());
+        assert!(draft_rows(&remote.list_policy_decisions().unwrap()).is_empty());
     }
 }

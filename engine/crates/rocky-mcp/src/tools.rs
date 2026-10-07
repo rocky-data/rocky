@@ -4313,30 +4313,82 @@ impl RockyMcpServer {
     /// this resolves to `NotConfigured` and behaviour is unchanged.
     ///
     /// `marker_freezes` is the durable freeze-marker set hoisted by the async
-    /// tool body (via [`Self::draft_marker_freezes`]) — the evaluation itself
-    /// is synchronous.
-    fn evaluate_draft_policy(
+    /// tool body (via [`Self::draft_marker_freezes`]); the local-backend
+    /// evaluation is synchronous and uses it directly.
+    ///
+    /// Under a remote `[state]` backend with a `[policy]` block the decision
+    /// row is published to the shared ledger in the same step
+    /// ([`rocky_cli::commands::evaluate_apply_policy_durable`], #2282). A
+    /// row left only in the local file is replaced by the loop's next
+    /// `download_state` before review ever reads it. That path is
+    /// fail-closed: an unreachable ledger is an error, and the caller's
+    /// rollback guard removes the draft.
+    ///
+    /// `prior_classifications` is the pre-image for the dual evaluation
+    /// (`draft_model` on an existing model); `None` is a plain evaluation.
+    async fn evaluate_draft_policy(
         &self,
         stem: &str,
         decision_id: &str,
         marker_freezes: &[rocky_core::freeze_marker::ActiveMarkerFreeze],
-    ) -> rocky_cli::commands::PolicyGate {
+        prior_classifications: Option<&std::collections::BTreeMap<String, Vec<String>>>,
+    ) -> Result<rocky_cli::commands::PolicyGate, Json<ToolError>> {
         let touched: std::collections::BTreeMap<String, rocky_core::config::PolicyCapability> =
             std::iter::once((
                 stem.to_string(),
                 rocky_core::config::PolicyCapability::Propose,
             ))
             .collect();
-        rocky_cli::commands::evaluate_apply_policy(
-            &self.config_path,
+        let state_path = self.state_path();
+        // A config that does not load cannot name a remote backend; the
+        // synchronous gate answers it exactly (`NotConfigured` for an absent
+        // file, `Unloadable` for a broken one — #1559).
+        let Ok(cfg) = rocky_core::config::load_rocky_config(&self.config_path) else {
+            return Ok(match prior_classifications {
+                Some(prior) => {
+                    rocky_cli::commands::evaluate_apply_policy_with_extra_classifications(
+                        &self.config_path,
+                        decision_id,
+                        rocky_core::config::PolicyPrincipal::Agent,
+                        &self.actor,
+                        &touched,
+                        &self.models_dir,
+                        &state_path,
+                        marker_freezes,
+                        prior,
+                    )
+                }
+                None => rocky_cli::commands::evaluate_apply_policy(
+                    &self.config_path,
+                    decision_id,
+                    rocky_core::config::PolicyPrincipal::Agent,
+                    &self.actor,
+                    &touched,
+                    &self.models_dir,
+                    &state_path,
+                    marker_freezes,
+                ),
+            });
+        };
+        rocky_cli::commands::evaluate_apply_policy_durable(
+            &cfg,
             decision_id,
             rocky_core::config::PolicyPrincipal::Agent,
             &self.actor,
             &touched,
             &self.models_dir,
-            &self.state_path(),
+            &state_path,
             marker_freezes,
+            prior_classifications,
         )
+        .await
+        .map_err(|e| {
+            ToolError::internal(
+                format!("failed to record the policy decision on the shared state ledger: {e:#}"),
+                "The remote [state] backend must be reachable so the draft's policy decision \
+                 survives to review (fail-closed). The draft was not kept.",
+            )
+        })
     }
 
     /// Durable freeze-marker LIST for a draft-class gate over `stem` — a
@@ -4567,13 +4619,6 @@ impl RockyMcpServer {
         // A config that EXISTS but fails to load is `Unloadable` instead, and
         // is refused — "no policy" and "could not read the policy" are
         // different answers, and only the first is permission (#1559).
-        let state_path = self.state_path();
-        let touched: std::collections::BTreeMap<String, rocky_core::config::PolicyCapability> =
-            std::iter::once((
-                paths.stem.clone(),
-                rocky_core::config::PolicyCapability::Propose,
-            ))
-            .collect();
         // A draft has no plan; the decision is recorded against a draft-scoped id
         // so the audit ledger stays honest about what it is.
         let decision_id = format!("draft:{}", paths.stem);
@@ -4591,17 +4636,14 @@ impl RockyMcpServer {
         // STRUCTURAL rather than an artifact of the merge staying correct.
         let prior_classifications_by_model: std::collections::BTreeMap<String, Vec<String>> =
             std::iter::once((paths.stem.clone(), prior_classifications)).collect();
-        let gate = rocky_cli::commands::evaluate_apply_policy_with_extra_classifications(
-            &self.config_path,
-            &decision_id,
-            rocky_core::config::PolicyPrincipal::Agent,
-            &self.actor,
-            &touched,
-            &self.models_dir,
-            &state_path,
-            &marker_freezes,
-            &prior_classifications_by_model,
-        );
+        let gate = self
+            .evaluate_draft_policy(
+                &paths.stem,
+                &decision_id,
+                &marker_freezes,
+                Some(&prior_classifications_by_model),
+            )
+            .await?;
 
         match gate {
             // NOT grouped with NotConfigured. A config that failed to LOAD may
@@ -4764,7 +4806,10 @@ impl RockyMcpServer {
         // Durable freeze-marker LIST, hoisted in the async body (the gate is
         // synchronous). Fail-closed; no `[policy]` ⇒ no LIST.
         let marker_freezes = self.draft_marker_freezes(&paths.stem).await?;
-        match self.evaluate_draft_policy(&paths.stem, &decision_id, &marker_freezes) {
+        match self
+            .evaluate_draft_policy(&paths.stem, &decision_id, &marker_freezes, None)
+            .await?
+        {
             // NOT grouped with NotConfigured. A config that failed to LOAD may
             // carry a `[policy]` block denying exactly this write; treating it
             // as "no policy configured" is what let a configured deny stop
@@ -4943,7 +4988,10 @@ impl RockyMcpServer {
         // Durable freeze-marker LIST, hoisted in the async body (the gate is
         // synchronous). Fail-closed; no `[policy]` ⇒ no LIST.
         let marker_freezes = self.draft_marker_freezes(&paths.stem).await?;
-        match self.evaluate_draft_policy(&paths.stem, &decision_id, &marker_freezes) {
+        match self
+            .evaluate_draft_policy(&paths.stem, &decision_id, &marker_freezes, None)
+            .await?
+        {
             // NOT grouped with NotConfigured. A config that failed to LOAD may
             // carry a `[policy]` block denying exactly this write; treating it
             // as "no policy configured" is what let a configured deny stop
@@ -5178,7 +5226,10 @@ impl RockyMcpServer {
         // classification, not by the pre-patch attribute set.
         let decision_id = format!("draft-metadata:{}", paths.stem);
         let marker_freezes = self.draft_marker_freezes(&paths.stem).await?;
-        match self.evaluate_draft_policy(&paths.stem, &decision_id, &marker_freezes) {
+        match self
+            .evaluate_draft_policy(&paths.stem, &decision_id, &marker_freezes, None)
+            .await?
+        {
             // NOT grouped with NotConfigured. A config that failed to LOAD may
             // carry a `[policy]` block denying exactly this write; treating it
             // as "no policy configured" is what let a configured deny stop
@@ -5364,9 +5415,9 @@ impl RockyMcpServer {
             }
             Err(ProposeError::LedgerDownload(inner)) => {
                 return Err(ToolError::internal(
-                    format!("failed to download remote state before the policy gate: {inner}"),
+                    format!("failed to sync remote state around the policy gate: {inner}"),
                     "The remote [state] backend must be reachable so a cross-pod freeze is \
-                     enforced before proposing a plan.",
+                     enforced and the policy decision is recorded before proposing a plan.",
                 ));
             }
             Err(ProposeError::MarkerList(inner)) => {

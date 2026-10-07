@@ -185,10 +185,10 @@ pub enum ProposeError {
     /// Computing the deterministic plan id failed.
     #[error("failed to compute plan id: {0}")]
     PlanId(String),
-    /// The pre-gate authoritative remote-ledger download failed
-    /// (fail-closed: a cross-pod freeze must be enforced before a plan
-    /// is persisted).
-    #[error("failed to download remote state before the policy gate: {0}")]
+    /// The remote-ledger download or decision publish around the policy gate
+    /// failed (fail-closed: a cross-pod freeze must be enforced before a plan
+    /// is persisted, and the gate's decision row must reach the shared ledger).
+    #[error("failed to sync remote state around the policy gate: {0}")]
     LedgerDownload(String),
     /// The durable freeze-marker list failed (fail-closed for the same
     /// reason).
@@ -469,26 +469,7 @@ pub async fn propose_governed_run_plan(
     // A genuinely absent config still yields `None` and the pre-policy posture.
     let cfg =
         super::apply::load_config_for_gate(config_path).map_err(ProposeError::PolicyUnreadable)?;
-    // Pull the authoritative remote freeze/budget ledger BEFORE the
-    // policy gate reads it, so an active cross-pod freeze denies the
-    // propose instead of persisting a plan a later apply would refuse.
-    // Fail-closed, remote-only, and only when the gate will actually read
-    // the ledger (a `[policy]` block + a non-empty touched set —
-    // otherwise the gate short-circuits without a ledger read).
-    if let Some(cfg) = &cfg
-        && cfg.policy.is_some()
-        && !touched.is_empty()
-        && !matches!(cfg.state.backend, rocky_core::config::StateBackend::Local)
-    {
-        let _authority = rocky_core::state_sync::download_state(
-            &cfg.state,
-            state_path,
-            cfg.cache.schemas.replicate,
-        )
-        .await
-        .map_err(|e| ProposeError::LedgerDownload(format!("{e:#}")))?;
-    }
-    // Durable freeze-marker LIST, hoisted beside the ledger download — a
+    // Durable freeze-marker LIST, hoisted beside the gate — a
     // marker-only freeze (its ledger row erased by a concurrent state
     // upload) must still deny the propose. Fail-closed on transport
     // failure.
@@ -498,16 +479,39 @@ pub async fn propose_governed_run_plan(
             .map_err(|e| ProposeError::MarkerList(format!("{e:#}")))?,
         None => Vec::new(),
     };
-    let gate = super::evaluate_apply_policy_with_policy(
-        cfg.as_ref().and_then(|c| c.policy.as_ref()),
-        &plan_id,
-        PolicyPrincipal::Agent,
-        actor,
-        &touched,
-        models_dir,
-        state_path,
-        &marker_freezes,
-    );
+    // Under a remote `[state]` backend with a `[policy]` block the gate runs
+    // through the ledger seam: it reads the authoritative remote ledger (so an
+    // active cross-pod freeze denies the propose instead of persisting a plan
+    // a later apply would refuse) AND publishes its decision rows. A bare
+    // download here replaced the replicated `policy_decisions` table and
+    // dropped the worker's local `draft_model` decision before review (#2282),
+    // and left this propose's own row local-only for the next download to
+    // drop. Fail-closed on a download or publish failure.
+    let gate = match &cfg {
+        Some(cfg) => super::evaluate_apply_policy_durable(
+            cfg,
+            &plan_id,
+            PolicyPrincipal::Agent,
+            actor,
+            &touched,
+            models_dir,
+            state_path,
+            &marker_freezes,
+            None,
+        )
+        .await
+        .map_err(|e| ProposeError::LedgerDownload(format!("{e:#}")))?,
+        None => super::evaluate_apply_policy_with_policy(
+            None,
+            &plan_id,
+            PolicyPrincipal::Agent,
+            actor,
+            &touched,
+            models_dir,
+            state_path,
+            &marker_freezes,
+        ),
+    };
 
     let write_plan = || {
         crate::plan_store::write_plan_governed(
