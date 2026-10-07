@@ -744,6 +744,8 @@ Three outcomes, and the middle one is the point of the no-credentials promise:
 | Present, with `${VAR}` placeholders in an adapter's connection fields you have not exported | Renders in the configured dialect. A credential is never sent anywhere, so it does not have to resolve. An unset placeholder anywhere else — an adapter `type`, an `[imports]` path — still refuses, because it changes what the config means. |
 | Present but malformed, or it breaks a config rule | Refuses, and names the file. Rendering a broken Snowflake project in DuckDB would answer a question you did not ask. |
 
+With a config present, `emit-sql` also runs the per-model-target checks of [`rocky compile`](/reference/commands/core-pipeline/#rocky-compile) (E042/E043, E044, E049, E051, E053, E054). It refuses to emit SQL that the pipeline's warehouse cannot run, such as a `merge` model on ClickHouse (E053).
+
 One exception sits under row two: a placeholder written as a bare value, such as `port = ${PORT}`, is not valid TOML whether or not the variable is set. That is row three, and the error names `PORT`.
 
 Full-refresh models emit a complete `CREATE OR REPLACE TABLE … AS …` that runs as-is against a fresh warehouse and matches what a run executes in the resolved dialect. Merge and `delete_insert` models emit their steady-state statement instead, which operates on an existing target. `rocky run` bootstraps the target table on first build, which a static emit cannot reproduce, so those files carry a leading note:

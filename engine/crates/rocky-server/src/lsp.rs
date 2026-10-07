@@ -854,7 +854,9 @@ impl RockyLsp {
         result: &CompileResult,
     ) {
         let outgoing = {
-            let mut last = published.lock().unwrap_or_else(|e| e.into_inner());
+            let mut last = published
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let (outgoing, now) = plan_publication(&last, diagnostics_by_uri(result));
             *last = now;
             outgoing

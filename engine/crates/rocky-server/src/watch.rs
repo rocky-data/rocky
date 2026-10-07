@@ -143,14 +143,14 @@ mod tests {
         let config = PathBuf::from("/proj/rocky.toml");
         assert!(event_triggers_recompile(
             &modify(),
-            &[config.clone()],
+            std::slice::from_ref(&config),
             Some(&config)
         ));
         // A config with another extension is still the config.
         let odd = PathBuf::from("/proj/rocky.conf");
         assert!(event_triggers_recompile(
             &modify(),
-            &[odd.clone()],
+            std::slice::from_ref(&odd),
             Some(&odd)
         ));
         assert!(!event_triggers_recompile(&modify(), &[odd], None));
@@ -167,7 +167,7 @@ mod tests {
         ));
         assert!(!event_triggers_recompile(
             &EventKind::Access(notify::event::AccessKind::Any),
-            &[config.clone()],
+            std::slice::from_ref(&config),
             Some(&config)
         ));
         assert!(event_triggers_recompile(
