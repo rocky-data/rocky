@@ -10,7 +10,9 @@ Configure these environments in the repository settings:
 ## `credentialed-pr-review`
 
 - Add `ANTHROPIC_API_KEY` as an environment secret.
-- Require at least one trusted reviewer and prevent self-review.
+- Require at least one trusted reviewer. On a repository with one maintainer,
+  that reviewer is the maintainer, so self-review cannot be prevented. The
+  approval is a deliberate pause before secrets are released, not a second person.
 - Disable administrator bypass.
 - Restrict deployment branches to `main`. The workflow accepts only PRs whose
   live base is `main` in this repository, loads tooling from
@@ -26,7 +28,9 @@ requires the label and environment approval again.
 ## `credentialed-ci`
 
 - Add `ANTHROPIC_API_KEY` as an environment secret.
-- Require at least one trusted reviewer and prevent self-review.
+- Require at least one trusted reviewer. On a repository with one maintainer,
+  that reviewer is the maintainer, so self-review cannot be prevented. The
+  approval is a deliberate pause before secrets are released, not a second person.
 - Disable administrator bypass.
 - Restrict deployment branches to `main` only.
 - Do not allow tags or arbitrary branches.
